@@ -22,7 +22,7 @@ Re-layer fresh-agent turn summaries in one the-usual run, delivering all of: (1)
 
 **Goal:** Fresh-agent turn summaries carry a server-tagged provenance (`echo` vs `authored`) that the client consumes directly — echo captions fold into activity-line expansions when superseded, authored prose stays a permanent boundary — with one Rust-side summary dialect across providers.
 
-**Architecture:** The Rust `freshell-freshagent` crate is the single summary producer: a new `summary.rs` module owns the dialect policy (140-char truncation, `Tool result`/`Tool error` labels, the two provenance constants) and the claude/codex/opencode snapshot builders tag every turn. The shared zod contract gains an optional `summaryKind` field plus a `turnSummaryIsAuthored` helper (missing tag = authored, conservative). The React transcript deletes its echo classifier, painted-summary store, and the write-only client summarizer, and drives line-absorb boundaries, caption folding into activity-strip expansions, and fully-filtered-turn handling purely from the tag.
+**Architecture:** The Rust `freshell-freshagent` crate is the single summary producer: a new `summary.rs` module owns the dialect policy (140-char truncation, `Tool result`/`Tool error` labels, the two provenance constants) and the claude/codex/opencode snapshot builders tag every turn. The shared zod contract gains an optional `summaryKind` field plus a `turnSummaryIsAuthored` helper (missing tag = authored, conservative). The React transcript deletes its echo classifier, painted-summary store, and the write-only client summarizer, and drives line-absorb boundaries, caption folding into activity-strip expansions, and display-filter handling purely from the tag. The only fold source is the absorb-stash of a superseded streaming-tail caption, gated to fully-visible absorbed turns so hidden thinking/reasoning text can never leak into an expansion (no Rust producer emits a zero-item turn with a non-blank summary, so there is no zero-item caption fold machinery — zero-item turns stay painted where they are).
 
 **Tech Stack:** Rust (freshell-freshagent crate, cargo test/clippy/fmt), TypeScript/React 18 (FreshAgentTranscript, freshAgentSlice), Zod shared contract (`shared/`), Vitest (unit), Playwright (e2e, routed-snapshot freshcodex panes).
 
@@ -43,9 +43,19 @@ Re-layer fresh-agent turn summaries in one the-usual run, delivering all of: (1)
 
 1. **DEVIATION — opencode reasoning excerpts tag `echo`, not `authored`.** The coordination input suggested opencode `reasoning.summary[0]` could tag `authored`. The user request defines authored as "provider-written prose (currently only codex reasoning summaries)", and the producer inventory (`reports/plan-rust-producers.md`) found opencode's `summary[0]` is the adapter's own mechanical projection of the part's full reasoning text (`crates/freshell-freshagent/src/lib.rs:1395-1439`), not provider summary prose. Tagging it `authored` would permanently paint full hidden reasoning in default-config (`showThinking=false`) opencode transcripts — an unrequested regression. **Every opencode summary tags `echo`.** This deviation is called out in the run's final report.
 2. **The `freshAgent.assistant` reducer is KEPT; only its summary write dies.** `addAssistantMessage` (`src/store/freshAgentSlice.ts:580-601`) also clears `streamingText`/`streamingActive`, which is live-read through `pane-activity.ts`. The write-only piece is `summarizeFreshAgentItems` (`freshAgentSlice.ts:130-143`) — the summary it computes has no remaining reader once the classifier is gone — so the reducer writes `summary: ''` and the function is deleted. The WS dispatch path (`src/lib/fresh-agent-ws.ts:269-275`) is untouched.
-3. **Fully-filtered echo turns are dropped, not stashed.** A hidden-thinking turn (`showThinking=false`) whose summary is an echo disappears when superseded and is NOT stashed into expansions: the user chose to hide that content, and the stashed caption would leak it. Stash sources are only (a) summaries of absorbed turns whose items render, and (b) zero-item echo captions superseded by a later same-role activity line.
+3. **Absorb-stash gate: fully-visible absorbed turns only.** An absorbed turn's echo caption is stashed into the line's expansion ONLY when the turn was fully visible — display filtering removed none of its items (`filterTurnsForDisplay` stamps `hadFilteredItems: true` on every removal path, and the absorb-stash checks the marker). Partially-filtered turns (e.g. a claude `[thinking, tool_use]` turn under the default `showThinking=false`, whose echo summary derives from the hidden thinking item) and fully-filtered turns DROP their captions at absorb — identical to pre-fold behavior: the user chose to hide that content, and the stashed caption would leak it (LB-1). With the zero-item fold deleted (LB-4, see the validation subsection below), this absorb-stash of superseded streaming-tail captions is the ONLY fold source; zero-item turns render their own article and never fold.
 4. **E2e lives in the existing `test/e2e-browser/specs/fresh-agent.spec.ts` (default chromium project).** The specs route the snapshot REST response and inject `freshAgent.session.changed` through the test harness — they never need a real Rust server — so no `RUST_ONLY_SPECS`/`testMatch` registration in `test/e2e-browser/playwright.config.ts` is required. `fresh-agent-control-rust.spec.ts` (rust-chromium) runs as impacted surface.
 5. **`docs/index.html` and `AGENTS.md` need no change** (Task 6 re-verifies): the docs mock renders a settled activity strip and no streaming echo captions; `AGENTS.md` references none of the deleted machinery. The historical plan `docs/plans/2026-08-23-freshagent-activity-line.md` is not modified.
+6. **Codex reasoning fallback keeps its shipped order — `authored` needs no reorder.** `map_codex_item` (`codex.rs:3315-3322`) constructs a reasoning item's `text` as the joined provider `summary` array whenever that array is non-empty (else the joined raw `content`), so the shipped selection order (direct `text` → provider `summary` array → `content`) already returns the provider prose in exactly the authored case. The rule Task 2 implements: `authored` is emitted IFF the returned summary string IS the provider-written reasoning `summary` join; every other selection order stays byte-identical to today's, so tagging changes no visible summary text. Task 2 pins both the construction-shaped case (authored) and a divergent synthetic case (echo).
+
+### Load-bearing validation
+
+Four plan-critical claims were validated against the worktree after this plan's first commit (all high confidence). Evidence stays in the validator reports (in the run's logs dir); only the resolutions are recorded here.
+
+- **LB-1** (`reports/load-bearing-validator-LB-1.md`): the absorb-stash as first planned also fired for partially-filtered turns, leaking hidden thinking/reasoning text into expansions (reachable in BOTH the claude and codex lanes under the default `showThinking=false`). **Resolution:** the stash gate is now fully-visible-only — decision 3 and Task 4. The validator's server-marked-source alternative was rejected: the `hadFilteredItems` display marker adds no contract surface and revives no classifier.
+- **LB-2** (`reports/load-bearing-validator-LB-2.md`): three legacy merge tests (`FreshAgentTranscript.test.tsx:460`, `:577`, `:895`) relied on untagged exact-echo merges but were missing from Task 3's update list — Task 3 Step 4's "Expected: PASS" was unreachable as written. **Resolution:** Task 3 step (f) now covers all three with the prescribed tagging, and the absorb guard is null-safe (`(turn.summary ?? '')`).
+- **LB-3** (`reports/load-bearing-validator-LB-3.md`): `fresh-agent-control-rust.spec.ts` is absorb-independent in all four lanes. **No plan change;** Task 5 Step 6 remains as the confirming run.
+- **LB-4** (`reports/load-bearing-validator-LB-4.md`): no Rust producer emits a zero-item turn with a non-blank summary (exhaustively verified, including streaming/partial paths), so the planned zero-item `pendingCaptions` fold was synthetic-only. **Resolution:** the machinery is deleted from Task 4; Task 4 pins benign zero-item blank-summary rendering instead; Task 2 pins the claude zero-item drop guard that keeps the non-blank `'[claude turn]'` fallback unreachable, and corrects the stale `build_codex_turn_json` doc comment. LB-1's side finding (codex fallback-order) resolved as decision 6.
 
 ## File responsibility map
 
@@ -62,9 +72,9 @@ Re-layer fresh-agent turn summaries in one the-usual run, delivering all of: (1)
 | `crates/freshell-freshagent/src/codex.rs` | `summarize_codex_items` returns `(String, kind)`; authored iff codex reasoning `summary[]` | 2 |
 | `crates/freshell-freshagent/src/lib.rs` | `mod summary;`; opencode summary tuple + tag | 2 |
 | `test/fixtures/fresh-agent/claude-snapshot-golden.json` | Golden snapshot regenerated with `summaryKind` + `Tool result` | 2 |
-| `src/components/fresh-agent/FreshAgentTranscript.tsx` | Provenance consumption (3), caption fold (4) | 3–4 |
+| `src/components/fresh-agent/FreshAgentTranscript.tsx` | Provenance consumption (3); absorb-stash caption fold gated to fully-visible turns (4) | 3–4 |
 | `src/store/freshAgentSlice.ts` | Delete write-only summarizer; `summary: ''` | 3 |
-| `test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx` | Rewritten pins + new fold tests | 3–4 |
+| `test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx` | Retagged merge pins (3); rewritten pins + absorb-stash/no-leak fold tests (3–4) | 3–4 |
 | `test/unit/client/lib/fresh-agent-ws.test.ts` | `summary: ''` expectation | 3 |
 | `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx` | `summary: ''` expectation | 3 |
 | `test/e2e-browser/specs/fresh-agent.spec.ts` | `foldable echo captions` describe | 5 |
@@ -75,8 +85,8 @@ Re-layer fresh-agent turn summaries in one the-usual run, delivering all of: (1)
 
 - Task 1 produces `FreshAgentTurn['summaryKind']?: 'echo' | 'authored'` (zod-optional) and `turnSummaryIsAuthored(turn: Pick<FreshAgentTurn, 'summaryKind'>): boolean` (`=== 'echo'` → false; missing/`'authored'` → true).
 - Task 2 emits `summaryKind: "echo" | "authored"` on every turn of every Rust snapshot; consumes Task 1's schema (the golden-fixture contract test parses strictly).
-- Task 3 consumes Task 1's helper; produces the provenance absorb guard, new `filterTurnsForDisplay` rules, and `appendTurnItems` kind recomputation (`echo` only when both sides are `'echo'`).
-- Task 4 consumes Task 3's guard; produces `ActivityRow` caption rows, `buildActivity(items, captions)`, the absorb-stash + pending-caption fold, and `data-testid="fresh-agent-activity-caption"`.
+- Task 3 consumes Task 1's helper; produces the null-safe provenance absorb guard, new `filterTurnsForDisplay` rules, and `appendTurnItems` kind recomputation (`echo` only when both sides are `'echo'`).
+- Task 4 consumes Task 3's guard; produces the `DisplayTurn` type (`FreshAgentTurn & { hadFilteredItems?: boolean }`, stamped by `filterTurnsForDisplay`), `ActivityRow` caption rows, `buildActivity(items, captions)`, the fully-visible-gated absorb-stash fold, and `data-testid="fresh-agent-activity-caption"`.
 - Task 5 consumes Task 4's UI (the caption testid and fold transitions).
 
 ### Task 1: Contract `summaryKind` field + `turnSummaryIsAuthored` helper
@@ -222,9 +232,32 @@ fn summarize_unifies_truncation_and_tool_result_labels() {
     let err = vec![json!({ "kind": "tool_result", "content": "boom", "isError": true })];
     assert_eq!(summarize(&err), "Tool error");
 }
+
+#[test]
+fn claude_zero_item_messages_are_dropped_before_summarizing() {
+    // Preservation pin (passes immediately — it guards an EXISTING invariant,
+    // see Step 2): `summarize`'s final fallback is the non-blank literal
+    // "[claude turn]", so the `if items.is_empty() { continue; }` guard ahead
+    // of it is the only thing keeping zero-item non-blank-summary turns
+    // unreachable (load-bearing validation LB-4). A message whose blocks are
+    // all unrecognized yields no items and must emit NO turn at all.
+    let transcript: &str = concat!(
+        r#"{"type":"assistant","message":{"content":[{"type":"future_block","data":"x"}]}}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"id":"msg_ok","content":[{"type":"text","text":"real answer"}]}}"#,
+        "\n",
+    );
+    let built = build_claude_snapshot_json("freshclaude", "t", transcript, 0);
+    let turns = built["turns"].as_array().unwrap();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0]["summary"], json!("real answer"));
+    assert!(turns
+        .iter()
+        .all(|turn| !turn["items"].as_array().unwrap().is_empty()));
+}
 ```
 
-Add to `crates/freshell-freshagent/src/codex.rs` tests (and update the existing `summarize_codex_items_uses_first_items_kind_specific_text_not_a_join` at :9837 to the tuple shape):
+Add to `crates/freshell-freshagent/src/codex.rs` tests (its `tests` module gains `use crate::summary::{SUMMARY_KIND_AUTHORED, SUMMARY_KIND_ECHO};`; update the existing `summarize_codex_items_uses_first_items_kind_specific_text_not_a_join` at :9837 to the tuple shape):
 
 ```rust
 #[test]
@@ -233,10 +266,54 @@ fn summarize_codex_items_uses_first_items_kind_specific_text_not_a_join() {
         json!({ "id": "a", "kind": "reasoning", "summary": ["thinking hard"], "content": [], "text": "thinking hard" }),
         json!({ "id": "b", "kind": "command", "command": "ls", "status": "completed", "output": null, "exitCode": null, "extensions": {} }),
     ];
-    // A reasoning item WITH a provider summary array is the only authored case.
+    // A reasoning item carrying a provider summary array is the only authored
+    // case; `text` is CONSTRUCTED as the joined provider summary by
+    // `map_codex_item`, so the authored value is exactly today's value.
     assert_eq!(
         summarize_codex_items(&items),
         ("thinking hard".to_string(), SUMMARY_KIND_AUTHORED)
+    );
+}
+
+#[test]
+fn summarize_codex_items_keeps_the_shipped_reasoning_fallback_order() {
+    // Planning decision 6: the reasoning fallback order is UNCHANGED (direct
+    // `text` -> provider `summary` array -> `content`); the reorder first
+    // drafted here was reverted by load-bearing validation (LB-1 side
+    // finding). Authored iff the RETURNED STRING is the provider summary
+    // join. Construction-shaped items (`text` == the join, as `map_codex_item`
+    // builds them) tag authored with an unchanged value:
+    let construction_shaped = vec![json!({
+        "id": "a", "kind": "reasoning",
+        "summary": ["provider prose"], "content": ["raw chain"], "text": "provider prose",
+    })];
+    assert_eq!(
+        summarize_codex_items(&construction_shaped),
+        ("provider prose".to_string(), SUMMARY_KIND_AUTHORED)
+    );
+
+    // Direct text empty: the provider summary array supplies the value, so
+    // the string IS provider prose -> authored (authored stays reachable
+    // under the untouched order).
+    let no_direct_text = vec![json!({
+        "id": "b", "kind": "reasoning",
+        "summary": ["provider prose"], "content": ["raw chain"], "text": "",
+    })];
+    assert_eq!(
+        summarize_codex_items(&no_direct_text),
+        ("provider prose".to_string(), SUMMARY_KIND_AUTHORED)
+    );
+
+    // A synthetic item whose direct text diverges from the provider summary
+    // keeps today's value (the direct text) and tags echo — the value was not
+    // taken from the provider array.
+    let divergent = vec![json!({
+        "id": "c", "kind": "reasoning",
+        "summary": ["provider prose"], "content": [], "text": "direct text",
+    })];
+    assert_eq!(
+        summarize_codex_items(&divergent),
+        ("direct text".to_string(), SUMMARY_KIND_ECHO)
     );
 }
 
@@ -307,7 +384,7 @@ Also add `assert_eq!(turns[1]["summaryKind"], json!("echo"));` beside the summar
 
 Run: `cargo test -p freshell-freshagent`
 
-Expected: FAIL because no turn carries a `summaryKind` key, `summarize` still caps at 120 and emits the `'[tool result]'` dialect, and `summarize_codex_items`/`opencode_turn_summary` return `String` rather than the `(String, &'static str)` tuple (a compile error in the new tests counts as the intended red: the missing behavior is the tuple+tag). Not a syntax/setup accident.
+Expected: FAIL because no turn carries a `summaryKind` key, `summarize` still caps at 120 and emits the `'[tool result]'` dialect, and `summarize_codex_items`/`opencode_turn_summary` return `String` rather than the `(String, &'static str)` tuple (a compile error in the new tests counts as the intended red: the missing behavior is the tuple+tag). One exception by design: `claude_zero_item_messages_are_dropped_before_summarizing` is a PRESERVATION pin — the `if items.is_empty() { continue; }` guard exists today, so that test is green even at red time (its red would come from someone deleting the guard while touching the fallback chain). Not a syntax/setup accident.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -421,7 +498,9 @@ and tag the turn at the insert site (:495):
         turn.insert("items".into(), json!(items));
 ```
 
-In `crates/freshell-freshagent/src/codex.rs`: import the policy, then replace `summarize_codex_items` (:3485-3567) with the tuple-returning version — every arm identical except `truncate140` → `truncate_summary`, the reasoning arm gains the authored check, and returns gain the kind:
+**Preserve the zero-item drop guard.** The `if items.is_empty() { continue; }` at :467-469 runs BEFORE `summarize` and MUST stay: the new `summarize` still ends in the non-blank `"[claude turn]"` fallback, so without the guard claude would start emitting zero-item turns with non-blank echo summaries — a shape load-bearing validation (LB-4) proved never occurs today and Task 4's client design relies on never occurring. The Step-1 preservation pin covers it.
+
+In `crates/freshell-freshagent/src/codex.rs`: import the policy, then replace `summarize_codex_items` (:3485-3567) with the tuple-returning version — every arm identical except `truncate140` → `truncate_summary`, the reasoning arm KEEPS ITS SHIPPED selection order and gains the authored check (planning decision 6), and returns gain the kind:
 
 ```rust
 /// `summarizeFreshAgentItems(items)` (`normalize.ts:168-207`): the turn's `summary` string is
@@ -430,16 +509,22 @@ In `crates/freshell-freshagent/src/codex.rs`: import the policy, then replace `s
 /// alone. Truncation is the shared 140-char policy (`crate::summary`).
 ///
 /// Provenance: the summary is AUTHORED only when it comes from a `reasoning`
-/// item's non-empty provider `summary` array (codex is the one provider that
+/// item's provider-written `summary` array (codex is the one provider that
 /// ships provider-written summary prose). Everything else — including a
 /// reasoning item reduced to its raw `content` text — is a mechanical
-/// projection and tags ECHO.
+/// projection and tags ECHO. The value SELECTION ORDER is the shipped one
+/// (direct `text` → provider `summary` → `content`), deliberately NOT
+/// reordered: `map_codex_item` (:3315-3322) constructs a reasoning item's
+/// `text` as the joined provider summary exactly when one exists, so authored
+/// is reachable with no visible-text change (planning decision 6).
 fn summarize_codex_items(items: &[Value]) -> (String, &'static str) {
     for item in items {
         let kind = item.get("kind").and_then(Value::as_str).unwrap_or("");
         let text = match kind {
             "text" | "thinking" => item.get("text").and_then(Value::as_str).map(truncate_summary),
             "reasoning" => {
+                // Shipped order: direct `text` first, then the provider
+                // `summary` array, then raw `content`.
                 let provider_summary = item
                     .get("summary")
                     .and_then(Value::as_array)
@@ -450,25 +535,32 @@ fn summarize_codex_items(items: &[Value]) -> (String, &'static str) {
                             .join("\n")
                     })
                     .filter(|joined| !joined.is_empty());
-                if let Some(summary) = provider_summary {
-                    return (truncate_summary(&summary), SUMMARY_KIND_AUTHORED);
-                }
                 let direct = item
                     .get("text")
                     .and_then(Value::as_str)
                     .filter(|s| !s.is_empty());
                 let text = direct.map(str::to_string).unwrap_or_else(|| {
-                    item.get("content")
-                        .and_then(Value::as_array)
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(Value::as_str)
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        })
-                        .unwrap_or_default()
+                    provider_summary.clone().unwrap_or_else(|| {
+                        item.get("content")
+                            .and_then(Value::as_array)
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(Value::as_str)
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            })
+                            .unwrap_or_default()
+                    })
                 });
-                Some(truncate_summary(&text))
+                // Authored iff the RETURNED string is the provider summary
+                // join. For `map_codex_item`-built items that holds exactly
+                // when a provider summary exists; a synthetic item whose
+                // direct text diverges stays echo (the value came from text).
+                let summary_kind = match &provider_summary {
+                    Some(joined) if *joined == text => SUMMARY_KIND_AUTHORED,
+                    _ => SUMMARY_KIND_ECHO,
+                };
+                return (truncate_summary(&text), summary_kind);
             }
             "command" => item.get("command").and_then(Value::as_str).map(truncate_summary),
             "file_change" => Some("File change".to_string()),
@@ -525,6 +617,16 @@ and the turn builder (:3793-3801):
                 "items": row.items,
             })
 ```
+
+Also correct two stale doc comments (neither matches the code; found by load-bearing validation LB-4). In `build_codex_turn_json`'s comment (:3682-3685), replace the false skipping claim:
+
+> DELIBERATE DEVIATION: an unrecognized item type no longer fails the turn -- per [`map_codex_item`]'s doc comment, it maps to an empty item list, **and this loop skips it entirely (no role/row bookkeeping touched) so it can never manufacture a spurious empty display row**. Every other item in the turn still renders normally.
+
+with the true behavior:
+
+> DELIBERATE DEVIATION: an unrecognized item type no longer fails the turn -- per [`map_codex_item`]'s doc comment, it maps to an empty item list. The loop does NOT skip it: its role is still classified (the catch-all arm of [`classify_codex_item_role`] yields `assistant`) and folded into `has_assistant_output`/`has_user_output`/`all_items_are_user`, and when that role differs from the previous row's a new row is pushed whose `items` is the empty list -- a ZERO-ITEM display row with a BLANK summary (`summarize_codex_items(&[])` returns `""`). When the role matches the previous row, `row.items.extend(mapped)` extends by nothing and no empty row appears. Every other item in the turn still renders normally.
+
+and in [`classify_codex_item_role`]'s comment (:3443-3447) drop the twin false claim that the caller only reaches it for non-empty mappings (the catch-all IS reachable for unrecognized types and decides whether the zero-item row appears); state instead that the caller classifies every raw item including unrecognized ones.
 
 In `crates/freshell-freshagent/src/lib.rs`, change `opencode_turn_summary` (:1395-1439) to return `(String, &'static str)`. Keep the `text_items` collection (:1396-1404) and the source-id grouping loop (:1405-1429) byte-for-byte; only the two return sites change — the text-join return becomes `return (truncate_summary(&groups.join("\n\n")), SUMMARY_KIND_ECHO);` and the reasoning fallback becomes:
 
@@ -692,7 +794,7 @@ git commit -m "feat(freshagent): tag rust snapshot summaries with echo/authored 
 
 **Interfaces:**
 - Consumes: `turnSummaryIsAuthored` and `FreshAgentTurn['summaryKind']` (Task 1).
-- Produces: the absorb guard (`absorb iff open.originIndex === turnIndex || turn.summary.trim() === '' || !turnSummaryIsAuthored(turn)`), the new `filterTurnsForDisplay` rules, and `appendTurnItems` kind recomputation that Task 4 builds the fold on.
+- Produces: the null-safe absorb guard (`absorb iff open.originIndex === turnIndex || (turn.summary ?? '').trim() === '' || !turnSummaryIsAuthored(turn)`), the new `filterTurnsForDisplay` rules, and `appendTurnItems` kind recomputation that Task 4 builds the fold on.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
@@ -860,6 +962,12 @@ In `test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx`:
 
 (f) Tag-only updates: :1759 (`summaryKind: 'echo'` on turn-c), :1774 (`summaryKind: 'authored'` on `turnCEmpty` — assertions unchanged), :1917 (`summaryKind: 'echo'` on the thinking turn — it now drops via the echo rule rather than "never painted"), :1938 and :1961 (`summaryKind: 'echo'` on turn-b), and the `thinkingOnly` helper in the jp70 describe (:1094) gains `summaryKind: 'echo' as const` (keeps `'drops a non-streaming turn when all items are filtered out'` :1223 green under the new filter rules; the streaming-tail siblings are unaffected). Rename :1741 to `'permanently separates tool runs when the follower turn carries an untagged (unknown-provenance) summary'` — fixtures unchanged (untagged = conservative authored), with an updated comment: `// Conservative rule: a server that does not emit summaryKind leaves every non-blank summary authored — no absorb, no folding.`
 
+Also in (f) — the three legacy merge tests found by LB-2 that relied on untagged exact-echo merges (each goes red under the new guard until tagged):
+
+- `:460` `'collapses consecutive activity-only assistant turns into one live strip'`: add `summaryKind: 'echo'` inline to each of the three `summary: 'Read'` assistant turns (the `'request'` user turn stays untagged — role changes never absorb). Assertions unchanged.
+- `:577` `'coalesces adjacent Claude tool-use/result exchanges without rendering synthetic You turns'`: add `summaryKind: 'echo'` to both `summary: 'Read'` assistant turns AND to both `summary: 'Tool result'` user turns — the result turns coalesce via `appendTurnItems`, which keeps echo only when BOTH sides are echo, so the synthetic side needs the tag for the merge to survive. Assertions unchanged.
+- `:895` `'merges adjacent activity-only display turns into one line actionable from the line end'`: both thinking turns are inline literals (not built by a helper), so add inline `summaryKind: 'echo' as const` to each (`summary: 'first thought'` / `'second thought'`). Assertions unchanged (they render under the component's `showThinking` prop default `true`, so both turns are fully visible).
+
 (g) DELETE the classifier/painted-era pins whose machinery no longer exists: :1822 (`'merges a follower whose live summary space-joins several item echoes'` — the live summarizer is deleted), :1843 (`'merges a codex image-generation follower whose summary echoes its result'` — classifier-specific; generic echo coverage is the :1759 pin plus the server-side tags), :2008 (`'does not let a painted summary mark a different turn that shares its turnId'`), :2042 (`'keeps the painted boundary when a streaming summary grows after painting'`) — the painted-summary store is deleted; folding is deterministic per the turn list, so there is no paint-history identity to confuse.
 
 (h) In `test/unit/client/lib/fresh-agent-ws.test.ts:462-466`, change the expectation to `summary: ''`. In `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx:1215-1219`, change `summary: 'Final answer'` to `summary: ''`.
@@ -894,7 +1002,7 @@ function filterTurnsForDisplay(
           return { ...turn, items: [] }
         }
         // Blank summary: nothing ever painted — drop the turn outright.
-        if (turn.summary.trim().length === 0) return null
+        if ((turn.summary ?? '').trim().length === 0) return null
         // Authored prose is real content: keep it painted as a summary-only
         // article (a permanent boundary between the surrounding lines).
         if (turnSummaryIsAuthored(turn)) return { ...turn, items: [] }
@@ -936,13 +1044,14 @@ function appendTurnItems(previous: FreshAgentTurn, next: FreshAgentTurn): FreshA
         // untagged one — conservative) is "something between": it can render,
         // so the runs behind it are permanently separated. Blank and
         // echo-tagged summaries carry no extra rendering and never block a
-        // merge.
+        // merge. (The `?? ''` is defensive — the zod schema requires `summary`
+        // on the wire, but ported fixtures may omit it.)
         if (
           open
           && open.role === turn.role
           && (
             open.originIndex === turnIndex
-            || turn.summary.trim().length === 0
+            || (turn.summary ?? '').trim().length === 0
             || !turnSummaryIsAuthored(turn)
           )
         ) {
@@ -960,7 +1069,7 @@ Expected: PASS
 
 - [ ] **Step 5: Refactor while green**
 
-Confirm no dead references remain: `rg -n "DisplayTurn|echoItems|filteredPlaceholder|paintedSummary|itemEchoes|segmentMatchesEchoes|summaryIsAuthoredContent|SUMMARY_LABEL_BY_KIND|summarizeFreshAgentItems" src/ test/` returns zero hits. `npm run typecheck` and `npm run lint` clean.
+Confirm no dead references remain: `rg -n "DisplayTurn|echoItems|filteredPlaceholder|paintedSummary|itemEchoes|segmentMatchesEchoes|summaryIsAuthoredContent|SUMMARY_LABEL_BY_KIND|summarizeFreshAgentItems" src/ test/` returns zero hits (this sweep runs before Task 4 lands — Task 4 deliberately reintroduces a NEW minimal `DisplayTurn` marker type for the fully-visible stash gate). `npm run typecheck` and `npm run lint` clean.
 
 - [ ] **Step 6: Run impacted-test verification**
 
@@ -977,62 +1086,114 @@ git add src/components/fresh-agent/FreshAgentTranscript.tsx src/store/freshAgent
 git commit -m "refactor(freshagent): consume server summaryKind; delete client echo classifier and painted-summary store"
 ```
 
-### Task 4: Foldable echo captions (stash + expansion rendering)
+### Task 4: Foldable echo captions (absorb-stash + expansion rendering)
 
 **Files:**
-- Modify: `src/components/fresh-agent/FreshAgentTranscript.tsx` (`ActivityRow` :91-93, `buildActivity` :95-157, `buildTranscriptLayout` :313-404, `FreshAgentActivityStrip` expansion :719-723, `selectLiveActivityBlockIdFromLayout` settled branch :582-585, render loop :1062-1092)
+- Modify: `src/components/fresh-agent/FreshAgentTranscript.tsx` (`ActivityRow` :91-93, `buildActivity` :95-157, `filterTurnsForDisplay` :503-525, `buildTranscriptLayout` :313-404, `FreshAgentActivityStrip` expansion :719-723, `selectLiveActivityBlockIdFromLayout` settled branch :582-585)
 - Test: `test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx`
 
 **Interfaces:**
-- Consumes: Task 3's provenance absorb guard and `turnSummaryIsAuthored`.
-- Produces: `ActivityRow` gains `{ type: 'caption'; id: string; text: string }`; `buildActivity(items, captions?)`; `TurnLayout.captionFolded?: true`; `data-testid="fresh-agent-activity-caption"`.
+- Consumes: Task 3's null-safe provenance absorb guard, Task 3's `filterTurnsForDisplay`, and `turnSummaryIsAuthored`.
+- Produces: `type DisplayTurn = FreshAgentTurn & { hadFilteredItems?: boolean }` (stamped by `filterTurnsForDisplay`, which now returns `DisplayTurn[]`); `ActivityRow` gains `{ type: 'caption'; id: string; text: string }`; `type LineCaption = { id: string; text: string; atItemIndex: number }`; `buildActivity(items, captions?)`; the fully-visible-gated absorb-stash; `data-testid="fresh-agent-activity-caption"`.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
 Add a `describe('foldable echo captions')` inside `describe('activity line collapse')` (it reuses the `toolTurn` helper):
 
 ```tsx
-    it('folds a zero-item echo caption into the next same-role activity line', () => {
-      const captionTurn = {
-        id: 'turn-cap', turnId: 'turn-cap', role: 'assistant' as const,
-        summary: 'Considering options', summaryKind: 'echo' as const, items: [],
+    it('stashes an absorbed echo caption only when the absorbed turn was fully visible (claude lane)', () => {
+      // Claude lane (LB-1): [thinking "secret", tool_use] under the production
+      // default showThinking=false. The echo summary derives from the HIDDEN
+      // thinking item; the turn is partially filtered, so its caption is
+      // DROPPED at absorb — never stashed into the expansion.
+      const secretTurn = {
+        id: 'turn-secret', turnId: 'turn-secret', role: 'assistant' as const,
+        summary: 'secret plans', summaryKind: 'echo' as const,
+        items: [
+          { id: 'think-secret', kind: 'thinking' as const, text: 'secret plans' },
+          { id: 'tool-c2', kind: 'tool_use' as const, toolUseId: 'c2', name: 'Read', input: { file_path: 'src/b.ts' } },
+        ],
       }
-      const { rerender } = render(
-        <FreshAgentTranscript isStreaming turns={[toolTurn('turn-a', [['c1', 'src/a.ts']]), captionTurn]} />,
-      )
-      expect(screen.getByText('Considering options')).toBeInTheDocument()
-
-      rerender(
-        <FreshAgentTranscript isStreaming turns={[toolTurn('turn-a', [['c1', 'src/a.ts']]), captionTurn, toolTurn('turn-b', [['c2', 'src/b.ts']])]} />,
-      )
-      // The caption left the stream; the zero-item turn still split the lines.
-      expect(screen.queryByText('Considering options')).not.toBeInTheDocument()
-      const strips = screen.getAllByRole('region', { name: 'Activity strip' })
-      expect(strips).toHaveLength(2)
-      // Stashed into the FOLLOWING line's expansion, before its tool row.
-      fireEvent.click(screen.getAllByRole('button', { name: 'Toggle activity details' })[1])
-      const caption = screen.getByTestId('fresh-agent-activity-caption')
-      expect(caption).toHaveTextContent('Considering options')
-      expect(
-        caption.compareDocumentPosition(screen.getByText('src/b.ts')) & Node.DOCUMENT_POSITION_FOLLOWING,
-      ).toBeTruthy()
-      // The first line's expansion does not carry it.
-      fireEvent.click(screen.getAllByRole('button', { name: 'Toggle activity details' })[0])
-      expect(screen.getAllByTestId('fresh-agent-activity-caption')).toHaveLength(1)
-    })
-
-    it('keeps an echo caption painted until later activity supersedes it', () => {
+      // Positive control: a fully-visible absorbed echo turn DOES stash. The
+      // same test therefore red-flags BOTH failure modes — no stash machinery
+      // at all (zero captions) and an ungated stash (the hidden text leaks).
+      const visibleTurn = {
+        id: 'turn-visible', turnId: 'turn-visible', role: 'assistant' as const,
+        summary: 'Read', summaryKind: 'echo' as const,
+        items: [{ id: 'tool-c3', kind: 'tool_use' as const, toolUseId: 'c3', name: 'Read', input: { file_path: 'src/c.ts' } }],
+      }
       render(
         <FreshAgentTranscript
+          isStreaming
+          showThinking={false}
+          turns={[toolTurn('turn-a', [['c1', 'src/a.ts']]), secretTurn, visibleTurn]}
+        />,
+      )
+      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
+      fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+      const captions = screen.getAllByTestId('fresh-agent-activity-caption')
+      expect(captions).toHaveLength(1)
+      expect(captions[0]).toHaveTextContent('Read')
+      // The hidden thinking text appears NOWHERE — not in the stream, not in
+      // the expansion.
+      expect(screen.queryByText('secret plans')).not.toBeInTheDocument()
+      // The visible item from the partially-filtered turn still absorbed.
+      expect(screen.getByText('src/b.ts')).toBeInTheDocument()
+      expect(screen.getByText('src/c.ts')).toBeInTheDocument()
+    })
+
+    it('stashes an absorbed echo caption only when the absorbed turn was fully visible (codex lane)', () => {
+      // Codex lane (LB-1): [reasoning{summary: [], text: "secret"}, command]
+      // under showThinking=false — the reasoning item is hidden, the command
+      // item renders; the echo summary derives from the hidden reasoning.
+      const secretTurn = {
+        id: 'turn-secret', turnId: 'turn-secret', role: 'assistant' as const,
+        summary: 'secret plans', summaryKind: 'echo' as const,
+        items: [
+          { id: 'reason-secret', kind: 'reasoning' as const, summary: [] as string[], content: ['secret plans'], text: 'secret plans' },
+          { id: 'cmd-c2', kind: 'command' as const, command: 'ls src', status: 'completed' as const },
+        ],
+      }
+      const visibleTurn = {
+        id: 'turn-visible', turnId: 'turn-visible', role: 'assistant' as const,
+        summary: 'ls test', summaryKind: 'echo' as const,
+        items: [{ id: 'cmd-c3', kind: 'command' as const, command: 'ls test', status: 'completed' as const }],
+      }
+      render(
+        <FreshAgentTranscript
+          isStreaming
+          showThinking={false}
+          turns={[toolTurn('turn-a', [['c1', 'src/a.ts']]), secretTurn, visibleTurn]}
+        />,
+      )
+      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
+      fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+      const captions = screen.getAllByTestId('fresh-agent-activity-caption')
+      expect(captions).toHaveLength(1)
+      expect(captions[0]).toHaveTextContent('ls test')
+      expect(screen.queryByText('secret plans')).not.toBeInTheDocument()
+    })
+
+    it('treats a zero-item blank-summary turn as a benign line boundary (opencode structural-message shape)', () => {
+      // Routine in opencode (LB-4): a message whose parts are all structural
+      // (step-start/step-finish) arrives as a turn with items: [] and
+      // summary: ''. It renders nothing, stashes nothing, and still
+      // hard-closes the open line.
+      render(
+        <FreshAgentTranscript
+          isStreaming
           turns={[
             toolTurn('turn-a', [['c1', 'src/a.ts']]),
-            { id: 'turn-cap', turnId: 'turn-cap', role: 'assistant',
-              summary: 'Considering options', summaryKind: 'echo', items: [] },
+            { id: 'turn-empty', turnId: 'turn-empty', role: 'assistant', summary: '', summaryKind: 'echo', items: [] },
+            toolTurn('turn-b', [['c2', 'src/b.ts']]),
           ]}
         />,
       )
-      expect(screen.getByText('Considering options')).toBeInTheDocument()
-      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
+      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(2)
+      for (const toggle of screen.getAllByRole('button', { name: 'Toggle activity details' })) {
+        fireEvent.click(toggle)
+      }
+      expect(screen.queryByTestId('fresh-agent-activity-caption')).not.toBeInTheDocument()
     })
 
     it('never folds authored prose: it stays painted and keeps the lines separate', () => {
@@ -1052,24 +1213,9 @@ Add a `describe('foldable echo captions')` inside `describe('activity line colla
       fireEvent.click(screen.getAllByRole('button', { name: 'Toggle activity details' })[1])
       expect(screen.queryByTestId('fresh-agent-activity-caption')).not.toBeInTheDocument()
     })
-
-    it('does not fold an echo caption across a role-change activity line', () => {
-      render(
-        <FreshAgentTranscript
-          turns={[
-            toolTurn('turn-a', [['c1', 'src/a.ts']]),
-            { id: 'turn-cap', turnId: 'turn-cap', role: 'assistant',
-              summary: 'Considering options', summaryKind: 'echo', items: [] },
-            { ...toolTurn('turn-b', [['c2', 'src/b.ts']]), role: 'tool' as const },
-          ]}
-        />,
-      )
-      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(2)
-      expect(screen.getByText('Considering options')).toBeInTheDocument()
-    })
 ```
 
-And EXTEND the Task-3 `'absorbs a painted echo caption when its turn gains items (fold baseline)'` test — after the two existing frame-2 assertions, add the stash assertions and rename it `'stashes a painted echo caption into the line expansion when its turn gains items and absorbs'`:
+And EXTEND the Task-3 `'absorbs a painted echo caption when its turn gains items (fold baseline)'` test — after the two existing frame-2 assertions, add the stash assertions and rename it `'stashes a painted echo caption into the line expansion when its turn gains items and absorbs'`. This is the POSITIVE fully-visible case the coordinator required: the turn renders with `showThinking` on, display filtering removes nothing, and the caption stashes:
 
 ```tsx
       // ...existing frame-2 assertions (1 strip, caption gone from stream)...
@@ -1081,24 +1227,69 @@ And EXTEND the Task-3 `'absorbs a painted echo caption when its turn gains items
       expect(caption.compareDocumentPosition(toolB) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
 ```
 
-Also extend `'drops a superseded hidden-thinking echo caption instead of holding a permanent boundary'` with the no-leak assertion at the end:
+Also extend `'drops a superseded hidden-thinking echo caption instead of holding a permanent boundary'` with the no-leak assertion at the end — the lane tests above cover the PARTIALLY-filtered absorb case; this keeps the FULLY-filtered case pinned:
 
 ```tsx
       fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
       expect(screen.queryByText('Considering options')).not.toBeInTheDocument()
 ```
 
+Re-check, no edit: `'treats a zero-item turn as a boundary between tool lines'` (:1611) stays green unchanged under this design — a zero-item turn still hard-closes the open line and renders its own article (blank summary → nothing visible), so its 2-strip assertion holds; Step 4's full-file run includes it.
+
 - [ ] **Step 2: Run the test and verify the intended failure**
 
 Run: `npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx`
 
-Expected: FAIL because there is no `fresh-agent-activity-caption` testid, folded captions' articles still render (the zero-item fold test finds 'Considering options' still painted), and absorbed-turn summaries are not stashed — not syntax/setup accidents.
+Expected: FAIL because the absorb-stash does not exist yet — `fresh-agent-activity-caption` matches nothing, so the extended stash test and both fully-visible-gate lane tests red on their positive caption assertions (`getByTestId`/`getAllByTestId` find zero caption rows). Each lane test has a second, stronger red mode: run against the absorb-stash WITHOUT the `hadFilteredItems` gate (the natural first cut), it finds the hidden text stashed in the expansion — the red that pins LB-1's leak shut. Green from the start BY DESIGN: the authored-boundary test and the zero-item benign-boundary test pin behavior the pre-fold layout already has. Not syntax/setup accidents.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
 In `src/components/fresh-agent/FreshAgentTranscript.tsx`:
 
-1. Extend `ActivityRow` and `buildActivity` (captions interleave by ITEM index; stitching/merging keep the first contributing item's index):
+1. Reintroduce a minimal `DisplayTurn` (the Task-3 deletion removed the old `filteredPlaceholder`/`echoItems` version) carrying the fully-visible marker, and stamp it in `filterTurnsForDisplay` — the marker is set on EVERY path that removes items, so the absorb-stash can gate on it without any new contract surface:
+
+```ts
+/**
+ * A display turn stamped by `filterTurnsForDisplay` when display filtering
+ * removed ANY of its items. The absorb-stash reads the marker: an absorbed
+ * turn's echo caption is stashed into the line's expansion ONLY when the turn
+ * was fully visible — every item rendered — because the echo summary may
+ * derive from a filtered-out (hidden) thinking/reasoning item, and stashing
+ * it would leak content the user chose to hide (LB-1).
+ */
+type DisplayTurn = FreshAgentTurn & { hadFilteredItems?: boolean }
+
+function filterTurnsForDisplay(
+  turns: FreshAgentTurn[],
+  options: TranscriptDisplayOptions,
+  isStreaming: boolean,
+): DisplayTurn[] {
+  return turns
+    .map((turn, index): DisplayTurn | null => {
+      const items = turn.items.filter((item) => shouldDisplayTranscriptItem(item, options))
+      if (turn.items.length > 0 && items.length === 0) {
+        // The streaming tail keeps painting so the busy caption does not flash
+        // out and back while the turn produces only hidden items.
+        if (isStreaming && index === turns.length - 1) {
+          return { ...turn, items: [], hadFilteredItems: true }
+        }
+        // Blank summary: nothing ever painted — drop the turn outright.
+        if ((turn.summary ?? '').trim().length === 0) return null
+        // Authored prose is real content: keep it painted as a summary-only
+        // article (a permanent boundary between the surrounding lines).
+        if (turnSummaryIsAuthored(turn)) return { ...turn, items: [], hadFilteredItems: true }
+        // Echo caption of now-hidden items: superseded — drop it. Its content
+        // stays hidden, matching the user's showThinking choice.
+        return null
+      }
+      if (items.length === turn.items.length) return turn
+      return { ...turn, items, hadFilteredItems: true }
+    })
+    .filter((turn): turn is DisplayTurn => turn !== null)
+}
+```
+
+2. Extend `ActivityRow` and `buildActivity` (captions interleave by ITEM index; stitching/merging keep the first contributing item's index):
 
 ```ts
 type ActivityRow =
@@ -1201,13 +1392,11 @@ function buildActivity(
 }
 ```
 
-2. `TurnLayout` gains the fold marker: `type TurnLayout = { blocks: RenderBlock[]; captionFolded?: true }`. Also update the layout doc comment (:216-218) — zero-item turns still hard-close any open line, but an echo-tagged one's summary now folds into the next same-role line's expansion and its article is suppressed.
-
-3. `buildTranscriptLayout` — full replacement (changes vs Task 3: `open` carries `captions`, absorb-time stash, zero-item echo captions queue in `pendingCaptions` and fold into the next same-role line, `captionSeq` ids):
+3. `buildTranscriptLayout` — full replacement (changes vs Task 3: the parameter type becomes `DisplayTurn[]`, `open` carries `captions`, the absorb guard gains the fully-visible stash, `captionSeq`/`lastAbsorbedTurnIndex` ids). Also update the layout doc comment (:216-218): zero-item turns still hard-close any open line and render their own article — there is NO cross-line zero-item caption fold (no Rust producer emits a zero-item turn with a non-blank summary, LB-4), so the absorb-stash is the only fold source.
 
 ```ts
 function buildTranscriptLayout(
-  turns: FreshAgentTurn[],
+  turns: DisplayTurn[],
 ): {
   layouts: TurnLayout[]
   lineEndIndex: Map<number, number>
@@ -1224,11 +1413,6 @@ function buildTranscriptLayout(
   let lineSeq = 0
   let captionSeq = 0
   let lastAbsorbedTurnIndex = -1
-  // Echo summaries of zero-item turns, painted as captions and waiting for the
-  // next same-role activity line to fold into. Authored/blank zero-item turns,
-  // visible message blocks, and role changes clear the queue (those captions
-  // stay painted where they are).
-  let pendingCaptions: Array<{ turnIndex: number; role: FreshAgentTurn['role']; text: string }> = []
 
   const flushOpen = () => {
     if (!open) return
@@ -1244,22 +1428,16 @@ function buildTranscriptLayout(
     const layout: TurnLayout = { blocks: [] }
     layouts.push(layout)
     if (turn.items.length === 0) {
+      // Zero-item turns hard-close any open line and render their own article
+      // (a summary-only streaming tail's painted caption; a structural-only
+      // opencode message renders nothing). NO cross-line zero-item caption
+      // fold: no Rust producer emits a zero-item turn with a non-blank
+      // summary (load-bearing validation LB-4), so the absorb-stash below is
+      // the only fold source.
       flushOpen()
-      const summary = turn.summary.trim()
-      if (summary && !turnSummaryIsAuthored(turn)) {
-        // Echo caption: painted now, folded into the next same-role activity
-        // line's expansion when one opens (superseded by later activity). The
-        // queue is single-role: a role change between caption turns is a
-        // boundary, so the older captions stay painted where they are.
-        if (pendingCaptions.length > 0 && pendingCaptions[pendingCaptions.length - 1].role !== turn.role) {
-          pendingCaptions = []
-        }
-        pendingCaptions.push({ turnIndex, role: turn.role, text: summary })
-      } else {
-        pendingCaptions = []
-      }
       continue
     }
+    const turnSummary = (turn.summary ?? '').trim()
     for (const item of turn.items) {
       if (isActivityLike(item)) {
         // (Guard comment from Task 3 stands: authored or untagged non-blank
@@ -1269,23 +1447,29 @@ function buildTranscriptLayout(
           && open.role === turn.role
           && (
             open.originIndex === turnIndex
-            || turn.summary.trim().length === 0
+            || turnSummary.length === 0
             || !turnSummaryIsAuthored(turn)
           )
         ) {
           // Absorbing a later turn into an earlier line: a non-blank echo
           // summary would vanish with the turn's article — stash it as a
           // caption row inside the line's expansion instead (once per turn,
-          // positioned before the turn's first absorbed item).
+          // positioned before the turn's first absorbed item). FULLY-VISIBLE
+          // turns only: when display filtering removed ANY of the turn's
+          // items, the echo summary may derive from hidden thinking/reasoning
+          // text and stashing it would leak content the user chose to hide
+          // (LB-1) — partially- and fully-filtered turns drop their caption,
+          // identical to pre-fold behavior.
           if (
             open.originIndex !== turnIndex
             && lastAbsorbedTurnIndex !== turnIndex
-            && turn.summary.trim().length > 0
+            && turnSummary.length > 0
+            && !turn.hadFilteredItems
             && !turnSummaryIsAuthored(turn)
           ) {
             open.captions.push({
               id: `caption:${captionSeq++}`,
-              text: turn.summary.trim(),
+              text: turnSummary,
               atItemIndex: open.items.length,
             })
             lastAbsorbedTurnIndex = turnIndex
@@ -1301,36 +1485,22 @@ function buildTranscriptLayout(
           lineEndIndex.set(open.originIndex, turnIndex)
         } else {
           flushOpen()
-          // A same-role line opening supersedes pending echo captions: fold
-          // them into this line's expansion (before its first row) and
-          // suppress their articles.
-          const folded: LineCaption[] = []
-          if (pendingCaptions.length > 0 && pendingCaptions[0].role === turn.role) {
-            for (const pending of pendingCaptions) {
-              folded.push({ id: `caption:${captionSeq++}`, text: pending.text, atItemIndex: 0 })
-              layouts[pending.turnIndex].captionFolded = true
-            }
-          }
-          pendingCaptions = []
-          open = { originIndex: turnIndex, role: turn.role, items: [item], captions: folded }
+          open = { originIndex: turnIndex, role: turn.role, items: [item], captions: [] }
         }
         continue
       }
       if (!rendersVisibly(item)) {
         // Invisible content only. Same-role turns merge freely (nothing renders
         // between the lines). A different-role turn still paints its header, so
-        // it closes the open line and keeps its (invisible-bodied) block —
-        // and any pending captions stay painted in front of it.
+        // it closes the open line and keeps its (invisible-bodied) block.
         if (open && turn.role !== open.role) {
           flushOpen()
           layout.blocks.push({ kind: 'item', item })
-          pendingCaptions = []
         }
         continue
       }
       flushOpen()
       layout.blocks.push({ kind: 'item', item })
-      pendingCaptions = []
     }
   }
   flushOpen()
@@ -1379,15 +1549,7 @@ function buildTranscriptLayout(
     return contentRows.at(-1)?.type === 'thinking' ? candidate.id : null
 ```
 
-6. Render loop: suppress the folded caption's article (add next to the absorbed check at :1064-1066; the Task-3-deleted `filteredPlaceholder` branch is already gone):
-
-```tsx
-          const absorbed = turn.items.length > 0 && blocksForTurn.length === 0
-          if (absorbed) return null
-          // Echo caption folded into a following line's expansion: the article
-          // is suppressed so the text renders exactly once (inside the strip).
-          if (turnLayouts[index]?.captionFolded) return null
-```
+No render-loop change: the existing `absorbed` check (:1064-1066) already suppresses an absorbed turn's article, so a stashed caption's text renders exactly once (inside the strip expansion); zero-item turns are never absorbed and always render their own article.
 
 - [ ] **Step 4: Run the focused test**
 
@@ -1543,14 +1705,20 @@ test.describe('foldable echo captions', () => {
     }
   }
 
-  test('an echo caption folds into the next activity line when superseded', async ({ freshellPage: _freshellPage, page, harness, terminal }) => {
-    const echoTurn = {
+  test('an echo caption folds into the expanded activity line when its turn gains items and absorbs', async ({ freshellPage: _freshellPage, page, harness, terminal }) => {
+    // The one real fold path: a summary-only streaming-tail turn paints its
+    // echo caption; the SAME turn then gains visible tool items and absorbs
+    // into the previous line, so the caption leaves the stream and lives only
+    // in that line's expansion. (All caption items are tools, so the turn is
+    // fully visible under the default showThinking=false and the stash gate
+    // passes.)
+    const captionTurnEmpty = {
       id: 'turn-caption', turnId: 'turn-caption', role: 'assistant',
       summary: 'Considering options', summaryKind: 'echo', items: [],
     }
     const pushSnapshot = await seedFoldablePane(page, terminal, harness, 'fold-thread', [
       toolTurn('turn-a', [['c1', 'src/a.ts']]),
-      echoTurn,
+      captionTurnEmpty,
     ])
     const pane = page.locator('[data-context="fresh-agent"]').last()
     await expect(pane.getByText('Considering options')).toBeVisible({ timeout: 10_000 })
@@ -1558,17 +1726,17 @@ test.describe('foldable echo captions', () => {
 
     await pushSnapshot([
       toolTurn('turn-a', [['c1', 'src/a.ts']]),
-      echoTurn,
-      toolTurn('turn-b', [['c2', 'src/b.ts']]),
+      { ...captionTurnEmpty, items: [{ id: 'tool-c2', kind: 'tool_use', toolUseId: 'c2', name: 'Read', input: { file_path: 'src/b.ts' } }] },
     ])
-    // Superseded: the caption left the stream and lives only in the new line's
-    // expansion; the zero-item turn still split the lines.
+    // Superseded: the caption left the stream and lives only in the line's
+    // expansion; the two tool turns merged into one.
     await expect(pane.getByText('Considering options')).toHaveCount(0, { timeout: 10_000 })
-    await expect(pane.getByRole('region', { name: 'Activity strip' })).toHaveCount(2)
-    await pane.getByRole('button', { name: 'Toggle activity details' }).nth(1).click()
+    await expect(pane.getByRole('region', { name: 'Activity strip' })).toHaveCount(1)
+    await pane.getByRole('button', { name: 'Toggle activity details' }).click()
     const caption = pane.getByTestId('fresh-agent-activity-caption')
     await expect(caption).toHaveCount(1)
     await expect(caption).toContainText('Considering options')
+    await expect(pane.getByText('src/b.ts')).toBeVisible()
   })
 
   test('authored prose never folds', async ({ freshellPage: _freshellPage, page, harness, terminal }) => {
@@ -1601,7 +1769,7 @@ test.describe('foldable echo captions', () => {
 
 Run: `npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/fresh-agent.spec.ts --grep "foldable echo captions"`
 
-Expected: FAIL because the echo caption never leaves the stream and no `fresh-agent-activity-caption` testid exists (run against the pre-Task-4 client build, or skip this red run if Tasks 3–4 already landed — the red was then observed in Task 4's unit step; state which in the task record).
+Expected: FAIL because no `fresh-agent-activity-caption` testid exists — against the pre-Task-3 client the painted-summary boundary also holds the tool runs at 2 strips (the `toHaveCount(1)` strip assertion reds first); against a Tasks-3-only client the caption leaves the stream but nothing stashes it. (Skip this red run if Tasks 3–4 already landed — the red was then observed in Task 4's unit step; state which in the task record.)
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -1648,7 +1816,7 @@ Not applicable — this task adds no behavior. Its checks are the documentation-
 
 - [ ] **Step 2: Run the documentation scan and verify no stale references**
 
-Run: `rg -n "itemEchoes|paintedSummary|filteredPlaceholder|summarizeFreshAgentItems|segmentMatchesEchoes|summaryIsAuthoredContent|SUMMARY_LABEL_BY_KIND" AGENTS.md docs/ README.md || true`
+Run: `rg -n "itemEchoes|paintedSummary|filteredPlaceholder|summarizeFreshAgentItems|segmentMatchesEchoes|summaryIsAuthoredContent|SUMMARY_LABEL_BY_KIND|pendingCaptions|captionFolded" AGENTS.md docs/ README.md || true`
 
 Expected: no hits (zero matches). The docs mock (`docs/index.html:836-845`) renders a settled activity strip with no streaming echo captions, so the foldable-captions change does not alter what the mock shows — no `docs/index.html` update. `AGENTS.md` documents none of the deleted machinery — no update. The historical plan `docs/plans/2026-08-23-freshagent-activity-line.md` stays untouched. If the scan DOES find a hit, update that reference in this task.
 
