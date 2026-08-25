@@ -424,6 +424,16 @@ fn next_snapshot_seq() -> u64 {
     SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
+/// STATUS-STRIP: per-PROCESS boot nonce (`bootId`). Seq ordering is trusted
+/// only within the same instance+boot (a clock-seeded counter cannot prove
+/// monotonicity across restarts under wall-clock rewind).
+fn directory_boot_id() -> &'static str {
+    static BOOT_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BOOT_ID
+        .get_or_init(|| format!("boot-{}", uuid::Uuid::new_v4().to_string()))
+        .as_str()
+}
+
 /// `z.number().int().positive().max(MAX_DIRECTORY_PAGE_ITEMS)` — checked in
 /// that order (verified: `limit=1.5` reports ONLY the int failure, never
 /// positive/max too).
@@ -585,6 +595,7 @@ async fn session_directory(
             page["revision"] = json!(revision);
             page["snapshotSeq"] = json!(snapshot_seq);
             page["serverInstance"] = json!(state.server_instance.as_str());
+            page["bootId"] = json!(directory_boot_id());
             if let Some((_, collision_count, duplicate_item_count)) = identity_collision {
                 // Keep an I/O/budget partial reason if the same request also
                 // encountered one. Collision identity travels only in the

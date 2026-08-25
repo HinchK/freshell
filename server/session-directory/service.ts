@@ -30,6 +30,8 @@ type QuerySessionDirectoryInput = {
   snapshotSeq?: number
   /** The serving server's instance id — responses are only orderable within it. */
   serverInstance?: string
+  /** Per-process boot nonce — seq ordering is trusted only within the same instance+boot. */
+  bootId?: string
 }
 
 type FileSearchResult = {
@@ -411,6 +413,7 @@ export async function querySessionDirectory(input: QuerySessionDirectoryInput): 
     revision,
     snapshotSeq: input.snapshotSeq ?? ++localSnapshotSeqFallback,
     ...(input.serverInstance ? { serverInstance: input.serverInstance } : {}),
+    ...(input.bootId ? { bootId: input.bootId } : {}),
   }
 
   const includeKeys = input.query.includeKeys

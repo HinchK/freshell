@@ -1,4 +1,5 @@
 import os from 'os'
+import { randomUUID } from 'crypto'
 import { Router } from 'express'
 import { z } from 'zod'
 import { cleanString } from './utils.js'
@@ -43,8 +44,11 @@ const log = logger.child({ component: 'sessions-router' })
 // STATUS-STRIP: monotonic per-process counter for session-directory pages,
 // assigned at query invocation (inside the scheduler's run() closure, right
 // before `codingCliIndexer.getProjects()` captures the index state). Clock-seeded
-// so a restarted process never restamps lower than a page it already served.
+// so a restarted process never restamps lower than a page it already served — and
+// paired with a per-boot nonce: ordering by snapshotSeq is only trusted within
+// the same (serverInstance, bootId) namespace.
 let directorySnapshotSeq = Date.now()
+const directoryBootId = randomUUID()
 
 export const SessionPatchSchema = z.object({
   titleOverride: z.string().optional().nullable(),
@@ -140,6 +144,7 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
             providers: codingCliProviders,
             signal: scheduledSignal,
             snapshotSeq,
+            bootId: directoryBootId,
             serverInstance: deps.serverInstanceId,
           })
         },

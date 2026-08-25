@@ -165,6 +165,7 @@ export interface SessionsState {
     tokenUsage: TokenSummary
     sourceSeq: number
     serverInstance?: string
+    bootId?: string
   }>
 }
 
@@ -621,10 +622,11 @@ export const sessionsSlice = createSlice({
         entries: SessionDirectoryContextUsageExtra[]
         sourceSeq: number
         serverInstance?: string
+        bootId?: string
         paneKeys: string[]
       }>,
     ) => {
-      const { entries, sourceSeq, serverInstance, paneKeys } = action.payload
+      const { entries, sourceSeq, serverInstance, bootId, paneKeys } = action.payload
       const keep = new Set(paneKeys)
       const next: SessionsState['contextUsageByKey'] = {}
       for (const key of Object.keys(state.contextUsageByKey ?? {})) {
@@ -636,19 +638,21 @@ export const sessionsSlice = createSlice({
         const key = `${extra.provider}:${extra.sessionId}`
         if (!keep.has(key)) continue
         const existing = state.contextUsageByKey[key]
-        // Higher per-instance seq always wins; equal seq → last write wins;
-        // lower seq (same instance) is dropped outright. Cross-instance writes
-        // replace unconditionally (a restarted server re-seeds the seq clock
-        // above anything it previously served).
+        // Ordering namespace: (serverInstance, bootId). Higher seq wins within
+        // one namespace; lower seq dropped; equal → last write. A changed
+        // namespace (restart or instance migration) replaces unconditionally —
+        // the clock-seeded counter may not be monotonic across processes.
         if (
           existing
           && existing.serverInstance === serverInstance
+          && existing.bootId === bootId
           && existing.sourceSeq > sourceSeq
         ) continue
         state.contextUsageByKey[key] = {
           tokenUsage: extra.tokenUsage as TokenSummary,
           sourceSeq,
           ...(serverInstance !== undefined ? { serverInstance } : {}),
+          ...(bootId !== undefined ? { bootId } : {}),
         }
       }
     },

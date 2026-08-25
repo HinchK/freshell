@@ -125,6 +125,8 @@ export const SessionDirectoryPageSchema = z.object({
   snapshotSeq: z.number().int().positive().optional(),
   /** The serving server's instance id — pages are only orderable by snapshotSeq within one instance. */
   serverInstance: z.string().min(1).optional(),
+  /** STATUS-STRIP: per-PROCESS boot nonce — sequence comparisons are valid within the same instance+boot namespace only (the clock-seeded counter alone cannot prove monotonicity across restarts under wall-clock rewind). */
+  bootId: z.string().min(1).optional(),
 })
 
 export const TerminalDirectoryQuerySchema = z.object({

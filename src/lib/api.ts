@@ -595,6 +595,8 @@ export type SearchResponse = {
   snapshotSeq?: number
   /** STATUS-STRIP: the serving server's instance id — snapshotSeq comparisons within it only. */
   serverInstance?: string
+  /** STATUS-STRIP: per-process boot nonce — snapshotSeq ordering is trusted only within the same instance+boot. */
+  bootId?: string
 }
 
 export type SearchOptions = {
@@ -730,6 +732,7 @@ export async function fetchSidebarSessionsSnapshot(options: {
     revision: page.revision,
     ...(page.snapshotSeq !== undefined ? { snapshotSeq: page.snapshotSeq } : {}),
     ...(page.serverInstance ? { serverInstance: page.serverInstance } : {}),
+    ...(page.bootId ? { bootId: page.bootId } : {}),
     ...(page.contextUsageExtras ? { contextUsageExtras: page.contextUsageExtras } : {}),
   }
 }
@@ -780,6 +783,7 @@ export async function searchSessions(options: SearchOptions): Promise<SearchResp
     revision: page.revision,
     ...(page.snapshotSeq !== undefined ? { snapshotSeq: page.snapshotSeq } : {}),
     ...(page.serverInstance ? { serverInstance: page.serverInstance } : {}),
+    ...(page.bootId ? { bootId: page.bootId } : {}),
     ...(page.projectColors ? { projectColors: page.projectColors } : {}),
     ...(page.contextUsageExtras ? { contextUsageExtras: page.contextUsageExtras } : {}),
   }

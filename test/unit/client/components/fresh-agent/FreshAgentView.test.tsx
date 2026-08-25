@@ -6523,7 +6523,66 @@ describe('FreshAgentView session status strip', () => {
     // The chip's raw-id+effort tooltip must describe the DISPLAYED (live)
     // model; the staged opus[1m]/'high' pairing must not leak under it.
     const chip = screen.getByRole('button', { name: 'Model: Live Ninety Nine — change model' })
-    expect(chip).toHaveAttribute('title', 'claude-live-99 · effort unknown')
+    // The tooltip carries the LIVE model id and its session effort — the pane
+    // was created with 'high', and no live snapshot effort overrides it.
+    expect(chip).toHaveAttribute('title', 'claude-live-99 · effort high')
+  })
+
+  it('a live-reported snapshot effort wins the chip tooltip', async () => {
+    apiMock.getFreshAgentModelCapabilities.mockResolvedValue({
+      ok: true,
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'fresh',
+      fetchedAt: 1_000,
+      models: [{
+        id: 'claude-live-99',
+        displayName: 'Live Ninety Nine',
+        provider: 'claude',
+        supportsEffort: true,
+        supportedEffortLevels: ['low', 'high'],
+        supportsAdaptiveThinking: true,
+      }],
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'summary',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [],
+      settings: { effort: 'low' },
+    } as never)
+    const store = createStore()
+    store.dispatch(sessionInit({
+      sessionId: CLAUDE_THREAD_ID,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'claude-live-99',
+    }))
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-strip-live-effort',
+            sessionId: CLAUDE_THREAD_ID,
+            status: 'connected',
+            model: 'opus[1m]',
+            effort: 'high',
+            resumeSessionId: CLAUDE_THREAD_ID,
+          }}
+        />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Model: Live Ninety Nine — change model' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Model: Live Ninety Nine — change model' }))
+        .toHaveAttribute('title', 'claude-live-99 · effort low')
+    })
   })
 
   it('renders the context meter with the exact-token tooltip from the indexed session usage', () => {

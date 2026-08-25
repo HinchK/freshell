@@ -2,7 +2,6 @@ import {
   useCallback,
   useEffect,
   useMemo,
-  useReducer,
   useRef,
   useState,
   type CSSProperties,
@@ -758,14 +757,13 @@ export function FreshAgentView({
   // ≤520px collapse favors the short form: drop a trailing "(1M context)"-style
   // parenthetical (raw ids carry none and pass through unchanged).
   const stripModelLabelShort = stripModelLabel?.replace(/\s*\([^)]*\)\s*$/, '') || stripModelLabel
-  // Effort is stamped for the pane's STAGED model; a live-session model that
-  // differs has no known effort — never mislabel it.
-  const stagedEffectiveModel = resolveEffectiveFreshAgentModel(paneContent, providerDefaults)
+  // Tooltip carries the live session's effort when the runtime reports one
+  // (opencode snapshot.settings.effort), else the effort the pane was
+  // created/resumed with — the tooltip words the SESSION's effort; the model
+  // id it labels is the live one.
   const stripModelTooltip = !stripModelId
     ? 'model not set'
-    : stripModelId !== stagedEffectiveModel
-      ? `${stripModelId} · effort unknown`
-      : `${stripModelId} · effort ${getEffectiveFreshAgentEffort(paneContent, providerDefaults) ?? 'Default'}`
+    : `${stripModelId} · effort ${snapshot?.settings?.effort ?? getEffectiveFreshAgentEffort(paneContent, providerDefaults) ?? 'Default'}`
   const contextSessionId = freshAgentContextSessionId(paneContent, agentSession)
   // STATUS-STRIP: the strip reads ONLY the unified usage map
   // (state.sessions.contextUsageByKey). Entries are upserted by committed

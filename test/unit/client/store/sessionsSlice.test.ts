@@ -1134,6 +1134,7 @@ describe('sessionsSlice', () => {
       entries: Array<{ provider: string; sessionId: string; tokenUsage?: unknown }>
       sourceSeq: number
       serverInstance: string | undefined
+      bootId: string | undefined
       paneKeys: string[]
     }> = {}) => applyContextUsageExtras({
       entries: [{ provider: 'claude', sessionId: 's1', tokenUsage: usageAt(50) as never }],
@@ -1153,15 +1154,17 @@ describe('sessionsSlice', () => {
       expect(state.contextUsageByKey['claude:s1']?.sourceSeq).toBe(10)
       expect(state.contextUsageByKey['claude:s1']).toBe(first)
 
-      // Same instance, higher seq: replaces.
-      state = sessionsReducer(state, stamp({ serverInstance: 'srv-1', sourceSeq: 12, entries: [{ provider: 'claude', sessionId: 's1', tokenUsage: usageAt(70) as never }] }))
+      // Same instance, same boot, higher seq: replaces.
+      state = sessionsReducer(state, stamp({ serverInstance: 'srv-1', bootId: 'b1', sourceSeq: 12, entries: [{ provider: 'claude', sessionId: 's1', tokenUsage: usageAt(70) as never }] }))
       expect(state.contextUsageByKey['claude:s1']?.sourceSeq).toBe(12)
       expect(state.contextUsageByKey['claude:s1']?.tokenUsage.compactPercent).toBe(70)
 
-      // New server instance (restart): replaces regardless of seq height.
-      state = sessionsReducer(state, stamp({ serverInstance: 'srv-2', sourceSeq: 1, entries: [{ provider: 'claude', sessionId: 's1', tokenUsage: usageAt(30) as never }] }))
+      // Same instance, NEW boot (restart): replaces unconditionally — the
+      // clock-seeded counter cannot prove monotonicity across processes.
+      state = sessionsReducer(state, stamp({ serverInstance: 'srv-1', bootId: 'b2', sourceSeq: 1, entries: [{ provider: 'claude', sessionId: 's1', tokenUsage: usageAt(30) as never }] }))
       expect(state.contextUsageByKey['claude:s1']?.sourceSeq).toBe(1)
       expect(state.contextUsageByKey['claude:s1']?.tokenUsage.compactPercent).toBe(30)
+      expect(state.contextUsageByKey['claude:s1']?.bootId).toBe('b2')
     })
 
     it('prunes entries outside the current pane keys and drops writes for them', () => {

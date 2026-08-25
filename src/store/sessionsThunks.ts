@@ -388,6 +388,7 @@ type UsageBearingRow = {
 type UsageStampResponse = {
   snapshotSeq?: number
   serverInstance?: string
+  bootId?: string
   contextUsageExtras?: SearchResponse['contextUsageExtras']
 }
 
@@ -420,6 +421,7 @@ function commitContextUsageFromRows(
     entries,
     sourceSeq: response.snapshotSeq ?? 0,
     serverInstance: response.serverInstance,
+    bootId: response.bootId,
     paneKeys: getContextUsageOpts(getState()).includeKeys ?? [],
   }))
 }
