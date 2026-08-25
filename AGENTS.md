@@ -12,6 +12,7 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 
 ## Repo Rules
 - Always work in a worktree (in \.worktrees\)
+- Pull before starting major work: `git fetch origin` and bring local `main` to `origin/main` (fast-forward) so new work always bases on the latest merged state.
 - Before creating a new worktree, ensure the repo-supported test suite is green on the intended base. If the suite is not green, pause before creating the worktree and notify the user with the failing command and failure summary.
 - New behavior changes start on a worktree branch from `origin/main` and are submitted as PRs targeting `main`.
 - Do not create or open a PR until the user explicitly approves PR creation for that branch/change. Preparing a branch, committing locally, and pushing the branch is fine; stop before `gh pr create` or any equivalent PR creation step unless approval is explicit.
@@ -50,7 +51,7 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 - `main` is the only integration branch. Local `main` should track the merged state of `origin/main`.
 - Author changes in dedicated `.worktrees/<slug>` worktrees on feature branches created from `origin/main`.
 - Do not commit behavior changes directly to local `main` or push them directly to `origin/main`.
-- When a change is ready, push the feature branch, ask the user for explicit approval to create the PR, open a PR targeting `main` only after that approval, wait for required checks, merge the PR, then update local `main` from `origin/main`.
+- When a change is ready, the worktree should be clean - if it's not, commit appropriately, then push the feature branch. Then, ask the user for explicit approval to land it via a PR and clean up the worktree. If they approve, open a PR targeting `main` only after that approval, wait for required checks, merge the PR, update local `main` from `origin/main`, and clean up the worktree.
 - Update local `main` with a fast-forward pull or merge only. If local `main` has local-only commits, a dirty worktree, or cannot fast-forward, stop and resolve that explicitly instead of creating a local merge commit.
 - Delete or retire obsolete local `dev` worktrees/branches after confirming they are not running the self-hosted Freshell process.
 
