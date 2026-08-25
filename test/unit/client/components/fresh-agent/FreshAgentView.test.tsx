@@ -6537,15 +6537,43 @@ describe('FreshAgentView session status strip', () => {
             createRequestId: 'req-strip-dialog',
             sessionId: CLAUDE_THREAD_ID,
             status: 'connected',
+            model: 'opus[1m]',
           }}
         />
       </Provider>,
     )
 
-    fireEvent.click(screen.getByRole('button', { name: 'Model: Freshclaude — change model' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Model: Claude Opus 5 (1M context) — change model' }))
 
     const dialog = await screen.findByRole('dialog', { name: 'Model and thinking level' })
     expect(within(dialog).getByText('Claude Opus 5 (1M context)')).toBeInTheDocument()
+  })
+
+  it('renders NO clickable model affordance when no model is set at all (chip hidden; gear + /model remain)', async () => {
+    const store = createStore()
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-strip-nomodel',
+            sessionId: CLAUDE_THREAD_ID,
+            status: 'connected',
+          }}
+        />
+      </Provider>,
+    )
+
+    // Pane-type labels are not model display names — no chip renders.
+    expect(screen.queryByRole('button', { name: /^Model: / })).toBeNull()
+    expect(screen.queryByRole('button', { name: /Freshclaude — change model/ })).toBeNull()
+    // The strip still renders with the unknown-context lug (strip exists even
+    // without the chip; the meter is anchored to the right edge).
+    expect(screen.getByText('context —')).toBeInTheDocument()
   })
 
   it('keeps the last known meter when the sessions window drops the row (window churn never blanks a reported meter)', async () => {

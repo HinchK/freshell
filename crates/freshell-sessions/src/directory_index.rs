@@ -2180,8 +2180,10 @@ fn refresh_snapshot(
 /// Schema version for the persisted parse-cache file. Bump on any format
 /// change so an old (or a future, if this ever needs to roll back) file is
 /// cleanly discarded -- never partially or incorrectly deserialized into a
-/// mismatched shape.
-const CACHE_SCHEMA_VERSION: u32 = 1;
+/// mismatched shape. (v2: `IndexedSession.token_usage` added — a v1 cache
+/// would load every session with `token_usage: None` forever, hiding usage
+/// data that already exists on disk from the fresh-agent strip meter.)
+const CACHE_SCHEMA_VERSION: u32 = 2;
 
 /// See "File location"/"Filename" above.
 const CACHE_FILENAME: &str = "rust-session-cache.json";

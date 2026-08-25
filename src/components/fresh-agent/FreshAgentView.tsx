@@ -755,19 +755,28 @@ export function FreshAgentView({
     ? stripProbedModelPair.label
     : undefined
   // The chip NEVER renders a raw model id (user directive, review-loop round
-  // delta-1/focused-ep1: raw ids are tooltip-only). With a model set, the chip
-  // exists only once a display name resolves (static table → pick-time stamp →
-  // catalog probe); with no model set at all, the pane-type label remains as
-  // the strip's left content.
+  // delta-1/focused-ep1: raw ids are tooltip-only). The chip exists ONLY once a
+  // display name resolves through the required chain (static table → pick-time
+  // stamp → catalog probe). A pane with NO model set at all gets no chip
+  // either — the pane-type label is not a model display name, and model
+  // selection stays reachable from the settings gear and /model.
   const stripModelLabel = stripModelId
     ? (stripStaticModelLabel ?? stripStampedModelLabel ?? stripProbedModelLabel)
-    : (descriptor?.label ?? 'Fresh Agent')
+    : null
   // ≤520px collapse favors the short form: drop a trailing "(1M context)"-style
   // parenthetical (raw ids carry none and pass through unchanged).
   const stripModelLabelShort = stripModelLabel?.replace(/\s*\([^)]*\)\s*$/, '') || stripModelLabel
   const stripModelTooltip = `${stripModelId ?? 'model not set'} · effort ${getEffectiveFreshAgentEffort(paneContent, providerDefaults) ?? 'Default'}`
   const contextSessionId = freshAgentContextSessionId(paneContent, agentSession)
-  const windowContextUsage = resolveFreshAgentContextUsage(paneContent, agentSession, projects)
+  const [usageTick, forceUsageTick] = useReducer((tick: number) => tick + 1, 0)
+  // Memoized: the last-known cache re-stamp effect must run only on a REAL
+  // data change — a fresh object identity per unrelated render would
+  // continuously re-timestamp the cache and stretch the 60s staleness bound
+  // (focused review round: exact-threshold staleness must hold).
+  const windowContextUsage = useMemo(
+    () => resolveFreshAgentContextUsage(paneContent, agentSession, projects),
+    [paneContent, agentSession, projects],
+  )
   // STATUS-STRIP extras: out-of-band usage for this pane's session from the
   // `includeKeys` side-channel (state.sessions.contextUsageByKey). Refresh
   // arrives on every window/search fetch; bound it by the same staleness
@@ -778,10 +787,15 @@ export function FreshAgentView({
       ? state.sessions?.contextUsageByKey?.[`${paneContent.provider}:${contextSessionId}`]
       : undefined
   ))
-  const extrasContextUsage = guardContextUsageTokenSummary(
-    contextUsageExtraEntry && Date.now() - contextUsageExtraEntry.fetchedAt < CONTEXT_USAGE_STALE_MS
-      ? contextUsageExtraEntry.tokenUsage
-      : undefined,
+  const extrasContextUsage = useMemo(
+    () => guardContextUsageTokenSummary(
+      contextUsageExtraEntry && Date.now() - contextUsageExtraEntry.fetchedAt < CONTEXT_USAGE_STALE_MS
+        ? contextUsageExtraEntry.tokenUsage
+        : undefined,
+    ),
+    // usageTick forces a re-evaluation of the staleness filter on the armed
+    // expiry timer's render.
+    [contextUsageExtraEntry, usageTick],
   )
   // Extras win over the window row when both exist: the extras are generated
   // server-side from the SAME indexer snapshot as the fresh page — so when the
@@ -802,7 +816,6 @@ export function FreshAgentView({
   // a materially stuck reading self-clears to "context —" instead of hiding a
   // severity-threshold crossing (fresh delta review round 1, Major).
   const lastKnownUsageRef = useRef(new Map<string, { usage: FreshAgentContextUsage; at: number }>())
-  const [, forceUsageTick] = useReducer((tick: number) => tick + 1, 0)
   useEffect(() => {
     if (liveContextUsage && contextSessionId) {
       lastKnownUsageRef.current.set(contextSessionId, { usage: liveContextUsage, at: Date.now() })

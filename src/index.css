@@ -1372,7 +1372,9 @@ html {
 .fresh-agent-status-chip:hover { background: var(--fresh-agent-subtle-surface); }
 .fresh-agent-status-chip-label { overflow: hidden; text-overflow: ellipsis; }
 .fresh-agent-status-chip-label-short { display: none; }
-.fresh-agent-status-context { display: inline-flex; align-items: center; gap: 8px; flex: none; }
+/* Pin the meter cluster to the right edge even when the left side is empty
+   (chip hidden while no display name has resolved, per the chip directive). */
+.fresh-agent-status-context { display: inline-flex; align-items: center; gap: 8px; flex: none; margin-left: auto; }
 .fresh-agent-status-meter { width: 96px; height: 4px; border-radius: 999px; background: hsl(var(--muted)); overflow: hidden; display: block; }
 .fresh-agent-status-meter > i { display: block; height: 100%; border-radius: 999px; background: var(--fresh-agent-muted-text); }
 .fresh-agent-status-pct { font-variant-numeric: tabular-nums; }
