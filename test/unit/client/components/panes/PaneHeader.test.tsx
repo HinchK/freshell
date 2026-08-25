@@ -1,15 +1,34 @@
-import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render as renderWithoutStore, screen, fireEvent, cleanup } from '@testing-library/react'
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest'
+import { render as renderWithoutStore, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
 import type { ReactElement } from 'react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import PaneHeader from '@/components/panes/PaneHeader'
 import freshAgentReducer, { freshAgentSnapshotReceived, sessionInit } from '@/store/freshAgentSlice'
 import repoIconsReducer from '@/store/repoIconsSlice'
+import settingsReducer from '@/store/settingsSlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
 import { formatPaneRuntimeLabel, formatPaneRuntimeTooltip } from '@/lib/format-terminal-title-meta'
 import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
 import type { PaneContent } from '@/store/paneTypes'
+
+// PaneHeader now owns its repo-icon probe (fetchRepoIconMeta → api.get); keep
+// resolution deterministic per test instead of letting it hit real fetch.
+const { mockApiGet } = vi.hoisted(() => ({
+  mockApiGet: vi.fn(),
+}))
+
+function defaultRepoIconMetaResponse(path: string) {
+  const cwd = new URLSearchParams(path.split('?')[1] ?? '').get('cwd') ?? ''
+  const repoName = cwd.replace(/[\\/]+$/, '').split(/[\\/]/).filter(Boolean).pop() ?? ''
+  return Promise.resolve({ repoRoot: cwd, checkoutRoot: cwd, repoName, hasIcon: false })
+}
+
+vi.mock('@/lib/api', () => ({
+  api: {
+    get: (path: string) => mockApiGet(path),
+  },
+}))
 
 vi.mock('lucide-react', () => ({
   X: ({ className }: { className?: string }) => (
@@ -74,7 +93,12 @@ function makeTerminalContent(mode = 'shell') {
 
 function makeFreshAgentStore() {
   return configureStore({
-    reducer: { freshAgent: freshAgentReducer, repoIcons: repoIconsReducer, terminalMeta: terminalMetaReducer },
+    reducer: {
+      freshAgent: freshAgentReducer,
+      repoIcons: repoIconsReducer,
+      terminalMeta: terminalMetaReducer,
+      settings: settingsReducer,
+    },
   })
 }
 
@@ -118,6 +142,11 @@ function makeFreshAgentSnapshot(
 }
 
 describe('PaneHeader', () => {
+  beforeEach(() => {
+    mockApiGet.mockReset()
+    mockApiGet.mockImplementation(defaultRepoIconMetaResponse)
+  })
+
   afterEach(() => {
     cleanup()
   })
@@ -207,14 +236,14 @@ describe('PaneHeader', () => {
       expect(screen.getByTitle('Close pane')).toBeInTheDocument()
     })
 
-    it('renders fresh-agent identity as the leftmost visible header item before CLI-style metadata', () => {
+    it('renders repo + agent icons for a fresh-agent pane, before metadata, with no session-type text label', () => {
       render(
         <Provider store={makeFreshAgentStore()}>
           <PaneHeader
             tabId="tab-1"
             paneId="pane-1"
             title="freshell"
-            metaLabel="freshell (main)  56%"
+            metaLabel="freshell (main)"
             metaTooltip="Directory: /home/dan/code/freshell"
             status="running"
             isActive={true}
@@ -228,32 +257,44 @@ describe('PaneHeader', () => {
               sessionId: 'fresh-session-1',
               createRequestId: 'fresh-req-1',
               status: 'idle',
+              initialCwd: '/home/dan/code/freshell',
             }}
           />
         </Provider>,
       )
 
       const banner = screen.getByRole('banner', { name: 'Pane: freshell' })
-      const identity = screen.getByText('freshcodex')
-      const metadata = screen.getByText(/freshell \(main\)\s+56%/)
+      // No repo metadata in store → the tooltip is the pane's cwd path (never
+      // a guessed basename claimed as the repo name).
+      const repoIcon = screen.getByTitle('/home/dan/code/freshell')
+      const agentIcon = screen.getByTitle('Codex (freshcodex pane)')
+      const metadata = screen.getByText('freshell (main)')
 
-      expect(banner).toContainElement(identity)
+      expect(banner).toContainElement(repoIcon)
+      expect(banner).toContainElement(agentIcon)
       expect(banner).toContainElement(metadata)
-      expect(screen.queryByTestId('pane-icon')).toBeNull()
-      expect(screen.getAllByText(/freshell/)).toHaveLength(1)
+      // The session type is tooltip-only now — never rendered as text.
+      expect(banner.textContent ?? '').not.toContain('freshcodex')
+      const agentIconSvg = agentIcon.querySelector('[data-testid="pane-icon"]')
+      expect(agentIconSvg).not.toBeNull()
+      expect(agentIconSvg?.getAttribute('class')).toContain('text-muted-foreground')
+      expect(repoIcon.querySelector('[data-testid="repo-icon"]')).not.toBeNull()
       expect(
-        identity.compareDocumentPosition(metadata) & Node.DOCUMENT_POSITION_FOLLOWING,
+        repoIcon.compareDocumentPosition(agentIcon) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy()
+      expect(
+        agentIcon.compareDocumentPosition(metadata) & Node.DOCUMENT_POSITION_FOLLOWING,
       ).toBeTruthy()
     })
 
-    it('keeps a custom fresh-agent pane title visible before CLI-style metadata', () => {
+    it('keeps a custom fresh-agent pane title visible after the icons, before metadata', () => {
       render(
         <Provider store={makeFreshAgentStore()}>
           <PaneHeader
             tabId="tab-1"
             paneId="pane-1"
             title="Ops desk"
-            metaLabel="freshell (main)  56%"
+            metaLabel="freshell (main)"
             metaTooltip="Directory: /home/dan/code/freshell"
             status="running"
             isActive={true}
@@ -271,12 +312,14 @@ describe('PaneHeader', () => {
         </Provider>,
       )
 
-      const identity = screen.getByText('freshcodex')
+      const banner = screen.getByRole('banner', { name: 'Pane: Ops desk' })
+      const agentIcon = screen.getByTitle('Codex (freshcodex pane)')
       const customTitle = screen.getByText('Ops desk')
-      const metadata = screen.getByText(/freshell \(main\)\s+56%/)
+      const metadata = screen.getByText('freshell (main)')
 
+      expect(banner.textContent ?? '').not.toContain('freshcodex')
       expect(
-        identity.compareDocumentPosition(customTitle) & Node.DOCUMENT_POSITION_FOLLOWING,
+        agentIcon.compareDocumentPosition(customTitle) & Node.DOCUMENT_POSITION_FOLLOWING,
       ).toBeTruthy()
       expect(
         customTitle.compareDocumentPosition(metadata) & Node.DOCUMENT_POSITION_FOLLOWING,
@@ -291,7 +334,7 @@ describe('PaneHeader', () => {
             tabId="tab-1"
             paneId="pane-1"
             title="freshell"
-            metaLabel="freshell (main)  56%"
+            metaLabel="freshell (main)"
             status="running"
             isActive={true}
             onClose={vi.fn()}
@@ -308,9 +351,11 @@ describe('PaneHeader', () => {
         </Provider>,
       )
 
-      expect(screen.getByText('freshcodex')).toBeInTheDocument()
-      expect(screen.getByText(/freshell \(main\)\s+56%/)).toBeInTheDocument()
+      const banner = screen.getByRole('banner', { name: 'Pane: freshell' })
+      expect(screen.getByText('freshell (main)')).toBeInTheDocument()
       expect(screen.queryByText('freshell')).toBeNull()
+      expect(banner.textContent ?? '').not.toContain('freshcodex')
+      expect(screen.getByTitle('Codex (freshcodex pane)')).toBeInTheDocument()
     })
 
     it('omits the redundant default label when a fresh-agent pane has no cwd metadata yet', () => {
@@ -334,23 +379,28 @@ describe('PaneHeader', () => {
         </Provider>,
       )
 
-      expect(screen.getByText('freshcodex')).toBeInTheDocument()
-      expect(screen.queryByText('Freshcodex')).toBeNull()
+      const banner = screen.getByRole('banner', { name: 'Pane: Freshcodex' })
+      // The agent icon carries the identity via tooltip; no session-type text,
+      // no default title, and (no cwd) no repo icon.
+      expect(screen.getByTitle('Codex (freshcodex pane)')).toBeInTheDocument()
+      expect(banner.textContent ?? '').not.toContain('Freshcodex')
+      expect(banner.textContent ?? '').not.toContain('freshcodex')
+      expect(screen.queryByTestId('repo-icon')).toBeNull()
     })
 
     it.each([
-      ['freshclaude', 'claude'],
-      ['freshcodex', 'codex'],
-      ['freshopencode', 'opencode'],
-      ['kilroy', 'claude'],
-    ] as const)('renders %s as the fresh-agent header identity', (sessionType, provider) => {
+      ['freshclaude', 'Claude', 'claude'],
+      ['freshcodex', 'Codex', 'codex'],
+      ['freshopencode', 'OpenCode', 'opencode'],
+      ['kilroy', 'Claude', 'claude'],
+    ] as const)('identifies a %s pane only by its agent icon tooltip', (sessionType, label, provider) => {
       render(
         <Provider store={makeFreshAgentStore()}>
           <PaneHeader
             tabId="tab-1"
             paneId="pane-1"
             title="freshell"
-            metaLabel="freshell (main)  56%"
+            metaLabel="freshell (main)"
             status="running"
             isActive={true}
             onClose={vi.fn()}
@@ -366,7 +416,57 @@ describe('PaneHeader', () => {
         </Provider>,
       )
 
-      expect(screen.getByText(sessionType)).toBeInTheDocument()
+      const banner = screen.getByRole('banner', { name: 'Pane: freshell' })
+      expect(screen.getByTitle(`${label} (${sessionType} pane)`)).toBeInTheDocument()
+      expect(banner.textContent ?? '').not.toContain(sessionType)
+    })
+
+    it('probes repo-icon meta itself and renders the letter-avatar fallback when repoIconsOnTabs is false', async () => {
+      mockApiGet.mockRejectedValue(new Error('no icon endpoint'))
+      const store = makeFreshAgentStore()
+      store.dispatch({
+        type: 'settings/updateSettingsLocal',
+        payload: { panes: { repoIconsOnTabs: false } },
+      })
+
+      render(
+        <Provider store={store}>
+          <PaneHeader
+            tabId="tab-1"
+            paneId="pane-1"
+            title="freshell"
+            metaLabel="freshell (main)"
+            status="running"
+            isActive={true}
+            onClose={vi.fn()}
+            content={{
+              kind: 'fresh-agent',
+              sessionType: 'freshcodex',
+              provider: 'codex',
+              sessionId: 'fresh-session-1',
+              createRequestId: 'fresh-req-1',
+              status: 'idle',
+              initialCwd: '/home/dan/code/freshell',
+            }}
+          />
+        </Provider>,
+      )
+
+      // Fresh-agent headers own their probe (TabBar may be unmounted or the
+      // tab-icon setting off): the meta request fires for this repoCwd…
+      expect(mockApiGet).toHaveBeenCalledWith(
+        '/api/repo-icon/meta?cwd=%2Fhome%2Fdan%2Fcode%2Ffreshell',
+      )
+      // …and the letter-avatar fallback renders immediately, tooltip showing
+      // the pane cwd path (metadata absent → no guessed repo name).
+      const repoIcon = screen.getByTitle('/home/dan/code/freshell')
+      expect(repoIcon.querySelector('[data-testid="repo-icon"]')).not.toBeNull()
+
+      await waitFor(() => {
+        expect(store.getState().repoIcons.byCwd['/home/dan/code/freshell']?.status).toBe('error')
+      })
+      // The tooltip stays put through the probe's error landing.
+      expect(screen.getByTitle('/home/dan/code/freshell')).toBeInTheDocument()
     })
 
     it('renders fresh-agent controls in settings refresh zoom close order without open-terminal or context-meter controls', () => {
@@ -630,7 +730,7 @@ describe('PaneHeader', () => {
       expect(paneIcon.getAttribute('class')).not.toContain('animate-pulse')
     })
 
-    it('applies blue text color to the fresh-agent identity when busy is true', () => {
+    it('applies blue color to the fresh-agent agent icon when busy is true', () => {
       render(
         <Provider store={makeFreshAgentStore()}>
           <PaneHeader
@@ -651,9 +751,11 @@ describe('PaneHeader', () => {
         </Provider>,
       )
 
-      const identity = screen.getByText('freshcodex')
-      expect(identity.getAttribute('class')).toContain('text-blue-500')
-      expect(screen.queryByTestId('pane-icon')).toBeNull()
+      const agentIcon = screen.getByTitle('Codex (freshcodex pane)')
+      const agentIconSvg = agentIcon.querySelector('[data-testid="pane-icon"]')
+      expect(agentIconSvg).not.toBeNull()
+      expect(agentIconSvg?.getAttribute('class')).toContain('text-blue-500')
+      expect(agentIconSvg?.getAttribute('class')).toContain('h-3.5 w-3.5')
     })
   })
 

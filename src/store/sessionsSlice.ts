@@ -1,5 +1,6 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
-import type { SessionDirectoryIntegrityError } from '@shared/read-models'
+import type { SessionDirectoryContextUsageExtra, SessionDirectoryIntegrityError } from '@shared/read-models'
+import type { TokenSummary } from '@shared/ws-protocol'
 import type { ProjectGroup } from './types'
 import type { TerminalMetaRecord } from './terminalMetaSlice'
 
@@ -153,6 +154,21 @@ export interface SessionsState {
   loadingKind?: SessionWindowLoadingKind
   activeSurface?: string
   windows: Record<string, SessionWindowState>
+  /**
+   * STATUS-STRIP: usage for open fresh-agent pane sessions. Keyed
+   * `provider:sessionId`. Never merged into `projects`/windows; bounded to
+   * the current `includeKeys` set on every commit. Competing writes are
+   * ordered by the page's per-instance monotonic `snapshotSeq` (same
+   * `serverInstance` only; cross-instance writes replace unconditionally).
+   */
+  contextUsageByKey: Record<string, {
+    tokenUsage: TokenSummary
+    sourceSeq: number
+    serverInstance?: string
+    bootId?: string
+    /** Client-side wall-clock stamp of the redis write — drives the validity window. */
+    fetchedAt: number
+  }>
 }
 
 const initialState: SessionsState = {
@@ -160,6 +176,7 @@ const initialState: SessionsState = {
   expandedProjects: new Set<string>(),
   wsSnapshotReceived: false,
   windows: {},
+  contextUsageByKey: {},
 }
 
 function ensureWindow(state: SessionsState, surface: string): SessionWindowState {
@@ -203,6 +220,10 @@ type SessionWindowCommitPayload = {
   integrityError?: SessionDirectoryIntegrityError
 }
 
+// Usage for the fresh-agent strip feeds the unified map ONLY through thunk-side
+// stamping (applyContextUsageExtras) — never from this commit path: committed
+// windows may contain merged/retained rows whose usage is not fresh and must
+// never be re-served as current.
 function commitWindowPayload(
   window: SessionWindowState,
   payload: SessionWindowCommitPayload,
@@ -589,12 +610,68 @@ export const sessionsSlice = createSlice({
         }
       }
     },
+    /**
+     * STATUS-STRIP: upsert usage into the unified map. `paneKeys` bounds the
+     * map to the pane-relevant keys currently requested — retention stays at
+     * most one entry per open fresh-agent pane. `sourceSeq`/`serverInstance` are the
+     * session-directory revision of the response the entries came from; a
+     * newer entry is never overwritten by an older one (cross-surface
+     * completion inversion can't regress an entry).
+     */
+    applyContextUsageExtras: (
+      state,
+      action: PayloadAction<{
+        entries: SessionDirectoryContextUsageExtra[]
+        sourceSeq: number
+        serverInstance?: string
+        bootId?: string
+        paneKeys: string[]
+      }>,
+    ) => {
+      const { entries, sourceSeq, serverInstance, bootId, paneKeys } = action.payload
+      const keep = new Set(paneKeys)
+      const next: SessionsState['contextUsageByKey'] = {}
+      for (const key of Object.keys(state.contextUsageByKey ?? {})) {
+        if (keep.has(key)) next[key] = state.contextUsageByKey[key]
+      }
+      state.contextUsageByKey = next
+      for (const extra of entries) {
+        const key = `${extra.provider}:${extra.sessionId}`
+        if (!keep.has(key)) continue
+        const existing = state.contextUsageByKey[key]
+        // Ordering namespace: (serverInstance, bootId). Higher seq wins within
+        // one namespace; lower seq dropped; equal → last write. A changed
+        // namespace (restart or instance migration) replaces unconditionally —
+        // the clock-seeded counter may not be monotonic across processes.
+        if (
+          existing
+          && existing.serverInstance === serverInstance
+          && existing.bootId === bootId
+          && existing.sourceSeq > sourceSeq
+        ) continue
+        if (!extra.tokenUsage) {
+          // Explicit server signal: this response reached the session but
+          // carries no usage — reporting stopped. Evict rather than let the
+          // last percentage ride forever (no client-side time expiry by design).
+          delete state.contextUsageByKey[key]
+          continue
+        }
+        state.contextUsageByKey[key] = {
+          tokenUsage: extra.tokenUsage as TokenSummary,
+          sourceSeq,
+          ...(serverInstance !== undefined ? { serverInstance } : {}),
+          ...(bootId !== undefined ? { bootId } : {}),
+          fetchedAt: Date.now(),
+        }
+      }
+    },
   },
 })
 
 export const {
   setActiveSessionSurface,
   setSessionWindowLoading,
+  applyContextUsageExtras,
   setSessionWindowError,
   commitSessionWindowReplacement,
   commitSessionWindowVisibleRefresh,

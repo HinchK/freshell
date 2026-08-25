@@ -10,7 +10,7 @@
 /// `context_tokens` / `model_context_window` / `compact_threshold_tokens` /
 /// `compact_percent` are `Option` because the codex envelope can omit them while the
 /// claude path always fills them.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TokenSummary {
     pub input_tokens: i64,
     pub output_tokens: i64,

@@ -2280,7 +2280,7 @@ describe('PaneContainer', () => {
   })
 
   describe('FreshClaude runtime metadata', () => {
-    it('renders FreshClaude header token usage from the indexed Claude session linked by cliSessionId and does not approximate from SDK totals', async () => {
+    it('derives FreshClaude header meta (dir+branch only) from the indexed Claude session linked by cliSessionId — token usage stays out of fresh-agent meta', async () => {
       const node: PaneNode = {
         type: 'leaf',
         id: 'pane-fresh',
@@ -2349,10 +2349,10 @@ describe('PaneContainer', () => {
         store,
       )
 
-      const meta = screen.getByText(/freshell \(main\*\)\s+25%/)
+      const meta = screen.getByText('freshell (main*)')
       expect(meta).toHaveAttribute(
         'title',
-        'Directory: /home/user/code/freshell/.worktrees/issue-163\nbranch: main*\nTokens: 15/60(25% full)',
+        'Directory: /home/user/code/freshell/.worktrees/issue-163\nbranch: main*',
       )
 
       store.dispatch(turnResult({
@@ -2362,7 +2362,9 @@ describe('PaneContainer', () => {
         usage: { input_tokens: 999999, output_tokens: 999999 },
       }))
 
-      expect(screen.getByText(/freshell \(main\*\)\s+25%/)).toBeInTheDocument()
+      // SDK divider totals never leak a % into the fresh-agent pane header.
+      expect(screen.getByText('freshell (main*)')).toBeInTheDocument()
+      expect(screen.queryByText(/25%/)).not.toBeInTheDocument()
 
       store.dispatch(applySessionsPatch({
         upsertProjects: [],
@@ -2372,7 +2374,7 @@ describe('PaneContainer', () => {
       expect(store.getState().sessions.projects).toEqual([])
 
       await waitFor(() => {
-        expect(screen.queryByText(/freshell \(main\*\)\s+25%/)).not.toBeInTheDocument()
+        expect(screen.queryByText(/freshell \(main\*\)/)).not.toBeInTheDocument()
       })
 
       store.dispatch(turnResult({
@@ -2456,15 +2458,16 @@ describe('PaneContainer', () => {
       )
 
       const banner = screen.getByRole('banner', { name: 'Pane: Ops desk' })
-      const identity = screen.getByText('freshclaude')
+      const agentIcon = screen.getByTitle('Claude (freshclaude pane)')
       const customTitle = screen.getByText('Ops desk')
-      const meta = screen.getByText(/freshell \(main\)\s+25%/)
+      const meta = screen.getByText('freshell (main)')
 
-      expect(banner).toContainElement(identity)
+      expect(banner.textContent ?? '').not.toContain('freshclaude')
+      expect(banner).toContainElement(agentIcon)
       expect(banner).toContainElement(customTitle)
       expect(banner).toContainElement(meta)
       expect(
-        identity.compareDocumentPosition(customTitle) & Node.DOCUMENT_POSITION_FOLLOWING,
+        agentIcon.compareDocumentPosition(customTitle) & Node.DOCUMENT_POSITION_FOLLOWING,
       ).toBeTruthy()
       expect(
         customTitle.compareDocumentPosition(meta) & Node.DOCUMENT_POSITION_FOLLOWING,
@@ -2500,14 +2503,15 @@ describe('PaneContainer', () => {
       )
 
       const banner = screen.getByRole('banner', { name: 'Pane: freshell' })
-      const identity = screen.getByText('freshcodex')
+      const agentIcon = screen.getByTitle('Codex (freshcodex pane)')
       const meta = screen.getByText('freshell')
 
-      expect(banner).toContainElement(identity)
+      expect(banner.textContent ?? '').not.toContain('freshcodex')
+      expect(banner).toContainElement(agentIcon)
       expect(banner).toContainElement(meta)
       expect(meta).toHaveAttribute('title', 'Directory: /home/user/code/freshell')
       expect(
-        identity.compareDocumentPosition(meta) & Node.DOCUMENT_POSITION_FOLLOWING,
+        agentIcon.compareDocumentPosition(meta) & Node.DOCUMENT_POSITION_FOLLOWING,
       ).toBeTruthy()
     })
 
@@ -2598,12 +2602,12 @@ describe('PaneContainer', () => {
         store,
       )
 
-      const meta = screen.getByText(/freshell \(main\*\)\s+25%/)
+      const meta = screen.getByText('freshell (main*)')
       expect(meta).toHaveAttribute(
         'title',
-        'Directory: /home/user/code/freshell\nbranch: main*\nTokens: 15/60(25% full)',
+        'Directory: /home/user/code/freshell\nbranch: main*',
       )
-      expect(screen.queryByText(/other \(stale\)\s+10%/)).not.toBeInTheDocument()
+      expect(screen.queryByText(/other \(stale\)/)).not.toBeInTheDocument()
     })
 
     it('prefers historySessionId over a stale resumeSessionId before cliSessionId exists', () => {
@@ -2693,12 +2697,12 @@ describe('PaneContainer', () => {
         store,
       )
 
-      const meta = screen.getByText(/freshell \(main\*\)\s+25%/)
+      const meta = screen.getByText('freshell (main*)')
       expect(meta).toHaveAttribute(
         'title',
-        'Directory: /home/user/code/freshell\nbranch: main*\nTokens: 15/60(25% full)',
+        'Directory: /home/user/code/freshell\nbranch: main*',
       )
-      expect(screen.queryByText(/other \(stale\)\s+10%/)).not.toBeInTheDocument()
+      expect(screen.queryByText(/other \(stale\)/)).not.toBeInTheDocument()
     })
 
     it('prefers a canonical cliSessionId over a named historySessionId when both exist', () => {
@@ -2789,12 +2793,12 @@ describe('PaneContainer', () => {
         store,
       )
 
-      const meta = screen.getByText(/freshell \(main\*\)\s+25%/)
+      const meta = screen.getByText('freshell (main*)')
       expect(meta).toHaveAttribute(
         'title',
-        'Directory: /home/user/code/freshell\nbranch: main*\nTokens: 15/60(25% full)',
+        'Directory: /home/user/code/freshell\nbranch: main*',
       )
-      expect(screen.queryByText(/other \(stale\)\s+10%/)).not.toBeInTheDocument()
+      expect(screen.queryByText(/other \(stale\)/)).not.toBeInTheDocument()
     })
 
     it('falls back to resumeSessionId for FreshClaude panes before sdk.session.init arrives', () => {
@@ -2857,7 +2861,8 @@ describe('PaneContainer', () => {
         store,
       )
 
-      expect(screen.getByText(/freshell \(main\)\s+25%/)).toBeInTheDocument()
+      expect(screen.getByText('freshell (main)')).toBeInTheDocument()
+      expect(screen.queryByText(/25%/)).not.toBeInTheDocument()
     })
 
     it('resolves Claude-backed runtime metadata for fresh-agent kilroy panes', () => {
@@ -2920,8 +2925,11 @@ describe('PaneContainer', () => {
         store,
       )
 
-      expect(screen.getByTitle('kilroy session')).toHaveTextContent('kilroy')
-      expect(screen.getByText(/freshell \(main\)\s+25%/)).toBeInTheDocument()
+      expect(screen.getByTitle('Claude (kilroy pane)')).toBeInTheDocument()
+      const kilroyBanner = screen.getByRole('banner')
+      expect(kilroyBanner.textContent ?? '').not.toContain('kilroy')
+      expect(screen.getByText('freshell (main)')).toBeInTheDocument()
+      expect(screen.queryByText(/25%/)).not.toBeInTheDocument()
     })
 
   })
@@ -2979,12 +2987,13 @@ describe('PaneContainer', () => {
         store,
       )
 
-      const meta = screen.getByText(/freshell \(dev\)\s+30%/)
+      const meta = screen.getByText('freshell (dev)')
       expect(meta).toBeInTheDocument()
       expect(meta).toHaveAttribute(
         'title',
         'Directory: /home/user/code/freshell\nbranch: dev',
       )
+      expect(screen.queryByText(/30%/)).not.toBeInTheDocument()
     })
 
     it('falls back to session.snapshot for a Claude pane with no indexed session', () => {
@@ -3036,15 +3045,16 @@ describe('PaneContainer', () => {
         store,
       )
 
-      const meta = screen.getByText(/myproject \(feature-x\)\s+45%/)
+      const meta = screen.getByText('myproject (feature-x)')
       expect(meta).toBeInTheDocument()
       expect(meta).toHaveAttribute(
         'title',
         'Directory: /home/user/code/myproject\nbranch: feature-x',
       )
+      expect(screen.queryByText(/45%/)).not.toBeInTheDocument()
     })
 
-    it('shapes tokenUsage from session.snapshot, defaulting cachedTokens to 0 and passing through compactPercent', () => {
+    it('keeps session.snapshot tokenUsage out of the fresh-agent header meta entirely', () => {
       const node: PaneNode = {
         type: 'leaf',
         id: 'pane-opencode',
@@ -3095,15 +3105,16 @@ describe('PaneContainer', () => {
         store,
       )
 
-      const meta = screen.getByText(/workdir \(main\)\s+60%/)
+      const meta = screen.getByText('workdir (main)')
       expect(meta).toBeInTheDocument()
       expect(meta).toHaveAttribute(
         'title',
         'Directory: /home/user/code/workdir\nbranch: main',
       )
+      expect(screen.queryByText(/60%/)).not.toBeInTheDocument()
     })
 
-    it('omits the percent label when session.snapshot tokenUsage has no compactPercent', () => {
+    it('renders dir+branch meta with no token fields even when snapshot usage carries no compactPercent', () => {
       const node: PaneNode = {
         type: 'leaf',
         id: 'pane-opencode-no-pct',
@@ -3153,7 +3164,7 @@ describe('PaneContainer', () => {
         store,
       )
 
-      expect(screen.getByText(/notedir \(trunk\)/)).toBeInTheDocument()
+      expect(screen.getByText('notedir (trunk)')).toBeInTheDocument()
       expect(screen.queryByText(/%\s*$/)).not.toBeInTheDocument()
     })
   })

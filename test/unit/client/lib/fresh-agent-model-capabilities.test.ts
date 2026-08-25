@@ -13,6 +13,7 @@ import {
   groupFreshAgentModelCapabilitiesBySource,
   isFreshAgentEffortSupported,
   isFreshAgentModelCapabilitiesFresh,
+  mergeClaudeModelCapabilities,
   mergeClaudeSelectorOptions,
   parseFreshAgentSettingsModelValue,
   requiresFreshAgentModelCapabilityValidation,
@@ -535,6 +536,103 @@ describe('mergeClaudeSelectorOptions', () => {
   })
 })
 
+describe('mergeClaudeModelCapabilities', () => {
+  const staticCapabilities = getFreshAgentStaticModelCapabilities('freshclaude')!
+
+  it('leaves the statics untouched when the probe catalog is absent (ok:false surfaces as undefined)', () => {
+    expect(mergeClaudeModelCapabilities(staticCapabilities, undefined)).toBe(staticCapabilities)
+  })
+
+  it('keeps the statics as the full row set for an empty probe catalog', () => {
+    const merged = mergeClaudeModelCapabilities(staticCapabilities, {
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'fresh',
+      fetchedAt: 4_321,
+      models: [],
+    })
+
+    expect(merged.models).toEqual(staticCapabilities.models)
+    expect(merged.fetchedAt).toBe(4_321)
+  })
+
+  it('drops probed rows whose id matches a static id (static label wins)', () => {
+    const merged = mergeClaudeModelCapabilities(staticCapabilities, {
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'fresh',
+      fetchedAt: 4_321,
+      models: [
+        {
+          id: 'opus[1m]',
+          displayName: 'Probed duplicate that must not replace the static',
+          provider: 'claude',
+          description: 'Duplicate alias row',
+          supportsEffort: false,
+          supportedEffortLevels: [],
+          supportsAdaptiveThinking: true,
+        },
+      ],
+    })
+
+    expect(merged.models).toHaveLength(1)
+    expect(merged.models[0]).toMatchObject({
+      id: 'opus[1m]',
+      displayName: 'Claude Opus 5 (1M context)',
+      supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+      supportsAdaptiveThinking: false,
+    })
+  })
+
+  it('appends probed-only rows verbatim in catalog order, preserving each row effort levels', () => {
+    const merged = mergeClaudeModelCapabilities(staticCapabilities, {
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'fresh',
+      fetchedAt: 4_321,
+      models: [
+        {
+          id: 'sonnet',
+          displayName: 'Sonnet alias row',
+          provider: 'claude',
+          description: 'Tracked alias',
+          supportsEffort: true,
+          supportedEffortLevels: ['low', 'high'],
+          supportsAdaptiveThinking: true,
+        },
+        {
+          id: 'claude-opus-4-7',
+          displayName: 'Claude Opus 4.7',
+          provider: 'claude',
+          supportsEffort: false,
+          supportedEffortLevels: [],
+          supportsAdaptiveThinking: false,
+        },
+      ],
+    })
+
+    expect(merged.models.map((model) => model.id)).toEqual(['opus[1m]', 'sonnet', 'claude-opus-4-7'])
+    expect(merged.models[1]).toEqual({
+      id: 'sonnet',
+      displayName: 'Sonnet alias row',
+      provider: 'claude',
+      description: 'Tracked alias',
+      supportsEffort: true,
+      supportedEffortLevels: ['low', 'high'],
+      supportsAdaptiveThinking: true,
+    })
+    expect(merged.models[2]).toEqual({
+      id: 'claude-opus-4-7',
+      displayName: 'Claude Opus 4.7',
+      provider: 'claude',
+      supportsEffort: false,
+      supportedEffortLevels: [],
+      supportsAdaptiveThinking: false,
+    })
+    expect(merged.models[0].supportedEffortLevels).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
+  })
+})
+
 describe('fresh-agent-model-capabilities static catalog mapping', () => {
   it('maps the freshcodex static menu into the shared capability shape', () => {
     const capabilities = getFreshAgentStaticModelCapabilities('freshcodex')
@@ -562,9 +660,30 @@ describe('fresh-agent-model-capabilities static catalog mapping', () => {
     }
   })
 
+  it('maps the claude static menu into the shared capability shape', () => {
+    for (const sessionType of ['freshclaude', 'kilroy'] as const) {
+      const capabilities = getFreshAgentStaticModelCapabilities(sessionType)
+
+      expect(capabilities).toMatchObject({
+        sessionType,
+        runtimeProvider: 'claude',
+        status: 'fresh',
+      })
+      expect(capabilities?.models.map((model) => model.id)).toEqual(['opus[1m]'])
+      expect(capabilities?.models[0]).toMatchObject({
+        displayName: 'Claude Opus 5 (1M context)',
+        provider: 'claude',
+        supportsEffort: true,
+        supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+        supportsAdaptiveThinking: false,
+      })
+      // No `source` on claude statics: statics and probed rows group together
+      // under the provider fallback, exactly as the probed claude catalog does.
+      expect(capabilities?.models[0]).not.toHaveProperty('source')
+    }
+  })
+
   it('does not fabricate a static catalog for session types without one', () => {
     expect(getFreshAgentStaticModelCapabilities('freshopencode')).toBeUndefined()
-    expect(getFreshAgentStaticModelCapabilities('freshclaude')).toBeUndefined()
-    expect(getFreshAgentStaticModelCapabilities('kilroy')).toBeUndefined()
   })
 })

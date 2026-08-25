@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useReducer,
   useRef,
   useState,
   type CSSProperties,
@@ -14,7 +15,7 @@ import type { PaneReconcileRequest } from '@shared/ws-protocol'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { getWsClient, RECONCILE_VERDICT_WAIT_MS } from '@/lib/ws-client'
 import { createLogger } from '@/lib/client-logger'
-import { api, getFreshAgentThreadSnapshot, setSessionMetadata } from '@/lib/api'
+import { api, getFreshAgentModelCapabilities, getFreshAgentThreadSnapshot, setSessionMetadata } from '@/lib/api'
 import { clearReconcilePendingPane, consumePaneRefreshRequest, mergePaneContent, updatePaneContent } from '@/store/panesSlice'
 import { FRESH_AGENT_MODEL_CATALOG_UNAVAILABLE_NOTICE } from '@/lib/fresh-agent-model-capabilities'
 import { clearPendingCreateFailure, clearSessionLost, setSessionStatus } from '@/store/freshAgentSlice'
@@ -45,6 +46,12 @@ import {
   getFreshAgentSlashCommands,
   type FreshAgentSlashCommand,
 } from '@shared/fresh-agent-slash-commands'
+import { FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE } from '@shared/fresh-agent-models'
+import {
+  freshAgentContextSessionId,
+  guardContextUsageTokenSummary,
+} from '@/lib/fresh-agent-context-usage'
+import { refreshActiveSessionWindow } from '@/store/sessionsThunks'
 import FreshAgentModelDialog from '@/components/fresh-agent/FreshAgentModelDialog'
 import { buildRestoreError, type RestoreErrorReason } from '@shared/session-contract'
 import { isDurableProviderSessionId } from '@shared/session-flavor'
@@ -63,6 +70,7 @@ import { FreshAgentTranscript, type FreshAgentTranscriptHandle } from './FreshAg
 import { FreshAgentComposer, type FreshAgentComposerHandle } from './FreshAgentComposer'
 import { FreshAgentDiffPanel } from './FreshAgentDiffPanel'
 import { FreshAgentSidebar } from './FreshAgentSidebar'
+import { FreshAgentStatusStrip } from './FreshAgentStatusStrip'
 
 const EARLY_STATES = new Set(['creating', 'starting'])
 const BUSY_STATES = new Set(['running', 'compacting'])
@@ -92,6 +100,11 @@ export const SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS = new Set([
   'freshAgent.question.cancelled',
 ])
 const log = createLogger('FreshAgentView')
+// Context usage validity window for the strip meter: at 60s the strip triggers
+// a background refresh (never a blank-out of an accurate idle reading); if no
+// re-stamp arrives within a further 30s grace the strip falls to "context —".
+const CONTEXT_USAGE_VALID_MS = 60_000
+const CONTEXT_USAGE_GRACE_MS = 30_000
 
 function getSnapshotIdentity(snapshot: FreshAgentSnapshot): string | null {
   if (!snapshot.sessionType || !snapshot.provider || !snapshot.threadId) return null
@@ -608,6 +621,10 @@ export function FreshAgentView({
     })
     return state.freshAgent.sessions[sessionKey]
   })
+  // Status-strip context meter source: the unified usage map stamped by
+  // committed sidebar refreshes (fresh rows + out-of-band extras). Deliberately
+  // NOT the fresh-agent snapshot tokenUsage — it never carries compactPercent,
+  // so reading it would be a silent "always unknown" bug.
   const hasUnresolvedLocalEchoForSession = useAppSelector((state) => {
     if (!paneContent.sessionId) return false
     return Object.values(state.panes.layouts).some((layout) => {
@@ -664,6 +681,7 @@ export function FreshAgentView({
   const [notice, setNotice] = useState<string | null>(null)
   const [modelDialogOpen, setModelDialogOpen] = useState(false)
   const closeModelDialog = useCallback(() => setModelDialogOpen(false), [])
+  const openModelDialog = useCallback(() => setModelDialogOpen(true), [])
   // /model with a dead catalog opens the shared notice, not an empty dialog.
   const handleModelCatalogUnavailable = useCallback(() => setNotice(FRESH_AGENT_MODEL_CATALOG_UNAVAILABLE_NOTICE), [])
   // Optimistic echo of the just-sent user message: the transcript renders
@@ -678,6 +696,143 @@ export function FreshAgentView({
   // so a resend can happen at most once per failed request (loop-proof).
   const lostSessionRetryRef = useRef<Set<string>>(new Set())
   const descriptor = resolveFreshAgentType(paneContent.sessionType)
+  // Status-strip model display: the chip mirrors the LIVE session model when
+  // the runtime reports one, else the staged/effective pane model. Label
+  // resolution maps the id through the static table by exact match only —
+  // never the default-substituting resolveFreshAgentModelOption helper: a
+  // catalog-only id renders NO label until the probe or pick-time stamp
+  // resolves a real display name (raw ids are tooltip-only) and never
+  // masquerades as the default.
+  // The displayed model is the LIVE session's — reported via the runtime
+  // session record (init), the REST snapshot's settings.model (Node adapters
+  // report it), and only then the staged/effective pane model. Restored,
+  // REST-created, and MCP panes can lack the init model while a snapshot with
+  // the active model is already loaded.
+  const stripModelId = agentSession?.model
+    ?? snapshot?.settings?.model
+    ?? resolveEffectiveFreshAgentModel(paneContent, providerDefaults)
+  const stripStaticModelLabel = FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE[paneContent.sessionType]
+    ?.find((option) => option.value === stripModelId)?.label
+  // Paired with the model id the probe resolved: a live-model switch leaves
+  // the previous model's probed label in state until the effect re-runs; only
+  // the id-paired label may render (no stale-label frame, no raw id).
+  const [stripProbedModelPair, setStripProbedModelPair] = useState<{ modelId: string; label: string } | null>(null)
+  // Catalog display-name upgrade: freshopencode's static table is empty
+  // ("live catalog only"), and freshclaude/kilroy users can now pick
+  // catalog-only models in the shared dialog — without this probe both would
+  // permanently render raw ids on the chip ("raw id is tooltip-only" is the
+  // contract). Same endpoint the settings popover calls (5-min server cache +
+  // in-flight dedupe). Re-probes when the active model changes; the raw id
+  // renders immediately and survives a catalog failure — never blank, never
+  // "Loading". Cancelled-flag guard matches the sibling probe effects
+  // (FreshAgentModelDialog/FreshAgentSettingsButton).
+  // Id-paired pick-time stamp from the dialog/popover: authoritative for
+  // catalog-only ids — the chip shows the picked label immediately, with no
+  // probe window and no raw-id flash, and survives probe failure.
+  const stripStampedModelLabel = paneContent.modelLabel != null && paneContent.modelLabel.modelId === stripModelId
+    ? paneContent.modelLabel.label
+    : undefined
+  const stripProbeSessionType = paneContent.sessionType === 'freshopencode'
+    || paneContent.sessionType === 'freshclaude'
+    || paneContent.sessionType === 'kilroy'
+    ? paneContent.sessionType
+    : null
+  useEffect(() => {
+    setStripProbedModelPair(null)
+    if (!stripProbeSessionType || !stripModelId || stripStaticModelLabel || stripStampedModelLabel) return
+    let cancelled = false
+    void getFreshAgentModelCapabilities(stripProbeSessionType, { cwd: paneContent.initialCwd })
+      .then((result) => {
+        if (cancelled) return
+        const probed = result.ok
+          ? result.models.find((model) => model.id === stripModelId)?.displayName ?? null
+          : null
+        // A displayName echoing the raw id is not a display name (e.g.
+        // opencode's no-name fallback) — the chip would render a raw id,
+        // which is tooltip-only by contract.
+        setStripProbedModelPair(probed && probed !== stripModelId ? { modelId: stripModelId, label: probed } : null)
+      })
+      .catch(() => {
+        if (!cancelled) setStripProbedModelPair(null)
+      })
+    return () => { cancelled = true }
+  }, [stripProbeSessionType, paneContent.initialCwd, stripModelId, stripStaticModelLabel, stripStampedModelLabel])
+  const stripProbedModelLabel = stripProbedModelPair && stripProbedModelPair.modelId === stripModelId
+    ? stripProbedModelPair.label
+    : undefined
+  // The chip NEVER renders a raw model id (user directive, review-loop round
+  // delta-1/focused-ep1: raw ids are tooltip-only). The chip exists ONLY once a
+  // display name resolves through the required chain (static table → pick-time
+  // stamp → catalog probe). A pane with NO model set at all gets no chip
+  // either — the pane-type label is not a model display name, and model
+  // selection stays reachable from the settings gear and /model.
+  const stripModelLabel = stripModelId
+    ? (stripStaticModelLabel ?? stripStampedModelLabel ?? stripProbedModelLabel)
+    : null
+  // ≤520px collapse favors the short form: drop a trailing "(1M context)"-style
+  // parenthetical (raw ids carry none and pass through unchanged).
+  const stripModelLabelShort = stripModelLabel?.replace(/\s*\([^)]*\)\s*$/, '') || stripModelLabel
+  // Tooltip carries the live session's effort when the runtime reports one
+  // (opencode snapshot.settings.effort), else the effort the pane was
+  // created/resumed with — the tooltip words the SESSION's effort; the model
+  // id it labels is the live one.
+  const stripModelTooltip = !stripModelId
+    ? 'model not set'
+    : `${stripModelId} · effort ${snapshot?.settings?.effort ?? getEffectiveFreshAgentEffort(paneContent, providerDefaults) ?? 'Default'}`
+  const contextSessionId = freshAgentContextSessionId(paneContent, agentSession)
+  const [usageTick, forceUsageTick] = useReducer((tick: number) => tick + 1, 0)
+  const usageRefreshDispatchedRef = useRef(false)
+  // STATUS-STRIP: one unified, timestamped usage map (state.sessions.contextUsageByKey).
+  // A reading stays live for 60s after its last stamp. At the boundary the strip
+  // triggers a background revalidation (extras + fresh rows re-stamp it) rather
+  // than blanking an accurate idle reading; if no re-stamp lands within a 30s
+  // grace, the strip drops to "context —". So nothing rides stale AND right-now
+  // idle sessions never go blank. Merge/retained rows never write, so the value
+  // can never regress; server-side usage-stop evicts immediately.
+  const usageEntry = useAppSelector((state) => (
+    contextSessionId
+      ? state.sessions?.contextUsageByKey?.[`${paneContent.provider}:${contextSessionId}`]
+      : undefined
+  ))
+  const usageValid = Boolean(
+    usageEntry && (
+      Date.now() - usageEntry.fetchedAt < CONTEXT_USAGE_VALID_MS
+      || (usageRefreshDispatchedRef.current && Date.now() - usageEntry.fetchedAt < CONTEXT_USAGE_VALID_MS + CONTEXT_USAGE_GRACE_MS)
+    ),
+  )
+  const contextUsage = useMemo(
+    () => (usageEntry && usageValid ? guardContextUsageTokenSummary(usageEntry.tokenUsage) : null),
+    // usageTick forces the boundary re-evaluation.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [usageEntry, usageValid, usageTick],
+  )
+  useEffect(() => {
+    if (!usageEntry || !contextUsage) {
+      usageRefreshDispatchedRef.current = false
+      return
+    }
+    const boundaryMs = usageEntry.fetchedAt + (usageRefreshDispatchedRef.current
+      ? CONTEXT_USAGE_VALID_MS + CONTEXT_USAGE_GRACE_MS
+      : CONTEXT_USAGE_VALID_MS)
+    const timer = window.setTimeout(() => {
+      if (!usageRefreshDispatchedRef.current) {
+        usageRefreshDispatchedRef.current = true
+        // The boundary revalidation is best-effort: a rejected thunk (partial
+        // store shape in tests, transient network failure) must never surface
+        // as an unhandled rejection from this timer.
+        const revalidation = dispatch(refreshActiveSessionWindow() as any)
+        if (revalidation && typeof (revalidation as Promise<unknown>)?.catch === 'function') {
+          ;(revalidation as Promise<unknown>).catch(() => {})
+        }
+      }
+      forceUsageTick()
+    }, Math.max(boundaryMs - Date.now(), 0))
+    return () => window.clearTimeout(timer)
+  }, [usageEntry, contextUsage, dispatch])
+  // A new stamp resets the revalidation arm (data arrived before the boundary).
+  useEffect(() => {
+    usageRefreshDispatchedRef.current = false
+  }, [usageEntry])
   // Capability-gated commands (e.g. /fork) only appear once the snapshot
   // confirms the provider supports the action. Provider-advertised session
   // commands from the same snapshot merge in under their own group; they
@@ -2528,6 +2683,16 @@ export function FreshAgentView({
               onForkFromTurn={(turnId) => sendFork(turnId)}
               onRewindToTurn={paneContent.initialCwd ? rewindToTurn : undefined}
             />
+            {/* Every fresh-agent pane gets the strip (unknown state included):
+                the model chip opens the shared model dialog and the strip owns
+                the bottom-chrome divider (the composer draws no border-top). */}
+            <FreshAgentStatusStrip
+              modelLabel={stripModelLabel ?? null}
+              modelLabelShort={stripModelLabelShort ?? undefined}
+              modelTooltip={stripModelTooltip}
+              contextUsage={contextUsage}
+              onOpenModelDialog={openModelDialog}
+            />
             <FreshAgentComposer
               ref={composerRef}
               disabled={composerDisabled}
@@ -2592,6 +2757,7 @@ export function FreshAgentView({
     claudeSession?.restoreFailureMessage,
     activeStyle,
     composerDisabled,
+    contextUsage,
     descriptor?.icon,
     descriptor?.label,
     effectiveStatus,
@@ -2604,6 +2770,10 @@ export function FreshAgentView({
     localEcho,
     modelDialogOpen,
     closeModelDialog,
+    openModelDialog,
+    stripModelLabel,
+    stripModelLabelShort,
+    stripModelTooltip,
     handleModelCatalogUnavailable,
     notice,
     paneContent,

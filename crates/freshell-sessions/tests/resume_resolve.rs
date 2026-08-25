@@ -44,6 +44,7 @@ fn session(provider: &str, id: &str, last: i64) -> IndexedSession {
         is_non_interactive: false,
         git_branch: None,
         source_file: None,
+        token_usage: None,
     }
 }
 
@@ -531,6 +532,7 @@ fn session_in(provider: &str, id: &str, project: &str, last_activity_at: i64) ->
         is_non_interactive: false,
         git_branch: None,
         source_file: None,
+        token_usage: None,
     }
 }
 

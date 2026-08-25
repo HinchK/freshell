@@ -583,3 +583,45 @@ describe('search tiers through the HTTP route (full round-trip)', () => {
     expect(res.body.items[0].matchedIn).toBe('assistantMessage')
   })
 })
+
+describe('STATUS-STRIP response ordering stamps', () => {
+  it('snapshotSeq strictly increases per page and never derives from activity timestamps', async () => {
+    const orderingApp = express()
+    orderingApp.use(express.json())
+    orderingApp.use('/api', (req, res, next) => {
+      const token = req.headers['x-auth-token']
+      if (token !== TEST_AUTH_TOKEN) return res.status(401).json({ error: 'Unauthorized' })
+      next()
+    })
+    orderingApp.use('/api', createSessionsRouter({
+      configStore: {
+        getSessionOverrides: () => ({}),
+        setSessionOverride: async () => ({}),
+        clearSessionOverride: async () => ({}),
+        patchSessionOverride: async () => ({}),
+        deleteSession: async () => undefined,
+      },
+      codingCliIndexer: { getProjects: () => [], refreshSessions: async () => {} },
+      codingCliProviders: [],
+      perfConfig: { slowSessionRefreshMs: 500 },
+      terminalMetadata: { list: () => [] },
+    }))
+
+    const res1 = await request(orderingApp)
+      .get('/api/session-directory?priority=visible')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+    const res2 = await request(orderingApp)
+      .get('/api/session-directory?priority=visible')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(res1.status).toBe(200)
+    expect(res2.status).toBe(200)
+    const s1 = res1.body.snapshotSeq as number
+    const s2 = res2.body.snapshotSeq as number
+    expect(Number.isInteger(s1)).toBe(true)
+    expect(Number.isInteger(s2)).toBe(true)
+    expect(s2).toBeGreaterThan(s1)
+    // Not monotonic-with-activity: an empty directory still increments.
+    expect(s1).not.toBe(res1.body.revision)
+  })
+})
