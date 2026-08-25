@@ -1167,6 +1167,19 @@ describe('sessionsSlice', () => {
       expect(state.contextUsageByKey['claude:s1']?.bootId).toBe('b2')
     })
 
+    it('an entry without tokenUsage evicts the key (server-proxied usage stop — no time expiry needed)', () => {
+      let state = sessionsReducer(undefined, stamp({ serverInstance: 'srv-1', bootId: 'b1', sourceSeq: 5 }))
+      expect(state.contextUsageByKey['claude:s1']).toBeDefined()
+
+      state = sessionsReducer(state, stamp({
+        serverInstance: 'srv-1',
+        bootId: 'b1',
+        sourceSeq: 6,
+        entries: [{ provider: 'claude', sessionId: 's1' }],
+      }))
+      expect(state.contextUsageByKey['claude:s1']).toBeUndefined()
+    })
+
     it('prunes entries outside the current pane keys and drops writes for them', () => {
       let state = sessionsReducer(undefined, stamp({ paneKeys: ['claude:s1'] }))
       expect(state.contextUsageByKey['claude:s1']).toBeDefined()

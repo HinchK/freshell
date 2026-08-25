@@ -634,7 +634,6 @@ export const sessionsSlice = createSlice({
       }
       state.contextUsageByKey = next
       for (const extra of entries) {
-        if (!extra.tokenUsage) continue
         const key = `${extra.provider}:${extra.sessionId}`
         if (!keep.has(key)) continue
         const existing = state.contextUsageByKey[key]
@@ -648,6 +647,13 @@ export const sessionsSlice = createSlice({
           && existing.bootId === bootId
           && existing.sourceSeq > sourceSeq
         ) continue
+        if (!extra.tokenUsage) {
+          // Explicit server signal: this response reached the session but
+          // carries no usage — reporting stopped. Evict rather than let the
+          // last percentage ride forever (no client-side time expiry by design).
+          delete state.contextUsageByKey[key]
+          continue
+        }
         state.contextUsageByKey[key] = {
           tokenUsage: extra.tokenUsage as TokenSummary,
           sourceSeq,

@@ -6528,6 +6528,60 @@ describe('FreshAgentView session status strip', () => {
     expect(chip).toHaveAttribute('title', 'claude-live-99 · effort high')
   })
 
+  it('uses the REST snapshot\'s settings.model when no session-init model exists (restored/MCP panes)', async () => {
+    apiMock.getFreshAgentModelCapabilities.mockResolvedValue({
+      ok: true,
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'fresh',
+      fetchedAt: 1_000,
+      models: [{
+        id: 'claude-live-99',
+        displayName: 'Live Ninety Nine',
+        provider: 'claude',
+        supportsEffort: true,
+        supportedEffortLevels: ['low', 'high'],
+        supportsAdaptiveThinking: true,
+      }],
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'summary',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [],
+      settings: { model: 'claude-live-99', effort: 'low' },
+    } as never)
+    const store = createStore()
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-strip-snap-model',
+            sessionId: CLAUDE_THREAD_ID,
+            status: 'connected',
+            // No live session/model staged: resolveEffective… would serve the
+            // provider default — the snapshot's active model must win.
+            resumeSessionId: CLAUDE_THREAD_ID,
+            effort: 'high',
+          }}
+        />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Model: Live Ninety Nine — change model' })).toBeInTheDocument()
+    })
+    expect(apiMock.getFreshAgentModelCapabilities).toHaveBeenCalled()
+    // Tooltip pairs the live id with the live effort (not the pane's 'high').
+    expect(screen.getByRole('button', { name: 'Model: Live Ninety Nine — change model' }))
+      .toHaveAttribute('title', 'claude-live-99 · effort low')
+  })
+
   it('a live-reported snapshot effort wins the chip tooltip', async () => {
     apiMock.getFreshAgentModelCapabilities.mockResolvedValue({
       ok: true,

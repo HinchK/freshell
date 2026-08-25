@@ -695,7 +695,14 @@ export function FreshAgentView({
   // catalog-only id renders NO label until the probe or pick-time stamp
   // resolves a real display name (raw ids are tooltip-only) and never
   // masquerades as the default.
-  const stripModelId = agentSession?.model ?? resolveEffectiveFreshAgentModel(paneContent, providerDefaults)
+  // The displayed model is the LIVE session's — reported via the runtime
+  // session record (init), the REST snapshot's settings.model (Node adapters
+  // report it), and only then the staged/effective pane model. Restored,
+  // REST-created, and MCP panes can lack the init model while a snapshot with
+  // the active model is already loaded.
+  const stripModelId = agentSession?.model
+    ?? snapshot?.settings?.model
+    ?? resolveEffectiveFreshAgentModel(paneContent, providerDefaults)
   const stripStaticModelLabel = FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE[paneContent.sessionType]
     ?.find((option) => option.value === stripModelId)?.label
   // Paired with the model id the probe resolved: a live-model switch leaves

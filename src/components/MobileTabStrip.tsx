@@ -99,7 +99,7 @@ export function MobileTabStrip({ onOpenSwitcher, sidebarCollapsed, onToggleSideb
           </span>
           {isActiveBusy && (
             <span
-              className="inline-flex shrink-0 items-center rounded-full bg-blue-500/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-blue-600 dark:text-blue-400"
+              className="inline-flex shrink-0 items-center rounded-full bg-blue-500/15 px-1.5 py-0.5 text-[13px] font-semibold uppercase tracking-wide text-blue-600 dark:text-blue-400"
               data-testid="mobile-tab-busy-badge"
             >
               Busy

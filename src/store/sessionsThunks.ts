@@ -409,10 +409,19 @@ function commitContextUsageFromRows(
   rows: UsageBearingRow[],
 ): void {
   const entries: SessionDirectoryContextUsageExtra[] = []
+  const paneKeys = getContextUsageOpts(getState()).includeKeys ?? []
+  const paneKeySet = new Set(paneKeys)
 
   for (const row of rows) {
-    if (!row.tokenUsage) continue
-    entries.push({ provider: row.provider, sessionId: row.sessionId, tokenUsage: row.tokenUsage })
+    const key = `${row.provider}:${row.sessionId}`
+    if (row.tokenUsage) {
+      entries.push({ provider: row.provider, sessionId: row.sessionId, tokenUsage: row.tokenUsage })
+    } else if (paneKeySet.has(key)) {
+      // A fresh page row reached the session WITHOUT usage: the provider
+      // stopped reporting. Relay the absence so the reducer evicts the stale
+      // entry instead of letting the last percentage ride forever.
+      entries.push({ provider: row.provider, sessionId: row.sessionId })
+    }
   }
   for (const extra of response.contextUsageExtras ?? []) {
     entries.push(extra)
@@ -422,7 +431,7 @@ function commitContextUsageFromRows(
     sourceSeq: response.snapshotSeq ?? 0,
     serverInstance: response.serverInstance,
     bootId: response.bootId,
-    paneKeys: getContextUsageOpts(getState()).includeKeys ?? [],
+    paneKeys,
   }))
 }
 
