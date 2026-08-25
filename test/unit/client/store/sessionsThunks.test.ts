@@ -2600,7 +2600,7 @@ describe('sessionsThunks', () => {
       expect(extras['claude:claude-live-uuid']?.tokenUsage?.compactPercent).toBe(47)
     })
 
-    it('evicts an extras entry once a fresh page covers its session (reverse ordering — older extras must never mask newer window data)', async () => {
+    it('a fresh page covering a session supersedes its extras entry (reverse ordering — older extras must never mask newer window data)', async () => {
       const panesReducer = (await import('@/store/panesSlice')).default
       const freshAgentReducer = (await import('@/store/freshAgentSlice')).default
       const usage = {
@@ -2671,7 +2671,10 @@ describe('sessionsThunks', () => {
         hasMore: false,
       })
       await store.dispatch(fetchSessionWindow({ surface: 'sidebar', priority: 'visible' }) as any)
-      expect((store.getState() as any).sessions.contextUsageByKey['claude:claude-live-uuid']).toBeUndefined()
+      // Supersede (upsert) semantics: the fresh window row's 70% replaces the
+      // extras 47% at the SAME key — not a deletion that could strand a stale
+      // reading, and not a retained 47% masking the fresh 70%.
+      expect((store.getState() as any).sessions.contextUsageByKey['claude:claude-live-uuid']?.tokenUsage?.compactPercent).toBe(70)
       expect((store.getState() as any).sessions.projects[0].sessions[0].tokenUsage.compactPercent).toBe(70)
     })
   })

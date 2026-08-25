@@ -211,12 +211,33 @@ type SessionWindowCommitPayload = {
   integrityError?: SessionDirectoryIntegrityError
 }
 
+// STATUS-STRIP: unified usage map. Rows in a FRESH commit supersede any older
+// entry (retained/deep-window rows never enter — they are not in the freshly
+// committed payload), and no row is ever deleted here: with no fresher data
+// arriving, the reader's 60s staleness bound clears the meter to "context —"
+// instead of re-serving an old reading.
+function upsertUsageIntoContextMap(state: SessionsState, projects: ProjectGroup[]) {
+  if (!state.contextUsageByKey) state.contextUsageByKey = {}
+  const fetchedAt = Date.now()
+  for (const project of projects) {
+    for (const session of project.sessions ?? []) {
+      if (!session.tokenUsage) continue
+      state.contextUsageByKey[`${session.provider}:${session.sessionId}`] = {
+        tokenUsage: session.tokenUsage,
+        fetchedAt,
+      }
+    }
+  }
+}
+
 function commitWindowPayload(
+  state: SessionsState,
   window: SessionWindowState,
   payload: SessionWindowCommitPayload,
 ) {
   window.projects = normalizeProjects(payload.projects)
   window.lastLoadedAt = Date.now()
+  upsertUsageIntoContextMap(state, payload.projects)
   window.resultVersion = (window.resultVersion ?? 0) + 1
   window.totalSessions = payload.totalSessions
   window.oldestLoadedTimestamp = payload.oldestLoadedTimestamp
@@ -372,7 +393,7 @@ export const sessionsSlice = createSlice({
       action: PayloadAction<SessionWindowCommitPayload>,
     ) => {
       const window = ensureWindow(state, action.payload.surface)
-      commitWindowPayload(window, action.payload)
+      commitWindowPayload(state, window, action.payload)
       window.loading = false
       window.loadingKind = undefined
       if (action.payload.query !== undefined) {
@@ -392,7 +413,7 @@ export const sessionsSlice = createSlice({
       action: PayloadAction<SessionWindowCommitPayload & { preserveLoading?: boolean }>,
     ) => {
       const window = ensureWindow(state, action.payload.surface)
-      commitWindowPayload(window, action.payload)
+      commitWindowPayload(state, window, action.payload)
       if (!action.payload.preserveLoading) {
         window.loading = false
         window.loadingKind = undefined
@@ -420,6 +441,8 @@ export const sessionsSlice = createSlice({
     setProjects: (state, action: PayloadAction<ProjectGroup[]>) => {
       state.projects = normalizeProjects(action.payload)
       state.lastLoadedAt = Date.now()
+      // setProjects is also the e2e seeding channel for fresh-window data.
+      upsertUsageIntoContextMap(state, state.projects)
       const valid = new Set(state.projects.map((p) => p.projectPath))
       state.expandedProjects = new Set(Array.from(state.expandedProjects).filter((k) => valid.has(k)))
       syncAllWindowsFromTopLevel(state)
@@ -616,17 +639,6 @@ export const sessionsSlice = createSlice({
         }
       }
     },
-    /**
-     * STATUS-STRIP: evict extras entries whose session was covered by the
-     * FRESH page of the just-returned fetch — that in-window row is newer, so
-     * the older out-of-band entry must stop outranking it.
-     */
-    clearContextUsageExtras: (state, action: PayloadAction<string[]>) => {
-      if (!state.contextUsageByKey) return
-      for (const key of action.payload) {
-        delete state.contextUsageByKey[key]
-      }
-    },
   },
 })
 
@@ -634,7 +646,6 @@ export const {
   setActiveSessionSurface,
   setSessionWindowLoading,
   applyContextUsageExtras,
-  clearContextUsageExtras,
   setSessionWindowError,
   commitSessionWindowReplacement,
   commitSessionWindowVisibleRefresh,

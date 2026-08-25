@@ -88,7 +88,16 @@ export default function PaneHeader({
         }
       : undefined
   // Fresh-agent header: always show a repo icon when the pane has a cwd —
-  // letter-avatar fallback while the probe is loading/missing/failed.
+  // letter-avatar fallback while the probe is loading/missing/failed. When the
+  // repo metadata never resolved (e.g. the Node dev server has no metadata
+  // endpoint), the tooltip shows the pane's cwd path rather than asserting a
+  // guessed basename IS the repo (delta review r3, Minor).
+  // repoEntry.repoName is synthesized from the cwd basename on probe ERROR
+  // (repoIconsSlice.rejected) — that is not a resolved repo identity, so the
+  // tooltip only claims "Repo:" for a READY entry.
+  const freshAgentRepoNameKnown = Boolean(
+    isFreshAgentPane && repoEntry?.status === 'ready' && repoEntry?.repoName,
+  )
   const freshAgentRepoIconInfo: RepoIconInfo | undefined =
     isFreshAgentPane && repoCwd
       ? {
@@ -185,7 +194,7 @@ export default function PaneHeader({
         <>
           {freshAgentRepoIconInfo ? (
             <span
-              title={`Repo: ${freshAgentRepoIconInfo.repoName}`}
+              title={freshAgentRepoNameKnown ? `Repo: ${freshAgentRepoIconInfo.repoName}` : freshAgentRepoIconInfo.repoKey}
               className="inline-flex shrink-0"
             >
               <RepoIcon info={freshAgentRepoIconInfo} className="h-3.5 w-3.5" />

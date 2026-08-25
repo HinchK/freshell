@@ -45,9 +45,7 @@ import { getFreshAgentSlashCommands, type FreshAgentSlashCommand } from '@shared
 import { FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE } from '@shared/fresh-agent-models'
 import {
   freshAgentContextSessionId,
-  resolveFreshAgentContextUsage,
   guardContextUsageTokenSummary,
-  type FreshAgentContextUsage,
 } from '@/lib/fresh-agent-context-usage'
 import FreshAgentModelDialog from '@/components/fresh-agent/FreshAgentModelDialog'
 import { buildRestoreError, type RestoreErrorReason } from '@shared/session-contract'
@@ -68,7 +66,6 @@ import { FreshAgentComposer, type FreshAgentComposerHandle } from './FreshAgentC
 import { FreshAgentDiffPanel } from './FreshAgentDiffPanel'
 import { FreshAgentSidebar } from './FreshAgentSidebar'
 import { FreshAgentStatusStrip } from './FreshAgentStatusStrip'
-import type { ProjectGroup } from '@/store/types'
 
 const EARLY_STATES = new Set(['creating', 'starting'])
 const BUSY_STATES = new Set(['running', 'compacting'])
@@ -98,13 +95,10 @@ export const SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS = new Set([
   'freshAgent.question.cancelled',
 ])
 const log = createLogger('FreshAgentView')
-// A cached context reading may serve only this long while the sidebar window
-// excludes its session row — bounded so a permanently excluded window can't
-// keep showing a pre-threshold reading into a live compaction risk.
+// A context usage reading serves only this long without a fresh commit —
+// bounded so a stale value can never hide a severity-threshold crossing
+// (amber ≥70%, red ≥90%) in a quiet pane.
 const CONTEXT_USAGE_STALE_MS = 60_000
-// Fallback for stores that do not register the sessions slice (keep the strip's
-// context lookup cheap and null instead of crashing).
-const EMPTY_PROJECTS: ProjectGroup[] = []
 
 function getSnapshotIdentity(snapshot: FreshAgentSnapshot): string | null {
   if (!snapshot.sessionType || !snapshot.provider || !snapshot.threadId) return null
@@ -621,11 +615,10 @@ export function FreshAgentView({
     })
     return state.freshAgent.sessions[sessionKey]
   })
-  // Status-strip context meter source: the session indexer's tokenUsage from
-  // the sidebar's session window (same lookup PaneContainer's pane meta uses).
-  // Deliberately NOT the fresh-agent snapshot tokenUsage — it never carries
-  // compactPercent, so reading it would be a silent "always unknown" bug.
-  const projects = useAppSelector((state) => state.sessions?.projects ?? EMPTY_PROJECTS)
+  // Status-strip context meter source: the unified usage map stamped by
+  // committed sidebar refreshes (fresh rows + out-of-band extras). Deliberately
+  // NOT the fresh-agent snapshot tokenUsage — it never carries compactPercent,
+  // so reading it would be a silent "always unknown" bug.
   const hasUnresolvedLocalEchoForSession = useAppSelector((state) => {
     if (!paneContent.sessionId) return false
     return Object.values(state.panes.layouts).some((layout) => {
@@ -766,88 +759,47 @@ export function FreshAgentView({
   // ≤520px collapse favors the short form: drop a trailing "(1M context)"-style
   // parenthetical (raw ids carry none and pass through unchanged).
   const stripModelLabelShort = stripModelLabel?.replace(/\s*\([^)]*\)\s*$/, '') || stripModelLabel
-  const stripModelTooltip = `${stripModelId ?? 'model not set'} · effort ${getEffectiveFreshAgentEffort(paneContent, providerDefaults) ?? 'Default'}`
+  // Effort is stamped for the pane's STAGED model; a live-session model that
+  // differs has no known effort — never mislabel it.
+  const stagedEffectiveModel = resolveEffectiveFreshAgentModel(paneContent, providerDefaults)
+  const stripModelTooltip = !stripModelId
+    ? 'model not set'
+    : stripModelId !== stagedEffectiveModel
+      ? `${stripModelId} · effort unknown`
+      : `${stripModelId} · effort ${getEffectiveFreshAgentEffort(paneContent, providerDefaults) ?? 'Default'}`
   const contextSessionId = freshAgentContextSessionId(paneContent, agentSession)
   const [usageTick, forceUsageTick] = useReducer((tick: number) => tick + 1, 0)
-  // Memoized: the last-known cache re-stamp effect must run only on a REAL
-  // data change — a fresh object identity per unrelated render would
-  // continuously re-timestamp the cache and stretch the 60s staleness bound
-  // (focused review round: exact-threshold staleness must hold).
-  const windowContextUsage = useMemo(
-    () => resolveFreshAgentContextUsage(paneContent, agentSession, projects),
-    [paneContent, agentSession, projects],
-  )
-  // STATUS-STRIP extras: out-of-band usage for this pane's session from the
-  // `includeKeys` side-channel (state.sessions.contextUsageByKey). Refresh
-  // arrives on every window/search fetch; bound it by the same staleness
-  // window as the last-known cache so a dead fetch cadence cannot freeze the
-  // meter mid-threshold.
-  const contextUsageExtraEntry = useAppSelector((state) => (
+  // STATUS-STRIP: the strip reads ONLY the unified usage map
+  // (state.sessions.contextUsageByKey). Entries are upserted by committed
+  // refreshes — fresh-page rows AND out-of-band extras alike — each carrying
+  // its own fetchedAt; retained deep-window rows structurally never enter, so
+  // an old reading can never be re-served past the 60s staleness bound (it
+  // expires to "context —" instead).
+  const usageEntry = useAppSelector((state) => (
     contextSessionId
       ? state.sessions?.contextUsageByKey?.[`${paneContent.provider}:${contextSessionId}`]
       : undefined
   ))
-  const extrasContextUsage = useMemo(
+  const contextUsage = useMemo(
     () => guardContextUsageTokenSummary(
-      contextUsageExtraEntry && Date.now() - contextUsageExtraEntry.fetchedAt < CONTEXT_USAGE_STALE_MS
-        ? contextUsageExtraEntry.tokenUsage
+      usageEntry && Date.now() - usageEntry.fetchedAt < CONTEXT_USAGE_STALE_MS
+        ? usageEntry.tokenUsage
         : undefined,
     ),
-    // usageTick forces a re-evaluation of the staleness filter on the armed
-    // expiry timer's render.
-    [contextUsageExtraEntry, usageTick],
+    // usageTick forces the staleness filter to re-evaluate on the armed expiry
+    // timer's render (intentional trigger dep, not a read value).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [usageEntry, usageTick],
   )
-  // Extras win over the window row when both exist: the extras are generated
-  // server-side from the SAME indexer snapshot as the fresh page — so when the
-  // two disagree the window row must be a STALE RETAINED one (deep pagination
-  // keeps older rows whose usage was never refreshed). A fresh page-1 row and
-  // its same-fetch extras can never actually disagree.
-  const liveContextUsage = extrasContextUsage ?? windowContextUsage
-  // Sidebar-window churn guard: `projects` is the sidebar's search/pagination
-  // window, replaced wholesale by each sidebar fetch — when this pane's row
-  // drops out (search results, the 50-session cap), the live lookup goes null
-  // and the meter would falsely revert to "context —" even though the provider
-  // already reported usage. Keep the last known reading per durable session id
-  // while this view is mounted; the meter self-heals the moment the row
-  // re-enters the window.
-  //
-  // The cache is STALENESS-BOUNDED: a cached reading expires after
-  // CONTEXT_USAGE_STALE_MS, so when the session stays excluded from the window
-  // a materially stuck reading self-clears to "context —" instead of hiding a
-  // severity-threshold crossing (fresh delta review round 1, Major).
-  const lastKnownUsageRef = useRef(new Map<string, { usage: FreshAgentContextUsage; at: number }>())
-  useEffect(() => {
-    if (liveContextUsage && contextSessionId) {
-      lastKnownUsageRef.current.set(contextSessionId, { usage: liveContextUsage, at: Date.now() })
-    }
-  }, [liveContextUsage, contextSessionId])
-  const cachedUsageEntry = contextSessionId ? lastKnownUsageRef.current.get(contextSessionId) : undefined
-  const cachedUsageFresh = cachedUsageEntry && Date.now() - cachedUsageEntry.at < CONTEXT_USAGE_STALE_MS
-    ? cachedUsageEntry.usage
-    : null
-  const contextUsage = liveContextUsage ?? cachedUsageFresh
   // Serving a bounded-staleness reading: re-render exactly at the expiry
-  // boundary of WHICHEVER slice is live (extras side-channel or last-known
-  // cache) so expiry is honored even in a completely quiet pane. Without the
-  // extras deadline, a stale extras row could ride forever once refreshes
-  // stop (extras are "live" while fresh, so the cache-only timer never armed).
+  // boundary so expiry is honored even in a completely quiet pane; the
+  // zero-remaining edge fires immediately instead of never.
   useEffect(() => {
-    const deadlines: number[] = []
-    if (extrasContextUsage && contextUsageExtraEntry) {
-      deadlines.push(contextUsageExtraEntry.fetchedAt + CONTEXT_USAGE_STALE_MS)
-    }
-    if (!liveContextUsage && cachedUsageEntry) {
-      deadlines.push(cachedUsageEntry.at + CONTEXT_USAGE_STALE_MS)
-    }
-    if (deadlines.length === 0) return
-    const remaining = Math.min(...deadlines) - Date.now()
-    // Exact-boundary tick: `remaining <= 0` means "stale RIGHT NOW relative to
-    // this render" — re-render immediately rather than serving stale forever
-    // in a quiet pane. No busy loop: at the re-render the reading already
-    // fails the freshness check, so no new deadline is armed.
+    if (!usageEntry || !contextUsage) return
+    const remaining = usageEntry.fetchedAt + CONTEXT_USAGE_STALE_MS - Date.now()
     const timer = window.setTimeout(forceUsageTick, Math.max(remaining, 0))
     return () => window.clearTimeout(timer)
-  }, [extrasContextUsage, contextUsageExtraEntry, liveContextUsage, cachedUsageEntry])
+  }, [usageEntry, contextUsage])
   // Capability-gated commands (e.g. /fork) only appear once the snapshot
   // confirms the provider supports the action.
   const slashCommands = useMemo(() => (

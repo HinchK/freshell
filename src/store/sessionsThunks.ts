@@ -9,9 +9,6 @@ import {
 import { collectFreshAgentContextUsageKeys } from '@/lib/fresh-agent-context-usage'
 import { createLogger } from '@/lib/client-logger'
 import type { AppDispatch, RootState } from './store'
-// Response row shapes for the extras reconciliation mapper below (the
-// snapshot/search adapters return loosely-typed objects).
-type FreshCoveredProject = { sessions?: Array<{ provider: string; sessionId: string }> }
 import type { ProjectGroup } from './types'
 import type { SessionDirectoryIntegrityError } from '@shared/read-models'
 
@@ -20,7 +17,6 @@ import {
   commitSessionWindowReplacement,
   commitSessionWindowVisibleRefresh,
   applyContextUsageExtras,
-  clearContextUsageExtras,
   setActiveSessionSurface,
   setSessionWindowError,
   setSessionWindowLoading,
@@ -384,23 +380,8 @@ function getContextUsageOpts(state: RootState): { includeKeys?: string[] } {
 
 function commitContextUsageExtras(
   dispatch: AppDispatch,
-  getState: () => RootState,
-  args: {
-    extras?: SearchResponse['contextUsageExtras']
-    /** `provider:sessionId` keys covered by THIS response's fresh page rows —
-     *  any extras entry for one of them is older than the in-window row and
-     *  must be evicted (extras outrank window rows on write-freshness). */
-    coveredKeys?: Iterable<string>
-  },
+  extras: SearchResponse['contextUsageExtras'],
 ): void {
-  const { extras, coveredKeys } = args
-  if (coveredKeys) {
-    const existing = getState().sessions.contextUsageByKey ?? {}
-    const evict = Array.from(coveredKeys).filter((key) => existing[key])
-    if (evict.length > 0) {
-      dispatch(clearContextUsageExtras(evict))
-    }
-  }
   if (extras && extras.length > 0) {
     dispatch(applyContextUsageExtras(extras))
   }
@@ -492,7 +473,7 @@ async function refreshVisibleSessionWindowSilently(args: {
         }))) {
           return
         }
-        commitContextUsageExtras(dispatch, getState, { extras: titleResponse.contextUsageExtras, coveredKeys: titleResponse.results.map((r) => `${r.provider}:${r.sessionId}`) })
+        commitContextUsageExtras(dispatch, titleResponse.contextUsageExtras)
 
         try {
           const deepResponse = await searchSessions({
@@ -512,7 +493,7 @@ async function refreshVisibleSessionWindowSilently(args: {
           // A rejected (stale-generation / mismatched-identity) window commit
           // must not still stamp its extras as fresh — old percentage would
           // ride the 60s staleness window on top of newer data.
-          if (committed) commitContextUsageExtras(dispatch, getState, { extras: deepResponse.contextUsageExtras, coveredKeys: deepResponse.results.map((r) => `${r.provider}:${r.sessionId}`) })
+          if (committed) commitContextUsageExtras(dispatch, deepResponse.contextUsageExtras)
         } catch {
           commitData(buildSearchPayload(surface, titleResponse.results, identity.query, identity.searchTier, false, {
             projectColors: titleResponse.projectColors,
@@ -537,7 +518,7 @@ async function refreshVisibleSessionWindowSilently(args: {
         integrityError: response.integrityError,
         projectColors: response.projectColors,
       }))
-      if (committed) commitContextUsageExtras(dispatch, getState, { extras: response.contextUsageExtras, coveredKeys: response.results.map((r) => `${r.provider}:${r.sessionId}`) })
+      if (committed) commitContextUsageExtras(dispatch, response.contextUsageExtras)
       return
     }
 
@@ -590,7 +571,7 @@ async function refreshVisibleSessionWindowSilently(args: {
       partialReason: response?.partialReason,
       integrityError: response?.integrityError,
     })
-    if (committed) commitContextUsageExtras(dispatch, getState, { extras: response?.contextUsageExtras, coveredKeys: ((response?.projects ?? []) as FreshCoveredProject[]).flatMap((p) => (p.sessions ?? []).map((s) => `${s.provider}:${s.sessionId}`)) })
+    if (committed) commitContextUsageExtras(dispatch, response.contextUsageExtras)
   } catch (error) {
     log.warn('Background refresh failed for', surface, error instanceof Error ? error.message : error)
     if (canCommit()) {
@@ -691,7 +672,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
               projects: mergedProjects,
               totalSessions: countSessions(mergedProjects),
             }))
-            commitContextUsageExtras(dispatch, getState, { extras: response.contextUsageExtras, coveredKeys: response.results.map((r) => `${r.provider}:${r.sessionId}`) })
+            commitContextUsageExtras(dispatch, response.contextUsageExtras)
             return
           }
 
@@ -706,7 +687,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
             })
             if (controller.signal.aborted) return
 
-            commitContextUsageExtras(dispatch, getState, { extras: titleResponse.contextUsageExtras, coveredKeys: titleResponse.results.map((r) => `${r.provider}:${r.sessionId}`) })
+            commitContextUsageExtras(dispatch, titleResponse.contextUsageExtras)
             dispatch(commitSessionWindowReplacement(buildSearchPayload(surface, titleResponse.results, trimmedQuery, searchTier, true, {
               projectColors: titleResponse.projectColors,
               partial: titleResponse.partial,
@@ -725,7 +706,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
               })
               if (controller.signal.aborted) return
 
-              commitContextUsageExtras(dispatch, getState, { extras: deepResponse.contextUsageExtras, coveredKeys: deepResponse.results.map((r) => `${r.provider}:${r.sessionId}`) })
+              commitContextUsageExtras(dispatch, deepResponse.contextUsageExtras)
               const merged = mergeSearchResults(titleResponse.results, deepResponse.results)
               dispatch(commitSessionWindowReplacement(buildSearchPayload(surface, merged, trimmedQuery, searchTier, false, {
                 partial: deepResponse.partial,
@@ -759,7 +740,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
             })
             if (controller.signal.aborted) return
 
-            commitContextUsageExtras(dispatch, getState, { extras: response.contextUsageExtras, coveredKeys: response.results.map((r) => `${r.provider}:${r.sessionId}`) })
+            commitContextUsageExtras(dispatch, response.contextUsageExtras)
 
             dispatch(commitSessionWindowReplacement(buildSearchPayload(surface, response.results, trimmedQuery, searchTier, false, {
               partial: response.partial,
@@ -790,7 +771,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
           ? mergeProjects(windowState?.projects ?? [], nextProjects)
           : nextProjects
 
-        commitContextUsageExtras(dispatch, getState, { extras: response?.contextUsageExtras, coveredKeys: ((response?.projects ?? []) as FreshCoveredProject[]).flatMap((p) => (p.sessions ?? []).map((s) => `${s.provider}:${s.sessionId}`)) })
+        commitContextUsageExtras(dispatch, response.contextUsageExtras)
         dispatch(commitSessionWindowReplacement({
           surface,
           projects,

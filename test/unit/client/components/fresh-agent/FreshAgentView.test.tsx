@@ -19,6 +19,25 @@ import { resetSnapshotSchedulerForTests } from '@/lib/fresh-agent-snapshot-sched
 import type { PaneNode } from '@/store/paneTypes'
 
 const CLAUDE_THREAD_ID = '550e8400-e29b-41d4-a716-446655440000'
+
+// STATUS-STRIP meter seeding helper: usage lands in the unified store map
+// (sessions.contextUsageByKey) exactly as a committed refresh would stamp it
+// — fresh-page rows and extras share the map, and the strip reads nothing else.
+function seedStripUsage(
+  store: ReturnType<typeof createStore>,
+  compactPercent: number,
+  contextTokens = 96_000,
+  sessionId = 'claude-strip-usage',
+) {
+  store.dispatch(applyContextUsageExtras([{
+    provider: 'claude',
+    sessionId,
+    tokenUsage: {
+      inputTokens: 1, outputTokens: 1, cachedTokens: 0, totalTokens: 2,
+      contextTokens, compactPercent, compactThresholdTokens: 200_000,
+    },
+  }]))
+}
 const CLAUDE_RESTORE_THREAD_ID = '550e8400-e29b-41d4-a716-446655440001'
 
 const wsMock = vi.hoisted(() => ({
@@ -6452,30 +6471,60 @@ describe('FreshAgentView session status strip', () => {
     expect(apiMock.getFreshAgentModelCapabilities).toHaveBeenCalledWith('freshclaude', expect.anything())
   })
 
+  it('pairs the chip tooltip effort with the displayed live model — never the staged model\'s effort under a live id', async () => {
+    apiMock.getFreshAgentModelCapabilities.mockResolvedValue({
+      ok: true,
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'fresh',
+      fetchedAt: 1_000,
+      models: [{
+        id: 'claude-live-99',
+        displayName: 'Live Ninety Nine',
+        provider: 'claude',
+        supportsEffort: true,
+        supportedEffortLevels: ['low', 'high'],
+        supportsAdaptiveThinking: true,
+      }],
+    })
+    const store = createStore()
+    store.dispatch(sessionInit({
+      sessionId: CLAUDE_THREAD_ID,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'claude-live-99',
+    }))
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-strip-live-tooltip',
+            sessionId: CLAUDE_THREAD_ID,
+            status: 'connected',
+            model: 'opus[1m]',
+            effort: 'high',
+          }}
+        />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Model: Live Ninety Nine — change model' })).toBeInTheDocument()
+    })
+    // The chip's raw-id+effort tooltip must describe the DISPLAYED (live)
+    // model; the staged opus[1m]/'high' pairing must not leak under it.
+    const chip = screen.getByRole('button', { name: 'Model: Live Ninety Nine — change model' })
+    expect(chip).toHaveAttribute('title', 'claude-live-99 · effort unknown')
+  })
+
   it('renders the context meter with the exact-token tooltip from the indexed session usage', () => {
     const store = createStore()
-    store.dispatch(applySessionsPatch({
-      removeProjectPaths: [],
-      upsertProjects: [{
-        projectPath: '/repo/strip',
-        sessions: [{
-          provider: 'claude' as const,
-          sessionType: 'freshclaude',
-          sessionId: 'claude-strip-usage',
-          projectPath: '/repo/strip',
-          cwd: '/repo/strip',
-          lastActivityAt: 1,
-          tokenUsage: {
-            inputTokens: 1,
-            outputTokens: 1,
-            totalTokens: 2,
-            contextTokens: 96000,
-            compactPercent: 47,
-            compactThresholdTokens: 200000,
-          },
-        }],
-      }],
-    }))
+    seedStripUsage(store, 47)
 
     render(
       <Provider store={store}>
@@ -6578,28 +6627,7 @@ describe('FreshAgentView session status strip', () => {
 
   it('keeps the last known meter when the sessions window drops the row (window churn never blanks a reported meter)', async () => {
     const store = createStore()
-    store.dispatch(applySessionsPatch({
-      removeProjectPaths: [],
-      upsertProjects: [{
-        projectPath: '/repo/strip',
-        sessions: [{
-          provider: 'claude' as const,
-          sessionType: 'freshclaude',
-          sessionId: 'claude-strip-usage',
-          projectPath: '/repo/strip',
-          cwd: '/repo/strip',
-          lastActivityAt: 1,
-          tokenUsage: {
-            inputTokens: 1,
-            outputTokens: 1,
-            totalTokens: 2,
-            contextTokens: 96000,
-            compactPercent: 47,
-            compactThresholdTokens: 200000,
-          },
-        }],
-      }],
-    }))
+    seedStripUsage(store, 47)
 
     render(
       <Provider store={store}>
@@ -6623,7 +6651,8 @@ describe('FreshAgentView session status strip', () => {
     expect(meter).toHaveAttribute('aria-valuenow', '47')
 
     // Sidebar search returns / the 50-session cap eviction REPLACE the projects
-    // window wholesale; the already-reported meter must not revert to unknown.
+    // window wholesale — the meter reads the unified usage map, so neither can
+    // blank a reported reading.
     act(() => {
       store.dispatch(applySessionsPatch({ upsertProjects: [], removeProjectPaths: ['/repo/strip'] }))
     })
@@ -6676,29 +6705,9 @@ describe('FreshAgentView session status strip', () => {
     expect(meter).toHaveAttribute('aria-valuenow', '70')
   })
 
-  it('fresh extras win over a stale retained window row (deep pagination keeps old usage)', () => {
+  it('a fresher commit supersedes an older usage reading (fresh-page rows and extras share one timestamped map)', () => {
     const store = createStore()
-    // The pane's row sits in the DEEP window (past page 1): it stays retained
-    // with the stale reading it had when first loaded, while fresh page-1
-    // refreshes no longer cover it. The includeKeys extras carry the live one.
-    store.dispatch(applySessionsPatch({
-      removeProjectPaths: [],
-      upsertProjects: [{
-        projectPath: '/repo/strip',
-        sessions: [{
-          provider: 'claude' as const,
-          sessionType: 'freshclaude',
-          sessionId: 'claude-strip-usage',
-          projectPath: '/repo/strip',
-          cwd: '/repo/strip',
-          lastActivityAt: 1,
-          tokenUsage: {
-            inputTokens: 1, outputTokens: 1, totalTokens: 2,
-            contextTokens: 96000, compactPercent: 47, compactThresholdTokens: 200000,
-          },
-        }],
-      }],
-    }))
+    seedStripUsage(store, 47)
     render(
       <Provider store={store}>
         <FreshAgentView
@@ -6719,15 +6728,11 @@ describe('FreshAgentView session status strip', () => {
     const meter = screen.getByRole('meter', { name: 'Context window used' })
     expect(meter).toHaveAttribute('aria-valuenow', '47')
 
-    // New usage arrives ONLY via the extras side-channel (the page-1 refresh no
-    // longer includes this deep row): the meter must cross the threshold, not
-    // freeze at the retained 47%.
+    // The next refresh commits a newer reading (regardless of whether the row
+    // was window-covered or out-of-band that cycle): the meter must cross the
+    // threshold, never freeze on the earlier value.
     act(() => {
-      store.dispatch(applyContextUsageExtras([{
-        provider: 'claude',
-        sessionId: 'claude-strip-usage',
-        tokenUsage: { inputTokens: 1, outputTokens: 1, cachedTokens: 0, totalTokens: 2, contextTokens: 140000, compactPercent: 70, compactThresholdTokens: 200000 },
-      }]))
+      seedStripUsage(store, 70, 140_000)
     })
     expect(meter).toHaveAttribute('aria-valuenow', '70')
   })
@@ -6810,28 +6815,7 @@ describe('FreshAgentView session status strip', () => {
     vi.useFakeTimers()
     try {
       const store = createStore()
-      store.dispatch(applySessionsPatch({
-        removeProjectPaths: [],
-        upsertProjects: [{
-          projectPath: '/repo/strip',
-          sessions: [{
-            provider: 'claude' as const,
-            sessionType: 'freshclaude',
-            sessionId: 'claude-strip-usage',
-            projectPath: '/repo/strip',
-            cwd: '/repo/strip',
-            lastActivityAt: 1,
-            tokenUsage: {
-              inputTokens: 1,
-              outputTokens: 1,
-              totalTokens: 2,
-              contextTokens: 96000,
-              compactPercent: 47,
-              compactThresholdTokens: 200000,
-            },
-          }],
-        }],
-      }))
+      seedStripUsage(store, 47)
 
       render(
         <Provider store={store}>
@@ -6856,7 +6840,7 @@ describe('FreshAgentView session status strip', () => {
       act(() => {
         store.dispatch(applySessionsPatch({ upsertProjects: [], removeProjectPaths: ['/repo/strip'] }))
       })
-      // Still serving the just-reported reading (window churn must not blank).
+      // Still serving the just-committed reading (window churn must not blank).
       expect(screen.getByRole('meter', { name: 'Context window used' })).toHaveAttribute('aria-valuenow', '47')
 
       // Past the staleness bound with the row still excluded, the meter clears

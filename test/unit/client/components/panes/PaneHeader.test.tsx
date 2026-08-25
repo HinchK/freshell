@@ -264,7 +264,9 @@ describe('PaneHeader', () => {
       )
 
       const banner = screen.getByRole('banner', { name: 'Pane: freshell' })
-      const repoIcon = screen.getByTitle('Repo: freshell')
+      // No repo metadata in store → the tooltip is the pane's cwd path (never
+      // a guessed basename claimed as the repo name).
+      const repoIcon = screen.getByTitle('/home/dan/code/freshell')
       const agentIcon = screen.getByTitle('Codex (freshcodex pane)')
       const metadata = screen.getByText('freshell (main)')
 
@@ -455,16 +457,16 @@ describe('PaneHeader', () => {
       expect(mockApiGet).toHaveBeenCalledWith(
         '/api/repo-icon/meta?cwd=%2Fhome%2Fdan%2Fcode%2Ffreshell',
       )
-      // …and the letter-avatar fallback renders immediately, tooltip from the
-      // cwd basename — never the generic "Repository".
-      const repoIcon = screen.getByTitle('Repo: freshell')
+      // …and the letter-avatar fallback renders immediately, tooltip showing
+      // the pane cwd path (metadata absent → no guessed repo name).
+      const repoIcon = screen.getByTitle('/home/dan/code/freshell')
       expect(repoIcon.querySelector('[data-testid="repo-icon"]')).not.toBeNull()
 
       await waitFor(() => {
         expect(store.getState().repoIcons.byCwd['/home/dan/code/freshell']?.status).toBe('error')
       })
       // The tooltip stays put through the probe's error landing.
-      expect(screen.getByTitle('Repo: freshell')).toBeInTheDocument()
+      expect(screen.getByTitle('/home/dan/code/freshell')).toBeInTheDocument()
     })
 
     it('renders fresh-agent controls in settings refresh zoom close order without open-terminal or context-meter controls', () => {
