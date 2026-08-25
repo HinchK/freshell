@@ -166,6 +166,8 @@ export interface SessionsState {
     sourceSeq: number
     serverInstance?: string
     bootId?: string
+    /** Client-side wall-clock stamp of the redis write — drives the validity window. */
+    fetchedAt: number
   }>
 }
 
@@ -659,6 +661,7 @@ export const sessionsSlice = createSlice({
           sourceSeq,
           ...(serverInstance !== undefined ? { serverInstance } : {}),
           ...(bootId !== undefined ? { bootId } : {}),
+          fetchedAt: Date.now(),
         }
       }
     },

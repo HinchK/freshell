@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useReducer,
   useRef,
   useState,
   type CSSProperties,
@@ -46,6 +47,7 @@ import {
   freshAgentContextSessionId,
   guardContextUsageTokenSummary,
 } from '@/lib/fresh-agent-context-usage'
+import { refreshActiveSessionWindow } from '@/store/sessionsThunks'
 import FreshAgentModelDialog from '@/components/fresh-agent/FreshAgentModelDialog'
 import { buildRestoreError, type RestoreErrorReason } from '@shared/session-contract'
 import { isDurableProviderSessionId } from '@shared/session-flavor'
@@ -94,9 +96,11 @@ export const SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS = new Set([
   'freshAgent.question.cancelled',
 ])
 const log = createLogger('FreshAgentView')
-// Context usage: read `state.sessions.contextUsageByKey` via the view's selector.
-// No client-side expiry — refreshes are event-driven (sessions.changed), so the
-// newest entry the server has is still accurate until superseded.
+// Context usage validity window for the strip meter: at 60s the strip triggers
+// a background refresh (never a blank-out of an accurate idle reading); if no
+// re-stamp arrives within a further 30s grace the strip falls to "context —".
+const CONTEXT_USAGE_VALID_MS = 60_000
+const CONTEXT_USAGE_GRACE_MS = 30_000
 
 function getSnapshotIdentity(snapshot: FreshAgentSnapshot): string | null {
   if (!snapshot.sessionType || !snapshot.provider || !snapshot.threadId) return null
@@ -772,23 +776,53 @@ export function FreshAgentView({
     ? 'model not set'
     : `${stripModelId} · effort ${snapshot?.settings?.effort ?? getEffectiveFreshAgentEffort(paneContent, providerDefaults) ?? 'Default'}`
   const contextSessionId = freshAgentContextSessionId(paneContent, agentSession)
-  // STATUS-STRIP: the strip reads ONLY the unified usage map
-  // (state.sessions.contextUsageByKey). Entries are upserted by committed
-  // refreshes — fresh-page rows AND out-of-band extras alike — and retained
-  // deep-window rows structurally never enter, so no reading can ever regress
-  // to older data. A reading is NEVER expired into "unknown": refreshes are
-  // event-driven (sessions.changed), so an entry the server has not superseded
-  // is still the newest value it knows — blanking it would only hide accurate
-  // data for idle sessions.
+  const [usageTick, forceUsageTick] = useReducer((tick: number) => tick + 1, 0)
+  const usageRefreshDispatchedRef = useRef(false)
+  // STATUS-STRIP: one unified, timestamped usage map (state.sessions.contextUsageByKey).
+  // A reading stays live for 60s after its last stamp. At the boundary the strip
+  // triggers a background revalidation (extras + fresh rows re-stamp it) rather
+  // than blanking an accurate idle reading; if no re-stamp lands within a 30s
+  // grace, the strip drops to "context —". So nothing rides stale AND right-now
+  // idle sessions never go blank. Merge/retained rows never write, so the value
+  // can never regress; server-side usage-stop evicts immediately.
   const usageEntry = useAppSelector((state) => (
     contextSessionId
       ? state.sessions?.contextUsageByKey?.[`${paneContent.provider}:${contextSessionId}`]
       : undefined
   ))
-  const contextUsage = useMemo(
-    () => guardContextUsageTokenSummary(usageEntry?.tokenUsage),
-    [usageEntry],
+  const usageValid = Boolean(
+    usageEntry && (
+      Date.now() - usageEntry.fetchedAt < CONTEXT_USAGE_VALID_MS
+      || (usageRefreshDispatchedRef.current && Date.now() - usageEntry.fetchedAt < CONTEXT_USAGE_VALID_MS + CONTEXT_USAGE_GRACE_MS)
+    ),
   )
+  const contextUsage = useMemo(
+    () => (usageEntry && usageValid ? guardContextUsageTokenSummary(usageEntry.tokenUsage) : null),
+    // usageTick forces the boundary re-evaluation.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [usageEntry, usageValid, usageTick],
+  )
+  useEffect(() => {
+    if (!usageEntry || !contextUsage) {
+      usageRefreshDispatchedRef.current = false
+      return
+    }
+    const boundaryMs = usageEntry.fetchedAt + (usageRefreshDispatchedRef.current
+      ? CONTEXT_USAGE_VALID_MS + CONTEXT_USAGE_GRACE_MS
+      : CONTEXT_USAGE_VALID_MS)
+    const timer = window.setTimeout(() => {
+      if (!usageRefreshDispatchedRef.current) {
+        usageRefreshDispatchedRef.current = true
+        void dispatch(refreshActiveSessionWindow() as any)
+      }
+      forceUsageTick()
+    }, Math.max(boundaryMs - Date.now(), 0))
+    return () => window.clearTimeout(timer)
+  }, [usageEntry, contextUsage, dispatch])
+  // A new stamp resets the revalidation arm (data arrived before the boundary).
+  useEffect(() => {
+    usageRefreshDispatchedRef.current = false
+  }, [usageEntry])
   // Capability-gated commands (e.g. /fork) only appear once the snapshot
   // confirms the provider supports the action.
   const slashCommands = useMemo(() => (

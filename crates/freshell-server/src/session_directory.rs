@@ -495,11 +495,6 @@ async fn session_directory(
     if !is_authed(&headers, &state.auth_token) {
         return unauthorized();
     }
-    // STATUS-STRIP: assign the monotonic snapshot sequence BEFORE the index
-    // snapshot is captured, so the stamp order matches the capture order
-    // (sessions-router.ts: `++directorySnapshotSeq` immediately before
-    // `getProjects()`).
-    let snapshot_seq = next_snapshot_seq();
     // R9: query-shape validation (`SessionDirectoryQuerySchema.safeParse`) BEFORE
     // any work -- mirrors `sessions-router.ts:74-88`'s early 400 return.
     let query = match validate_query(&raw) {
@@ -526,6 +521,10 @@ async fn session_directory(
             .collect(),
         None => Vec::new(),
     };
+    // STATUS-STRIP: assign the monotonic snapshot sequence AFTER the index
+    // snapshot is captured — captured order is authoritative, and a seq
+    // assigned pre-await would interleave with concurrent requests.
+    let snapshot_seq = next_snapshot_seq();
     let items = apply_session_overrides(items, &state.settings.session_overrides());
     // Task 20: read-join `sessionType` from the SESSION-06 metadata store --
     // ONE `get_all()` per request (a cached read; disk is touched at most

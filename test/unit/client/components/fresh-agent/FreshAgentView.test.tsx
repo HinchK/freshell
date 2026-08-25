@@ -6830,6 +6830,49 @@ describe('FreshAgentView session status strip', () => {
     expect(meter).toHaveAttribute('aria-valuenow', '70')
   })
 
+  it('a current usage reading survives past the boundary via revalidation, and blanks only after the grace window without one', () => {
+    vi.useFakeTimers()
+    try {
+      const store = createStore()
+      seedStripUsage(store, 47)
+      render(
+        <Provider store={store}>
+          <FreshAgentView
+            tabId="tab-1"
+            paneId="pane-1"
+            paneContent={{
+              kind: 'fresh-agent',
+              sessionType: 'freshclaude',
+              provider: 'claude',
+              createRequestId: 'req-strip-validity',
+              sessionId: CLAUDE_THREAD_ID,
+              resumeSessionId: 'claude-strip-usage',
+              status: 'connected',
+            }}
+          />
+        </Provider>,
+      )
+      expect(screen.getByRole('meter', { name: 'Context window used' })).toHaveAttribute('aria-valuenow', '47')
+
+      // Past the validity boundary: a revalidation was dispatched, and the
+      // meter stays live while awaiting it (never blanks an accurate reading).
+      act(() => {
+        vi.advanceTimersByTime(61_000)
+      })
+      expect(screen.getByRole('meter', { name: 'Context window used' })).toHaveAttribute('aria-valuenow', '47')
+
+      // No re-stamp arrives (channel silent): past the grace window the strip
+      // drops to the honest unknown state.
+      act(() => {
+        vi.advanceTimersByTime(31_000)
+      })
+      expect(screen.queryByRole('meter')).toBeNull()
+      expect(screen.getByText('context —')).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('a fresher commit supersedes an older usage reading (fresh-page rows and extras share one timestamped map)', () => {
     const store = createStore()
     seedStripUsage(store, 47)

@@ -106,7 +106,7 @@ export function MobileTabStrip({ onOpenSwitcher, sidebarCollapsed, onToggleSideb
             </span>
           )}
         </span>
-        <span className="text-xs text-muted-foreground">
+        <span className="text-[13px] text-muted-foreground">
           {activeIndex + 1} / {tabs.length}
         </span>
       </button>
