@@ -41,11 +41,13 @@ use crate::tabs_store::DurableTabsStore;
 use crate::tabs_store_model::{
     apply_queued_maintenance, build_snapshot_payload_hash, canonical_stringify,
     client_snapshot_key, closed_at_or_updated, compare_by_event_time, default_caps, empty_state,
-    normalize_registry_pane_kinds, pick_event_winner, record_status, record_str,
-    sort_by_closed_desc, sort_by_updated_desc, validate_record_caps, validate_registry_record,
-    validate_state_caps, ClientOpenSnapshot, ClientRevisionWatermark, CompactState,
-    RegistryDeviceEntry, TabsStoreCaps, DAY_MS, DEFAULT_CLOSED_RETENTION_DAYS,
-    DEFAULT_DEVICE_DISPLAY_TTL_DAYS, DEFAULT_OPEN_SNAPSHOT_TTL_MINUTES, MINUTE_MS,
+    is_durable_provider_session_id, is_placeholder_provider_session_id,
+    normalize_registry_pane_kinds, pick_event_winner, read_restore_error, record_status,
+    record_str, sanitize_session_ref, sort_by_closed_desc, sort_by_updated_desc,
+    validate_record_caps, validate_registry_record, validate_state_caps, ClientOpenSnapshot,
+    ClientRevisionWatermark, CompactState, RegistryDeviceEntry, TabsStoreCaps, DAY_MS,
+    DEFAULT_CLOSED_RETENTION_DAYS, DEFAULT_DEVICE_DISPLAY_TTL_DAYS,
+    DEFAULT_OPEN_SNAPSHOT_TTL_MINUTES, MINUTE_MS,
 };
 
 /// `'Stale snapshot revision rejected...'` (store.ts:1140, 1149) — the
@@ -170,6 +172,12 @@ impl TabsRegistry {
             persist_reason: None,
         };
 
+        // Recovery generations reflect registry truth, not the raw client push
+        // payload: after a mutating push the COMMITTED (post-clamp) records —
+        // read back from the just-derived snapshot for this device/client key —
+        // are the single source for the persist side channel below. `None` only
+        // when nothing was committed (idempotent retry / rejected).
+        let mut committed_records: Option<Vec<Value>> = None;
         let mutated = match &self.store {
             Some(store) => {
                 // The store mutex is the mutation lock (module doc): held
@@ -192,6 +200,7 @@ impl TabsRegistry {
                         // Commit error → Err to the client, in-memory state
                         // unchanged (Node throws out of the mutation,
                         // store.ts:1189).
+                        committed_records = committed_records_of(&next, &prepared.key);
                         store_guard
                             .commit(next.clone(), now)
                             .map_err(|err| err.to_string())?;
@@ -214,6 +223,7 @@ impl TabsRegistry {
                 )? {
                     None => false,
                     Some(next) => {
+                        committed_records = committed_records_of(&next, &prepared.key);
                         *state = next;
                         true
                     }
@@ -223,9 +233,12 @@ impl TabsRegistry {
 
         // Best-effort snapshot generation (never fails the push), AFTER every
         // lock is released. Empty/idempotent pushes never overwrite the
-        // last-good generation.
+        // last-good generation. A mutating push without committed records (an
+        // unreachable state — derive_push_next just inserted `prepared.key`
+        // with a fresh `snapshot_received_at`, so maintenance retains it) skips
+        // persistence rather than ever persisting the raw push payload.
         if mutated && !prepared.open_records.is_empty() {
-            if let Some(dir) = &self.persist_dir {
+            if let (Some(dir), Some(records)) = (&self.persist_dir, committed_records.as_deref()) {
                 match crate::tabs_persist::persist_generation(
                     dir,
                     server_instance_id,
@@ -233,7 +246,7 @@ impl TabsRegistry {
                     device_label,
                     client_instance_id,
                     snapshot_revision,
-                    &prepared.open_records,
+                    records,
                     now,
                 ) {
                     crate::tabs_persist::PersistOutcome::Persisted => {}
@@ -647,10 +660,25 @@ fn derive_push_next(
     }
 
     let mut next = current.clone();
+    // Placeholder sessionRef clamp (kata item 1 server-side backstop): a
+    // pushed fresh-agent pane placeholder never regresses a durable identity
+    // ANY current registry state holds for the same (tabKey, paneId, provider,
+    // createRequestId). BOTH pushed record sets are clamped on clones BEFORE
+    // the folds below — open records AND closed records (a stale client
+    // closing a materialized tab with a re-derived placeholder payload is the
+    // closed/reopen regression surface). The folds read only
+    // event-time/identity fields the clamp never touches, so winner selection
+    // is unaffected BY the clamp while the STORED winners carry the clamped
+    // payloads. Clamp sources are the CURRENT (pre-push) state: every open
+    // snapshot ∪ every closed winner.
+    let mut open_records = prepared.open_records.clone();
+    let open_clamped = clamp_placeholder_session_refs(&mut open_records, current);
+    let mut closed_records = prepared.closed_records.clone();
+    clamp_placeholder_session_refs(&mut closed_records, current);
     // Fold closed records, event-time winner per tabKey — but a closed record
     // LOSES to a newer open winner for that tabKey across ALL snapshots
     // (`findOpenWinnerForTab`, store.ts:556-568 + :1158-1164).
-    for closed in &prepared.closed_records {
+    for closed in &closed_records {
         let Some(tab_key) = record_tab_key(closed) else {
             continue;
         };
@@ -666,7 +694,9 @@ fn derive_push_next(
         next.closed_by_tab_key.insert(tab_key, winner);
     }
     // An open record newer than a tombstone clears it (store.ts:1166-1171).
-    for open in &prepared.open_records {
+    // Reads the clamped open clone; the clamp touches only sessionRef payloads,
+    // never the event-time/identity fields this fold compares.
+    for open in &open_records {
         let Some(tab_key) = record_tab_key(open) else {
             continue;
         };
@@ -676,6 +706,28 @@ fn derive_push_next(
             }
         }
     }
+    // HASH CORRECTNESS: the stored `open_snapshot_payload_hash` must describe
+    // the STORED open records — `parse_open_snapshot` rebuilds it from them at
+    // reopen and rejects a mismatch as corruption (fatal at server startup).
+    // When the open clamp changed anything, rebuild the hash over the CLAMPED
+    // records with the same identity inputs used at prepare time. The
+    // whole-push `last_push_payload_hash` stays RAW: it is the retry identity,
+    // so an identical raw retry after a clamped store still dedupes. The
+    // CLOSED clamp needs no hash work at all: closed records never enter a
+    // stored open snapshot (`parse_open_snapshot` accepts open records only)
+    // and closed winners carry no payload hash — closed clamping is
+    // content-only.
+    let open_snapshot_hash = if open_clamped {
+        build_snapshot_payload_hash(
+            device_id,
+            device_label,
+            client_instance_id,
+            snapshot_revision,
+            &open_records,
+        )
+    } else {
+        prepared.open_snapshot_hash.clone()
+    };
     next.open_snapshots_by_client.insert(
         prepared.key.clone(),
         ClientOpenSnapshot {
@@ -684,9 +736,9 @@ fn derive_push_next(
             client_instance_id: client_instance_id.to_string(),
             snapshot_revision,
             last_push_payload_hash: prepared.push_hash.clone(),
-            open_snapshot_payload_hash: prepared.open_snapshot_hash.clone(),
+            open_snapshot_payload_hash: open_snapshot_hash,
             snapshot_received_at: now,
-            records: prepared.open_records.clone(),
+            records: open_records,
         },
     );
     next.client_revisions_by_client.insert(
@@ -712,6 +764,259 @@ fn derive_push_next(
     apply_queued_maintenance(&mut next, now, caps);
     validate_state_caps(&next, caps)?;
     Ok(Some(next))
+}
+
+/// The open records committed under `key` in `next` — the COMMITTED
+/// (post-clamp) source for the persist side channel (never the raw push
+/// payload). `derive_push_next` inserts `key` with a fresh
+/// `snapshot_received_at`, so maintenance retains it and this is `Some` for
+/// every mutating push.
+fn committed_records_of(next: &CompactState, key: &str) -> Option<Vec<Value>> {
+    next.open_snapshots_by_client
+        .get(key)
+        .map(|snapshot| snapshot.records.clone())
+}
+
+// ── Placeholder sessionRef clamp (kata item 1 server-side backstop) ─────────
+
+/// The durable identity recovered from a current registry snapshot pane: the
+/// materialized `sessionRef.sessionId` plus the payload's `sessionId` /
+/// `resumeSessionId`, each falling back to the sessionRef id when absent — the
+/// `preservedDurableFreshAgentIdentity` field semantics (shared/fresh-agent.ts,
+/// the client-side fold guard this is the registry twin of).
+struct DurableSessionIdentity {
+    session_ref_session_id: String,
+    session_id: String,
+    resume_session_id: String,
+}
+
+/// Server-side backstop for the placeholder-regression guard (kata item 1): a
+/// pushed fresh-agent pane whose identity re-derived a PLACEHOLDER
+/// (`freshopencode-<createRequestId>`, `freshcodex-…`, any non-canonical
+/// claude id) is rewritten to the DURABLE identity any current open snapshot
+/// or closed winner already holds for the same (tabKey, paneId, provider,
+/// createRequestId), substituting `sessionRef` + `sessionId` +
+/// `resumeSessionId`. Deliberate resets — a new createRequestId — and
+/// provider switches pass through. Returns `true` when any pane was clamped
+/// (the caller must then rebuild the open-snapshot payload hash over the
+/// clamped records — only ever needed for OPEN records, the only hashed set).
+///
+/// Staleness classification per pane (the
+/// `preservedDurableFreshAgentIdentity` staleness mirror,
+/// shared/fresh-agent.ts):
+/// - locator present: the locator alone classifies — its provider must agree
+///   with the pane provider and its id classify placeholder. A DURABLE
+///   locator means the record carries a real identity: never stale, so a
+///   restoreError on a genuinely broken durable pane passes through
+///   untouched.
+/// - locator absent (the restoreError migration strips it — the incident's
+///   normalized shape): a VALIDATED restoreError must be present AND any
+///   present scalar identity field (`sessionId` / `resumeSessionId`) classify
+///   placeholder for the provider.
+///
+/// On a durable hit, any restoreError on the record is REMOVED with the
+/// placeholder identity — a record stale in identity is stale wholesale, and
+/// the registry now carries the recoverable identity. With no durable source
+/// the record passes through untouched (a legitimate restoreError).
+fn clamp_placeholder_session_refs(records: &mut [Value], current: &CompactState) -> bool {
+    let mut clamped_any = false;
+    for record in records.iter_mut() {
+        let Some(tab_key) = record_str(record, "tabKey") else {
+            continue;
+        };
+        let Some(panes) = record.get_mut("panes").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for pane in panes.iter_mut() {
+            let Some(obj) = pane.as_object_mut() else {
+                continue;
+            };
+            if obj.get("kind").and_then(Value::as_str) != Some("fresh-agent") {
+                continue;
+            }
+            // Owned: the payload mutation below cannot hold pane borrows.
+            let Some(pane_id) = obj
+                .get("paneId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let Some(payload) = obj.get_mut("payload").and_then(Value::as_object_mut) else {
+                continue;
+            };
+            let Some(provider) = payload
+                .get("provider")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let Some(create_request_id) = payload
+                .get("createRequestId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let Some(placeholder_session_id) = stale_placeholder_session_id(payload, &provider)
+            else {
+                continue;
+            };
+            let Some(identity) = find_durable_session_identity(
+                current,
+                &tab_key,
+                &pane_id,
+                &provider,
+                &create_request_id,
+            ) else {
+                continue;
+            };
+            tracing::info!(target: "freshell_ws::tabs",
+                tab_key = %tab_key, pane_id = %pane_id, provider = %provider,
+                create_request_id = %create_request_id,
+                placeholder_session_id = %placeholder_session_id,
+                durable_session_id = %identity.session_ref_session_id,
+                "clamped placeholder fresh-agent sessionRef in tabs.sync push");
+            payload.insert(
+                "sessionRef".to_string(),
+                json!({ "provider": provider, "sessionId": identity.session_ref_session_id }),
+            );
+            payload.insert("sessionId".to_string(), json!(identity.session_id));
+            payload.insert(
+                "resumeSessionId".to_string(),
+                json!(identity.resume_session_id),
+            );
+            payload.remove("restoreError");
+            clamped_any = true;
+        }
+    }
+    clamped_any
+}
+
+/// The pushed pane's offending placeholder id when its identity is provably
+/// stale (see [`clamp_placeholder_session_refs`] for the classification
+/// contract); `None` when the pane passes through.
+fn stale_placeholder_session_id(
+    payload: &serde_json::Map<String, Value>,
+    provider: &str,
+) -> Option<String> {
+    match sanitize_session_ref(payload.get("sessionRef")) {
+        Some((ref_provider, ref_session_id)) => {
+            // The locator's provider must agree with the pane provider (the
+            // `preservedDurableFreshAgentIdentity` consistency rule), and the
+            // pushed id must classify as a re-derived placeholder for it.
+            if ref_provider != provider
+                || !is_placeholder_provider_session_id(&ref_provider, &ref_session_id)
+            {
+                return None;
+            }
+            Some(ref_session_id)
+        }
+        None => {
+            // Locator absent (the restoreError migration strips it): the
+            // incident's identity-erased shape is stale exactly when a
+            // validated restoreError rides placeholder scalars.
+            read_restore_error(payload.get("restoreError"))?;
+            ["sessionId", "resumeSessionId"]
+                .iter()
+                .filter_map(|field| payload.get(*field).and_then(Value::as_str))
+                .find(|id| is_placeholder_provider_session_id(provider, id))
+                .map(str::to_string)
+        }
+    }
+}
+
+/// The newest (event-time) durable fresh-agent identity `current` holds for
+/// (tabKey, paneId, provider, createRequestId) across EVERY client's open
+/// snapshot — including the pushing client's own not-yet-replaced snapshot,
+/// the common self-regression case — AND every current closed winner (the
+/// closed/reopen surface: a durable closed record must clamp a later
+/// placeholder re-close). Winner selection uses the registry's event-time
+/// comparator (updatedAt, then revision, then status, then sourceKey) so ties
+/// resolve deterministically regardless of map order.
+fn find_durable_session_identity(
+    current: &CompactState,
+    tab_key: &str,
+    pane_id: &str,
+    provider: &str,
+    create_request_id: &str,
+) -> Option<DurableSessionIdentity> {
+    let mut winner: Option<&Value> = None;
+    let mut identity: Option<DurableSessionIdentity> = None;
+    let candidates = current
+        .open_snapshots_by_client
+        .values()
+        .flat_map(|snapshot| snapshot.records.iter())
+        .chain(current.closed_by_tab_key.values());
+    for record in candidates {
+        if record_str(record, "tabKey").as_deref() != Some(tab_key) {
+            continue;
+        }
+        let Some(panes) = record.get("panes").and_then(Value::as_array) else {
+            continue;
+        };
+        let Some(candidate) = panes.iter().find_map(|pane| {
+            durable_identity_from_pane(pane, pane_id, provider, create_request_id)
+        }) else {
+            continue;
+        };
+        let newer = match winner {
+            None => true,
+            Some(incumbent) => compare_by_event_time(incumbent, record).is_lt(),
+        };
+        if newer {
+            winner = Some(record);
+            identity = Some(candidate);
+        }
+    }
+    identity
+}
+
+/// The pane's durable identity when it matches (paneId, provider,
+/// createRequestId) and its sessionRef classifies as DURABLE for its provider.
+/// The locator's provider must agree with the pane provider, so a
+/// structurally-inconsistent stored pane is never a clamp source.
+fn durable_identity_from_pane(
+    pane: &Value,
+    pane_id: &str,
+    provider: &str,
+    create_request_id: &str,
+) -> Option<DurableSessionIdentity> {
+    let obj = pane.as_object()?;
+    if obj.get("kind").and_then(Value::as_str) != Some("fresh-agent") {
+        return None;
+    }
+    if obj.get("paneId").and_then(Value::as_str) != Some(pane_id) {
+        return None;
+    }
+    let payload = obj.get("payload")?.as_object()?;
+    if payload.get("provider").and_then(Value::as_str) != Some(provider) {
+        return None;
+    }
+    if payload.get("createRequestId").and_then(Value::as_str) != Some(create_request_id) {
+        return None;
+    }
+    let (ref_provider, ref_session_id) = sanitize_session_ref(payload.get("sessionRef"))?;
+    if ref_provider != provider || !is_durable_provider_session_id(&ref_provider, &ref_session_id) {
+        return None;
+    }
+    let payload_str = |field: &str| {
+        payload
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    Some(DurableSessionIdentity {
+        session_id: payload_str("sessionId")
+            .unwrap_or(ref_session_id.as_str())
+            .to_string(),
+        resume_session_id: payload_str("resumeSessionId")
+            .unwrap_or(ref_session_id.as_str())
+            .to_string(),
+        session_ref_session_id: ref_session_id,
+    })
 }
 
 /// The two retire branches (store.ts:1198-1237). `None` = not accepted.
