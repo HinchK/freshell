@@ -165,4 +165,34 @@ describe('Claude fresh-agent normalization', () => {
     expect(JSON.stringify(snapshot.turns)).not.toContain('Base directory for this skill')
     expect(JSON.stringify(snapshot.turns)).not.toContain('Fresh Eyes - Independent Code Review')
   })
+
+  it('folds published session commands into the snapshot verbatim', () => {
+    const snapshot = normalizeClaudeThreadSnapshot({
+      threadId: 'sdk-claude-1',
+      liveSession: makeClaudeLiveSession({
+        commands: [
+          { name: 'review', description: 'Review the current changes', argumentHint: '[file]', aliases: ['rev'] },
+          { name: 'compact', description: 'Compact the conversation', argumentHint: '' },
+        ],
+      }),
+      resolved: makeClaudeRestoreResolution(),
+      status: 'idle',
+    })
+
+    expect(snapshot.commands).toEqual([
+      { name: 'review', description: 'Review the current changes', argumentHint: '[file]', aliases: ['rev'] },
+      { name: 'compact', description: 'Compact the conversation', argumentHint: '' },
+    ])
+  })
+
+  it('omits the commands key entirely when the session has published none', () => {
+    const snapshot = normalizeClaudeThreadSnapshot({
+      threadId: 'sdk-claude-1',
+      liveSession: makeClaudeLiveSession(),
+      resolved: makeClaudeRestoreResolution(),
+      status: 'idle',
+    })
+
+    expect(snapshot).not.toHaveProperty('commands')
+  })
 })

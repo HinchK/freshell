@@ -11,6 +11,7 @@ import {
   FreshAgentSnapshotSchema,
   FreshAgentTurnBodySchema,
   FreshAgentTurnPageSchema,
+  type FreshAgentSessionCommand,
 } from '../../../../shared/fresh-agent-contract.js'
 
 export type FreshAgentNormalizedItem =
@@ -73,6 +74,9 @@ export type FreshAgentClaudeSnapshot = {
   }
   pendingApprovals: FreshAgentPendingApproval[]
   pendingQuestions: FreshAgentPendingQuestion[]
+  /** Provider-advertised session commands, folded from the live session's published
+   *  catalog; absent until the init+probe/push join has fired (fresh-agent contract). */
+  commands?: readonly FreshAgentSessionCommand[]
   turns: FreshAgentNormalizedTurn[]
   extensions: {
     claude: {
@@ -243,6 +247,7 @@ export function normalizeClaudeThreadSnapshot(input: {
     },
     pendingApprovals: normalizePendingApprovals(input.liveSession),
     pendingQuestions: normalizePendingQuestions(input.liveSession),
+    ...(input.liveSession?.commands ? { commands: input.liveSession.commands } : {}),
     turns,
     extensions: {
       claude: {

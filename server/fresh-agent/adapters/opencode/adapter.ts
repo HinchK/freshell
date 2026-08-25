@@ -10,6 +10,12 @@ import type {
 import { FreshAgentLostSessionError } from '../../runtime-manager.js'
 import { nextMonotonicTurnCompleteAt } from '../../turn-complete-clock.js'
 import { normalizeFreshAgentEffort, normalizeFreshAgentModel } from '../../../../shared/fresh-agent-models.js'
+import type { FreshAgentSessionCommand } from '../../../../shared/fresh-agent-contract.js'
+import {
+  matchOpencodeSlashCommand,
+  normalizeOpencodeCommandCatalog,
+  type OpencodeSlashCommandMatch,
+} from './commands-catalog.js'
 import { logger } from '../../../logger.js'
 import { defaultOpencodeDataHome } from '../../../coding-cli/providers/opencode.js'
 import {
@@ -47,6 +53,10 @@ const TRANSCRIPT_SETTLE_POLL_MS = 150
 const TRANSCRIPT_SETTLE_MAX_POLLS = 10 // ~1.5 s worst case
 const TRANSCRIPT_SETTLE_PAGE_LIMIT = 20
 const CLOCK_SKEW_MS = 5_000
+/** Lazy catalog re-capture gate: after a failed create/resume/attach-time capture, the
+ * send path re-attempts at most ONCE per session, and only once this much wall time has
+ * passed since the failure (a persistently failing sidecar must not be pounded per send). */
+const COMMANDS_CAPTURE_RETRY_BACKOFF_MS = 60_000
 
 const defaultSettleSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
@@ -105,6 +115,20 @@ type OpencodeSessionState = {
    * on the state for test determinism. Never rejects — failures are logged internally.
    */
   pendingRecovery?: Promise<void>
+  /** Sidecar /command catalog for the session's directory, captured per established
+   * adapter state (create/resume/attach) plus at most one lazy send-path retry after a
+   * failed capture. Absent while the fetch is in flight or when it failed — the send
+   * path then never matches and slash text stays verbatim. */
+  commands?: FreshAgentSessionCommand[]
+  /** The in-flight catalog capture (fire-and-forget for callers; kept on the state so the
+   * send path can await it before classifying leading-slash text — a send fired the
+   * instant after create must not miss its match and leak verbatim to the model). */
+  pendingCommands?: Promise<void>
+  /** Wall-clock of the last failed (or malformed) catalog capture; undefined on success.
+   * Gates the lazy send-path retry (see COMMANDS_CAPTURE_RETRY_BACKOFF_MS). */
+  commandsCaptureFailedAt?: number
+  /** True once the session's single lazy send-path re-capture has been fired. */
+  commandsCaptureRetried?: boolean
 }
 
 /** Content-free per-session summary served by the read-only incident endpoint
@@ -342,6 +366,27 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
     await serveManager.promptAsync(realId, body)
   }
 
+  /** VAL-A LB-04b dispatch lane: execute a catalog-matched slash command via
+   * POST /session/:id/command. The route is synchronous at turn scale — its response is
+   * the completed assistant message and IS the completion edge, so the adapter arms NO
+   * onceIdle waiter here (onceIdle's busy/idle evidence is SSE/status-map-driven and
+   * unproven for command turns; the emitStatus bracket in materializeOrSend covers
+   * truthfulness either way). timeoutMs must be turn-scale, not request-scale. */
+  async function commandForState(
+    state: OpencodeSessionState,
+    realId: string,
+    match: OpencodeSlashCommandMatch,
+    timeoutMs: number,
+  ): Promise<void> {
+    const route = cwdRoute(state.cwd)
+    const body = { command: match.name, arguments: match.arguments }
+    if (route) {
+      await serveManager.runCommand(realId, body, route, timeoutMs)
+      return
+    }
+    await serveManager.runCommand(realId, body, undefined, timeoutMs)
+  }
+
   async function abortForState(state: OpencodeSessionState): Promise<void> {
     if (!state.realSessionId) return
     await ensureMutableRoute(state)
@@ -470,6 +515,65 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       source: 'adapter',
       ...(state.cwd ? { cwdHash: hashForLogs(state.cwd) } : {}),
     })
+  }
+
+  /** Capture the sidecar's /command listing once per established adapter state
+   * (create/resume/attach), scoped to the pane's directory via the serve manager's
+   * withRoute convention — the SAME long-lived sidecar the session itself runs on; never
+   * a scratch spawn (VAL-A LB-03: --pure drops config-inline user commands). A blank
+   * state cwd intentionally fetches the undirected listing: a cwd-less session materializes
+   * in the sidecar's root directory, which is exactly what undirected /command serves.
+   *
+   * Fire-and-forget for callers; failure/absent/5xx/timeout ⇒ commands stay absent and
+   * leading-slash sends keep the verbatim prompt path — NEVER session-fatal. The sidecar
+   * scans project-layer command files at startup only, so a catalog captured here does not
+   * see command files created after the sidecar booted (E4 freshness caveat). */
+  function captureCommands(state: OpencodeSessionState): void {
+    const route = cwdRoute(state.cwd)
+    state.pendingCommands = (async () => {
+      try {
+        const raw = route ? await serveManager.listCommands(route) : await serveManager.listCommands()
+        const rows = normalizeOpencodeCommandCatalog(raw)
+        if (!rows) {
+          state.commandsCaptureFailedAt = Date.now()
+          log.warn({
+            provider: 'opencode',
+            sessionIdHash: hashForLogs(state.realSessionId ?? state.placeholderId),
+            ...(state.cwd ? { cwdHash: hashForLogs(state.cwd) } : {}),
+          }, 'opencode command catalog listing was malformed; advertising no session commands')
+          return
+        }
+        state.commands = rows
+        state.commandsCaptureFailedAt = undefined
+        // The claude-side invalidation precedent: freshAgent.session.changed (translated
+        // from sdk.session.changed) is already in the client's snapshot-invalidating set,
+        // so a live composer refetches the snapshot and sees the catalog — no new WS shape.
+        state.events.emit('event', { type: 'sdk.session.changed', sessionId: state.placeholderId, reason: 'session-commands' })
+      } catch (error) {
+        state.commandsCaptureFailedAt = Date.now()
+        log.warn({
+          provider: 'opencode',
+          sessionIdHash: hashForLogs(state.realSessionId ?? state.placeholderId),
+          ...(state.cwd ? { cwdHash: hashForLogs(state.cwd) } : {}),
+          err: error,
+        }, 'opencode command catalog fetch failed; advertising no session commands')
+      }
+    })()
+  }
+
+  /** Settle the catalog before the send path classifies leading-slash text. Always
+   * awaits any in-flight capture; when the last capture FAILED (or was malformed) and
+   * the backoff has elapsed, also fires this session's single lazy re-capture and
+   * awaits it — a create-time failure otherwise leaves commands permanently absent
+   * and every slash send leaks verbatim to the model. Never rejects. */
+  async function settleCommandsBeforeSend(state: OpencodeSessionState): Promise<void> {
+    await state.pendingCommands
+    if (state.commands || state.commandsCaptureRetried) return
+    if (state.commandsCaptureFailedAt === undefined) return
+    if (Date.now() - state.commandsCaptureFailedAt < COMMANDS_CAPTURE_RETRY_BACKOFF_MS) return
+    state.commandsCaptureRetried = true
+    captureCommands(state)
+    await state.pendingCommands
   }
 
   /**
@@ -647,28 +751,46 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       sendsInFlight.add(realId)
       try {
         const idleRoute = cwdRoute(state.cwd)
-        const idle = idleRoute
-          ? serveManager.onceIdle(realId, turnTimeoutMs, idleRoute)
-          : serveManager.onceIdle(realId, turnTimeoutMs)
-        // If promptAsync fails and we leave via the catch(), `idle` may still
-        // reject later on its timeout timer. Attach a no-op handler now so that
-        // later rejection cannot become an unhandled rejection.
-        void idle.catch(() => {})
+        // A catalog capture fired at create/resume/attach may still be in flight; settle
+        // it BEFORE classifying the text so a leading-slash send issued the instant after
+        // create cannot miss its match and leak verbatim to the model as prose. The settle
+        // is cheap in the steady state (the fetch resolved with the sidecar startup that
+        // materialization above already waited on) and never rejects; a failed create-time
+        // capture gets its one lazy re-attempt here, gated by backoff.
+        await settleCommandsBeforeSend(state)
+        const slashCommand = matchOpencodeSlashCommand(text, state.commands)
         // Freshness anchor (kata zrrj): the settle proof below accepts only assistant
         // messages created at/after this send (minus clock skew).
         const sentAtMs = Date.now()
-        await promptAsyncForState(state, realId, {
-          parts: [{ type: 'text', text }],
-          ...(splitOpencodeModel(modelStr) ? { model: splitOpencodeModel(modelStr)! } : {}),
-          ...(effort ? { variant: effort } : {}),
-        })
-        await idle
+        if (slashCommand) {
+          // Command-route turn (VAL-A LB-04b): POST /session/:id/command executes the row
+          // server-side (template expansion is the provider's) and RETURNS on turn
+          // completion — no onceIdle waiter, no verbatim prompt is ever sent. Busy/idle
+          // stay the adapter-synthesized bracket below; whether the live sidecar also
+          // emits busy SSE around /command turns is unprobed (VAL-A) and irrelevant to
+          // the bracket's truthfulness.
+          await commandForState(state, realId, slashCommand, turnTimeoutMs)
+        } else {
+          const idle = idleRoute
+            ? serveManager.onceIdle(realId, turnTimeoutMs, idleRoute)
+            : serveManager.onceIdle(realId, turnTimeoutMs)
+          // If promptAsync fails and we leave via the catch(), `idle` may still
+          // reject later on its timeout timer. Attach a no-op handler now so that
+          // later rejection cannot become an unhandled rejection.
+          void idle.catch(() => {})
+          await promptAsyncForState(state, realId, {
+            parts: [{ type: 'text', text }],
+            ...(splitOpencodeModel(modelStr) ? { model: splitOpencodeModel(modelStr)! } : {}),
+            ...(effort ? { variant: effort } : {}),
+          })
+          await idle
+          state.model = modelStr ?? state.model
+          state.effort = effort
+        }
         // Prove the final assistant message is queryable via the REST read path BEFORE
         // emitting idle/turn-complete — session.idle does not sequence behind message
         // persistence, so the client's post-idle snapshot could otherwise miss the answer.
         await awaitTranscriptSettled(state, sentAtMs)
-        state.model = modelStr ?? state.model
-        state.effort = effort
         emitStatus(state, 'idle')
         // Server-authoritative turn-complete edge for the GREEN/SOUND pipeline. onceIdle
         // resolves on ANY idle — including the idle an interrupt's abort triggers or the idle
@@ -855,6 +977,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
         sendQueue: Promise.resolve(),
       }
       remember(state)
+      captureCommands(state)
       return { sessionId: state.placeholderId, sessionRef: { provider: 'opencode', sessionId: state.placeholderId } }
     },
 
@@ -870,6 +993,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
         }
         remember(state)
         bindServeStream(state)
+        captureCommands(state)
         await reconcileStatus(state)
         scheduleInterruptedTurnRecovery(state)
         return { sessionId: real, sessionRef: { provider: 'opencode', sessionId: real } }
@@ -883,6 +1007,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       }
       remember(state)
       bindServeStream(state)
+      captureCommands(state)
       await reconcileStatus(state)
       scheduleInterruptedTurnRecovery(state)
       return { sessionId, sessionRef: { provider: 'opencode', sessionId } }
@@ -900,6 +1025,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
           existing.cwd = locator.cwd
         }
         remember(existing)
+        captureCommands(existing)
         await reconcileStatus(existing)
         scheduleInterruptedTurnRecovery(existing)
         return { sessionId: locator.sessionId, sessionRef: { provider: 'opencode', sessionId: locator.sessionId } }
@@ -920,6 +1046,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       }
       remember(state)
       bindServeStream(state)
+      captureCommands(state)
       await reconcileStatus(state)
       scheduleInterruptedTurnRecovery(state)
       return { sessionId: locator.sessionId, sessionRef: { provider: 'opencode', sessionId: locator.sessionId } }
@@ -1038,7 +1165,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       if (liveState && !liveState.realSessionId) {
         return normalizeOpencodeSnapshot({
           sessionType: 'freshopencode', threadId: thread.threadId, status: liveState.status,
-          model: liveState.model, effort: liveState.effort,
+          model: liveState.model, effort: liveState.effort, commands: liveState.commands,
         })
       }
       const realId = durableId(thread.threadId)
@@ -1050,6 +1177,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
         sessionType: 'freshopencode', threadId: thread.threadId,
         exported: { ...exported, info: { ...(exported.info ?? {}), time: { ...((exported.info?.time) ?? {}), updated: revision } } },
         status: liveState?.status ?? 'idle', model: liveState?.model, effort: liveState?.effort,
+        commands: liveState?.commands,
         // Task 4's client busy-clear gate: only a snapshot whose status comes from live,
         // reconciled adapter state may clear busy; the untracked default above must not.
         statusFromLiveState: liveState?.initialReconcileCompleted === true,

@@ -28,7 +28,7 @@ import { createLogger } from '@/lib/client-logger'
 import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
 import { sanitizeRestoreError, sanitizeCrashTrace, sanitizeSessionRef, type RestoreError } from '@shared/session-contract'
 import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
-import { migrateLegacyFreshAgentContent, migrateLegacyFreshAgentDurableState } from '@shared/fresh-agent'
+import { migrateLegacyFreshAgentContent, migrateLegacyFreshAgentDurableState, preservedDurableFreshAgentIdentity } from '@shared/fresh-agent'
 import { normalizeFreshAgentStyleOverride } from '@shared/settings'
 
 
@@ -139,44 +139,70 @@ function normalizePaneContent(
         : undefined
     const status = input.status || (pendingLocalEcho ? 'running' : 'creating')
     if (existingRestoreError) {
-      return {
-        kind: 'fresh-agent',
-        sessionType: input.sessionType,
-        provider: input.provider,
-        sessionId: input.sessionId,
-        createRequestId: typeof input.createRequestId === 'string' && input.createRequestId
-          ? input.createRequestId
-          : previousCreateRequestId || nanoid(),
-        status,
-        ...(existingRestoreError.reason === 'invalid_legacy_restore_target'
-          ? {}
-          : { resumeSessionId: input.resumeSessionId }),
-        serverInstanceId: typeof input.serverInstanceId === 'string' ? input.serverInstanceId : undefined,
-        restoreError: existingRestoreError,
-        initialCwd: input.initialCwd,
-        createError: input.createError,
-        modelSelection: normalizeFreshAgentModelSelection(
-          (input as { modelSelection?: unknown }).modelSelection,
-          (input as { model?: unknown }).model,
-        ),
-        model: input.model,
-        ...(modelLabel ? { modelLabel } : {}),
-        permissionMode: input.permissionMode,
-        sandbox: input.sandbox,
-        effort: normalizeFreshAgentEffortOverride(input.effort),
-        ...(modelEffortLevels ? { modelEffortLevels } : {}),
-        plugins: input.plugins,
-        ...(style ? { style } : {}),
-        settingsDismissed: input.settingsDismissed,
-        showThinking: typeof input.showThinking === 'boolean' ? input.showThinking : undefined,
-        showTools: typeof input.showTools === 'boolean' ? input.showTools : undefined,
-        showTimecodes: typeof input.showTimecodes === 'boolean' ? input.showTimecodes : undefined,
-        ...(pendingLocalEcho ? { pendingLocalEcho } : {}),
-        ...(typeof input.reconcileNotice === 'string' ? { reconcileNotice: input.reconcileNotice } : {}),
-        ...(input.pendingReconcile === 'respawn' || input.pendingReconcile === 'fresh'
-          ? { pendingReconcile: input.pendingReconcile }
-          : {}),
-        ...(typeof input.reconcileEpoch === 'number' ? { reconcileEpoch: input.reconcileEpoch } : {}),
+      // Identity staleness pre-check (kata item 1, restoreError fold shape):
+      // a restoreError payload provably stale in IDENTITY — placeholder
+      // locator, sessionId, or resumeSessionId for the same
+      // provider+createRequestId whose previous state holds a DURABLE
+      // identity — is stale wholesale: the restoreError is dropped and the
+      // fold falls through to the normal path, where the durable-identity
+      // guard restores sessionRef/sessionId/resumeSessionId. A restoreError
+      // on a DURABLE incoming identity (a genuinely broken durable pane) and
+      // a deliberate reset (a different createRequestId) are NOT stale and
+      // keep applying below.
+      const staleFoldPreservedIdentity = preservedDurableFreshAgentIdentity(
+        previous?.kind === 'fresh-agent' ? previous : undefined,
+        {
+          provider: input.provider,
+          // The early-return's createRequestId resolution, minus the nanoid
+          // fallback: no explicit/inherited id means no continuity to key on.
+          createRequestId: typeof input.createRequestId === 'string' && input.createRequestId
+            ? input.createRequestId
+            : previousCreateRequestId,
+          sessionRef: sanitizeSessionRef(input.sessionRef),
+          sessionId: typeof input.sessionId === 'string' ? input.sessionId : undefined,
+          resumeSessionId: typeof input.resumeSessionId === 'string' ? input.resumeSessionId : undefined,
+        },
+      )
+      if (!staleFoldPreservedIdentity) {
+        return {
+          kind: 'fresh-agent',
+          sessionType: input.sessionType,
+          provider: input.provider,
+          sessionId: input.sessionId,
+          createRequestId: typeof input.createRequestId === 'string' && input.createRequestId
+            ? input.createRequestId
+            : previousCreateRequestId || nanoid(),
+          status,
+          ...(existingRestoreError.reason === 'invalid_legacy_restore_target'
+            ? {}
+            : { resumeSessionId: input.resumeSessionId }),
+          serverInstanceId: typeof input.serverInstanceId === 'string' ? input.serverInstanceId : undefined,
+          restoreError: existingRestoreError,
+          initialCwd: input.initialCwd,
+          createError: input.createError,
+          modelSelection: normalizeFreshAgentModelSelection(
+            (input as { modelSelection?: unknown }).modelSelection,
+            (input as { model?: unknown }).model,
+          ),
+          model: input.model,
+          ...(modelLabel ? { modelLabel } : {}),
+          permissionMode: input.permissionMode,
+          sandbox: input.sandbox,
+          effort: normalizeFreshAgentEffortOverride(input.effort),
+          ...(modelEffortLevels ? { modelEffortLevels } : {}),
+          plugins: input.plugins,
+          ...(style ? { style } : {}),
+          settingsDismissed: input.settingsDismissed,
+          showThinking: typeof input.showThinking === 'boolean' ? input.showThinking : undefined,
+          showTools: typeof input.showTools === 'boolean' ? input.showTools : undefined,
+          showTimecodes: typeof input.showTimecodes === 'boolean' ? input.showTimecodes : undefined,
+          ...(pendingLocalEcho ? { pendingLocalEcho } : {}),
+          ...(typeof input.reconcileNotice === 'string' ? { reconcileNotice: input.reconcileNotice } : {}),
+          ...(input.pendingReconcile === 'respawn' || input.pendingReconcile === 'fresh'
+            ? { pendingReconcile: input.pendingReconcile }
+            : {}),
+          ...(typeof input.reconcileEpoch === 'number' ? { reconcileEpoch: input.reconcileEpoch } : {}),
+        }
       }
     }
 
@@ -191,17 +217,45 @@ function normalizePaneContent(
       rejectNonCanonicalClaudeSessionRef: true,
     })
     const sessionRef = durableState.sessionRef
+    const createRequestId = typeof input.createRequestId === 'string' && input.createRequestId
+      ? input.createRequestId
+      : previousCreateRequestId || nanoid()
+    // Identity guard (kata item 1): a pane that already materialized a durable
+    // provider session identity keeps it when this fold carries a re-derived
+    // placeholder for the same provider+createRequestId. New generations (a
+    // different createRequestId) are deliberately not clamped.
+    const preservedIdentity = preservedDurableFreshAgentIdentity(
+      previous?.kind === 'fresh-agent' ? previous : undefined,
+      {
+        provider: input.provider,
+        createRequestId,
+        sessionRef,
+        sessionId: typeof input.sessionId === 'string' ? input.sessionId : undefined,
+        // The restoreError-migration surviving scalar: a stale restoreError
+        // fold that fell through the pre-check above classifies from here
+        // when no locator survived.
+        resumeSessionId: typeof input.resumeSessionId === 'string' ? input.resumeSessionId : undefined,
+      },
+    )
+    if (preservedIdentity) {
+      log.warn('Clamped a re-derived placeholder fresh-agent sessionRef over the pane’s durable identity', {
+        source: 'normalizePaneContent',
+        provider: input.provider,
+        createRequestId,
+        preservedSessionId: preservedIdentity.sessionRef?.sessionId,
+        placeholderSessionId: sessionRef?.sessionId,
+      })
+    }
     return {
       kind: 'fresh-agent',
       sessionType: input.sessionType,
       provider: input.provider,
       sessionId: input.sessionId,
-      createRequestId: typeof input.createRequestId === 'string' && input.createRequestId
-        ? input.createRequestId
-        : previousCreateRequestId || nanoid(),
+      createRequestId,
       status,
       ...(typeof input.resumeSessionId === 'string' ? { resumeSessionId: input.resumeSessionId } : {}),
       ...(sessionRef ? { sessionRef } : {}),
+      ...preservedIdentity,
       serverInstanceId: typeof input.serverInstanceId === 'string' ? input.serverInstanceId : undefined,
       ...('restoreError' in durableState && durableState.restoreError ? { restoreError: durableState.restoreError } : {}),
       initialCwd: input.initialCwd,
@@ -873,34 +927,67 @@ function mergeTerminalState(
         return local
       }
       if (incoming.content.createRequestId === local.content.createRequestId) {
+        // Identity guard (kata item 1): a materialized durable fresh-agent
+        // session identity must never regress to a re-derived placeholder
+        // (freshopencode-<createRequestId> et al.) from a stale
+        // persisted/tabs.sync payload. Keyed on provider+createRequestId
+        // continuity; deliberate resets (new createRequestId) pass through.
+        const preservedIdentity = preservedDurableFreshAgentIdentity(local.content, incoming.content)
+        if (preservedIdentity) {
+          log.warn('Clamped a re-derived placeholder fresh-agent sessionRef over the pane’s durable identity', {
+            source: 'mergeTerminalState',
+            provider: incoming.content.provider,
+            createRequestId: incoming.content.createRequestId,
+            preservedSessionId: preservedIdentity.sessionRef?.sessionId,
+            placeholderSessionId: sanitizeSessionRef(incoming.content.sessionRef)?.sessionId,
+          })
+        }
+        // The identity clamp restores the durable identity tuple but must not
+        // early-return past the sibling arms: `status` is the one field that
+        // can still arrive regressed in the same stale payload, so the
+        // early-status protection below composes on top of the restored
+        // identity. `incomingContent` is `incoming.content` verbatim when no
+        // clamp fired, so every other path behaves byte-identically. A fold
+        // provably stale in identity is stale wholesale: a piggybacking
+        // restoreError is dropped with the placeholder identity (a
+        // restoreError on a DURABLE incoming identity never fires the clamp,
+        // so legitimate restore flows are untouched).
+        let incomingContent = incoming.content
+        if (preservedIdentity) {
+          const { restoreError: _staleRestoreError, ...rest } = incoming.content
+          incomingContent = { ...rest, ...preservedIdentity }
+        }
         if (
           shouldPreserveLocalCanonicalResumeSessionId(
             local.content.resumeSessionId,
-            incoming.content.resumeSessionId,
+            incomingContent.resumeSessionId,
           )
         ) {
           return {
             ...incoming,
             content: {
-              ...incoming.content,
+              ...incomingContent,
               resumeSessionId: local.content.resumeSessionId,
               sessionRef: buildPreservedSessionRef(local.content, local.content.resumeSessionId),
             },
           }
         }
         // Preserve local sessionId if incoming doesn't have it yet
-        if (local.content.sessionId && !incoming.content.sessionId) {
+        if (local.content.sessionId && !incomingContent.sessionId) {
           return { ...incoming, content: local.content }
         }
         // Don't regress back to early states (creating/starting) once past them.
         // Normal cycles like running→idle are fine and must not be blocked.
-        if (local.content.sessionId && incoming.content.sessionId === local.content.sessionId) {
+        if (local.content.sessionId && incomingContent.sessionId === local.content.sessionId) {
           const EARLY_STATES = new Set(['creating', 'starting'])
           const localStatus = local.content.status ?? ''
-          const incomingStatus = incoming.content.status ?? ''
+          const incomingStatus = incomingContent.status ?? ''
           if (!EARLY_STATES.has(localStatus) && EARLY_STATES.has(incomingStatus)) {
-            return { ...incoming, content: { ...incoming.content, status: local.content.status } }
+            return { ...incoming, content: { ...incomingContent, status: local.content.status } }
           }
+        }
+        if (preservedIdentity) {
+          return { ...incoming, content: incomingContent }
         }
       }
     }

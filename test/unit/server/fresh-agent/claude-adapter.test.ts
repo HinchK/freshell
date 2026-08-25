@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import { createClaudeFreshAgentAdapter } from '../../../../server/fresh-agent/adapters/claude/adapter.js'
-import { makeClaudeLiveSession } from '../../../fixtures/fresh-agent/claude/thread.js'
+import { makeClaudeLiveSession, makeClaudeRestoreResolution } from '../../../fixtures/fresh-agent/claude/thread.js'
 
 describe('Claude fresh-agent adapter', () => {
   it('delegates create, resume, send, interrupt, and interactive responses to the sdk bridge', async () => {
@@ -188,5 +188,46 @@ describe('Claude fresh-agent adapter', () => {
       },
     })
     expect(snapshot?.turns.map((turn: { source: string }) => turn.source)).toEqual(['live'])
+  })
+
+  it('carries the session\'s published slash-command rows into the resolved snapshot', async () => {
+    const liveSession = makeClaudeLiveSession({
+      sessionId: 'sdk-cmds-1',
+      cliSessionId: '00000000-0000-4000-8000-000000000333',
+      commands: [
+        { name: 'review', description: 'Review the current changes', argumentHint: '[file]' },
+        { name: 'compact', description: 'Compact the conversation', argumentHint: '', aliases: ['compress-messages'] },
+      ],
+    })
+    const sdkBridge = {
+      getSession: vi.fn(),
+      findSessionByCliSessionId: vi.fn((threadId: string) => (
+        threadId === liveSession.cliSessionId ? liveSession : undefined
+      )),
+    }
+    const agentHistorySource = {
+      resolve: vi.fn().mockResolvedValue(makeClaudeRestoreResolution()),
+    }
+
+    const adapter = createClaudeFreshAgentAdapter({
+      sdkBridge: sdkBridge as any,
+      agentHistorySource: agentHistorySource as any,
+      historyService: {
+        getSnapshot: vi.fn(),
+        getThreadTurnPage: vi.fn(),
+        getTurnBody: vi.fn(),
+      } as any,
+    })
+
+    const snapshot = await adapter.getSnapshot?.({
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      threadId: liveSession.cliSessionId!,
+    })
+
+    expect(snapshot.commands).toEqual([
+      { name: 'review', description: 'Review the current changes', argumentHint: '[file]' },
+      { name: 'compact', description: 'Compact the conversation', argumentHint: '', aliases: ['compress-messages'] },
+    ])
   })
 })
