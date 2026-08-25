@@ -58,10 +58,16 @@ pub const OPENCODE_SNAPSHOTS_DISABLED_CONFIG: &str = "{\"snapshot\": false}";
 /// documents server plugins flowing through it), so the managed launch MERGES the
 /// snapshots pin INTO an inherited JSON document instead of replacing it:
 /// - `None`/absent → exactly [`OPENCODE_SNAPSHOTS_DISABLED_CONFIG`];
-/// - a JSON OBJECT → the same document with top-level `"snapshot": false` forced
+/// - a JSONC OBJECT → the same document with top-level `"snapshot": false` forced
 ///   (a user-supplied `snapshot` key is overwritten — conversation rollback must
-///   never re-apply file state; that pin is the entire point of the decision);
-/// - MALFORMED (non-JSON, or JSON that isn't an object — a document with no
+///   never re-apply file state; that pin is the entire point of the decision).
+///   Focused ep1-r4 F1: the inherited document is normalized through
+///   [`jsonc_to_strict_json`] FIRST because OpenCode parses this lane with its
+///   JSONC parser (1.18.21 `ConfigParse.jsonc` → `jsonc-parser` with
+///   `allowTrailingComma`) — the merge accepts EXACTLY the same dialect the
+///   vendored CLI would, never replacing valid comment/trailing-comma config;
+/// - MALFORMED (unparseable even after JSONC normalization, or a JSON value that
+///   isn't an object — a document with no
 ///   top-level key space can't take the pin) → replaced by the bare pin document,
 ///   with a structured warning naming ONLY the replaced value's byte length.
 ///   Focused ep1-r2 F5: inline config can carry credential-shaped fields (API
@@ -70,7 +76,7 @@ pub const OPENCODE_SNAPSHOTS_DISABLED_CONFIG: &str = "{\"snapshot\": false}";
 pub fn merged_opencode_config_content(inherited: Option<&str>) -> String {
     match inherited.filter(|raw| !raw.is_empty()) {
         None => OPENCODE_SNAPSHOTS_DISABLED_CONFIG.to_string(),
-        Some(raw) => match serde_json::from_str::<Value>(raw) {
+        Some(raw) => match serde_json::from_str::<Value>(&jsonc_to_strict_json(raw)) {
             Ok(Value::Object(mut map)) => {
                 map.insert("snapshot".to_string(), Value::Bool(false));
                 Value::Object(map).to_string()
@@ -84,6 +90,109 @@ pub fn merged_opencode_config_content(inherited: Option<&str>) -> String {
             }
         },
     }
+}
+
+/// Focused ep1-r4 F1: normalize the JSONC dialect OpenCode's own config loader
+/// accepts for this lane (1.18.21 `ConfigParse.jsonc` — `jsonc-parser` with
+/// `allowTrailingComma: true`) into the strict JSON `serde_json` parses, so the
+/// merge accepts EXACTLY the same documents the vendored CLI would have:
+///   (1) strip `//` line and `/* */` block comments (each replaced by ONE space
+///       so adjacent value tokens are never fused — `1/**/2` → `1 2`, not `12`);
+///       string-literal-aware, so a URL's `//`, a `\"` before a closer, or a
+///       literal `/*` inside a quoted string survive VERBATIM;
+///   (2) drop a comma whose next non-whitespace character is `}` or `]`
+///       (whitespace between the comma and the closer — including a stripped
+///       comment's space — is left in place).
+/// Anything still unparseable after normalization keeps the existing
+/// content-free malformed path above (the warning NEVER logs content — F5).
+fn jsonc_to_strict_json(raw: &str) -> String {
+    let stripped = {
+        // Pass (1): comment strip, one left-to-right scan.
+        let chars: Vec<char> = raw.chars().collect();
+        let mut out = String::with_capacity(raw.len());
+        let mut i = 0;
+        let mut in_string = false;
+        while i < chars.len() {
+            let c = chars[i];
+            if in_string {
+                out.push(c);
+                // `\` escapes the NEXT char verbatim (it can never end the string).
+                if c == '\\' && i + 1 < chars.len() {
+                    out.push(chars[i + 1]);
+                    i += 1;
+                } else if c == '"' {
+                    in_string = false;
+                }
+                i += 1;
+            } else if c == '"' {
+                in_string = true;
+                out.push(c);
+                i += 1;
+            } else if c == '/' && chars.get(i + 1) == Some(&'/') {
+                // Line comment: ONE space; runs to (never consuming) the newline,
+                // or to EOF. A dangling `\r` rides inside the comment (harmless
+                // JSON whitespace either way).
+                out.push(' ');
+                i += 2;
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            } else if c == '/' && chars.get(i + 1) == Some(&'*') {
+                // Block comment: ONE space; runs through the closer, or to EOF
+                // (the strict parse then judges the unterminated document).
+                out.push(' ');
+                i += 2;
+                while i < chars.len() {
+                    if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            } else {
+                out.push(c);
+                i += 1;
+            }
+        }
+        out
+    };
+    // Pass (2): trailing-comma drop over the comment-stripped text.
+    let chars: Vec<char> = stripped.chars().collect();
+    let mut out = String::with_capacity(stripped.len());
+    let mut i = 0;
+    let mut in_string = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_string {
+            out.push(c);
+            if c == '\\' && i + 1 < chars.len() {
+                out.push(chars[i + 1]);
+                i += 1;
+            } else if c == '"' {
+                in_string = false;
+            }
+            i += 1;
+        } else if c == '"' {
+            in_string = true;
+            out.push(c);
+            i += 1;
+        } else if c == ',' {
+            let mut j = i + 1;
+            while matches!(chars.get(j), Some(' ' | '\t' | '\n' | '\r')) {
+                j += 1;
+            }
+            if matches!(chars.get(j), Some('}' | ']')) {
+                i += 1; // trailing comma: drop it, keep the whitespace run
+            } else {
+                out.push(c);
+                i += 1;
+            }
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// A boxed, `Send` future — the object-safe async return used by the injected IO
@@ -1888,6 +1997,153 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── focused ep1-r4 F1: OpenCode (v1.18.21) parses OPENCODE_CONFIG_CONTENT
+    //    with a JSONC parser (// and /* */ comments, trailing commas) — the merge
+    //    must accept the same dialect, never replace valid inline config ──────
+
+    #[test]
+    fn jsonc_normalization_strips_comments_string_literal_aware() {
+        // Line comments end AT the newline; block comments end at the closer.
+        assert_eq!(
+            jsonc_to_strict_json("{\"a\":1}//note\n{\"b\":2}"),
+            "{\"a\":1} \n{\"b\":2}"
+        );
+        assert_eq!(
+            jsonc_to_strict_json("{/* head */\"a\": /* inline */ 1}"),
+            "{ \"a\":   1}"
+        );
+        // A removed comment leaves ONE space — adjacent tokens are NEVER fused.
+        assert_eq!(jsonc_to_strict_json("1/**/2"), "1 2");
+        // Unterminated block comment runs to EOF (then strict-parse judges it).
+        assert_eq!(jsonc_to_strict_json("{\"a\":1}/* dangling"), "{\"a\":1} ");
+        // Comment OPENERS INSIDE string literals survive verbatim (a URL's "//"
+        // is data, never a comment).
+        assert_eq!(
+            jsonc_to_strict_json("{\"u\":\"https://x//y\",\"s\":\"/* not a comment */\"}"),
+            "{\"u\":\"https://x//y\",\"s\":\"/* not a comment */\"}"
+        );
+        // An escaped quote does NOT close the string — the trailing // stays
+        // string content.
+        assert_eq!(
+            jsonc_to_strict_json("{\"s\":\"a\\\"//b\"}"),
+            "{\"s\":\"a\\\"//b\"}"
+        );
+    }
+
+    #[test]
+    fn jsonc_normalization_drops_trailing_commas_string_literal_aware() {
+        assert_eq!(
+            jsonc_to_strict_json("{\"a\":[1,2,],\"b\":2,}"),
+            "{\"a\":[1,2],\"b\":2}"
+        );
+        // A comma separated from the closer by a (now-stripped) comment/ws drops.
+        assert_eq!(jsonc_to_strict_json("{\"a\":1, /* x */ }"), "{\"a\":1   }");
+        // ",}" / ",]" sequences INSIDE strings are data — never stripped.
+        assert_eq!(
+            jsonc_to_strict_json("{\"s\":\"a,}b,]c\",\"t\":1,}"),
+            "{\"s\":\"a,}b,]c\",\"t\":1}"
+        );
+        // A REAL content comma is kept (only a comma directly before a closer drops).
+        assert_eq!(
+            jsonc_to_strict_json("{\"a\":1,\"b\":2}"),
+            "{\"a\":1,\"b\":2}"
+        );
+    }
+
+    #[test]
+    fn merged_config_parses_jsonc_and_preserves_every_user_key_verbatim() {
+        let user = r#"{
+            // the provider pin — credential-shaped fields legitimately ride this lane
+            "provider": {
+                "dev": {
+                    "models": { "m-x": { "name": "M X" } },
+                    "options": {
+                        "apiKey": "sk-test-only",
+                        "headers": { "X-Api-Key": "hdr-test-only", "Authorization": "Bearer t" }
+                    }
+                }
+            },
+            "model": "dev/m-x",
+            "plugin": [
+                "https://plugins.example/p.js", // a quoted URL carries "//" — data, never a comment
+            ],
+            "log": "https://logs.example/tail", /* a block comment before the closer */
+            "snapshot": true,
+        }"#;
+        let merged: Value = serde_json::from_str(&merged_opencode_config_content(Some(user)))
+            .expect("the merged document is valid strict JSON");
+        assert_eq!(
+            merged,
+            serde_json::json!({
+                "provider": { "dev": {
+                    "models": { "m-x": { "name": "M X" } },
+                    "options": {
+                        "apiKey": "sk-test-only",
+                        "headers": { "X-Api-Key": "hdr-test-only", "Authorization": "Bearer t" }
+                    },
+                }},
+                "model": "dev/m-x",
+                "plugin": ["https://plugins.example/p.js"],
+                "log": "https://logs.example/tail",
+                "snapshot": false,
+            }),
+            "JSONC object ⇒ merged preserving ALL user keys verbatim (incl. models/apiKey/headers \
+             and comment-containing strings); the snapshot:false pin still wins over the user key"
+        );
+    }
+
+    /// Focused ep1-r4 F1: a VALID JSONC document never enters the malformed
+    /// branch — the content-free warning fires ONLY for genuinely unparseable
+    /// input (below).
+    #[test]
+    fn merged_config_valid_jsonc_never_emits_the_malformed_warning() {
+        let (events, _guard) = config_capture::capture();
+        let jsonc = "{\n  // line comment\n  \"share\": \"disabled\", /* block */\n  \"autoupdate\": false,\n}";
+        let merged: Value = serde_json::from_str(&merged_opencode_config_content(Some(jsonc)))
+            .expect("the merged document is valid strict JSON");
+        assert_eq!(
+            merged,
+            serde_json::json!({ "share": "disabled", "autoupdate": false, "snapshot": false })
+        );
+        let events = events.lock().expect("capture lock");
+        assert!(
+            events.iter().all(|fields| {
+                fields.get("message").map(String::as_str)
+                    != Some("freshell_opencode.config_content.malformed_inline_config_replaced")
+            }),
+            "valid JSONC never warns: {events:?}"
+        );
+    }
+
+    /// A document unparseable even AFTER comment/trailing-comma normalization
+    /// keeps the existing content-free replace+warn behavior (F5 unchanged).
+    #[test]
+    fn merged_config_unparseable_after_jsonc_normalization_still_warns_content_free() {
+        let (events, _guard) = config_capture::capture();
+        let malformed = "{ \"model\": , // no value\n }";
+        let replaced = merged_opencode_config_content(Some(malformed));
+        assert_eq!(replaced, OPENCODE_SNAPSHOTS_DISABLED_CONFIG);
+        let events = events.lock().expect("capture lock");
+        let warn = events
+            .iter()
+            .find(|fields| {
+                fields.get("message").map(String::as_str)
+                    == Some("freshell_opencode.config_content.malformed_inline_config_replaced")
+            })
+            .expect("a genuinely unparseable document still warns loudly");
+        assert_eq!(
+            warn.get("replaced_value_bytes_len")
+                .cloned()
+                .unwrap_or_default(),
+            malformed.len().to_string(),
+            "length-only, content-free (F5): {warn:?}"
+        );
+        assert!(
+            warn.values().all(|v| !v.contains("model")),
+            "no content substring survives into the warning: {warn:?}"
+        );
     }
 
     /// A non-object JSON value can't take a top-level pin either — same

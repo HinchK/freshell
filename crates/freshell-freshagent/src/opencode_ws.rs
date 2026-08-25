@@ -6788,6 +6788,145 @@ mod tests {
         );
     }
 
+    /// Focused-review ep1-r4 F2: seed the PRE-F8 STORED BYTES shape (no `epoch`
+    /// on any entry, no `currentEpoch`, stale `canRedo:true` over TWO frozen
+    /// steps) — the real pre-repair durable row. The load-time migration freezes
+    /// the entries AND forces the stored bit OFF (an epochless row cannot prove
+    /// which frozen steps remain redoable at the provider: undo → partial redo →
+    /// stop reads identically to all-steps-outstanding). A /redo against it
+    /// refuses typed-cleanly — `REDO_UNAVAILABLE` + `REDO_EMPTY_MESSAGE`, exactly
+    /// one reply frame, ZERO mutation traffic (reads only) — and the frozen
+    /// markers survive untouched (decision 6).
+    #[tokio::test]
+    async fn handle_rollback_redo_on_a_migrated_legacy_record_refuses_with_zero_mutation_traffic() {
+        // Pointer at msg_u2: the provider provably exposes BOTH remaining steps
+        // (msg_u2 and msg_u3 groups) — the truncate-after-one-step failure shape.
+        let (st, _rx, st_sink, http) = state_with_rollback_fake(Some("msg_u2")).await;
+        st_sink.seed_rollback_payload(
+            PROVIDER,
+            "ses_real",
+            json!({
+                "version": 1,
+                "lastOpAtMs": 50,
+                "redoDestroyed": false,
+                "canRedo": true,
+                "entries": [
+                    { "removedTurns": [
+                        RollbackFakeHttp::marker_turn("msg_u2", "user", "prompt two"),
+                        RollbackFakeHttp::marker_turn("msg_a2", "assistant", "answer two"),
+                    ], "promptText": "prompt two", "atMs": 40 },
+                    { "removedTurns": [
+                        RollbackFakeHttp::marker_turn("msg_u3", "user", "prompt three"),
+                        RollbackFakeHttp::marker_turn("msg_a3", "assistant", "answer three"),
+                    ], "promptText": "prompt three", "atMs": 50 },
+                ],
+            }),
+        );
+        let (sink, captured) = capturing_sink();
+        let mut op = undo_op("ses_real", "rb-legacy-1");
+        op.direction = RollbackDirection::Redo;
+        st.handle_rollback(op, sink).await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "exactly one typed refusal: {frames:?}");
+        assert_eq!(frames[0]["event"]["code"], json!("REDO_UNAVAILABLE"));
+        assert_eq!(frames[0]["event"]["message"], json!(REDO_EMPTY_MESSAGE));
+        assert!(
+            http.recorded().iter().all(|r| r.method == "GET"),
+            "reads only — a refused redo never mutates: {:?}",
+            http.recorded()
+        );
+        let record = st_sink.load_rollback(PROVIDER, "ses_real").expect("record");
+        assert_eq!(
+            record.entries.len(),
+            2,
+            "the frozen legacy markers are preserved verbatim (decision 6): {record:?}"
+        );
+        assert!(record.entries.iter().all(|e| e.epoch == 0));
+        assert_eq!(
+            record.current_epoch, 1,
+            "the migration froze the prefix below the bumped epoch"
+        );
+        assert!(
+            !record.can_redo(),
+            "the forced-off bit survives the refused op"
+        );
+    }
+
+    /// F2 companion: after the refusal, a NEW undo over the migrated record
+    /// records into the bumped epoch and redo is re-established truthfully for
+    /// THAT tail only — the frozen prefix is preserved but never redoable.
+    #[tokio::test]
+    async fn handle_rollback_after_legacy_migration_a_new_undo_reestablishes_new_epoch_redo_only() {
+        let (st, _rx, st_sink, http) = state_with_rollback_fake(Some("msg_u2")).await;
+        st_sink.seed_rollback_payload(
+            PROVIDER,
+            "ses_real",
+            json!({
+                "version": 1,
+                "lastOpAtMs": 50,
+                "redoDestroyed": false,
+                "canRedo": true,
+                "entries": [
+                    { "removedTurns": [
+                        RollbackFakeHttp::marker_turn("msg_u2", "user", "prompt two"),
+                        RollbackFakeHttp::marker_turn("msg_a2", "assistant", "answer two"),
+                    ], "promptText": "prompt two", "atMs": 40 },
+                    { "removedTurns": [
+                        RollbackFakeHttp::marker_turn("msg_u3", "user", "prompt three"),
+                        RollbackFakeHttp::marker_turn("msg_a3", "assistant", "answer three"),
+                    ], "promptText": "prompt three", "atMs": 50 },
+                ],
+            }),
+        );
+
+        // A new undo steps the boundary DEEPER (msg_u2 → msg_u1).
+        let (sink, _captured) = capturing_sink();
+        st.handle_rollback(undo_op("ses_real", "rb-legacy-2"), sink)
+            .await;
+        let reverts = http.revert_posts();
+        assert_eq!(reverts.len(), 1, "one boundary-moving revert");
+        assert_eq!(
+            reverts[0].body,
+            Some(json!({ "messageID": "msg_u1" })),
+            "the new undo steps into the active prefix's own history"
+        );
+        let record = st_sink.load_rollback(PROVIDER, "ses_real").expect("record");
+        assert_eq!(
+            record.entries.len(),
+            3,
+            "the frozen prefix PLUS the new-epoch entry: {record:?}"
+        );
+        assert!(record.entries[..2].iter().all(|e| e.epoch == 0));
+        assert_eq!(
+            record.entries[2].epoch, 1,
+            "the new undo sits in the bumped epoch"
+        );
+        assert!(record.can_redo(), "the new epoch's tail is redoable");
+
+        // One redo step restores the new epoch's group ONLY — the frozen prefix
+        // stays in the ledger but never regains redo.
+        let (sink, captured) = capturing_sink();
+        let mut op = undo_op("ses_real", "rb-legacy-3");
+        op.direction = RollbackDirection::Redo;
+        st.handle_rollback(op, sink).await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames[0]["event"]["type"], json!("freshAgent.redone"));
+        assert_eq!(frames[0]["event"]["restoredThroughTurnId"], json!("msg_a1"));
+        assert_eq!(
+            frames[0]["event"]["canRedo"],
+            json!(false),
+            "the restored new-epoch tail is spent; the frozen prefix is never redoable"
+        );
+        let record = st_sink.load_rollback(PROVIDER, "ses_real").expect("record");
+        assert_eq!(
+            record.entries.len(),
+            2,
+            "the spent new-epoch entry dropped; the frozen legacy prefix survives: {record:?}"
+        );
+        assert!(record.entries.iter().all(|e| e.epoch == 0));
+        assert!(!record.can_redo());
+    }
+
     #[tokio::test]
     async fn handle_rollback_mid_turn_is_busy() {
         let (st, _rx, _sink, http) = state_with_rollback_fake_busy_turn().await;

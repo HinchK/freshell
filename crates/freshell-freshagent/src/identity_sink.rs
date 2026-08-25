@@ -105,6 +105,13 @@ pub(crate) struct FakeIdentitySink {
     pub recorded: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
     /// (provider, sessionId) -> stored rollback record (kata 1wxv).
     pub rollbacks: std::sync::Mutex<std::collections::HashMap<(String, String), RollbackRecord>>,
+    /// Focused ep1-r4 F2: (provider, sessionId) -> a row seeded as RAW STORED
+    /// BYTES (a pre-epoch-fields legacy payload). `load_rollback` routes these
+    /// through [`RollbackRecord::from_stored_payload`] exactly like the real
+    /// `LedgerIdentitySink`'s read of stored bytes, so handler tests drive the
+    /// in-memory migration itself, never a hand-stamped typed record.
+    pub legacy_rollback_payloads:
+        std::sync::Mutex<std::collections::HashMap<(String, String), serde_json::Value>>,
     /// When true, write futures resolve to Err — for failure-surfacing tests.
     pub fail_writes: std::sync::atomic::AtomicBool,
 }
@@ -136,6 +143,24 @@ impl FakeIdentitySink {
     pub fn set_fail_writes(&self, fail: bool) {
         self.fail_writes
             .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+    /// Focused ep1-r4 F2: seed the rollback row as RAW STORED BYTES (the legacy
+    /// pre-epoch payload shape), replacing any typed seed — `load_rollback` then
+    /// runs the real read path's migration ([`RollbackRecord::from_stored_payload`])
+    /// over them.
+    #[allow(dead_code)] // used by the kata 1wxv focused ep1-r4 F2 tests
+    pub fn seed_rollback_payload(
+        &self,
+        provider: &str,
+        session_id: &str,
+        payload: serde_json::Value,
+    ) {
+        let key = (provider.into(), session_id.into());
+        self.rollbacks.lock().unwrap().remove(&key);
+        self.legacy_rollback_payloads
+            .lock()
+            .unwrap()
+            .insert(key, payload);
     }
     fn write_result(&self) -> SinkWrite {
         if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
@@ -218,20 +243,37 @@ impl PaneIdentitySink for FakeIdentitySink {
                 .lock()
                 .unwrap()
                 .insert((provider.into(), session_id.into()), record);
+            // A real write supersedes any seeded raw-bytes row (the handler's
+            // post-op record carries EXPLICIT epoch keys from here on).
+            self.legacy_rollback_payloads
+                .lock()
+                .unwrap()
+                .remove(&(provider.into(), session_id.into()));
         }
         self.write_result()
     }
     fn load_rollback(&self, provider: &str, session_id: &str) -> Option<RollbackRecord> {
-        self.rollbacks
+        let key = (provider.into(), session_id.into());
+        if let Some(record) = self.rollbacks.lock().unwrap().get(&key) {
+            return (record.version == ROLLBACK_RECORD_VERSION).then(|| record.clone());
+        }
+        // Focused ep1-r4 F2: a seeded raw-bytes row reads through the REAL
+        // migration reader — never a hand-stamped typed record.
+        let payload = self
+            .legacy_rollback_payloads
             .lock()
             .unwrap()
-            .get(&(provider.into(), session_id.into()))
-            .cloned()
-            .filter(|record| record.version == ROLLBACK_RECORD_VERSION)
+            .get(&key)
+            .cloned();
+        payload.and_then(RollbackRecord::from_stored_payload)
     }
     fn delete_rollback(&self, provider: &str, session_id: &str) -> SinkWrite {
         if !self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
             self.rollbacks
+                .lock()
+                .unwrap()
+                .remove(&(provider.into(), session_id.into()));
+            self.legacy_rollback_payloads
                 .lock()
                 .unwrap()
                 .remove(&(provider.into(), session_id.into()));

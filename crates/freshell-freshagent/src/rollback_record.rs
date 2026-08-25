@@ -218,6 +218,25 @@ impl RollbackRecord {
     /// op's write. Post-F8 rows (every entry carries `epoch` EXPLICITLY and the
     /// record carries `currentEpoch`) load UNMIGRATED — an explicit `epoch: 0`
     /// therefore never misfires as legacy.
+    ///
+    /// Focused-review ep1-r4 F2: an epochless row ALSO cannot prove which of
+    /// its frozen steps remain redoable at the provider — an
+    /// undo → partial redo → stop history reads IDENTICALLY to
+    /// all-steps-outstanding, so the stored `canRedo:true` is
+    /// stale-unknowable. Admitting a pointer-lane (opencode) redo on that bit
+    /// restores ONE step, then the redo path's current-epoch-only restamp
+    /// (`set_can_redo` over `epoch == current_epoch` entries) permanently
+    /// truncates the rest of a still-valid durable pre-repair rollback state.
+    /// The migration therefore FORCES the stored bit OFF for anchor-less rows
+    /// (opencode/codex — the rows whose admission trusts the stored bit): the
+    /// handler refuses /redo typed-cleanly with ZERO provider traffic, the
+    /// frozen markers are preserved verbatim (decision 6), and a NEW undo
+    /// records into the bumped epoch and re-establishes redo truthfully.
+    /// Claude rows carry `originalSessionId` and KEEP the stored bit: the
+    /// claude lane never admits a redo on it (admission is chain-anchored —
+    /// original transcript + LCP — and each op re-derives its own can_redo),
+    /// so forcing it off there would only darken a redo the chain could still
+    /// truthfully validate.
     pub fn from_stored_payload(payload: Value) -> Option<Self> {
         let legacy_epochless_union = payload
             .get("entries")
@@ -235,6 +254,12 @@ impl RollbackRecord {
             record.current_epoch = record
                 .current_epoch
                 .max(record.entries.iter().map(|e| e.epoch).max().unwrap_or(0) + 1);
+            // F2: anchor-less rows (opencode/codex) lose the stale-unprovable
+            // stored bit — see the method doc. Claude-anchored rows keep it
+            // (their admission never consults it).
+            if record.original_session_id.is_none() {
+                record.can_redo = false;
+            }
         }
         Some(record)
     }
@@ -954,6 +979,78 @@ mod tests {
         assert_eq!(
             reloaded, record,
             "a post-migration write round-trips byte-identical — no re-migration"
+        );
+    }
+
+    /// Focused-review ep1-r4 F2 (opencode_ws.rs redo admission): a legacy
+    /// epochless union's stored `canRedo:true` is STALE-UNKNOWABLE — the row
+    /// cannot prove which of its frozen steps remain redoable at the provider
+    /// (an undo → partial redo → stop history reads identically to
+    /// all-steps-outstanding). Admitting a pointer-lane redo on that bit
+    /// restores ONE step, then the current-epoch-only restamp permanently
+    /// truncates the rest of a valid durable pre-repair rollback state. The
+    /// migration therefore FORCES the stored bit OFF for anchor-less
+    /// (opencode/codex) rows: the handler refuses /redo typed-cleanly with
+    /// ZERO provider traffic, the frozen markers are preserved (decision 6),
+    /// and a NEW undo writes into the bumped epoch and re-establishes redo
+    /// truthfully.
+    #[test]
+    fn legacy_anchorless_epochless_record_loads_with_redo_forced_off() {
+        let legacy = json!({
+            "version": 1,
+            "lastOpAtMs": 70,
+            "redoDestroyed": false,
+            "canRedo": true,
+            "entries": [
+                { "removedTurns": [marker_turn("t1", "user"), marker_turn("a1", "assistant")], "promptText": "p1", "atMs": 40 },
+                { "removedTurns": [marker_turn("t2", "user"), marker_turn("a2", "assistant")], "promptText": "p2", "atMs": 50 },
+            ],
+        });
+        let record = RollbackRecord::from_stored_payload(legacy).expect("legacy payload parses");
+        assert!(
+            !record.redo_destroyed,
+            "the destroy bit is honored literally"
+        );
+        assert_eq!(
+            record.current_epoch, 1,
+            "the union froze below the bumped epoch"
+        );
+        assert!(
+            !record.entries.is_empty() && record.entries.iter().all(|e| e.epoch == 0),
+            "the all-frozen prefix is preserved verbatim (decision 6): {record:?}"
+        );
+        assert_eq!(record.entries.len(), 2);
+        assert!(
+            !record.can_redo(),
+            "F2: the stale-unprovable stored bit is forced OFF — /redo refuses typed-cleanly"
+        );
+    }
+
+    /// F2 scoping: the force-off applies to ANCHOR-LESS rows (opencode/codex).
+    /// A claude legacy row carries `originalSessionId`; its lane NEVER admits a
+    /// redo on the stored bit (admission is chain-anchored — the original
+    /// transcript + LCP — and the per-op `can_redo` is re-derived), so the bit
+    /// is kept verbatim: forcing it off there would only darken a redo the
+    /// chain could still truthfully validate.
+    #[test]
+    fn legacy_claude_anchored_epochless_record_keeps_the_stored_bit() {
+        let legacy = json!({
+            "version": 1,
+            "lastOpAtMs": 70,
+            "redoDestroyed": false,
+            "canRedo": true,
+            "originalSessionId": "durable-orig",
+            "originalTipUuid": "uuid-tip",
+            "entries": [
+                { "removedTurns": [marker_turn("t1", "user")], "promptText": "p1", "atMs": 40 },
+            ],
+        });
+        let record = RollbackRecord::from_stored_payload(legacy).expect("legacy payload parses");
+        assert_eq!(record.current_epoch, 1, "the union still freezes");
+        assert!(record.entries.iter().all(|e| e.epoch == 0));
+        assert!(
+            record.can_redo(),
+            "claude's stored bit survives — its admission never consults it: {record:?}"
         );
     }
 
