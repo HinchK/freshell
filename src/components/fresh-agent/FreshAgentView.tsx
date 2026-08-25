@@ -813,7 +813,13 @@ export function FreshAgentView({
     const timer = window.setTimeout(() => {
       if (!usageRefreshDispatchedRef.current) {
         usageRefreshDispatchedRef.current = true
-        void dispatch(refreshActiveSessionWindow() as any)
+        // The boundary revalidation is best-effort: a rejected thunk (partial
+        // store shape in tests, transient network failure) must never surface
+        // as an unhandled rejection from this timer.
+        const revalidation = dispatch(refreshActiveSessionWindow() as any)
+        if (revalidation && typeof (revalidation as Promise<unknown>)?.catch === 'function') {
+          ;(revalidation as Promise<unknown>).catch(() => {})
+        }
       }
       forceUsageTick()
     }, Math.max(boundaryMs - Date.now(), 0))
