@@ -430,7 +430,7 @@ fn next_snapshot_seq() -> u64 {
 fn directory_boot_id() -> &'static str {
     static BOOT_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     BOOT_ID
-        .get_or_init(|| format!("boot-{}", uuid::Uuid::new_v4().to_string()))
+        .get_or_init(|| format!("boot-{}", uuid::Uuid::new_v4()))
         .as_str()
 }
 
