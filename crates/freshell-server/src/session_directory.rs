@@ -353,7 +353,12 @@ fn validate_query(raw: &std::collections::HashMap<String, String>) -> Result<Dir
     // without pretending to byte-parity.
     let mut include_keys: Vec<String> = raw
         .get("includeKeys")
-        .map(|v| v.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect())
+        .map(|v| {
+            v.split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default();
     if include_keys.len() > 200 {
         details.push(json!({
@@ -1516,11 +1521,30 @@ fn apply_query(
     // subagent-classed, non-interactive, or untitled/idle, and its meter must
     // stay live regardless of the sidebar window's filtering state. Extras are
     // returned out-of-band and never merged into `items`, so lowering the
-    // visibility bar here cannot leak hidden rows into the sidebar.
-    let extras_candidates: Option<Vec<DirItem>> = if q.include_keys.is_empty() {
+    // visibility bar here cannot leak hidden rows into the sidebar. The
+    // snapshot carries ONLY the three fields the extras need (never a full
+    // per-request DirItem clone).
+    let extras_candidates: Option<
+        Vec<(
+            String,
+            String,
+            Option<freshell_sessions::meta::TokenSummary>,
+        )>,
+    > = if q.include_keys.is_empty() {
         None
     } else {
-        Some(items.clone())
+        Some(
+            items
+                .iter()
+                .map(|i| {
+                    (
+                        i.provider.clone(),
+                        i.session_id.clone(),
+                        i.token_usage.clone(),
+                    )
+                })
+                .collect(),
+        )
     };
 
     // Server-side visibility pre-filter (service.ts:244-252).
@@ -1615,12 +1639,15 @@ fn apply_query(
             q.include_keys.iter().map(String::as_str).collect();
         let extras: Vec<Value> = candidates
             .iter()
-            .filter(|item| wanted.contains(item.key().as_str()) && !page_keys.contains(&item.key()))
-            .map(|item| {
+            .filter(|(provider, session_id, _)| {
+                let key = format!("{provider}:{session_id}");
+                wanted.contains(key.as_str()) && !page_keys.contains(&key)
+            })
+            .map(|(provider, session_id, token_usage)| {
                 let mut o = Map::new();
-                o.insert("provider".into(), json!(item.provider));
-                o.insert("sessionId".into(), json!(item.session_id));
-                if let Some(u) = &item.token_usage {
+                o.insert("provider".into(), json!(provider));
+                o.insert("sessionId".into(), json!(session_id));
+                if let Some(u) = token_usage {
                     o.insert("tokenUsage".into(), token_usage_value(u));
                 }
                 Value::Object(o)
@@ -2214,7 +2241,10 @@ mod tests {
             usage_dir_item("meter-other", 400, "Other"),
         ];
         let page = apply_query(items.clone(), &q1, &[]).unwrap();
-        assert_eq!(page["items"].as_array().unwrap()[0]["sessionId"], json!("meter-hit"));
+        assert_eq!(
+            page["items"].as_array().unwrap()[0]["sessionId"],
+            json!("meter-hit")
+        );
         assert!(page.get("contextUsageExtras").is_none());
         // Page 2 paged it out → arrives as an extra instead.
         let cursor = page["nextCursor"].as_str().unwrap().to_string();
@@ -2225,7 +2255,10 @@ mod tests {
             ..DirQuery::default()
         };
         let page2 = apply_query(items, &q2, &[]).unwrap();
-        assert_eq!(page2["items"].as_array().unwrap()[0]["sessionId"], json!("meter-other"));
+        assert_eq!(
+            page2["items"].as_array().unwrap()[0]["sessionId"],
+            json!("meter-other")
+        );
         assert_eq!(
             page2["contextUsageExtras"].as_array().unwrap()[0]["sessionId"],
             json!("meter-hit")

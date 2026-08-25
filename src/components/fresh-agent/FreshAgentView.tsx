@@ -700,13 +700,17 @@ export function FreshAgentView({
   // Status-strip model display: the chip mirrors the LIVE session model when
   // the runtime reports one, else the staged/effective pane model. Label
   // resolution maps the id through the static table by exact match only —
-  // never the default-substituting resolveFreshAgentModelOption helper, so a
-  // catalog-only id renders its raw id instead of masquerading as the default
-  // (it upgrades to the catalog displayName via the probe below).
+  // never the default-substituting resolveFreshAgentModelOption helper: a
+  // catalog-only id renders NO label until the probe or pick-time stamp
+  // resolves a real display name (raw ids are tooltip-only) and never
+  // masquerades as the default.
   const stripModelId = agentSession?.model ?? resolveEffectiveFreshAgentModel(paneContent, providerDefaults)
   const stripStaticModelLabel = FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE[paneContent.sessionType]
     ?.find((option) => option.value === stripModelId)?.label
-  const [stripProbedModelLabel, setStripProbedModelLabel] = useState<string | null>(null)
+  // Paired with the model id the probe resolved: a live-model switch leaves
+  // the previous model's probed label in state until the effect re-runs; only
+  // the id-paired label may render (no stale-label frame, no raw id).
+  const [stripProbedModelPair, setStripProbedModelPair] = useState<{ modelId: string; label: string } | null>(null)
   // Catalog display-name upgrade: freshopencode's static table is empty
   // ("live catalog only"), and freshclaude/kilroy users can now pick
   // catalog-only models in the shared dialog — without this probe both would
@@ -728,7 +732,7 @@ export function FreshAgentView({
     ? paneContent.sessionType
     : null
   useEffect(() => {
-    setStripProbedModelLabel(null)
+    setStripProbedModelPair(null)
     if (!stripProbeSessionType || !stripModelId || stripStaticModelLabel || stripStampedModelLabel) return
     let cancelled = false
     void getFreshAgentModelCapabilities(stripProbeSessionType, { cwd: paneContent.initialCwd })
@@ -740,13 +744,16 @@ export function FreshAgentView({
         // A displayName echoing the raw id is not a display name (e.g.
         // opencode's no-name fallback) — the chip would render a raw id,
         // which is tooltip-only by contract.
-        setStripProbedModelLabel(probed && probed !== stripModelId ? probed : null)
+        setStripProbedModelPair(probed && probed !== stripModelId ? { modelId: stripModelId, label: probed } : null)
       })
       .catch(() => {
-        if (!cancelled) setStripProbedModelLabel(null)
+        if (!cancelled) setStripProbedModelPair(null)
       })
     return () => { cancelled = true }
   }, [stripProbeSessionType, paneContent.initialCwd, stripModelId, stripStaticModelLabel, stripStampedModelLabel])
+  const stripProbedModelLabel = stripProbedModelPair && stripProbedModelPair.modelId === stripModelId
+    ? stripProbedModelPair.label
+    : undefined
   // The chip NEVER renders a raw model id (user directive, review-loop round
   // delta-1/focused-ep1: raw ids are tooltip-only). With a model set, the chip
   // exists only once a display name resolves (static table → pick-time stamp →
@@ -772,11 +779,16 @@ export function FreshAgentView({
       : undefined
   ))
   const extrasContextUsage = guardContextUsageTokenSummary(
-    contextUsageExtraEntry && Date.now() - contextUsageExtraEntry.fetchedAt <= CONTEXT_USAGE_STALE_MS
+    contextUsageExtraEntry && Date.now() - contextUsageExtraEntry.fetchedAt < CONTEXT_USAGE_STALE_MS
       ? contextUsageExtraEntry.tokenUsage
       : undefined,
   )
-  const liveContextUsage = windowContextUsage ?? extrasContextUsage
+  // Extras win over the window row when both exist: the extras are generated
+  // server-side from the SAME indexer snapshot as the fresh page — so when the
+  // two disagree the window row must be a STALE RETAINED one (deep pagination
+  // keeps older rows whose usage was never refreshed). A fresh page-1 row and
+  // its same-fetch extras can never actually disagree.
+  const liveContextUsage = extrasContextUsage ?? windowContextUsage
   // Sidebar-window churn guard: `projects` is the sidebar's search/pagination
   // window, replaced wholesale by each sidebar fetch — when this pane's row
   // drops out (search results, the 50-session cap), the live lookup goes null
@@ -797,7 +809,7 @@ export function FreshAgentView({
     }
   }, [liveContextUsage, contextSessionId])
   const cachedUsageEntry = contextSessionId ? lastKnownUsageRef.current.get(contextSessionId) : undefined
-  const cachedUsageFresh = cachedUsageEntry && Date.now() - cachedUsageEntry.at <= CONTEXT_USAGE_STALE_MS
+  const cachedUsageFresh = cachedUsageEntry && Date.now() - cachedUsageEntry.at < CONTEXT_USAGE_STALE_MS
     ? cachedUsageEntry.usage
     : null
   const contextUsage = liveContextUsage ?? cachedUsageFresh
@@ -816,8 +828,11 @@ export function FreshAgentView({
     }
     if (deadlines.length === 0) return
     const remaining = Math.min(...deadlines) - Date.now()
-    if (remaining <= 0) return
-    const timer = window.setTimeout(forceUsageTick, remaining)
+    // Exact-boundary tick: `remaining <= 0` means "stale RIGHT NOW relative to
+    // this render" — re-render immediately rather than serving stale forever
+    // in a quiet pane. No busy loop: at the re-render the reading already
+    // fails the freshness check, so no new deadline is armed.
+    const timer = window.setTimeout(forceUsageTick, Math.max(remaining, 0))
     return () => window.clearTimeout(timer)
   }, [extrasContextUsage, contextUsageExtraEntry, liveContextUsage, cachedUsageEntry])
   // Capability-gated commands (e.g. /fork) only appear once the snapshot
