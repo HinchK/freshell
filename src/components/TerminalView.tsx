@@ -1258,6 +1258,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     pendingOsc52EventRef.current = pendingOsc52Event
   }, [pendingOsc52Event])
 
+  const shouldFocusActiveTerminalRef = useRef(false)
+
   // Sync during render (not in useEffect) so refs always have latest values
   paneLastInputAtRef.current = paneLastInputAt
   settingsRef.current = settings
@@ -1270,6 +1272,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   }, [serverInstanceId])
 
   const shouldFocusActiveTerminal = !hidden && activeTabId === tabId && activePaneId === paneId
+  shouldFocusActiveTerminalRef.current = shouldFocusActiveTerminal
 
   // Keep the active pane's terminal focused when tabs/panes switch so typing works immediately.
   useEffect(() => {
@@ -1708,7 +1711,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     if (shouldScrollToBottom) {
       try { term.scrollToBottom() } catch { /* disposed */ }
     }
-    if (shouldFocus) {
+    if (shouldFocus && shouldFocusActiveTerminalRef.current) {
       term.focus()
     }
   }, [suppressNetworkEffects, syncGeometryEpochForViewport, ws])

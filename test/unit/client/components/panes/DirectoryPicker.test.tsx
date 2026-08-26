@@ -410,4 +410,20 @@ describe('DirectoryPicker', () => {
       expect(onConfirm).toHaveBeenCalledWith('/tmp/shift-enter')
     })
   })
+
+  describe('focus gating', () => {
+    it('focuses and selects the input by default (focusEligible omitted)', async () => {
+      renderDirectoryPicker({ defaultCwd: '/tmp/work' })
+      const input = screen.getByLabelText('Starting directory for Claude') as HTMLInputElement
+      await waitFor(() => expect(input).toHaveFocus())
+      await waitFor(() => expect(input.selectionEnd).toBe('/tmp/work'.length))
+    })
+
+    it('does not focus the input when focusEligible is false', async () => {
+      renderDirectoryPicker({ defaultCwd: '/tmp/work', focusEligible: false })
+      const input = screen.getByLabelText('Starting directory for Claude') as HTMLInputElement
+      await waitFor(() => expect(input.value).toBe('/tmp/work'))
+      expect(input).not.toHaveFocus()
+    })
+  })
 })

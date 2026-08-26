@@ -655,4 +655,16 @@ describe('BrowserPane', () => {
       })
     })
   })
+
+  describe('focus gating', () => {
+    it('focuses the URL input for an empty-url pane that owns focus (default)', () => {
+      renderBrowserPane({ url: '' })
+      expect(screen.getByPlaceholderText('Enter URL...')).toHaveFocus()
+    })
+
+    it('does not focus the URL input when focusEligible is false', () => {
+      renderBrowserPane({ url: '', focusEligible: false })
+      expect(screen.getByPlaceholderText('Enter URL...')).not.toHaveFocus()
+    })
+  })
 })

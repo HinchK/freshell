@@ -135,6 +135,7 @@ interface EditorPaneProps {
   content: string
   viewMode?: 'source' | 'preview'
   wordWrap?: boolean
+  focusEligible?: boolean
 }
 
 export default function EditorPane({
@@ -146,6 +147,7 @@ export default function EditorPane({
   content,
   viewMode = 'source',
   wordWrap = true,
+  focusEligible = true,
 }: EditorPaneProps) {
   const dispatch = useAppDispatch()
   const monacoTheme = useMonacoTheme()
@@ -294,8 +296,18 @@ export default function EditorPane({
 
   function handleEditorMount(editor: Monaco.editor.IStandaloneCodeEditor) {
     editorRef.current = editor
-    editor.focus()
+    // onMount is async — eligible-at-mount focus can only happen HERE.
+    if (focusEligible) editor.focus()
   }
+
+  // Later false→true eligibility flips (explicit select bringing a
+  // background-mounted editor forward) — handleEditorMount never refires.
+  const prevFocusEligibleRef = useRef(focusEligible)
+  useEffect(() => {
+    const was = prevFocusEligibleRef.current
+    prevFocusEligibleRef.current = focusEligible
+    if (focusEligible && !was) editorRef.current?.focus()
+  }, [focusEligible])
 
   const debouncedPathChange = useMemo(
     () =>

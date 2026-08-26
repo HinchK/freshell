@@ -119,15 +119,16 @@ function createStore(overrides?: {
 
 function renderPicker(
   overrides?: Parameters<typeof createStore>[0],
-  props?: { onSelect?: ReturnType<typeof vi.fn>; onCancel?: ReturnType<typeof vi.fn>; isOnlyPane?: boolean }
+  props?: { onSelect?: ReturnType<typeof vi.fn>; onCancel?: ReturnType<typeof vi.fn>; isOnlyPane?: boolean; focusEligible?: boolean }
 ) {
   const store = createStore(overrides)
   const onSelect = props?.onSelect ?? vi.fn()
   const onCancel = props?.onCancel ?? vi.fn()
   const isOnlyPane = props?.isOnlyPane ?? false
+  const focusEligible = props?.focusEligible ?? true
   render(
     <Provider store={store}>
-      <PanePicker onSelect={onSelect} onCancel={onCancel} isOnlyPane={isOnlyPane} />
+      <PanePicker onSelect={onSelect} onCancel={onCancel} isOnlyPane={isOnlyPane} focusEligible={focusEligible} />
     </Provider>
   )
   return { onSelect, onCancel, store }
@@ -677,6 +678,11 @@ describe('PanePicker', () => {
       renderPicker()
       const container = getContainer()
       expect(container).toHaveFocus()
+    })
+
+    it('does not focus the picker container when focusEligible is false', () => {
+      renderPicker(undefined, { focusEligible: false })
+      expect(getContainer()).not.toHaveFocus()
     })
   })
 

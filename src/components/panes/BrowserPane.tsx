@@ -17,6 +17,7 @@ interface BrowserPaneProps {
   browserInstanceId: string
   url: string
   devToolsOpen: boolean
+  focusEligible?: boolean
 }
 
 const MAX_HISTORY_SIZE = 50
@@ -179,6 +180,7 @@ export default function BrowserPane({
   browserInstanceId,
   url,
   devToolsOpen,
+  focusEligible = true,
 }: BrowserPaneProps) {
   const dispatch = useAppDispatch()
   const refreshRequest = useAppSelector((state) => state.panes.refreshRequestsByPane?.[tabId]?.[paneId] ?? null)
@@ -433,12 +435,13 @@ export default function BrowserPane({
   }
 
   useEffect(() => {
-    // Focus the URL input only when there's no initial URL (user just created a new browser pane)
-    // This is more accessible than autoFocus and allows users to manually control focus
-    if (!url && inputRef.current) {
+    // Focus the URL input only when there's no initial URL (user just created a
+    // new browser pane) AND this pane owns focus. Background-mounted browser
+    // panes (agent-created hidden tabs) must not steal keyboard focus.
+    if (focusEligible && !url && inputRef.current) {
       inputRef.current.focus()
     }
-  }, [url])
+  }, [url, focusEligible])
 
   useEffect(() => {
     if (!refreshRequest) return

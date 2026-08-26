@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { useEffect } from 'react'
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { Provider } from 'react-redux'
@@ -19,16 +20,35 @@ vi.mock('@/components/markdown/LazyMarkdown', async () => {
   }
 })
 
+const monacoMountControl = vi.hoisted(() => ({
+  enabled: false,
+  /** Monaco's real onMount is async — tests can model the delay explicitly. */
+  mountDelayMs: 0,
+  focus: vi.fn(),
+}))
+
 // Mock Monaco to avoid loading issues in tests
 vi.mock('@monaco-editor/react', () => {
-  const MonacoMock = ({ value, onChange, theme }: any) => (
-    <textarea
-      data-testid="monaco-mock"
-      data-theme={theme}
-      value={value}
-      onChange={(e: any) => onChange?.(e.target.value)}
-    />
-  )
+  const MonacoMock = ({ value, onChange, theme, onMount }: any) => {
+    useEffect(() => {
+      if (!monacoMountControl.enabled) return
+      const timer = setTimeout(() => {
+        onMount?.(
+          { focus: monacoMountControl.focus, getValue: () => '', setValue: () => {}, updateOptions: () => {}, getModel: () => null } as any,
+          {} as any,
+        )
+      }, monacoMountControl.mountDelayMs)
+      return () => clearTimeout(timer)
+    }, [])
+    return (
+      <textarea
+        data-testid="monaco-mock"
+        data-theme={theme}
+        value={value}
+        onChange={(e: any) => onChange?.(e.target.value)}
+      />
+    )
+  }
   return {
     default: MonacoMock,
     Editor: MonacoMock,
@@ -701,6 +721,48 @@ describe('EditorPane', () => {
 
       // Defaults to true, so button should say "disable" (can turn it off)
       expect(screen.getByRole('button', { name: /disable line wrap/i })).toBeInTheDocument()
+    })
+  })
+
+  describe('focus gating', () => {
+    beforeEach(() => {
+      monacoMountControl.focus.mockClear()
+    })
+
+    afterEach(() => {
+      monacoMountControl.enabled = false
+      monacoMountControl.mountDelayMs = 0
+    })
+
+    it('focuses the editor on ASYNC mount for an eligible pane (default — pins initial autofocus)', async () => {
+      monacoMountControl.enabled = true
+      monacoMountControl.mountDelayMs = 30
+      render(
+        <Provider store={store}>
+          <EditorPane paneId="pane-1" tabId="tab-1" filePath="/test.ts" language="typescript" readOnly={false} content="const x = 1" viewMode="source" />
+        </Provider>
+      )
+      await waitFor(() => expect(screen.getByTestId('monaco-mock')).toBeInTheDocument())
+      await waitFor(() => expect(monacoMountControl.focus).toHaveBeenCalled())
+    })
+
+    it('does not focus the editor while ineligible, but focuses on the later false→true flip (explicit select)', async () => {
+      monacoMountControl.enabled = true
+      const { rerender } = render(
+        <Provider store={store}>
+          <EditorPane paneId="pane-1" tabId="tab-1" filePath="/test.ts" language="typescript" readOnly={false} content="const x = 1" viewMode="source" focusEligible={false} />
+        </Provider>
+      )
+      await waitFor(() => expect(screen.getByTestId('monaco-mock')).toBeInTheDocument())
+      await new Promise((r) => setTimeout(r, 50))
+      expect(monacoMountControl.focus).not.toHaveBeenCalled()
+
+      rerender(
+        <Provider store={store}>
+          <EditorPane paneId="pane-1" tabId="tab-1" filePath="/test.ts" language="typescript" readOnly={false} content="const x = 1" viewMode="source" focusEligible />
+        </Provider>
+      )
+      await waitFor(() => expect(monacoMountControl.focus).toHaveBeenCalledTimes(1))
     })
   })
 })

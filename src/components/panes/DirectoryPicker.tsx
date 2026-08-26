@@ -13,6 +13,7 @@ type DirectoryPickerProps = {
   globalDefault?: string
   onConfirm: (cwd: string) => void
   onBack: () => void
+  focusEligible?: boolean
 }
 
 type CompletionSuggestion = {
@@ -53,6 +54,7 @@ export default function DirectoryPicker({
   globalDefault,
   onConfirm,
   onBack,
+  focusEligible = true,
 }: DirectoryPickerProps) {
   const inputId = useId()
   const listboxId = useId()
@@ -75,9 +77,10 @@ export default function DirectoryPicker({
   }, [defaultCwd])
 
   useEffect(() => {
+    if (!focusEligible) return
     inputRef.current?.focus()
     inputRef.current?.select()
-  }, [])
+  }, [focusEligible])
 
   useEffect(() => {
     let cancelled = false

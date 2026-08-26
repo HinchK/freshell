@@ -69,9 +69,10 @@ interface PanePickerProps {
   isOnlyPane: boolean
   tabId?: string
   paneId?: string
+  focusEligible?: boolean
 }
 
-export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, paneId }: PanePickerProps) {
+export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, paneId, focusEligible = true }: PanePickerProps) {
   useEnsureExtensionsRegistry()
 
   const platform = useAppSelector((s) => s.connection?.platform ?? null)
@@ -208,10 +209,11 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
     }
   }, [handleSelect, options])
 
-  // Auto-focus the container on mount so keyboard shortcuts work immediately
+  // Auto-focus the container when the picker owns focus, so keyboard shortcuts
+  // work immediately; background-mounted pickers must not steal DOM focus.
   useEffect(() => {
-    containerRef.current?.focus()
-  }, [])
+    if (focusEligible) containerRef.current?.focus()
+  }, [focusEligible])
 
   // Measure the container once and track its size with a ResizeObserver so the
   // adaptive grid re-layouts as the pane resizes.

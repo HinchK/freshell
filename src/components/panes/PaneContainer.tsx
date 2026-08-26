@@ -518,6 +518,12 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       ? () => dispatch(requestPaneRefresh({ tabId, paneId: node.id }))
       : undefined
 
+    // focusEligible: this pane may auto-focus DOM when it mounts. Requires the
+    // VISIBLE tab (!hidden) AND this tab's active pane. Agent-created tabs land
+    // hidden (Task 1 keeps Redux activeTabId on the user's tab), so their panes
+    // mount without stealing keyboard focus.
+    const focusEligible = !hidden && activePane === node.id
+
     return (
       <Pane
         tabId={tabId}
@@ -545,7 +551,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         onRefresh={handleRefresh}
         onDoubleClickTitle={() => startRename(node.id, paneTitle)}
       >
-        {renderContent(tabId, node.id, node.content, isOnlyPane, hidden)}
+        {renderContent(tabId, node.id, node.content, isOnlyPane, hidden, focusEligible)}
       </Pane>
     )
   }
@@ -586,10 +592,12 @@ function PickerWrapper({
   tabId,
   paneId,
   isOnlyPane,
+  focusEligible = true,
 }: {
   tabId: string
   paneId: string
   isOnlyPane: boolean
+  focusEligible?: boolean
 }) {
   const dispatch = useAppDispatch()
   const settings = useAppSelector((s) => s.settings?.settings)
@@ -799,6 +807,7 @@ function PickerWrapper({
         globalDefault={globalDefault}
         onConfirm={handleDirectoryConfirm}
         onBack={() => setStep({ step: 'type' })}
+        focusEligible={focusEligible}
       />
     )
   }
@@ -810,6 +819,7 @@ function PickerWrapper({
       isOnlyPane={isOnlyPane}
       tabId={tabId}
       paneId={paneId}
+      focusEligible={focusEligible}
     />
   )
 }
@@ -820,6 +830,7 @@ function renderContent(
   content: PaneContent,
   isOnlyPane: boolean,
   hidden?: boolean,
+  focusEligible = true,
 ) {
   if (content.kind === 'terminal') {
     return (
@@ -838,6 +849,7 @@ function renderContent(
           browserInstanceId={content.browserInstanceId}
           url={content.url}
           devToolsOpen={content.devToolsOpen}
+          focusEligible={focusEligible}
         />
       </ErrorBoundary>
     )
@@ -866,6 +878,7 @@ function renderContent(
             content={content.content}
             viewMode={content.viewMode}
             wordWrap={content.wordWrap}
+            focusEligible={focusEligible}
           />
         </Suspense>
       </ErrorBoundary>
@@ -891,6 +904,7 @@ function renderContent(
         tabId={tabId}
         paneId={paneId}
         isOnlyPane={isOnlyPane}
+        focusEligible={focusEligible}
       />
     )
   }
