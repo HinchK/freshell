@@ -4580,12 +4580,21 @@ fn reduce_notification(
                 .collect()
         }
         CodexNotification::ThreadStatusChanged { thread_id, status } => {
-            // adapter.ts:898-903 — unconditional clear (harmless if unset) once the thread
-            // leaves running/starting, regardless of whether TurnStarted ever fired.
+            // adapter.ts:898-903 — clear (harmless if unset) once the thread
+            // leaves running/starting, regardless of whether TurnStarted ever
+            // fired. ep3-r4 F2: while a compact window is armed, the
+            // thread-level idle is the COMPACT LIFECYCLE's documented
+            // punctuation (it lands between the compact's turn/started and its
+            // turn/completed) — it must never clear `active_turn`, which a
+            // submission accepted inside the window has already installed for
+            // its own newer turn; the id-matched completion arm owns every
+            // retirement inside the window.
             if thread_id == subscription.session_id() {
                 let normalized = normalize_codex_thread_status(&status);
                 if normalized != CodexStatus::Running && normalized != CodexStatus::Starting {
-                    clear_active_turn(active_turn);
+                    if !compact_in_flight.load(Ordering::SeqCst) {
+                        clear_active_turn(active_turn);
+                    }
                 }
             }
             subscription
@@ -6439,6 +6448,150 @@ pub(crate) mod tests {
             captured_frames(&captured)[0]["event"]["code"],
             json!("NOTHING_TO_UNDO"),
             "the newer turn's own completion released the gate"
+        );
+    }
+
+    /// Focused-review ep3-r4 F2 (the compact window's thread-level idle must
+    /// never erase a NEWER turn's busy truth): the documented compact event
+    /// sequence carries `thread/status:changed{type:idle}` BETWEEN the
+    /// compact's `turn/started` and its `turn/completed`; a submission accepted
+    /// inside the window installs its own active turn (whose turn/started can
+    /// land before that idle) — and the status arm UNCONDITIONALLY cleared
+    /// `active_turn`, so the compact's id-matched completion then retired only
+    /// the compact bits: both rollback-gate inputs read false mid-new-turn and
+    /// a `thread/revert` admitted there force-interrupts the newer turn. The
+    /// thread-level idle is the compact lifecycle's own punctuation while the
+    /// window is armed — it must not touch `active_turn` (the id-matched
+    /// completion owns retirements inside the window).
+    #[tokio::test]
+    async fn the_compact_windows_thread_level_idle_keeps_the_newer_turns_busy_truth() {
+        let (st, _rx_boot) = state_with_bus();
+        let (peer, mut wire) = insert_idle_compact_session(&st, "thread-cidle").await;
+
+        // Arm the compact: RPC answers; the compact's own turn starts.
+        let compact_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-cidle")).await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (compact_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        peer.respond(&compact_id, json!({}));
+        compact_driver.await.expect("compact task");
+        peer.emit_notification(
+            "turn/started",
+            json!({ "threadId": "thread-cidle", "turn": { "id": "turn-compact-7" } }),
+        );
+
+        // A submission inside the window installs its own active turn BEFORE
+        // the compact window's thread-level idle lands.
+        let send_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_send(FreshAgentSend {
+                    request_id: Some("req-cidle".to_string()),
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    session_id: "thread-cidle".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    text: "newer turn".to_string(),
+                    images: None,
+                    cwd: None,
+                    settings: None,
+                })
+                .await;
+            })
+        };
+        let (turn_req, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        peer.respond(&turn_req, json!({ "turn": { "id": "turn-new-1" } }));
+        send_driver.await.expect("send task");
+        peer.emit_notification(
+            "turn/started",
+            json!({ "threadId": "thread-cidle", "turn": { "id": "turn-new-1" } }),
+        );
+
+        // The compact window's documented thread-level idle lands NOW — it is
+        // the compact lifecycle's punctuation, NOT the newer turn's end: the
+        // newer turn's busy truth must survive it.
+        drain_wire(&mut wire);
+        peer.emit_notification(
+            "thread/status/changed",
+            json!({ "threadId": "thread-cidle", "status": { "type": "idle" } }),
+        );
+        // ...and the compact's own completion retires exactly the compact bits.
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-cidle", "turn": { "id": "turn-compact-7", "status": "completed" } }),
+        );
+        await_next_idle_snapshot(&mut wire, "thread-cidle").await;
+
+        // The rollback gate MUST refuse: the newer turn is still running and
+        // owns the busy truth.
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(undo_msg("thread-cidle", "rb-cidle-1", None), sink)
+            .await;
+        let frames = captured_frames(&captured);
+        assert_eq!(
+            frames[0]["event"]["code"],
+            json!("BUSY_TURN"),
+            "ep3-r4 F2: the compact window's idle never erases the newer turn's busy truth: {frames:?}"
+        );
+
+        // The newer turn's own completion then retires it EXACTLY — the gate
+        // opens (NOTHING_TO_UNDO — prowl through the empty durable ledger).
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-cidle", "turn": { "id": "turn-new-1", "status": "completed" } }),
+        );
+        await_next_idle_snapshot(&mut wire, "thread-cidle").await;
+        // The status snapshot broadcast precedes the reduce-notification's
+        // applied clearing by a consumer poll — poll the gate inputs until the
+        // newer turn's completion has landed (id-matched retirement).
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let active_turn = {
+                    let guard = st.sessions.lock().await;
+                    guard
+                        .get("thread-cidle")
+                        .expect("session")
+                        .active_turn
+                        .clone()
+                };
+                if active_turn.lock().expect("active_turn mutex").is_none() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            settled.is_ok(),
+            "the newer turn's own completion retires the gate input"
+        );
+        let (sink, captured) = capturing_sink();
+        let rollback_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thread-cidle", "rb-cidle-2", None), sink)
+                    .await;
+            })
+        };
+        while let Ok((read_id, method, _)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), peer.expect_request()).await
+        {
+            assert_eq!(method, "thread/read");
+            peer.respond(
+                &read_id,
+                json!({ "thread": { "id": "thread-cidle", "turns": [] } }),
+            );
+        }
+        rollback_driver.await.expect("rollback task 2");
+        assert_eq!(
+            captured_frames(&captured)[0]["event"]["code"],
+            json!("NOTHING_TO_UNDO"),
+            "the newer turn's own completion releases the gate"
         );
     }
 

@@ -2844,7 +2844,7 @@ impl FreshClaudeState {
                         // unknown (manual or automatic): mark the CANDIDATE
                         // only (ep3-r1 F1; promotion waits for the manual
                         // completion boundary).
-                        mark_compact_candidate(&turn_tracker);
+                        mark_compact_candidate(&in_turn, &turn_tracker);
                     }
                     Some("sdk.compact_boundary") => {
                         // The compaction's completion boundary is the ONLY
@@ -3099,20 +3099,28 @@ fn undo_turn_op_arm(
     in_turn.store(tracker.busy(), std::sync::atomic::Ordering::SeqCst);
 }
 
-/// One OBSERVED `sdk.status:compacting`: a compaction is running NOW — but the
-/// frame carries NO trigger: the SDK fires it for an explicit `/compact` AND
-/// for its own automatic context compaction (focused ep3-r1 F1). Marking it as
-/// the promotion evidence here is WRONG: an automatic compaction mid-turn would
-/// promote a queued explicit Compact (possibly a silently-DROPPED one), and that
-/// turn's own terminal edge would retire the phantom — stranding the real turn
-/// queued forever (its paired idle is deliberately skipped, ep2-r1 F1) and
-/// wedging the gate permanently BUSY. The status frame only ever marks a
-/// CANDIDATE; promotion waits for the compaction's completion boundary.
-fn mark_compact_candidate(turn_tracker: &std::sync::Mutex<TurnTracker>) {
-    turn_tracker
-        .lock()
-        .expect("turn tracker lock")
-        .compact_candidate = true;
+/// One OBSERVED `sdk.status:compacting`: a compaction is running NOW — the
+/// provider is provably in-flight (mid-turn auto or a `/compact` run), so the
+/// gate CLOSES at this frame (ep3-r4 F1: after a SURVIVE-absorb opened the
+/// gate, a revived compact's status must re-arm the busy truth at the status,
+/// not at its later completion boundary, or the whole status→boundary
+/// interval — and a status landing a beat after a probe's admission — admits
+/// rollback while a compaction is provably executing). The frame carries NO
+/// trigger, though, so it can NEVER promote a queued compact
+/// (focused ep3-r1 F1): it marks a CANDIDATE; attribution waits for the
+/// compaction's completion boundary, which consumes the candidate and
+/// recomputes the gate.
+fn mark_compact_candidate(
+    in_turn: &std::sync::atomic::AtomicBool,
+    turn_tracker: &std::sync::Mutex<TurnTracker>,
+) {
+    {
+        turn_tracker
+            .lock()
+            .expect("turn tracker lock")
+            .compact_candidate = true;
+    }
+    in_turn.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// The compaction's completion boundary (`sdk.compact_boundary {trigger}` —
@@ -3152,6 +3160,13 @@ fn confirm_compact_candidate(
         // compact whose debt left the gate open re-closes it the moment its
         // run provably starts (revived compacts hold the mid-compaction gate).
         in_turn.store(true, std::sync::atomic::Ordering::SeqCst);
+    } else {
+        // No promotion (auto boundary, a leftover, or no front Compact): the
+        // candidate is consumed and the gate recomputes from owed debt —
+        // ep3-r4 F1's status-time boost never wedges the tracker: queued
+        // compacts keep the gate closed (the absorb probe can still settle
+        // them later), an empty tracker re-opens it here.
+        in_turn.store(tracker.busy(), std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -7602,6 +7617,105 @@ rl.on('line', (line) => {
         drop(env);
     }
 
+    /// Focused-review ep3-r4 F1 (the absorb-revival STATUS window): SURVIVE-
+    /// absorb leaves the debt queued with the gate open; when an absorbed
+    /// compact actually starts, its bare `sdk.status:compacting` marks the
+    /// candidate — but pre-fix NOTHING re-armed `in_turn` until the manual
+    /// boundary arrived, so the whole status→boundary interval (and a status
+    /// arriving a beat AFTER a probe's admission check) let a rollback proceed
+    /// while the provider compacted mid-flight. The status marks the candidate
+    /// AND closes the gate (in_turn=true); consumption at the boundary either
+    /// promotes (gate stays held) or recomputes the owed-debt busy truth.
+    ///
+    ///   A → C1 → C2 → A's pair → absorb probe (admitted; C1+C2 survive; gate
+    ///   open) → C1's STATUS lands (candidate: the gate RE-CLOSES immediately)
+    ///   → manual boundary (C1 promoted; held) → C1's pair (C1 retires; C2
+    ///   owed) → absorb probe (admitted again) — the gate never rides the
+    ///   proven-running interval.
+    #[tokio::test]
+    async fn a_revived_absorbed_compact_closes_the_gate_at_its_status_frame_not_just_its_boundary()
+    {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-revive")).await;
+        let created = await_claude_created(&mut rx, "req-revive").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        await_status_frame(&mut rx, &session_id, "idle").await;
+
+        st.handle_send(send_msg(&session_id, "turn one")).await; // A
+        st.handle_compact(compact_msg(&session_id, None)).await; // C1
+        st.handle_compact(compact_msg(&session_id, None)).await; // C2
+
+        // A's pair retires A: [C1, C2] queued, nothing running.
+        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
+        inject_raw_send(&st, &session_id, "__emit_idle__").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Provably-quiescent debt: the gate ADMITS (entries survive).
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-rev-0", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        assert_eq!(
+            captured_json(&captured)[0]["event"]["code"],
+            "NOTHING_TO_UNDO",
+            "quiescent compact debt admits"
+        );
+        assert!(
+            !in_turn_of(&st, &session_id).await,
+            "the absorb opened the gate"
+        );
+
+        // C1 now actually starts: the STATUS alone must RE-CLOSE the gate (the
+        // candidate is provable in-flight compaction — mid-compaction rollback
+        // is never admissible).
+        inject_raw_send(&st, &session_id, "__emit_compacting__").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-rev-1", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        assert_eq!(
+            captured_json(&captured)[0]["event"]["code"],
+            "BUSY_TURN",
+            "ep3-r4 F1: the revived compact's status frame holds the gate — never admit mid-compaction"
+        );
+        assert!(in_turn_of(&st, &session_id).await);
+
+        // C1's boundary promotes it (still held); its own pair retires it; C2
+        // is owed; the gate admits at the next absorb probe, quiescent again.
+        inject_raw_send(&st, &session_id, "__emit_compact_boundary_manual__").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            in_turn_of(&st, &session_id).await,
+            "promotion holds the closed gate through the boundary"
+        );
+        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
+        inject_raw_send(&st, &session_id, "__emit_idle__").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            in_turn_of(&st, &session_id).await,
+            "C2's surviving debt keeps the tracker busy"
+        );
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-rev-2", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        assert_eq!(
+            captured_json(&captured)[0]["event"]["code"],
+            "NOTHING_TO_UNDO",
+            "the remnant survivor absorbs again — quiescent debt settles only at the gate"
+        );
+        drop(env);
+    }
+
     /// Focused-review ep3-r3 F1 (dropped compact ahead of a RUNNING compact):
     /// the wire carries no compaction-op identity — the manual boundary always
     /// promotes the FRONT queued compact, so [C1 silently dropped, C2 runs] is
@@ -8080,7 +8194,7 @@ rl.on('line', (line) => {
         fold_terminal_edge(&in_turn, &turn_tracker);
         st.handle_send(send_msg("rb-armfail-gar", "turn garlanded"))
             .await;
-        mark_compact_candidate(&turn_tracker);
+        mark_compact_candidate(&in_turn, &turn_tracker);
         confirm_compact_candidate(&in_turn, &turn_tracker, true);
 
         // Let the fixture `tee` fully drain the pipe before freezing — a
