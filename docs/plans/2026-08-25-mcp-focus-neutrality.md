@@ -1,5 +1,13 @@
 # MCP Focus Neutrality Implementation Plan
 
+> **EXECUTED.** All tasks below have landed on branch
+> `the-usual/mcp-focus-neutrality` in
+> `/home/dan/code/freshell/.worktrees/mcp-focus-neutrality` (GREEN-verified and
+> committed per task: Tasks 1–5 as `682ef8991`, `f9a7de069`, `dff5158e8`,
+> `91b70bfca`, `d92154fca`; plus `4a5e09aaa` tab-focus-behavior repair,
+> `e4b9b59ce` Task 6 inert gate, and the delta-round-2 followups). The checkbox
+> steps are retained unchecked as historical detail — do not re-execute them.
+
 > **For agentic workers:** Execute this plan task by task with a fresh
 > implementer and a specification-plus-quality review after every task. Track
 > progress with the checkbox steps below.
@@ -29,8 +37,10 @@ unit/component tests, Playwright e2e against the owned RustServer wall harness.
 ## Global Constraints
 
 - Worktree: `/home/dan/code/freshell/.worktrees/mcp-focus-neutrality`;
-  branch `the-usual/mcp-focus-neutrality`; base `f2c7ef7a` (origin/main).
-  All commands run from the worktree root.
+  branch `the-usual/mcp-focus-neutrality`; original base `f2c7ef7a`
+  (origin/main), rebased mid-run onto `5b8717017` (upstream delta was
+  doc-only: AGENTS.md rule lines + a skill deletion). All commands run from
+  the worktree root.
 - **Env sanitization is mandatory** for every test/build command in this run
   (we run inside a live Freshell pane and leaked vars break tests, e.g.
   `FRESHELL_BIND_HOST` poisons `test/unit/vite-config.test.ts`). Prefix every
@@ -80,7 +90,8 @@ unit/component tests, Playwright e2e against the owned RustServer wall harness.
 
 ## Current behavior / root-cause evidence
 
-All line numbers verified in the worktree at base `f2c7ef7a`.
+All line numbers verified in the worktree at base `f2c7ef7a`, re-checked against
+the visible post-rebase state (`5b8717017`) during delta review followups.
 
 1. **Redux activation (the primary steal).** The `addTab` reducer
    unconditionally sets `state.activeTabId = id` (`src/store/tabsSlice.ts:323`);
@@ -1961,9 +1972,10 @@ INSTRUCTIONS, HELP_TEXT via the help action) in test/unit/server/mcp/freshell-to
 
 Added during Stage 5 after the Fresh Eyes delta review's round-1 Major finding.
 A same-origin page loading inside a visible-but-NOT-focus-eligible browser
-pane (agent split into the active tab — hidden background tabs are already
-inert via display:none) could still focus its own document and seize
-keystrokes. Gate: the `<iframe>` carries the `inert` attribute while
+pane (agent split into the active tab — hidden background tabs' panes are
+already un-focusable because `.tab-hidden` uses `visibility:hidden` + absolute
+positioning + `pointer-events:none`, so hidden content has no focusable area)
+could still focus its own document and seize keystrokes. Gate: the `<iframe>` carries the `inert` attribute while
 `focusEligible` is false (`src/components/panes/BrowserPane.tsx`, iframe at
 :580); removing it on a false→true flip does NOT reload (same element, src
 untouched). Tests: `BrowserPane.test.tsx` focus-gating describe — inert set
@@ -1976,7 +1988,41 @@ removed hidden-mount steal (outside Task 2's components impacted-set; caught by
 the full coordinated suite) — minimally inverted, phase-2 discrimination
 intact. Committed as 4a5e09aaa.
 
+### Task 7 (post-hoc, landed): BrowserPane/ExtensionPane focus parity
+
+Added during Stage 5's delta-round-2 Major fix. Previously, DOM focus for
+browser panes was content-dependent: an EMPTY pane focused the URL input while
+a LOADED pane focused nothing (its iframe removed from sequential navigation
+but never program-focused), so "the pane that owns the focus slot holds DOM
+focus" broke on explicit select and after leaf→split remounts; ExtensionPane
+had no eligibility support at all.
+
+Change: BrowserPane's root div gained `ref` + `tabIndex={-1}` and Task 2's
+URL-input effect was merged into a single owns-focus effect — eligible mount
+or false→true flip focuses the URL input when the pane is empty and the pane
+root when loaded. Navigation NEVER refocuses (url is read via a render-synced
+ref, deps `[focusEligible]`). ExtensionPane gained the same `focusEligible`
+prop threaded from PaneContainer's extension arm, Task-6-equivalent `inert`
+gating on its sandboxed iframe, and an iframe focus effect for eligible
+mount/flips. This also closes the same-origin extension-iframe steal vector
+for extension category `client` (sandbox allows same-origin + scripts).
+
+Tests: 2 new BrowserPane focus-gating tests (root-focus mount for loaded pane;
+flip after hidden mount) + new `ExtensionPane.test.tsx` (inert when ineligible,
+focused when eligible, flip re-eligible without reload). RED observed on all 5
+(iframe inert attribute absent / nothing focused). GREEN: BrowserPane 37/37,
+ExtensionPane 3/3, pane suites total 638/638. Plus wall e2e remains green after
+the marker baseline now asserts pane A owns document focus pre-tag.
+
+Also in this round: `panesSlice.test.ts` `activate:false` now pre-zooms the
+original pane and asserts `zoomedPane` clears (unconditional layout-invariant
+pinned on the non-activating path), and the plan doc corrections in the delta
+round 2 record below.
+
 ## Fresh Eyes record
+
+- **Delta round 2 (Codex, independent; base 5b8717017): FAILED — 2 Major + 3 Minor + 1 Nit**, all assessed valid and fixed: (1 Major) BrowserPane DOM-focus restoration was content-dependent — a LOADED browser pane (url set) had no focus path on explicit select or after a leaf→split remount, and ExtensionPane had no `focusEligible` support at all (same same-origin iframe steal vector Task 6 closed for browser panes) → Task 7 focus parity: BrowserPane root is now `tabIndex={-1}` with a merged owns-focus effect (empty pane → URL input, loaded pane → pane root; url tracked via ref so navigation never yanks focus), ExtensionPane threads `focusEligible` through PaneContainer's extension arm with the same inert gating + iframe focus (mount-while-eligible and false→true flip), verified by 2 new BrowserPane tests + a new `ExtensionPane.test.tsx` (638/638 pane suites green, wall e2e re-run green with the new baseline-focus step); (2 Major) plan doc no longer executable as written → EXECUTED banner at top, base note corrected for the mid-run rebase to 5b8717017; (1 Minor) e2e spec now asserts pane A owns document focus (`expect.poll(focusedPaneId).toBe(paneA)`) BEFORE tagging the identity marker, so the marker can never pin `body` or another tab's element; (2 Minor) the `activate:false` panesSlice test now pre-zooms the original pane so the unconditional zoom-clear invariant is pinned on that path; (3 Minor) Task 6's "inert via display:none" sentence corrected to the real `.tab-hidden` mechanism (`visibility:hidden` + absolute positioning + `pointer-events:none`); (1 Nit) duplicated Round 2 record entry removed.
+  Runner report: `.worktrees/.the-usual-logs/mcp-focus-neutrality/review-logs/usual-fresheyes-20260826T082834Z-1938727.md`
 
 - **Delta round 1 (Codex, independent; base 5b8717017): FAILED — 3 Major**, all assessed valid and fixed: (1) BrowserPane iframe focus-steal path → Task 6 inert gate (landed, e4b9b59ce); (2) Global Constraints' stale direct-`npx playwright` bullet contradicted the backend-wrapper policy — rewritten to reference the wrapper; (3) Task 3's test snippet had an unmatched `})` closing the describe early (the implementer had already applied the only valid reading; plan text corrected).
   Runner report: `.worktrees/.the-usual-logs/mcp-focus-neutrality/review-logs/usual-fresheyes-20260826T073820Z-1241336.md`
@@ -2041,25 +2087,6 @@ intact. Committed as 4a5e09aaa.
   finding across all three rounds is fixed in this revision.
   Runner report:
   `.worktrees/.the-usual-logs/mcp-focus-neutrality/review-logs/usual-fresheyes-20260826T021400Z-2126234.md`
-
-- **Round 2 (Codex, independent): FAILED — 6 Major + 1 Minor**, assessed valid
-  and fixed in this revision: (1 Minor) stale base — new "Base sync first"
-  constraint step; (1 Major) e2e execution now goes through the
-  `scripts/e2e-cloud.sh run` backend wrapper (`--list` discovery stays
-  plain-Playwright) and the backend choice is user-pinned before Stage 4;
-  (2 Major) DirectoryPicker wiring now covered by driving PickerWrapper through
-  its directory step in the wiring test; (3 Major) EditorPane gates BOTH the
-  async `onMount` focus and later eligibility flips (effect-only gate would
-  silently drop mount autofocus; pin test models the async delay);
-  (4 Major) Task 3 exports `restoreFocus`/`FocusSnapshot` in a behavior-neutral
-  pre-RED prerequisite so the RED is behavioral, not a module-load error;
-  (5 Major) the post-paint verify now treats a target deleted DURING the
-  restore window as incomplete (plus a race pin test using an rAF-queued
-  deletion); (6 Major) the e2e spec now tags the exact focused element before
-  each mutation, waits for mount+rAF settle, asserts exact focus identity
-  survives, and asserts explicit selects move DOM focus to the selected pane.
-  Runner report:
-  `.worktrees/.the-usual-logs/mcp-focus-neutrality/review-logs/usual-fresheyes-20260826T014331Z-1577551.md`
 
 ## Out of scope (recorded, not fixed here)
 
