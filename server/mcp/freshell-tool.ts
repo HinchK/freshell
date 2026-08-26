@@ -41,7 +41,9 @@ Key actions:
 Common params: target (ID or name), name, mode, direction, keys, url, scope.
 
 Fresh agents (in-app): use new-tab/split-pane with agent="opencode" (also "claude"/"codex"), optional model=, effort=, cwd=. Then drive the pane with send-keys (the prompt; blocks until the turn completes), read it with capture-pane (returns the transcript), and optionally wait-for (reports idle). Example:
-  new-tab { agent: "opencode", model: "umans-ai-coding-plan/umans-kimi-k2.7", prompt: "Summarize README.md" }`
+  new-tab { agent: "opencode", model: "umans-ai-coding-plan/umans-kimi-k2.7", prompt: "Summarize README.md" }
+
+Creation actions (new-tab, split-pane) are focus-neutral; use select-tab to move the user's focus explicitly.`
 
 export const INSTRUCTIONS = `Freshell is a browser-accessible terminal multiplexer and session organizer.
 
@@ -88,6 +90,7 @@ FRESHELL_URL and FRESHELL_TOKEN are already set in your environment.
 - Editor panes show "Loading..." until the tab is visited in the browser. When screenshotting multiple tabs, visit each tab first (select-tab), then loop back for screenshots.
 - Browser pane screenshots: proxied localhost URLs render actual content in the iframe. Truly cross-origin URLs (e.g. https://example.com) render a placeholder with the source URL instead of a blank region.
 - Freshell has a 50 PTY limit. Scripted runs accumulate orphan terminals silently. Clean up with list-terminals and kill unneeded tabs/panes.
+- **Focus neutrality:** new-tab, split-pane, and every pane/tab creation are focus-neutral — they never change which tab or pane the user is looking at. Use select-tab / select-pane when you explicitly intend to move the user's focus. send-keys, capture-pane, and wait-for all target panes without moving focus.
 
 ## tmux compatibility
 
@@ -436,7 +439,7 @@ Tab commands:
                   To open a URL in a browser pane, use 'open-browser' instead.
                   resume/resumeSessionId sugar is honored for mode panes and for agent: "opencode" only.
   list-tabs       List all tabs. Returns { tabs: [...], activeTabId }.
-  select-tab      Activate a tab. Params: target (tab ID or title)
+  select-tab      Activate a tab. Params: target (tab ID or title) (pane/tab creation is focus-neutral — select moves focus explicitly)
   kill-tab        Close a tab. Params: target
   rename-tab      Rename a tab. Params: name, target?
                   Omit target to rename the caller tab (or active tab as fallback).
@@ -448,7 +451,7 @@ Pane commands:
   split-pane      Split a pane. Params: target?, direction? (horizontal=left/right, vertical=top/bottom; defaults to horizontal = left/right), mode?, shell?, cwd?, browser?, editor?, resume?, sessionRef?
                    Omit target to split your own pane (the pane where this MCP server was spawned). Returns { paneId, tabId }.
   list-panes      List panes. Params: target? (tab ID or title to filter by). Returns { panes: [...] }.
-  select-pane     Activate a pane. Params: target (pane ID or index)
+  select-pane     Activate a pane. Params: target (pane ID or index) (pane/tab creation is focus-neutral — select moves focus explicitly)
   kill-pane       Close a pane. Params: target
   rename-pane     Rename a pane. Params: name, target?
                   Omit target to rename the caller pane (or the tab's active pane as fallback).

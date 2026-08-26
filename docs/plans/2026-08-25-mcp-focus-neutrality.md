@@ -1915,7 +1915,7 @@ tab.create/pane.split ACTIVATED the new tab/pane on every client. As of
 activate:false into addTab/splitPane, so they never change the user's active
 tab or per-tab active pane (bootstrap exception: the client's very first tab
 still activates). Focus changes remain exclusive to the explicit verbs
-(tab.select, pane.select, tabs.next/prev). Screenshot capture still moves and
+(tab.select, pane.select; REST /tabs/next|prev and MCP next-tab/prev-tab fold into tab.select). Screenshot capture still moves and
 auto-restores focus, and now reports restoredFocus:false when a snapshot
 target was deleted mid-capture instead of resurrecting dead ids. See
 docs/plans/2026-08-25-mcp-focus-neutrality.md.

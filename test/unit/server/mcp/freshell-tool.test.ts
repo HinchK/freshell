@@ -12,7 +12,7 @@ vi.mock('../../../../server/mcp/http-client.js', () => ({
   createApiClient: () => mockClient,
 }))
 
-import { TOOL_DESCRIPTION, INPUT_SCHEMA, executeAction } from '../../../../server/mcp/freshell-tool.js'
+import { TOOL_DESCRIPTION, INSTRUCTIONS, INPUT_SCHEMA, executeAction } from '../../../../server/mcp/freshell-tool.js'
 
 beforeEach(() => {
   mockClient.get.mockReset()
@@ -1598,5 +1598,18 @@ describe('executeAction -- parameter validation', () => {
     expect(text).toContain("use 'open-browser'")
     expect(text).toContain('open-browser')
     expect(text).toContain('Playbook: open a URL')
+  })
+})
+
+describe('focus-neutrality documentation', () => {
+  it('agent-facing text documents focus neutrality and the explicit select verbs', async () => {
+    expect(TOOL_DESCRIPTION).toContain('focus-neutral')
+    expect(TOOL_DESCRIPTION).toContain('select-tab')
+    expect(INSTRUCTIONS).toContain('focus-neutral')
+    expect(INSTRUCTIONS).toContain('select-tab')
+    expect(INSTRUCTIONS).toContain('select-pane')
+    // HELP_TEXT is module-private but reachable through the tool's own help
+    // action (freshell-tool.ts case 'help' returns HELP_TEXT directly, ~:944).
+    expect(await executeAction('help', {})).toContain('focus-neutral')
   })
 })
