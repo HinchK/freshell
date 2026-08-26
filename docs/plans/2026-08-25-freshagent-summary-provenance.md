@@ -183,7 +183,7 @@ No refactor needed: one schema field, one two-line helper, two fixture keys. The
 
 The schema is shared by every fresh-agent surface; the fixtures feed the contract test, `test/fixtures/fresh-agent/contract-traceability.ts`, and the fetch-mock tests in `test/unit/client/lib/api.test.ts` (the additive optional key must not break them). Impacted set: all shared-contract consumers plus the strict-schema Rust golden-fixture contract test, plus typecheck (the new optional field must not break existing turn construction).
 
-Run: `npm run test:vitest -- run test/unit/shared/ test/unit/server/rust-claude-snapshot-contract.test.ts test/unit/client/lib/api.test.ts && npm run typecheck`
+Run (the repo coordinator silently drops `test/unit/server/**` from the default-config run — the contract test runs as a second, explicit server-config invocation; observed during Task 1 execution): `npm run test:vitest -- run test/unit/shared/ test/unit/client/lib/api.test.ts && npm run test:vitest -- run test/unit/server/rust-claude-snapshot-contract.test.ts && npm run typecheck`
 
 Expected: PASS
 
@@ -785,7 +785,7 @@ Delete the now-dead inner `truncate140` helper in `codex.rs` (fully replaced by 
 
 The turn JSON shape is a shared contract crossing into the freshell-server routes and the TS strict-schema test. Impacted set: the whole Rust workspace suite (the contract type is workspace-shared) plus the TS contract tests that parse the golden fixture and the shared schema.
 
-Run: `cargo test --workspace --exclude freshell-tauri && npm run test:vitest -- run test/unit/server/rust-claude-snapshot-contract.test.ts test/unit/shared/`
+Run (two invocations — same routing caveat as Task 1 Step 6): `cargo test --workspace --exclude freshell-tauri && npm run test:vitest -- run test/unit/shared/ && npm run test:vitest -- run test/unit/server/rust-claude-snapshot-contract.test.ts`
 
 Expected: PASS
 
