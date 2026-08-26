@@ -1168,9 +1168,11 @@ export const panesSlice = createSlice({
         direction: 'horizontal' | 'vertical'
         newContent: PaneContentInput
         newPaneId?: string
+        /** ui.command pane.split passes false — agent-driven splits never steal focus-in-tab. */
+        activate?: boolean
       }>
     ) => {
-      const { tabId, paneId, direction, newContent, newPaneId: providedPaneId } = action.payload
+      const { tabId, paneId, direction, newContent, newPaneId: providedPaneId, activate } = action.payload
       const root = state.layouts[tabId]
       if (!root) return
 
@@ -1196,7 +1198,9 @@ export const panesSlice = createSlice({
       const newRoot = findAndReplace(root, paneId, splitNode)
       if (newRoot) {
         state.layouts[tabId] = newRoot
-        state.activePane[tabId] = newPaneId
+        if (activate !== false) {
+          state.activePane[tabId] = newPaneId
+        }
 
         // Clear zoom so the new pane is visible
         if (state.zoomedPane?.[tabId]) {

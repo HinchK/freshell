@@ -86,6 +86,7 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
         sessionRef: msg.payload.sessionRef,
         resumeSessionId: msg.payload.resumeSessionId,
         status: msg.payload.status,
+        activate: false,
       }))
       if (msg.payload.paneId && msg.payload.paneContent) {
         return dispatch(initLayout({ tabId: msg.payload.id, paneId: msg.payload.paneId, content: msg.payload.paneContent }))
@@ -119,6 +120,7 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
         direction: msg.payload.direction,
         newContent: msg.payload.newContent,
         newPaneId: msg.payload.newPaneId,
+        activate: false,
       }))
     case 'pane.close':
       return dispatch(closePaneWithCleanup({ tabId: msg.payload.tabId, paneId: msg.payload.paneId }))

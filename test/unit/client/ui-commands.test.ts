@@ -1,6 +1,9 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { configureStore } from '@reduxjs/toolkit'
 import { handleUiCommand } from '../../../src/lib/ui-commands'
 import { captureUiScreenshot } from '../../../src/lib/ui-screenshot'
+import tabsReducer from '../../../src/store/tabsSlice'
+import panesReducer from '../../../src/store/panesSlice'
 
 vi.mock('../../../src/lib/ui-screenshot', () => ({
   captureUiScreenshot: vi.fn(),
@@ -20,6 +23,16 @@ describe('handleUiCommand', () => {
 
     handleUiCommand({ type: 'ui.command', command: 'tab.create', payload: { id: 't1', title: 'Alpha' } }, dispatch)
     expect(actions[0].type).toBe('tabs/addTab')
+  })
+
+  it('tab.create dispatches addTab with activate: false (agent actions must not steal focus)', () => {
+    const actions: any[] = []
+    const dispatch = (action: any) => { actions.push(action); return action }
+
+    handleUiCommand({ type: 'ui.command', command: 'tab.create', payload: { id: 't1', title: 'Alpha' } }, dispatch)
+
+    expect(actions[0].type).toBe('tabs/addTab')
+    expect(actions[0].payload.activate).toBe(false)
   })
 
   it('initializes layout when tab.create includes pane content', () => {
@@ -55,6 +68,21 @@ describe('handleUiCommand', () => {
 
     expect(actions[0].type).toBe('panes/splitPane')
     expect(actions[0].payload.newPaneId).toBe('p2')
+  })
+
+  it('pane.split dispatches splitPane with activate: false', () => {
+    const actions: any[] = []
+    const dispatch = (action: any) => { actions.push(action); return action }
+
+    handleUiCommand({
+      type: 'ui.command',
+      command: 'pane.split',
+      payload: { tabId: 't1', paneId: 'p1', direction: 'horizontal', newPaneId: 'p2', newContent: { kind: 'terminal', mode: 'shell' } },
+    }, dispatch)
+
+    expect(actions[0].type).toBe('panes/splitPane')
+    expect(actions[0].payload.newPaneId).toBe('p2')
+    expect(actions[0].payload.activate).toBe(false)
   })
 
   it('handles pane.resize and pane.swap', () => {
@@ -188,5 +216,66 @@ describe('handleUiCommand', () => {
       changedFocus: false,
       restoredFocus: false,
     }))
+  })
+})
+
+describe('ui.command focus neutrality through a real Redux store', () => {
+  function makeUiStore() {
+    return configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+      middleware: (getDefault) => getDefault({ serializableCheck: false }),
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: 'tab-A',
+            createRequestId: 'req-A',
+            title: 'Tab A',
+            status: 'running' as const,
+            mode: 'shell' as const,
+            shell: 'system' as const,
+            createdAt: 1,
+          }],
+          activeTabId: 'tab-A',
+          renameRequestTabId: null,
+        },
+        panes: {
+          layouts: {
+            'tab-A': { type: 'leaf' as const, id: 'pane-A1', content: { kind: 'terminal' as const, mode: 'shell' as const, status: 'running' as const, terminalId: 'term-A1' } },
+          },
+          activePane: { 'tab-A': 'pane-A1' },
+          paneTitles: { 'tab-A': { 'pane-A1': 'Tab A' } },
+          paneTitleSetByUser: {},
+          renameRequestTabId: null,
+          renameRequestPaneId: null,
+          zoomedPane: {},
+          refreshRequestsByPane: {},
+        },
+      } as any,
+    })
+  }
+
+  it('tab.create never activates; explicit tab.select still does', () => {
+    const store = makeUiStore()
+    handleUiCommand({ type: 'ui.command', command: 'tab.create', payload: { id: 'tab-B', title: 'Agent tab' } }, store.dispatch)
+    expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['tab-A', 'tab-B'])
+    expect(store.getState().tabs.activeTabId).toBe('tab-A')
+
+    handleUiCommand({ type: 'ui.command', command: 'tab.select', payload: { id: 'tab-B' } }, store.dispatch)
+    expect(store.getState().tabs.activeTabId).toBe('tab-B')
+  })
+
+  it('pane.split never activates; explicit pane.select still does', () => {
+    const store = makeUiStore()
+    handleUiCommand({
+      type: 'ui.command',
+      command: 'pane.split',
+      payload: { tabId: 'tab-A', paneId: 'pane-A1', direction: 'horizontal', newPaneId: 'pane-A2', newContent: { kind: 'terminal', mode: 'shell' } },
+    }, store.dispatch)
+    expect(store.getState().panes.layouts['tab-A'].type).toBe('split')
+    expect(store.getState().panes.activePane['tab-A']).toBe('pane-A1')
+
+    handleUiCommand({ type: 'ui.command', command: 'pane.select', payload: { tabId: 'tab-A', paneId: 'pane-A2' } }, store.dispatch)
+    expect(store.getState().panes.activePane['tab-A']).toBe('pane-A2')
+    expect(store.getState().tabs.activeTabId).toBe('tab-A')
   })
 })

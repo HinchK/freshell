@@ -912,6 +912,33 @@ describe('panesSlice', () => {
         expect(newPane.content.devToolsOpen).toBe(true)
       }
     })
+
+    it('activate: false keeps the current active pane', () => {
+      let state = panesReducer(
+        initialState,
+        initLayout({ tabId: 'tab-1', content: { kind: 'terminal', mode: 'shell' } })
+      )
+      const originalPaneId = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).id
+
+      state = panesReducer(
+        state,
+        splitPane({
+          tabId: 'tab-1',
+          paneId: originalPaneId,
+          direction: 'horizontal',
+          newPaneId: 'pane-new',
+          newContent: { kind: 'terminal', mode: 'claude' },
+          activate: false,
+        })
+      )
+
+      const split = state.layouts['tab-1'] as Extract<PaneNode, { type: 'split' }>
+      expect(split.type).toBe('split')
+      expect((split.children[1] as Extract<PaneNode, { type: 'leaf' }>).id).toBe('pane-new')
+      expect(state.activePane['tab-1']).toBe(originalPaneId)
+      // Zoom-clear and title bookkeeping stay unconditional (layout invariants, not focus):
+      expect(state.paneTitles['tab-1']['pane-new']).toBeDefined()
+    })
   })
 
   describe('swapPanes', () => {
