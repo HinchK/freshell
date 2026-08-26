@@ -38,8 +38,10 @@ unit/component tests, Playwright e2e against the owned RustServer wall harness.
   `env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL`
 - Focused unit/component test command shape:
   `env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL npm run test:vitest -- run <files...> --config config/vitest/vitest.config.ts`
-- E2E command shape (Rust-only specs):
-  `env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium <spec-basename>`
+- E2E command shape (Rust-only specs) — execution goes through the backend
+  wrapper (see the "E2E backend policy" bullet below); discovery-only
+  `--list` flags may run plain Playwright:
+  `env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL bash scripts/e2e-cloud.sh run --local --project=rust-chromium <spec-basename>`
   The wall harness boots its OWN RustServer on an ephemeral port — never touch
   the live self-hosted server (port 3001).
 - **No runtime BEHAVIOR changes under `server/` or `crates/`.** The behavior
@@ -1391,7 +1393,6 @@ describe('restoreFocus deleted-target hardening', () => {
     )
     expect(ok).toBe(false)
   })
-})
 
   it('reports false when the restore target is deleted DURING the restore window (race pin)', async () => {
     const store = createFocusStore()
@@ -1956,7 +1957,29 @@ Also pins the three agent-facing instruction surfaces (TOOL_DESCRIPTION,
 INSTRUCTIONS, HELP_TEXT via the help action) in test/unit/server/mcp/freshell-tool.test.ts."
 ```
 
+### Task 6 (post-hoc, landed): BrowserPane iframe inert gating
+
+Added during Stage 5 after the Fresh Eyes delta review's round-1 Major finding.
+A same-origin page loading inside a visible-but-NOT-focus-eligible browser
+pane (agent split into the active tab — hidden background tabs are already
+inert via display:none) could still focus its own document and seize
+keystrokes. Gate: the `<iframe>` carries the `inert` attribute while
+`focusEligible` is false (`src/components/panes/BrowserPane.tsx`, iframe at
+:580); removing it on a false→true flip does NOT reload (same element, src
+untouched). Tests: `BrowserPane.test.tsx` focus-gating describe — inert set
+when ineligible, absent when eligible (pin), flip removes without reload.
+RED: both inert tests failed with `inert` absent. GREEN: 35/35. Committed as
+e4b9b59ce.
+
+Also during Stage 5: `test/e2e/tab-focus-behavior.test.tsx` phase-1 pinned the
+removed hidden-mount steal (outside Task 2's components impacted-set; caught by
+the full coordinated suite) — minimally inverted, phase-2 discrimination
+intact. Committed as 4a5e09aaa.
+
 ## Fresh Eyes record
+
+- **Delta round 1 (Codex, independent; base 5b8717017): FAILED — 3 Major**, all assessed valid and fixed: (1) BrowserPane iframe focus-steal path → Task 6 inert gate (landed, e4b9b59ce); (2) Global Constraints' stale direct-`npx playwright` bullet contradicted the backend-wrapper policy — rewritten to reference the wrapper; (3) Task 3's test snippet had an unmatched `})` closing the describe early (the implementer had already applied the only valid reading; plan text corrected).
+  Runner report: `.worktrees/.the-usual-logs/mcp-focus-neutrality/review-logs/usual-fresheyes-20260826T073820Z-1241336.md`
 
 - **Round 1 (Codex, independent): FAILED — 8 Major**, all assessed valid and
   fixed in this revision: (1) server-tree constraint vs Task 5's
