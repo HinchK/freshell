@@ -42,9 +42,14 @@ unit/component tests, Playwright e2e against the owned RustServer wall harness.
   `env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium <spec-basename>`
   The wall harness boots its OWN RustServer on an ephemeral port — never touch
   the live self-hosted server (port 3001).
-- **No changes under `server/` or `crates/`.** This is a client-only behavior
-  change; it deploys via `scripts/launch-rust.sh --client-only` + browser
-  refresh, no server restart. The frozen WS contract
+- **No runtime BEHAVIOR changes under `server/` or `crates/`.** The behavior
+  fix is client-only; it deploys via `scripts/launch-rust.sh --client-only` +
+  browser hard-refresh, no server restart. Task 5's ONLY server-tree edit is
+  doc strings in `server/mcp/freshell-tool.ts` (agent-facing instructions):
+  those ship to MCP agents the next time the MCP server binary is
+  rebuilt/deployed (production MCP prefers `dist/server/mcp/server.js`), do
+  not affect runtime behavior, and are NOT required for the behavior fix — no
+  server restart is implied by this plan. The frozen WS contract
   (`port/contract/ws-server-messages.schema.json:3205-3221`, `"payload": true`)
   is untouched.
 - Default-`true` semantics preserve every local/user-driven flow (tab-bar "+",
@@ -584,6 +589,7 @@ tab-hiding step now uses an explicit reveal (REST create no longer activates)."
 - Test: `test/unit/client/components/panes/EditorPane.test.tsx` (monaco mock :23-36 gains onMount support)
 - Test: `test/unit/client/components/panes/PanePicker.test.tsx` (renderPicker helper :120-136 + auto-focus describe :675-681)
 - Test (create): `test/unit/client/components/TerminalView.focusGate.test.tsx`
+- Test (create): `test/unit/client/components/panes/PaneContainer.focusEligible.test.tsx`
 
 **Interfaces:**
 - Consumes: nothing from Task 1 (independent layer; either can land first).
@@ -709,7 +715,7 @@ vi.mock('@monaco-editor/react', () => {
       monacoMountControl.enabled = false
     })
 
-    it('focuses the editor on mount for the pane owning focus (default)', async () => {
+    it('focuses the editor on mount for an eligible pane (default)', async () => {
       monacoMountControl.enabled = true
       render(
         <Provider store={store}>
@@ -720,9 +726,9 @@ vi.mock('@monaco-editor/react', () => {
       await waitFor(() => expect(monacoMountControl.focus).toHaveBeenCalled())
     })
 
-    it('does not focus the editor on mount when focusEligible is false', async () => {
+    it('does not focus the editor while ineligible, but focuses on the later false→true flip (explicit select)', async () => {
       monacoMountControl.enabled = true
-      render(
+      const { rerender } = render(
         <Provider store={store}>
           <EditorPane paneId="pane-1" tabId="tab-1" filePath="/test.ts" language="typescript" readOnly={false} content="const x = 1" viewMode="source" focusEligible={false} />
         </Provider>
@@ -730,6 +736,13 @@ vi.mock('@monaco-editor/react', () => {
       await waitFor(() => expect(screen.getByTestId('monaco-mock')).toBeInTheDocument())
       await new Promise((r) => setTimeout(r, 50))
       expect(monacoMountControl.focus).not.toHaveBeenCalled()
+
+      rerender(
+        <Provider store={store}>
+          <EditorPane paneId="pane-1" tabId="tab-1" filePath="/test.ts" language="typescript" readOnly={false} content="const x = 1" viewMode="source" focusEligible />
+        </Provider>
+      )
+      await waitFor(() => expect(monacoMountControl.focus).toHaveBeenCalledTimes(1))
     })
   })
 ```
@@ -795,14 +808,163 @@ describe('TerminalView scheduled-focus gate (agent focus neutrality)', () => {
 
 (The positive pin doubles as harness validation: if IT fails pre-change, the scheduler flush never fired — debug the harness, not the gate.)
 
+(f) Create `test/unit/client/components/panes/PaneContainer.focusEligible.test.tsx` — the WIRING coverage that PaneContainer computes `focusEligible = !hidden && activePane === node.id` and forwards it to the browser, editor, and picker arms (a misrouted or omitted forward would otherwise pass every component-level test while real panes still steal focus). `PaneContainer`'s props are `{ tabId, node, hidden? }` (PaneContainer.tsx:74-78):
+
+```tsx
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { render, cleanup } from '@testing-library/react'
+import { configureStore } from '@reduxjs/toolkit'
+import { Provider } from 'react-redux'
+import PaneContainer from '@/components/panes/PaneContainer'
+import panesReducer from '@/store/panesSlice'
+import tabsReducer from '@/store/tabsSlice'
+import settingsReducer from '@/store/settingsSlice'
+import connectionReducer from '@/store/connectionSlice'
+import extensionsReducer from '@/store/extensionsSlice'
+import terminalMetaReducer from '@/store/terminalMetaSlice'
+import sessionsReducer from '@/store/sessionsSlice'
+import freshAgentReducer from '@/store/freshAgentSlice'
+import opencodeActivityReducer from '@/store/opencodeActivitySlice'
+import turnCompletionReducer from '@/store/turnCompletionSlice'
+import type { PaneNode } from '@/store/paneTypes'
+
+const captured = vi.hoisted(() => ({
+  browser: [] as any[],
+  editor: [] as any[],
+  picker: [] as any[],
+}))
+
+vi.mock('@/components/panes/BrowserPane', () => ({
+  default: (props: any) => { captured.browser.push(props); return null },
+}))
+vi.mock('@/components/panes/EditorPane', () => ({
+  default: (props: any) => { captured.editor.push(props); return null },
+}))
+vi.mock('@/components/panes/PanePicker', () => ({
+  default: (props: any) => { captured.picker.push(props); return null },
+}))
+vi.mock('@/components/TerminalView', () => ({
+  default: () => null,
+}))
+
+function makeStore(panesState: any) {
+  return configureStore({
+    reducer: {
+      panes: panesReducer,
+      tabs: tabsReducer,
+      settings: settingsReducer,
+      connection: connectionReducer,
+      extensions: extensionsReducer,
+      terminalMeta: terminalMetaReducer,
+      sessions: sessionsReducer,
+      freshAgent: freshAgentReducer,
+      opencodeActivity: opencodeActivityReducer,
+      turnCompletion: turnCompletionReducer,
+    },
+    preloadedState: {
+      tabs: {
+        tabs: [{ id: 'tab-1', createRequestId: 'r1', title: 'T1', status: 'running', mode: 'shell', shell: 'system', createdAt: 1 }],
+        activeTabId: 'tab-1',
+        renameRequestTabId: null,
+      },
+      panes: {
+        layouts: {},
+        activePane: {},
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+        ...panesState,
+      },
+    } as any,
+  })
+}
+
+const browserLeaf: PaneNode = {
+  type: 'leaf',
+  id: 'pane-b',
+  content: { kind: 'browser', url: 'https://example.com', devToolsOpen: false, browserInstanceId: 'bi-1' },
+} as any
+const editorLeaf: PaneNode = {
+  type: 'leaf',
+  id: 'pane-e',
+  content: { kind: 'editor', filePath: '/tmp/a.ts', language: 'typescript', readOnly: false, content: 'x', viewMode: 'source', wordWrap: true },
+} as any
+const pickerLeaf: PaneNode = { type: 'leaf', id: 'pane-k', content: { kind: 'picker' } } as any
+
+function renderNode(node: PaneNode, opts: { hidden?: boolean; activePaneId?: string } = {}) {
+  const leafId = (function firstLeaf(n: PaneNode): string { return n.type === 'leaf' ? n.id : firstLeaf(n.children[0]) })(node)
+  const store = makeStore({
+    layouts: { 'tab-1': node },
+    activePane: { 'tab-1': opts.activePaneId ?? leafId },
+  })
+  return render(
+    <Provider store={store}>
+      <PaneContainer tabId="tab-1" node={node} hidden={opts.hidden} />
+    </Provider>,
+  )
+}
+
+describe('PaneContainer focusEligible wiring', () => {
+  beforeEach(() => { captured.browser.length = captured.editor.length = captured.picker.length = 0 })
+  afterEach(() => cleanup())
+
+  it('browser arm: eligible when visible + active pane', () => {
+    renderNode(browserLeaf)
+    expect(captured.browser[0].focusEligible).toBe(true)
+  })
+
+  it('browser arm: ineligible when the tab is hidden', () => {
+    renderNode(browserLeaf, { hidden: true })
+    expect(captured.browser[0].focusEligible).toBe(false)
+  })
+
+  it('browser arm: ineligible when another pane is active in the visible tab', () => {
+    const terminalLeaf: PaneNode = { type: 'leaf', id: 'pane-t', content: { kind: 'terminal', mode: 'shell' } } as any
+    const split: PaneNode = { type: 'split', id: 'split-1', direction: 'horizontal', sizes: [50, 50], children: [browserLeaf, terminalLeaf] }
+    renderNode(split, { activePaneId: 'pane-t' })
+    expect(captured.browser[0].focusEligible).toBe(false)
+  })
+
+  it('editor arm: eligible when visible + active pane', () => {
+    renderNode(editorLeaf)
+    expect(captured.editor[0].focusEligible).toBe(true)
+  })
+
+  it('editor arm: ineligible when the tab is hidden', () => {
+    renderNode(editorLeaf, { hidden: true })
+    expect(captured.editor[0].focusEligible).toBe(false)
+  })
+
+  it('picker arm: eligible when visible + active pane', () => {
+    renderNode(pickerLeaf)
+    expect(captured.picker[0].focusEligible).toBe(true)
+  })
+
+  it('picker arm: ineligible when the tab is hidden', () => {
+    renderNode(pickerLeaf, { hidden: true })
+    expect(captured.picker[0].focusEligible).toBe(false)
+  })
+})
+```
+
+(DirectoryPicker sits one hop deeper, inside PickerWrapper's directory step; it
+receives the identical forwarded value from the adjacent JSX line — the
+"picker arm ineligible" test pins the wrapper's forwarding, and per-component
+behavior is pinned in (a).)
+
 - [ ] **Step 2: Run the tests and verify the intended failures**
 
-Run: `env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL npm run test:vitest -- run test/unit/client/components/panes/DirectoryPicker.test.tsx test/unit/client/components/panes/BrowserPane.test.tsx test/unit/client/components/panes/PanePicker.test.tsx test/unit/client/components/panes/EditorPane.test.tsx test/unit/client/components/TerminalView.focusGate.test.tsx --config config/vitest/vitest.config.ts`
+Run: `env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL npm run test:vitest -- run test/unit/client/components/panes/DirectoryPicker.test.tsx test/unit/client/components/panes/BrowserPane.test.tsx test/unit/client/components/panes/PanePicker.test.tsx test/unit/client/components/panes/EditorPane.test.tsx test/unit/client/components/panes/PaneContainer.focusEligible.test.tsx test/unit/client/components/TerminalView.focusGate.test.tsx --config config/vitest/vitest.config.ts`
 
 Expected: FAIL, exactly —
-- DirectoryPicker/BrowserPane/PanePicker/EditorPane: the `focusEligible is false` tests fail (focus happens unconditionally today; the prop is unknown/ignored).
+- DirectoryPicker/BrowserPane/PanePicker: the `focusEligible is false` tests fail (focus happens unconditionally today; the prop is unknown/ignored).
+- EditorPane: the ineligible-no-focus + false→true flip test fails (today `handleEditorMount` focuses unconditionally — the negative assertion fails before the flip is reached).
+- PaneContainer.focusEligible: ALL wiring tests fail (no `focusEligible` prop exists today → captured value is `undefined`, so the `=== true` and `=== false` assertions both fail).
 - TerminalView.focusGate: the two `never focuses` tests fail (`flushScheduledLayout`'s focus is ungated today).
-Expected PASS already (pins): every default-omitted focus test (proves today’s user-flow autofocus).
+Expected PASS already (pins): the four component-level `focusEligible` DEFAULT tests (DirectoryPicker/BrowserPane/PanePicker/EditorPane eligible cases — today's unconditional focus satisfies them).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -874,14 +1036,25 @@ Expected PASS already (pins): every default-omitted focus test (proves today’s
 `src/components/panes/EditorPane.tsx`:
 - `EditorPaneProps` (:129-138): add `focusEligible?: boolean`.
 - Destructure: add `focusEligible = true`.
-- `handleEditorMount` (:295-298):
+- Split mount from focus so later eligibility flips (explicit select of a
+  background-mounted editor) still acquire DOM focus — `handleEditorMount`
+  fires only once per Monaco mount, so the gate cannot live there alone
+  (:295-298 becomes ref-store only; focus moves into an eligibility effect):
 
 ```tsx
   function handleEditorMount(editor: Monaco.editor.IStandaloneCodeEditor) {
     editorRef.current = editor
-    if (focusEligible) editor.focus()
   }
+
+  // Focus whenever this pane OWNS focus: on mount while eligible AND on any
+  // later false→true eligibility flip (explicit tab/pane select bringing a
+  // background-mounted editor forward). Background-mounted editors never focus.
+  useEffect(() => {
+    if (focusEligible) editorRef.current?.focus()
+  }, [focusEligible])
 ```
+
+(`useEffect` is already imported in EditorPane.tsx; verify during Step 4 rather than re-reading here.)
 
 `src/components/panes/PanePicker.tsx`:
 - `PanePickerProps` (:66-72): add `focusEligible?: boolean`.
@@ -943,9 +1116,9 @@ gates on `shouldFocusActiveTerminal` — no change.)
 
 - [ ] **Step 4: Run the focused tests**
 
-Run: `env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL npm run test:vitest -- run test/unit/client/components/panes/DirectoryPicker.test.tsx test/unit/client/components/panes/BrowserPane.test.tsx test/unit/client/components/panes/PanePicker.test.tsx test/unit/client/components/panes/EditorPane.test.tsx test/unit/client/components/TerminalView.focusGate.test.tsx --config config/vitest/vitest.config.ts`
+Run: `env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL npm run test:vitest -- run test/unit/client/components/panes/DirectoryPicker.test.tsx test/unit/client/components/panes/BrowserPane.test.tsx test/unit/client/components/panes/PanePicker.test.tsx test/unit/client/components/panes/EditorPane.test.tsx test/unit/client/components/panes/PaneContainer.focusEligible.test.tsx test/unit/client/components/TerminalView.focusGate.test.tsx --config config/vitest/vitest.config.ts`
 
-Expected: PASS (new gates green; all pins green).
+Expected: PASS (new gates green; wiring green; all pins green).
 
 - [ ] **Step 5: Refactor while green**
 
@@ -971,7 +1144,7 @@ renderContent indirectly), and all `TerminalView.*` files.
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add src/components/panes/PaneContainer.tsx src/components/panes/BrowserPane.tsx src/components/panes/EditorPane.tsx src/components/panes/PanePicker.tsx src/components/panes/DirectoryPicker.tsx src/components/TerminalView.tsx test/unit/client/components/panes/BrowserPane.test.tsx test/unit/client/components/panes/DirectoryPicker.test.tsx test/unit/client/components/panes/EditorPane.test.tsx test/unit/client/components/panes/PanePicker.test.tsx test/unit/client/components/TerminalView.focusGate.test.tsx
+git add src/components/panes/PaneContainer.tsx src/components/panes/BrowserPane.tsx src/components/panes/EditorPane.tsx src/components/panes/PanePicker.tsx src/components/panes/DirectoryPicker.tsx src/components/TerminalView.tsx test/unit/client/components/panes/BrowserPane.test.tsx test/unit/client/components/panes/DirectoryPicker.test.tsx test/unit/client/components/panes/EditorPane.test.tsx test/unit/client/components/panes/PanePicker.test.tsx test/unit/client/components/panes/PaneContainer.focusEligible.test.tsx test/unit/client/components/TerminalView.focusGate.test.tsx
 git commit -m "feat(client): gate mount-time DOM focus on pane focus eligibility
 
 PaneContainer computes focusEligible = !hidden && activePane === node.id and
@@ -992,8 +1165,10 @@ user-flow autofocus."
 - Consumes: nothing from Tasks 1-2 (independent hardening).
 - Produces: `restoreFocus` becomes exported (directly unit-testable) and
   `FocusSnapshot` becomes an exported type. Visible behavior change: a capture
-  whose original focus target was deleted mid-capture now reports
-  `restoredFocus:false` instead of resurrecting the dead id into Redux state.
+  whose original focus target was deleted mid-capture now skips the dead
+  target (never resurrecting a dead id into Redux state), restores every
+  surviving target best-effort, and reports `restoredFocus:false` when any
+  target was skipped.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1084,6 +1259,9 @@ describe('restoreFocus deleted-target hardening', () => {
 
   it('never dispatches setActivePane for a pane deleted mid-capture (reports false)', async () => {
     const store = createFocusStore()
+    // closePane is a no-op on a root leaf, so split first, then close the
+    // snapshot pane (leaving layout collapsed to the sibling leaf).
+    store.dispatch(splitPane({ tabId: 'tab-2', paneId: 'pane-2', direction: 'horizontal', newContent: { kind: 'terminal', mode: 'shell' }, newPaneId: 'pane-2b' }))
     store.dispatch(closePane({ tabId: 'tab-2', paneId: 'pane-2' }))
     const spy = vi.spyOn(store, 'dispatch')
     const ok = await restoreFocus(
@@ -1094,6 +1272,23 @@ describe('restoreFocus deleted-target hardening', () => {
     expect(ok).toBe(false)
     const setPaneCalls = spy.mock.calls.filter(([a]) => (a as any)?.type === 'panes/setActivePane')
     expect(setPaneCalls).toHaveLength(0)
+  })
+
+  it('still restores the surviving active tab when only a pane target vanished (best-effort, reports false)', async () => {
+    const store = createFocusStore()
+    store.dispatch(splitPane({ tabId: 'tab-2', paneId: 'pane-2', direction: 'horizontal', newContent: { kind: 'terminal', mode: 'shell' }, newPaneId: 'pane-2b' }))
+    store.dispatch(closePane({ tabId: 'tab-2', paneId: 'pane-2' }))
+    store.dispatch(setActiveTab('tab-2')) // the capture itself switched the user away
+    const spy = vi.spyOn(store, 'dispatch')
+    const ok = await restoreFocus(
+      { dispatch: store.dispatch, getState: store.getState },
+      { activeTabId: 'tab-1', activePaneByTab: { 'tab-2': 'pane-2' } },
+      new Set(['tab-2']),
+    )
+    expect(ok).toBe(false)                                   // incomplete restore, honestly reported
+    expect(store.getState().tabs.activeTabId).toBe('tab-1')  // surviving tab focus STILL restored
+    const setPaneCalls = spy.mock.calls.filter(([a]) => (a as any)?.type === 'panes/setActivePane')
+    expect(setPaneCalls).toHaveLength(0)                     // never toward the dead pane
   })
 })
 ```
@@ -1106,7 +1301,8 @@ Run: `env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHE
 
 Expected: FAIL, exactly —
 - tab-deleted test: today `restoreFocus` dispatches `tabs/setActiveTab` into the dead id (spy records it) and returns truthy.
-- pane-deleted test: today `restoreFocus` either dispatches `panes/setActivePane` toward the dead pane (spy records it) or returns `true` (if `closePane` left a stale `activePane` entry). At least one assertion must fail — both failure shapes are the bug.
+- pane-deleted test: today, after split+close, `activePane['tab-2']` is the sibling `'pane-2b'` ≠ snapshot `'pane-2'`, so restore dispatches `panes/setActivePane` toward the dead pane (spy records it) and the post-paint verify passes → returns `true`. Both assertions fail.
+- best-effort test: the zero-dead-pane-dispatch assertion fails identically (today's restore dispatches to the dead pane; it restores the tab too, so only that assertion is discriminating).
 Expected PASS already (pins): the two restore-success pin tests prove current behavior for live targets.
 
 - [ ] **Step 3: Add the minimal production implementation**
@@ -1122,17 +1318,22 @@ export type FocusSnapshot = {
 
 ```ts
 export async function restoreFocus(ctx: RuntimeContext, before: FocusSnapshot, paneTabsToRestore: Set<string>): Promise<boolean> {
+  let incomplete = false
   try {
     for (const tabId of paneTabsToRestore) {
       const originalPaneId = before.activePaneByTab[tabId]
       if (!originalPaneId) continue
       const state = ctx.getState()
-      // A pane/tab deleted mid-capture can never receive focus back:
-      // dispatching the restore would resurrect a dead activePane entry and
-      // blank the tab's work area. A capture whose focus target vanished
-      // cannot honestly report restoredFocus — return false instead.
-      if (!state.tabs.tabs.some((t) => t.id === tabId)) return false
-      if (!nodeContainsPane(state.panes.layouts[tabId], originalPaneId)) return false
+      // Best-effort: a pane/tab deleted mid-capture can never receive focus
+      // back — skip it (dispatching the restore would resurrect a dead
+      // activePane entry and blank the tab's work area), mark the restore
+      // incomplete, and KEEP restoring the surviving targets rather than
+      // leaving the user parked on a capture-selected tab/pane.
+      if (!state.tabs.tabs.some((t) => t.id === tabId)
+        || !nodeContainsPane(state.panes.layouts[tabId], originalPaneId)) {
+        incomplete = true
+        continue
+      }
       if (state.panes.activePane[tabId] !== originalPaneId) {
         ctx.dispatch(setActivePane({ tabId, paneId: originalPaneId }))
       }
@@ -1140,8 +1341,9 @@ export async function restoreFocus(ctx: RuntimeContext, before: FocusSnapshot, p
 
     if (before.activeTabId) {
       const state = ctx.getState()
-      if (!state.tabs.tabs.some((t) => t.id === before.activeTabId)) return false
-      if (state.tabs.activeTabId !== before.activeTabId) {
+      if (!state.tabs.tabs.some((t) => t.id === before.activeTabId)) {
+        incomplete = true
+      } else if (state.tabs.activeTabId !== before.activeTabId) {
         ctx.dispatch(setActiveTab(before.activeTabId))
       }
     }
@@ -1149,13 +1351,16 @@ export async function restoreFocus(ctx: RuntimeContext, before: FocusSnapshot, p
     await afterPaint()
 
     const after = ctx.getState()
-    if (before.activeTabId && after.tabs.activeTabId !== before.activeTabId) return false
+    if (before.activeTabId
+      && after.tabs.tabs.some((t) => t.id === before.activeTabId)
+      && after.tabs.activeTabId !== before.activeTabId) return false
     for (const tabId of paneTabsToRestore) {
       const originalPaneId = before.activePaneByTab[tabId]
       if (!originalPaneId) continue
-      if (after.panes.activePane[tabId] !== originalPaneId) return false
+      if (nodeContainsPane(after.panes.layouts[tabId], originalPaneId)
+        && after.panes.activePane[tabId] !== originalPaneId) return false
     }
-    return true
+    return !incomplete
   } catch {
     return false
   }
@@ -1374,15 +1579,36 @@ failure — verify by reading the code path, no re-run on unfixed base required:
 
 - [ ] **Step 3: Add registration (no production code)**
 
-In `test/e2e-browser/playwright.config.ts`, rust-chromium `testMatch` (:353-383), append after the mcp-qa-smoke entry:
+Rust-only specs must appear in BOTH lists — the match-all `chromium` project
+uses `RUST_ONLY_SPECS` as its `testIgnore` (playwright.config.ts:330), so an
+entry missing there gets picked up by chromium and fails its own
+`expect(e2eServerKind).toBe('rust')` guard (the cloud config inherits the
+chromium project, so it is affected identically).
+
+In `test/e2e-browser/playwright.config.ts`:
+
+(a) Append to `RUST_ONLY_SPECS` (:176+, a list of regexes with rationale comments):
+
+```ts
+  // MCP/REST focus neutrality: hard `expect(e2eServerKind).toBe('rust')` guard
+  // and owned-RustServer wall harness (same convention as the other entries,
+  // e.g. terminal-activity-rust).
+  /mcp-focus-neutrality-rust\.spec\.ts$/,
+```
+
+(b) Append to the rust-chromium project `testMatch` (:353-383), after the mcp-qa-smoke entry:
 
 ```ts
         // MCP/REST focus neutrality: agent-surface creates/splits must not
         // change client focus (Redux active tab/pane nor DOM focus); only the
-        // explicit select routes may. Rust-only by convention (owned-wall
-        // harness, same as hidden-pane-rebind-rust).
+        // explicit select routes may.
         /mcp-focus-neutrality-rust\.spec\.ts$/,
 ```
+
+Verify the non-rust discovery path no longer sees it:
+`env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL npx playwright test --config test/e2e-browser/playwright.config.ts --project=chromium --list 2>&1 | grep -c mcp-focus-neutrality` → Expected output: `0`
+and the rust lane does:
+`env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium --list 2>&1 | grep -c mcp-focus-neutrality` → Expected output: `1`
 
 Cloud legality: the spec uses ONLY shell-mode terminals — no external CLIs —
 so it must NOT be added to `CLOUD_SKIP_SPECS` in
@@ -1416,9 +1642,9 @@ git commit -m "test(e2e): MCP/REST focus-neutrality coverage (rust)
 
 New rust-only spec proves REST tab create + pane split leave the client's
 active tab, per-tab active pane, and document.activeElement untouched, while
-the explicit tab/pane select routes still move focus. Registered in
-rust-chromium testMatch (cloud-legal: shell-mode only, not in
-CLOUD_SKIP_SPECS)."
+the explicit tab/pane select routes still move focus. Registered in BOTH
+RUST_ONLY_SPECS (chromium testIgnore) and the rust-chromium testMatch.
+Cloud-legal: shell-mode only, not in CLOUD_SKIP_SPECS."
 ```
 
 ### Task 5: Documentation — MCP tool text, orchestration skill, parity addendum, AGENTS.md
@@ -1435,24 +1661,50 @@ CLOUD_SKIP_SPECS)."
 - Produces: agent-facing documentation matching the new contract, so MCP
   agents learn "creates are focus-neutral; select explicitly to move focus".
 
-- [ ] **Step 1: Write the verification test**
+- [ ] **Step 1: Write the failing verification test**
 
-Text-only + comment edits are doc changes; per the development philosophy,
-trivial doc changes need no RED cycle — but the MCP tool text is executable
-surface area, so its existing unit suite is the gate (see Step 4).
+The instruction strings ARE executable surface (they ship to every MCP agent),
+so pin their content rather than trusting unreviewed prose. Append to
+`test/unit/server/mcp/freshell-tool.test.ts` (extend the existing import at :15
+of `TOOL_DESCRIPTION, INPUT_SCHEMA, executeAction` with `INSTRUCTIONS`):
 
-- [ ] **Step 2: Run the test and verify the current pass**
+```ts
+describe('focus-neutrality documentation', () => {
+  it('agent-facing text documents focus neutrality and the explicit select verbs', async () => {
+    expect(TOOL_DESCRIPTION).toContain('focus-neutral')
+    expect(TOOL_DESCRIPTION).toContain('select-tab')
+    expect(INSTRUCTIONS).toContain('focus-neutral')
+    expect(INSTRUCTIONS).toContain('select-tab')
+    expect(INSTRUCTIONS).toContain('select-pane')
+    // HELP_TEXT is module-private but reachable through the tool's own help
+    // action (freshell-tool.ts case 'help' returns HELP_TEXT directly, ~:944).
+    expect(await executeAction('help', {})).toContain('focus-neutral')
+  })
+})
+```
 
-Run: `env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL npm run test:vitest -- run test/unit/server/mcp/freshell-tool.test.ts --config config/vitest/vitest.config.ts`
-Expected: PASS (baseline before edits).
+- [ ] **Step 2: Run the test and verify the intended failure**
+
+Run: `env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL npm run test:vitest -- run test/unit/server/mcp/freshell-tool.test.ts --config config/vitest/vitest.server.config.ts`
+
+NOTE the config: `test/unit/server/**` is EXCLUDED from the default client
+vitest config (config/vitest/vitest.config.ts:40) — every command touching this
+file MUST use `config/vitest/vitest.server.config.ts`.
+
+Expected: FAIL only in the new `focus-neutrality documentation` test (none of
+the three strings contains the contract today); every pre-existing test PASS.
 
 - [ ] **Step 3: Make the documentation edits**
 
-`server/mcp/freshell-tool.ts` — add this bullet to the `KEY GOTCHAS` section of TOOL/INSTRUCTIONS (and mirror a one-liner into HELP_TEXT near `select-tab`):
+`server/mcp/freshell-tool.ts`:
+- TOOL_DESCRIPTION (:27+): append this sentence — `Creation actions (new-tab, split-pane) are focus-neutral; use select-tab to move the user's focus explicitly.`
+- Add this bullet to the `KEY GOTCHAS` section of INSTRUCTIONS (:46+):
 
 ```
 **Focus neutrality:** new-tab, split-pane, and every pane/tab creation are focus-neutral — they never change which tab or pane the user is looking at. Use select-tab / select-pane when you explicitly intend to move the user's focus. send-keys, capture-pane, and wait-for all target panes without moving focus.
 ```
+
+- HELP_TEXT (:411+): on the `select-tab` / `select-pane` entry lines, append `(pane/tab creation is focus-neutral — select moves focus explicitly)`.
 
 `.agents/skills/freshell-orchestration/SKILL.md` — add a short section (near the tab/pane focus documentation):
 
@@ -1490,8 +1742,8 @@ Agent-driven tab/pane creation is focus-neutral by contract: server-broadcast ui
 Run: `env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL npm run typecheck`
 Expected: PASS (`freshell-tool.ts` is TypeScript — string edits typecheck trivially).
 
-Run: `env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL npm run test:vitest -- run test/unit/server/mcp/freshell-tool.test.ts --config config/vitest/vitest.config.ts`
-Expected: PASS (suite exercises tool actions/params, not the doc strings).
+Run: `env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL npm run test:vitest -- run test/unit/server/mcp/freshell-tool.test.ts --config config/vitest/vitest.server.config.ts`
+Expected: PASS (new doc-content test green; the rest of the suite exercises tool actions/params unchanged).
 
 Run: `env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL npm run lint`
 Expected: PASS (a11y lint is CI-required before merge; unrelated to the doc edits but cheap to confirm).
@@ -1507,9 +1759,33 @@ Doc-only task; the typecheck + mcp tool suite above is the complete impacted set
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add server/mcp/freshell-tool.ts .agents/skills/freshell-orchestration/SKILL.md docs/plans/2026-07-18-agent-api-mcp-parity-spec.md AGENTS.md
-git commit -m "docs: document agent focus neutrality (MCP tool, orchestration skill, parity addendum, AGENTS)"
+git add server/mcp/freshell-tool.ts test/unit/server/mcp/freshell-tool.test.ts .agents/skills/freshell-orchestration/SKILL.md docs/plans/2026-07-18-agent-api-mcp-parity-spec.md AGENTS.md
+git commit -m "docs: document agent focus neutrality (MCP tool, orchestration skill, parity addendum, AGENTS)
+
+Also pins the three agent-facing instruction surfaces (TOOL_DESCRIPTION,
+INSTRUCTIONS, HELP_TEXT via the help action) in test/unit/server/mcp/freshell-tool.test.ts."
 ```
+
+## Fresh Eyes record
+
+- **Round 1 (Codex, independent): FAILED — 8 Major**, all assessed valid and
+  fixed in this revision: (1) server-tree constraint vs Task 5's
+  freshell-tool.ts text edit reconciled (doc-string-only carve-out + MCP
+  rebuild deploy story); (2) PaneContainer focusEligible wiring tests added
+  (new `PaneContainer.focusEligible.test.tsx` covers browser/editor/picker
+  arms × eligible/hidden/other-pane-active, so a misrouted prop cannot pass
+  green); (3) EditorPane focus moved out of mount-only `handleEditorMount`
+  into a `focusEligible` effect (false→true flips focus on explicit select);
+  (4) Task 3 deleted-pane fixture now split-then-close (root-leaf closePane
+  is a no-op); (5) restoreFocus is best-effort + incomplete-reporting instead
+  of early-return (surviving tab focus still restored); (6) the new e2e spec
+  registers in BOTH `RUST_ONLY_SPECS` and rust-chromium testMatch (+ `--list`
+  verification); (7) Task 5's MCP suite runs under
+  `vitest.server.config.ts` (`test/unit/server/**` is excluded from the
+  default config); (8) Task 5 pins the doc strings with a real RED test
+  across TOOL_DESCRIPTION, INSTRUCTIONS, and HELP_TEXT (via the help action).
+  Runner report:
+  `.worktrees/.the-usual-logs/mcp-focus-neutrality/review-logs/usual-fresheyes-20260826T010828Z-942802.md`
 
 ## Out of scope (recorded, not fixed here)
 
