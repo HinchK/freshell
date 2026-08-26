@@ -929,7 +929,9 @@ In `test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx`:
       const { rerender } = render(
         <FreshAgentTranscript isStreaming showThinking={false} turns={[turnA, thinkingTurn]} />,
       )
-      expect(screen.getByText('Considering options')).toBeInTheDocument()
+      // The fully-filtered thinking-only tail never paints its hidden-derived
+      // caption (task (c)); the placeholder article renders nothing.
+      expect(screen.queryByText('Considering options')).not.toBeInTheDocument()
       rerender(<FreshAgentTranscript isStreaming showThinking={false} turns={[turnA, thinkingTurn, turnB]} />)
       expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
       expect(screen.queryByText('Considering options')).not.toBeInTheDocument()
@@ -1113,8 +1115,10 @@ function buildTranscriptLayout(
     layouts.push(layout)
     if (turn.items.length === 0) {
       // Zero-item turns hard-close any open line and render their own article;
-      // they never carry a caption (no Rust producer emits a zero-item turn
-      // with a non-blank summary, LB-4), so nothing folds here.
+      // they never carry a caption OF THEIR OWN (no Rust producer emits a
+      // zero-item turn with a non-blank summary, LB-4). The close itself is a
+      // later-activity boundary: Task 4's stash treats it as superseding the
+      // closing line's last member.
       flushOpen()
       continue
     }
@@ -1348,6 +1352,36 @@ Add a `describe('foldable echo captions')` inside `describe('activity line colla
       expect(screen.queryByTestId('fresh-agent-activity-caption')).not.toBeInTheDocument()
     })
 
+    it('a zero-item structural turn closes the line and folds its last member caption into the expansion', () => {
+      // Supersede semantics (fresh-eyes round 2, Finding 3): the zero-item
+      // opencode structural turn contributes nothing itself — but its ARRIVAL
+      // is a later-activity boundary that closes the open line, so the closing
+      // line's last member is superseded and its gated echo caption stashes.
+      // Without this, a caption painted moments ago would vanish with nowhere
+      // to go — the exact failure the fold feature exists to fix.
+      const captionTurn = {
+        id: 'turn-caption', turnId: 'turn-caption', role: 'assistant' as const,
+        summary: 'Considering options', summaryKind: 'echo' as const,
+        items: [{ id: 'tool-c2', kind: 'tool_use' as const, toolUseId: 'c2', name: 'Read', input: { file_path: 'src/b.ts' } }],
+      }
+      render(
+        <FreshAgentTranscript
+          isStreaming
+          turns={[
+            toolTurn('turn-a', [['c1', 'src/a.ts']]),
+            captionTurn,
+            { id: 'turn-empty', turnId: 'turn-empty', role: 'assistant' as const, summary: '', summaryKind: 'echo' as const, items: [] },
+            toolTurn('turn-b', [['c3', 'src/c.ts']]),
+          ]}
+        />,
+      )
+      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(2)
+      expect(screen.queryByTestId('fresh-agent-tail-caption')).not.toBeInTheDocument()
+      expect(screen.queryByText('Considering options')).not.toBeInTheDocument()
+      fireEvent.click(screen.getAllByRole('button', { name: 'Toggle activity details' })[0])
+      expect(screen.getByTestId('fresh-agent-activity-caption')).toHaveTextContent('Considering options')
+    })
+
     it('never folds authored prose: it stays painted and keeps the lines separate', () => {
       const proseTurn = {
         id: 'turn-prose', turnId: 'turn-prose', role: 'assistant' as const,
@@ -1393,7 +1427,7 @@ Re-check, no edit: `'treats a zero-item turn as a boundary between tool lines'` 
 
 Run: `npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx`
 
-Expected: FAIL because the superseded-member stash does not exist yet — `fresh-agent-activity-caption` matches nothing, so the extended fold-baseline test and both fully-visible-gate lane tests red on their positive caption assertions (`getByTestId`/`getAllByTestId` find zero caption rows). Each lane test has a second, stronger red mode: run against the stash WITHOUT the `hadFilteredItems` gate (the natural first cut), it finds the hidden text stashed in the expansion — the red that pins LB-1's leak shut (both directions: the Task-3 paint gate already passed it, the Task-4 stash gate is what these tests add). Green from the start BY DESIGN: the authored-boundary test and the zero-item benign-boundary test pin behavior the pre-fold layout already has. Not syntax/setup accidents.
+Expected: FAIL because the superseded-member stash does not exist yet — `fresh-agent-activity-caption` matches nothing, so the extended fold-baseline test, the zero-item-close supersede pin, and both fully-visible-gate lane tests red on their positive caption assertions (`getByTestId`/`getAllByTestId` find zero caption rows). Each lane test has a second, stronger red mode: run against the stash WITHOUT the `hadFilteredItems` gate (the natural first cut), it finds the hidden text stashed in the expansion — the red that pins LB-1's leak shut (both directions: the Task-3 paint gate already passed it, the Task-4 stash gate is what these tests add). Green from the start BY DESIGN: the authored-boundary test and the zero-item benign-boundary test pin behavior the pre-fold layout already has. Not syntax/setup accidents.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -1501,7 +1535,7 @@ function buildActivity(
 }
 ```
 
-3. `buildTranscriptLayout` — flush paths gain the superseded-member stash (changes vs Task 3's member-tracking version: `flushOpen(stashLastMember)` stashes members' pre-gated captions into the line's `captions` before `buildActivity`; the final post-loop flush passes `false` and yields `tailCaption`). Also update the layout doc comment (:216-218): zero-item turns still hard-close any open line and render their own article — there is NO cross-line zero-item caption fold (no Rust producer emits a zero-item turn with a non-blank summary, LB-4), so the supersession stash is the only fold source; the final open line's last member paints in-stream instead.
+3. `buildTranscriptLayout` — flush paths gain the superseded-member stash (changes vs Task 3's member-tracking version: `flushOpen(stashLastMember)` stashes members' pre-gated captions into the line's `captions` before `buildActivity`; the final post-loop flush passes `false` and yields `tailCaption`). Also update the layout doc comment (:216-218): zero-item turns still hard-close any open line and render their own article; no Rust producer emits a zero-item turn with a non-blank summary (LB-4), so a zero-item turn never folds ITS OWN caption — but the close itself is a later-activity boundary: it supersedes the closing line's last member, whose gated caption folds into THAT LINE's expansion (never cross-line). The supersession stash is the only fold source; the final open line's last member paints in-stream instead.
 
 ```ts
   const flushOpen = (stashLastMember: boolean) => {
@@ -1526,7 +1560,7 @@ function buildActivity(
   }
 ```
 
-Every in-loop flush call site becomes `flushOpen(true)` (zero-item hard-close, role-change invisible boundary, visible-content boundary, line-open replace) — a later visible turn is arriving, so the closing line's last member IS superseded. The post-loop flush is the only `flushOpen(false)`: its last member's caption becomes the painted tail caption (`tailCaption` initialized `null` before the loop). Nothing else in the function changes from Task 3: the absorb branch still only records the member (Task 3 snippet) and pushes the (deduped) item; the absorb guard is byte-identical to Task 3's.
+Every in-loop flush call site becomes `flushOpen(true)` (zero-item hard-close, role-change invisible boundary, visible-content boundary, line-open replace) — a later turn BOUNDARY is arriving, so the closing line's last member IS superseded. Note the semantics precisely: a zero-item structural turn contributes no caption of its own (LB-4), but it is still a later-activity boundary — without stashing the closed line's caption, a caption that painted moments ago would vanish entirely, which is exactly the "caption disappeared before I read it" failure this feature exists to fix. The post-loop flush is the only `flushOpen(false)`: its last member's caption becomes the painted tail caption (`tailCaption` initialized `null` before the loop). Also add the stash buffer to the accumulator (fresh-eyes round 2, Finding 2): the `open` record gains `captions: LineCaption[]`, initialized `captions: []` at the line-open site and reset by every flush. Nothing else changes from Task 3: the absorb branch still only records the member (Task 3 snippet) and pushes the (deduped) item; the absorb guard is byte-identical to Task 3's.
 
 4. Render caption rows in the strip expansion (replace the `displayRows.map` at :719-723; caption rows are non-interactive text — a11y-clean):
 
