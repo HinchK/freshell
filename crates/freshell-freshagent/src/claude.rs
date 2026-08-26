@@ -1984,6 +1984,49 @@ impl FreshClaudeState {
             }
         }
 
+        // ep3-r5 F1 (the admit→teardown window): the gate's quiescence-proof is
+        // consumed ONCE at admission, but the consumer task folds evidence
+        // WITHOUT the session turn lock — a compact can arm and start
+        // (status folded, candidate set, gate re-boosted by ep3-r4 F1) while
+        // this already-admitted handler is doing transcript I/O. Recheck the
+        // tracker at the point of no return (immediately before teardown):
+        // any revived busy truth aborts the rollback here with BUSY_TURN and a
+        // compensating ledger rewrite — the durable pre-write provably matches
+        // the provider (nothing was mutated).
+        if let Ok(ms) = std::env::var("FRESHELL_TEST_CLAUDE_ROLLBACK_PRE_TEARDOWN_MS") {
+            // Test-only knob: parks this handler in the admit→teardown window so
+            // the recheck choreography is deterministic (never in production).
+            if let Ok(ms) = ms.parse::<u64>() {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+            }
+        }
+        let revived = {
+            let tracker = turn_tracker.lock().expect("turn tracker lock");
+            tracker.running.is_some()
+                || tracker.compact_candidate
+                || tracker.queued.iter().any(|op| *op == TrackedOp::Turn)
+        };
+        if revived {
+            // Compensate the pre-op durable record: the provider was never
+            // touched, so the ledger must describe nothing happening —
+            // restore the pre-op record (or an empty one, mirroring the
+            // opencode lane's compensate discipline).
+            if let Some(sink) = self.identity_sink() {
+                let restore = existing
+                    .clone()
+                    .unwrap_or_else(|| RollbackRecord::empty(now));
+                if let Err(e) = sink.record_rollback(PROVIDER, &durable_id, restore).await {
+                    tracing::warn!(error = %e, session = %durable_id, "freshagent.claude.rollback_recheck_compensate_failed");
+                }
+            }
+            reply_sink(rollback_error_frame(
+                &op,
+                "BUSY_TURN",
+                ROLLBACK_BUSY_MESSAGE,
+            ));
+            return;
+        }
+
         // Cancel pending cards BEFORE teardown (decision 6) — both spawn legs.
         self.emit_pending_cancellations(&map_key, &op.session_id, session_type)
             .await;
@@ -3114,12 +3157,12 @@ fn mark_compact_candidate(
     in_turn: &std::sync::atomic::AtomicBool,
     turn_tracker: &std::sync::Mutex<TurnTracker>,
 ) {
-    {
-        turn_tracker
-            .lock()
-            .expect("turn tracker lock")
-            .compact_candidate = true;
-    }
+    // ep3-r5 F2 (torn publication): the candidate bit AND the gate-visible
+    // `in_turn` boost publish ATOMICALLY under the tracker mutex — any reader
+    // seeing `candidate == true` also provably sees `in_turn == true` (the
+    // gate reads `in_turn` first and must never slip a mark→boost pair).
+    let mut tracker = turn_tracker.lock().expect("turn tracker lock");
+    tracker.compact_candidate = true;
     in_turn.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
@@ -7614,6 +7657,112 @@ rl.on('line', (line) => {
             "NOTHING_TO_UNDO",
             "ep2-r1 F2: S's edge is the drop proof and releases — no stale debt may swallow it: {frames:?}"
         );
+        drop(env);
+    }
+
+    /// Focused-review ep3-r5 F2 (publication contract): the candidate mark and
+    /// its gate-visible `in_turn` boost publish under ONE critical section — a
+    /// rollback probe that reads `in_turn` first and refuses to consult the
+    /// tracker on a false read can therefore never slip past a live candidate.
+    /// (The torn two-step shape is not statically reachable; this pins the
+    /// end-state contract the gate's decision rule leans on.)
+    #[test]
+    fn compact_candidate_publication_is_atomic_under_the_tracker_lock() {
+        let in_turn = std::sync::atomic::AtomicBool::new(false);
+        let tracker = std::sync::Mutex::new(TurnTracker::default());
+        mark_compact_candidate(&in_turn, &tracker);
+        assert!(tracker.lock().expect("turn tracker lock").compact_candidate);
+        assert!(in_turn.load(std::sync::atomic::Ordering::SeqCst));
+        // The consume side unwinds the same pair under the same lock.
+        confirm_compact_candidate(&in_turn, &tracker, false); // auto boundary
+        assert!(!tracker.lock().expect("turn tracker lock").compact_candidate);
+        assert!(!in_turn.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// Focused-review ep3-r5 F1 (the admit→teardown window): the gate's
+    /// quiescence-proof is consulted ONCE at admission; the rollback handler
+    /// then runs transcript I/O before tearing the sidecar down, and the
+    /// consumer task folds evidence WITHOUT the session turn lock — a compact
+    /// armed just before admission can START mid-handler (its status folded,
+    /// candidate observed), and pre-fix the complete-determined handler tore
+    /// the sidecar down mid-compaction anyway (the sole busy gate defeated).
+    /// The handler now RECHECKS the tracker at the point of no return: revived
+    /// busy truth aborts the rollback with BUSY_TURN and a compensating ledger
+    /// rewrite, with zero teardown traffic.
+    ///
+    /// Choreography: C1 armed (running) → C2 queued → C1 settles (fold retires
+    /// it; C2 quiescent) → rollback admitted at the gate (absorb, C2 survives)
+    /// → parked in the admit→teardown window (test knob) → C2's compacting
+    /// status folds (the candidate marks mid-flight compaction) → the recheck
+    /// ABORTS the rollback.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_compaction_starting_mid_rollback_aborts_at_the_pre_teardown_recheck() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        std::env::set_var("FRESHELL_TEST_CLAUDE_ROLLBACK_PRE_TEARDOWN_MS", "400");
+        write_rollback_transcript(home.path(), "dur-midcomp", &two_turn_transcript());
+        let (st, _rx) = state_with_bus();
+        let sink_impl = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(sink_impl.clone());
+        let _stdin_log = insert_rollback_fixture_session(&st, "dur-midcomp", "dur-midcomp").await;
+
+        // Arm two compacts: C1 takes the running slot, C2 queues behind.
+        st.handle_compact(compact_msg("dur-midcomp", None)).await;
+        st.handle_compact(compact_msg("dur-midcomp", None)).await;
+        let (in_turn, turn_tracker) = busy_tracker_arcs(&st, "dur-midcomp").await;
+        assert!(in_turn.load(std::sync::atomic::Ordering::SeqCst));
+
+        // C1's own terminal edge (its compacted run settled): retires C1; C2
+        // remains queued-but-quiescent.
+        fold_terminal_edge(&in_turn, &turn_tracker);
+        assert!(
+            in_turn.load(std::sync::atomic::Ordering::SeqCst),
+            "C2's debt keeps the busy truth"
+        );
+
+        let (sink, captured) = capturing_sink();
+        let rollback_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(
+                    rollback_op("dur-midcomp", "rb-midcomp-1", RollbackDirection::Undo),
+                    sink,
+                )
+                .await;
+            })
+        };
+        // Let the rollback pass the gate (absorb admits the quiescent C2) and
+        // park in the admit→teardown window — then C2's compaction STARTS.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        mark_compact_candidate(&in_turn, &turn_tracker);
+        rollback_driver.await.expect("rollback task");
+
+        let frames = captured_json(&captured);
+        assert_eq!(
+            frames[0]["event"]["code"],
+            "BUSY_TURN",
+            "ep3-r5 F1: a compaction starting mid-handler aborts the rollback at the pre-teardown recheck: {frames:?}"
+        );
+        assert_eq!(
+            env.spawn_count(),
+            0,
+            "zero fork-create traffic — the teardown never engaged"
+        );
+        assert!(
+            st.sessions.lock().await.contains_key("dur-midcomp"),
+            "no teardown"
+        );
+        let record = sink_impl
+            .load_rollback("claude", "dur-midcomp")
+            .expect("the compensated ledger row");
+        assert!(
+            record.entries.is_empty(),
+            "the pre-write compensated: the ledger describes no mutation: {record:?}"
+        );
+        std::env::remove_var("FRESHELL_TEST_CLAUDE_ROLLBACK_PRE_TEARDOWN_MS");
         drop(env);
     }
 
