@@ -1026,12 +1026,14 @@ impl FreshOpencodeState {
     /// an aborted drive over an accepted POST can never leave `canRedo` true
     /// across a tail the provider may have deleted). The ONLY failure that
     /// compensates the pre-record back (`restore_redo_on_undelivered_compact`)
-    /// is a PROVABLY-UNDELIVERED dispatch (`ServeError::Undelivered` — the
-    /// transport's connect phase refused before a byte left, so the serve
-    /// never saw the POST); the refusal/preflight no-POST paths likewise leave
-    /// redo valid. EVERY in-flight / HTTP-response outcome after the POST may
-    /// have arrived — a non-2xx ANSWER, a timeout, a mid-flight reset, an
-    /// abort — keeps the destroy forever (error-after-send ≠ tail survived).
+    /// is one PROVING the POST never left the process
+    /// (`ServeError::never_dispatched` — the connect-phase refusal AND every
+    /// startup-phase failure, since the drive runs `ensure_started()` before
+    /// the request exists, ep2-r1 F3); the refusal/preflight no-POST paths
+    /// likewise leave redo valid. EVERY in-flight / HTTP-response outcome after
+    /// the POST may have arrived — a non-2xx ANSWER, a timeout, a mid-flight
+    /// reset, an abort — keeps the destroy forever (error-after-send ≠ tail
+    /// survived).
     /// Markers survive regardless (decision 6).
     pub async fn handle_compact(&self, msg: FreshAgentCompact) {
         let session_id = msg.session_id.clone();
@@ -1134,13 +1136,16 @@ impl FreshOpencodeState {
         // advertising redo over a tail the provider may have deleted. The
         // preflight legs above (untracked session, unmaterialized placeholder,
         // busy refusal, the no-model failure) and ONLY those still skip the
-        // destroy (ep1-r1 F2 unchanged). ep1-r3 F2: the destroy is FINAL once
-        // the drive is engaged — the ONLY compensation is a PROVABLY-UNDELIVERED
-        // dispatch (`ServeError::Undelivered`: connect-phase refusal before a
-        // byte left ⇒ the serve never saw the POST ⇒ the tail provably
-        // survives); every post-send failure class (incl. ANY answered non-2xx —
-        // OpenCode ≥1.18.21's summarize runs revertSvc.cleanup FIRST) lets the
-        // destroy stand. ep2-r1 F2: durable-BEFORE-mutation runs BOTH ways —
+        // destroy (ep1-r1 F2 unchanged). ep1-r3 F2 (widened ep2-r1 F3): the
+        // destroy is FINAL once the drive is engaged — the ONLY compensation is
+        // a failure PROVING the POST never left the process
+        // (`ServeError::never_dispatched`: connect-phase refusal AND every
+        // startup-phase failure — the drive runs `ensure_started()` before the
+        // request exists ⇒ the serve provably never saw the POST ⇒ the tail
+        // provably survives); every post-send failure class (incl. ANY answered
+        // non-2xx — OpenCode ≥1.18.21's summarize runs revertSvc.cleanup FIRST)
+        // lets the destroy stand. ep2-r1 F2: durable-BEFORE-mutation runs BOTH
+        // ways —
         // when the pre-drive destroy CANNOT be persisted, the compact is
         // REFUSED with zero provider traffic (never warn+continue: OpenCode
         // would delete the reverted tail while the durable ledger still
@@ -1196,17 +1201,20 @@ impl FreshOpencodeState {
                         .await
                 }
                 Err(err) => {
-                    // ep1-r3 F2 compensation: ONLY a PROVABLY-UNDELIVERED
-                    // dispatch (ServeError::Undelivered — the connect phase
-                    // refused before a byte left, so the serve never saw the
-                    // POST) proves the reverted tail survived; restoring the
-                    // pre-drive record is honest exactly there. EVERY failure
-                    // timed at/after the send — a non-2xx ANSWER (OpenCode
-                    // ≥1.18.21 summarize runs revertSvc.cleanup FIRST — the
-                    // tail may already be gone), RequestTimeout, mid-flight
-                    // Transport, Decode, and EVERY abort — lets the destroy
-                    // stand forever (error-after-send ≠ tail survived).
-                    if let freshell_opencode::ServeError::Undelivered(_) = &err {
+                    // ep1-r3 F2 compensation: ONLY a failure PROVING the
+                    // summarize POST never left the process
+                    // (`ServeError::never_dispatched` — the connect-phase
+                    // refusal AND every startup-phase failure: the compact
+                    // drive runs `ensure_started()` before the request is even
+                    // constructed, ep2-r1 F3) proves the reverted tail
+                    // survived; restoring the pre-drive record is honest
+                    // exactly there. EVERY failure timed at/after the send — a
+                    // non-2xx ANSWER (OpenCode ≥1.18.21 summarize runs
+                    // revertSvc.cleanup FIRST — the tail may already be gone),
+                    // RequestTimeout, mid-flight Transport, Decode, and EVERY
+                    // abort — lets the destroy stand forever
+                    // (error-after-send ≠ tail survived).
+                    if err.never_dispatched() {
                         if let Some(pre) = pre_drive_record {
                             if let Some(e) =
                                 crate::rollback_record::restore_redo_on_undelivered_compact(
@@ -2639,6 +2647,18 @@ mod tests {
             Ok(Box::new(TrackedProcess {
                 killed: self.killed.clone(),
             }))
+        }
+    }
+
+    /// ep2-r1 F3: a spawner whose `spawn` ALWAYS refuses — the compact drive's
+    /// `ensure_started()` fails BEFORE the summarize request exists (the
+    /// provably-no-POST startup leg).
+    const FAILSPAWN_MARK: &str = "test spawn refusal";
+
+    struct FailSpawner;
+    impl ProcessSpawner for FailSpawner {
+        fn spawn(&self, _req: SpawnRequest) -> Result<Box<dyn ServeProcess>, String> {
+            Err(FAILSPAWN_MARK.to_string())
         }
     }
 
@@ -4791,6 +4811,73 @@ mod tests {
             snap["rollback"]["canRedo"],
             json!(true),
             "the snapshot truth keeps advertising the still-valid redo"
+        );
+    }
+
+    /// Focused-review ep2-r1 F3: startup-phase failures of the compact drive
+    /// prove no POST ever left the process — `manager.compact()` runs
+    /// `ensure_started()` BEFORE the summarize request is even constructed, so
+    /// the startup-failure variants (`Spawn`/`StartupFailed`/`ProcessExited`/
+    /// `PortAllocation`/`NotHealthy`, and the manager-level `ShuttingDown`/
+    /// `StartupAborted`) carry the same no-side-effects truth as
+    /// `ServeError::Undelivered` (connect-phase refusal). Compensating ONLY
+    /// `Undelivered` persisted a destroyed redo over an untouched tail: a
+    /// recoverable sidecar startup failure permanently discarded valid redo.
+    /// Here the spawn REFUSES: zero summarize POSTs exist, the error is LOUD,
+    /// and the pre-drive destroy is compensated back (redo stays valid).
+    #[tokio::test]
+    async fn compact_summarize_startup_failure_preserves_redo() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx.clone()));
+        let http = Arc::new(CompactFakeHttp::new(
+            r#"{"model":null}"#.as_bytes().to_vec(),
+            SummarizeOutcome::OkAnswered,
+            tx.subscribe(),
+            None,
+        ));
+        let deps = ServeDeps {
+            spawner: Arc::new(FailSpawner),
+            http: http.clone(),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        // The manager is NEVER started: the compact's ensure_started() must hit
+        // the refusing spawner INSIDE the drive, pre-POST.
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
+        let sink = seed_redoable_record(&st, "ses_1").await;
+
+        st.handle_compact(compact_msg("ses_1")).await;
+
+        let frames = frames_until(&mut rx, |f| is_event(f, "freshAgent.error", None)).await;
+        let error_frame = frames
+            .iter()
+            .find(|f| is_event(f, "freshAgent.error", None))
+            .expect("the failure is LOUD");
+        assert_eq!(error_frame["event"]["code"], "OPENCODE_COMPACT_FAILED");
+        assert!(
+            error_frame["event"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains(FAILSPAWN_MARK),
+            "the startup diagnostic crosses the wire: {error_frame}"
+        );
+        assert!(
+            http.summarize_requests().is_empty(),
+            "the startup failure proves the summarize POST never left the process"
+        );
+        let record = sink
+            .load_rollback(PROVIDER, "ses_1")
+            .expect("the record survives");
+        assert!(
+            !record.redo_destroyed && record.can_redo(),
+            "ep2-r1 F3: no-POST startup failure ⇒ the pre-drive destroy is compensated back — redo stays valid: {record:?}"
         );
     }
 

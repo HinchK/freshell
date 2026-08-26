@@ -470,6 +470,44 @@ impl std::fmt::Display for ServeError {
 
 impl std::error::Error for ServeError {}
 
+impl ServeError {
+    /// TRUE exactly when this failure PROVES the request never left the client
+    /// process — the downstream rollback-redo compensation predicate
+    /// (ep1-r3 F2, widened by focused ep2-r1 F3). Two provable families:
+    ///
+    /// - [`ServeError::Undelivered`] — the transport's connect phase refused
+    ///   BEFORE a byte left the client (the serve provably never saw the
+    ///   request);
+    /// - EVERY startup-phase failure — [`ServeError::ShuttingDown`],
+    ///   [`ServeError::StartupAborted`], [`ServeError::StartupFailed`],
+    ///   [`ServeError::ProcessExited`], [`ServeError::PortAllocation`],
+    ///   [`ServeError::Spawn`], [`ServeError::NotHealthy`]: all raised from
+    ///   `ensure_started`/`wait_for_health` BEFORE the request is even
+    ///   constructed, so no POST could exist.
+    ///
+    /// Everything else is post-dispatch or ambiguous — an answered non-2xx
+    /// ([`ServeError::Http`]; OpenCode ≥1.18.21 summarize runs
+    /// `revertSvc.cleanup` FIRST, so the tail may already be gone), a
+    /// mid-flight [`ServeError::RequestTimeout`], an ongoing-connection
+    /// [`ServeError::Transport`] (the ambiguous transport leg), a
+    /// [`ServeError::Decode`] (answer bytes arrived), and the post-send
+    /// [`ServeError::IdleTimeout`]/[`ServeError::SidecarLost`] — and must keep
+    /// the redo destroy intact FOREVER (error-after-send ≠ tail survived).
+    pub fn never_dispatched(&self) -> bool {
+        matches!(
+            self,
+            ServeError::Undelivered(_)
+                | ServeError::ShuttingDown
+                | ServeError::StartupAborted
+                | ServeError::StartupFailed(_)
+                | ServeError::ProcessExited { .. }
+                | ServeError::PortAllocation(_)
+                | ServeError::Spawn(_)
+                | ServeError::NotHealthy { .. }
+        )
+    }
+}
+
 // ── config / deps ────────────────────────────────────────────────────────────────
 
 /// Timing knobs, defaulted to the reference values (`serve-manager.ts:12-14,121-123`).

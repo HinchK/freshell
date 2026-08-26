@@ -308,8 +308,29 @@ struct ClaudeSession {
     /// it only from 0 (a second arm under the SAME active op owes the same
     /// single edge). Consumed (decremented) by the first result/idle edge
     /// folded while armed (the busy truth then remains held by
-    /// construction); zeroed at every disarm.
+    /// construction); ep2-r1 F2: ALSO consumed by the observed-compacting
+    /// retire branch when that retiring edge IS the owed one (a later arm
+    /// while the retired compact was the active op owed exactly this edge —
+    /// leave it and the debt outlives its edge, wedging the trackers forever).
+    /// Zeroed at every disarm.
     prior_edges_owed: Arc<std::sync::atomic::AtomicUsize>,
+    /// Focused-review ep2-r1 F1: the paired-terminal-frames mark. The
+    /// supported protocol closes EVERY turn with `sdk.result` AND a trailing
+    /// `sdk.status:idle` (both provider fixtures emit exactly that pair; the
+    /// real sidecar's consumeStream finally emits the trailing idle). The
+    /// idle is the SAME turn's closing punctuation, never a new op's edge —
+    /// set by the consumer after folding ANY `sdk.result`, consumed by the
+    /// NEXT `sdk.status:idle` which skips the fold (a second edge's
+    /// attribution would double-count the turn — the reviewer's exact repro:
+    /// A's trailing idle misattributed to a queued garlanded send fired the
+    /// FIFO-drop branch and released the busy gate over still-queued work).
+    /// Arms/sends NEVER reset it (a fresh op submitted between a turn's
+    /// result and its trailing idle must not let that idle fold); an
+    /// in-stream `sdk.error` DOES reset it (the fail-closed `in_turn` needs a
+    /// LIVE terminal edge after the error — the trailing idle must fold
+    /// there), and sidecar EOF zeroes it with the tracker set. Carried across
+    /// the rollback's kill+respawn exactly like `in_turn`.
+    result_idle_pair_pending: Arc<std::sync::atomic::AtomicBool>,
     /// kata 1wxv Task 4 (r2 serialization discipline): ONE per-session async turn
     /// lock. `handle_rollback` holds it across the WHOLE handler (busy-check →
     /// reads → record pre-write → pending-cancel → kill+spawn+adoption → reply);
@@ -615,6 +636,7 @@ impl FreshClaudeState {
         let saw_compacting = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let garlanded_sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let prior_edges_owed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let result_idle_pair_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let consumer = self.spawn_consumer(
             reader,
             created.clone(),
@@ -628,6 +650,7 @@ impl FreshClaudeState {
             Arc::clone(&saw_compacting),
             Arc::clone(&garlanded_sends),
             Arc::clone(&prior_edges_owed),
+            Arc::clone(&result_idle_pair_pending),
             None,
         );
 
@@ -658,6 +681,7 @@ impl FreshClaudeState {
                 saw_compacting,
                 garlanded_sends,
                 prior_edges_owed,
+                result_idle_pair_pending,
                 turn_lock: Arc::new(TokioMutex::new(())),
             },
         );
@@ -1561,6 +1585,7 @@ impl FreshClaudeState {
             saw_compacting,
             garlanded_sends,
             prior_edges_owed,
+            result_idle_pair_pending,
             turn_lock,
             session_type,
         ) = {
@@ -1573,6 +1598,7 @@ impl FreshClaudeState {
                     s.saw_compacting.clone(),
                     s.garlanded_sends.clone(),
                     s.prior_edges_owed.clone(),
+                    s.result_idle_pair_pending.clone(),
                     s.turn_lock.clone(),
                     session_type_str(op.session_type),
                 ),
@@ -2160,6 +2186,7 @@ impl FreshClaudeState {
             saw_compacting.clone(),
             garlanded_sends.clone(),
             prior_edges_owed.clone(),
+            result_idle_pair_pending.clone(),
             Some(RollbackAdoption {
                 supersedes: durable_id.clone(),
                 preseeded_init,
@@ -2182,6 +2209,7 @@ impl FreshClaudeState {
                 saw_compacting: saw_compacting.clone(),
                 garlanded_sends: garlanded_sends.clone(),
                 prior_edges_owed: prior_edges_owed.clone(),
+                result_idle_pair_pending: result_idle_pair_pending.clone(),
                 turn_lock: turn_lock.clone(),
             },
         );
@@ -2581,6 +2609,7 @@ impl FreshClaudeState {
         let saw_compacting = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let garlanded_sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let prior_edges_owed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let result_idle_pair_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let consumer = self.spawn_consumer(
             reader,
             msg.session_id.clone(),
@@ -2594,6 +2623,7 @@ impl FreshClaudeState {
             Arc::clone(&saw_compacting),
             Arc::clone(&garlanded_sends),
             Arc::clone(&prior_edges_owed),
+            Arc::clone(&result_idle_pair_pending),
             None,
         );
         self.sessions.lock().await.insert(
@@ -2612,6 +2642,7 @@ impl FreshClaudeState {
                 saw_compacting,
                 garlanded_sends,
                 prior_edges_owed,
+                result_idle_pair_pending,
                 turn_lock: Arc::new(TokioMutex::new(())),
             },
         );
@@ -2781,6 +2812,11 @@ impl FreshClaudeState {
         saw_compacting: Arc<std::sync::atomic::AtomicBool>,
         garlanded_sends: Arc<std::sync::atomic::AtomicUsize>,
         prior_edges_owed: Arc<std::sync::atomic::AtomicUsize>,
+        // ep2-r1 F1: the paired-terminal-frames mark — see
+        // [`ClaudeSession::result_idle_pair_pending`]. This consumer sets it
+        // after folding ANY `sdk.result`, and the NEXT `sdk.status:idle`
+        // consumes it to skip the fold (pair punctuation, never an edge).
+        result_idle_pair_pending: Arc<std::sync::atomic::AtomicBool>,
         // kata 1wxv Task 4: Some ONLY on the rollback fork/fresh respawn — the
         // handler PREREAD the sdk.session.init line, so the consumer runs the
         // adoption for it FIRST (supersedes-aware), then resolves the parked
@@ -2841,32 +2877,28 @@ impl FreshClaudeState {
                 // attribution, cardinality-exact): with `queued_compacts > 0` the
                 // fold attributes each terminal edge FIFO —strictly: (a) an edge
                 // after an observed `sdk.status:compacting` belongs to A COMPACT's
-                // own turn (retire ONE queued compact; release the busy truth ONLY
-                // when no compact or garlanded send remains owed); else (b) with
-                // the arm's structural prior edge already consumed AND garlanded
-                // sends outstanding, the edge is ONE garlanded send's and EVERY
-                // remaining queued compact provably never ran (the drop proof — a
-                // FIFO provider would have been observed compacting first):
-                // extinguish the compact count wholesale, retire one send; else
-                // the edge belongs to the PRIOR turn (consume the owed edge — the
-                // busy truth HOLDS). Beyond the owed edge, an armed edge with
-                // neither mark holds fail-closed. With no compact armed, a
-                // garlanded tail (the compact(s) already retired, send edges
-                // still owed) retires one send per edge and releases exactly at
-                // the last. Any `sdk.error` zeroes the tracker set outright (the
-                // queued compacts provably never arrive) while leaving `in_turn`
-                // fail-closed untouched.
+                // own turn (retire ONE queued compact; consume a still-owed prior
+                // debt the retiring edge itself settles (ep2-r1 F2); release the
+                // busy truth ONLY when no compact or garlanded send remains owed);
+                // else (b) with the arm's structural prior edge already consumed
+                // AND garlanded sends outstanding, the edge is ONE garlanded
+                // send's and EVERY remaining queued compact provably never ran
+                // (the drop proof — a FIFO provider would have been observed
+                // compacting first): extinguish the compact count wholesale,
+                // retire one send; else the edge belongs to the PRIOR turn
+                // (consume the owed edge — the busy truth HOLDS). Beyond the owed
+                // edge, an armed edge with neither mark holds fail-closed. With
+                // no compact armed, a garlanded tail (the compact(s) already
+                // retired, send edges still owed) retires one send per edge and
+                // releases exactly at the last. Any `sdk.error` zeroes the
+                // tracker set outright (the queued compacts provably never
+                // arrive) while leaving `in_turn` fail-closed untouched.
+                // ep2-r1 F1 (the paired terminal frames): EVERY turn closes with
+                // `sdk.result` AND a trailing `sdk.status:idle` — the idle is
+                // the SAME turn's punctuation, never a second edge; the fold
+                // below skips the fold for exactly that paired idle.
                 match value.get("type").and_then(Value::as_str) {
-                    Some("sdk.result") => fold_terminal_edge(
-                        &in_turn,
-                        &queued_compacts,
-                        &saw_compacting,
-                        &garlanded_sends,
-                        &prior_edges_owed,
-                    ),
-                    Some("sdk.status")
-                        if value.get("status").and_then(Value::as_str) == Some("idle") =>
-                    {
+                    Some("sdk.result") => {
                         fold_terminal_edge(
                             &in_turn,
                             &queued_compacts,
@@ -2874,6 +2906,29 @@ impl FreshClaudeState {
                             &garlanded_sends,
                             &prior_edges_owed,
                         );
+                        // A result's trailing idle is its pair punctuation the
+                        // idle arm below skips (ep2-r1 F1).
+                        result_idle_pair_pending.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Some("sdk.status")
+                        if value.get("status").and_then(Value::as_str) == Some("idle") =>
+                    {
+                        // ep2-r1 F1: the idle trailing a result is the SAME
+                        // turn's closing punctuation — NEVER a new op's edge
+                        // (folding it would double-attribute the turn: the
+                        // reviewer's exact repro fired the FIFO-drop branch on
+                        // A's trailing idle while C/S sat queued).
+                        if !result_idle_pair_pending
+                            .swap(false, std::sync::atomic::Ordering::SeqCst)
+                        {
+                            fold_terminal_edge(
+                                &in_turn,
+                                &queued_compacts,
+                                &saw_compacting,
+                                &garlanded_sends,
+                                &prior_edges_owed,
+                            );
+                        }
                     }
                     Some("sdk.status")
                         if value.get("status").and_then(Value::as_str) == Some("compacting") =>
@@ -2887,11 +2942,15 @@ impl FreshClaudeState {
                     Some("sdk.error") => {
                         // F2 (c): the queued compacts provably never arrive as
                         // their own turns — zero the whole attribution set
-                        // (in_turn stays fail-closed).
+                        // (in_turn stays fail-closed). ep2-r1 F1: the pair mark
+                        // resets TOO — the fail-closed `in_turn` needs a LIVE
+                        // terminal edge after the error; a result's trailing
+                        // idle past an error must fold, never be skipped.
                         queued_compacts.store(0, std::sync::atomic::Ordering::SeqCst);
                         saw_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
                         garlanded_sends.store(0, std::sync::atomic::Ordering::SeqCst);
                         prior_edges_owed.store(0, std::sync::atomic::Ordering::SeqCst);
+                        result_idle_pair_pending.store(false, std::sync::atomic::Ordering::SeqCst);
                     }
                     _ => {}
                 }
@@ -2934,6 +2993,7 @@ impl FreshClaudeState {
             saw_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
             garlanded_sends.store(0, std::sync::atomic::Ordering::SeqCst);
             prior_edges_owed.store(0, std::sync::atomic::Ordering::SeqCst);
+            result_idle_pair_pending.store(false, std::sync::atomic::Ordering::SeqCst);
             // Consumer exit == this sidecar's stdout closed == sidecar death
             // (ledger A9). Evict the dead session and its cli_index entries,
             // identity-guarded: a newer session re-registered under the same
@@ -3066,7 +3126,12 @@ fn dec_sat(count: &std::sync::atomic::AtomicUsize) -> usize {
 ///       sends (ep1-r3 F1: a send queued BEHIND the compact generates NOW, so
 ///       the compact's terminal must NOT release the gate; the send armed
 ///       `in_turn` itself and its OWN terminal edge — folding through the
-///       garlanded-tail path below — releases it);
+///       garlanded-tail path below — releases it). ep2-r1 F2: if a prior edge
+///       is STILL owed here, this retiring edge IS it (a later arm while the
+///       retired compact was the active op owed exactly this edge) — consume
+///       it too: left outstanding, the stale debt outlives its edge and, on a
+///       later provider-dropped compact + completing garlanded send, swallows
+///       the send's drop-proof edge, wedging every tracker forever;
 ///   (prior) the arm's structurally-owed edge — the ONE op active at arm time
 ///       owes exactly ONE prior-turn terminal edge before any edge could
 ///       belong to a queued compact or a garlanded send (a send accepted
@@ -3101,6 +3166,18 @@ fn fold_terminal_edge(
             // (ep1-r5 F1) — then release the busy truth ONLY if this was the
             // last queued compact AND no garlanded send is owed (ep1-r3 F1).
             dec_sat(queued_compacts);
+            // ep2-r1 F2: this retiring edge also settles a still-owed prior
+            // debt when the retiring compact WAS the op a later arm owed (FIFO:
+            // the owed op always runs AHEAD — with saw_compacting live, this
+            // edge is the owed op's; a debt owed to an EARLIER, already-edged
+            // op would have been consumed by the prior branch below). Leave it
+            // outstanding and the stale debt outlives its edge: a later
+            // provider-dropped compact's garlanded send edge then gets
+            // swallowed consuming the stale debt, and every tracker stays set
+            // forever with no edge left to retire them (a permanent wedge).
+            if prior_edges_owed.load(SeqCst) > 0 {
+                dec_sat(prior_edges_owed);
+            }
             if queued_compacts.load(SeqCst) == 0 && garlanded_sends.load(SeqCst) == 0 {
                 in_turn.store(false, SeqCst);
             }
@@ -3878,6 +3955,7 @@ pub(crate) mod tests {
                 saw_compacting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 garlanded_sends: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 prior_edges_owed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                result_idle_pair_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 turn_lock: Arc::new(TokioMutex::new(())),
             },
         );
@@ -5014,6 +5092,7 @@ rl.on('line', (line) => {
                 saw_compacting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 garlanded_sends: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 prior_edges_owed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                result_idle_pair_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 turn_lock: Arc::new(TokioMutex::new(())),
             },
         );
@@ -5455,6 +5534,7 @@ rl.on('line', (line) => {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             None,
         );
 
@@ -6197,6 +6277,7 @@ rl.on('line', (line) => {
                 saw_compacting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 garlanded_sends: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 prior_edges_owed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                result_idle_pair_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 turn_lock: Arc::new(TokioMutex::new(())),
             },
         );
@@ -7068,6 +7149,190 @@ rl.on('line', (line) => {
         assert_eq!(
             frames[0]["event"]["code"], "NOTHING_TO_UNDO",
             "the gate released exactly at the last garlanded send's terminal edge: {frames:?}"
+        );
+        drop(env);
+    }
+
+    /// Focused-review ep2-r1 F1 (the PAIRED terminal frames): the supported
+    /// Claude/Kilroy protocol emits `sdk.result` AND a trailing
+    /// `sdk.status:idle` for ONE turn (both provider fixtures emit exactly that
+    /// pair; the real sidecar's consumeStream finally emits the trailing idle).
+    /// The trailing idle is the SAME turn's closing punctuation, never a new
+    /// op's edge — folding it through attribution double-counts the turn. The
+    /// repair-delta fold missed this: with turn A running and C+S queued
+    /// behind it, A's result consumed the prior debt and then A's TRAILING IDLE
+    /// was attributed to the garlanded send (the FIFO-drop branch), clearing
+    /// the compact/send trackers and `in_turn` while C and S were still
+    /// queued — rollback passed the sole busy gate mid-queue.
+    ///
+    /// Queue: A running → C queued → S queued. EVERY turn ends with its pair
+    /// (result then idle).
+    ///   1. A's pair: the result folds as the owed prior edge; the trailing
+    ///      idle is pair-skipped (NEVER the garlanded drop proof) — the gate
+    ///      HOLDS;
+    ///   2. C's observed compacting + result + trailing idle retires C — the
+    ///      gate HOLDS (S still owed);
+    ///   3. S's result releases the gate (its trailing idle is skipped too).
+    #[tokio::test]
+    async fn a_turns_trailing_idle_is_pair_skipped_never_attributed_to_queued_ops() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-qpair")).await;
+        let created = await_claude_created(&mut rx, "req-qpair").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        await_status_frame(&mut rx, &session_id, "idle").await;
+
+        st.handle_send(send_msg(&session_id, "turn one")).await; // A
+        st.handle_compact(compact_msg(&session_id, None)).await; // C
+        st.handle_send(send_msg(&session_id, "turn two")).await; // S
+
+        // (1) A's pair — the result consumes the ONE owed prior edge; the
+        // trailing idle is C's/S's edges' queue-mate punctuation, NEVER theirs.
+        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
+        inject_raw_send(&st, &session_id, "__emit_idle__").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            in_turn_of(&st, &session_id).await,
+            "A's trailing idle is pair-punctuation, not the garlanded drop proof — the compact and send are STILL queued"
+        );
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-qpair-1", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        let frames = captured_json(&captured);
+        assert_eq!(
+            frames[0]["event"]["code"], "BUSY_TURN",
+            "ep2-r1 F1: A's trailing idle must not release the gate over queued C/S: {frames:?}"
+        );
+        assert_eq!(
+            env.spawn_count(),
+            1,
+            "zero teardown from the refused attempt"
+        );
+
+        // (2) C observably runs and its pair lands: retires C — the gate HOLDS
+        // (S is generating behind it).
+        inject_raw_send(&st, &session_id, "__emit_compacting__").await;
+        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
+        inject_raw_send(&st, &session_id, "__emit_idle__").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            in_turn_of(&st, &session_id).await,
+            "C's pair retires C only — S's own terminal edge is still owed"
+        );
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-qpair-2", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        assert_eq!(
+            captured_json(&captured)[0]["event"]["code"],
+            "BUSY_TURN",
+            "the garlanded send is still owed after C's pair — the gate holds"
+        );
+
+        // (3) S's pair: the result is the garlanded tail's last owed edge — the
+        // gate releases here; the trailing idle folds nothing further.
+        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
+        inject_raw_send(&st, &session_id, "__emit_idle__").await;
+        await_in_turn(&st, &session_id, false).await;
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-qpair-3", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        let frames = captured_json(&captured);
+        assert_eq!(
+            frames[0]["event"]["code"], "NOTHING_TO_UNDO",
+            "the gate released exactly at S's own terminal edge: {frames:?}"
+        );
+        drop(env);
+    }
+
+    /// Focused-review ep2-r1 F2 (the stale prior-edge debt): a SECOND compact
+    /// armed while the FIRST compact is mid-compaction owes C₁'s terminal edge
+    /// (the one op active at its arm). When C₁'s terminal lands it is C₁'s OWN
+    /// edge (the observed-compacting branch) — yet that edge ALSO settles C₂'s
+    /// debt: miss that and, with C₂ subsequently provider-DROPPED while a
+    /// garlanded send completes, the send's edge is swallowed consuming the
+    /// stale debt, leaving every tracker set forever with no edge left to
+    /// retire them — the pane wedges BUSY and rollback is disabled
+    /// permanently.
+    ///
+    /// Queue: A completed → C₁ mid-compaction → C₂ armed (owes C₁'s edge) → S
+    /// garlanded → C₁'s result lands (C₂'s debt settled redundantly with C₁'s
+    /// retirement) → C₂ provider-dropped (never observed compacting) → S's
+    /// result is the drop proof: extinguishes C₂ AND releases the gate.
+    #[tokio::test]
+    async fn arming_a_compact_during_an_active_compaction_settles_its_debt_at_that_compactions_edge(
+    ) {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-qstale")).await;
+        let created = await_claude_created(&mut rx, "req-qstale").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        await_status_frame(&mut rx, &session_id, "idle").await;
+
+        st.handle_send(send_msg(&session_id, "turn one")).await; // A
+        st.handle_compact(compact_msg(&session_id, None)).await; // C₁ queued
+                                                                 // A's pair lands first: the result settles the arm's prior debt; A's
+                                                                 // trailing idle is pair-skipped.
+        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
+        inject_raw_send(&st, &session_id, "__emit_idle__").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // S queues behind the armed compact(s); C₁ observably starts.
+        st.handle_send(send_msg(&session_id, "turn two")).await; // S garlanded
+        inject_raw_send(&st, &session_id, "__emit_compacting__").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // C₂ arms while C₁ is MID-COMPACTION — it owes C₁'s terminal edge.
+        st.handle_compact(compact_msg(&session_id, None)).await;
+
+        // C₁'s pair: retires C₁ AND settles C₂'s owed edge — C₂ remains the
+        // sole queued compact; S is still owed. The gate HOLDS throughout.
+        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
+        inject_raw_send(&st, &session_id, "__emit_idle__").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            in_turn_of(&st, &session_id).await,
+            "C₁'s edge retired C₁ and settled C₂'s debt — C₂ and S still owe edges"
+        );
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-qstale-1", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        assert_eq!(
+            captured_json(&captured)[0]["event"]["code"],
+            "BUSY_TURN",
+            "C₂ queued + S owed — the gate holds past C₁'s pair"
+        );
+
+        // C₂ is provider-DROPPED (never observed compacting); S's pair lands:
+        // the result is the FIFO-drop proof (C₂ provably never ran), releasing
+        // at the LAST garlanded edge; the trailing idle is pair-skipped.
+        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
+        inject_raw_send(&st, &session_id, "__emit_idle__").await;
+        await_in_turn(&st, &session_id, false).await;
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-qstale-2", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        let frames = captured_json(&captured);
+        assert_eq!(
+            frames[0]["event"]["code"],
+            "NOTHING_TO_UNDO",
+            "ep2-r1 F2: S's edge is the drop proof and releases — no stale debt may swallow it: {frames:?}"
         );
         drop(env);
     }
