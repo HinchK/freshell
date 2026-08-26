@@ -281,9 +281,14 @@ function buildTranscriptLayout(
   let captionSeq = 0
   let tailCaption: LineCaption | null = null
 
-  /** echo AND non-blank AND fully visible — the one gate for paint and stash (LB-1). */
+  /** echo AND non-blank AND fully visible — the one gate for paint and stash (LB-1).
+   * Sanitize BEFORE the blank gate (delta review R1-F1): both caption copies
+   * (painted tail, stashed expansion) render this string verbatim, so the
+   * summary must pass the same stripSystemReminders sanitation the text/
+   * thinking/summary-fallback render paths use. A reminder-only summary
+   * strips to '' → gated out → neither copy paints anything. */
   const foldCaption = (turn: DisplayTurn, atItemIndex: number): LineCaption | null => {
-    const text = (turn.summary ?? '').trim()
+    const text = stripSystemReminders(turn.summary ?? '').trim()
     if (text.length === 0 || turn.hadFilteredItems || turnSummaryIsAuthored(turn)) return null
     const id = `caption:${captionSeq++}`
     return { id, text, atItemIndex }

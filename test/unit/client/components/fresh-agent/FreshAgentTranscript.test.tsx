@@ -2286,6 +2286,46 @@ describe('FreshAgentTranscript', () => {
         const thinkingRow = screen.getByRole('button', { name: 'Thinking' })
         expect(captions[0].compareDocumentPosition(thinkingRow) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy()
       })
+
+      it('strips system-reminders from painted and stashed echo captions (delta review R1-F1)', () => {
+        // R1-F1: foldCaption copied turn.summary verbatim into both caption
+        // copies, bypassing the stripSystemReminders sanitation every other
+        // summary render path uses. A fully-visible echo turn whose summary
+        // projects an item containing <system-reminder>…</system-reminder>
+        // (routine in claude lanes — reminders hide in text/tool-result
+        // blocks and never render as items) would expose the hidden text as
+        // a visible caption, both painted at the tail and stashed in the
+        // expansion after supersede.
+        const captionTurn = {
+          id: 'turn-caption', turnId: 'turn-caption', role: 'assistant' as const,
+          summary: 'Reading setup<system-reminder>hidden internals</system-reminder> for the merge',
+          summaryKind: 'echo' as const,
+          items: [
+            { id: 'tool-c1', kind: 'tool_use' as const, toolUseId: 'c1', name: 'Read', input: { file_path: 'src/a.ts' } },
+            { id: 'result-c1', kind: 'tool_result' as const, toolUseId: 'c1', content: 'ok', isError: false },
+          ],
+        }
+        const { rerender } = render(
+          <FreshAgentTranscript isStreaming turns={[captionTurn]} />,
+        )
+        // Paint position: the tail caption shows only the sanitized text.
+        const tailCaption = screen.getByTestId('fresh-agent-tail-caption')
+        expect(tailCaption).toHaveTextContent('Reading setup for the merge')
+        expect(tailCaption.textContent).not.toContain('hidden internals')
+        expect(screen.queryByText(/hidden internals/)).not.toBeInTheDocument()
+
+        // Superseded by a later same-role activity turn: the caption folds
+        // into the line's expansion — still sanitized, reminder still absent.
+        rerender(
+          <FreshAgentTranscript isStreaming turns={[captionTurn, toolTurn('turn-z', [['c9', 'src/z.ts']])]} />,
+        )
+        expect(screen.queryByTestId('fresh-agent-tail-caption')).not.toBeInTheDocument()
+        expect(screen.queryByText(/hidden internals/)).not.toBeInTheDocument()
+        fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+        const stashed = screen.getByTestId('fresh-agent-activity-caption')
+        expect(stashed).toHaveTextContent('Reading setup for the merge')
+        expect(stashed.textContent).not.toContain('hidden internals')
+      })
     })
   })
 })
