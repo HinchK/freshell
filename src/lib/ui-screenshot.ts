@@ -35,7 +35,7 @@ type RuntimeContext = {
   getState: () => RootState
 }
 
-type FocusSnapshot = {
+export type FocusSnapshot = {
   activeTabId: string | null
   activePaneByTab: Record<string, string>
 }
@@ -290,30 +290,59 @@ function findTabIdForPane(state: RootState, paneId: string): string | undefined 
   return undefined
 }
 
-async function restoreFocus(ctx: RuntimeContext, before: FocusSnapshot, paneTabsToRestore: Set<string>): Promise<boolean> {
+export async function restoreFocus(ctx: RuntimeContext, before: FocusSnapshot, paneTabsToRestore: Set<string>): Promise<boolean> {
+  let incomplete = false
   try {
     for (const tabId of paneTabsToRestore) {
       const originalPaneId = before.activePaneByTab[tabId]
       if (!originalPaneId) continue
-      if (ctx.getState().panes.activePane[tabId] !== originalPaneId) {
+      const state = ctx.getState()
+      // Best-effort: a pane/tab deleted mid-capture can never receive focus
+      // back — skip it (dispatching the restore would resurrect a dead
+      // activePane entry and blank the tab's work area), mark the restore
+      // incomplete, and KEEP restoring the surviving targets rather than
+      // leaving the user parked on a capture-selected tab/pane.
+      if (!state.tabs.tabs.some((t) => t.id === tabId)
+        || !nodeContainsPane(state.panes.layouts[tabId], originalPaneId)) {
+        incomplete = true
+        continue
+      }
+      if (state.panes.activePane[tabId] !== originalPaneId) {
         ctx.dispatch(setActivePane({ tabId, paneId: originalPaneId }))
       }
     }
 
-    if (before.activeTabId && ctx.getState().tabs.activeTabId !== before.activeTabId) {
-      ctx.dispatch(setActiveTab(before.activeTabId))
+    if (before.activeTabId) {
+      const state = ctx.getState()
+      if (!state.tabs.tabs.some((t) => t.id === before.activeTabId)) {
+        incomplete = true
+      } else if (state.tabs.activeTabId !== before.activeTabId) {
+        ctx.dispatch(setActiveTab(before.activeTabId))
+      }
     }
 
     await afterPaint()
 
     const after = ctx.getState()
-    if (before.activeTabId && after.tabs.activeTabId !== before.activeTabId) return false
+    if (before.activeTabId) {
+      if (!after.tabs.tabs.some((t) => t.id === before.activeTabId)) {
+        incomplete = true // deleted during the restore window
+      } else if (after.tabs.activeTabId !== before.activeTabId) return false
+    }
     for (const tabId of paneTabsToRestore) {
       const originalPaneId = before.activePaneByTab[tabId]
       if (!originalPaneId) continue
+      // The OWNING TAB may have been deleted during the restore window while
+      // stale pane layout/activePane entries linger (removeTab and the pane
+      // cleanup are separate slices) — that must ALSO be incomplete, not true.
+      if (!after.tabs.tabs.some((t) => t.id === tabId)
+        || !nodeContainsPane(after.panes.layouts[tabId], originalPaneId)) {
+        incomplete = true // deleted during the restore window
+        continue
+      }
       if (after.panes.activePane[tabId] !== originalPaneId) return false
     }
-    return true
+    return !incomplete
   } catch {
     return false
   }

@@ -9,14 +9,14 @@ import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { createElement } from 'react'
 import html2canvas from 'html2canvas'
-import tabsReducer from '@/store/tabsSlice'
-import panesReducer from '@/store/panesSlice'
+import tabsReducer, { setActiveTab, removeTab } from '@/store/tabsSlice'
+import panesReducer, { splitPane, closePane } from '@/store/panesSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
-import { captureUiScreenshot } from '../../../src/lib/ui-screenshot'
+import { captureUiScreenshot, restoreFocus } from '../../../src/lib/ui-screenshot'
 
 vi.mock('html2canvas', () => ({
   default: vi.fn(),
@@ -417,5 +417,145 @@ describe('captureUiScreenshot iframe handling', () => {
     const artifact = await fs.readFile(contextMenuProofPath)
     expect(artifact.length).toBeGreaterThan(8)
     expect(Array.from(artifact.subarray(0, 8))).toEqual([...PNG_SIGNATURE_BYTES])
+  })
+})
+
+describe('restoreFocus deleted-target hardening', () => {
+  function createFocusStore() {
+    return configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+      middleware: (getDefault) => getDefault({ serializableCheck: false }),
+      preloadedState: {
+        tabs: {
+          tabs: [
+            { id: 'tab-1', createRequestId: 'req-1', title: 'One', status: 'running' as const, mode: 'shell' as const, shell: 'system' as const, createdAt: 1 },
+            { id: 'tab-2', createRequestId: 'req-2', title: 'Two', status: 'running' as const, mode: 'shell' as const, shell: 'system' as const, createdAt: 2 },
+          ],
+          activeTabId: 'tab-1',
+          renameRequestTabId: null,
+        },
+        panes: {
+          layouts: {
+            'tab-1': { type: 'leaf' as const, id: 'pane-1', content: { kind: 'terminal' as const, mode: 'shell' as const, status: 'running' as const, terminalId: 'term-1' } },
+            'tab-2': { type: 'leaf' as const, id: 'pane-2', content: { kind: 'terminal' as const, mode: 'shell' as const, status: 'running' as const, terminalId: 'term-2' } },
+          },
+          activePane: { 'tab-1': 'pane-1', 'tab-2': 'pane-2' },
+          paneTitles: { 'tab-1': { 'pane-1': 'One' }, 'tab-2': { 'pane-2': 'Two' } },
+          paneTitleSetByUser: {},
+          renameRequestTabId: null,
+          renameRequestPaneId: null,
+          zoomedPane: {},
+          refreshRequestsByPane: {},
+        },
+      } as any,
+    })
+  }
+
+  it('restores a still-valid snapshot and reports success (pin)', async () => {
+    const store = createFocusStore()
+    store.dispatch(setActiveTab('tab-2')) // simulate the capture switching away
+    const spy = vi.spyOn(store, 'dispatch')
+    const ok = await restoreFocus(
+      { dispatch: store.dispatch, getState: store.getState },
+      { activeTabId: 'tab-1', activePaneByTab: {} },
+      new Set(),
+    )
+    expect(ok).toBe(true)
+    expect(store.getState().tabs.activeTabId).toBe('tab-1')
+    expect(spy.mock.calls.map(([a]) => (a as any)?.type)).toContain('tabs/setActiveTab')
+  })
+
+  it('restores a still-valid pane focus and reports success (pin)', async () => {
+    const store = createFocusStore()
+    store.dispatch(splitPane({ tabId: 'tab-2', paneId: 'pane-2', direction: 'horizontal', newContent: { kind: 'terminal', mode: 'shell' }, newPaneId: 'pane-2b' }))
+    // activePane['tab-2'] is now 'pane-2b' (splits activate by default);
+    // the snapshot says pane-2 owned focus.
+    const ok = await restoreFocus(
+      { dispatch: store.dispatch, getState: store.getState },
+      { activeTabId: 'tab-1', activePaneByTab: { 'tab-2': 'pane-2' } },
+      new Set(['tab-2']),
+    )
+    expect(ok).toBe(true)
+    expect(store.getState().panes.activePane['tab-2']).toBe('pane-2')
+  })
+
+  it('never dispatches setActiveTab for a tab deleted mid-capture (reports false)', async () => {
+    const store = createFocusStore()
+    store.dispatch(setActiveTab('tab-2'))
+    store.dispatch(removeTab('tab-1'))
+    const spy = vi.spyOn(store, 'dispatch') // spy AFTER setup: only restore dispatches are observed
+    const ok = await restoreFocus(
+      { dispatch: store.dispatch, getState: store.getState },
+      { activeTabId: 'tab-1', activePaneByTab: {} },
+      new Set(),
+    )
+    expect(ok).toBe(false)
+    expect(spy).not.toHaveBeenCalled()
+  })
+
+  it('never dispatches setActivePane for a pane deleted mid-capture (reports false)', async () => {
+    const store = createFocusStore()
+    // closePane is a no-op on a root leaf, so split first, then close the
+    // snapshot pane (leaving layout collapsed to the sibling leaf).
+    store.dispatch(splitPane({ tabId: 'tab-2', paneId: 'pane-2', direction: 'horizontal', newContent: { kind: 'terminal', mode: 'shell' }, newPaneId: 'pane-2b' }))
+    store.dispatch(closePane({ tabId: 'tab-2', paneId: 'pane-2' }))
+    const spy = vi.spyOn(store, 'dispatch')
+    const ok = await restoreFocus(
+      { dispatch: store.dispatch, getState: store.getState },
+      { activeTabId: 'tab-1', activePaneByTab: { 'tab-2': 'pane-2' } },
+      new Set(['tab-2']),
+    )
+    expect(ok).toBe(false)
+    const setPaneCalls = spy.mock.calls.filter(([a]) => (a as any)?.type === 'panes/setActivePane')
+    expect(setPaneCalls).toHaveLength(0)
+  })
+
+  it('still restores the surviving active tab when only a pane target vanished (best-effort, reports false)', async () => {
+    const store = createFocusStore()
+    store.dispatch(splitPane({ tabId: 'tab-2', paneId: 'pane-2', direction: 'horizontal', newContent: { kind: 'terminal', mode: 'shell' }, newPaneId: 'pane-2b' }))
+    store.dispatch(closePane({ tabId: 'tab-2', paneId: 'pane-2' }))
+    store.dispatch(setActiveTab('tab-2')) // the capture itself switched the user away
+    const spy = vi.spyOn(store, 'dispatch')
+    const ok = await restoreFocus(
+      { dispatch: store.dispatch, getState: store.getState },
+      { activeTabId: 'tab-1', activePaneByTab: { 'tab-2': 'pane-2' } },
+      new Set(['tab-2']),
+    )
+    expect(ok).toBe(false)                                   // incomplete restore, honestly reported
+    expect(store.getState().tabs.activeTabId).toBe('tab-1')  // surviving tab focus STILL restored
+    const setPaneCalls = spy.mock.calls.filter(([a]) => (a as any)?.type === 'panes/setActivePane')
+    expect(setPaneCalls).toHaveLength(0)                     // never toward the dead pane
+  })
+
+  it('reports false when the owning TAB is deleted inside the restore window (mid-flight race pin)', async () => {
+    const store = createFocusStore()
+    store.dispatch(splitPane({ tabId: 'tab-2', paneId: 'pane-2', direction: 'horizontal', newContent: { kind: 'terminal', mode: 'shell' }, newPaneId: 'pane-2b' }))
+    // tab-2 exists and pane-2 is a restore target at dispatch time; the tab
+    // vanishes inside restoreFocus's afterPaint window. Our rAF callback is
+    // enqueued BEFORE restoreFocus's internal post-paint checks, so the
+    // deletion deterministically lands in the verify window.
+    requestAnimationFrame(() => { store.dispatch(removeTab('tab-2')) })
+    const ok = await restoreFocus(
+      { dispatch: store.dispatch, getState: store.getState },
+      { activeTabId: 'tab-1', activePaneByTab: { 'tab-2': 'pane-2' } },
+      new Set(['tab-2']),
+    )
+    expect(ok).toBe(false)
+  })
+
+  it('reports false when the restore target is deleted DURING the restore window (race pin)', async () => {
+    const store = createFocusStore()
+    store.dispatch(setActiveTab('tab-2')) // capture switched away
+    // Delete the restore target inside the afterPaint window: restoreFocus
+    // dispatches setActiveTab('tab-1') while tab-1 still exists, then awaits
+    // two animation frames; our rAF-queued removeTab runs inside that window
+    // (rAF callbacks fire FIFO), so the post-paint verify must see it gone.
+    requestAnimationFrame(() => { store.dispatch(removeTab('tab-1')) })
+    const ok = await restoreFocus(
+      { dispatch: store.dispatch, getState: store.getState },
+      { activeTabId: 'tab-1', activePaneByTab: {} },
+      new Set(),
+    )
+    expect(ok).toBe(false)
   })
 })
