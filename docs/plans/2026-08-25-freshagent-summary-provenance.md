@@ -1448,6 +1448,10 @@ Add a `describe('foldable echo captions')` inside `describe('activity line colla
     })
 ```
 
+Post-review list addition (task-004 review finding M1 — the list above pins the fold lifecycle but prescribed no liveness test):
+
+- `'keeps liveness pinned to the last non-caption row when a stashed caption trails a merged thinking row'` — pins the caption-skip liveness guards (settled branch + strip `lastRow`): a `[tool, thinking]` member plus an absorbed turn entering on a merged thinking row leaves the line's last ROW a stashed caption, and the `Thinking` live marker/spinner must survive both streaming and settled judging the last NON-caption row.
+
 And EXTEND the Task-3 fold-baseline test — after the existing frame-2 assertions, add the stash assertions and rename it `'stashes a superseded tail caption into the line expansion when the next turn absorbs'`. This is the POSITIVE fully-visible case: all turns are item-bearing and `showThinking` is on, display filtering removes nothing, and the caption stashes:
 
 ```tsx

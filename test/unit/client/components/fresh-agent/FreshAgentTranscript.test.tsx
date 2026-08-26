@@ -2226,6 +2226,66 @@ describe('FreshAgentTranscript', () => {
         fireEvent.click(screen.getAllByRole('button', { name: 'Toggle activity details' })[1])
         expect(screen.queryByTestId('fresh-agent-activity-caption')).not.toBeInTheDocument()
       })
+
+      it('keeps liveness pinned to the last non-caption row when a stashed caption trails a merged thinking row', () => {
+        // Task-004 review finding M1 (caption-skip liveness guards). Shape:
+        // turn-a ([tool, thinking] member) + turn-b entering on a THINKING item
+        // that MERGES into turn-a's thinking row (rowStartItemIndexes keeps the
+        // FIRST contributing index), carrying a fully-visible echo caption
+        // anchored at the line's final item index; turn-c (blank echo)
+        // supersedes turn-b, so turn-b's caption stashes AFTER the merged
+        // thinking row — the line's last ROW is a caption, and both liveness
+        // paths must judge the last NON-caption row instead.
+        const turnA = {
+          id: 'turn-a', turnId: 'turn-a', role: 'assistant' as const, summary: '',
+          items: [
+            { id: 'tool-c1', kind: 'tool_use' as const, toolUseId: 'c1', name: 'Read', input: { file_path: 'src/a.ts' } },
+            { id: 'result-c1', kind: 'tool_result' as const, toolUseId: 'c1', content: 'ok', isError: false },
+            { id: 'think-a', kind: 'thinking' as const, text: 'Mapping the layout' },
+          ],
+        }
+        const turnB = {
+          id: 'turn-b', turnId: 'turn-b', role: 'assistant' as const,
+          summary: 'Weighing the next file', summaryKind: 'echo' as const,
+          items: [{ id: 'think-b', kind: 'thinking' as const, text: 'Weighing the next file' }],
+        }
+        const turnC = {
+          id: 'turn-c', turnId: 'turn-c', role: 'assistant' as const,
+          summary: '', summaryKind: 'echo' as const,
+          items: [{ id: 'think-c', kind: 'thinking' as const, text: 'Final deliberation' }],
+        }
+        const { rerender } = render(
+          <FreshAgentTranscript isStreaming turns={[turnA, turnB, turnC]} />,
+        )
+        // Streaming: one merged line; the strip stays live on the merged
+        // THINKING row — the spinner and the 'Thinking' reel survive even
+        // though the line's final row is the stashed caption.
+        expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
+        expect(screen.getByLabelText('running')).toBeInTheDocument()
+        expect(screen.getByText('Thinking')).toBeInTheDocument()
+        // The superseded caption is folded: nothing paints in the stream.
+        expect(screen.queryByTestId('fresh-agent-tail-caption')).not.toBeInTheDocument()
+        expect(screen.queryByText('Weighing the next file')).not.toBeInTheDocument()
+
+        // Settled flip: the trailing merged thinking row still settles the
+        // strip live (matching the existing trailing-thinking settled pin) —
+        // the caption at the end of the line's rows must not confuse the
+        // settled branch's candidate either.
+        rerender(<FreshAgentTranscript isStreaming={false} turns={[turnA, turnB, turnC]} />)
+        expect(screen.getByLabelText('running')).toBeInTheDocument()
+        expect(screen.getByText('Thinking')).toBeInTheDocument()
+        expect(screen.queryByText('Weighing the next file')).not.toBeInTheDocument()
+
+        // The stashed caption lives inside the expansion, AFTER the merged
+        // thinking row (its anchor item index trails every row's first
+        // contributing item index, so buildActivity appends it last).
+        fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+        const captions = screen.getAllByTestId('fresh-agent-activity-caption')
+        expect(captions).toHaveLength(1)
+        expect(captions[0]).toHaveTextContent('Weighing the next file')
+        const thinkingRow = screen.getByRole('button', { name: 'Thinking' })
+        expect(captions[0].compareDocumentPosition(thinkingRow) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy()
+      })
     })
   })
 })
