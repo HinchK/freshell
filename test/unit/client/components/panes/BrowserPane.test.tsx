@@ -666,5 +666,35 @@ describe('BrowserPane', () => {
       renderBrowserPane({ url: '', focusEligible: false })
       expect(screen.getByPlaceholderText('Enter URL...')).not.toHaveFocus()
     })
+
+    it('marks the iframe inert when NOT focus-eligible (page content cannot programmatically steal focus)', () => {
+      renderBrowserPane({ url: 'https://example.com', focusEligible: false })
+      const iframe = document.querySelector('iframe')
+      expect(iframe).toBeTruthy()
+      expect(iframe!.hasAttribute('inert')).toBe(true)
+    })
+
+    it('does NOT set inert when the pane owns focus (default) — content stays interactive', () => {
+      renderBrowserPane({ url: 'https://example.com' })
+      const iframe = document.querySelector('iframe')
+      expect(iframe).toBeTruthy()
+      expect(iframe!.hasAttribute('inert')).toBe(false)
+    })
+
+    it('removes inert on a false→true eligibility flip (explicit select) without reloading the iframe', () => {
+      const { rerender, store } = renderBrowserPane({ url: 'https://example.com', focusEligible: false })
+      const iframe = document.querySelector('iframe')
+      expect(iframe!.hasAttribute('inert')).toBe(true)
+      const srcBefore = iframe!.getAttribute('src')
+      rerender(
+        <Provider store={store}>
+          <BrowserPane paneId="pane-1" tabId="tab-1" browserInstanceId="browser-1" url="https://example.com" devToolsOpen={false} focusEligible />
+        </Provider>,
+      )
+      const iframeAfter = document.querySelector('iframe')
+      expect(iframeAfter === iframe).toBe(true) // same element — no reload
+      expect(iframeAfter!.hasAttribute('inert')).toBe(false)
+      expect(iframeAfter!.getAttribute('src')).toBe(srcBefore)
+    })
   })
 })

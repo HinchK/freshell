@@ -582,6 +582,12 @@ export default function BrowserPane({
               src={resolvedSrc}
               className="w-full h-full border-0 bg-white"
               sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
+              // Focus neutrality: while this pane does NOT own focus, the
+              // nested document is inert — a same-origin page loading in the
+              // background cannot programmatically focus itself and seize
+              // keystrokes. Removing inert on eligibility flip does not reload
+              // the iframe (attribute only, src untouched).
+              {...(focusEligible ? {} : ({ inert: '' } as Record<string, string>))}
               onLoad={() => setIsLoading(false)}
               onError={() => {
                 setIsLoading(false)
