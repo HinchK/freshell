@@ -186,6 +186,7 @@ export default function BrowserPane({
   const refreshRequest = useAppSelector((state) => state.panes.refreshRequestsByPane?.[tabId]?.[paneId] ?? null)
   const iframeRef = useRef<HTMLIFrameElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
+  const rootRef = useRef<HTMLDivElement>(null)
   const [inputUrl, setInputUrl] = useState(url)
   const [isLoading, setIsLoading] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -434,14 +435,22 @@ export default function BrowserPane({
     }
   }
 
+  // Track the current url in a ref so flip-time focus sees the latest page
+  // WITHOUT making this effect navigation-reactive (navigation must never yank
+  // focus — existing UX).
+  const urlRef = useRef(url)
+  urlRef.current = url
+
+  // Owns-focus ⇒ DOM focus belongs to this pane: an empty pane goes to the URL
+  // input (user just created it), a loaded pane goes to the pane root so
+  // keystrokes belong here (explicit select of a loaded browser pane, remount
+  // after a leaf→split, mount while eligible). Background/ineligible panes
+  // never focus anything.
   useEffect(() => {
-    // Focus the URL input only when there's no initial URL (user just created a
-    // new browser pane) AND this pane owns focus. Background-mounted browser
-    // panes (agent-created hidden tabs) must not steal keyboard focus.
-    if (focusEligible && !url && inputRef.current) {
-      inputRef.current.focus()
-    }
-  }, [url, focusEligible])
+    if (!focusEligible) return
+    if (urlRef.current) rootRef.current?.focus()
+    else inputRef.current?.focus()
+  }, [focusEligible])
 
   useEffect(() => {
     if (!refreshRequest) return
@@ -483,6 +492,8 @@ export default function BrowserPane({
 
   return (
     <div
+      ref={rootRef}
+      tabIndex={-1}
       className="flex flex-col h-full w-full bg-background"
       data-context={ContextIds.Browser}
       data-pane-id={paneId}

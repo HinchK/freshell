@@ -912,7 +912,7 @@ function renderContent(
   if (content.kind === 'extension') {
     return (
       <ErrorBoundary key={paneId} label="Extension">
-        <ExtensionPane tabId={tabId} paneId={paneId} content={content} />
+        <ExtensionPane tabId={tabId} paneId={paneId} content={content} focusEligible={focusEligible} />
       </ErrorBoundary>
     )
   }

@@ -696,5 +696,25 @@ describe('BrowserPane', () => {
       expect(iframeAfter!.hasAttribute('inert')).toBe(false)
       expect(iframeAfter!.getAttribute('src')).toBe(srcBefore)
     })
+
+    it('focuses the pane root on mount for a loaded pane that owns focus', () => {
+      renderBrowserPane({ url: 'https://example.com' })
+      const root = document.querySelector('[data-pane-id="pane-1"]')
+      expect(root).toHaveFocus()
+    })
+
+    it('does not focus a loaded pane while ineligible, but on the later false→true flip (explicit select)', () => {
+      const { rerender, store } = renderBrowserPane({ url: 'https://example.com', focusEligible: false })
+      const iframe = document.querySelector('iframe')
+      const root = document.querySelector('[data-pane-id="pane-1"]')
+      expect(iframe).not.toBeNull()
+      expect(root).not.toHaveFocus()
+      rerender(
+        <Provider store={store}>
+          <BrowserPane paneId="pane-1" tabId="tab-1" browserInstanceId="browser-1" url="https://example.com" devToolsOpen={false} focusEligible />
+        </Provider>,
+      )
+      expect(root).toHaveFocus()
+    })
   })
 })

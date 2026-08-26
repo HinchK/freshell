@@ -13,6 +13,7 @@ interface ExtensionPaneProps {
   tabId: string
   paneId: string
   content: ExtensionPaneContent
+  focusEligible?: boolean
 }
 
 /**
@@ -53,7 +54,7 @@ function detectIframeError(iframe: HTMLIFrameElement): string | null {
   return null
 }
 
-export default function ExtensionPane({ content }: ExtensionPaneProps) {
+export default function ExtensionPane({ content, focusEligible = true }: ExtensionPaneProps) {
   useEnsureExtensionsRegistry()
 
   const dispatch = useAppDispatch()
@@ -147,6 +148,13 @@ export default function ExtensionPane({ content }: ExtensionPaneProps) {
     }
   }, [handleIframeError, handleIframeLoad, loadAttempt])
 
+  // Focus neutrality: this pane owns DOM focus (eligible mount or flip) ⇒
+  // focus the iframe; when NOT eligible the iframe is inert and background
+  // extension content can neither be focused nor focus itself.
+  useEffect(() => {
+    if (focusEligible) iframeRef.current?.focus()
+  }, [focusEligible])
+
   // Reset load error on retry
   useEffect(() => {
     setLoadError(null)
@@ -218,6 +226,7 @@ export default function ExtensionPane({ content }: ExtensionPaneProps) {
       className="w-full h-full border-0"
       sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
       title={extension.label}
+      {...(focusEligible ? {} : ({ inert: '' } as Record<string, string>))}
     />
   )
 }

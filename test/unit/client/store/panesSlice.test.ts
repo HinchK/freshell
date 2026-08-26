@@ -920,6 +920,12 @@ describe('panesSlice', () => {
       )
       const originalPaneId = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).id
 
+      // Pre-zoom the original pane so the split's zoom-clear invariant is pinned
+      // for the activate:false path too (it must be unconditional — it is a
+      // layout invariant, not a focus move).
+      state = panesReducer(state, toggleZoom({ tabId: 'tab-1', paneId: originalPaneId }))
+      expect(state.zoomedPane['tab-1']).toBe(originalPaneId)
+
       state = panesReducer(
         state,
         splitPane({
@@ -936,7 +942,8 @@ describe('panesSlice', () => {
       expect(split.type).toBe('split')
       expect((split.children[1] as Extract<PaneNode, { type: 'leaf' }>).id).toBe('pane-new')
       expect(state.activePane['tab-1']).toBe(originalPaneId)
-      // Zoom-clear and title bookkeeping stay unconditional (layout invariants, not focus):
+      // Zoom clear + title bookkeeping stay unconditional (layout invariants, not focus):
+      expect(state.zoomedPane['tab-1']).toBeUndefined()
       expect(state.paneTitles['tab-1']['pane-new']).toBeDefined()
     })
   })

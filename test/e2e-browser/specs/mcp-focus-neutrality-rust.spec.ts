@@ -113,6 +113,12 @@ test.describe('MCP/REST focus neutrality', () => {
         .poll(async () => (await harness.getPaneLayout(tabA))?.content?.terminalId ?? null, { timeout: 15_000 })
         .not.toBeNull()
       await flushClientFocusScheduling(page)
+      const paneA = ((await harness.getState()).panes.layouts[tabA])?.id
+      expect(paneA).toBeTruthy()
+      // Baseline focus ownership: assert pane A OWNS document focus before
+      // tagging — otherwise the identity marker pins whatever happened to be
+      // focused (possibly body) and the background-tab sections prove nothing.
+      await expect.poll(() => focusedPaneId(page), { timeout: 10_000 }).toBe(paneA)
       const marker = await tagActiveElement(page)
 
       // --- 1: REST tab create does NOT activate (the discriminating assertion:
