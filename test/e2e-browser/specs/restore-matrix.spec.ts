@@ -1264,13 +1264,14 @@ test.describe('Restore Matrix', () => {
         // SPLIT (shell pane + this freshcodex pane, per `bootAndConnect`
         // above), so an unscoped tab-level icon or `getByRole('banner')`
         // lookup would ambiguously match the shell pane's icon/banner too.
-        // Fresh-agent pane headers render the busy/blue state on the
-        // `pane-header-fresh-agent-identity` text span (`PaneHeader.tsx`),
-        // not on an icon -- unlike terminal panes, which use `PaneIcon`.
-        const freshAgentIdentity = page
+        // Fresh-agent pane headers render the busy/blue state on the agent
+        // icon inside its tooltip wrapper (`PaneHeader.tsx`), the same
+        // `PaneIcon` treatment terminal panes get.
+        const freshAgentIcon = page
           .locator(`[data-pane-shell="true"][data-pane-id="${freshAgentPaneId}"]`)
-          .locator('.pane-header-fresh-agent-identity')
-        await expect(freshAgentIdentity).toHaveClass(/text-blue-500/, { timeout: 15_000 })
+          .getByTitle('Codex (freshcodex pane)')
+          .locator('svg')
+        await expect(freshAgentIcon).toHaveClass(/text-blue-500/, { timeout: 15_000 })
 
         await composer.fill('term18-crash-mid-turn probe')
         await paneRoot.getByRole('button', { name: 'Send' }).click()
@@ -1290,7 +1291,7 @@ test.describe('Restore Matrix', () => {
         // the busy state seeded above -- the indicator asserted ON above
         // MUST now be gone, never left stuck blue after the provider
         // process is lost.
-        await expect(freshAgentIdentity).not.toHaveClass(/text-blue-500/, { timeout: 15_000 })
+        await expect(freshAgentIcon).not.toHaveClass(/text-blue-500/, { timeout: 15_000 })
 
         // No chime: the harness's sent-message ledger and the pane's own
         // visible state are the only two truthful signals this spec can

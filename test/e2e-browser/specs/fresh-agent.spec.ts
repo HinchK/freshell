@@ -106,10 +106,13 @@ async function pointActiveFreshcodexLeafAtSession(page: any, sessionId: string) 
   }, sessionId), { timeout: 10_000 }).toBe(true)
 }
 
-async function openFreshAgentSettings(page: any, providerName: string) {
-  const headerIdentity = providerName.toLowerCase()
+async function openFreshAgentSettings(page: any, sessionType: 'freshclaude' | 'freshcodex') {
+  // The pane header identifies a fresh-agent pane by its agent-icon tooltip
+  // ("<AgentLabel> (<sessionType> pane)", the preview's agent display name) —
+  // there is no session-type text label.
+  const agentLabel = sessionType === 'freshclaude' ? 'Claude' : 'Codex'
   const pane = page.getByRole('group').filter({
-    has: page.getByText(headerIdentity, { exact: true }),
+    has: page.getByTitle(`${agentLabel} (${sessionType} pane)`),
   }).last()
   await expect(pane).toBeVisible({ timeout: 10_000 })
 
@@ -175,7 +178,401 @@ async function expectFreshAgentSubmitButtonContrasted(
   expect(styles.backgroundColor).not.toBe(styles.panelBackgroundColor)
 }
 
+/** Convert the active leaf terminal pane into a freshclaude pane carrying the
+ * strip-relevant wiring: a canonical (UUID) durable session id chain so the
+ * restore machinery never trips the "legacy name" restore error, and the
+ * static default model ('opus[1m]') so the chip label is deterministic.
+ * Network effects are suppressed BEFORE the conversion so the attach effect
+ * records instead of sending; the REST snapshot is served by
+ * stubFreshclaudeThread. */
+async function installFreshclaudeStripPane(page: any, sessionId: string) {
+  await page.evaluate((currentSessionId) => {
+    const harness = window.__FRESHELL_TEST_HARNESS__
+    if (!harness) return
+    const state = harness.getState()
+    const tabId = state?.tabs?.activeTabId as string | undefined
+    const paneId = tabId ? state?.panes?.activePane?.[tabId] : null
+    if (!tabId || !paneId) return
+    harness.setFreshAgentNetworkEffectsSuppressed(paneId, true)
+    harness.dispatch({
+      type: 'panes/updatePaneContent',
+      payload: {
+        tabId,
+        paneId,
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
+          createRequestId: `req-strip-${currentSessionId}`,
+          sessionId: currentSessionId,
+          sessionRef: { provider: 'claude', sessionId: currentSessionId },
+          resumeSessionId: currentSessionId,
+          status: 'idle',
+          initialCwd: '/home/user/code/freshell',
+          model: 'opus[1m]',
+          settingsDismissed: true,
+        },
+      },
+    })
+  }, sessionId)
+}
+
+/** Deterministic idle snapshot for a freshclaude thread, with optional turns. */
+async function stubFreshclaudeThread(page: any, sessionId: string, turns: unknown[] = []) {
+  await page.route(`**/api/fresh-agent/threads/freshclaude/claude/${sessionId}*`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        threadId: sessionId,
+        sessionId,
+        revision: 1,
+        latestTurnId: turns.length > 0 ? (turns[turns.length - 1] as { id?: string })?.id ?? null : null,
+        status: 'idle',
+        summary: '',
+        capabilities: { send: true, interrupt: true, approvals: true, questions: true, fork: false },
+        settings: { model: 'opus[1m]', permissionMode: 'default', plugins: [] },
+        tokenUsage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, costUsd: 0 },
+        pendingApprovals: [],
+        pendingQuestions: [],
+        turns,
+        extensions: {
+          claude: {
+            liveSessionId: sessionId,
+            cliSessionId: sessionId,
+          },
+        },
+      }),
+    })
+  })
+}
+
+/** Boot-time sidebar session-window commits copy the server's (empty here)
+ * index into state.sessions.projects — an indexer seed dispatched before (or
+ * raced by) those commits is overwritten (observed: seeded projects reset to
+ * [], strip falls back to "context —"). Re-seeding is idempotent, so poll
+ * until the meter actually appears. */
+async function seedUntilMeterSettles(page: any, meter: any, usage: { sessionId: string; percent: number; contextTokens: number; thresholdTokens: number }) {
+  await expect.poll(async () => {
+    await seedIndexedClaudeContextUsage(page, usage)
+    return meter.isVisible().catch(() => false)
+  }, { timeout: 15_000, intervals: [250, 500, 1000] }).toBe(true)
+}
+
+/** Seed the session indexer's tokenUsage record that the strip meter reads
+ * (resolveFreshAgentContextUsage matches by provider + durable session id). */
+async function seedIndexedClaudeContextUsage(
+  page: any,
+  usage: { sessionId: string; percent: number; contextTokens: number; thresholdTokens: number },
+) {
+  await page.evaluate((o) => {
+    window.__FRESHELL_TEST_HARNESS__?.dispatch({
+      type: 'sessions/applyContextUsageExtras',
+      payload: {
+        entries: [{
+          provider: 'claude',
+          sessionId: o.sessionId,
+          tokenUsage: {
+            inputTokens: 1,
+            outputTokens: 1,
+            cachedTokens: 0,
+            totalTokens: 2,
+            contextTokens: o.contextTokens,
+            compactThresholdTokens: o.thresholdTokens,
+            compactPercent: o.percent,
+          },
+        }],
+        sourceSeq: Date.now(),
+        serverInstance: '__e2e_seed__',
+        paneKeys: [`claude:${o.sessionId}`],
+      },
+    })
+  }, usage)
+}
+
 test.describe('Fresh Agent', () => {
+  test('shows the session status strip in the unknown state (chip + muted context lug, no meter)', async ({ freshellPage, page, terminal }) => {
+    await terminal.waitForTerminal()
+    await stubFreshclaudeThread(page, '63333000-0000-4333-8333-000000000001')
+    await installFreshclaudeStripPane(page, '63333000-0000-4333-8333-000000000001')
+
+    const paneRoot = page.locator('[data-context="fresh-agent"]')
+    await expect(paneRoot).toBeVisible({ timeout: 10_000 })
+
+    // Model chip: effective model display name on the button, raw id + effort
+    // on the hover tooltip, dialog affordance in the accessible name.
+    const chip = paneRoot.getByRole('button', { name: 'Model: Claude Opus 5 (1M context) — change model' })
+    await expect(chip).toBeVisible()
+    await expect(chip).toHaveAttribute('title', 'opus[1m] · effort high')
+    // Desktop (>520px pane) shows the long label form.
+    await expect(paneRoot.getByText('Claude Opus 5 (1M context)', { exact: true })).toBeVisible()
+
+    // Unknown context state: muted lug, never a fake 0% meter.
+    await expect(paneRoot.getByText('context —', { exact: true })).toBeVisible()
+    await expect(paneRoot.getByRole('meter')).toHaveCount(0)
+  })
+
+  test('shows a seeded context meter with the exact-token tooltip', async ({ freshellPage, page, terminal }) => {
+    await terminal.waitForTerminal()
+    await stubFreshclaudeThread(page, '63333000-0000-4333-8333-000000000002')
+    await installFreshclaudeStripPane(page, '63333000-0000-4333-8333-000000000002')
+
+    const paneRoot = page.locator('[data-context="fresh-agent"]')
+    await expect(paneRoot).toBeVisible({ timeout: 10_000 })
+
+    const meter = paneRoot.getByRole('meter', { name: 'Context window used' })
+    await seedUntilMeterSettles(page, meter, {
+      sessionId: '63333000-0000-4333-8333-000000000002',
+      percent: 47,
+      contextTokens: 96000,
+      thresholdTokens: 200000,
+    })
+    await expect(meter).toBeVisible()
+    await expect(meter).toHaveAttribute('aria-valuenow', '47')
+    const tooltip = await meter.getAttribute('title')
+    expect(tooltip).toContain('96,000 / 200,000 tokens (47% full)')
+    expect(tooltip).toContain('compacts at 100%')
+    // Wide-pane (≥520px) counterpart to the mobile collapse proof: the word
+    // "context" is displayed here, closing the mobile test's hidden-only
+    // asymmetry (the word is display:none'd on mobile, never removed).
+    await expect(paneRoot.getByText('context', { exact: true })).toBeVisible()
+
+    // Desktop reference width for the mobile collapse proof (the cluster is the
+    // role-bearing span: label + track + numeral). Recorded in the run log.
+    const clusterBox = await meter.boundingBox()
+    const paneBox = await paneRoot.boundingBox()
+    console.log(`[status-strip] desktop cluster width: ${clusterBox?.width}px (pane ${paneBox?.width}px)`)
+    expect(clusterBox!.width).toBeGreaterThan(0)
+  })
+
+  test('status strip chip opens the model dialog', async ({ freshellPage, page, terminal }) => {
+    await terminal.waitForTerminal()
+    await page.route('**/api/fresh-agent/model-capabilities/freshclaude**', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          ok: true,
+          sessionType: 'freshclaude',
+          runtimeProvider: 'claude',
+          status: 'fresh',
+          fetchedAt: Date.now(),
+          models: [],
+        }),
+      })
+    })
+    await stubFreshclaudeThread(page, '63333000-0000-4333-8333-000000000003')
+    await installFreshclaudeStripPane(page, '63333000-0000-4333-8333-000000000003')
+
+    const chip = page.getByRole('button', { name: 'Model: Claude Opus 5 (1M context) — change model' })
+    await expect(chip).toBeVisible({ timeout: 10_000 })
+    await chip.click()
+    await expect(page.getByRole('dialog', { name: 'Model and thinking level' })).toBeVisible({ timeout: 10_000 })
+  })
+
+  test('narrow pane (≤280px) keeps the meter cluster and numeral while the meter track hides', async ({ freshellPage, page, harness, terminal }) => {
+    await page.setViewportSize({ width: 320, height: 760 })
+    await terminal.waitForTerminal()
+
+    const tabId = await harness.getActiveTabId()
+    expect(tabId).toBeTruthy()
+    const layout = await harness.getPaneLayout(tabId!)
+    expect(layout?.type).toBe('leaf')
+    const terminalPaneId = layout.id as string
+    const narrowSessionId = '63333000-0000-4333-8333-000000000004'
+    await stubFreshclaudeThread(page, narrowSessionId)
+
+    await page.evaluate(({ currentTabId, currentPaneId, currentSessionId }) => {
+      window.__FRESHELL_TEST_HARNESS__?.setFreshAgentNetworkEffectsSuppressed('pane-narrow-strip', true)
+      window.__FRESHELL_TEST_HARNESS__?.dispatch({
+        type: 'panes/splitPane',
+        payload: {
+          tabId: currentTabId,
+          paneId: currentPaneId,
+          direction: 'horizontal',
+          newPaneId: 'pane-narrow-strip',
+          newContent: {
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-narrow-strip',
+            sessionId: currentSessionId,
+            sessionRef: { provider: 'claude', sessionId: currentSessionId },
+            resumeSessionId: currentSessionId,
+            status: 'idle',
+            initialCwd: '/home/user/code/freshell',
+            model: 'opus[1m]',
+            settingsDismissed: true,
+          },
+        },
+      })
+      window.__FRESHELL_TEST_HARNESS__?.dispatch({
+        type: 'panes/resizePanes',
+        payload: {
+          tabId: currentTabId,
+          splitId: window.__FRESHELL_TEST_HARNESS__?.getState().panes.layouts[currentTabId].id,
+          sizes: [50, 50],
+        },
+      })
+    }, { currentTabId: tabId!, currentPaneId: terminalPaneId, currentSessionId: narrowSessionId })
+
+    const stripPane = page.locator('[data-context="fresh-agent"][data-pane-id="pane-narrow-strip"]')
+    await expect(stripPane).toBeVisible({ timeout: 10_000 })
+
+    const meter = stripPane.getByRole('meter', { name: 'Context window used' })
+    await seedUntilMeterSettles(page, meter, {
+      sessionId: narrowSessionId,
+      percent: 62,
+      contextTokens: 124000,
+      thresholdTokens: 200000,
+    })
+    await expect(meter).toBeVisible()
+    await expect(meter).toHaveAttribute('aria-valuenow', '62')
+    await expect(stripPane.getByText('62%', { exact: true })).toBeVisible()
+
+    // ≤280px: the track is display:none, but the role/value cluster survives so
+    // assistive tech retains the reading.
+    const trackDisplay = await meter.evaluate((el) => {
+      const track = el.querySelector('.fresh-agent-status-meter')
+      return track ? getComputedStyle(track).display : 'missing'
+    })
+    expect(trackDisplay).toBe('none')
+
+    // The surviving cluster (numeral only) must be narrower than the 64px-meter
+    // form factor one collapse tier up. Record actual widths in the run log.
+    const paneBox = await stripPane.boundingBox()
+    const clusterBox = await meter.boundingBox()
+    console.log(`[status-strip] narrow pane width: ${paneBox?.width}px; cluster width: ${clusterBox?.width}px`)
+    expect(paneBox!.width).toBeLessThanOrEqual(280)
+    expect(clusterBox!.width).toBeLessThan(64)
+  })
+
+  test('typography floors, hierarchy, and the turn-header font follows the pane style', async ({ freshellPage, page, terminal }) => {
+    await terminal.waitForTerminal()
+    const sessionId = '63333000-0000-4333-8333-000000000005'
+    await stubFreshclaudeThread(page, sessionId, [
+      {
+        id: 'turn-typography-user',
+        turnId: 'turn-typography-user',
+        role: 'user',
+        summary: 'Set up the typography baseline.',
+        items: [{ id: 'item-typography-user', kind: 'text', text: 'Set up the typography baseline.' }],
+      },
+      {
+        id: 'turn-typography-assistant',
+        turnId: 'turn-typography-assistant',
+        role: 'assistant',
+        summary: 'Typography copy body line.',
+        items: [{ id: 'item-typography-assistant', kind: 'text', text: 'Typography copy body line.' }],
+      },
+    ])
+    await installFreshclaudeStripPane(page, sessionId)
+
+    const paneRoot = page.locator('[data-context="fresh-agent"]')
+    await expect(paneRoot).toBeVisible({ timeout: 10_000 })
+    await expect(paneRoot.getByText('Typography copy body line.')).toBeVisible({ timeout: 10_000 })
+    await expect(paneRoot.getByText('You', { exact: true })).toBeVisible()
+    await expect(paneRoot.getByText('context —', { exact: true })).toBeVisible()
+
+    // One round-trip measuring all four tiers from the LIVE DOM (no element
+    // handles: the transcript re-renders during snapshot resolution, so a
+    // pre-captured handle can go detached before the evaluate runs).
+    const sizes = await page.evaluate(() => {
+      const normalize = (text: string | null | undefined): string =>
+        (text ?? '').replace(/\s+/g, ' ').trim()
+      const findTextIn = (root: Element | Document, wanted: string): Element | null => {
+        const walker = document.createTreeWalker(root as Node, NodeFilter.SHOW_ELEMENT)
+        let node = walker.nextNode() as Element | null
+        while (node) {
+          if (normalize(node.textContent) === wanted) return node
+          node = walker.nextNode() as Element | null
+        }
+        return null
+      }
+      const measure = (el: Element | null, via?: string): number | null | { missing: string } => {
+        if (!el) return { missing: via ?? 'self (text not found)' }
+        const target = (via ? el.closest(via) : el) as HTMLElement | null
+        return target ? parseFloat(getComputedStyle(target).fontSize) : { missing: via ?? 'self' }
+      }
+      const freshAgentRoot = document.querySelector('[data-context="fresh-agent"]')
+      const header = document.querySelector('[role="banner"][aria-label="Pane: freshell"]')
+      const copyProbe = freshAgentRoot ? findTextIn(freshAgentRoot, 'Typography copy body line.') : null
+      const turnProbe = freshAgentRoot ? findTextIn(freshAgentRoot, 'You') : null
+      const stripProbe = freshAgentRoot ? findTextIn(freshAgentRoot, 'context —') : null
+      const headerProbe = header ? findTextIn(header, 'freshell') : null
+      return {
+        transcript: measure(copyProbe, '.fresh-agent-transcript-copy'),
+        header: measure(headerProbe),
+        turnHeader: measure(turnProbe, '.fresh-agent-turn-header'),
+        strip: measure(stripProbe, '.fresh-agent-status-strip'),
+      }
+    })
+    console.log('[status-strip] desktop typography sizes:', JSON.stringify(sizes))
+    for (const [tier, value] of Object.entries(sizes)) {
+      expect(typeof value, `${tier} resolved to a measurable element: ${JSON.stringify(value)}`).toBe('number')
+    }
+    const measured = sizes as { transcript: number; header: number; turnHeader: number; strip: number }
+    expect(measured.transcript).toBeGreaterThan(measured.header)
+    expect(measured.header).toBeGreaterThan(measured.turnHeader)
+    expect(measured.turnHeader).toBeGreaterThanOrEqual(measured.strip)
+    expect(measured.strip).toBeGreaterThanOrEqual(12)
+
+    // Font follows the pane style: default (sans) has no mono face on the
+    // turn-header; switching the pane to the mono style flips it. Read fresh
+    // from the live DOM each time (no element handles across render epochs).
+    const readTurnHeaderFontFamily = () => page.evaluate(() => {
+      const normalize = (text: string | null | undefined): string =>
+        (text ?? '').replace(/\s+/g, ' ').trim()
+      const root = document.querySelector('[data-context="fresh-agent"]')
+      if (!root) return null
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT)
+      let node = walker.nextNode() as Element | null
+      while (node) {
+        if (normalize(node.textContent) === 'You') {
+          const header = node.closest('.fresh-agent-turn-header') as HTMLElement | null
+          return header ? getComputedStyle(header).fontFamily : null
+        }
+        node = walker.nextNode() as Element | null
+      }
+      return null
+    })
+    const defaultFont = await readTurnHeaderFontFamily()
+    expect(defaultFont).toBeTruthy()
+    expect(defaultFont!).not.toMatch(/mono/i)
+
+    await page.evaluate(() => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      const state = harness?.getState()
+      let target: { tabId: string; leaf: any } | null = null
+      for (const [candidateTabId, layout] of Object.entries(state?.panes?.layouts ?? {})) {
+        const walk = (node: any): any => {
+          if (!node) return null
+          if (node.type === 'leaf' && node.content?.kind === 'fresh-agent') return node
+          if (node.type === 'split') return walk(node.children?.[0]) ?? walk(node.children?.[1])
+          return null
+        }
+        const leaf = walk(layout)
+        if (leaf) target = { tabId: candidateTabId, leaf }
+      }
+      if (!target) return
+      const t = target as { tabId: string; leaf: any }
+      harness?.dispatch({
+        type: 'panes/updatePaneContent',
+        payload: {
+          tabId: t.tabId,
+          paneId: t.leaf.id,
+          content: { ...t.leaf.content, style: 'mono' },
+        },
+      })
+    })
+    await expect(page.locator('[data-context="fresh-agent"][data-style="mono"]').last()).toBeVisible({ timeout: 10_000 })
+    const monoFont = await readTurnHeaderFontFamily()
+    expect(monoFont).toMatch(/mono/i)
+    expect(monoFont).not.toBe(defaultFont)
+  })
+
   test('pane picker hides fresh clients by default even when their CLIs are enabled', async ({ freshellPage, page, terminal }) => {
     await terminal.waitForTerminal()
     await page.evaluate(() => {
@@ -257,8 +654,11 @@ test.describe('Fresh Agent', () => {
     const header = freshcodexPane.getByRole('banner', { name: 'Pane: freshell' })
     await expect(header).toBeVisible()
 
-    await expect(header.getByText('freshcodex', { exact: true })).toBeVisible()
-    await expect(header.getByText('freshell', { exact: true })).toBeVisible()
+    await expect(header.getByTitle('Codex (freshcodex pane)')).toBeVisible()
+    // ~160px pane: the dir/branch meta hides entirely at ≤480px (approved
+    // preview: "in narrow mobile panes the meta hides entirely"); identity
+    // persists via the icon tooltips.
+    await expect(header.getByText('freshell', { exact: true })).not.toBeVisible()
   })
 
   test('freshclaude settings use FreshAgent model defaults and create payload', async ({ freshellPage: _freshellPage, page, harness, terminal }) => {
@@ -271,7 +671,7 @@ test.describe('Fresh Agent', () => {
     await picker.getByRole('button', { name: /^Freshclaude$/i }).click({ force: true })
     await page.getByRole('option').first().click()
 
-    const dialog = await openFreshAgentSettings(page, 'Freshclaude')
+    const dialog = await openFreshAgentSettings(page, 'freshclaude')
     await expect(dialog.getByRole('radio', { name: 'Claude Opus 5 (1M context)' })).toBeChecked()
 
     const thinking = dialog.getByRole('combobox', { name: /^Thinking level$/i })
@@ -303,7 +703,7 @@ test.describe('Fresh Agent', () => {
     await picker.getByRole('button', { name: /^Freshcodex$/i }).click({ force: true })
     await page.getByRole('option').first().click()
 
-    let dialog = await openFreshAgentSettings(page, 'Freshcodex')
+    let dialog = await openFreshAgentSettings(page, 'freshcodex')
     await expect(dialog.getByRole('combobox', { name: /^Style$/i })).toHaveValue('sans')
     await dialog.getByRole('combobox', { name: /^Style$/i }).selectOption('serif')
 
@@ -450,7 +850,15 @@ test.describe('Fresh Agent', () => {
     await expect(freshcodexRoot.locator('[data-turn-continuation="true"]')).toHaveCount(1)
     await freshcodexRoot.getByRole('button', { name: 'Toggle activity details' }).click()
     await expect(freshcodexRoot.getByText('private style reasoning should stay hidden')).toHaveCount(0)
-    await freshcodexRoot.getByRole('button', { name: 'Thinking' }).click()
+    // The status strip shrank the transcript viewport by one row, so the
+    // "Jump to your message" glom chip overlays the top band where the
+    // Thinking toggle's click point lands. The chip re-derives from scroll
+    // position on every scroll-into-view, so mouse dismissing it is racy
+    // (Playwright re-scrolls to the toggle and the chip returns on top of the
+    // click point). Activate the toggle by keyboard Enter instead: focus +
+    // keypress targets the element, not the point, so the overlay cannot
+    // intercept the activation.
+    await freshcodexRoot.getByRole('button', { name: 'Thinking' }).press('Enter')
     await expect(freshcodexRoot.getByText('private style reasoning should stay hidden')).toBeVisible()
     await freshcodexRoot.getByRole('button', { name: /Diff: src\/index\.css/ }).click()
     const transcriptFont = await transcript.evaluate((node) => getComputedStyle(node).fontFamily)
@@ -526,7 +934,7 @@ test.describe('Fresh Agent', () => {
     })
     await expect(page.locator('[data-context="fresh-agent"][data-style="sans"]').last()).toBeVisible({ timeout: 10_000 })
 
-    dialog = await openFreshAgentSettings(page, 'Freshclaude')
+    dialog = await openFreshAgentSettings(page, 'freshclaude')
     await expect(dialog.getByRole('combobox', { name: /^Style$/i })).toHaveValue('sans')
 
     await page.keyboard.press('Escape')
@@ -572,7 +980,7 @@ test.describe('Fresh Agent', () => {
     })
     await expect(page.locator('[data-context="fresh-agent"][data-style="serif"]').last()).toBeVisible({ timeout: 10_000 })
 
-    dialog = await openFreshAgentSettings(page, 'Freshcodex')
+    dialog = await openFreshAgentSettings(page, 'freshcodex')
     await expect(dialog.getByRole('combobox', { name: /^Style$/i })).toHaveValue('serif')
     await dialog.getByRole('combobox', { name: /^Style$/i }).selectOption('mono')
     const monoRoot = page.locator('[data-context="fresh-agent"][data-style="mono"]').last()
@@ -592,7 +1000,7 @@ test.describe('Fresh Agent', () => {
 
     // Start in serif: it has an explicit [data-markdown-body] paragraph-color
     // override, which is the hardest case for muted thinking text.
-    let dialog = await openFreshAgentSettings(page, 'Freshcodex')
+    let dialog = await openFreshAgentSettings(page, 'freshcodex')
     await dialog.getByRole('combobox', { name: /^Style$/i }).selectOption('serif')
     await page.keyboard.press('Escape')
     await expect(page.locator('[data-context="fresh-agent"][data-style="serif"]').last()).toBeVisible({ timeout: 10_000 })
@@ -714,7 +1122,7 @@ test.describe('Fresh Agent', () => {
 
     for (const style of ['serif', 'sans', 'mono'] as const) {
       if (style !== 'serif') {
-        dialog = await openFreshAgentSettings(page, 'Freshcodex')
+        dialog = await openFreshAgentSettings(page, 'freshcodex')
         await dialog.getByRole('combobox', { name: /^Style$/i }).selectOption(style)
         await page.keyboard.press('Escape')
       }
@@ -1023,7 +1431,7 @@ test.describe('Fresh Agent', () => {
     await page.getByRole('button', { name: /^Freshcodex$/i }).click()
     await page.getByRole('option').first().click()
     await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible()
-    await expect(page.getByText('freshcodex', { exact: true })).toBeVisible()
+    await expect(page.getByTitle('Codex (freshcodex pane)')).toBeVisible()
 
     await page.evaluate(({ currentTabId, currentPaneId }) => {
       window.__FRESHELL_TEST_HARNESS__?.dispatch({

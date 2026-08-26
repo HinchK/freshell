@@ -148,6 +148,18 @@ export function resolveFreshAgentType(
   return FRESH_AGENT_REGISTRY.find((entry) => entry.sessionType === sessionType)
 }
 
+/**
+ * Display names for the runtime providers that back fresh-agent panes, in the
+ * approved-preview casing ("Claude", "Codex", "OpenCode"). Used where the UI
+ * names the coding AGENT (e.g. the pane-header icon tooltip) rather than the
+ * pane type — the registry `label` names the pane type ("Freshclaude", …).
+ */
+export const FRESH_AGENT_RUNTIME_PROVIDER_LABELS: Record<FreshAgentRuntimeProvider, string> = {
+  claude: 'Claude',
+  codex: 'Codex',
+  opencode: 'OpenCode',
+}
+
 export function getFreshAgentLabel(sessionType: string | undefined): string {
   return resolveFreshAgentType(sessionType)?.label
     ?? getFreshAgentDescriptor(sessionType)?.label

@@ -76,6 +76,34 @@ const catalogResponse = {
   models: CATALOG_MODELS,
 }
 
+// Mirrors the settings-popover suite's claude catalog: a probed row re-using
+// the static id (must dedupe into the static row) and an alias-only row.
+const CLAUDE_CATALOG_RESPONSE = {
+  ok: true as const,
+  sessionType: 'freshclaude' as const,
+  runtimeProvider: 'claude' as const,
+  status: 'fresh' as const,
+  fetchedAt: 1_234,
+  models: [
+    {
+      id: 'opus[1m]',
+      displayName: 'Opus (1M context)',
+      provider: 'claude' as const,
+      supportsEffort: true,
+      supportedEffortLevels: ['low', 'medium', 'high'],
+      supportsAdaptiveThinking: true,
+    },
+    {
+      id: 'sonnet',
+      displayName: 'Sonnet',
+      provider: 'claude' as const,
+      supportsEffort: true,
+      supportedEffortLevels: ['low', 'medium', 'high'],
+      supportsAdaptiveThinking: false,
+    },
+  ],
+}
+
 function createStore() {
   return configureStore({
     reducer: {
@@ -125,6 +153,32 @@ function seedFreshcodexPane(
     provider: 'codex',
     model: 'gpt-5.5',
     effort: 'max',
+    ...overrides,
+  })
+}
+
+function seedFreshclaudePane(
+  store: ReturnType<typeof createStore>,
+  overrides: Partial<FreshAgentPaneContent> = {},
+) {
+  seedPane(store, {
+    sessionType: 'freshclaude',
+    provider: 'claude',
+    model: 'opus[1m]',
+    effort: 'high',
+    ...overrides,
+  })
+}
+
+function seedKilroyPane(
+  store: ReturnType<typeof createStore>,
+  overrides: Partial<FreshAgentPaneContent> = {},
+) {
+  seedPane(store, {
+    sessionType: 'kilroy',
+    provider: 'claude',
+    model: 'opus[1m]',
+    effort: 'high',
     ...overrides,
   })
 }
@@ -528,5 +582,183 @@ describe('FreshAgentModelDialog (freshcodex)', () => {
     })
     const levelMru = JSON.parse(window.localStorage.getItem('freshcodex.modelLevelMru.v1') ?? '[]')
     expect(levelMru).toEqual([expect.objectContaining({ modelId: 'gpt-5.4-flash', level: 'low' })])
+  })
+})
+
+describe('FreshAgentModelDialog (freshclaude)', () => {
+  it('renders the static claude row immediately and merges the probed claude catalog static-wins', async () => {
+    // Deferred probe: statics render instantly (no loading gate), exactly like
+    // the settings popover's claude path.
+    let resolveProbe: ((value: typeof CLAUDE_CATALOG_RESPONSE) => void) | undefined
+    getFreshAgentModelCapabilitiesSpy.mockReturnValueOnce(
+      new Promise((resolve) => { resolveProbe = resolve }),
+    )
+    const store = createStore()
+    seedFreshclaudePane(store)
+
+    renderDialog(store, { open: true })
+
+    const modelsList = await screen.findByRole('listbox', { name: 'Models' })
+    expect(modelsList).toHaveTextContent('Claude Opus 5 (1M context)')
+    expect(screen.getByRole('option', { name: /Claude Opus 5 \(1M context\).*current/ })).toBeInTheDocument()
+    expect(getFreshAgentModelCapabilitiesSpy).toHaveBeenCalledWith('freshclaude', expect.objectContaining({ cwd: '/repo/project-a' }))
+
+    resolveProbe!(CLAUDE_CATALOG_RESPONSE)
+
+    // probed alias rows surface; the probed opus[1m] row dedupes into the
+    // static row (static label wins)
+    await screen.findByRole('option', { name: /^Sonnet$/ })
+    expect(screen.getAllByRole('option', { name: /Opus/ })).toHaveLength(1)
+    expect(screen.getByRole('option', { name: /Claude Opus 5 \(1M context\)/ })).toBeInTheDocument()
+  })
+
+  it('commits a probed-only claude model: stores the selection, stamps modelEffortLevels (popover semantics), persists provider defaults', async () => {
+    const onClose = vi.fn()
+    getFreshAgentModelCapabilitiesSpy.mockResolvedValue(CLAUDE_CATALOG_RESPONSE)
+    const store = createStore()
+    seedFreshclaudePane(store)
+
+    renderDialog(store, { open: true, onClose })
+
+    fireEvent.click(await screen.findByRole('option', { name: /^Sonnet$/ }))
+    const levelsList = screen.getByRole('listbox', { name: 'Thinking levels for Sonnet' })
+    fireEvent.click(Array.from(levelsList.querySelectorAll('[role="option"]')).find((el) => el.textContent?.includes('low'))!)
+    fireEvent.click(screen.getByRole('button', { name: 'Use Sonnet · low' }))
+
+    expect(onClose).toHaveBeenCalled()
+    const content = paneContent(store)
+    expect(content.model).toBe('sonnet')
+    expect(content.modelSelection).toEqual({ kind: 'exact', modelId: 'sonnet' })
+    expect(content.effort).toBe('low')
+    // the stamp the settings popover writes for the same probed row, so later
+    // effort normalization clamps against THESE levels, never the static
+    // table's default-model fallback
+    expect(content.modelEffortLevels).toEqual(['low', 'medium', 'high'])
+    // the pick-time display label for the status-strip chip (catalog-only ids
+    // would otherwise render their raw id until a probe resolves)
+    expect(content.modelLabel).toEqual({ modelId: 'sonnet', label: 'Sonnet' })
+
+    expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
+      freshAgent: {
+        providers: {
+          freshclaude: {
+            modelSelection: { kind: 'exact', modelId: 'sonnet' },
+            effort: 'low',
+          },
+        },
+      },
+    })
+  })
+
+  it('commits the static claude row with its static levels stamped (popover parity for static rows)', async () => {
+    const onClose = vi.fn()
+    getFreshAgentModelCapabilitiesSpy.mockResolvedValue(CLAUDE_CATALOG_RESPONSE)
+    const store = createStore()
+    seedFreshclaudePane(store)
+
+    renderDialog(store, { open: true, onClose })
+
+    fireEvent.click(await screen.findByRole('option', { name: /Claude Opus 5 \(1M context\)/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Use Claude Opus 5 (1M context) · max' }))
+
+    expect(onClose).toHaveBeenCalled()
+    const content = paneContent(store)
+    expect(content.model).toBe('opus[1m]')
+    expect(content.effort).toBe('max')
+    expect(content.modelEffortLevels).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
+  })
+
+  it('commits a probed claude row that declares no effort levels with an empty-levels stamp (never the static fallback)', async () => {
+    const onClose = vi.fn()
+    getFreshAgentModelCapabilitiesSpy.mockResolvedValue({
+      ...CLAUDE_CATALOG_RESPONSE,
+      models: [
+        {
+          id: 'haiku',
+          displayName: 'Haiku',
+          provider: 'claude' as const,
+          supportsEffort: false,
+          supportedEffortLevels: [],
+          supportsAdaptiveThinking: false,
+        },
+      ],
+    })
+    const store = createStore()
+    seedFreshclaudePane(store)
+
+    renderDialog(store, { open: true, onClose })
+
+    fireEvent.click(await screen.findByRole('option', { name: /^Haiku$/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Use Haiku · Default' }))
+
+    expect(onClose).toHaveBeenCalled()
+    const content = paneContent(store)
+    expect(content.model).toBe('haiku')
+    expect(content.effort).toBeUndefined()
+    expect(content.modelEffortLevels).toEqual([])
+  })
+
+  it('degrades to the static claude rows when the claude catalog probe fails (dialog stays open, no unavailable notice)', async () => {
+    getFreshAgentModelCapabilitiesSpy.mockRejectedValue(new Error('probe down'))
+    const onClose = vi.fn()
+    const onCatalogUnavailable = vi.fn()
+    const store = createStore()
+    seedFreshclaudePane(store)
+
+    renderDialog(store, { open: true, onClose, onCatalogUnavailable })
+
+    expect(await screen.findByRole('option', { name: /Claude Opus 5 \(1M context\)/ })).toBeInTheDocument()
+    await waitFor(() => expect(getFreshAgentModelCapabilitiesSpy).toHaveBeenCalledTimes(1))
+    expect(onCatalogUnavailable).not.toHaveBeenCalled()
+    expect(onClose).not.toHaveBeenCalled()
+  })
+
+  it('stamps no modelLabel when the picked row\'s displayName echoes its raw id (raw ids are tooltip-only)', async () => {
+    const onClose = vi.fn()
+    getFreshAgentModelCapabilitiesSpy.mockResolvedValue({
+      ...CLAUDE_CATALOG_RESPONSE,
+      models: [
+        {
+          // e.g. opencode's no-name fallback: the catalog itself has no real
+          // display name, so displayName === id. Stamping it would put a raw
+          // id on the status-strip chip.
+          id: 'claude-ish/unnamed-7',
+          displayName: 'claude-ish/unnamed-7',
+          provider: 'claude' as const,
+          supportsEffort: false,
+          supportedEffortLevels: [],
+          supportsAdaptiveThinking: false,
+        },
+      ],
+    })
+    const store = createStore()
+    seedFreshclaudePane(store)
+
+    renderDialog(store, { open: true, onClose })
+
+    fireEvent.click(await screen.findByRole('option', { name: /^claude-ish\/unnamed-7$/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Use claude-ish/unnamed-7 · Default' }))
+
+    expect(onClose).toHaveBeenCalled()
+    const content = paneContent(store)
+    expect(content.model).toBe('claude-ish/unnamed-7')
+    expect(content.modelLabel).toBeUndefined()
+  })
+})
+
+describe('FreshAgentModelDialog (kilroy)', () => {
+  it('renders the kilroy static claude row and probes with the kilroy session type', async () => {
+    getFreshAgentModelCapabilitiesSpy.mockResolvedValue({
+      ...CLAUDE_CATALOG_RESPONSE,
+      sessionType: 'kilroy' as const,
+    })
+    const store = createStore()
+    seedKilroyPane(store)
+
+    renderDialog(store, { open: true })
+
+    await screen.findByRole('dialog', { name: 'Model and thinking level' })
+    expect(screen.getByRole('option', { name: /Claude Opus 5 \(1M context\)/ })).toBeInTheDocument()
+    expect(getFreshAgentModelCapabilitiesSpy).toHaveBeenCalledWith('kilroy', expect.objectContaining({ cwd: '/repo/project-a' }))
   })
 })

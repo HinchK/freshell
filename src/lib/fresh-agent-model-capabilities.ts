@@ -328,6 +328,33 @@ export type FreshAgentModelSourceGroup = {
   models: FreshAgentModelCapability[]
 }
 
+/**
+ * Merge a probed claude model catalog into the claude static capability
+ * table STATIC-WINS so the shared model+thinking dialog can serve
+ * freshclaude/kilroy: statics render instantly, then probed rows (aliases
+ * included) append once the catalog resolves. This is the capability-shape
+ * counterpart to `mergeClaudeSelectorOptions` (the settings popover's
+ * selector-shape merge), with identical semantics: the dedupe key is the row
+ * `id`; a probed row whose id equals a static id is dropped entirely (static
+ * label wins); probed rows otherwise pass through verbatim — never
+ * re-derived client-side. A missing/unavailable probed catalog leaves the
+ * statics untouched. Pure: no fetches, no globals.
+ */
+export function mergeClaudeModelCapabilities(
+  staticCapabilities: FreshAgentModelCapabilities,
+  probedCatalog: FreshAgentModelCapabilities | undefined,
+): FreshAgentModelCapabilities {
+  if (!probedCatalog) return staticCapabilities
+  const seen = new Set(staticCapabilities.models.map((model) => model.id))
+  const models = [...staticCapabilities.models]
+  for (const model of probedCatalog.models) {
+    if (seen.has(model.id)) continue
+    seen.add(model.id)
+    models.push(model)
+  }
+  return { ...probedCatalog, models }
+}
+
 function compareModelCapability(a: FreshAgentModelCapability, b: FreshAgentModelCapability): number {
   return a.displayName.localeCompare(b.displayName, undefined, { sensitivity: 'base' })
     || a.id.localeCompare(b.id, undefined, { sensitivity: 'base' })
@@ -412,13 +439,33 @@ export function capFreshAgentModelSourceRows(
 /**
  * Map a provider's baked-in model menu into the live-catalog capability shape
  * so the shared model+thinking dialog treats baked-in and probed catalogs as
- * data-only differences. Only freshcodex has a meaningful static table today;
- * freshopencode models come from the probed catalog and freshclaude/kilroy
- * keep their simple popover list.
+ * data-only differences. freshcodex and the claude providers
+ * (freshclaude/kilroy) have baked-in static tables; freshopencode models come
+ * from the probed catalog alone. The claude arm carries no `source`, so
+ * statics and probed rows group together under the provider fallback exactly
+ * as the probed claude catalog does.
  */
 export function getFreshAgentStaticModelCapabilities(
   sessionType: FreshAgentSessionType,
 ): FreshAgentModelCapabilities | undefined {
+  if (sessionType === 'freshclaude' || sessionType === 'kilroy') {
+    const models: FreshAgentModelCapability[] = FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE[sessionType]
+      .map((option) => ({
+        id: option.value,
+        displayName: option.label,
+        provider: 'claude' as const,
+        supportsEffort: (option.thinkingEfforts?.length ?? 0) > 0,
+        supportedEffortLevels: [...(option.thinkingEfforts ?? [])],
+        supportsAdaptiveThinking: false,
+      }))
+    return {
+      sessionType,
+      runtimeProvider: 'claude',
+      status: 'fresh',
+      fetchedAt: 0,
+      models,
+    }
+  }
   if (sessionType !== 'freshcodex') return undefined
   const models: FreshAgentModelCapability[] = FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE.freshcodex
     .map((option) => ({

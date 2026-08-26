@@ -21,6 +21,17 @@ type QuerySessionDirectoryInput = {
   terminalMeta: TerminalMeta[]
   providers?: CodingCliProvider[]
   signal?: AbortSignal
+  /**
+   * STATUS-STRIP: monotonic per-process sequence assigned by the router at
+   * query invocation — clients use it to order competing session-directory
+   * responses (a slow older response can never regress a newer one). Optional
+   * for direct/unit callers (local fallback counter keeps the output monotonic).
+   */
+  snapshotSeq?: number
+  /** The serving server's instance id — responses are only orderable within it. */
+  serverInstance?: string
+  /** Per-process boot nonce — seq ordering is trusted only within the same instance+boot. */
+  bootId?: string
 }
 
 type FileSearchResult = {
@@ -130,6 +141,10 @@ function throwIfAborted(signal?: AbortSignal): void {
   }
 }
 
+// STATUS-STRIP fallback when no router-assigned `snapshotSeq` is provided
+// (direct/unit callers): local per-process counter keeps page.seq monotonic.
+let localSnapshotSeqFallback = 0
+
 function compareItems(a: SessionDirectoryItem, b: SessionDirectoryItem): number {
   return compareSessionDirectoryComparableItems(a, b)
 }
@@ -197,6 +212,10 @@ function buildLiveTerminalSessionItem(meta: TerminalMeta): SessionDirectoryItem 
     isRunning: true,
     runningTerminalId: meta.terminalId,
     liveTerminalOnly: !meta.sessionId,
+    // STATUS-STRIP: live terminal rows carry the terminal's own usage so an
+    // active fresh-agent session's meter has data even before/without the
+    // indexer's persisted-record parse.
+    tokenUsage: meta.tokenUsage,
     // Bug-1 (sidebar rail): mirror the Rust projection
     // (session_directory.rs build_live_terminal_session_item) — a terminal
     // whose opencode resume target is a SUBAGENT (child) session must carry
@@ -332,6 +351,14 @@ export async function querySessionDirectory(input: QuerySessionDirectoryInput): 
 
   let items = toItems(persistedProjects, input.terminalMeta).sort(compareItems)
 
+  // STATUS-STRIP: snapshot the extras candidate list BEFORE the sidebar
+  // visibility filters too — a fresh-agent pane's own session may be
+  // subagent-classed, non-interactive, or untitled/idle, and its meter must
+  // stay live regardless of the sidebar window's filtering state. Extras are
+  // returned out-of-band and never merged into `items`, so lowering the
+  // visibility bar here cannot leak hidden rows into the sidebar.
+  const extrasCandidateItems = items
+
   // Server-side visibility pre-filtering to avoid wasting search budget on
   // sessions the client will hide. Matches the client's default sidebar settings.
   if (!input.query.includeSubagents) {
@@ -384,6 +411,25 @@ export async function querySessionDirectory(input: QuerySessionDirectoryInput): 
     items: pageItems,
     nextCursor,
     revision,
+    snapshotSeq: input.snapshotSeq ?? ++localSnapshotSeqFallback,
+    ...(input.serverInstance ? { serverInstance: input.serverInstance } : {}),
+    ...(input.bootId ? { bootId: input.bootId } : {}),
+  }
+
+  const includeKeys = input.query.includeKeys
+  if (includeKeys && includeKeys.length > 0) {
+    const wanted = new Set(includeKeys)
+    const pageKeys = new Set(pageItems.map(buildSessionKey))
+    const extras = extrasCandidateItems
+      .filter((item) => wanted.has(buildSessionKey(item)) && !pageKeys.has(buildSessionKey(item)))
+      .map((item) => ({
+        provider: item.provider,
+        sessionId: item.sessionId,
+        ...(item.tokenUsage ? { tokenUsage: item.tokenUsage } : {}),
+      }))
+    if (extras.length > 0) {
+      page.contextUsageExtras = extras
+    }
   }
 
   // SESSION-05: embed the resolved project colors. They come from the

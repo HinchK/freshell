@@ -572,7 +572,7 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
 
   return (
     <form
-      className="fresh-agent-composer relative border-t border-border/60 p-3 pb-[max(env(safe-area-inset-bottom),0.75rem)] sm:pb-3"
+      className="fresh-agent-composer relative p-3 pb-[max(env(safe-area-inset-bottom),0.75rem)] sm:pb-3"
       onSubmit={(event) => {
         event.preventDefault()
         sendText()

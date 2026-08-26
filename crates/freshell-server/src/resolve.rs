@@ -966,6 +966,7 @@ mod tests {
             is_non_interactive: false,
             git_branch: None,
             source_file: None,
+            token_usage: None,
         }
     }
 

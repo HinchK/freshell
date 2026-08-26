@@ -28,19 +28,20 @@ html {
   flex: 1 1 auto;
 }
 
-.pane-header-fresh-agent-identity {
-  max-width: 8rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .pane-header-fresh-agent-detail {
   flex: 1 1 auto;
 }
 
 .pane-header-fresh-agent-meta {
   min-width: min-content;
+}
+
+/* Narrow mobile panes (approved preview): the dir/branch meta hides entirely —
+   the icons + title carry the header; the strip below still shows context. */
+@container (max-width: 480px) {
+  .pane-header--fresh-agent .pane-header-fresh-agent-meta {
+    display: none;
+  }
 }
 
 @container (max-width: 280px) {
@@ -62,9 +63,8 @@ html {
     gap: 0.2rem;
   }
 
-  .pane-header--fresh-agent .pane-header-fresh-agent-identity,
   .pane-header--fresh-agent .pane-header-fresh-agent-detail {
-    font-size: 0.68rem;
+    font-size: 13px;
   }
 
   .pane-header--fresh-agent .pane-header-actions button {
@@ -195,6 +195,10 @@ html {
 
 .fresh-agent-turn-header {
   font-family: var(--fresh-agent-meta-font-family);
+  /* 12px desktop floor: the project's custom `text-xs` utility is 11px
+     (0.6875rem); the serif/mono overrides below already pin 0.75rem and the
+     ≤520px container bump (further below, source-order load-bearing) pins 13px. */
+  font-size: 0.75rem;
   letter-spacing: 0;
 }
 
@@ -358,7 +362,7 @@ html {
 
 .fresh-agent-style-serif .fresh-agent-turn-header {
   color: var(--fresh-agent-soft-text);
-  font-size: 0.58rem;
+  font-size: 0.75rem;
   font-weight: 500;
   letter-spacing: 0.12em;
   line-height: 1.25;
@@ -692,8 +696,12 @@ html {
 
 .fresh-agent-style-serif .fresh-agent-composer {
   background: var(--fresh-agent-surface);
-  border-top-color: var(--fresh-agent-border);
   padding: 0.95rem 1.4rem max(env(safe-area-inset-bottom), 0.95rem);
+}
+
+.fresh-agent-style-serif .fresh-agent-status-strip {
+  border-top-color: var(--fresh-agent-border);
+  padding: 0 1.4rem;
 }
 
 .fresh-agent-style-serif .fresh-agent-composer-input {
@@ -879,7 +887,7 @@ html {
 
 .fresh-agent-style-mono .fresh-agent-turn-header {
   color: var(--fresh-agent-soft-text);
-  font-size: 0.62rem;
+  font-size: 0.75rem;
   font-weight: 500;
   letter-spacing: 0;
   line-height: 1.25;
@@ -903,6 +911,15 @@ html {
 .fresh-agent-style-mono .fresh-agent-turn[data-turn-role="user"] .fresh-agent-turn-header {
   color: var(--fresh-agent-accent);
   margin-bottom: 0.25rem;
+}
+
+/* Turn-header legibility floor on narrow panes: 13px. Placement is
+   load-bearing — this block must follow the serif/mono turn-header rules so
+   equal-specificity ties resolve here by source order (no !important). */
+@container (max-width: 520px) {
+  .fresh-agent-turn-header,
+  .fresh-agent-style-serif .fresh-agent-turn-header,
+  .fresh-agent-style-mono .fresh-agent-turn-header { font-size: 13px; }
 }
 
 .fresh-agent-style-mono .fresh-agent-turn[data-turn-role="user"] .fresh-agent-transcript-copy {
@@ -1204,8 +1221,12 @@ html {
 
 .fresh-agent-style-mono .fresh-agent-composer {
   background: var(--fresh-agent-surface);
-  border-top: 1px solid var(--fresh-agent-border);
   padding: 0.75rem 1rem max(env(safe-area-inset-bottom), 0.75rem);
+}
+
+.fresh-agent-style-mono .fresh-agent-status-strip {
+  border-top: 1px solid var(--fresh-agent-border);
+  padding: 0 1rem;
 }
 
 .fresh-agent-style-mono .fresh-agent-composer-input {
@@ -1333,6 +1354,46 @@ html {
   .fresh-agent-composer-action {
     width: 100% !important;
   }
+}
+
+/* ---------- fresh-agent session status strip ---------- */
+.fresh-agent-status-strip {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  height: 26px; padding: 0 8px;
+  border-top: 1px solid hsl(var(--border) / 0.6);
+  font-family: var(--fresh-agent-meta-font-family);
+  font-size: 12px; color: var(--fresh-agent-muted-text);
+}
+.fresh-agent-status-chip {
+  display: inline-flex; align-items: center; gap: 4px; min-width: 0;
+  background: transparent; border: 0; padding: 3px 6px; border-radius: 4px;
+  font: inherit; font-weight: 500; color: inherit; cursor: pointer; white-space: nowrap; line-height: 1.3;
+}
+.fresh-agent-status-chip:hover { background: var(--fresh-agent-subtle-surface); }
+.fresh-agent-status-chip-label { overflow: hidden; text-overflow: ellipsis; }
+.fresh-agent-status-chip-label-short { display: none; }
+/* Pin the meter cluster to the right edge even when the left side is empty
+   (chip hidden while no display name has resolved, per the chip directive). */
+.fresh-agent-status-context { display: inline-flex; align-items: center; gap: 8px; flex: none; margin-left: auto; }
+.fresh-agent-status-meter { width: 96px; height: 4px; border-radius: 999px; background: hsl(var(--muted)); overflow: hidden; display: block; }
+.fresh-agent-status-meter > i { display: block; height: 100%; border-radius: 999px; background: var(--fresh-agent-muted-text); }
+.fresh-agent-status-pct { font-variant-numeric: tabular-nums; }
+.fresh-agent-status-strip[data-severity="warn"] .fresh-agent-status-meter > i { background: hsl(var(--warning)); }
+.fresh-agent-status-strip[data-severity="warn"] .fresh-agent-status-pct { color: hsl(var(--warning)); }
+.fresh-agent-status-strip[data-severity="hot"] .fresh-agent-status-meter > i { background: hsl(var(--destructive)); }
+.fresh-agent-status-strip[data-severity="hot"] .fresh-agent-status-pct { color: hsl(var(--destructive)); }
+.fresh-agent-status-context-unknown { color: var(--fresh-agent-muted-text); }
+
+@container (max-width: 520px) {
+  .fresh-agent-status-strip { height: 32px; font-size: 13px; }
+  .fresh-agent-status-chip { padding: 8px; }
+  .fresh-agent-status-chip-label-long { display: none; }
+  .fresh-agent-status-chip-label-short { display: inline; }
+  .fresh-agent-status-context-label { display: none; }
+  .fresh-agent-status-meter { width: 64px; height: 5px; }
+}
+@container (max-width: 280px) {
+  .fresh-agent-status-meter { display: none; }
 }
 
 @container (min-width: 900px) {

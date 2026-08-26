@@ -41,8 +41,12 @@ function getTurnLabel(turn: FreshAgentTurn, agentLabel?: string): string {
 function formatTurnTimecode(timestamp: string | undefined): string | null {
   if (!timestamp) return null
   const date = new Date(timestamp)
-  if (Number.isNaN(date.getTime())) return timestamp
-  return date.toLocaleTimeString()
+  // Malformed provider timestamps render no timecode at all — a raw
+  // passthrough could leak seconds or a UTC "Z" suffix.
+  if (Number.isNaN(date.getTime())) return null
+  // Local time, h:mm AM/PM, no seconds (hour12 pins the meridiem even in
+  // 24-hour-default locales).
+  return date.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit', hour12: true })
 }
 
 function isToolLike(item: FreshAgentTranscriptItem): boolean {
@@ -795,7 +799,7 @@ function FreshAgentTurnArticle({
         onOpenActions={actions.onOpenActions}
       />
       {showHeader ? (
-        <div className="fresh-agent-turn-header mb-1 flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+        <div className="fresh-agent-turn-header mb-1 flex items-center justify-between gap-2 text-xs text-muted-foreground">
           <span>{turnLabel}</span>
           {showTimecodes && (timecode || turn.model) ? (
             <span className="flex min-w-0 items-center gap-2">

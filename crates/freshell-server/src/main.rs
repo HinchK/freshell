@@ -1457,6 +1457,8 @@ async fn main() -> ExitCode {
         // Task 20: the SAME store the POST route writes through -- the
         // directory read-join must see every persisted `sessionType` tag.
         metadata: session_metadata_store.clone(),
+        // STATUS-STRIP: sessions.cloned pages are client-ordered per instance.
+        server_instance: Arc::clone(&server_instance_id),
     };
 
     let client_dir = Arc::new(resolve_client_dir());
@@ -2754,6 +2756,7 @@ mod sessions_sweep_tests {
             is_subagent: false,
             is_non_interactive: false,
             source_file: None,
+            token_usage: None,
         }
     }
 

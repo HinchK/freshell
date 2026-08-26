@@ -46,12 +46,13 @@ import { cancelCreate } from '@/lib/create-cancellation'
 import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
-import type { ProjectGroup, CodingCliSession } from '@/store/types'
+import type { ProjectGroup } from '@/store/types'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
 import { applyPaneRename } from '@/store/titleSync'
 import { saveServerSettingsPatch } from '@/store/settingsThunks'
 import { getPreferredResumeSessionId } from '@/store/persistControl'
+import { findIndexedSessionById } from '@/lib/fresh-agent-context-usage'
 import type { SessionLocator } from '@shared/ws-protocol'
 
 // Stable empty object to avoid selector memoization issues
@@ -127,20 +128,6 @@ function resolvePaneRuntimeMeta(
   return undefined
 }
 
-function findIndexedSessionById(
-  projects: ProjectGroup[],
-  provider: CodingCliProviderName,
-  sessionId: string,
-): CodingCliSession | undefined {
-  for (const project of projects) {
-    const match = project.sessions.find((session) => (
-      session.provider === provider && session.sessionId === sessionId
-    ))
-    if (match) return match
-  }
-  return undefined
-}
-
 function resolveFreshAgentRuntimeMeta(
   indexedProjects: ProjectGroup[],
   content: FreshAgentPaneContent,
@@ -152,13 +139,14 @@ function resolveFreshAgentRuntimeMeta(
   if (provider && sessionId) {
     const indexed = findIndexedSessionById(indexedProjects, provider, sessionId)
     if (indexed) {
+      // Fresh-agent pane headers carry dir+branch only — context usage lives
+      // in the session status strip between transcript and composer.
       return {
         cwd: indexed.cwd,
         checkoutRoot: indexed.projectPath,
         repoRoot: indexed.projectPath,
         branch: indexed.gitBranch,
         isDirty: indexed.isDirty,
-        tokenUsage: indexed.tokenUsage,
       }
     }
   }
@@ -177,20 +165,11 @@ function resolveFreshAgentRuntimeMeta(
     branch = session.snapshot.worktrees[0].branch
   }
 
-  const snapshotTokenUsage = session.snapshot?.tokenUsage
   const cwd = session.cwd ?? content.initialCwd
   return {
     cwd,
     checkoutRoot: cwd,
     branch,
-    tokenUsage: snapshotTokenUsage && {
-      inputTokens: snapshotTokenUsage.inputTokens,
-      outputTokens: snapshotTokenUsage.outputTokens,
-      cachedTokens: snapshotTokenUsage.cachedTokens ?? 0,
-      totalTokens: snapshotTokenUsage.totalTokens,
-      ...(snapshotTokenUsage.contextTokens !== undefined && { contextTokens: snapshotTokenUsage.contextTokens }),
-      ...(snapshotTokenUsage.compactPercent !== undefined && { compactPercent: snapshotTokenUsage.compactPercent }),
-    },
   }
 }
 
