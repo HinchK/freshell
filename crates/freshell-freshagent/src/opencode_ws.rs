@@ -1682,12 +1682,16 @@ impl FreshOpencodeState {
                 // The composer-refill payload: plain text of the first removed USER
                 // message.
                 let prompt = first_user_prompt_text(removed_msgs);
-                // Post-op record FIRST (durable-BEFORE-mutation): the marker bucket is
-                // the r3 UNION under delta-r1 F8's literal epoch bookkeeping — frozen
-                // prior-epoch entries PRECEDE the current epoch (which reads
-                // conversation-order ascending: a second same-epoch undo removes an
-                // EARLIER step, so its entry splices ahead of the prior one; undo 3
-                // then undo 2 ⇒ markers [2, 3]).
+                // Post-op record FIRST (durable-BEFORE-mutation): the CURRENT-epoch
+                // portion of `entries` is REBUILT to exactly the current
+                // serve-revert tail — ONE entry when non-empty, its turns in
+                // ORIGINAL CONVERSATION ORDER (the r3 union: frozen prior-epoch
+                // entries PRECEDE it) — per the plan's opencode wire-design
+                // bullet. The rebuild merge dedupes by turn id, so a RETRY whose
+                // provider-slice re-derives the SAME turns (plan triad (c)'s
+                // deliberately-kept speculative entry, provider unmoved) is
+                // IDEMPOTENT at the ledger — never a duplicated bucket
+                // (ep2-r3). (Conversation position never reads timestamps.)
                 let now = crate::rollback_record::now_ms();
                 let previous = self
                     .identity_sink()
@@ -1706,15 +1710,7 @@ impl FreshOpencodeState {
                     record.redo_destroyed = false;
                     record.begin_new_epoch();
                 }
-                record.splice_undo_entry(
-                    RollbackEntry {
-                        removed_turns,
-                        prompt_text: prompt.clone(),
-                        at_ms: now,
-                        epoch: record.current_epoch,
-                    },
-                    now,
-                );
+                record.rebuild_current_epoch_tail(removed_turns, prompt.clone(), now);
                 // The new tail is provably non-empty (it contains the target), so the
                 // fresh chain is redoable.
                 record.set_can_redo(true, now);
@@ -6320,8 +6316,11 @@ mod tests {
         revert_status: StdMutex<u16>,
         /// false simulates the silent-200 no-op (unknown/stale messageID).
         revert_moves_pointer: StdMutex<bool>,
-        /// Fail every `GET /session/<id>` past the Nth (post-verify read triad leg (c)).
-        get_session_fail_after: StdMutex<Option<usize>>,
+        /// Fail exactly these (1-indexed) `GET /session/<id>` calls (post-verify
+        /// read triad leg (c); a per-call set because the ep2-r3 retry repro
+        /// fails op1's post-verify AND op2's post-verify while op2's initial
+        /// read succeeds).
+        get_session_fail_calls: StdMutex<std::collections::BTreeSet<usize>>,
         get_session_calls: StdMutex<usize>,
         /// When armed, the NEXT revert POST records itself then parks on `notified()` —
         /// the deterministic "rollback in flight" window (the fork-gate idiom).
@@ -6349,7 +6348,7 @@ mod tests {
                 revert_pointer: StdMutex::new(pointer.map(str::to_string)),
                 revert_status: StdMutex::new(200),
                 revert_moves_pointer: StdMutex::new(true),
-                get_session_fail_after: StdMutex::new(None),
+                get_session_fail_calls: StdMutex::new(std::collections::BTreeSet::new()),
                 get_session_calls: StdMutex::new(0),
                 revert_gate: StdMutex::new(None),
                 summarize_gate: StdMutex::new(None),
@@ -6555,8 +6554,8 @@ mod tests {
                 let mut calls = self.get_session_calls.lock().expect("calls mutex");
                 *calls += 1;
                 let n_calls = *calls;
-                let fail_after = *self.get_session_fail_after.lock().expect("flag mutex");
-                if fail_after.is_some_and(|after| n_calls > after) {
+                let fail_calls = self.get_session_fail_calls.lock().expect("flag mutex");
+                if fail_calls.contains(&n_calls) {
                     return Box::pin(async {
                         Ok(ServeHttpResponse::new(500, b"read exploded".to_vec()))
                     });
@@ -7131,7 +7130,10 @@ mod tests {
     async fn handle_rollback_twice_keeps_markers_in_conversation_order() {
         // Undo (removes the msg_u3 group), then undo again (removes the msg_u2
         // group): the marker bucket is the tail in its ORIGINAL CONVERSATION ORDER
-        // [u2,a2,u3,a3] — never wire order [u3,a3,u2,a2].
+        // [u2,a2,u3,a3] — never wire order [u3,a3,u2,a2] — as ONE rebuilt
+        // current-epoch entry (the plan's opencode bullet: the current-epoch
+        // portion is REBUILT to exactly the current serve-revert tail; focused
+        // ep2-r3 — never one spliced entry per op).
         let (st, _rx, st_sink, _http) = state_with_rollback_fake(None).await;
         let (sink, _captured) = capturing_sink();
         st.handle_rollback(undo_op("ses_real", "rb-8a"), sink).await;
@@ -7139,19 +7141,16 @@ mod tests {
         st.handle_rollback(undo_op("ses_real", "rb-8b"), sink2)
             .await;
         let record = st_sink.load_rollback(PROVIDER, "ses_real").expect("record");
-        // Delta-r1 F8: entry-granular epochs (the bucket's READ shape is
-        // unchanged) — the second same-epoch undo splices BEFORE the first's
-        // entry, so the current epoch reads conversation-order ascending.
+        // Delta-r1 F8 + ep2-r3 F2: one REBUILT entry carries the whole current
+        // epoch's tail, conversation-order ascending (the second same-epoch
+        // undo's slice precedes the first's).
         assert_eq!(
             record.entries.len(),
-            2,
-            "one entry per undo op, both in the current epoch: {record:?}"
+            1,
+            "one REBUILT entry for the whole current epoch: {record:?}"
         );
-        assert!(
-            record
-                .entries
-                .iter()
-                .all(|e| e.epoch == record.current_epoch),
+        assert_eq!(
+            record.entries[0].epoch, record.current_epoch,
             "no epoch boundary without a destroy: {record:?}"
         );
         let ids: Vec<&str> = record
@@ -7162,7 +7161,7 @@ mod tests {
         assert_eq!(
             ids,
             vec!["msg_u2", "msg_a2", "msg_u3", "msg_a3"],
-            "markers follow the tail's conversation order"
+            "the rebuilt tail reads the tail's conversation order"
         );
     }
 
@@ -7229,7 +7228,7 @@ mod tests {
         // verbatim). Note in the handler: the next snapshot derives its prefix from
         // provider rows, so pane + record reconverge automatically on retry.
         let (st, _rx, st_sink, http) = state_with_rollback_fake(None).await;
-        *http.get_session_fail_after.lock().expect("flag") = Some(1);
+        http.get_session_fail_calls.lock().expect("flag").insert(2);
         let (sink, captured) = capturing_sink();
         st.handle_rollback(undo_op("ses_real", "rb-11a"), sink)
             .await;
@@ -7258,6 +7257,62 @@ mod tests {
         );
     }
 
+    /// Focused-review ep2-r3 / plan wire-design opencode bullet: plan triad (c)
+    /// deliberately keeps the speculative post-op record after an UNVERIFIABLE
+    /// mutation; a RETRY over an UNMOVED provider re-derives the exact same
+    /// removed slice. The current-epoch portion must be REBUILT to exactly the
+    /// serve-revert tail (one entry, absorbed by turn id) — the prior per-op
+    /// splice inserted the same slice TWICE; snapshot stamping then flattened
+    /// BOTH entries into duplicated rolledBackTurns / inflated undoneDepth /
+    /// duplicated redoableTurnIds. Rig: EVERY post-verify read fails (triad (c)
+    /// keeps the ledger each time: call 2, call 4) while the provider's pointer
+    /// provably never moves (the silent-200 no-op shape — the same turns stay
+    /// live), so BOTH ops keep their speculative record legs.
+    #[tokio::test]
+    async fn repeated_ambiguous_undo_retries_rebuild_never_duplicate_the_marker_slice() {
+        let (st, _rx, st_sink, http) = state_with_rollback_fake(None).await;
+        http.get_session_fail_calls
+            .lock()
+            .expect("flag")
+            .extend([2usize, 4usize]);
+        *http.revert_moves_pointer.lock().expect("flag") = false;
+        st.handle_rollback(undo_op("ses_real", "rb-qc-1"), capturing_sink().0)
+            .await;
+        st.handle_rollback(undo_op("ses_real", "rb-qc-2"), capturing_sink().0)
+            .await;
+        let record = st_sink
+            .load_rollback(PROVIDER, "ses_real")
+            .expect("the ledger is KEPT verbatim on both triad-(c) legs");
+        assert_eq!(
+            record.entries.len(),
+            1,
+            "ep2-r3: a same-slice ambiguous retry REBUILDS the current-epoch tail — never duplicates it: {record:?}"
+        );
+        assert_eq!(
+            RollbackFakeHttp::turn_ids(&record.entries[0].removed_turns),
+            vec!["msg_u3", "msg_a3"],
+            "one entry, exactly the serve-revert slice: {record:?}"
+        );
+        // The snapshot truth flattens the bucket exactly once.
+        let snap = crate::build_opencode_snapshot_json(
+            "ses_real",
+            &json!({ "id": "ses_real", "time": { "updated": 10 } }),
+            &json!([]),
+            Some(&record),
+        );
+        assert_eq!(
+            snap["rollback"]["undoneDepth"],
+            json!(1),
+            "ONE undone user step — never the duplicated count: {snap}"
+        );
+        let bucket = snap["rolledBackTurns"].as_array().expect("bucket");
+        assert_eq!(
+            bucket.len(),
+            2,
+            "the marker slice flattens exactly once: {snap}"
+        );
+    }
+
     #[tokio::test]
     async fn handle_rollback_redo_post_verify_read_failure_keeps_the_ledger_and_reports_internal_error(
     ) {
@@ -7265,7 +7320,7 @@ mod tests {
         // failed read after a re-revert yields the same INTERNAL_ERROR + ledger-kept
         // outcome.
         let (st, _rx, st_sink, http) = state_with_rollback_fake(Some("msg_u2")).await;
-        *http.get_session_fail_after.lock().expect("flag") = Some(1);
+        http.get_session_fail_calls.lock().expect("flag").insert(2);
         let (sink, captured) = capturing_sink();
         let mut op = undo_op("ses_real", "rb-11b");
         op.direction = RollbackDirection::Redo;

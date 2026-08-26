@@ -848,7 +848,17 @@ impl FreshClaudeState {
             // clear (interrupting the active turn with a compact+send still
             // queued behind it must leave the gate CLOSED).
             let mut tracker = session.turn_tracker.lock().expect("turn tracker lock");
-            tracker.running = None;
+            // Retire the op ACTUALLY in flight: the `running` slot, or — queued
+            // turns are never promoted (only compacts promote, via the observed
+            // compacting frame) — the queue FRONT, which is the de-facto active
+            // turn once the slot is empty (ep2-r3: interrupting a turn AFTER it
+            // advanced from the queue wedged the gate forever — no result frame
+            // ever arrives for an interrupted turn, so nothing would retire its
+            // entry afterward). The ops BEHIND the front stay queued (the
+            // interrupt never drains them).
+            if tracker.running.take().is_none() {
+                tracker.queued.pop_front();
+            }
             session
                 .in_turn
                 .store(tracker.busy(), std::sync::atomic::Ordering::SeqCst);
@@ -7274,6 +7284,72 @@ rl.on('line', (line) => {
         assert_eq!(
             frames[0]["event"]["code"], "NOTHING_TO_UNDO",
             "the gate released exactly at C2's own terminal edge: {frames:?}"
+        );
+        drop(env);
+    }
+
+    /// Focused-review ep2-r3 (queue-advanced interrupt): queued TURNS are never
+    /// OBSERVED promoted (only compacts promote via the compacting frame), so
+    /// once the prior op's edge frees the `running` slot, the queue FRONT is the
+    /// de-facto active turn. Interrupting THAT turn produces no result frame —
+    /// nothing retires its queued entry afterward, so an interrupt that only
+    /// cleared the `running` slot left the entry there forever: `in_turn` stayed
+    /// true and the sole mid-turn gate rejected undo/redo permanently. The
+    /// interrupt retires the running slot OR the queue FRONT (the op actually in
+    /// flight) — never the still-queued ops behind it.
+    ///
+    /// A running → B queued → A's pair retires A → B starts → interrupt B.
+    #[tokio::test]
+    async fn interrupting_a_queue_advanced_turn_releases_the_gate() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-qadv")).await;
+        let created = await_claude_created(&mut rx, "req-qadv").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        await_status_frame(&mut rx, &session_id, "idle").await;
+
+        st.handle_send(send_msg(&session_id, "turn one")).await; // A
+        st.handle_send(send_msg(&session_id, "turn two")).await; // B queued
+
+        // A's pair retires the running op; B (the queue front) is now the
+        // de-facto active turn — the gate stays closed (B owes its own edge).
+        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
+        inject_raw_send(&st, &session_id, "__emit_idle__").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            in_turn_of(&st, &session_id).await,
+            "B advanced from the queue — the gate holds for its own edge"
+        );
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-qadv-0", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        assert_eq!(
+            captured_json(&captured)[0]["event"]["code"],
+            "BUSY_TURN",
+            "B is in flight — the gate is closed pre-interrupt"
+        );
+
+        // Interrupt B (no result frame exists for it — the interrupt IS its
+        // busy-clear edge): the gate opens here, permanently.
+        st.handle_interrupt(interrupt_msg(&session_id)).await;
+        assert!(
+            !in_turn_of(&st, &session_id).await,
+            "ep2-r3: interrupting the queue-advanced turn ends its busy truth — the queued entry never strands the gate"
+        );
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-qadv-1", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        let frames = captured_json(&captured);
+        assert_eq!(
+            frames[0]["event"]["code"], "NOTHING_TO_UNDO",
+            "the gate released with the interrupt — never wedged: {frames:?}"
         );
         drop(env);
     }

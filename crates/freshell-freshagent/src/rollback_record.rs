@@ -308,6 +308,8 @@ impl RollbackRecord {
     /// entries (sequential undos within one epoch each remove an
     /// earlier-in-conversation step, so the current-epoch block reads
     /// conversation-order ascending). Entry positions never consult `at_ms`.
+    /// (CLAUDE lane per the plan's claude bullet — "each undo APPENDS that op's
+    /// removed display-turn slice"; OPENCODE uses [`Self::rebuild_current_epoch_tail`].)
     pub fn splice_undo_entry(&mut self, entry: RollbackEntry, now_ms: i64) {
         let insert_at = self
             .entries
@@ -315,6 +317,66 @@ impl RollbackRecord {
             .take_while(|e| e.epoch < self.current_epoch)
             .count();
         self.entries.insert(insert_at, entry);
+        self.last_op_at_ms = now_ms;
+    }
+
+    /// Opencode plan rule (the plan's wire-design opencode bullet): after every
+    /// op the CURRENT-epoch portion of `entries` is REBUILT to exactly the
+    /// current serve-revert tail — ONE entry when non-empty, in the tail's
+    /// ORIGINAL CONVERSATION ORDER — while FROZEN prior-epoch markers PRECEDE
+    /// it. The merge dedupes by turn identity (marker `turnId`, falling back to
+    /// `id`): plan triad (c) deliberately keeps the speculative post-op record
+    /// after an unverifiable mutation, so a RETRY over an unmoved provider
+    /// re-derives the SAME slice — the rebuild absorbs it in place and can
+    /// NEVER duplicate the marker bucket (focused-review ep2-r3: the per-op
+    /// splice inserted the same removed turns twice, and the snapshot then
+    /// flattened BOTH — duplicated `rolledBackTurns`, inflated `undoneDepth` and
+    /// `redoableTurnIds`). Same-epoch undos each remove an EARLIER step, so the
+    /// new slice precedes the existing current-epoch content in conversation
+    /// order.
+    pub fn rebuild_current_epoch_tail(
+        &mut self,
+        removed_turns: Vec<Value>,
+        prompt_text: String,
+        now_ms: i64,
+    ) {
+        let frozen = self
+            .entries
+            .iter()
+            .take_while(|e| e.epoch < self.current_epoch)
+            .count();
+        // Everything past the frozen prefix is the outgoing current-epoch
+        // portion; the new slice PRECEDES it in conversation order.
+        let existing: Vec<Value> = self
+            .entries
+            .drain(frozen..)
+            .flat_map(|e| e.removed_turns)
+            .collect();
+        let mut merged: Vec<Value> = Vec::with_capacity(removed_turns.len() + existing.len());
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for turn in removed_turns.into_iter().chain(existing) {
+            let id = turn
+                .get("turnId")
+                .or_else(|| turn.get("id"))
+                .and_then(Value::as_str);
+            if let Some(id) = id {
+                if !seen.insert(id.to_string()) {
+                    continue;
+                }
+            }
+            merged.push(turn);
+        }
+        if !merged.is_empty() {
+            self.entries.insert(
+                frozen,
+                RollbackEntry {
+                    removed_turns: merged,
+                    prompt_text,
+                    at_ms: now_ms,
+                    epoch: self.current_epoch,
+                },
+            );
+        }
         self.last_op_at_ms = now_ms;
     }
 }
