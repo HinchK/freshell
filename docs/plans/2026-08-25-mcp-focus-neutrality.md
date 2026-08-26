@@ -52,6 +52,18 @@ unit/component tests, Playwright e2e against the owned RustServer wall harness.
   server restart is implied by this plan. The frozen WS contract
   (`port/contract/ws-server-messages.schema.json:3205-3221`, `"payload": true`)
   is untouched.
+- **Base sync first.** At plan-write time the branch is 2 commits behind
+  `origin/main` (doc-only upstream delta). Before executing Task 1:
+  `git fetch origin` and fast-forward/rebase the branch onto `origin/main`,
+  update run-state's base note, and re-check the line anchors cited in this
+  plan if the upstream delta touched any edited file (it did not at write time).
+- **E2E backend policy.** All e2e EXECUTION goes through the backend wrapper
+  (`bash scripts/e2e-cloud.sh run --local …` shown below; substitute
+  `--cloud` when the configured `FRESHELL_E2E_BACKEND` is `cloud`). Discovery
+  commands (`--list`) run plain Playwright directly — they never execute
+  tests. Per repo policy the backend choice (`FRESHELL_E2E_BACKEND` /
+  `FRESHELL_VITEST_BACKEND`) is pinned by the user before Stage 4
+  (local = free/slower, cloud = ~$0.03/run/parallel).
 - Default-`true` semantics preserve every local/user-driven flow (tab-bar "+",
   pane "+", picker, keyboard shortcuts, drag-splits): all existing reducer and
   component tests must keep passing unchanged. The only behavior change is for
@@ -549,13 +561,14 @@ the prompt-gate poll block (ends :332):
     await expect.poll(async () => harness.getActiveTabId(), { timeout: 10_000 }).toBe(restTabId)
 ```
 
-Run the five repaired tests in three invocations (`-g` applies to every spec
-basename in the same run, so the unfiltered hidden-pane spec goes alone):
+Run the five repaired tests in three invocations through the backend wrapper
+(`--grep` is a supported wrapper flag; substitute `--cloud` for `--local`
+when the configured backend is cloud):
 
 ```bash
-env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium hidden-pane-rebind-rust
-env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium git-badges-rust sidebar-registry-sync-rust -g "a REST-created shell tab|case-c: fresh codex terminal collapses"
-env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium restore-contract-wall-rust -g "hidden-pane rebind: a background tab pane must rebind without being revealed|shell terminal: SIGKILL restore yields a fresh shell in initialCwd"
+env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL bash scripts/e2e-cloud.sh run --local --project=rust-chromium hidden-pane-rebind-rust
+env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL bash scripts/e2e-cloud.sh run --local --project=rust-chromium --grep="a REST-created shell tab|case-c: fresh codex terminal collapses" git-badges-rust sidebar-registry-sync-rust
+env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL bash scripts/e2e-cloud.sh run --local --project=rust-chromium --grep="hidden-pane rebind: a background tab pane must rebind without being revealed|shell terminal: SIGKILL restore yields a fresh shell in initialCwd" restore-contract-wall-rust
 ```
 
 Expected: PASS for all five repaired tests (the reveals have the same
@@ -674,18 +687,22 @@ function renderPicker(
 ```tsx
 const monacoMountControl = vi.hoisted(() => ({
   enabled: false,
+  /** Monaco's real onMount is async — tests can model the delay explicitly. */
+  mountDelayMs: 0,
   focus: vi.fn(),
 }))
 
 vi.mock('@monaco-editor/react', () => {
   const MonacoMock = ({ value, onChange, theme, onMount }: any) => {
     useEffect(() => {
-      if (monacoMountControl.enabled) {
+      if (!monacoMountControl.enabled) return
+      const timer = setTimeout(() => {
         onMount?.(
           { focus: monacoMountControl.focus, getValue: () => '', setValue: () => {}, updateOptions: () => {}, getModel: () => null } as any,
           {} as any,
         )
-      }
+      }, monacoMountControl.mountDelayMs)
+      return () => clearTimeout(timer)
     }, [])
     return (
       <textarea
@@ -713,10 +730,12 @@ vi.mock('@monaco-editor/react', () => {
 
     afterEach(() => {
       monacoMountControl.enabled = false
+      monacoMountControl.mountDelayMs = 0
     })
 
-    it('focuses the editor on mount for an eligible pane (default)', async () => {
+    it('focuses the editor on ASYNC mount for an eligible pane (default — pins initial autofocus)', async () => {
       monacoMountControl.enabled = true
+      monacoMountControl.mountDelayMs = 30
       render(
         <Provider store={store}>
           <EditorPane paneId="pane-1" tabId="tab-1" filePath="/test.ts" language="typescript" readOnly={false} content="const x = 1" viewMode="source" />
@@ -832,7 +851,11 @@ const captured = vi.hoisted(() => ({
   browser: [] as any[],
   editor: [] as any[],
   picker: [] as any[],
+  directory: [] as any[],
 }))
+
+// Drives PickerWrapper from step 'type' into step 'directory' (the DirectoryPicker arm).
+const wiringControl = vi.hoisted(() => ({ autoSelectProvider: null as string | null }))
 
 vi.mock('@/components/panes/BrowserPane', () => ({
   default: (props: any) => { captured.browser.push(props); return null },
@@ -840,8 +863,20 @@ vi.mock('@/components/panes/BrowserPane', () => ({
 vi.mock('@/components/panes/EditorPane', () => ({
   default: (props: any) => { captured.editor.push(props); return null },
 }))
-vi.mock('@/components/panes/PanePicker', () => ({
-  default: (props: any) => { captured.picker.push(props); return null },
+vi.mock('@/components/panes/PanePicker', () => {
+  const React = require('react')
+  return {
+    default: (props: any) => {
+      captured.picker.push(props)
+      React.useEffect(() => {
+        if (wiringControl.autoSelectProvider) props.onSelect?.(wiringControl.autoSelectProvider)
+      }, [])
+      return null
+    },
+  }
+})
+vi.mock('@/components/panes/DirectoryPicker', () => ({
+  default: (props: any) => { captured.directory.push(props); return null },
 }))
 vi.mock('@/components/TerminalView', () => ({
   default: () => null,
@@ -908,7 +943,7 @@ function renderNode(node: PaneNode, opts: { hidden?: boolean; activePaneId?: str
 }
 
 describe('PaneContainer focusEligible wiring', () => {
-  beforeEach(() => { captured.browser.length = captured.editor.length = captured.picker.length = 0 })
+  beforeEach(() => { captured.browser.length = captured.editor.length = captured.picker.length = captured.directory.length = 0 })
   afterEach(() => cleanup())
 
   it('browser arm: eligible when visible + active pane', () => {
@@ -947,13 +982,27 @@ describe('PaneContainer focusEligible wiring', () => {
     renderNode(pickerLeaf, { hidden: true })
     expect(captured.picker[0].focusEligible).toBe(false)
   })
+
+  it('directory step: PickerWrapper forwards focusEligible=false into DirectoryPicker when hidden', () => {
+    wiringControl.autoSelectProvider = 'claude' // a CLI provider routed to the directory step
+    try {
+      renderNode(pickerLeaf, { hidden: true })
+      expect(captured.directory.length).toBeGreaterThan(0)
+      expect(captured.directory[0].focusEligible).toBe(false)
+    } finally {
+      wiringControl.autoSelectProvider = null
+    }
+  })
 })
 ```
 
-(DirectoryPicker sits one hop deeper, inside PickerWrapper's directory step; it
-receives the identical forwarded value from the adjacent JSX line — the
-"picker arm ineligible" test pins the wrapper's forwarding, and per-component
-behavior is pinned in (a).)
+(DirectoryPicker sits one hop deeper, inside PickerWrapper's directory step;
+the last test drives the wrapper THROUGH that step so the full forward chain
+PaneContainer → PickerWrapper → DirectoryPicker is pinned, not just the first
+hop. If `captured.directory.length` stays 0 at RED, the chosen provider did
+NOT route to the directory step — pick one that does (a plain CLI provider
+like claude routes there per PickerWrapper's step machine); that is a harness
+adjustment, not a gate adjustment.)
 
 - [ ] **Step 2: Run the tests and verify the intended failures**
 
@@ -961,8 +1010,8 @@ Run: `env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHE
 
 Expected: FAIL, exactly —
 - DirectoryPicker/BrowserPane/PanePicker: the `focusEligible is false` tests fail (focus happens unconditionally today; the prop is unknown/ignored).
-- EditorPane: the ineligible-no-focus + false→true flip test fails (today `handleEditorMount` focuses unconditionally — the negative assertion fails before the flip is reached).
-- PaneContainer.focusEligible: ALL wiring tests fail (no `focusEligible` prop exists today → captured value is `undefined`, so the `=== true` and `=== false` assertions both fail).
+- EditorPane: the ineligible-no-focus + false→true flip test fails (today `handleEditorMount` focuses unconditionally — the negative assertion fails before the flip is reached). The eligible + ASYNC-delay mount test passes today (pin); it would FAIL against an effect-only gate (Monaco's async onMount — round-2 review's exact hazard), which is its purpose.
+- PaneContainer.focusEligible: ALL wiring tests fail (no `focusEligible` prop exists today → captured value is `undefined`, so the `=== true` and `=== false` assertions both fail; the directory-step test fails the same way after asserting the wrapper did route).
 - TerminalView.focusGate: the two `never focuses` tests fail (`flushScheduledLayout`'s focus is ungated today).
 Expected PASS already (pins): the four component-level `focusEligible` DEFAULT tests (DirectoryPicker/BrowserPane/PanePicker/EditorPane eligible cases — today's unconditional focus satisfies them).
 
@@ -1036,25 +1085,29 @@ Expected PASS already (pins): the four component-level `focusEligible` DEFAULT t
 `src/components/panes/EditorPane.tsx`:
 - `EditorPaneProps` (:129-138): add `focusEligible?: boolean`.
 - Destructure: add `focusEligible = true`.
-- Split mount from focus so later eligibility flips (explicit select of a
-  background-mounted editor) still acquire DOM focus — `handleEditorMount`
-  fires only once per Monaco mount, so the gate cannot live there alone
-  (:295-298 becomes ref-store only; focus moves into an eligibility effect):
+- `@monaco-editor/react` (pinned 4.7.x) initializes Monaco ASYNCHRONOUSLY and
+  invokes `onMount` only after readiness — by then the parent's
+  `[focusEligible]` effect has already run with `editorRef.current === null`,
+  and assigning the ref causes no rerender. So an eligibility effect ALONE
+  silently drops initial mount autofocus. Gate BOTH moments (:295-298 + new
+  flip effect; `useRef` is already imported):
 
 ```tsx
   function handleEditorMount(editor: Monaco.editor.IStandaloneCodeEditor) {
     editorRef.current = editor
+    // onMount is async — eligible-at-mount focus can only happen HERE.
+    if (focusEligible) editor.focus()
   }
 
-  // Focus whenever this pane OWNS focus: on mount while eligible AND on any
-  // later false→true eligibility flip (explicit tab/pane select bringing a
-  // background-mounted editor forward). Background-mounted editors never focus.
+  // Later false→true eligibility flips (explicit select bringing a
+  // background-mounted editor forward) — handleEditorMount never refires.
+  const prevFocusEligibleRef = useRef(focusEligible)
   useEffect(() => {
-    if (focusEligible) editorRef.current?.focus()
+    const was = prevFocusEligibleRef.current
+    prevFocusEligibleRef.current = focusEligible
+    if (focusEligible && !was) editorRef.current?.focus()
   }, [focusEligible])
 ```
-
-(`useEffect` is already imported in EditorPane.tsx; verify during Step 4 rather than re-reading here.)
 
 `src/components/panes/PanePicker.tsx`:
 - `PanePickerProps` (:66-72): add `focusEligible?: boolean`.
@@ -1171,6 +1224,14 @@ user-flow autofocus."
   target was skipped.
 
 - [ ] **Step 1: Write the failing tests**
+
+**Behavior-neutral prerequisite (do first, as part of this step):** the RED
+suite imports `restoreFocus`/`FocusSnapshot`, which are module-private today —
+importing a missing export fails module loading, producing the WRONG RED. So
+first make this logic-free change in `src/lib/ui-screenshot.ts`: add `export`
+to the existing `type FocusSnapshot` (:38) and the existing
+`async function restoreFocus` (:293) — nothing else. That keeps today's
+behavior intact, which is exactly what the two pin tests below encode.
 
 Add imports to `test/unit/client/ui-screenshot.test.ts` (the file already
 imports `tabsReducer`, `panesReducer`, `configureStore`):
@@ -1290,6 +1351,22 @@ describe('restoreFocus deleted-target hardening', () => {
     const setPaneCalls = spy.mock.calls.filter(([a]) => (a as any)?.type === 'panes/setActivePane')
     expect(setPaneCalls).toHaveLength(0)                     // never toward the dead pane
   })
+
+  it('reports false when the restore target is deleted DURING the restore window (race pin)', async () => {
+    const store = createFocusStore()
+    store.dispatch(setActiveTab('tab-2')) // capture switched away
+    // Delete the restore target inside the afterPaint window: restoreFocus
+    // dispatches setActiveTab('tab-1') while tab-1 still exists, then awaits
+    // two animation frames; our rAF-queued removeTab runs inside that window
+    // (rAF callbacks fire FIFO), so the post-paint verify must see it gone.
+    requestAnimationFrame(() => { store.dispatch(removeTab('tab-1')) })
+    const ok = await restoreFocus(
+      { dispatch: store.dispatch, getState: store.getState },
+      { activeTabId: 'tab-1', activePaneByTab: {} },
+      new Set(),
+    )
+    expect(ok).toBe(false)
+  })
 })
 ```
 
@@ -1303,7 +1380,11 @@ Expected: FAIL, exactly —
 - tab-deleted test: today `restoreFocus` dispatches `tabs/setActiveTab` into the dead id (spy records it) and returns truthy.
 - pane-deleted test: today, after split+close, `activePane['tab-2']` is the sibling `'pane-2b'` ≠ snapshot `'pane-2'`, so restore dispatches `panes/setActivePane` toward the dead pane (spy records it) and the post-paint verify passes → returns `true`. Both assertions fail.
 - best-effort test: the zero-dead-pane-dispatch assertion fails identically (today's restore dispatches to the dead pane; it restores the tab too, so only that assertion is discriminating).
-Expected PASS already (pins): the two restore-success pin tests prove current behavior for live targets.
+Expected PASS already (pins): the two restore-success tests (live targets) and
+the during-restore race test — today it returns false via the global mismatch
+check; after the best-effort refactor it must STILL return false via the
+incomplete flag, i.e. the race semantics are locked so the verify-loop rewrite
+cannot regress them.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -1351,14 +1432,19 @@ export async function restoreFocus(ctx: RuntimeContext, before: FocusSnapshot, p
     await afterPaint()
 
     const after = ctx.getState()
-    if (before.activeTabId
-      && after.tabs.tabs.some((t) => t.id === before.activeTabId)
-      && after.tabs.activeTabId !== before.activeTabId) return false
+    if (before.activeTabId) {
+      if (!after.tabs.tabs.some((t) => t.id === before.activeTabId)) {
+        incomplete = true // deleted during the restore window
+      } else if (after.tabs.activeTabId !== before.activeTabId) return false
+    }
     for (const tabId of paneTabsToRestore) {
       const originalPaneId = before.activePaneByTab[tabId]
       if (!originalPaneId) continue
-      if (nodeContainsPane(after.panes.layouts[tabId], originalPaneId)
-        && after.panes.activePane[tabId] !== originalPaneId) return false
+      if (!nodeContainsPane(after.panes.layouts[tabId], originalPaneId)) {
+        incomplete = true // deleted during the restore window
+        continue
+      }
+      if (after.panes.activePane[tabId] !== originalPaneId) return false
     }
     return !incomplete
   } catch {
@@ -1493,6 +1579,31 @@ async function focusedPaneId(page: Page): Promise<string | null> {
   )
 }
 
+/** Tag the CURRENT document.activeElement with a marker attribute; returns the
+ *  marker. Assert exact focus identity (not just "not the new pane") survives
+ *  an agent-driven mutation. */
+async function tagActiveElement(page: Page): Promise<string> {
+  const marker = `focus-marker-${Math.random().toString(36).slice(2)}`
+  await page.evaluate((m) => {
+    (document.activeElement as HTMLElement | null)?.setAttribute('data-focus-marker', m)
+  }, marker)
+  return marker
+}
+
+async function activeElementStillTagged(page: Page, marker: string): Promise<boolean> {
+  return page.evaluate(
+    (m) => (document.activeElement as HTMLElement | null)?.getAttribute('data-focus-marker') === m,
+    marker,
+  )
+}
+
+/** Flush the client's mount + scheduled-focus work (layout scheduler is rAF-driven). */
+async function flushClientFocusScheduling(page: Page): Promise<void> {
+  await page.evaluate(
+    () => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))),
+  )
+}
+
 test.describe('MCP/REST focus neutrality', () => {
   test.setTimeout(120_000)
 
@@ -1503,35 +1614,47 @@ test.describe('MCP/REST focus neutrality', () => {
       await selectShellIfPickerShowing(page)
       const tabA = (await harness.getActiveTabId())!
       expect(tabA).toBeTruthy()
+      await flushClientFocusScheduling(page)
+      const marker = await tagActiveElement(page)
 
       // --- 1: REST tab create does NOT activate (the discriminating assertion:
       // on unfixed code activeTabId flips to the new tab atomically with the
       // fold, and waitForTabCount(2) proves the fold already ran).
       const tabB = await createTabViaRest(info, { mode: 'shell', cwd: os.tmpdir() })
       await harness.waitForTabCount(2)
-      expect(await harness.getActiveTabId()).toBe(tabA)
-
-      // DOM focus must not land in the background tab either (the new tab's
-      // pane stays mounted-but-hidden; TerminalView/picker effects must not
-      // have run .focus()).
       const stateAfterB = await harness.getState()
       const paneB = stateAfterB.panes.layouts[tabB]?.id
       expect(paneB).toBeTruthy()
+      // Wait until the background tab's pane is actually MOUNTED (its mount
+      // effects are the only window in which a steal could occur), flush the
+      // rAF scheduler, then assert.
+      await page.waitForSelector(`[data-pane-id="${paneB}"]`, { state: 'attached', timeout: 15_000 })
+      await flushClientFocusScheduling(page)
+      expect(await harness.getActiveTabId()).toBe(tabA)
       expect(await focusedPaneId(page)).not.toBe(paneB)
+      expect(await activeElementStillTagged(page, marker)).toBe(true) // exact focus identity preserved
 
-      // --- 2: explicit REST tab.select activates.
+      // --- 2: explicit REST tab.select activates AND moves DOM focus
+      // (TerminalView's eligible-focus refocus effect fires on the flip).
       const selRes = await fetch(`${info.baseUrl}/api/tabs/${tabB}/select`, {
         method: 'POST', headers: restApiHeaders(info), body: '{}',
       })
       expect(selRes.ok).toBe(true)
       await expect.poll(() => harness.getActiveTabId(), { timeout: 10_000 }).toBe(tabB)
+      await expect.poll(() => focusedPaneId(page), { timeout: 10_000 }).toBe(paneB)
+      const markerB = await tagActiveElement(page) // re-tag: paneB's xterm now holds focus
 
-      // --- 3: another REST create still does not activate.
-      await createTabViaRest(info, { mode: 'shell', cwd: os.tmpdir() })
+      // --- 3: another REST create still does not activate nor move DOM focus.
+      const tabC = await createTabViaRest(info, { mode: 'shell', cwd: os.tmpdir() })
       await harness.waitForTabCount(3)
+      const paneC = ((await harness.getState()).panes.layouts[tabC])?.id
+      await page.waitForSelector(`[data-pane-id="${paneC}"]`, { state: 'attached', timeout: 15_000 })
+      await flushClientFocusScheduling(page)
       expect(await harness.getActiveTabId()).toBe(tabB)
+      expect(await focusedPaneId(page)).not.toBe(paneC)
+      expect(await activeElementStillTagged(page, markerB)).toBe(true)
 
-      // --- 4: REST pane.split does not change tab B's active pane.
+      // --- 4: REST pane.split does not change tab B's active pane nor DOM focus.
       const originalActivePane = (await harness.getState()).panes.activePane[tabB]
       expect(originalActivePane).toBeTruthy()
       const splitRes = await fetch(`${info.baseUrl}/api/panes/${originalActivePane}/split`, {
@@ -1544,14 +1667,14 @@ test.describe('MCP/REST focus neutrality', () => {
       await expect
         .poll(async () => (await harness.getState()).panes.layouts[tabB]?.type, { timeout: 10_000 })
         .toBe('split')
-      expect((await harness.getState()).panes.activePane[tabB]).toBe(originalActivePane)
-
-      // ... nor steal DOM focus (the new pane mounts visible but non-active in
-      // the now-active tab B).
       const newPaneId = (await harness.getState()).panes.layouts[tabB].children[1].id
+      await page.waitForSelector(`[data-pane-id="${newPaneId}"]`, { state: 'attached', timeout: 15_000 })
+      await flushClientFocusScheduling(page)
+      expect((await harness.getState()).panes.activePane[tabB]).toBe(originalActivePane)
       expect(await focusedPaneId(page)).not.toBe(newPaneId)
+      expect(await activeElementStillTagged(page, markerB)).toBe(true)
 
-      // --- 5: explicit REST pane.select activates the new pane (and keeps tab B active).
+      // --- 5: explicit REST pane.select activates the new pane AND moves DOM focus to it.
       const paneSelRes = await fetch(`${info.baseUrl}/api/panes/${newPaneId}/select`, {
         method: 'POST', headers: restApiHeaders(info), body: '{}',
       })
@@ -1559,6 +1682,7 @@ test.describe('MCP/REST focus neutrality', () => {
       await expect
         .poll(async () => (await harness.getState()).panes.activePane[tabB], { timeout: 10_000 })
         .toBe(newPaneId)
+      await expect.poll(() => focusedPaneId(page), { timeout: 10_000 }).toBe(newPaneId)
       expect(await harness.getActiveTabId()).toBe(tabB)
     } finally {
       await server.stop()
@@ -1567,17 +1691,7 @@ test.describe('MCP/REST focus neutrality', () => {
 })
 ```
 
-- [ ] **Step 2: Run the test and verify the intended failure**
-
-Run (this task is NOT written RED against the unfixed base — Task 1 has already
-landed its Redux behavior; treat this as a protective spec): `env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium mcp-focus-neutrality-rust`
-
-Expected: PASS on the Task-1+2 tree. (Sanity: `git stash` of Task 1's
-`ui-commands.ts` change must flip section 1's `toBe(tabA)` assertion to a
-failure — verify by reading the code path, no re-run on unfixed base required:
-`addTab` activates unconditionally BEFORE Task 1's gate.)
-
-- [ ] **Step 3: Add registration (no production code)**
+- [ ] **Step 2: Add registration (no production code; MUST precede the first run — the rust-chromium project only discovers listed specs)**
 
 Rust-only specs must appear in BOTH lists — the match-all `chromium` project
 uses `RUST_ONLY_SPECS` as its `testIgnore` (playwright.config.ts:330), so an
@@ -1605,9 +1719,9 @@ In `test/e2e-browser/playwright.config.ts`:
         /mcp-focus-neutrality-rust\.spec\.ts$/,
 ```
 
-Verify the non-rust discovery path no longer sees it:
+Verify discovery on both lanes (these are Discovery-only `--list` runs; they
+never execute tests, so plain Playwright is correct here):
 `env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL npx playwright test --config test/e2e-browser/playwright.config.ts --project=chromium --list 2>&1 | grep -c mcp-focus-neutrality` → Expected output: `0`
-and the rust lane does:
 `env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium --list 2>&1 | grep -c mcp-focus-neutrality` → Expected output: `1`
 
 Cloud legality: the spec uses ONLY shell-mode terminals — no external CLIs —
@@ -1615,26 +1729,30 @@ so it must NOT be added to `CLOUD_SKIP_SPECS` in
 `test/e2e-browser/playwright.cloud.config.ts`. Verify it is absent
 (grep for `mcp-focus-neutrality` in that file; expect no matches).
 
-- [ ] **Step 4: Run the focused tests**
+- [ ] **Step 3: Run the focused tests**
 
-Run: `env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium mcp-focus-neutrality-rust hidden-pane-rebind-rust`
+Run: `env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL bash scripts/e2e-cloud.sh run --local --project=rust-chromium mcp-focus-neutrality-rust hidden-pane-rebind-rust` (substitute `--cloud` when the configured backend is cloud)
+
 Expected: PASS for both specs (new coverage green; repaired spec still green).
+This task is NOT RED against the unfixed base — Task 1 already landed the
+Redux behavior; this is protective coverage. (Discrimination is structural:
+section 1's `toBe(tabA)` fails atomically under the pre-Task-1 gate.)
 
-- [ ] **Step 5: Refactor while green**
+- [ ] **Step 4: Refactor while green**
 
 No shared helper extraction: this suite deliberately copies helpers per-spec
 (per-spec-ownership convention) so one spec's helper drift can't break
 another. Keep as-is.
 
-- [ ] **Step 6: Impacted-test verification**
+- [ ] **Step 5: Impacted-test verification**
 
-Task 4 adds a spec and a testMatch entry only — no runtime code. The impacted
+Task 4 adds a spec and two registration entries only — no runtime code. The impacted
 set is the two rust specs just run plus a typecheck of the config file.
 
 Run: `env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL npm run typecheck`
 Expected: PASS.
 
-- [ ] **Step 7: Commit the task**
+- [ ] **Step 6: Commit the task**
 
 ```bash
 git add test/e2e-browser/specs/mcp-focus-neutrality-rust.spec.ts test/e2e-browser/playwright.config.ts
@@ -1786,6 +1904,25 @@ INSTRUCTIONS, HELP_TEXT via the help action) in test/unit/server/mcp/freshell-to
   across TOOL_DESCRIPTION, INSTRUCTIONS, and HELP_TEXT (via the help action).
   Runner report:
   `.worktrees/.the-usual-logs/mcp-focus-neutrality/review-logs/usual-fresheyes-20260826T010828Z-942802.md`
+
+- **Round 2 (Codex, independent): FAILED — 6 Major + 1 Minor**, assessed valid
+  and fixed in this revision: (1 Minor) stale base — new "Base sync first"
+  constraint step; (1 Major) e2e execution now goes through the
+  `scripts/e2e-cloud.sh run` backend wrapper (`--list` discovery stays
+  plain-Playwright) and the backend choice is user-pinned before Stage 4;
+  (2 Major) DirectoryPicker wiring now covered by driving PickerWrapper through
+  its directory step in the wiring test; (3 Major) EditorPane gates BOTH the
+  async `onMount` focus and later eligibility flips (effect-only gate would
+  silently drop mount autofocus; pin test models the async delay);
+  (4 Major) Task 3 exports `restoreFocus`/`FocusSnapshot` in a behavior-neutral
+  pre-RED prerequisite so the RED is behavioral, not a module-load error;
+  (5 Major) the post-paint verify now treats a target deleted DURING the
+  restore window as incomplete (plus a race pin test using an rAF-queued
+  deletion); (6 Major) the e2e spec now tags the exact focused element before
+  each mutation, waits for mount+rAF settle, asserts exact focus identity
+  survives, and asserts explicit selects move DOM focus to the selected pane.
+  Runner report:
+  `.worktrees/.the-usual-logs/mcp-focus-neutrality/review-logs/usual-fresheyes-20260826T014331Z-1577551.md`
 
 ## Out of scope (recorded, not fixed here)
 
