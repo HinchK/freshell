@@ -850,14 +850,23 @@ impl FreshClaudeState {
             let mut tracker = session.turn_tracker.lock().expect("turn tracker lock");
             // Retire the op ACTUALLY in flight: the `running` slot, or — queued
             // turns are never promoted (only compacts promote, via the observed
-            // compacting frame) — the queue FRONT, which is the de-facto active
-            // turn once the slot is empty (ep2-r3: interrupting a turn AFTER it
-            // advanced from the queue wedged the gate forever — no result frame
-            // ever arrives for an interrupted turn, so nothing would retire its
-            // entry afterward). The ops BEHIND the front stay queued (the
-            // interrupt never drains them).
+            // compacting frame) — the de-facto ACTIVE queued op (ep2-r3:
+            // interrupting a turn AFTER it advanced from the queue wedged the
+            // gate forever — no result frame ever arrives for an interrupted
+            // turn). The active queued op is the OLDEST QUEUED TURN: retire it
+            // and absorb the never-evidenced SILENT DROP of every unpromoted
+            // compact queued AHEAD of it (ep2-r4: a turn generating while a
+            // compact ahead never promoted IS the drop evidence — retiring only
+            // the front stranded the interrupted turn's entry forever). Queued
+            // ops BEHIND the interrupted turn stay queued (the interrupt never
+            // drains them).
             if tracker.running.take().is_none() {
-                tracker.queued.pop_front();
+                while let Some(op) = tracker.queued.front().copied() {
+                    tracker.queued.pop_front();
+                    if op == TrackedOp::Turn {
+                        break;
+                    }
+                }
             }
             session
                 .in_turn
@@ -7288,6 +7297,83 @@ rl.on('line', (line) => {
         drop(env);
     }
 
+    /// Focused-review ep2-r4 (interrupt inside the drop window): with the
+    /// running slot empty and a queue [C1 (dropped silently — NEVER promoted),
+    /// B (the de-facto active turn)], the queue-front retirement rule popped
+    /// the FRONT — the COMPACT — off the tracker and left the interrupted B
+    /// stranded forever (no result frame exists for an interrupted turn):
+    /// `in_turn` held and every undo/redo was refused BUSY_TURN from then on.
+    /// The interrupt retires the op ACTUALLY in flight — the de-facto ACTIVE
+    /// queued op — and a Turn can only be de-facto active with every op ahead
+    /// of it already retired-or-dropped: those ahead compacts' silence at the
+    /// live turn's generation IS the drop evidence, absorbed here.
+    ///
+    ///   A running → C1 queued → B queued → A's pair → B generating NOW →
+    ///   interrupt. Aftermath: NOTHING stands — the gate opens and STAYS sized
+    ///   (a follow-up turn cycles fully clean).
+    #[tokio::test]
+    async fn interrupting_the_active_turn_absorbs_ahead_queued_silently_dropped_compacts() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-qdropint")).await;
+        let created = await_claude_created(&mut rx, "req-qdropint").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        await_status_frame(&mut rx, &session_id, "idle").await;
+
+        st.handle_send(send_msg(&session_id, "turn one")).await; // A
+        st.handle_compact(compact_msg(&session_id, None)).await; // C1
+        st.handle_send(send_msg(&session_id, "turn two")).await; // B
+
+        // A's pair retires the running op; C1's compacting frame NEVER came —
+        // B generates (the drop-evidence window). The gate is closed.
+        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
+        inject_raw_send(&st, &session_id, "__emit_idle__").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            in_turn_of(&st, &session_id).await,
+            "C1 believed queued + B outstanding — the gate is closed pre-interrupt"
+        );
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-qdi-0", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        assert_eq!(
+            captured_json(&captured)[0]["event"]["code"],
+            "BUSY_TURN",
+            "pre-interrupt the gate is closed beyond doubt"
+        );
+
+        // Interrupt the ACTIVE turn (B): its entry AND C1's never-evidenced
+        // drop retire together — nothing remains to wedge the gate.
+        st.handle_interrupt(interrupt_msg(&session_id)).await;
+        assert!(
+            !in_turn_of(&st, &session_id).await,
+            "ep2-r4 F1: the interrupted active turn + dropped compact retire — nothing wedges"
+        );
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-qdi-1", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        let frames = captured_json(&captured);
+        assert_eq!(
+            frames[0]["event"]["code"], "NOTHING_TO_UNDO",
+            "ep2-r4 F1: the gate opened exactly at the interrupt and stays truthful: {frames:?}"
+        );
+
+        // No-residue proof: a fresh turn's pair cycles the tracker fully clean.
+        st.handle_send(send_msg(&session_id, "turn three")).await;
+        assert!(in_turn_of(&st, &session_id).await);
+        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
+        inject_raw_send(&st, &session_id, "__emit_idle__").await;
+        await_in_turn(&st, &session_id, false).await;
+        drop(env);
+    }
+
     /// Focused-review ep2-r3 (queue-advanced interrupt): queued TURNS are never
     /// OBSERVED promoted (only compacts promote via the compacting frame), so
     /// once the prior op's edge frees the `running` slot, the queue FRONT is the
@@ -7350,6 +7436,72 @@ rl.on('line', (line) => {
         assert_eq!(
             frames[0]["event"]["code"], "NOTHING_TO_UNDO",
             "the gate released with the interrupt — never wedged: {frames:?}"
+        );
+        drop(env);
+    }
+
+    /// Focused-review ep2-r4 (interrupt with a never-promoted compact between):
+    /// [A running → C1 queued → B queued → A retires → B generates with C1
+    /// silently DROPPED ahead of it (never promoted)]: the interrupted op is B.
+    /// The naive queue-front retirement removed C1 instead — stranding B (no
+    /// result frame exists for an interrupted turn) and wedging the sole
+    /// mid-turn gate FOREVER (BUSY_TURN for every later undo/redo). The
+    /// interrupt retires the OLDEST QUEUED TURN; the compacts ahead of it were
+    /// provably dropped by B's own generation (C1 promoted would have been
+    /// observed compacting before B's activity), so they absorb into the same
+    /// retirement.
+    #[tokio::test]
+    async fn interrupting_a_turn_behind_a_silently_dropped_compact_retires_the_turn_not_the_compact(
+    ) {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-qdropabs")).await;
+        let created = await_claude_created(&mut rx, "req-qdropabs").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        await_status_frame(&mut rx, &session_id, "idle").await;
+
+        st.handle_send(send_msg(&session_id, "turn one")).await; // A
+        st.handle_compact(compact_msg(&session_id, None)).await; // C1
+        st.handle_send(send_msg(&session_id, "turn two")).await; // B
+
+        // A's pair retires A. [C1 (never promoted — dropped), B (now the
+        // de-facto active turn)] remains; the gate is closed.
+        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
+        inject_raw_send(&st, &session_id, "__emit_idle__").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(in_turn_of(&st, &session_id).await, "C1(dropped) + B owed");
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-qda-0", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        assert_eq!(
+            captured_json(&captured)[0]["event"]["code"],
+            "BUSY_TURN",
+            "pre-interrupt: C1 + B are owed"
+        );
+
+        // Interrupt: retires B (the op actually in flight) and absorbs C1's
+        // never-evidenced drop. The gate OPENS — the pane must never wedge
+        // permanently busy over an interrupted turn.
+        st.handle_interrupt(interrupt_msg(&session_id)).await;
+        assert!(
+            !in_turn_of(&st, &session_id).await,
+            "ep2-r4 F1: the interrupt retires the ACTIVELY-generating turn (B) — never the dropped compact's entry (C1)
+             — and absorbs the never-evidenced drop: nothing remains"
+        );
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-qda-1", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        let frames = captured_json(&captured);
+        assert_eq!(
+            frames[0]["event"]["code"], "NOTHING_TO_UNDO",
+            "ep2-r4 F1: the gate opened at the interrupt — never wedged: {frames:?}"
         );
         drop(env);
     }

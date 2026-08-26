@@ -4594,9 +4594,23 @@ fn reduce_notification(
                 .collect()
         }
         CodexNotification::TurnCompleted(event) => {
-            // adapter.ts:912-913 — the turn is over regardless of status; clear unconditionally.
+            // The compact-window ownership block below owns `compact_in_flight`;
+            // `active_turn` retires ONLY when the completing turn IS the active
+            // one (the ids match). Unconditional was WRONG (ep2-r4): the compact's
+            // own delayed `turn/completed` lands AFTER the thread went idle —
+            // and a send submitted in that idle window installed ITS own active
+            // turn; clearing unconditionally erased the newer turn's busy truth
+            // while it was still running (the rollback gate then observed
+            // false||false and admitted a mid-turn thread/revert that
+            // force-interrupts the newer turn). A completion carrying NO id can
+            // never retire anything (fail-closed).
             if event.thread_id == subscription.session_id() {
-                clear_active_turn(active_turn);
+                let mut active = active_turn.lock().expect("active_turn mutex");
+                if event.turn_id.as_deref().is_some()
+                    && active.as_deref() == event.turn_id.as_deref()
+                {
+                    *active = None;
+                }
                 // Delta-r1 F2 + ep1-r3 F4 (completion-id OWNERSHIP): the compact
                 // window ends HERE — but ONLY on the `turn/completed` whose params
                 // turn id MATCHES the captured `compact_turn_id` (any status — a
@@ -6287,6 +6301,144 @@ pub(crate) mod tests {
             captured_frames(&captured2)[0]["event"]["code"],
             json!("NOTHING_TO_UNDO"),
             "the matching completion released the gate"
+        );
+    }
+
+    /// Focused-review ep2-r4 (codex completion reaches past the compact into a
+    /// NEWER turn): the documented provider order reports `thread/status:idle`
+    /// (clearing `active_turn`, composer sendable) BEFORE the compact's delayed
+    /// `turn/completed`; a submission inside that window installs its own active
+    /// turn. The compact's own completion then ran the session-wide UNCONDITIONAL
+    /// active-turn clear — erasing the newer send's busy truth: the rollback
+    /// gate read false||false exactly while the new turn was in flight, and a
+    /// `thread/revert` admitted there FORCE-INTERRUPTS that turn. The completion
+    /// now clears `active_turn` ONLY when the completed id MATCHES the active
+    /// turn's id; the compact-window clear keeps its own ownership rule.
+    ///
+    ///   thread/status:idle → compact armed (RPC answered) → turn/started{id-c}
+    ///   → NEW SEND (turn/start → id-new) → turn/completed{id-c} (the compact's
+    ///   OWN completion — clears ONLY the compact window) — the gate must stay
+    ///   BUSY on the newer turn → turn/completed{id-new} releases it EXACTLY.
+    #[tokio::test]
+    async fn a_compact_completion_inside_a_newer_turns_window_clears_only_the_compact_window() {
+        let (st, _rx_boot) = state_with_bus();
+        let (peer, mut wire) = insert_idle_compact_session(&st, "thread-cnewer").await;
+
+        // The prior turn ended: idle is observed BEFORE its delayed completion.
+        peer.emit_notification(
+            "thread/status/changed",
+            json!({ "threadId": "thread-cnewer", "status": { "type": "idle" } }),
+        );
+
+        // Arm the compact: the RPC answers immediately; ownership id lands with
+        // its turn/started.
+        let compact_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-cnewer")).await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (compact_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        peer.respond(&compact_id, json!({}));
+        compact_driver.await.expect("compact task");
+        peer.emit_notification(
+            "turn/started",
+            json!({ "threadId": "thread-cnewer", "turn": { "id": "turn-c-1" } }),
+        );
+
+        // INSIDE the compact window: a new submission installs its own active
+        // turn (the initialized connection means turn/start is the next RPC).
+        let send_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_send(FreshAgentSend {
+                    request_id: Some("req-cnewer".to_string()),
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    session_id: "thread-cnewer".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    text: "fresh submission".to_string(),
+                    images: None,
+                    cwd: None,
+                    settings: None,
+                })
+                .await;
+            })
+        };
+        let (turn_req, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        peer.respond(&turn_req, json!({ "turn": { "id": "turn-new-9" } }));
+        send_driver.await.expect("send task");
+
+        // The compact's OWN delayed completion lands NOW: clears the compact
+        // window (ownership match) — and MUST leave the newer send's
+        // `active_turn` untouched. The rollback gate stays BUSY on it.
+        drain_wire(&mut wire);
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-cnewer", "turn": { "id": "turn-c-1", "status": "completed" } }),
+        );
+        await_next_idle_snapshot(&mut wire, "thread-cnewer").await;
+        let (sink, captured) = capturing_sink();
+        let rollback_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thread-cnewer", "rb-cnewer-1", None), sink)
+                    .await;
+            })
+        };
+        while let Ok((read_id, method, _)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), peer.expect_request()).await
+        {
+            assert_eq!(method, "thread/read");
+            peer.respond(
+                &read_id,
+                json!({ "thread": { "id": "thread-cnewer", "turns": [] } }),
+            );
+        }
+        rollback_driver.await.expect("rollback task");
+        assert_eq!(
+            captured_frames(&captured)[0]["event"]["code"],
+            json!("BUSY_TURN"),
+            "ep2-r4: the compact's completion never reaches past its own window — the newer turn still owns the gate"
+        );
+
+        // The newer turn's OWN completion releases the gate exactly here.
+        drain_wire(&mut wire);
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-cnewer", "turn": { "id": "turn-new-9", "status": "completed" } }),
+        );
+        await_next_idle_snapshot(&mut wire, "thread-cnewer").await;
+        let (sink, captured) = capturing_sink();
+        let rollback_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thread-cnewer", "rb-cnewer-2", None), sink)
+                    .await;
+            })
+        };
+        let mut saw_read = false;
+        while let Ok((read_id, method, _)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), peer.expect_request()).await
+        {
+            assert_eq!(method, "thread/read");
+            saw_read = true;
+            peer.respond(
+                &read_id,
+                json!({ "thread": { "id": "thread-cnewer", "turns": [] } }),
+            );
+        }
+        rollback_driver.await.expect("rollback task 2");
+        assert!(
+            saw_read,
+            "the newer turn's own completion reopened the gate"
+        );
+        assert_eq!(
+            captured_frames(&captured)[0]["event"]["code"],
+            json!("NOTHING_TO_UNDO"),
+            "the newer turn's own completion released the gate"
         );
     }
 

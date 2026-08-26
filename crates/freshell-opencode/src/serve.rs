@@ -96,10 +96,14 @@ pub fn merged_opencode_config_content(inherited: Option<&str>) -> String {
 /// accepts for this lane (1.18.21 `ConfigParse.jsonc` — `jsonc-parser` with
 /// `allowTrailingComma: true`) into the strict JSON `serde_json` parses, so the
 /// merge accepts EXACTLY the same documents the vendored CLI would have:
-///   (1) strip `//` line and `/* */` block comments (each replaced by ONE space
-///       so adjacent value tokens are never fused — `1/**/2` → `1 2`, not `12`);
-///       string-literal-aware, so a URL's `//`, a `\"` before a closer, or a
-///       literal `/*` inside a quoted string survive VERBATIM;
+///   (1) strip `//` line and TERMINATED `/* */` block comments (each replaced
+///       by ONE space so adjacent value tokens are never fused — `1/**/2` →
+///       `1 2`, not `12`); string-literal-aware, so a URL's `//`, a `\"`
+///       before a closer, or a literal `/*` inside a quoted string survive
+///       VERBATIM; an UNTERMINATED block comment's tail survives VERBATIM too
+///       (jsonc-parser rejects it lexically) — stripping it to EOF could leave
+///       a VALID strict document, silently accepting malformed JSONC
+///       (ep2-r4);
 ///   (2) drop a comma whose next non-whitespace character is `}` or `]`
 ///       (whitespace between the comma and the closer — including a stripped
 ///       comment's space — is left in place).
@@ -139,16 +143,28 @@ fn jsonc_to_strict_json(raw: &str) -> String {
                     i += 1;
                 }
             } else if c == '/' && chars.get(i + 1) == Some(&'*') {
-                // Block comment: ONE space; runs through the closer, or to EOF
-                // (the strict parse then judges the unterminated document).
+                // Block comment: ONE space; runs through the closer. An
+                // UNTERMINATED block comment keeps its tail VERBATIM (ep2-r4:
+                // stripping to EOF can leave a VALID strict document —
+                // `{"a":1}/* dangling` → `{"a":1} ` — silently accepting
+                // malformed JSONC into the merge. The parser OpenCode actually
+                // delegates to errors lexically on it; the merge must accept
+                // exactly the same document set, so the tail survives verbatim
+                // and the strict parse rejects it).
+                let comment_start = i;
                 out.push(' ');
                 i += 2;
+                let mut closed = false;
                 while i < chars.len() {
                     if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
                         i += 2;
+                        closed = true;
                         break;
                     }
                     i += 1;
+                }
+                if !closed {
+                    out.extend(chars[comment_start..].iter());
                 }
             } else {
                 out.push(c);
@@ -2055,8 +2071,16 @@ mod tests {
         );
         // A removed comment leaves ONE space — adjacent tokens are NEVER fused.
         assert_eq!(jsonc_to_strict_json("1/**/2"), "1 2");
-        // Unterminated block comment runs to EOF (then strict-parse judges it).
-        assert_eq!(jsonc_to_strict_json("{\"a\":1}/* dangling"), "{\"a\":1} ");
+        // An UNTERMINATED block comment keeps its tail VERBATIM (ep2-r4: the
+        // parser OpenCode actually uses raises a lexical error there — stripping
+        // to EOF could leave a VALID strict document ("{"a":1}/* dangling" →
+        // "{"a":1} "), silently accepting malformed JSONC into the merge).
+        let verbatim = jsonc_to_strict_json("{\"a\":1}/* dangling");
+        assert_eq!(verbatim, "{\"a\":1} /* dangling");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&verbatim).is_err(),
+            "the unterminated document stays INVALID for the strict parse: {verbatim:?}"
+        );
         // Comment OPENERS INSIDE string literals survive verbatim (a URL's "//"
         // is data, never a comment).
         assert_eq!(
