@@ -993,6 +993,18 @@ const server = http.createServer(async (req, res) => {
           })
         }
         forkDb.prepare('UPDATE session SET time_updated = ? WHERE id = ?').run(now + forkSeq + 1, childSessionId)
+        // Focused ep3-r1 F3: the copy loop mints `msg_<child>_<1..forkSeq>_*`
+        // ids WITHOUT touching the child's persistent `message_seq` row, so the
+        // first prompt to the fork minted sequence 1/2 and `INSERT OR REPLACE`
+        // OVERWROTE the copied first turn. Seed the child's counter past the
+        // copied tail (`nextMessageSequence` returns `next` then stores
+        // `next + 2`, so `forkSeq + 1` is the first free user sequence) — the
+        // fixture's forked history then appends exactly like real OpenCode.
+        if (forkSeq > 0) {
+          forkDb
+            .prepare('INSERT OR REPLACE INTO message_seq (session_id, next) VALUES (?, ?)')
+            .run(childSessionId, forkSeq + 1)
+        }
       } finally {
         forkDb.close()
       }

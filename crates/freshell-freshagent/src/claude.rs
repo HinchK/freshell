@@ -265,9 +265,10 @@ struct ClaudeSession {
     /// arm's own entry ([`undo_turn_op_arm`]). Disarm set (the sidecar input
     /// queue is FIFO; a later send queues BEHIND a compact and
     /// `query.interrupt()` does not drain it, so NEITHER is a disarm):
-    ///   (a) the terminal edge of a compact OBSERVED compacting (promoted to
-    ///       `running` by [`observe_compacting`]) — retires that ONE op and
-    ///       holds busy while anything remains outstanding (ep1-r3 F1);
+    ///   (a) the terminal edge of a compact whose run was CONFIRMED manual
+    ///       (promoted to `running` by [`confirm_compact_candidate`]) — retires
+    ///       that ONE op and holds busy while anything remains outstanding
+    ///       (ep1-r3 F1);
     ///   (b) the FIFO-drop peel — a terminal edge with NO running op whose
     ///       oldest queued op is an UNPROMOTED compact: the compact provably
     ///       dropped, evidenced by a queued Turn that follows it (peel
@@ -842,15 +843,17 @@ impl FreshClaudeState {
             // clear (the turn may still be running — fail-closed). Focused
             // ep1-r2 F2 / ep2-r2 F2: the interrupt does NOT drain the sidecar's
             // FIFO input queue — `query.interrupt()` cancels the RUNNING turn
-            // only, so every QUEUED op still runs (its own observed compacting
-            // → terminal sequence, or an sdk.error/EOF, retires it): the busy
+            // only, so every QUEUED op still runs (its own manual-confirmed
+            // compacting boundary → terminal sequence, or an sdk.error/EOF,
+            // retires it): the busy
             // truth is recomputed from the surviving queue — NEVER a blanket
             // clear (interrupting the active turn with a compact+send still
             // queued behind it must leave the gate CLOSED).
             let mut tracker = session.turn_tracker.lock().expect("turn tracker lock");
             // Retire the op ACTUALLY in flight: the `running` slot, or — queued
-            // turns are never promoted (only compacts promote, via the observed
-            // compacting frame) — the de-facto ACTIVE queued op (ep2-r3:
+            // turns are never promoted (only compacts promote, via the
+            // manual-confirmed compacting boundary) — the de-facto ACTIVE
+            // queued op (ep2-r3:
             // interrupting a turn AFTER it advanced from the queue wedged the
             // gate forever — no result frame ever arrives for an interrupted
             // turn). The active queued op is the OLDEST QUEUED TURN: retire it
@@ -2695,7 +2698,8 @@ impl FreshClaudeState {
         // turn lock, the promote/retire/disarm folds live here). `in_turn` is
         // its DERIVED busy cache — this task's folds recompute it from
         // [`TurnTracker::busy`] at every terminal edge:
-        // (a) result/unpaired-idle while a compact was PROMOTED observed — the
+        // (a) result/unpaired-idle while a compact was PROMOTED (manual-confirmed
+        //     by its completion boundary, ep3-r1 F1) — the
         //     compact's own terminal edge: retire `running`, hold busy while
         //     anything remains outstanding (ep1-r3 F1);
         // (b) the FIFO-drop peel — result/unpaired-idle with NO running op and
@@ -2809,10 +2813,24 @@ impl FreshClaudeState {
                     Some("sdk.status")
                         if value.get("status").and_then(Value::as_str) == Some("compacting") =>
                     {
-                        // A compact is observably running NOW — promote the
-                        // OLDEST queued compact into the `running` slot (its
-                        // coming terminal edge then retires it there).
-                        observe_compacting(&turn_tracker);
+                        // A compaction is observably running NOW — trigger
+                        // unknown (manual or automatic): mark the CANDIDATE
+                        // only (ep3-r1 F1; promotion waits for the manual
+                        // completion boundary).
+                        mark_compact_candidate(&turn_tracker);
+                    }
+                    Some("sdk.compact_boundary") => {
+                        // The compaction's completion boundary is the ONLY
+                        // wire-level witness of its trigger
+                        // (`compact_metadata.trigger`; the sidecar fails toward
+                        // `auto`). A `manual` boundary promotes the OLDEST
+                        // queued Compact into the `running` slot (its coming
+                        // terminal edge then retires it there); `auto` promotes
+                        // nothing.
+                        confirm_compact_candidate(
+                            &turn_tracker,
+                            value.get("trigger").and_then(Value::as_str) == Some("manual"),
+                        );
                     }
                     Some("sdk.error") => {
                         // The queued ops provably never arrive as
@@ -2870,6 +2888,7 @@ impl FreshClaudeState {
                 let mut tracker = turn_tracker.lock().expect("turn tracker lock");
                 tracker.running = None;
                 tracker.queued.clear();
+                tracker.compact_candidate = false;
             }
             result_idle_pair_pending.store(false, std::sync::atomic::Ordering::SeqCst);
             // Consumer exit == this sidecar's stdout closed == sidecar death
@@ -2948,33 +2967,40 @@ impl FreshClaudeState {
 /// `sdk.status:idle` PUNCTUATION (paired-skipped by the consumer before this
 /// fold ever sees it, ep2-r1 F1), or a completed interrupt stands in for the
 /// running op's edge at the write site (no result frame exists, Task 4 edge
-/// (d)); and a compact's terminal edge is ALWAYS preceded by its observed
-/// `sdk.status:compacting` frame in-stream (an unpromoted compact can never
-/// own a terminal edge — the drop proof's premise, ep1-r2 F2).
+/// (d)); and a compact's terminal edge is ALWAYS preceded by its
+/// manual-confirmed completion boundary in-stream (an unpromoted compact can
+/// never own a terminal edge — the drop proof's premise, ep1-r2 F2; the bare
+/// compacting STATUS frame is trigger-blind, ep3-r1 F1, so promotion waits for
+/// the boundary's `manual` witness).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TrackedOp {
     /// A user send's turn (a "garlanded send" is simply a Turn queued behind
     /// a compact — kind alone now, no separate count).
     Turn,
     /// A `/compact` op. Only a Compact ever carries (is promoted by) the
-    /// observed-compacting frame; the promotion retires the queue entry into
+    /// manual-confirmed completion boundary; the promotion retires the queue
+    /// entry into
     /// the `running` slot.
     Compact,
 }
 
 /// The per-session FIFO attribution state (ep2-r2). `running` holds the ONE op
 /// the provider is working on (a fresh op armed from idle owns it immediately;
-/// a queued Compact moves here when its `sdk.status:compacting` is OBSERVED —
+/// a queued Compact moves here when its `sdk.status:compacting` is CONFIRMED as
+/// a manual `/compact` run by its completion boundary (ep3-r1 F1) —
 /// queued Turns never visibly "start" and instead retire straight out of the
 /// queue at their own terminal edge, which is fine: attribution always retires
 /// the OLDEST outstanding op). `queued` is the acceptance-ordered remainder.
-/// Shares ONE std Mutex with no awaits inside any critical section; every
+/// `compact_candidate` marks a compaction announced by the bare
+/// `sdk.status:compacting` frame whose trigger is not yet known. Shares ONE
+/// std Mutex with no awaits inside any critical section; every
 /// mutation recomputes the derived `in_turn` busy cache (`busy()`) in the same
 /// critical section, so the rollback gate never reads a torn pair.
 #[derive(Default)]
 struct TurnTracker {
     running: Option<TrackedOp>,
     queued: std::collections::VecDeque<TrackedOp>,
+    compact_candidate: bool,
 }
 
 impl TurnTracker {
@@ -3030,18 +3056,44 @@ fn undo_turn_op_arm(
     in_turn.store(tracker.busy(), std::sync::atomic::Ordering::SeqCst);
 }
 
-/// One OBSERVED `sdk.status:compacting`: a compact is observably running NOW.
-/// FIFO-strict, every op ahead of it already produced its terminal edge, so the
-/// `running` slot is empty exactly when the tracker's ordering holds — promote
-/// the OLDEST queued Compact into it (its coming terminal edge then retires
-/// `running` at the fold, distinguishing the compact's edge from any queued
-/// send's). `running` already occupied means a compact armed from idle owns the
-/// slot (never promoted, its own edge retires it directly) or the stream's
-/// ordering provably hasn't advanced to this compact yet — never promote past
-/// the occupied slot.
-fn observe_compacting(turn_tracker: &std::sync::Mutex<TurnTracker>) {
+/// One OBSERVED `sdk.status:compacting`: a compaction is running NOW — but the
+/// frame carries NO trigger: the SDK fires it for an explicit `/compact` AND
+/// for its own automatic context compaction (focused ep3-r1 F1). Marking it as
+/// the promotion evidence here is WRONG: an automatic compaction mid-turn would
+/// promote a queued explicit Compact (possibly a silently-DROPPED one), and that
+/// turn's own terminal edge would retire the phantom — stranding the real turn
+/// queued forever (its paired idle is deliberately skipped, ep2-r1 F1) and
+/// wedging the gate permanently BUSY. The status frame only ever marks a
+/// CANDIDATE; promotion waits for the compaction's completion boundary.
+fn mark_compact_candidate(turn_tracker: &std::sync::Mutex<TurnTracker>) {
+    turn_tracker
+        .lock()
+        .expect("turn tracker lock")
+        .compact_candidate = true;
+}
+
+/// The compaction's completion boundary (`sdk.compact_boundary {trigger}` —
+/// the sidecar relays the SDK `compact_boundary` whose
+/// `compact_metadata.trigger` the SDK fills as `'manual' | 'auto'`; the
+/// sidecar fails toward `auto` on anything unknown). A `manual` boundary is
+/// the ONLY wire-level witness that the compaction now finishing was requested
+/// by `/compact`: promote the OLDEST queued Compact into the `running` slot
+/// (FIFO-strict, every op ahead of it already produced its terminal edge, so
+/// the `running` slot is empty exactly when the tracker's ordering holds — an
+/// occupied slot means a compact armed from idle owns it (never promoted) or
+/// the stream's ordering provably hasn't advanced; never promote past an
+/// occupied slot, and never promote anything past a queued Compact either:
+/// the candidate's trigger may be manual while the queued ops ahead are still
+/// genuinely owed). An `auto` boundary (or no boundary — a failed compaction
+/// settles at its own terminal edge instead) promotes NOTHING, and the
+/// candidate is consumed either way.
+fn confirm_compact_candidate(turn_tracker: &std::sync::Mutex<TurnTracker>, boundary_manual: bool) {
     let mut tracker = turn_tracker.lock().expect("turn tracker lock");
-    if tracker.running.is_none() && matches!(tracker.queued.front(), Some(TrackedOp::Compact)) {
+    tracker.compact_candidate = false;
+    if boundary_manual
+        && tracker.running.is_none()
+        && matches!(tracker.queued.front(), Some(TrackedOp::Compact))
+    {
         tracker.running = tracker.queued.pop_front();
     }
 }
@@ -3051,11 +3103,11 @@ fn observe_compacting(turn_tracker: &std::sync::Mutex<TurnTracker>) {
 /// retires the OLDEST outstanding op:
 ///
 ///   (running) the edge belongs to the op in the `running` slot — the active
-///     turn, or the promoted compaction whose observed `compacting` frame put
+///     turn, or the promoted compaction whose manual-confirmed boundary put
 ///     it there. Retire it;
 ///   (drop peel) `running` empty and the OLDEST queued op is an UNPROMOTED
 ///     Compact: this edge cannot be its (a compact's terminal edge is ALWAYS
-///     preceded by its own observed compacting frame, and that promotion never
+///     preceded by its own manual-confirmed boundary, and that promotion never
 ///     happened). The compact provably DROPPED — but ONLY because a following
 ///     queued Turn evidences it (this edge must belong to the oldest such
 ///     Turn: FIFO). Peel every leading unpromoted Compact up to that Turn —
@@ -3075,6 +3127,10 @@ fn fold_terminal_edge(
     turn_tracker: &std::sync::Mutex<TurnTracker>,
 ) {
     let mut tracker = turn_tracker.lock().expect("turn tracker lock");
+    // A terminal edge settles any compaction that never produced a completion
+    // boundary (e.g. a failed compact run — no boundary is emitted) — drop the
+    // unconsumed candidate; promotion happens only from `confirm_compact_candidate`.
+    tracker.compact_candidate = false;
     if tracker.running.take().is_none() {
         loop {
             match tracker.queued.front().copied() {
@@ -4473,6 +4529,15 @@ rl.on('line', (line) => {
       console.log(JSON.stringify({ type: 'sdk.error', sessionId: msg.sessionId, message: 'boom' }))
     } else if (msg.text === '__emit_compacting__') {
       console.log(JSON.stringify({ type: 'sdk.status', sessionId: msg.sessionId, status: 'compacting' }))
+    // Task 4b (kata 1wxv, ep3-r1 F1): the SDK's compact COMPLETION boundary
+    // carries the manual/auto trigger the bare `compacting` status lacks — the
+    // ONLY wire-level way to tell an explicit `/compact` run apart from the
+    // SDK's automatic context compaction. The real sidecar relays it as
+    // `sdk.compact_boundary {trigger}` (crates/freshell-claude-sidecar).
+    } else if (msg.text === '__emit_compact_boundary_manual__') {
+      console.log(JSON.stringify({ type: 'sdk.compact_boundary', sessionId: msg.sessionId, trigger: 'manual' }))
+    } else if (msg.text === '__emit_compact_boundary_auto__') {
+      console.log(JSON.stringify({ type: 'sdk.compact_boundary', sessionId: msg.sessionId, trigger: 'auto' }))
     } else if (msg.text === '__emit_assistant__') {
       console.log(JSON.stringify({ type: 'sdk.assistant', sessionId: msg.sessionId, content: [{ type: 'text', text: 'noise' }] }))
     // Task 2 test hook: raise a canned pending permission the approve/deny flow can
@@ -6556,8 +6621,11 @@ rl.on('line', (line) => {
             "F2: an accepted send never proves the compact drained — the gate stays closed"
         );
 
-        // (3a) The compact's own turn starts: the provider OBSERVABLY compacts.
+        // (3a) The compact's own turn starts: the provider OBSERVABLY compacts
+        // and its completion boundary confirms the run was the manual one
+        // (ep3-r1 F1: the trigger-blind status alone never promotes).
         inject_raw_send(&st, &session_id, "__emit_compacting__").await;
+        inject_raw_send(&st, &session_id, "__emit_compact_boundary_manual__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         let (sink, captured) = capturing_sink();
         st.handle_rollback(
@@ -6616,6 +6684,80 @@ rl.on('line', (line) => {
         assert_eq!(
             frames2[0]["event"]["code"], "NOTHING_TO_UNDO",
             "the busy gate released exactly at B's own terminal edge: {frames2:?}"
+        );
+        drop(env);
+    }
+
+    /// Focused-review ep3-r1 F1 (automatic compaction is NEVER a queued
+    /// explicit compact's evidence): the bare `sdk.status:compacting` frame
+    /// carries NO trigger — the SDK fires it for an explicit `/compact` AND for
+    /// its own automatic context compaction. With [A done, C1 (queue-dropped)
+    /// ahead, B queued as the de-facto active turn], B automatically
+    /// compacts mid-turn: status-time promotion attributed the AUTO compaction
+    /// to C1 ("promotes the phantom"); B's own result frame then retired the
+    /// PHANTOM compact and stranded B queued — its PAIRED idle deliberately
+    /// skipped (ep2-r1 F1) — `in_turn` held FOREVER (BUSY_TURN for every later
+    /// undo). Only the SDK's compact COMPLETION boundary
+    /// (`sdk.compact_boundary {trigger}`) discriminates the trigger; promotion
+    /// now requires the `manual` boundary.
+    ///
+    ///   A → C1 → B → A's pair (A retires) → B generating → AUTO compact
+    ///   (status + boundary auto — NO promotion) → B's own result + idle pair
+    ///   (B retires) → the gate OPENS.
+    #[tokio::test]
+    async fn an_automatic_compaction_mid_turn_is_never_attributed_to_a_queued_compact() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-autocompact")).await;
+        let created = await_claude_created(&mut rx, "req-autocompact").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        await_status_frame(&mut rx, &session_id, "idle").await;
+
+        st.handle_send(send_msg(&session_id, "turn one")).await; // A
+        st.handle_compact(compact_msg(&session_id, None)).await; // C1
+        st.handle_send(send_msg(&session_id, "turn two")).await; // B
+
+        // A's pair retires A; [C1 dropped, B (de-facto active)] remains.
+        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
+        inject_raw_send(&st, &session_id, "__emit_idle__").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(in_turn_of(&st, &session_id).await, "C1(dropped) + B owed");
+
+        // B's AUTOMATIC context compaction: bare compacting status + its
+        // completion boundary tagged `auto`. NEVER C1's evidence: C1 is NOT
+        // promoted and the gate stays closed while B generates.
+        inject_raw_send(&st, &session_id, "__emit_compacting__").await;
+        inject_raw_send(&st, &session_id, "__emit_compact_boundary_auto__").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-auto-0", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        assert_eq!(
+            captured_json(&captured)[0]["event"]["code"],
+            "BUSY_TURN",
+            "ep3-r1 F1: the queued C1 is NOT promoted by an automatic compaction — B still owes its terminal edge"
+        );
+
+        // B's own result + its PAIRED idle retires B — and the gate OPENS:
+        // nothing is owed (C1's silent drop is proven by B's activity per the
+        // existing drop-absorber), the pane is never permanently busy.
+        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
+        inject_raw_send(&st, &session_id, "__emit_idle__").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-auto-1", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        let frames = captured_json(&captured);
+        assert_eq!(
+            frames[0]["event"]["code"], "NOTHING_TO_UNDO",
+            "ep3-r1 F1: the gate opened at B's own terminal edge — never wedged by a mis-promoted phantom compact: {frames:?}"
         );
         drop(env);
     }
@@ -6772,6 +6914,7 @@ rl.on('line', (line) => {
         // SURVIVES here (the garlanded send "turn two" is still generating);
         // only the send's own terminal edge releases it.
         inject_raw_send(&st, &session_id, "__emit_compacting__").await;
+        inject_raw_send(&st, &session_id, "__emit_compact_boundary_manual__").await;
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
@@ -6871,6 +7014,7 @@ rl.on('line', (line) => {
         // busy gate MUST stay closed through it (the one-slot trackers released
         // here: the re-arm had nothing left to distinguish C₂).
         inject_raw_send(&st, &session_id, "__emit_compacting__").await;
+        inject_raw_send(&st, &session_id, "__emit_compact_boundary_manual__").await;
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
@@ -6901,6 +7045,7 @@ rl.on('line', (line) => {
         // (3) C₂ observably runs and ends: the gate releases EXACTLY at C₂'s
         // own terminal edge — never earlier.
         inject_raw_send(&st, &session_id, "__emit_compacting__").await;
+        inject_raw_send(&st, &session_id, "__emit_compact_boundary_manual__").await;
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
         await_in_turn(&st, &session_id, false).await;
         let (sink, captured) = capturing_sink();
@@ -6964,6 +7109,7 @@ rl.on('line', (line) => {
         // (2) C's observed run + OWN terminal edge: retires C — S₁ and S₂
         // still owe their terminal edges, so the gate HOLDS.
         inject_raw_send(&st, &session_id, "__emit_compacting__").await;
+        inject_raw_send(&st, &session_id, "__emit_compact_boundary_manual__").await;
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
@@ -7093,6 +7239,7 @@ rl.on('line', (line) => {
         // (2) C observably runs and its pair lands: retires C — the gate HOLDS
         // (S is generating behind it).
         inject_raw_send(&st, &session_id, "__emit_compacting__").await;
+        inject_raw_send(&st, &session_id, "__emit_compact_boundary_manual__").await;
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
         inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -7167,6 +7314,7 @@ rl.on('line', (line) => {
         // C₁ observably starts; C₂ arms while C₁ is MID-COMPACTION — it owes
         // C₁'s terminal edge; S queues behind BOTH compacts.
         inject_raw_send(&st, &session_id, "__emit_compacting__").await;
+        inject_raw_send(&st, &session_id, "__emit_compact_boundary_manual__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         st.handle_compact(compact_msg(&session_id, None)).await; // C₂ armed
         st.handle_send(send_msg(&session_id, "turn two")).await; // S garlanded
@@ -7277,9 +7425,11 @@ rl.on('line', (line) => {
             "no teardown"
         );
 
-        // C2 then runs for real: its observed compacting → pair lands — the
-        // gate releases EXACTLY at C2's own terminal edge (never earlier).
+        // C2 then runs for real: its observed compacting + confirmed-manual
+        // boundary → pair lands — the gate releases EXACTLY at C2's own
+        // terminal edge (never earlier).
         inject_raw_send(&st, &session_id, "__emit_compacting__").await;
+        inject_raw_send(&st, &session_id, "__emit_compact_boundary_manual__").await;
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
         inject_raw_send(&st, &session_id, "__emit_idle__").await;
         await_in_turn(&st, &session_id, false).await;
@@ -7546,9 +7696,11 @@ rl.on('line', (line) => {
             "the interrupt freed A only — C and S are still queued"
         );
 
-        // C runs for real: observed compacting + its pair — retires C, and S
-        // is STILL owed: the gate MUST stay closed here.
+        // C runs for real: observed compacting + confirmed-manual boundary +
+        // its pair — retires C, and S is STILL owed: the gate MUST stay closed
+        // here.
         inject_raw_send(&st, &session_id, "__emit_compacting__").await;
+        inject_raw_send(&st, &session_id, "__emit_compact_boundary_manual__").await;
         inject_raw_send(&st, &session_id, "__emit_result_error__").await;
         inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -7622,7 +7774,8 @@ rl.on('line', (line) => {
         fold_terminal_edge(&in_turn, &turn_tracker);
         st.handle_send(send_msg("rb-armfail-gar", "turn garlanded"))
             .await;
-        observe_compacting(&turn_tracker);
+        mark_compact_candidate(&turn_tracker);
+        confirm_compact_candidate(&turn_tracker, true);
 
         // Let the fixture `tee` fully drain the pipe before freezing — a
         // partially-consumed pipe would park the fill loop short of the

@@ -158,6 +158,17 @@ function handleSdkMessage(sessionId, msg) {
         })
       } else if (msg.subtype === 'status' && msg.status === 'compacting') {
         emit({ type: 'sdk.status', sessionId, status: 'compacting' })
+      } else if (msg.subtype === 'compact_boundary') {
+        // kata 1wxv ep3-r1 F1: the bare compacting STATUS frame carries no
+        // trigger — the SDK fires it for an explicit `/compact` AND for its
+        // own automatic context compaction, and misattributing the automatic
+        // one to a queued explicit compact wedges the rollback busy gate
+        // (the phantom compact absorbs the turn's own terminal edge). Only the
+        // compact COMPLETION boundary discriminates the trigger; relay it.
+        // Fail toward 'auto' on a missing/unknown trigger so promotion to a
+        // queued explicit compact never happens without a proven manual run.
+        const trigger = msg.compact_metadata?.trigger === 'manual' ? 'manual' : 'auto'
+        emit({ type: 'sdk.compact_boundary', sessionId, trigger })
       }
       break
     }

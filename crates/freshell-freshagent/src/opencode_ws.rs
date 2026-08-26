@@ -1956,7 +1956,19 @@ impl FreshOpencodeState {
             None => manager.unrevert(real_id, route).await,
         };
         if let Err(err) = result {
-            if matches!(err, ServeError::Http { .. }) {
+            // ep3-r1 F2 (the compact path's compensation discipline applied to
+            // rollback): an answered non-2xx (`ServeError::Http`) means the
+            // serve REJECTED the mutation, and `ServeError::never_dispatched()`
+            // (connect-phase refusal + every startup-phase failure) means the
+            // POST provably never left this process — in BOTH cases the provider
+            // history is untouched, so the speculative pre-write must be
+            // compensated or the ledger would describe a mutation the provider
+            // provably did not perform (a failed undo would expose the same
+            // turns as active AND rolled back; a failed full redo would durably
+            // destroy redo availability while the provider remains reverted).
+            // Timed-at/after-send failures stay uncompensated forever
+            // (error-after-send ≠ mutation refused).
+            if matches!(&err, ServeError::Http { .. }) || err.never_dispatched() {
                 self.compensate_opencode_record(real_id, plan.previous, plan.now)
                     .await;
             }
@@ -6316,6 +6328,11 @@ mod tests {
         revert_status: StdMutex<u16>,
         /// false simulates the silent-200 no-op (unknown/stale messageID).
         revert_moves_pointer: StdMutex<bool>,
+        /// ep3-r1 F2: when armed, the revert POST answers `Err(Undelivered)` —
+        /// the connect-phase refusal shape (the request provably never left
+        /// this process), exercising the rollback ledger's never-dispatched
+        /// compensation leg.
+        revert_undelivered: StdMutex<bool>,
         /// Fail exactly these (1-indexed) `GET /session/<id>` calls (post-verify
         /// read triad leg (c); a per-call set because the ep2-r3 retry repro
         /// fails op1's post-verify AND op2's post-verify while op2's initial
@@ -6348,6 +6365,7 @@ mod tests {
                 revert_pointer: StdMutex::new(pointer.map(str::to_string)),
                 revert_status: StdMutex::new(200),
                 revert_moves_pointer: StdMutex::new(true),
+                revert_undelivered: StdMutex::new(false),
                 get_session_fail_calls: StdMutex::new(std::collections::BTreeSet::new()),
                 get_session_calls: StdMutex::new(0),
                 revert_gate: StdMutex::new(None),
@@ -6484,6 +6502,14 @@ mod tests {
                 return Box::pin(async { Ok(ServeHttpResponse::new(200, b"true".to_vec())) });
             }
             if method == "POST" && req.url.contains("/revert") {
+                let undelivered = *self.revert_undelivered.lock().expect("flag mutex");
+                if undelivered {
+                    return Box::pin(async {
+                        Err(ServeHttpError::Undelivered(
+                            "connect refused (fake)".to_string(),
+                        ))
+                    });
+                }
                 let status = *self.revert_status.lock().expect("status mutex");
                 let moves = *self.revert_moves_pointer.lock().expect("flag mutex");
                 let gate = self.revert_gate.lock().expect("gate mutex").take();
@@ -7361,6 +7387,43 @@ mod tests {
         let frames = captured_frames(&captured);
         assert_eq!(frames[0]["event"]["code"], json!("INTERNAL_ERROR"));
         assert_ne!(frames[0]["event"]["message"], json!(OPENCODE_OLD_CLI_COPY));
+    }
+
+    /// Focused-review ep3-r1 F2 (never-dispatched compensation on rollback):
+    /// an UNDELIVERED revert (the transport's connect-phase refusal — the POST
+    /// provably never left this process) leaves the provider untouched, so the
+    /// speculative pre-write MUST be compensated exactly like the answered-HTTP
+    /// leg. Only [`ServeError::Http`] compensated before: the ledger kept the
+    /// just-written post-undo entry here, describing a rollback the provider
+    /// provably never performed (the same turns then read active AND rolled
+    /// back in the durable history).
+    #[tokio::test]
+    async fn handle_rollback_compensates_the_record_when_the_mutation_never_left_the_process() {
+        let (st, _rx, st_sink, http) = state_with_rollback_fake(None).await;
+        *http.revert_undelivered.lock().expect("flag") = true;
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(undo_op("ses_real", "rb-16"), sink).await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "exactly one frame: {frames:?}");
+        assert_eq!(frames[0]["event"]["code"], json!("INTERNAL_ERROR"));
+        assert!(
+            frames[0]["event"]["message"]
+                .as_str()
+                .expect("message")
+                .contains("never reached the server"),
+            "the undelivered copy: {frames:?}"
+        );
+        let record = st_sink
+            .load_rollback(PROVIDER, "ses_real")
+            .expect("the compensated record is loadable");
+        assert!(
+            record.entries.is_empty(),
+            "ep3-r1 F2: the compensated record carries NO rollback entry (provider provably untouched): {record:?}"
+        );
+        assert!(
+            !record.can_redo,
+            "redo availability restored to the pre-op state"
+        );
     }
 
     #[tokio::test]
