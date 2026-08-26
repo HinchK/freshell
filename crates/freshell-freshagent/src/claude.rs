@@ -863,14 +863,34 @@ impl FreshClaudeState {
             // the front stranded the interrupted turn's entry forever). Queued
             // ops BEHIND the interrupted turn stay queued (the interrupt never
             // drains them).
+            //
+            // ep3-r2 F1 (the candidate window): a compaction whose bare
+            // `sdk.status:compacting` arrived (candidate pending) but whose
+            // completion boundary has NOT IS the op currently in flight
+            // provider-side — SDK interrupt() cancels exactly the current
+            // execution and provably leaves LATER queued work to run. Retire
+            // exactly THAT front compact; draining past it would erase ops the
+            // provider still owes (a later compact/send), opening the gate
+            // while provider work remains queued.
             if tracker.running.take().is_none() {
-                while let Some(op) = tracker.queued.front().copied() {
+                if tracker.compact_candidate
+                    && matches!(tracker.queued.front(), Some(TrackedOp::Compact))
+                {
                     tracker.queued.pop_front();
-                    if op == TrackedOp::Turn {
-                        break;
+                } else {
+                    while let Some(op) = tracker.queued.front().copied() {
+                        tracker.queued.pop_front();
+                        if op == TrackedOp::Turn {
+                            break;
+                        }
                     }
                 }
             }
+            // Any pending compaction candidate perished with the interrupted
+            // execution (auto: with the turn; manual candidate: retired above) —
+            // a stray leftover boundary must never promote a LATER queued
+            // compact it was never observed for.
+            tracker.compact_candidate = false;
             session
                 .in_turn
                 .store(tracker.busy(), std::sync::atomic::Ordering::SeqCst);
@@ -2840,11 +2860,26 @@ impl FreshClaudeState {
                         // resets TOO — the fail-closed `in_turn` needs a LIVE
                         // terminal edge after the error; a result's trailing
                         // idle past an error must fold, never be skipped.
-                        turn_tracker
-                            .lock()
-                            .expect("turn tracker lock")
-                            .queued
-                            .clear();
+                        let session_dead =
+                            value.get("sessionNotFound").and_then(Value::as_bool) == Some(true);
+                        {
+                            let mut tracker = turn_tracker.lock().expect("turn tracker lock");
+                            tracker.queued.clear();
+                            if session_dead {
+                                // ep3-r2 F2: the provider-side session is DEAD —
+                                // the sidecar (handleSend/handleInterrupt)
+                                // answers `sdk.error` and keeps the long-lived
+                                // stdout OPEN, so NO terminal edge or EOF will
+                                // ever retire what remains. Every tracked op —
+                                // including `running` — can never complete:
+                                // retire the whole tracker and open the gate
+                                // (else the pane wedges BUSY forever after an
+                                // interrupted/deleted provider session).
+                                tracker.running = None;
+                                tracker.compact_candidate = false;
+                                in_turn.store(false, std::sync::atomic::Ordering::SeqCst);
+                            }
+                        }
                         result_idle_pair_pending.store(false, std::sync::atomic::Ordering::SeqCst);
                     }
                     _ => {}
@@ -3089,8 +3124,14 @@ fn mark_compact_candidate(turn_tracker: &std::sync::Mutex<TurnTracker>) {
 /// candidate is consumed either way.
 fn confirm_compact_candidate(turn_tracker: &std::sync::Mutex<TurnTracker>, boundary_manual: bool) {
     let mut tracker = turn_tracker.lock().expect("turn tracker lock");
+    // The boundary confirms ONLY a LIVE candidate (ep3-r2 F1): a boundary
+    // arriving with NO pending candidate is a leftover (e.g. an interrupted
+    // compaction's late completion) and must never promote a LATER queued
+    // compact it was never observed for.
+    let had_candidate = tracker.compact_candidate;
     tracker.compact_candidate = false;
     if boundary_manual
+        && had_candidate
         && tracker.running.is_none()
         && matches!(tracker.queued.front(), Some(TrackedOp::Compact))
     {
@@ -4482,6 +4523,11 @@ const deferCreateMs = parseInt(process.env.FRESHELL_TEST_CLAUDE_DEFER_CREATE_MS 
 const failCreate = process.env.FRESHELL_TEST_CLAUDE_FAIL_CREATE === '1'
 
 let counter = 0
+// Task 4c (ep3-r2 F2): live-session membership — the real sidecar DELETES its
+// JS session when consumeStream's finally runs (stream end) while stdout stays
+// open, so a later send is answered by a lone signed `sdk.error` (no terminal
+// edge, no EOF). `__drop_session__` simulates that provider-side death.
+const liveSessions = new Set()
 const rl = readline.createInterface({ input: process.stdin, terminal: false })
 rl.on('line', (line) => {
   const trimmed = line.trim()
@@ -4502,6 +4548,7 @@ rl.on('line', (line) => {
     const answer = () => {
       counter += 1
       const sessionId = `fake-claude-session-${process.pid}-${counter}`
+      liveSessions.add(sessionId)
       process.stdout.write(JSON.stringify({ type: 'created', sessionId }) + '\n')
       // Mirror the real sidecar's post-create init: echo resumeSessionId as the durable
       // id when present (resume continuity), else a fixed fake uuid.
@@ -4538,6 +4585,13 @@ rl.on('line', (line) => {
       console.log(JSON.stringify({ type: 'sdk.compact_boundary', sessionId: msg.sessionId, trigger: 'manual' }))
     } else if (msg.text === '__emit_compact_boundary_auto__') {
       console.log(JSON.stringify({ type: 'sdk.compact_boundary', sessionId: msg.sessionId, trigger: 'auto' }))
+    } else if (msg.text === '__drop_session__') {
+      liveSessions.delete(msg.sessionId)
+    } else if (!liveSessions.has(msg.sessionId)) {
+      // Task 4c (ep3-r2 F2): the provider-side session was DELETED (stream end)
+      // while stdout stayed open — the real sidecar answers with this lone
+      // signed frame and NOTHING after (no result, no idle, no EOF).
+      console.log(JSON.stringify({ type: 'sdk.error', sessionId: msg.sessionId, message: 'session not found', sessionNotFound: true }))
     } else if (msg.text === '__emit_assistant__') {
       console.log(JSON.stringify({ type: 'sdk.assistant', sessionId: msg.sessionId, content: [{ type: 'text', text: 'noise' }] }))
     // Task 2 test hook: raise a canned pending permission the approve/deny flow can
@@ -6758,6 +6812,143 @@ rl.on('line', (line) => {
         assert_eq!(
             frames[0]["event"]["code"], "NOTHING_TO_UNDO",
             "ep3-r1 F1: the gate opened at B's own terminal edge — never wedged by a mis-promoted phantom compact: {frames:?}"
+        );
+        drop(env);
+    }
+
+    /// Focused-review ep3-r2 F1 (interrupt inside the compact candidate
+    /// window): C1's bare `sdk.status:compacting` has arrived but its manual
+    /// completion boundary has NOT — C1 is exactly the execution the SDK's
+    /// `query.interrupt()` cancels, while every op QUEUED BEHIND it (C2, S)
+    /// provably still runs. The silent-drop absorber (retire-to-first-Turn)
+    /// erased them too: `in_turn` went FALSE while C2 and S remained owed —
+    /// the sole mid-turn gate admitted a rollback wipe mid-generation. With a
+    /// LIVE candidate the interrupt retires EXACTLY the front compact.
+    ///
+    ///   A → C1 → C2 → S → A's pair (A retires) → C1 compacting (candidate) →
+    ///   INTERRUPT (cancels C1 only — the gate STAYS CLOSED for C2 + S) → C2's
+    ///   manual boundary + pair (C2 retires; S still owed) → S's pair (gate
+    ///   OPENS exactly here).
+    #[tokio::test]
+    async fn an_interrupt_inside_the_compact_candidate_window_retires_only_the_interrupted_compact()
+    {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-icand")).await;
+        let created = await_claude_created(&mut rx, "req-icand").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        await_status_frame(&mut rx, &session_id, "idle").await;
+
+        st.handle_send(send_msg(&session_id, "turn one")).await; // A
+        st.handle_compact(compact_msg(&session_id, None)).await; // C1
+        st.handle_compact(compact_msg(&session_id, None)).await; // C2
+        st.handle_send(send_msg(&session_id, "turn two")).await; // S
+
+        // A's pair retires A: [C1, C2, S] all queued, running empty.
+        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
+        inject_raw_send(&st, &session_id, "__emit_idle__").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // C1 starts compacting (candidate pending — the boundary lands later).
+        inject_raw_send(&st, &session_id, "__emit_compacting__").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // The interrupt cancels C1 — C2 and S provably survive provider-side:
+        // the gate MUST stay closed.
+        st.handle_interrupt(interrupt_msg(&session_id)).await;
+        assert!(
+            in_turn_of(&st, &session_id).await,
+            "ep3-r2 F1: the interrupt cancelled ONLY the in-flight C1 — C2 and S are still owed"
+        );
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-icand-0", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        assert_eq!(
+            captured_json(&captured)[0]["event"]["code"],
+            "BUSY_TURN",
+            "ep3-r2 F1: rollback stays refused while C2/S remain owed"
+        );
+
+        // C2 then runs for real: status marks its candidate, the manual
+        // boundary promotes it, and its own pair retires it; S is still owed
+        // behind it — the gate holds.
+        inject_raw_send(&st, &session_id, "__emit_compacting__").await;
+        inject_raw_send(&st, &session_id, "__emit_compact_boundary_manual__").await;
+        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
+        inject_raw_send(&st, &session_id, "__emit_idle__").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(in_turn_of(&st, &session_id).await, "S still owed behind C2");
+
+        // S's own pair: the gate OPENS at the last owed edge, exactly.
+        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
+        inject_raw_send(&st, &session_id, "__emit_idle__").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-icand-1", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        let frames = captured_json(&captured);
+        assert_eq!(
+            frames[0]["event"]["code"], "NOTHING_TO_UNDO",
+            "ep3-r2 F1: the gate opened at S's own edge — never early, never wedged: {frames:?}"
+        );
+        drop(env);
+    }
+
+    /// Focused-review ep3-r2 F2 (provider-session death behind a live stdout):
+    /// the sidecar's consumeStream finally DELETES the JS session while the
+    /// long-lived stdout stays open; a later send arms the tracker and is then
+    /// answered by a lone signed `sdk.error{sessionNotFound:true}` — no result,
+    /// no idle, no EOF ever follows. The queue-only clear wedged `in_turn`
+    /// forever (BUSY_TURN for every later undo). The signed not-found error
+    /// retires the WHOLE tracker: the ops provably cannot complete.
+    #[tokio::test]
+    async fn a_signed_session_not_found_error_opens_the_gate_instead_of_wedging_it() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-notfound")).await;
+        let created = await_claude_created(&mut rx, "req-notfound").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        await_status_frame(&mut rx, &session_id, "idle").await;
+
+        // One completed turn (armed then retired by its pair) — the gate is open.
+        st.handle_send(send_msg(&session_id, "turn one")).await;
+        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
+        inject_raw_send(&st, &session_id, "__emit_idle__").await;
+        await_in_turn(&st, &session_id, false).await;
+
+        // The provider-side session DIES (stream end deletes it) — stdout stays
+        // open, nothing announces it yet.
+        inject_raw_send(&st, &session_id, "__drop_session__").await;
+
+        // A new send ARMS the tracker; the fake answers with the signed
+        // not-found error and NOTHING after.
+        st.handle_send(send_msg(&session_id, "turn two")).await;
+        assert!(
+            in_turn_of(&st, &session_id).await,
+            "the send arms the gate before the death surfaces"
+        );
+
+        // The signed not-found error must retire the whole tracker — pre-fix
+        // the queue-only clear left `running` armed forever (the BUSY wedge).
+        await_in_turn(&st, &session_id, false).await;
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-nf-1", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        let frames = captured_json(&captured);
+        assert_ne!(
+            frames[0]["event"]["code"], "BUSY_TURN",
+            "ep3-r2 F2: the gate is open after the provider session's death — never wedged: {frames:?}"
         );
         drop(env);
     }

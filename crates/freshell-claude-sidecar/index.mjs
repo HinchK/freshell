@@ -296,7 +296,10 @@ function handleCreate(req) {
 
 function handleSend(req) {
   const st = sessions.get(req.sessionId)
-  if (!st) { emit({ type: 'sdk.error', sessionId: req.sessionId, message: 'session not found' }); return }
+  // ep3-r2 F2: the signed frame — when the JS session is gone but stdout stays
+  // open (consumeStream deleted it), NO terminal edge or EOF follows; the Rust
+  // busy tracker must fold this specific failure as provider-session death.
+  if (!st) { emit({ type: 'sdk.error', sessionId: req.sessionId, message: 'session not found', sessionNotFound: true }); return }
   st.inputStream.push({
     type: 'user',
     message: { role: 'user', content: [{ type: 'text', text: req.text }] },
@@ -310,7 +313,7 @@ function handleSend(req) {
 // success (the Rust side mirrors this: no confirmation frame is broadcast either).
 function handleInterrupt(req) {
   const st = sessions.get(req.sessionId)
-  if (!st) { emit({ type: 'sdk.error', sessionId: req.sessionId, message: 'session not found' }); return }
+  if (!st) { emit({ type: 'sdk.error', sessionId: req.sessionId, message: 'session not found', sessionNotFound: true }); return }
   // The transport is still open here (interrupt only signals), so resolving the
   // parked requests with deny is safe — and required so the SDK's canUseTool
   // await settles instead of hanging the interrupted turn.
