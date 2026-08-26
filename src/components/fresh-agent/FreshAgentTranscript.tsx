@@ -91,28 +91,37 @@ function formatJson(value: unknown): string {
 type ActivityRow =
   | { type: 'thinking'; id: string; text: string }
   | { type: 'tool'; tool: FreshAgentToolDisplay }
+  | { type: 'caption'; id: string; text: string }
 
-function buildActivity(items: FreshAgentTranscriptItem[]): ActivityRow[] {
+function buildActivity(
+  items: FreshAgentTranscriptItem[],
+  captions: LineCaption[] = [],
+): ActivityRow[] {
   const rows: ActivityRow[] = []
+  // First item index that produced each row (tool_use/tool_result stitching and
+  // thinking merges keep the FIRST contributing item's index) so captions
+  // interleave at the position where they painted.
+  const rowStartItemIndexes: number[] = []
   const toolIndexById = new Map<string, number>()
   // Providers stream thinking in chunks; consecutive thinking/reasoning items
   // merge into one row instead of stacking N "Thinking:" fragments.
-  const pushThinking = (id: string, text: string) => {
+  const pushThinking = (id: string, text: string, itemIndex: number) => {
     if (!text) return
     const last = rows[rows.length - 1]
     if (last?.type === 'thinking') {
       rows[rows.length - 1] = { ...last, text: `${last.text}\n\n${text}` }
       return
     }
+    rowStartItemIndexes.push(itemIndex)
     rows.push({ type: 'thinking', id, text })
   }
-  for (const item of items) {
+  for (const [itemIndex, item] of items.entries()) {
     if (item.kind === 'thinking') {
-      pushThinking(item.id, stripSystemReminders(item.text))
+      pushThinking(item.id, stripSystemReminders(item.text), itemIndex)
       continue
     }
     if (item.kind === 'reasoning') {
-      pushThinking(item.id, item.summary.length > 0 ? item.summary.join('\n') : (item.text ?? ''))
+      pushThinking(item.id, item.summary.length > 0 ? item.summary.join('\n') : (item.text ?? ''), itemIndex)
       continue
     }
     if (item.kind === 'tool_result') {
@@ -130,6 +139,7 @@ function buildActivity(items: FreshAgentTranscriptItem[]): ActivityRow[] {
         }
       } else {
         toolIndexById.set(item.id, rows.length)
+        rowStartItemIndexes.push(itemIndex)
         rows.push({
           type: 'tool',
           tool: {
@@ -150,10 +160,28 @@ function buildActivity(items: FreshAgentTranscriptItem[]): ActivityRow[] {
       rows[existingIndex] = { type: 'tool', tool }
     } else {
       toolIndexById.set(tool.id, rows.length)
+      rowStartItemIndexes.push(itemIndex)
       rows.push({ type: 'tool', tool })
     }
   }
-  return rows
+  if (captions.length === 0) return rows
+  const withCaptions: ActivityRow[] = []
+  const ordered = [...captions].sort((a, b) => a.atItemIndex - b.atItemIndex)
+  let captionIndex = 0
+  for (const [rowIndex, row] of rows.entries()) {
+    while (
+      captionIndex < ordered.length
+      && ordered[captionIndex].atItemIndex <= rowStartItemIndexes[rowIndex]
+    ) {
+      withCaptions.push({ type: 'caption', id: ordered[captionIndex].id, text: ordered[captionIndex].text })
+      captionIndex += 1
+    }
+    withCaptions.push(row)
+  }
+  for (; captionIndex < ordered.length; captionIndex++) {
+    withCaptions.push({ type: 'caption', id: ordered[captionIndex].id, text: ordered[captionIndex].text })
+  }
+  return withCaptions
 }
 
 function activityTools(rows: ActivityRow[]): FreshAgentToolDisplay[] {
@@ -215,7 +243,13 @@ function rendersVisibly(item: FreshAgentTranscriptItem): boolean {
  *
  * Zero-item turns (Rust codex `subAgentActivity` rows, opencode structural
  * messages) render real articles today, so they hard-close any open line —
- * they are "something between" by definition. Absorbed follower items get
+ * they are "something between" by definition. No Rust producer emits a
+ * zero-item turn with a non-blank summary (LB-4), so a zero-item turn never
+ * folds ITS OWN caption — but the close itself is a later-activity boundary:
+ * it supersedes the closing line's last member, whose gated caption folds
+ * into THAT LINE's expansion (never cross-line). The supersession stash is
+ * the only fold source; the final open line's last member paints in-stream
+ * instead (the tail caption). Absorbed follower items get
  * display-only id dedupe (TS claude reuses item ids across turns sharing one
  * provider message id; stitching keys toolUseId, which is verified unique, so
  * stitching is unaffected — only React keys need this).
@@ -240,6 +274,7 @@ function buildTranscriptLayout(
     role: FreshAgentTurn['role']
     items: FreshAgentTranscriptItem[]
     members: LineMember[]
+    captions: LineCaption[]
   } | null = null
   const lineEndIndex = new Map<number, number>()
   let lineSeq = 0
@@ -254,12 +289,30 @@ function buildTranscriptLayout(
     return { id, text, atItemIndex }
   }
 
-  const flushOpen = () => {
+  const flushOpen = (stashLastMember: boolean, transferTurnIndex?: number) => {
     if (!open) return
-    const rows = buildActivity(open.items)
+    // Every superseded member's pre-gated caption folds into the expansion.
+    // The LAST member stashes only when a later visible turn superseded it
+    // (stashLastMember) — otherwise its caption paints in-stream via
+    // tailCaption and must not double-render here. `transferTurnIndex` skips
+    // the closing boundary's OWN turn when that turn has more activity items
+    // coming: a multi-line turn ([tool, text, tool], claude/opencode both
+    // interleave them) would otherwise stash its caption into the first line
+    // AND paint it again after the second — violating the one-caption/one-place
+    // invariant (fresh-eyes round 3, Finding 1). Transferred captions are
+    // re-created by the turn's next line-open member record.
+    const stash = (stashLastMember ? open.members : open.members.slice(0, -1))
+      .filter((member) => member.turnIndex !== transferTurnIndex)
+    for (const member of stash) {
+      if (member.caption) open.captions.push(member.caption)
+    }
+    const rows = buildActivity(open.items, open.captions)
     if (rows.length > 0) {
       const id = `line:${lineSeq++}`
       layouts[open.originIndex].blocks.push({ kind: 'activity', id, rows })
+    }
+    if (!stashLastMember) {
+      tailCaption = open.members.at(-1)?.caption ?? null
     }
     open = null
   }
@@ -271,12 +324,12 @@ function buildTranscriptLayout(
       // Zero-item turns hard-close any open line and render their own article;
       // they never carry a caption OF THEIR OWN (no Rust producer emits a
       // zero-item turn with a non-blank summary, LB-4). The close itself is a
-      // later-activity boundary: Task 4's stash treats it as superseding the
-      // closing line's last member.
-      flushOpen()
+      // later-activity boundary: it supersedes the closing line's last member,
+      // whose gated caption folds into the closing line's expansion.
+      flushOpen(true)
       continue
     }
-    for (const item of turn.items) {
+    for (const [itemIndex, item] of turn.items.entries()) {
       if (isActivityLike(item)) {
         // The boundary guard applies only to absorbing into a PREVIOUS turn's
         // line. Once this turn has opened its own line, its later activity
@@ -310,8 +363,8 @@ function buildTranscriptLayout(
           open.items.push(displayItem as FreshAgentTranscriptItem)
           lineEndIndex.set(open.originIndex, turnIndex)
         } else {
-          flushOpen()
-          open = { originIndex: turnIndex, role: turn.role, items: [item], members: [{ turnIndex, atItemIndex: 0, caption: foldCaption(turn, 0) }] }
+          flushOpen(true)
+          open = { originIndex: turnIndex, role: turn.role, items: [item], members: [{ turnIndex, atItemIndex: 0, caption: foldCaption(turn, 0) }], captions: [] }
         }
         continue
       }
@@ -321,21 +374,27 @@ function buildTranscriptLayout(
         // it closes the open line and keeps its (invisible-bodied) block,
         // matching the pre-change renderer's chrome.
         if (open && turn.role !== open.role) {
-          flushOpen()
+          flushOpen(true)
           layout.blocks.push({ kind: 'item', item })
         }
         continue
       }
-      flushOpen()
+      // Visible content closes the open line. When the CLOSING turn has more
+      // activity items coming ([tool, text, tool] — claude/opencode interleave),
+      // its caption transfers to the turn's next line instead of stashing here:
+      // stashing now plus re-painting after the next line-open would duplicate
+      // the same turn summary in one frame.
+      const hasLaterActivity = turn.items.slice(itemIndex + 1).some(isActivityLike)
+      flushOpen(true, hasLaterActivity ? turnIndex : undefined)
       layout.blocks.push({ kind: 'item', item })
     }
   }
   // The final open line's LAST member is not superseded: its pre-gated
   // caption paints in-stream as the transcript tail (while streaming and
   // after the session settles — the caption stays until later activity
-  // supersedes it). Task 4 stashes the superseded members' captions.
-  tailCaption = open?.members.at(-1)?.caption ?? null
-  flushOpen()
+  // supersedes it). `flushOpen(false)` stashes the SUPERSEDED members'
+  // captions into the line and yields the last member's caption as tailCaption.
+  flushOpen(false)
 
   // tail = last rendered block overall when it is an activity line; null when
   // the transcript visibly ends in a message.
@@ -483,9 +542,12 @@ function selectLiveActivityBlockIdFromLayout(
         : null
     if (!candidateId) return null
     const candidate = [...layouts.flatMap((l) => l.blocks)].find((b) => b.kind === 'activity' && b.id === candidateId)
-    return candidate?.kind === 'activity' && candidate.rows.at(-1)?.type === 'thinking'
-      ? candidate.id
-      : null
+    if (candidate?.kind !== 'activity') return null
+    // Settled liveness judges the last NON-caption row: caption rows are fold
+    // artifacts, not activity, so a trailing caption must not hide a thinking
+    // row that settles the strip live.
+    const contentRows = candidate.rows.filter((row) => row.type !== 'caption')
+    return contentRows.at(-1)?.type === 'thinking' ? candidate.id : null
   }
 
   if (lastTurn && lastTurn.items.length > 0) return latestActivityBlockId
@@ -549,7 +611,9 @@ function FreshAgentActivityStrip({
   const tools = activityTools(displayRows)
   const hasErrors = tools.some((tool) => tool.isError)
   const singleToolExpand = tools.length === 1 && displayRows.length === 1
-  const lastRow = displayRows[displayRows.length - 1] ?? null
+  // Liveness judges the last NON-caption row: a caption positioned after a
+  // merged thinking row must not kill thinkingLive/the spinner.
+  const lastRow = [...displayRows].reverse().find((row) => row.type !== 'caption') ?? null
   const runningTool = live ? [...tools].reverse().find((tool) => tool.status === 'running') ?? null : null
   const thinkingLive = live && lastRow?.type === 'thinking'
   const liveTool = !thinkingLive && live ? (tools[tools.length - 1] ?? null) : null
@@ -619,11 +683,23 @@ function FreshAgentActivityStrip({
           >
             <ChevronRight className="h-3 w-3 rotate-90 transition-transform" />
           </button>
-          {displayRows.map((row) => (
-            row.type === 'thinking'
+          {displayRows.map((row) => {
+            if (row.type === 'caption') {
+              // Non-interactive text — a folded echo caption needs no role/tabIndex.
+              return (
+                <div
+                  key={row.id}
+                  data-testid="fresh-agent-activity-caption"
+                  className="fresh-agent-activity-caption my-0.5 px-2 py-0.5 text-xs italic text-muted-foreground"
+                >
+                  {row.text}
+                </div>
+              )
+            }
+            return row.type === 'thinking'
               ? <FreshAgentThinkingRow key={row.id} text={row.text} />
               : <FreshAgentToolBlock key={row.tool.id} tool={row.tool} initialExpanded={initialExpanded || singleToolExpand} />
-          ))}
+          })}
         </div>
       )}
     </div>

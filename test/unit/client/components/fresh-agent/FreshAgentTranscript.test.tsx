@@ -1889,6 +1889,11 @@ describe('FreshAgentTranscript', () => {
       rerender(<FreshAgentTranscript isStreaming showThinking={false} turns={[turnA, thinkingTurn, turnB]} />)
       expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
       expect(screen.queryByText('Considering options')).not.toBeInTheDocument()
+      // FULLY-filtered no-leak (the lane tests cover the partially-filtered
+      // absorb case): the hidden thinking text must not appear in the
+      // expansion either.
+      fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+      expect(screen.queryByText('Considering options')).not.toBeInTheDocument()
     })
 
     it('keeps the fold after the session goes idle (isStreaming flips false)', () => {
@@ -1983,7 +1988,7 @@ describe('FreshAgentTranscript', () => {
       expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
     })
 
-    it('paints an echo caption at the transcript tail and drops it from the stream when superseded (fold baseline)', () => {
+    it('stashes a superseded tail caption into the line expansion when the next turn absorbs', () => {
       const turnA = {
         id: 'turn-a', turnId: 'turn-a', role: 'assistant' as const, summary: '',
         items: [{ id: 'tool-c1', kind: 'tool_use' as const, toolUseId: 'c1', name: 'Read', input: { file_path: 'src/a.ts' } }],
@@ -2002,7 +2007,7 @@ describe('FreshAgentTranscript', () => {
       expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
 
       // Frame 2: turnC absorbs into the line; turnB is superseded — the
-      // caption leaves the stream (Task 4 stashes it into the expansion).
+      // caption leaves the stream and stashes into the expansion.
       const turnC = {
         id: 'turn-c', turnId: 'turn-c', role: 'assistant' as const, summary: '',
         items: [{ id: 'tool-c3', kind: 'tool_use' as const, toolUseId: 'c3', name: 'Read', input: { file_path: 'src/c.ts' } }],
@@ -2010,6 +2015,217 @@ describe('FreshAgentTranscript', () => {
       rerender(<FreshAgentTranscript isStreaming turns={[turnA, turnB, turnC]} />)
       expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
       expect(screen.queryByText('Wrapping up shortly')).not.toBeInTheDocument()
+      // This is the POSITIVE fully-visible case: all turns are item-bearing and
+      // showThinking is on, so display filtering removes nothing and the
+      // caption stashes.
+      fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+      const caption = screen.getByTestId('fresh-agent-activity-caption')
+      expect(caption).toHaveTextContent('Wrapping up shortly')
+      // The stash anchors where turnB entered the line: after turnA's row,
+      // before turnB's tool row.
+      const toolB = screen.getByText('src/b.ts')
+      expect(caption.compareDocumentPosition(toolB) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    })
+
+    describe('foldable echo captions', () => {
+      it('stashes a superseded echo caption only when its turn was fully visible (claude lane)', () => {
+        // Claude lane (LB-1): [thinking "secret", tool_use] under the production
+        // default showThinking=false. The echo summary derives from the HIDDEN
+        // thinking item; the turn is partially filtered, so its caption is
+        // NEITHER painted at the tail NOR stashed into the expansion.
+        const secretTurn = {
+          id: 'turn-secret', turnId: 'turn-secret', role: 'assistant' as const,
+          summary: 'secret plans', summaryKind: 'echo' as const,
+          items: [
+            { id: 'think-secret', kind: 'thinking' as const, text: 'secret plans' },
+            { id: 'tool-c2', kind: 'tool_use' as const, toolUseId: 'c2', name: 'Read', input: { file_path: 'src/b.ts' } },
+          ],
+        }
+        // Positive control: a fully-visible superseded echo turn DOES stash. The
+        // same test therefore red-flags BOTH failure modes — no stash machinery
+        // at all (zero captions) and an ungated stash (the hidden text leaks).
+        const visibleTurn = {
+          id: 'turn-visible', turnId: 'turn-visible', role: 'assistant' as const,
+          summary: 'Read', summaryKind: 'echo' as const,
+          items: [{ id: 'tool-c3', kind: 'tool_use' as const, toolUseId: 'c3', name: 'Read', input: { file_path: 'src/c.ts' } }],
+        }
+        render(
+          <FreshAgentTranscript
+            isStreaming
+            showThinking={false}
+            turns={[toolTurn('turn-a', [['c1', 'src/a.ts']]), secretTurn, visibleTurn, toolTurn('turn-z', [['c4', 'src/d.ts']])]}
+          />,
+        )
+        expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
+        // turn-z is the blank-captioned tail, so nothing paints in-stream…
+        expect(screen.queryByTestId('fresh-agent-tail-caption')).not.toBeInTheDocument()
+        fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+        const captions = screen.getAllByTestId('fresh-agent-activity-caption')
+        expect(captions).toHaveLength(1)
+        expect(captions[0]).toHaveTextContent('Read')
+        // The hidden thinking text appears NOWHERE — not in the stream, not in
+        // the expansion.
+        expect(screen.queryByText('secret plans')).not.toBeInTheDocument()
+        // The visible item from the partially-filtered turn still absorbed.
+        expect(screen.getByText('src/b.ts')).toBeInTheDocument()
+        expect(screen.getByText('src/c.ts')).toBeInTheDocument()
+      })
+
+      it('stashes a superseded echo caption only when its turn was fully visible (codex lane)', () => {
+        // Codex lane (LB-1): [reasoning{summary: [], text: "secret"}, command]
+        // under showThinking=false — the reasoning item is hidden, the command
+        // item renders; the echo summary derives from the hidden reasoning.
+        const secretTurn = {
+          id: 'turn-secret', turnId: 'turn-secret', role: 'assistant' as const,
+          summary: 'secret plans', summaryKind: 'echo' as const,
+          items: [
+            { id: 'reason-secret', kind: 'reasoning' as const, summary: [] as string[], content: ['secret plans'], text: 'secret plans' },
+            { id: 'cmd-c2', kind: 'command' as const, command: 'ls src', status: 'completed' as const },
+          ],
+        }
+        const visibleTurn = {
+          id: 'turn-visible', turnId: 'turn-visible', role: 'assistant' as const,
+          summary: 'ls test', summaryKind: 'echo' as const,
+          items: [{ id: 'cmd-c3', kind: 'command' as const, command: 'ls test', status: 'completed' as const }],
+        }
+        render(
+          <FreshAgentTranscript
+            isStreaming
+            showThinking={false}
+            turns={[toolTurn('turn-a', [['c1', 'src/a.ts']]), secretTurn, visibleTurn, toolTurn('turn-z', [['c4', 'src/d.ts']])]}
+          />,
+        )
+        expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
+        fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+        const captions = screen.getAllByTestId('fresh-agent-activity-caption')
+        expect(captions).toHaveLength(1)
+        expect(captions[0]).toHaveTextContent('ls test')
+        expect(screen.queryByText('secret plans')).not.toBeInTheDocument()
+      })
+
+      it('treats a zero-item blank-summary turn as a benign line boundary (opencode structural-message shape)', () => {
+        // Routine in opencode (LB-4): a message whose parts are all structural
+        // (step-start/step-finish) arrives as a turn with items: [] and
+        // summary: ''. It renders nothing, stashes nothing, and still
+        // hard-closes the open line.
+        render(
+          <FreshAgentTranscript
+            isStreaming
+            turns={[
+              toolTurn('turn-a', [['c1', 'src/a.ts']]),
+              { id: 'turn-empty', turnId: 'turn-empty', role: 'assistant', summary: '', summaryKind: 'echo', items: [] },
+              toolTurn('turn-b', [['c2', 'src/b.ts']]),
+            ]}
+          />,
+        )
+        expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(2)
+        for (const toggle of screen.getAllByRole('button', { name: 'Toggle activity details' })) {
+          fireEvent.click(toggle)
+        }
+        expect(screen.queryByTestId('fresh-agent-activity-caption')).not.toBeInTheDocument()
+      })
+
+      it('a zero-item structural turn closes the line and folds its last member caption into the expansion', () => {
+        // Supersede semantics (fresh-eyes round 2, Finding 3): the zero-item
+        // opencode structural turn contributes nothing itself — but its ARRIVAL
+        // is a later-activity boundary that closes the open line, so the closing
+        // line's last member is superseded and its gated echo caption stashes.
+        // Without this, a caption painted moments ago would vanish with nowhere
+        // to go — the exact failure the fold feature exists to fix.
+        const captionTurn = {
+          id: 'turn-caption', turnId: 'turn-caption', role: 'assistant' as const,
+          summary: 'Considering options', summaryKind: 'echo' as const,
+          items: [{ id: 'tool-c2', kind: 'tool_use' as const, toolUseId: 'c2', name: 'Read', input: { file_path: 'src/b.ts' } }],
+        }
+        render(
+          <FreshAgentTranscript
+            isStreaming
+            turns={[
+              toolTurn('turn-a', [['c1', 'src/a.ts']]),
+              captionTurn,
+              { id: 'turn-empty', turnId: 'turn-empty', role: 'assistant' as const, summary: '', summaryKind: 'echo' as const, items: [] },
+              toolTurn('turn-b', [['c3', 'src/c.ts']]),
+            ]}
+          />,
+        )
+        expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(2)
+        expect(screen.queryByTestId('fresh-agent-tail-caption')).not.toBeInTheDocument()
+        expect(screen.queryByText('Considering options')).not.toBeInTheDocument()
+        fireEvent.click(screen.getAllByRole('button', { name: 'Toggle activity details' })[0])
+        expect(screen.getByTestId('fresh-agent-activity-caption')).toHaveTextContent('Considering options')
+      })
+
+      it('a multi-line echo turn paints/stashes its caption in exactly ONE place (caption transfer)', () => {
+        // Real producer shape (fresh-eyes round 3, Finding 1): one assistant turn
+        // interleaves [tool, visible text, tool], which spans TWO activity lines.
+        // The turn's caption must transfer to the turn's next line at the text
+        // boundary, never appearing in two places in one frame.
+        const multiLineTurn = {
+          id: 'turn-multi', turnId: 'turn-multi', role: 'assistant' as const,
+          summary: 'Reading the config files', summaryKind: 'echo' as const,
+          items: [
+            { id: 'tool-m1', kind: 'tool_use' as const, toolUseId: 'm1', name: 'Read', input: { file_path: 'src/a.ts' } },
+            { id: 'text-mid', kind: 'text' as const, text: 'Both files read fine.' },
+            { id: 'tool-m2', kind: 'tool_use' as const, toolUseId: 'm2', name: 'Read', input: { file_path: 'src/b.ts' } },
+          ],
+        }
+        const { rerender } = render(
+          <FreshAgentTranscript isStreaming turns={[multiLineTurn]} />,
+        )
+        // Live frame: the caption paints ONCE, as the tail caption of the turn's
+        // SECOND line (the final open line) — not in the first line's expansion.
+        const streamMatches = screen.getAllByText('Reading the config files')
+        expect(streamMatches).toHaveLength(1)
+        expect(screen.getByTestId('fresh-agent-tail-caption')).toHaveTextContent('Reading the config files')
+        for (const toggle of screen.getAllByRole('button', { name: 'Toggle activity details' })) {
+          fireEvent.click(toggle)
+        }
+        expect(screen.queryByTestId('fresh-agent-activity-caption')).not.toBeInTheDocument()
+        // Reset both strips to COLLAPSED: line ids (`line:N`) are stable per
+        // frame, so the strip's `expanded` state survives the rerender below —
+        // the frame-2 "not in the document" assertion and toggle directions
+        // require both strips collapsed again.
+        for (const toggle of screen.getAllByRole('button', { name: 'Toggle activity details' })) {
+          fireEvent.click(toggle)
+        }
+
+        // A later turn supersedes the second line: the caption folds into THAT
+        // line's expansion — still exactly one visible place.
+        rerender(
+          <FreshAgentTranscript
+            isStreaming
+            turns={[multiLineTurn, toolTurn('turn-z', [['c9', 'src/z.ts']])]}
+          />,
+        )
+        expect(screen.queryByText('Reading the config files')).not.toBeInTheDocument()
+        const strips = screen.getAllByRole('region', { name: 'Activity strip' })
+        expect(strips).toHaveLength(2)
+        expect(screen.queryByTestId('fresh-agent-tail-caption')).not.toBeInTheDocument()
+        fireEvent.click(strips[1].querySelector('button[aria-label="Toggle activity details"]')!)
+        const caption = screen.getByTestId('fresh-agent-activity-caption')
+        expect(caption).toHaveTextContent('Reading the config files')
+        // First line's expansion stays caption-free (the transfer happened).
+        fireEvent.click(strips[0].querySelector('button[aria-label="Toggle activity details"]')!)
+        expect(screen.getAllByTestId('fresh-agent-activity-caption')).toHaveLength(1)
+      })
+
+      it('never folds authored prose: it stays painted and keeps the lines separate', () => {
+        const proseTurn = {
+          id: 'turn-prose', turnId: 'turn-prose', role: 'assistant' as const,
+          summary: 'Pausing to plan the next step', summaryKind: 'authored' as const, items: [],
+        }
+        const { rerender } = render(
+          <FreshAgentTranscript isStreaming turns={[toolTurn('turn-a', [['c1', 'src/a.ts']]), proseTurn]} />,
+        )
+        expect(screen.getByText('Pausing to plan the next step')).toBeInTheDocument()
+        rerender(
+          <FreshAgentTranscript isStreaming turns={[toolTurn('turn-a', [['c1', 'src/a.ts']]), proseTurn, toolTurn('turn-b', [['c2', 'src/b.ts']])]} />,
+        )
+        expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(2)
+        expect(screen.getByText('Pausing to plan the next step')).toBeInTheDocument()
+        fireEvent.click(screen.getAllByRole('button', { name: 'Toggle activity details' })[1])
+        expect(screen.queryByTestId('fresh-agent-activity-caption')).not.toBeInTheDocument()
+      })
     })
   })
 })
