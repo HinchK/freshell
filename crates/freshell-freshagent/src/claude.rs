@@ -249,71 +249,35 @@ struct ClaudeSession {
     /// kill+respawn into the replacing record (the fork continues the same logical
     /// session lifetime).
     in_turn: Arc<std::sync::atomic::AtomicBool>,
-    /// Focused-review ep1-r1 F1 / ep1-r2 F2 / ep1-r5 F1: the QUEUED-compact
-    /// tracker, delta-distinct from `in_turn` and CARDINALITY-COUNTED
-    /// (ep1-r5 F1: `/compact`s accepted while a turn is active are DISTINCT
-    /// queued ops — a one-slot bool tracker re-armed the same bits per arm,
-    /// so the FIRST compact's terminal edge disarmed everything and released
-    /// the busy gate with a SECOND compact still queued/running). A
-    /// `/compact` written to the sidecar WHILE a turn is active queues BEHIND
-    /// it (`in_turn` already reads true, so the compact arms nothing there);
-    /// only EACH compact's OWN terminal edge may retire its count — while
-    /// this count reads non-zero, the busy gate (`in_turn ||
-    /// queued_compacts > 0`) stays closed through every OTHER turn's edges.
-    /// Incremented by `handle_compact` UNDER the session turn lock BEFORE the
-    /// sidecar write await (ep1-r3 F3: the consumer's terminal-edge fold
-    /// never takes that lock, so a post-await arm races it), never from idle
-    /// (an idle-armed compact IS the turn and `in_turn` alone covers it); a
-    /// no-write failure SYNCHRONOUSLY undoes the arm's own edits
-    /// ([`revert_compact_arm_state`]). F2's FIFO-aware disarm set (the
-    /// sidecar input queue is FIFO; a later send queues BEHIND the compact
-    /// and `query.interrupt()` does not drain it, so NEITHER is a disarm):
-    ///   (a) the terminal edge of a turn OBSERVED compacting
-    ///       (`saw_compacting`) — retires ONE queued compact and ends the
-    ///       busy truth UNLESS further compacts or garlanded sends are owed
-    ///       at this edge (ep1-r3 F1: a send queued BEHIND the compact is
-    ///       generating now, so busy survives until the send's OWN terminal
-    ///       edge);
-    ///   (b) the FIFO-drop proof — a result/idle edge arriving with NO
-    ///       compacting observed, the arm's prior edge already consumed, AND
-    ///       fresh sends accepted while armed (`garlanded_sends`): EVERY
-    ///       remaining queued compact provably never ran (a FIFO provider
-    ///       had run any of them ahead of this send it would have been
-    ///       observed compacting first), so the count extinguishes wholesale
-    ///       and the edge belongs to ONE garlanded send — busy ends exactly
-    ///       when the LAST garlanded send's own edge lands;
+    /// Focused-review ep1-r1 F1 / ep1-r2 F2 / ep2-r2: the per-session FIFO
+    /// turn tracker — the EXPLICIT, order-expressive replacement for the
+    /// counter quartet (op counts could not encode queue order; the ep2-r2
+    /// interleaving review repro had a wholesale-extinguish defect that a
+    /// `VecDeque<TrackedOp>` makes structurally impossible). A `/compact`
+    /// written to the sidecar WHILE a turn is active queues BEHIND it
+    /// ([`arm_turn_op`]); only EACH op's OWN terminal edge retires its entry
+    /// ([`fold_terminal_edge`]) — so the busy gate reads `in_turn`, recomputed
+    /// from [`TurnTracker::busy`] inside every mutation's critical section,
+    /// and stays closed through every OTHER op's edges. Arms happen UNDER the
+    /// session turn lock BEFORE the sidecar write await (ep1-r3 F3: the
+    /// consumer's terminal-edge fold never takes that lock, so a post-await
+    /// arm races it); a no-write failure SYNCHRONOUSLY undoes exactly the
+    /// arm's own entry ([`undo_turn_op_arm`]). Disarm set (the sidecar input
+    /// queue is FIFO; a later send queues BEHIND a compact and
+    /// `query.interrupt()` does not drain it, so NEITHER is a disarm):
+    ///   (a) the terminal edge of a compact OBSERVED compacting (promoted to
+    ///       `running` by [`observe_compacting`]) — retires that ONE op and
+    ///       holds busy while anything remains outstanding (ep1-r3 F1);
+    ///   (b) the FIFO-drop peel — a terminal edge with NO running op whose
+    ///       oldest queued op is an UNPROMOTED compact: the compact provably
+    ///       dropped, evidenced by a queued Turn that follows it (peel
+    ///       leading unpromoted compacts up to that Turn; a compact queued
+    ///       BEHIND the send needs no evidence handling — it genuinely
+    ///       remains queued, ep2-r2 F1);
     ///   (c) any in-stream `sdk.error` frame, or sidecar EOF/death (the queue
     ///       is gone).
-    /// A disarm zeroes ALL FOUR trackers together (the whole attribution
-    /// cycle's bookkeeping dies with the queue). Carried across the
-    /// rollback's kill+respawn exactly like `in_turn`.
-    queued_compacts: Arc<std::sync::atomic::AtomicUsize>,
-    /// F2 tracker (a): set by the in-stream fold on `sdk.status:compacting`
-    /// while [`Self::queued_compacts`] is non-zero — the observed-compacting
-    /// mark attributing the NEXT terminal edge to a compact's own turn (the
-    /// fold retires exactly one queued compact there).
-    saw_compacting: Arc<std::sync::atomic::AtomicBool>,
-    /// F2 tracker (b) CARDINALITY: incremented by `handle_send` on an ACCEPTED
-    /// sidecar write while a queued compact is armed — each such send exists
-    /// in the queue behind the compact(s) and owes its OWN terminal edge.
-    /// Incremented ONLY while armed, so it can never be mistaken for a
-    /// pre-arm send; decremented per garlanded send's terminal edge (the
-    /// drop-proof edge / the post-compact tail), zeroed at every disarm.
-    garlanded_sends: Arc<std::sync::atomic::AtomicUsize>,
-    /// F2's arm-cycle edge bookkeeping: a queued arm happens under a RUNNING
-    /// prior turn, so exactly ONE prior terminal edge is structurally owed
-    /// before any edge could belong to a queued compact or a garlanded send
-    /// (FIFO-strict). ep1-r5 F1: the count is 0-or-1 BY CONSTRUCTION — each
-    /// arm owes only the ONE op active at its arm time, so a fresh arm sets
-    /// it only from 0 (a second arm under the SAME active op owes the same
-    /// single edge). Consumed (decremented) by the first result/idle edge
-    /// folded while armed (the busy truth then remains held by
-    /// construction); ep2-r1 F2: ALSO consumed by the observed-compacting
-    /// retire branch when that retiring edge IS the owed one (a later arm
-    /// while the retired compact was the active op owed exactly this edge —
-    /// leave it and the debt outlives its edge, wedging the trackers forever).
-    /// Zeroed at every disarm.
-    prior_edges_owed: Arc<std::sync::atomic::AtomicUsize>,
+    /// Carried across the rollback's kill+respawn exactly like `in_turn`.
+    turn_tracker: Arc<std::sync::Mutex<TurnTracker>>,
     /// Focused-review ep2-r1 F1: the paired-terminal-frames mark. The
     /// supported protocol closes EVERY turn with `sdk.result` AND a trailing
     /// `sdk.status:idle` (both provider fixtures emit exactly that pair; the
@@ -632,10 +596,7 @@ impl FreshClaudeState {
         let broadcast_id = Arc::new(std::sync::Mutex::new(created.clone()));
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
         let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let queued_compacts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let saw_compacting = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let garlanded_sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let prior_edges_owed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let turn_tracker = Arc::new(std::sync::Mutex::new(TurnTracker::default()));
         let result_idle_pair_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let consumer = self.spawn_consumer(
             reader,
@@ -646,10 +607,7 @@ impl FreshClaudeState {
             Arc::clone(&broadcast_id),
             Arc::clone(&pending),
             Arc::clone(&in_turn),
-            Arc::clone(&queued_compacts),
-            Arc::clone(&saw_compacting),
-            Arc::clone(&garlanded_sends),
-            Arc::clone(&prior_edges_owed),
+            Arc::clone(&turn_tracker),
             Arc::clone(&result_idle_pair_pending),
             None,
         );
@@ -677,10 +635,7 @@ impl FreshClaudeState {
                 broadcast_id,
                 pending,
                 in_turn,
-                queued_compacts,
-                saw_compacting,
-                garlanded_sends,
-                prior_edges_owed,
+                turn_tracker,
                 result_idle_pair_pending,
                 turn_lock: Arc::new(TokioMutex::new(())),
             },
@@ -882,16 +837,21 @@ impl FreshClaudeState {
             self.send_error(&None, "CLAUDE_INTERRUPT_FAILED", &err);
         } else {
             // kata 1wxv Task 4 busy-truth clear edge (d): a COMPLETED interrupt
-            // clears `in_turn` — interrupts yield NO `result` frame at all, so no
-            // in-stream edge can cover this. A FAILED write does NOT clear (the
-            // turn may still be running — fail-closed). Focused ep1-r2 F2: the
-            // interrupt does NOT disarm a queued compact — `query.interrupt()`
-            // cancels the RUNNING turn but does not drain the sidecar's FIFO
-            // input queue, so the queued compact still runs (its own observed
-            // compacting → terminal sequence, or an sdk.error/EOF, disarms it).
+            // retires the RUNNING op — interrupts yield NO `result` frame at
+            // all, so no in-stream edge can cover this. A FAILED write does NOT
+            // clear (the turn may still be running — fail-closed). Focused
+            // ep1-r2 F2 / ep2-r2 F2: the interrupt does NOT drain the sidecar's
+            // FIFO input queue — `query.interrupt()` cancels the RUNNING turn
+            // only, so every QUEUED op still runs (its own observed compacting
+            // → terminal sequence, or an sdk.error/EOF, retires it): the busy
+            // truth is recomputed from the surviving queue — NEVER a blanket
+            // clear (interrupting the active turn with a compact+send still
+            // queued behind it must leave the gate CLOSED).
+            let mut tracker = session.turn_tracker.lock().expect("turn tracker lock");
+            tracker.running = None;
             session
                 .in_turn
-                .store(false, std::sync::atomic::Ordering::SeqCst);
+                .store(tracker.busy(), std::sync::atomic::Ordering::SeqCst);
         }
         // Success: no broadcast (mirrors legacy's silent fire-and-forget interrupt).
     }
@@ -922,7 +882,7 @@ impl FreshClaudeState {
         // membership. A miss persisting after the rollback exits means the session
         // is genuinely gone (a provably-rejected fork is torn down) — the honest
         // SESSION_NOT_FOUND leg.
-        let (map_key, turn_lock, in_turn, queued_compacts, garlanded_sends) = loop {
+        let (map_key, turn_lock, in_turn, turn_tracker) = loop {
             let handles = match self.resolve_session_key(&session_id).await {
                 Some(key) => {
                     let guard = self.sessions.lock().await;
@@ -931,8 +891,7 @@ impl FreshClaudeState {
                             key,
                             s.turn_lock.clone(),
                             s.in_turn.clone(),
-                            s.queued_compacts.clone(),
-                            s.garlanded_sends.clone(),
+                            s.turn_tracker.clone(),
                         )
                     })
                 }
@@ -996,17 +955,20 @@ impl FreshClaudeState {
                 tracing::warn!(error = %err, session = %durable, "freshagent.claude.destroy_redo_on_submit_failed");
             }
         }
-        // Set the busy truth UNDER the lock, BEFORE the sidecar write. Focused
-        // ep1-r2 F2: this send is the ONLY garlanded tracker write — any prior
-        // "belt" disarm of the queued-compact count here was WRONG: the
+        // Set the busy truth UNDER the lock, BEFORE the sidecar write — and now
+        // ORDER-EXPLICITLY (ep2-r2): this send enqueues as a distinct tracked
+        // op behind every outstanding op (or takes the running slot from
+        // idle), so its OWN terminal edge — never the prior op's — retires it.
+        // ep1-r2 F2: there is NO "belt" disarm of queued compacts here: the
         // sidecar's FIFO input queue merely queues this send BEHIND a pending
         // compact, so a send acceptance proves nothing about queue drainage
         // (the disarm set lives in the in-stream edge fold: observed-compacting
-        // terminal edge, the garlanded drop proof, sdk.error/EOF).
-        in_turn.store(true, std::sync::atomic::Ordering::SeqCst);
+        // terminal edge, the drop peel, sdk.error/EOF).
+        let send_was_busy = arm_turn_op(&in_turn, &turn_tracker, TrackedOp::Turn);
         let mut guard = self.sessions.lock().await;
         let Some(session) = guard.get_mut(&map_key) else {
             drop(guard);
+            undo_turn_op_arm(&in_turn, &turn_tracker, send_was_busy);
             self.send_error(&request_id, "SESSION_NOT_FOUND", "claude session not found");
             return;
         };
@@ -1016,22 +978,13 @@ impl FreshClaudeState {
             json!({ "type": "send", "sessionId": session.sidecar_session_id, "text": msg.text });
         if let Err(err) = write_line(&mut session.stdin, &send_req).await {
             drop(guard);
-            // The write never went out — no turn is running (clear what we set,
-            // else the busy truth wedges).
-            in_turn.store(false, std::sync::atomic::Ordering::SeqCst);
+            // The write never went out — undo EXACTLY our own arm (ep2-r2:
+            // recomputed from the surviving tracker, so a still-queued earlier
+            // op keeps the busy truth instead of a blanket clear wedging or
+            // falsely freeing the gate).
+            undo_turn_op_arm(&in_turn, &turn_tracker, send_was_busy);
             self.send_error(&request_id, "CLAUDE_SEND_FAILED", &err);
             return;
-        }
-        // The send was ACCEPTED onto the sidecar's FIFO input queue (F2's
-        // garlanded tracker): while a queued compact is armed, this send queues
-        // BEHIND it and owes its OWN terminal edge — count it (ep1-r5 F1: the
-        // count is CARDINALITY-exact; ≥2 sends behind a compact each owe one).
-        // Incrementing ONLY while armed keeps a pre-arm send indistinguishable
-        // from the attribution bookkeeping — when its edge provably arrives
-        // (the arms' prior edge consumed, no compacting observed) it is the
-        // drop-proof disarm.
-        if queued_compacts.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-            garlanded_sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         drop(guard);
 
@@ -1224,22 +1177,18 @@ impl FreshClaudeState {
     /// set terminates it (plus `sdk.status:idle`, sidecar EOF, or a completed
     /// interrupt); a FAILED write clears what we set (nothing was submitted).
     ///
-    /// Focused-review ep1-r1 F1 (queued-compact busy truth, ep1-r2 F2's
-    /// FIFO-aware disarm, ep1-r3 F3's pre-await arm): a compact submitted WHILE
-    /// a turn is active queues BEHIND it on the provider — `in_turn` already
-    /// reads true, so the handler arms the session's
-    /// [`ClaudeSession::queued_compacts`] count and starts a fresh attribution
-    /// cycle (no observed compacting, no garlanded send, the running prior
-    /// turn owing its one structural terminal edge) UNDER the turn lock,
-    /// BEFORE the sidecar write await — the consumer's terminal-edge fold
-    /// never takes that lock, so only a pre-await arm closes the mid-window
-    /// race. The pane stays busy until
-    /// the compact's OWN OBSERVED terminal edge lands, or an F2 disarm case
-    /// proves the queue ended differently. A
-    /// no-write failure SYNCHRONOUSLY undoes the arm's edits
-    /// ([`revert_compact_arm_state`]) and clears `in_turn` exactly
-    /// when leaving it would wedge (this compact WAS the turn, or the armed
-    /// owed prior edge was already spent against it mid-window).
+    /// Focused-review ep1-r1 F1 (queued-compact busy truth; ep1-r2 F2's
+    /// FIFO-aware disarm; ep1-r3 F3's pre-await arm; ep2-r2's order-explicit
+    /// re-model): a compact submitted WHILE a turn is active queues BEHIND it
+    /// on the provider, so the handler arms the session's
+    /// [`ClaudeSession::turn_tracker`] with a distinct queued entry UNDER the
+    /// turn lock, BEFORE the sidecar write await — the consumer's
+    /// terminal-edge fold never takes that lock, so only a pre-await arm
+    /// closes the mid-window race. The pane stays busy until the compact's OWN
+    /// terminal edge lands, or a disarm case (drop peel / sdk.error / EOF)
+    /// proves the queue ended differently. A no-write failure SYNCHRONOUSLY
+    /// undoes exactly the arm's own entry ([`undo_turn_op_arm`]) and recomputes
+    /// `in_turn` from the surviving tracker — never a stale whole-set restore.
     pub async fn handle_compact(&self, msg: FreshAgentCompact) {
         let session_id = msg.session_id.clone();
         let session_type = session_type_str(msg.session_type);
@@ -1250,7 +1199,7 @@ impl FreshClaudeState {
         // membership and re-resolve (the compact then serializes BEHIND the rollback
         // on the carried-over turn lock). This handler never ACQUIRES
         // `rollback_in_flight` (no circular wait exists): it only polls membership.
-        let (map_key, turn_lock, in_turn, queued_compacts, prior_edges_owed) = loop {
+        let (map_key, turn_lock, in_turn, turn_tracker) = loop {
             let handles = match self.resolve_session_key(&session_id).await {
                 Some(key) => {
                     let guard = self.sessions.lock().await;
@@ -1259,8 +1208,7 @@ impl FreshClaudeState {
                             key,
                             s.turn_lock.clone(),
                             s.in_turn.clone(),
-                            s.queued_compacts.clone(),
-                            s.prior_edges_owed.clone(),
+                            s.turn_tracker.clone(),
                         )
                     })
                 }
@@ -1279,49 +1227,25 @@ impl FreshClaudeState {
         // serialization discipline) — a rollback holding this lock observes either
         // no-compact or a fully-marked in-flight compact turn.
         let _turn = turn_lock.lock().await;
-        // Set the busy truth UNDER the lock, BEFORE the sidecar write. `was_busy`
-        // distinguishes the QUEUED compact (a turn already active) from a compact
-        // that IS the turn — only the former arms the attribution tracker set.
-        let was_busy = in_turn.swap(true, std::sync::atomic::Ordering::SeqCst);
         // ep1-r3 F3 (the arm/await race): with a prior turn active this compact is
-        // QUEUED — arm the attribution set NOW, BEFORE the sidecar write await.
-        // The stdout consumer's terminal-edge fold NEVER takes the turn lock, so
-        // an arm landing only after the await lets the prior turn's terminal edge
-        // fold past the unarmed tracker mid-write (busy dies with the compact
-        // still owed — and the post-await arm then invents an outstanding prior
-        // edge the next terminal edge gets swallowed by: a permanent wedge). A
-        // no-write failure leg SYNCHRONOUSLY undoes exactly the arm's own edits
-        // below ([`revert_compact_arm_state`]): a compact the blocked sidecar
-        // never received must not hold the pane busy.
-        //
-        // ep1-r5 F1 (cardinality): each queued compact adds its OWN count, and
-        // each arm owes exactly the ONE op active at its arm time — a second
-        // arm under the SAME active op owes the same single edge, so the prior
-        // count only ever goes 0→1 per arm cycle.
-        use std::sync::atomic::Ordering::SeqCst;
-        let arm_bumped_prior = if was_busy {
-            queued_compacts.fetch_add(1, SeqCst);
-            Some(
-                prior_edges_owed
-                    .compare_exchange(0, 1, SeqCst, SeqCst)
-                    .is_ok(),
-            )
-        } else {
-            None
-        };
+        // QUEUED — arm the tracker NOW, BEFORE the sidecar write await. The stdout
+        // consumer's terminal-edge fold NEVER takes the turn lock, so an arm
+        // landing only after the await lets the prior turn's terminal edge fold
+        // past the unarmed tracker mid-write (busy dies with the compact still
+        // owed). A no-write failure leg SYNCHRONOUSLY undoes exactly this arm's
+        // own entry below ([`undo_turn_op_arm`]): a compact the blocked sidecar
+        // never received must not hold the pane busy. ep2-r2: the arm is a
+        // distinct FIFO entry — N queued compacts are N entries retiring at their
+        // own observed terminal edges (ep1-r5 F1), and a compact queued BEHIND a
+        // garlanded send survives that send's drop peel (ep2-r2 F1).
+        let was_busy = arm_turn_op(&in_turn, &turn_tracker, TrackedOp::Compact);
         let mut guard = self.sessions.lock().await;
         let Some(session) = guard.get_mut(&map_key) else {
             drop(guard);
             // Nothing was submitted — undo ONLY what our arm edited (the busy
             // truth must never wedge; a prior turn's truth is not ours to
             // clear).
-            revert_compact_arm_state(
-                was_busy,
-                arm_bumped_prior,
-                &in_turn,
-                &queued_compacts,
-                &prior_edges_owed,
-            );
+            undo_turn_op_arm(&in_turn, &turn_tracker, was_busy);
             self.broadcast(&lost_session_frame(&session_id, msg.session_type));
             return;
         };
@@ -1338,21 +1262,14 @@ impl FreshClaudeState {
         if let Err(err) = write_line(&mut session.stdin, &send_req).await {
             drop(guard);
             // The write never went out — no turn was submitted: SYNCHRONOUSLY
-            // undo the arm's own edits (the handle_send fail-closed leg extended
-            // to the tracker set; the failure path never holds the blocked
+            // undo the arm's own entry (the handle_send fail-closed leg extended
+            // to the tracker; the failure path never holds the blocked
             // sidecar's pane busy over a compact it never received).
-            revert_compact_arm_state(
-                was_busy,
-                arm_bumped_prior,
-                &in_turn,
-                &queued_compacts,
-                &prior_edges_owed,
-            );
+            undo_turn_op_arm(&in_turn, &turn_tracker, was_busy);
             self.emit_fresh_agent_error(&session_id, session_type, "INTERNAL_ERROR", &err);
         }
-        // The compact write was ACCEPTED; a queued compact's tracker (armed
-        // pre-write above) STAYS armed — only the compact's own observed terminal
-        // edge (or an F2 disarm-set edge) ends its busy truth.
+        // The compact write was ACCEPTED; its tracker entry (armed pre-write
+        // above) STAYS — only its own terminal edge (or a disarm case) retires it.
     }
 
     /// The session's live pending approvals + questions as overlay JSON (approvals,
@@ -1537,10 +1454,9 @@ impl FreshClaudeState {
     ///
     /// Ordering (durable-BEFORE-mutation + r2 lock discipline): toTurn validation
     /// → rollback_in_flight single-flight (FIRST) → per-session turn lock (held
-    /// across the WHOLE handler) → busy gate (`in_turn || queued_compacts > 0`
-    /// ⇒ BUSY_TURN, the SOLE mid-turn protection — no sidecar traffic at all on
-    /// a refused attempt; `queued_compacts` is the queued-compact tracker,
-    /// focused ep1-r1 F1, cardinality-exact since ep1-r5 F1) →
+    /// across the WHOLE handler) → busy gate (`in_turn` — the FIFO tracker's
+    /// DERIVED busy cache — ⇒ BUSY_TURN, the SOLE mid-turn protection; no
+    /// sidecar traffic at all on a refused attempt, ep2-r2) →
     /// create-resume lease claim on the OLD durable id (so a concurrent attach
     /// cannot bind the pre-rollback id mid-fork) → transcript reads + resume math
     /// → AWAITED record pre-write (a pre-write failure REFUSES with
@@ -1578,26 +1494,13 @@ impl FreshClaudeState {
             ));
             return;
         }
-        let (
-            durable_id,
-            in_turn,
-            queued_compacts,
-            saw_compacting,
-            garlanded_sends,
-            prior_edges_owed,
-            result_idle_pair_pending,
-            turn_lock,
-            session_type,
-        ) = {
+        let (durable_id, in_turn, turn_tracker, result_idle_pair_pending, turn_lock, session_type) = {
             let guard = self.sessions.lock().await;
             match guard.get(&map_key) {
                 Some(s) => (
                     s.cli_session_id.clone().unwrap_or_else(|| map_key.clone()),
                     s.in_turn.clone(),
-                    s.queued_compacts.clone(),
-                    s.saw_compacting.clone(),
-                    s.garlanded_sends.clone(),
-                    s.prior_edges_owed.clone(),
+                    s.turn_tracker.clone(),
                     s.result_idle_pair_pending.clone(),
                     s.turn_lock.clone(),
                     session_type_str(op.session_type),
@@ -1626,17 +1529,15 @@ impl FreshClaudeState {
         };
         // Held for the REST of this handler. in_turn is set by handle_send UNDER
         // this same lock BEFORE the sidecar write (the check-then-set window is
-        // closed): observed false here means no send is in flight. Focused ep1-r1
-        // F1: the gate reads `in_turn || queued_compacts > 0` — a queued compact
-        // (armed on an accepted write while a turn was active) keeps the pane
-        // busy until the compact's OWN terminal edge, even though the prior
-        // turn's terminal edge already fired. ep1-r5 F1: the count is
-        // cardinality-exact — N queued compacts hold the gate until EACH one's
-        // own terminal edge retires it.
+        // closed): observed false here means no op is in flight. Focused ep1-r1
+        // F1 through ep2-r2: `in_turn` is the FIFO tracker's DERIVED busy truth
+        // — recomputed from `TurnTracker::busy()` inside every mutation's
+        // critical section — so the gate stays closed through every op that is
+        // queued or mid-compaction, whether its turn ended technically (the
+        // interrupted active turn included, ep2-r2 F2: the queue survives it)
+        // or only structurally (every queued op owes its own terminal edge).
         let _turn = turn_lock.lock().await;
-        if in_turn.load(std::sync::atomic::Ordering::SeqCst)
-            || queued_compacts.load(std::sync::atomic::Ordering::SeqCst) > 0
-        {
+        if in_turn.load(std::sync::atomic::Ordering::SeqCst) {
             reply_sink(rollback_error_frame(
                 &op,
                 "BUSY_TURN",
@@ -2182,10 +2083,7 @@ impl FreshClaudeState {
             Arc::clone(&broadcast_id),
             Arc::clone(&pending),
             in_turn.clone(),
-            queued_compacts.clone(),
-            saw_compacting.clone(),
-            garlanded_sends.clone(),
-            prior_edges_owed.clone(),
+            turn_tracker.clone(),
             result_idle_pair_pending.clone(),
             Some(RollbackAdoption {
                 supersedes: durable_id.clone(),
@@ -2205,10 +2103,7 @@ impl FreshClaudeState {
                 broadcast_id: Arc::clone(&broadcast_id),
                 pending,
                 in_turn: in_turn.clone(),
-                queued_compacts: queued_compacts.clone(),
-                saw_compacting: saw_compacting.clone(),
-                garlanded_sends: garlanded_sends.clone(),
-                prior_edges_owed: prior_edges_owed.clone(),
+                turn_tracker: turn_tracker.clone(),
                 result_idle_pair_pending: result_idle_pair_pending.clone(),
                 turn_lock: turn_lock.clone(),
             },
@@ -2605,10 +2500,7 @@ impl FreshClaudeState {
         let broadcast_id = Arc::new(std::sync::Mutex::new(msg.session_id.clone()));
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
         let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let queued_compacts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let saw_compacting = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let garlanded_sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let prior_edges_owed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let turn_tracker = Arc::new(std::sync::Mutex::new(TurnTracker::default()));
         let result_idle_pair_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let consumer = self.spawn_consumer(
             reader,
@@ -2619,10 +2511,7 @@ impl FreshClaudeState {
             Arc::clone(&broadcast_id),
             Arc::clone(&pending),
             Arc::clone(&in_turn),
-            Arc::clone(&queued_compacts),
-            Arc::clone(&saw_compacting),
-            Arc::clone(&garlanded_sends),
-            Arc::clone(&prior_edges_owed),
+            Arc::clone(&turn_tracker),
             Arc::clone(&result_idle_pair_pending),
             None,
         );
@@ -2638,10 +2527,7 @@ impl FreshClaudeState {
                 broadcast_id,
                 pending,
                 in_turn,
-                queued_compacts,
-                saw_compacting,
-                garlanded_sends,
-                prior_edges_owed,
+                turn_tracker,
                 result_idle_pair_pending,
                 turn_lock: Arc::new(TokioMutex::new(())),
             },
@@ -2785,33 +2671,24 @@ impl FreshClaudeState {
         // EXACTLY-four contract edges (`sdk.result` any subtype, `sdk.status`
         // idle, EOF/death below, completed handle_interrupt at the write site).
         in_turn: Arc<std::sync::atomic::AtomicBool>,
-        // Focused-review ep1-r1 F1 / ep1-r2 F2 / ep1-r5 F1: the session's
-        // queued-compact tracker set (the whole quartet is handed over
-        // together; the count arms live in the handlers under the turn lock,
-        // the observed/retire/disarm folds live here). The gate reads
-        // `in_turn || queued_compacts > 0`; this fold owns the F2 retire/
-        // disarm set, CARDINALITY-exact since ep1-r5 F1:
-        // (a) result/idle after an observed `sdk.status:compacting`
-        //     (`saw_compacting`) — A compact's own terminal edge: retire ONE
-        //     queued compact; end the busy truth UNLESS further compacts or
-        //     garlanded sends are still owed (ep1-r3 F1 / ep1-r5 F1 — the
-        //     queued ops behind this one generate NOW; their own terminal
-        //     edges release it);
-        // (b) the FIFO-drop proof — result/idle while armed, no compacting
-        //     observed, the arm's structurally-owed prior edge already
-        //     consumed, AND fresh sends accepted while armed
-        //     (`garlanded_sends`): EVERY remaining queued compact provably
-        //     never ran (FIFO-strict: any that had run ahead of this send
-        //     would have been observed compacting) — extinguish the compact
-        //     count wholesale, retire ONE garlanded send, and end the busy
-        //     truth exactly when the LAST garlanded send's edge lands;
-        // (c) `sdk.error` (the queued compacts provably never arrive) or EOF
-        //     (the queue died with the sidecar) — zero the whole tracker set,
-        //     never `in_turn` (fail-closed; a terminal edge/EOF clears that).
-        queued_compacts: Arc<std::sync::atomic::AtomicUsize>,
-        saw_compacting: Arc<std::sync::atomic::AtomicBool>,
-        garlanded_sends: Arc<std::sync::atomic::AtomicUsize>,
-        prior_edges_owed: Arc<std::sync::atomic::AtomicUsize>,
+        // Focused-review ep1-r1 F1 / ep1-r2 F2 / ep2-r2: the session's FIFO turn
+        // tracker (handed over whole; the arms live in the handlers under the
+        // turn lock, the promote/retire/disarm folds live here). `in_turn` is
+        // its DERIVED busy cache — this task's folds recompute it from
+        // [`TurnTracker::busy`] at every terminal edge:
+        // (a) result/unpaired-idle while a compact was PROMOTED observed — the
+        //     compact's own terminal edge: retire `running`, hold busy while
+        //     anything remains outstanding (ep1-r3 F1);
+        // (b) the FIFO-drop peel — result/unpaired-idle with NO running op and
+        //     an UNPROMOTED compact at the queue head: the compact provably
+        //     dropped, evidenced by the oldest queued Turn behind it (peel
+        //     leading compacts up to that Turn; compacts queued BEHIND the send
+        //     survive — ep2-r2 F1);
+        // (c) `sdk.error` (the queued ops provably never arrive) clears the
+        //     QUEUE (never `running`/`in_turn` — fail-closed; the running op's
+        //     own terminal edge or EOF retires it), or EOF (the queue died
+        //     with the sidecar) zeroes everything.
+        turn_tracker: Arc<std::sync::Mutex<TurnTracker>>,
         // ep2-r1 F1: the paired-terminal-frames mark — see
         // [`ClaudeSession::result_idle_pair_pending`]. This consumer sets it
         // after folding ANY `sdk.result`, and the NEXT `sdk.status:idle`
@@ -2873,39 +2750,25 @@ impl FreshClaudeState {
                 // success-only wording is void), and `sdk.status:idle`. NO other
                 // in-stream edge (sdk.error/compacting/assistant never clear —
                 // fail-closed; a missing arm wedges BUSY_TURN refusals forever).
-                // Focused ep1-r2 F2 + ep1-r5 F1 (FIFO-aware queued-compact
-                // attribution, cardinality-exact): with `queued_compacts > 0` the
-                // fold attributes each terminal edge FIFO —strictly: (a) an edge
-                // after an observed `sdk.status:compacting` belongs to A COMPACT's
-                // own turn (retire ONE queued compact; consume a still-owed prior
-                // debt the retiring edge itself settles (ep2-r1 F2); release the
-                // busy truth ONLY when no compact or garlanded send remains owed);
-                // else (b) with the arm's structural prior edge already consumed
-                // AND garlanded sends outstanding, the edge is ONE garlanded
-                // send's and EVERY remaining queued compact provably never ran
-                // (the drop proof — a FIFO provider would have been observed
-                // compacting first): extinguish the compact count wholesale,
-                // retire one send; else the edge belongs to the PRIOR turn
-                // (consume the owed edge — the busy truth HOLDS). Beyond the owed
-                // edge, an armed edge with neither mark holds fail-closed. With
-                // no compact armed, a garlanded tail (the compact(s) already
-                // retired, send edges still owed) retires one send per edge and
-                // releases exactly at the last. Any `sdk.error` zeroes the
-                // tracker set outright (the queued compacts provably never
-                // arrive) while leaving `in_turn` fail-closed untouched.
+                // Focused ep1-r2 F2 + ep2-r2 (order-explicit FIFO attribution):
+                // [`fold_terminal_edge`] retires the OLDEST outstanding tracked op
+                // — the `running` slot first (an observed-promoted compaction or
+                // the idle-armed op), else a queued send, peeling an unpromoted
+                // compact ONLY when a following queued send evidences its silent
+                // drop (a compact queued BEHIND the send survives, ep2-r2 F1);
+                // an unexplained edge with only compacts outstanding holds
+                // fail-closed. `in_turn` is stored as the recomputed
+                // [`TurnTracker::busy`], so the gate releases at EXACTLY the last
+                // outstanding op's own edge. Any `sdk.error` clears the QUEUE
+                // outright (the queued ops provably never arrive) while leaving
+                // the running op / `in_turn` fail-closed untouched.
                 // ep2-r1 F1 (the paired terminal frames): EVERY turn closes with
                 // `sdk.result` AND a trailing `sdk.status:idle` — the idle is
                 // the SAME turn's punctuation, never a second edge; the fold
                 // below skips the fold for exactly that paired idle.
                 match value.get("type").and_then(Value::as_str) {
                     Some("sdk.result") => {
-                        fold_terminal_edge(
-                            &in_turn,
-                            &queued_compacts,
-                            &saw_compacting,
-                            &garlanded_sends,
-                            &prior_edges_owed,
-                        );
+                        fold_terminal_edge(&in_turn, &turn_tracker);
                         // A result's trailing idle is its pair punctuation the
                         // idle arm below skips (ep2-r1 F1).
                         result_idle_pair_pending.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -2916,40 +2779,35 @@ impl FreshClaudeState {
                         // ep2-r1 F1: the idle trailing a result is the SAME
                         // turn's closing punctuation — NEVER a new op's edge
                         // (folding it would double-attribute the turn: the
-                        // reviewer's exact repro fired the FIFO-drop branch on
+                        // reviewer's exact repro fired the drop branch on
                         // A's trailing idle while C/S sat queued).
                         if !result_idle_pair_pending
                             .swap(false, std::sync::atomic::Ordering::SeqCst)
                         {
-                            fold_terminal_edge(
-                                &in_turn,
-                                &queued_compacts,
-                                &saw_compacting,
-                                &garlanded_sends,
-                                &prior_edges_owed,
-                            );
+                            fold_terminal_edge(&in_turn, &turn_tracker);
                         }
                     }
                     Some("sdk.status")
                         if value.get("status").and_then(Value::as_str) == Some("compacting") =>
                     {
-                        // F2 (a): A compact's own turn OBSERVABLY started — the
-                        // NEXT terminal edge retires ONE queued compact.
-                        if queued_compacts.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-                            saw_compacting.store(true, std::sync::atomic::Ordering::SeqCst);
-                        }
+                        // A compact is observably running NOW — promote the
+                        // OLDEST queued compact into the `running` slot (its
+                        // coming terminal edge then retires it there).
+                        observe_compacting(&turn_tracker);
                     }
                     Some("sdk.error") => {
-                        // F2 (c): the queued compacts provably never arrive as
-                        // their own turns — zero the whole attribution set
-                        // (in_turn stays fail-closed). ep2-r1 F1: the pair mark
+                        // The queued ops provably never arrive as
+                        // their own turns — clear the QUEUE outright (the running
+                        // op and `in_turn` stay fail-closed for its own terminal
+                        // edge or EOF to retire). ep2-r1 F1: the pair mark
                         // resets TOO — the fail-closed `in_turn` needs a LIVE
                         // terminal edge after the error; a result's trailing
                         // idle past an error must fold, never be skipped.
-                        queued_compacts.store(0, std::sync::atomic::Ordering::SeqCst);
-                        saw_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
-                        garlanded_sends.store(0, std::sync::atomic::Ordering::SeqCst);
-                        prior_edges_owed.store(0, std::sync::atomic::Ordering::SeqCst);
+                        turn_tracker
+                            .lock()
+                            .expect("turn tracker lock")
+                            .queued
+                            .clear();
                         result_idle_pair_pending.store(false, std::sync::atomic::Ordering::SeqCst);
                     }
                     _ => {}
@@ -2985,14 +2843,15 @@ impl FreshClaudeState {
             }
             // kata 1wxv Task 4 busy-truth clear edge (c): sidecar EOF/death clears
             // the busy truth BEFORE the eviction verdict below (an unrequested
-            // death can never hold a rollback BUSY_TURN hostage). Focused ep1-r2
-            // F2 (c): the dead sidecar's whole input queue died with it — zero
-            // the entire queued-compact attribution set.
+            // death can never hold a rollback BUSY_TURN hostage). The dead
+            // sidecar's whole input queue died with it — zero the entire FIFO
+            // tracker.
             in_turn.store(false, std::sync::atomic::Ordering::SeqCst);
-            queued_compacts.store(0, std::sync::atomic::Ordering::SeqCst);
-            saw_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
-            garlanded_sends.store(0, std::sync::atomic::Ordering::SeqCst);
-            prior_edges_owed.store(0, std::sync::atomic::Ordering::SeqCst);
+            {
+                let mut tracker = turn_tracker.lock().expect("turn tracker lock");
+                tracker.running = None;
+                tracker.queued.clear();
+            }
             result_idle_pair_pending.store(false, std::sync::atomic::Ordering::SeqCst);
             // Consumer exit == this sidecar's stdout closed == sidecar death
             // (ledger A9). Evict the dead session and its cli_index entries,
@@ -3052,161 +2911,177 @@ impl FreshClaudeState {
     }
 }
 
-// ── pending-set fold (Task 2) ────────────────────────────────────────────────────────────
+// ── FIFO turn tracker (ep2-r2) ───────────────────────────────────────────────────────────
 
-/// ep1-r3 F3 / ep1-r5 F1: SYNCHRONOUSLY undo the pre-write tracker arm on a
-/// no-write failure leg of [`FreshClaudeState::handle_compact`]. The arm made
-/// exactly two edits: `queued_compacts += 1` and, when no prior edge was owed,
-/// `prior_edges_owed` 0→1 (`arm_bumped_prior`). The revert undoes EXACTLY
-/// those edits — NEVER a stale whole-set snapshot: the consumer's fold may
-/// have retired an EARLIER armed compact (case (a)) or extinguished the queue
-/// (case (b)) DURING the write window, and re-storing a snapshot would
-/// resurrect dead counts (a wedge). The busy truth (`in_turn`) is released
-/// precisely when leaving it would wedge the pane:
-/// (i) this compact WAS the turn (`!was_busy` — nothing at all is running), or
-/// (ii) the arm's 0→1 prior-edge bump was CONSUMED by the consumer's fold
-/// during the write window (the prior turn's terminal edge is spent and the
-/// compact never went out — nothing remains that could end the busy truth a
-/// still-set `in_turn` would assert). Detecting (ii): the arm set the count
-/// 0→1, so reading 0 at revert time means the fold spent it
-/// (`compare_exchange(1, 0)` fails). When the owed edge is still outstanding
-/// the prior turn is still RUNNING — its terminal edge clears `in_turn`
-/// through the fold's armed path, exactly like the pre-arm past.
-fn revert_compact_arm_state(
-    was_busy: bool,
-    arm_bumped_prior: Option<bool>,
+/// Focused-review ep2-r2: the busy/attribution tracker is an EXPLICIT FIFO of
+/// accepted ops. The counter approach it replaces could not encode QUEUE ORDER
+/// — the reviewer's exact ep2-r2 repro: compact C1 → send S1 → compact C2 with
+/// C1 silently provider-dropped, S1's terminal edge extinguished the WHOLE
+/// compact count (C2 included) and released the rollback gate while C2 could
+/// still run. Here every accepted op is a distinct queued entry retiring at its
+/// OWN edge, so the gate's mid-turn protection (its SOLE protection per the
+/// spec) is enumerable op-by-op.
+///
+/// Stream invariants the attribution leans on (provider FIFO discipline): the
+/// sidecar processes its input queue strictly in acceptance order; at most one
+/// op runs at a time; EVERY op ends with exactly one logical terminal edge —
+/// a turn emits `sdk.result` (any subtype) followed by its trailing
+/// `sdk.status:idle` PUNCTUATION (paired-skipped by the consumer before this
+/// fold ever sees it, ep2-r1 F1), or a completed interrupt stands in for the
+/// running op's edge at the write site (no result frame exists, Task 4 edge
+/// (d)); and a compact's terminal edge is ALWAYS preceded by its observed
+/// `sdk.status:compacting` frame in-stream (an unpromoted compact can never
+/// own a terminal edge — the drop proof's premise, ep1-r2 F2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TrackedOp {
+    /// A user send's turn (a "garlanded send" is simply a Turn queued behind
+    /// a compact — kind alone now, no separate count).
+    Turn,
+    /// A `/compact` op. Only a Compact ever carries (is promoted by) the
+    /// observed-compacting frame; the promotion retires the queue entry into
+    /// the `running` slot.
+    Compact,
+}
+
+/// The per-session FIFO attribution state (ep2-r2). `running` holds the ONE op
+/// the provider is working on (a fresh op armed from idle owns it immediately;
+/// a queued Compact moves here when its `sdk.status:compacting` is OBSERVED —
+/// queued Turns never visibly "start" and instead retire straight out of the
+/// queue at their own terminal edge, which is fine: attribution always retires
+/// the OLDEST outstanding op). `queued` is the acceptance-ordered remainder.
+/// Shares ONE std Mutex with no awaits inside any critical section; every
+/// mutation recomputes the derived `in_turn` busy cache (`busy()`) in the same
+/// critical section, so the rollback gate never reads a torn pair.
+#[derive(Default)]
+struct TurnTracker {
+    running: Option<TrackedOp>,
+    queued: std::collections::VecDeque<TrackedOp>,
+}
+
+impl TurnTracker {
+    /// The derived busy truth: the rollback gate's sole mid-turn input.
+    fn busy(&self) -> bool {
+        self.running.is_some() || !self.queued.is_empty()
+    }
+}
+
+/// Arm one accepted op UNDER the session turn lock BEFORE the sidecar write:
+/// an idle tracker takes the op as RUNNING, else it queues BEHIND every
+/// outstanding op (FIFO). Either way the busy truth holds for the handler's
+/// whole write window (the check-then-set window against `handle_rollback`'s
+/// busy check stays closed). Returns `was_busy` for [`undo_turn_op_arm`]'s
+/// exact undo (the arm site owns whether the op went to `running` vs
+/// `queued`).
+fn arm_turn_op(
     in_turn: &std::sync::atomic::AtomicBool,
-    queued_compacts: &std::sync::atomic::AtomicUsize,
-    prior_edges_owed: &std::sync::atomic::AtomicUsize,
+    turn_tracker: &std::sync::Mutex<TurnTracker>,
+    op: TrackedOp,
+) -> bool {
+    let mut tracker = turn_tracker.lock().expect("turn tracker lock");
+    let was_busy = tracker.busy();
+    if was_busy {
+        tracker.queued.push_back(op);
+    } else {
+        tracker.running = Some(op);
+    }
+    in_turn.store(true, std::sync::atomic::Ordering::SeqCst);
+    was_busy
+}
+
+/// SYNCHRONOUSLY undo EXACTLY the op this handler armed when the sidecar write
+/// provably never happened (ep1-r3 F3's discipline, structural): pop our own
+/// BACK entry (handler arms serialize on the session turn lock and the fold
+/// only ever pops the FRONT, so ours is provably still last) — or clear
+/// `running` when we were the idle-armed op. NEVER a stale whole-set restore:
+/// the consumer's fold may have retired an EARLIER op mid-window, and the busy
+/// truth is then recomputed from what genuinely survives (ep2-r2 F3: a reverted
+/// arm with a send still queued behind an earlier op keeps the gate CLOSED —
+/// the old spent-prior CAS cleared `in_turn` unconditionally right there).
+fn undo_turn_op_arm(
+    in_turn: &std::sync::atomic::AtomicBool,
+    turn_tracker: &std::sync::Mutex<TurnTracker>,
+    was_busy: bool,
 ) {
-    use std::sync::atomic::Ordering::SeqCst;
-    if !was_busy {
-        // This compact WAS the turn and never went out — release what we set.
-        in_turn.store(false, SeqCst);
-        return;
+    let mut tracker = turn_tracker.lock().expect("turn tracker lock");
+    if was_busy {
+        tracker.queued.pop_back();
+    } else {
+        tracker.running = None;
     }
-    // Undo the arm's own +1, saturating: a mid-window case-(b) extinguish may
-    // already have zeroed the count (our unsent compact died with the queue).
-    let _ = queued_compacts.fetch_update(SeqCst, SeqCst, |c| Some(c.saturating_sub(1)));
-    if arm_bumped_prior == Some(true) {
-        // Ours to undo. Still-1 ⇒ outstanding (unset it); 0 ⇒ the fold spent
-        // the arm's owed edge mid-window ⇒ nothing remains to end the busy
-        // truth this arm held — release it ourselves.
-        if prior_edges_owed
-            .compare_exchange(1, 0, SeqCst, SeqCst)
-            .is_err()
-        {
-            in_turn.store(false, SeqCst);
-        }
+    in_turn.store(tracker.busy(), std::sync::atomic::Ordering::SeqCst);
+}
+
+/// One OBSERVED `sdk.status:compacting`: a compact is observably running NOW.
+/// FIFO-strict, every op ahead of it already produced its terminal edge, so the
+/// `running` slot is empty exactly when the tracker's ordering holds — promote
+/// the OLDEST queued Compact into it (its coming terminal edge then retires
+/// `running` at the fold, distinguishing the compact's edge from any queued
+/// send's). `running` already occupied means a compact armed from idle owns the
+/// slot (never promoted, its own edge retires it directly) or the stream's
+/// ordering provably hasn't advanced to this compact yet — never promote past
+/// the occupied slot.
+fn observe_compacting(turn_tracker: &std::sync::Mutex<TurnTracker>) {
+    let mut tracker = turn_tracker.lock().expect("turn tracker lock");
+    if tracker.running.is_none() && matches!(tracker.queued.front(), Some(TrackedOp::Compact)) {
+        tracker.running = tracker.queued.pop_front();
     }
 }
 
-/// Saturating `count -= 1` for the tracker folds: a disarm/case-(b)
-/// extinguish may already have zeroed the shared count mid-window, and an
-/// underflow must never wrap an AtomicUsize to `usize::MAX`.
-fn dec_sat(count: &std::sync::atomic::AtomicUsize) -> usize {
-    use std::sync::atomic::Ordering::SeqCst;
-    count
-        .fetch_update(SeqCst, SeqCst, |c| Some(c.saturating_sub(1)))
-        .map(|prev| prev.saturating_sub(1))
-        .unwrap_or(0)
-}
-
-/// Focused-review ep1-r2 F2 / ep1-r5 F1: the in-stream TERMINAL-edge fold
-/// (`sdk.result` any subtype / `sdk.status:idle`) with FIFO-aware,
-/// CARDINALITY-EXACT queued-compact attribution. The sidecar's input queue is
-/// FIFO and every arm happens under a RUNNING prior turn, so with
-/// `queued_compacts > 0` each edge is attributed strictly, in order:
+/// The in-stream TERMINAL-edge fold (`sdk.result` any subtype; `sdk.status:idle`
+/// only when the consumer's pair-skip let it through, ep2-r1 F1). Attribution
+/// retires the OLDEST outstanding op:
 ///
-///   (a) `saw_compacting` — an edge after an observed
-///       `sdk.status:compacting` belongs to A COMPACT's own turn: retire ONE
-///       queued compact and release the busy truth ONLY when NOTHING queued
-///       behind it remains — neither further compacts (ep1-r5 F1: each queued
-///       `/compact` is a distinct op retiring at its OWN edge) nor garlanded
-///       sends (ep1-r3 F1: a send queued BEHIND the compact generates NOW, so
-///       the compact's terminal must NOT release the gate; the send armed
-///       `in_turn` itself and its OWN terminal edge — folding through the
-///       garlanded-tail path below — releases it). ep2-r1 F2: if a prior edge
-///       is STILL owed here, this retiring edge IS it (a later arm while the
-///       retired compact was the active op owed exactly this edge) — consume
-///       it too: left outstanding, the stale debt outlives its edge and, on a
-///       later provider-dropped compact + completing garlanded send, swallows
-///       the send's drop-proof edge, wedging every tracker forever;
-///   (prior) the arm's structurally-owed edge — the ONE op active at arm time
-///       owes exactly ONE prior-turn terminal edge before any edge could
-///       belong to a queued compact or a garlanded send (a send accepted
-///       between the arm and that prior edge queues BEHIND the compact(s) and
-///       cannot own it): consume the owed edge, busy truth HOLDS (`in_turn`
-///       stays set, ep1-r1 F1's requirement);
-///   (b) `garlanded_sends > 0` with the owed edge consumed and NO compacting
-///       observed — the FIFO-drop proof: the edge can only be ONE garlanded
-///       send's, and every queued compact HAD it run ahead of that send would
-///       have been observed compacting — EVERY remaining queued compact
-///       provably never ran: extinguish the compact count wholesale, retire
-///       this one send, and release the busy truth exactly when the LAST
-///       garlanded send's own edge lands;
-///   (else) fail-closed HOLD (an armed edge beyond the owed one with neither
-///       mark — only (a)/(b)/sdk.error/EOF retire trackers).
+///   (running) the edge belongs to the op in the `running` slot — the active
+///     turn, or the promoted compaction whose observed `compacting` frame put
+///     it there. Retire it;
+///   (drop peel) `running` empty and the OLDEST queued op is an UNPROMOTED
+///     Compact: this edge cannot be its (a compact's terminal edge is ALWAYS
+///     preceded by its own observed compacting frame, and that promotion never
+///     happened). The compact provably DROPPED — but ONLY because a following
+///     queued Turn evidences it (this edge must belong to the oldest such
+///     Turn: FIFO). Peel every leading unpromoted Compact up to that Turn —
+///     compacts queued BEHIND the send need NO evidence handling: they remain
+///     genuinely queued and survive (ep2-r2 F1). With NO Turn queued anywhere
+///     behind, nothing can attribute the edge: fail-closed HOLD (`in_turn`
+///     untouched — the gate stays closed, the old armed-with-neither-mark
+///     wedge-avoiding discipline preserved);
+///   (queued Turn) the edge retires the OLDEST queued Turn;
+///   (nothing outstanding) the plain unarmed edge — clears the busy truth.
 ///
-/// With NO compact armed, outstanding garlanded sends are the post-compact
-/// TAIL: each owes its own terminal edge; only the LAST tail edge releases
-/// the busy truth. Otherwise unarmed edges clear `in_turn` outright (the kata
-/// 1wxv Task 4 contract).
+/// `in_turn` is then stored as the recomputed `busy()`: the gate releases at
+/// EXACTLY the last outstanding op's own edge — never earlier (each prior op
+/// leaves the queue non-empty), and never wedged by a stale count.
 fn fold_terminal_edge(
     in_turn: &std::sync::atomic::AtomicBool,
-    queued_compacts: &std::sync::atomic::AtomicUsize,
-    saw_compacting: &std::sync::atomic::AtomicBool,
-    garlanded_sends: &std::sync::atomic::AtomicUsize,
-    prior_edges_owed: &std::sync::atomic::AtomicUsize,
+    turn_tracker: &std::sync::Mutex<TurnTracker>,
 ) {
-    use std::sync::atomic::Ordering::SeqCst;
-    if queued_compacts.load(SeqCst) > 0 {
-        if saw_compacting.swap(false, SeqCst) {
-            // A compact's own terminal edge: retire exactly ONE queued compact
-            // (ep1-r5 F1) — then release the busy truth ONLY if this was the
-            // last queued compact AND no garlanded send is owed (ep1-r3 F1).
-            dec_sat(queued_compacts);
-            // ep2-r1 F2: this retiring edge also settles a still-owed prior
-            // debt when the retiring compact WAS the op a later arm owed (FIFO:
-            // the owed op always runs AHEAD — with saw_compacting live, this
-            // edge is the owed op's; a debt owed to an EARLIER, already-edged
-            // op would have been consumed by the prior branch below). Leave it
-            // outstanding and the stale debt outlives its edge: a later
-            // provider-dropped compact's garlanded send edge then gets
-            // swallowed consuming the stale debt, and every tracker stays set
-            // forever with no edge left to retire them (a permanent wedge).
-            if prior_edges_owed.load(SeqCst) > 0 {
-                dec_sat(prior_edges_owed);
-            }
-            if queued_compacts.load(SeqCst) == 0 && garlanded_sends.load(SeqCst) == 0 {
-                in_turn.store(false, SeqCst);
-            }
-        } else if prior_edges_owed.load(SeqCst) > 0 {
-            // The arm's owed prior edge — busy truth HOLDS; attribution set
-            // stays armed.
-            dec_sat(prior_edges_owed);
-        } else if garlanded_sends.load(SeqCst) > 0 {
-            // The FIFO-drop proof: this edge is ONE garlanded send's — EVERY
-            // remaining queued compact provably never ran (FIFO-strict: any
-            // of them would have been observed compacting first). Extinguish
-            // the compact count wholesale and retire the one send; the busy
-            // truth ends exactly when the LAST garlanded send's edge lands.
-            queued_compacts.store(0, SeqCst);
-            if dec_sat(garlanded_sends) == 0 {
-                in_turn.store(false, SeqCst);
+    let mut tracker = turn_tracker.lock().expect("turn tracker lock");
+    if tracker.running.take().is_none() {
+        loop {
+            match tracker.queued.front().copied() {
+                Some(TrackedOp::Compact) => {
+                    if tracker.queued.iter().any(|op| *op == TrackedOp::Turn) {
+                        // The silent provider drop, evidenced by a following
+                        // send: peel it and attribute onward.
+                        tracker.queued.pop_front();
+                        continue;
+                    }
+                    // No following op can evidence attribution — fail-closed
+                    // HOLD: leave `in_turn` exactly as it stands.
+                    return;
+                }
+                Some(TrackedOp::Turn) => {
+                    tracker.queued.pop_front();
+                    break;
+                }
+                None => break,
             }
         }
-        // else: fail-closed HOLD.
-    } else if garlanded_sends.load(SeqCst) > 0 {
-        // The garlanded tail: the compact(s) retired already; each remaining
-        // send owes its OWN terminal edge — only the last releases busy.
-        if dec_sat(garlanded_sends) == 0 {
-            in_turn.store(false, SeqCst);
-        }
-    } else {
-        in_turn.store(false, SeqCst);
     }
+    in_turn.store(tracker.busy(), std::sync::atomic::Ordering::SeqCst);
 }
+
+// ── pending-set fold (Task 2) ────────────────────────────────────────────────────────────
 
 /// Fold one sidecar line into the session's pending approval/question state:
 /// `sdk.permission.request`/`sdk.question.request` PUSH (resend of the same requestId
@@ -3951,10 +3826,7 @@ pub(crate) mod tests {
                 broadcast_id: Arc::new(std::sync::Mutex::new(session_id.to_string())),
                 pending: Arc::new(std::sync::Mutex::new(ClaudePending::default())),
                 in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                queued_compacts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                saw_compacting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                garlanded_sends: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                prior_edges_owed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                turn_tracker: Arc::new(std::sync::Mutex::new(TurnTracker::default())),
                 result_idle_pair_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 turn_lock: Arc::new(TokioMutex::new(())),
             },
@@ -5088,10 +4960,7 @@ rl.on('line', (line) => {
                 broadcast_id: Arc::new(std::sync::Mutex::new(session_id.to_string())),
                 pending: Arc::new(std::sync::Mutex::new(pending)),
                 in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                queued_compacts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                saw_compacting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                garlanded_sends: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                prior_edges_owed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                turn_tracker: Arc::new(std::sync::Mutex::new(TurnTracker::default())),
                 result_idle_pair_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 turn_lock: Arc::new(TokioMutex::new(())),
             },
@@ -5530,10 +5399,7 @@ rl.on('line', (line) => {
             Arc::new(std::sync::Mutex::new("fold-session".to_string())),
             Arc::clone(&pending),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Arc::new(std::sync::Mutex::new(TurnTracker::default())),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             None,
         );
@@ -6273,10 +6139,7 @@ rl.on('line', (line) => {
                 broadcast_id: Arc::new(std::sync::Mutex::new(map_key.to_string())),
                 pending: Arc::new(std::sync::Mutex::new(ClaudePending::default())),
                 in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                queued_compacts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                saw_compacting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                garlanded_sends: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                prior_edges_owed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                turn_tracker: Arc::new(std::sync::Mutex::new(TurnTracker::default())),
                 result_idle_pair_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 turn_lock: Arc::new(TokioMutex::new(())),
             },
@@ -6406,16 +6269,18 @@ rl.on('line', (line) => {
         // here an ERRORED result, the subtype the voided "success-only" wording excluded):
         st.handle_send(send_msg(&sid, "turn one")).await;
         assert!(in_turn_of(&st, &sid).await, "a send sets the busy truth");
-        st.handle_send(send_msg(&sid, "__emit_result_error__"))
-            .await;
+        // inject_raw_send: the provider's terminal edge, NOT another tracked op
+        // (a magic-text handle_send would enqueue a phantom second op under the
+        // ep2-r2 order-explicit tracker).
+        inject_raw_send(&st, &sid, "__emit_result_error__").await;
         await_in_turn(&st, &sid, false).await;
 
         // Fail-closed: the NON-EDGES must NOT clear — sdk.error, sdk.status
         // compacting, sdk.assistant frames all leave in_turn TRUE.
         st.handle_send(send_msg(&sid, "turn two")).await;
-        st.handle_send(send_msg(&sid, "__emit_error__")).await;
-        st.handle_send(send_msg(&sid, "__emit_compacting__")).await;
-        st.handle_send(send_msg(&sid, "__emit_assistant__")).await;
+        inject_raw_send(&st, &sid, "__emit_error__").await;
+        inject_raw_send(&st, &sid, "__emit_compacting__").await;
+        inject_raw_send(&st, &sid, "__emit_assistant__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             in_turn_of(&st, &sid).await,
@@ -6423,7 +6288,7 @@ rl.on('line', (line) => {
         );
 
         // (b) sdk.status with status == "idle" clears:
-        st.handle_send(send_msg(&sid, "__emit_idle__")).await;
+        inject_raw_send(&st, &sid, "__emit_idle__").await;
         await_in_turn(&st, &sid, false).await;
 
         // (d) a completed handle_interrupt clears — and an interrupt NEVER produces
@@ -6482,14 +6347,7 @@ rl.on('line', (line) => {
         let env = FakeClaudeSidecarEnv::install();
         let (st, _rx) = state_with_bus();
         let stdin_log = insert_rollback_fixture_session(&st, "rb-busy", "dur-busy").await;
-        {
-            let guard = st.sessions.lock().await;
-            guard
-                .get("rb-busy")
-                .expect("fixture session")
-                .in_turn
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-        }
+        prime_fixture_running_turn(&st, "rb-busy").await;
         let (sink, captured) = capturing_sink();
         st.handle_rollback(
             rollback_op("dur-busy", "rb-busy-1", RollbackDirection::Undo),
@@ -6575,8 +6433,8 @@ rl.on('line', (line) => {
         // ERRORED one); the four-edge clear set already covers it, and the busy
         // gate reopens (a follow-up rollback leaves the window for its true
         // verdict — NOTHING_TO_UNDO on this transcript-less session).
-        st.handle_send(send_msg(&session_id, "__emit_result_error__"))
-            .await;
+        // inject_raw_send: the compact op's OWN edge, not a phantom second op.
+        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
         await_in_turn(&st, &session_id, false).await;
         let (sink2, captured2) = capturing_sink();
         st.handle_rollback(
@@ -7287,13 +7145,12 @@ rl.on('line', (line) => {
         inject_raw_send(&st, &session_id, "__emit_idle__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        // S queues behind the armed compact(s); C₁ observably starts.
-        st.handle_send(send_msg(&session_id, "turn two")).await; // S garlanded
+        // C₁ observably starts; C₂ arms while C₁ is MID-COMPACTION — it owes
+        // C₁'s terminal edge; S queues behind BOTH compacts.
         inject_raw_send(&st, &session_id, "__emit_compacting__").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
-
-        // C₂ arms while C₁ is MID-COMPACTION — it owes C₁'s terminal edge.
-        st.handle_compact(compact_msg(&session_id, None)).await;
+        st.handle_compact(compact_msg(&session_id, None)).await; // C₂ armed
+        st.handle_send(send_msg(&session_id, "turn two")).await; // S garlanded
 
         // C₁'s pair: retires C₁ AND settles C₂'s owed edge — C₂ remains the
         // sole queued compact; S is still owed. The gate HOLDS throughout.
@@ -7337,29 +7194,314 @@ rl.on('line', (line) => {
         drop(env);
     }
 
-    /// ep1-r3 F3 rig: the session's busy-truth + queued-compact tracker arcs
-    /// (the exact set the stdout consumer folds against).
+    /// Focused-review ep2-r2 F1 (the INTERLEAVED queue): the FIFO-drop proof may
+    /// extinguish ONLY compacts queued AHEAD of the evidenced send — a compact
+    /// queued BEHIND it remains genuinely queued and survives. Bare op-counts
+    /// cannot express that order: with queue [C1, S1, C2] and C1
+    /// provider-dropped (never observed compacting), S1's terminal edge fired
+    /// the drop branch and zeroed the whole compact count — C2 included —
+    /// releasing the gate while C2 could still run. Rollback passed the sole
+    /// busy gate with a compact mid-queue.
+    ///
+    /// Queue: A running → C1 → S1 → C2 (C2 queued BEHIND the send). C1 never
+    /// observed (silent provider drop); C2 then runs for real.
+    #[tokio::test]
+    async fn a_dropped_compact_extinguishes_only_compacts_ahead_of_the_evidencing_send() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-qinterleave")).await;
+        let created = await_claude_created(&mut rx, "req-qinterleave").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        await_status_frame(&mut rx, &session_id, "idle").await;
+
+        st.handle_send(send_msg(&session_id, "turn one")).await; // A
+        st.handle_compact(compact_msg(&session_id, None)).await; // C1
+        st.handle_send(send_msg(&session_id, "turn two")).await; // S1
+        st.handle_compact(compact_msg(&session_id, None)).await; // C2 (behind S1)
+
+        // A's pair: the result retires A; the trailing idle is pair-skipped.
+        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
+        inject_raw_send(&st, &session_id, "__emit_idle__").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(in_turn_of(&st, &session_id).await, "three ops still queued");
+
+        // C1 is provider-DROPPED (never observed); S1's pair lands: the result
+        // evidences C1's drop and retires S1 — but C2 is queued BEHIND S1 and
+        // may still run, so the busy gate MUST stay closed past S1's edge.
+        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
+        inject_raw_send(&st, &session_id, "__emit_idle__").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            in_turn_of(&st, &session_id).await,
+            "S1's edge retires C1's drop + S1 only — C2 is still queued behind the send"
+        );
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-qint-1", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        let frames = captured_json(&captured);
+        assert_eq!(
+            frames[0]["event"]["code"],
+            "BUSY_TURN",
+            "ep2-r2 F1: the drop proof must not release a compact queued BEHIND the evidenced send: {frames:?}"
+        );
+        assert_eq!(
+            env.spawn_count(),
+            1,
+            "zero teardown from the refused attempt"
+        );
+        assert!(
+            st.sessions.lock().await.contains_key(&session_id),
+            "no teardown"
+        );
+
+        // C2 then runs for real: its observed compacting → pair lands — the
+        // gate releases EXACTLY at C2's own terminal edge (never earlier).
+        inject_raw_send(&st, &session_id, "__emit_compacting__").await;
+        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
+        inject_raw_send(&st, &session_id, "__emit_idle__").await;
+        await_in_turn(&st, &session_id, false).await;
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-qint-2", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        let frames = captured_json(&captured);
+        assert_eq!(
+            frames[0]["event"]["code"], "NOTHING_TO_UNDO",
+            "the gate released exactly at C2's own terminal edge: {frames:?}"
+        );
+        drop(env);
+    }
+
+    /// Focused-review ep2-r2 F2 (interrupt ≠ drain): a completed
+    /// `handle_interrupt` ends the ACTIVE turn's busy truth, but
+    /// `query.interrupt()` does not drain the sidecar's FIFO input queue — a
+    /// queued compact AND a queued send behind it both still run. The counter
+    /// gate read `in_turn || queued_compacts > 0` but NEITHER counted a queued
+    /// SEND: interrupting A with [C, S] behind it, then letting C complete,
+    /// left in_turn=false, queued=0, and S still generating — the gate accepted
+    /// rollback mid-send.
+    ///
+    /// Queue: A running → C → S; A is interrupted mid-turn; then C runs for
+    /// real and S generates — the gate stays closed until S's own edge.
+    #[tokio::test]
+    async fn an_interrupt_keeps_the_gate_closed_until_the_queued_compact_and_send_both_finish() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-qirq")).await;
+        let created = await_claude_created(&mut rx, "req-qirq").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        await_status_frame(&mut rx, &session_id, "idle").await;
+
+        st.handle_send(send_msg(&session_id, "turn one")).await; // A
+        st.handle_compact(compact_msg(&session_id, None)).await; // C
+        st.handle_send(send_msg(&session_id, "turn two")).await; // S
+
+        // A is interrupted mid-turn (its OWN busy truth ends — but the FIFO
+        // queue is intact: C and S still owe their edges).
+        st.handle_interrupt(interrupt_msg(&session_id)).await;
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-qirq-0", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        assert_eq!(
+            captured_json(&captured)[0]["event"]["code"],
+            "BUSY_TURN",
+            "the interrupt freed A only — C and S are still queued"
+        );
+
+        // C runs for real: observed compacting + its pair — retires C, and S
+        // is STILL owed: the gate MUST stay closed here.
+        inject_raw_send(&st, &session_id, "__emit_compacting__").await;
+        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
+        inject_raw_send(&st, &session_id, "__emit_idle__").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            in_turn_of(&st, &session_id).await,
+            "ep2-r2 F2: C's edge retires C — S is still generating"
+        );
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-qirq-1", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        let frames = captured_json(&captured);
+        assert_eq!(
+            frames[0]["event"]["code"],
+            "BUSY_TURN",
+            "ep2-r2 F2: past the interrupted turn's compact, the queued send still owns the gate: {frames:?}"
+        );
+        assert_eq!(env.spawn_count(), 1, "zero teardown from refused attempts");
+
+        // S's pair: the gate releases exactly at S's own terminal edge.
+        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
+        inject_raw_send(&st, &session_id, "__emit_idle__").await;
+        await_in_turn(&st, &session_id, false).await;
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-qirq-2", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        let frames = captured_json(&captured);
+        assert_eq!(
+            frames[0]["event"]["code"], "NOTHING_TO_UNDO",
+            "the gate released exactly at S's own terminal edge: {frames:?}"
+        );
+        drop(env);
+    }
+
+    /// Focused-review ep2-r2 F3 (arm-revert vs queued sends): a queued
+    /// compact's no-write failure must undo EXACTLY its own bookkeeping — with
+    /// a send queued behind an EARLIER compact still outstanding, releasing
+    /// `in_turn` at the failed arm's revert opens the rollback gate while that
+    /// send generates. The counter revert cleared `in_turn` unconditionally on
+    /// its spent-prior CAS, and the gate never consulted the garlanded count:
+    /// C1 completed (its edge folded mid-window) while C2's write failed behind
+    /// it, leaving S1's send owed with the gate wide open.
+    ///
+    /// Rig: a REAL armed C1 behind fixture turn A; S1 accepted (garlanded); C1
+    /// observably compacting; C2 armed and parked in its write window
+    /// (SIGSTOP'd fixture child, full pipe); C1's terminal edge folds
+    /// mid-window; C2's write then fails (SIGKILL) — the revert must keep the
+    /// gate closed for S1, and S1's own terminal edge releases it.
     #[cfg(target_os = "linux")]
-    #[allow(clippy::type_complexity)]
+    #[tokio::test]
+    async fn a_failed_compact_write_keeps_the_gate_closed_while_a_garlanded_send_is_owed() {
+        let (st, _rx) = state_with_bus();
+        insert_rollback_fixture_session(&st, "rb-armfail-gar", "dur-armfail-gar").await;
+        // Turn A running at the STRUCTURAL level (the running slot + busy cache).
+        prime_fixture_running_turn(&st, "rb-armfail-gar").await;
+
+        // Fetch the tracker arcs NOW: the compact driver holds the sessions
+        // lock ACROSS its parked write await — reading from the map mid-window
+        // would deadlock the rig.
+        let (in_turn, turn_tracker) = busy_tracker_arcs(&st, "rb-armfail-gar").await;
+
+        // C1 arms behind A (write succeeds un-frozen) — then A's terminal edge
+        // retires the running turn, S1 accepts queued behind C1, and C1
+        // observably starts compacting (promoted into `running`).
+        st.handle_compact(compact_msg("rb-armfail-gar", None)).await;
+        fold_terminal_edge(&in_turn, &turn_tracker);
+        st.handle_send(send_msg("rb-armfail-gar", "turn garlanded"))
+            .await;
+        observe_compacting(&turn_tracker);
+
+        // Let the fixture `tee` fully drain the pipe before freezing — a
+        // partially-consumed pipe would park the fill loop short of the
+        // helper's full-buffer assertion (its 64KiB threshold assumes an empty
+        // pipe: armrace/armfail freeze before any handler write).
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Park C2's write mid-window.
+        let pid = freeze_fixture_stdin(&st, "rb-armfail-gar").await;
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("rb-armfail-gar", None)).await;
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // C1's terminal edge folds mid-window: retires the promoted C1 — the
+        // gate stays closed with C2's armed entry + S1 still owed.
+        fold_terminal_edge(&in_turn, &turn_tracker);
+        assert!(
+            in_turn.load(std::sync::atomic::Ordering::SeqCst),
+            "C2 armed + S1 owed — the gate holds past C1's edge"
+        );
+
+        // C2's write FAILS: the undo pops EXACTLY C2's own entry — and the gate
+        // MUST stay closed for S1 (still queued behind the completed C1).
+        assert_eq!(
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) },
+            0,
+            "SIGKILL the fixture child — the parked write fails"
+        );
+        tokio::time::timeout(Duration::from_secs(15), driver)
+            .await
+            .expect("the failed write resolves the handler")
+            .expect("the compact task joins");
+        assert!(
+            in_turn.load(std::sync::atomic::Ordering::SeqCst),
+            "ep2-r2 F3: the failed arm's undo never releases the gate while S1 is owed"
+        );
+        {
+            let tracker = turn_tracker.lock().expect("turn tracker lock");
+            assert_eq!(
+                tracker.queued.iter().copied().collect::<Vec<_>>(),
+                vec![TrackedOp::Turn],
+                "exactly S1's queued entry survives the undo"
+            );
+            assert!(
+                tracker.running.is_none(),
+                "nothing is marked running after the undo"
+            );
+        }
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op("dur-armfail-gar", "rb-ag-1", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        let frames = captured_json(&captured);
+        assert_eq!(
+            frames[0]["event"]["code"], "BUSY_TURN",
+            "ep2-r2 F3: rollback must refuse while the garlanded send is owed: {frames:?}"
+        );
+
+        // S1's own terminal edge: the gate releases exactly here.
+        fold_terminal_edge(&in_turn, &turn_tracker);
+        assert!(!in_turn.load(std::sync::atomic::Ordering::SeqCst));
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op("dur-armfail-gar", "rb-ag-2", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        assert_eq!(
+            captured_json(&captured)[0]["event"]["code"],
+            "NOTHING_TO_UNDO",
+            "the gate released exactly at S1's terminal edge"
+        );
+        assert!(
+            st.sessions.lock().await.contains_key("rb-armfail-gar"),
+            "the failed write never tore the session down"
+        );
+    }
+
+    /// ep1-r3 F3 rig: the session's busy-truth Arc + the FIFO turn tracker the
+    /// stdout consumer folds against (the whole tracked state the rig's direct
+    /// folds mutate).
+    #[cfg(target_os = "linux")]
     async fn busy_tracker_arcs(
         st: &FreshClaudeState,
         map_key: &str,
     ) -> (
         Arc<std::sync::atomic::AtomicBool>,
-        Arc<std::sync::atomic::AtomicUsize>,
-        Arc<std::sync::atomic::AtomicBool>,
-        Arc<std::sync::atomic::AtomicUsize>,
-        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::Mutex<TurnTracker>>,
     ) {
         let guard = st.sessions.lock().await;
         let s = guard.get(map_key).expect("tracked session");
-        (
-            s.in_turn.clone(),
-            s.queued_compacts.clone(),
-            s.saw_compacting.clone(),
-            s.garlanded_sends.clone(),
-            s.prior_edges_owed.clone(),
-        )
+        (s.in_turn.clone(), s.turn_tracker.clone())
+    }
+
+    /// ep2-r2 rig: mark a fixture session mid-turn at the STRUCTURAL level
+    /// (the running slot holds the op + the derived busy cache set) — a bare
+    /// `in_turn.store(true)` would leave the tracker empty and steal the next
+    /// fold's attribution from the running op it never recorded.
+    async fn prime_fixture_running_turn(st: &FreshClaudeState, map_key: &str) {
+        let guard = st.sessions.lock().await;
+        let s = guard.get(map_key).expect("tracked session");
+        arm_turn_op(&s.in_turn, &s.turn_tracker, TrackedOp::Turn);
     }
 
     /// ep1-r3 F3 rig: SIGSTOP the fixture's `tee` and FILL its stdin pipe, so
@@ -7416,21 +7558,13 @@ rl.on('line', (line) => {
     ) {
         let (st, _rx) = state_with_bus();
         insert_rollback_fixture_session(&st, "rb-armrace", "dur-armrace").await;
-        {
-            let guard = st.sessions.lock().await;
-            guard
-                .get("rb-armrace")
-                .expect("fixture session")
-                .in_turn
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-        }
+        prime_fixture_running_turn(&st, "rb-armrace").await;
         let pid = freeze_fixture_stdin(&st, "rb-armrace").await;
 
         // Fetch the tracker arcs NOW: the compact handler holds the sessions
         // lock ACROSS its parked write await, so reading them from the map
         // mid-window would deadlock the rig.
-        let (in_turn, queued_compacts, saw_compacting, garlanded_sends, prior_edges_owed) =
-            busy_tracker_arcs(&st, "rb-armrace").await;
+        let (in_turn, turn_tracker) = busy_tracker_arcs(&st, "rb-armrace").await;
 
         // The compact queues behind the running prior turn — and parks INSIDE
         // the write await (the stopped child never drains a full pipe).
@@ -7441,26 +7575,22 @@ rl.on('line', (line) => {
             })
         };
         tokio::time::sleep(Duration::from_millis(300)).await;
-        fold_terminal_edge(
-            &in_turn,
-            &queued_compacts,
-            &saw_compacting,
-            &garlanded_sends,
-            &prior_edges_owed,
-        );
-        assert_eq!(
-            queued_compacts.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "F3: the tracker was armed BEFORE the write await — the fold saw the armed compact"
-        );
-        assert_eq!(
-            prior_edges_owed.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "the fold consumed the arm's owed prior edge"
-        );
+        fold_terminal_edge(&in_turn, &turn_tracker);
+        {
+            let tracker = turn_tracker.lock().expect("turn tracker lock");
+            assert!(
+                tracker.running.is_none(),
+                "the fold retired the prior turn's running entry mid-window"
+            );
+            assert_eq!(
+                tracker.queued.iter().copied().collect::<Vec<_>>(),
+                vec![TrackedOp::Compact],
+                "F3: the compact was armed BEFORE the write await — the fold saw its queued entry"
+            );
+        }
         assert!(
             in_turn.load(std::sync::atomic::Ordering::SeqCst),
-            "F3: the busy truth survives the mid-window fold (no phantom prior edge)"
+            "F3: the busy truth survives the mid-window fold (the queued compact persists)"
         );
 
         // Resume: the parked write drains and the handler completes with the
@@ -7474,9 +7604,10 @@ rl.on('line', (line) => {
             .await
             .expect("the parked compact write completes once the child resumes")
             .expect("the compact task joins");
-        assert!(
-            in_turn.load(std::sync::atomic::Ordering::SeqCst)
-                && queued_compacts.load(std::sync::atomic::Ordering::SeqCst) == 1,
+        assert!(in_turn.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            turn_tracker.lock().expect("turn tracker lock").queued.len(),
+            1,
             "the accepted queued compact's busy truth survives the whole window"
         );
 
@@ -7508,21 +7639,13 @@ rl.on('line', (line) => {
     async fn a_failed_compact_write_reverts_the_armed_tracker_and_releases_the_spent_busy_truth() {
         let (st, mut rx) = state_with_bus();
         insert_rollback_fixture_session(&st, "rb-armfail", "dur-armfail").await;
-        {
-            let guard = st.sessions.lock().await;
-            guard
-                .get("rb-armfail")
-                .expect("fixture session")
-                .in_turn
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-        }
+        prime_fixture_running_turn(&st, "rb-armfail").await;
         let pid = freeze_fixture_stdin(&st, "rb-armfail").await;
 
         // Fetch the tracker arcs NOW: the compact handler holds the sessions
         // lock ACROSS its parked write await, so reading them from the map
         // mid-window would deadlock the rig.
-        let (in_turn, queued_compacts, saw_compacting, garlanded_sends, prior_edges_owed) =
-            busy_tracker_arcs(&st, "rb-armfail").await;
+        let (in_turn, turn_tracker) = busy_tracker_arcs(&st, "rb-armfail").await;
 
         let driver = {
             let st = st.clone();
@@ -7531,16 +7654,12 @@ rl.on('line', (line) => {
             })
         };
         tokio::time::sleep(Duration::from_millis(300)).await;
-        fold_terminal_edge(
-            &in_turn,
-            &queued_compacts,
-            &saw_compacting,
-            &garlanded_sends,
-            &prior_edges_owed,
-        );
+        // The prior turn's terminal edge folds mid-window: retires the running
+        // turn; the armed compact's queued entry survives (busy holds).
+        fold_terminal_edge(&in_turn, &turn_tracker);
 
         // The write now FAILS (the child is SIGKILLed — the parked write gets
-        // EPIPE): the armed state must revert synchronously.
+        // EPIPE): the armed entry must be undone synchronously.
         assert_eq!(
             unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) },
             0,
@@ -7555,35 +7674,30 @@ rl.on('line', (line) => {
         let frame = await_frame_of_inner_type(&mut rx, "freshAgent.error").await;
         assert_eq!(frame["event"]["code"], json!("INTERNAL_ERROR"), "{frame}");
 
-        // REVERT PROOF: busy released (the prior edge was spent mid-window —
-        // nothing could ever clear a surviving count), and NO phantom edges are
-        // outstanding (the whole quartet is back to its pre-arm state).
+        // UNDO PROOF: busy released (the running prior turn's edge was spent
+        // mid-window and the compact never went out — nothing remains that
+        // could end a surviving busy truth), and the tracker is EMPTY (no
+        // phantom ops outstanding — the undo removed exactly the arm's entry).
         use std::sync::atomic::Ordering::SeqCst;
         assert!(
             !in_turn.load(SeqCst),
-            "revert released the spent busy truth — no wedge"
+            "the undo released the spent busy truth — no wedge"
         );
-        assert!(
-            queued_compacts.load(SeqCst) == 0
-                && !saw_compacting.load(SeqCst)
-                && garlanded_sends.load(SeqCst) == 0
-                && prior_edges_owed.load(SeqCst) == 0,
-            "no phantom edges outstanding — the full quartet reverted"
-        );
-        // The phantom-edge proof IN ACTION: a later ordinary turn's terminal
-        // edge folds through the NORMAL unarmed path and clears (a lingering
-        // owed/queued count would have swallowed it and wedged busy).
+        {
+            let tracker = turn_tracker.lock().expect("turn tracker lock");
+            assert!(
+                tracker.running.is_none() && tracker.queued.is_empty(),
+                "no phantom ops outstanding — the undo removed exactly the arm's entry"
+            );
+        }
+        // The phantom-op proof IN ACTION: a later ordinary turn's terminal
+        // edge folds through the NORMAL nothing-outstanding path and clears (a
+        // lingering entry would have swallowed it and wedged busy).
         in_turn.store(true, SeqCst); // a new turn is running
-        fold_terminal_edge(
-            &in_turn,
-            &queued_compacts,
-            &saw_compacting,
-            &garlanded_sends,
-            &prior_edges_owed,
-        );
+        fold_terminal_edge(&in_turn, &turn_tracker);
         assert!(
             !in_turn.load(SeqCst),
-            "a later turn's terminal edge clears cleanly — no phantom prior edge swallowed it"
+            "a later turn's terminal edge clears cleanly — no phantom op swallowed it"
         );
         assert!(
             st.sessions.lock().await.contains_key("rb-armfail"),
