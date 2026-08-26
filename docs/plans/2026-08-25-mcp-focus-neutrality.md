@@ -102,25 +102,36 @@ All line numbers verified in the worktree at base `f2c7ef7a`.
    target still exists — a tab/pane deleted mid-capture gets resurrected as a
    stale `activePane`/`activeTabId` entry, blanking the work area.
 
-## Stage-2 load-bearing assumptions to validate before execution
+## Stage-2 load-bearing validation — results (2026-08-25)
 
-These are cross-checked by the load-bearing ledger before Stage 3. Dispatch
-validators ONE assumption per subagent (small chunks).
+Validators dispatched one-assumption-per-subagent; full evidence in
+`.worktrees/.the-usual-logs/mcp-focus-neutrality/load-bearing-ledger.md`.
 
-1. `ui.command` never fires in response to user-initiated local flows. In
-   particular the Rust deferred `uiCommand` payloads embedded in *HTTP
-   responses* (`crates/freshell-terminal/src/terminal_tabs.rs:181-186`,
-   continuity pipeline): verify whether any client code folds HTTP-response
-   `uiCommand` payloads through `handleUiCommand`, and whether those arms
-   would now inappropriately carry `activate:false`.
-2. `hidden-pane-rebind-rust.spec.ts` is the ONLY e2e spec relying on
-   create-implies-activation (search for other specs polling
-   `getActiveTabId()` after a REST create).
-3. No existing unit/e2e test asserts that a `ui.command` create ACTIVATES
-   (they must not encode the old steal as expectation).
-4. The `focusEligible` gating does not refire/refocus for local user flows
-   (the mount-focus effects' dependency arrays gain `focusEligible`; confirm
-   no visible-pane autofocus regression risk beyond what tests pin).
+1. **CONFIRMED with correction:** `handleUiCommand` (fed by WS frames only)
+   is the single fold; every Node `ui.command` emission arm is agent-surface
+   (`server/agent-api/router.ts` callers of `broadcastUiCommand`
+   `server/ws-handler.ts:3896-3898`; `screenshot.capture` unicast at :1121-1130).
+   No client code folds HTTP-response `uiCommand` payloads (`src/` has zero
+   camelCase `uiCommand` references). Correction: the Rust server DOES embed
+   `uiCommand` in HTTP responses (`crates/freshell-freshagent/src/terminal_tabs.rs:311,2293`)
+   but only via `create_terminal_or_content_tab_deferred` (:181-186), which
+   has ZERO callers (the `POST /api/tabs-sync/restore` consumer was never
+   implemented) — unreachable dead code, irrelevant to this change.
+2. **REVISED (plan updated):** hidden-pane-rebind-rust was NOT the only
+   steal-reliant spec. Validator found three more: restore-contract-wall-rust
+   (:2326-2331, :573ff), git-badges-rust (:194-196), sidebar-registry-sync-rust
+   (case-c :339-341). All repairs are now in Task 1 Step 6.
+3. **CONFIRMED:** no test asserts activation as the outcome of a ui.command
+   tab.create/pane.split fold (`ui-commands.test.ts` asserts action types;
+   `tabsPersistence.test.ts:488-514` asserts persistence outcomes only; server
+   ws tests touch screenshot.capture only).
+4. **CONFIRMED with FreshAgentView note:** the four gated components render
+   ONLY via PaneContainer renderContent (no modal/onboarding callers), direct
+   test renders get the default `focusEligible=true`, and no pre-existing test
+   asserts focus behavior in hidden/non-active state. FreshAgentView needs no
+   prop: it self-gates via `isActivePane = !hidden && activeTabId === tabId &&
+   activePaneId === paneId` (FreshAgentView.tsx:652-658) and its focus effect
+   early-returns when inactive (:2277-2291).
 
 ---
 
@@ -133,7 +144,7 @@ validators ONE assumption per subagent (small chunks).
 - Test: `test/unit/client/store/tabsSlice.test.ts` (extend `describe('addTab')`, :56+)
 - Test: `test/unit/client/store/panesSlice.test.ts` (extend `describe('splitPane')`, :612+)
 - Test: `test/unit/client/ui-commands.test.ts` (192-line dispatch-capture file; extend + append integration describe)
-- Test (repair, same commit): `test/e2e-browser/specs/hidden-pane-rebind-rust.spec.ts` (:230-232 and :329-332)
+- Test (repair, same commit): `test/e2e-browser/specs/hidden-pane-rebind-rust.spec.ts` (:230-232 and :329-332), `test/e2e-browser/specs/restore-contract-wall-rust.spec.ts` (:2326-2331 and :573ff), `test/e2e-browser/specs/git-badges-rust.spec.ts` (:194-196), `test/e2e-browser/specs/sidebar-registry-sync-rust.spec.ts` (case-c, before :339)
 
 **Interfaces:**
 - Consumes: existing reducers `addTab`, `splitPane`; existing `handleUiCommand` command arms; existing `revealTab(page, harness, tabId)` helper in the e2e spec (:190-200).
@@ -413,10 +424,15 @@ Run: `env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHE
 Expected: PASS.
 
 E2E repair (REQUIRED in this commit — Task 1's fold change turns the old
-steal into a failure in this spec): `hidden-pane-rebind-rust.spec.ts` uses
-"REST create ⇒ client activates the new tab" as its hiding mechanism at two
-sites. Replace both with an explicit user-equivalent reveal using the
-spec's existing `revealTab` helper (:190-200).
+steal into failures in four spec files; load-bearing validator #2 located
+every site). The repair pattern is uniform: after a REST create that a test
+relied on for activation, add an explicit user-equivalent reveal (tab-strip
+click, `[data-context="tab"][data-tab-id="..."]` — the DOM hook from
+`hidden-pane-rebind-rust.spec.ts`'s revealTab comment at :187-189 and the
+verbatim idiom at `reconnect-revive-rust.spec.ts:188`).
+
+**Repair 1** — `hidden-pane-rebind-rust.spec.ts`, two sites, using this spec's
+existing `revealTab` helper (:190-200).
 
 Site 1 (:229-232), replace:
 
@@ -460,14 +476,91 @@ with:
       await expect.poll(async () => harness.getActiveTabId(), { timeout: 15_000 }).not.toBe(freshTabId)
 ```
 
-Run: `env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium hidden-pane-rebind-rust`
-Expected: PASS (both tests; the reveal has the same semantic effect the
-implicit activation had, so the rebind discriminating polls are untouched).
+**Repair 2** — `restore-contract-wall-rust.spec.ts`, two site groups (this
+spec has no revealTab helper; use the tab-strip click idiom directly).
+
+Site A (:2326-2331, the hidden-pane-rebind wall entry), replace:
+
+```ts
+      // Second tab becomes active; the first is now hidden.
+      await createTabViaRest(info, { mode: 'shell', cwd: os.tmpdir() })
+      await harness.waitForTabCount(2)
+      await expect
+        .poll(async () => harness.getActiveTabId(), { timeout: 15_000 })
+        .not.toBe(hiddenTabId)
+```
+
+with:
+
+```ts
+      // Second tab becomes active; the first is now hidden. REST creates are
+      // focus-neutral (agent-driven creates must not steal user focus), so the
+      // switch requires an explicit reveal — a user-equivalent tab-strip click.
+      const secondTabId = await createTabViaRest(info, { mode: 'shell', cwd: os.tmpdir() })
+      await harness.waitForTabCount(2)
+      await page.locator(`[data-context="tab"][data-tab-id="${secondTabId}"]`).click()
+      await expect
+        .poll(async () => harness.getActiveTabId(), { timeout: 15_000 })
+        .not.toBe(hiddenTabId)
+```
+
+Site B (:573, 'shell terminal: SIGKILL restore yields a fresh shell in
+initialCwd') — the test interacts with the new tab via `.xterm` clicks at
+:587 and :612, which require the new tab active. Insert the reveal right
+after the tab-count poll (:574-576) and before the terminalId poll (:578):
+
+```ts
+      // REST creates are focus-neutral; reveal the new tab explicitly
+      // (user-equivalent tab-strip click) before driving its terminal.
+      await page.locator(`[data-context="tab"][data-tab-id="${tabId}"]`).click()
+      await expect.poll(async () => harness.getActiveTabId(), { timeout: 10_000 }).toBe(tabId)
+```
+
+(The pre-existing `.xterm` `.last()` selectors keep working: the new tab is
+appended last in DOM order and is now active+visible, exactly as the implicit
+activation arranged before.)
+
+**Repair 3** — `git-badges-rust.spec.ts` :194-196 (test 'a REST-created shell
+tab (POST /api/tabs {cwd}) shows a git badge (seedFromTerminal parity)'). The
+pane-visibility assertion requires the REST-created tab active. Insert
+between the tab-strip text assertion (:194) and the paneShell assertion (:195):
+
+```ts
+      // REST creates are focus-neutral; reveal the tab explicitly (user-
+      // equivalent tab-strip click) before asserting its pane is visible.
+      await page.locator(`[data-context="tab"][data-tab-id="${tabId}"]`).click()
+```
+
+**Repair 4** — `sidebar-registry-sync-rust.spec.ts` case-c ('case-c: fresh
+codex terminal collapses to a single green row'), before the `.xterm`
+interactions at :339-341. The test REST-creates the codex tab at :308-314
+(binding `restTabId`) and later types Enter into its PTY. Insert right after
+the prompt-gate poll block (ends :332):
+
+```ts
+    // REST creates are focus-neutral; reveal the codex tab explicitly (user-
+    // equivalent tab-strip click) before driving its terminal.
+    await page.locator(`[data-context="tab"][data-tab-id="${restTabId}"]`).click()
+    await expect.poll(async () => harness.getActiveTabId(), { timeout: 10_000 }).toBe(restTabId)
+```
+
+Run the five repaired tests in three invocations (`-g` applies to every spec
+basename in the same run, so the unfiltered hidden-pane spec goes alone):
+
+```bash
+env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium hidden-pane-rebind-rust
+env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium git-badges-rust sidebar-registry-sync-rust -g "a REST-created shell tab|case-c: fresh codex terminal collapses"
+env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium restore-contract-wall-rust -g "hidden-pane rebind: a background tab pane must rebind without being revealed|shell terminal: SIGKILL restore yields a fresh shell in initialCwd"
+```
+
+Expected: PASS for all five repaired tests (the reveals have the same
+semantic effect the implicit activation had, so every discriminating poll
+downstream is untouched).
 
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add src/store/tabsSlice.ts src/store/panesSlice.ts src/lib/ui-commands.ts test/unit/client/store/tabsSlice.test.ts test/unit/client/store/panesSlice.test.ts test/unit/client/ui-commands.test.ts test/e2e-browser/specs/hidden-pane-rebind-rust.spec.ts
+git add src/store/tabsSlice.ts src/store/panesSlice.ts src/lib/ui-commands.ts test/unit/client/store/tabsSlice.test.ts test/unit/client/store/panesSlice.test.ts test/unit/client/ui-commands.test.ts test/e2e-browser/specs/hidden-pane-rebind-rust.spec.ts test/e2e-browser/specs/restore-contract-wall-rust.spec.ts test/e2e-browser/specs/git-badges-rust.spec.ts test/e2e-browser/specs/sidebar-registry-sync-rust.spec.ts
 git commit -m "feat(client): focus-neutral agent-driven tab/pane creation
 
 addTab/splitPane gain activate?:boolean (default activate; addTab still
