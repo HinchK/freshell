@@ -297,6 +297,10 @@ export const RUST_ONLY_SPECS = [
   // Reconnect-revive acceptance: socket-drop/freeze revival; drives
   // RustServer + forceDisconnect + SIGSTOP (docs/plans/2026-08-22-reconnect-revive.md).
   /reconnect-revive-rust\.spec\.ts$/,
+  // MCP/REST focus neutrality: hard `expect(e2eServerKind).toBe('rust')` guard
+  // and owned-RustServer wall harness (same convention as the other entries,
+  // e.g. terminal-activity-rust).
+  /mcp-focus-neutrality-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -379,6 +383,10 @@ export default defineConfig({
         // through the same unmodified legacy MCP stdio binary. See
         // mcp-qa-smoke-rust.spec.ts's own doc comment.
         /mcp-qa-smoke-rust\.spec\.ts$/,
+        // MCP/REST focus neutrality: agent-surface creates/splits must not
+        // change client focus (Redux active tab/pane nor DOM focus); only the
+        // explicit select routes may.
+        /mcp-focus-neutrality-rust\.spec\.ts$/,
         // Lane C2 reconcile completion (see RUST_ONLY_SPECS entry above).
         /reconcile-completion-rust\.spec\.ts$/,
         // TERM-28 (`docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md`):
