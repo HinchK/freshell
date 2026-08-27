@@ -797,6 +797,12 @@ pub struct Ready {
     pub boot_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_instance_id: Option<String>,
+    /// The git commit this server binary was built from (`"unknown"`
+    /// fallback), stamped so the browser client can detect a client/server
+    /// build mismatch and reload once. Omitted from the wire entirely when
+    /// `None` (frozen-client inertness — same rule as `boot_id`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_id: Option<String>,
     /// Reconciliation-handshake advertisement (§4.2): `Some` only when the
     /// client's `hello` opted in via `capabilities.paneReconcileV1`. A client
     /// must not send `pane.reconcile.request` unless the `ready` it just

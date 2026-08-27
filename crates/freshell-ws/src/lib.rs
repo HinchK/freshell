@@ -20,6 +20,16 @@
 //! The crate emits the frozen [`freshell_protocol`] server-message types so its
 //! wire bytes are contract-locked.
 
+/// The git commit THIS binary was built from, baked into this crate at
+/// compile time by this crate's `build.rs` (`FRESHELL_WS_BUILD_COMMIT`).
+/// Falls back to the literal `"unknown"` when git was unavailable at build
+/// time (e.g. a source tarball or the Cloud Run image, which builds without
+/// git metadata) -- never a runtime failure. Build provenance is
+/// BUILD-scoped, so this deliberately does NOT ride on `WsState`.
+pub fn ready_build_id() -> Option<String> {
+    Some(option_env!("FRESHELL_WS_BUILD_COMMIT").unwrap_or("unknown").to_string())
+}
+
 pub mod activity;
 pub mod auto_resume;
 pub mod backpressure;
@@ -537,6 +547,7 @@ pub async fn build_handshake_with_capabilities(
             timestamp: now_iso(),
             boot_id: Some(boot_id.clone()),
             server_instance_id: Some(state.server_instance_id.as_ref().clone()),
+            build_id: ready_build_id(),
             capabilities: (pane_reconcile_v1 || pane_reconcile_fresh_agent_v1).then_some(
                 freshell_protocol::ReadyCapabilities {
                     pane_reconcile_v1: pane_reconcile_v1.then_some(true),
@@ -1023,6 +1034,23 @@ mod tests {
         assert_eq!(wire[3]["bootId"], wire[0]["bootId"]);
         assert_eq!(wire[3]["terminals"], json!([]));
         assert_eq!(wire[3]["terminalMeta"], json!([]));
+    }
+
+    /// The handshake `ready` stamps the build identity baked into THIS crate
+    /// by its `build.rs` (`FRESHELL_WS_BUILD_COMMIT`, the git commit the
+    /// binary was built from) so the browser client can detect a client/
+    /// server build mismatch and reload once. Never absent on the wire from
+    /// a real server: the baked value is always `Some` (sha or `"unknown"`).
+    #[tokio::test]
+    async fn handshake_ready_stamps_build_id() {
+        let msgs = build_handshake(&state()).await;
+        let ready = serde_json::to_value(&msgs[0]).unwrap();
+        assert!(
+            ready.get("buildId").is_some(),
+            "ready must stamp buildId: {ready}"
+        );
+        let build_id = ready["buildId"].as_str().expect("buildId is a string");
+        assert!(!build_id.is_empty(), "buildId must be non-empty: {build_id}");
     }
 
     /// GAP1 (CFG-03 checklist follow-up) RED/GREEN target: when boot fell

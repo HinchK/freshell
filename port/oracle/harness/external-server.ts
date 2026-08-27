@@ -110,12 +110,37 @@ export function rustServerBinPath(root: string = PROJECT_ROOT): string {
 }
 
 /**
+ * Whether the node dist's baked build stamp (written by `build:server`'s
+ * `scripts/bake-server-build-id.mjs`) matches the CURRENT checkout HEAD.
+ * True when no bake file exists (pre-stamp dist or git-less build — keep
+ * the legacy exists-only behavior), when git is unavailable, or when the
+ * stamp is unreadable: those cases have no stamp semantics to violate.
+ * False only for a REAL staleness — a bake from an earlier HEAD — which
+ * must trigger a rebuild so the oracle's node-vs-rust `buildId` comparison
+ * compares same-HEAD artifacts, never a stale checkout against a fresh
+ * cargo build.
+ */
+function nodeBuildStampIsCurrent(root: string): boolean {
+  const bakePath = path.join(root, 'dist', 'server', 'build-id.json')
+  if (!fs.existsSync(bakePath)) return true
+  try {
+    const baked = (JSON.parse(fs.readFileSync(bakePath, 'utf8')) as { buildId?: unknown }).buildId
+    if (typeof baked !== 'string' || baked === 'unknown') return true
+    const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' })
+    if (head.status !== 0) return true
+    return baked === head.stdout.trim()
+  } catch {
+    return true
+  }
+}
+
+/**
  * Ensure the production node server bundle exists. Builds it with `npm run
  * build:server` if missing. Safe to call repeatedly — a no-op once built.
  */
 export function ensureServerBuilt(root: string = PROJECT_ROOT): string {
   const entry = serverEntryPath(root)
-  if (fs.existsSync(entry)) return entry
+  if (fs.existsSync(entry) && nodeBuildStampIsCurrent(root)) return entry
 
   const result = spawnSync('npm', ['run', 'build:server'], {
     cwd: root,
