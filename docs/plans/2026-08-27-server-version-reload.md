@@ -1,5 +1,17 @@
 # Server-Build Mismatch Auto-Reload Implementation Plan
 
+> **STATUS: IMPLEMENTED (2026-08-27) — ARCHIVAL DOCUMENT. DO NOT EXECUTE.**
+> Every task below is complete: feature commits `f137951d6` (protocol + both
+> servers), `2ae0dd136` (client), `f9ac736c8` (e2e + docs), plus gate-driven
+> fixes `738e9346d`, `3e5d5de20`, `49f00cfdfd8`. Steps were checked off during
+> execution; the durable execution record lives in
+> `.git/worktrees/server-version-reload/usual-sdd/progress.md` and
+> `/home/dan/code/freshell/.worktrees/.the-usual-logs/server-version-reload/`.
+> Two as-built amendments diverge from the original text and are marked
+> inline: the lazy `defaultBakePath()` (Step 3h) and the e2e match-path
+> assertion (Task 3). The document is retained as the authoritative spec of
+> what was built.
+
 > **For agentic workers:** Execute this plan task by task with a fresh
 > implementer and a specification-plus-quality review after every task. Track
 > progress with the checkbox steps below.
@@ -50,7 +62,7 @@
 - Consumes: nothing new — `crates/freshell-server/build.rs` and `diag.rs:124` are untouched (freshell-ws now bakes its own constant; both crates compile at the same HEAD in every workspace build, so the values agree).
 - Produces: `freshell_protocol::Ready { build_id: Option<String> }` (serde camelCase → wire key `buildId`, skipped when `None`); `freshell_ws::ready_build_id() -> Option<String>` (the crate-baked sha or `"unknown"`, always `Some` in practice); `server/build-id.ts` exporting `computeBuildId(cwd?: string): string` (pure git probe), `readBakedBuildId(bakePath: string): string | undefined` (pure file read), `resolveServerBuildId(bakePath?: string): string` (bake-wins-else-probe), `serverBuildId(): string` (cached), `_resetServerBuildIdCacheForTests(): void`; `dist/server/build-id.json` (`{"buildId": "<sha|unknown>"}`) written by `build:server`; TS `ReadyMessage.buildId?: string`; regenerated `port/contract/ws-server-messages.schema.json` with an optional `buildId` on `ready` (still `additionalProperties: false`). Task 2's client schema and Task 3's e2e injection consume the wire key `buildId`.
 
-- [ ] **Step 1: Write the failing behavioral tests (protocol roundtrip, rust wire, node module, node wire)**
+- [x] **Step 1: Write the failing behavioral tests (protocol roundtrip, rust wire, node module, node wire)**
 
 1a. Add to `crates/freshell-protocol/tests/roundtrip.rs` immediately after the `ready_carries_server_instance_id_and_boot_id` test (line 164):
 
@@ -271,7 +283,7 @@ describe('server build id', () => {
   })
 ```
 
-- [ ] **Step 2: Run the tests and verify the intended failures**
+- [x] **Step 2: Run the tests and verify the intended failures**
 
 ```bash
 cargo test -p freshell-protocol --test roundtrip ready_carries_build_id_and_omits_it_when_absent
@@ -281,7 +293,7 @@ npm run test:vitest -- run test/server/build-id.test.ts test/server/ws-handshake
 
 Expected: all FAIL for the missing behavior — the Rust roundtrip test fails to COMPILE (`no field \`build_id\` on struct Ready`); the freshell-ws wire test COMPILES (it references no new symbols) and fails its first assertion (`ready must stamp buildId` — the ready frame carries no `buildId`); `build-id.test.ts` fails to resolve `../../server/build-id.js` (module missing); the new snapshot test fails on `expect(typeof ready1.buildId).toBe('string')`.
 
-- [ ] **Step 3: Add the minimal production implementation**
+- [x] **Step 3: Add the minimal production implementation**
 
 3a. `shared/ws-protocol.ts` — in `ReadyMessage` (lines 743-750), add after `bootId`:
 
@@ -657,7 +669,7 @@ to
   if (fs.existsSync(entry) && nodeBuildStampIsCurrent(root)) return entry
 ```
 
-- [ ] **Step 4: Run the focused tests**
+- [x] **Step 4: Run the focused tests**
 
 ```bash
 cargo test -p freshell-protocol --test roundtrip ready_carries_build_id_and_omits_it_when_absent
@@ -667,11 +679,11 @@ npm run test:vitest -- run test/server/build-id.test.ts test/server/ws-handshake
 
 Expected: all PASS.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 No refactor needed — the Rust stamp mirrors the adjacent `boot_id` idiom, and the Node stamp mirrors `bootId`'s always-stamped treatment. Do NOT regenerate `port/oracle/fixtures/handshake-transcript.json`: the frozen transcript stays byte-valid because Rust omits `build_id` when deserialized as `None`, and the mutation/oracle suites consume the regenerated SCHEMA (not the live node bytes) for conformance.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 This change touches the shared wire protocol, both server implementations, the generated schema, and the `build:server` pipeline, so the impacted set is: both Rust crates' full test trees, the workspace compile, the whole server-config suite (any test asserting handshake/ready shapes), the port contract suites, and the port-ORACLE suites. **`npm run test:port` does NOT run the oracle suites** (`vitest.port.config.ts` excludes `test/unit/port/oracle/**`; they run only via `npm run test:oracle`, which boots real servers — budget several minutes). Notes:
 
@@ -691,7 +703,7 @@ npm run test:oracle
 
 Expected: all PASS, and `dist/server/build-id.json` contains the current worktree HEAD sha.
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 Stage by directory so every compiler-enumerated fix lands in the commit (the worktree starts clean; verify nothing unexpected is staged):
 
@@ -720,7 +732,7 @@ Expected: the first `git status --short` lists exactly the Task 1 files (all und
 - Consumes: Task 1's wire contract (`ReadyMessage.buildId?: string`, parsed by `ReadyMessageSchema`).
 - Produces: `checkServerBuildId(options?: ServerBuildCheckOptions): void` from `@/lib/server-build-check`, with `ServerBuildCheckOptions { clientBuildId?: string; serverBuildId?: string; reload?: () => void; storage?: Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> }`; `__FRESHELL_BUILD_ID__: string` available client-side at build time. Task 3's e2e exercises the production wiring end to end.
 
-- [ ] **Step 1: Write the failing behavioral tests**
+- [x] **Step 1: Write the failing behavioral tests**
 
 1a. Create `test/unit/client/lib/server-build-check.test.ts`:
 
@@ -986,7 +998,7 @@ describe('App ready buildId → one-shot server-build reload', () => {
 })
 ```
 
-- [ ] **Step 2: Run the tests and verify the intended failures**
+- [x] **Step 2: Run the tests and verify the intended failures**
 
 ```bash
 npm run test:vitest -- run test/unit/client/lib/server-build-check.test.ts test/unit/client/components/App.restart-signals.test.tsx
@@ -994,7 +1006,7 @@ npm run test:vitest -- run test/unit/client/lib/server-build-check.test.ts test/
 
 Expected: FAIL — `server-build-check.test.ts` cannot resolve `@/lib/server-build-check` (module missing), and the App tests fail because a ready with `buildId` triggers no reload (`expect(reloadCalls).toBe(1)` sees 0).
 
-- [ ] **Step 3: Add the minimal production implementation**
+- [x] **Step 3: Add the minimal production implementation**
 
 3a. Create `src/lib/server-build-check.ts`:
 
@@ -1183,7 +1195,7 @@ Add the call inside the `else` (ready-success) branch, immediately after the `if
             checkServerBuildId({ serverBuildId: ready.data.buildId })
 ```
 
-- [ ] **Step 4: Run the focused tests**
+- [x] **Step 4: Run the focused tests**
 
 ```bash
 npm run test:vitest -- run test/unit/client/lib/server-build-check.test.ts test/unit/client/components/App.restart-signals.test.tsx
@@ -1191,7 +1203,7 @@ npm run test:vitest -- run test/unit/client/lib/server-build-check.test.ts test/
 
 Expected: PASS.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Verify the Vite define actually bakes the sha into the bundle (explicit pass/fail so automation cannot swallow a failed match through a pipe):
 
@@ -1202,7 +1214,7 @@ rg -q "$(git rev-parse HEAD)" dist/client/assets/*.js && echo "BAKE OK: sha pres
 
 Expected: `BAKE OK: sha present in bundle` — the command exits 0. A missing bake prints `BAKE MISSING` and exits NONZERO (the failure branch must not mask the failure behind a successful `echo`). (`npm run build:client` from this worktree writes the worktree's own `dist/client` — the main-checkout `npm run build` production-server guard does not apply here.)
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 `ReadyMessageSchema` and App's ready handling are shared client-critical paths and the define constant touches the whole client build; the impacted set is the client unit suite plus typecheck and lint:
 
@@ -1214,7 +1226,7 @@ npm run test:vitest -- run test/unit/client
 
 Expected: all PASS.
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 ```bash
 git add src/lib/server-build-check.ts config/vite/vite.config.ts src/vite-env.d.ts src/App.tsx test/unit/client/lib/server-build-check.test.ts test/unit/client/components/App.restart-signals.test.tsx
@@ -1235,7 +1247,7 @@ git commit -m "feat(client): reload once when ready.buildId differs from the bak
 - Consumes: Tasks 1-2 (both servers stamp `ready.buildId`; the client compares and reloads once; `TestHarness.receiveWsMessage` → `ws.receiveMessageForTest` → `handleIncomingMessage` feeds an injected frame through the real App ready handler — verified at `src/lib/ws-client.ts:917-919`).
 - Produces: the user-outcome proof on the LOCAL lane — a stale client against a newer server reboots itself exactly once and converges to a healthy ready connection; sessionStorage persistence across a REAL navigation; repeat mismatches suppressed by the sentinel.
 
-- [ ] **Step 1: Write the failing behavioral test**
+- [x] **Step 1: Write the failing behavioral test**
 
 Create `test/e2e-browser/specs/server-build-mismatch-rust.spec.ts`:
 
@@ -1421,7 +1433,7 @@ In `AGENTS.md`, under "Key Architectural Patterns", append to the **WebSocket Pr
 The `ready` frame carries an optional additive `buildId` (the server's artifact-time-baked git commit, `"unknown"` fallback): the client bakes its own at Vite build time (`__FRESHELL_BUILD_ID__`) and, on a mismatch, reloads exactly once per tab session (sessionStorage sentinel `freshell.server-build-reload`), self-healing stale-client contract errors; `"unknown"` on either side never triggers or clears the guard (`src/lib/server-build-check.ts`). The once-guard is per server identity: an origin fronted by mixed-build servers could oscillate, and a newer client against an older server costs one futile bounded reload per fresh tab session (both accepted for the single-server self-hosted model).
 ```
 
-- [ ] **Step 2: Run the test and verify it passes, then RED-VERIFY it exercises the feature**
+- [x] **Step 2: Run the test and verify it passes, then RED-VERIFY it exercises the feature**
 
 Build the client fresh first so the served bundle provably contains the feature (the red-verification's validity depends on it):
 
@@ -1455,19 +1467,19 @@ npx playwright test --config test/e2e-browser/playwright.config.ts --project=rus
 
 Expected: PASS. (Record all three runs in the task review — the red-verification is mandatory.)
 
-- [ ] **Step 3: No production implementation step**
+- [x] **Step 3: No production implementation step**
 
 Tasks 1-2 implemented the behavior; this task only proves it end to end.
 
-- [ ] **Step 4: Run the focused test**
+- [x] **Step 4: Run the focused test**
 
 Same command as Step 2's final run. Expected: PASS.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 No refactor needed. Confirm the registration mechanics: excluded from the match-all `chromium` project by the `RUST_ONLY_SPECS` entry (`testIgnore: RUST_ONLY_SPECS` at `playwright.config.ts:330`), included in `rust-chromium`'s `testMatch`, and skipped on the cloud lane by the `CLOUD_SKIP_SPECS` entry with its justification comment.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 Playwright registration changed (a new rust-only spec) and AGENTS.md was touched; the impacted set is the rust-chromium self-test that boots a real Rust server through its own fixture (proving the registration change disturbed nothing — note `continuity-smoke.spec.ts` runs ONLY under its own conditional `continuity-smoke` project, NOT under `rust-chromium`, so it must not be used as the neighbor here) plus the two unit files most adjacent to the feature:
 
@@ -1478,7 +1490,7 @@ npm run test:vitest -- run test/unit/client/lib/server-build-check.test.ts test/
 
 Expected: all PASS. Backend note: the repo rule about the configured `FRESHELL_E2E_BACKEND` is honored at execution kickoff — the user chooses local vs cloud once, INFORMED that this spec is cloud-incompatible by construction (the cloud image builds without git metadata, so both stamps are `"unknown"` and the compare is inert there). Regardless of the choice, this spec's coverage lane is the LOCAL rust-chromium project and it is CLOUD_SKIP'd with that justification (`playwright.cloud.config.ts`); if the user chooses cloud, the PR description documents the skip explicitly so no coverage claim is silent. No cloud claim is made about cargo (the cloud runtime uses a prebuilt binary; cargo never runs there per `rust-server.ts:82-90`).
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 ```bash
 git add test/e2e-browser/specs/server-build-mismatch-rust.spec.ts test/e2e-browser/playwright.config.ts test/e2e-browser/playwright.cloud.config.ts AGENTS.md

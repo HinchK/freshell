@@ -21,8 +21,9 @@
  * deterministic here: after any reload the boot's REAL ready either matches
  * (same-HEAD artifacts → legitimately clears the sentinel) or mismatches
  * (stale-bake environments → keeps it), so the post-reload sentinel state
- * is environment-dependent — hence the persistence test reads at commit
- * time and the suppression test seeds its state AFTER the boot settles.
+ * is environment-dependent — hence the persistence test snapshots the
+ * sentinel at DOCUMENT CREATION (an init script runs before page scripts)
+ * and the suppression test seeds its state AFTER the boot settles.
  * Seeding is state setup, the same practice as seeding localStorage in
  * other suites; the PERSISTENCE and SUPPRESSION behavior exercised is
  * entirely production code.
@@ -119,10 +120,21 @@ test.describe('server build mismatch reload (rust)', () => {
     await page.evaluate((key) => sessionStorage.setItem(key, '1'), SENTINEL)
 
     // A REAL navigation: sessionStorage must survive it (per-tab, per-origin
-    // storage) — read at commit time, BEFORE the rebooted app's real ready
-    // can legitimately match-and-clear it (same-HEAD artifacts match).
+    // storage). The value is snapshotted at DOCUMENT CREATION — an init
+    // script runs before page scripts — so it is immune to the rebooted
+    // app's later match-and-clear (same-HEAD artifacts legitimately clear
+    // the sentinel after the real ready): the reload's `commit` event only
+    // guarantees the document exists, and by the time the new app has
+    // received the real (matching) ready it may ALREADY have cleared the
+    // sentinel before a late `page.evaluate` could read it. `null` would
+    // mean absent at document start; `'1'` means persisted.
+    await page.addInitScript((key) => {
+      ;(window as any).__sentinelAtDocumentStart = window.sessionStorage.getItem(key)
+    }, SENTINEL)
     await page.reload({ waitUntil: 'commit' })
-    const persisted = await page.evaluate((key) => sessionStorage.getItem(key), SENTINEL)
+    const persisted = await page
+      .waitForFunction(() => (window as any).__sentinelAtDocumentStart !== undefined)
+      .then(() => page.evaluate(() => (window as any).__sentinelAtDocumentStart))
     expect(persisted, 'sentinel must survive a real navigation').toBe('1')
 
     await context.close()
