@@ -6,20 +6,24 @@
 
 **Goal:** When a browser tab connects (or reconnects) to a Freshell server built from a different commit than the client bundle it is running, the client detects the mismatch from the WS `ready` frame and reloads itself exactly once — self-healing the "Fresh-agent snapshot response did not match the shared contract" class of stale-client failures without ever reload-looping.
 
-**Architecture:** All three producers stamp the same identity — `git rev-parse HEAD` with literal `"unknown"` fallback (Rust at compile time via the existing `build.rs`, Node at first use via a new cached module, client at Vite build time via a `define` constant). The WS `ready` message gains an additive optional `buildId` field (omitted from the wire when the Rust value is `None`, so frozen transcripts stay byte-identical; the Node frame always stamps it, mirroring `bootId`). The client compares its baked `__FRESHELL_BUILD_ID__` against every parsed `ready.buildId`; on mismatch it sets a `sessionStorage` sentinel and calls `location.reload()` exactly once per tab session (the sentinel also self-clears on a subsequent match, re-arming the guard).
+**Architecture:** All three producers stamp the same identity — `git rev-parse HEAD` with literal `"unknown"` fallback — each baked/resolved at the time its ARTIFACT is produced: Rust at compile time (new `crates/freshell-ws/build.rs`, mirroring the existing `freshell-server/build.rs`), Node at `build:server` time (a bake script writes `dist/server/build-id.json`, which the server prefers over a runtime git probe; dev mode via tsx correctly falls back to the runtime probe because it runs current source), client at Vite build time via a `define` constant. The WS `ready` message gains an additive optional `buildId` field (omitted from the wire when the Rust value is `None`, so frozen transcripts stay byte-identical; the Node frame always stamps it, mirroring `bootId`). The client compares its baked `__FRESHELL_BUILD_ID__` against every parsed `ready.buildId`; on mismatch it sets a `sessionStorage` sentinel and calls `location.reload()` exactly once per tab session (the sentinel also self-clears on a subsequent match, re-arming the guard).
 
-**Tech Stack:** Rust (serde/serde_json, tokio, existing `freshell-protocol`/`freshell-ws` crates), Node.js/ESM (`node:child_process`), React 18 + Vite `define` + Zod, Vitest (jsdom client config / node server config), Playwright (rust-chromium project).
+**Tech Stack:** Rust (serde/serde_json, tokio, build scripts, existing `freshell-protocol`/`freshell-ws` crates), Node.js/ESM (`node:child_process`, `node:fs`), React 18 + Vite `define` + Zod, Vitest (jsdom client config / node server config), Playwright (rust-chromium project, local lane).
 
 ## Global Constraints
 
 - **Worktree discipline:** All work happens in `/home/dan/code/freshell/.worktrees/server-version-reload` on branch `the-usual/server-version-reload`. Never run `node dist/server/index.js`; never touch the live 3001 server or `~/.freshell` state. No deploy/restart is part of this plan.
-- **Additive contract only ("bootId doctrine"):** `buildId` is optional everywhere and omitted from the wire when the Rust value is `None`. Old clients must not break; the frozen `port/oracle/fixtures/handshake-transcript.json` must remain byte-valid without regenerating it. The Node ready frame ALWAYS stamps `buildId` (string, `"unknown"` fallback) — mirroring how it always stamps `bootId` — and the Rust handshake always stamps `Some(...)` from `WsState.build_id`. Both servers MUST stamp in the same commit (Task 1): the T0 oracle deep-diffs node-vs-rust handshakes, so an intermediate where only one side stamps would fail it.
-- **Value semantics on every side:** the value is the full `git rev-parse HEAD` SHA of the repo at build/bake time; when git is unavailable or the output is not 40 lowercase hex chars, the literal `"unknown"`. The client's compare rule: reload iff BOTH ids are present, non-empty, neither is `"unknown"`, and they differ. `"unknown" == "unknown"` is NOT a match-and-clear (it is a no-op) — two unknown builds must never trigger a reload and must never clear an armed sentinel.
-- **Loop-guard invariant:** at most ONE reload per tab session. The sentinel key is `freshell.server-build-reload` (`sessionStorage`, value `"1"`), set BEFORE calling `reload()`. If `sessionStorage` throws, no reload happens (fail-safe). A matching `ready` clears the sentinel (self-re-arm).
+- **Additive contract only ("bootId doctrine"):** `buildId` is optional everywhere and omitted from the wire when the Rust value is `None`. Old clients must not break; the frozen `port/oracle/fixtures/handshake-transcript.json` must remain byte-valid without regenerating it. The Node ready frame ALWAYS stamps `buildId` (string, `"unknown"` fallback) — mirroring how it always stamps `bootId` — and the Rust handshake stamps `Some(...)` from its crate-baked constant.
+- **Build-scoped, not boot-scoped:** build provenance is a compile-time property of the code, so it does NOT ride on `WsState` (whose doc comment scopes it to boot-scoped ids injected by `freshell-server`). `freshell-ws` bakes its own constant via its own `build.rs`; the value equals `freshell-server`'s bake because both crates compile in the same `cargo build` at the same HEAD.
+- **Artifact-time semantics everywhere:** each stamp describes the artifact that emits it. Rust bakes at compile; Node's production stamp comes from the `dist/server/build-id.json` written by `build:server` (a stale dist advertises the sha it was BUILT from — never the checkout's current HEAD); tsx dev mode has no bake file next to source and probes runtime HEAD (correct: it runs current source); Vite bakes the client's sha at bundle time.
+- **Value semantics on every side:** the value is the full `git rev-parse HEAD` SHA of the repo at build/bake time; when git is unavailable or the output is not 40 lowercase hex chars (Node/Vite enforce the 40-hex check; the Rust scripts accept any successful output), the literal `"unknown"`. Known caveat (accepted, documented): a SHA-256 git checkout would make Rust stamp 64 hex while Node/Vite stamp `"unknown"` — the guard goes inert (no false reloads, no crash); this repo is SHA-1.
+- **Client compare rule:** reload iff BOTH ids are present, non-empty, neither is `"unknown"`, and they differ. `"unknown" == "unknown"` is NOT a match-and-clear (it is a no-op) — two unknown builds must never trigger a reload and must never clear an armed sentinel. The compare is direction-free: a NEWER client against an OLDER server also performs one bounded reload per fresh tab session (futile but harmless; shas carry no ordering) — documented, accepted.
+- **Loop-guard invariant:** at most ONE code-triggered reload per tab session, per server identity. The sentinel key is `freshell.server-build-reload` (`sessionStorage`, value `"1"`), set BEFORE calling `reload()`. If `sessionStorage` cannot be read or written (property access throwing a SecurityError, quota errors, absent API), no reload happens and the suppression failure is logged (fail-safe with observability). A matching `ready` clears the sentinel (self-re-arm). KNOWN LIMIT (accepted, documented): one origin fronted by servers built from DIFFERENT commits could oscillate (mismatch → reload → match clears → mismatch → …); deliberately not hardened with a clears-per-session cap for the single-server self-hosted threat model.
 - **Client module must not crash under Vitest:** the Vitest client config has no `__FRESHELL_BUILD_ID__` define, so the module must use a `typeof __FRESHELL_BUILD_ID__ === 'undefined'` guard (same precedent as `src/lib/perf-logger.ts:45` with `__PERF_LOGGING__`).
 - **NodeNext/ESM:** every relative import in `server/` and `shared/` uses `.js` extensions; client code uses `@/` aliases without extensions.
-- **Test coordination:** broad suites go through the repo coordinator (`npm run test:vitest -- run ...`); never raw `npx vitest`. Focused Rust tests use `cargo test -p <crate>` directly.
-- **Scope boundary:** client-only redeploys (redeploying a new client bundle WITHOUT a server change) are deliberately NOT covered — no auto-refresh loop, no polling, no `/api/server-info` polling fallback. The ready-frame compare is the only trigger.
+- **Test coordination:** broad suites go through the repo coordinator (`npm run test:vitest -- run ...`); never raw `npx vitest`. Focused Rust tests use `cargo test -p <crate>` directly. The port-ORACLE suites are NOT covered by `npm run test:port` / `npm run check` — they run only via `npm run test:oracle`.
+- **E2E backend rule:** per repo instructions, when `FRESHELL_E2E_BACKEND` is unset the user chooses local vs cloud before e2e runs — surface that question once at execution kickoff and record the answer in `run-state.md`. This feature's e2e coverage lane is the LOCAL `rust-chromium` project regardless: the new spec is added to `CLOUD_SKIP_SPECS` with a technical justification (the cloud image builds without git metadata, so both stamps are `"unknown"` and the compare is inert there — see Task 3). Never claim a cloud run proves cargo availability: the cloud runtime uses a prebuilt binary and cargo never runs there (`test/e2e-browser/helpers/rust-server.ts:82-90`).
+- **Scope boundary:** client-only redeploys (redeploying a new client bundle WITHOUT a server change) are deliberately NOT covered by any auto-trigger — no polling, no `/api/server-info` fallback, no reload loop. The ready-frame compare is the only trigger; a client-only redeploy costs at most one bounded reload per fresh tab session.
 - **No unrelated restructuring; comments explain invariants, in the existing voice.**
 
 ---
@@ -29,20 +33,21 @@
 **Files:**
 - Modify: `shared/ws-protocol.ts:743-750` (`ReadyMessage` type)
 - Modify: `crates/freshell-protocol/src/server_messages.rs:792-806` (`Ready` struct)
-- Modify: `crates/freshell-ws/src/lib.rs:97-124` (`WsState` struct field), `:529-546` (`build_handshake_with_capabilities`), `:868-917` (`state()` test builder)
-- Modify: `crates/freshell-server/src/main.rs:1011-1066` (`WsState` literal)
+- Create: `crates/freshell-ws/build.rs` (crate-local commit bake; adapted from `crates/freshell-server/build.rs`)
+- Modify: `crates/freshell-ws/src/lib.rs` (`ready_build_id()` helper + handshake `Ready` literal stamp at :536; wire test in `mod tests` after `handshake_is_ordered_with_shared_bootid` ending :1026)
 - Modify: `crates/freshell-protocol/tests/pane_reconcile.rs:52-82` (two `Ready` literals)
+- Modify: `package.json` (`build:server` script gains the bake step)
+- Create: `scripts/bake-server-build-id.mjs`
 - Create: `server/build-id.ts`
 - Modify: `server/ws-handler.ts` (import block; field after `:587`; init after `:651`; ready send `:2034-2039`)
 - Modify (generated): `port/contract/ws-server-messages.schema.json` (via `npm run contract:generate`)
 - Test: `crates/freshell-protocol/tests/roundtrip.rs` (new test after `ready_carries_server_instance_id_and_boot_id`, which ends at line 164)
-- Test: `crates/freshell-ws/src/lib.rs` `#[cfg(test)] mod tests` (new test after `handshake_is_ordered_with_shared_bootid`, which ends at line 1026)
 - Test: `test/server/build-id.test.ts` (new)
 - Test: `test/server/ws-handshake-snapshot.test.ts` (new test after the `includes a bootId in the ready message...` test, which ends at line 301)
 
 **Interfaces:**
-- Consumes: `crates/freshell-server/src/diag.rs:124` `pub(crate) fn build_commit() -> &'static str` (already returns the baked `FRESHELL_BUILD_COMMIT` or `"unknown"`; `build.rs` re-stamps on HEAD moves — no change needed there).
-- Produces: `freshell_protocol::Ready { build_id: Option<String> }` (serde camelCase → wire key `buildId`, skipped when `None`); `freshell_ws::WsState { build_id: Arc<String> }`; `server/build-id.ts` exporting `computeBuildId(cwd?: string): string` (pure) and `serverBuildId(): string` (cached per process); TS `ReadyMessage.buildId?: string`; regenerated `port/contract/ws-server-messages.schema.json` with an optional `buildId` on `ready` (still `additionalProperties: false`). Task 2's client schema and Task 3's e2e injection consume the wire key `buildId`.
+- Consumes: nothing new — `crates/freshell-server/build.rs` and `diag.rs:124` are untouched (freshell-ws now bakes its own constant; both crates compile at the same HEAD in every workspace build, so the values agree).
+- Produces: `freshell_protocol::Ready { build_id: Option<String> }` (serde camelCase → wire key `buildId`, skipped when `None`); `freshell_ws::ready_build_id() -> Option<String>` (the crate-baked sha or `"unknown"`, always `Some` in practice); `server/build-id.ts` exporting `computeBuildId(cwd?: string): string` (pure git probe), `readBakedBuildId(bakePath: string): string | undefined` (pure file read), `resolveServerBuildId(bakePath?: string): string` (bake-wins-else-probe), `serverBuildId(): string` (cached), `_resetServerBuildIdCacheForTests(): void`; `dist/server/build-id.json` (`{"buildId": "<sha|unknown>"}`) written by `build:server`; TS `ReadyMessage.buildId?: string`; regenerated `port/contract/ws-server-messages.schema.json` with an optional `buildId` on `ready` (still `additionalProperties: false`). Task 2's client schema and Task 3's e2e injection consume the wire key `buildId`.
 
 - [ ] **Step 1: Write the failing behavioral tests (protocol roundtrip, rust wire, node module, node wire)**
 
@@ -82,16 +87,18 @@ fn ready_carries_build_id_and_omits_it_when_absent() {
 1b. Add to `crates/freshell-ws/src/lib.rs` inside `mod tests`, immediately after `handshake_is_ordered_with_shared_bootid` (line 1026):
 
 ```rust
-    /// The handshake `ready` stamps the build identity (`WsState.build_id`,
-    /// baked from `diag::build_commit()` by `freshell-server`'s `main.rs`) so
-    /// the browser client can detect a client/server build mismatch and
-    /// reload once. Serde omits the field when `None`; a real server always
-    /// stamps `Some` (sha or `"unknown"`), so presence is asserted here.
+    /// The handshake `ready` stamps the build identity baked into THIS crate
+    /// by its `build.rs` (`FRESHELL_WS_BUILD_COMMIT`, the git commit the
+    /// binary was built from) so the browser client can detect a client/
+    /// server build mismatch and reload once. Never absent on the wire from
+    /// a real server: the baked value is always `Some` (sha or `"unknown"`).
     #[tokio::test]
     async fn handshake_ready_stamps_build_id() {
         let msgs = build_handshake(&state()).await;
         let ready = serde_json::to_value(&msgs[0]).unwrap();
-        assert_eq!(ready["buildId"], "build-3333");
+        let baked = ready_build_id().expect("crate always bakes a build id");
+        assert!(!baked.is_empty());
+        assert_eq!(ready["buildId"], serde_json::json!(baked));
     }
 ```
 
@@ -103,20 +110,48 @@ import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { describe, expect, it } from 'vitest'
-import { computeBuildId, serverBuildId } from '../../server/build-id.js'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import {
+  _resetServerBuildIdCacheForTests,
+  computeBuildId,
+  readBakedBuildId,
+  resolveServerBuildId,
+  serverBuildId,
+} from '../../server/build-id.js'
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>()
+  return { ...actual, execFileSync: vi.fn(actual.execFileSync) }
+})
+
+// The module under test imports execFileSync by name; re-import it mocked.
+import { execFileSync as mockedExecFileSync } from 'node:child_process'
+
+function tempBakeFile(buildId: string | null): { dir: string; bakePath: string } {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'build-id-bake-'))
+  const bakePath = path.join(dir, 'build-id.json')
+  if (buildId !== null) {
+    fs.writeFileSync(bakePath, JSON.stringify({ buildId }))
+  }
+  return { dir, bakePath }
+}
+
 describe('server build id', () => {
-  it('returns the current git HEAD sha for the repository', () => {
+  afterEach(() => {
+    _resetServerBuildIdCacheForTests()
+    vi.mocked(mockedExecFileSync).mockClear()
+  })
+
+  it('computeBuildId returns the current git HEAD sha for the repository', () => {
     const expected = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: REPO_ROOT })
       .toString()
       .trim()
     expect(computeBuildId(REPO_ROOT)).toBe(expected)
   })
 
-  it('falls back to "unknown" outside a git repository', () => {
+  it('computeBuildId falls back to "unknown" outside a git repository', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'build-id-no-git-'))
     try {
       expect(computeBuildId(dir)).toBe('unknown')
@@ -125,8 +160,57 @@ describe('server build id', () => {
     }
   })
 
-  it('caches the id within a process', () => {
-    expect(serverBuildId()).toBe(serverBuildId())
+  it('readBakedBuildId returns the baked value for a well-formed file', () => {
+    const { dir, bakePath } = tempBakeFile('b'.repeat(40))
+    try {
+      expect(readBakedBuildId(bakePath)).toBe('b'.repeat(40))
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('readBakedBuildId returns undefined for malformed JSON, wrong shapes, or a missing file', () => {
+    const { dir, bakePath } = tempBakeFile(null)
+    try {
+      fs.writeFileSync(bakePath, 'not json {')
+      expect(readBakedBuildId(bakePath)).toBeUndefined()
+      fs.writeFileSync(bakePath, JSON.stringify({ buildId: 42 }))
+      expect(readBakedBuildId(bakePath)).toBeUndefined()
+      fs.writeFileSync(bakePath, JSON.stringify({ buildId: '' }))
+      expect(readBakedBuildId(bakePath)).toBeUndefined()
+      expect(readBakedBuildId(path.join(dir, 'absent.json'))).toBeUndefined()
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('resolveServerBuildId prefers the bake file over a runtime git probe', () => {
+    const { dir, bakePath } = tempBakeFile('c'.repeat(40))
+    try {
+      expect(resolveServerBuildId(bakePath)).toBe('c'.repeat(40))
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('resolveServerBuildId falls back to the runtime git probe when no bake file exists', () => {
+    const { dir } = tempBakeFile(null)
+    try {
+      expect(resolveServerBuildId(path.join(dir, 'build-id.json'))).toBe(computeBuildId(REPO_ROOT))
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('serverBuildId memoizes: the git probe runs once per process', () => {
+    _resetServerBuildIdCacheForTests()
+    // Source runs (tsx/vitest) have no bake file next to server/build-id.ts,
+    // so the first resolution exercises the git probe.
+    const first = serverBuildId()
+    const callsAfterFirst = vi.mocked(mockedExecFileSync).mock.calls.length
+    expect(serverBuildId()).toBe(first)
+    expect(vi.mocked(mockedExecFileSync).mock.calls.length).toBe(callsAfterFirst)
+    expect(callsAfterFirst).toBeGreaterThan(0)
   })
 })
 ```
@@ -149,7 +233,8 @@ describe('server build id', () => {
         waitForReady(ws2, 10_000),
       ])
 
-      // Always stamped (sha or "unknown" fallback), stable within the process.
+      // Always stamped (bake or runtime probe, "unknown" fallback), stable
+      // within the process.
       expect(typeof ready1.buildId).toBe('string')
       expect((ready1.buildId as string).length).toBeGreaterThan(0)
       expect(ready2.buildId).toBe(ready1.buildId)
@@ -170,7 +255,7 @@ cargo test -p freshell-ws handshake_ready_stamps_build_id
 npm run test:vitest -- run test/server/build-id.test.ts test/server/ws-handshake-snapshot.test.ts --config config/vitest/vitest.server.config.ts
 ```
 
-Expected: all FAIL for the missing behavior — the two Rust commands fail to COMPILE (`no field \`build_id\` on struct Ready` / `no field \`build_id\` on struct WsState`); `build-id.test.ts` fails to resolve `../../server/build-id.js` (module missing); the new snapshot test fails on `expect(typeof ready1.buildId).toBe('string')` (the Node ready frame carries no `buildId`).
+Expected: all FAIL for the missing behavior — the Rust roundtrip test fails to COMPILE (`no field \`build_id\` on struct Ready`); the freshell-ws wire test COMPILES (it references no new field) and fails its JSON assertion (`ready["buildId"]` is JSON null ≠ the baked string — the ready frame carries no `buildId`); `build-id.test.ts` fails to resolve `../../server/build-id.js` (module missing); the new snapshot test fails on `expect(typeof ready1.buildId).toBe('string')`.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -212,61 +297,187 @@ Expected: the regenerated diff adds an optional `buildId` property to the `ready
     pub build_id: Option<String>,
 ```
 
-3d. `crates/freshell-ws/src/lib.rs` — in `WsState`, after the `boot_id` field (line 103):
+3d. Create `crates/freshell-ws/build.rs` — crate-local commit bake, adapted from `crates/freshell-server/build.rs` (which keeps its own, dirty-flag-inclusive copy; the two crates compile in the same `cargo build` at the same HEAD, so the values agree). Keep the module doc short and point at the original for the full rationale:
 
 ```rust
-    /// The git commit this server binary was built from (`"unknown"`
-    /// fallback) — baked once per build by `freshell-server`'s `main.rs` from
-    /// `diag::build_commit()` and stamped into every handshake's `ready`.
-    pub build_id: Arc<String>,
+//! Compile-time build-provenance stamp for `freshell-ws`: bakes the git
+//! commit SHA into `FRESHELL_WS_BUILD_COMMIT` so the WS handshake's `ready`
+//! can stamp `ready.buildId` (client-side stale-bundle auto-reload).
+//! Build provenance is BUILD-scoped, not boot-scoped, so it deliberately
+//! does NOT ride on `WsState` (whose contents are boot-scoped ids/state
+//! injected by `freshell-server`). The full worktree-aware rationale for
+//! the `rerun-if-changed` set lives in `crates/freshell-server/build.rs` —
+//! this copy performs the SAME resolved-HEAD/ref/packed-refs watching so a
+//! cached rebuild re-stamps when HEAD moves; both crates compile in the
+//! same workspace build, so their baked commits agree. Never fails the
+//! build over a missing/unavailable `git` (falls back to `"unknown"`).
+
+use std::path::PathBuf;
+use std::process::Command;
+
+fn main() {
+    let commit = git_head_commit().unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=FRESHELL_WS_BUILD_COMMIT={commit}");
+    for path in rerun_paths() {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+}
+
+/// `git rev-parse HEAD`, trimmed. `None` on any failure (git not on `PATH`,
+/// not inside a git checkout, ...) -- the caller falls back to `"unknown"`.
+fn git_head_commit() -> Option<String> {
+    let out = Command::new("git").args(["rev-parse", "HEAD"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// The exact paths that change when HEAD moves in THIS checkout, resolved
+/// worktree-aware via `git rev-parse --git-path` (see the module doc and
+/// `crates/freshell-server/build.rs`'s richer version for why each entry is
+/// watched). Skipped resolutions degrade to cargo's default heuristics.
+fn rerun_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let git_path = |arg: &str| {
+        Command::new("git")
+            .args(["rev-parse", "--git-path", arg])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
+            .filter(|p| !p.as_os_str().is_empty())
+    };
+    if let Some(head) = git_path("HEAD") {
+        paths.push(head);
+    }
+    if let Some(head) = git_path("HEAD") {
+        if let Ok(contents) = std::fs::read_to_string(&head) {
+            if let Some(ref_name) = contents.strip_prefix("ref: ") {
+                if let Some(resolved) = git_path(ref_name.trim()) {
+                    paths.push(resolved);
+                }
+            }
+        }
+    }
+    if let Some(packed) = git_path("packed-refs") {
+        if packed.exists() {
+            paths.push(packed);
+        }
+    }
+    paths
+}
 ```
 
-In `build_handshake_with_capabilities`, in the `Ready` literal (lines 536-546), add after `server_instance_id`:
+3e. `crates/freshell-ws/src/lib.rs` — add the read-back helper near the top of the crate (after the imports, before `WsState`), and stamp it in the handshake:
 
 ```rust
-            build_id: Some(state.build_id.as_ref().clone()),
+/// The git commit THIS binary was built from, baked into this crate at
+/// compile time by this crate's `build.rs` (`FRESHELL_WS_BUILD_COMMIT`).
+/// Falls back to the literal `"unknown"` when git was unavailable at build
+/// time (e.g. a source tarball or the Cloud Run image, which builds without
+/// git metadata) -- never a runtime failure. Build provenance is
+/// BUILD-scoped, so this deliberately does NOT ride on `WsState`.
+pub fn ready_build_id() -> Option<String> {
+    Some(option_env!("FRESHELL_WS_BUILD_COMMIT").unwrap_or("unknown").to_string())
+}
 ```
 
-3e. Fix every struct-literal site so the workspace compiles. In `crates/freshell-ws/src/lib.rs`'s `state()` test builder (after `boot_id: Arc::new("boot-2222".to_string()),` at line 878):
+In `build_handshake_with_capabilities`, in the `Ready` literal (line 536), add after `server_instance_id`:
 
 ```rust
-            build_id: Arc::new("build-3333".to_string()),
+            build_id: ready_build_id(),
 ```
 
-In `crates/freshell-server/src/main.rs`'s `WsState` literal (after the `boot_id: Arc::clone(&boot_id),` line at 1031):
-
-```rust
-        // The build identity every handshake `ready` stamps (client-side
-        // stale-bundle auto-reload). SAME source `GET /api/server-info`'s
-        // `commit` reports — one source of truth (`diag::build_commit()`).
-        build_id: Arc::new(crate::diag::build_commit().to_string()),
-```
-
-In `crates/freshell-protocol/tests/pane_reconcile.rs`, both `Ready` literals (lines 56-61 and 71-79) each get:
+3f. Fix the remaining protocol-`Ready` literal sites (exactly two, both tests): in `crates/freshell-protocol/tests/pane_reconcile.rs`, both `freshell_protocol::Ready {` literals (lines 56 and 71) each get:
 
 ```rust
         build_id: None,
 ```
 
-Then enumerate any remaining literal sites:
+Then enumerate any remaining sites:
 
 ```bash
-cargo check --workspace --all-targets 2>&1 | rg "missing field" || echo "no missing-field errors"
+cargo check --workspace --all-targets 2>&1 | rg "missing field \`build_id\`" || echo "no missing-field errors"
 ```
 
-Expected: `no missing-field errors` (if any site beyond the ones above is listed, add `build_id: None` — or, for `WsState` literals, a `build_id: Arc::new(...)` value — the same way; every site compiles before proceeding).
+Expected: `no missing-field errors`. (Only the three sites above construct the protocol `Ready` today; the check catches any straggler — add `build_id: None` there the same way. Note `WsState` is deliberately untouched: ~36 files construct it and none changes.)
 
-3f. Create `server/build-id.ts`:
+3g. Create `scripts/bake-server-build-id.mjs`:
+
+```javascript
+#!/usr/bin/env node
+/**
+ * Bake the build-provenance stamp for the compiled Node server: writes
+ * `dist/server/build-id.json` = {"buildId": "<git HEAD sha | 'unknown'>"}.
+ *
+ * WHY a bake file: the running stamp must describe the BUILT ARTIFACT, not
+ * the checkout. `server/build-id.ts` prefers this file (resolved next to
+ * its compiled dist/server/build-id.js) and falls back to a runtime
+ * `git rev-parse HEAD` probe ONLY when no bake file exists next to it —
+ * which is exactly the tsx-from-source dev case, where the runtime probe
+ * is correct because dev runs current source. A stale `dist/server`
+ * started after HEAD moved therefore advertises the sha it was BUILT from,
+ * never a false "current" one.
+ *
+ * Runs after `tsc` in the `build:server` script. Atomic write (tmp+rename).
+ */
+import { execFileSync } from 'node:child_process'
+import * as fs from 'node:fs'
+import * as path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+const outPath = path.join(repoRoot, 'dist', 'server', 'build-id.json')
+
+function computeBuildId() {
+  try {
+    const sha = execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+      .toString()
+      .trim()
+    return /^[0-9a-f]{40}$/.test(sha) ? sha : 'unknown'
+  } catch {
+    return 'unknown'
+  }
+}
+
+fs.mkdirSync(path.dirname(outPath), { recursive: true })
+const tmpPath = `${outPath}.tmp-${process.pid}`
+fs.writeFileSync(tmpPath, `${JSON.stringify({ buildId: computeBuildId() })}\n`)
+fs.renameSync(tmpPath, outPath)
+console.log(`[bake-server-build-id] wrote ${outPath}`)
+```
+
+Update `package.json`'s `build:server` script:
+
+```json
+    "build:server": "tsc -p tsconfig.server.json && node scripts/bake-server-build-id.mjs",
+```
+
+3h. Create `server/build-id.ts`:
 
 ```typescript
 import { execFileSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 
 const SHA_PATTERN = /^[0-9a-f]{40}$/
 
+// Resolved relative to THIS module: next to the compiled
+// dist/server/build-id.js in production (where `build:server`'s bake step
+// wrote dist/server/build-id.json), or next to server/build-id.ts in
+// tsx-from-source runs (where no bake file exists and the runtime probe is
+// correct because dev runs current source).
+const DEFAULT_BAKE_PATH = fileURLToPath(new URL('build-id.json', import.meta.url))
+
 /**
- * The git commit this server process runs from — the SAME identity the Rust
- * server bakes at compile time (`crates/freshell-server/src/diag.rs`'s
- * `build_commit()`) and the client bakes at Vite build time
+ * The git commit the server runs from — the SAME identity the Rust server
+ * bakes at compile time (`crates/freshell-ws/build.rs`'s
+ * `FRESHELL_WS_BUILD_COMMIT`) and the client bakes at Vite build time
  * (`__FRESHELL_BUILD_ID__`). Falls back to the literal `"unknown"` when git
  * is unavailable or the output is not a full 40-hex sha; the client's
  * compare rule ignores `"unknown"` on both sides, so a git-less deployment
@@ -287,16 +498,41 @@ export function computeBuildId(cwd: string = process.cwd()): string {
   }
 }
 
+/** Read a bake file written by `scripts/bake-server-build-id.mjs`. */
+export function readBakedBuildId(bakePath: string): string | undefined {
+  try {
+    const raw = JSON.parse(readFileSync(bakePath, 'utf8')) as { buildId?: unknown }
+    return typeof raw.buildId === 'string' && raw.buildId.length > 0 ? raw.buildId : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * BAKE-WINS-ELSE-PROBE: production (compiled dist/server) prefers the bake
+ * file written at build:server time, so the stamp describes the BUILT
+ * ARTIFACT — a stale dist started after HEAD moved advertises the sha it
+ * was built from, never a false "current" one. Source runs (tsx dev, vitest)
+ * find no bake file next to the source module and probe runtime HEAD.
+ */
+export function resolveServerBuildId(bakePath: string = DEFAULT_BAKE_PATH): string {
+  return readBakedBuildId(bakePath) ?? computeBuildId()
+}
+
 let cached: string | undefined
 
-/** Per-process cached build id — one git probe per server lifetime. */
+/** Per-process cached build id — one resolution per server lifetime. */
 export function serverBuildId(): string {
-  if (cached === undefined) cached = computeBuildId()
+  if (cached === undefined) cached = resolveServerBuildId()
   return cached
+}
+
+export function _resetServerBuildIdCacheForTests(): void {
+  cached = undefined
 }
 ```
 
-3g. In `server/ws-handler.ts`:
+3i. In `server/ws-handler.ts`:
 
 Add the import alongside the other relative imports at the top of the file:
 
@@ -340,29 +576,40 @@ Expected: all PASS.
 
 - [ ] **Step 5: Refactor while green**
 
-No refactor needed — every addition mirrors the adjacent `bootId` idiom on its side. Do NOT regenerate `port/oracle/fixtures/handshake-transcript.json`: the frozen transcript stays byte-valid because Rust omits `build_id` when deserialized as `None`, and the mutation/oracle suites consume the regenerated SCHEMA (not the live node bytes) for conformance.
+No refactor needed — the Rust stamp mirrors the adjacent `boot_id` idiom, and the Node stamp mirrors `bootId`'s always-stamped treatment. Do NOT regenerate `port/oracle/fixtures/handshake-transcript.json`: the frozen transcript stays byte-valid because Rust omits `build_id` when deserialized as `None`, and the mutation/oracle suites consume the regenerated SCHEMA (not the live node bytes) for conformance.
 
 - [ ] **Step 6: Run impacted-test verification**
 
-This change touches the shared wire protocol, both server implementations, and the generated schema, so the impacted set is: both Rust crates' full test trees, the workspace compile of every literal site, the whole server-config suite (any test asserting handshake/ready shapes), and the port-oracle suites. **`npm run test:port` does NOT run the oracle suites** (`vitest.port.config.ts` excludes `test/unit/port/oracle/**`; they are deliberately outside the coordinator and run only via `npm run test:oracle`, which boots real servers — budget several minutes). Note on `t0-equivalence-rust.test.ts`: its node-vs-rust deep diff compares `ready` frames value-by-value (`buildId` is NOT in the normalization registry, so it is compared RAW) — both sides stamp the SAME value (the worktree HEAD sha: the oracle node target runs from an isolated runtime root under the worktree so `git rev-parse HEAD` walk-up resolves the worktree sha; the rust target is `cargo build`-ed at test time by `ensureRustServerBuilt` and `build.rs` re-stamps on HEAD moves; Node computes the same sha at runtime), or both `"unknown"` in git-less environments, so the diff stays clean — and this run is the proof.
+This change touches the shared wire protocol, both server implementations, the generated schema, and the `build:server` pipeline, so the impacted set is: both Rust crates' full test trees, the workspace compile, the whole server-config suite (any test asserting handshake/ready shapes), the port contract suites, and the port-ORACLE suites. **`npm run test:port` does NOT run the oracle suites** (`vitest.port.config.ts` excludes `test/unit/port/oracle/**`; they run only via `npm run test:oracle`, which boots real servers — budget several minutes). Notes:
+
+- `t0-equivalence-rust.test.ts` node-vs-rust deep diff compares `ready` frames value-by-value (`buildId` is NOT in the normalization registry, so it is compared RAW): both sides stamp the SAME value — the worktree HEAD sha (the oracle node target runs from an isolated runtime root under the worktree so `git rev-parse HEAD` walk-up resolves the worktree sha; the rust target is `cargo build`-ed at test time by `ensureRustServerBuilt` and both build scripts re-stamp on HEAD moves; Node's source-run probe resolves the same HEAD) — or both `"unknown"` in git-less environments. This run is the proof.
+- `build:server` now emits `dist/server/build-id.json`; confirm with a real build:
 
 ```bash
 cargo test -p freshell-protocol
 cargo test -p freshell-ws
 cargo check --workspace --all-targets
+npm run build:server
+cat dist/server/build-id.json
 npm run test:integration
 npm run test:port
 npm run test:oracle
 ```
 
-Expected: all PASS.
+Expected: all PASS, and `dist/server/build-id.json` contains the current worktree HEAD sha.
 
 - [ ] **Step 7: Commit the task**
 
+Stage by directory so every compiler-enumerated fix lands in the commit (the worktree starts clean; verify nothing unexpected is staged):
+
 ```bash
-git add shared/ws-protocol.ts crates/freshell-protocol/src/server_messages.rs crates/freshell-protocol/tests/roundtrip.rs crates/freshell-protocol/tests/pane_reconcile.rs crates/freshell-ws/src/lib.rs crates/freshell-server/src/main.rs server/build-id.ts server/ws-handler.ts test/server/build-id.test.ts test/server/ws-handshake-snapshot.test.ts port/contract/ws-server-messages.schema.json
-git commit -m "feat(protocol): both servers stamp additive optional ready.buildId (git HEAD)"
+git status --short
+git add shared/ port/contract/ws-server-messages.schema.json server/ scripts/bake-server-build-id.mjs test/server/ crates/ package.json
+git status --short
+git commit -m "feat(protocol): both servers stamp additive optional ready.buildId (artifact-time bake)"
 ```
+
+Expected: the first `git status --short` lists exactly the Task 1 files (all under the staged paths); the second shows the staged set; the commit compiles standalone (`cargo check --workspace --all-targets` from a clean checkout of it would pass — every `Ready` literal fix is inside `crates/`).
 
 ---
 
@@ -469,6 +716,19 @@ describe('checkServerBuildId', () => {
     expect(reload).not.toHaveBeenCalled()
   })
 
+  it('does not throw or reload when the sessionStorage PROPERTY itself is inaccessible', () => {
+    const reload = vi.fn()
+    const original = Object.getOwnPropertyDescriptor(window, 'sessionStorage')
+    Object.defineProperty(window, 'sessionStorage', { value: undefined, configurable: true })
+    try {
+      expect(() => checkServerBuildId({ clientBuildId: 'a'.repeat(40), serverBuildId: 'b'.repeat(40), reload }))
+        .not.toThrow()
+      expect(reload).not.toHaveBeenCalled()
+    } finally {
+      if (original) Object.defineProperty(window, 'sessionStorage', original)
+    }
+  })
+
   it('falls back to the __FRESHELL_BUILD_ID__ global and window defaults when options are omitted', () => {
     vi.stubGlobal('__FRESHELL_BUILD_ID__', 'c'.repeat(40))
     const reload = vi.fn()
@@ -502,7 +762,7 @@ describe('checkServerBuildId', () => {
 })
 ```
 
-1b. In `test/unit/client/components/App.restart-signals.test.tsx`, append a new `describe` block at the end of the file. It reuses that file's existing harness plumbing (`createStore`, `renderApp`, `sendReady`, `wsMocks`, `messageHandler`, `stubAudio`, `terminalRestoreMocks`, `fetchSidebarSessionsSnapshot`, `getTerminalDirectoryPage`, `searchTerminalView`, `apiGet`, `defaultServerSettings`, `defaultSettings` — all defined at the top of that file; mirror the existing describe's beforeEach exactly):
+1b. In `test/unit/client/components/App.restart-signals.test.tsx`, append a new `describe` block at the end of the file. It reuses that file's existing harness plumbing (`createStore`, `renderApp`, `sendReady`, `wsMocks`, `messageHandler`, `stubAudio`, `terminalRestoreMocks`, `fetchSidebarSessionsSnapshot`, `getTerminalDirectoryPage`, `searchTerminalView`, `apiGet`, `defaultServerSettings`, `defaultSettings` — all defined at the top of that file; mirror the existing describe's beforeEach exactly). Note the jsdom `sessionStorage` here is REAL and persists across the two simulated reboot cycles below — the unit-level proof that a code-armed sentinel survives the reload boundary:
 
 ```tsx
 describe('App ready buildId → one-shot server-build reload', () => {
@@ -567,7 +827,7 @@ describe('App ready buildId → one-shot server-build reload', () => {
     sessionStorage.clear()
   })
 
-  it('mismatched ready buildId triggers exactly one reload, and the sentinel suppresses the next mismatched ready', async () => {
+  it('mismatched ready buildId triggers exactly one reload, and the sentinel (real sessionStorage, persisting across the simulated reboot) suppresses the next mismatched ready', async () => {
     vi.stubGlobal('__FRESHELL_BUILD_ID__', 'a'.repeat(40))
     const store = createStore()
     await renderApp(store)
@@ -576,8 +836,9 @@ describe('App ready buildId → one-shot server-build reload', () => {
     expect(window.location.reload).toHaveBeenCalledTimes(1)
     expect(sessionStorage.getItem('freshell.server-build-reload')).toBe('1')
 
-    // Reconnect delivers another mismatched ready (stale server still up):
-    // the sentinel must suppress the reload.
+    // The reload lands: the page reboots in the SAME tab (real jsdom
+    // sessionStorage persists), the server is still stale, and the next
+    // ready must NOT reload again.
     sendReady({ serverInstanceId: 'srv-1', bootId: 'boot-1', buildId: 'b'.repeat(40) })
     expect(window.location.reload).toHaveBeenCalledTimes(1)
   })
@@ -650,19 +911,35 @@ function resolveClientBuildId(): string | undefined {
 }
 
 /**
+ * sessionStorage can throw on PROPERTY ACCESS in hardened contexts (iframe
+ * sandboxing, privacy modes) — resolving it must be inside the fail-safe,
+ * never a ready-handler crash.
+ */
+function defaultStorage(): Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> | undefined {
+  try {
+    return window.sessionStorage
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * Compare the server's `ready.buildId` against our own baked build id and
  * reload ONCE on a real mismatch. Invariants:
  * - reload iff BOTH ids are present, non-empty, neither is "unknown", and
  *   they differ ("unknown" == "unknown" is a no-op, never a match-and-clear);
  * - the sessionStorage sentinel is set BEFORE reloading and suppresses any
  *   further reloads this tab session (a half-deployed server can never
- *   reload-loop; sessionStorage access failure = no reload, fail-safe);
+ *   reload-loop; any sessionStorage failure = no reload, logged, fail-safe);
  * - a MATCHING ready clears the sentinel (self-re-arm after convergence).
- * KNOWN LIMIT (accepted for the self-hosted single-server threat model):
- * the "once" guarantee is per server identity — one origin fronted by
- * servers built from DIFFERENT commits can oscillate (mismatch → reload →
- * match clears → mismatch → …). Deliberately not hardened with a
- * clears-per-session cap; revisit only if a split-deploy origin appears.
+ * KNOWN LIMITS (accepted for the self-hosted single-server threat model):
+ * - the "once" guarantee is per server identity — one origin fronted by
+ *   servers built from DIFFERENT commits can oscillate (mismatch → reload →
+ *   match clears → mismatch → …). Not hardened with a clears-per-session
+ *   cap; revisit only if a split-deploy origin appears.
+ * - the compare is direction-free (shas carry no ordering), so a NEWER
+ *   client against an OLDER server performs one futile bounded reload per
+ *   fresh tab session.
  */
 export function checkServerBuildId(options?: ServerBuildCheckOptions): void {
   const clientBuildId = options?.clientBuildId ?? resolveClientBuildId()
@@ -671,17 +948,26 @@ export function checkServerBuildId(options?: ServerBuildCheckOptions): void {
   if (clientBuildId === 'unknown' || serverBuildId === 'unknown') return
 
   const reload = options?.reload ?? (() => window.location.reload())
-  const storage = options?.storage ?? window.sessionStorage
 
   if (clientBuildId === serverBuildId) {
+    const storage = options?.storage ?? defaultStorage()
     try {
-      storage.removeItem(SERVER_BUILD_RELOAD_SENTINEL)
+      storage?.removeItem(SERVER_BUILD_RELOAD_SENTINEL)
     } catch {
-      // Ignore sessionStorage access failures.
+      // Ignore sessionStorage access failures (already disarmed-or-armed as
+      // found; nothing reloads on the match path either way).
     }
     return
   }
 
+  const storage = options?.storage ?? defaultStorage()
+  if (!storage) {
+    log.warn(
+      `server build ${serverBuildId} differs from client build ${clientBuildId} but `
+      + 'sessionStorage is unavailable — suppressing the reload (fail-safe against loops)',
+    )
+    return
+  }
   try {
     if (storage.getItem(SERVER_BUILD_RELOAD_SENTINEL) === '1') {
       log.warn(
@@ -691,8 +977,8 @@ export function checkServerBuildId(options?: ServerBuildCheckOptions): void {
       return
     }
     storage.setItem(SERVER_BUILD_RELOAD_SENTINEL, '1')
-  } catch {
-    // Cannot persist the sentinel: reloading without it risks a loop.
+  } catch (err) {
+    log.warn('server-build sentinel persistence failed; suppressing the reload', err)
     return
   }
   log.warn(
@@ -714,9 +1000,9 @@ Add the helper after `projectRoot` (line 10):
 ```typescript
 /**
  * The client's build identity: the git commit the bundle was built from,
- * matching the server-side stamp (`crates/freshell-server/src/diag.rs`'s
- * `build_commit()` / `server/build-id.ts`). `"unknown"` fallback — the
- * client's compare rule ignores `"unknown"` on both sides.
+ * matching the server-side stamps (`crates/freshell-ws/build.rs` /
+ * `server/build-id.ts` + `scripts/bake-server-build-id.mjs`). `"unknown"`
+ * fallback — the client's compare rule ignores `"unknown"` on both sides.
  */
 function computeClientBuildId(): string {
   try {
@@ -817,16 +1103,17 @@ git commit -m "feat(client): reload once when ready.buildId differs from the bak
 
 ---
 
-### Task 3: E2E proof (rust-chromium) + docs
+### Task 3: E2E proof (rust-chromium, local lane) + docs
 
 **Files:**
 - Create: `test/e2e-browser/specs/server-build-mismatch-rust.spec.ts`
 - Modify: `test/e2e-browser/playwright.config.ts` (add the spec to `RUST_ONLY_SPECS`, whose `/create-protection-isolation-rust\.spec\.ts$/,` entry is at line 204; add the spec to the `rust-chromium` project's `testMatch`, whose `/codex-terminal-bounce-rust\.spec\.ts$/,` entry is at line 371)
+- Modify: `test/e2e-browser/playwright.cloud.config.ts` (add the spec to `CLOUD_SKIP_SPECS` with justification)
 - Modify: `AGENTS.md` (one-line note under "Key Architectural Patterns → WebSocket Protocol")
 
 **Interfaces:**
 - Consumes: Tasks 1-2 (both servers stamp `ready.buildId`; the client compares and reloads once; `TestHarness.receiveWsMessage` → `ws.receiveMessageForTest` → `handleIncomingMessage` feeds an injected frame through the real App ready handler — verified at `src/lib/ws-client.ts:917-919`).
-- Produces: the user-outcome proof — a stale client against a newer server reboots itself exactly once and converges to a healthy ready connection; repeat mismatches are suppressed by the sentinel.
+- Produces: the user-outcome proof on the LOCAL lane — a stale client against a newer server reboots itself exactly once and converges to a healthy ready connection; sessionStorage persistence across a REAL navigation; repeat mismatches suppressed by the sentinel.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
@@ -843,19 +1130,31 @@ Create `test/e2e-browser/specs/server-build-mismatch-rust.spec.ts`:
  * converges to a healthy ready connection. A repeat mismatched ready must
  * NOT reload again — a half-deployed server can never reload-loop.
  *
- * Mismatch is injected with `harness.receiveWsMessage` (a REAL server
+ * COVERAGE BOUNDARY (read before judging): what e2e proves here is
+ * (1) the full production compare-and-reload pipeline through the REAL App
+ * ready handler (mismatch injected via the test harness — a REAL server
  * stamps its own sha, which may or may not equal this worktree's client
- * bake — the injection makes the compare deterministic either way). The
- * injected frame flows through the production pipeline: ws-client
- * `receiveMessageForTest` → `handleIncomingMessage` → App's ready handler
- * → `ReadyMessageSchema` → `checkServerBuildId`.
- *
- * Service workers are blocked (perf-harness precedent,
- * recover-my-panes-rust.spec.ts's FRESH_CONTEXT_OPTIONS) so the count of
- * navigations is exactly the reloads this feature performs.
+ * bake, so the injection makes the compare deterministic either way),
+ * (2) sessionStorage persistence across a REAL navigation, and (3)
+ * suppression of a repeat mismatch. The "code armed the sentinel BEFORE
+ * reloading" ORDER is proven by the unit suite (App.restart-signals: real
+ * jsdom sessionStorage persisting across the simulated reboot). Observing
+ * the code-armed sentinel surviving a REAL navigation e2e is not
+ * deterministic here: after any reload the boot's REAL ready either matches
+ * (same-HEAD artifacts → legitimately clears the sentinel) or mismatches
+ * (stale-bake environments → keeps it), so the post-reload sentinel state
+ * is environment-dependent — hence the persistence test reads at commit
+ * time and the suppression test seeds its state AFTER the boot settles.
+ * Seeding is state setup, the same practice as seeding localStorage in
+ * other suites; the PERSISTENCE and SUPPRESSION behavior exercised is
+ * entirely production code.
  *
  * Rust-only: registers under `rust-chromium` + RUST_ONLY_SPECS (owns a
- * RustServer directly, the e2eServerKind seam not used).
+ * RustServer directly, the e2eServerKind seam not used). CLOUD-SKIPPED with
+ * justification (see playwright.cloud.config.ts): the Cloud Run image
+ * builds WITHOUT git metadata, so both the Rust bake and the Vite define
+ * are "unknown" there and the compare is inert BY DESIGN — this spec can
+ * only pass on a lane where at least the client bake is a real sha.
  */
 import { test, expect } from '../helpers/fixtures.js'
 import { RustServer, ensureRustServerBuilt } from '../helpers/rust-server.js'
@@ -880,11 +1179,11 @@ test.describe('server build mismatch reload (rust)', () => {
     await server?.stop().catch(() => {})
   })
 
-  test('mismatched ready buildId reloads exactly once and converges; the sentinel suppresses repeats', async ({ browser }) => {
+  test('mismatched ready buildId reloads exactly once and converges', async ({ browser }) => {
     const context = await browser.newContext({ serviceWorkers: 'block' })
     const page = await context.newPage()
     await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
-    let harness = new TestHarness(page)
+    const harness = new TestHarness(page)
     await harness.waitForHarness()
     await harness.waitForConnection()
 
@@ -896,8 +1195,8 @@ test.describe('server build mismatch reload (rust)', () => {
     let navigations = 0
     page.on('framenavigated', () => { navigations++ })
 
-    // 1) Injected mismatch → exactly one reload, and the page reboots into a
-    //    healthy ready connection (convergence).
+    // Injected mismatch → exactly one reload, and the page reboots into a
+    // healthy ready connection (convergence).
     await harness.receiveWsMessage({
       type: 'ready',
       timestamp: new Date().toISOString(),
@@ -906,15 +1205,51 @@ test.describe('server build mismatch reload (rust)', () => {
       buildId: MISMATCHED_BUILD_ID,
     })
     await expect.poll(() => navigations, { timeout: 20_000 }).toBe(1)
-    harness = new TestHarness(page)
+    const rebooted = new TestHarness(page)
+    await rebooted.waitForHarness()
+    await rebooted.waitForConnection()
+
+    await context.close()
+  })
+
+  test('sentinel persists across a real navigation', async ({ browser }) => {
+    const context = await browser.newContext({ serviceWorkers: 'block' })
+    const page = await context.newPage()
+    await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+    const harness = new TestHarness(page)
     await harness.waitForHarness()
     await harness.waitForConnection()
 
-    // 2) Re-arm explicitly, then inject the SAME mismatch again: the
-    //    sentinel must suppress the reload (no loop). The explicit re-arm
-    //    keeps this assertion deterministic regardless of whether the real
-    //    server's ready matched the client bake (which would self-clear).
+    // Seed the state the production code would have armed on a previous
+    // mismatched ready in this tab (see the coverage boundary above).
     await page.evaluate((key) => sessionStorage.setItem(key, '1'), SENTINEL)
+
+    // A REAL navigation: sessionStorage must survive it (per-tab, per-origin
+    // storage) — read at commit time, BEFORE the rebooted app's real ready
+    // can legitimately match-and-clear it (same-HEAD artifacts match).
+    await page.reload({ waitUntil: 'commit' })
+    const persisted = await page.evaluate((key) => sessionStorage.getItem(key), SENTINEL)
+    expect(persisted, 'sentinel must survive a real navigation').toBe('1')
+
+    await context.close()
+  })
+
+  test('a seeded sentinel suppresses a repeat mismatch (no reload)', async ({ browser }) => {
+    const context = await browser.newContext({ serviceWorkers: 'block' })
+    const page = await context.newPage()
+    await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+    const harness = new TestHarness(page)
+    await harness.waitForHarness()
+    await harness.waitForConnection()
+
+    // Seed AFTER the boot settles (the boot's real ready may legitimately
+    // match-and-clear an earlier sentinel; seeding here is the setup for
+    // the suppression proof — the arming ORDER is unit-proven, the
+    // navigation persistence is proven by the previous test).
+    await page.evaluate((key) => sessionStorage.setItem(key, '1'), SENTINEL)
+    let navigations = 0
+    page.on('framenavigated', () => { navigations++ })
+
     await harness.receiveWsMessage({
       type: 'ready',
       timestamp: new Date().toISOString(),
@@ -923,7 +1258,7 @@ test.describe('server build mismatch reload (rust)', () => {
       buildId: MISMATCHED_BUILD_ID,
     })
     await page.waitForTimeout(3_000)
-    expect(navigations, 'sentinel must suppress the second mismatched ready').toBe(1)
+    expect(navigations, 'persisted sentinel must suppress the repeat mismatch').toBe(0)
 
     await context.close()
   })
@@ -949,10 +1284,21 @@ In the `rust-chromium` project's `testMatch` array, after the `/codex-terminal-b
         /server-build-mismatch-rust\.spec\.ts$/,
 ```
 
+In `CLOUD_SKIP_SPECS` (the cloud config's skip list in `playwright.cloud.config.ts`), add with justification:
+
+```typescript
+  // Server-build mismatch reload: the Cloud Run image builds WITHOUT git
+  // metadata (.dockerignore drops .git), so the Rust bake and the Vite
+  // define are both "unknown" there and the client's compare is inert BY
+  // DESIGN — a mismatched ready can never trigger a reload on that lane.
+  // Coverage lives on the local rust-chromium project.
+  /server-build-mismatch-rust\.spec\.ts$/,
+```
+
 In `AGENTS.md`, under "Key Architectural Patterns", append to the **WebSocket Protocol** paragraph:
 
 ```
-The `ready` frame carries an optional additive `buildId` (the server's baked git commit, `"unknown"` fallback): the client bakes its own at Vite build time (`__FRESHELL_BUILD_ID__`) and, on a mismatch, reloads exactly once per tab session (sessionStorage sentinel `freshell.server-build-reload`), self-healing stale-client contract errors; `"unknown"` on either side never triggers or clears the guard (`src/lib/server-build-check.ts`). The once-guard is per server identity: an origin fronted by mixed-build servers could oscillate (accepted for the single-server self-hosted model).
+The `ready` frame carries an optional additive `buildId` (the server's artifact-time-baked git commit, `"unknown"` fallback): the client bakes its own at Vite build time (`__FRESHELL_BUILD_ID__`) and, on a mismatch, reloads exactly once per tab session (sessionStorage sentinel `freshell.server-build-reload`), self-healing stale-client contract errors; `"unknown"` on either side never triggers or clears the guard (`src/lib/server-build-check.ts`). The once-guard is per server identity: an origin fronted by mixed-build servers could oscillate, and a newer client against an older server costs one futile bounded reload per fresh tab session (both accepted for the single-server self-hosted model).
 ```
 
 - [ ] **Step 2: Run the test and verify it passes, then RED-VERIFY it exercises the feature**
@@ -978,7 +1324,7 @@ npm run build:client
 npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium test/e2e-browser/specs/server-build-mismatch-rust.spec.ts
 ```
 
-Expected: FAIL — `expect.poll` times out with `navigations` stuck at 0 (no reload happens without the compare).
+Expected: FAIL — test 1's `expect.poll` times out with `navigations` stuck at 0 (no reload happens without the compare). Tests 2 and 3 still pass with the compare disabled (their sentinels are seeded state), which is exactly why the unit suite owns the arming-order proof — record all three observations.
 
 Restore the call and rebuild:
 
@@ -999,7 +1345,7 @@ Same command as Step 2's final run. Expected: PASS.
 
 - [ ] **Step 5: Refactor while green**
 
-No refactor needed. Confirm the spec is excluded from the match-all `chromium` project by the `RUST_ONLY_SPECS` entry (`testIgnore: RUST_ONLY_SPECS` at `playwright.config.ts:330`) and runs ONLY under `rust-chromium`. Note the spec also runs on the CLOUD e2e lane when `FRESHELL_E2E_BACKEND=cloud` (`playwright.cloud.config.ts` filters only firefox/webkit/continuity-smoke, so `rust-chromium` survives; the spec is not in `CLOUD_SKIP_SPECS`) — do not add it there; coverage comes from Step 6's backend run.
+No refactor needed. Confirm the registration mechanics: excluded from the match-all `chromium` project by the `RUST_ONLY_SPECS` entry (`testIgnore: RUST_ONLY_SPECS` at `playwright.config.ts:330`), included in `rust-chromium`'s `testMatch`, and skipped on the cloud lane by the `CLOUD_SKIP_SPECS` entry with its justification comment.
 
 - [ ] **Step 6: Run impacted-test verification**
 
@@ -1010,14 +1356,12 @@ npx playwright test --config test/e2e-browser/playwright.config.ts --project=rus
 npm run test:vitest -- run test/unit/client/lib/server-build-check.test.ts test/unit/client/components/App.restart-signals.test.tsx
 ```
 
-Expected: all PASS.
-
-**Backend proof (repo rule: an affected e2e spec must pass on the configured `FRESHELL_E2E_BACKEND` before a PR is filed):** before the branch is PR'd, run this spec on the configured backend — if `FRESHELL_E2E_BACKEND=cloud`, `npm run test:e2e:cloud` filtered to this spec (this also proves `cargo` availability and the build stamp inside the cloud image); if unset/local, the local runs above satisfy the rule. This is a pre-PR gate recorded in the run log, not part of the task commit.
+Expected: all PASS. Backend note: the repo rule about the configured `FRESHELL_E2E_BACKEND` is honored at execution kickoff (the user chooses local vs cloud once; the answer is recorded in `run-state.md`). This spec's coverage lane is the LOCAL rust-chromium project; it is CLOUD_SKIP'd with justification (no git metadata in the cloud build → both stamps "unknown" → the compare is inert there), and no cloud claim is made about cargo (the cloud runtime uses a prebuilt binary; cargo never runs there per `rust-server.ts:82-90`).
 
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add test/e2e-browser/specs/server-build-mismatch-rust.spec.ts test/e2e-browser/playwright.config.ts AGENTS.md
+git add test/e2e-browser/specs/server-build-mismatch-rust.spec.ts test/e2e-browser/playwright.config.ts test/e2e-browser/playwright.cloud.config.ts AGENTS.md
 git commit -m "test(e2e): rust spec proves one-shot sentinel-guarded reload on ready.buildId mismatch"
 ```
 
@@ -1032,17 +1376,18 @@ npm run check
 npm run test:oracle
 ```
 
-Expected: typecheck + full default + server suites PASS, and the oracle suites (t0-equivalence, handshake-determinism, external-handshake, mutation-validation) PASS — `npm run test:oracle` boots real servers and cargo-builds the workspace, so budget several minutes. Also confirm the Task 3 backend proof was recorded (the spec passing on the configured `FRESHELL_E2E_BACKEND`).
+Expected: typecheck + full default + server suites PASS, and the oracle suites (t0-equivalence, handshake-determinism, external-handshake, mutation-validation) PASS — `npm run test:oracle` boots real servers and cargo-builds the workspace, so budget several minutes. Also confirm the Task 3 e2e runs were recorded on the user-chosen backend (this spec's lane is local rust-chromium; cloud is skipped with justification).
 
 **User-outcome recap (maps every requirement to its proof):**
 
 | Requirement | Production behavior | Proof |
 | --- | --- | --- |
-| Server stamps build identity in `ready` | Rust `WsState.build_id` → `Ready.build_id` (`Some`, sha/`"unknown"`); Node `serverBuildId()` → `buildId`; schema regenerated | roundtrip + wire tests; `test:port`; Node snapshot test |
-| Identity = git HEAD, `"unknown"` fallback, everywhere | `build.rs` (existing, HEAD-move aware), `server/build-id.ts`, `computeClientBuildId()` | `build-id.test.ts`; bundle-bake check (Task 2 Step 5) |
+| Server stamps build identity in `ready` | Rust `freshell-ws/build.rs` bake → `Ready.build_id` (`Some`, sha/`"unknown"`); Node bake-file-or-probe → `buildId`; schema regenerated | roundtrip + wire tests; `test:port` + `test:oracle`; Node snapshot test |
+| Identity = artifact-time git HEAD, `"unknown"` fallback, everywhere | `crates/freshell-ws/build.rs`; `dist/server/build-id.json` written by `build:server` (stale dist advertises its own build); `computeClientBuildId()` | `build-id.test.ts` (bake precedence + probe fallback); bundle-bake check (Task 2 Step 5); `cat dist/server/build-id.json` (Task 1 Step 6) |
 | Client compares on every `ready` | `ReadyMessageSchema.buildId` → `checkServerBuildId` in App's ready handler | App.restart-signals describe block |
-| Mismatch → reload exactly once | sentinel set before `reload()`; armed sentinel suppresses | unit matrix; e2e navigation count === 1 |
-| Never reload-loops (incl. storage failure, repeated mismatches) | fail-safe catch; suppression branch; `"unknown"` no-op | unit cases; e2e repeat-injection step |
+| Mismatch → reload exactly once | sentinel set before `reload()`; armed sentinel suppresses | unit matrix (real jsdom sessionStorage across the simulated reboot); e2e navigation count === 1 |
+| Sentinel survives a REAL navigation; repeat mismatches suppressed | sessionStorage per-tab persistence; suppression branch | e2e test 2 (commit-time persistence read + suppression); unit matrix |
+| Never reload-loops (incl. storage failure, repeated mismatches) | fail-safe catch + property-access guard + logged suppression; `"unknown"` no-op | unit cases (throwing storage, undefined sessionStorage, unknown-vs-unknown); e2e repeat-injection step |
 | Match clears the sentinel (self-re-arm) | removeItem on equal ids | unit cases; App re-arm test |
 | Old servers/forks unaffected (additive contract) | optional field, omitted when `None`; schema stays `additionalProperties: false` | frozen transcript roundtrip; contract-freeze + mutation suites |
-| Real-world convergence | reloaded page reconnects and reaches ready | e2e `waitForConnection` after reload |
+| Real-world convergence | reloaded page reconnects and reaches ready | e2e test 1 `waitForConnection` after reload |
