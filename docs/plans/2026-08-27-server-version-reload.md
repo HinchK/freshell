@@ -22,7 +22,7 @@
 - **Client module must not crash under Vitest:** the Vitest client config has no `__FRESHELL_BUILD_ID__` define, so the module must use a `typeof __FRESHELL_BUILD_ID__ === 'undefined'` guard (same precedent as `src/lib/perf-logger.ts:45` with `__PERF_LOGGING__`).
 - **NodeNext/ESM:** every relative import in `server/` and `shared/` uses `.js` extensions; client code uses `@/` aliases without extensions.
 - **Test coordination:** broad suites go through the repo coordinator (`npm run test:vitest -- run ...`); never raw `npx vitest`. Focused Rust tests use `cargo test -p <crate>` directly. The port-ORACLE suites are NOT covered by `npm run test:port` / `npm run check` — they run only via `npm run test:oracle`.
-- **E2E backend rule:** per repo instructions, when `FRESHELL_E2E_BACKEND` is unset the user chooses local vs cloud before e2e runs — surface that question once at execution kickoff and record the answer in `run-state.md`. This feature's e2e coverage lane is the LOCAL `rust-chromium` project regardless: the new spec is added to `CLOUD_SKIP_SPECS` with a technical justification (the cloud image builds without git metadata, so both stamps are `"unknown"` and the compare is inert there — see Task 3). Never claim a cloud run proves cargo availability: the cloud runtime uses a prebuilt binary and cargo never runs there (`test/e2e-browser/helpers/rust-server.ts:82-90`).
+- **E2E backend rule:** per repo instructions, when `FRESHELL_E2E_BACKEND` is unset the user chooses local vs cloud before e2e runs — surface that question once at execution kickoff, INFORMED that the new spec is cloud-incompatible by construction (the cloud image builds without git metadata, so both stamps are `"unknown"` and the compare is inert there), and record the answer in `run-state.md`. This feature's e2e coverage lane is the LOCAL `rust-chromium` project regardless of the choice; the spec is added to `CLOUD_SKIP_SPECS` with that justification, and if cloud is chosen the PR description documents the skip explicitly so no coverage claim is silent. Never claim a cloud run proves cargo availability: the cloud runtime uses a prebuilt binary and cargo never runs there (`test/e2e-browser/helpers/rust-server.ts:82-90`).
 - **Scope boundary:** client-only redeploys (redeploying a new client bundle WITHOUT a server change) are deliberately NOT covered by any auto-trigger — no polling, no `/api/server-info` fallback, no reload loop. The ready-frame compare is the only trigger; a client-only redeploy costs at most one bounded reload per fresh tab session.
 - **No unrelated restructuring; comments explain invariants, in the existing voice.**
 
@@ -40,7 +40,8 @@
 - Create: `scripts/bake-server-build-id.mjs`
 - Create: `server/build-id.ts`
 - Modify: `server/ws-handler.ts` (import block; field after `:587`; init after `:651`; ready send `:2034-2039`)
-- Modify (generated): `port/contract/ws-server-messages.schema.json` (via `npm run contract:generate`)
+- Modify: `port/contract/ws-server-messages.schema.json` (via `npm run contract:generate`)
+- Modify: `port/oracle/harness/external-server.ts` (`ensureServerBuilt` stamp-freshness guard)
 - Test: `crates/freshell-protocol/tests/roundtrip.rs` (new test after `ready_carries_server_instance_id_and_boot_id`, which ends at line 164)
 - Test: `test/server/build-id.test.ts` (new)
 - Test: `test/server/ws-handshake-snapshot.test.ts` (new test after the `includes a bootId in the ready message...` test, which ends at line 301)
@@ -181,6 +182,10 @@ describe('server build id', () => {
       expect(readBakedBuildId(bakePath)).toBeUndefined()
       fs.writeFileSync(bakePath, JSON.stringify({ buildId: '' }))
       expect(readBakedBuildId(bakePath)).toBeUndefined()
+      // Same validation as the writer: only a 40-hex sha or "unknown" is a
+      // legitimate stamp; a garbage string must never become authoritative.
+      fs.writeFileSync(bakePath, JSON.stringify({ buildId: 'garbage-stamp' }))
+      expect(readBakedBuildId(bakePath)).toBeUndefined()
       expect(readBakedBuildId(path.join(dir, 'absent.json'))).toBeUndefined()
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
@@ -196,10 +201,26 @@ describe('server build id', () => {
     }
   })
 
-  it('resolveServerBuildId falls back to the runtime git probe when no bake file exists', () => {
+  it('resolveServerBuildId falls back to the runtime git probe when no bake file exists in SOURCE mode', () => {
     const { dir } = tempBakeFile(null)
     try {
       expect(resolveServerBuildId(path.join(dir, 'build-id.json'))).toBe(computeBuildId(REPO_ROOT))
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('resolveServerBuildId fails inert to "unknown" for a compiled artifact without a valid stamp', () => {
+    const { dir, bakePath } = tempBakeFile(null)
+    try {
+      // A compiled artifact (sourceMode: false) must NEVER probe the
+      // checkout: a stale dist without its stamp advertises "unknown", not
+      // the current HEAD (which would falsely match a current client).
+      expect(resolveServerBuildId(path.join(dir, 'build-id.json'), { sourceMode: false })).toBe('unknown')
+      fs.writeFileSync(bakePath, 'corrupt {')
+      expect(resolveServerBuildId(bakePath, { sourceMode: false })).toBe('unknown')
+      fs.writeFileSync(bakePath, JSON.stringify({ buildId: 'garbage-stamp' }))
+      expect(resolveServerBuildId(bakePath, { sourceMode: false })).toBe('unknown')
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }
@@ -505,21 +526,39 @@ export function computeBuildId(cwd: string = process.cwd()): string {
 export function readBakedBuildId(bakePath: string): string | undefined {
   try {
     const raw = JSON.parse(readFileSync(bakePath, 'utf8')) as { buildId?: unknown }
-    return typeof raw.buildId === 'string' && raw.buildId.length > 0 ? raw.buildId : undefined
+    const value = raw.buildId
+    if (typeof value !== 'string') return undefined
+    // Same validation as the writer and the git probes: a 40-hex sha or the
+    // literal "unknown". Anything else is a malformed stamp — treat as
+    // absent, never authoritative (a garbage stamp would cause a needless
+    // mismatch reload).
+    return value === 'unknown' || SHA_PATTERN.test(value) ? value : undefined
   } catch {
     return undefined
   }
 }
 
+// Source runs (tsx dev, vitest) execute THIS .ts module; a compiled
+// production artifact executes dist/server/build-id.js. The distinction
+// decides what a MISSING bake file means (see resolveServerBuildId).
+const SOURCE_MODE = import.meta.url.endsWith('.ts')
+
 /**
- * BAKE-WINS-ELSE-PROBE: production (compiled dist/server) prefers the bake
- * file written at build:server time, so the stamp describes the BUILT
- * ARTIFACT — a stale dist started after HEAD moved advertises the sha it
- * was built from, never a false "current" one. Source runs (tsx dev, vitest)
- * find no bake file next to the source module and probe runtime HEAD.
+ * BAKE-WINS-ELSE-FAIL-INERT: a compiled production artifact describes
+ * itself ONLY by its bake file — a stale dist started after HEAD moved
+ * advertises the sha it was built from (never a false "current" one), and
+ * an artifact whose stamp is missing or malformed fails inert to
+ * "unknown" (it must never impersonate the checkout). Source runs have no
+ * bake file next to the source module and probe runtime HEAD instead,
+ * which is correct because they execute current source.
  */
-export function resolveServerBuildId(bakePath: string = DEFAULT_BAKE_PATH): string {
-  return readBakedBuildId(bakePath) ?? computeBuildId()
+export function resolveServerBuildId(
+  bakePath: string = DEFAULT_BAKE_PATH,
+  opts?: { sourceMode?: boolean },
+): string {
+  const sourceMode = opts?.sourceMode ?? SOURCE_MODE
+  if (sourceMode) return computeBuildId()
+  return readBakedBuildId(bakePath) ?? 'unknown'
 }
 
 let cached: string | undefined
@@ -536,7 +575,6 @@ export function _resetServerBuildIdCacheForTests(): void {
 ```
 
 3i. In `server/ws-handler.ts`:
-
 Add the import alongside the other relative imports at the top of the file:
 
 ```typescript
@@ -567,6 +605,47 @@ Extend the ready send (lines 2034-2039):
         })
 ```
 
+3j. In `port/oracle/harness/external-server.ts` — the oracle's node target runs the COMPILED `dist/server/index.js`, and `ensureServerBuilt` rebuilds only when the entry is ABSENT. After this feature, a stale pre-existing `dist` carries a stale bake file, and `npm run test:oracle` would compare a stale Node `buildId` against the fresh cargo-built Rust value — a false implementation divergence. Add a stamp-freshness check so a stale node dist rebuilds (keep the legacy behavior when no bake file exists, so git-less/pre-stamp dists are unaffected):
+
+```typescript
+/**
+ * Whether the node dist's baked build stamp (written by `build:server`'s
+ * `scripts/bake-server-build-id.mjs`) matches the CURRENT checkout HEAD.
+ * True when no bake file exists (pre-stamp dist or git-less build — keep
+ * the legacy exists-only behavior), when git is unavailable, or when the
+ * stamp is unreadable: those cases have no stamp semantics to violate.
+ * False only for a REAL staleness — a bake from an earlier HEAD — which
+ * must trigger a rebuild so the oracle's node-vs-rust `buildId` comparison
+ * compares same-HEAD artifacts, never a stale checkout against a fresh
+ * cargo build.
+ */
+function nodeBuildStampIsCurrent(root: string): boolean {
+  const bakePath = path.join(root, 'dist', 'server', 'build-id.json')
+  if (!fs.existsSync(bakePath)) return true
+  try {
+    const baked = (JSON.parse(fs.readFileSync(bakePath, 'utf8')) as { buildId?: unknown }).buildId
+    if (typeof baked !== 'string' || baked === 'unknown') return true
+    const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' })
+    if (head.status !== 0) return true
+    return baked === head.stdout.trim()
+  } catch {
+    return true
+  }
+}
+```
+
+and change `ensureServerBuilt`'s first guard from
+
+```typescript
+  if (fs.existsSync(entry)) return entry
+```
+
+to
+
+```typescript
+  if (fs.existsSync(entry) && nodeBuildStampIsCurrent(root)) return entry
+```
+
 - [ ] **Step 4: Run the focused tests**
 
 ```bash
@@ -585,7 +664,7 @@ No refactor needed — the Rust stamp mirrors the adjacent `boot_id` idiom, and 
 
 This change touches the shared wire protocol, both server implementations, the generated schema, and the `build:server` pipeline, so the impacted set is: both Rust crates' full test trees, the workspace compile, the whole server-config suite (any test asserting handshake/ready shapes), the port contract suites, and the port-ORACLE suites. **`npm run test:port` does NOT run the oracle suites** (`vitest.port.config.ts` excludes `test/unit/port/oracle/**`; they run only via `npm run test:oracle`, which boots real servers — budget several minutes). Notes:
 
-- `t0-equivalence-rust.test.ts` node-vs-rust deep diff compares `ready` frames value-by-value (`buildId` is NOT in the normalization registry, so it is compared RAW): both sides stamp the SAME value — the worktree HEAD sha (the oracle node target runs from an isolated runtime root under the worktree so `git rev-parse HEAD` walk-up resolves the worktree sha; the rust target is `cargo build`-ed at test time by `ensureRustServerBuilt` and both build scripts re-stamp on HEAD moves; Node's source-run probe resolves the same HEAD) — or both `"unknown"` in git-less environments. This run is the proof.
+- `t0-equivalence-rust.test.ts` node-vs-rust deep diff compares `ready` frames value-by-value (`buildId` is NOT in the normalization registry, so it is compared RAW): both sides stamp the SAME value — the worktree HEAD sha at build time. The node oracle target runs the COMPILED `dist/server/index.js` (its bake file written by `build:server` at the worktree HEAD), and `ensureServerBuilt`'s new stamp-freshness check (step 3j) rebuilds a stale node dist so a pre-existing stale `dist/` can never false-diverge against the fresh cargo-built rust target (`ensureRustServerBuilt`; both Rust build scripts re-stamp on HEAD moves). With git-less environments both stamps are `"unknown"`. This run is the parity proof.
 - `build:server` now emits `dist/server/build-id.json`; confirm with a real build:
 
 ```bash
@@ -607,7 +686,7 @@ Stage by directory so every compiler-enumerated fix lands in the commit (the wor
 
 ```bash
 git status --short
-git add shared/ port/contract/ws-server-messages.schema.json server/ scripts/bake-server-build-id.mjs test/server/ crates/ package.json
+git add shared/ port/contract/ws-server-messages.schema.json port/oracle/harness/external-server.ts server/ scripts/bake-server-build-id.mjs test/server/ crates/ package.json
 git status --short
 git commit -m "feat(protocol): both servers stamp additive optional ready.buildId (artifact-time bake)"
 ```
@@ -656,9 +735,14 @@ describe('checkServerBuildId', () => {
     vi.restoreAllMocks()
   })
 
-  it('reloads once and sets the sentinel on a real mismatch', () => {
+  it('reloads once, arming the sentinel BEFORE the reload fires, and the sentinel suppresses a second mismatch', () => {
     const storage = mapStorage()
-    const reload = vi.fn()
+    const reload = vi.fn(() => {
+      // Ordering proof: production must persist the sentinel BEFORE
+      // calling reload — an implementation that reloads first and arms
+      // second would lose the sentinel across the navigation.
+      expect(storage._map.get(SENTINEL), 'sentinel must be armed BEFORE reload fires').toBe('1')
+    })
     checkServerBuildId({ clientBuildId: 'a'.repeat(40), serverBuildId: 'b'.repeat(40), reload, storage })
     expect(reload).toHaveBeenCalledTimes(1)
     expect(storage._map.get(SENTINEL)).toBe('1')
@@ -722,7 +806,13 @@ describe('checkServerBuildId', () => {
   it('does not throw or reload when the sessionStorage PROPERTY itself is inaccessible', () => {
     const reload = vi.fn()
     const original = Object.getOwnPropertyDescriptor(window, 'sessionStorage')
-    Object.defineProperty(window, 'sessionStorage', { value: undefined, configurable: true })
+    // Harden contexts throw on PROPERTY ACCESS (SecurityError from a
+    // denying getter), not merely on method calls — install a getter that
+    // throws so the defaultStorage() fail-safe is actually exercised.
+    Object.defineProperty(window, 'sessionStorage', {
+      get() { throw new Error('SecurityError: storage denied') },
+      configurable: true,
+    })
     try {
       expect(() => checkServerBuildId({ clientBuildId: 'a'.repeat(40), serverBuildId: 'b'.repeat(40), reload }))
         .not.toThrow()
@@ -770,6 +860,7 @@ describe('checkServerBuildId', () => {
 ```tsx
 describe('App ready buildId → one-shot server-build reload', () => {
   let originalLocation: Location
+  let reloadCalls: number
   beforeEach(() => {
     cleanup()
     vi.resetAllMocks()
@@ -808,12 +899,24 @@ describe('App ready buildId → one-shot server-build reload', () => {
     })
 
     sessionStorage.clear()
+    reloadCalls = 0
     // jsdom 25's Location owns `reload` non-configurably — defineProperty on
     // window.location itself throws. Repo precedent (import-retry.test.ts):
-    // window-level replacement with save/restore.
+    // window-level replacement with save/restore. The reload stub asserts
+    // the sentinel is armed AT CALL TIME (the ordering proof lives here
+    // too, against real jsdom sessionStorage) and counts invocations.
     originalLocation = window.location
     Object.defineProperty(window, 'location', {
-      value: { ...window.location, reload: vi.fn() },
+      value: {
+        ...window.location,
+        reload: () => {
+          expect(
+            sessionStorage.getItem('freshell.server-build-reload'),
+            'sentinel must be armed BEFORE reload fires',
+          ).toBe('1')
+          reloadCalls++
+        },
+      },
       writable: true,
       configurable: true,
     })
@@ -836,14 +939,14 @@ describe('App ready buildId → one-shot server-build reload', () => {
     await renderApp(store)
 
     sendReady({ serverInstanceId: 'srv-1', bootId: 'boot-1', buildId: 'b'.repeat(40) })
-    expect(window.location.reload).toHaveBeenCalledTimes(1)
+    expect(reloadCalls).toBe(1)
     expect(sessionStorage.getItem('freshell.server-build-reload')).toBe('1')
 
     // The reload lands: the page reboots in the SAME tab (real jsdom
     // sessionStorage persists), the server is still stale, and the next
     // ready must NOT reload again.
     sendReady({ serverInstanceId: 'srv-1', bootId: 'boot-1', buildId: 'b'.repeat(40) })
-    expect(window.location.reload).toHaveBeenCalledTimes(1)
+    expect(reloadCalls).toBe(1)
   })
 
   it('a matching ready clears the sentinel and re-arms the guard', async () => {
@@ -855,7 +958,7 @@ describe('App ready buildId → one-shot server-build reload', () => {
     // Server caught up to the client build (the post-reload convergence
     // case): match → sentinel cleared, no reload.
     sendReady({ serverInstanceId: 'srv-1', bootId: 'boot-1', buildId: 'a'.repeat(40) })
-    expect(window.location.reload).not.toHaveBeenCalled()
+    expect(reloadCalls).toBe(0)
     expect(sessionStorage.getItem('freshell.server-build-reload')).toBeNull()
   })
 
@@ -866,7 +969,7 @@ describe('App ready buildId → one-shot server-build reload', () => {
 
     sendReady({ serverInstanceId: 'srv-1', bootId: 'boot-1' })
     sendReady({ serverInstanceId: 'srv-1', bootId: 'boot-1', buildId: 'unknown' })
-    expect(window.location.reload).not.toHaveBeenCalled()
+    expect(reloadCalls).toBe(0)
     expect(sessionStorage.getItem('freshell.server-build-reload')).toBeNull()
   })
 })
@@ -878,7 +981,7 @@ describe('App ready buildId → one-shot server-build reload', () => {
 npm run test:vitest -- run test/unit/client/lib/server-build-check.test.ts test/unit/client/components/App.restart-signals.test.tsx
 ```
 
-Expected: FAIL — `server-build-check.test.ts` cannot resolve `@/lib/server-build-check` (module missing), and the App tests fail because a ready with `buildId` triggers no reload (`expect(window.location.reload).toHaveBeenCalledTimes(1)` sees 0).
+Expected: FAIL — `server-build-check.test.ts` cannot resolve `@/lib/server-build-check` (module missing), and the App tests fail because a ready with `buildId` triggers no reload (`expect(reloadCalls).toBe(1)` sees 0).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -1083,10 +1186,10 @@ Verify the Vite define actually bakes the sha into the bundle (explicit pass/fai
 
 ```bash
 npm run build:client
-rg -q "$(git rev-parse HEAD)" dist/client/assets/*.js && echo "BAKE OK: sha present in bundle" || echo "BAKE MISSING: sha absent from bundle"
+rg -q "$(git rev-parse HEAD)" dist/client/assets/*.js && echo "BAKE OK: sha present in bundle" || { echo "BAKE MISSING: sha absent from bundle"; exit 1; }
 ```
 
-Expected: `BAKE OK: sha present in bundle` (the baked sha appears in the built bundle). (`npm run build:client` from this worktree writes the worktree's own `dist/client` — the main-checkout `npm run build` production-server guard does not apply here.)
+Expected: `BAKE OK: sha present in bundle` — the command exits 0. A missing bake prints `BAKE MISSING` and exits NONZERO (the failure branch must not mask the failure behind a successful `echo`). (`npm run build:client` from this worktree writes the worktree's own `dist/client` — the main-checkout `npm run build` production-server guard does not apply here.)
 
 - [ ] **Step 6: Run impacted-test verification**
 
@@ -1355,14 +1458,14 @@ No refactor needed. Confirm the registration mechanics: excluded from the match-
 
 - [ ] **Step 6: Run impacted-test verification**
 
-Playwright registration changed (a new rust-only spec) and AGENTS.md was touched; the impacted set is the rust-chromium smoke that boots a real server (proving the registration change disturbed nothing) plus the two unit files most adjacent to the feature as a final belt-and-suspenders:
+Playwright registration changed (a new rust-only spec) and AGENTS.md was touched; the impacted set is the rust-chromium self-test that boots a real Rust server through its own fixture (proving the registration change disturbed nothing — note `continuity-smoke.spec.ts` runs ONLY under its own conditional `continuity-smoke` project, NOT under `rust-chromium`, so it must not be used as the neighbor here) plus the two unit files most adjacent to the feature:
 
 ```bash
-npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium test/e2e-browser/specs/continuity-smoke.spec.ts test/e2e-browser/specs/server-build-mismatch-rust.spec.ts
+npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium test/e2e-browser/specs/harness-01-rust-server.spec.ts test/e2e-browser/specs/server-build-mismatch-rust.spec.ts
 npm run test:vitest -- run test/unit/client/lib/server-build-check.test.ts test/unit/client/components/App.restart-signals.test.tsx
 ```
 
-Expected: all PASS. Backend note: the repo rule about the configured `FRESHELL_E2E_BACKEND` is honored at execution kickoff (the user chooses local vs cloud once; the answer is recorded in `run-state.md`). This spec's coverage lane is the LOCAL rust-chromium project; it is CLOUD_SKIP'd with justification (no git metadata in the cloud build → both stamps "unknown" → the compare is inert there), and no cloud claim is made about cargo (the cloud runtime uses a prebuilt binary; cargo never runs there per `rust-server.ts:82-90`).
+Expected: all PASS. Backend note: the repo rule about the configured `FRESHELL_E2E_BACKEND` is honored at execution kickoff — the user chooses local vs cloud once, INFORMED that this spec is cloud-incompatible by construction (the cloud image builds without git metadata, so both stamps are `"unknown"` and the compare is inert there). Regardless of the choice, this spec's coverage lane is the LOCAL rust-chromium project and it is CLOUD_SKIP'd with that justification (`playwright.cloud.config.ts`); if the user chooses cloud, the PR description documents the skip explicitly so no coverage claim is silent. No cloud claim is made about cargo (the cloud runtime uses a prebuilt binary; cargo never runs there per `rust-server.ts:82-90`).
 
 - [ ] **Step 7: Commit the task**
 
@@ -1388,8 +1491,8 @@ Expected: typecheck + full default + server suites PASS, and the oracle suites (
 
 | Requirement | Production behavior | Proof |
 | --- | --- | --- |
-| Server stamps build identity in `ready` | Rust `freshell-ws/build.rs` bake → `Ready.build_id` (`Some`, sha/`"unknown"`); Node bake-file-or-probe → `buildId`; schema regenerated | roundtrip + wire tests; `test:port` + `test:oracle`; Node snapshot test |
-| Identity = artifact-time git HEAD, `"unknown"` fallback, everywhere | `crates/freshell-ws/build.rs`; `dist/server/build-id.json` written by `build:server` (stale dist advertises its own build); `computeClientBuildId()` | `build-id.test.ts` (bake precedence + probe fallback); bundle-bake check (Task 2 Step 5); `cat dist/server/build-id.json` (Task 1 Step 6) |
+| Server stamps build identity in `ready` | Rust `freshell-ws/build.rs` bake → `Ready.build_id` (`Some`, sha/`"unknown"`); Node bake-file-or-probe → `buildId`; schema regenerated | roundtrip + wire tests; `test:port` + `test:oracle` (oracle node dist rebuilds when its stamp is stale); Node snapshot test |
+| Identity = artifact-time git HEAD, `"unknown"` fallback, everywhere | `crates/freshell-ws/build.rs`; `dist/server/build-id.json` written by `build:server` — compiled artifacts fail inert to `"unknown"` without a valid stamp (never a checkout probe); `computeClientBuildId()` | `build-id.test.ts` (bake precedence, source-vs-compiled split, garbage-stamp rejection); bundle-bake check (Task 2 Step 5); `cat dist/server/build-id.json` (Task 1 Step 6) |
 | Client compares on every `ready` | `ReadyMessageSchema.buildId` → `checkServerBuildId` in App's ready handler | App.restart-signals describe block |
 | Mismatch → reload exactly once | sentinel set before `reload()`; armed sentinel suppresses | unit matrix (real jsdom sessionStorage across the simulated reboot); e2e navigation count === 1 |
 | Sentinel survives a REAL navigation; repeat mismatches suppressed | sessionStorage per-tab persistence; suppression branch | e2e test 2 (commit-time persistence read + suppression); unit matrix |
