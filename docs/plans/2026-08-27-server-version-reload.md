@@ -84,7 +84,7 @@ fn ready_carries_build_id_and_omits_it_when_absent() {
 }
 ```
 
-1b. Add to `crates/freshell-ws/src/lib.rs` inside `mod tests`, immediately after `handshake_is_ordered_with_shared_bootid` (line 1026):
+1b. Add to `crates/freshell-ws/src/lib.rs` inside `mod tests`, immediately after `handshake_is_ordered_with_shared_bootid` (line 1026). Deliberately references NO new symbols, so its RED phase compiles and fails on the assertion:
 
 ```rust
     /// The handshake `ready` stamps the build identity baked into THIS crate
@@ -96,9 +96,12 @@ fn ready_carries_build_id_and_omits_it_when_absent() {
     async fn handshake_ready_stamps_build_id() {
         let msgs = build_handshake(&state()).await;
         let ready = serde_json::to_value(&msgs[0]).unwrap();
-        let baked = ready_build_id().expect("crate always bakes a build id");
-        assert!(!baked.is_empty());
-        assert_eq!(ready["buildId"], serde_json::json!(baked));
+        assert!(
+            ready.get("buildId").is_some(),
+            "ready must stamp buildId: {ready}"
+        );
+        let build_id = ready["buildId"].as_str().expect("buildId is a string");
+        assert!(!build_id.is_empty(), "buildId must be non-empty: {build_id}");
     }
 ```
 
@@ -255,7 +258,7 @@ cargo test -p freshell-ws handshake_ready_stamps_build_id
 npm run test:vitest -- run test/server/build-id.test.ts test/server/ws-handshake-snapshot.test.ts --config config/vitest/vitest.server.config.ts
 ```
 
-Expected: all FAIL for the missing behavior — the Rust roundtrip test fails to COMPILE (`no field \`build_id\` on struct Ready`); the freshell-ws wire test COMPILES (it references no new field) and fails its JSON assertion (`ready["buildId"]` is JSON null ≠ the baked string — the ready frame carries no `buildId`); `build-id.test.ts` fails to resolve `../../server/build-id.js` (module missing); the new snapshot test fails on `expect(typeof ready1.buildId).toBe('string')`.
+Expected: all FAIL for the missing behavior — the Rust roundtrip test fails to COMPILE (`no field \`build_id\` on struct Ready`); the freshell-ws wire test COMPILES (it references no new symbols) and fails its first assertion (`ready must stamp buildId` — the ready frame carries no `buildId`); `build-id.test.ts` fails to resolve `../../server/build-id.js` (module missing); the new snapshot test fails on `expect(typeof ready1.buildId).toBe('string')`.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -1047,9 +1050,12 @@ Extend `ReadyMessageSchema` (lines 157-166), after the `bootId` line:
 ```typescript
   bootId: z.string().min(1).optional(),
   // The server's baked build identity (additive/optional — old servers omit
-  // it). Compared in checkServerBuildId below; must never fail the WHOLE
-  // ready frame, hence optional + min(1) only.
-  buildId: z.string().min(1).optional(),
+  // it). Compared in checkServerBuildId below. Plain `z.string()` (NOT
+  // min(1)): a present-but-EMPTY buildId must reach the helper and no-op
+  // there, never fail the WHOLE ready frame and silently disable restart
+  // detection. Only a non-string TYPE can fail the frame, which no real
+  // server emits (the helper additionally treats "unknown" as a no-op).
+  buildId: z.string().optional(),
 ```
 
 Add the call inside the `else` (ready-success) branch, immediately after the `if (!newBootId) { ... }` warn block that ends at line 1031:
@@ -1073,14 +1079,14 @@ Expected: PASS.
 
 - [ ] **Step 5: Refactor while green**
 
-Verify the Vite define actually bakes the sha into the bundle:
+Verify the Vite define actually bakes the sha into the bundle (explicit pass/fail so automation cannot swallow a failed match through a pipe):
 
 ```bash
 npm run build:client
-rg -o "$(git rev-parse HEAD)" dist/client/assets/*.js | head -1
+rg -q "$(git rev-parse HEAD)" dist/client/assets/*.js && echo "BAKE OK: sha present in bundle" || echo "BAKE MISSING: sha absent from bundle"
 ```
 
-Expected: at least one match (the baked sha appears in the built bundle). (`npm run build:client` from this worktree writes the worktree's own `dist/client` — the main-checkout `npm run build` production-server guard does not apply here.)
+Expected: `BAKE OK: sha present in bundle` (the baked sha appears in the built bundle). (`npm run build:client` from this worktree writes the worktree's own `dist/client` — the main-checkout `npm run build` production-server guard does not apply here.)
 
 - [ ] **Step 6: Run impacted-test verification**
 
@@ -1284,7 +1290,7 @@ In the `rust-chromium` project's `testMatch` array, after the `/codex-terminal-b
         /server-build-mismatch-rust\.spec\.ts$/,
 ```
 
-In `CLOUD_SKIP_SPECS` (the cloud config's skip list in `playwright.cloud.config.ts`), add with justification:
+In `CLOUD_SKIP_SPECS` (the filename-string skip list in `playwright.cloud.config.ts` — entries are converted to `**/${s}` globs, so this MUST be a plain filename string, not a regex), add with justification:
 
 ```typescript
   // Server-build mismatch reload: the Cloud Run image builds WITHOUT git
@@ -1292,7 +1298,7 @@ In `CLOUD_SKIP_SPECS` (the cloud config's skip list in `playwright.cloud.config.
   // define are both "unknown" there and the client's compare is inert BY
   // DESIGN — a mismatched ready can never trigger a reload on that lane.
   // Coverage lives on the local rust-chromium project.
-  /server-build-mismatch-rust\.spec\.ts$/,
+  'server-build-mismatch-rust.spec.ts',
 ```
 
 In `AGENTS.md`, under "Key Architectural Patterns", append to the **WebSocket Protocol** paragraph:
