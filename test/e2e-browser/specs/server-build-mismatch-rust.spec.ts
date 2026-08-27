@@ -87,6 +87,22 @@ test.describe('server build mismatch reload (rust)', () => {
     await rebooted.waitForHarness()
     await rebooted.waitForConnection()
 
+    // The real post-reload ready must MATCH: in normal e2e runs the harness
+    // guarantees same-HEAD artifacts — global setup fresh-builds both sides
+    // (test/e2e-browser/global-setup.ts runs `npm run build:client && npm run
+    // build:server` at run start) and `ensureRustServerBuilt` restamps the
+    // Rust binary on HEAD moves — so the real `ready.buildId` equals the
+    // client's baked `__FRESHELL_BUILD_ID__` and the production match path
+    // MUST have cleared the sentinel. A failure here means the real ready
+    // did not MATCH — a genuine cross-artifact stamping regression, not a
+    // suppression artifact. (Known caveat: a stale dist from a non-harness
+    // flow will fail this assertion loudly, which is the feature working as
+    // designed.)
+    expect(
+      await page.evaluate((key) => sessionStorage.getItem(key), SENTINEL),
+      'real post-reload ready must MATCH and clear the sentinel (same-HEAD harness guarantee)',
+    ).toBeNull()
+
     await context.close()
   })
 

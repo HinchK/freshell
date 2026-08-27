@@ -527,8 +527,11 @@ pub async fn build_handshake(state: &WsState) -> Vec<ServerMessage> {
 /// [`build_handshake`], parameterized on the connection's negotiated
 /// `hello.capabilities.paneReconcileV1` (reconciliation design §4.2): the
 /// `ready.capabilities` advertisement is emitted **only when the client's
-/// `hello` opted in** — today's frozen client doesn't, so the emitted
-/// handshake stays byte-for-byte identical to the pinned clean-boot shape.
+/// `hello` opted in** — today's frozen client doesn't, so that field stays
+/// omitted for it (frozen-client inertness). The handshake overall is no
+/// longer byte-for-byte identical to the pinned clean-boot shape: `ready`
+/// now always stamps `buildId`, an additive change old clients ignore as
+/// an unknown field.
 ///
 /// CFG-12: `settings.updated` resolves [`WsState::handshake_settings`] — the
 /// LIVE tree — fresh on every call (one call per `/ws` connection), matching

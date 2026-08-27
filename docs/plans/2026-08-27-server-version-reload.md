@@ -484,6 +484,8 @@ Update `package.json`'s `build:server` script:
 
 3h. Create `server/build-id.ts`:
 
+> As-built amendment (delta review round 1): the bake path is resolved lazily — the eager form originally planned crashed module import in non-`file:` loaders (see commit 738e9346d).
+
 ```typescript
 import { execFileSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
@@ -496,7 +498,16 @@ const SHA_PATTERN = /^[0-9a-f]{40}$/
 // wrote dist/server/build-id.json), or next to server/build-id.ts in
 // tsx-from-source runs (where no bake file exists and the runtime probe is
 // correct because dev runs current source).
-const DEFAULT_BAKE_PATH = fileURLToPath(new URL('build-id.json', import.meta.url))
+function defaultBakePath(): string {
+  try {
+    return fileURLToPath(new URL('build-id.json', import.meta.url))
+  } catch {
+    // Non-file: import.meta.url (electron-style loaders): a relative path
+    // that readFileSync will miss, degrading to the inert "unknown" (compiled)
+    // or the runtime git probe (source) — never an import crash.
+    return 'build-id.json'
+  }
+}
 
 /**
  * The git commit the server runs from — the SAME identity the Rust server
@@ -553,7 +564,7 @@ const SOURCE_MODE = import.meta.url.endsWith('.ts')
  * which is correct because they execute current source.
  */
 export function resolveServerBuildId(
-  bakePath: string = DEFAULT_BAKE_PATH,
+  bakePath: string = defaultBakePath(),
   opts?: { sourceMode?: boolean },
 ): string {
   const sourceMode = opts?.sourceMode ?? SOURCE_MODE

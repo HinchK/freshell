@@ -112,17 +112,22 @@ export function rustServerBinPath(root: string = PROJECT_ROOT): string {
 /**
  * Whether the node dist's baked build stamp (written by `build:server`'s
  * `scripts/bake-server-build-id.mjs`) matches the CURRENT checkout HEAD.
- * True when no bake file exists (pre-stamp dist or git-less build — keep
- * the legacy exists-only behavior), when git is unavailable, or when the
- * stamp is unreadable: those cases have no stamp semantics to violate.
- * False only for a REAL staleness — a bake from an earlier HEAD — which
- * must trigger a rebuild so the oracle's node-vs-rust `buildId` comparison
- * compares same-HEAD artifacts, never a stale checkout against a fresh
- * cargo build.
+ * False when NO bake file exists: post-feature `build:server` ALWAYS writes
+ * the bake file (including `"unknown"` for git-less builds), so absence
+ * means a pre-feature or raw-`tsc` artifact whose ready frame may omit
+ * `buildId` entirely — reusing it would make the oracle's raw `buildId`
+ * comparison fail, so it must trigger a rebuild. True only for leniency
+ * cases that have no comparable stamp semantics to violate: the file
+ * EXISTS but is malformed/unreadable (defensive — the writer is atomic),
+ * the stamp is `"unknown"` (a git-less build; a rebuild writes the same),
+ * or git is unavailable. False too for a REAL staleness — a bake from an
+ * earlier HEAD — which must trigger a rebuild so the oracle's
+ * node-vs-rust `buildId` comparison compares same-HEAD artifacts, never a
+ * stale checkout against a fresh cargo build.
  */
 function nodeBuildStampIsCurrent(root: string): boolean {
   const bakePath = path.join(root, 'dist', 'server', 'build-id.json')
-  if (!fs.existsSync(bakePath)) return true
+  if (!fs.existsSync(bakePath)) return false
   try {
     const baked = (JSON.parse(fs.readFileSync(bakePath, 'utf8')) as { buildId?: unknown }).buildId
     if (typeof baked !== 'string' || baked === 'unknown') return true
