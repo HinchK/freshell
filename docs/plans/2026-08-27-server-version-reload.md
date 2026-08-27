@@ -635,7 +635,14 @@ Extend the ready send (lines 2034-2039):
         })
 ```
 
-3j. In `port/oracle/harness/external-server.ts` — the oracle's node target runs the COMPILED `dist/server/index.js`, and `ensureServerBuilt` rebuilds only when the entry is ABSENT. After this feature, a stale pre-existing `dist` carries a stale bake file, and `npm run test:oracle` would compare a stale Node `buildId` against the fresh cargo-built Rust value — a false implementation divergence. Add a stamp-freshness check so a stale node dist rebuilds (keep the legacy behavior when no bake file exists, so git-less/pre-stamp dists are unaffected):
+3j. In `port/oracle/harness/external-server.ts` — the oracle's node target runs the COMPILED `dist/server/index.js`, and `ensureServerBuilt` rebuilds only when the entry is ABSENT. After this feature, a stale pre-existing `dist` carries a stale bake file, and `npm run test:oracle` would compare a stale Node `buildId` against the fresh cargo-built Rust value — a false implementation divergence. Add a stamp-freshness check so a stale node dist rebuilds.
+
+> As-built amendments (delta reviews rounds 1-2): the final predicate is STRICTER than the
+> first draft below — with Git HEAD available, ONLY a bake stamp exactly equal to HEAD is
+> current; a MISSING, unreadable, mismatched, or `"unknown"` stamp all trigger a rebuild
+> (a stampless/raw-`tsc` or git-less-built artifact must never be reused against a fresh
+> cargo-built rust binary). Git-unavailable environments keep the legacy reuse behavior.
+> Directly tested by `test/unit/port/oracle-harness-freshness.test.ts`.
 
 ```typescript
 /**
