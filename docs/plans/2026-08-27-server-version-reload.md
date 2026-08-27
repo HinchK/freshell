@@ -344,7 +344,7 @@ No refactor needed — every addition mirrors the adjacent `bootId` idiom on its
 
 - [ ] **Step 6: Run impacted-test verification**
 
-This change touches the shared wire protocol, both server implementations, and the generated schema, so the impacted set is: both Rust crates' full test trees, the workspace compile of every literal site, the whole server-config suite (any test asserting handshake/ready shapes), and the port oracle suites. Note on `t0-equivalence-rust.test.ts`: its node-vs-rust deep diff compares `ready` frames value-by-value — both sides now stamp the SAME value (the worktree HEAD sha; `ensureRustServerBuilt` runs `cargo build` at test time and `build.rs` re-stamps on HEAD moves; Node computes the same sha at runtime), or both `"unknown"` in git-less environments, so the diff stays clean.
+This change touches the shared wire protocol, both server implementations, and the generated schema, so the impacted set is: both Rust crates' full test trees, the workspace compile of every literal site, the whole server-config suite (any test asserting handshake/ready shapes), and the port-oracle suites. **`npm run test:port` does NOT run the oracle suites** (`vitest.port.config.ts` excludes `test/unit/port/oracle/**`; they are deliberately outside the coordinator and run only via `npm run test:oracle`, which boots real servers — budget several minutes). Note on `t0-equivalence-rust.test.ts`: its node-vs-rust deep diff compares `ready` frames value-by-value (`buildId` is NOT in the normalization registry, so it is compared RAW) — both sides stamp the SAME value (the worktree HEAD sha: the oracle node target runs from an isolated runtime root under the worktree so `git rev-parse HEAD` walk-up resolves the worktree sha; the rust target is `cargo build`-ed at test time by `ensureRustServerBuilt` and `build.rs` re-stamps on HEAD moves; Node computes the same sha at runtime), or both `"unknown"` in git-less environments, so the diff stays clean — and this run is the proof.
 
 ```bash
 cargo test -p freshell-protocol
@@ -352,6 +352,7 @@ cargo test -p freshell-ws
 cargo check --workspace --all-targets
 npm run test:integration
 npm run test:port
+npm run test:oracle
 ```
 
 Expected: all PASS.
@@ -471,7 +472,15 @@ describe('checkServerBuildId', () => {
   it('falls back to the __FRESHELL_BUILD_ID__ global and window defaults when options are omitted', () => {
     vi.stubGlobal('__FRESHELL_BUILD_ID__', 'c'.repeat(40))
     const reload = vi.fn()
-    Object.defineProperty(window.location, 'reload', { value: reload, configurable: true, writable: true })
+    // jsdom 25's Location owns `reload` non-configurably — defineProperty on
+    // window.location itself throws. Repo precedent (import-retry.test.ts):
+    // replace window-level with a spread copy.
+    const originalLocation = window.location
+    Object.defineProperty(window, 'location', {
+      value: { ...window.location, reload },
+      writable: true,
+      configurable: true,
+    })
     sessionStorage.clear()
 
     checkServerBuildId({ serverBuildId: 'd'.repeat(40) })
@@ -483,6 +492,12 @@ describe('checkServerBuildId', () => {
     sessionStorage.removeItem(SENTINEL)
     checkServerBuildId({ serverBuildId: 'd'.repeat(40) })
     expect(reload).toHaveBeenCalledTimes(1)
+
+    Object.defineProperty(window, 'location', {
+      value: originalLocation,
+      writable: true,
+      configurable: true,
+    })
   })
 })
 ```
@@ -491,6 +506,7 @@ describe('checkServerBuildId', () => {
 
 ```tsx
 describe('App ready buildId → one-shot server-build reload', () => {
+  let originalLocation: Location
   beforeEach(() => {
     cleanup()
     vi.resetAllMocks()
@@ -529,16 +545,25 @@ describe('App ready buildId → one-shot server-build reload', () => {
     })
 
     sessionStorage.clear()
-    Object.defineProperty(window.location, 'reload', {
-      value: vi.fn(),
-      configurable: true,
+    // jsdom 25's Location owns `reload` non-configurably — defineProperty on
+    // window.location itself throws. Repo precedent (import-retry.test.ts):
+    // window-level replacement with save/restore.
+    originalLocation = window.location
+    Object.defineProperty(window, 'location', {
+      value: { ...window.location, reload: vi.fn() },
       writable: true,
+      configurable: true,
     })
   })
 
   afterEach(() => {
     cleanup()
     vi.unstubAllGlobals()
+    Object.defineProperty(window, 'location', {
+      value: originalLocation,
+      writable: true,
+      configurable: true,
+    })
     sessionStorage.clear()
   })
 
@@ -633,6 +658,11 @@ function resolveClientBuildId(): string | undefined {
  *   further reloads this tab session (a half-deployed server can never
  *   reload-loop; sessionStorage access failure = no reload, fail-safe);
  * - a MATCHING ready clears the sentinel (self-re-arm after convergence).
+ * KNOWN LIMIT (accepted for the self-hosted single-server threat model):
+ * the "once" guarantee is per server identity — one origin fronted by
+ * servers built from DIFFERENT commits can oscillate (mismatch → reload →
+ * match clears → mismatch → …). Deliberately not hardened with a
+ * clears-per-session cap; revisit only if a split-deploy origin appears.
  */
 export function checkServerBuildId(options?: ServerBuildCheckOptions): void {
   const clientBuildId = options?.clientBuildId ?? resolveClientBuildId()
@@ -922,10 +952,16 @@ In the `rust-chromium` project's `testMatch` array, after the `/codex-terminal-b
 In `AGENTS.md`, under "Key Architectural Patterns", append to the **WebSocket Protocol** paragraph:
 
 ```
-The `ready` frame carries an optional additive `buildId` (the server's baked git commit, `"unknown"` fallback): the client bakes its own at Vite build time (`__FRESHELL_BUILD_ID__`) and, on a mismatch, reloads exactly once per tab session (sessionStorage sentinel `freshell.server-build-reload`), self-healing stale-client contract errors; `"unknown"` on either side never triggers or clears the guard (`src/lib/server-build-check.ts`).
+The `ready` frame carries an optional additive `buildId` (the server's baked git commit, `"unknown"` fallback): the client bakes its own at Vite build time (`__FRESHELL_BUILD_ID__`) and, on a mismatch, reloads exactly once per tab session (sessionStorage sentinel `freshell.server-build-reload`), self-healing stale-client contract errors; `"unknown"` on either side never triggers or clears the guard (`src/lib/server-build-check.ts`). The once-guard is per server identity: an origin fronted by mixed-build servers could oscillate (accepted for the single-server self-hosted model).
 ```
 
 - [ ] **Step 2: Run the test and verify it passes, then RED-VERIFY it exercises the feature**
+
+Build the client fresh first so the served bundle provably contains the feature (the red-verification's validity depends on it):
+
+```bash
+npm run build:client
+```
 
 With Tasks 1-2 landed the behavior exists, so the fresh test should be green — but a green-only run is not sufficient proof. First run it green:
 
@@ -963,7 +999,7 @@ Same command as Step 2's final run. Expected: PASS.
 
 - [ ] **Step 5: Refactor while green**
 
-No refactor needed. Confirm the spec is excluded from the match-all `chromium` project by the `RUST_ONLY_SPECS` entry (`testIgnore: RUST_ONLY_SPECS` at `playwright.config.ts:330`) and runs ONLY under `rust-chromium`.
+No refactor needed. Confirm the spec is excluded from the match-all `chromium` project by the `RUST_ONLY_SPECS` entry (`testIgnore: RUST_ONLY_SPECS` at `playwright.config.ts:330`) and runs ONLY under `rust-chromium`. Note the spec also runs on the CLOUD e2e lane when `FRESHELL_E2E_BACKEND=cloud` (`playwright.cloud.config.ts` filters only firefox/webkit/continuity-smoke, so `rust-chromium` survives; the spec is not in `CLOUD_SKIP_SPECS`) — do not add it there; coverage comes from Step 6's backend run.
 
 - [ ] **Step 6: Run impacted-test verification**
 
@@ -976,6 +1012,8 @@ npm run test:vitest -- run test/unit/client/lib/server-build-check.test.ts test/
 
 Expected: all PASS.
 
+**Backend proof (repo rule: an affected e2e spec must pass on the configured `FRESHELL_E2E_BACKEND` before a PR is filed):** before the branch is PR'd, run this spec on the configured backend — if `FRESHELL_E2E_BACKEND=cloud`, `npm run test:e2e:cloud` filtered to this spec (this also proves `cargo` availability and the build stamp inside the cloud image); if unset/local, the local runs above satisfy the rule. This is a pre-PR gate recorded in the run log, not part of the task commit.
+
 - [ ] **Step 7: Commit the task**
 
 ```bash
@@ -987,13 +1025,14 @@ git commit -m "test(e2e): rust spec proves one-shot sentinel-guarded reload on r
 
 ## Post-execution verification (after Task 3)
 
-Run the coordinated full suite once, from the worktree:
+Run the coordinated full suite once, from the worktree, plus the oracle suites (which `npm run check` deliberately does NOT cover — they live outside the coordinator):
 
 ```bash
 npm run check
+npm run test:oracle
 ```
 
-Expected: typecheck + full default + server suites PASS (the electron suite is unaffected but runs as part of the coordinated run).
+Expected: typecheck + full default + server suites PASS, and the oracle suites (t0-equivalence, handshake-determinism, external-handshake, mutation-validation) PASS — `npm run test:oracle` boots real servers and cargo-builds the workspace, so budget several minutes. Also confirm the Task 3 backend proof was recorded (the spec passing on the configured `FRESHELL_E2E_BACKEND`).
 
 **User-outcome recap (maps every requirement to its proof):**
 
