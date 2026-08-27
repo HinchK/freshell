@@ -19,31 +19,50 @@ describe('checkServerBuildId', () => {
     vi.restoreAllMocks()
   })
 
-  it('reloads once, arming the sentinel BEFORE the reload fires, and the sentinel suppresses a second mismatch', () => {
+  it('reloads once, recording the attempted server build id in the sentinel BEFORE the reload fires', () => {
     const storage = mapStorage()
     const reload = vi.fn(() => {
       // Ordering proof: production must persist the sentinel BEFORE
       // calling reload — an implementation that reloads first and arms
       // second would lose the sentinel across the navigation.
-      expect(storage._map.get(SENTINEL), 'sentinel must be armed BEFORE reload fires').toBe('1')
+      expect(storage._map.get(SENTINEL), 'sentinel must be armed BEFORE reload fires').toBe('b'.repeat(40))
     })
     checkServerBuildId({ clientBuildId: 'a'.repeat(40), serverBuildId: 'b'.repeat(40), reload, storage })
     expect(reload).toHaveBeenCalledTimes(1)
-    expect(storage._map.get(SENTINEL)).toBe('1')
+    expect(storage._map.get(SENTINEL)).toBe('b'.repeat(40))
   })
 
-  it('never reloads twice: an armed sentinel suppresses the reload', () => {
+  it('never reloads twice for the same server build id: a recorded sentinel suppresses the reload', () => {
     const storage = mapStorage()
-    storage._map.set(SENTINEL, '1')
+    storage._map.set(SENTINEL, 'b'.repeat(40))
     const reload = vi.fn()
     checkServerBuildId({ clientBuildId: 'a'.repeat(40), serverBuildId: 'b'.repeat(40), reload, storage })
     expect(reload).not.toHaveBeenCalled()
-    expect(storage._map.get(SENTINEL)).toBe('1')
+    expect(storage._map.get(SENTINEL)).toBe('b'.repeat(40))
   })
 
-  it('a matching ready clears the sentinel (self-re-arm)', () => {
+  it('re-arms for a DIFFERENT mismatched server build id: B attempts once, repeats of B suppress, C reloads again', () => {
     const storage = mapStorage()
-    storage._map.set(SENTINEL, '1')
+    const reload = vi.fn()
+    // Mismatch vs B: reload, sentinel records B.
+    checkServerBuildId({ clientBuildId: 'a'.repeat(40), serverBuildId: 'b'.repeat(40), reload, storage })
+    expect(reload).toHaveBeenCalledTimes(1)
+    expect(storage._map.get(SENTINEL)).toBe('b'.repeat(40))
+    // Mismatch vs B again (the half-deployed case): the same identity was
+    // already attempted — suppressed, no reload.
+    checkServerBuildId({ clientBuildId: 'a'.repeat(40), serverBuildId: 'b'.repeat(40), reload, storage })
+    expect(reload).toHaveBeenCalledTimes(1)
+    expect(storage._map.get(SENTINEL)).toBe('b'.repeat(40))
+    // A corrected deployment (C): a different server build id re-arms the
+    // guard — reloads again, sentinel now records C.
+    checkServerBuildId({ clientBuildId: 'a'.repeat(40), serverBuildId: 'c'.repeat(40), reload, storage })
+    expect(reload).toHaveBeenCalledTimes(2)
+    expect(storage._map.get(SENTINEL)).toBe('c'.repeat(40))
+  })
+
+  it('a matching ready clears the recorded sentinel (self-re-arm)', () => {
+    const storage = mapStorage()
+    storage._map.set(SENTINEL, 'b'.repeat(40))
     const reload = vi.fn()
     checkServerBuildId({ clientBuildId: 'a'.repeat(40), serverBuildId: 'a'.repeat(40), reload, storage })
     expect(reload).not.toHaveBeenCalled()
@@ -67,13 +86,13 @@ describe('checkServerBuildId', () => {
     }
   })
 
-  it('an armed sentinel survives an "unknown"-vs-"unknown" ready (never treated as a match)', () => {
+  it('a recorded sentinel survives an "unknown"-vs-"unknown" ready (never treated as a match)', () => {
     const storage = mapStorage()
-    storage._map.set(SENTINEL, '1')
+    storage._map.set(SENTINEL, 'b'.repeat(40))
     const reload = vi.fn()
     checkServerBuildId({ clientBuildId: 'unknown', serverBuildId: 'unknown', reload, storage })
     expect(reload).not.toHaveBeenCalled()
-    expect(storage._map.get(SENTINEL)).toBe('1')
+    expect(storage._map.get(SENTINEL)).toBe('b'.repeat(40))
   })
 
   it('does not reload when the sentinel cannot be persisted (fail-safe against reload loops)', () => {
@@ -122,7 +141,7 @@ describe('checkServerBuildId', () => {
 
     checkServerBuildId({ serverBuildId: 'd'.repeat(40) })
     expect(reload).toHaveBeenCalledTimes(1)
-    expect(sessionStorage.getItem(SENTINEL)).toBe('1')
+    expect(sessionStorage.getItem(SENTINEL)).toBe('d'.repeat(40))
 
     // And with the global absent (Vitest has no define), it is a no-op.
     vi.unstubAllGlobals()

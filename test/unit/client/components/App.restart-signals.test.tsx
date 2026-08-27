@@ -486,8 +486,9 @@ describe('App ready buildId → one-shot server-build reload', () => {
     // jsdom 25's Location owns `reload` non-configurably — defineProperty on
     // window.location itself throws. Repo precedent (import-retry.test.ts):
     // window-level replacement with save/restore. The reload stub asserts
-    // the sentinel is armed AT CALL TIME (the ordering proof lives here
-    // too, against real jsdom sessionStorage) and counts invocations.
+    // the sentinel is armed AT CALL TIME with the attempted server build id
+    // (the ordering proof lives here too, against real jsdom sessionStorage)
+    // and counts invocations.
     originalLocation = window.location
     Object.defineProperty(window, 'location', {
       value: {
@@ -496,7 +497,7 @@ describe('App ready buildId → one-shot server-build reload', () => {
           expect(
             sessionStorage.getItem('freshell.server-build-reload'),
             'sentinel must be armed BEFORE reload fires',
-          ).toBe('1')
+          ).toBe('b'.repeat(40))
           reloadCalls++
         },
       },
@@ -523,7 +524,7 @@ describe('App ready buildId → one-shot server-build reload', () => {
 
     sendReady({ serverInstanceId: 'srv-1', bootId: 'boot-1', buildId: 'b'.repeat(40) })
     expect(reloadCalls).toBe(1)
-    expect(sessionStorage.getItem('freshell.server-build-reload')).toBe('1')
+    expect(sessionStorage.getItem('freshell.server-build-reload')).toBe('b'.repeat(40))
 
     // The reload lands: the page reboots in the SAME tab (real jsdom
     // sessionStorage persists), the server is still stale, and the next
@@ -534,7 +535,9 @@ describe('App ready buildId → one-shot server-build reload', () => {
 
   it('a matching ready clears the sentinel and re-arms the guard', async () => {
     vi.stubGlobal('__FRESHELL_BUILD_ID__', 'a'.repeat(40))
-    sessionStorage.setItem('freshell.server-build-reload', '1')
+    // A sentinel recorded by an earlier mismatched ready (the attempted
+    // server build id), as the production code would have persisted it.
+    sessionStorage.setItem('freshell.server-build-reload', 'b'.repeat(40))
     const store = createStore()
     await renderApp(store)
 

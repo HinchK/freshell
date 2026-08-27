@@ -44,15 +44,18 @@ function defaultStorage(): Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> |
  * reload ONCE on a real mismatch. Invariants:
  * - reload iff BOTH ids are present, non-empty, neither is "unknown", and
  *   they differ ("unknown" == "unknown" is a no-op, never a match-and-clear);
- * - the sessionStorage sentinel is set BEFORE reloading and suppresses any
- *   further reloads this tab session (a half-deployed server can never
- *   reload-loop; any sessionStorage failure = no reload, logged, fail-safe);
+ * - the sessionStorage sentinel records the ATTEMPTED server build id and is
+ *   written BEFORE reloading: the same server build id never reloads twice
+ *   this tab session (a half-deployed server can never reload-loop), while a
+ *   DIFFERENT mismatched id re-arms the guard — a corrected deployment
+ *   changes what a reload fetches, so it must stay reachable; any
+ *   sessionStorage failure = no reload, logged, fail-safe;
  * - a MATCHING ready clears the sentinel (self-re-arm after convergence).
  * KNOWN LIMITS (accepted for the self-hosted single-server threat model):
- * - the "once" guarantee is per server identity — one origin fronted by
- *   servers built from DIFFERENT commits can oscillate (mismatch → reload →
- *   match clears → mismatch → …). Not hardened with a clears-per-session
- *   cap; revisit only if a split-deploy origin appears.
+ * - the mixed-build-origin oscillation door stays open through match-clears:
+ *   one origin fronted by servers built from DIFFERENT commits can oscillate
+ *   (mismatch → reload → match clears → mismatch → …). Not hardened with a
+ *   clears-per-session cap; revisit only if a split-deploy origin appears.
  * - the compare is direction-free (shas carry no ordering), so a NEWER
  *   client against an OLDER server performs one futile bounded reload per
  *   fresh tab session.
@@ -85,21 +88,23 @@ export function checkServerBuildId(options?: ServerBuildCheckOptions): void {
     return
   }
   try {
-    if (storage.getItem(SERVER_BUILD_RELOAD_SENTINEL) === '1') {
+    if (storage.getItem(SERVER_BUILD_RELOAD_SENTINEL) === serverBuildId) {
       log.warn(
         `server build ${serverBuildId} still differs from client build ${clientBuildId}; `
-        + 'one reload already attempted this tab session — suppressing further reloads',
+        + `a reload for build ${serverBuildId} was already attempted this tab session — `
+        + 'suppressing further reloads for it',
       )
       return
     }
-    storage.setItem(SERVER_BUILD_RELOAD_SENTINEL, '1')
+    storage.setItem(SERVER_BUILD_RELOAD_SENTINEL, serverBuildId)
   } catch (err) {
     log.warn('server-build sentinel persistence failed; suppressing the reload', err)
     return
   }
   log.warn(
     `server build ${serverBuildId} differs from client build ${clientBuildId}; `
-    + 'reloading once to pick up the matching client bundle',
+    + `reloading once for build ${serverBuildId} to pick up the matching client bundle `
+    + '(a different server build id will re-arm this guard)',
   )
   reload()
 }

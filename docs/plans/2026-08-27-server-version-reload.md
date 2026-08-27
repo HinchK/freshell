@@ -9,12 +9,18 @@
 > `/home/dan/code/freshell/.worktrees/.the-usual-logs/server-version-reload/`.
 > Two as-built amendments diverge from the original text and are marked
 > inline: the lazy `defaultBakePath()` (Step 3h) and the e2e match-path
-> assertion (Task 3). The document is retained as the authoritative spec of
-> what was built.
+> assertion (Task 3). A third as-built amendment (delta review round 3) —
+> the reload sentinel records the attempted server build id instead of the
+> literal `"1"` — is marked inline at the Global Constraints loop-guard
+> bullet and the Task 2 listings. The document is retained as the
+> authoritative spec of what was built.
 
-> **For agentic workers:** Execute this plan task by task with a fresh
-> implementer and a specification-plus-quality review after every task. Track
-> progress with the checkbox steps below.
+> **For agentic workers:** This plan has been fully executed and is retained
+> as the authoritative specification of what was built. Do not re-execute it.
+> Progress, reviews, and verification evidence: the `usual-sdd` ledger in the
+> worktree's git directory and the run logs under
+> `/home/dan/code/freshell/.worktrees/.the-usual-logs/server-version-reload/`.
+> Track historical progress with the (completed) checkbox steps below.
 
 **Goal:** When a browser tab connects (or reconnects) to a Freshell server built from a different commit than the client bundle it is running, the client detects the mismatch from the WS `ready` frame and reloads itself exactly once — self-healing the "Fresh-agent snapshot response did not match the shared contract" class of stale-client failures without ever reload-looping.
 
@@ -30,7 +36,8 @@
 - **Artifact-time semantics everywhere:** each stamp describes the artifact that emits it. Rust bakes at compile; Node's production stamp comes from the `dist/server/build-id.json` written by `build:server` (a stale dist advertises the sha it was BUILT from — never the checkout's current HEAD); tsx dev mode has no bake file next to source and probes runtime HEAD (correct: it runs current source); Vite bakes the client's sha at bundle time.
 - **Value semantics on every side:** the value is the full `git rev-parse HEAD` SHA of the repo at build/bake time; when git is unavailable or the output is not 40 lowercase hex chars (Node/Vite enforce the 40-hex check; the Rust scripts accept any successful output), the literal `"unknown"`. Known caveat (accepted, documented): a SHA-256 git checkout would make Rust stamp 64 hex while Node/Vite stamp `"unknown"` — the guard goes inert (no false reloads, no crash); this repo is SHA-1.
 - **Client compare rule:** reload iff BOTH ids are present, non-empty, neither is `"unknown"`, and they differ. `"unknown" == "unknown"` is NOT a match-and-clear (it is a no-op) — two unknown builds must never trigger a reload and must never clear an armed sentinel. The compare is direction-free: a NEWER client against an OLDER server also performs one bounded reload per fresh tab session (futile but harmless; shas carry no ordering) — documented, accepted.
-- **Loop-guard invariant:** at most ONE code-triggered reload per tab session, per server identity. The sentinel key is `freshell.server-build-reload` (`sessionStorage`, value `"1"`), set BEFORE calling `reload()`. If `sessionStorage` cannot be read or written (property access throwing a SecurityError, quota errors, absent API), no reload happens and the suppression failure is logged (fail-safe with observability). A matching `ready` clears the sentinel (self-re-arm). KNOWN LIMIT (accepted, documented): one origin fronted by servers built from DIFFERENT commits could oscillate (mismatch → reload → match clears → mismatch → …); deliberately not hardened with a clears-per-session cap for the single-server self-hosted threat model.
+- **Loop-guard invariant:** at most ONE code-triggered reload per tab session, per server build identity. The sentinel key is `freshell.server-build-reload` (`sessionStorage`); it records the last attempted SERVER build id and is written BEFORE calling `reload()` — the same id never reloads twice, and a different (corrected) deployment re-arms the guard (deployments change what a reload fetches). If `sessionStorage` cannot be read or written (property access throwing a SecurityError, quota errors, absent API), no reload happens and the suppression failure is logged (fail-safe with observability). A matching `ready` clears the sentinel (self-re-arm). KNOWN LIMIT (accepted, documented): one origin fronted by servers built from DIFFERENT commits could oscillate (mismatch → reload → match clears → mismatch → …); deliberately not hardened with a clears-per-session cap for the single-server self-hosted threat model.
+  > As-built amendment (delta review round 3): the sentinel value records the last attempted server build id (originally the literal `"1"`), making the once-guard per (tab session, server build id) — a half-deployed server B no longer suppresses a later corrected deployment C; the match-clears oscillation limit above is unchanged.
 - **Client module must not crash under Vitest:** the Vitest client config has no `__FRESHELL_BUILD_ID__` define, so the module must use a `typeof __FRESHELL_BUILD_ID__ === 'undefined'` guard (same precedent as `src/lib/perf-logger.ts:45` with `__PERF_LOGGING__`).
 - **NodeNext/ESM:** every relative import in `server/` and `shared/` uses `.js` extensions; client code uses `@/` aliases without extensions.
 - **Test coordination:** broad suites go through the repo coordinator (`npm run test:vitest -- run ...`); never raw `npx vitest`. Focused Rust tests use `cargo test -p <crate>` directly. The port-ORACLE suites are NOT covered by `npm run test:port` / `npm run check` — they run only via `npm run test:oracle`.
@@ -736,6 +743,8 @@ Expected: the first `git status --short` lists exactly the Task 1 files (all und
 
 1a. Create `test/unit/client/lib/server-build-check.test.ts`:
 
+> As-built amendment (delta review round 3): the sentinel records the attempted server build id (see the Global Constraints loop-guard amendment) — the listing below shows the as-built semantics, including the added re-arm sequence test.
+
 ```typescript
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { checkServerBuildId } from '@/lib/server-build-check'
@@ -758,31 +767,50 @@ describe('checkServerBuildId', () => {
     vi.restoreAllMocks()
   })
 
-  it('reloads once, arming the sentinel BEFORE the reload fires, and the sentinel suppresses a second mismatch', () => {
+  it('reloads once, recording the attempted server build id in the sentinel BEFORE the reload fires', () => {
     const storage = mapStorage()
     const reload = vi.fn(() => {
       // Ordering proof: production must persist the sentinel BEFORE
       // calling reload — an implementation that reloads first and arms
       // second would lose the sentinel across the navigation.
-      expect(storage._map.get(SENTINEL), 'sentinel must be armed BEFORE reload fires').toBe('1')
+      expect(storage._map.get(SENTINEL), 'sentinel must be armed BEFORE reload fires').toBe('b'.repeat(40))
     })
     checkServerBuildId({ clientBuildId: 'a'.repeat(40), serverBuildId: 'b'.repeat(40), reload, storage })
     expect(reload).toHaveBeenCalledTimes(1)
-    expect(storage._map.get(SENTINEL)).toBe('1')
+    expect(storage._map.get(SENTINEL)).toBe('b'.repeat(40))
   })
 
-  it('never reloads twice: an armed sentinel suppresses the reload', () => {
+  it('never reloads twice for the same server build id: a recorded sentinel suppresses the reload', () => {
     const storage = mapStorage()
-    storage._map.set(SENTINEL, '1')
+    storage._map.set(SENTINEL, 'b'.repeat(40))
     const reload = vi.fn()
     checkServerBuildId({ clientBuildId: 'a'.repeat(40), serverBuildId: 'b'.repeat(40), reload, storage })
     expect(reload).not.toHaveBeenCalled()
-    expect(storage._map.get(SENTINEL)).toBe('1')
+    expect(storage._map.get(SENTINEL)).toBe('b'.repeat(40))
   })
 
-  it('a matching ready clears the sentinel (self-re-arm)', () => {
+  it('re-arms for a DIFFERENT mismatched server build id: B attempts once, repeats of B suppress, C reloads again', () => {
     const storage = mapStorage()
-    storage._map.set(SENTINEL, '1')
+    const reload = vi.fn()
+    // Mismatch vs B: reload, sentinel records B.
+    checkServerBuildId({ clientBuildId: 'a'.repeat(40), serverBuildId: 'b'.repeat(40), reload, storage })
+    expect(reload).toHaveBeenCalledTimes(1)
+    expect(storage._map.get(SENTINEL)).toBe('b'.repeat(40))
+    // Mismatch vs B again (the half-deployed case): the same identity was
+    // already attempted — suppressed, no reload.
+    checkServerBuildId({ clientBuildId: 'a'.repeat(40), serverBuildId: 'b'.repeat(40), reload, storage })
+    expect(reload).toHaveBeenCalledTimes(1)
+    expect(storage._map.get(SENTINEL)).toBe('b'.repeat(40))
+    // A corrected deployment (C): a different server build id re-arms the
+    // guard — reloads again, sentinel now records C.
+    checkServerBuildId({ clientBuildId: 'a'.repeat(40), serverBuildId: 'c'.repeat(40), reload, storage })
+    expect(reload).toHaveBeenCalledTimes(2)
+    expect(storage._map.get(SENTINEL)).toBe('c'.repeat(40))
+  })
+
+  it('a matching ready clears the recorded sentinel (self-re-arm)', () => {
+    const storage = mapStorage()
+    storage._map.set(SENTINEL, 'b'.repeat(40))
     const reload = vi.fn()
     checkServerBuildId({ clientBuildId: 'a'.repeat(40), serverBuildId: 'a'.repeat(40), reload, storage })
     expect(reload).not.toHaveBeenCalled()
@@ -806,13 +834,13 @@ describe('checkServerBuildId', () => {
     }
   })
 
-  it('an armed sentinel survives an "unknown"-vs-"unknown" ready (never treated as a match)', () => {
+  it('a recorded sentinel survives an "unknown"-vs-"unknown" ready (never treated as a match)', () => {
     const storage = mapStorage()
-    storage._map.set(SENTINEL, '1')
+    storage._map.set(SENTINEL, 'b'.repeat(40))
     const reload = vi.fn()
     checkServerBuildId({ clientBuildId: 'unknown', serverBuildId: 'unknown', reload, storage })
     expect(reload).not.toHaveBeenCalled()
-    expect(storage._map.get(SENTINEL)).toBe('1')
+    expect(storage._map.get(SENTINEL)).toBe('b'.repeat(40))
   })
 
   it('does not reload when the sentinel cannot be persisted (fail-safe against reload loops)', () => {
@@ -861,7 +889,7 @@ describe('checkServerBuildId', () => {
 
     checkServerBuildId({ serverBuildId: 'd'.repeat(40) })
     expect(reload).toHaveBeenCalledTimes(1)
-    expect(sessionStorage.getItem(SENTINEL)).toBe('1')
+    expect(sessionStorage.getItem(SENTINEL)).toBe('d'.repeat(40))
 
     // And with the global absent (Vitest has no define), it is a no-op.
     vi.unstubAllGlobals()
@@ -926,8 +954,9 @@ describe('App ready buildId → one-shot server-build reload', () => {
     // jsdom 25's Location owns `reload` non-configurably — defineProperty on
     // window.location itself throws. Repo precedent (import-retry.test.ts):
     // window-level replacement with save/restore. The reload stub asserts
-    // the sentinel is armed AT CALL TIME (the ordering proof lives here
-    // too, against real jsdom sessionStorage) and counts invocations.
+    // the sentinel is armed AT CALL TIME with the attempted server build id
+    // (the ordering proof lives here too, against real jsdom sessionStorage)
+    // and counts invocations.
     originalLocation = window.location
     Object.defineProperty(window, 'location', {
       value: {
@@ -936,7 +965,7 @@ describe('App ready buildId → one-shot server-build reload', () => {
           expect(
             sessionStorage.getItem('freshell.server-build-reload'),
             'sentinel must be armed BEFORE reload fires',
-          ).toBe('1')
+          ).toBe('b'.repeat(40))
           reloadCalls++
         },
       },
@@ -963,7 +992,7 @@ describe('App ready buildId → one-shot server-build reload', () => {
 
     sendReady({ serverInstanceId: 'srv-1', bootId: 'boot-1', buildId: 'b'.repeat(40) })
     expect(reloadCalls).toBe(1)
-    expect(sessionStorage.getItem('freshell.server-build-reload')).toBe('1')
+    expect(sessionStorage.getItem('freshell.server-build-reload')).toBe('b'.repeat(40))
 
     // The reload lands: the page reboots in the SAME tab (real jsdom
     // sessionStorage persists), the server is still stale, and the next
@@ -974,7 +1003,9 @@ describe('App ready buildId → one-shot server-build reload', () => {
 
   it('a matching ready clears the sentinel and re-arms the guard', async () => {
     vi.stubGlobal('__FRESHELL_BUILD_ID__', 'a'.repeat(40))
-    sessionStorage.setItem('freshell.server-build-reload', '1')
+    // A sentinel recorded by an earlier mismatched ready (the attempted
+    // server build id), as the production code would have persisted it.
+    sessionStorage.setItem('freshell.server-build-reload', 'b'.repeat(40))
     const store = createStore()
     await renderApp(store)
 
@@ -1009,6 +1040,8 @@ Expected: FAIL — `server-build-check.test.ts` cannot resolve `@/lib/server-bui
 - [x] **Step 3: Add the minimal production implementation**
 
 3a. Create `src/lib/server-build-check.ts`:
+
+> As-built amendment (delta review round 3): the sentinel records the attempted server build id — see the Global Constraints loop-guard amendment; the listing below is the as-built module.
 
 ```typescript
 import { createLogger } from '@/lib/client-logger'
@@ -1057,15 +1090,18 @@ function defaultStorage(): Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> |
  * reload ONCE on a real mismatch. Invariants:
  * - reload iff BOTH ids are present, non-empty, neither is "unknown", and
  *   they differ ("unknown" == "unknown" is a no-op, never a match-and-clear);
- * - the sessionStorage sentinel is set BEFORE reloading and suppresses any
- *   further reloads this tab session (a half-deployed server can never
- *   reload-loop; any sessionStorage failure = no reload, logged, fail-safe);
+ * - the sessionStorage sentinel records the ATTEMPTED server build id and is
+ *   written BEFORE reloading: the same server build id never reloads twice
+ *   this tab session (a half-deployed server can never reload-loop), while a
+ *   DIFFERENT mismatched id re-arms the guard — a corrected deployment
+ *   changes what a reload fetches, so it must stay reachable; any
+ *   sessionStorage failure = no reload, logged, fail-safe;
  * - a MATCHING ready clears the sentinel (self-re-arm after convergence).
  * KNOWN LIMITS (accepted for the self-hosted single-server threat model):
- * - the "once" guarantee is per server identity — one origin fronted by
- *   servers built from DIFFERENT commits can oscillate (mismatch → reload →
- *   match clears → mismatch → …). Not hardened with a clears-per-session
- *   cap; revisit only if a split-deploy origin appears.
+ * - the mixed-build-origin oscillation door stays open through match-clears:
+ *   one origin fronted by servers built from DIFFERENT commits can oscillate
+ *   (mismatch → reload → match clears → mismatch → …). Not hardened with a
+ *   clears-per-session cap; revisit only if a split-deploy origin appears.
  * - the compare is direction-free (shas carry no ordering), so a NEWER
  *   client against an OLDER server performs one futile bounded reload per
  *   fresh tab session.
@@ -1098,21 +1134,23 @@ export function checkServerBuildId(options?: ServerBuildCheckOptions): void {
     return
   }
   try {
-    if (storage.getItem(SERVER_BUILD_RELOAD_SENTINEL) === '1') {
+    if (storage.getItem(SERVER_BUILD_RELOAD_SENTINEL) === serverBuildId) {
       log.warn(
         `server build ${serverBuildId} still differs from client build ${clientBuildId}; `
-        + 'one reload already attempted this tab session — suppressing further reloads',
+        + `a reload for build ${serverBuildId} was already attempted this tab session — `
+        + 'suppressing further reloads for it',
       )
       return
     }
-    storage.setItem(SERVER_BUILD_RELOAD_SENTINEL, '1')
+    storage.setItem(SERVER_BUILD_RELOAD_SENTINEL, serverBuildId)
   } catch (err) {
     log.warn('server-build sentinel persistence failed; suppressing the reload', err)
     return
   }
   log.warn(
     `server build ${serverBuildId} differs from client build ${clientBuildId}; `
-    + 'reloading once to pick up the matching client bundle',
+    + `reloading once for build ${serverBuildId} to pick up the matching client bundle `
+    + '(a different server build id will re-arm this guard)',
   )
   reload()
 }
@@ -1251,6 +1289,8 @@ git commit -m "feat(client): reload once when ready.buildId differs from the bak
 
 Create `test/e2e-browser/specs/server-build-mismatch-rust.spec.ts`:
 
+> As-built amendment (delta review round 3): the seeded sentinel value is `MISMATCHED_BUILD_ID` (the attempted server build id the injected mismatch presents), not the literal `"1"` — see the Global Constraints loop-guard amendment. (The listing below otherwise reflects the original text; the as-built spec's match-path assertion and init-script persistence read are the amendment declared in the banner.)
+
 ```typescript
 /**
  * Server-build mismatch auto-reload (the-usual/server-version-reload).
@@ -1258,7 +1298,8 @@ Create `test/e2e-browser/specs/server-build-mismatch-rust.spec.ts`:
  * The user story: a tab running a client bundle built at commit A connects
  * to a server built at commit B; the server's `ready.buildId` differs from
  * the client's baked `__FRESHELL_BUILD_ID__`; the client reloads EXACTLY
- * ONCE (sentinel `freshell.server-build-reload` in sessionStorage) and
+ * ONCE (sentinel `freshell.server-build-reload` in sessionStorage, which
+ * records the attempted server build id) and
  * converges to a healthy ready connection. A repeat mismatched ready must
  * NOT reload again — a half-deployed server can never reload-loop.
  *
@@ -1353,15 +1394,17 @@ test.describe('server build mismatch reload (rust)', () => {
     await harness.waitForConnection()
 
     // Seed the state the production code would have armed on a previous
-    // mismatched ready in this tab (see the coverage boundary above).
-    await page.evaluate((key) => sessionStorage.setItem(key, '1'), SENTINEL)
+    // mismatched ready in this tab (see the coverage boundary above): the
+    // sentinel records the attempted server build id, which here is the id
+    // a mismatched ready would have presented.
+    await page.evaluate(([key, value]) => sessionStorage.setItem(key, value), [SENTINEL, MISMATCHED_BUILD_ID])
 
     // A REAL navigation: sessionStorage must survive it (per-tab, per-origin
     // storage) — read at commit time, BEFORE the rebooted app's real ready
     // can legitimately match-and-clear it (same-HEAD artifacts match).
     await page.reload({ waitUntil: 'commit' })
     const persisted = await page.evaluate((key) => sessionStorage.getItem(key), SENTINEL)
-    expect(persisted, 'sentinel must survive a real navigation').toBe('1')
+    expect(persisted, 'sentinel must survive a real navigation').toBe(MISMATCHED_BUILD_ID)
 
     await context.close()
   })
@@ -1377,8 +1420,11 @@ test.describe('server build mismatch reload (rust)', () => {
     // Seed AFTER the boot settles (the boot's real ready may legitimately
     // match-and-clear an earlier sentinel; seeding here is the setup for
     // the suppression proof — the arming ORDER is unit-proven, the
-    // navigation persistence is proven by the previous test).
-    await page.evaluate((key) => sessionStorage.setItem(key, '1'), SENTINEL)
+    // navigation persistence is proven by the previous test). The value is
+    // MISMATCHED_BUILD_ID: the attempted server build id the injected
+    // mismatch below will present, so the production suppression branch
+    // (same id already attempted) is the one exercised.
+    await page.evaluate(([key, value]) => sessionStorage.setItem(key, value), [SENTINEL, MISMATCHED_BUILD_ID])
     let navigations = 0
     page.on('framenavigated', () => { navigations++ })
 
@@ -1430,7 +1476,7 @@ In `CLOUD_SKIP_SPECS` (the filename-string skip list in `playwright.cloud.config
 In `AGENTS.md`, under "Key Architectural Patterns", append to the **WebSocket Protocol** paragraph:
 
 ```
-The `ready` frame carries an optional additive `buildId` (the server's artifact-time-baked git commit, `"unknown"` fallback): the client bakes its own at Vite build time (`__FRESHELL_BUILD_ID__`) and, on a mismatch, reloads exactly once per tab session (sessionStorage sentinel `freshell.server-build-reload`), self-healing stale-client contract errors; `"unknown"` on either side never triggers or clears the guard (`src/lib/server-build-check.ts`). The once-guard is per server identity: an origin fronted by mixed-build servers could oscillate, and a newer client against an older server costs one futile bounded reload per fresh tab session (both accepted for the single-server self-hosted model).
+The `ready` frame carries an optional additive `buildId` (the server's artifact-time-baked git commit, `"unknown"` fallback): the client bakes its own at Vite build time (`__FRESHELL_BUILD_ID__`) and, on a mismatch, reloads exactly once per tab session (sessionStorage sentinel `freshell.server-build-reload` records the last attempted server build id; the same id never reloads twice, a different (corrected) deployment re-arms the guard), self-healing stale-client contract errors; `"unknown"` on either side never triggers or clears the guard (`src/lib/server-build-check.ts`). The once-guard is per server identity: an origin fronted by mixed-build servers could oscillate, and a newer client against an older server costs one futile bounded reload per fresh tab session (both accepted for the single-server self-hosted model).
 ```
 
 - [x] **Step 2: Run the test and verify it passes, then RED-VERIFY it exercises the feature**

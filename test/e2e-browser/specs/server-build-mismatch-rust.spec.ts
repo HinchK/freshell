@@ -4,9 +4,10 @@
  * The user story: a tab running a client bundle built at commit A connects
  * to a server built at commit B; the server's `ready.buildId` differs from
  * the client's baked `__FRESHELL_BUILD_ID__`; the client reloads EXACTLY
- * ONCE (sentinel `freshell.server-build-reload` in sessionStorage) and
- * converges to a healthy ready connection. A repeat mismatched ready must
- * NOT reload again — a half-deployed server can never reload-loop.
+ * ONCE (sentinel `freshell.server-build-reload` in sessionStorage, which
+ * records the attempted server build id) and converges to a healthy ready
+ * connection. A repeat mismatched ready for the SAME build id must NOT
+ * reload again — a half-deployed server can never reload-loop.
  *
  * COVERAGE BOUNDARY (read before judging): what e2e proves here is
  * (1) the full production compare-and-reload pipeline through the REAL App
@@ -116,8 +117,10 @@ test.describe('server build mismatch reload (rust)', () => {
     await harness.waitForConnection()
 
     // Seed the state the production code would have armed on a previous
-    // mismatched ready in this tab (see the coverage boundary above).
-    await page.evaluate((key) => sessionStorage.setItem(key, '1'), SENTINEL)
+    // mismatched ready in this tab (see the coverage boundary above): the
+    // sentinel records the attempted server build id, which here is the id
+    // a mismatched ready would have presented.
+    await page.evaluate(([key, value]) => sessionStorage.setItem(key, value), [SENTINEL, MISMATCHED_BUILD_ID])
 
     // A REAL navigation: sessionStorage must survive it (per-tab, per-origin
     // storage). The value is snapshotted at DOCUMENT CREATION — an init
@@ -127,7 +130,7 @@ test.describe('server build mismatch reload (rust)', () => {
     // guarantees the document exists, and by the time the new app has
     // received the real (matching) ready it may ALREADY have cleared the
     // sentinel before a late `page.evaluate` could read it. `null` would
-    // mean absent at document start; `'1'` means persisted.
+    // mean absent at document start; `MISMATCHED_BUILD_ID` means persisted.
     await page.addInitScript((key) => {
       ;(window as any).__sentinelAtDocumentStart = window.sessionStorage.getItem(key)
     }, SENTINEL)
@@ -135,7 +138,7 @@ test.describe('server build mismatch reload (rust)', () => {
     const persisted = await page
       .waitForFunction(() => (window as any).__sentinelAtDocumentStart !== undefined)
       .then(() => page.evaluate(() => (window as any).__sentinelAtDocumentStart))
-    expect(persisted, 'sentinel must survive a real navigation').toBe('1')
+    expect(persisted, 'sentinel must survive a real navigation').toBe(MISMATCHED_BUILD_ID)
 
     await context.close()
   })
@@ -151,8 +154,11 @@ test.describe('server build mismatch reload (rust)', () => {
     // Seed AFTER the boot settles (the boot's real ready may legitimately
     // match-and-clear an earlier sentinel; seeding here is the setup for
     // the suppression proof — the arming ORDER is unit-proven, the
-    // navigation persistence is proven by the previous test).
-    await page.evaluate((key) => sessionStorage.setItem(key, '1'), SENTINEL)
+    // navigation persistence is proven by the previous test). The value is
+    // MISMATCHED_BUILD_ID: the attempted server build id the injected
+    // mismatch below will present, so the production suppression branch
+    // (same id already attempted) is the one exercised.
+    await page.evaluate(([key, value]) => sessionStorage.setItem(key, value), [SENTINEL, MISMATCHED_BUILD_ID])
     let navigations = 0
     page.on('framenavigated', () => { navigations++ })
 
