@@ -133,6 +133,11 @@ rl.on('line', (line) => {
     // The rollback capture surface must NEVER see a completion chime; idle is the
     // busy-clear edge.
     process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId: msg.sessionId, status: 'idle' }) + '\n')
+  } else if (msg.type === 'rollback.quiesce') {
+    // ep4-r3 wire parity: rollback's pre-teardown probe — this fake never has
+    // an inflight turn at that point (its sends settle their statuses
+    // immediately) and nothing sits in an SDK-input queue.
+    process.stdout.write(JSON.stringify({ type: 'sdk.rollback.quiesced', sessionId: msg.sessionId, probeId: msg.probeId ?? null, cancelledQueue: 0, inFlightTurn: false, handedCompactLikely: false }) + '\n')
   } else if (msg.type === 'interrupt') {
     // ep4-r2 wire parity: the real sidecar always answers with the signed
     // settle; on this fake nothing is ever in flight mid-rollback, matching

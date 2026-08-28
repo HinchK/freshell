@@ -305,15 +305,33 @@ struct ClaudeSession {
     /// Carried across the rollback's kill+respawn so a send that resolved its
     /// handle (or parked through the window) serializes identically.
     turn_lock: Arc<TokioMutex<()>>,
-    /// Focused ep4-r2 (probe protocol): rollback's pre-teardown quiesce probe
-    /// registers a oneshot here before writing the interrupt request; the
-    /// consumer's `sdk.interrupt_settled` fold fires it. Because the consumer
-    /// folds lines IN STREAM ORDER, the settle frame provably lands AFTER every
-    /// already-emitted piece of evidence (e.g. a compaction that the sidecar
-    /// started before consuming the probe) — rollback's recheck after the probe
-    /// therefore sees all of it. `Option` + single-flight rollback guarantees
-    /// no concurrent probes.
-    rollback_probe_slot: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    /// Focused ep4-r2/ep4-r3 (probe protocol): rollback's pre-teardown quiesce
+    /// probe registers its probeId + a oneshot here before writing the
+    /// `rollback.quiesce` request; the consumer's `sdk.rollback.quiesced` fold
+    /// fires it ONLY on a probeId match (ep4-r3 F2: a stale receipt from an
+    /// ordinary interrupt or an earlier timed-out probe can never close a
+    /// live probe). Because the consumer folds lines IN STREAM ORDER, the
+    /// quiesced frame provably lands after every already-emitted piece of
+    /// evidence — and because the sidecar answers from its OWN input queue, it
+    /// reports cancellation of never-handed compacts and in-flight/handed
+    /// truth rollback cannot observe from wire frames alone.
+    #[allow(clippy::type_complexity)]
+    rollback_probe_slot:
+        Arc<std::sync::Mutex<Option<(String, tokio::sync::oneshot::Sender<QuiesceVerdict>)>>>,
+}
+
+/// The sidecar's signed answer to a `rollback.quiesce` probe (ep4-r3). All
+/// three fields are sidecar-owned truth the wire frames alone cannot carry:
+/// `cancelled_queue` — compacts dropped from the SDK-input queue (they
+/// provably never start); `in_flight_turn` — an SDK turn is mid-flight;
+/// `handed_compact_likely` — a compact already crossed the un-cancellable
+/// same-tick handoff to an awaiting SDK consumer. Either busy signal fails
+/// the probe closed (BUSY_TURN + compensating ledger rewrite).
+#[derive(Debug, Clone, Copy)]
+struct QuiesceVerdict {
+    cancelled_queue: u64,
+    in_flight_turn: bool,
+    handed_compact_likely: bool,
 }
 
 impl FreshClaudeState {
@@ -1962,36 +1980,46 @@ impl FreshClaudeState {
             }
         }
 
-        // Focused ep4-r2 F2 (the post-admission evidence race, repaired for real):
-        // absorbed compact debt can STILL start in the sidecar after admission
-        // (the absorb premise is "never started on the provider side" — the
-        // dispatch order is the sidecar's FIFO input queue, and a genuine
-        // start folds its `sdk.status:compacting` candidate here). Because the
-        // consumer folds stream lines IN ORDER, an interrupt request written
-        // NOW acts as an in-order quiesce probe: its `sdk.interrupt_settled`
-        // frame reaches the consumer's fold only AFTER every already-emitted
-        // piece of evidence has been folded. Await the probe (the consumer
-        // fires the per-session oneshot at the settle fold), THEN recheck:
-        // any work that started behind our back is provably visible here.
-        // Skip when no live evidence path exists: write failure (sidecar
-        // already dead), or a FINISHED consumer (its EOF reaped the busy
-        // truth; nothing can arrive that a recheck would miss). A dead
-        // sidecar holds no live work; the recheck below still runs.
+        // Focused ep4-r2/ep4-r3 (the post-admission evidence race, repaired
+        // for real): absorbed compact debt can STILL start in the sidecar
+        // after admission — the dispatch lifecycle is: sidecar input queue →
+        // SAME-TICK handoff when the SDK consumer is awaiting → SDK turn
+        // start (its `compacting` status folds the candidate here). The
+        // quiesce probe closes every leg of that lifecycle atomically: the
+        // sidecar (1) DROPS never-handed compacts from its own input queue
+        // (cancellation the SDK surface cannot provide for queue items), (2)
+        // reports in-flight/handed truth, and (3) answers on its stdout
+        // stream AFTER every already-emitted piece of evidence has been folded
+        // (stream order), correlated by probeId so a stale receipt can never
+        // close the probe. The verdict gates below plus the recheck cover the
+        // whole shape: all-clear → proceed; any busy signal or no answer →
+        // BUSY_TURN + compensating ledger rewrite. Skip when no live evidence
+        // path exists: write failure (sidecar already dead), or a FINISHED
+        // consumer (its EOF reaped the busy truth; nothing fresh can arrive).
         let mut probe_armed = false;
         let mut probe_rx = None;
+        let mut probe_id = String::new();
         {
             let mut guard = self.sessions.lock().await;
             if let Some(session) = guard.get_mut(&map_key) {
                 if session.consumer.is_finished() {
                     // EOF already zeroed the tracker — the recheck sees it.
                 } else {
-                    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+                    let (tx, rx) = tokio::sync::oneshot::channel::<QuiesceVerdict>();
+                    probe_id = uuid::Uuid::new_v4().to_string();
                     *session
                         .rollback_probe_slot
                         .lock()
-                        .expect("rollback probe slot lock") = Some(tx);
-                    let probe_req =
-                        json!({ "type": "interrupt", "sessionId": session.sidecar_session_id });
+                        .expect("rollback probe slot lock") = Some((probe_id.clone(), tx));
+                    // ep4-r3: the quiesce is its own request type — the sidecar
+                    // drains never-handed queued compacts and answers with its
+                    // own queue truth (the SDK's queued inputs cannot be
+                    // cancelled once handed).
+                    let probe_req = json!({
+                        "type": "rollback.quiesce",
+                        "sessionId": session.sidecar_session_id,
+                        "probeId": probe_id,
+                    });
                     match write_line(&mut session.stdin, &probe_req).await {
                         Ok(()) => {
                             probe_armed = true;
@@ -2013,28 +2041,73 @@ impl FreshClaudeState {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(3000);
-            let settled = matches!(
-                tokio::time::timeout(Duration::from_millis(timeout_ms), probe_rx.unwrap()).await,
-                Ok(Ok(()))
-            );
-            if !settled {
-                // The sidecar never confirmed quiesce within the bound — the
-                // absorb premise is unproven: refuse rather than tear a live
-                // provider flow down blind. Compensate the pre-write.
-                if let Some(sink) = self.identity_sink() {
-                    let restore = existing
-                        .clone()
-                        .unwrap_or_else(|| RollbackRecord::empty(now));
-                    if let Err(e) = sink.record_rollback(PROVIDER, &durable_id, restore).await {
-                        tracing::warn!(error = %e, session = %durable_id, "freshagent.claude.rollback_probe_compensate_failed");
+            let verdict =
+                tokio::time::timeout(Duration::from_millis(timeout_ms), probe_rx.unwrap()).await;
+            match verdict {
+                Ok(Ok(QuiesceVerdict {
+                    cancelled_queue,
+                    in_flight_turn: false,
+                    handed_compact_likely: false,
+                })) => {
+                    if cancelled_queue > 0 {
+                        tracing::info!(
+                            session = %map_key,
+                            cancelled = cancelled_queue,
+                            "freshagent.claude.rollback_quiesce_cancelled_queue"
+                        );
                     }
                 }
-                reply_sink(rollback_error_frame(
-                    &op,
-                    "BUSY_TURN",
-                    ROLLBACK_BUSY_MESSAGE,
-                ));
-                return;
+                Ok(Ok(verdict)) => {
+                    // ep4-r3 F1: provider work crossed the un-cancellable
+                    // handoff (a turn mid-flight, or a compact already handed
+                    // to an awaiting SDK consumer) — refuse.
+                    tracing::info!(session = %map_key, ?verdict, "freshagent.claude.rollback_quiesce_busy");
+                    if let Some(sink) = self.identity_sink() {
+                        let restore = existing
+                            .clone()
+                            .unwrap_or_else(|| RollbackRecord::empty(now));
+                        if let Err(e) = sink.record_rollback(PROVIDER, &durable_id, restore).await {
+                            tracing::warn!(error = %e, session = %durable_id, "freshagent.claude.rollback_probe_compensate_failed");
+                        }
+                    }
+                    reply_sink(rollback_error_frame(
+                        &op,
+                        "BUSY_TURN",
+                        ROLLBACK_BUSY_MESSAGE,
+                    ));
+                    return;
+                }
+                _ => {
+                    // Timeout (or a dropped sender — impossible in practice
+                    // since the slot outlives this handler): the absorb premise
+                    // is unproven — refuse rather than tear a live provider
+                    // flow down blind. Clear OUR slot (a stale receipt must
+                    // never fire a later probe — ep4-r3 F2 defense in depth
+                    // on top of probeId correlation).
+                    if let Some(session) = self.sessions.lock().await.get(&map_key) {
+                        let mut slot = session
+                            .rollback_probe_slot
+                            .lock()
+                            .expect("rollback probe slot lock");
+                        if slot.as_ref().is_some_and(|(id, _)| *id == probe_id) {
+                            slot.take();
+                        }
+                    }
+                    if let Some(sink) = self.identity_sink() {
+                        let restore = existing
+                            .clone()
+                            .unwrap_or_else(|| RollbackRecord::empty(now));
+                        if let Err(e) = sink.record_rollback(PROVIDER, &durable_id, restore).await {
+                            tracing::warn!(error = %e, session = %durable_id, "freshagent.claude.rollback_probe_compensate_failed");
+                        }
+                    }
+                    reply_sink(rollback_error_frame(
+                        &op,
+                        "BUSY_TURN",
+                        ROLLBACK_BUSY_MESSAGE,
+                    ));
+                    return;
+                }
             }
         }
 
@@ -2954,10 +3027,8 @@ impl FreshClaudeState {
                         // QUIESCE ACK, never a retirement — per the SDK contract
                         // (the control receipt is written BEFORE the
                         // interrupted op's terminal `sdk.result`) the op's own
-                        // result owns the fold. Its fold-time roles here:
-                        //   1) close rollback's in-order quiesce probe (see
-                        //      handle_rollback);
-                        //   2) ok:true + a live compact candidate => the
+                        // result owns the fold. Its fold-time role here:
+                        //   ok:true + a live compact candidate => the
                         //      in-flight compaction IS the interruption's
                         //      subject: PROMOTE the front queued compact into
                         //      `running` (the exact promotion the manual
@@ -2967,6 +3038,9 @@ impl FreshClaudeState {
                         //      A rejected/absent settle (the turn provably
                         //      still running) never promotes and retires
                         //      nothing (warn-log only — fail-closed).
+                        // ep4-r3 F2: it NEVER fires a rollback probe — only a
+                        // probeId-correlated `sdk.rollback.quiesced` does (the
+                        // arm below).
                         let ok = value.get("ok").and_then(Value::as_bool) == Some(true);
                         if !ok {
                             tracing::warn!(session = %session_id, "freshagent.claude.interrupt_rejected_or_unsettled");
@@ -2988,14 +3062,48 @@ impl FreshClaudeState {
                             // preserves busy; a live candidate's ep3-r4 re-boost
                             // must never be clobbered by a bare busy() write.
                         }
+                    }
+                    Some("sdk.rollback.quiesced") => {
+                        // Focused ep4-r3 (probe protocol): the sidecar answered
+                        // a rollback quiesce from its OWN queue truth. Fire the
+                        // armed probe ONLY on a probeId match — stale receipts
+                        // (an ordinary interrupt's settle, an earlier timed-out
+                        // probe's late answer) never close a live probe, and a
+                        // rejected-shape answer is fail-closed in the handler
+                        // (busy signals abort; a timeout also aborts).
+                        let frame_probe_id =
+                            value.get("probeId").and_then(Value::as_str).unwrap_or("");
+                        let verdict = QuiesceVerdict {
+                            cancelled_queue: value
+                                .get("cancelledQueue")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0),
+                            in_flight_turn: value
+                                .get("inFlightTurn")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(true),
+                            handed_compact_likely: value
+                                .get("handedCompactLikely")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(true),
+                        };
                         if let Some(session) = sessions.lock().await.get(&session_id) {
-                            if let Some(tx) = session
-                                .rollback_probe_slot
-                                .lock()
-                                .expect("rollback probe slot lock")
-                                .take()
-                            {
-                                let _ = tx.send(());
+                            let fired = {
+                                let mut slot = session
+                                    .rollback_probe_slot
+                                    .lock()
+                                    .expect("rollback probe slot lock");
+                                match slot.as_ref() {
+                                    Some((armed_id, _)) if armed_id == frame_probe_id => {
+                                        slot.take()
+                                    }
+                                    _ => None,
+                                }
+                            };
+                            if let Some((_, tx)) = fired {
+                                let _ = tx.send(verdict);
+                            } else {
+                                tracing::debug!(session = %session_id, probe_id = %frame_probe_id, "freshagent.claude.quiesced_unmatched");
                             }
                         }
                     }
@@ -4745,6 +4853,11 @@ const liveSessions = new Set(
     .map((s) => s.trim())
     .filter(Boolean),
 ) // ep4-r2: the live-fixture rig boots WITHOUT a `create` frame — preseed its durable ids here so its sends are not answered with session-not-found.
+// ep4-r3: a minimal model of the SDK-input queue for compact intents — every
+// `/compact` send sits in it until the quiesce DRAINS it (the drain-count IS
+// the cancelledQueue the real sidecar reports), mirroring the real
+// cancellation authority at the pre-handoff residence.
+const compactQueue = []
 const rl = readline.createInterface({ input: process.stdin, terminal: false })
 rl.on('line', (line) => {
   const trimmed = line.trim()
@@ -4809,6 +4922,11 @@ rl.on('line', (line) => {
       // while stdout stayed open — the real sidecar answers with this lone
       // signed frame and NOTHING after (no result, no idle, no EOF).
       console.log(JSON.stringify({ type: 'sdk.error', sessionId: msg.sessionId, message: 'session not found', sessionNotFound: true }))
+    } else if (/^\s*\/compact(\s|$)/.test(String(msg.text ?? ''))) {
+      // ep4-r3: track compact intents in the fake's queue (the quiesce arm
+      // drains them) — then log like every other non-magic send.
+      compactQueue.push(msg.text)
+      if (respondLog) fs.appendFileSync(respondLog, `${JSON.stringify(msg)}\n`)
     } else if (msg.text === '__emit_assistant__') {
       console.log(JSON.stringify({ type: 'sdk.assistant', sessionId: msg.sessionId, content: [{ type: 'text', text: 'noise' }] }))
     // Task 2 test hook: raise a canned pending permission the approve/deny flow can
@@ -4870,6 +4988,34 @@ rl.on('line', (line) => {
     }
     if (settleMs > 0) setTimeout(settle, settleMs)
     else settle()
+  } else if (msg.type === 'rollback.quiesce') {
+    // Task 4c (kata 1wxv ep4-r3): rollback's pre-teardown quiesce probe. The
+    // fake drains its tracked compact queue and answers with a
+    // probeId-correlated verdict, echoing the real sidecar's stream order and
+    // fields. Knob FRESHELL_TEST_CLAUDE_PROBE_COMPACT_BEFORE_SETTLE=1 models
+    // the un-cancellable race: an absorbed compact was HANDED to an idle SDK
+    // consumer before the probe — its compacting STATUS lands first (in-order
+    // evidence) and the answer reports handedCompactLikely (BUSY verdict); no
+    // trailing terminal frames (its run never completed in the hazard window).
+    const compactBeforeSettle = process.env.FRESHELL_TEST_CLAUDE_PROBE_COMPACT_BEFORE_SETTLE === '1'
+    // FRESHELL_TEST_CLAUDE_PROBE_WRONG_ID=1 — answer with a FOREIGN probe id
+    // (a stale receipt): the probe must stay open and time out, never close on
+    // it (ep4-r3 F2 correlation).
+    const wrongId = process.env.FRESHELL_TEST_CLAUDE_PROBE_WRONG_ID === '1'
+    const echoId = wrongId ? 'stale-receipt-not-this-probe' : (msg.probeId ?? null)
+    if (compactBeforeSettle) {
+      console.log(JSON.stringify({ type: 'sdk.status', sessionId: msg.sessionId, status: 'compacting' }))
+      console.log(JSON.stringify({ type: 'sdk.rollback.quiesced', sessionId: msg.sessionId, probeId: echoId, cancelledQueue: 0, inFlightTurn: false, handedCompactLikely: true }))
+    } else if (process.env.FRESHELL_TEST_CLAUDE_PROBE_HANDED_BUSY === '1') {
+      // Models the SAME-TICK handoff: an absorbed compact was handed to an
+      // awaiting SDK consumer immediately before the probe — NO status has
+      // been emitted yet, so the verdict is the ONLY evidence. The gate must
+      // abort on the verdict alone.
+      console.log(JSON.stringify({ type: 'sdk.rollback.quiesced', sessionId: msg.sessionId, probeId: echoId, cancelledQueue: 0, inFlightTurn: false, handedCompactLikely: true }))
+    } else {
+      const cancelled = compactQueue.splice(0).length
+      console.log(JSON.stringify({ type: 'sdk.rollback.quiesced', sessionId: msg.sessionId, probeId: echoId, cancelledQueue: cancelled, inFlightTurn: false, handedCompactLikely: false }))
+    }
   } else if (msg.type === 'shutdown') {
     process.exit(0)
   }
@@ -6530,6 +6676,15 @@ rl.on('line', (line) => {
         type: 'sdk.interrupt_settled',
         sessionId: msg.sessionId,
         ok: true,
+      }) + '\n')
+    } else if (msg && msg.type === 'rollback.quiesce') {
+      process.stdout.write(JSON.stringify({
+        type: 'sdk.rollback.quiesced',
+        sessionId: msg.sessionId,
+        probeId: msg.probeId ?? null,
+        cancelledQueue: 0,
+        inFlightTurn: false,
+        handedCompactLikely: false,
       }) + '\n')
     }
   } catch {}
@@ -8868,6 +9023,156 @@ rl.on('line', (line) => {
             "NOTHING_TO_UNDO",
             "the gate opened at B's own terminal frames"
         );
+        drop(env);
+    }
+
+    /// Focused-review ep4-r3 F2 (probe correlation): an answer whose probeId
+    /// does NOT match the armed probe (a stale receipt from an earlier probe
+    /// or an unrelated interrupt's settle frame) must never close it. The
+    /// knobs force the fake to answer with a foreign probe id and shrink the
+    /// probe timeout so the wait resolves by timeout => BUSY_TURN — the SAFE
+    /// default, never a blind admit.
+    ///
+    /// RED harness: verifying the correlation code is what saves us requires
+    /// only flipping the consumer's probeId equality (the temporary
+    /// `armed_id == frame_probe_id` toggle) — the rollback then admits on the
+    /// stale answer (rolledBack), proving the exact attacker the finding named.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_stale_quiesced_frame_never_closes_a_live_rollback_probe() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        std::env::set_var("FRESHELL_TEST_CLAUDE_PROBE_WRONG_ID", "1");
+        std::env::set_var("FRESHELL_TEST_CLAUDE_ROLLBACK_PROBE_TIMEOUT_MS", "200");
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        write_rollback_transcript(home.path(), "dur-stale", &two_turn_transcript());
+        let (st, _rx) = state_with_bus();
+        let sink_impl = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(sink_impl.clone());
+        insert_rollback_fixture_session_with_live_sidecar(&st, "rb-stale", "dur-stale").await;
+
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op("dur-stale", "rb-stale-0", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        let frames = captured_json(&captured);
+        assert_eq!(
+            frames[0]["event"]["code"],
+            "BUSY_TURN",
+            "ep4-r3 F2: the stale (foreign probeId) answer never closes the probe — the wait times out into the safe refusal: {frames:?}"
+        );
+        assert_eq!(env.spawn_count(), 0, "no teardown happened");
+        std::env::remove_var("FRESHELL_TEST_CLAUDE_PROBE_WRONG_ID");
+        std::env::remove_var("FRESHELL_TEST_CLAUDE_ROLLBACK_PROBE_TIMEOUT_MS");
+        drop(env);
+    }
+
+    /// Focused ep4-r3 (the probe's ADMIT path stays true): absorbed compact
+    /// debt the sidecar never started is cancelled AT the quiesce (its drain
+    /// count rides the answer), the verdict comes back all-clear, and the
+    /// rollback completes — absorb never became a BUSY-wedge (the point of
+    /// the ep3-r3 absorb lane).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_quiesce_probe_admits_when_the_sidecar_drains_unstarted_compacts() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        write_rollback_transcript(home.path(), "dur-qadmit", &two_turn_transcript());
+        let (st, _rx) = state_with_bus();
+        let sink_impl = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(sink_impl.clone());
+        let _ =
+            insert_rollback_fixture_session_with_live_sidecar(&st, "rb-qadmit", "dur-qadmit").await;
+
+        // Compact-only owed queue (C1 rides under A; A's pair retires it; C2).
+        st.handle_send(send_msg("rb-qadmit", "turn one")).await;
+        st.handle_compact(compact_msg("rb-qadmit", None)).await;
+        inject_raw_send(&st, "rb-qadmit", "__emit_result_error__").await;
+        inject_raw_send(&st, "rb-qadmit", "__emit_idle__").await;
+        st.handle_compact(compact_msg("rb-qadmit", None)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op("dur-qadmit", "rb-qadmit-0", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        let frames = captured_json(&captured);
+        assert_eq!(
+            frames[0]["event"]["type"],
+            "freshAgent.rolledBack",
+            "the quiesce drained the never-started compacts and answered all-clear — the rollback completed: {frames:?}"
+        );
+        // The absorbed debt was dropped at the sidecar's OWN dispatch boundary;
+        // both probe round-trips passed.
+        assert!(
+            !st.sessions.lock().await.is_empty(),
+            "the respawned session exists post-rollback"
+        );
+        drop(env);
+    }
+
+    /// Focused-review ep4-r3 F1 (same-tick handoff): an absorbed compact
+    /// handed to an AWAITING SDK consumer in the tick before the probe is
+    /// un-cancellable AND emits no status before the quiesce answers — the
+    /// verdict is the ONLY evidence, so the busy branch of the verdict gate is
+    /// standalone load-bearing (the recheck's candidate fold covers the OTHER,
+    /// status-visible leg).
+    ///
+    ///   folded-debt fixture on a live sidecar; the probe answers BUSY via
+    ///   `handedCompactLikely` with zero status frames → BUSY_TURN, zero
+    ///   teardown, gate re-closed by the verdict... note: the verdict itself
+    ///   re-boosts nothing — the queue was absorbed empty — so the gate's
+    ///   post-abort truth is open (the compact still owes its own evidence;
+    ///   this assert anchors the abort, not a wedge).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_compact_handed_in_the_probes_tick_aborts_on_the_verdict_alone() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        std::env::set_var("FRESHELL_TEST_CLAUDE_PROBE_HANDED_BUSY", "1");
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        write_rollback_transcript(home.path(), "dur-vhanded", &two_turn_transcript());
+        let (st, _rx) = state_with_bus();
+        let sink_impl = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(sink_impl.clone());
+        insert_rollback_fixture_session_with_live_sidecar(&st, "rb-vhanded", "dur-vhanded").await;
+
+        // A send+compact arm the debt realistically (A's pair folds them to
+        // absorb shape: [C] owed, running empty).
+        st.handle_send(send_msg("rb-vhanded", "turn one")).await;
+        st.handle_compact(compact_msg("rb-vhanded", None)).await;
+        inject_raw_send(&st, "rb-vhanded", "__emit_result_error__").await;
+        inject_raw_send(&st, "rb-vhanded", "__emit_idle__").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op("dur-vhanded", "rb-vhanded-0", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        let frames = captured_json(&captured);
+        assert_eq!(
+            frames[0]["event"]["code"],
+            "BUSY_TURN",
+            "ep4-r3 F1: the verdict alone refuses — the handed compact is un-cancellable: {frames:?}"
+        );
+        let record = sink_impl
+            .load_rollback("claude", "dur-vhanded")
+            .expect("the compensated ledger row");
+        assert!(
+            record.entries.is_empty(),
+            "the pre-write compensated: the ledger describes no mutation: {record:?}"
+        );
+        std::env::remove_var("FRESHELL_TEST_CLAUDE_PROBE_HANDED_BUSY");
         drop(env);
     }
 

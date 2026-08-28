@@ -51,6 +51,22 @@ export function query({ prompt, options }) {
           { toolUseID: 'toolu_fake_2', signal: new AbortController().signal },
         )
         probe({ type: 'probe.resolved', kind: 'question', n, decision })
+      } else if (text && /^__park_\d+__$/.test(text)) {
+        // Quiesce-suite hook: park INSIDE the message handler so the module's
+        // consumer is provably NOT awaiting next() — pushes made meanwhile
+        // land in the sidecar's own queue (the cancellation residence).
+        const ms = Number(text.slice('__park_'.length, -2))
+        await new Promise((resolve) => setTimeout(resolve, ms))
+      } else if (text === '__open_turn__') {
+        // Yields an assistant frame and then returns to awaiting with NO
+        // result — the sidecar's turnOpen flag stays true (observable via
+        // rollback.quiesce answers).
+        yield { type: 'assistant', message: { content: [] }, session_id: 'ses-open' }
+      } else if (typeof text === 'string' && /^\s*\/compact(\s|$)/.test(text)) {
+        // The compact runs and settles: the sidecar must clear both quiesce
+        // busy flags on this result.
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        yield { type: 'result', subtype: 'success', session_id: 'ses-compact' }
       }
     }
   })()
