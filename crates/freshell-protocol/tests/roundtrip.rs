@@ -179,7 +179,8 @@ fn ready_carries_build_id_and_omits_it_when_absent() {
         other => panic!("expected Ready, got {other:?}"),
     }
 
-    let without = r#"{"type":"ready","timestamp":"2026-07-05T04:20:52.546Z","serverInstanceId":"srv-abc"}"#;
+    let without =
+        r#"{"type":"ready","timestamp":"2026-07-05T04:20:52.546Z","serverInstanceId":"srv-abc"}"#;
     let msg: ServerMessage = serde_json::from_str(without).unwrap();
     let reser = serde_json::to_value(&msg).unwrap();
     assert!(

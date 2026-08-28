@@ -27,7 +27,11 @@
 /// git metadata) -- never a runtime failure. Build provenance is
 /// BUILD-scoped, so this deliberately does NOT ride on `WsState`.
 pub fn ready_build_id() -> Option<String> {
-    Some(option_env!("FRESHELL_WS_BUILD_COMMIT").unwrap_or("unknown").to_string())
+    Some(
+        option_env!("FRESHELL_WS_BUILD_COMMIT")
+            .unwrap_or("unknown")
+            .to_string(),
+    )
 }
 
 pub mod activity;
@@ -1053,7 +1057,10 @@ mod tests {
             "ready must stamp buildId: {ready}"
         );
         let build_id = ready["buildId"].as_str().expect("buildId is a string");
-        assert!(!build_id.is_empty(), "buildId must be non-empty: {build_id}");
+        assert!(
+            !build_id.is_empty(),
+            "buildId must be non-empty: {build_id}"
+        );
     }
 
     /// GAP1 (CFG-03 checklist follow-up) RED/GREEN target: when boot fell

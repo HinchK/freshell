@@ -24,12 +24,19 @@ fn main() {
 /// `git rev-parse HEAD`, trimmed. `None` on any failure (git not on `PATH`,
 /// not inside a git checkout, ...) -- the caller falls back to `"unknown"`.
 fn git_head_commit() -> Option<String> {
-    let out = Command::new("git").args(["rev-parse", "HEAD"]).output().ok()?;
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() { None } else { Some(s) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 /// The exact paths that change when HEAD moves in THIS checkout, resolved
