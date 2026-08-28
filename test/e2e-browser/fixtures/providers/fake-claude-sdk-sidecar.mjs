@@ -410,6 +410,17 @@ async function handleInput(line) {
       }
       st.pending = 0
     }
+    // kata 1wxv ep4 (roll-back quiesce protocol): every interrupt now yields
+    // the settled receipt after `query.interrupt()` resolves — nothing was in
+    // flight here, matching the real sidecar's 'no in-flight SDK query'
+    // answer. This must precede any of the frames below in stream order (the
+    // consumer folds the receipt only after provably-earlier evidence).
+    emit({
+      type: 'sdk.interrupt_settled',
+      sessionId: msg.sessionId,
+      ok: false,
+      message: 'no in-flight SDK query',
+    })
     const emitted = await engine.handleMessage(msg)
     if (emitted.has('crash')) return
     if (!emitted.has('activity') && !emitted.has('marker')) {

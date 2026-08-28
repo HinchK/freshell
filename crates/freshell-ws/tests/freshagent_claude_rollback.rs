@@ -133,6 +133,12 @@ rl.on('line', (line) => {
     // The rollback capture surface must NEVER see a completion chime; idle is the
     // busy-clear edge.
     process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId: msg.sessionId, status: 'idle' }) + '\n')
+  } else if (msg.type === 'interrupt') {
+    // ep4-r2 wire parity: the real sidecar always answers with the signed
+    // settle; on this fake nothing is ever in flight mid-rollback, matching
+    // the real sidecar's 'no in-flight SDK query' answer (NO trailing result
+    // — no turn exists to terminate).
+    process.stdout.write(JSON.stringify({ type: 'sdk.interrupt_settled', sessionId: msg.sessionId, ok: false, message: 'no in-flight SDK query' }) + '\n')
   } else if (msg.type === 'shutdown') {
     process.exit(0)
   }
