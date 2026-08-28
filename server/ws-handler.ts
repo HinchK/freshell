@@ -3,6 +3,7 @@ import { randomUUID } from 'crypto'
 import WebSocket, { WebSocketServer } from 'ws'
 import { z } from 'zod'
 import { logger } from './logger.js'
+import { serverBuildId } from './build-id.js'
 import { testClockNowMs } from './test-clock.js'
 import { recordSessionLifecycleEvent } from './session-observability.js'
 import { getPerfConfig, startPerfTimer } from './perf-logger.js'
@@ -585,6 +586,7 @@ export class WsHandler {
 
   private readonly serverInstanceId: string
   private readonly bootId: string
+  private readonly buildId: string
   // The runtime validator is authoritative here; we keep the field typed broadly because
   // the dynamic provider schemas widen discriminated-union inference beyond what TS/Zod model well.
   // Definitely assigned via rebuildClientMessageSchema() in the constructor (and re-run on dev reload).
@@ -649,6 +651,7 @@ export class WsHandler {
       ? options.serverInstanceId
       : `srv-${randomUUID()}`
     this.bootId = `boot-${randomUUID()}`
+    this.buildId = serverBuildId()
     this.registry.setServerInstanceId?.(this.serverInstanceId)
     this.terminalStreamBroker = new TerminalStreamBroker(this.registry)
 
@@ -2036,6 +2039,7 @@ export class WsHandler {
           timestamp: nowIso(),
           serverInstanceId: this.serverInstanceId,
           bootId: this.bootId,
+          buildId: this.buildId,
         })
         this.scheduleHandshakeSnapshot(ws, state)
         return

@@ -1382,6 +1382,9 @@
         "bootId": {
           "type": "string"
         },
+        "buildId": {
+          "type": "string"
+        },
         "capabilities": {
           "additionalProperties": false,
           "properties": {

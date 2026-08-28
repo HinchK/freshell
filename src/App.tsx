@@ -33,6 +33,7 @@ import {
 import { handleUiCommand } from '@/lib/ui-commands'
 import { getAuthToken } from '@/lib/auth'
 import { installTestHarness } from '@/lib/test-harness'
+import { checkServerBuildId } from '@/lib/server-build-check'
 import { createPerfAuditBridge, installPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { getTabSwitchShortcutDirection, getTabLifecycleAction } from '@/lib/tab-switch-shortcuts'
 import { useThemeEffect } from '@/hooks/useTheme'
@@ -159,6 +160,13 @@ const ReadyMessageSchema = z.object({
   timestamp: z.string(),
   serverInstanceId: z.string().min(1),
   bootId: z.string().min(1).optional(),
+  // The server's baked build identity (additive/optional — old servers omit
+  // it). Compared in checkServerBuildId below. Plain `z.string()` (NOT
+  // min(1)): a present-but-EMPTY buildId must reach the helper and no-op
+  // there, never fail the WHOLE ready frame and silently disable restart
+  // detection. Only a non-string TYPE can fail the frame, which no real
+  // server emits (the helper additionally treats "unknown" as a no-op).
+  buildId: z.string().optional(),
   // Server capability ack (present iff our hello opted in). Deliberately a
   // loose record: an unexpected capabilities shape must never fail the WHOLE
   // ready frame and silently disable restart detection.
@@ -1029,6 +1037,12 @@ export default function App() {
             if (!newBootId) {
               log.warn('ready frame carried no bootId; falling back to serverInstanceId for restart detection')
             }
+            // Server-build mismatch detection: the server stamps the git
+            // commit it was built from (ready.buildId, additive/optional);
+            // we compare it against our own Vite-baked
+            // __FRESHELL_BUILD_ID__ and reload ONCE on a mismatch (sentinel
+            // loop-guard lives in src/lib/server-build-check.ts).
+            checkServerBuildId({ serverBuildId: ready.data.buildId })
             const bootIdRestart = !!previousBootId && previousBootId !== newBootId
             const instanceChanged = !!previousServerInstanceId
               && !!nextServerInstanceId

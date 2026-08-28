@@ -745,6 +745,11 @@ export type ReadyMessage = {
   timestamp: string
   serverInstanceId?: string
   bootId?: string
+  /** The git commit the server binary was built from ("unknown" fallback).
+   *  Additive/optional bootId doctrine: the client bakes its own build id at
+   *  Vite build time and reloads once on a mismatch. Omitted from the wire
+   *  when the Rust value is None. */
+  buildId?: string
   /** Present iff the client's hello opted in via capabilities.paneReconcileV1. */
   capabilities?: ReadyCapabilities
 }
