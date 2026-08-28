@@ -4591,10 +4591,11 @@ fn reduce_notification(
             // retirement inside the window.
             if thread_id == subscription.session_id() {
                 let normalized = normalize_codex_thread_status(&status);
-                if normalized != CodexStatus::Running && normalized != CodexStatus::Starting {
-                    if !compact_in_flight.load(Ordering::SeqCst) {
-                        clear_active_turn(active_turn);
-                    }
+                if normalized != CodexStatus::Running
+                    && normalized != CodexStatus::Starting
+                    && !compact_in_flight.load(Ordering::SeqCst)
+                {
+                    clear_active_turn(active_turn);
                 }
             }
             subscription

@@ -318,9 +318,22 @@ function handleInterrupt(req) {
   // parked requests with deny is safe — and required so the SDK's canUseTool
   // await settles instead of hanging the interrupted turn.
   cancelPending(st, emit, req.sessionId, { resolveDeny: true })
-  st.query?.interrupt?.().catch((err) => {
-    logerr(`interrupt failed: ${err?.message || err}`)
-  })
+  // kata 1wxv focused ep4-r1 F1: a fire-and-forget interrupt() write proved
+  // NOTHING about completion — the gate's retirement at the request site once
+  // admitted rollback while the provider turn still ran (a delayed or REJECTED
+  // interrupt). The retirement evidence must be the SETTLED outcome: await the
+  // SDK call and emit a signed settle event in either case (rejection = the
+  // turn provably still running → the gate stays closed).
+  if (!st.query?.interrupt) {
+    emit({ type: 'sdk.interrupt_settled', sessionId: req.sessionId, ok: false, message: 'no in-flight SDK query' })
+    return
+  }
+  st.query.interrupt()
+    .then(() => emit({ type: 'sdk.interrupt_settled', sessionId: req.sessionId, ok: true }))
+    .catch((err) => {
+      logerr(`interrupt failed: ${err?.message || err}`)
+      emit({ type: 'sdk.interrupt_settled', sessionId: req.sessionId, ok: false, message: String(err?.message || err) })
+    })
 }
 
 function shutdown() {

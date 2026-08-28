@@ -599,6 +599,7 @@ impl FreshClaudeState {
         let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let turn_tracker = Arc::new(std::sync::Mutex::new(TurnTracker::default()));
         let result_idle_pair_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let turn_lock = Arc::new(TokioMutex::new(()));
         let consumer = self.spawn_consumer(
             reader,
             created.clone(),
@@ -610,6 +611,7 @@ impl FreshClaudeState {
             Arc::clone(&in_turn),
             Arc::clone(&turn_tracker),
             Arc::clone(&result_idle_pair_pending),
+            Arc::clone(&turn_lock),
             None,
         );
 
@@ -638,7 +640,7 @@ impl FreshClaudeState {
                 in_turn,
                 turn_tracker,
                 result_idle_pair_pending,
-                turn_lock: Arc::new(TokioMutex::new(())),
+                turn_lock,
             },
         );
 
@@ -836,66 +838,14 @@ impl FreshClaudeState {
         if let Err(err) = write_line(&mut session.stdin, &interrupt_req).await {
             drop(guard);
             self.send_error(&None, "CLAUDE_INTERRUPT_FAILED", &err);
-        } else {
-            // kata 1wxv Task 4 busy-truth clear edge (d): a COMPLETED interrupt
-            // retires the RUNNING op — interrupts yield NO `result` frame at
-            // all, so no in-stream edge can cover this. A FAILED write does NOT
-            // clear (the turn may still be running — fail-closed). Focused
-            // ep1-r2 F2 / ep2-r2 F2: the interrupt does NOT drain the sidecar's
-            // FIFO input queue — `query.interrupt()` cancels the RUNNING turn
-            // only, so every QUEUED op still runs (its own manual-confirmed
-            // compacting boundary → terminal sequence, or an sdk.error/EOF,
-            // retires it): the busy
-            // truth is recomputed from the surviving queue — NEVER a blanket
-            // clear (interrupting the active turn with a compact+send still
-            // queued behind it must leave the gate CLOSED).
-            let mut tracker = session.turn_tracker.lock().expect("turn tracker lock");
-            // Retire the op ACTUALLY in flight: the `running` slot, or — queued
-            // turns are never promoted (only compacts promote, via the
-            // manual-confirmed compacting boundary) — the de-facto ACTIVE
-            // queued op (ep2-r3:
-            // interrupting a turn AFTER it advanced from the queue wedged the
-            // gate forever — no result frame ever arrives for an interrupted
-            // turn). The active queued op is the OLDEST QUEUED TURN: retire it
-            // and absorb the never-evidenced SILENT DROP of every unpromoted
-            // compact queued AHEAD of it (ep2-r4: a turn generating while a
-            // compact ahead never promoted IS the drop evidence — retiring only
-            // the front stranded the interrupted turn's entry forever). Queued
-            // ops BEHIND the interrupted turn stay queued (the interrupt never
-            // drains them).
-            //
-            // ep3-r2 F1 (the candidate window): a compaction whose bare
-            // `sdk.status:compacting` arrived (candidate pending) but whose
-            // completion boundary has NOT IS the op currently in flight
-            // provider-side — SDK interrupt() cancels exactly the current
-            // execution and provably leaves LATER queued work to run. Retire
-            // exactly THAT front compact; draining past it would erase ops the
-            // provider still owes (a later compact/send), opening the gate
-            // while provider work remains queued.
-            if tracker.running.take().is_none() {
-                if tracker.compact_candidate
-                    && matches!(tracker.queued.front(), Some(TrackedOp::Compact))
-                {
-                    tracker.queued.pop_front();
-                } else {
-                    while let Some(op) = tracker.queued.front().copied() {
-                        tracker.queued.pop_front();
-                        if op == TrackedOp::Turn {
-                            break;
-                        }
-                    }
-                }
-            }
-            // Any pending compaction candidate perished with the interrupted
-            // execution (auto: with the turn; manual candidate: retired above) —
-            // a stray leftover boundary must never promote a LATER queued
-            // compact it was never observed for.
-            tracker.compact_candidate = false;
-            session
-                .in_turn
-                .store(tracker.busy(), std::sync::atomic::Ordering::SeqCst);
         }
-        // Success: no broadcast (mirrors legacy's silent fire-and-forget interrupt).
+        // Focused ep4-r1 F1: retirement happens at the consumer's
+        // `sdk.interrupt_settled{ok:true}` fold ("[`retire_interrupted_turn_op`]"),
+        // NEVER at the request write — a write proves only the request left the
+        // process, not that `query.interrupt()` completed (the sidecar awaits it
+        // and emits the signed settle; a rejection leaves the turn's own terminal
+        // edge owning its retirement — the gate stays closed). Success: no
+        // broadcast (mirrors legacy's silent fire-and-forget interrupt).
     }
 
     // ── freshAgent.send (WS) ─────────────────────────────────────────────────────────
@@ -2177,6 +2127,7 @@ impl FreshClaudeState {
             in_turn.clone(),
             turn_tracker.clone(),
             result_idle_pair_pending.clone(),
+            turn_lock.clone(),
             Some(RollbackAdoption {
                 supersedes: durable_id.clone(),
                 preseeded_init,
@@ -2594,6 +2545,7 @@ impl FreshClaudeState {
         let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let turn_tracker = Arc::new(std::sync::Mutex::new(TurnTracker::default()));
         let result_idle_pair_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let turn_lock = Arc::new(TokioMutex::new(()));
         let consumer = self.spawn_consumer(
             reader,
             msg.session_id.clone(),
@@ -2605,6 +2557,7 @@ impl FreshClaudeState {
             Arc::clone(&in_turn),
             Arc::clone(&turn_tracker),
             Arc::clone(&result_idle_pair_pending),
+            Arc::clone(&turn_lock),
             None,
         );
         self.sessions.lock().await.insert(
@@ -2621,7 +2574,7 @@ impl FreshClaudeState {
                 in_turn,
                 turn_tracker,
                 result_idle_pair_pending,
-                turn_lock: Arc::new(TokioMutex::new(())),
+                turn_lock,
             },
         );
         self.cli_index
@@ -2787,6 +2740,14 @@ impl FreshClaudeState {
         // after folding ANY `sdk.result`, and the NEXT `sdk.status:idle`
         // consumes it to skip the fold (pair punctuation, never an edge).
         result_idle_pair_pending: Arc<std::sync::atomic::AtomicBool>,
+        // Focused ep4-r1 F2: the session turn lock — every busy-evidence
+        // mutation (status/result/boundary/settle folds) serializes through it.
+        // `handle_rollback` holds the SAME lock from its absorb/gate decision
+        // through the pre-teardown recheck, so no evidence race can straddle
+        // them (the consumer previously folded without it, re-arming the busy
+        // truth a beat AFTER a passed recheck — teardown still proceeded into a
+        // revived compact's run).
+        turn_lock: Arc<TokioMutex<()>>,
         // kata 1wxv Task 4: Some ONLY on the rollback fork/fresh respawn — the
         // handler PREREAD the sdk.session.init line, so the consumer runs the
         // adoption for it FIRST (supersedes-aware), then resolves the parked
@@ -2859,6 +2820,11 @@ impl FreshClaudeState {
                 // `sdk.result` AND a trailing `sdk.status:idle` — the idle is
                 // the SAME turn's punctuation, never a second edge; the fold
                 // below skips the fold for exactly that paired idle.
+                // ep4-r1 F2: every busy-truth mutation below runs under the
+                // session turn lock — `handle_rollback` holds it from its gate
+                // decision through the pre-teardown recheck, so a compaction
+                // candidate/status fold can never straddle that window.
+                let _busy_evidence = turn_lock.lock().await;
                 match value.get("type").and_then(Value::as_str) {
                     Some("sdk.result") => {
                         fold_terminal_edge(&in_turn, &turn_tracker);
@@ -2903,6 +2869,21 @@ impl FreshClaudeState {
                             value.get("trigger").and_then(Value::as_str) == Some("manual"),
                         );
                     }
+                    Some("sdk.interrupt_settled") => {
+                        // Focused ep4-r1 F1: the ONLY interrupt-retirement
+                        // evidence. ok:true — the sidecar's awaited
+                        // `query.interrupt()` completed: retire the ops it
+                        // cancelled ([`retire_interrupted_turn_op`]).
+                        // ok:false/absent — the provider REJECTED or never
+                        // settled the interrupt (the turn provably still runs):
+                        // retire NOTHING and let the turn's own terminal edge
+                        // own its retirement (warn-log only — fail-closed).
+                        if value.get("ok").and_then(Value::as_bool) == Some(true) {
+                            retire_interrupted_turn_op(&in_turn, &turn_tracker);
+                        } else {
+                            tracing::warn!(session = %session_id, "freshagent.claude.interrupt_rejected_or_unsettled");
+                        }
+                    }
                     Some("sdk.error") => {
                         // The queued ops provably never arrive as
                         // their own turns — clear the QUEUE outright (the running
@@ -2935,6 +2916,7 @@ impl FreshClaudeState {
                     }
                     _ => {}
                 }
+                drop(_busy_evidence);
                 // Task 2: fold the pending approval/question state BEFORE the
                 // normalize/broadcast step, so a respond racing the event never
                 // observes a stale membership check.
@@ -2968,7 +2950,9 @@ impl FreshClaudeState {
             // the busy truth BEFORE the eviction verdict below (an unrequested
             // death can never hold a rollback BUSY_TURN hostage). The dead
             // sidecar's whole input queue died with it — zero the entire FIFO
-            // tracker.
+            // tracker. Serialized with the rollback handler under the session
+            // turn lock like the other busy folds (ep4-r1 F2).
+            let _eof_evidence = turn_lock.lock().await;
             in_turn.store(false, std::sync::atomic::Ordering::SeqCst);
             {
                 let mut tracker = turn_tracker.lock().expect("turn tracker lock");
@@ -3275,6 +3259,41 @@ fn absorb_unstarted_compact_debt(
 /// `in_turn` is then stored as the recomputed `busy()`: the gate releases at
 /// EXACTLY the last outstanding op's own edge — never earlier (each prior op
 /// leaves the queue non-empty), and never wedged by a stale count.
+/// Retire the ops a COMPLETED interrupt actually cancelled. Runs ONLY from the
+/// consumer's `sdk.interrupt_settled` fold (the sidecar awaits the SDK's
+/// `query.interrupt()` before emitting it — focused ep4-r1 F1: the request
+/// write proved nothing about completion). A REJECTED/unavailable interrupt
+/// (ok:false) is warn-logged and retires NOTHING — the turn provably still
+/// runs and every later terminal edge still owns its retirement.
+///
+///   - the running op (idle-armed), else the OLDEST queued Turn retiring out of
+///     the queue (ep2-r3);
+///   - absorb leading UNPROMOTED queued compacts up to that turn — their
+///     silence-at-a-live-turn IS the drop evidence (ep2-r4);
+///   - inside the compact candidate window the front queued Compact IS the
+///     in-flight execution: retire exactly it; ops behind survive (ep3-r2 F1);
+///   - the candidate is consumed either way (ep3-r2 F1).
+fn retire_interrupted_turn_op(
+    in_turn: &std::sync::atomic::AtomicBool,
+    turn_tracker: &std::sync::Mutex<TurnTracker>,
+) {
+    let mut tracker = turn_tracker.lock().expect("turn tracker lock");
+    if tracker.running.take().is_none() {
+        if tracker.compact_candidate && matches!(tracker.queued.front(), Some(TrackedOp::Compact)) {
+            tracker.queued.pop_front();
+        } else {
+            while let Some(op) = tracker.queued.front().copied() {
+                tracker.queued.pop_front();
+                if op == TrackedOp::Turn {
+                    break;
+                }
+            }
+        }
+    }
+    tracker.compact_candidate = false;
+    in_turn.store(tracker.busy(), std::sync::atomic::Ordering::SeqCst);
+}
+
 fn fold_terminal_edge(
     in_turn: &std::sync::atomic::AtomicBool,
     turn_tracker: &std::sync::Mutex<TurnTracker>,
@@ -4729,6 +4748,18 @@ rl.on('line', (line) => {
   } else if (msg.type === 'interrupt') {
     const interruptLog = process.env.FRESHELL_TEST_CLAUDE_INTERRUPT_LOG
     if (interruptLog) fs.appendFileSync(interruptLog, `${msg.sessionId}\n`)
+    // Task 4c (kata 1wxv focused ep4-r1 F1): the interrupt SETTLES asynchronously —
+    // the fake mirrors the real sidecar's awaited query.interrupt() by emitting a
+    // signed settle event: ok:true by default; knobs: FRESHELL_TEST_CLAUDE_INTERRUPT_REJECT=1
+    // (answer ok:false — the provider REJECTED the interrupt: the turn still runs,
+    // so the rollback gate must stay closed), FRESHELL_TEST_CLAUDE_INTERRUPT_SETTLE_MS
+    // (defer the settle — the request↔settle window is the provider-work window the
+    // gate must hold).
+    const settleMs = parseInt(process.env.FRESHELL_TEST_CLAUDE_INTERRUPT_SETTLE_MS || '0', 10)
+    const reject = process.env.FRESHELL_TEST_CLAUDE_INTERRUPT_REJECT === '1'
+    const settle = () => console.log(JSON.stringify({ type: 'sdk.interrupt_settled', sessionId: msg.sessionId, ok: !reject }))
+    if (settleMs > 0) setTimeout(settle, settleMs)
+    else settle()
   } else if (msg.type === 'shutdown') {
     process.exit(0)
   }
@@ -5651,6 +5682,7 @@ rl.on('line', (line) => {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(TurnTracker::default())),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(TokioMutex::new(())),
             None,
         );
 
@@ -6553,10 +6585,9 @@ rl.on('line', (line) => {
         // Baseline: drop every frame the create/emit dance left on the bus.
         while rx.try_recv().is_ok() {}
         st.handle_interrupt(interrupt_msg(&sid)).await;
-        assert!(
-            !in_turn_of(&st, &sid).await,
-            "a completed handle_interrupt clears the busy truth (edge d)"
-        );
+        // ep4-r1 F1: retirement waits for the sidecar's awaited settle ack —
+        // poll for the cleared gate.
+        await_in_turn(&st, &sid, false).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         while let Ok(raw) = rx.try_recv() {
             let frame: Value = serde_json::from_str(&raw).unwrap();
@@ -8068,10 +8099,8 @@ rl.on('line', (line) => {
         // Interrupt the ACTIVE turn (B): its entry AND C1's never-evidenced
         // drop retire together — nothing remains to wedge the gate.
         st.handle_interrupt(interrupt_msg(&session_id)).await;
-        assert!(
-            !in_turn_of(&st, &session_id).await,
-            "ep2-r4 F1: the interrupted active turn + dropped compact retire — nothing wedges"
-        );
+        // ep4-r1 F1: retirement waits for the sidecar's awaited settle ack.
+        await_in_turn(&st, &session_id, false).await;
         let (sink, captured) = capturing_sink();
         st.handle_rollback(
             rollback_op(&session_id, "rb-qdi-1", RollbackDirection::Undo),
@@ -8141,10 +8170,8 @@ rl.on('line', (line) => {
         // Interrupt B (no result frame exists for it — the interrupt IS its
         // busy-clear edge): the gate opens here, permanently.
         st.handle_interrupt(interrupt_msg(&session_id)).await;
-        assert!(
-            !in_turn_of(&st, &session_id).await,
-            "ep2-r3: interrupting the queue-advanced turn ends its busy truth — the queued entry never strands the gate"
-        );
+        // ep4-r1 F1: retirement waits for the sidecar's awaited settle ack.
+        await_in_turn(&st, &session_id, false).await;
         let (sink, captured) = capturing_sink();
         st.handle_rollback(
             rollback_op(&session_id, "rb-qadv-1", RollbackDirection::Undo),
@@ -8206,11 +8233,9 @@ rl.on('line', (line) => {
         // never-evidenced drop. The gate OPENS — the pane must never wedge
         // permanently busy over an interrupted turn.
         st.handle_interrupt(interrupt_msg(&session_id)).await;
-        assert!(
-            !in_turn_of(&st, &session_id).await,
-            "ep2-r4 F1: the interrupt retires the ACTIVELY-generating turn (B) — never the dropped compact's entry (C1)
-             — and absorbs the never-evidenced drop: nothing remains"
-        );
+        // ep4-r1 F1: retirement waits for the sidecar's awaited settle ack (the
+        // interrupt clears B AND absorbs the never-evidenced drop).
+        await_in_turn(&st, &session_id, false).await;
         let (sink, captured) = capturing_sink();
         st.handle_rollback(
             rollback_op(&session_id, "rb-qda-1", RollbackDirection::Undo),
@@ -8306,6 +8331,120 @@ rl.on('line', (line) => {
             frames[0]["event"]["code"], "NOTHING_TO_UNDO",
             "the gate released exactly at S's own terminal edge: {frames:?}"
         );
+        drop(env);
+    }
+
+    /// Focused-review ep4-r1 F1 (interrupt request ≠ interrupt completed): the
+    /// rollback gate used to OPEN at the request write — but the sidecar's
+    /// `query.interrupt()` settles asynchronously and can be REJECTED. The
+    /// retirement evidence is the signed `sdk.interrupt_settled` frame the
+    /// awaited sidecar emits: until it lands, the gate stays closed.
+    ///
+    ///   A running → interrupt (settle deferred by knob) → mid-window rollback
+    ///   probe: BUSY_TURN (gate provably closed without the ack) → settle
+    ///   (ok:true) → gate OPENS.
+    #[tokio::test]
+    async fn an_interrupt_keeps_the_gate_closed_until_the_settle_ack_lands() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        std::env::set_var("FRESHELL_TEST_CLAUDE_INTERRUPT_SETTLE_MS", "400");
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-settle")).await;
+        let created = await_claude_created(&mut rx, "req-settle").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        await_status_frame(&mut rx, &session_id, "idle").await;
+
+        st.handle_send(send_msg(&session_id, "turn one")).await;
+        assert!(in_turn_of(&st, &session_id).await, "the turn is running");
+
+        st.handle_interrupt(interrupt_msg(&session_id)).await;
+        // The write landed; the settle is DEFERRED: the gate MUST stay closed.
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-settle-0", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        assert_eq!(
+            captured_json(&captured)[0]["event"]["code"],
+            "BUSY_TURN",
+            "ep4-r1 F1: an interrupt REQUEST never opens the gate — the settle ack owns the retirement"
+        );
+        assert!(
+            in_turn_of(&st, &session_id).await,
+            "the busy truth holds past the request write"
+        );
+
+        // The settle arrives: the interrupted turn retires — the gate opens.
+        await_in_turn(&st, &session_id, false).await;
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-settle-1", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        assert_eq!(
+            captured_json(&captured)[0]["event"]["code"],
+            "NOTHING_TO_UNDO",
+            "the settled interrupt retired the turn — gate opens on ack"
+        );
+        std::env::remove_var("FRESHELL_TEST_CLAUDE_INTERRUPT_SETTLE_MS");
+        drop(env);
+    }
+
+    /// Focused-review ep4-r1 F1 (rejection): a REJECTED interrupt (the sidecar
+    /// answers ok:false — e.g. the provider had no cancellable turn) retires
+    /// NOTHING: the gate stays closed and the turn's OWN terminal edge releases
+    /// it later.
+    #[tokio::test]
+    async fn a_rejected_interrupt_never_retires_the_running_turn() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        std::env::set_var("FRESHELL_TEST_CLAUDE_INTERRUPT_REJECT", "1");
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-ireject")).await;
+        let created = await_claude_created(&mut rx, "req-ireject").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        await_status_frame(&mut rx, &session_id, "idle").await;
+
+        st.handle_send(send_msg(&session_id, "turn one")).await;
+
+        st.handle_interrupt(interrupt_msg(&session_id)).await;
+        // The rejection settles immediately: NOTHING retires — gate closed.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            in_turn_of(&st, &session_id).await,
+            "ep4-r1 F1: a rejected interrupt retires nothing"
+        );
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-ireject-0", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        assert_eq!(
+            captured_json(&captured)[0]["event"]["code"],
+            "BUSY_TURN",
+            "the rejected interrupt left the running turn owed — gate closed"
+        );
+
+        // The turn's OWN terminal edge (its real result + paired idle) retires
+        // it — the gate opens exactly there.
+        inject_raw_send(&st, &session_id, "__emit_result_error__").await;
+        inject_raw_send(&st, &session_id, "__emit_idle__").await;
+        await_in_turn(&st, &session_id, false).await;
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(
+            rollback_op(&session_id, "rb-ireject-1", RollbackDirection::Undo),
+            sink,
+        )
+        .await;
+        assert_eq!(
+            captured_json(&captured)[0]["event"]["code"],
+            "NOTHING_TO_UNDO",
+            "the turn's own edge released the gate after the rejected interrupt"
+        );
+        std::env::remove_var("FRESHELL_TEST_CLAUDE_INTERRUPT_REJECT");
         drop(env);
     }
 
