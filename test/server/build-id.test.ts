@@ -38,10 +38,25 @@ describe('server build id', () => {
   })
 
   it('computeBuildId returns the current git HEAD sha for the repository', () => {
-    const expected = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: REPO_ROOT })
-      .toString()
-      .trim()
-    expect(computeBuildId(REPO_ROOT)).toBe(expected)
+    // Build a fixture repo instead of probing this checkout: CI cloud images
+    // ship the source tree without .git/ (see .gcloudignore/.dockerignore),
+    // so asserting against REPO_ROOT's HEAD is impossible there. Only a git
+    // binary is required anywhere this suite runs.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'build-id-fixture-repo-'))
+    try {
+      execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: dir })
+      execFileSync(
+        'git',
+        ['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '-q', '--allow-empty', '-m', 'init'],
+        { cwd: dir },
+      )
+      const expected = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir })
+        .toString()
+        .trim()
+      expect(computeBuildId(dir)).toBe(expected)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
   })
 
   it('computeBuildId falls back to "unknown" outside a git repository', () => {
