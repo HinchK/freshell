@@ -64,8 +64,11 @@ export function query({ prompt, options }) {
         yield { type: 'assistant', message: { content: [] }, session_id: 'ses-open' }
       } else if (typeof text === 'string' && /^\s*\/compact(\s|$)/.test(text)) {
         // The compact runs and settles: the sidecar must clear both quiesce
-        // busy flags on this result. The sleep models the compact's RUN —
-        // window the handed flag must hold for (pull-to-terminal).
+        // busy flags on this result. The probe frame marks the RUN start (the
+        // quiesce test synchronizes on it instead of wall-clock windows — the
+        // reviewer-flagged flake), then the sleep models the pull-to-terminal
+        // interval the handed flag must hold for.
+        probe({ type: 'probe.compact_running', text })
         await new Promise((resolve) => setTimeout(resolve, 250))
         yield { type: 'result', subtype: 'success', session_id: 'ses-compact' }
       }

@@ -178,9 +178,13 @@ describe('rollback quiesce protocol (ep4-r3)', () => {
     h.send({ type: 'send', sessionId: sid, text: '__park_400__' }) // consumed after park 1 ends
     h.send({ type: 'send', sessionId: sid, text: '/compact queued-second' })
     // The first park ends; the loop pulls __park_400__ (busy again), and only
-    // after IT ends is the queued compact pulled (armed) + run (250ms).
-    // Wait long enough to be inside the compact's run window.
-    await new Promise((r) => setTimeout(r, 600 + 400 + 80))
+    // after IT ends is the queued compact pulled (armed) + run. The module
+    // signals the run start with probe.compact_running — synchronize on THAT,
+    // never on wall-clock arithmetic (the reviewer-flagged flake).
+    await h.waitFor(
+      (f) => f.type === 'probe.compact_running',
+      'the queued compact starts running',
+    )
     h.send({ type: 'rollback.quiesce', sessionId: sid, probeId: 'probe-pulled' })
     const pulled = await h.waitFor(isQuiescedFor(sid, 'probe-pulled'), 'quiesced post-pull busy')
     expect(pulled.handedCompactLikely).toBe(true)

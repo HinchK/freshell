@@ -1527,8 +1527,22 @@ impl FreshCodexState {
         *compact_turn_id.lock().expect("compact_turn_id mutex") = None;
         compact_in_flight.store(true, Ordering::SeqCst);
         if let Err(err) = client.compact_thread(&session_id).await {
-            compact_in_flight.store(false, Ordering::SeqCst);
-            *compact_turn_id.lock().expect("compact_turn_id mutex") = None;
+            match &err {
+                // Focused ep4-r5 (codex.rs:1530): an explicit JSON-RPC
+                // rejection is PROOF the compact never started → clear what
+                // we armed. Every post-send-class failure (Timeout after the
+                // request frame was written, Closed mid-flight, an
+                // unparseable answer) is ambiguous — the app server may still
+                // be starting the compact — so the marker STAYS armed and the
+                // compact turn's own notifications own the retirement (a
+                // never-starting compact can only wedge fail-closed, never
+                // open the rollback gate over live provider work).
+                CodexAppServerError::Rpc { .. } | CodexAppServerError::Transport { .. } => {
+                    compact_in_flight.store(false, Ordering::SeqCst);
+                    *compact_turn_id.lock().expect("compact_turn_id mutex") = None;
+                }
+                _ => {}
+            }
             self.emit_fresh_agent_error(&session_id, "CODEX_COMPACT_FAILED", &err.to_string());
         }
     }
@@ -5978,6 +5992,36 @@ pub(crate) mod tests {
         (peer, rx)
     }
 
+    /// [`insert_idle_compact_session`] with a short client request timeout, so
+    /// an unanswered RPC resolves as `CodexAppServerError::Timeout` inside the
+    /// test's budget (the ep4-r5 fail-closed window: the request frame provably
+    /// left, but the answer never came).
+    async fn insert_idle_compact_session_with_timeout(
+        st: &FreshCodexState,
+        thread_id: &str,
+        request_timeout_ms: u64,
+    ) -> (
+        freshell_codex::ChannelPeer,
+        tokio::sync::broadcast::Receiver<String>,
+    ) {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect_with_timeout(
+            transport,
+            Duration::from_millis(request_timeout_ms),
+        );
+        let rx = insert_fake_session_with_real_consumer(
+            st,
+            thread_id,
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            notifs,
+            spawn_sleeper(),
+            &format!("codex-sidecar-test-compact-{thread_id}"),
+        )
+        .await;
+        (peer, rx)
+    }
+
     /// Complete the initialize handshake a first RPC triggers (client.ts:777-778).
     async fn answer_initialize(peer: &freshell_codex::ChannelPeer) {
         let (init_id, init_method, _p) = peer.expect_request().await;
@@ -6934,6 +6978,81 @@ pub(crate) mod tests {
         assert!(
             rx.try_recv().is_err(),
             "an RPC failure must not fabricate a completion"
+        );
+
+        // ep4-r5: an EXPLICIT rejection is proof the compact never started —
+        // the busy marker cleared, so a retried compact reaches a fresh RPC
+        // (as opposed to the timeout class, which refuses locally).
+        let driver2 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-ce")).await;
+            })
+        };
+        let (id2, method2, _p2) = peer.expect_request().await;
+        assert_eq!(
+            method2, "thread/compact/start",
+            "an explicit rejection re-opens the gate for a retry"
+        );
+        peer.respond_error(&id2, -32600, "compact rejected again");
+        driver2.await.expect("compact task 2");
+    }
+
+    /// Focused-review ep4-r4 (Minor-1, codex.rs:1530): a compact RPC that
+    /// TIMES OUT crossed the wire with an ambiguous lifecycle — the app server
+    /// may still start the compact — so the busy marker must STAY armed: a
+    /// second compact is refused LOCALLY (no second RPC may reach the peer),
+    /// and the rollback gate would stay closed with it. Clearing the marker on
+    /// timeout (the pre-fix shape) re-arms a second compact -> a live provider
+    /// compaction folded by... exactly the torn-owner hazard ep1-r2 F3 closed.
+    #[tokio::test]
+    async fn handle_compact_rpc_timeout_keeps_the_busy_marker_fail_closed() {
+        let (st, _rx_boot) = state_with_bus();
+        let (peer, mut rx) = insert_idle_compact_session_with_timeout(&st, "thread-cto", 50).await;
+
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-cto")).await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (_id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        // Never answer: the client's request timeout fires (50ms).
+        driver
+            .await
+            .expect("the compact handler resolves on the timeout");
+
+        // The loud error envelope arrived; the busy marker must OUTLIVE it.
+        loop {
+            let raw = rx.recv().await.expect("the bus stays open");
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.event" && frame["event"]["type"] == "freshAgent.error" {
+                assert_eq!(frame["event"]["code"], "CODEX_COMPACT_FAILED");
+                break;
+            }
+        }
+
+        // A second compact must be refused WITHOUT another RPC — proof the
+        // timed-out window still owns the gate.
+        st.handle_compact(compact_msg("thread-cto")).await;
+        loop {
+            let raw = rx.recv().await.expect("the bus stays open");
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.event" && frame["event"]["type"] == "freshAgent.error" {
+                assert_eq!(
+                    frame["event"]["code"], "BUSY_TURN",
+                    "the second compact refused through the (surviving) busy marker: {frame}"
+                );
+                break;
+            }
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), peer.expect_request())
+                .await
+                .is_err(),
+            "ep4-r4: the refused second compact NEVER reaches the app server"
         );
     }
 

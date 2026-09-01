@@ -169,6 +169,67 @@ struct TurnTask {
     handle: tokio::task::JoinHandle<()>,
 }
 
+/// Focused ep4-r5 (opencode_ws.rs:1155): the pre-drive redo destroy must be
+/// restored when the compact drive dies without ever dispatching the
+/// summarize POST — INCLUDING the kill/interrupt-during-cold-start leg that
+/// drops the drive task before `manager.compact()` even returns (the match
+/// arm never runs for a dropped future). Owned by the drive task; `disarm()`
+/// marks the resolutions that already settled the ledger (success stands,
+/// answered-failure stands, never-dispatched restored inline), so a dropped-
+/// while-armed guard is alive ONLY on the provably-undelivered abort window.
+struct PreDriveRedoGuard {
+    identity_sink:
+        std::sync::Arc<std::sync::OnceLock<crate::identity_sink::SharedPaneIdentitySink>>,
+    session_id: String,
+    /// `Some` while the pre-drive destroy is still uncompensated on the drive
+    /// path — the NONE shape IS the disarm (every settled resolution emptying
+    /// it names a ledger state already written).
+    pre_drive_record: Option<crate::rollback_record::RollbackRecord>,
+    destroy_now: i64,
+    /// Flipped by [`OpencodeServeManager::compact`] exactly at the crossing
+    /// from the cancellable cold-start leg into the HTTP request leg. An
+    /// aborted drive past that point is ambiguous-possibly-mutated: the
+    /// pre-drive destroy stands (never restored).
+    summarize_dispatched: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PreDriveRedoGuard {
+    fn disarm(&mut self) {
+        self.pre_drive_record = None;
+    }
+}
+
+impl Drop for PreDriveRedoGuard {
+    fn drop(&mut self) {
+        if self
+            .summarize_dispatched
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let Some(pre) = self.pre_drive_record.take() else {
+            return;
+        };
+        let sink = self.identity_sink.get().cloned();
+        let id = self.session_id.clone();
+        let destroy_now = self.destroy_now;
+        tokio::spawn(async move {
+            if let Some(e) = crate::rollback_record::restore_redo_on_undelivered_compact(
+                &sink,
+                PROVIDER,
+                &id,
+                pre,
+                destroy_now,
+                crate::rollback_record::now_ms(),
+            )
+            .await
+            {
+                tracing::warn!(error = %e, session = %id, "freshagent.opencode.redo_restore_on_aborted_compact_failed");
+            }
+        });
+    }
+}
+
 impl TurnTask {
     fn is_finished(&self) -> bool {
         self.handle.is_finished()
@@ -1182,6 +1243,24 @@ impl FreshOpencodeState {
         let fresh_agent = self.fresh_agent.clone();
         let identity_sink = std::sync::Arc::clone(&self.identity_sink);
         let compact_id = real_id.clone();
+        // Focused ep4-r5 (opencode_ws.rs:1155): an abort (kill/interrupt)
+        // that drops this task WHILE the drive is parked inside
+        // `ensure_started` (a cold start, or any point before the summarize
+        // POST left the process) never enters the match below. Worse, the
+        // FIRST poll may never happen at all (the test harness's interrupt
+        // races the spawn): the guard is therefore CONSTRUCTED OUTSIDE the
+        // async block and moved in — a never-started future still drops its
+        // captures, and the armed-but-undropped guard restores the pre-drive
+        // record exactly like the never-dispatched failure leg.
+        let summarize_dispatched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut undo_guard = PreDriveRedoGuard {
+            identity_sink: identity_sink.clone(),
+            session_id: compact_id.clone(),
+            pre_drive_record: pre_drive_record.clone(),
+            destroy_now,
+            summarize_dispatched: summarize_dispatched.clone(),
+        };
+        let collected_witness = summarize_dispatched.clone();
         let compact_task = tokio::spawn(async move {
             let result = match manager
                 .compact(
@@ -1189,6 +1268,7 @@ impl FreshOpencodeState {
                     &model_pair.provider_id,
                     &model_pair.model_id,
                     &route,
+                    Some(collected_witness),
                 )
                 .await
             {
@@ -1196,6 +1276,7 @@ impl FreshOpencodeState {
                     // The 2xx landed — the reverted tail is genuinely deleted
                     // and the PRE-DRIVE destroy already retired redo (F4);
                     // nothing more to persist. Settle waits on idle.
+                    undo_guard.disarm();
                     manager
                         .await_idle(&compact_id, rx, DEFAULT_TURN_TIMEOUT, route)
                         .await
@@ -1211,9 +1292,12 @@ impl FreshOpencodeState {
                     // exactly there. EVERY failure timed at/after the send — a
                     // non-2xx ANSWER (OpenCode ≥1.18.21 summarize runs
                     // revertSvc.cleanup FIRST — the tail may already be gone),
-                    // RequestTimeout, mid-flight Transport, Decode, and EVERY
-                    // abort — lets the destroy stand forever
-                    // (error-after-send ≠ tail survived).
+                    // RequestTimeout, mid-flight Transport, Decode lets the
+                    // destroy stand forever (error-after-send ≠ tail
+                    // survived). ep4-r5: an ABORT never reaches this match at
+                    // all — it is the guard's drop-cancellation leg, and it
+                    // restores on the SAME provable premise (a cancelled-but-
+                    // never-dispatched drive provably touched nothing).
                     if err.never_dispatched() {
                         if let Some(pre) = pre_drive_record {
                             if let Some(e) =
@@ -1230,6 +1314,9 @@ impl FreshOpencodeState {
                                 tracing::warn!(error = %e, session = %compact_id, "freshagent.opencode.redo_restore_on_undelivered_compact_failed");
                             }
                         }
+                        undo_guard.disarm();
+                    } else {
+                        undo_guard.disarm();
                     }
                     Err(err)
                 }
@@ -4222,6 +4309,10 @@ mod tests {
         /// recording itself + the order pin — a deterministic "compact in
         /// flight" window for the kill/interrupt lifecycle tests.
         summarize_gate: Option<Arc<tokio::sync::Notify>>,
+        /// ep4-r5: when set, the `/global/health` GET parks on `notified()` —
+        /// a deterministic "serve cold-start in progress" window (the compact
+        /// drive's `ensure_started` waits INSIDE it, pre-POST).
+        health_gate: Option<Arc<tokio::sync::Notify>>,
     }
 
     impl CompactFakeHttp {
@@ -4230,6 +4321,7 @@ mod tests {
             summarize_outcome: SummarizeOutcome,
             bus_probe: tokio::sync::broadcast::Receiver<String>,
             summarize_gate: Option<Arc<tokio::sync::Notify>>,
+            health_gate: Option<Arc<tokio::sync::Notify>>,
         ) -> Self {
             Self {
                 next_session: AtomicUsize::new(0),
@@ -4239,6 +4331,7 @@ mod tests {
                 config_body,
                 bus_probe: StdMutex::new(bus_probe),
                 summarize_gate,
+                health_gate,
             }
         }
 
@@ -4320,7 +4413,13 @@ mod tests {
                 });
 
             if req.url.contains("/global/health") {
-                return Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) });
+                let gate = self.health_gate.clone();
+                return Box::pin(async move {
+                    if let Some(gate) = gate {
+                        gate.notified().await;
+                    }
+                    Ok(ServeHttpResponse::new(200, b"{}".to_vec()))
+                });
             }
             // Precise create-match: exactly `POST /session` (optionally `?directory=...`).
             if method == "POST" && (req.url.ends_with("/session") || req.url.contains("/session?"))
@@ -4429,6 +4528,7 @@ mod tests {
             summarize_outcome,
             tx.subscribe(),
             summarize_gate,
+            None,
         ));
         let deps = ServeDeps {
             spawner: Arc::new(TrackedSpawner {
@@ -4842,6 +4942,7 @@ mod tests {
             SummarizeOutcome::OkAnswered,
             tx.subscribe(),
             None,
+            None,
         ));
         let deps = ServeDeps {
             spawner: Arc::new(FailSpawner),
@@ -4887,6 +4988,100 @@ mod tests {
             !record.redo_destroyed && record.can_redo(),
             "ep2-r1 F3: no-POST startup failure ⇒ the pre-drive destroy is compensated back — redo stays valid: {record:?}"
         );
+    }
+
+    /// Focused-review ep4-r4 (major, opencode_ws.rs:1155): a compact drive
+    /// aborted DURING COLD START (killed/interrupted while `ensure_started()`
+    /// still waits on the health probe) drops the task before
+    /// `manager.compact()` ever returns — pre-fix the never-POSTed ledger's
+    /// destroy stood forever (no summarize POST existed, the reverted tail is
+    /// intact, yet `canRedo:false` persisted). The drop-guard restore must
+    /// compensate it back, exactly like the never-dispatched failure leg.
+    #[tokio::test]
+    async fn a_compact_aborted_during_cold_start_restores_the_durably_destroyed_redo() {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx.clone()));
+        let health_gate = Arc::new(tokio::sync::Notify::new());
+        let http = Arc::new(CompactFakeHttp::new(
+            r#"{"model":null}"#.as_bytes().to_vec(),
+            SummarizeOutcome::OkAnswered,
+            tx.subscribe(),
+            None,
+            Some(health_gate.clone()),
+        ));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: http.clone(),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        // The manager is NEVER started: the compact drive's ensure_started()
+        // parks INSIDE the health probe until the gate fires.
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
+        let sink = seed_redoable_record(&st, "ses_1").await;
+
+        st.handle_compact(compact_msg("ses_1")).await;
+        // The pre-drive destroy lands durably (and synchronously relative to
+        // the drive launch): poll for it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let record = sink
+                .load_rollback(PROVIDER, "ses_1")
+                .expect("record visible");
+            if record.redo_destroyed {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the pre-drive destroy never landed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            http.summarize_requests().is_empty(),
+            "no summarize POST exists — the serve is parked in cold start"
+        );
+
+        // Kill the drive mid-cold-start (the ep4-r5 window): the task is
+        // aborted before compact() returns.
+        st.handle_interrupt(FreshAgentInterrupt {
+            provider: AgentProvider::Opencode,
+            session_id: "ses_1".to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+
+        // The drop-guard restore: the redo chain is durably valid again.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let record = sink
+                .load_rollback(PROVIDER, "ses_1")
+                .expect("record visible");
+            if !record.redo_destroyed && record.can_redo() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "ep4-r5: the aborted-before-dispatch compact never restored redo: {record:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            http.summarize_requests().is_empty(),
+            "still no POST — the restore rides the provably-undelivered premise"
+        );
+        // Release the parked health probe so no task lingers past the test.
+        health_gate.notify_waiters();
     }
 
     /// Focused-review ep1-r2 F4's core repro: a compact whose drive is ABORTED

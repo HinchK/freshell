@@ -993,17 +993,30 @@ impl OpencodeServeManager {
     /// EXACTLY those two keys — the manager stores no session metadata, hence the model
     /// pair is an EXPLICIT parameter the caller resolved upstream. The 200 `boolean`
     /// result is not consumed by the fresh-agent path.
+    ///
+    /// kata 1wxv ep4-r5 (abort-window boundary): `dispatched_witness` flips to
+    /// `true` exactly when the drive crosses from the cancellable leg into the
+    /// request leg — AFTER `require_base` (the serve is running; aborts in the
+    /// cold-start leg are still provably no-side-effects) and BEFORE the HTTP
+    /// call is issued. An aborted drive past this point is ambiguous-possibly-
+    /// mutated and must never be compensated by ledger restore.
     pub async fn compact(
         &self,
         id: &str,
         provider_id: &str,
         model_id: &str,
         route: &Route,
+        dispatched_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<(), ServeError> {
         let path = with_route(
             &format!("/session/{}/summarize", encode_path_segment(id)),
             route,
         );
+        // The cold-start leg (spawn/health) — the request does not exist yet.
+        self.require_base().await?;
+        if let Some(witness) = &dispatched_witness {
+            witness.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         self.json_request(
             HttpMethod::Post,
             &path,
@@ -1604,9 +1617,15 @@ mod tests {
         let http = Arc::new(RecordingHttp::new());
         let mgr = started_recording_manager(http.clone()).await;
 
-        mgr.compact("ses_9", "prov-a", "mdl-x", &Some("/work dir".to_string()))
-            .await
-            .expect("200 summarize succeeds");
+        mgr.compact(
+            "ses_9",
+            "prov-a",
+            "mdl-x",
+            &Some("/work dir".to_string()),
+            None,
+        )
+        .await
+        .expect("200 summarize succeeds");
 
         let requests = http.recorded();
         let (_, url, body) = requests
@@ -1641,7 +1660,7 @@ mod tests {
         });
         let mgr = started_recording_manager(http).await;
 
-        match mgr.compact("ses_9", "prov-a", "mdl-x", &None).await {
+        match mgr.compact("ses_9", "prov-a", "mdl-x", &None, None).await {
             Err(ServeError::Http { method, status, .. }) => {
                 assert_eq!(method, "POST");
                 assert_eq!(status, 400);
