@@ -191,6 +191,38 @@ describe('rollback quiesce protocol (ep4-r3)', () => {
     expect(pulled.cancelledQueue).toBe(0)
   })
 
+  it('ep4-r6 F1: an unrelated turn result never discharges the handed-compact busy truth; only the compact evidence does', async () => {
+    const h = spawnSidecar()
+    const sid = await bootSession(h)
+    // /compact against an eagerly-draining module: the handoff is same-tick (armed).
+    h.send({ type: 'send', sessionId: sid, text: '/compact' })
+    await h.waitFor((f) => f.type === 'probe.compact_running', 'compact run started')
+    // An unrelated turn's terminal result lands FIRST (the SDK drives inputs
+    // and results independently) — then, and only then, the compact's own
+    // evidence (status compacting at +300ms, its result at +500ms).
+    h.send({ type: 'send', sessionId: sid, text: '__one_result__' })
+    await h.waitFor(
+      (f) => f.type === 'sdk.result',
+      'the unrelated result lands mid-window',
+    )
+    // MID-WINDOW probe: the handed flag must survive the unrelated result.
+    h.send({ type: 'rollback.quiesce', sessionId: sid, probeId: 'probe-f1-mid' })
+    const busy = await h.waitFor(isQuiescedFor(sid, 'probe-f1-mid'), 'mid-window busy answer')
+    expect(busy.handedCompactLikely).toBe(true)
+
+    // The compact's OWN evidence lands: status discharges the handed flag, its
+    // result closes the turn — a probe after both is all-clear again.
+    await h.waitFor((f) => f.type === 'sdk.status' && f.status === 'compacting', 'compacting status')
+    await h.waitFor(
+      (f) => h.frames.filter((x) => x.type === 'sdk.result').length >= 2,
+      'the compact result',
+    )
+    h.send({ type: 'rollback.quiesce', sessionId: sid, probeId: 'probe-f1-after' })
+    const clear = await h.waitFor(isQuiescedFor(sid, 'probe-f1-after'), 'post-evidence all-clear')
+    expect(clear.handedCompactLikely).toBe(false)
+    expect(clear.inFlightTurn).toBe(false)
+  })
+
   it('echoes only the requesting probeId (an unrelated probeId is its own answer)', async () => {
     const h = spawnSidecar()
     const sid = await bootSession(h)

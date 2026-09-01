@@ -2062,14 +2062,11 @@ impl FreshClaudeState {
                     // handoff (a turn mid-flight, or a compact already handed
                     // to an awaiting SDK consumer) — refuse.
                     tracing::info!(session = %map_key, ?verdict, "freshagent.claude.rollback_quiesce_busy");
-                    if let Some(sink) = self.identity_sink() {
-                        let restore = existing
-                            .clone()
-                            .unwrap_or_else(|| RollbackRecord::empty(now));
-                        if let Err(e) = sink.record_rollback(PROVIDER, &durable_id, restore).await {
-                            tracing::warn!(error = %e, session = %durable_id, "freshagent.claude.rollback_probe_compensate_failed");
-                        }
-                    }
+                    // ep4-r6 F5: never fabricate an empty row for a rollback
+                    // that never happened — the shared helper DELETES the
+                    // pre-write when the pre-op record was absent.
+                    self.compensate_rollback_record(&durable_id, existing.clone())
+                        .await;
                     reply_sink(rollback_error_frame(
                         &op,
                         "BUSY_TURN",
@@ -2093,14 +2090,11 @@ impl FreshClaudeState {
                             slot.take();
                         }
                     }
-                    if let Some(sink) = self.identity_sink() {
-                        let restore = existing
-                            .clone()
-                            .unwrap_or_else(|| RollbackRecord::empty(now));
-                        if let Err(e) = sink.record_rollback(PROVIDER, &durable_id, restore).await {
-                            tracing::warn!(error = %e, session = %durable_id, "freshagent.claude.rollback_probe_compensate_failed");
-                        }
-                    }
+                    // ep4-r6 F5: never fabricate an empty row for a rollback
+                    // that never happened — the shared helper DELETES the
+                    // pre-write when the pre-op record was absent.
+                    self.compensate_rollback_record(&durable_id, existing.clone())
+                        .await;
                     reply_sink(rollback_error_frame(
                         &op,
                         "BUSY_TURN",
@@ -2120,16 +2114,10 @@ impl FreshClaudeState {
         if revived {
             // Compensate the pre-op durable record: the provider was never
             // touched, so the ledger must describe nothing happening —
-            // restore the pre-op record (or an empty one, mirroring the
-            // opencode lane's compensate discipline).
-            if let Some(sink) = self.identity_sink() {
-                let restore = existing
-                    .clone()
-                    .unwrap_or_else(|| RollbackRecord::empty(now));
-                if let Err(e) = sink.record_rollback(PROVIDER, &durable_id, restore).await {
-                    tracing::warn!(error = %e, session = %durable_id, "freshagent.claude.rollback_recheck_compensate_failed");
-                }
-            }
+            // restore the pre-op record, and DELETE the just-written row when
+            // there was none (never fabricate, ep4-r6 F5).
+            self.compensate_rollback_record(&durable_id, existing.clone())
+                .await;
             reply_sink(rollback_error_frame(
                 &op,
                 "BUSY_TURN",
@@ -8229,12 +8217,9 @@ rl.on('line', (line) => {
             st.sessions.lock().await.contains_key("dur-midcomp"),
             "no teardown"
         );
-        let record = sink_impl
-            .load_rollback("claude", "dur-midcomp")
-            .expect("the compensated ledger row");
         assert!(
-            record.entries.is_empty(),
-            "the pre-write compensated: the ledger describes no mutation: {record:?}"
+            sink_impl.load_rollback("claude", "dur-midcomp").is_none(),
+            "ep4-r6 F5: no pre-op record existed, so the compensation DELETED the pre-write row"
         );
         std::env::remove_var("FRESHELL_TEST_CLAUDE_ROLLBACK_PRE_TEARDOWN_MS");
         drop(env);
@@ -8954,12 +8939,9 @@ rl.on('line', (line) => {
             in_turn_of(&st, "rb-probe").await,
             "the revived candidate keeps the gate closed after the abort"
         );
-        let record = sink_impl
-            .load_rollback("claude", "dur-probe")
-            .expect("the compensated ledger row");
         assert!(
-            record.entries.is_empty(),
-            "the pre-write compensated: the ledger describes no mutation: {record:?}"
+            sink_impl.load_rollback("claude", "dur-probe").is_none(),
+            "the compensation deleted the pre-write row (nothing ever happened)"
         );
         std::env::remove_var("FRESHELL_TEST_CLAUDE_PROBE_COMPACT_BEFORE_SETTLE");
         drop(env);
@@ -9165,12 +9147,9 @@ rl.on('line', (line) => {
             "BUSY_TURN",
             "ep4-r3 F1: the verdict alone refuses — the handed compact is un-cancellable: {frames:?}"
         );
-        let record = sink_impl
-            .load_rollback("claude", "dur-vhanded")
-            .expect("the compensated ledger row");
         assert!(
-            record.entries.is_empty(),
-            "the pre-write compensated: the ledger describes no mutation: {record:?}"
+            sink_impl.load_rollback("claude", "dur-vhanded").is_none(),
+            "the compensation deleted the pre-write row (nothing ever happened)"
         );
         std::env::remove_var("FRESHELL_TEST_CLAUDE_PROBE_HANDED_BUSY");
         drop(env);

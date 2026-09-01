@@ -819,6 +819,23 @@ impl OpencodeServeManager {
         body: Option<Value>,
         not_found_value: Option<Value>,
     ) -> Result<Value, ServeError> {
+        self.json_request_maybe_witnessed(method, path, body, not_found_value, None)
+            .await
+    }
+
+    /// [`json_request`] with an optional dispatch witness: when present, the
+    /// flag flips exactly once the URL exists and the HTTP send is issued —
+    /// after this call's own `require_base` — the TRUE dispatch point (ep4-r6
+    /// F3: arming the witness between two require_base calls misclassifies an
+    /// abort that lands inside the second one's wait as "dispatched").
+    async fn json_request_maybe_witnessed(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        body: Option<Value>,
+        not_found_value: Option<Value>,
+        dispatch_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<Value, ServeError> {
         let base = self.require_base().await?;
         let url = format!("{base}{path}");
         let timeout = self.config().request_timeout;
@@ -832,7 +849,14 @@ impl OpencodeServeManager {
         req = req.with_timeout(timeout);
 
         let method_str = format!("{method:?}").to_uppercase();
-        let resp = match tokio::time::timeout(timeout, self.inner.deps.http.request(req)).await {
+        let resp = match {
+            if let Some(witness) = &dispatch_witness {
+                witness.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            tokio::time::timeout(timeout, self.inner.deps.http.request(req))
+        }
+        .await
+        {
             Err(_) => {
                 self.discard_running("request_timeout").await;
                 return Err(ServeError::RequestTimeout {
@@ -1012,16 +1036,17 @@ impl OpencodeServeManager {
             &format!("/session/{}/summarize", encode_path_segment(id)),
             route,
         );
-        // The cold-start leg (spawn/health) — the request does not exist yet.
-        self.require_base().await?;
-        if let Some(witness) = &dispatched_witness {
-            witness.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-        self.json_request(
+        // The witness flips INSIDE the request leg at the true send point —
+        // after its own `require_base` (the serve is running; aborts in the
+        // cold-start leg are still provably no-side-effects) and right where
+        // the HTTP call is issued (an abort inside the request leg's shared
+        // lock waits doesn't falsely look dispatched — ep4-r6 F3).
+        self.json_request_maybe_witnessed(
             HttpMethod::Post,
             &path,
             Some(json!({ "providerID": provider_id, "modelID": model_id })),
             None,
+            dispatched_witness,
         )
         .await?;
         Ok(())

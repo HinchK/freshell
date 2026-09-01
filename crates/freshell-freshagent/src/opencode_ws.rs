@@ -167,6 +167,11 @@ enum TurnTaskKind {
 struct TurnTask {
     kind: TurnTaskKind,
     handle: tokio::task::JoinHandle<()>,
+    /// ep4-r6 (F2): a Compact drive's pre-drive-redo compensation settles
+    /// through this channel from [`PreDriveRedoGuard`]'s drop. The abort paths
+    /// AWAIT it after joining the aborted handle, so a following send can
+    /// never observe the still-destroyed interim state mid-restore.
+    compact_settled_rx: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 /// Focused ep4-r5 (opencode_ws.rs:1155): the pre-drive redo destroy must be
@@ -191,6 +196,10 @@ struct PreDriveRedoGuard {
     /// aborted drive past that point is ambiguous-possibly-mutated: the
     /// pre-drive destroy stands (never restored).
     summarize_dispatched: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The abort paths await the matching receiver AFTER joining the aborted
+    /// handle — a following send can never observe/keep the interim destroyed
+    /// state. `take()`n at drop.
+    settled_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl PreDriveRedoGuard {
@@ -201,32 +210,51 @@ impl PreDriveRedoGuard {
 
 impl Drop for PreDriveRedoGuard {
     fn drop(&mut self) {
-        if self
+        let dispatched = self
             .summarize_dispatched
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            return;
-        }
-        let Some(pre) = self.pre_drive_record.take() else {
-            return;
-        };
-        let sink = self.identity_sink.get().cloned();
-        let id = self.session_id.clone();
-        let destroy_now = self.destroy_now;
-        tokio::spawn(async move {
-            if let Some(e) = crate::rollback_record::restore_redo_on_undelivered_compact(
-                &sink,
-                PROVIDER,
-                &id,
-                pre,
-                destroy_now,
-                crate::rollback_record::now_ms(),
-            )
-            .await
-            {
-                tracing::warn!(error = %e, session = %id, "freshagent.opencode.redo_restore_on_aborted_compact_failed");
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let pre = self.pre_drive_record.take();
+        if !dispatched {
+            if let Some(pre) = pre {
+                let sink = self.identity_sink.get().cloned();
+                let id = self.session_id.clone();
+                let destroy_now = self.destroy_now;
+                let settled_tx = self.settled_tx.take();
+                tokio::spawn(async move {
+                    // Test-only knob: a delay before the restore runs models
+                    // the real disk write being a beat — it makes the
+                    // interrupt-answer-vs-restore interleaving deterministic
+                    // for the ep4-r6 settle test (never used in production).
+                    if let Ok(ms) = std::env::var("FRESHELL_TEST_OPENCODE_REDO_RESTORE_DELAY_MS") {
+                        if let Ok(ms) = ms.parse::<u64>() {
+                            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                        }
+                    }
+                    if let Some(e) = crate::rollback_record::restore_redo_on_undelivered_compact(
+                        &sink,
+                        PROVIDER,
+                        &id,
+                        pre,
+                        destroy_now,
+                        crate::rollback_record::now_ms(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %e, session = %id, "freshagent.opencode.redo_restore_on_aborted_compact_failed");
+                    }
+                    // The settle signal fires only after the restore LANDED.
+                    if let Some(tx) = settled_tx {
+                        let _ = tx.send(());
+                    }
+                });
+                return;
             }
-        });
+        }
+        // Dispatched-or-disarmed: nothing to restore — the signal is
+        // immediate (the abort path's settle wait resolves without a 5s leg).
+        if let Some(tx) = self.settled_tx.take() {
+            let _ = tx.send(());
+        }
     }
 }
 
@@ -237,6 +265,20 @@ impl TurnTask {
 
     fn abort(&self) {
         self.handle.abort();
+    }
+
+    /// Abort + join + (for compacts) settle-wait. Every abort site runs this —
+    /// ep4-r6 F2: the compensation must have LANDED before this handler
+    /// answers, or a send that follows inside the window reads
+    /// `redoDestroyed:true` for a drive whose POST provably never existed,
+    /// and the deferred restore would then resurrect `[canRedo: true]` behind
+    /// it (destroy-at-submit treats the still-destroyed state as a no-op).
+    async fn abort_and_settle(self) {
+        self.handle.abort();
+        let _ = self.handle.await;
+        if let Some(rx) = self.compact_settled_rx {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
+        }
     }
 }
 
@@ -902,6 +944,7 @@ impl FreshOpencodeState {
         session.turn_task = Some(TurnTask {
             kind: TurnTaskKind::Send,
             handle: turn_task,
+            compact_settled_rx: None,
         });
     }
 
@@ -940,7 +983,9 @@ impl FreshOpencodeState {
         if let Some(session_arc) = session_arc {
             let mut s = session_arc.lock().await;
             if let Some(task) = s.turn_task.take() {
-                task.abort();
+                // ep4-r6 F2: join + await the compact's pre-drive-redo settle
+                // before the kill answers — the compensation must have landed.
+                task.abort_and_settle().await;
             }
             // PR-3: stop the persistent serve-SSE bridge too (`unsubscribeServe?.()`,
             // adapter.ts:568) so it doesn't keep broadcasting for a dead session.
@@ -996,7 +1041,9 @@ impl FreshOpencodeState {
             let mut session = session_arc.lock().await;
             session.turn_aborted.store(true, Ordering::SeqCst);
             if let Some(task) = session.turn_task.take() {
-                task.abort();
+                // ep4-r6 F2: join + await the compact's pre-drive-redo settle
+                // — the interrupt's answer must never precede the restore.
+                task.abort_and_settle().await;
             }
             (
                 session.real_session_id.clone(),
@@ -1253,12 +1300,14 @@ impl FreshOpencodeState {
         // captures, and the armed-but-undropped guard restores the pre-drive
         // record exactly like the never-dispatched failure leg.
         let summarize_dispatched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (compact_settled_tx, compact_settled_rx) = tokio::sync::oneshot::channel::<()>();
         let mut undo_guard = PreDriveRedoGuard {
             identity_sink: identity_sink.clone(),
             session_id: compact_id.clone(),
             pre_drive_record: pre_drive_record.clone(),
             destroy_now,
             summarize_dispatched: summarize_dispatched.clone(),
+            settled_tx: Some(compact_settled_tx),
         };
         let collected_witness = summarize_dispatched.clone();
         let compact_task = tokio::spawn(async move {
@@ -1350,6 +1399,7 @@ impl FreshOpencodeState {
         session.turn_task = Some(TurnTask {
             kind: TurnTaskKind::Compact,
             handle: compact_task,
+            compact_settled_rx: Some(compact_settled_rx),
         });
     }
 
@@ -2754,6 +2804,26 @@ mod tests {
     impl ProcessSpawner for FailSpawner {
         fn spawn(&self, _req: SpawnRequest) -> Result<Box<dyn ServeProcess>, String> {
             Err(FAILSPAWN_MARK.to_string())
+        }
+    }
+
+    /// ep4-r6 (the interrupt-window unmask): the FIRST spawn succeeds, every
+    /// later one refuses — with a parked health gate the compact drive stays in
+    /// its cold-start window, while the interrupt handler's best-effort
+    /// `manager.abort` (which re-derives ensure_started) fails fast instead of
+    /// burning the health budget and hiding the compensation window.
+    struct SpawnOnceThenRefuse {
+        spawned: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl ProcessSpawner for SpawnOnceThenRefuse {
+        fn spawn(&self, _req: SpawnRequest) -> Result<Box<dyn ServeProcess>, String> {
+            if self.spawned.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                Err(FAILSPAWN_MARK.to_string())
+            } else {
+                Ok(Box::new(TrackedProcess {
+                    killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                }))
+            }
         }
     }
 
@@ -5084,6 +5154,101 @@ mod tests {
         health_gate.notify_waiters();
     }
 
+    /// Focused-review ep4-r5 (Major, opencode_ws.rs:216): with a drop-guard
+    /// restore that settles ASYNCHRONOUSLY, a send landing between the compact
+    /// task's abort and the restore sees `redoDestroyed:true` —
+    /// `destroy_redo_on_submit` treats that as a no-op — and the late restore
+    /// then resurrects `canRedo:true` behind a fresh submission. The abort
+    /// paths therefore AWAIT the settle before answering; the window never
+    /// exists.
+    ///
+    ///   Compact parked in cold start ⇒ pre-drive destroy landed ⇒ interrupt
+    ///   (restore awaited) ⇒ send ⇒ the FINAL durable state is the new
+    ///   submission's destroy (redo destroyed, never resurrected).
+    #[tokio::test]
+    async fn a_send_landing_after_a_coldstart_compact_abort_never_resurrects_redo() {
+        // The restore beats the real disk by design flakiness in this rig: the
+        // knob makes the compensation take 300ms, so a non-awaiting abort path
+        // leaves the window standing deterministically.
+        std::env::set_var("FRESHELL_TEST_OPENCODE_REDO_RESTORE_DELAY_MS", "300");
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx.clone()));
+        let health_gate = Arc::new(tokio::sync::Notify::new());
+        let http = Arc::new(CompactFakeHttp::new(
+            r#"{"model":null}"#.as_bytes().to_vec(),
+            SummarizeOutcome::OkAnswered,
+            tx.subscribe(),
+            None,
+            Some(health_gate.clone()),
+        ));
+        let deps = ServeDeps {
+            spawner: Arc::new(SpawnOnceThenRefuse {
+                spawned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: http.clone(),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
+        let sink = seed_redoable_record(&st, "ses_1").await;
+
+        st.handle_compact(compact_msg("ses_1")).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let record = sink
+                .load_rollback(PROVIDER, "ses_1")
+                .expect("record visible");
+            if record.redo_destroyed {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the pre-drive destroy never landed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        st.handle_interrupt(FreshAgentInterrupt {
+            provider: AgentProvider::Opencode,
+            session_id: "ses_1".to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+        // The interrupt answer means the restore has LANDED (the settle was
+        // awaited): redo reads valid again.
+        let record = sink
+            .load_rollback(PROVIDER, "ses_1")
+            .expect("record visible");
+        assert!(
+            !record.redo_destroyed && record.can_redo(),
+            "post-interrupt: cold-start restore visible before any later op: {record:?}"
+        );
+
+        // Now the fresh submission: it destroys redo (that's the ledger's own
+        // rule for a submit) — and that state must be FINAL (no resurrection
+        // can arrive past the settle boundary).
+        st.handle_send(send_msg("ses_1", "fresh turn")).await;
+        // A beat for the send's ledger consequence to land.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let record = sink
+            .load_rollback(PROVIDER, "ses_1")
+            .expect("record visible");
+        assert!(
+            record.redo_destroyed && !record.can_redo(),
+            "ep4-r5 F2: after a fresh submission the redo chain is durably destroyed — never resurrected: {record:?}"
+        );
+        std::env::remove_var("FRESHELL_TEST_OPENCODE_REDO_RESTORE_DELAY_MS");
+        health_gate.notify_waiters();
+    }
+
     /// Focused-review ep1-r2 F4's core repro: a compact whose drive is ABORTED
     /// mid-summarize (an interrupt landing while the accepted POST awaits its
     /// answer) can never strand the durable record advertising `canRedo` over a
@@ -5563,6 +5728,7 @@ mod tests {
         session_arc.lock().await.turn_task = Some(TurnTask {
             kind: TurnTaskKind::Send,
             handle: tokio::spawn(std::future::pending::<()>()),
+            compact_settled_rx: None,
         });
 
         st.handle_compact(compact_msg("ses_1")).await;
@@ -6903,6 +7069,7 @@ mod tests {
         session_arc.lock().await.turn_task = Some(TurnTask {
             kind: TurnTaskKind::Send,
             handle: tokio::spawn(async { std::future::pending::<()>().await }),
+            compact_settled_rx: None,
         });
         (st, rx, sink, http)
     }

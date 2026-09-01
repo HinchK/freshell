@@ -176,22 +176,25 @@ function handleSdkMessage(sessionId, msg) {
   const st = sessions.get(sessionId)
   if (!st) return
 
-  // ep4-r3 quiesce bookkeeping (fail-closed approximations; BOTH flags clear
-  // only on evidence whose own frames have ordered into the Rust fold):
-  // - `result` closes a turn (and the handed-compact story: its run ended);
-  // - any other turn-bearing frame (assistant/status running/compacting/
-  //   boundary) means the SDK is INSIDE a turn — a handed compact whose status
-  //   we now see has started, so the handed flag discharges into honest busy
-  //   truth (`turnOpen`).
+  // ep4-r6 quiesce bookkeeping (fail-closed approximations; the discharge rule
+  // is tight per ep4-r5 F1):
+  // - a `result` closes whatever turn was open (`turnOpen`);
+  // - an assistant/system frame marks a TURN boundary (`turnOpen`);
+  // - ONLY a `compacting` status discharges `handedCompactLikely`: the handed
+  //   compact's OWN evidence finally carrying the busy truth (an unrelated
+  //   earlier result — the SDK drains the iterable independently — must never
+  //   drop it, or a rollback probe between that result and the compact's
+  //   status sees a false all-clear; the reviewer repro).
   if (msg.type === 'result') {
     st.turnOpen = false
-    st.handedCompactLikely = false
   } else if (
     msg.type === 'assistant' ||
     (msg.type === 'system' && msg.subtype === 'status')
   ) {
     st.turnOpen = true
-    if (st.handedCompactLikely) st.handedCompactLikely = false
+    if (msg.type === 'system' && msg.subtype === 'status' && msg.status === 'compacting') {
+      st.handedCompactLikely = false
+    }
   }
 
   switch (msg.type) {

@@ -1528,16 +1528,15 @@ impl FreshCodexState {
         compact_in_flight.store(true, Ordering::SeqCst);
         if let Err(err) = client.compact_thread(&session_id).await {
             match &err {
-                // Focused ep4-r5 (codex.rs:1530): an explicit JSON-RPC
-                // rejection is PROOF the compact never started → clear what
-                // we armed. Every post-send-class failure (Timeout after the
-                // request frame was written, Closed mid-flight, an
-                // unparseable answer) is ambiguous — the app server may still
-                // be starting the compact — so the marker STAYS armed and the
-                // compact turn's own notifications own the retirement (a
-                // never-starting compact can only wedge fail-closed, never
-                // open the rollback gate over live provider work).
-                CodexAppServerError::Rpc { .. } | CodexAppServerError::Transport { .. } => {
+                // Focused ep4-r6 (codex.rs:1530, F4 at round 5): ONLY an
+                // explicit JSON-RPC rejection proves the compact never started
+                // → the marker clears. Transport means a WS write/flush
+                // failure — which tells nothing about whether the server
+                // received the frame — and every other class is the
+                // ambiguous-post-send shape; all stay fail-closed: the compact
+                // turn's own notifications own the retirement (a never-
+                // starting compact wedges conservatively, never silently).
+                CodexAppServerError::Rpc { .. } => {
                     compact_in_flight.store(false, Ordering::SeqCst);
                     *compact_turn_id.lock().expect("compact_turn_id mutex") = None;
                 }
