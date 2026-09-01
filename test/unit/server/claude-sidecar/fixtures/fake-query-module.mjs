@@ -64,8 +64,9 @@ export function query({ prompt, options }) {
         yield { type: 'assistant', message: { content: [] }, session_id: 'ses-open' }
       } else if (typeof text === 'string' && /^\s*\/compact(\s|$)/.test(text)) {
         // The compact runs and settles: the sidecar must clear both quiesce
-        // busy flags on this result.
-        await new Promise((resolve) => setTimeout(resolve, 20))
+        // busy flags on this result. The sleep models the compact's RUN —
+        // window the handed flag must hold for (pull-to-terminal).
+        await new Promise((resolve) => setTimeout(resolve, 250))
         yield { type: 'result', subtype: 'success', session_id: 'ses-compact' }
       }
     }

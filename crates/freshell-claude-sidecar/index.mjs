@@ -103,7 +103,12 @@ function createClaudeSdkCleanEnv(env = process.env) {
 }
 
 // ── streaming input stream (server/sdk-bridge.ts:274-316) ────────────────────
-function createInputStream() {
+// `onHandoff(isCompact)` fires on EVERY permanent handoff into the SDK
+// consumer — BOTH the same-tick push-into-a-waiting-consumer path and the
+// later `next()` queue-shift path (ep4-r4: the latter equally crosses the
+// un-cancellable boundary; an absorbed compact pulled mid-window must arm the
+// busy verdict just as the immediate handoff does).
+function createInputStream(onHandoff) {
   // Items are { msg, isCompact } — the wrapper lets rollback's quiesce drain
   // never-yet-handed compacts (kata 1wxv ep4-r3: the SDK's queued-input
   // surface cannot cancel UUID-less items, so cancellation authority lives at
@@ -112,21 +117,20 @@ function createInputStream() {
   let waiting = null
   let done = false
   const handle = {
-    push: (msg, isCompact = false, onImmediateHandoff = null) => {
+    push: (msg, isCompact = false) => {
       if (waiting) {
         const r = waiting; waiting = null;
         r({ value: msg, done: false })
         // A push into an AWAITING SDK consumer hands the item over in this
-        // same tick — un-cancellable from here (the SDK has it). Report so the
-        // session's handed-compact flag arms (quiesce must answer BUSY).
-        if (isCompact && onImmediateHandoff) onImmediateHandoff()
+        // same tick — un-cancellable from here (the SDK has it).
+        if (isCompact) onHandoff(true)
       } else {
         queue.push({ msg, isCompact })
       }
     },
     // kata 1wxv ep4-r1 F1 → rollback quiesce: every queued compact is
-    // provably never handed to the SDK (the handoff above is the only pull) —
-    // dropping them here cancels them permanently.
+    // provably never handed to the SDK (the handoffs above/below are the only
+    // pulls) — dropping them here cancels them permanently.
     drainCompacts: () => {
       let cancelled = 0
       for (let i = queue.length - 1; i >= 0; i--) {
@@ -143,7 +147,13 @@ function createInputStream() {
     [Symbol.asyncIterator]() {
       return {
         next() {
-          if (queue.length > 0) return Promise.resolve({ value: queue.shift().msg, done: false })
+          if (queue.length > 0) {
+            const item = queue.shift()
+            // ep4-r4: a later pull of a QUEUED compact is the same
+            // un-cancellable handoff as the same-tick push — arm it too.
+            if (item.isCompact) onHandoff(true)
+            return Promise.resolve({ value: item.msg, done: false })
+          }
           if (done) return Promise.resolve({ value: undefined, done: true })
           return new Promise((resolve) => { waiting = resolve })
         },
@@ -284,22 +294,25 @@ function handleCreate(req) {
   try {
     sessionId = nanoid()
     const abort = new AbortController()
-    const { iterable, handle } = createInputStream()
-    // Liveness IS session-map membership: consumeStream's finally removes the
-    // session synchronously after cancelPending (LB-04 — a parked canUseTool
-    // promise must never be resolved after transport close), and stdin line
-    // events (macrotasks) cannot interleave inside that finally.
-    // ep4-r3 quiesce state: turnOpen — an SDK turn is mid-flight (cleared at
-    // its result); handedCompactLikely — a compact was handed to an IDLE
-    // awaiting SDK consumer (un-cancellable); cleared at the next result or
-    // observed status frame (its evidence has by then reached Rust).
+    // ep4-r3/ep4-r4 quiesce state (declared first so the stream can arm it):
+    // turnOpen — an SDK turn is mid-flight (cleared at its result);
+    // handedCompactLikely — a compact crossed the un-cancellable SDK handoff
+    // (same-tick push OR queued pull — either path); cleared at the next
+    // result or observed status frame (its evidence has by then reached Rust).
     const state = {
-      inputStream: handle,
       abort,
       permissionMode: req.permissionMode,
       turnOpen: false,
       handedCompactLikely: false,
     }
+    const { iterable, handle } = createInputStream((isCompact) => {
+      if (isCompact) state.handedCompactLikely = true
+    })
+    state.inputStream = handle
+    // Liveness IS session-map membership: consumeStream's finally removes the
+    // session synchronously after cancelPending (LB-04 — a parked canUseTool
+    // promise must never be resolved after transport close), and stdin line
+    // events (macrotasks) cannot interleave inside that finally.
     sessions.set(sessionId, state)
 
     const sdkQuery = query({
@@ -362,7 +375,6 @@ function handleSend(req) {
       session_id: st.cliSessionId || 'default',
     },
     isCompact,
-    () => { st.handedCompactLikely = true },
   )
 }
 

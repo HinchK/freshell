@@ -155,6 +155,38 @@ describe('rollback quiesce protocol (ep4-r3)', () => {
     expect(busy.inFlightTurn).toBe(true)
   })
 
+  it('ep4-r4: a compact QUEUED behind a parked turn arming on its LATER pull (the queued-cells handoff) is busy-flagged until its result (case 6)', async () => {
+    const h = spawnSidecar()
+    const sid = await bootSession(h)
+    // Park the module INSIDE its message handler: the consumer is provably
+    // not awaiting next(), so the /compact lands in the sidecar queue.
+    h.send({ type: 'send', sessionId: sid, text: '__park_600__' })
+    await new Promise((r) => setTimeout(r, 60)) // the park owns the loop
+    h.send({ type: 'send', sessionId: sid, text: '/compact' })
+    await new Promise((r) => setTimeout(r, 40))
+    // Pre-pull probe: the compact is still queued → drained, all-clear.
+    h.send({ type: 'rollback.quiesce', sessionId: sid, probeId: 'probe-prepull' })
+    const pre = await h.waitFor(isQuiescedFor(sid, 'probe-prepull'), 'quiesced pre-pull')
+    expect(pre.cancelledQueue).toBe(1)
+    expect(pre.handedCompactLikely).toBe(false)
+
+    // ep4-r0 regression anchor for this exact finding: with the compact
+    // REMOVED from the queue pre-pull (drained above), there is nothing left
+    // to pull — assert instead with a fresh compact parked across the
+    // park boundary: queue it behind a second park so its HANDOFF happens
+    // under the module's return to next() (the pull path this case names).
+    h.send({ type: 'send', sessionId: sid, text: '__park_400__' }) // consumed after park 1 ends
+    h.send({ type: 'send', sessionId: sid, text: '/compact queued-second' })
+    // The first park ends; the loop pulls __park_400__ (busy again), and only
+    // after IT ends is the queued compact pulled (armed) + run (250ms).
+    // Wait long enough to be inside the compact's run window.
+    await new Promise((r) => setTimeout(r, 600 + 400 + 80))
+    h.send({ type: 'rollback.quiesce', sessionId: sid, probeId: 'probe-pulled' })
+    const pulled = await h.waitFor(isQuiescedFor(sid, 'probe-pulled'), 'quiesced post-pull busy')
+    expect(pulled.handedCompactLikely).toBe(true)
+    expect(pulled.cancelledQueue).toBe(0)
+  })
+
   it('echoes only the requesting probeId (an unrelated probeId is its own answer)', async () => {
     const h = spawnSidecar()
     const sid = await bootSession(h)
