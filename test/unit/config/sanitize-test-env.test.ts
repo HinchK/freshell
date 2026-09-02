@@ -36,7 +36,14 @@ const POISONED_ENV = {
 }
 
 async function runFixture(mode: 'plain' | 'clean', env: NodeJS.ProcessEnv) {
-  const { stdout } = await execFileAsync(process.execPath, [tsxCli, fixture, mode], { env: { ...process.env, ...env }, maxBuffer: 1024 * 1024 })
+  const spawnEnv = { ...process.env, ...env }
+  // The behavioral suite must not inherit a global flag whose whole point is
+  // to BEND the sanitizer for a different lane (the opt-in real-provider
+  // contract tests) — under a broad `FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1`
+  // run the fixture's 'clean' mode would keep the proxies and contradict its
+  // own empty-stderr expectation.
+  delete spawnEnv.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS
+  const { stdout } = await execFileAsync(process.execPath, [tsxCli, fixture, mode], { env: spawnEnv, maxBuffer: 1024 * 1024 })
   return JSON.parse(stdout) as { innerStderr: string; envReport: Record<string, string | undefined> }
 }
 
