@@ -206,6 +206,23 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
     // this binary installs no tracing subscriber. Per C1's reasoning we do
     // NOT retry-mask; instead every assertion below carries the on-disk and
     // errno evidence needed to diagnose the next occurrence on sight.
+    //
+    // DEFLAKE-2 (the-usual test-flake-hardening): the proven flake signature
+    // is errno=11 EWOULDBLOCK at the re-acquire after `drop(holder)`: the
+    // dropped holder's flock can remain kernel-held for a tick, and
+    // `new_locked` swallows the errno into a DISABLED ledger
+    // (pane_ledger.rs:247-255). The one-shot probe-2 acquire (which panicked
+    // on exactly that signature) and the third construction are therefore
+    // REPLACED by one bounded wait whose RETRY UNIT is the third construction
+    // itself: each failed construction is diagnosed by a separate
+    // acquire_store_lock probe — retry ONLY when the probe shows EWOULDBLOCK
+    // (the proven signature), panic immediately with probe 2's errno+kind
+    // diagnostics when the probe shows the lock FREE (blind ledger, H2 —
+    // never retried, so a real regression cannot be masked), and panic on
+    // any other errno or on budget expiry with the last errno evidence. The
+    // loser-construction property and the on-disk evidence probe stay
+    // one-shot and untouched — the C1 no-retry-masking decision holds for
+    // everything the wait does not cover.
     let root = temp_root("lock");
     let holder = PaneLedger::new_locked(Some(root.clone()));
     holder
@@ -229,28 +246,65 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
         "holder's s1.json must be durably on disk before the re-acquire"
     );
 
-    // Evidence probe 2: re-acquire through the SAME private code path
-    // production uses, so an Err surfaces its errno instead of being
-    // swallowed into a DISABLED ledger.
-    match PaneLedger::acquire_store_lock(&root) {
-        Ok(lock) => drop(lock), // release before constructing `next`
-        Err(err) => panic!(
-            "acquire_store_lock failed after holder drop: errno={:?} kind={:?} \
-             (EWOULDBLOCK => flock genuinely still held after drop; \
-             ENOSPC/EMFILE/EACCES => resource pressure, H1)",
-            err.raw_os_error(),
-            err.kind()
-        ),
-    }
-
-    let next = PaneLedger::new_locked(Some(root.clone()));
-    assert!(
-        next.ever_bound("claude", "s1"),
-        "third new_locked came up blind despite the lock being acquirable and \
-         s1.json on disk ({s1_on_disk}): load_index silently returned empty \
-         (H2, pane_ledger.rs:299-321 swallows I/O errors) or a second \
-         acquire Err raced in after the probe"
-    );
+    // Bounded wait whose retry UNIT is the third construction itself: each
+    // failed construction is diagnosed by a separate acquire_store_lock probe
+    // (errno surface) — retry ONLY when the probe shows the proven flake
+    // signature (EWOULDBLOCK: flock still vapor-held after the holder's drop);
+    // when the probe shows the lock FREE the construction came up blind
+    // (load_index swallowed an I/O error, H2) or disabled for a non-lock reason
+    // — fail immediately with probe 2's errno+kind diagnostic intact; any other
+    // errno fails immediately too. On budget expiry, panic with the last errno
+    // evidence. The loser-construction property above and the on-disk probe stay
+    // one-shot and untouched.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // `next` is intentionally unused: the bounded wait's success IS the
+    // assertion (a bare `next` binding would trip the repo's -D warnings gate);
+    // the name documents that the loop value is the third construction.
+    let _next = loop {
+        let candidate = PaneLedger::new_locked(Some(root.clone()));
+        if candidate.ever_bound("claude", "s1") {
+            break candidate;
+        }
+        // Diagnose ONLY after releasing the candidate: a candidate that locked
+        // successfully but came up blind holds the flock itself, so probing first
+        // would misread its OWN lock as the transient EWOULDBLOCK and silently
+        // retry an H2 failure. Order matters here and nowhere else.
+        drop(candidate);
+        // Construction failed to see the binding — name the mechanism.
+        match PaneLedger::acquire_store_lock(&root) {
+            Ok(lock) => {
+                drop(lock);
+                panic!(
+                    "third new_locked came up blind while the lock WAS FREE — \
+                     s1.json confirmed on disk by the on-disk probe above, so \
+                     load_index swallowed an I/O error (H2, pane_ledger.rs:314) \
+                     or a non-lock disable path fired"
+                );
+            }
+            Err(err) => {
+                let errno = err.raw_os_error();
+                match errno {
+                    Some(code) if code == libc::EWOULDBLOCK => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "flock still EWOULDBLOCK (errno={code}) after the 10s bounded wait — \
+                             the proven flake signature persisted past the wait (fossils family: \
+                             pane-ledger-test-lock-*)"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    _ => panic!(
+                        "acquire_store_lock failed after holder drop: errno={errno:?} kind={:?} \
+                         (ENOSPC/EMFILE/EACCES => resource pressure, H1)",
+                        err.kind()
+                    ),
+                }
+            }
+        }
+    };
+    // The loop above breaks only when the third construction sees the binding —
+    // the old trailing `assert!(next.ever_bound(...))` is subsumed by the loop's
+    // success criterion and is removed (it would have been unreachable).
     std::fs::remove_dir_all(&root).ok();
 }
 
