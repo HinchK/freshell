@@ -107,12 +107,27 @@ async fn create_claude_terminal(ws: &mut common::TestWs, request_id: &str) -> (S
 }
 
 /// Read frames until `pred` matches one (returns it) or the deadline passes.
+///
+/// DEFLAKE self-diagnosis (the-usual test-flake-hardening, mechanism-B RCA —
+/// reports/mechanism-b-rca.md §0/§4): every parsed-but-non-matching Text frame
+/// is RECORDED (its `type` plus `status`/`code` when present, last 10 in a
+/// ring) and dumped into the deadline panic, because a zero-frame stall
+/// receipt could not distinguish "nothing emitted for the whole budget" from
+/// "an early `terminal.status{exited}` settle frame was silently discarded,
+/// then nothing". The failure (if it recurs) still fails at the same point
+/// with the same budget — only the diagnostic is complete
+/// (self-diagnosing-flake idiom, 884fc8721). Loop logic and the `other` panic
+/// arm are unchanged.
 async fn wait_frame_matching(
     ws: &mut common::TestWs,
     what: &str,
     deadline: tokio::time::Instant,
     mut pred: impl FnMut(&serde_json::Value) -> bool,
 ) -> serde_json::Value {
+    // Ring of the last 10 ignored frames: parsed Text frames that failed
+    // `pred`, summarized as `type=<v>` plus `status=<v>`/`code=<v>` when the
+    // frame carries those fields.
+    let mut ignored: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     while tokio::time::Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         match tokio::time::timeout(remaining.max(Duration::from_millis(1)), ws.next()).await {
@@ -121,13 +136,27 @@ async fn wait_frame_matching(
                     if pred(&value) {
                         return value;
                     }
+                    let mut summary = format!("type={}", value["type"]);
+                    if let Some(status) = value.get("status") {
+                        summary.push_str(&format!(" status={status}"));
+                    }
+                    if let Some(code) = value.get("code") {
+                        summary.push_str(&format!(" code={code}"));
+                    }
+                    if ignored.len() == 10 {
+                        ignored.pop_front();
+                    }
+                    ignored.push_back(summary);
                 }
             }
             Ok(Some(Ok(_))) => {}
             other => panic!("stream ended while waiting for {what}: {other:?}"),
         }
     }
-    panic!("{what} never arrived before the deadline");
+    panic!(
+        "{what} never arrived before the deadline; ignored frames (last {}): {ignored:?}",
+        ignored.len()
+    );
 }
 
 fn spawn_count(count_file: &std::path::Path) -> usize {
