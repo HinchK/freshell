@@ -386,8 +386,8 @@ If `restore_spawn_gate.rs`'s file-local helpers now duplicate `common/mod.rs` he
 
 - [ ] **Step 6: Certification (deflake convention)**
 
-Run, in order (failure-sensitive: a failed iteration MUST fail the step):
-1. Focused green: `cargo test -p freshell-ws --locked --test auto_resume_e2e --test restore_spawn_gate` — Expected: all 14 tests PASS.
+Run, in order (failure-sensitive: a failed iteration MUST fail the step; mechanism-B occurrences receive the addition-#5 revised rule and must be listed by receipt line refs):
+1. Focused green: `cargo test -p freshell-ws --locked --test auto_resume_e2e --test restore_spawn_gate --test rate_limit_retry_clock` — Expected: all 16 tests PASS (4 in auto_resume_e2e incl. the 2 ring-pin tests, 11 in restore_spawn_gate after the rate test moved out, 1 in rate_limit_retry_clock).
 2. Repeated certification (the f3wp convention), 10 iterations with per-iteration exit codes kept and evidence logged:
 
 ```bash
@@ -423,7 +423,7 @@ git commit -m "test(freshell-ws): widen ws-e2e frame/poll budgets to a shared 30
 2. **M2 — pane-ledger diagnosis must capture the errno AT failure, not via a later probe.** The drop→probe ordering still racy (transient EWOULDBLOCK at construction, released holder by probe time → probe Ok → mislabeled H2-panic). REPLACE the probe with a thread-local tracing capture (same pattern family as `pane_reconcile_freshagent.rs`'s LogCapture): production already logs `pane_ledger_lock_unavailable` WITH the io error Display string ("Resource temporarily unavailable (os error 11)") synchronously inside `new_locked` on the construction thread. New shape: wrap the wait in a tiny capture layer (registry + Event layer on this thread; set_default guard); on each failed construction classify from the CAPTURED event's error text: contains "os error 11" → transient EWOULDBLOCK → sleep/retry; event present with any other error text → immediate panic with it; NO event → immediate panic ("disabled path did not log the expected event" — a third, real signal). Enabled-but-blind → immediate H2 panic (unchanged from r1 fix). Deadline panic names the last captured error text. NO probe calls remain; C1 property: every non-transient reason fails loudly immediately, and the transient loop is classified ONLY by evidence captured at the exact failure instant.
 3. **M3 — rate-window determinism via the HARNESS-14 clock's per-binary split, not a bigger number.** The 2s wall-clock window is still load-racy in principle (a >2s stamp-to-check gap expires the token). The repo solved this class with `test_clock_routing.rs` — an OWN integration binary because the process-global clock pollutes parallel siblings. FOLLOW THAT PRECEDENT: MOVE `rate_limited_retry_same_requestid_proceeds` out of `restore_spawn_gate.rs` into a NEW single-test binary `crates/freshell-ws/tests/rate_limit_retry_clock.rs` which: uses `freshell_platform::clock::set_enabled_override_for_tests(Some(true))` guarded by a GateGuard clone (mutex + reset-on-drop, copied from test_clock_routing.rs), `freeze()` before rl-1's send so BOTH rl-1's stamp and rl-2's check read the SAME frozen instant (deterministic RATE_LIMITED irrespective of load), then `advance_ms(400)` so the resend deterministically passes the window, then guard drop/reset. Keep: the twice-limited sentinel probe AND the post-slide created assertions (identical assertions, zero wall-clock sleeps — the `sleep(400ms)`/`sleep(2_100ms)` leaves entirely). Config knobs stay `rate_limit: 1, rate_window_ms: 300` (determinism comes from the clock, not the count). The clock is process-global ONLY within this process' single test ⇒ no sibling pollution (the exact reason the routing tests live in their own binary). Delete the test from restore_spawn_gate.rs in the same commit. Certification loops (both lists) now include this binary: focused `cargo test -p freshell-ws --locked --test auto_resume_e2e --test restore_spawn_gate --test rate_limit_retry_clock` and the 10× certify; while restoring spawn gate's test count drops to 11 and the new binary holds 1. the remaining auto_resume zero-frame stall (2 occurrences in ~40 runs under load) root-caused to: `wait_frame_matching` silently ignores every non-matching frame, including the hub's terminal `terminal.status{exited}` settle that fires on every replacement-abort tail — so the receipts cannot name the mechanism. Fix, per the repo's f3wp self-diagnosing idiom (884fc8721): make `wait_frame_matching` record the type (and key fields) of up to the last ~10 ignored frames and include them in its deadline panic message. The failure (if it recurs) still FAILS at the same point with the same budget — only the diagnostic is complete. The RCA also identified a genuine production-side question (auto-resume hub supervisor CrashEvent loss-on-panic, auto_resume.rs:233-279) which is OUT OF SCOPE for this plan (production change owned elsewhere) and is recorded for the recap.
 
-**Plan addition #5 (delta-r2 certification evidence → mechanism-B final disposition, 2026-09-02):** The delta-r2 fixer's 10× certification witnessed-while-instrumented mechanism B twice (receipts: `task2c-certify.log` runs 1 & 5). The ignore-ring names mechanism B exactly: `terminal.status{exited}` settle then silence — the hub's `decide`/`emit_settled` tail ran (or the natural-exit broadcast did) and NO `recovering` ever followed. The production hub (`auto_resume.rs`) is byte-identical at base_ref, so the defect pre-dates this branch; the certification failures recorded pre-branch (task-002 reports) match the same signature pre-instrumentation. Following the repo's f3wp doctrine (never paper a real signal, never lose the evidence): the certification rule for Task-2 binaries is REVISED to "every iteration passes OR fails ONLY with the receipted mechanism-B signature (one or more `terminal.status{exited}` settle frames for the crashed terminal followed by no `recovering`/`replaced`); any other failure signature blocks." Mechanism-B is simultaneously (a) SMALL INSTRUMENTATION REFINEMENT: the ring now includes each frame's `reason`, `code`, `attempt`, `sessionRef` fields when present (test-only, inside the existing helper — assertion semantics unchanged), so every future occurrence carries the full settle diagnostics the follow-up task needs; and (b) DEFERRED to a follow-up task per user-scope discipline (it is a production-side defect: a terminal's crash is occasionally never recovered under load; discovered and documented here, never weakened in-test). The Final Gate and this plan's certification receipts MUST list mechanism-B occurrences explicitly with their task2c2-certify.log line references.
+**Plan addition #5 (delta-r2 certification evidence → mechanism-B final disposition, 2026-09-02):** The delta-r2 fixer's 10× certification witnessed-while-instrumented mechanism B twice (receipts: `task2c-certify.log` runs 1 & 5). The ignore-ring names mechanism B exactly: `terminal.status{exited}` settle then silence — the hub's `decide`/`emit_settled` tail ran (or the natural-exit broadcast did) and NO `recovering` ever followed. The production hub (`auto_resume.rs`) is byte-identical at base_ref, so the defect pre-dates this branch; the certification failures recorded pre-branch (task-002 reports) match the same signature pre-instrumentation. Following the repo's f3wp doctrine (never paper a real signal, never lose the evidence): the certification rule for Task-2 binaries is REVISED to: every iteration passes OR fails ONLY with the EXACT receipted mechanism-B signature — on a single crashed-terminal wait, the observed frames contain ONLY `terminal.status{exited}` settle frame(s) carrying `reason="no_resumable_identity"` (read from the enriched ring's `reason` field in the failure output line 15-16 of task2c2-certify.log), followed by no `recovering`/`replaced`. Any OTHER settle reason (`respawn_failed`, `session_lease_held`, `lease_completion_lost`, cancellation, etc.), any other failure shape, or any missing `reason` in a settle ring BLOCKS the run — this is a waiver for the one receipted tail only, never for "any settle then silence". Mechanism-B is simultaneously (a) SMALL INSTRUMENTATION REFINEMENT: the ring now includes each frame's `reason`, `code`, `attempt`, `sessionRef` fields when present (test-only, inside the existing helper — assertion semantics unchanged), so every future occurrence carries the full settle diagnostics the follow-up task needs; and (b) DEFERRED to a follow-up task per user-scope discipline (it is a production-side defect: a terminal's crash is occasionally never recovered under load; discovered and documented here, never weakened in-test). The Final Gate and this plan's certification receipts MUST list mechanism-B occurrences explicitly with their task2c2-certify.log line references.
 
 ### Task 2b: Mechanism-B self-diagnosing instrumentation
 
@@ -501,95 +501,10 @@ In the same DEFLAKE comment block above the test, append one paragraph (text bel
 
 - [ ] **Step 2: Implement the bounded wait (RED/GREEN not applicable — the flake only manifests under load; certification replaces RED/GREEN per the Task 2 note)**
 
-Design constraint (settled by review round 2 with cited code): `new_locked` (pane_ledger.rs:247-255) converts ANY acquire error into a DISABLED ledger and drops the errno, so a gap between a successful probe-drop and a later construction re-acquire can re-deliver the same EWOULDBLOCK with no diagnostics. The retry unit must therefore be the CONSTRUCTION itself. The per-iteration diagnosis is TWO-BRANCHED (delta-review round 1): `candidate.is_enabled()` (pane_ledger.rs:295 — `root.is_some()`, false only when the candidate's OWN lock acquisition failed) is checked FIRST; an enabled-but-blind candidate is the provisional-final H2 shape and panics on the spot (probing it would read the candidate's own still-held lock as EWOULDBLOCK and a retry would mask the regression), and only the DISABLED (lock-failed) branch drops the candidate and runs the separate `acquire_store_lock` errno probe.
+The final implementation was evolved through independent review and is COMPLETE AND COMMITTED (commit `ed0622148`); the authoritative listing is the executed code, not a plan block: `crates/freshell-ws/src/pane_ledger_tests.rs` around the `new_locked_degrades_to_disabled_when_another_holder_exists` test's third-construction wait. The design history and its current required shape:
 
-Replace the test's probe-2 block AND third construction (the pre-Task-3 one-shot `match PaneLedger::acquire_store_lock(&root) {...}` followed by `let next = PaneLedger::new_locked(...)`) with:
-
-```rust
-// Bounded wait whose retry UNIT is the third construction itself. Each
-// failed construction takes ONE of two branches keyed on
-// `candidate.is_enabled()`:
-//  - ENABLED but blind — the candidate holds the flock itself yet cannot
-//    see s1.json: fail IMMEDIATELY, never probed and never retried (a
-//    probe could misread the candidate's OWN lock as the benign
-//    EWOULDBLOCK transient and silently retry an H2 regression).
-//  - DISABLED — the candidate's lock acquisition failed: release the
-//    candidate, then a separate acquire_store_lock probe (errno surface)
-//    classifies the failure — retry ONLY when the probe shows the proven
-//    flake signature (EWOULDBLOCK: flock still vapor-held after the
-//    holder's drop); lock FREE on the probe (a non-lock disable path) or
-//    any other errno fails immediately with the probe's errno+kind
-//    diagnostic intact; on budget expiry panic with the last errno
-//    evidence.
-// The loser-construction property above and the on-disk probe stay
-// one-shot and untouched.
-let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-// `next` is intentionally unused: the bounded wait's success IS the
-// assertion (a bare `next` binding would trip the repo's -D warnings gate);
-// the name documents that the loop value is the third construction.
-let _next = loop {
-    let candidate = PaneLedger::new_locked(Some(root.clone()));
-    if candidate.ever_bound("claude", "s1") {
-        break candidate;
-    }
-    // Branch 1 — ENABLED yet blind: the candidate ITSELF holds the flock
-    // (the lock WAS free / was acquired by us) and s1.json is confirmed
-    // on disk, so load_index swallowed an I/O error. This is the
-    // provisional-final H2 shape: panic NOW — do NOT probe (the probe
-    // would read our own lock as the transient EWOULDBLOCK) and do NOT
-    // drop-and-retry (C1 no-retry-masking).
-    if candidate.is_enabled() {
-        panic!(
-            "third new_locked came up ENABLED yet BLIND — the candidate \
-             itself holds the flock (lock WAS free/held by us) and \
-             s1.json is confirmed on disk by the on-disk probe above, so \
-             load_index swallowed an I/O error (H2, pane_ledger.rs:314) \
-             — provisional-final, never retried"
-        );
-    }
-    // Branch 2 — DISABLED: the candidate's lock acquisition failed, so
-    // it holds nothing. Release it, then name the mechanism with a
-    // separate acquire_store_lock probe (errno surface).
-    drop(candidate);
-    // Construction failed to see the binding — name the mechanism.
-    match PaneLedger::acquire_store_lock(&root) {
-        Ok(lock) => {
-            drop(lock);
-            panic!(
-                "third new_locked came up blind while the lock WAS FREE — \
-                 s1.json confirmed on disk by the on-disk probe above, so \
-                 load_index swallowed an I/O error (H2, pane_ledger.rs:314) \
-                 or a non-lock disable path fired"
-            );
-        }
-        Err(err) => {
-            let errno = err.raw_os_error();
-            match errno {
-                Some(code) if code == libc::EWOULDBLOCK => {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "flock still EWOULDBLOCK (errno={code}) after the 10s bounded wait — \
-                         the proven flake signature persisted past the wait (fossils family: \
-                         pane-ledger-test-lock-*)"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                }
-                _ => panic!(
-                    "acquire_store_lock failed after holder drop: errno={errno:?} kind={:?} \
-                     (ENOSPC/EMFILE/EACCES => resource pressure, H1)",
-                    err.kind()
-                ),
-            }
-        }
-    }
-};
-// The loop above breaks only when the third construction sees the binding —
-// the old trailing `assert!(next.ever_bound(...))` is subsumed by the loop's
-// success criterion and is removed (it would have been unreachable).
-std::fs::remove_dir_all(&root).ok();
-```
-
-Evidence probe 1 (on-disk s1.json assert) stays byte-identical. Nothing else in the test, the file, or `pane_ledger.rs` changes.
+1. (Initial plan) Retry on EWOULDBLOCK via an after-the-fact `acquire_store_lock` probe — REJECTED at plan round 3 (probe sees the candidate's own lock) and again at delta round 2 (TOCTOU: holder release between construction and probe mislabels the transient as H2).
+2. **Final required shape (executed):** the wait retries ONLY the third CONSTRUCTION. Per iteration, the outcome is classified by evidence captured AT the failure instant: a disabled (lock-failed) candidate is diagnosed by a thread-local tracing capture of the production `pane_ledger_lock_unavailable` event, whose error text contains the os error number (compared via `libc::EWOULDBLOCK` so it is portable); enabled-but-blind → immediate H2 panic, never retried; other errnos or a missing event → immediate panic; budget expiry → panic with the last captured errno text. Evidence probe 1 (on-disk) and the loser construction stay one-shot and untouched; production `pane_ledger.rs` stays byte-identical.
 
 - [ ] **Step 3: Focused verification**
 
