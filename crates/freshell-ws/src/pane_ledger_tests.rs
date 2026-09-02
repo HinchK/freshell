@@ -409,18 +409,43 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
         // synchronously on THIS thread. Classify from THAT captured event
         // (never a later probe call).
         drop(candidate);
+        // delta-r5 (finding 2): capture the first lock- OR scan-unavailable
+        // event — after qzka's 9a3d74e09 lands, `new_locked` can also come up
+        // DISABLED via the construction scan fault
+        // (`pane_ledger_scan_unavailable`) while HOLDING the flock; that shape
+        // must be named with its captured fields, never fall through to the
+        // generic not-captured branch.
         let captured = {
             let log = events.lock().expect("capture lock");
             log[seen_before..]
                 .iter()
-                .find(|e| e.message.contains("pane_ledger_lock_unavailable"))
-                .map(|e| e.fields.get("error").cloned().unwrap_or_default())
+                .find(|e| {
+                    e.message.contains("pane_ledger_lock_unavailable")
+                        || e.message.contains("pane_ledger_scan_unavailable")
+                })
+                .cloned()
         };
         match captured {
+            // UNREACHABLE until qzka's 9a3d74e09 lands — today's pane_ledger.rs
+            // logs ONLY pane_ledger_lock_unavailable, so no test targets this
+            // arm today by design (delta-review r5 finding 2).
+            Some(evt) if evt.message.contains("pane_ledger_scan_unavailable") => panic!(
+                "candidate DISABLED via scan fault (pane_ledger_scan_unavailable): \
+                 the construction scan failed under the HELD flock — the qzka \
+                 scan-fault shape, NOT the EWOULDBLOCK lock transient; never \
+                 retried; captured fields: {:?}",
+                evt.fields
+            ),
             // The proven flake signature: flock still vapor-held after the
             // holder's drop (EWOULDBLOCK's io error Display contains
             // "os error 11").
-            Some(err_text) if err_text.contains(&would_block_marker) => {
+            Some(evt)
+                if evt
+                    .fields
+                    .get("error")
+                    .is_some_and(|e| e.contains(&would_block_marker)) =>
+            {
+                let err_text = evt.fields.get("error").cloned().unwrap_or_default();
                 assert!(
                     std::time::Instant::now() < deadline,
                     "flock still EWOULDBLOCK after the 10s bounded wait — the \
@@ -430,15 +455,17 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
                 );
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
-            Some(err_text) => panic!(
+            Some(evt) => panic!(
                 "third new_locked came up DISABLED with a non-transient lock \
-                 failure captured at the failure instant: {err_text} \
-                 (ENOSPC/EMFILE/EACCES => resource pressure, H1)"
+                 failure captured at the failure instant: {} \
+                 (ENOSPC/EMFILE/EACCES => resource pressure, H1)",
+                evt.fields.get("error").cloned().unwrap_or_default()
             ),
             None => panic!(
-                "third new_locked came up DISABLED but the expected \
-                 pane_ledger_lock_unavailable event was not captured — the \
-                 disabled path did not log the failure (a third, real signal)"
+                "third new_locked came up DISABLED but neither the \
+                 pane_ledger_lock_unavailable nor the pane_ledger_scan_unavailable \
+                 event was captured — the disabled path did not log the failure \
+                 (a third, real signal)"
             ),
         }
     };
