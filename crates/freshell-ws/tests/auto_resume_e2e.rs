@@ -106,18 +106,31 @@ async fn create_claude_terminal(ws: &mut common::TestWs, request_id: &str) -> (S
     (old_tid, session_id)
 }
 
+/// One shared rendering of the ignored-frames ring for BOTH
+/// `wait_frame_matching` panic arms (delta-review r1): the catch-all arm is
+/// the one that actually fires when the peer goes silent — the final
+/// `Err(Elapsed)` from `tokio::time::timeout` routes there, NOT to the
+/// end-of-loop deadline panic — so a deadline-only dump would be bypassed by
+/// exactly the mechanism-B receipt shape it exists to diagnose.
+fn format_ignored_frames(ignored: &std::collections::VecDeque<String>) -> String {
+    format!("ignored frames (last {}): {ignored:?}", ignored.len())
+}
+
 /// Read frames until `pred` matches one (returns it) or the deadline passes.
 ///
 /// DEFLAKE self-diagnosis (the-usual test-flake-hardening, mechanism-B RCA —
 /// reports/mechanism-b-rca.md §0/§4): every parsed-but-non-matching Text frame
 /// is RECORDED (its `type` plus `status`/`code` when present, last 10 in a
-/// ring) and dumped into the deadline panic, because a zero-frame stall
-/// receipt could not distinguish "nothing emitted for the whole budget" from
-/// "an early `terminal.status{exited}` settle frame was silently discarded,
-/// then nothing". The failure (if it recurs) still fails at the same point
-/// with the same budget — only the diagnostic is complete
-/// (self-diagnosing-flake idiom, 884fc8721). Loop logic and the `other` panic
-/// arm are unchanged.
+/// ring) and dumped into BOTH panic arms — the catch-all `other` arm (which
+/// fires on the final `Err(Elapsed)` when the peer simply stops sending, the
+/// exact mechanism-B receipt shape; delta-review r1) and the end-of-loop
+/// deadline panic — because a zero-frame stall receipt could not distinguish
+/// "nothing emitted for the whole budget" from "an early
+/// `terminal.status{exited}` settle frame was silently discarded, then
+/// nothing". The failure (if it recurs) still fails at the same point with
+/// the same budget — only the diagnostic is complete
+/// (self-diagnosing-flake idiom, 884fc8721). Loop logic and budgets are
+/// unchanged.
 async fn wait_frame_matching(
     ws: &mut common::TestWs,
     what: &str,
@@ -150,12 +163,15 @@ async fn wait_frame_matching(
                 }
             }
             Ok(Some(Ok(_))) => {}
-            other => panic!("stream ended while waiting for {what}: {other:?}"),
+            other => panic!(
+                "stream ended while waiting for {what}: {other:?}; {}",
+                format_ignored_frames(&ignored)
+            ),
         }
     }
     panic!(
-        "{what} never arrived before the deadline; ignored frames (last {}): {ignored:?}",
-        ignored.len()
+        "{what} never arrived before the deadline; {}",
+        format_ignored_frames(&ignored)
     );
 }
 
@@ -368,4 +384,100 @@ async fn reconcile_after_replacement_attaches_to_the_new_terminal() {
 
     // Cleanup: reap the surviving replacement PTY.
     registry.kill(&new_tid);
+}
+
+/// Loopback WS harness for the `wait_frame_matching` panic-path pins
+/// (delta-review r1): binds an ephemeral loopback port, spawns a task that
+/// accepts ONE connection and runs `serve` on the server half, and returns
+/// the client half as a `common::TestWs` (the exact type
+/// `connect_async`-based harness helpers use), so the pins exercise the
+/// real helper signature. `serve` must HOLD the server socket open (move it
+/// into its future) when it wants the client to read a deadline — dropping
+/// it would end the stream and take the wrong panic arm.
+async fn loopback_test_ws<S, F>(serve: S) -> common::TestWs
+where
+    S: FnOnce(tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) -> F + Send + 'static,
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral loopback port");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept loopback client");
+        let server_ws = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("accept ws handshake");
+        serve(server_ws).await;
+    });
+    let (ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+        .await
+        .expect("loopback client connect");
+    ws
+}
+
+/// Delta-review r1 pin: the silent-peer failure (mechanism B's receipt
+/// shape — the final `Err(Elapsed)` routing through the catch-all arm, NOT
+/// the deadline panic) must still carry the ignored-frames ring, even when
+/// that ring is empty. The peer holds the socket open and sends NOTHING, so
+/// the client's read can only resolve as `Err(Elapsed)`.
+#[tokio::test]
+#[should_panic(expected = "ignored frames")]
+async fn wait_frame_matching_silent_peer_panic_carries_the_ignored_ring() {
+    let mut ws = loopback_test_ws(|server_ws| async move {
+        // Silent peer: the socket must stay OPEN for the whole read (a drop
+        // would end the stream and take the wrong panic arm). The trailing
+        // use-after-await pins the socket into the future's state so it is
+        // NOT dropped at the last-use point before the never-resolving
+        // await.
+        std::future::pending::<()>().await;
+        drop(server_ws);
+    })
+    .await;
+    let _ = wait_frame_matching(
+        &mut ws,
+        "a frame the silent loopback peer never sends",
+        tokio::time::Instant::now() + Duration::from_millis(100),
+        |_| false,
+    )
+    .await;
+}
+
+/// Delta-review r1 pin: with unrelated frames recorded in the ring, the
+/// elapsed-path panic NAMES them — the diagnostic the mechanism-B receipts
+/// were missing. The peer sends two frames that can never match the
+/// predicate, then goes silent with the socket held open.
+#[tokio::test]
+#[should_panic(
+    expected = "ignored frames (last 2): [\"type=\\\"sessions.updated\\\"\", \"type=\\\"terminal.status\\\" status=\\\"exited\\\"\"]"
+)]
+async fn wait_frame_matching_unrelated_frames_panic_names_the_ring() {
+    let mut ws = loopback_test_ws(|mut server_ws| async move {
+        for frame in [
+            serde_json::json!({ "type": "sessions.updated", "sessions": [] }),
+            serde_json::json!({
+                "type": "terminal.status",
+                "terminalId": "t-unrelated",
+                "status": "exited",
+            }),
+        ] {
+            server_ws
+                .send(WsMessage::Text(frame.to_string()))
+                .await
+                .expect("send unrelated frame");
+        }
+        // Then go silent with the socket held OPEN (trailing use-after-await
+        // keeps it in the future's state), so the client's next read takes
+        // the `Err(Elapsed)` arm against a populated ring.
+        std::future::pending::<()>().await;
+        drop(server_ws);
+    })
+    .await;
+    let _ = wait_frame_matching(
+        &mut ws,
+        "terminal.replaced (never sent by the loopback peer)",
+        tokio::time::Instant::now() + Duration::from_millis(100),
+        |v| v["type"] == "terminal.replaced",
+    )
+    .await;
 }

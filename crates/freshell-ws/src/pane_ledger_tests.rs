@@ -214,13 +214,23 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
     // (pane_ledger.rs:247-255). The one-shot probe-2 acquire (which panicked
     // on exactly that signature) and the third construction are therefore
     // REPLACED by one bounded wait whose RETRY UNIT is the third construction
-    // itself: each failed construction is diagnosed by a separate
-    // acquire_store_lock probe — retry ONLY when the probe shows EWOULDBLOCK
-    // (the proven signature), panic immediately with probe 2's errno+kind
-    // diagnostics when the probe shows the lock FREE (blind ledger, H2 —
-    // never retried, so a real regression cannot be masked), and panic on
-    // any other errno or on budget expiry with the last errno evidence. The
-    // loser-construction property and the on-disk evidence probe stay
+    // itself, with a TWO-BRANCH diagnosis per failed construction keyed on
+    // `candidate.is_enabled()` (pane_ledger.rs:295 — false only when the
+    // candidate's own lock acquisition FAILED):
+    //  - ENABLED but blind (the candidate holds the flock yet cannot see
+    //    s1.json — load_index swallowed an I/O error, H2): panic
+    //    IMMEDIATELY, never probed and never retried. A probe cannot
+    //    diagnose this branch at all — it would misread the candidate's
+    //    OWN still-held lock as the transient EWOULDBLOCK, and the
+    //    resulting retry would silently mask the exact H2 regression C1
+    //    requires to fail loudly.
+    //  - DISABLED (the candidate's lock acquisition failed): drop the
+    //    candidate, then classify with a separate acquire_store_lock probe
+    //    — retry ONLY when the probe shows EWOULDBLOCK (the proven
+    //    signature); lock FREE on the probe (a non-lock disable path) or
+    //    any other errno panics immediately with the probe's errno+kind
+    //    diagnostics; budget expiry panics with the last errno evidence.
+    // The loser-construction property and the on-disk evidence probe stay
     // one-shot and untouched — the C1 no-retry-masking decision holds for
     // everything the wait does not cover.
     let root = temp_root("lock");
@@ -246,15 +256,22 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
         "holder's s1.json must be durably on disk before the re-acquire"
     );
 
-    // Bounded wait whose retry UNIT is the third construction itself: each
-    // failed construction is diagnosed by a separate acquire_store_lock probe
-    // (errno surface) — retry ONLY when the probe shows the proven flake
-    // signature (EWOULDBLOCK: flock still vapor-held after the holder's drop);
-    // when the probe shows the lock FREE the construction came up blind
-    // (load_index swallowed an I/O error, H2) or disabled for a non-lock reason
-    // — fail immediately with probe 2's errno+kind diagnostic intact; any other
-    // errno fails immediately too. On budget expiry, panic with the last errno
-    // evidence. The loser-construction property above and the on-disk probe stay
+    // Bounded wait whose retry UNIT is the third construction itself. Each
+    // failed construction takes ONE of two branches keyed on
+    // `candidate.is_enabled()`:
+    //  - ENABLED but blind — the candidate holds the flock itself yet cannot
+    //    see s1.json: fail IMMEDIATELY, never probed and never retried (a
+    //    probe could misread the candidate's OWN lock as the benign
+    //    EWOULDBLOCK transient and silently retry an H2 regression).
+    //  - DISABLED — the candidate's lock acquisition failed: release the
+    //    candidate, then a separate acquire_store_lock probe (errno surface)
+    //    classifies the failure — retry ONLY when the probe shows the proven
+    //    flake signature (EWOULDBLOCK: flock still vapor-held after the
+    //    holder's drop); lock FREE on the probe (a non-lock disable path) or
+    //    any other errno fails immediately with the probe's errno+kind
+    //    diagnostic intact; on budget expiry panic with the last errno
+    //    evidence.
+    // The loser-construction property above and the on-disk probe stay
     // one-shot and untouched.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     // `next` is intentionally unused: the bounded wait's success IS the
@@ -265,10 +282,24 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
         if candidate.ever_bound("claude", "s1") {
             break candidate;
         }
-        // Diagnose ONLY after releasing the candidate: a candidate that locked
-        // successfully but came up blind holds the flock itself, so probing first
-        // would misread its OWN lock as the transient EWOULDBLOCK and silently
-        // retry an H2 failure. Order matters here and nowhere else.
+        // Branch 1 — ENABLED yet blind: the candidate ITSELF holds the flock
+        // (the lock WAS free / was acquired by us) and s1.json is confirmed
+        // on disk, so load_index swallowed an I/O error. This is the
+        // provisional-final H2 shape: panic NOW — do NOT probe (the probe
+        // could read our own lock as the transient EWOULDBLOCK) and do NOT
+        // drop-and-retry (C1 no-retry-masking).
+        if candidate.is_enabled() {
+            panic!(
+                "third new_locked came up ENABLED yet BLIND — the candidate \
+                 itself holds the flock (lock WAS free/held by us) and \
+                 s1.json is confirmed on disk by the on-disk probe above, so \
+                 load_index swallowed an I/O error (H2, pane_ledger.rs:314) \
+                 — provisional-final, never retried"
+            );
+        }
+        // Branch 2 — DISABLED: the candidate's lock acquisition failed, so
+        // it holds nothing. Release it, then name the mechanism with a
+        // separate acquire_store_lock probe (errno surface).
         drop(candidate);
         // Construction failed to see the binding — name the mechanism.
         match PaneLedger::acquire_store_lock(&root) {
