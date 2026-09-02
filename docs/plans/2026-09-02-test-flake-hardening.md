@@ -26,7 +26,7 @@
 
 **Goal:** Local full-suite test runs pass with ambient proxy vars and `FRESHELL_BIND_HOST` present, and the three flaky Rust suites tolerate heavy machine load without any weakened assertion.
 
-**Architecture:** (1) A shared side-effect prelude imported first in all 9 vitest config files strips known shell-env poisons from `process.env` before worker pools spawn (mirroring the existing inline NODE_ENV config-top precedent), with a pure exported function unit-tested directly and a child-process behavioral test proving the UNDICI warning disappears iff the prelude loads. (2) The ws test suites adopt the repo's merged deflake idiom: one named 30s frame budget replacing scattered 5–10s timeouts, bounded polls extended to the same budget, assertions byte-identical, evidence-citing DEFLAKE comments. (3) The pane_ledger lock test converts its third construction into a bounded, fail-loud wait that retries ONLY on `EWOULDBLOCK`, keeps both evidence probes, and still fails loudly on any other errno or expiry.
+**Architecture:** (1) A shared side-effect prelude imported first in all 9 vitest config files strips known shell-env poisons from `process.env` before worker pools spawn (mirroring the existing inline NODE_ENV config-top precedent), with a pure exported function unit-tested directly and a child-process behavioral test proving the UNDICI warning disappears iff the prelude loads. (2) The ws test suites adopt the repo's merged deflake idiom: one named 30s frame budget replacing scattered 5–10s timeouts, bounded polls extended to the same budget, assertions byte-identical, evidence-citing DEFLAKE comments. (3) The pane_ledger lock test folds its one-shot post-drop re-acquire probe and third construction into one bounded, fail-loud wait that retries ONLY on `EWOULDBLOCK` (the proven flake signature that probe used to panic on), carries the probe's errno+kind diagnostics into its panic messages, keeps the on-disk evidence probe byte-identical, and still fails loudly on any other errno or expiry.
 
 **Tech Stack:** Vitest 3.2.4 configs (ESM/TS), Node 22, `tsx` child spawns; Rust workspace (`freshell-ws` crate, tokio, tokio-tungstenite, libc flock).
 
@@ -68,14 +68,18 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import path from 'path'
 import { createRequire } from 'node:module'
-import { AMBIENT_ENV_POISONS, stripAmbientEnvPoisons } from '../../../config/vitest/sanitize-test-env'
+import { AMBIENT_ENV_POISONS, stripAmbientEnvPoisons } from '../../../config/vitest/sanitize-test-env.js'
 
 const require = createRequire(import.meta.url)
 const execFileAsync = promisify(execFile)
 const tsxCli = require.resolve('tsx/cli')
 const fixture = path.resolve(process.cwd(), 'test/unit/config/fixtures/sanitize-env-child.ts')
 
-// A poisoned env: proxies + FRESHELL_BIND_HOST, as this shell exports them.
+// The failure shape under test: AMBIENT shell env + proxy vars (the proxies make
+// Node install the experimental EnvHttpProxyAgent; the `[UNDICI-EHPA]` warning
+// is emitted lazily at the FIRST undici dispatch activation — e.g. one fetch() —
+// which is why the fixture's inner child performs a fetch and why the env here
+// MERGES into the ambient env instead of replacing it).
 const POISONED_ENV = {
   HTTP_PROXY: 'http://127.0.0.1:9',
   HTTPS_PROXY: 'http://127.0.0.1:9',
@@ -85,7 +89,7 @@ const POISONED_ENV = {
 }
 
 async function runFixture(mode: 'plain' | 'clean', env: NodeJS.ProcessEnv) {
-  const { stdout } = await execFileAsync(process.execPath, [tsxCli, fixture, mode], { env: { ...env }, maxBuffer: 1024 * 1024 })
+  const { stdout } = await execFileAsync(process.execPath, [tsxCli, fixture, mode], { env: { ...process.env, ...env }, maxBuffer: 1024 * 1024 })
   return JSON.parse(stdout) as { innerStderr: string; envReport: Record<string, string | undefined> }
 }
 
@@ -98,16 +102,25 @@ describe('stripAmbientEnvPoisons (pure function)', () => {
     expect(new Set(removed)).toEqual(new Set(Object.keys(POISONED_ENV)))
   })
 
-  it('is a no-op (removes nothing) when the real-provider-contracts escape hatch is set', () => {
+  it('is a no-op (removes nothing) when the real-provider-contracts escape hatch is exactly "1"', () => {
     const env: NodeJS.ProcessEnv = { ...POISONED_ENV, FRESHELL_RUN_REAL_PROVIDER_CONTRACTS: '1' }
     const removed = stripAmbientEnvPoisons(env)
-    expect(removed).toEqual([])
+    expect(removed).not.toContain('HTTPS_PROXY')
     expect(env.HTTPS_PROXY).toBe('http://127.0.0.1:9')
+    // The hatch exists only for proxy egress: FRESHELL_BIND_HOST is ALWAYS stripped.
+    expect(env.FRESHELL_BIND_HOST).toBeUndefined()
+    expect(removed).toContain('FRESHELL_BIND_HOST')
+  })
+
+  it('treats any non-"1" value (e.g. "0") as unset — matching the real-provider gate convention', () => {
+    const env: NodeJS.ProcessEnv = { ...POISONED_ENV, FRESHELL_RUN_REAL_PROVIDER_CONTRACTS: '0' }
+    stripAmbientEnvPoisons(env)
+    for (const key of AMBIENT_ENV_POISONS) expect(env[key]).toBeUndefined()
   })
 })
 
 describe('sanitize-test-env prelude (behavioral, via spawned node children)', () => {
-  it('WITHOUT the prelude, a node child under poisoned env does print the UNDICI warning (pins the external mechanism)', async () => {
+  it('WITHOUT the prelude, a node child under poisoned env prints the UNDICI warning at first fetch (pins the external mechanism)', async () => {
     const { innerStderr } = await runFixture('plain', POISONED_ENV)
     expect(innerStderr).toContain('[UNDICI-EHPA]')
   })
@@ -125,8 +138,11 @@ Create the fixture `test/unit/config/fixtures/sanitize-env-child.ts`:
 ```ts
 // Fixture for sanitize-test-env.test.ts. `argv[2]` = 'plain' | 'clean'.
 // In 'clean' mode it applies the shared sanitize to its OWN env — exactly what
-// importing config/vitest/sanitize-test-env.ts at config load does — then spawns
-// an inner plain `node -e` child and reports the inner child's stderr verbatim.
+// importing config/vitest/sanitize-test-env.ts at config load does. It then
+// spawns an inner plain node child whose one fetch() forces undici's
+// EnvHttpProxyAgent activation (the `[UNDICI-EHPA]` warning is emitted lazily
+// at the first dispatch, not at process start) and reports the inner child's
+// stderr verbatim on stdout as JSON.
 import { spawnSync } from 'node:child_process'
 
 const mode = process.argv[2]
@@ -135,7 +151,11 @@ if (mode === 'clean') {
   stripAmbientEnvPoisons(process.env)
 }
 
-const inner = spawnSync(process.execPath, ['-e', "process.stdout.write('inner alive')\n"], { encoding: 'utf8' })
+const inner = spawnSync(
+  process.execPath,
+  ['-e', "fetch('data:text/plain,hi').then(() => process.stdout.write('inner alive'))\n"],
+  { encoding: 'utf8' },
+)
 const envReport: Record<string, string | undefined> = {}
 for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'FRESHELL_BIND_HOST']) {
   envReport[key] = process.env[key]
@@ -184,14 +204,25 @@ export const AMBIENT_ENV_POISONS = [
   'FRESHELL_BIND_HOST',
 ] as const
 
+const PROXY_POISONS = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy'] as const
+
 export function stripAmbientEnvPoisons(env: NodeJS.ProcessEnv = process.env): string[] {
-  if (env.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS) return []
+  // Escape hatch — proxy vars only, and only on EXACTLY '1' (the same gate
+  // convention the real-provider contract tests themselves use; a stray '0'
+  // must not silently keep proxies), because its purpose is proxy egress for
+  // those spawned CLIs. FRESHELL_BIND_HOST is ALWAYS stripped regardless.
+  const proxyEscape = env.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS === '1'
   const removed: string[] = []
-  for (const key of AMBIENT_ENV_POISONS) {
+  for (const key of PROXY_POISONS) {
+    if (proxyEscape) break
     if (key in env) {
       delete env[key]
       removed.push(key)
     }
+  }
+  if ('FRESHELL_BIND_HOST' in env) {
+    delete env.FRESHELL_BIND_HOST
+    removed.push('FRESHELL_BIND_HOST')
   }
   return removed
 }
@@ -199,10 +230,10 @@ export function stripAmbientEnvPoisons(env: NodeJS.ProcessEnv = process.env): st
 stripAmbientEnvPoisons()
 ```
 
-Then add, as the FIRST import line of each of the 9 configs (before the inline NODE_ENV blocks, mirroring their role):
+Then add, as the FIRST import line of each of the 9 configs (before the inline NODE_ENV blocks, mirroring their role; `.js` extension per the repo's NodeNext relative-import rule):
 
-- `config/vitest/vitest.config.ts` etc. → `import './sanitize-test-env'`
-- `test/e2e-browser/vitest.config.ts` → `import '../../config/vitest/sanitize-test-env'`
+- `config/vitest/vitest.config.ts` etc. → `import './sanitize-test-env.js'`
+- `test/e2e-browser/vitest.config.ts` → `import '../../config/vitest/sanitize-test-env.js'`
 
 (Add a one-line comment above the import in each: `// Strip ambient shell env (proxies, FRESHELL_BIND_HOST) before anything else — see sanitize-test-env.ts.`)
 
@@ -323,8 +354,8 @@ git commit -m "test(freshell-ws): widen ws-e2e frame/poll budgets to a shared 30
 - Test: the existing test itself; certification loop in Step 4
 
 **Interfaces:**
-- Consumes: `PaneLedger::new_locked`, `PaneLedger::acquire_store_lock` (private, same-module test access), the two existing evidence probes (kept byte-identical).
-- Produces: a module-private test helper `wait_for_third_locked_ledger(root: &Path, budget: Duration) -> PaneLedger` inside `src/pane_ledger_tests.rs`.
+- Consumes: `PaneLedger::new_locked`, `PaneLedger::acquire_store_lock` (private, same-module test access), the on-disk evidence probe (kept byte-identical).
+- Produces: an inline bounded EWOULDBLOCK-only wait (no new helper, no production change).
 
 No production code changes. No new asserts added to production paths.
 
@@ -334,68 +365,58 @@ In the same DEFLAKE comment block above the test, append one paragraph:
 
 ```
 // DEFLAKE-2 (the-usual test-flake-hardening): the proven flake signature is
-// errno=11 EWOULDBLOCK at the THIRD acquire: the dropped holder's flock can
-// remain kernel-held for a tick. The third construction is therefore replaced
-// by a bounded wait that retries ONLY on EWOULDBLOCK — any other errno (or
-// budget expiry) panics with the same evidence, and the loser-construction
-// single-writer property above stays one-shot and untouched, preserving the
-// C1 no-retry-masking decision for everything the retry does not cover.
+// errno=11 EWOULDBLOCK at the re-acquire after `drop(holder)`: the dropped
+// holder's flock can remain kernel-held for a tick. The one-shot probe-2
+// acquire (which panicked on exactly that signature) and the third
+// construction are therefore REPLACED by one bounded wait that retries ONLY
+// on EWOULDBLOCK, carries probe-2's errno+kind diagnostics verbatim into its
+// panic messages, and panics (with the last errno evidence) on any other
+// errno or on budget expiry. The on-disk evidence probe above and the
+// loser-construction single-writer property stay one-shot and untouched —
+// the C1 no-retry-masking decision holds for everything the wait does not
+// cover: a lock that never frees still fails loudly with its errno named.
 ```
 
-- [ ] **Step 2: Implement the bounded wait (RED/GREEN not applicable — see plan intro to Task 2; this is the same flake class)**
+- [ ] **Step 2: Implement the bounded wait (RED/GREEN not applicable — the flake only manifests under load; certification replaces RED/GREEN per the Task 2 note)**
 
-Add to `src/pane_ledger_tests.rs`:
+Replace the test's probe-2 block AND third construction (currently `match PaneLedger::acquire_store_lock(&root) { Ok(lock) => drop(lock), Err(err) => panic!(...) }` followed by `let next = PaneLedger::new_locked(...)` at pane_ledger_tests.rs:189-200) with:
 
 ```rust
-/// Bounded, fail-loud wait for the kernel to release the dropped holder's
-/// flock: retries ONLY on EWOULDBLOCK; panics with errno+kind on anything
-/// else; panics with the last errno evidence on budget expiry. Preserves the
-/// C1 decision: this is not retry-masking a second writer (that property is
-/// asserted separately on the loser construction above) — it waits ONLY on
-/// the proven vapor-lock mechanism.
-#[cfg(unix)]
-fn wait_for_third_locked_ledger(root: &std::path::Path, budget: std::time::Duration) -> PaneLedger {
-    let deadline = std::time::Instant::now() + budget;
-    loop {
-        match PaneLedger::acquire_store_lock(root) {
-            Ok(lock) => {
-                drop(lock); // release before constructing the real ledger
-                return PaneLedger::new_locked(Some(root.to_path_buf()));
-            }
-            Err(err) => {
-                let errno = err.raw_os_error();
-                match errno {
-                    Some(code) if code == libc::EWOULDBLOCK => {
-                        assert!(
-                            std::time::Instant::now() < deadline,
-                            "flock still EWOULDBLOCK (errno={code}) after {budget:?} — the proven flake \
-                             mechanism persisted past the bounded wait (fossils family: pane-ledger-test-lock-*)"
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(25));
-                    }
-                    _ => panic!(
-                        "acquire_store_lock failed after holder drop: errno={errno:?} kind={:?} \
-                         (ENOSPC/EMFILE/EACCES => resource pressure, H1)",
-                        err.kind()
-                    ),
+// Bounded wait for the kernel to release the dropped holder's flock:
+// retries ONLY on EWOULDBLOCK (the proven flake signature), panics with
+// the SAME errno+kind diagnostics probe 2 previously carried on anything
+// else, and panics with the last errno evidence on budget expiry.
+let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+let next = loop {
+    match PaneLedger::acquire_store_lock(&root) {
+        Ok(lock) => {
+            drop(lock); // release before constructing the real ledger
+            break PaneLedger::new_locked(Some(root.clone()));
+        }
+        Err(err) => {
+            let errno = err.raw_os_error();
+            match errno {
+                Some(code) if code == libc::EWOULDBLOCK => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "flock still EWOULDBLOCK (errno={code}) after the 10s bounded wait — \
+                         the proven flake signature persisted past the wait (fossils family: \
+                         pane-ledger-test-lock-*)"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(25));
                 }
+                _ => panic!(
+                    "acquire_store_lock failed after holder drop: errno={errno:?} kind={:?} \
+                     (ENOSPC/EMFILE/EACCES => resource pressure, H1)",
+                    err.kind()
+                ),
             }
         }
     }
-}
+};
 ```
 
-Then replace the segment from `let next = PaneLedger::new_locked(...)` in the test with:
-
-```rust
-let next = wait_for_third_locked_ledger(&root, std::time::Duration::from_secs(10));
-assert!(
-    next.ever_bound("claude", "s1"),
-    "third new_locked came up blind … (existing assertion text unchanged)"
-);
-```
-
-Evidence probes 1 and 2 and their panics stay byte-identical. The one-shot probe-2 acquire remains (it is the diagnostic one-shot; the bounded wait follows it).
+The `assert!(next.ever_bound("claude", "s1"), ...)` after it stays byte-identical. Evidence probe 1 (on-disk s1.json assert) stays byte-identical. Nothing else in the test, the file, or `pane_ledger.rs` changes.
 
 - [ ] **Step 3: Focused verification**
 
