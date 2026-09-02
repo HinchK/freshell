@@ -160,10 +160,18 @@ async fn crashing_agent_is_resumed_twice_then_settles_exited() {
 
     // (b) The broadcast recovery frames, in order: recovering attempt 1 for
     // the crashed terminal, then replaced attempt 1 naming its successor.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let recovering = wait_frame_matching(&mut ws, "terminal.status{recovering}", deadline, |v| {
-        v["type"] == "terminal.status" && v["status"] == "recovering"
-    })
+    // DEFLAKE: FRAME_BUDGET (30s) replaces the old 10s frame budget, with one
+    // FRESH deadline per wait_frame_matching stage (per-stage budget) — a
+    // single Instant shared by the recovering+replaced stages could expire
+    // after the recovering stage consumed most of it under extreme scheduling
+    // lag (certification run 9 of task2-certify.log, 2026-09-02). Assertions
+    // unchanged (see the constant's doc comment).
+    let recovering = wait_frame_matching(
+        &mut ws,
+        "terminal.status{recovering}",
+        tokio::time::Instant::now() + common::FRAME_BUDGET,
+        |v| v["type"] == "terminal.status" && v["status"] == "recovering",
+    )
     .await;
     assert_eq!(recovering["terminalId"], serde_json::json!(old_tid));
     assert_eq!(recovering["attempt"], serde_json::json!(1));
@@ -176,9 +184,12 @@ async fn crashing_agent_is_resumed_twice_then_settles_exited() {
         reason.contains("claude crashed") && reason.contains("attempt 1/2"),
         "unexpected reason: {reason}"
     );
-    let replaced = wait_frame_matching(&mut ws, "terminal.replaced", deadline, |v| {
-        v["type"] == "terminal.replaced"
-    })
+    let replaced = wait_frame_matching(
+        &mut ws,
+        "terminal.replaced",
+        tokio::time::Instant::now() + common::FRAME_BUDGET,
+        |v| v["type"] == "terminal.replaced",
+    )
     .await;
     assert_eq!(replaced["oldTerminalId"], serde_json::json!(old_tid));
     assert_eq!(replaced["attempt"], serde_json::json!(1));
@@ -190,7 +201,9 @@ async fn crashing_agent_is_resumed_twice_then_settles_exited() {
     assert_ne!(first_replacement, old_tid);
 
     // (a) 3 spawns total: the original + 2 retries.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // DEFLAKE: FRAME_BUDGET (30s) replaces the old 5s poll deadline; the 25ms
+    // interval paces (unchanged) — see the constant's doc comment.
+    let deadline = std::time::Instant::now() + common::FRAME_BUDGET;
     while spawn_count(&count_file) < 3 {
         assert!(
             std::time::Instant::now() < deadline,
@@ -202,7 +215,9 @@ async fn crashing_agent_is_resumed_twice_then_settles_exited() {
     assert_eq!(spawn_count(&count_file), 3);
 
     // (c) The newest generation for the createRequestId settles exited...
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // DEFLAKE: FRAME_BUDGET (30s) replaces the old 5s poll deadline; the 25ms
+    // interval paces (unchanged) — see the constant's doc comment.
+    let deadline = std::time::Instant::now() + common::FRAME_BUDGET;
     loop {
         let newest = registry
             .newest_by_create_request_id(create_request_id)
@@ -218,6 +233,10 @@ async fn crashing_agent_is_resumed_twice_then_settles_exited() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     // ...and the budget is spent: no further spawns for 500ms.
+    // DEFLAKE-keep (the-usual test-flake-hardening): this negative window
+    // stays at 500ms — a late respawn under load only makes the window MORE
+    // likely to catch it (load-SAFE direction), so there is no false-fail
+    // pressure to widen (2026-09 host-pressure-pane receipts).
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(
         spawn_count(&count_file),
@@ -249,10 +268,16 @@ async fn reconcile_after_replacement_attaches_to_the_new_terminal() {
     let create_request_id = "req-e2e-crash-once";
     let (old_tid, session_id) = create_claude_terminal(&mut ws, create_request_id).await;
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let replaced = wait_frame_matching(&mut ws, "terminal.replaced", deadline, |v| {
-        v["type"] == "terminal.replaced"
-    })
+    // DEFLAKE: FRAME_BUDGET (30s) replaces the old 10s frame budget as a
+    // per-stage budget (this wait gets its own fresh deadline — see the
+    // per-stage note in crashing_agent_is_resumed_twice_then_settles_exited);
+    // assertions unchanged (see the constant's doc comment).
+    let replaced = wait_frame_matching(
+        &mut ws,
+        "terminal.replaced",
+        tokio::time::Instant::now() + common::FRAME_BUDGET,
+        |v| v["type"] == "terminal.replaced",
+    )
     .await;
     assert_eq!(replaced["oldTerminalId"], serde_json::json!(old_tid));
     let new_tid = replaced["newTerminalId"]

@@ -6,9 +6,11 @@
 //! exists for -- are gated. REAL axum server + REAL tokio-tungstenite
 //! client, the session_identity_frames.rs harness convention.
 
-use std::sync::Arc;
-use std::time::Duration;
+mod common;
 
+use std::sync::Arc;
+
+use common::FRAME_BUDGET;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -133,6 +135,10 @@ async fn spawn_server(
         ]),
         shutdown: std::sync::Arc::clone(&shutdown),
         ping_interval_ms: 30_000,
+        // DEFLAKE-keep (the-usual test-flake-hardening): the server-side hello
+        // timeout stays 5s — no evidence it fired in the load flakes (2026-09
+        // host-pressure-pane receipts); a separate door from the widened
+        // client-side read budgets (see FRAME_BUDGET).
         hello_timeout_ms: 5_000,
         allowed_origins: Arc::new(freshell_ws::origin::default_allowed_origins()),
         ws_max_payload_bytes: 16 * 1024 * 1024,
@@ -198,7 +204,9 @@ async fn connect_and_hello(url: &str) -> TestWs {
     .expect("send hello");
 
     for _ in 0..4u8 {
-        let _ = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        // DEFLAKE: FRAME_BUDGET (30s) replaces the old 5s per-frame read —
+        // assertions unchanged; see the constant's doc comment.
+        let _ = tokio::time::timeout(FRAME_BUDGET, ws.next())
             .await
             .expect("handshake message within timeout")
             .expect("stream not ended")
@@ -217,7 +225,9 @@ async fn send_text(ws: &mut TestWs, text: &str) {
 /// Read text frames until one with `type == wanted` arrives (bounded).
 async fn next_json_of_type(ws: &mut TestWs, wanted: &str) -> serde_json::Value {
     for _ in 0..20u8 {
-        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        // DEFLAKE: FRAME_BUDGET (30s) replaces the old 5s per-frame read —
+        // assertions unchanged; see the constant's doc comment.
+        let msg = tokio::time::timeout(FRAME_BUDGET, ws.next())
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for a {wanted} frame"))
             .expect("stream not ended")
@@ -238,7 +248,9 @@ async fn next_close_frame(
     ws: &mut TestWs,
 ) -> tokio_tungstenite::tungstenite::protocol::CloseFrame<'static> {
     for _ in 0..20u8 {
-        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        // DEFLAKE: FRAME_BUDGET (30s) replaces the old 5s per-frame read —
+        // assertions unchanged; see the constant's doc comment.
+        let msg = tokio::time::timeout(FRAME_BUDGET, ws.next())
             .await
             .expect("close frame within timeout")
             .expect("stream not ended")
@@ -257,7 +269,9 @@ async fn next_close_frame(
 /// never auto-attaches, registry.rs:548).
 async fn next_json_of_type_failing_on_output(ws: &mut TestWs, wanted: &str) -> serde_json::Value {
     for _ in 0..40u8 {
-        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        // DEFLAKE: FRAME_BUDGET (30s) replaces the old 5s per-frame read —
+        // assertions unchanged; see the constant's doc comment.
+        let msg = tokio::time::timeout(FRAME_BUDGET, ws.next())
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for a {wanted} frame"))
             .expect("stream not ended")
@@ -346,7 +360,11 @@ async fn restore_creates_are_gated_and_non_restore_bypass() {
     // Restore create consults the gate: it parks on the 0-permit queue —
     // the wiring proof in the restore direction.
     send_text(&mut client, &create_frame("restore-1", true)).await;
-    for _ in 0..200 {
+    // DEFLAKE: deadline poll bounded by FRAME_BUDGET replaces the old 1s
+    // counter budget; the 5ms interval paces (unchanged) and the assert
+    // below is byte-identical — see the constant's doc comment.
+    let deadline = std::time::Instant::now() + FRAME_BUDGET;
+    while std::time::Instant::now() < deadline {
         if gate.queued_total() == 1 {
             break;
         }
@@ -360,7 +378,11 @@ async fn restore_creates_are_gated_and_non_restore_bypass() {
 
     // Disconnect: the parked restore create is cancelled without spawning.
     drop(client);
-    for _ in 0..200 {
+    // DEFLAKE: deadline poll bounded by FRAME_BUDGET replaces the old 2s
+    // counter budget; the 10ms interval paces (unchanged) and the assert
+    // below is byte-identical — see the constant's doc comment.
+    let deadline = std::time::Instant::now() + FRAME_BUDGET;
+    while std::time::Instant::now() < deadline {
         if gate.cancellations() == 1 {
             break;
         }
@@ -398,8 +420,10 @@ async fn restore_creates_queue_behind_held_permit_and_both_settle() {
 
     // Hold the only permit so both creates MUST queue.
     let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+    // DEFLAKE: FRAME_BUDGET (30s) replaces the old 5s acquire budget;
+    // assertions unchanged — see the constant's doc comment.
     let permit = gate
-        .acquire(std::time::Duration::from_secs(5), &mut cancel_rx)
+        .acquire(FRAME_BUDGET, &mut cancel_rx)
         .await
         .expect("test acquires the gate's only permit");
 
@@ -408,7 +432,11 @@ async fn restore_creates_queue_behind_held_permit_and_both_settle() {
 
     // Bounded poll (suite idiom, cf. the disconnect test): both creates
     // observably queued behind the held permit.
-    for _ in 0..400 {
+    // DEFLAKE: deadline poll bounded by FRAME_BUDGET replaces the old 2s
+    // counter budget; the 5ms interval paces (unchanged) and the assert
+    // below is byte-identical — see the constant's doc comment.
+    let deadline = std::time::Instant::now() + FRAME_BUDGET;
+    while std::time::Instant::now() < deadline {
         if gate.queued_total() >= 2 {
             break;
         }
@@ -434,9 +462,9 @@ async fn restore_creates_queue_behind_held_permit_and_both_settle() {
 
     // Permit-leak check: once both creates settled, the permit must be
     // re-acquirable (released at settle, not retained).
-    let reacquired = gate
-        .acquire(std::time::Duration::from_secs(5), &mut cancel_rx)
-        .await;
+    // DEFLAKE: FRAME_BUDGET (30s) replaces the old 5s acquire budget;
+    // assertions unchanged — see the constant's doc comment.
+    let reacquired = gate.acquire(FRAME_BUDGET, &mut cancel_rx).await;
     assert!(
         reacquired.is_ok(),
         "gate permit must be free again once both creates settled"
@@ -467,6 +495,10 @@ async fn gated_create_racing_shutdown_leaves_no_live_pty() {
     send_text(&mut client, &create_frame("late", true)).await;
 
     // Give the gated task time to (wrongly) spawn and settle.
+    // DEFLAKE-keep (the-usual test-flake-hardening): this negative window
+    // stays at 500ms — a late wrong spawn under load only makes the window
+    // MORE likely to catch it (load-SAFE direction), so there is no
+    // false-fail pressure to widen (2026-09 host-pressure-pane receipts).
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert_eq!(
         registry.kill_all(),
@@ -488,7 +520,11 @@ async fn queued_restore_create_is_abandoned_on_disconnect_without_spawning() {
     send_text(&mut client, &create_frame("doomed", true)).await;
 
     // Wait until the create is actually queued on the gate.
-    for _ in 0..200 {
+    // DEFLAKE: deadline poll bounded by FRAME_BUDGET replaces the old 1s
+    // counter budget; the 5ms interval paces (unchanged) and the assert
+    // below is byte-identical — see the constant's doc comment.
+    let deadline = std::time::Instant::now() + FRAME_BUDGET;
+    while std::time::Instant::now() < deadline {
         if gate.queued_total() == 1 {
             break;
         }
@@ -501,7 +537,11 @@ async fn queued_restore_create_is_abandoned_on_disconnect_without_spawning() {
 
     // The queued create must unblock as Cancelled — not sit out its 30s
     // timeout, and not spawn.
-    for _ in 0..200 {
+    // DEFLAKE: deadline poll bounded by FRAME_BUDGET replaces the old 2s
+    // counter budget; the 10ms interval paces (unchanged) and the assert
+    // below is byte-identical — see the constant's doc comment.
+    let deadline = std::time::Instant::now() + FRAME_BUDGET;
+    while std::time::Instant::now() < deadline {
         if gate.cancellations() == 1 {
             break;
         }
@@ -527,7 +567,11 @@ async fn queued_restore_creates_drain_without_spawning_on_shutdown() {
     send_text(&mut client, &create_frame("draining-1", true)).await;
     send_text(&mut client, &create_frame("draining-2", true)).await;
 
-    for _ in 0..200 {
+    // DEFLAKE: deadline poll bounded by FRAME_BUDGET replaces the old 1s
+    // counter budget; the 5ms interval paces (unchanged) and the assert
+    // below is byte-identical — see the constant's doc comment.
+    let deadline = std::time::Instant::now() + FRAME_BUDGET;
+    while std::time::Instant::now() < deadline {
         if gate.queued_total() == 2 {
             break;
         }
@@ -547,7 +591,11 @@ async fn queued_restore_creates_drain_without_spawning_on_shutdown() {
     let close = next_close_frame(&mut client).await;
     assert_eq!(close.code, 4009_u16.into());
 
-    for _ in 0..200 {
+    // DEFLAKE: deadline poll bounded by FRAME_BUDGET replaces the old 2s
+    // counter budget; the 10ms interval paces (unchanged) and the assert
+    // below is byte-identical — see the constant's doc comment.
+    let deadline = std::time::Instant::now() + FRAME_BUDGET;
+    while std::time::Instant::now() < deadline {
         if gate.cancellations() == 2 {
             break;
         }
@@ -676,7 +724,11 @@ async fn duplicate_while_queued_does_not_double_spawn() {
         spawn_server(cfg, SpawnGate::new(0, 64)).await;
     let mut client = connect_and_hello(&ws_url).await;
     send_text(&mut client, &create_frame("dup-q", true)).await;
-    for _ in 0..200 {
+    // DEFLAKE: deadline poll bounded by FRAME_BUDGET replaces the old 1s
+    // counter budget; the 5ms interval paces (unchanged) and the assert
+    // below is byte-identical — see the constant's doc comment.
+    let deadline = std::time::Instant::now() + FRAME_BUDGET;
+    while std::time::Instant::now() < deadline {
         if gate.queued_total() == 1 {
             break;
         }
@@ -702,9 +754,37 @@ async fn rate_limited_retry_same_requestid_proceeds() {
     // clear the sentinel; otherwise the frozen client's 2s retry with the
     // SAME requestId (TerminalView.tsx:155-157, :3995-3999) is swallowed as
     // DuplicateInFlight forever and the pane wedges.
+    //
+    // DEFLAKE (the-usual test-flake-hardening; certification run 1 of
+    // task2-certify.log, 2026-09-02): run 1 failed budget-independently —
+    // the expected RATE_LIMITED error never existed. Mechanism (verified
+    // against the server): the per-connection dispatch loop is SEQUENTIAL
+    // and awaits each non-restore create's whole spawn
+    // (terminal.rs:807-880), and the rate stamp happens BEFORE that spawn
+    // at dispatch (terminal.rs:2589), so rl-2's rate check necessarily
+    // lands a full spawn+turnaround AFTER rl-1's stamp — under load that
+    // gap exceeded the old 300ms test window and rl-2 was legitimately
+    // ACCEPTED. The test's own config knobs are therefore widened
+    // (rate_window_ms 300 → 2_000, post-slide sleep 400ms → 2_100ms):
+    // receipts bound the worst observed in-loop dispatch lag well under
+    // 2s, so every rate check below is structurally in or out of the
+    // window by construction. The sentinel-cleanup proof is TWICE-limited:
+    // after the FIRST RATE_LIMITED error for rl-2, rl-2 is resent
+    // IMMEDIATELY (still inside the 2s window) and a SECOND RATE_LIMITED
+    // error is asserted — a LEAKED InFlight sentinel would swallow the
+    // resend as a waiter (no error frame) and the bounded read fails,
+    // while a cleared sentinel re-enters an in-window rate check. The
+    // post-window-slide retry (2.1s sleep > 2s window, then
+    // terminal.created) stays load-safe in its direction: the sleep starts
+    // after rl-1's terminal.created receipt (≥ rl-1's stamp), so any lag
+    // can only move the retry further past the window start.
     let cfg = CreateProtectConfig {
         rate_limit: 1,
-        rate_window_ms: 300,
+        // DEFLAKE-widened 300 → 2_000 (certification run 1,
+        // task2-certify.log): 2s ≫ the worst in-loop dispatch lag, so
+        // rl-2's rate check — a full spawn+turnaround after rl-1's stamp,
+        // by sequential dispatch — is structurally in-window.
+        rate_window_ms: 2_000,
         ..CreateProtectConfig::default()
     };
     let (ws_url, registry, _shutdown, _gate, _shutdown_started) =
@@ -720,8 +800,19 @@ async fn rate_limited_retry_same_requestid_proceeds() {
     assert_eq!(err["code"], "RATE_LIMITED");
     assert_eq!(err["requestId"], "rl-2");
 
-    // Client-style retry: SAME requestId after the window slides.
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    // Twice-limited sentinel-cleanup probe (see the DEFLAKE paragraph above):
+    // the immediate resend must ALSO be answered RATE_LIMITED — a leaked
+    // InFlight sentinel would swallow it as a waiter (no error frame), and a
+    // cleared one re-enters the rate check while rl-1's stamp is still in
+    // the 2s window.
+    send_text(&mut client, &create_frame("rl-2", false)).await;
+    let err2 = next_json_of_type(&mut client, "error").await;
+    assert_eq!(err2["code"], "RATE_LIMITED");
+    assert_eq!(err2["requestId"], "rl-2");
+
+    // Client-style retry: SAME requestId after the window slides (2.1s sleep
+    // > 2s window; load-safe direction — see the DEFLAKE paragraph above).
+    tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
     send_text(&mut client, &create_frame("rl-2", false)).await;
     let retried = next_json_of_type(&mut client, "terminal.created").await;
     assert_eq!(
@@ -777,7 +868,11 @@ async fn resend_on_new_connection_never_swallowed_while_inflight() {
     let mut client1 = connect_and_hello(&ws_url).await;
     let mut client2 = connect_and_hello(&ws_url).await;
     send_text(&mut client1, &create_frame("xq", true)).await;
-    for _ in 0..200 {
+    // DEFLAKE: deadline poll bounded by FRAME_BUDGET replaces the old 1s
+    // counter budget; the 5ms interval paces (unchanged) and the assert
+    // below is byte-identical — see the constant's doc comment.
+    let deadline = std::time::Instant::now() + FRAME_BUDGET;
+    while std::time::Instant::now() < deadline {
         if gate.queued_total() == 1 {
             break;
         }
