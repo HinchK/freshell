@@ -59,7 +59,7 @@
 - Consumes: nothing repo-internal (no dependencies; pure `process.env` manipulation)
 - Produces: `AMBIENT_ENV_POISONS: readonly string[]` and `stripAmbientEnvPoisons(env?: Pick<NodeJS.ProcessEnv, ...>): string[]` — the latter optional only for the behavioral fixture; configs import the module for its side effect.
 
-- [ ] **Step 1: Write the failing behavioral test**
+- [x] **Step 1: Write the failing behavioral test**
 
 Create `test/unit/config/sanitize-test-env.test.ts`:
 
@@ -189,13 +189,13 @@ for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'FR
 process.stdout.write(JSON.stringify({ innerStderr: inner.stderr ?? '', envReport }))
 ```
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+- [x] **Step 2: Run the test and verify the intended failure**
 
 Run: `npm run test:vitest -- run test/unit/config/sanitize-test-env.test.ts`
 
 Expected: FAIL because `config/vitest/sanitize-test-env` does not exist yet (module resolution error). Do NOT proceed if the failure is a syntax or fixture-layout accident — fix the test/fixture so the ONLY failure is the missing module.
 
-- [ ] **Step 3: Add the minimal production implementation**
+- [x] **Step 3: Add the minimal production implementation**
 
 Create `config/vitest/sanitize-test-env.ts`:
 
@@ -275,17 +275,17 @@ Add to `AGENTS.md` in the Test Coordination section, one line:
 
 > Ambient proxy vars (`HTTP(S)_PROXY`, either case) and `FRESHELL_BIND_HOST` are stripped at vitest config load by `config/vitest/sanitize-test-env.ts` (imported first by every config EXCEPT the two real-provider smoke configs); local test runs do not need env pre-stripping.
 
-- [ ] **Step 4: Run the focused test**
+- [x] **Step 4: Run the focused test**
 
 Run: `npm run test:vitest -- run test/unit/config/sanitize-test-env.test.ts`
 
 Expected: PASS (5 tests). Note: run this WITHOUT stripping ambient env — the poisoned env is supplied by the test itself via spawn env, so shell state is irrelevant.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Confirm no duplication beyond the config import line; confirm the two real-provider smoke configs carry the documented exclusion instead of the import, and that no other code skips the sanitize by config choice (the functional escape hatch remains env-driven by `FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1` for the `test/integration/real/` lane). No other refactor expected.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 The prelude alters `process.env` for EVERY vitest run. Impacted set = the two known strict-stderr files, plus the vite-config test that self-manages `FRESHELL_BIND_HOST`, plus the e2e-browser helper config's tests. Then prove the headline property: run the previously-RED base-gate suite file with ambient proxies deliberately SET.
 
@@ -304,7 +304,7 @@ npm run test:e2e:helpers
 
 Expected: PASS with ambient proxies present (present from the shell or the synthesized dummy above). The last line runs the e2e-helper harness tests, whose config (`test/e2e-browser/vitest.config.ts`) is NOT loaded by `npm test` — required because this task edits that config.
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 ```bash
 git add config/vitest/ test/unit/config/ test/e2e-browser/vitest.config.ts AGENTS.md
@@ -326,7 +326,7 @@ git commit -m "test(env): sanitize ambient proxy + FRESHELL_BIND_HOST at vitest 
 
 No production Rust code changes in this task.
 
-- [ ] **Step 1: Enumerate every deadline site (RED-equivalent)**
+- [x] **Step 1: Enumerate every deadline site (RED-equivalent)**
 
 This task has no new failing test to write (the flake only manifests under load); the repo's merged deflake idiom (`f2c505e9f`, `f451871d0`, `dcd7baad2`) explicitly uses "widen the budget, assertions unchanged, certify with evidence runs" instead of RED/GREEN for this class. Enumerate the complete site list first so nothing is missed OR over-widened:
 
@@ -343,7 +343,7 @@ Map EVERY hit onto exactly one bucket. The fixed widen/keep rule (the narrowing 
 - **WIDEN, in `restore_spawn_gate.rs`:** the file-local helpers' 5s per-frame timeouts (:201, :220, :241, :260) and the two test-side `gate.acquire(5s)` (~:402, ~:438); the nine 1–2s bounded counter polls convert to deadline polls on the same budget.
 - **KEEP (do not widen), with a brief DEFLAKE-keep note where ambiguity could linger:** the 500ms negative-window sleep in `auto_resume_e2e` (load-SAFE direction), the 5–25ms poll intervals (they pace, they don't bound), the server-side `hello_timeout_ms: 5_000` (no evidence it fired; separate door), and EVERY other `common/mod.rs` helper — explicitly `create_shell_terminal` (:955), `wait_for_attach_ready` (:1062), `drain_until_marker_or_deadline` (:995) and their reads — because the suites that use them did not flake and widening them would only raise unrelated suites' failure latency.
 
-- [ ] **Step 2: Add the shared budget constant**
+- [x] **Step 2: Add the shared budget constant**
 
 In `crates/freshell-ws/tests/common/mod.rs` (near the top, before the helpers):
 
@@ -359,14 +359,14 @@ pub const FRAME_BUDGET: Duration = Duration::from_secs(30);
 
 Then route ONLY the 5s per-frame `tokio::time::timeout(Duration::from_secs(5), ws.next())` reads in `connect_and_capture_inventory`'s handshake loop (~:936) and in `next_frame_of_type` (~:1100) through `FRAME_BUDGET` — no other helper in this file changes (rule defined in Step 1).
 
-- [ ] **Step 3: Widen `auto_resume_e2e.rs`**
+- [x] **Step 3: Widen `auto_resume_e2e.rs`**
 
 Replace:
 - :163 and :252 `Duration::from_secs(10)` → `common::FRAME_BUDGET` (the one 10s Instant budget shared by the recovering+replaced waits);
 - :193 and :205 `Duration::from_secs(5)` poll deadlines → `common::FRAME_BUDGET` (same 25ms interval; deadline-from-budget);
 - keep the 500ms negative-window sleep and `hello_timeout_ms: 5_000` unchanged, each with a brief DEFLAKE comment noting the decision and citing the evidence receipts.
 
-- [ ] **Step 4: Widen `restore_spawn_gate.rs`**
+- [x] **Step 4: Widen `restore_spawn_gate.rs`**
 
 In its file-local helpers (`connect_and_hello`'s handshake loop, `next_json_of_type`, `next_close_frame`, `next_json_of_type_failing_on_output` — per explorer inventory at :201, :220, :241, :260): `Duration::from_secs(5)` → `common::FRAME_BUDGET`. The two test-side `gate.acquire(Duration::from_secs(5), ...)` (~:402, ~:438) → `common::FRAME_BUDGET`. The nine 1–2s bounded counter polls (`for _ in 0..400 { ...; sleep(5ms) }` shape, e.g. the observed-queued poll) → deadline polls bounded by `common::FRAME_BUDGET` keeping the 5–10ms intervals, with the final assert after the loop unchanged. Every changed site gets the same one-line DEFLAKE pointer as the constant.
 
@@ -380,11 +380,11 @@ In its file-local helpers (`connect_and_hello`'s handshake loop, `next_json_of_t
 
 Import: these integration-test binaries reach the shared harness via a crate-local `mod common;` declaration. `auto_resume_e2e.rs` already has it (`mod common;` at :10, `use common::next_frame_of_type;` at :14). `restore_spawn_gate.rs` does NOT declare it today (verified 2026-09-02): add `mod common;` at the top with the file's existing declarations and `use common::FRAME_BUDGET;` with the other uses.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 If `restore_spawn_gate.rs`'s file-local helpers now duplicate `common/mod.rs` helpers byte-for-byte after the widening (`next_json_of_type` ≈ `common::next_frame_of_type`), do NOT unify them in this task (out of scope, extra diff; leave for a later cleanup). Note this in the task report instead.
 
-- [ ] **Step 6: Certification (deflake convention)**
+- [x] **Step 6: Certification (deflake convention)**
 
 Run, in order (failure-sensitive: a failed iteration MUST fail the step; mechanism-B occurrences receive the addition-#5 revised rule and must be listed by receipt line refs):
 1. Focused green: `cargo test -p freshell-ws --locked --test auto_resume_e2e --test restore_spawn_gate --test rate_limit_retry_clock` — Expected: all 16 tests PASS (4 in auto_resume_e2e incl. the 2 ring-pin tests, 11 in restore_spawn_gate after the rate test moved out, 1 in rate_limit_retry_clock).
@@ -435,7 +435,7 @@ Expected: final line `CERTIFY: … / … / 0 blocked` with exit 0. Any non-mecha
 
 **Plan addition #7 (delta-review round 5, 2026-09-02):** the Step-6 classifier above was rewritten after review found the waiver could neither fire nor enforce: (a) the ring is Debug-rendered, so receipts carry `reason=\"no_resumable_identity\"` with escaped quotes and the old quoted grep never matched; (b) the old checks did not reject other auto-resume failures, other settle reasons, or arrived recovering/replaced frames. The classifier now normalizes each failing chunk ONCE (`tr -d '\\'` — every keyword grep is then quote-escape-insensitive by construction) and requires ALL FOUR checks: (1) every `panicked at` line names `tests/auto_resume_e2e.rs`; (2) ≥1 `no_resumable_identity` occurrence (bare name); (3) NO arrived `terminal.replaced` frame — anchored to the `type=`-tagged arrived-frame shape because the receipted failure line itself (`stream ended while waiting for terminal.replaced: …`, task2c2-certify.log:16) contains the bare word as the awaited-frame name, so a bare-word grep would block the waivered tail itself (the waivered tail is by definition "never replaced": no replaced frame ARRIVES); (4) NO `recovering` occurrence. Standalone-verified against five synthetic chunks (clean pass; exact mech-B shape with escaped quotes waived; recovering-then-vanish, other-file panic, and arrived-replaced all blocked) — evidence: usual-sdd/delta-r5-fix-report.md.
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 ```bash
 git add crates/freshell-ws/tests/common/mod.rs crates/freshell-ws/tests/auto_resume_e2e.rs crates/freshell-ws/tests/restore_spawn_gate.rs
@@ -464,19 +464,19 @@ git commit -m "test(freshell-ws): widen ws-e2e frame/poll budgets to a shared 30
 - Consumes: existing `common::FRAME_BUDGET` (Task 2); `WsMessage` scan logic.
 - Produces: `wait_frame_matching` panic messages now enumerate ignored frames (type + `status`/`code` when present).
 
-- [ ] **Step 1: Extend the helper (self-diagnosing idiom)**
+- [x] **Step 1: Extend the helper (self-diagnosing idiom)**
 
 Change ONLY `wait_frame_matching` inside `auto_resume_e2e.rs` (this file's private helper — the shared `common/mod.rs` helpers stay untouched, per Task 2's fixed widen/keep rule): keep the frame loop identical, but track ignored frames: on `Ok(Some(Ok(WsMessage::Text(text))))` that parses but fails `pred`, record `value["type"]` plus `value["status"]` / `value["code"]` when present, keeping the last 10 in a `VecDeque`/`Vec` ring; on deadline expiry, include them in the panic message, e.g. `panic!("{what} never arrived before the deadline; ignored frames (last {n}): ...")`. Keep the existing `other => panic!("stream ended while waiting for {what}: {other:?}")` branch byte-identical.
 
 **Delta-review round-1 refinement (executed):** the ring rendering is shared by BOTH panic arms via a small `format_ignored_frames(&ring)` helper — the end-of-loop deadline panic AND the catch-all `other` arm (which is the arm that actually fires when the peer goes silent: the final `Err(Elapsed)` routes there, not to the deadline panic — the exact mechanism-B receipt shape). Two loopback-WS `#[tokio::test]` pins inside `auto_resume_e2e.rs` cover the elapsed path: `wait_frame_matching_silent_peer_panic_carries_the_ignored_ring` (silent peer, empty ring) and `wait_frame_matching_unrelated_frames_panic_names_the_ring` (unrelated frames recorded, ring contents named in the panic). Loop logic and budgets unchanged.
 
-- [ ] **Step 2: Focused green + certification**
+- [x] **Step 2: Focused green + certification**
 
 Run: the Task 2 focused command, then the Task 2 certification loop verbatim (10 iterations, failure-sensitive, log to `reports/task2b-certify.log`) → final line `CERTIFY 10/10 PASS`.
 
 Expected: PASS. If mechanism B recurs, the log now names the settle frames it ignored — record the receipt and STOP with BLOCKED (do not paper over).
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add crates/freshell-ws/tests/auto_resume_e2e.rs
@@ -503,7 +503,7 @@ git commit -m "test(freshell-ws): wait_frame_matching records ignored frames for
 
 No production code changes. No new asserts added to production paths.
 
-- [ ] **Step 1: Document intent (comment-only prelude)**
+- [x] **Step 1: Document intent (comment-only prelude)**
 
 In the same DEFLAKE comment block above the test, append one paragraph (text below is the FINAL shape after delta-review round 1 — the diagnosis is two-branched, keyed on `candidate.is_enabled()`, so an enabled-but-blind H2 candidate can never be probed-and-retried):
 
@@ -534,14 +534,14 @@ In the same DEFLAKE comment block above the test, append one paragraph (text bel
 // everything the wait does not cover.
 ```
 
-- [ ] **Step 2: Implement the bounded wait (RED/GREEN not applicable — the flake only manifests under load; certification replaces RED/GREEN per the Task 2 note)**
+- [x] **Step 2: Implement the bounded wait (RED/GREEN not applicable — the flake only manifests under load; certification replaces RED/GREEN per the Task 2 note)**
 
 The final implementation was evolved through independent review and is COMPLETE AND COMMITTED (commit `ed0622148`); the authoritative listing is the executed code, not a plan block: `crates/freshell-ws/src/pane_ledger_tests.rs` around the `new_locked_degrades_to_disabled_when_another_holder_exists` test's third-construction wait. The design history and its current required shape:
 
 1. (Initial plan) Retry on EWOULDBLOCK via an after-the-fact `acquire_store_lock` probe — REJECTED at plan round 3 (probe sees the candidate's own lock) and again at delta round 2 (TOCTOU: holder release between construction and probe mislabels the transient as H2).
 2. **Final required shape (executed):** the wait retries ONLY the third CONSTRUCTION. Per iteration, the outcome is classified by evidence captured AT the failure instant: a disabled (lock-failed) candidate is diagnosed by a thread-local tracing capture of the production `pane_ledger_lock_unavailable` event, whose error text contains the os error number (compared via `libc::EWOULDBLOCK` so it is portable); enabled-but-blind → immediate H2 panic, never retried; other errnos or a missing event → immediate panic; budget expiry → panic with the last captured errno text. Evidence probe 1 (on-disk) and the loser construction stay one-shot and untouched; production `pane_ledger.rs` stays byte-identical.
 
-- [ ] **Step 3: Focused verification**
+- [x] **Step 3: Focused verification**
 
 Run:
 ```
@@ -551,7 +551,7 @@ cargo fmt --check
 
 Expected: the lock test + all pane_ledger tests PASS; fmt clean for the touched files.
 
-- [ ] **Step 4: Certification**
+- [x] **Step 4: Certification**
 
 Run (failure-sensitive, same pattern as Task 2):
 
@@ -571,7 +571,7 @@ test "$(grep -c '^run .*: PASS$' "$LOG")" -eq 20 && echo 'CERTIFY 20/20 PASS' ||
 
 Expected: final line exactly `CERTIFY 20/20 PASS` (any failure prints `CERTIFY FAILED` and exits non-zero).
 
-- [ ] **Step 5: Run impacted-test verification**
+- [x] **Step 5: Run impacted-test verification**
 
 This is a test-only change inside one file of the freshell-ws lib binary: run the whole freshell-ws lib test module plus the touchpoint suites.
 
@@ -579,7 +579,7 @@ Run: `cargo test -p freshell-ws --locked`
 
 Expected: ALL PASS.
 
-- [ ] **Step 6: Commit the task**
+- [x] **Step 6: Commit the task**
 
 ```bash
 git add crates/freshell-ws/src/pane_ledger_tests.rs
