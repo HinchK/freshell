@@ -944,10 +944,15 @@ pub async fn connect_and_capture_inventory(url: &str) -> (TestWs, serde_json::Va
     .expect("send hello");
 
     let mut inventory = serde_json::Value::Null;
+    // DEFLAKE (delta-r2 M1): ONE deadline per CALL (Instant::now() +
+    // FRAME_BUDGET), each read wrapped in timeout(remaining.max(1ms), ...) —
+    // the per-frame FRAME_BUDGET form multiplied the budget across the loop.
+    // The 4-frame handshake cap stays as the secondary bound; panic strings
+    // unchanged.
+    let deadline = std::time::Instant::now() + FRAME_BUDGET;
     for _ in 0..4u8 {
-        // DEFLAKE: FRAME_BUDGET (30s) replaces the old 5s per-frame read —
-        // assertions unchanged; see the constant's doc comment.
-        let msg = tokio::time::timeout(FRAME_BUDGET, ws.next())
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let msg = tokio::time::timeout(remaining.max(Duration::from_millis(1)), ws.next())
             .await
             .expect("handshake message within timeout")
             .expect("stream not ended")
@@ -1118,10 +1123,16 @@ pub async fn send_input(ws: &mut TestWs, terminal_id: &str, data: &str) {
 
 /// Read text frames until one with `type == wanted` arrives (bounded).
 pub async fn next_frame_of_type(ws: &mut TestWs, wanted: &str) -> serde_json::Value {
+    // DEFLAKE (delta-r2 M1): ONE deadline per CALL (Instant::now() +
+    // FRAME_BUDGET), each read wrapped in timeout(remaining.max(1ms), ...) —
+    // the per-frame FRAME_BUDGET form multiplied the budget across the 20-frame
+    // loop (a genuinely missing frame fails in ≤ FRAME_BUDGET, restored
+    // exactly). The 20-message cap stays as the secondary bound; panic strings
+    // unchanged.
+    let deadline = std::time::Instant::now() + FRAME_BUDGET;
     for _ in 0..20u8 {
-        // DEFLAKE: FRAME_BUDGET (30s) replaces the old 5s per-frame read —
-        // assertions unchanged; see the constant's doc comment.
-        let msg = tokio::time::timeout(FRAME_BUDGET, ws.next())
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let msg = tokio::time::timeout(remaining.max(Duration::from_millis(1)), ws.next())
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for a {wanted} frame"))
             .expect("stream not ended")

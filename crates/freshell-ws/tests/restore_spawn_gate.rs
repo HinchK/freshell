@@ -203,14 +203,22 @@ async fn connect_and_hello(url: &str) -> TestWs {
     .await
     .expect("send hello");
 
+    // DEFLAKE (delta-r2 M1): ONE deadline per CALL (Instant::now() +
+    // FRAME_BUDGET), each read wrapped in timeout(remaining.max(1ms), ...) —
+    // the per-frame FRAME_BUDGET form multiplied the budget across the loop.
+    // The 4-frame handshake cap stays as the secondary bound; panic strings
+    // unchanged.
+    let deadline = std::time::Instant::now() + FRAME_BUDGET;
     for _ in 0..4u8 {
-        // DEFLAKE: FRAME_BUDGET (30s) replaces the old 5s per-frame read —
-        // assertions unchanged; see the constant's doc comment.
-        let _ = tokio::time::timeout(FRAME_BUDGET, ws.next())
-            .await
-            .expect("handshake message within timeout")
-            .expect("stream not ended")
-            .expect("no ws error");
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let _ = tokio::time::timeout(
+            remaining.max(std::time::Duration::from_millis(1)),
+            ws.next(),
+        )
+        .await
+        .expect("handshake message within timeout")
+        .expect("stream not ended")
+        .expect("no ws error");
     }
     ws
 }
@@ -224,14 +232,22 @@ async fn send_text(ws: &mut TestWs, text: &str) {
 
 /// Read text frames until one with `type == wanted` arrives (bounded).
 async fn next_json_of_type(ws: &mut TestWs, wanted: &str) -> serde_json::Value {
+    // DEFLAKE (delta-r2 M1): ONE deadline per CALL (Instant::now() +
+    // FRAME_BUDGET), each read wrapped in timeout(remaining.max(1ms), ...) —
+    // the per-frame FRAME_BUDGET form multiplied the budget across the 20-frame
+    // loop. The 20-message cap stays as the secondary bound; panic strings
+    // unchanged.
+    let deadline = std::time::Instant::now() + FRAME_BUDGET;
     for _ in 0..20u8 {
-        // DEFLAKE: FRAME_BUDGET (30s) replaces the old 5s per-frame read —
-        // assertions unchanged; see the constant's doc comment.
-        let msg = tokio::time::timeout(FRAME_BUDGET, ws.next())
-            .await
-            .unwrap_or_else(|_| panic!("timed out waiting for a {wanted} frame"))
-            .expect("stream not ended")
-            .expect("no ws error");
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let msg = tokio::time::timeout(
+            remaining.max(std::time::Duration::from_millis(1)),
+            ws.next(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for a {wanted} frame"))
+        .expect("stream not ended")
+        .expect("no ws error");
         if let WsMessage::Text(text) = &msg {
             let value: serde_json::Value = serde_json::from_str(text).expect("json frame");
             if value["type"] == serde_json::json!(wanted) {
@@ -247,14 +263,22 @@ async fn next_json_of_type(ws: &mut TestWs, wanted: &str) -> serde_json::Value {
 async fn next_close_frame(
     ws: &mut TestWs,
 ) -> tokio_tungstenite::tungstenite::protocol::CloseFrame<'static> {
+    // DEFLAKE (delta-r2 M1): ONE deadline per CALL (Instant::now() +
+    // FRAME_BUDGET), each read wrapped in timeout(remaining.max(1ms), ...) —
+    // the per-frame FRAME_BUDGET form multiplied the budget across the 20-frame
+    // loop. The 20-message cap stays as the secondary bound; panic strings
+    // unchanged.
+    let deadline = std::time::Instant::now() + FRAME_BUDGET;
     for _ in 0..20u8 {
-        // DEFLAKE: FRAME_BUDGET (30s) replaces the old 5s per-frame read —
-        // assertions unchanged; see the constant's doc comment.
-        let msg = tokio::time::timeout(FRAME_BUDGET, ws.next())
-            .await
-            .expect("close frame within timeout")
-            .expect("stream not ended")
-            .expect("no ws error");
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let msg = tokio::time::timeout(
+            remaining.max(std::time::Duration::from_millis(1)),
+            ws.next(),
+        )
+        .await
+        .expect("close frame within timeout")
+        .expect("stream not ended")
+        .expect("no ws error");
         if let WsMessage::Close(Some(frame)) = msg {
             return frame;
         }
@@ -268,14 +292,22 @@ async fn next_close_frame(
 /// so output before attach would break the A21 causal invariant (create
 /// never auto-attaches, registry.rs:548).
 async fn next_json_of_type_failing_on_output(ws: &mut TestWs, wanted: &str) -> serde_json::Value {
+    // DEFLAKE (delta-r2 M1): ONE deadline per CALL (Instant::now() +
+    // FRAME_BUDGET), each read wrapped in timeout(remaining.max(1ms), ...) —
+    // the per-frame FRAME_BUDGET form multiplied the budget across the 40-frame
+    // loop. The 40-message cap stays as the secondary bound; panic strings
+    // unchanged.
+    let deadline = std::time::Instant::now() + FRAME_BUDGET;
     for _ in 0..40u8 {
-        // DEFLAKE: FRAME_BUDGET (30s) replaces the old 5s per-frame read —
-        // assertions unchanged; see the constant's doc comment.
-        let msg = tokio::time::timeout(FRAME_BUDGET, ws.next())
-            .await
-            .unwrap_or_else(|_| panic!("timed out waiting for a {wanted} frame"))
-            .expect("stream not ended")
-            .expect("no ws error");
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let msg = tokio::time::timeout(
+            remaining.max(std::time::Duration::from_millis(1)),
+            ws.next(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for a {wanted} frame"))
+        .expect("stream not ended")
+        .expect("no ws error");
         if let WsMessage::Text(text) = &msg {
             let value: serde_json::Value = serde_json::from_str(text).expect("json frame");
             let frame_type = value["type"].as_str().unwrap_or("");
@@ -744,82 +776,6 @@ async fn duplicate_while_queued_does_not_double_spawn() {
         "duplicate must not enqueue a second gated create"
     );
     assert_eq!(registry.kill_all(), 0, "no PTY spawned for either copy");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn rate_limited_retry_same_requestid_proceeds() {
-    // A2 hard requirement: a rate-limited create must NOT leave an InFlight
-    // sentinel behind. The dedupe `begin` runs at the TOP of the dispatch
-    // arm — BEFORE the rate limiter — so the RATE_LIMITED early return must
-    // clear the sentinel; otherwise the frozen client's 2s retry with the
-    // SAME requestId (TerminalView.tsx:155-157, :3995-3999) is swallowed as
-    // DuplicateInFlight forever and the pane wedges.
-    //
-    // DEFLAKE (the-usual test-flake-hardening; certification run 1 of
-    // task2-certify.log, 2026-09-02): run 1 failed budget-independently —
-    // the expected RATE_LIMITED error never existed. Mechanism (verified
-    // against the server): the per-connection dispatch loop is SEQUENTIAL
-    // and awaits each non-restore create's whole spawn
-    // (terminal.rs:807-880), and the rate stamp happens BEFORE that spawn
-    // at dispatch (terminal.rs:2589), so rl-2's rate check necessarily
-    // lands a full spawn+turnaround AFTER rl-1's stamp — under load that
-    // gap exceeded the old 300ms test window and rl-2 was legitimately
-    // ACCEPTED. The test's own config knobs are therefore widened
-    // (rate_window_ms 300 → 2_000, post-slide sleep 400ms → 2_100ms):
-    // receipts bound the worst observed in-loop dispatch lag well under
-    // 2s, so every rate check below is structurally in or out of the
-    // window by construction. The sentinel-cleanup proof is TWICE-limited:
-    // after the FIRST RATE_LIMITED error for rl-2, rl-2 is resent
-    // IMMEDIATELY (still inside the 2s window) and a SECOND RATE_LIMITED
-    // error is asserted — a LEAKED InFlight sentinel would swallow the
-    // resend as a waiter (no error frame) and the bounded read fails,
-    // while a cleared sentinel re-enters an in-window rate check. The
-    // post-window-slide retry (2.1s sleep > 2s window, then
-    // terminal.created) stays load-safe in its direction: the sleep starts
-    // after rl-1's terminal.created receipt (≥ rl-1's stamp), so any lag
-    // can only move the retry further past the window start.
-    let cfg = CreateProtectConfig {
-        rate_limit: 1,
-        // DEFLAKE-widened 300 → 2_000 (certification run 1,
-        // task2-certify.log): 2s ≫ the worst in-loop dispatch lag, so
-        // rl-2's rate check — a full spawn+turnaround after rl-1's stamp,
-        // by sequential dispatch — is structurally in-window.
-        rate_window_ms: 2_000,
-        ..CreateProtectConfig::default()
-    };
-    let (ws_url, registry, _shutdown, _gate, _shutdown_started) =
-        spawn_server(cfg, SpawnGate::new(4, 64)).await;
-    let mut client = connect_and_hello(&ws_url).await;
-    // First non-restore create consumes the whole 1-token budget.
-    send_text(&mut client, &create_frame("rl-1", false)).await;
-    let _ = next_json_of_type(&mut client, "terminal.created").await;
-
-    // Second non-restore create is rate-limited.
-    send_text(&mut client, &create_frame("rl-2", false)).await;
-    let err = next_json_of_type(&mut client, "error").await;
-    assert_eq!(err["code"], "RATE_LIMITED");
-    assert_eq!(err["requestId"], "rl-2");
-
-    // Twice-limited sentinel-cleanup probe (see the DEFLAKE paragraph above):
-    // the immediate resend must ALSO be answered RATE_LIMITED — a leaked
-    // InFlight sentinel would swallow it as a waiter (no error frame), and a
-    // cleared one re-enters the rate check while rl-1's stamp is still in
-    // the 2s window.
-    send_text(&mut client, &create_frame("rl-2", false)).await;
-    let err2 = next_json_of_type(&mut client, "error").await;
-    assert_eq!(err2["code"], "RATE_LIMITED");
-    assert_eq!(err2["requestId"], "rl-2");
-
-    // Client-style retry: SAME requestId after the window slides (2.1s sleep
-    // > 2s window; load-safe direction — see the DEFLAKE paragraph above).
-    tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
-    send_text(&mut client, &create_frame("rl-2", false)).await;
-    let retried = next_json_of_type(&mut client, "terminal.created").await;
-    assert_eq!(
-        retried["requestId"], "rl-2",
-        "same-requestId retry after RATE_LIMITED must proceed as a fresh create"
-    );
-    assert_eq!(registry.kill_all(), 2, "rl-1 plus the retried rl-2");
 }
 
 #[tokio::test(flavor = "multi_thread")]

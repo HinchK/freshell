@@ -120,8 +120,11 @@ fn format_ignored_frames(ignored: &std::collections::VecDeque<String>) -> String
 ///
 /// DEFLAKE self-diagnosis (the-usual test-flake-hardening, mechanism-B RCA —
 /// reports/mechanism-b-rca.md §0/§4): every parsed-but-non-matching Text frame
-/// is RECORDED (its `type` plus `status`/`code` when present, last 10 in a
-/// ring) and dumped into BOTH panic arms — the catch-all `other` arm (which
+/// is RECORDED (its `type` plus `status`/`code`/`reason`/`attempt`/
+/// `sessionRef` when present, last 10 in a ring — the settle-diagnostic field
+/// set widened at delta-r2 plan addition #5(a) so every future mechanism-B
+/// occurrence self-names its settle tail for the follow-up task) and dumped
+/// into BOTH panic arms — the catch-all `other` arm (which
 /// fires on the final `Err(Elapsed)` when the peer simply stops sending, the
 /// exact mechanism-B receipt shape; delta-review r1) and the end-of-loop
 /// deadline panic — because a zero-frame stall receipt could not distinguish
@@ -138,8 +141,10 @@ async fn wait_frame_matching(
     mut pred: impl FnMut(&serde_json::Value) -> bool,
 ) -> serde_json::Value {
     // Ring of the last 10 ignored frames: parsed Text frames that failed
-    // `pred`, summarized as `type=<v>` plus `status=<v>`/`code=<v>` when the
-    // frame carries those fields.
+    // `pred`, summarized as `type=<v>` plus `status=<v>`/`code=<v>`/
+    // `reason=<v>`/`attempt=<v>`/`sessionRef=<v>` when the frame carries
+    // those fields (the wire TerminalStatus settle/recovering shapes carry
+    // `reason`/`attempt`; error frames carry `code`).
     let mut ignored: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     while tokio::time::Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -155,6 +160,19 @@ async fn wait_frame_matching(
                     }
                     if let Some(code) = value.get("code") {
                         summary.push_str(&format!(" code={code}"));
+                    }
+                    // delta-r2 #5(a): the settle-diagnostic fields — a
+                    // mechanism-B settle tail carries `reason` (real settle
+                    // frames set it, auto_resume.rs's broadcast_settled_frame)
+                    // and recovering frames carry `attempt`.
+                    if let Some(reason) = value.get("reason") {
+                        summary.push_str(&format!(" reason={reason}"));
+                    }
+                    if let Some(attempt) = value.get("attempt") {
+                        summary.push_str(&format!(" attempt={attempt}"));
+                    }
+                    if let Some(session_ref) = value.get("sessionRef") {
+                        summary.push_str(&format!(" sessionRef={session_ref}"));
                     }
                     if ignored.len() == 10 {
                         ignored.pop_front();
@@ -446,10 +464,13 @@ async fn wait_frame_matching_silent_peer_panic_carries_the_ignored_ring() {
 /// Delta-review r1 pin: with unrelated frames recorded in the ring, the
 /// elapsed-path panic NAMES them — the diagnostic the mechanism-B receipts
 /// were missing. The peer sends two frames that can never match the
-/// predicate, then goes silent with the socket held open.
+/// predicate, then goes silent with the socket held open. The second frame
+/// carries a real settle-frame `reason` (auto_resume.rs's
+/// broadcast_settled_frame always sets one), pinning the delta-r2 #5(a) ring
+/// enrichment on the mechanism-B-relevant field.
 #[tokio::test]
 #[should_panic(
-    expected = "ignored frames (last 2): [\"type=\\\"sessions.updated\\\"\", \"type=\\\"terminal.status\\\" status=\\\"exited\\\"\"]"
+    expected = "ignored frames (last 2): [\"type=\\\"sessions.updated\\\"\", \"type=\\\"terminal.status\\\" status=\\\"exited\\\" reason=\\\"clean_exit\\\"\"]"
 )]
 async fn wait_frame_matching_unrelated_frames_panic_names_the_ring() {
     let mut ws = loopback_test_ws(|mut server_ws| async move {
@@ -459,6 +480,7 @@ async fn wait_frame_matching_unrelated_frames_panic_names_the_ring() {
                 "type": "terminal.status",
                 "terminalId": "t-unrelated",
                 "status": "exited",
+                "reason": "clean_exit",
             }),
         ] {
             server_ws
