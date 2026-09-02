@@ -377,6 +377,9 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
     // one-shot and untouched.
     let (events, _trace_guard) = lock_log_capture::lock_failure_capture();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // libc supplies EWOULDBLOCK's portable errno value (11 on Linux, 35 on
+    // macOS), so the marker is derived from the compiled constant, not a literal.
+    let would_block_marker = format!("(os error {})", libc::EWOULDBLOCK);
     // `next` is intentionally unused: the bounded wait's success IS the
     // assertion (a bare `next` binding would trip the repo's -D warnings gate);
     // the name documents that the loop value is the third construction.
@@ -417,7 +420,7 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
             // The proven flake signature: flock still vapor-held after the
             // holder's drop (EWOULDBLOCK's io error Display contains
             // "os error 11").
-            Some(err_text) if err_text.contains("os error 11") => {
+            Some(err_text) if err_text.contains(&would_block_marker) => {
                 assert!(
                     std::time::Instant::now() < deadline,
                     "flock still EWOULDBLOCK after the 10s bounded wait — the \
