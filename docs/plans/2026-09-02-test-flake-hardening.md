@@ -19,7 +19,7 @@
 - Honor the merged C1 decision (commit `884fc8721`): no silent retry-masking in the pane_ledger lock test; evidence probes stay intact.
 
 ### Accepted tradeoffs and residuals
-- Wider wait budgets mean a genuinely-missing WS frame fails ~30s later instead of 5–10s — the repo's accepted deflake idiom (merged precedent `f2c505e9f`: "a genuinely missing frame still fails, 20s later").
+- Wider wait budgets mean a genuinely-missing WS frame fails ~30s later instead of 5–10s — the repo's accepted deflake idiom (merged precedent `f2c505e9f`: "a genuinely missing frame still fails, 20s later"). Because two of the widened helpers live in the shared `tests/common/mod.rs`, OTHER freshell-ws integration suites inherit the wider worst-case failure latency too; scoping the budget per-caller (wrapper params) was considered and rejected as needless complexity — the merged idiom widened a shared helper the same way.
 - pane_ledger's production-side "comes up loudly DISABLED" hardening remains owned by `darkforge/qzka`; this plan hardens only the flaky TEST.
 - `FRESHELL_BIND_HOST` is folded into the same sanitize as the proxies (identical failure class; it already burned `vite-config.test.ts` once, whose comment says so). Safely striped at config load: the only vitest-lane test that cares manages it in-test, and e2e helpers pin it explicitly.
 - Real-provider contract tests (`test/integration/real/`, opt-in) get an escape hatch from proxy-stripping because their spawned CLIs may need proxy internet egress.
@@ -76,15 +76,20 @@ const execFileAsync = promisify(execFile)
 const tsxCli = require.resolve('tsx/cli')
 const fixture = path.resolve(process.cwd(), 'test/unit/config/fixtures/sanitize-env-child.ts')
 
-// The failure shape under test: AMBIENT shell env + proxy vars. Two
-// mechanism facts, pinned by executed probes on 2026-09-02:
+// The failure shape under test: AMBIENT shell env + proxy vars. Mechanism
+// facts, each pinned by executed probes on 2026-09-02 on this host's repo Node
+// (nvm v22.21.1):
 //  1. The `[UNDICI-EHPA]` warning is emitted lazily at the FIRST undici
 //     dispatch activation (one fetch()), not at process start — the
 //     fixture's inner child therefore performs one fetch('data:...').
-//  2. Undici env-proxy honoring (NODE_USE_ENV_PROXY / --use-env-proxy) is
-//     only DEFAULT-ON in Node >= 22.21.0 (repo engines allow >=22.5.0), so
-//     the negative-control warning assertion is capability-gated below; the
-//     universal control is var-inheritance (deterministic at any version).
+//  2. Env-proxy honoring differs across supported Node builds (executed:
+//     /usr/bin/node on this host does NOT warn at all; nvm v22.21.1 warns
+//     ONLY when proxies are set). The negative-control warning assertion is
+//     therefore capability-gated on (major, minor) >= (22, 21); the universal
+//     control is var-inheritance (deterministic at any version/behavior).
+//  3. The fixture's inner child env pins the knobs explicitly — proxies set,
+//     NODE_OPTIONS cleared, NODE_USE_ENV_PROXY=1 — so ambient suppression
+//     flags can never make the control unfalsifiable.
 const [nodeMajor, nodeMinor] = process.versions.node.split('.').map(Number)
 const ENV_PROXY_SUPPORTED = nodeMajor > 22 || (nodeMajor === 22 && nodeMinor >= 21)
 
@@ -132,10 +137,10 @@ describe('sanitize-test-env prelude (behavioral, via spawned node children)', ()
     const { innerStderr, envReport } = await runFixture('plain', POISONED_ENV)
     // Universal control: without the sanitize, children inherit the vars.
     for (const key of Object.keys(POISONED_ENV)) expect(envReport[key]).toBe(POISONED_ENV[key as keyof typeof POISONED_ENV])
-    // Mechanism pin where the host's Node honors env proxies (>= 22.21.0);
-    // a host that additionally disables the warning via NODE_OPTIONS
-    // (--disable-warning=UNDICI-EHPA) cannot satisfy this line — documented,
-    // since such a host sees no warning in the first place.
+    // Mechanism pin where the RUNNER's Node honors env proxies (>= 22.21.0
+    // observed default-on; inner env also pins NODE_USE_ENV_PROXY=1 and
+    // clears NODE_OPTIONS, so neither ambient suppression nor ambient
+    // flags can make this unfalsifiable).
     if (ENV_PROXY_SUPPORTED) expect(innerStderr).toContain('[UNDICI-EHPA]')
   })
 
@@ -168,7 +173,14 @@ if (mode === 'clean') {
 const inner = spawnSync(
   process.execPath,
   ['-e', "fetch('data:text/plain,hi').then(() => process.stdout.write('inner alive'))\n"],
-  { encoding: 'utf8' },
+  {
+    encoding: 'utf8',
+    // Pin the knobs ambient state cannot be trusted with: clear NODE_OPTIONS
+    // (a --disable-warning=UNDICI-EHPA there would suppress the very warning
+    // the control asserts) and explicitly enable env-proxy handling
+    // (inert on Nodes that already default it on).
+    env: { ...process.env, NODE_OPTIONS: '', NODE_USE_ENV_PROXY: '1' },
+  },
 )
 const envReport: Record<string, string | undefined> = {}
 for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'FRESHELL_BIND_HOST']) {
@@ -287,9 +299,10 @@ Run:
 ```
 npm run test:vitest -- run test/unit/lib/visible-first-audit-gate.test.ts test/unit/vite-config.test.ts test/unit/config/sanitize-test-env.test.ts
 npm run test:vitest -- run test/e2e/update-flow.test.ts
+npm run test:e2e:helpers
 ```
 
-Expected: PASS with ambient proxies present (present from the shell or the synthesized dummy above).
+Expected: PASS with ambient proxies present (present from the shell or the synthesized dummy above). The last line runs the e2e-helper harness tests, whose config (`test/e2e-browser/vitest.config.ts`) is NOT loaded by `npm test` — required because this task edits that config.
 
 - [ ] **Step 7: Commit the task**
 
@@ -357,7 +370,7 @@ Replace:
 
 In its file-local helpers (`connect_and_hello`'s handshake loop, `next_json_of_type`, `next_close_frame`, `next_json_of_type_failing_on_output` — per explorer inventory at :201, :220, :241, :260): `Duration::from_secs(5)` → `common::FRAME_BUDGET`. The two test-side `gate.acquire(Duration::from_secs(5), ...)` (~:402, ~:438) → `common::FRAME_BUDGET`. The nine 1–2s bounded counter polls (`for _ in 0..400 { ...; sleep(5ms) }` shape, e.g. the observed-queued poll) → deadline polls bounded by `common::FRAME_BUDGET` keeping the 5–10ms intervals, with the final assert after the loop unchanged. Every changed site gets the same one-line DEFLAKE pointer as the constant.
 
-Import: `use super::common::FRAME_BUDGET;` is wrong for an integration test (a `tests/*.rs` binary) — use `use common::FRAME_BUDGET;` (these files already do `mod common;` / `use common::...`). Adjust per existing imports in the file.
+Import: these integration-test binaries reach the shared harness via a crate-local `mod common;` declaration. `auto_resume_e2e.rs` already has it (`mod common;` at :10, `use common::next_frame_of_type;` at :14). `restore_spawn_gate.rs` does NOT declare it today (verified 2026-09-02): add `mod common;` at the top with the file's existing declarations and `use common::FRAME_BUDGET;` with the other uses.
 
 - [ ] **Step 5: Refactor while green**
 
@@ -451,6 +464,11 @@ let next = loop {
     if candidate.ever_bound("claude", "s1") {
         break candidate;
     }
+    // Diagnose ONLY after releasing the candidate: a candidate that locked
+    // successfully but came up blind holds the flock itself, so probing first
+    // would misread its OWN lock as the transient EWOULDBLOCK and silently
+    // retry an H2 failure. Order matters here and nowhere else.
+    drop(candidate);
     // Construction failed to see the binding — name the mechanism.
     match PaneLedger::acquire_store_lock(&root) {
         Ok(lock) => {
@@ -545,8 +563,9 @@ In the worktree, with ambient proxy env NOT stripped (that is the Task 1 propert
 1. `npm run typecheck` — exit 0.
 2. `npm run lint` — 0 errors (pre-existing warnings unchanged: 12).
 3. Coordinated full suite `FRESHELL_TEST_SUMMARY=the-usual-test-flake-hardening-final npm test` **with proxies ambient** — green. (This replaces the old "-u" ceremony; the baseline ledger's ambient-proxy failure receipt is the regression baseline.)
-4. `cargo test --workspace --locked` — green.
-5. `cargo clippy --workspace --locked --all-targets -- -D warnings` — green; `cargo fmt --check --all` — clean.
-6. Contract regen: `cd crates/freshell-protocol && cargo run --locked --bin contract-regen && git diff --exit-code src/port-contract.rs` (evidence: `[contract] wrote ... 2970 lines ... 211 types + 45 normalized paths`).
-7. `npm run build` — exit 0.
-8. E2e: not required (test-infrastructure-only change; no user-facing behavior; e2e helpers manage their own env), recorded as a deliberate skip.
+4. `npm run test:e2e:helpers` — green (the `test/e2e-browser/vitest.config.ts` this task touches is not loaded by `npm test`).
+5. `cargo test --workspace --locked` — green.
+6. `cargo clippy --workspace --locked --all-targets -- -D warnings` — green; `cargo fmt --check --all` — clean.
+7. Contract regen: `cd crates/freshell-protocol && cargo run --locked --bin contract-regen && git diff --exit-code src/port-contract.rs` (evidence: `[contract] wrote ... 2970 lines ... 211 types + 45 normalized paths`).
+8. `npm run build` — exit 0.
+9. E2e: not required (test-infrastructure-only change; no user-facing behavior; e2e helpers manage their own env), recorded as a deliberate skip.
