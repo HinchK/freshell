@@ -263,10 +263,6 @@ impl TurnTask {
         self.handle.is_finished()
     }
 
-    fn abort(&self) {
-        self.handle.abort();
-    }
-
     /// Abort + join + (for compacts) settle-wait. Every abort site runs this —
     /// ep4-r6 F2: the compensation must have LANDED before this handler
     /// answers, or a send that follows inside the window reads
@@ -5970,7 +5966,7 @@ mod tests {
             !task.is_finished(),
             "the refused compact left the turn alone"
         );
-        task.abort();
+        task.handle.abort();
     }
 
     /// D1-F1(b): the compact's driving task is the session's `turn_task`, so a

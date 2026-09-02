@@ -1531,20 +1531,17 @@ impl FreshCodexState {
         *compact_turn_id.lock().expect("compact_turn_id mutex") = None;
         compact_in_flight.store(true, Ordering::SeqCst);
         if let Err(err) = client.compact_thread(&session_id).await {
-            match &err {
-                // Focused ep4-r6 (codex.rs:1530, F4 at round 5): ONLY an
-                // explicit JSON-RPC rejection proves the compact never started
-                // → the marker clears. Transport means a WS write/flush
-                // failure — which tells nothing about whether the server
-                // received the frame — and every other class is the
-                // ambiguous-post-send shape; all stay fail-closed: the compact
-                // turn's own notifications own the retirement (a never-
-                // starting compact wedges conservatively, never silently).
-                CodexAppServerError::Rpc { .. } => {
-                    compact_in_flight.store(false, Ordering::SeqCst);
-                    *compact_turn_id.lock().expect("compact_turn_id mutex") = None;
-                }
-                _ => {}
+            // Focused ep4-r6 (codex.rs:1530, F4 at round 5): ONLY an
+            // explicit JSON-RPC rejection proves the compact never started
+            // → the marker clears. Transport means a WS write/flush
+            // failure — which tells nothing about whether the server
+            // received the frame — and every other class is the
+            // ambiguous-post-send shape; all stay fail-closed: the compact
+            // turn's own notifications own the retirement (a never-
+            // starting compact wedges conservatively, never silently).
+            if matches!(&err, CodexAppServerError::Rpc { .. }) {
+                compact_in_flight.store(false, Ordering::SeqCst);
+                *compact_turn_id.lock().expect("compact_turn_id mutex") = None;
             }
             self.emit_fresh_agent_error(&session_id, "CODEX_COMPACT_FAILED", &err.to_string());
         }
