@@ -26,7 +26,7 @@
 
 **Goal:** Local full-suite test runs pass with ambient proxy vars and `FRESHELL_BIND_HOST` present, and the three flaky Rust suites tolerate heavy machine load without any weakened assertion.
 
-**Architecture:** (1) A shared side-effect prelude imported first in all 9 vitest config files strips known shell-env poisons from `process.env` before worker pools spawn (mirroring the existing inline NODE_ENV config-top precedent), with a pure exported function unit-tested directly and a child-process behavioral test proving the UNDICI warning disappears iff the prelude loads. (2) The ws test suites adopt the repo's merged deflake idiom: one named 30s frame budget replacing scattered 5–10s timeouts, bounded polls extended to the same budget, assertions byte-identical, evidence-citing DEFLAKE comments. (3) The pane_ledger lock test folds its one-shot post-drop re-acquire probe and third construction into one bounded, fail-loud wait that retries ONLY on `EWOULDBLOCK` (the proven flake signature that probe used to panic on), carries the probe's errno+kind diagnostics into its panic messages, keeps the on-disk evidence probe byte-identical, and still fails loudly on any other errno or expiry.
+**Architecture:** (1) A shared side-effect prelude imported first in all 9 vitest config files strips known shell-env poisons from `process.env` before worker pools spawn (mirroring the existing inline NODE_ENV config-top precedent), with a pure exported function unit-tested directly and a child-process behavioral test proving the UNDICI warning disappears iff the prelude loads. (2) The ws test suites adopt the repo's merged deflake idiom: one named 30s frame budget replacing scattered 5–10s timeouts, bounded polls extended to the same budget, assertions byte-identical, evidence-citing DEFLAKE comments. (3) The pane_ledger lock test replaces its one-shot post-drop re-acquire probe and third construction with one bounded wait whose retry unit is the construction itself: retries proceed ONLY while a separate probe keeps showing `EWOULDBLOCK` (the proven signature); a free-lock-blind construction (H2), any other errno, or expiry fails immediately with the probe's errno+kind diagnostics and the on-disk evidence intact.
 
 **Tech Stack:** Vitest 3.2.4 configs (ESM/TS), Node 22, `tsx` child spawns; Rust workspace (`freshell-ws` crate, tokio, tokio-tungstenite, libc flock).
 
@@ -50,7 +50,8 @@
 - Create: `config/vitest/sanitize-test-env.ts`
 - Create: `test/unit/config/sanitize-test-env.test.ts`
 - Create: `test/unit/config/fixtures/sanitize-env-child.ts`
-- Modify: `config/vitest/vitest.config.ts` (line 1), `config/vitest/vitest.server.config.ts`, `config/vitest/vitest.electron.config.ts`, `config/vitest/vitest.port.config.ts`, `config/vitest/vitest.oracle.config.ts`, `config/vitest/vitest.oracle-t2.config.ts`, `config/vitest/vitest.codex-real-provider-smoke.config.ts`, `config/vitest/vitest.opencode-serve-real-provider-smoke.config.ts`, `test/e2e-browser/vitest.config.ts` — one import line each
+- Modify: `config/vitest/vitest.config.ts` (line 1), `config/vitest/vitest.server.config.ts`, `config/vitest/vitest.electron.config.ts`, `config/vitest/vitest.port.config.ts`, `config/vitest/vitest.oracle.config.ts`, `config/vitest/vitest.oracle-t2.config.ts`, `test/e2e-browser/vitest.config.ts` — one import line each (7 files)
+- Modify: `config/vitest/vitest.codex-real-provider-smoke.config.ts`, `config/vitest/vitest.opencode-serve-real-provider-smoke.config.ts` — one DOCUMENTED EXCLUSION comment each (NO import; these two configs spawn real Codex/OpenCode CLI binaries whose package-script commands do not set `FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1`, so importing the prelude would strip the proxy egress a proxy-only host needs)
 - Modify: `AGENTS.md` (Test Coordination section) — one line noting the sanitization
 - Test: `test/unit/config/sanitize-test-env.test.ts`
 
@@ -75,11 +76,18 @@ const execFileAsync = promisify(execFile)
 const tsxCli = require.resolve('tsx/cli')
 const fixture = path.resolve(process.cwd(), 'test/unit/config/fixtures/sanitize-env-child.ts')
 
-// The failure shape under test: AMBIENT shell env + proxy vars (the proxies make
-// Node install the experimental EnvHttpProxyAgent; the `[UNDICI-EHPA]` warning
-// is emitted lazily at the FIRST undici dispatch activation — e.g. one fetch() —
-// which is why the fixture's inner child performs a fetch and why the env here
-// MERGES into the ambient env instead of replacing it).
+// The failure shape under test: AMBIENT shell env + proxy vars. Two
+// mechanism facts, pinned by executed probes on 2026-09-02:
+//  1. The `[UNDICI-EHPA]` warning is emitted lazily at the FIRST undici
+//     dispatch activation (one fetch()), not at process start — the
+//     fixture's inner child therefore performs one fetch('data:...').
+//  2. Undici env-proxy honoring (NODE_USE_ENV_PROXY / --use-env-proxy) is
+//     only DEFAULT-ON in Node >= 22.21.0 (repo engines allow >=22.5.0), so
+//     the negative-control warning assertion is capability-gated below; the
+//     universal control is var-inheritance (deterministic at any version).
+const [nodeMajor, nodeMinor] = process.versions.node.split('.').map(Number)
+const ENV_PROXY_SUPPORTED = nodeMajor > 22 || (nodeMajor === 22 && nodeMinor >= 21)
+
 const POISONED_ENV = {
   HTTP_PROXY: 'http://127.0.0.1:9',
   HTTPS_PROXY: 'http://127.0.0.1:9',
@@ -102,7 +110,7 @@ describe('stripAmbientEnvPoisons (pure function)', () => {
     expect(new Set(removed)).toEqual(new Set(Object.keys(POISONED_ENV)))
   })
 
-  it('is a no-op (removes nothing) when the real-provider-contracts escape hatch is exactly "1"', () => {
+  it('keeps proxies but still strips FRESHELL_BIND_HOST when the real-provider escape hatch is exactly "1"', () => {
     const env: NodeJS.ProcessEnv = { ...POISONED_ENV, FRESHELL_RUN_REAL_PROVIDER_CONTRACTS: '1' }
     const removed = stripAmbientEnvPoisons(env)
     expect(removed).not.toContain('HTTPS_PROXY')
@@ -120,9 +128,15 @@ describe('stripAmbientEnvPoisons (pure function)', () => {
 })
 
 describe('sanitize-test-env prelude (behavioral, via spawned node children)', () => {
-  it('WITHOUT the prelude, a node child under poisoned env prints the UNDICI warning at first fetch (pins the external mechanism)', async () => {
-    const { innerStderr } = await runFixture('plain', POISONED_ENV)
-    expect(innerStderr).toContain('[UNDICI-EHPA]')
+  it('WITHOUT the prelude, the spawned child inherits the poisoned vars (and, on env-proxy-capable Node, warns)', async () => {
+    const { innerStderr, envReport } = await runFixture('plain', POISONED_ENV)
+    // Universal control: without the sanitize, children inherit the vars.
+    for (const key of Object.keys(POISONED_ENV)) expect(envReport[key]).toBe(POISONED_ENV[key as keyof typeof POISONED_ENV])
+    // Mechanism pin where the host's Node honors env proxies (>= 22.21.0);
+    // a host that additionally disables the warning via NODE_OPTIONS
+    // (--disable-warning=UNDICI-EHPA) cannot satisfy this line — documented,
+    // since such a host sees no warning in the first place.
+    if (ENV_PROXY_SUPPORTED) expect(innerStderr).toContain('[UNDICI-EHPA]')
   })
 
   it('WITH the prelude loaded, the spawned node child has no poisoned vars and no stderr noise', async () => {
@@ -230,30 +244,44 @@ export function stripAmbientEnvPoisons(env: NodeJS.ProcessEnv = process.env): st
 stripAmbientEnvPoisons()
 ```
 
-Then add, as the FIRST import line of each of the 9 configs (before the inline NODE_ENV blocks, mirroring their role; `.js` extension per the repo's NodeNext relative-import rule):
+Then add, as the FIRST import line of 7 config files (before the inline NODE_ENV blocks, mirroring their role; `.js` extension per the repo's NodeNext relative-import rule):
 
-- `config/vitest/vitest.config.ts` etc. → `import './sanitize-test-env.js'`
+- `config/vitest/vitest.config.ts` and its 5 non-smoke siblings in `config/vitest/` → `import './sanitize-test-env.js'`
 - `test/e2e-browser/vitest.config.ts` → `import '../../config/vitest/sanitize-test-env.js'`
 
 (Add a one-line comment above the import in each: `// Strip ambient shell env (proxies, FRESHELL_BIND_HOST) before anything else — see sanitize-test-env.ts.`)
 
+And in the TWO real-provider smoke configs (`vitest.codex-real-provider-smoke.config.ts`, `vitest.opencode-serve-real-provider-smoke.config.ts`) add INSTEAD a documented exclusion comment at the same position:
+
+```ts
+// Deliberately NOT importing ./sanitize-test-env.js: this config's package
+// script does not set FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1, and its tests
+// spawn real provider CLIs that may need ambient proxy egress on some hosts.
+```
+
 Add to `AGENTS.md` in the Test Coordination section, one line:
 
-> Ambient proxy vars (`HTTP(S)_PROXY`, either case) and `FRESHELL_BIND_HOST` are stripped at vitest config load by `config/vitest/sanitize-test-env.ts`; local test runs do not need env pre-stripping.
+> Ambient proxy vars (`HTTP(S)_PROXY`, either case) and `FRESHELL_BIND_HOST` are stripped at vitest config load by `config/vitest/sanitize-test-env.ts` (imported first by every config EXCEPT the two real-provider smoke configs); local test runs do not need env pre-stripping.
 
 - [ ] **Step 4: Run the focused test**
 
 Run: `npm run test:vitest -- run test/unit/config/sanitize-test-env.test.ts`
 
-Expected: PASS (4 tests). Note: run this WITHOUT stripping ambient env — the poisoned env is supplied by the test itself via spawn env, so shell state is irrelevant.
+Expected: PASS (5 tests). Note: run this WITHOUT stripping ambient env — the poisoned env is supplied by the test itself via spawn env, so shell state is irrelevant.
 
 - [ ] **Step 5: Refactor while green**
 
-Confirm no duplication beyond the config import line; confirm the two real-provider smoke configs (which exist for the escape-hatch lane) also import the prelude (the escape hatch is env-driven, not config-exclusion). No other refactor expected.
+Confirm no duplication beyond the config import line; confirm the two real-provider smoke configs carry the documented exclusion instead of the import, and that no other code skips the sanitize by config choice (the functional escape hatch remains env-driven by `FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1` for the `test/integration/real/` lane). No other refactor expected.
 
 - [ ] **Step 6: Run impacted-test verification**
 
-The prelude alters `process.env` for EVERY vitest run. Impacted set = the two known strict-stderr files, plus the vite-config test that self-manages `FRESHELL_BIND_HOST`, plus the e2e-browser helper config's tests. Then prove the headline property: run the previously-RED base-gate suite file with ambient proxies deliberately SET (simulated here, since the current shell exports proxies already):
+The prelude alters `process.env` for EVERY vitest run. Impacted set = the two known strict-stderr files, plus the vite-config test that self-manages `FRESHELL_BIND_HOST`, plus the e2e-browser helper config's tests. Then prove the headline property: run the previously-RED base-gate suite file with ambient proxies deliberately SET.
+
+Non-printing presence check first (never echo a proxy value — proxy URLs can embed credentials), synthesizing a dummy if genuinely unset:
+
+```bash
+test -n "${HTTPS_PROXY}${HTTP_PROXY}" && echo 'ambient proxy present (value not printed)' || { export HTTPS_PROXY=http://127.0.0.1:9 HTTP_PROXY=http://127.0.0.1:9; echo 'no ambient proxy; dummy exported for this gate'; }
+```
 
 Run:
 ```
@@ -261,7 +289,7 @@ npm run test:vitest -- run test/unit/lib/visible-first-audit-gate.test.ts test/u
 npm run test:vitest -- run test/e2e/update-flow.test.ts
 ```
 
-Expected: PASS with the shell's ambient proxies NOT stripped (assert `echo $HTTPS_PROXY` is non-empty first — if empty, export one before running).
+Expected: PASS with ambient proxies present (present from the shell or the synthesized dummy above).
 
 - [ ] **Step 7: Commit the task**
 
@@ -287,7 +315,7 @@ No production Rust code changes in this task.
 
 - [ ] **Step 1: Enumerate every deadline site (RED-equivalent)**
 
-This task has no new failing test to write (the flake only manifests under load); the repo's merged deflake idiom (`f2c505e9f`, `f451871d0`, `dcd7baad2`) explicitly uses "widen the budget, assertions unchanged, certify with evidence runs" instead of RED/GREEN for this class. Enumerate the complete site list first so nothing is missed:
+This task has no new failing test to write (the flake only manifests under load); the repo's merged deflake idiom (`f2c505e9f`, `f451871d0`, `dcd7baad2`) explicitly uses "widen the budget, assertions unchanged, certify with evidence runs" instead of RED/GREEN for this class. Enumerate the complete site list first so nothing is missed OR over-widened:
 
 Run:
 ```
@@ -295,7 +323,12 @@ rg -n "from_secs\(|from_millis\(" crates/freshell-ws/tests/auto_resume_e2e.rs cr
 rg -n "from_secs\(5\)|from_millis\(5\)" crates/freshell-ws/tests/common/mod.rs
 ```
 
-Expected: every hit mapped onto one of: (a) widened to `FRAME_BUDGET`, (b) kept by documented reason (the 500ms negative-window sleep — load-safe direction; the server-side `hello_timeout_ms: 5_000` — proven not to be a flake factor, noted in plan), or (c) poll intervals (5–25ms sleeps — kept).
+Map EVERY hit onto exactly one bucket. The fixed widen/keep rule (the narrowing decision Fresh Eyes round 2 required — only the read paths these two suites exercise get wider):
+
+- **WIDEN, in `common/mod.rs`:** the handshake frame-read loop inside `connect_and_capture_inventory` (~:936) and `next_frame_of_type` (~:1100) — the two helpers in the two suites' frame path.
+- **WIDEN, in `auto_resume_e2e.rs`:** the two 10s frame budgets (:163, :252) and the two 5s polls (:193 spawn-count poll, :205 settle poll).
+- **WIDEN, in `restore_spawn_gate.rs`:** the file-local helpers' 5s per-frame timeouts (:201, :220, :241, :260) and the two test-side `gate.acquire(5s)` (~:402, ~:438); the nine 1–2s bounded counter polls convert to deadline polls on the same budget.
+- **KEEP (do not widen), with a brief DEFLAKE-keep note where ambiguity could linger:** the 500ms negative-window sleep in `auto_resume_e2e` (load-SAFE direction), the 5–25ms poll intervals (they pace, they don't bound), the server-side `hello_timeout_ms: 5_000` (no evidence it fired; separate door), and EVERY other `common/mod.rs` helper — explicitly `create_shell_terminal` (:955), `wait_for_attach_ready` (:1062), `drain_until_marker_or_deadline` (:995) and their reads — because the suites that use them did not flake and widening them would only raise unrelated suites' failure latency.
 
 - [ ] **Step 2: Add the shared budget constant**
 
@@ -311,7 +344,7 @@ In `crates/freshell-ws/tests/common/mod.rs` (near the top, before the helpers):
 pub const FRAME_BUDGET: Duration = Duration::from_secs(30);
 ```
 
-Then route the 5s per-frame `tokio::time::timeout(Duration::from_secs(5), ws.next())` reads inside THIS file's helpers (the handshake loop in the connect helpers, `next_frame_of_type`, and any others found in Step 1) through `FRAME_BUDGET`.
+Then route ONLY the 5s per-frame `tokio::time::timeout(Duration::from_secs(5), ws.next())` reads in `connect_and_capture_inventory`'s handshake loop (~:936) and in `next_frame_of_type` (~:1100) through `FRAME_BUDGET` — no other helper in this file changes (rule defined in Step 1).
 
 - [ ] **Step 3: Widen `auto_resume_e2e.rs`**
 
@@ -332,11 +365,25 @@ If `restore_spawn_gate.rs`'s file-local helpers now duplicate `common/mod.rs` he
 
 - [ ] **Step 6: Certification (deflake convention)**
 
-Run, in order:
+Run, in order (failure-sensitive: a failed iteration MUST fail the step):
 1. Focused green: `cargo test -p freshell-ws --locked --test auto_resume_e2e --test restore_spawn_gate` — Expected: all 14 tests PASS.
-2. Repeated certification (the f3wp convention): `for i in $(seq 1 10); do cargo test -p freshell-ws --locked --test auto_resume_e2e --test restore_spawn_gate 2>&1 | tail -3; done` and log the 10/10 outcome to `/home/dan/code/freshell/.worktrees/.the-usual-logs/test-flake-hardening/reports/task2-certify.log`.
+2. Repeated certification (the f3wp convention), 10 iterations with per-iteration exit codes kept and evidence logged:
 
-Expected: 10/10 iterations green.
+```bash
+set -o pipefail
+LOG=/home/dan/code/freshell/.worktrees/.the-usual-logs/test-flake-hardening/reports/task2-certify.log
+: > "$LOG"
+for i in $(seq 1 10); do
+  if cargo test -p freshell-ws --locked --test auto_resume_e2e --test restore_spawn_gate >> "$LOG" 2>&1; then
+    echo "run $i: PASS" | tee -a "$LOG"
+  else
+    echo "run $i: FAIL" | tee -a "$LOG"
+  fi
+done
+test "$(grep -c '^run .*: PASS$' "$LOG")" -eq 10 && echo 'CERTIFY 10/10 PASS' || { echo 'CERTIFY FAILED'; exit 1; }
+```
+
+Expected: final line exactly `CERTIFY 10/10 PASS` (any failure prints `CERTIFY FAILED` and exits non-zero).
 
 - [ ] **Step 7: Commit the task**
 
@@ -366,32 +413,54 @@ In the same DEFLAKE comment block above the test, append one paragraph:
 ```
 // DEFLAKE-2 (the-usual test-flake-hardening): the proven flake signature is
 // errno=11 EWOULDBLOCK at the re-acquire after `drop(holder)`: the dropped
-// holder's flock can remain kernel-held for a tick. The one-shot probe-2
-// acquire (which panicked on exactly that signature) and the third
-// construction are therefore REPLACED by one bounded wait that retries ONLY
-// on EWOULDBLOCK, carries probe-2's errno+kind diagnostics verbatim into its
-// panic messages, and panics (with the last errno evidence) on any other
-// errno or on budget expiry. The on-disk evidence probe above and the
-// loser-construction single-writer property stay one-shot and untouched —
-// the C1 no-retry-masking decision holds for everything the wait does not
-// cover: a lock that never frees still fails loudly with its errno named.
+// holder's flock can remain kernel-held for a tick, and `new_locked` swallows
+// the errno into a DISABLED ledger (pane_ledger.rs:247-255). The one-shot
+// probe-2 acquire (which panicked on exactly that signature) and the third
+// construction are therefore REPLACED by one bounded wait whose RETRY UNIT is
+// the third construction itself: each failed construction is diagnosed by a
+// separate acquire_store_lock probe — retry ONLY when the probe shows
+// EWOULDBLOCK (the proven signature), panic immediately with probe 2's
+// errno+kind diagnostics when the probe shows the lock FREE (blind ledger,
+// H2 — never retried, so a real regression cannot be masked), and panic on
+// any other errno or on budget expiry with the last errno evidence. The
+// loser-construction property and the on-disk evidence probe stay one-shot
+// and untouched — the C1 no-retry-masking decision holds for everything the
+// wait does not cover.
 ```
 
 - [ ] **Step 2: Implement the bounded wait (RED/GREEN not applicable — the flake only manifests under load; certification replaces RED/GREEN per the Task 2 note)**
 
-Replace the test's probe-2 block AND third construction (currently `match PaneLedger::acquire_store_lock(&root) { Ok(lock) => drop(lock), Err(err) => panic!(...) }` followed by `let next = PaneLedger::new_locked(...)` at pane_ledger_tests.rs:189-200) with:
+Design constraint (settled by review round 2 with cited code): `new_locked` (pane_ledger.rs:247-255) converts ANY acquire error into a DISABLED ledger and drops the errno, so a gap between a successful probe-drop and a later construction re-acquire can re-deliver the same EWOULDBLOCK with no diagnostics. The retry unit must therefore be the CONSTRUCTION itself, with a separate `acquire_store_lock` probe used ONLY to diagnose a failed construction:
+
+Replace the test's probe-2 block AND third construction (currently the one-shot `match PaneLedger::acquire_store_lock(&root) {...}` at pane_ledger_tests.rs:189-198 followed by `let next = PaneLedger::new_locked(...)` at ~:200) with:
 
 ```rust
-// Bounded wait for the kernel to release the dropped holder's flock:
-// retries ONLY on EWOULDBLOCK (the proven flake signature), panics with
-// the SAME errno+kind diagnostics probe 2 previously carried on anything
-// else, and panics with the last errno evidence on budget expiry.
+// Bounded wait whose retry UNIT is the third construction itself: each
+// failed construction is diagnosed by a separate acquire_store_lock probe
+// (errno surface) — retry ONLY when the probe shows the proven flake
+// signature (EWOULDBLOCK: flock still vapor-held after the holder's drop);
+// when the probe shows the lock FREE the construction came up blind
+// (load_index swallowed an I/O error, H2) or disabled for a non-lock reason
+// — fail immediately with probe 2's errno+kind diagnostic intact; any other
+// errno fails immediately too. On budget expiry, panic with the last errno
+// evidence. The loser-construction property above and the on-disk probe stay
+// one-shot and untouched.
 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
 let next = loop {
+    let candidate = PaneLedger::new_locked(Some(root.clone()));
+    if candidate.ever_bound("claude", "s1") {
+        break candidate;
+    }
+    // Construction failed to see the binding — name the mechanism.
     match PaneLedger::acquire_store_lock(&root) {
         Ok(lock) => {
-            drop(lock); // release before constructing the real ledger
-            break PaneLedger::new_locked(Some(root.clone()));
+            drop(lock);
+            panic!(
+                "third new_locked came up blind while the lock WAS FREE — \
+                 s1.json confirmed on disk by the on-disk probe above, so \
+                 load_index swallowed an I/O error (H2, pane_ledger.rs:314) \
+                 or a non-lock disable path fired"
+            );
         }
         Err(err) => {
             let errno = err.raw_os_error();
@@ -414,9 +483,13 @@ let next = loop {
         }
     }
 };
+// The loop above breaks only when the third construction sees the binding —
+// the old trailing `assert!(next.ever_bound(...))` is subsumed by the loop's
+// success criterion and is removed (it would have been unreachable).
+std::fs::remove_dir_all(&root).ok();
 ```
 
-The `assert!(next.ever_bound("claude", "s1"), ...)` after it stays byte-identical. Evidence probe 1 (on-disk s1.json assert) stays byte-identical. Nothing else in the test, the file, or `pane_ledger.rs` changes.
+Evidence probe 1 (on-disk s1.json assert) stays byte-identical. Nothing else in the test, the file, or `pane_ledger.rs` changes.
 
 - [ ] **Step 3: Focused verification**
 
@@ -430,9 +503,23 @@ Expected: the lock test + all pane_ledger tests PASS; fmt clean for the touched 
 
 - [ ] **Step 4: Certification**
 
-Run: `for i in $(seq 1 20); do cargo test -p freshell-ws --locked pane_ledger 2>&1 | tail -2; done | tee /home/dan/code/freshell/.worktrees/.the-usual-logs/test-flake-hardening/reports/task3-certify.log | rg -c "test result: ok"`
+Run (failure-sensitive, same pattern as Task 2):
 
-Expected: 20 lines (one per iteration), i.e. 20/20 green.
+```bash
+set -o pipefail
+LOG=/home/dan/code/freshell/.worktrees/.the-usual-logs/test-flake-hardening/reports/task3-certify.log
+: > "$LOG"
+for i in $(seq 1 20); do
+  if cargo test -p freshell-ws --locked pane_ledger >> "$LOG" 2>&1; then
+    echo "run $i: PASS" | tee -a "$LOG"
+  else
+    echo "run $i: FAIL" | tee -a "$LOG"
+  fi
+done
+test "$(grep -c '^run .*: PASS$' "$LOG")" -eq 20 && echo 'CERTIFY 20/20 PASS' || { echo 'CERTIFY FAILED'; exit 1; }
+```
+
+Expected: final line exactly `CERTIFY 20/20 PASS` (any failure prints `CERTIFY FAILED` and exits non-zero).
 
 - [ ] **Step 5: Run impacted-test verification**
 
@@ -453,7 +540,7 @@ git commit -m "test(freshell-ws): bounded fail-loud EWOULDBLOCK wait for the pan
 
 ### Final Integration Gate (run at the end, at final HEAD)
 
-In the worktree, with ambient proxy env NOT stripped (that is the Task 1 property under test — assert `$HTTPS_PROXY` non-empty first):
+In the worktree, with ambient proxy env NOT stripped (that is the Task 1 property under test — run the non-printing presence check first: `test -n "${HTTPS_PROXY}${HTTP_PROXY}" && echo 'ambient proxy present (value not printed)' || { export HTTPS_PROXY=http://127.0.0.1:9 HTTP_PROXY=http://127.0.0.1:9; echo 'dummy exported for this gate'; }`; never echo a proxy value because proxy URLs can embed credentials):
 
 1. `npm run typecheck` — exit 0.
 2. `npm run lint` — 0 errors (pre-existing warnings unchanged: 12).
