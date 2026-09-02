@@ -400,12 +400,30 @@ for i in $(seq 1 10); do
   if cargo test -p freshell-ws --locked --test auto_resume_e2e --test restore_spawn_gate --test rate_limit_retry_clock > "$CHUNKS/run-$i.log" 2>&1; then
     echo "run $i: PASS" | tee -a "$LOG"; GREEN=$((GREEN+1))
   else
-    OTHER_FAILS=$(grep "panicked at" "$CHUNKS/run-$i.log" | grep -vc "tests/auto_resume_e2e.rs")
-    ANY_MECHB=$(grep -c 'reason="no_resumable_identity"' "$CHUNKS/run-$i.log")
-    if [ "$OTHER_FAILS" -eq 0 ] && [ "$ANY_MECHB" -ge 1 ]; then
+    # Exact-shape mech-B waiver (addition #5 / delta-r5): the ring is
+    # Debug-rendered with escaped quotes (`reason=\"no_resumable_identity\"`),
+    # so classify on ONE normalized copy with backslashes stripped — every
+    # keyword grep below is then quote-escape-insensitive. ALL FOUR checks
+    # must hold for a waiver; failing ANY check is a hard stop.
+    NORM="$CHUNKS/run-$i.normalized.log"
+    tr -d '\\' < "$CHUNKS/run-$i.log" > "$NORM"
+    # (1) every panic is in auto_resume_e2e (no other file may fail);
+    # (2) >=1 no_resumable_identity occurrence (bare name, escape-insensitive);
+    # (3) NO arrived terminal.replaced frame — matched type-tag-anchored
+    #     because the receipted wait's own panic preamble ("waiting for
+    #     terminal.replaced") contains the bare word; a bare grep would block
+    #     the waivered tail itself. The RE also catches raw-JSON dumps
+    #     (`"type":"terminal.replaced"`, optional space);
+    # (4) NO recovering occurrence (recovery starting then vanishing is a
+    #     different defect).
+    OTHER_FAILS=$(grep "panicked at" "$NORM" | grep -cv "tests/auto_resume_e2e.rs")
+    HAS_MECHB=$(grep -c "no_resumable_identity" "$NORM")
+    ARRIVED_REPLACED=$(grep -cE 'type"?[=:] ?"terminal\.replaced' "$NORM")
+    HAS_RECOVERING=$(grep -c "recovering" "$NORM")
+    if [ "$OTHER_FAILS" -eq 0 ] && [ "$HAS_MECHB" -ge 1 ] && [ "$ARRIVED_REPLACED" -eq 0 ] && [ "$HAS_RECOVERING" -eq 0 ]; then
       echo "run $i: PASS(mech-B waived — settle reason no_resumable_identity; exact signature per addition #5; chunk $CHUNKS/run-$i.log)" | tee -a "$LOG"; MECHB=$((MECHB+1))
     else
-      echo "run $i: FAIL (non-mechanism-B shape — BLOCKS; chunk $CHUNKS/run-$i.log)" | tee -a "$LOG"; BLOCKED=$((BLOCKED+1))
+      echo "run $i: FAIL (non-mechanism-B shape — BLOCKS; other-file panics=$OTHER_FAILS mechB-reasons=$HAS_MECHB arrived-replaced=$ARRIVED_REPLACED recovering=$HAS_RECOVERING; chunk $CHUNKS/run-$i.log)" | tee -a "$LOG"; BLOCKED=$((BLOCKED+1))
     fi
   fi
 done
@@ -414,6 +432,8 @@ echo "CERTIFY: $GREEN green / $MECHB mech-B-waived / $BLOCKED blocked" | tee -a 
 ```
 
 Expected: final line `CERTIFY: … / … / 0 blocked` with exit 0. Any non-mechanism-B shape yields a non-zero exit.
+
+**Plan addition #7 (delta-review round 5, 2026-09-02):** the Step-6 classifier above was rewritten after review found the waiver could neither fire nor enforce: (a) the ring is Debug-rendered, so receipts carry `reason=\"no_resumable_identity\"` with escaped quotes and the old quoted grep never matched; (b) the old checks did not reject other auto-resume failures, other settle reasons, or arrived recovering/replaced frames. The classifier now normalizes each failing chunk ONCE (`tr -d '\\'` — every keyword grep is then quote-escape-insensitive by construction) and requires ALL FOUR checks: (1) every `panicked at` line names `tests/auto_resume_e2e.rs`; (2) ≥1 `no_resumable_identity` occurrence (bare name); (3) NO arrived `terminal.replaced` frame — anchored to the `type=`-tagged arrived-frame shape because the receipted failure line itself (`stream ended while waiting for terminal.replaced: …`, task2c2-certify.log:16) contains the bare word as the awaited-frame name, so a bare-word grep would block the waivered tail itself (the waivered tail is by definition "never replaced": no replaced frame ARRIVES); (4) NO `recovering` occurrence. Standalone-verified against five synthetic chunks (clean pass; exact mech-B shape with escaped quotes waived; recovering-then-vanish, other-file panic, and arrived-replaced all blocked) — evidence: usual-sdd/delta-r5-fix-report.md.
 
 - [ ] **Step 7: Commit the task**
 
@@ -471,7 +491,7 @@ git commit -m "test(freshell-ws): wait_frame_matching records ignored frames for
 
 1. **qzka merge-conflict finding (kept, routed explicitly):** `git merge-tree --write-tree <this-branch> darkforge/qzka` confirms a text conflict in `crates/freshell-ws/src/pane_ledger_tests.rs` (qzka's `6b15cd06e` rewords the final-assert diagnostic text that our bounded-wait replaces). RESOLUTION WITHOUT absorbing or burdening the qzka lane: the constraint "do not conflict with the in-flight branch" is honored by ORDER and DIRECTION — this branch is NOT landed before qzka; when cleared for PR, the landing order is `darkforge/qzka` first, then this branch rebases onto the result and WE perform the manual resolution. Our bounded-wait design SUBSUMES qzka's reworded diagnostic semantically: where their assert text names "scan fault → pane_ledger_scan_unavailable, or a lock race with the holder's drop" as alternatives, our capture-at-failure classifier distinguishes exactly those cases at classification time (errno capture for the lock race; the blind-disabled path reporting scan faults), so nothing qzka's test-side change protects is lost in the resolution. No qzka-side edit is required. This is recorded for the recap and the PR body.
 2. **Task 2 Step 6's certification loop script** now runs all three binaries (`--test auto_resume_e2e --test restore_spawn_gate --test rate_limit_retry_clock`) — the earlier remediation updated the focused command but not the loop.
-3. **The certification loop's waiver mechanism is now operable** (the prior script hard-exited on any FAIL): on a FAIL, the per-iteration chunk is classified — an iteration counts as `PASS(mech-B)` ONLY IF every failing-test name in that chunk belongs to `auto_resume_e2e` AND the chunk contains a settle-ring line with `reason="no_resumable_identity"` (the exact waivered signature) AND no `panicked` line for any other suite/test. Any other failing shape is a hard stop. The loop prints `N green / M mech-B-waived / K blocked`; K > 0 exits 1.
+3. **The certification loop's waiver mechanism is now operable** (the prior script hard-exited on any FAIL): on a FAIL, the per-iteration chunk is classified — an iteration counts as `PASS(mech-B)` ONLY IF every failing-test name in that chunk belongs to `auto_resume_e2e` AND the chunk contains a settle-ring line with `reason="no_resumable_identity"` (the exact waivered signature) AND no `panicked` line for any other suite/test. Any other failing shape is a hard stop. The loop prints `N green / M mech-B-waived / K blocked`; K > 0 exits 1. (Superseded in detail by addition #7 at delta-review round 5: the executable classifier now normalizes Debug-escaped backslashes first and enforces the four-check exact shape — the description here predates that rewrite; the script in Task 2 Step 6 is authoritative.)
 
 **Files:**
 - Modify: `crates/freshell-ws/src/pane_ledger_tests.rs` (`new_locked_degrades_to_disabled_when_another_holder_exists`, :146-209 — ONLY its third-construction segment)
