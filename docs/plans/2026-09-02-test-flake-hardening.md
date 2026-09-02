@@ -605,6 +605,6 @@ In the worktree, with ambient proxy env NOT stripped (that is the Task 1 propert
 4. `npm run test:e2e:helpers` — green (the `test/e2e-browser/vitest.config.ts` this task touches is not loaded by `npm test`).
 5. `cargo test --workspace --locked` — green.
 6. `cargo clippy --workspace --locked --all-targets -- -D warnings` — green; `cargo fmt --check --all` — clean.
-7. Contract regen: `cd crates/freshell-protocol && cargo run --locked --bin contract-regen && git diff --exit-code src/port-contract.rs` (evidence: `[contract] wrote ... 2970 lines ... 211 types + 45 normalized paths`).
+7. Contract regen idempotence: `npm run contract:generate && git diff --exit-code port/contract/` — the generated contract is drift-free at HEAD.
 8. `npm run build` — exit 0.
 9. E2e: not required (test-infrastructure-only change; no user-facing behavior; e2e helpers manage their own env), recorded as a deliberate skip.
