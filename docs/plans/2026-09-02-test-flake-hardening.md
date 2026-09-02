@@ -415,6 +415,37 @@ git commit -m "test(freshell-ws): widen ws-e2e frame/poll budgets to a shared 30
 
 ---
 
+**Plan addition #3 (mechanism-B RCA, 2026-09-02):** the remaining auto_resume zero-frame stall (2 occurrences in ~40 runs under load) root-caused to: `wait_frame_matching` silently ignores every non-matching frame, including the hub's terminal `terminal.status{exited}` settle that fires on every replacement-abort tail — so the receipts cannot name the mechanism. Fix, per the repo's f3wp self-diagnosing idiom (884fc8721): make `wait_frame_matching` record the type (and key fields) of up to the last ~10 ignored frames and include them in its deadline panic message. The failure (if it recurs) still FAILS at the same point with the same budget — only the diagnostic is complete. The RCA also identified a genuine production-side question (auto-resume hub supervisor CrashEvent loss-on-panic, auto_resume.rs:233-279) which is OUT OF SCOPE for this plan (production change owned elsewhere) and is recorded for the recap.
+
+### Task 2b: Mechanism-B self-diagnosing instrumentation
+
+**Files:**
+- Modify: `crates/freshell-ws/tests/auto_resume_e2e.rs` (`wait_frame_matching` helper, ~:110-131, plus its panic message)
+- Test: the suites themselves (certification as in Task 2)
+
+**Interfaces:**
+- Consumes: existing `common::FRAME_BUDGET` (Task 2); `WsMessage` scan logic.
+- Produces: `wait_frame_matching` panic messages now enumerate ignored frames (type + `status`/`code` when present).
+
+- [ ] **Step 1: Extend the helper (self-diagnosing idiom)**
+
+Change ONLY `wait_frame_matching` inside `auto_resume_e2e.rs` (this file's private helper — the shared `common/mod.rs` helpers stay untouched, per Task 2's fixed widen/keep rule): keep the frame loop identical, but track ignored frames: on `Ok(Some(Ok(WsMessage::Text(text))))` that parses but fails `pred`, record `value["type"]` plus `value["status"]` / `value["code"]` when present, keeping the last 10 in a `VecDeque`/`Vec` ring; on deadline expiry, include them in the panic message, e.g. `panic!("{what} never arrived before the deadline; ignored frames (last {n}): ...")`. Keep the existing `other => panic!("stream ended while waiting for {what}: {other:?}")` branch byte-identical.
+
+- [ ] **Step 2: Focused green + certification**
+
+Run: the Task 2 focused command, then the Task 2 certification loop verbatim (10 iterations, failure-sensitive, log to `reports/task2b-certify.log`) → final line `CERTIFY 10/10 PASS`.
+
+Expected: PASS. If mechanism B recurs, the log now names the settle frames it ignored — record the receipt and STOP with BLOCKED (do not paper over).
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add crates/freshell-ws/tests/auto_resume_e2e.rs
+git commit -m "test(freshell-ws): wait_frame_matching records ignored frames for flake diagnosis"
+```
+
+---
+
 ### Task 3: Bounded fail-loud EWOULDBLOCK wait in the pane_ledger lock test
 
 **Files:**
