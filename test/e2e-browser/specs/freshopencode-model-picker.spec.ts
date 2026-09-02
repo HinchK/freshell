@@ -118,17 +118,29 @@ async function routeCatalog(page: Page, catalog: unknown): Promise<void> {
   })
 }
 
-async function routeThreads(page: Page): Promise<void> {
+/**
+ * Serves the fresh-agent thread snapshot with optional overrides (e.g. a
+ * stubbed `commands` catalog). Returns a hit-count getter so tests can gate
+ * menu assertions on the stubbed snapshot having LANDED (freshopencode pane
+ * state is a settled no-commands/catalog state, never a pre-fetch transient).
+ */
+async function routeThreads(page: Page, overrides?: Record<string, unknown>): Promise<() => number> {
+  let hits = 0
   await page.route('**/api/fresh-agent/threads/**', async (route) => {
     const url = new URL(route.request().url())
     const [, sessionType = 'freshopencode', provider = 'opencode', threadId = 'ses_e2e'] =
       url.pathname.match(/\/api\/fresh-agent\/threads\/([^/]+)\/([^/]+)\/([^/?]+)/) ?? []
+    hits += 1
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
-      body: JSON.stringify(freshAgentSnapshot(sessionType, provider, decodeURIComponent(threadId))),
+      body: JSON.stringify({
+        ...freshAgentSnapshot(sessionType, provider, decodeURIComponent(threadId)),
+        ...(overrides ?? {}),
+      }),
     })
   })
+  return () => hits
 }
 
 async function routeFileApis(page: Page, cwd: string): Promise<void> {
@@ -207,9 +219,9 @@ async function createFreshopencodePane(page: Page, cwd: string): Promise<void> {
 
 async function openFreshAgentSettings(page: Page) {
   const pane = page.getByRole('group').filter({
-    // The pane banner badge renders the provider lowercase ("freshopencode");
-    // fresh-agent.spec.ts's identical helper filters on providerName.toLowerCase().
-    has: page.getByText('freshopencode', { exact: true }),
+    // The pane header identifies a fresh-agent pane by its agent-icon tooltip
+    // ("<Label> (<sessionType> pane)") — there is no session-type text label.
+    has: page.getByTitle('OpenCode (freshopencode pane)'),
   }).last()
   await expect(pane).toBeVisible({ timeout: 10_000 })
 
@@ -424,5 +436,123 @@ test.describe('Freshopencode model + thinking selector', () => {
     await composer.press('Enter')
     await expect(page.getByRole('alert').filter({ hasText: 'Model catalog unavailable — try again' })).toBeVisible({ timeout: 10_000 })
     await expect(page.getByRole('dialog', { name: 'Model and thinking level' })).toHaveCount(0)
+  })
+})
+
+/**
+ * Slash-command menu: provider-advertised session rows (freshopencode leg).
+ * The view merges `snapshot.commands` (stubbed here through routeThreads)
+ * into the composer menu as a second, labelled group that inserts verbatim
+ * `/name ` text on select — never dispatching, never auto-sending. Statics
+ * (Pane actions) are byte-identical when the catalog is absent.
+ */
+test.describe('Fresh-agent slash-command menu — stubbed provider catalog (freshopencode leg)', () => {
+  const DEPLOY_COMMAND = { name: 'deploy', description: 'Deploy the thing', argumentHint: '<env>' }
+
+  async function bootPaneWithSnapshot(page: Page, cwd: string, overrides?: Record<string, unknown>): Promise<() => number> {
+    const hits = await routeThreads(page, overrides)
+    await routeFileApis(page, cwd)
+    await enableFreshClientsAndOpencode(page)
+    await createFreshopencodePane(page, cwd)
+    // Hold all menu assertions until the stubbed snapshot has LANDED, so the
+    // observed menu is the settled state (never a pre-fetch transient).
+    await expect.poll(() => hits(), { timeout: 10_000 }).toBeGreaterThan(0)
+    const composer = page.getByRole('textbox', { name: 'Chat message input' })
+    await expect(composer).toBeEnabled({ timeout: 15_000 })
+    return hits
+  }
+
+  test('snapshot.commands renders as a grouped "Agent session" section beside the static "Pane actions"', async ({
+    freshellPage,
+    page,
+    terminal,
+  }) => {
+    await terminal.waitForTerminal()
+    const cwd = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-slash-catalog-'))
+    await bootPaneWithSnapshot(page, cwd, { commands: [DEPLOY_COMMAND] })
+
+    // Typed-prefix entry: '/d' matches /model (static) AND /deploy (catalog).
+    const composer = page.getByRole('textbox', { name: 'Chat message input' })
+    await composer.fill('/d')
+
+    const menu = page.getByRole('menu', { name: 'Slash commands' })
+    await expect(menu).toBeVisible({ timeout: 10_000 })
+
+    const groups = menu.getByRole('group')
+    await expect(groups).toHaveCount(2)
+    await expect(groups.nth(0)).toContainText('Pane actions')
+    await expect(groups.nth(1)).toContainText('Agent session')
+
+    const paneActions = menu.getByRole('group', { name: 'Pane actions' })
+    const agentSession = menu.getByRole('group', { name: 'Agent session' })
+    await expect(paneActions.getByRole('menuitem', { name: /^\/model/ })).toHaveCount(1)
+    // The catalog row carries its argumentHint and description verbatim.
+    await expect(agentSession.getByRole('menuitem', { name: /\/deploy <env>\s*Deploy the thing/ })).toHaveCount(1)
+    await expect(menu.getByRole('menuitem')).toHaveCount(2)
+  })
+
+  test('selecting a session row inserts /name into the composer and never sends', async ({
+    freshellPage,
+    page,
+    harness,
+    terminal,
+  }) => {
+    await terminal.waitForTerminal()
+    const cwd = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-slash-insert-'))
+    await bootPaneWithSnapshot(page, cwd, { commands: [DEPLOY_COMMAND] })
+    await harness.clearSentWsMessages()
+
+    const composer = page.getByRole('textbox', { name: 'Chat message input' })
+    await composer.fill('/d')
+    const menu = page.getByRole('menu', { name: 'Slash commands' })
+    const deployRow = menu
+      .getByRole('group', { name: 'Agent session' })
+      .getByRole('menuitem', { name: /\/deploy/ })
+    await expect(deployRow).toBeVisible({ timeout: 10_000 })
+    await deployRow.click()
+
+    // Insert-never-send: the canonical slash text lands in the input, the menu
+    // closes, and NOTHING leaves the page on the wire.
+    await expect(composer).toHaveValue('/deploy ')
+    await expect(menu).toHaveCount(0)
+
+    // Bounded negative window: poll the WS spy for the full window so even a
+    // LATE send frame (retries/queued effects) would be caught.
+    const deadline = Date.now() + 1500
+    while (Date.now() < deadline) {
+      const sent = (await harness.getSentWsMessages()) as Array<{ type?: string }>
+      expect(
+        sent.some((message) => message?.type === 'freshAgent.send'),
+        'session-row selection must never emit a freshAgent.send frame',
+      ).toBe(false)
+      await page.waitForTimeout(150)
+    }
+  })
+
+  test('snapshot without commands shows the static action list with no "Agent session" group', async ({
+    freshellPage,
+    page,
+    terminal,
+  }) => {
+    await terminal.waitForTerminal()
+    const cwd = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-slash-statics-'))
+    await bootPaneWithSnapshot(page, cwd) // no overrides: the stub omits `commands`
+
+    // Browse entry: the slash button lists every row regardless of filter.
+    await page.getByRole('button', { name: 'Slash commands' }).click()
+    const menu = page.getByRole('menu', { name: 'Slash commands' })
+    await expect(menu).toBeVisible({ timeout: 10_000 })
+
+    // All four statics (the freshopencode set, fork included via stubbed
+    // capabilities.fork=true), and nothing else.
+    await expect(menu.getByRole('menuitem', { name: /^\/new/ })).toHaveCount(1)
+    await expect(menu.getByRole('menuitem', { name: /^\/compact/ })).toHaveCount(1)
+    await expect(menu.getByRole('menuitem', { name: /^\/fork/ })).toHaveCount(1)
+    await expect(menu.getByRole('menuitem', { name: /^\/model/ })).toHaveCount(1)
+    await expect(menu.getByRole('menuitem')).toHaveCount(4)
+
+    // Structure witness: no provider-catalog group, no catalog rows at all.
+    await expect(menu.getByRole('group', { name: 'Agent session' })).toHaveCount(0)
+    await expect(menu.getByRole('menuitem', { name: /\/deploy/ })).toHaveCount(0)
   })
 })

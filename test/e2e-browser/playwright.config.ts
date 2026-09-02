@@ -167,6 +167,13 @@ export const MATRIX_SPECS = [
   // shared code, so legacy is a true regression control proving they didn't
   // regress Node behavior. See title-sync-convergence.spec.ts.
   /title-sync-convergence\.spec\.ts$/,
+  // HOST-STATS (host-pressure-pane plan, Task 10) — Host Stats pane smoke:
+  // picker create, verdict strip/CPU tile, refresh interaction (Collecting
+  // state + age label), Disks fallback em-dash contract, tab-switch liveness,
+  // reload restore. Assertions are backend-agnostic (the Rust lane renders
+  // zero-shape values identically), so legacy is a true parity control. See
+  // test/e2e-browser/specs/host-stats-pane.spec.ts.
+  /host-stats-pane\.spec\.ts$/,
 ]
 
 // CONTINUITY TRIO: rust-only specs kept out of every match-all project
@@ -202,6 +209,10 @@ export const RUST_ONLY_SPECS = [
   // LANE E create protection: two concurrent RustServers, storm-isolation
   // proof. See docs/plans/2026-07-25-rust-create-protection.md
   /create-protection-isolation-rust\.spec\.ts$/,
+  // Server-build mismatch auto-reload: injects a mismatched ready.buildId
+  // through the test harness and proves ONE sentinel-guarded reload.
+  // Rust-only: owns a RustServer directly (see the spec header).
+  /server-build-mismatch-rust\.spec\.ts$/,
   /launch-retry-restart-rust\.spec\.ts$/,
   /double-restart-terminal-restore-rust\.spec\.ts$/,
   /turn-complete-restart-resume-rust\.spec\.ts$/,
@@ -243,6 +254,11 @@ export const RUST_ONLY_SPECS = [
   // P1.13 (Lane B4 Task 14): per-provider settings survive restart + codex
   // crash memory-loss banner. Imports RustServer directly for restartAbrupt().
   /freshagent-settings-resume-rust\.spec\.ts$/,
+  // Task 6 (the-usual/freshagent-sessionref-regression): REST fresh-agent
+  // `sessionRef` resume (durable + placeholder→durable via the pane ledger,
+  // loud 4xx failures) + the tabs.sync registry placeholder clamp. Imports
+  // RustServer directly for restartAbrupt().
+  /fresh-agent-rest-resume-rust\.spec\.ts$/,
   // imports RustServer directly; restart()/ledger semantics are rust-only (P1.14)
   /sidebar-registry-sync-rust\.spec\.ts$/,
   // Lane D1: agent crash auto-resume — rust-server-only spec.
@@ -293,6 +309,9 @@ export const RUST_ONLY_SPECS = [
   // RustServers, hard e2eServerKind==='rust' assertion per test; the legacy
   // tree has no amplifier provider registered at all (pre-existing gap fix).
   /remote-tab-linkage-rust\.spec\.ts$/,
+  // Reconnect-revive acceptance: socket-drop/freeze revival; drives
+  // RustServer + forceDisconnect + SIGSTOP (docs/plans/2026-08-22-reconnect-revive.md).
+  /reconnect-revive-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -365,6 +384,9 @@ export default defineConfig({
         // Rust WS create path's codex-special resume derivation ignoring
         // `sessionRef` (legacy anchor `ws-handler.ts:2040-2047` was correct).
         /codex-terminal-bounce-rust\.spec\.ts$/,
+        // Server-build mismatch auto-reload (the-usual/server-version-reload):
+        // mismatched ready.buildId → one reload, sentinel suppresses repeats.
+        /server-build-mismatch-rust\.spec\.ts$/,
         // MCP bridge pin (Slice 2, docs/plans/2026-07-18-agent-api-mcp-parity-spec.md
         // §6/§8.3): drives the UNMODIFIED legacy Node MCP stdio binary
         // against an owned, ephemeral Rust server. Rust-only (no legacy
@@ -471,6 +493,9 @@ export default defineConfig({
         // codex crash memory-loss banner. Imports RustServer directly for
         // restartAbrupt().
         /freshagent-settings-resume-rust\.spec\.ts$/,
+        // Task 6 (see the RUST_ONLY_SPECS entry): REST fresh-agent resume +
+        // registry placeholder clamp. Imports RustServer for restartAbrupt().
+        /fresh-agent-rest-resume-rust\.spec\.ts$/,
         // P1.14 (Lane C1): sidebar/tab-registry sync pinning suite -- imports
         // RustServer directly; restart()/ledger semantics are rust-only.
         /sidebar-registry-sync-rust\.spec\.ts$/,
@@ -537,6 +562,9 @@ export default defineConfig({
         // SESSION-02/03 -- soft-delete route + unmatched-/api/* 404-JSON
         // contract wall (see RUST_ONLY_SPECS entry + the spec's doc comment).
         /session-delete-rust\.spec\.ts$/,
+        // Reconnect-revive acceptance: socket-drop/freeze revival; drives
+        // RustServer + forceDisconnect + SIGSTOP (see RUST_ONLY_SPECS entry).
+        /reconnect-revive-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL

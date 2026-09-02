@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createRef } from 'react'
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { FreshAgentComposer, type FreshAgentComposerHandle } from '@/components/fresh-agent/FreshAgentComposer'
-import type { FreshAgentSlashCommand } from '@shared/fresh-agent-slash-commands'
+import type { FreshAgentSessionMenuRow, FreshAgentSlashCommand } from '@shared/fresh-agent-slash-commands'
 
 const apiGet = vi.fn()
 vi.mock('@/lib/api', () => ({
@@ -17,6 +17,9 @@ const COMMANDS: readonly FreshAgentSlashCommand[] = [
   { name: 'compact', description: 'Compact the context', action: 'compact' },
   { name: 'fork', description: 'Fork this conversation', action: 'fork', requiresCapability: 'fork' },
 ]
+// The composer prop is the grouped menu: statics under `action`,
+// provider-advertised rows under `session`.
+const GROUPED_COMMANDS = { action: COMMANDS, session: [] }
 
 function getInput(): HTMLTextAreaElement {
   return screen.getByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
@@ -32,7 +35,7 @@ describe('FreshAgentComposer', () => {
 
   it('opens the slash menu when typing / and runs the highlighted command', () => {
     const onCommand = vi.fn()
-    render(<FreshAgentComposer commands={COMMANDS} onCommand={onCommand} />)
+    render(<FreshAgentComposer commands={GROUPED_COMMANDS} onCommand={onCommand} />)
 
     fireEvent.change(getInput(), { target: { value: '/for' } })
     const menu = screen.getByRole('menu', { name: 'Slash commands' })
@@ -48,7 +51,7 @@ describe('FreshAgentComposer', () => {
 
   it('passes arguments through slash command text', () => {
     const onCommand = vi.fn()
-    render(<FreshAgentComposer commands={COMMANDS} onCommand={onCommand} />)
+    render(<FreshAgentComposer commands={GROUPED_COMMANDS} onCommand={onCommand} />)
 
     fireEvent.change(getInput(), { target: { value: '/compact focus on ws-handler' } })
     fireEvent.keyDown(getInput(), { key: 'Enter' })
@@ -60,7 +63,7 @@ describe('FreshAgentComposer', () => {
 
   it('completes the highlighted slash command with Tab without sending it', () => {
     const onCommand = vi.fn()
-    render(<FreshAgentComposer commands={COMMANDS} onCommand={onCommand} />)
+    render(<FreshAgentComposer commands={GROUPED_COMMANDS} onCommand={onCommand} />)
 
     fireEvent.change(getInput(), { target: { value: '/for' } })
     fireEvent.keyDown(getInput(), { key: 'Tab' })
@@ -77,7 +80,7 @@ describe('FreshAgentComposer', () => {
       ],
     })
     const onSend = vi.fn()
-    render(<FreshAgentComposer commands={COMMANDS} onSend={onSend} cwd="/home/dan/code/freshell" />)
+    render(<FreshAgentComposer commands={GROUPED_COMMANDS} onSend={onSend} cwd="/home/dan/code/freshell" />)
 
     fireEvent.change(getInput(), { target: { value: 'look at @s' } })
 
@@ -98,7 +101,7 @@ describe('FreshAgentComposer', () => {
     apiGet.mockResolvedValue({
       suggestions: [{ path: '/home/dan/code/freshell/server', isDirectory: true }],
     })
-    render(<FreshAgentComposer commands={COMMANDS} cwd="/home/dan/code/freshell" />)
+    render(<FreshAgentComposer commands={GROUPED_COMMANDS} cwd="/home/dan/code/freshell" />)
 
     fireEvent.change(getInput(), { target: { value: '@se' } })
     const item = await screen.findByRole('menuitem', { name: /server/ })
@@ -116,7 +119,7 @@ describe('FreshAgentComposer', () => {
     const onSend = vi.fn()
     render(
       <FreshAgentComposer
-        commands={COMMANDS}
+        commands={GROUPED_COMMANDS}
         onSend={onSend}
         historyKey="fresh-agent-prompt-history:test"
       />,
@@ -142,13 +145,13 @@ describe('FreshAgentComposer', () => {
   it('persists prompt history per history key', () => {
     const key = 'fresh-agent-prompt-history:persist-test'
     const first = render(
-      <FreshAgentComposer commands={COMMANDS} onSend={vi.fn()} historyKey={key} />,
+      <FreshAgentComposer commands={GROUPED_COMMANDS} onSend={vi.fn()} historyKey={key} />,
     )
     fireEvent.change(getInput(), { target: { value: 'remembered prompt' } })
     fireEvent.keyDown(getInput(), { key: 'Enter' })
     first.unmount()
 
-    render(<FreshAgentComposer commands={COMMANDS} onSend={vi.fn()} historyKey={key} />)
+    render(<FreshAgentComposer commands={GROUPED_COMMANDS} onSend={vi.fn()} historyKey={key} />)
     fireEvent.keyDown(getInput(), { key: 'ArrowUp' })
     expect(getInput().value).toBe('remembered prompt')
   })
@@ -156,7 +159,7 @@ describe('FreshAgentComposer', () => {
   it('does not hijack ArrowUp while drafting text', () => {
     render(
       <FreshAgentComposer
-        commands={COMMANDS}
+        commands={GROUPED_COMMANDS}
         onSend={vi.fn()}
         historyKey="fresh-agent-prompt-history:drafting"
       />,
@@ -170,7 +173,7 @@ describe('FreshAgentComposer', () => {
   })
 
   it('focuses the chat input by default when requested and enabled', async () => {
-    render(<FreshAgentComposer commands={COMMANDS} focusOnReady onSend={vi.fn()} />)
+    render(<FreshAgentComposer commands={GROUPED_COMMANDS} focusOnReady onSend={vi.fn()} />)
 
     await waitFor(() => {
       expect(document.activeElement).toBe(getInput())
@@ -178,17 +181,17 @@ describe('FreshAgentComposer', () => {
   })
 
   it('keeps the subtle thinking bar slot stable when work starts and stops', () => {
-    const { rerender } = render(<FreshAgentComposer commands={COMMANDS} onSend={vi.fn()} />)
+    const { rerender } = render(<FreshAgentComposer commands={GROUPED_COMMANDS} onSend={vi.fn()} />)
 
     expect(screen.getByTestId('fresh-agent-thinking-bar')).toHaveAttribute('data-state', 'idle')
 
-    rerender(<FreshAgentComposer commands={COMMANDS} thinking onSend={vi.fn()} />)
+    rerender(<FreshAgentComposer commands={GROUPED_COMMANDS} thinking onSend={vi.fn()} />)
     expect(screen.getByTestId('fresh-agent-thinking-bar')).toBeInTheDocument()
     expect(screen.getByTestId('fresh-agent-thinking-bar')).toHaveAttribute('data-state', 'active')
   })
 
   it('matches message text sizing and labels the command and send buttons with tooltips', () => {
-    render(<FreshAgentComposer commands={COMMANDS} onSend={vi.fn()} />)
+    render(<FreshAgentComposer commands={GROUPED_COMMANDS} onSend={vi.fn()} />)
 
     expect(getInput().className).toContain('fresh-agent-composer-input')
     expect(getInput().className).toContain('text-base')
@@ -212,7 +215,7 @@ describe('FreshAgentComposer', () => {
     const onCancelQueued = vi.fn()
     render(
       <FreshAgentComposer
-        commands={COMMANDS}
+        commands={GROUPED_COMMANDS}
         queuedMessages={[
           'Do not pin my newest message at the bottom',
           'Keep this queued follow-up private until expanded',
@@ -232,11 +235,221 @@ describe('FreshAgentComposer', () => {
     expect(onCancelQueued).toHaveBeenCalledWith(0)
   })
 
+  describe('grouped slash menu (provider session commands)', () => {
+    const SESSION_ROWS: readonly FreshAgentSessionMenuRow[] = [
+      {
+        kind: 'session',
+        name: 'review',
+        description: 'Review the current diff',
+        argumentHint: '[file]',
+        aliases: ['pr'],
+      },
+      { kind: 'session', name: 'init', description: 'Scan the project and write AGENTS.md' },
+    ]
+
+    it('groups pane actions before provider session rows behind labelled dividers', () => {
+      render(
+        <FreshAgentComposer
+          commands={{ action: COMMANDS, session: SESSION_ROWS }}
+          onCommand={vi.fn()}
+        />,
+      )
+
+      fireEvent.change(getInput(), { target: { value: '/' } })
+      const menu = screen.getByRole('menu', { name: 'Slash commands' })
+
+      const paneActions = within(menu).getByRole('group', { name: 'Pane actions' })
+      const agentSession = within(menu).getByRole('group', { name: 'Agent session' })
+      // Divider labels are visible, static text (not focusable rows).
+      expect(within(paneActions).getByText('Pane actions')).toBeInTheDocument()
+      expect(within(agentSession).getByText('Agent session')).toBeInTheDocument()
+
+      // Action rows render first, session rows after (flat document order).
+      const items = within(menu).getAllByRole('menuitem')
+      expect(items.map((item) => item.textContent)).toEqual([
+        expect.stringContaining('/new'),
+        expect.stringContaining('/compact'),
+        expect.stringContaining('/fork'),
+        expect.stringContaining('/review'),
+        expect.stringContaining('/init'),
+      ])
+
+      // Session rows render name + description + argumentHint.
+      const reviewRow = within(agentSession).getByRole('menuitem', { name: /\/review/ })
+      expect(reviewRow).toHaveTextContent('/review')
+      expect(reviewRow).toHaveTextContent('Review the current diff')
+      expect(reviewRow).toHaveTextContent('[file]')
+    })
+
+    it('renders colliding action and session rows and keeps typed-Enter dispatching the action', () => {
+      const onCommand = vi.fn()
+      const onSend = vi.fn()
+      render(
+        <FreshAgentComposer
+          commands={{
+            action: [{ name: 'compact', description: 'Compact the context (pane action)', action: 'compact' }],
+            session: [{ kind: 'session', name: 'compact', description: 'Provider compact (session command)' }],
+          }}
+          onCommand={onCommand}
+          onSend={onSend}
+        />,
+      )
+
+      fireEvent.change(getInput(), { target: { value: '/compact' } })
+      expect(screen.getAllByRole('menuitem', { name: /\/compact/ })).toHaveLength(2)
+
+      fireEvent.keyDown(getInput(), { key: 'Enter' })
+      expect(onCommand).toHaveBeenCalledWith(
+        expect.objectContaining({ name: 'compact', action: 'compact' }),
+        '',
+      )
+      expect(onSend).not.toHaveBeenCalled()
+      // The action executed; the input was NOT left holding '/compact ' text.
+      expect(getInput().value).toBe('')
+    })
+
+    it('inserts the canonical session command name on click select and never sends', async () => {
+      const onCommand = vi.fn()
+      const onSend = vi.fn()
+      render(
+        <FreshAgentComposer
+          commands={{ action: [], session: SESSION_ROWS }}
+          onCommand={onCommand}
+          onSend={onSend}
+        />,
+      )
+
+      // The 'review' row carries the alias 'pr'; selection still inserts the
+      // canonical catalog name.
+      fireEvent.change(getInput(), { target: { value: '/rev' } })
+      fireEvent.click(screen.getByRole('menuitem', { name: /\/review/ }))
+
+      expect(getInput().value).toBe('/review ')
+      expect(onCommand).not.toHaveBeenCalled()
+      expect(onSend).not.toHaveBeenCalled()
+      await waitFor(() => expect(document.activeElement).toBe(getInput()))
+    })
+
+    it('inserts the canonical session command name on keyboard select and never sends', async () => {
+      const onCommand = vi.fn()
+      const onSend = vi.fn()
+      render(
+        <FreshAgentComposer
+          commands={{ action: [], session: SESSION_ROWS }}
+          onCommand={onCommand}
+          onSend={onSend}
+        />,
+      )
+
+      fireEvent.change(getInput(), { target: { value: '/rev' } })
+      fireEvent.keyDown(getInput(), { key: 'Enter' })
+
+      expect(getInput().value).toBe('/review ')
+      expect(onCommand).not.toHaveBeenCalled()
+      expect(onSend).not.toHaveBeenCalled()
+      await waitFor(() => expect(document.activeElement).toBe(getInput()))
+    })
+
+    it('sends a typed unknown slash command verbatim (session rows never hijack typed-Enter)', () => {
+      const onCommand = vi.fn()
+      const onSend = vi.fn()
+      render(
+        <FreshAgentComposer
+          commands={{ action: [], session: SESSION_ROWS }}
+          onCommand={onCommand}
+          onSend={onSend}
+        />,
+      )
+
+      // '/pr' is only an alias of the 'review' session row: typed-Enter
+      // dispatch consults action rows only, so the text ships verbatim.
+      fireEvent.change(getInput(), { target: { value: '/pr docs' } })
+      fireEvent.keyDown(getInput(), { key: 'Enter' })
+
+      expect(onSend).toHaveBeenCalledWith('/pr docs', [])
+      expect(onCommand).not.toHaveBeenCalled()
+    })
+
+    it('describes Enter accurately for the highlighted row kind: runs for pane actions, inserts for session rows', () => {
+      render(
+        <FreshAgentComposer
+          commands={{ action: COMMANDS, session: SESSION_ROWS }}
+          onCommand={vi.fn()}
+        />,
+      )
+
+      fireEvent.change(getInput(), { target: { value: '/' } })
+      const menu = screen.getByRole('menu', { name: 'Slash commands' })
+      // The highlight opens on the first pane action row: Enter RUNS that action.
+      expect(within(menu).getByText('Enter runs')).toBeInTheDocument()
+
+      // Walk the highlight onto the first session row: Enter INSERTS that row's
+      // /name text — the hint must not claim it runs anything.
+      fireEvent.keyDown(getInput(), { key: 'ArrowDown' })
+      fireEvent.keyDown(getInput(), { key: 'ArrowDown' })
+      fireEvent.keyDown(getInput(), { key: 'ArrowDown' })
+      expect(within(menu).getByText('Enter inserts')).toBeInTheDocument()
+      expect(within(menu).queryByText('Enter runs')).toBeNull()
+
+      // Back onto a pane action row, the original hint returns unchanged.
+      fireEvent.keyDown(getInput(), { key: 'ArrowUp' })
+      expect(within(menu).getByText('Enter runs')).toBeInTheDocument()
+      expect(within(menu).queryByText('Enter inserts')).toBeNull()
+    })
+
+    it('renders the flat single-list menu structure when no session rows exist', () => {
+      render(
+        <FreshAgentComposer
+          commands={{ action: COMMANDS, session: [] }}
+          onCommand={vi.fn()}
+        />,
+      )
+
+      fireEvent.change(getInput(), { target: { value: '/' } })
+      const menu = screen.getByRole('menu', { name: 'Slash commands' })
+      expect(within(menu).queryByRole('group')).toBeNull()
+      expect(within(menu).queryByText('Pane actions')).toBeNull()
+      expect(within(menu).queryByText('Agent session')).toBeNull()
+      expect(within(menu).getAllByRole('menuitem')).toHaveLength(3)
+    })
+
+    it('matches colliding rows on a name-substring filter and leaves no menu ARIA once closed', () => {
+      render(
+        <FreshAgentComposer
+          commands={{
+            action: [{ name: 'compact', description: 'Compact the context (pane action)', action: 'compact' }],
+            session: [{ kind: 'session', name: 'compact', description: 'Provider compact (session command)' }],
+          }}
+          onCommand={vi.fn()}
+        />,
+      )
+
+      fireEvent.change(getInput(), { target: { value: '/comp' } })
+      expect(screen.getAllByRole('menuitem', { name: /\/compact/ })).toHaveLength(2)
+      expect(screen.getByRole('group', { name: 'Pane actions' })).toBeInTheDocument()
+      expect(screen.getByRole('group', { name: 'Agent session' })).toBeInTheDocument()
+
+      // Clearing the draft closes the menu (Escape in chat mode re-opens
+      // immediately while the input still holds '/…' — a pre-existing quirk
+      // left alone here). Closed means: no menu roles anywhere, and the input
+      // never grew combobox ARIA.
+      fireEvent.change(getInput(), { target: { value: '' } })
+      expect(screen.queryByRole('menu')).toBeNull()
+      expect(screen.queryByRole('menuitem')).toBeNull()
+      expect(screen.queryByRole('group')).toBeNull()
+      // The input never grows combobox ARIA — the menu owns all of it,
+      // only while open.
+      expect(getInput()).not.toHaveAttribute('aria-expanded')
+      expect(getInput()).not.toHaveAttribute('aria-controls')
+      expect(getInput()).not.toHaveAttribute('aria-activedescendant')
+    })
+  })
+
   describe('state-aware disabled behavior', () => {
     it('shows the provided placeholder instead of the generic read-only text', () => {
       render(
         <FreshAgentComposer
-          commands={COMMANDS}
+          commands={GROUPED_COMMANDS}
           disabled
           placeholder="Starting session…"
         />,
@@ -245,13 +458,13 @@ describe('FreshAgentComposer', () => {
     })
 
     it('falls back to Read-only session when disabled without a placeholder', () => {
-      render(<FreshAgentComposer commands={COMMANDS} disabled />)
+      render(<FreshAgentComposer commands={GROUPED_COMMANDS} disabled />)
       expect(getInput()).toHaveAttribute('placeholder', 'Read-only session')
     })
 
     it('keeps /new reachable from the command menu while disabled', () => {
       const onCommand = vi.fn()
-      render(<FreshAgentComposer commands={COMMANDS} disabled onCommand={onCommand} />)
+      render(<FreshAgentComposer commands={GROUPED_COMMANDS} disabled onCommand={onCommand} />)
 
       const browse = screen.getByRole('button', { name: 'Slash commands' })
       expect(browse).toBeEnabled()
@@ -307,7 +520,7 @@ describe('FreshAgentComposer', () => {
       // (capability-filtered in shared/fresh-agent-slash-commands.ts, Task 1).
       render(
         <FreshAgentComposer
-          commands={[...COMMANDS, UNDO_COMMAND]}
+          commands={{ action: [...COMMANDS, UNDO_COMMAND], session: [] }}
           onCommand={onCommand}
           onSend={onSend}
           onReservedRollbackCommand={onReservedRollbackCommand}
@@ -335,7 +548,7 @@ describe('FreshAgentComposer', () => {
       const onReservedRollbackCommand = vi.fn()
       render(
         <FreshAgentComposer
-          commands={COMMANDS}
+          commands={{ action: COMMANDS, session: [] }}
           onSend={onSend}
           onReservedRollbackCommand={onReservedRollbackCommand}
         />,
@@ -357,7 +570,7 @@ describe('FreshAgentComposer', () => {
       // freshopencode-shaped catalog: /undo AND /redo both resolve.
       render(
         <FreshAgentComposer
-          commands={[...COMMANDS, UNDO_COMMAND, REDO_COMMAND]}
+          commands={{ action: [...COMMANDS, UNDO_COMMAND, REDO_COMMAND], session: [] }}
           onCommand={onCommand}
           onSend={onSend}
           onReservedRollbackCommand={onReservedRollbackCommand}

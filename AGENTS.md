@@ -12,6 +12,7 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 
 ## Repo Rules
 - Always work in a worktree (in \.worktrees\)
+- Pull before starting major work: `git fetch origin` and bring local `main` to `origin/main` (fast-forward) so new work always bases on the latest merged state.
 - Before creating a new worktree, ensure the repo-supported test suite is green on the intended base. If the suite is not green, pause before creating the worktree and notify the user with the failing command and failure summary.
 - New behavior changes start on a worktree branch from `origin/main` and are submitted as PRs targeting `main`.
 - Do not create or open a PR until the user explicitly approves PR creation for that branch/change. Preparing a branch, committing locally, and pushing the branch is fine; stop before `gh pr create` or any equivalent PR creation step unless approval is explicit.
@@ -50,7 +51,7 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 - `main` is the only integration branch. Local `main` should track the merged state of `origin/main`.
 - Author changes in dedicated `.worktrees/<slug>` worktrees on feature branches created from `origin/main`.
 - Do not commit behavior changes directly to local `main` or push them directly to `origin/main`.
-- When a change is ready, push the feature branch, ask the user for explicit approval to create the PR, open a PR targeting `main` only after that approval, wait for required checks, merge the PR, then update local `main` from `origin/main`.
+- When a change is ready, the worktree should be clean - if it's not, commit appropriately, then push the feature branch. Then, ask the user for explicit approval to land it via a PR and clean up the worktree. If they approve, open a PR targeting `main` only after that approval, wait for required checks, merge the PR, update local `main` from `origin/main`, and clean up the worktree.
 - Update local `main` with a fast-forward pull or merge only. If local `main` has local-only commits, a dirty worktree, or cannot fast-forward, stop and resolve that explicitly instead of creating a local merge commit.
 - Delete or retire obsolete local `dev` worktrees/branches after confirming they are not running the self-hosted Freshell process.
 
@@ -137,6 +138,8 @@ npm run serve               # Build and run production server
 **On WSL machines, "the desktop app" means the Windows app.** Always build, install, and launch the Windows Electron app (`npm run electron:build:win` + the NSIS installer) — never a Linux AppImage/deb under WSLg. The Windows build must run as a native Windows process (WSL cannot compile `node-pty` for win32); drive it from WSL by rsyncing to a Windows-local dir and running Windows npm via `cmd.exe` — see [docs/development/windows-electron-build.md](docs/development/windows-electron-build.md).
 
 ### Testing
+Backend fallback policy: never silently fall back from the configured cloud test backend to local — if the cloud path fails, fix it; a local-backend run may substitute only when the cloud path cannot be fixed AND the user explicitly approves.
+
 ```bash
 npm test                    # Coordinated full suite (default + server configs)
 npm run check               # Typecheck, then coordinated full suite
@@ -167,6 +170,14 @@ npm run test:cloud:build    # Build and push the Docker image to Artifact Regist
 
 **Note:** The electron suite always runs locally even in cloud mode (it needs a display and native modules not available in the container).
 
+**Identity:** cloud lanes never require an interactive `gcloud auth login`.
+They resolve a gcloud identity lazily, in this order: `--account=` flag >
+`FRESHELL_GCP_ACCOUNT` > `GCLOUD_IDENT` > gcloud-robot probe (needs
+`GCLOUD_ROBOT_HOME`, the installed gcloud-robot skill directory) > ambient
+gcloud (with a one-line stderr note). Provisioning, rotation, and revocation
+live in [docs/development/gcloud-robot.md](docs/development/gcloud-robot.md).
+`GCLOUD_ROBOT_REQUIRE=1` fails closed when no robot identity resolves.
+
 ### E2E Test Backend (Cloud Run Jobs)
 
 Playwright e2e tests can run locally or on Google Cloud Run Jobs. The `FRESHELL_E2E_BACKEND` environment variable controls the default:
@@ -182,6 +193,14 @@ npm run test:e2e:cloud      # Force cloud
 **If `FRESHELL_E2E_BACKEND` is not set, ask the user which way to set it** before running e2e tests. Explain that cloud is much faster (parallel shards, ~2-3 min vs ~28 min) but is a paid Google Cloud service (~$0.03/run); local is free but slower. Once the user chooses, set it permanently in their `~/.bashrc` (or equivalent) so agents don't need to ask again.
 
 **Before filing any PR, ensure the affected e2e specs actually pass on the configured `FRESHELL_E2E_BACKEND` backend** — a spec sitting in `CLOUD_SKIP_SPECS` (`test/e2e-browser/playwright.cloud.config.ts`) or a filter that matched no tests is not coverage.
+
+**Identity:** cloud lanes never require an interactive `gcloud auth login`.
+They resolve a gcloud identity lazily, in this order: `--account=` flag >
+`FRESHELL_GCP_ACCOUNT` > `GCLOUD_IDENT` > gcloud-robot probe (needs
+`GCLOUD_ROBOT_HOME`, the installed gcloud-robot skill directory) > ambient
+gcloud (with a one-line stderr note). Provisioning, rotation, and revocation
+live in [docs/development/gcloud-robot.md](docs/development/gcloud-robot.md).
+`GCLOUD_ROBOT_REQUIRE=1` fails closed when no robot identity resolves.
 
 ## Architecture
 
@@ -205,7 +224,7 @@ npm run test:e2e:cloud      # Force cloud
 
 ### Key Architectural Patterns
 
-**WebSocket Protocol:** Schema-validated messages using Zod. Handshake flow: client sends `hello` with token → server validates → sends `ready`. Message types include `terminal.create/input/resize/detach/attach` and broadcasts like `sessions.updated`.
+**WebSocket Protocol:** Schema-validated messages using Zod. Handshake flow: client sends `hello` with token → server validates → sends `ready`. Message types include `terminal.create/input/resize/detach/attach` and broadcasts like `sessions.updated`. The `ready` frame carries an optional additive `buildId` (the server's artifact-time-baked git commit, `"unknown"` fallback): the client bakes its own at Vite build time (`__FRESHELL_BUILD_ID__`) and, on a mismatch, reloads exactly once per tab session (sessionStorage sentinel `freshell.server-build-reload` records the last attempted server build id; the same id never reloads twice, a different (corrected) deployment re-arms the guard), self-healing stale-client contract errors; `"unknown"` on either side never triggers or clears the guard (`src/lib/server-build-check.ts`). The once-guard is per server identity: an origin fronted by mixed-build servers could oscillate, and a newer client against an older server costs one futile bounded reload per fresh tab session (both accepted for the single-server self-hosted model).
 
 **PTY Lifecycle:** Each terminal has a unique ID. Server maintains 64KB scrollback buffer. On attach, client receives buffer snapshot then streams new output. On detach, process continues running (background session). Configurable idle timeout (15 mins default).
 
@@ -215,11 +234,11 @@ npm run test:e2e:cloud      # Force cloud
 
 **Configuration Persistence:** User config stored at `~/.freshell/config.json`. Atomic writes with temp file + rename. Settings changes POST to `/api/settings` and broadcast via WebSocket.
 
-**Pane System:** Tabs contain pane layouts (tree structure of splits). Each pane owns its terminal lifecycle via `createRequestId` and `terminalId`. When splitting panes, each new pane gets its own `createRequestId`, ensuring independent backend terminals. Pane content types: `terminal` (with mode, shell, status) and `browser` (with URL, devtools state).
+**Pane System:** Tabs contain pane layouts (tree structure of splits). Each pane owns its terminal lifecycle via `createRequestId` and `terminalId`. When splitting panes, each new pane gets its own `createRequestId`, ensuring independent backend terminals. Pane content types: `terminal` (with mode, shell, status), `browser` (with URL, devtools state), `editor` (file path), and `host-stats` (host pressure dashboard; no per-pane payload).
 
 **Agent Status Indicators:** Blue/busy status is derived from provider activity slices through `resolvePaneActivity`; green/needs-attention and the idle sound flow through `recordTurnComplete` and `useTurnCompletionNotifications`. Turn-complete (green/sound) is server-authoritative everywhere: terminal CLIs via `terminal.turn.complete`, and fresh-agent panes (freshclaude/kilroy/freshcodex/freshopencode) via a discrete `freshAgent.turn.complete` edge emitted only on a positive completion — freshclaude/kilroy on the SDK `result` with `subtype === 'success'`, freshopencode on the success-only `emitStatus(idle)` path, and freshcodex on `turn/completed` only when `params.turn.status === 'completed'` (the notification also fires on interrupt). The client folds it in via `applyFreshAgentCompletion` using the `at`-monotonic dedupe regime (wall-clock `at`, no per-session counter, so a resumed durable session can't swallow completions across a server restart). The waiting-for-approval edge is ALSO server-authoritative: the Claude/kilroy `SdkBridge` emits a discrete `freshAgent.turn.waiting` edge on the 0→≥1 pending permission/question transition (only Claude/kilroy raise approvals/questions), and the client folds it in via `applyFreshAgentWaiting` under a distinct `${provider}:${sessionId}#waiting` dedupe namespace so it can never poison (or be poisoned by) the turn-complete bucket. The fragile client-side busy→idle derivation AND the client-side waiting-edge hook (`useAgentSessionTurnCompletion`) were both removed — all green/sound edges are now server-emitted. freshcodex additionally self-heals a crashed/disconnected codex sidecar by consuming the runtime `onExit` hook in `subscribe()`, emitting `sdk.status:'exited'` to clear BLUE (no chime — a crash is not a positive completion). `freshopencode` still runs on a shared long-lived `opencode serve` sidecar and uses server-pushed `session.idle`/`session.status` events to drive busy. Gemini and Kimi terminal modes are status-in... [truncated] Separately, the sidebar shows cross-device remote status rings around a session row's icon: a green ring means the session is open on another device, a blue ring means it is busy on another device (blue wins over green), and rings are suppressed entirely when the session is open on this device (derived from `tabs.sync` registry snapshots — producing clients stamp pane payloads with `sessionKeys`/`busySessionKeys`, consumers re-query remote snapshots on a 30s interval, and the server partitions same-device records into `sameDeviceOpen`, which never produces rings).
 
-**Fresh-Agent Orchestration:** The REST agent API (`/api/tabs`, `/api/panes/:id/split`, `/api/panes/:id/send-keys`, `/api/panes/:id/capture`, `/api/panes/:id/wait-for`) and the MCP `freshell` tool accept `agent`/`model`/`effort` parameters to create and drive fresh-agent panes (e.g. `agent=opencode`). The orchestration layer dispatches to the registered `FreshAgentRuntimeManager`, so the same external surface works for any fresh-agent provider.
+**Fresh-Agent Orchestration:** The REST agent API (`/api/tabs`, `/api/panes/:id/split`, `/api/panes/:id/send-keys`, `/api/panes/:id/capture`, `/api/panes/:id/wait-for`) and the MCP `freshell` tool accept `agent`/`model`/`effort` parameters to create and drive fresh-agent panes (e.g. `agent=opencode`). The orchestration layer dispatches to the registered `FreshAgentRuntimeManager`, so the same external surface works for any fresh-agent provider. On MCP `new-tab`, resume sugar (`resume`/`resumeSessionId`) is honored for `agent: "opencode"` (Rust server). Agent-resume via `sessionRef` is NOT supported for claude/codex/kilroy agents (the Rust server rejects it with a 400; the Node server silently ignores it) — use an explicit `sessionRef` on MODE panes where that path supports it.
 
 ### Data Flow
 

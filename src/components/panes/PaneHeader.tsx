@@ -8,10 +8,11 @@ import PaneIcon from '@/components/icons/PaneIcon'
 import FreshAgentSettingsButton from '@/components/fresh-agent/FreshAgentSettingsButton'
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
-import { useAppSelector } from '@/store/hooks'
+import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import RepoIcon, { type RepoIconInfo } from '@/components/icons/RepoIcon'
 import { resolvePaneRepoCwd, pathBasename, buildRepoIconUrl } from '@/lib/repo-icon'
-import type { RepoIconEntry } from '@/store/repoIconsSlice'
+import { fetchRepoIconMeta, type RepoIconEntry } from '@/store/repoIconsSlice'
+import { FRESH_AGENT_RUNTIME_PROVIDER_LABELS, resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
 
 const EMPTY_REPO_ICONS: Record<string, RepoIconEntry> = {}
@@ -67,10 +68,16 @@ export default function PaneHeader({
   onRefresh,
 }: PaneHeaderProps) {
   const inputRef = useRef<HTMLInputElement>(null)
+  const dispatch = useAppDispatch()
   const repoIconsOnTabs = useAppSelector((s) => s.settings?.settings?.panes?.repoIconsOnTabs ?? true)
   const repoIconsByCwd = useAppSelector((s) => s.repoIcons?.byCwd ?? EMPTY_REPO_ICONS)
   const terminalMetaById = useAppSelector((s) => s.terminalMeta?.byTerminalId ?? EMPTY_TERMINAL_META)
-  const repoCwd = repoIconsOnTabs ? resolvePaneRepoCwd(content, undefined, terminalMetaById) : undefined
+  const isFreshAgentPane = content.kind === 'fresh-agent'
+  // The tabs-only `repoIconsOnTabs` setting does not govern the fresh-agent
+  // pane header — its repo icon is part of the header design regardless.
+  const repoCwd = isFreshAgentPane || repoIconsOnTabs
+    ? resolvePaneRepoCwd(content, undefined, terminalMetaById)
+    : undefined
   const repoEntry = repoCwd ? repoIconsByCwd[repoCwd] : undefined
   const repoIconInfo: RepoIconInfo | undefined =
     repoCwd && repoEntry && repoEntry.status !== 'loading'
@@ -80,7 +87,44 @@ export default function PaneHeader({
           iconUrl: repoEntry.hasIcon ? buildRepoIconUrl(repoCwd) : undefined,
         }
       : undefined
-  const isFreshAgentPane = content.kind === 'fresh-agent'
+  // Fresh-agent header: always show a repo icon when the pane has a cwd —
+  // letter-avatar fallback while the probe is loading/missing/failed. When the
+  // repo metadata never resolved (e.g. the Node dev server has no metadata
+  // endpoint), the tooltip shows the pane's cwd path rather than asserting a
+  // guessed basename IS the repo (delta review r3, Minor).
+  // repoEntry.repoName is synthesized from the cwd basename on probe ERROR
+  // (repoIconsSlice.rejected) — that is not a resolved repo identity, so the
+  // tooltip only claims "Repo:" for a READY entry.
+  const freshAgentRepoNameKnown = Boolean(
+    isFreshAgentPane && repoEntry?.status === 'ready' && repoEntry?.repoName,
+  )
+  const freshAgentRepoIconInfo: RepoIconInfo | undefined =
+    isFreshAgentPane && repoCwd
+      ? {
+          repoKey: repoEntry?.repoRoot || repoCwd,
+          repoName: repoEntry?.repoName || pathBasename(repoEntry?.repoRoot || repoCwd),
+          iconUrl: repoEntry && repoEntry.status !== 'loading' && repoEntry.hasIcon
+            ? buildRepoIconUrl(repoCwd)
+            : undefined,
+        }
+      : undefined
+  // The tooltip names the coding agent (preview wording: "Claude (freshclaude
+  // pane)"), i.e. the runtime provider's display name — never the pane-type
+  // label ("Freshclaude") that the picker surfaces.
+  const freshAgentLabel = isFreshAgentPane
+    ? FRESH_AGENT_RUNTIME_PROVIDER_LABELS[content.provider]
+      ?? resolveFreshAgentType(content.sessionType)?.label
+      ?? content.sessionType
+    : undefined
+
+  // TabBar is not mounted on every surface (e.g. initial mobile-landscape
+  // terminal view) and its probe skips entirely when repoIconsOnTabs is off,
+  // so the header owns the one-per-cwd probe for the icon it renders.
+  useEffect(() => {
+    if (repoCwd && !repoIconsByCwd[repoCwd]) {
+      void dispatch(fetchRepoIconMeta(repoCwd))
+    }
+  }, [repoCwd, repoIconsByCwd, dispatch])
   const freshAgentDerivedTitle = isFreshAgentPane ? derivePaneTitle(content) : undefined
   const freshAgentTitle = title.trim()
   const freshAgentTitleMatchesMeta = isFreshAgentPane
@@ -146,21 +190,35 @@ export default function PaneHeader({
         />
       ) : null}
 
+      {isFreshAgentPane ? (
+        <>
+          {freshAgentRepoIconInfo ? (
+            <span
+              title={freshAgentRepoNameKnown ? `Repo: ${freshAgentRepoIconInfo.repoName}` : freshAgentRepoIconInfo.repoKey}
+              className="inline-flex shrink-0"
+            >
+              <RepoIcon info={freshAgentRepoIconInfo} className="h-3.5 w-3.5" />
+            </span>
+          ) : null}
+          <span
+            title={`${freshAgentLabel} (${content.sessionType} pane)`}
+            className="inline-flex shrink-0"
+          >
+            <PaneIcon
+              content={content}
+              className={cn(
+                'h-3.5 w-3.5',
+                busy && status === 'running' ? 'text-blue-500' : 'text-muted-foreground',
+              )}
+            />
+          </span>
+        </>
+      ) : null}
+
       <div className={cn(
         'min-w-0 flex flex-1 items-center gap-1.5',
         isFreshAgentPane && 'pane-header-fresh-agent-title',
       )}>
-        {isFreshAgentPane && !isRenaming ? (
-          <span
-            className={cn(
-              'pane-header-fresh-agent-identity shrink-0 text-sm',
-              busy && status === 'running' ? 'text-blue-500' : 'text-muted-foreground',
-            )}
-            title={`${content.sessionType} session`}
-          >
-            {content.sessionType}
-          </span>
-        ) : null}
         {isRenaming ? (
           <input
             ref={inputRef}

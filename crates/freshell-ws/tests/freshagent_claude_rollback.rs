@@ -312,6 +312,16 @@ impl PaneIdentitySink for TestLedgerSink {
                 .map_err(std::io::Error::other)?
         })
     }
+
+    fn lookup_by_create_request_id(
+        &self,
+        provider: &str,
+        create_request_id: &str,
+    ) -> Option<String> {
+        self.ledger
+            .lookup_by_create_request_id(provider, create_request_id)
+            .map(|row| row.session_id)
+    }
 }
 
 fn test_settings_value() -> Value {
@@ -383,6 +393,7 @@ async fn spawn_server_with_rollback_rig(
         tabs: freshell_ws::tabs::TabsRegistry::new(),
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         subagent_interest: Default::default(),
+        host_stats: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::new(Vec::new()),

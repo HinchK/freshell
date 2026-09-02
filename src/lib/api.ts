@@ -1,4 +1,5 @@
 import type { CodingCliProviderName } from './coding-cli-types'
+import type { TokenSummary } from '@shared/ws-protocol'
 import {
   FreshAgentSnapshotSchema,
   FreshAgentTurnBodySchema,
@@ -25,6 +26,7 @@ import {
   type FreshAgentThreadTurnBodyQuery,
   type FreshAgentThreadTurnsQuery,
   type SessionDirectoryItem as ReadModelSessionDirectoryItem,
+  type SessionDirectoryContextUsageExtra as ReadModelSessionDirectoryContextUsageExtra,
   type SessionDirectoryIntegrityError as ReadModelSessionDirectoryIntegrityError,
   type SessionDirectoryPage as ReadModelSessionDirectoryPage,
   type SessionDirectoryQuery,
@@ -361,6 +363,7 @@ export async function getSessionDirectoryPage(
       ['includeSubagents', parsed.includeSubagents ? '1' : undefined],
       ['includeNonInteractive', parsed.includeNonInteractive ? '1' : undefined],
       ['includeEmpty', parsed.includeEmpty ? '1' : undefined],
+      ['includeKeys', parsed.includeKeys && parsed.includeKeys.length > 0 ? parsed.includeKeys.join(',') : undefined],
     ])}`,
     options,
   )
@@ -565,6 +568,8 @@ export type SearchResult = {
   isRunning?: boolean
   runningTerminalId?: string
   liveTerminalOnly?: boolean
+  /** STATUS-STRIP: live token usage from the server read model. */
+  tokenUsage?: TokenSummary
 }
 
 export type SearchResponse = {
@@ -582,6 +587,16 @@ export type SearchResponse = {
   integrityError?: ReadModelSessionDirectoryIntegrityError
   /** SESSION-05: the page's per-project color map (only present when the server emitted one). */
   projectColors?: Record<string, string>
+  /** STATUS-STRIP: usage for `includeKeys` sessions that fell outside the search results. */
+  contextUsageExtras?: ReadModelSessionDirectoryContextUsageExtra[]
+  /** STATUS-STRIP: session-directory revision of the data snapshot (NOT monotonic — see snapshotSeq). */
+  revision?: number
+  /** STATUS-STRIP: monotonic per-instance page sequence — the ordering key for competing usage writes. */
+  snapshotSeq?: number
+  /** STATUS-STRIP: the serving server's instance id — snapshotSeq comparisons within it only. */
+  serverInstance?: string
+  /** STATUS-STRIP: per-process boot nonce — snapshotSeq ordering is trusted only within the same instance+boot. */
+  bootId?: string
 }
 
 export type SearchOptions = {
@@ -595,6 +610,8 @@ export type SearchOptions = {
   includeSubagents?: boolean
   includeNonInteractive?: boolean
   includeEmpty?: boolean
+  /** STATUS-STRIP: `provider:sessionId` keys to keep usage-live regardless of the search filter. */
+  includeKeys?: string[]
 }
 
 function encodeSessionCursor(before: number | undefined, beforeId: string | undefined): string | undefined {
@@ -641,6 +658,9 @@ function groupDirectoryItemsAsProjects(
       liveTerminalOnly: item.liveTerminalOnly,
       firstUserMessage: item.firstUserMessage,
       sessionType: item.sessionType,
+      // STATUS-STRIP: window rows carry live usage so the fresh-agent strip
+      // context meter reads the same data the sidebar fetches.
+      ...(item.tokenUsage ? { tokenUsage: item.tokenUsage } : {}),
     })),
   }))
 }
@@ -668,6 +688,8 @@ export async function fetchSidebarSessionsSnapshot(options: {
   includeSubagents?: boolean
   includeNonInteractive?: boolean
   includeEmpty?: boolean
+  /** STATUS-STRIP: `provider:sessionId` keys to keep usage-live regardless of the window. */
+  includeKeys?: string[]
 } = {}): Promise<any> {
   const {
     limit = 100,
@@ -678,6 +700,7 @@ export async function fetchSidebarSessionsSnapshot(options: {
     includeSubagents,
     includeNonInteractive,
     includeEmpty,
+    includeKeys,
   } = options
   sanitizeSessionLocators(openSessions)
 
@@ -689,6 +712,7 @@ export async function fetchSidebarSessionsSnapshot(options: {
     includeSubagents,
     includeNonInteractive,
     includeEmpty,
+    ...(includeKeys && includeKeys.length > 0 ? { includeKeys } : {}),
   }, {
     signal,
   })) as ReadModelSessionDirectoryPage
@@ -705,11 +729,16 @@ export async function fetchSidebarSessionsSnapshot(options: {
     partial: page.partial,
     partialReason: page.partialReason,
     integrityError: page.integrityError,
+    revision: page.revision,
+    ...(page.snapshotSeq !== undefined ? { snapshotSeq: page.snapshotSeq } : {}),
+    ...(page.serverInstance ? { serverInstance: page.serverInstance } : {}),
+    ...(page.bootId ? { bootId: page.bootId } : {}),
+    ...(page.contextUsageExtras ? { contextUsageExtras: page.contextUsageExtras } : {}),
   }
 }
 
 export async function searchSessions(options: SearchOptions): Promise<SearchResponse> {
-  const { query, tier = 'title', limit, cursor, signal, includeSubagents, includeNonInteractive, includeEmpty } = options
+  const { query, tier = 'title', limit, cursor, signal, includeSubagents, includeNonInteractive, includeEmpty, includeKeys } = options
   const page = SessionDirectoryPageSchema.parse(await getSessionDirectoryPage({
     priority: 'visible',
     query,
@@ -719,6 +748,7 @@ export async function searchSessions(options: SearchOptions): Promise<SearchResp
     includeSubagents,
     includeNonInteractive,
     includeEmpty,
+    ...(includeKeys && includeKeys.length > 0 ? { includeKeys } : {}),
   }, {
     signal,
   })) as ReadModelSessionDirectoryPage
@@ -743,13 +773,19 @@ export async function searchSessions(options: SearchOptions): Promise<SearchResp
       isRunning: item.isRunning,
       runningTerminalId: item.runningTerminalId,
       liveTerminalOnly: item.liveTerminalOnly,
+      ...(item.tokenUsage ? { tokenUsage: item.tokenUsage } : {}),
     })),
     tier,
     query,
     totalScanned: page.items.length,
     nextCursor: page.nextCursor,
     hasMore: page.nextCursor !== null,
+    revision: page.revision,
+    ...(page.snapshotSeq !== undefined ? { snapshotSeq: page.snapshotSeq } : {}),
+    ...(page.serverInstance ? { serverInstance: page.serverInstance } : {}),
+    ...(page.bootId ? { bootId: page.bootId } : {}),
     ...(page.projectColors ? { projectColors: page.projectColors } : {}),
+    ...(page.contextUsageExtras ? { contextUsageExtras: page.contextUsageExtras } : {}),
   }
 
   if (page.partial) {

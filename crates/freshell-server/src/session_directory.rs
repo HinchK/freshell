@@ -85,6 +85,9 @@ pub struct SessionDirectoryState {
     /// `buildLiveTerminalSessionItem`, `service.ts:77-151`). `O(terminals)` per
     /// request, no new I/O — reads the already-in-memory registry snapshot.
     pub identity: freshell_ws::identity::TerminalIdentityRegistry,
+    /// STATUS-STRIP: stamped on every session-directory page (`serverInstance`);
+    /// clients order pages by `snapshotSeq` only within one instance.
+    pub server_instance: Arc<String>,
     /// Task 20 (read-join): the SESSION-06 metadata store
     /// (`session-metadata.json`, same `.freshell` home dir as the POST route)
     /// whose `sessionType` tags [`apply_session_metadata`] overlays onto
@@ -150,6 +153,12 @@ struct DirItem {
     /// `sourceFiles.get(key)` (`session-directory/service.ts:164-173`), which
     /// is looked up server-side and never sent to the client either.
     source_file: Option<PathBuf>,
+    /// STATUS-STRIP: live token usage (`SessionDirectoryItem.tokenUsage`,
+    /// `shared/read-models.ts`; Node's `CodingCliSession.tokenUsage`,
+    /// `coding-cli/types.ts:190`). Powers the fresh-agent strip's context
+    /// meter (`compactPercent` etc.). `None` when the source carries none
+    /// (opencode direct rows, live-terminal synthesized items).
+    token_usage: Option<freshell_sessions::meta::TokenSummary>,
 }
 
 impl DirItem {
@@ -216,8 +225,36 @@ impl DirItem {
         if let Some(v) = &self.session_type {
             o.insert("sessionType".into(), json!(v));
         }
+        if let Some(u) = &self.token_usage {
+            o.insert("tokenUsage".into(), token_usage_value(u));
+        }
         Value::Object(o)
     }
+}
+
+/// Serialize a [`freshell_sessions::meta::TokenSummary`] to the
+/// `TokenSummarySchema` wire shape (`shared/ws-protocol.ts:61-72`): required
+/// numeric fields always present, the context/compact optionals omitted when
+/// absent (matching the zod `.optional()`s).
+fn token_usage_value(u: &freshell_sessions::meta::TokenSummary) -> Value {
+    let mut o = Map::new();
+    o.insert("inputTokens".into(), json!(u.input_tokens));
+    o.insert("outputTokens".into(), json!(u.output_tokens));
+    o.insert("cachedTokens".into(), json!(u.cached_tokens));
+    o.insert("totalTokens".into(), json!(u.total_tokens));
+    if let Some(v) = u.context_tokens {
+        o.insert("contextTokens".into(), json!(v));
+    }
+    if let Some(v) = u.model_context_window {
+        o.insert("modelContextWindow".into(), json!(v));
+    }
+    if let Some(v) = u.compact_threshold_tokens {
+        o.insert("compactThresholdTokens".into(), json!(v));
+    }
+    if let Some(v) = u.compact_percent {
+        o.insert("compactPercent".into(), json!(v));
+    }
+    Value::Object(o)
 }
 
 /// `SessionDirectoryQuerySchema.tier` (`shared/read-models.ts:30`,
@@ -246,6 +283,11 @@ struct DirQuery {
     include_subagents: bool,
     include_non_interactive: bool,
     include_empty: bool,
+    /// STATUS-STRIP: `includeKeys` (`shared/read-models.ts`) — comma-separated
+    /// `provider:sessionId` keys whose usage the client needs regardless of
+    /// the sidebar search/pagination window. Matching sessions are returned
+    /// out-of-band as `contextUsageExtras` (never merged into `items`).
+    include_keys: Vec<String>,
 }
 
 /// R9: `SessionDirectoryQuerySchema` (`shared/read-models.ts:28-38`) makes
@@ -303,6 +345,34 @@ fn validate_query(raw: &std::collections::HashMap<String, String>) -> Result<Dir
         }
     };
 
+    // STATUS-STRIP: `includeKeys` (comma-separated; `shared/read-models.ts`
+    // `z.array(z.string().min(1)).max(200)` — the 200-pane ceiling). Issues
+    // join the SAME details
+    // array as the fields above (zod collects issues across every violated
+    // field into one response). The client self-enforces ≤200 via its own
+    // schema parse (`getSessionDirectoryPage`), so the over-limit issue text
+    // is not wire-probed byte-for-byte — a hand-rolled request beyond the cap
+    // gets a 400 with a zod-flavored issue, enough for a 400 contract check
+    // without pretending to byte-parity.
+    let mut include_keys: Vec<String> = raw
+        .get("includeKeys")
+        .map(|v| {
+            v.split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if include_keys.len() > 200 {
+        details.push(json!({
+            "code": "too_big",
+            "maximum": 200,
+            "path": ["includeKeys"],
+            "message": "Too big: expected array to have <=200 items",
+        }));
+        include_keys.truncate(200);
+    }
+
     if !details.is_empty() {
         return Err(json!(details));
     }
@@ -316,6 +386,7 @@ fn validate_query(raw: &std::collections::HashMap<String, String>) -> Result<Dir
         include_subagents: flag("includeSubagents"),
         include_non_interactive: flag("includeNonInteractive"),
         include_empty: flag("includeEmpty"),
+        include_keys,
     })
 }
 
@@ -336,6 +407,31 @@ fn js_number(raw: &str) -> f64 {
             .unwrap_or(f64::NAN);
     }
     trimmed.parse::<f64>().unwrap_or(f64::NAN)
+}
+
+/// STATUS-STRIP: monotonic per-process page sequence (`snapshotSeq`, stamped
+/// on every session-directory response). NEVER derives from data (revision is
+/// a max-activity timestamp and can decrease) — seeded from the wall clock so
+/// a restarted process of the same instance never restamps lower than any
+/// page it already served, then incremented per query via a single atomic.
+fn next_snapshot_seq() -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    SEQ.fetch_max(now, std::sync::atomic::Ordering::Relaxed);
+    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// STATUS-STRIP: per-PROCESS boot nonce (`bootId`). Seq ordering is trusted
+/// only within the same instance+boot (a clock-seeded counter cannot prove
+/// monotonicity across restarts under wall-clock rewind).
+fn directory_boot_id() -> &'static str {
+    static BOOT_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BOOT_ID
+        .get_or_init(|| format!("boot-{}", uuid::Uuid::new_v4()))
+        .as_str()
 }
 
 /// `z.number().int().positive().max(MAX_DIRECTORY_PAGE_ITEMS)` — checked in
@@ -425,6 +521,10 @@ async fn session_directory(
             .collect(),
         None => Vec::new(),
     };
+    // STATUS-STRIP: assign the monotonic snapshot sequence AFTER the index
+    // snapshot is captured — captured order is authoritative, and a seq
+    // assigned pre-await would interleave with concurrent requests.
+    let snapshot_seq = next_snapshot_seq();
     let items = apply_session_overrides(items, &state.settings.session_overrides());
     // Task 20: read-join `sessionType` from the SESSION-06 metadata store --
     // ONE `get_all()` per request (a cached read; disk is touched at most
@@ -492,6 +592,9 @@ async fn session_directory(
     match apply_query(items, &query, &identities) {
         Ok(mut page) => {
             page["revision"] = json!(revision);
+            page["snapshotSeq"] = json!(snapshot_seq);
+            page["serverInstance"] = json!(state.server_instance.as_str());
+            page["bootId"] = json!(directory_boot_id());
             if let Some((_, collision_count, duplicate_item_count)) = identity_collision {
                 // Keep an I/O/budget partial reason if the same request also
                 // encountered one. Collision identity travels only in the
@@ -776,6 +879,7 @@ fn dir_item_from_indexed(idx: &IndexedSession) -> DirItem {
         session_type: None,
         title_source: idx.title_source.clone(),
         source_file: idx.source_file.clone(),
+        token_usage: idx.token_usage.clone(),
     }
 }
 
@@ -936,6 +1040,7 @@ fn item_from_meta(
         session_type: None,
         title_source: meta.title_source.clone(),
         source_file,
+        token_usage: None,
     }
 }
 
@@ -1133,6 +1238,12 @@ fn build_live_terminal_session_item(
         // `titleSource` either, `service.ts:110-130`).
         title_source: None,
         source_file: None,
+        // PARITY NOTE: Rust's `TerminalIdentity` carries no token usage, so a
+        // live-terminal-only row reports none here — unlike Node, whose
+        // `TerminalMeta` carries `tokenUsage`. Fresh-agent pane sessions are
+        // indexed from transcripts (their usage arrives via that path), so
+        // this gap only covers pre-adoption transient rows.
+        token_usage: None,
     })
 }
 
@@ -1193,6 +1304,7 @@ mod join_tests {
             session_type: None,
             title_source: None,
             source_file: None,
+            token_usage: None,
         }
     }
 
@@ -1439,6 +1551,37 @@ fn apply_query(
             .then_with(|| b.key().cmp(&a.key()))
     });
 
+    // STATUS-STRIP: snapshot the extras candidate list BEFORE the sidebar
+    // visibility filters too — a fresh-agent pane's own session may be
+    // subagent-classed, non-interactive, or untitled/idle, and its meter must
+    // stay live regardless of the sidebar window's filtering state. Extras are
+    // returned out-of-band and never merged into `items`, so lowering the
+    // visibility bar here cannot leak hidden rows into the sidebar. The
+    // snapshot carries ONLY the three fields the extras need (never a full
+    // per-request DirItem clone).
+    let extras_candidates: Option<
+        Vec<(
+            String,
+            String,
+            Option<freshell_sessions::meta::TokenSummary>,
+        )>,
+    > = if q.include_keys.is_empty() {
+        None
+    } else {
+        Some(
+            items
+                .iter()
+                .map(|i| {
+                    (
+                        i.provider.clone(),
+                        i.session_id.clone(),
+                        i.token_usage.clone(),
+                    )
+                })
+                .collect(),
+        )
+    };
+
     // Server-side visibility pre-filter (service.ts:244-252).
     if !q.include_subagents {
         items.retain(|i| !i.is_subagent);
@@ -1517,6 +1660,36 @@ fn apply_query(
         page["partial"] = json!(true);
         if let Some(reason) = partial_reason {
             page["partialReason"] = json!(reason);
+        }
+    }
+
+    // STATUS-STRIP: out-of-band usage for `includeKeys` sessions that fell
+    // outside this page's `items` (search-filtered or paged out). Omitted
+    // entirely when nothing matched (zod `.optional()` shape — the original
+    // only sets the key when there is at least one extra).
+    if let Some(candidates) = extras_candidates {
+        let page_keys: std::collections::HashSet<String> =
+            items.iter().take(limit).map(DirItem::key).collect();
+        let wanted: std::collections::HashSet<&str> =
+            q.include_keys.iter().map(String::as_str).collect();
+        let extras: Vec<Value> = candidates
+            .iter()
+            .filter(|(provider, session_id, _)| {
+                let key = format!("{provider}:{session_id}");
+                wanted.contains(key.as_str()) && !page_keys.contains(&key)
+            })
+            .map(|(provider, session_id, token_usage)| {
+                let mut o = Map::new();
+                o.insert("provider".into(), json!(provider));
+                o.insert("sessionId".into(), json!(session_id));
+                if let Some(u) = token_usage {
+                    o.insert("tokenUsage".into(), token_usage_value(u));
+                }
+                Value::Object(o)
+            })
+            .collect();
+        if !extras.is_empty() {
+            page["contextUsageExtras"] = json!(extras);
         }
     }
     Ok(page)
@@ -2014,6 +2187,205 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// STATUS-STRIP: a DirItem carrying usage (mirrors `service.test.ts`'s
+    /// `meter-hit` rows).
+    fn usage_dir_item(session_id: &str, last_activity_at: i64, title: &str) -> DirItem {
+        DirItem {
+            session_id: session_id.to_string(),
+            legacy_session_id: None,
+            provider: "claude".to_string(),
+            project_path: "/repo/meter".to_string(),
+            title: Some(title.to_string()),
+            summary: None,
+            first_user_message: None,
+            last_activity_at,
+            created_at: Some(last_activity_at),
+            cwd: Some("/repo/meter".to_string()),
+            is_subagent: false,
+            is_non_interactive: false,
+            is_running: false,
+            archived: false,
+            matched_in: None,
+            snippet: None,
+            running_terminal_id: None,
+            live_terminal_only: false,
+            session_type: None,
+            title_source: None,
+            source_file: None,
+            token_usage: Some(freshell_sessions::meta::TokenSummary {
+                input_tokens: 10,
+                output_tokens: 5,
+                cached_tokens: 0,
+                total_tokens: 15,
+                context_tokens: Some(900),
+                model_context_window: None,
+                compact_threshold_tokens: Some(1000),
+                compact_percent: Some(90),
+            }),
+        }
+    }
+
+    #[test]
+    fn token_usage_serializes_on_items() {
+        let items = vec![usage_dir_item("meter-hit", 500, "Metered session")];
+        let page = apply_query(items, &default_query(), &[]).unwrap();
+        let arr = page["items"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["tokenUsage"]["compactPercent"], json!(90));
+        assert_eq!(arr[0]["tokenUsage"]["contextTokens"], json!(900));
+        assert_eq!(arr[0]["tokenUsage"]["compactThresholdTokens"], json!(1000));
+        assert_eq!(arr[0]["tokenUsage"]["inputTokens"], json!(10));
+    }
+
+    #[test]
+    fn include_keys_returns_usage_for_session_excluded_by_search_query() {
+        let items = vec![
+            usage_dir_item("meter-hit", 500, "Metered session"),
+            DirItem {
+                token_usage: None,
+                ..usage_dir_item("meter-other", 400, "Something else entirely")
+            },
+        ];
+        let q = DirQuery {
+            query: Some("Something else".to_string()),
+            include_keys: vec!["claude:meter-hit".to_string()],
+            ..DirQuery::default()
+        };
+        let page = apply_query(items, &q, &[]).unwrap();
+        let arr = page["items"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["sessionId"], json!("meter-other"));
+        let extras = page["contextUsageExtras"].as_array().unwrap();
+        assert_eq!(extras.len(), 1);
+        assert_eq!(extras[0]["provider"], json!("claude"));
+        assert_eq!(extras[0]["sessionId"], json!("meter-hit"));
+        assert_eq!(extras[0]["tokenUsage"]["compactPercent"], json!(90));
+    }
+
+    #[test]
+    fn include_keys_returns_usage_for_session_paged_out_of_the_window() {
+        // Page 1 (limit 1) contains meter-hit as a normal item → NOT duplicated
+        // as an extra.
+        let q1 = DirQuery {
+            limit: Some(1),
+            include_keys: vec!["claude:meter-hit".to_string()],
+            ..DirQuery::default()
+        };
+        let items = vec![
+            usage_dir_item("meter-hit", 500, "Metered session"),
+            usage_dir_item("meter-other", 400, "Other"),
+        ];
+        let page = apply_query(items.clone(), &q1, &[]).unwrap();
+        assert_eq!(
+            page["items"].as_array().unwrap()[0]["sessionId"],
+            json!("meter-hit")
+        );
+        assert!(page.get("contextUsageExtras").is_none());
+        // Page 2 paged it out → arrives as an extra instead.
+        let cursor = page["nextCursor"].as_str().unwrap().to_string();
+        let q2 = DirQuery {
+            limit: Some(1),
+            cursor: Some(cursor),
+            include_keys: vec!["claude:meter-hit".to_string()],
+            ..DirQuery::default()
+        };
+        let page2 = apply_query(items, &q2, &[]).unwrap();
+        assert_eq!(
+            page2["items"].as_array().unwrap()[0]["sessionId"],
+            json!("meter-other")
+        );
+        assert_eq!(
+            page2["contextUsageExtras"].as_array().unwrap()[0]["sessionId"],
+            json!("meter-hit")
+        );
+    }
+
+    #[test]
+    fn include_keys_without_match_emits_no_extras_key() {
+        let items = vec![usage_dir_item("meter-hit", 500, "Metered session")];
+        let q = DirQuery {
+            include_keys: vec!["claude:no-such-session".to_string()],
+            ..DirQuery::default()
+        };
+        let page = apply_query(items, &q, &[]).unwrap();
+        assert_eq!(page["items"].as_array().unwrap().len(), 1);
+        assert!(page.get("contextUsageExtras").is_none());
+    }
+
+    #[test]
+    fn include_keys_bypass_sidebar_visibility_filters() {
+        // Subagent-classed AND untitled/idle open-pane sessions get no row in
+        // the default sidebar window, but their meter must stay live — extras
+        // match above the visibility filters (service.ts).
+        let items = vec![
+            DirItem {
+                is_subagent: true,
+                ..usage_dir_item("meter-subagent", 300, "Subagent row")
+            },
+            DirItem {
+                title: None,
+                ..usage_dir_item("meter-untitled", 200, "ignored-title")
+            },
+        ];
+        let q = DirQuery {
+            include_keys: vec![
+                "claude:meter-subagent".to_string(),
+                "claude:meter-untitled".to_string(),
+            ],
+            ..DirQuery::default()
+        };
+        let page = apply_query(items, &q, &[]).unwrap();
+        assert_eq!(page["items"].as_array().unwrap().len(), 0);
+        let extras: Vec<&str> = page["contextUsageExtras"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["sessionId"].as_str().unwrap())
+            .collect();
+        assert!(
+            extras.contains(&"meter-subagent") && extras.contains(&"meter-untitled"),
+            "visibility-filtered open-pane sessions still arrive as extras: {extras:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn page_stamps_snapshot_seq_and_server_instance() {
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let home = claude_home_with(&["real-corrupted.jsonl"]);
+        let app = static_directory_app(Vec::new(), &home);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/session-directory?priority=visible")
+                    .header("x-auth-token", "tok")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(page["snapshotSeq"].as_u64().unwrap() > 0);
+        assert_eq!(page["serverInstance"], json!("srv-test"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn snapshot_seq_counter_is_monotonic() {
+        // STATUS-STRIP: clients order competing pages by snapshotSeq within one
+        // server instance — the sequence must strictly increase per call and
+        // must not derive from data (activity timestamps).
+        let s1 = next_snapshot_seq();
+        let s2 = next_snapshot_seq();
+        assert!(s2 > s1, "sequence increases per page build: {s1} < {s2}");
+    }
+
     #[test]
     fn r10b_cwdless_repair_fixture_never_surfaces_under_any_flags() {
         // Byte-matched against a live probe of the ORIGINAL: seeding
@@ -2103,6 +2475,7 @@ mod tests {
             session_type: None,
             title_source: None,
             source_file: None,
+            token_usage: None,
         };
         let items = vec![mk("a", 100), mk("b", 200)];
         let q = DirQuery {
@@ -2318,6 +2691,7 @@ mod tests {
             session_type: None,
             title_source: None,
             source_file: None,
+            token_usage: None,
         };
         let items = vec![mk("keep"), mk("gone")];
 
@@ -2363,6 +2737,7 @@ mod tests {
             session_type: None,
             title_source: None,
             source_file: None,
+            token_usage: None,
         };
         let mut overrides = serde_json::Map::new();
         overrides.insert(
@@ -2423,6 +2798,7 @@ mod tests {
             session_type: None,
             title_source: None,
             source_file: None,
+            token_usage: None,
         };
         let copied = DirItem {
             session_id: "copied-transcript".into(),
@@ -2485,6 +2861,7 @@ mod tests {
             session_type: None,
             title_source: None,
             source_file: None,
+            token_usage: None,
         };
         let overlaid = apply_session_overrides(vec![item], &serde_json::Map::new());
         let v = overlaid[0].to_value();
@@ -2528,6 +2905,7 @@ mod tests {
             session_type: None,
             title_source: title_source.map(str::to_string),
             source_file: None,
+            token_usage: None,
         }
     }
 
@@ -2701,6 +3079,7 @@ mod tests {
             is_subagent: false,
             is_non_interactive: false,
             source_file: Some(PathBuf::from(source_file)),
+            token_usage: None,
         }
     }
 
@@ -2727,6 +3106,7 @@ mod tests {
             session_index: Some(Arc::new(test_session_index(vec![Arc::new(source)]))),
             identity,
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+            server_instance: std::sync::Arc::new("srv-test".to_string()),
         })
     }
 
@@ -2835,6 +3215,7 @@ mod tests {
             session_index: Some(session_index),
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+            server_instance: std::sync::Arc::new("srv-test".to_string()),
         };
         let app = router(state);
         let resp = app
@@ -3238,6 +3619,7 @@ mod tests {
             // A FRESH store instance over the same dir (not the writer above):
             // proves the join reads the persisted file, not shared memory.
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+            server_instance: std::sync::Arc::new("srv-test".to_string()),
         };
         let app = router(state);
         let resp = app
@@ -3314,6 +3696,7 @@ mod tests {
             session_index: Some(session_index),
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+            server_instance: std::sync::Arc::new("srv-test".to_string()),
         };
         let app = router(state);
         let resp = app
@@ -3372,6 +3755,7 @@ mod tests {
             session_index: Some(session_index),
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+            server_instance: std::sync::Arc::new("srv-test".to_string()),
         };
         let app = router(state);
         let resp = app
@@ -3415,6 +3799,7 @@ mod tests {
             // No home: a unique, nonexistent dir -- the store tolerates a
             // missing file (empty metadata), matching the no-home page.
             metadata: crate::session_metadata::SessionMetadataStore::new(unique_temp_dir()),
+            server_instance: std::sync::Arc::new("srv-test".to_string()),
         };
         let app = router(state);
         let resp = app
@@ -3497,6 +3882,7 @@ mod tests {
             session_index: Some(session_index),
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+            server_instance: std::sync::Arc::new("srv-test".to_string()),
         };
         let app = router(state);
 
@@ -3599,6 +3985,7 @@ mod tests {
             session_index: Some(session_index),
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+            server_instance: std::sync::Arc::new("srv-test".to_string()),
         };
         let app = router(state);
 
@@ -3696,6 +4083,7 @@ mod tests {
             session_index: Some(session_index),
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+            server_instance: std::sync::Arc::new("srv-test".to_string()),
         };
         let app = router(state);
 
@@ -3790,6 +4178,7 @@ mod tests {
             session_index: Some(session_index),
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+            server_instance: std::sync::Arc::new("srv-test".to_string()),
         };
         let app = router(state);
 
@@ -4112,6 +4501,7 @@ mod tests {
             session_type: None,
             title_source: None,
             source_file: None,
+            token_usage: None,
         };
         let mut overrides = serde_json::Map::new();
         overrides.insert(

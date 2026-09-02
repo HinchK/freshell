@@ -6,6 +6,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$ROOT"
 
+# gcloud-robot hermeticity pin (skill trap 11): the wrappers now carry a live
+# identity ladder. Pinning GCLOUD_IDENT forces the ladder's rung-2 bypass, so
+# no wrapper invocation from this suite can reach the real probe/network —
+# even if the harness environment happens to export GCLOUD_ROBOT_HOME. The
+# value is deliberately fake; nothing in this suite depends on it.
+export GCLOUD_IDENT="suite-pinned-identity@example.invalid"
+
 CLOUDBUILD="$ROOT/docker/cloud-run/cloudbuild.yaml"
 GCLOUDIGNORE="$ROOT/.gcloudignore"
 

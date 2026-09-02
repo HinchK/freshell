@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  FRESH_AGENT_CONTRACT_SCHEMA_NAMES,
   FreshAgentActionResultSchema,
   FreshAgentCapabilitiesSchema,
   FreshAgentContractErrorSchema,
   FreshAgentRequestIdSchema,
+  FreshAgentSessionCommandSchema,
   FreshAgentSnapshotSchema,
   FreshAgentTurnBodySchema,
   FreshAgentTurnPageSchema,
@@ -31,6 +33,8 @@ describe('fresh-agent shared contract schemas', () => {
     })
     expect(claudeSnapshot.extensions.claude).not.toHaveProperty('timelineSessionId')
     expect(FreshAgentSnapshotSchema.parse(codexContractSnapshot).sessionType).toBe('freshcodex')
+    expect(claudeSnapshot.turns[0].summaryKind).toBe('echo')
+    expect(FreshAgentSnapshotSchema.parse(codexContractSnapshot).turns[0].summaryKind).toBe('echo')
   })
 
   it('parses turn pages and turn bodies with the full session locator', () => {
@@ -51,6 +55,42 @@ describe('fresh-agent shared contract schemas', () => {
       ...codexContractSnapshot,
       extensions: { codex: { review: { id: 'review-1' } }, extraProvider: {} },
     })).toThrow()
+  })
+
+  it('parses a snapshot carrying provider-advertised session commands and round-trips the rows', () => {
+    const commands = [
+      { name: 'compact', description: 'Compact the conversation', argumentHint: '[focus]', aliases: ['squeeze'] },
+      { name: 'review', description: '' },
+    ]
+    const parsed = FreshAgentSnapshotSchema.parse({ ...claudeContractSnapshot, commands })
+    expect(parsed.commands).toEqual(commands)
+    expect(FreshAgentSessionCommandSchema.parse(commands[0])).toEqual(commands[0])
+    expect(FreshAgentSessionCommandSchema.parse(commands[1])).toEqual(commands[1])
+  })
+
+  it('rejects garbage session-command rows on the row schema and inside the snapshot', () => {
+    const garbageRows = [
+      { description: 'missing name' },
+      { name: '', description: 'empty name' },
+      { name: 'compact', description: 'strict extra key', bogus: true },
+    ]
+    for (const row of garbageRows) {
+      expect(() => FreshAgentSessionCommandSchema.parse(row)).toThrow()
+      expect(() => FreshAgentSnapshotSchema.parse({ ...claudeContractSnapshot, commands: [row] })).toThrow()
+    }
+  })
+
+  it('parses snapshots without commands exactly as before (graceful absence for Rust/codex/offline)', () => {
+    const claudeParsed = FreshAgentSnapshotSchema.parse(claudeContractSnapshot)
+    const codexParsed = FreshAgentSnapshotSchema.parse(codexContractSnapshot)
+    expect('commands' in claudeParsed).toBe(false)
+    expect('commands' in codexParsed).toBe(false)
+    expect(claudeParsed.sessionType).toBe('freshclaude')
+    expect(codexParsed.sessionType).toBe('freshcodex')
+  })
+
+  it('registers the session-command schema for contract traceability', () => {
+    expect(FRESH_AGENT_CONTRACT_SCHEMA_NAMES).toContain('FreshAgentSessionCommandSchema')
   })
 
   it('parses action results and contract errors with locator context', () => {

@@ -128,7 +128,7 @@ describe('mobile coarse-pointer composer keyboard behavior', () => {
   it('Enter inserts a newline instead of sending on touch keyboards', () => {
     stubCoarsePointer(true)
     const onSend = vi.fn()
-    render(<FreshAgentComposer commands={[]} onSend={onSend} />)
+    render(<FreshAgentComposer commands={{ action: [], session: [] }} onSend={onSend} />)
 
     const input = screen.getByRole('textbox', { name: 'Chat message input' })
     fireEvent.change(input, { target: { value: 'hello' } })
@@ -142,7 +142,7 @@ describe('mobile coarse-pointer composer keyboard behavior', () => {
   it('Enter still sends on fine pointers', () => {
     stubCoarsePointer(false)
     const onSend = vi.fn()
-    render(<FreshAgentComposer commands={[]} onSend={onSend} />)
+    render(<FreshAgentComposer commands={{ action: [], session: [] }} onSend={onSend} />)
 
     const input = screen.getByRole('textbox', { name: 'Chat message input' })
     fireEvent.change(input, { target: { value: 'hello' } })

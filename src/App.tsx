@@ -18,8 +18,8 @@ import {
 } from '@/store/sessionsThunks'
 import { fetchTerminalDirectoryWindow } from '@/store/terminalDirectoryThunks'
 import { createTerminalInvalidationHandler } from '@/lib/terminal-invalidation-handler'
-import { buildReconcileRequest, collectTerminalPaneTargets, foldVerdicts, setFreshAgentReconcileActive } from '@/lib/pane-reconcile'
-import { PaneReconcileResultSchema, type PaneReconcileRequest } from '@shared/ws-protocol'
+import { buildReconcileRequest, collectTerminalPaneTargets, foldVerdicts, RECONCILE_RESULT_WAIT_MS, setFreshAgentReconcileActive } from '@/lib/pane-reconcile'
+import { PaneReconcileResultSchema, type PaneReconcileRequest, type HostStatsRefreshResponseMessage, type HostStatsSnapshotMessage } from '@shared/ws-protocol'
 import { getShareAction, ensureShareUrlToken, isRemoteAccessEnabledStatus } from '@/lib/share-utils'
 import { getWsClient } from '@/lib/ws-client'
 import { collectSessionLocatorsFromTabs, getSessionsForHello } from '@/lib/session-utils'
@@ -33,6 +33,7 @@ import {
 import { handleUiCommand } from '@/lib/ui-commands'
 import { getAuthToken } from '@/lib/auth'
 import { installTestHarness } from '@/lib/test-harness'
+import { checkServerBuildId } from '@/lib/server-build-check'
 import { createPerfAuditBridge, installPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { getTabSwitchShortcutDirection, getTabLifecycleAction } from '@/lib/tab-switch-shortcuts'
 import { useThemeEffect } from '@/hooks/useTheme'
@@ -75,6 +76,8 @@ import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, res
 import { setClaudeActivitySnapshot, upsertClaudeActivity, removeClaudeActivity, resetClaudeActivity } from '@/store/claudeActivitySlice'
 import { setAmplifierActivitySnapshot, upsertAmplifierActivity, removeAmplifierActivity, resetAmplifierActivity } from '@/store/amplifierActivitySlice'
 import { setOpencodeActivitySnapshot, upsertOpencodeActivity, removeOpencodeActivity, resetOpencodeActivity } from '@/store/opencodeActivitySlice'
+import { hostStatsReset, hostStatsSnapshotReceived, hostStatsSubscribedSet, resolveHostStatsRefresh, failHostStatsRefresh } from '@/store/hostStatsSlice'
+import { subscribeHostStats } from '@/lib/host-stats-ws'
 import { applyServerIdle } from '@/store/turnCompletionThunks'
 import { setRegistry, updateServerStatus } from '@/store/extensionsSlice'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
@@ -159,6 +162,13 @@ const ReadyMessageSchema = z.object({
   timestamp: z.string(),
   serverInstanceId: z.string().min(1),
   bootId: z.string().min(1).optional(),
+  // The server's baked build identity (additive/optional — old servers omit
+  // it). Compared in checkServerBuildId below. Plain `z.string()` (NOT
+  // min(1)): a present-but-EMPTY buildId must reach the helper and no-op
+  // there, never fail the WHOLE ready frame and silently disable restart
+  // detection. Only a non-string TYPE can fail the frame, which no real
+  // server emits (the helper additionally treats "unknown" as a no-op).
+  buildId: z.string().optional(),
   // Server capability ack (present iff our hello opted in). Deliberately a
   // loose record: an unexpected capabilities shape must never fail the WHOLE
   // ready frame and silently disable restart detection.
@@ -267,6 +277,9 @@ export default function App() {
   // mint their own).
   const paneReconcileActiveRef = useRef(false)
   const pendingReconcileRef = useRef<PaneReconcileRequest | null>(null)
+  // Wall-clock timer for the bounded boot-reconcile result wait; see
+  // clearReconcileResultWait in the ws effect for the full contract.
+  const reconcileResultTimerRef = useRef<number | null>(null)
   const fullscreenTouchStartYRef = useRef<number | null>(null)
   const isLandscapeTerminalView = isMobile && isLandscape && view === 'terminal'
   const shareAccessUrl = networkStatus?.accessUrl
@@ -511,6 +524,19 @@ export default function App() {
     let lastReadyServerInstanceId: string | undefined
     let lastSessionsRevision = -1
     const versionInfoLoadedRef = { current: false }
+
+    // Bounded wait for the current boot's pane.reconcile.result: the result
+    // is unicast to THIS socket, so a result lost with a dying socket would
+    // otherwise wedge panes pending-verdict until the NEXT ready healed them
+    // (the reported gray-and-dead shape). Armed right after the request is
+    // sent; cancelled by the result, a correlated error, disconnect, or
+    // teardown.
+    const clearReconcileResultWait = () => {
+      if (reconcileResultTimerRef.current !== null) {
+        window.clearTimeout(reconcileResultTimerRef.current)
+        reconcileResultTimerRef.current = null
+      }
+    }
 
     async function bootstrap() {
       const performAuthFailureTeardown = () => {
@@ -765,10 +791,17 @@ export default function App() {
 
       stopWsDisconnectSync = wsWithOptionalDisconnect.onDisconnect?.(() => {
         if (cancelled) return
+        // Cancel any armed boot-result wait: never census from stale
+        // inventory while offline — the next ready re-sends the request and
+        // re-arms the wait.
+        clearReconcileResultWait()
+        pendingReconcileRef.current = null
         resetCodexActivityOverlay()
         resetClaudeActivityOverlay()
         resetAmplifierActivityOverlay()
         resetOpencodeActivityOverlay()
+        // The hoststats subscription died with the socket; keep last-known values.
+        dispatch(hostStatsReset())
         dispatch(setStatus('disconnected'))
       }) ?? null
 
@@ -907,15 +940,19 @@ export default function App() {
         }
       }
 
-      // Terminal failure of a reconcile App minted (cardinality violation or a
+      // Terminal failure of a reconcile App minted (cardinality violation, a
       // correlated server error frame like RECONCILE_TOO_LARGE /
-      // RECONCILE_UNAVAILABLE): deactivate reconcile for THIS inventory cycle
-      // (re-set true on the next ready) and run the legacy census once from
-      // the CACHED liveTerminalIds — on the real wire terminal.inventory
-      // ALWAYS precedes any reconcile result, so the cache is populated.
-      // Deliberately NO wall-clock timeout on the pending reconcile: it would
-      // false-trip on legitimate deferrals; the request is re-sent on every
-      // ready, so reconnect covers loss windows.
+      // RECONCILE_UNAVAILABLE / RECONCILE_NOT_NEGOTIATED, or expiry of the
+      // bounded boot-result wait): deactivate reconcile for THIS inventory
+      // cycle (re-set true on the next ready) and run the legacy census once
+      // from the CACHED liveTerminalIds — on the real wire
+      // terminal.inventory ALWAYS precedes any reconcile result, so the
+      // cache is populated. The pending reconcile carries a bounded
+      // wall-clock wait (RECONCILE_RESULT_WAIT_MS, well past the server's
+      // single 2s warming deferral) that routes here on expiry — the earlier
+      // deliberate no-timeout decision wedged panes pending-verdict forever
+      // when the result died with its socket (the reported gray-and-dead
+      // shape).
       const fallBackToLegacyCensus = () => {
         pendingReconcileRef.current = null
         paneReconcileActiveRef.current = false
@@ -1004,6 +1041,12 @@ export default function App() {
             if (!newBootId) {
               log.warn('ready frame carried no bootId; falling back to serverInstanceId for restart detection')
             }
+            // Server-build mismatch detection: the server stamps the git
+            // commit it was built from (ready.buildId, additive/optional);
+            // we compare it against our own Vite-baked
+            // __FRESHELL_BUILD_ID__ and reload ONCE on a mismatch (sentinel
+            // loop-guard lives in src/lib/server-build-check.ts).
+            checkServerBuildId({ serverBuildId: ready.data.buildId })
             const bootIdRestart = !!previousBootId && previousBootId !== newBootId
             const instanceChanged = !!previousServerInstanceId
               && !!nextServerInstanceId
@@ -1051,6 +1094,22 @@ export default function App() {
                 dispatch(setReconcilePendingPanes({ paneKeys: req.panes.map((p) => p.paneKey), startedAt: Date.now() }))
                 ws.setReconcilePendingCreates(req.panes.map((p) => p.createRequestId))
                 ws.send(req)
+                clearReconcileResultWait()
+                reconcileResultTimerRef.current = window.setTimeout(() => {
+                  reconcileResultTimerRef.current = null
+                  if (!pendingReconcileRef.current) return
+                  // The result is unicast to THIS socket; if it was lost with
+                  // a dying socket, only ANOTHER ready would heal the wedge
+                  // (gray panes, zero chrome). Bound the wait and degrade to
+                  // the legacy census instead. This supersedes the earlier
+                  // deliberate no-timeout decision: the wedge it permits is
+                  // the reported gray-and-dead shape.
+                  log.warn('[reconcile] result wait expired — falling back to legacy census')
+                  pendingReconcileRef.current = null
+                  dispatch(clearAllReconcilePendingPanes())
+                  ws.clearReconcileCreateHold()
+                  fallBackToLegacyCensus()
+                }, RECONCILE_RESULT_WAIT_MS)
               } else {
                 ws.clearReconcileCreateHold() // nothing to reconcile — release any held creates immediately
               }
@@ -1066,6 +1125,15 @@ export default function App() {
           requestClaudeActivityList()
           requestAmplifierActivityList()
           requestOpencodeActivityList()
+          // hoststats: the old socket's subscription died; keep last live/manual
+          // values and resubscribe iff any Host Stats panes are mounted.
+          dispatch(hostStatsReset())
+          // `?.` mirrors the state.freshAgent?.sessions precedent: App-level
+          // folds run against deliberately partial stores in App unit tests.
+          if ((appStore.getState().hostStats?.mountedPanes ?? 0) > 0) {
+            subscribeHostStats()
+            dispatch(hostStatsSubscribedSet(true))
+          }
           lastSessionsRevision = -1
           void recoverMissingStartupState()
         }
@@ -1078,6 +1146,7 @@ export default function App() {
             return
           }
           pendingReconcileRef.current = null
+          clearReconcileResultWait()
           const parsed = PaneReconcileResultSchema.safeParse(msg)
           if (!parsed.success) {
             console.error('[reconcile] malformed result — falling back to legacy census', parsed.error.issues)
@@ -1134,6 +1203,7 @@ export default function App() {
             console.error('[reconcile] server error — falling back to legacy census', (msg as { code?: unknown }).code)
             // Terminal for this reconcile: no verdicts are coming — release
             // the pending panes and the sender hold before the census.
+            clearReconcileResultWait()
             dispatch(clearAllReconcilePendingPanes())
             ws.clearReconcileCreateHold()
             fallBackToLegacyCensus()
@@ -1398,6 +1468,31 @@ export default function App() {
           dispatch(updateServerStatus({ name: msg.name, serverRunning: false, serverPort: undefined }))
         }
 
+        // hoststats.* frames are server-validated; the client trusts them and
+        // folds without runtime revalidation (shared/ws-protocol.ts header).
+        if (msg.type === 'hoststats.snapshot') {
+          const snapshot = msg as HostStatsSnapshotMessage
+          dispatch(hostStatsSnapshotReceived({
+            at: snapshot.at,
+            live: snapshot.live,
+            manualAt: snapshot.manualAt ?? null,
+            manual: snapshot.manual ?? null,
+          }))
+        }
+        if (msg.type === 'hoststats.refresh.response') {
+          const resp = msg as HostStatsRefreshResponseMessage
+          // Ref-map semantics keyed by requestId; unknown ids are ignored by
+          // the resolve/fail thunks without throwing.
+          const requestId = typeof resp.requestId === 'string' ? resp.requestId : ''
+          if (requestId) {
+            if (resp.ok === true && typeof resp.at === 'number' && resp.manual) {
+              dispatch(resolveHostStatsRefresh({ requestId, at: resp.at, manual: resp.manual }))
+            } else if (resp.ok === false) {
+              dispatch(failHostStatsRefresh({ requestId, error: typeof resp.error === 'string' ? resp.error : 'refresh failed' }))
+            }
+          }
+        }
+
         handleFreshAgentMessage(dispatch, msg as Record<string, unknown>, ws)
       })
 
@@ -1476,9 +1571,24 @@ export default function App() {
 
     const cleanupPromise = bootstrap()
 
+    // Foreground reconnect poke: mobile browsers freeze or silently kill the
+    // socket while backgrounded, so re-assert transport liveness whenever the
+    // page comes back to the front (visibilitychange/online/pageshow — the
+    // iOS bfcache restore only fires pageshow).
+    const ws = getWsClient()
+    const pokeWs = () => ws.poke()
+    const pokeWsWhenVisible = () => { if (document.visibilityState === 'visible') ws.poke() }
+    window.addEventListener('online', pokeWs)
+    window.addEventListener('pageshow', pokeWs)
+    document.addEventListener('visibilitychange', pokeWsWhenVisible)
+
     return () => {
+      window.removeEventListener('online', pokeWs)
+      window.removeEventListener('pageshow', pokeWs)
+      document.removeEventListener('visibilitychange', pokeWsWhenVisible)
       cancelled = true
       cleanedUp = true
+      clearReconcileResultWait()
       cleanup?.()
       stopTabRegistrySync?.()
       stopWsDisconnectSync?.()

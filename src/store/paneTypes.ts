@@ -159,6 +159,15 @@ export type PickerPaneContent = {
   kind: 'picker'
 }
 
+/**
+ * Host stats pane content — the host pressure dashboard (CPU/memory/PSI/IO).
+ * Stateless: every value lives in the connection-level hostStats slice, so a
+ * host-stats leaf carries no fields beyond its kind.
+ */
+export type HostStatsPaneContent = {
+  kind: 'host-stats'
+}
+
 /** SDK session statuses — richer than TerminalStatus to reflect Claude Code lifecycle */
 export type SdkSessionStatus = 'creating' | 'starting' | 'connected' | 'running' | 'idle' | 'compacting' | 'exited' | 'create-failed'
 
@@ -214,6 +223,12 @@ export type FreshAgentPaneContent = {
    * Absent for panes created outside the selector (REST/MCP/restored) —
    * those fall back to static-table normalization, unchanged. */
   modelEffortLevels?: string[]
+  /** Display label for the pane's model as known at pick time (static-table or
+   * probed catalog label), stamped by the selectors together with the model id.
+   * Id-paired: readers apply it only while the pane's effective model id still
+   * equals `modelId`, so a writer that changes the model without restamping can
+   * never mislabel the chip. */
+  modelLabel?: { modelId: string; label: string }
   plugins?: string[]
   /** Visual style for this pane; missing legacy panes resolve from provider defaults, then sans. */
   style?: FreshAgentStyle
@@ -244,7 +259,7 @@ export type ExtensionPaneContent = {
  * Union type for all pane content types.
  */
 export type PaneContent = TerminalPaneContent | BrowserPaneContent | EditorPaneContent
-  | PickerPaneContent | FreshAgentPaneContent | ExtensionPaneContent
+  | PickerPaneContent | FreshAgentPaneContent | ExtensionPaneContent | HostStatsPaneContent
 
 /**
  * Input type for creating terminal panes.
@@ -273,7 +288,7 @@ export type FreshAgentPaneInput = Omit<FreshAgentPaneContent, 'createRequestId' 
 export type ExtensionPaneInput = ExtensionPaneContent
 
 export type LivePaneContentInput = TerminalPaneInput | BrowserPaneInput | EditorPaneInput
-  | PickerPaneContent | FreshAgentPaneInput | ExtensionPaneInput
+  | PickerPaneContent | FreshAgentPaneInput | ExtensionPaneInput | HostStatsPaneContent
 
 export type LegacyPaneContentInput = Record<string, unknown>
 

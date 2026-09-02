@@ -46,26 +46,36 @@ describe('session-directory projection', () => {
       sessionType: 'codex',
       isSubagent: false,
       isNonInteractive: false,
+      // STATUS-STRIP: usage is now a directory-visible field — usage ticks must
+      // trigger sessions.changed so the strip's context meter refetches.
+      tokenUsage: { inputTokens: 1, outputTokens: 2, cachedTokens: 3, totalTokens: 6 },
     })
   })
 
-  it('ignores invisible metadata and project color but still treats lastActivityAt as visible', () => {
+  it('ignores invisible metadata and project color but still treats lastActivityAt and tokenUsage as visible', () => {
     const first: ProjectGroup[] = [{
       projectPath: '/repo',
       color: '#f00',
       sessions: [{ ...baseSession, tokenUsage: { inputTokens: 1, outputTokens: 2, cachedTokens: 0, totalTokens: 3 } }],
     }]
-    const second: ProjectGroup[] = [{
+    const sameUsageDifferentColor: ProjectGroup[] = [{
       projectPath: '/repo',
       color: '#0f0',
-      sessions: [{ ...baseSession, tokenUsage: { inputTokens: 9, outputTokens: 9, cachedTokens: 9, totalTokens: 27 }, sourceFile: '/tmp/other.jsonl' }],
+      sessions: [{ ...baseSession, tokenUsage: { inputTokens: 1, outputTokens: 2, cachedTokens: 0, totalTokens: 3 }, sourceFile: '/tmp/other.jsonl' }],
+    }]
+    const usageChanged: ProjectGroup[] = [{
+      projectPath: '/repo',
+      sessions: [{ ...baseSession, tokenUsage: { inputTokens: 9, outputTokens: 9, cachedTokens: 9, totalTokens: 27 } }],
     }]
     const lastActivityAtChanged: ProjectGroup[] = [{
       projectPath: '/repo',
       sessions: [{ ...baseSession, lastActivityAt: 101 }],
     }]
 
-    expect(hasSessionDirectorySnapshotChange(first, second)).toBe(false)
+    expect(hasSessionDirectorySnapshotChange(first, sameUsageDifferentColor)).toBe(false)
+    // STATUS-STRIP: usage ticks count as a change so sessions.changed fires and
+    // the strip's context meter refetches even when nothing else moved.
+    expect(hasSessionDirectorySnapshotChange(first, usageChanged)).toBe(true)
     expect(hasSessionDirectorySnapshotChange(
       [{ projectPath: '/repo', sessions: [{ ...baseSession, lastActivityAt: 100 }] }],
       lastActivityAtChanged,

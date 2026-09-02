@@ -161,7 +161,7 @@ describe('SessionsSyncService', () => {
     expect(ws.broadcastSessionsChanged).toHaveBeenLastCalledWith(1)
   })
 
-  it('broadcasts only when directory-visible fields change', () => {
+  it('broadcasts when directory-visible fields change (STATUS-STRIP: tokenUsage is now visible)', () => {
     const ws = createWsMocks()
     const svc = new SessionsSyncService(ws as any, { coalesceMs: 0 })
 
@@ -194,10 +194,9 @@ describe('SessionsSyncService', () => {
           totalTokens: 27,
         },
         sourceFile: '/tmp/other.jsonl',
-        // SESSION-05: same color as the baseline publish — project colors
-        // ARE directory-visible now (see the color-only test below), so
-        // this leg must hold color constant to keep asserting that only
-        // tokenUsage/sourceFile metadata is invisible.
+        // STATUS-STRIP: tokenUsage is directory-visible now — usage ticks
+        // broadcast sessions.changed so the fresh-agent strip's context meter
+        // refetches. Same color as the baseline publish to isolate that delta.
       }, '#f00'),
     ])
     svc.publish([
@@ -223,6 +222,7 @@ describe('SessionsSyncService', () => {
       [1],
       [2],
       [3],
+      [4],
     ])
   })
 

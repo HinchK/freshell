@@ -1,4 +1,5 @@
 import os from 'os'
+import { randomUUID } from 'crypto'
 import { Router } from 'express'
 import { z } from 'zod'
 import { cleanString } from './utils.js'
@@ -39,6 +40,15 @@ import {
 } from './read-models/work-scheduler.js'
 
 const log = logger.child({ component: 'sessions-router' })
+
+// STATUS-STRIP: monotonic per-process counter for session-directory pages,
+// assigned at query invocation (inside the scheduler's run() closure, right
+// before `codingCliIndexer.getProjects()` captures the index state). Clock-seeded
+// so a restarted process never restamps lower than a page it already served — and
+// paired with a per-boot nonce: ordering by snapshotSeq is only trusted within
+// the same (serverInstance, bootId) namespace.
+let directorySnapshotSeq = Date.now()
+const directoryBootId = randomUUID()
 
 export const SessionPatchSchema = z.object({
   titleOverride: z.string().optional().nullable(),
@@ -105,6 +115,11 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
       includeSubagents: req.query.includeSubagents,
       includeNonInteractive: req.query.includeNonInteractive,
       includeEmpty: req.query.includeEmpty,
+      // STATUS-STRIP: comma-separated `provider:sessionId` keys the client
+      // needs usage for regardless of the sidebar window (context meter).
+      includeKeys: typeof req.query.includeKeys === 'string' && req.query.includeKeys.length > 0
+        ? req.query.includeKeys.split(',').filter(Boolean)
+        : undefined,
     })
 
     if (!parsed.success) {
@@ -117,13 +132,22 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
       const page = await readModelScheduler.schedule({
         lane: parsed.data.priority,
         signal,
-        run: (scheduledSignal) => querySessionDirectory({
-          projects: codingCliIndexer.getProjects(),
-          query: parsed.data,
-          terminalMeta: deps.terminalMetadata?.list() ?? [],
-          providers: codingCliProviders,
-          signal: scheduledSignal,
-        }),
+        run: (scheduledSignal) => {
+          // Assign immediately before capturing the indexer snapshot: the
+          // sequence order matches the getProjects() capture order, so a later
+          // query is never stamped lower than an earlier one.
+          const snapshotSeq = ++directorySnapshotSeq
+          return querySessionDirectory({
+            projects: codingCliIndexer.getProjects(),
+            query: parsed.data,
+            terminalMeta: deps.terminalMetadata?.list() ?? [],
+            providers: codingCliProviders,
+            signal: scheduledSignal,
+            snapshotSeq,
+            bootId: directoryBootId,
+            serverInstance: deps.serverInstanceId,
+          })
+        },
       })
       setResponsePerfContext(res, {
         readModelLane: parsed.data.priority,

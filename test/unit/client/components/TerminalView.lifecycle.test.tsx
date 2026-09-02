@@ -3249,6 +3249,162 @@ describe('TerminalView lifecycle updates', () => {
     expect(createCallsAfter.length).toBe(createCallsBefore.length + 1)
   })
 
+  describe('D7-refusal revival (close→reopen reattach)', () => {
+    function setupRevivalPane() {
+      const tabId = 'tab-revive'
+      const paneId = 'pane-revive'
+
+      const paneContent: TerminalPaneContent = {
+        kind: 'terminal',
+        createRequestId: 'req-revive',
+        status: 'creating',
+        mode: 'shell',
+        shell: 'system',
+      }
+
+      const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+      const store = configureStore({
+        reducer: {
+          tabs: tabsReducer,
+          panes: panesReducer,
+          settings: settingsReducer,
+          connection: connectionReducer,
+        },
+        preloadedState: {
+          tabs: {
+            tabs: [{
+              id: tabId,
+              mode: 'shell',
+              status: 'creating',
+              title: 'Shell',
+              titleSetByUser: false,
+              createRequestId: 'req-revive',
+            }],
+            activeTabId: tabId,
+          },
+          panes: {
+            layouts: { [tabId]: root },
+            activePane: { [tabId]: paneId },
+            paneTitles: {},
+          },
+          settings: createSettingsState(),
+          connection: { status: 'connected', error: null },
+        },
+      })
+
+      render(
+        <Provider store={store}>
+          <TerminalViewFromStore tabId={tabId} paneId={paneId} />
+        </Provider>
+      )
+
+      return { store, tabId, paneId }
+    }
+
+    const d7Refusal = (requestId: string) => ({
+      type: 'error' as const,
+      code: 'RESTORE_UNAVAILABLE',
+      message: 'Session sess-live is still running on the server.',
+      requestId,
+      liveTerminalId: 't-live-owner',
+    })
+
+    it('reattaches the pane to the live owner the enriched refusal names — never the dead-end write', async () => {
+      const { store, tabId } = setupRevivalPane()
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+        expect(
+          wsMocks.send.mock.calls.filter(([msg]) => msg?.type === 'terminal.create'),
+        ).toHaveLength(1)
+      })
+
+      // The D7 refusal lands carrying the STILL-RUNNING owner id (the
+      // close→reopen fallback shape: open pane, live server-side owner).
+      act(() => {
+        messageHandler!(d7Refusal('req-revive'))
+      })
+
+      // The revival fold: store state gains the live handle via the new
+      // reducer — never status:'error', and createRequestId stays put
+      // (council rule 2: never re-minted).
+      const revived = getLeafTerminalContent(store, tabId)
+      expect(revived.terminalId).toBe('t-live-owner')
+      expect(revived.status).toBe('running')
+      expect(revived.restoreError).toBeUndefined()
+      expect(revived.createRequestId).toBe('req-revive')
+
+      // The epoch bump re-fires the lifecycle effect, so a terminal.attach for
+      // the NAMED id leaves the client — and no second terminal.create is sent.
+      await waitFor(() => {
+        expect(
+          wsMocks.send.mock.calls
+            .map(([msg]) => msg)
+            .filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === 't-live-owner'),
+        ).toHaveLength(1)
+      })
+      expect(
+        wsMocks.send.mock.calls.map(([msg]) => msg).filter((msg) => msg?.type === 'terminal.create'),
+      ).toHaveLength(1)
+
+      // The pane announces the reconnection — never the dead-end write.
+      const term = terminalInstances[0]
+      expectTerminalWriteContaining(term, 'Reconnected to the still-running session.')
+      expect(terminalWriteStrings(term).some((entry) => entry.includes('[Restore failed]'))).toBe(false)
+      expect(terminalWriteStrings(term).some((entry) => entry.includes('[Launch failed]'))).toBe(false)
+    })
+
+    it('revives at most once per createRequestId — the second refusal lands the existing error write', async () => {
+      const { store, tabId } = setupRevivalPane()
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+        expect(
+          wsMocks.send.mock.calls.filter(([msg]) => msg?.type === 'terminal.create'),
+        ).toHaveLength(1)
+      })
+
+      // First refusal revives the pane onto the live owner…
+      act(() => {
+        messageHandler!(d7Refusal('req-revive'))
+      })
+      await waitFor(() => {
+        expect(
+          wsMocks.send.mock.calls
+            .map(([msg]) => msg)
+            .filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === 't-live-owner'),
+        ).toHaveLength(1)
+      })
+      const attachesAfterRevival = wsMocks.send.mock.calls.map(([msg]) => msg).filter(
+        (msg) => msg?.type === 'terminal.attach',
+      ).length
+
+      // …but if the live handle died in the race, the follow-on refusal for
+      // the same createRequestId must NOT loop the revival — it falls through
+      // to the existing dead-end error write.
+      act(() => {
+        messageHandler!(d7Refusal('req-revive'))
+      })
+
+      const fallen = getLeafTerminalContent(store, tabId)
+      expect(fallen.status).toBe('error')
+      expect(
+        wsMocks.send.mock.calls.map(([msg]) => msg).filter((msg) => msg?.type === 'terminal.attach'),
+      ).toHaveLength(attachesAfterRevival)
+      expect(
+        wsMocks.send.mock.calls.map(([msg]) => msg).filter((msg) => msg?.type === 'terminal.create'),
+      ).toHaveLength(1)
+
+      const term = terminalInstances[0]
+      expectTerminalWriteContaining(term, 'Reconnected to the still-running session.')
+      expectTerminalWriteContaining(term, 'Session sess-live is still running on the server.')
+      expect(
+        terminalWriteStrings(term).filter((entry) => entry.includes('Reconnected to the still-running session.')),
+      ).toHaveLength(1)
+    })
+  })
+
   it('does not reconnect after terminal.exit when INVALID_TERMINAL_ID is received', async () => {
     // This test verifies the fix for the runaway terminal creation loop:
     // 1. Terminal exits normally (e.g., Claude fails to resume)
@@ -7970,6 +8126,76 @@ describe('TerminalView lifecycle updates', () => {
           cols: expect.any(Number),
           rows: expect.any(Number),
         }))
+      })
+    })
+
+    it('pumps the hydration queue for a hidden pane on reconnect even without a usable parser checkpoint', async () => {
+      // The active tab hydrated first: the background pump is already started
+      // (onActiveTabReady is one-shot) before this hidden pane ever mounts.
+      act(() => {
+        getHydrationQueue().onActiveTabReady('tab-active-first', ['tab-active-first'])
+      })
+
+      const { terminalId } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-hidden-reconnect-pump',
+        hidden: true,
+        ackInitialAttach: false,
+      })
+
+      // A hidden pane mounted post-startup registers WITHOUT queueIfStarted by
+      // design -- it waits for reveal. Nothing may attach while it stays hidden.
+      expect(wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)).toHaveLength(0)
+
+      // No parser-applied checkpoint exists for this terminal in the harness,
+      // so the reconnect hidden branch takes the checkpoint-missing path --
+      // exactly the branch that registered with queueIfStarted:false and wedged
+      // behind the consumed registration guard.
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      // The pane must be re-queued AND pumped with no reveal: a full replay
+      // attach leaves the client through the background hydration slot.
+      // (Hidden viewport hydration uses the keepalive_delta wire token per the
+      // attach policy's geometry swap; sinceSeq 0 = full replay.)
+      await waitFor(() => {
+        expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+          type: 'terminal.attach',
+          terminalId,
+          intent: 'keepalive_delta',
+          sinceSeq: 0,
+          priority: 'background',
+          attachRequestId: expect.any(String),
+        }))
+      })
+
+      // The queue stays one-at-a-time: a second hidden pane registered behind
+      // this one must hold until this pane's hydration completes -- proof the
+      // reconnect re-register took the pump slot and the queue then advanced
+      // past it.
+      const trailingTrigger = vi.fn()
+      act(() => {
+        getHydrationQueue().register(
+          { tabId: 'tab-trailing', paneId: 'pane-trailing', trigger: trailingTrigger },
+          { queueIfStarted: true },
+        )
+      })
+      expect(trailingTrigger).not.toHaveBeenCalled()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 0,
+          replayFromSeq: 1,
+          replayToSeq: 0,
+        })
+      })
+      await waitFor(() => {
+        expect(trailingTrigger).toHaveBeenCalledTimes(1)
       })
     })
 

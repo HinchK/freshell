@@ -319,12 +319,20 @@ export function FreshAgentSettingsButton({
                                 nextModel,
                                 paneContent.effort,
                               )
-                          dispatch(mergePaneContent({
-                            tabId,
-                            paneId,
-                            updates: {
-                              model: nextModel,
-                              effort: nextEffort,
+                            dispatch(mergePaneContent({
+                              tabId,
+                              paneId,
+                              updates: {
+                                model: nextModel,
+                                // Stamp the picked row's display label for the
+                                // status-strip chip (id-paired; a later model
+                                // change without a stamp can never mislabel).
+                                // A label echoing the raw id is not a display
+                                // name (e.g. opencode's no-name fallback): skip.
+                                ...(nextRow && nextRow.label !== nextModel
+                                  ? { modelLabel: { modelId: nextModel, label: nextRow.label } }
+                                  : {}),
+                                effort: nextEffort,
                               // Stamp the switched-to row's known levels
                               // (static or probed) so effort normalization
                               // clamps against THEM — never re-derived from

@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import type { LocalSettingsPatch, ServerSettings } from './settings.js'
+import { TokenSummarySchema } from './ws-protocol.js'
 
 export const MAX_BOOTSTRAP_PAYLOAD_BYTES = 12 * 1024
 export const MAX_REALTIME_MESSAGE_BYTES = 16 * 1024
@@ -35,6 +36,14 @@ export const SessionDirectoryQuerySchema = z.object({
   includeSubagents: z.coerce.boolean().optional(),
   includeNonInteractive: z.coerce.boolean().optional(),
   includeEmpty: z.coerce.boolean().optional(),
+  /**
+   * STATUS-STRIP (fresh-agent context meter): composite `provider:sessionId`
+   * keys the client needs usage for regardless of sidebar search/pagination.
+   * Matching sessions are returned in `contextUsageExtras` — never merged into
+   * `items`, so sidebar rendering is untouched. Capped at the 200-pane ceiling
+   * (larger workspaces would otherwise reject every sidebar fetch).
+   */
+  includeKeys: z.array(z.string().min(1)).max(200).optional(),
 })
 
 export const SessionDirectoryItemSchema = z.object({
@@ -57,6 +66,22 @@ export const SessionDirectoryItemSchema = z.object({
   isRunning: z.boolean(),
   runningTerminalId: z.string().optional(),
   liveTerminalOnly: z.boolean().optional(),
+  /**
+   * STATUS-STRIP: live token usage (incl. compactPercent) from the session
+   * indexer / terminal metadata. Powers the fresh-agent strip context meter.
+   */
+  tokenUsage: TokenSummarySchema.optional(),
+})
+
+/**
+ * STATUS-STRIP: a usage-carrying session returned out-of-band when the client
+ * asked for it via `includeKeys` but the row was filtered out of the paged
+ * `items` (sidebar search / pagination). Deliberately NOT merged into items.
+ */
+export const SessionDirectoryContextUsageExtraSchema = z.object({
+  provider: z.string().min(1),
+  sessionId: z.string().min(1),
+  tokenUsage: TokenSummarySchema.optional(),
 })
 
 /**
@@ -94,6 +119,14 @@ export const SessionDirectoryPageSchema = z.object({
   // `server/session-directory/service.ts`; Rust:
   // `crates/freshell-server/src/session_directory.rs`).
   projectColors: z.record(z.string(), z.string()).optional(),
+  /** STATUS-STRIP: present only when `includeKeys` matched sessions that fell outside `items`. */
+  contextUsageExtras: z.array(SessionDirectoryContextUsageExtraSchema).optional(),
+  /** STATUS-STRIP: monotonic per-process response sequence — clients order competing pages by it (unlike `revision`, which is a data-derived max timestamp and is NOT monotonic). */
+  snapshotSeq: z.number().int().positive().optional(),
+  /** The serving server's instance id — pages are only orderable by snapshotSeq within one instance. */
+  serverInstance: z.string().min(1).optional(),
+  /** STATUS-STRIP: per-PROCESS boot nonce — sequence comparisons are valid within the same instance+boot namespace only (the clock-seeded counter alone cannot prove monotonicity across restarts under wall-clock rewind). */
+  bootId: z.string().min(1).optional(),
 })
 
 export const TerminalDirectoryQuerySchema = z.object({
@@ -147,6 +180,7 @@ export type ReadModelPriority = z.infer<typeof ReadModelPrioritySchema>
 export type ReadModelLane = z.infer<typeof ReadModelLaneSchema>
 export type SessionDirectoryQuery = z.infer<typeof SessionDirectoryQuerySchema>
 export type SessionDirectoryItem = z.infer<typeof SessionDirectoryItemSchema>
+export type SessionDirectoryContextUsageExtra = z.infer<typeof SessionDirectoryContextUsageExtraSchema>
 export type SessionDirectoryIntegrityError = z.infer<typeof SessionDirectoryIntegrityErrorSchema>
 export type SessionDirectoryPage = z.infer<typeof SessionDirectoryPageSchema>
 export type TerminalDirectoryQuery = z.infer<typeof TerminalDirectoryQuerySchema>

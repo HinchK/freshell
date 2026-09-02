@@ -1,4 +1,4 @@
-//! Client → server messages (`ClientMessage`, 33 discriminants).
+//! Client → server messages (`ClientMessage`, 36 discriminants).
 //!
 //! These are the Zod-validated inbound surface. Deserialization is
 //! accept-and-strip (no `deny_unknown_fields`), mirroring the runtime.
@@ -85,11 +85,17 @@ pub enum ClientMessage {
     FreshAgentRedo(FreshAgentRedo),
     #[serde(rename = "pane.reconcile.request")]
     PaneReconcileRequest(PaneReconcileRequest),
+    #[serde(rename = "hoststats.subscribe")]
+    HostStatsSubscribe,
+    #[serde(rename = "hoststats.unsubscribe")]
+    HostStatsUnsubscribe,
+    #[serde(rename = "hoststats.refresh")]
+    HostStatsRefresh(HostStatsRefresh),
 }
 
 /// The exact `type` discriminants of every client→server message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const CLIENT_MESSAGE_TYPES: [&str; 33] = [
+pub const CLIENT_MESSAGE_TYPES: [&str; 36] = [
     "amplifier.activity.list",
     "claude.activity.list",
     "client.diagnostic",
@@ -109,6 +115,9 @@ pub const CLIENT_MESSAGE_TYPES: [&str; 33] = [
     "freshAgent.send",
     "freshAgent.undo",
     "hello",
+    "hoststats.refresh",
+    "hoststats.subscribe",
+    "hoststats.unsubscribe",
     "opencode.activity.list",
     "pane.reconcile.request",
     "ping",
@@ -689,7 +698,6 @@ pub struct FreshAgentFork {
     pub cwd: Option<String>,
 }
 
-/// kata 1wxv: rollback `mode` field (`absent => step` on the server side).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RollbackMode {
@@ -726,4 +734,14 @@ pub struct FreshAgentRedo {
     pub turn_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+}
+
+// --- hoststats.* -----------------------------------------------------------
+
+/// `HostStatsRefreshSchema` (`shared/ws-protocol.ts`) — client-minted
+/// `requestId`, echoed verbatim by `hoststats.refresh.response`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostStatsRefresh {
+    #[serde(rename = "requestId")]
+    pub request_id: String,
 }

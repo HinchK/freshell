@@ -26,7 +26,9 @@
 #   --timeout=DURATION Cloud Run task timeout (default: 60m)
 #   --grep=PATTERN    Pass --grep=PATTERN to Playwright
 #   --project=NAME    Pass --project=NAME to Playwright
-#   --account=EMAIL   GCP account (default: FRESHELL_GCP_ACCOUNT env or dan@danshapiro.com)
+#   --account=EMAIL   GCP account pin (highest precedence; default: none —
+#                     FRESHELL_GCP_ACCOUNT env, then the gcloud-robot identity
+#                     ladder, then ambient gcloud)
 #   --project-id=ID   GCP project (default: FRESHELL_GCP_PROJECT env or misc-puttering-project)
 #   --region=REGION   GCP region (default: FRESHELL_GCP_REGION env or us-west1)
 #
@@ -42,7 +44,11 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
-GCP_ACCOUNT="${FRESHELL_GCP_ACCOUNT:-dan@danshapiro.com}"
+# No account is hardcoded. Precedence: --account= flag > FRESHELL_GCP_ACCOUNT
+# > gcloud-robot identity ladder (freshell_resolve_cloud_identity, resolved
+# lazily per cloud lane) > unset — calls then omit --account and ambient
+# gcloud applies, which the ladder announces once on stderr.
+GCP_ACCOUNT="${FRESHELL_GCP_ACCOUNT:-}"
 GCP_PROJECT="${FRESHELL_GCP_PROJECT:-misc-puttering-project}"
 GCP_REGION="${FRESHELL_GCP_REGION:-us-west1}"
 GCP_REPO="${FRESHELL_GCP_REPO:-freshell-e2e}"
@@ -54,6 +60,12 @@ IMAGE_REMOTE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/${IMAGE_NA
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Shared gcloud identity ladder (gcloud-robot). Sourcing only defines
+# functions — no side effects, no output — so help and local lanes stay
+# gcloud-free and silent.
+# shellcheck source=scripts/lib/gcp-identity.sh
+. "$SCRIPT_DIR/lib/gcp-identity.sh"
 
 # Commit-addressed image tag (wrap-review r3): a cloud run must execute the
 # code at the CURRENT HEAD — with only a mutable :latest tag, `run` would
@@ -92,7 +104,13 @@ fi
 # Helpers
 # ---------------------------------------------------------------------------
 gcloud_flags() {
-  echo "--account=${GCP_ACCOUNT} --project=${GCP_PROJECT} --region=${GCP_REGION}"
+  # No identity may legitimately resolve (rung 4: ambient gcloud). An empty
+  # pin omits --account entirely rather than passing gcloud an empty value.
+  if [ -n "${GCP_ACCOUNT:-}" ]; then
+    echo "--account=${GCP_ACCOUNT} --project=${GCP_PROJECT} --region=${GCP_REGION}"
+  else
+    echo "--project=${GCP_PROJECT} --region=${GCP_REGION}"
+  fi
 }
 
 # Unique per-run job. `gcloud run jobs execute` snapshots the job's CURRENT
@@ -110,7 +128,21 @@ unique_job_name() {
 
 # gcloud artifacts commands use --location, not --region
 gcloud_artifacts_flags() {
-  echo "--account=${GCP_ACCOUNT} --project=${GCP_PROJECT} --location=${GCP_REGION}"
+  if [ -n "${GCP_ACCOUNT:-}" ]; then
+    echo "--account=${GCP_ACCOUNT} --project=${GCP_PROJECT} --location=${GCP_REGION}"
+  else
+    echo "--project=${GCP_PROJECT} --location=${GCP_REGION}"
+  fi
+}
+
+# Prints a pinned --account flag, or NOTHING (not even an empty word) when no
+# identity resolved — for the gcloud calls that pin inline instead of via
+# gcloud_flags(). An empty expansion inside an unquoted $() yields no argv
+# word, which is exactly what "omit --account" needs; always exits 0.
+account_flag() {
+  if [ -n "${GCP_ACCOUNT:-}" ]; then
+    printf -- '--account=%s' "${GCP_ACCOUNT}"
+  fi
 }
 
 usage() {
@@ -133,13 +165,21 @@ Flags:
   --timeout=DURATION Cloud Run task timeout (default: 60m)
   --grep=PATTERN    Pass --grep=PATTERN to Playwright
   --project=NAME    Pass --project=NAME to Playwright
-  --account=EMAIL   GCP account (default: dan@danshapiro.com)
+  --account=EMAIL   GCP account pin (highest precedence; default: none)
   --project-id=ID   GCP project (default: misc-puttering-project)
   --region=REGION   GCP region (default: us-west1)
 
 Environment:
   FRESHELL_E2E_BACKEND  "local" (default) or "cloud"
   FRESHELL_GCP_JOB      Cloud Run job-name prefix (default: freshell-e2e)
+  FRESHELL_GCP_ACCOUNT  GCP account override pinned on every gcloud call (optional)
+
+Identity (cloud lanes only — details: docs/development/gcloud-robot.md):
+  Cloud subcommands resolve a gcloud identity lazily, in this order:
+  --account= > FRESHELL_GCP_ACCOUNT > GCLOUD_IDENT > gcloud-robot probe
+  (needs GCLOUD_ROBOT_HOME, the installed gcloud-robot skill directory)
+  > ambient gcloud (one quiet stderr note). GCLOUD_ROBOT_REQUIRE=1 fails
+  closed with guidance instead of the ambient fallback.
 
 Cloud job lifecycle: each cloud run creates its OWN unique job
 (<prefix>-<commit>[-dirty]-<random>), executes it, and deletes it
@@ -188,6 +228,11 @@ cmd_build() {
     esac
   done
 
+  # Identity ladder (build/push lane): resolve before the first gcloud call,
+  # never at script top — help and local-only paths must keep working with
+  # zero GCP tooling. Probe = the lane's gating permission.
+  freshell_resolve_cloud_identity "cloudbuild.builds.create"
+
   # Content-addressed tag (see image_tag_for_head): the only tag `run` pins.
   local tag remote_base
   tag="$(image_tag_for_head)"
@@ -205,7 +250,7 @@ cmd_build() {
     echo "[e2e-cloud] Building Docker image via Cloud Build (tag: $tag)..."
     gcloud builds submit \
       --config "$ROOT/docker/cloud-run/cloudbuild.yaml" \
-      --account="$GCP_ACCOUNT" \
+      $(account_flag) \
       --project="$GCP_PROJECT" \
       --substitutions=_IMAGE="${remote_base}:${tag}" \
       "$ROOT"
@@ -219,6 +264,32 @@ cmd_build() {
 cmd_push() {
   echo "[e2e-cloud] Pushing to Artifact Registry..."
 
+  # The standalone push lane honors the same pin flags as build/run;
+  # parse FIRST so an explicit --account= wins without touching the ladder.
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --account=*)
+        GCP_ACCOUNT="${1#*=}"
+        shift
+        ;;
+      --project-id=*)
+        GCP_PROJECT="${1#*=}"
+        shift
+        ;;
+      --region=*)
+        GCP_REGION="${1#*=}"
+        shift
+        ;;
+      *)
+        shift
+        ;;
+    esac
+  done
+
+  # A standalone `push` reaches gcloud without passing through cmd_build;
+  # resolve idempotently (free when cmd_build already did).
+  freshell_resolve_cloud_identity "cloudbuild.builds.create"
+
   # Ensure the Artifact Registry repo exists
   if ! gcloud artifacts repositories describe $(gcloud_artifacts_flags) "$GCP_REPO" &>/dev/null; then
     echo "[e2e-cloud] Creating Artifact Registry repository: $GCP_REPO"
@@ -228,7 +299,7 @@ cmd_push() {
 
   # Authenticate Docker to Artifact Registry using an access token.
   # We can't rely on the docker-credential-gcloud helper being on PATH.
-  gcloud auth print-access-token --account="$GCP_ACCOUNT" | \
+  gcloud auth print-access-token $(account_flag) | \
     docker login -u oauth2accesstoken --password-stdin \
       "https://${GCP_REGION}-docker.pkg.dev"
 
@@ -363,6 +434,12 @@ cmd_run() {
       "${pw_args[@]}"
   fi
 
+  # Identity ladder (run lane): resolve before the image describe / build /
+  # job calls below. `run --local` never reaches here (it exec'd above),
+  # so the local lane stays free of GCP tooling and of the ladder's
+  # stderr note.
+  freshell_resolve_cloud_identity "run.jobs.run"
+
   # Recompute the remote ref with potentially overridden GCP settings —
   # COMMIT-ADDRESSED, never mutable :latest (see image_tag_for_head): the
   # job must run THIS HEAD's code or fail loudly, never pass on a stale
@@ -390,7 +467,7 @@ cmd_run() {
       cmd_build
     fi
   elif ! gcloud artifacts docker images describe "$IMAGE_REMOTE" \
-      --account="$GCP_ACCOUNT" --project="$GCP_PROJECT" &>/dev/null 2>&1; then
+      $(account_flag) --project="$GCP_PROJECT" &>/dev/null 2>&1; then
     # Clean tree: the HEAD tag genuinely addresses this image's content.
     echo "[e2e-cloud] No remote image for HEAD ($image_tag), building and pushing..."
     if $local_build_flag; then
@@ -572,6 +649,35 @@ cmd_logs() {
   # legacy lookup only helps for executions of the old shared job. Per-run
   # logs are printed in full during the run and remain queryable in Cloud
   # Logging by job/execution name afterwards.
+
+  # Parse the pin flags FIRST (same contract as build/run); the rest passes
+  # through to `logs read` verbatim, preserving the existing behavior.
+  local -a logs_passthrough=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --account=*)
+        GCP_ACCOUNT="${1#*=}"
+        shift
+        ;;
+      --project-id=*)
+        GCP_PROJECT="${1#*=}"
+        shift
+        ;;
+      --region=*)
+        GCP_REGION="${1#*=}"
+        shift
+        ;;
+      *)
+        logs_passthrough+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  # logs is a cloud-only lane (executions list + logs read); resolve after
+  # parsing so an explicit pin short-circuits the ladder.
+  freshell_resolve_cloud_identity "run.jobs.run"
+
   local execution_id
   execution_id=$(gcloud run jobs executions list $(gcloud_flags) \
     --job="$GCP_JOB" \
@@ -582,7 +688,8 @@ cmd_logs() {
     echo "[e2e-cloud] No executions found for job $GCP_JOB" >&2
     exit 1
   fi
-  gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" "$@"
+  gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" \
+    "${logs_passthrough[@]+"${logs_passthrough[@]}"}"
 }
 
 # ---------------------------------------------------------------------------

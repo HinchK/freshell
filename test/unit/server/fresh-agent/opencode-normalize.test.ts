@@ -442,6 +442,35 @@ describe('OpenCode fresh-agent normalization', () => {
     })
     expect(FreshAgentTurnPageSchema.parse(fallback).nextCursor).toBe('fallback-cursor')
   })
+
+  it('attaches captured session commands to the snapshot and validates against the strict contract', () => {
+    const snapshot = normalizeOpencodeSnapshot({
+      sessionType: 'freshopencode',
+      threadId: 'ses-commands',
+      status: 'idle',
+      commands: [
+        { name: 'review', description: 'review the diff' },
+        { name: 'val-b-probe', description: '' },
+      ],
+    })
+
+    expect(() => FreshAgentSnapshotSchema.parse(snapshot)).not.toThrow()
+    expect(snapshot.commands).toEqual([
+      { name: 'review', description: 'review the diff' },
+      { name: 'val-b-probe', description: '' },
+    ])
+  })
+
+  it('omits the commands key entirely when no catalog was captured (graceful absence)', () => {
+    const snapshot = normalizeOpencodeSnapshot({
+      sessionType: 'freshopencode',
+      threadId: 'ses-no-commands',
+      status: 'idle',
+    })
+
+    expect(snapshot).not.toHaveProperty('commands')
+    expect(() => FreshAgentSnapshotSchema.parse(snapshot)).not.toThrow()
+  })
 })
 
 describe('turn evidence extraction (zrrj)', () => {

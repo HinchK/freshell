@@ -127,21 +127,6 @@ function requestRestoreHydrationRestart(session: FreshAgentSessionState): void {
   session.restoreHydrationRequestId = (session.restoreHydrationRequestId ?? 0) + 1
 }
 
-function summarizeFreshAgentItems(items: FreshAgentContentBlock[]): string {
-  const text = items
-    .map((item) => {
-      if (item.kind === 'text') return item.text
-      if (item.kind === 'thinking') return item.text
-      if (item.kind === 'tool_use') return item.name
-      if (item.kind === 'tool_result') return typeof item.content === 'string' ? item.content : JSON.stringify(item.content)
-      return item.kind
-    })
-    .filter(Boolean)
-    .join(' ')
-    .trim()
-  return text || 'Agent activity'
-}
-
 function normalizeLegacyContentBlock(block: Record<string, unknown>, index: number): FreshAgentContentBlock | undefined {
   const id = typeof block.id === 'string' && block.id.length > 0
     ? block.id
@@ -300,6 +285,10 @@ const freshAgentSlice = createSlice({
     }>) {
       const session = resolveOrEnsureSession(state, action.payload, action.payload.status)
       if (!session) return
+      // Truth-bearing frame: a snapshot answer proves the session exists —
+      // revoke a stale `lost` flag from a transient dead-window race
+      // (reconnect unwedge).
+      session.lost = false
       const shouldRestartHydration = Boolean(
         session.historyLoaded
           && action.payload.revision != null
@@ -378,6 +367,11 @@ const freshAgentSlice = createSlice({
         sessionType: snapshot.sessionType,
         provider: snapshot.provider,
       }, snapshot.status as FreshAgentSessionStatus)
+      // Truth-bearing frame: a snapshot answer proves the session exists —
+      // revoke a stale `lost` flag from a transient dead-window race
+      // (reconnect unwedge). This reducer is currently production-dormant (no
+      // dispatch site); the line is armor for any future HTTP-snapshot fold.
+      session.lost = false
       session.snapshot = snapshot
       writeSessionStatus(session, snapshot.status as FreshAgentSessionStatus)
       session.latestTurnId = snapshot.latestTurnId
@@ -583,7 +577,10 @@ const freshAgentSlice = createSlice({
         turnId,
         role: 'assistant',
         model: action.payload.model,
-        summary: summarizeFreshAgentItems(items),
+        // Server-authoritative provenance: the client no longer summarizes
+        // fresh-agent items (the write-only summarizer was deleted); the
+        // Rust server tags every turn's summaryKind itself.
+        summary: '',
         items,
       })
       session.historyItems = session.turns

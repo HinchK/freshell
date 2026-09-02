@@ -474,6 +474,7 @@ impl FreshOpencodeState {
             retry_after_ms: None,
             terminal_exit_code: None,
             terminal_id: None,
+            live_terminal_id: None,
         }));
     }
 
@@ -830,7 +831,16 @@ impl FreshOpencodeState {
                 provider: PROVIDER.into(),
                 session_id: durable_id.clone(),
                 mode: SESSION_TYPE.into(),
-                create_request_id: request_id.clone(),
+                // Task 3 binding fix: the lineage key is the CREATE requestId,
+                // derived from the placeholder minted at handle_create
+                // (`freshopencode-<createRequestId>`) — NOT this send's
+                // requestId (the old bug; every materialization re-keyed the
+                // lineage to the triggering send). A born-durable placeholder
+                // strips to None.
+                create_request_id: session
+                    .placeholder_id
+                    .strip_prefix(crate::OPENCODE_PLACEHOLDER_PREFIX)
+                    .map(str::to_string),
                 resolves_pending: Some(session.placeholder_id.clone()),
                 supersedes: None,
                 settings: crate::identity_sink::FreshAgentSettings {
@@ -845,18 +855,7 @@ impl FreshOpencodeState {
 
             // `freshAgent.session.materialized` (ws-handler.ts:3477-3484): placeholder ->
             // durable, emitted EXACTLY ONCE (a later send never re-enters this branch).
-            self.broadcast(&ServerMessage::FreshAgentSessionMaterialized(
-                FreshAgentSessionMaterialized {
-                    previous_session_id: session.placeholder_id.clone(),
-                    provider: PROVIDER.to_string(),
-                    session_id: durable_id.clone(),
-                    session_type: SESSION_TYPE.to_string(),
-                    session_ref: Some(SessionLocator {
-                        provider: PROVIDER.to_string(),
-                        session_id: durable_id.clone(),
-                    }),
-                },
-            ));
+            self.broadcast(&materialized_frame(&session.placeholder_id, &durable_id));
 
             // PR-3: `bindServeStream(state)` (adapter.ts:349) -- start the persistent
             // serve-SSE bridge ONCE, right after materialization. A later send never
@@ -2245,7 +2244,7 @@ impl FreshOpencodeState {
             },
         };
 
-        let (status_session_id, running) = {
+        let (status_session_id, running, real_session_id) = {
             let mut session = session_arc.lock().await;
 
             // Ensure the serve-SSE bridge is running (restart it if it died) -- only
@@ -2276,8 +2275,19 @@ impl FreshOpencodeState {
                 .as_ref()
                 .map(|t| !t.is_finished())
                 .unwrap_or(false);
-            (status_session_id, running)
+            (status_session_id, running, session.real_session_id.clone())
         };
+
+        // Attach addressed by the PLACEHOLDER id of an already-materialized session:
+        // the requesting pane cannot correlate frames stamped with the real ses_* id
+        // (locatorMatchesPane), so its snapshot fetch would 404 into a false
+        // restore-error. Re-key it first via the same wire event the send path uses
+        // (materialize-on-send) -- the client fold updates slice AND pane content.
+        if let Some(real_id) = real_session_id.as_ref() {
+            if real_id != &msg.session_id {
+                self.broadcast(&materialized_frame(&msg.session_id, real_id));
+            }
+        }
 
         let status = if running { "running" } else { "idle" };
         self.broadcast(&event_frame(
@@ -2345,11 +2355,16 @@ impl FreshOpencodeState {
 
         // V5 caveat (b): `RequestOptions.timeout` defaults to `None`, so a
         // wedged-but-accepting `opencode serve` would hang this await forever and hold
-        // the sessionRef reserved until restart. Bound it (env-tunable for tests).
-        let budget = std::env::var("FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(10_000u64);
+        // the sessionRef reserved until restart. Bound it (env-tunable for tests) —
+        // resolved through the SAME pure function the REST resume door uses
+        // (`crate::resolve_probe_timeout_ms`: env parse > 10_000ms default) so the
+        // two doors can never drift.
+        let budget = crate::resolve_probe_timeout_ms(
+            None,
+            std::env::var("FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS")
+                .ok()
+                .as_deref(),
+        );
         let get = tokio::time::timeout(
             std::time::Duration::from_millis(budget),
             manager.get_session(session_id, &route),
@@ -2630,6 +2645,24 @@ fn settle_turn_outcome(
     }
 }
 
+/// `freshAgent.session.materialized` (legacy reference: server/ws-handler.ts's
+/// emission of the same event; line numbers drift — cite by name): placeholder -> durable
+/// re-key frame. Shared by the materialize-on-send path and the tracked attach arm
+/// (Task 5: re-key a placeholder-addressed pane BEFORE its real-id-stamped ack
+/// snapshot, so the pane can correlate the ack it is about to receive).
+fn materialized_frame(previous_session_id: &str, real_id: &str) -> ServerMessage {
+    ServerMessage::FreshAgentSessionMaterialized(FreshAgentSessionMaterialized {
+        previous_session_id: previous_session_id.to_string(),
+        provider: PROVIDER.to_string(),
+        session_id: real_id.to_string(),
+        session_type: SESSION_TYPE.to_string(),
+        session_ref: Some(SessionLocator {
+            provider: PROVIDER.to_string(),
+            session_id: real_id.to_string(),
+        }),
+    })
+}
+
 /// The `freshAgent.error{code:'INVALID_SESSION_ID'}` shape (`sdk-events.ts:37`) the client
 /// folds into `markSessionLost` (`fresh-agent-ws.ts:326-328`) instead of hanging on a stale
 /// `freshAgent.attach` for a session this server has never heard of. Duplicated from
@@ -2716,6 +2749,10 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    // The identity-sink trait's methods (record_binding/load_settings/
+    // was_recorded/lookup_by_create_request_id) are trait methods on the fake,
+    // unlike its inherent seed/field knobs.
+    use crate::identity_sink::PaneIdentitySink;
     use freshell_opencode::serve::{
         Endpoint, EventSink, EventSource, EventStreamHandle, OpencodeServeManager, PortAllocator,
         ProcessSpawner, ServeConfig, ServeDeps, ServeHttp, ServeHttpError, ServeHttpRequest,
@@ -3673,6 +3710,108 @@ mod tests {
         assert_eq!(snapshot["event"]["status"], "idle");
     }
 
+    /// Task 5 (reconnect-revive): a pane restored from the persisted layout may still be
+    /// addressed by the PLACEHOLDER id of an already-materialized session (it missed the
+    /// original materialized frame while disconnected). Its tracked `freshAgent.attach`
+    /// must re-key it FIRST via `freshAgent.session.materialized` — otherwise the ack
+    /// snapshot (stamped with the real `ses_*` id per the `real ?? placeholder` rule)
+    /// fails `locatorMatchesPane` and the pane's next snapshot GET 404s into a false
+    /// `durable_artifact_missing` against a live session.
+    #[tokio::test]
+    async fn attach_placeholder_addressed_session_emits_materialized_first() {
+        let (st, mut rx) = state_with_status_poll_and_receiver(1).await;
+
+        st.handle_create(create_msg("req-attach-ph")).await;
+        let placeholder = "freshopencode-req-attach-ph";
+        st.handle_send(send_msg(placeholder, "hello")).await;
+        let real_id = {
+            let guard = st.sessions.lock().await;
+            let session_arc = guard.get(placeholder).cloned().expect("session exists");
+            let s = session_arc.lock().await;
+            s.real_session_id.clone().expect("materialized after send")
+        };
+
+        // Same settle-wait as `attach_known_materialized_session_emits_idle_snapshot`:
+        // the ack snapshot's `status` must not race the detached turn task.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let done = {
+                    let guard = st.sessions.lock().await;
+                    let session_arc = guard.get(&real_id).cloned().expect("session exists");
+                    let s = session_arc.lock().await;
+                    s.turn_task
+                        .as_ref()
+                        .map(|t| t.is_finished())
+                        .unwrap_or(true)
+                };
+                if done {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the turn task finishes within the budget");
+
+        // Drain every pre-attach frame (created / materialized-on-send / status / turn
+        // frames) so what is collected below is exactly what THIS attach emits; the
+        // awaited `handle_attach` queues all of its frames before it returns.
+        while rx.try_recv().is_ok() {}
+
+        st.handle_attach(attach_msg(placeholder)).await;
+        let mut frames: Vec<serde_json::Value> = Vec::new();
+        while let Ok(raw) = rx.try_recv() {
+            frames.push(serde_json::from_str(&raw).unwrap());
+        }
+
+        let materialized_idx = frames
+            .iter()
+            .position(|f| f["type"] == "freshAgent.session.materialized")
+            .expect("a placeholder-addressed attach must emit the materialized re-key");
+        let materialized = &frames[materialized_idx];
+        assert_eq!(materialized["previousSessionId"], placeholder);
+        assert_eq!(materialized["sessionId"], real_id);
+        assert_eq!(materialized["provider"], "opencode");
+        assert_eq!(materialized["sessionType"], "freshopencode");
+        assert_eq!(materialized["sessionRef"]["sessionId"], real_id);
+        assert_eq!(materialized["sessionRef"]["provider"], "opencode");
+
+        let snapshot_idx = frames
+            .iter()
+            .position(|f| {
+                f["event"]["type"] == "freshAgent.session.snapshot" && f["sessionId"] == real_id
+            })
+            .expect("the ack snapshot is still emitted");
+        assert!(
+            materialized_idx < snapshot_idx,
+            "the re-key must precede the real-id-stamped snapshot: {frames:?}"
+        );
+
+        // Regression guard (identity already matches): an attach addressed by the
+        // REAL id must NOT re-emit the materialized frame — only the snapshot.
+        while rx.try_recv().is_ok() {}
+        st.handle_attach(attach_msg(&real_id)).await;
+        let mut saw_materialized = false;
+        let mut saw_snapshot = false;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.session.materialized" {
+                saw_materialized = true;
+            }
+            if frame["event"]["type"] == "freshAgent.session.snapshot" {
+                saw_snapshot = true;
+            }
+        }
+        assert!(
+            !saw_materialized,
+            "an attach addressed by the real id must not spam the materialized frame"
+        );
+        assert!(
+            saw_snapshot,
+            "the real-id attach still answers with a snapshot"
+        );
+    }
+
     #[tokio::test]
     async fn session_materialized_emitted_exactly_once_across_two_sends() {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
@@ -3817,6 +3956,14 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .starts_with("freshopencode-"));
+        // Task 3 (corrected semantics): `create_request_id` is the CREATE's
+        // requestId ("r1") — derived from the placeholder id — NOT this send's
+        // requestId ("req-hello"), which was the lineage keying bug.
+        assert_eq!(
+            b.create_request_id.as_deref(),
+            Some("r1"),
+            "lineage is keyed by the CREATE requestId (placeholder-derived), never the send's"
+        );
     }
 
     #[tokio::test]
@@ -3936,6 +4083,57 @@ mod tests {
             s.cwd.as_deref(),
             Some("/real/project"),
             "cwd from the record, not the attach message"
+        );
+    }
+
+    /// Task 3: a lineage-only ledger row (binding exists with create_request_id
+    /// lineage but an all-blank settings snapshot — exactly what the now-
+    /// unconditional materialization writes produce for a default create) must
+    /// NEVER arm the V7/A10 SETTINGS_RESET alarm on resume: `was_recorded` now
+    /// keys off settings-bearing records, so the gate's second arm is false.
+    /// Regression guard for the false-alarm shape (`was_recorded == true` with
+    /// `load_settings == None`) the old keying produced.
+    #[tokio::test]
+    async fn lineage_only_binding_does_not_arm_settings_reset_on_resume() {
+        let (state, mut rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: DURABLE_ID.into(),
+            mode: "freshopencode".into(),
+            create_request_id: Some("cr-lineage".into()),
+            resolves_pending: Some("freshopencode-cr-lineage".into()),
+            supersedes: None,
+            settings: crate::identity_sink::FreshAgentSettings::default(),
+        })
+        .await
+        .expect("lineage binding write ok");
+        state.set_identity_sink(fake.clone());
+
+        // The lineage row exists but is NOT a settings-bearing record.
+        assert!(
+            fake.load_settings("opencode", DURABLE_ID).is_none(),
+            "a lineage-only row answers no settings snapshot"
+        );
+        assert!(
+            !fake.was_recorded("opencode", DURABLE_ID),
+            "a lineage-only row must not count as recorded"
+        );
+
+        state.handle_attach(attach_msg(DURABLE_ID)).await;
+
+        let mut saw_settings_reset = false;
+        while let Ok(frame) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await
+        {
+            let Ok(text) = frame else { break };
+            if text.contains("SETTINGS_RESET") {
+                saw_settings_reset = true;
+            }
+        }
+        assert!(
+            !saw_settings_reset,
+            "a lineage-only row must never arm SETTINGS_RESET on resume"
         );
     }
 
@@ -6655,7 +6853,6 @@ mod tests {
 
     // ── freshAgent.undo / freshAgent.redo (kata 1wxv Task 3) ────────────────
 
-    use crate::identity_sink::PaneIdentitySink;
     use crate::rollback_record::{
         RollbackDirection, RollbackEntry, RollbackModeReq, RollbackRecord, RollbackRequest,
         LEDGER_WRITE_REFUSAL_COPY, OPENCODE_OLD_CLI_COPY, REDO_DESTROYED_MESSAGE,

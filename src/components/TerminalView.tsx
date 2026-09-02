@@ -15,6 +15,7 @@ import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { updateTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import {
   applyReconcileAttach,
+  applyReattachToLiveTerminal,
   clearPaneReconcileNotice,
   clearReconcilePendingPane,
   consumePaneRefreshRequest,
@@ -836,6 +837,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     expectedGeometryAuthority: TerminalGeometryAuthority
   } | null>(null)
   const launchAttemptRef = useRef<LaunchAttemptState | null>(null)
+  // One-shot revival bound: a create refused with a D7 liveTerminalId folds
+  // ONE reattach per createRequestId; a second refusal falls through to the
+  // existing dead-end write — never loop on a handle that died mid-revival.
+  // Reset wherever a fresh createRequestId is minted (launch-attempt
+  // bookkeeping sites), so a new create round gets a new revival chance.
+  const reviveAttemptedRef = useRef<string | null>(null)
   const suppressNextMatchingResizeRef = useRef<{
     terminalId: string
     cols: number
@@ -3300,6 +3307,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       requestIdRef.current = pending.requestId
       terminalIdRef.current = undefined
       launchAttemptRef.current = null
+      reviveAttemptedRef.current = null
       clearQuarantineRepair()
       currentAttachRef.current = null
       deferredAttachStateRef.current = {
@@ -4820,6 +4828,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           addTerminalRestoreRequestId(newRequestId)
           requestIdRef.current = newRequestId
           launchAttemptRef.current = null
+          reviveAttemptedRef.current = null
           clearQuarantineRepair()
           currentAttachRef.current = null
           clearRateLimitRetry()
@@ -4870,6 +4879,31 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         }
 
         if (msg.type === 'error' && msg.requestId === reqId) {
+          // D7-refusal revival (reconnect-revive Task 7): the create was
+          // refused because the session is STILL RUNNING under the named
+          // terminal — reattach the pane to it instead of dead-ending on
+          // "[Restore failed] Session … is still running on the server."
+          // The epoch-bumping reducer fold is the ONLY re-fire signal the
+          // lifecycle effect honors (deps exclude terminalId/status by
+          // design), so the reattach rides the same proven path as
+          // applyReconcileAttach. One revival per createRequestId: if the
+          // live handle died in the race, the follow-on refusal lands the
+          // existing dead-end write — never loop.
+          if (
+            msg.code === 'RESTORE_UNAVAILABLE'
+            && typeof reqId === 'string'
+            && typeof msg.liveTerminalId === 'string'
+            && reviveAttemptedRef.current !== reqId
+          ) {
+            reviveAttemptedRef.current = reqId
+            dispatch(applyReattachToLiveTerminal({
+              tabId,
+              paneId: paneIdRef.current,
+              terminalId: msg.liveTerminalId,
+            }))
+            writeLocalXtermNotice(term, `\r\nReconnected to the still-running session.\r\n`)
+            return
+          }
           if (msg.code === 'RATE_LIMITED') {
             const scheduled = scheduleCreateRetry(reqId, 'rate-limit')
             if (scheduled) {
@@ -5038,6 +5072,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               writeLocalXtermNotice(term, '\r\n[Starting a new terminal because the previous live terminal is gone and no durable session identity was saved]\r\n')
               const newRequestId = nanoid()
               launchAttemptRef.current = null
+              reviveAttemptedRef.current = null
               clearQuarantineRepair()
               currentAttachRef.current = null
               clearRateLimitRetry()
@@ -5109,6 +5144,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             clearTerminalRestoreRequestId(requestIdRef.current)
             addTerminalRestoreRequestId(newRequestId)
             requestIdRef.current = newRequestId
+            reviveAttemptedRef.current = null
             clearQuarantineRepair()
             currentAttachRef.current = null
             clearTerminalCursor(currentTerminalId)
@@ -5204,7 +5240,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
                 pendingSinceSeq: 0,
                 pendingReason: 'hidden_reveal',
               }
-          registerForBackgroundHydration({ queueIfStarted: canResumeFromParserAppliedSurface })
+          // Same three-step re-register as the terminal.created hidden path
+          // (~:4506): a stale active slot or a consumed registration guard
+          // otherwise wedges this pane out of the post-reconnect pump entirely.
+          getHydrationQueue().onHydrationComplete(paneIdRef.current)
+          hydrationRegisteredRef.current = false
+          // Always queueIfStarted: a hidden pane's reattach must not wait for
+          // reveal. The deferred intent chosen above governs the REVEAL path;
+          // when the pump grants this pane a slot it recomputes the checkpoint
+          // decision at grant time. This call only governs THAT the pump runs.
+          registerForBackgroundHydration({ queueIfStarted: true })
           return
         }
         attachTerminal(tid, 'transport_reconnect')

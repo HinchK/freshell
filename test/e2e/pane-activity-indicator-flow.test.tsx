@@ -246,8 +246,13 @@ function getVisibleSinglePaneTab() {
 }
 
 function expectFreshAgentHeaderBusy(paneHeader: HTMLElement, expectedBusy: boolean) {
-  const identity = within(paneHeader).getByText('freshclaude')
-  const className = identity.getAttribute('class') ?? ''
+  // Busy-blue lives on the agent icon inside its tooltip wrapper (the
+  // session-type text label is gone — the header identifies the pane by
+  // icons, and the blue rides the icon itself).
+  const agentIconWrapper = within(paneHeader).getByTitle(/\(freshclaude pane\)$/)
+  const agentIcon = agentIconWrapper.querySelector('svg')
+  expect(agentIcon).not.toBeNull()
+  const className = agentIcon?.getAttribute('class') ?? ''
   if (expectedBusy) {
     expect(className).toContain('text-blue-500')
   } else {

@@ -1,11 +1,13 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, waitFor, fireEvent, createEvent, cleanup, act } from '@testing-library/react'
+import { render, screen, waitFor, fireEvent, createEvent, cleanup, act, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { previewServerSettingsPatch, updateSettingsLocal } from '@/store/settingsSlice'
+import sessionsReducer, { applySessionsPatch, applyContextUsageExtras } from '@/store/sessionsSlice'
 import freshAgentReducer, { sessionInit, setSessionStatus, markSessionLost } from '@/store/freshAgentSlice'
 import tabsReducer from '@/store/tabsSlice'
+import connectionReducer from '@/store/connectionSlice'
 import { FreshAgentView, IDLE_INCOMPLETE_MAX_RETRIES } from '@/components/fresh-agent/FreshAgentView'
 import { FreshAgentSettingsButton } from '@/components/fresh-agent/FreshAgentSettingsButton'
 import { initLayout, requestPaneRefresh, setActivePane, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
@@ -25,6 +27,29 @@ import { getFreshAgentPaneActions } from '@/lib/pane-action-registry'
 import type { PaneNode } from '@/store/paneTypes'
 
 const CLAUDE_THREAD_ID = '550e8400-e29b-41d4-a716-446655440000'
+
+// STATUS-STRIP meter seeding helper: usage lands in the unified store map
+// (sessions.contextUsageByKey) exactly as a committed refresh would stamp it
+// — fresh-page rows and extras share the map, and the strip reads nothing else.
+function seedStripUsage(
+  store: ReturnType<typeof createStore>,
+  compactPercent: number,
+  contextTokens = 96_000,
+  sessionId = 'claude-strip-usage',
+) {
+  store.dispatch(applyContextUsageExtras({
+    entries: [{
+      provider: 'claude',
+      sessionId,
+      tokenUsage: {
+        inputTokens: 1, outputTokens: 1, cachedTokens: 0, totalTokens: 2,
+        contextTokens, compactPercent, compactThresholdTokens: 200_000,
+      },
+    }],
+    sourceSeq: 0,
+    paneKeys: [`claude:${sessionId}`],
+  }))
+}
 const CLAUDE_RESTORE_THREAD_ID = '550e8400-e29b-41d4-a716-446655440001'
 
 const wsMock = vi.hoisted(() => ({
@@ -71,8 +96,33 @@ function createStore(tabTitleSetByUser = false) {
       settings: settingsReducer,
       freshAgent: freshAgentReducer,
       tabs: tabsReducer,
+      // FreshAgentView reads connection.status to gate the .lost recovery
+      // driver; preload ready so tests keep the pre-gate behavior.
+      connection: connectionReducer,
+      // The status-strip context meter reads the session indexer's tokenUsage
+      // from this slice (wsSnapshotReceived un-gates applySessionsPatch).
+      sessions: sessionsReducer,
     },
+    middleware: (getDefaultMiddleware) =>
+      getDefaultMiddleware({
+        // sessions.expandedProjects is a Set by slice design (same ignore as
+        // PaneContainer.test.tsx's createStore).
+        serializableCheck: {
+          ignoredPaths: ['sessions.expandedProjects'],
+        },
+      }),
     preloadedState: {
+      connection: {
+        status: 'ready' as const,
+        platform: null,
+        availableClis: {},
+        featureFlags: {},
+      },
+      sessions: {
+        projects: [],
+        expandedProjects: new Set(),
+        wsSnapshotReceived: true,
+      },
       panes: {
         layouts: {},
         activePane: {},
@@ -479,7 +529,12 @@ describe('FreshAgentView', () => {
     })
     expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()
     expect(screen.getByText('claude-opus-4-6')).toBeInTheDocument()
-    expect(screen.getByText(new Date('2026-06-15T12:34:56.000Z').toLocaleTimeString())).toBeInTheDocument()
+    // Local time h:mm AM/PM — no seconds, never UTC.
+    const expectedTimecode = new Date('2026-06-15T12:34:56.000Z')
+      .toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit', hour12: true })
+    const timecodeEl = screen.getByText(expectedTimecode)
+    expect(timecodeEl.tagName).toBe('TIME')
+    expect(timecodeEl.textContent).toMatch(/^\d{1,2}:\d{2}\s?(AM|PM)$/i)
   })
 
   it('does not pin the provider snapshot summary above the transcript', async () => {
@@ -1213,7 +1268,7 @@ describe('FreshAgentView', () => {
     expect(assistantSession.turns[0]).toMatchObject({
       role: 'assistant',
       model: 'codex-5',
-      summary: 'Final answer',
+      summary: '',
     })
 
     deliverThroughAppAndMountedView({
@@ -6863,5 +6918,957 @@ describe('/undo + /redo dispatch (kata 1wxv)', () => {
       expect(actions?.redoSupported).toBe(true)
       expect(actions?.canRedo).toBe(true)
     })
+  })
+})
+
+describe('FreshAgentView session status strip', () => {
+  it('renders the chip with the effective model display name when the pane has no explicit model', () => {
+    const store = createStore()
+    // Provider defaults live in server settings (mirrors the "saved provider
+    // model" pattern above) — the pane itself stages no model.
+    store.dispatch(previewServerSettingsPatch({
+      freshAgent: {
+        providers: {
+          freshclaude: { modelSelection: { kind: 'exact', modelId: 'opus[1m]' } },
+        },
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-strip-default-model',
+            sessionId: CLAUDE_THREAD_ID,
+            status: 'connected',
+          }}
+        />
+      </Provider>,
+    )
+
+    const chip = screen.getByRole('button', { name: 'Model: Claude Opus 5 (1M context) — change model' })
+    expect(chip).toHaveAttribute('title', 'opus[1m] · effort high')
+  })
+
+  it('hides the chip when the model matches no static option and no probe matches it — raw ids never render, and never the default option label', async () => {
+    const store = createStore()
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-strip-raw-id',
+            sessionId: CLAUDE_THREAD_ID,
+            status: 'connected',
+            model: 'custom-blend-x',
+          }}
+        />
+      </Provider>,
+    )
+
+    // No chip at all while the label is unresolved (raw ids are tooltip-only,
+    // and the default option label is a mislabel — neither may render).
+    expect(screen.queryByRole('button', { name: /^Model: / })).toBeNull()
+    await waitFor(() => {
+      expect(apiMock.getFreshAgentModelCapabilities).toHaveBeenCalled()
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+    // Probe resolved without a match: still no raw id on the chip.
+    expect(screen.queryByRole('button', { name: /custom-blend-x/ })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Model: Claude Opus 5 (1M context) — change model' })).toBeNull()
+  })
+
+  it('shows the live session model ahead of the staged pane model on the chip', async () => {
+    apiMock.getFreshAgentModelCapabilities.mockResolvedValue({
+      ok: true,
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'fresh',
+      fetchedAt: 1_000,
+      models: [{
+        id: 'claude-live-99',
+        displayName: 'Live Ninety Nine',
+        provider: 'claude',
+        supportsEffort: true,
+        supportedEffortLevels: ['low', 'high'],
+        supportsAdaptiveThinking: true,
+      }],
+    })
+    const store = createStore()
+    store.dispatch(sessionInit({
+      sessionId: CLAUDE_THREAD_ID,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'claude-live-99',
+    }))
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-strip-live-model',
+            sessionId: CLAUDE_THREAD_ID,
+            status: 'connected',
+            model: 'opus[1m]',
+          }}
+        />
+      </Provider>,
+    )
+
+    // The live raw id never renders; once the probe matches it, its display
+    // name wins over the staged pane model's static label.
+    expect(screen.queryByRole('button', { name: /claude-live-99/ })).toBeNull()
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Model: Live Ninety Nine — change model' })).toBeInTheDocument()
+    })
+    expect(screen.queryByRole('button', { name: 'Model: Claude Opus 5 (1M context) — change model' })).toBeNull()
+    expect(apiMock.getFreshAgentModelCapabilities).toHaveBeenCalledWith('freshclaude', expect.anything())
+  })
+
+  it('pairs the chip tooltip effort with the displayed live model — never the staged model\'s effort under a live id', async () => {
+    apiMock.getFreshAgentModelCapabilities.mockResolvedValue({
+      ok: true,
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'fresh',
+      fetchedAt: 1_000,
+      models: [{
+        id: 'claude-live-99',
+        displayName: 'Live Ninety Nine',
+        provider: 'claude',
+        supportsEffort: true,
+        supportedEffortLevels: ['low', 'high'],
+        supportsAdaptiveThinking: true,
+      }],
+    })
+    const store = createStore()
+    store.dispatch(sessionInit({
+      sessionId: CLAUDE_THREAD_ID,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'claude-live-99',
+    }))
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-strip-live-tooltip',
+            sessionId: CLAUDE_THREAD_ID,
+            status: 'connected',
+            model: 'opus[1m]',
+            effort: 'high',
+          }}
+        />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Model: Live Ninety Nine — change model' })).toBeInTheDocument()
+    })
+    // The chip's raw-id+effort tooltip must describe the DISPLAYED (live)
+    // model; the staged opus[1m]/'high' pairing must not leak under it.
+    const chip = screen.getByRole('button', { name: 'Model: Live Ninety Nine — change model' })
+    // The tooltip carries the LIVE model id and its session effort — the pane
+    // was created with 'high', and no live snapshot effort overrides it.
+    expect(chip).toHaveAttribute('title', 'claude-live-99 · effort high')
+  })
+
+  it('uses the REST snapshot\'s settings.model when no session-init model exists (restored/MCP panes)', async () => {
+    apiMock.getFreshAgentModelCapabilities.mockResolvedValue({
+      ok: true,
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'fresh',
+      fetchedAt: 1_000,
+      models: [{
+        id: 'claude-live-99',
+        displayName: 'Live Ninety Nine',
+        provider: 'claude',
+        supportsEffort: true,
+        supportedEffortLevels: ['low', 'high'],
+        supportsAdaptiveThinking: true,
+      }],
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'summary',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [],
+      settings: { model: 'claude-live-99', effort: 'low' },
+    } as never)
+    const store = createStore()
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-strip-snap-model',
+            sessionId: CLAUDE_THREAD_ID,
+            status: 'connected',
+            // No live session/model staged: resolveEffective… would serve the
+            // provider default — the snapshot's active model must win.
+            resumeSessionId: CLAUDE_THREAD_ID,
+            effort: 'high',
+          }}
+        />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Model: Live Ninety Nine — change model' })).toBeInTheDocument()
+    })
+    expect(apiMock.getFreshAgentModelCapabilities).toHaveBeenCalled()
+    // Tooltip pairs the live id with the live effort (not the pane's 'high').
+    expect(screen.getByRole('button', { name: 'Model: Live Ninety Nine — change model' }))
+      .toHaveAttribute('title', 'claude-live-99 · effort low')
+  })
+
+  it('a live-reported snapshot effort wins the chip tooltip', async () => {
+    apiMock.getFreshAgentModelCapabilities.mockResolvedValue({
+      ok: true,
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'fresh',
+      fetchedAt: 1_000,
+      models: [{
+        id: 'claude-live-99',
+        displayName: 'Live Ninety Nine',
+        provider: 'claude',
+        supportsEffort: true,
+        supportedEffortLevels: ['low', 'high'],
+        supportsAdaptiveThinking: true,
+      }],
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'summary',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [],
+      settings: { effort: 'low' },
+    } as never)
+    const store = createStore()
+    store.dispatch(sessionInit({
+      sessionId: CLAUDE_THREAD_ID,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'claude-live-99',
+    }))
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-strip-live-effort',
+            sessionId: CLAUDE_THREAD_ID,
+            status: 'connected',
+            model: 'opus[1m]',
+            effort: 'high',
+            resumeSessionId: CLAUDE_THREAD_ID,
+          }}
+        />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Model: Live Ninety Nine — change model' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Model: Live Ninety Nine — change model' }))
+        .toHaveAttribute('title', 'claude-live-99 · effort low')
+    })
+  })
+
+  it('renders the context meter with the exact-token tooltip from the indexed session usage', () => {
+    const store = createStore()
+    seedStripUsage(store, 47)
+
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-strip-meter',
+            sessionId: CLAUDE_THREAD_ID,
+            resumeSessionId: 'claude-strip-usage',
+            status: 'connected',
+          }}
+        />
+      </Provider>,
+    )
+
+    const meter = screen.getByRole('meter', { name: 'Context window used' })
+    expect(meter).toHaveAttribute('aria-valuenow', '47')
+    expect(meter).toHaveAttribute('title', '96,000 / 200,000 tokens (47% full) — compacts at 100%')
+  })
+
+  it('renders muted "context —" with no meter when no indexed usage exists', () => {
+    const store = createStore()
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-strip-unknown',
+            sessionId: CLAUDE_THREAD_ID,
+            status: 'connected',
+          }}
+        />
+      </Provider>,
+    )
+
+    expect(screen.getByText('context —')).toBeInTheDocument()
+    expect(screen.queryByRole('meter')).toBeNull()
+  })
+
+  it('opens the model dialog (with claude rows) when the chip is clicked', async () => {
+    const store = createStore()
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-strip-dialog',
+            sessionId: CLAUDE_THREAD_ID,
+            status: 'connected',
+            model: 'opus[1m]',
+          }}
+        />
+      </Provider>,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Model: Claude Opus 5 (1M context) — change model' }))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Model and thinking level' })
+    expect(within(dialog).getByText('Claude Opus 5 (1M context)')).toBeInTheDocument()
+  })
+
+  it('renders NO clickable model affordance when no model is set at all (chip hidden; gear + /model remain)', async () => {
+    const store = createStore()
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-strip-nomodel',
+            sessionId: CLAUDE_THREAD_ID,
+            status: 'connected',
+          }}
+        />
+      </Provider>,
+    )
+
+    // Pane-type labels are not model display names — no chip renders.
+    expect(screen.queryByRole('button', { name: /^Model: / })).toBeNull()
+    expect(screen.queryByRole('button', { name: /Freshclaude — change model/ })).toBeNull()
+    // The strip still renders with the unknown-context lug (strip exists even
+    // without the chip; the meter is anchored to the right edge).
+    expect(screen.getByText('context —')).toBeInTheDocument()
+  })
+
+  it('keeps the last known meter when the sessions window drops the row (window churn never blanks a reported meter)', async () => {
+    const store = createStore()
+    seedStripUsage(store, 47)
+
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-strip-churn',
+            sessionId: CLAUDE_THREAD_ID,
+            resumeSessionId: 'claude-strip-usage',
+            status: 'connected',
+          }}
+        />
+      </Provider>,
+    )
+
+    const meter = screen.getByRole('meter', { name: 'Context window used' })
+    expect(meter).toHaveAttribute('aria-valuenow', '47')
+
+    // Sidebar search returns / the 50-session cap eviction REPLACE the projects
+    // window wholesale — the meter reads the unified usage map, so neither can
+    // blank a reported reading.
+    act(() => {
+      store.dispatch(applySessionsPatch({ upsertProjects: [], removeProjectPaths: ['/repo/strip'] }))
+    })
+
+    expect(meter).toHaveAttribute('aria-valuenow', '47')
+    expect(screen.queryByText('context —')).toBeNull()
+  })
+
+  it('keeps the meter live from includeKeys extras while the sessions window excludes the row', async () => {
+    const store = createStore()
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-strip-extras',
+            sessionId: CLAUDE_THREAD_ID,
+            resumeSessionId: 'claude-strip-usage',
+            status: 'connected',
+          }}
+        />
+      </Provider>,
+    )
+
+    // The pane's session is NOT in the sidebar window (search excludes it) —
+    // but the every-refresh includeKeys side-channel still delivers usage.
+    // The meter must move with each extras refresh, never freezing at a
+    // previously-safe reading as the session climbs past the thresholds.
+    act(() => {
+      store.dispatch(applyContextUsageExtras({
+        entries: [{
+          provider: 'claude',
+          sessionId: 'claude-strip-usage',
+          tokenUsage: { inputTokens: 1, outputTokens: 1, cachedTokens: 0, totalTokens: 2, contextTokens: 96000, compactPercent: 47, compactThresholdTokens: 200000 },
+        }],
+        sourceSeq: 0,
+        paneKeys: ['claude:claude-strip-usage'],
+      }))
+    })
+    const meter = screen.getByRole('meter', { name: 'Context window used' })
+    expect(meter).toHaveAttribute('aria-valuenow', '47')
+
+    act(() => {
+      store.dispatch(applyContextUsageExtras({
+        entries: [{
+          provider: 'claude',
+          sessionId: 'claude-strip-usage',
+          tokenUsage: { inputTokens: 1, outputTokens: 1, cachedTokens: 0, totalTokens: 2, contextTokens: 140000, compactPercent: 70, compactThresholdTokens: 200000 },
+        }],
+        sourceSeq: 0,
+        paneKeys: ['claude:claude-strip-usage'],
+      }))
+    })
+    expect(meter).toHaveAttribute('aria-valuenow', '70')
+  })
+
+  it('a current usage reading survives past the boundary via revalidation, and blanks only after the grace window without one', () => {
+    vi.useFakeTimers()
+    try {
+      const store = createStore()
+      seedStripUsage(store, 47)
+      render(
+        <Provider store={store}>
+          <FreshAgentView
+            tabId="tab-1"
+            paneId="pane-1"
+            paneContent={{
+              kind: 'fresh-agent',
+              sessionType: 'freshclaude',
+              provider: 'claude',
+              createRequestId: 'req-strip-validity',
+              sessionId: CLAUDE_THREAD_ID,
+              resumeSessionId: 'claude-strip-usage',
+              status: 'connected',
+            }}
+          />
+        </Provider>,
+      )
+      expect(screen.getByRole('meter', { name: 'Context window used' })).toHaveAttribute('aria-valuenow', '47')
+
+      // Past the validity boundary: a revalidation was dispatched, and the
+      // meter stays live while awaiting it (never blanks an accurate reading).
+      act(() => {
+        vi.advanceTimersByTime(61_000)
+      })
+      expect(screen.getByRole('meter', { name: 'Context window used' })).toHaveAttribute('aria-valuenow', '47')
+
+      // No re-stamp arrives (channel silent): past the grace window the strip
+      // drops to the honest unknown state.
+      act(() => {
+        vi.advanceTimersByTime(31_000)
+      })
+      expect(screen.queryByRole('meter')).toBeNull()
+      expect(screen.getByText('context —')).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a fresher commit supersedes an older usage reading (fresh-page rows and extras share one timestamped map)', () => {
+    const store = createStore()
+    seedStripUsage(store, 47)
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-strip-stale-retained',
+            sessionId: CLAUDE_THREAD_ID,
+            resumeSessionId: 'claude-strip-usage',
+            status: 'connected',
+          }}
+        />
+      </Provider>,
+    )
+    const meter = screen.getByRole('meter', { name: 'Context window used' })
+    expect(meter).toHaveAttribute('aria-valuenow', '47')
+
+    // The next refresh commits a newer reading (regardless of whether the row
+    // was window-covered or out-of-band that cycle): the meter must cross the
+    // threshold, never freeze on the earlier value.
+    act(() => {
+      seedStripUsage(store, 70, 140_000)
+    })
+    expect(meter).toHaveAttribute('aria-valuenow', '70')
+  })
+
+  it('shows the pick-time display label for a catalog-only model immediately, with no probe', async () => {
+    const store = createStore()
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-strip-stamp',
+            sessionId: 'ses_strip_stamp',
+            status: 'connected',
+            model: 'claude-ish/sonnet-future',
+            modelLabel: { modelId: 'claude-ish/sonnet-future', label: 'Sonnet Future' },
+          }}
+        />
+      </Provider>,
+    )
+
+    expect(screen.getByRole('button', { name: 'Model: Sonnet Future — change model' })).toBeInTheDocument()
+    // Raw id never appears, and the stamp answers before (and instead of) the
+    // catalog probe.
+    expect(screen.queryByRole('button', { name: 'Model: claude-ish/sonnet-future — change model' })).toBeNull()
+    await act(async () => { await Promise.resolve() })
+    expect(apiMock.getFreshAgentModelCapabilities).not.toHaveBeenCalled()
+  })
+
+  it('ignores a stamp that no longer matches the effective model and falls back to the probe', async () => {
+    apiMock.getFreshAgentModelCapabilities.mockResolvedValue({
+      ok: true,
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'fresh',
+      fetchedAt: 1_000,
+      models: [{
+        id: 'claude-ish/opus-future',
+        displayName: 'Opus Future',
+        provider: 'claude',
+        supportsEffort: true,
+        supportedEffortLevels: ['low', 'high'],
+        supportsAdaptiveThinking: true,
+      }],
+    })
+    const store = createStore()
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-strip-stamp-stale',
+            sessionId: 'ses_strip_stamp_stale',
+            status: 'connected',
+            model: 'claude-ish/opus-future',
+            modelLabel: { modelId: 'claude-ish/sonnet-future', label: 'Sonnet Future' },
+          }}
+        />
+      </Provider>,
+    )
+
+    // Mismatched stamp must not render (a model change that skipped restamping
+    // can never mislabel the chip).
+    expect(screen.queryByRole('button', { name: 'Model: Sonnet Future — change model' })).toBeNull()
+    await waitFor(() => {
+      expect(apiMock.getFreshAgentModelCapabilities).toHaveBeenCalledWith('freshclaude', expect.anything())
+      expect(screen.getByRole('button', { name: 'Model: Opus Future — change model' })).toBeInTheDocument()
+    })
+  })
+
+  it.each([
+    ['freshclaude', 'claude-ish/sonnet-future', 'Sonnet Future', 'claude'],
+    ['kilroy', 'claude-ish/sonnet-future', 'Sonnet Future', 'claude'],
+  ] as const)('upgrades a catalog-only %s model on the chip once the probe resolves (its display name wins over the raw id)', async (sessionType, modelId, displayName, provider) => {
+    apiMock.getFreshAgentModelCapabilities.mockResolvedValue({
+      ok: true,
+      sessionType,
+      runtimeProvider: provider,
+      status: 'fresh',
+      fetchedAt: 1_000,
+      models: [{
+        id: modelId,
+        displayName,
+        provider,
+        supportsEffort: true,
+        supportedEffortLevels: ['low', 'high'],
+        supportsAdaptiveThinking: true,
+      }],
+    })
+    const store = createStore()
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType,
+            provider,
+            createRequestId: `req-strip-catalog-${sessionType}`,
+            sessionId: `ses_strip_catalog_${sessionType}`,
+            status: 'connected',
+            model: modelId,
+          }}
+        />
+      </Provider>,
+    )
+
+    // Raw model ids never render on the chip (user directive): a restored
+    // pane with an unresolvable id shows NO chip until the probe resolves.
+    expect(screen.queryByRole('button', { name: /^Model: / })).toBeNull()
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: `Model: ${displayName} — change model` })).toBeInTheDocument()
+    })
+    expect(screen.queryByRole('button', { name: `Model: ${modelId} — change model` })).toBeNull()
+    expect(apiMock.getFreshAgentModelCapabilities).toHaveBeenCalledWith(sessionType, expect.anything())
+  })
+
+  it('upgrades a catalog-only freshopencode model to its catalog display name once the probe resolves', async () => {
+    apiMock.getFreshAgentModelCapabilities.mockResolvedValue({
+      ok: true,
+      sessionType: 'freshopencode',
+      runtimeProvider: 'opencode',
+      status: 'fresh',
+      fetchedAt: 1_000,
+      models: [{
+        id: 'opencode-go/glm-5.2',
+        displayName: 'GLM 5.2',
+        provider: 'opencode',
+        supportsEffort: true,
+        supportedEffortLevels: ['low', 'high', 'max'],
+        supportsAdaptiveThinking: true,
+      }],
+    })
+    const store = createStore()
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshopencode',
+            provider: 'opencode',
+            createRequestId: 'req-strip-catalog-upgrade',
+            sessionId: 'ses_strip_catalog_upgrade',
+            status: 'connected',
+            model: 'opencode-go/glm-5.2',
+          }}
+        />
+      </Provider>,
+    )
+
+    // No chip at all while the label is unresolved (raw ids are tooltip-only).
+    expect(screen.queryByRole('button', { name: /^Model: / })).toBeNull()
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Model: GLM 5.2 — change model' })).toBeInTheDocument()
+    })
+    expect(screen.queryByRole('button', { name: 'Model: opencode-go/glm-5.2 — change model' })).toBeNull()
+  })
+
+  it('keeps the chip hidden when the freshopencode catalog probe fails — raw ids never render', async () => {
+    apiMock.getFreshAgentModelCapabilities.mockRejectedValue(new Error('catalog down'))
+    const store = createStore()
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshopencode',
+            provider: 'opencode',
+            createRequestId: 'req-strip-catalog-fail',
+            sessionId: 'ses_strip_catalog_fail',
+            status: 'connected',
+            model: 'opencode-go/glm-5.2',
+          }}
+        />
+      </Provider>,
+    )
+
+    expect(screen.queryByRole('button', { name: /^Model: / })).toBeNull()
+    await waitFor(() => {
+      expect(apiMock.getFreshAgentModelCapabilities).toHaveBeenCalled()
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(screen.queryByRole('button', { name: /opencode-go\/glm-5\.2/ })).toBeNull()
+    expect(screen.queryByRole('button', { name: /GLM 5\.2/ })).toBeNull()
+  })
+
+  it('keeps the chip hidden when the catalog row\'s displayName echoes the raw id (no-name fallback)', async () => {
+    apiMock.getFreshAgentModelCapabilities.mockResolvedValue({
+      ok: true,
+      sessionType: 'freshopencode',
+      runtimeProvider: 'opencode',
+      status: 'fresh',
+      fetchedAt: 1_000,
+      models: [{
+        id: 'opencode-go/unnamed-9',
+        displayName: 'opencode-go/unnamed-9',
+        provider: 'opencode',
+        supportsEffort: false,
+        supportedEffortLevels: [],
+        supportsAdaptiveThinking: false,
+      }],
+    })
+    const store = createStore()
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshopencode',
+            provider: 'opencode',
+            createRequestId: 'req-strip-echo-id',
+            sessionId: 'ses_strip_echo_id',
+            status: 'connected',
+            model: 'opencode-go/unnamed-9',
+          }}
+        />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(apiMock.getFreshAgentModelCapabilities).toHaveBeenCalled()
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+    // The probed "display name" IS the raw id — the chip stays hidden rather
+    // than render it.
+    expect(screen.queryByRole('button', { name: /opencode-go\/unnamed-9/ })).toBeNull()
+    // The strip itself still renders with its unknown-context lug.
+    expect(screen.getByText('context —')).toBeInTheDocument()
+  })
+
+  it('never mislabels the previous probed label onto a just-switched catalog-only model', async () => {
+    let resolveSecondProbe: ((value: unknown) => void) | undefined
+    apiMock.getFreshAgentModelCapabilities
+      .mockResolvedValueOnce({
+        ok: true,
+        sessionType: 'freshopencode',
+        runtimeProvider: 'opencode',
+        status: 'fresh',
+        fetchedAt: 1_000,
+        models: [
+          { id: 'opencode-go/alpha-x', displayName: 'Alpha Claude', provider: 'opencode', supportsEffort: true, supportedEffortLevels: ['low'], supportsAdaptiveThinking: true },
+          { id: 'opencode-go/beta-y', displayName: 'Beta Claude', provider: 'opencode', supportsEffort: true, supportedEffortLevels: ['low'], supportsAdaptiveThinking: true },
+        ],
+      })
+      .mockReturnValueOnce(new Promise((resolve) => { resolveSecondProbe = resolve }))
+    const store = createStore()
+    store.dispatch(sessionInit({
+      sessionId: 'ses-strip-swap',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      model: 'opencode-go/alpha-x',
+    }))
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshopencode',
+            provider: 'opencode',
+            createRequestId: 'req-strip-swap',
+            sessionId: 'ses-strip-swap',
+            status: 'connected',
+            model: 'opencode-go/alpha-x',
+          }}
+        />
+      </Provider>,
+    )
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Model: Alpha Claude — change model' })).toBeInTheDocument()
+    })
+
+    // Live session model switches to a new catalog-only id; the previous
+    // label must not render even for a frame while the new probe is in flight.
+    act(() => {
+      store.dispatch(sessionInit({
+        sessionId: 'ses-strip-swap',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        model: 'opencode-go/beta-y',
+      }))
+    })
+    expect(screen.queryByRole('button', { name: 'Model: Alpha Claude — change model' })).toBeNull()
+    expect(screen.queryByRole('button', { name: /opencode-go\/beta-y/ })).toBeNull()
+
+    resolveSecondProbe!({
+      ok: true,
+      sessionType: 'freshopencode',
+      runtimeProvider: 'opencode',
+      status: 'fresh',
+      fetchedAt: 1_001,
+      models: [{ id: 'opencode-go/beta-y', displayName: 'Beta Claude', provider: 'opencode', supportsEffort: true, supportedEffortLevels: ['low'], supportsAdaptiveThinking: true }],
+    })
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Model: Beta Claude — change model' })).toBeInTheDocument()
+    })
+  })
+})
+
+describe('FreshAgentView provider-advertised session commands', () => {
+  function sessionCommandPaneContent() {
+    return {
+      kind: 'fresh-agent' as const,
+      sessionType: 'freshopencode' as const,
+      provider: 'opencode' as const,
+      createRequestId: 'req-session-commands',
+      sessionId: 'ses_session_commands',
+      status: 'idle' as const,
+    }
+  }
+
+  function renderSessionCommandPane(store: ReturnType<typeof createStore>) {
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: sessionCommandPaneContent(),
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+  }
+
+  it('lists snapshot-advertised commands in an Agent session group after the pane actions', async () => {
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      ...freshopencodeSnapshot('done', 1),
+      commands: [
+        { name: 'review', description: 'Review the current diff', argumentHint: '[file]' },
+        { name: 'init', description: 'Scan the project and write AGENTS.md' },
+      ],
+    })
+    const store = createStore()
+    renderSessionCommandPane(store)
+
+    await screen.findByText('done')
+    fireEvent.click(screen.getByRole('button', { name: 'Slash commands' }))
+
+    const menu = await screen.findByRole('menu', { name: 'Slash commands' })
+    const paneActions = await within(menu).findByRole('group', { name: 'Pane actions' })
+    const agentSession = within(menu).getByRole('group', { name: 'Agent session' })
+    // Static pane actions survive verbatim (ungated /new remains listed).
+    expect(within(paneActions).getByRole('menuitem', { name: /\/new/ })).toBeInTheDocument()
+    // Session rows arrive from the snapshot with description + argumentHint.
+    const reviewRow = within(agentSession).getByRole('menuitem', { name: /\/review/ })
+    expect(reviewRow).toHaveTextContent('Review the current diff')
+    expect(reviewRow).toHaveTextContent('[file]')
+    expect(within(agentSession).getByRole('menuitem', { name: /\/init/ })).toBeInTheDocument()
+  })
+
+  it('renders the flat static-only menu when the snapshot advertises no commands', async () => {
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(freshopencodeSnapshot('done', 1))
+    const store = createStore()
+    renderSessionCommandPane(store)
+
+    await screen.findByText('done')
+    fireEvent.click(screen.getByRole('button', { name: 'Slash commands' }))
+
+    const menu = await screen.findByRole('menu', { name: 'Slash commands' })
+    expect(within(menu).queryByRole('group')).toBeNull()
+    expect(within(menu).queryByText('Agent session')).toBeNull()
+    expect(within(menu).getByRole('menuitem', { name: /\/new/ })).toBeInTheDocument()
+    expect(within(menu).getByRole('menuitem', { name: /\/model/ })).toBeInTheDocument()
+  })
+
+  it('keeps /fork capability-gated while snapshot commands surface ungated', async () => {
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      ...freshopencodeSnapshot('done', 1),
+      capabilities: { send: true, interrupt: true, fork: false },
+      commands: [{ name: 'review', description: 'Review the current diff' }],
+    })
+    const store = createStore()
+    renderSessionCommandPane(store)
+
+    await screen.findByText('done')
+    fireEvent.click(screen.getByRole('button', { name: 'Slash commands' }))
+
+    const menu = await screen.findByRole('menu', { name: 'Slash commands' })
+    await within(menu).findByRole('group', { name: 'Agent session' })
+    expect(within(menu).queryByRole('menuitem', { name: /\/fork/ })).toBeNull()
+    expect(within(menu).getByRole('menuitem', { name: /\/review/ })).toBeInTheDocument()
   })
 })

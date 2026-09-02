@@ -302,7 +302,7 @@ async function handleDisplay(format: string, target?: string): Promise<string> {
 // ---------------------------------------------------------------------------
 
 const ACTION_PARAMS: Record<string, { required: string[]; optional: string[] }> = {
-  'new-tab':         { required: [],                          optional: ['name', 'mode', 'shell', 'cwd', 'browser', 'editor', 'resume', 'resumeSessionId', 'sessionRef', 'prompt', 'agent', 'model', 'effort'] },
+  'new-tab':         { required: [],                          optional: ['name', 'mode', 'shell', 'cwd', 'browser', 'editor', 'hostStats', 'resume', 'resumeSessionId', 'sessionRef', 'prompt', 'agent', 'model', 'effort'] },
   'list-tabs':       { required: [],                          optional: [] },
   'select-tab':      { required: ['target'],                  optional: [] },
   'kill-tab':        { required: ['target'],                  optional: [] },
@@ -310,7 +310,7 @@ const ACTION_PARAMS: Record<string, { required: string[]; optional: string[] }> 
   'has-tab':         { required: ['target'],                  optional: [] },
   'next-tab':        { required: [],                          optional: [] },
   'prev-tab':        { required: [],                          optional: [] },
-  'split-pane':      { required: [],                          optional: ['target', 'direction', 'mode', 'shell', 'cwd', 'browser', 'editor', 'resume', 'sessionRef', 'agent', 'model', 'effort'] },
+  'split-pane':      { required: [],                          optional: ['target', 'direction', 'mode', 'shell', 'cwd', 'browser', 'editor', 'hostStats', 'resume', 'sessionRef', 'agent', 'model', 'effort'] },
   'list-panes':      { required: [],                          optional: ['target'] },
   'select-pane':     { required: ['target'],                  optional: [] },
   'rename-pane':     { required: ['name'],                    optional: ['target'] },
@@ -391,6 +391,19 @@ function rejectRawCodexResume(
   return undefined
 }
 
+// Resume sugar (`resume`/`resumeSessionId`) on the fresh-agent shorthand path
+// (agent param, no mode): only opencode maps to a synthesized sessionRef -- it
+// is the only provider the REST resume endpoint honors. codex maps to 'codex'
+// so the raw-resume refusal above fires with parity to mode=codex. Every other
+// value (claude/kilroy/unknown/non-string) returns undefined: no synthesis,
+// resume fields keep their dropped behavior, and explicit sessionRef (already
+// forwarded for any provider) remains the documented path.
+// Accepts unknown because routeAction args are Record<string, unknown>.
+function agentResumeProvider(agent: unknown): 'codex' | 'opencode' | undefined {
+  if (agent === 'opencode' || agent === 'codex') return agent
+  return undefined
+}
+
 // ---------------------------------------------------------------------------
 // Action router
 // ---------------------------------------------------------------------------
@@ -421,6 +434,7 @@ Tab commands:
                   mode values: shell (default), claude, codex, kimi, opencode, or any supported CLI.
                   prompt: text to send to the terminal after creation (via send-keys with literal mode).
                   To open a URL in a browser pane, use 'open-browser' instead.
+                  resume/resumeSessionId sugar is honored for mode panes and for agent: "opencode" only.
   list-tabs       List all tabs. Returns { tabs: [...], activeTabId }.
   select-tab      Activate a tab. Params: target (tab ID or title)
   kill-tab        Close a tab. Params: target
@@ -441,6 +455,7 @@ Pane commands:
   resize-pane     Resize a pane. Params: target, x? (1-99), y? (1-99)
   swap-pane       Swap two panes. Params: target, with (other pane ID)
   respawn-pane    Restart a pane's terminal. Params: target, mode?, shell?, cwd?, resume?, sessionRef?
+  hostStats       Pass hostStats: true on new-tab or split-pane to create a Host Stats pane (CPU/RAM/load metrics) instead of a terminal -- no process is spawned.
 
 Terminal I/O:
   send-keys       Send input to a pane. Params: target, keys, literal?, sessionRef?
@@ -646,10 +661,14 @@ async function routeAction(
       // Both resolve to the canonical sessionRef below; the raw legacy field is
       // never forwarded over the wire.
       const legacyResume = typeof resume === 'string' ? resume : resumeSessionId
-      const codexResumeError = rejectRawCodexResume(mode, legacyResume, explicitSessionRef)
+      // Provider the resume sugar keys on: an explicit mode wins; otherwise the
+      // fresh-agent shorthand contributes one only for the REST-honorable set
+      // (opencode synthesizes, codex rejects raw ids; see agentResumeProvider).
+      const resumeProvider = mode ?? agentResumeProvider(rest.agent)
+      const codexResumeError = rejectRawCodexResume(resumeProvider, legacyResume, explicitSessionRef)
       if (codexResumeError) return codexResumeError
-      const sessionRef = explicitSessionRef ?? (typeof mode === 'string' && mode !== 'codex' && typeof legacyResume === 'string'
-        ? { provider: mode, sessionId: legacyResume }
+      const sessionRef = explicitSessionRef ?? (typeof resumeProvider === 'string' && resumeProvider !== 'codex' && typeof legacyResume === 'string'
+        ? { provider: resumeProvider, sessionId: legacyResume }
         : undefined)
       const tabResult = await c.post('/api/tabs', {
         name,
