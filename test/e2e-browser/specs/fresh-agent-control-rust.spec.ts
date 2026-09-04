@@ -1235,13 +1235,14 @@ function projectSlugOf(cwd: string): string {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Boot a freshcodex pane against the behavior-driven fake codex app-server. */
-async function bootCodexLane(page: Page): Promise<{
+async function bootCodexLane(page: Page, behavior: Record<string, unknown> = {}): Promise<{
   server: RustServer
   info: TestServerInfo
   harness: TestHarness
   sharedRoot: string
   projectDir: string
   opLogPath: string
+  responseLogPath: string
   tabId: string
 }> {
   const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-agentctl-codex-'))
@@ -1249,6 +1250,7 @@ async function bootCodexLane(page: Page): Promise<{
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
     const opLogPath = path.join(sharedRoot, 'codex-ops.jsonl')
+    const responseLogPath = path.join(sharedRoot, 'codex-responses.jsonl')
     const { server, info, harness } = await bootWall(page, {
       env: {
         // Whitespace-split by spawn_sidecar (codex.rs): interpreter + script.
@@ -1258,6 +1260,8 @@ async function bootCodexLane(page: Page): Promise<{
           // REAL per-thread turn recording (fixture opt-in): thread/read
           // answers the recorded history, so forks provably diverge at the pin.
           recordTurns: true,
+          appendClientResponseLogPath: responseLogPath,
+          ...behavior,
         }),
       },
       setupHome: seedWallConfig({ providers: ['codex'], freshAgent: true }),
@@ -1268,7 +1272,7 @@ async function bootCodexLane(page: Page): Promise<{
     const tabId = (await harness.getActiveTabId())!
     expect(tabId).toBeTruthy()
     await createFreshAgentPane(page, /^Freshcodex$/, 'Freshcodex', projectDir)
-    return { server, info, harness, sharedRoot, projectDir, opLogPath, tabId }
+    return { server, info, harness, sharedRoot, projectDir, opLogPath, responseLogPath, tabId }
   } catch (error) {
     await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
     throw error
@@ -1337,6 +1341,46 @@ async function readRollout(homeDir: string, threadId: string): Promise<string | 
 
 test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
   test.setTimeout(240_000)
+
+  test('Codex approvals and questions survive reload and send user decisions to the provider', async ({ page, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    const lane = await bootCodexLane(page, { serverRequestsByPrompt: {
+      'Approve tests': { id: 501, method: 'item/commandExecution/requestApproval', params: { command: 'npm test', reason: 'Run project tests' } },
+      'Ask a question': { id: 'question-501', method: 'item/tool/requestUserInput', params: { isBlocking: true, questions: [{ id: 'color', header: 'Color', question: 'Choose a color', options: [{ label: 'Blue', description: 'Use blue' }] }] } },
+      'Deny an edit': { id: 502, method: 'item/fileChange/requestApproval', params: { reason: 'Change the file', grantRoot: '/tmp/example' } },
+    } })
+    try {
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      await sendComposerText(page, 'Approve tests')
+      const approval = page.getByRole('alert', { name: 'Permission request for Bash' })
+      await expect(approval).toBeVisible()
+      expect(readJsonl(lane.responseLogPath)).toHaveLength(0)
+      await page.reload()
+      await expect(approval).toHaveCount(1)
+      await expect(approval).toBeVisible()
+      await approval.getByRole('button', { name: 'Allow tool use', exact: true }).click()
+      await expect.poll(() => readJsonl(lane.responseLogPath)).toContainEqual({ id: 501, result: { decision: 'accept' } })
+      await expect(approval).toBeHidden()
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      await sendComposerText(page, 'Ask a question')
+      const question = page.getByRole('region', { name: 'Question from Codex' })
+      await expect(question).toBeVisible()
+      await question.getByRole('button', { name: 'Blue', exact: true }).click()
+      await expect.poll(() => readJsonl(lane.responseLogPath)).toContainEqual({ id: 'question-501', result: { answers: { color: { answers: ['Blue'] } } } })
+      await expect(question).toBeHidden()
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      await sendComposerText(page, 'Deny an edit')
+      const edit = page.getByRole('alert', { name: 'Permission request for Edit' })
+      await expect(edit).toBeVisible()
+      await edit.getByRole('button', { name: 'Deny tool use', exact: true }).click()
+      await expect.poll(() => readJsonl(lane.responseLogPath)).toContainEqual({ id: 502, result: { decision: 'decline' } })
+      await expect(edit).toBeHidden()
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+    } finally {
+      await lane.server.stop().catch(() => {})
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
 
   test('compact: thread/compact/start, never a turn; pane returns usable', async ({ page, e2eServerKind }) => {
     expect(e2eServerKind).toBe('rust')
