@@ -20,11 +20,18 @@
  *     `reason="no_resumable_identity"`, AND a `tid` (terminalId). The tid is
  *     mandatory: without it the settle frame cannot be correlated to the
  *     crashed terminal and the waiver cannot apply.
- *  3. Within the same section, NO ring entry may carry `type="terminal.replaced"`
- *     with a tid that equals a settle tid, and NO `terminal.status` entry with
- *     `status="recovering"` may carry a settle tid — recovery activity for the
- *     crashed terminal is not Mechanism B as accepted. (Frames about OTHER
- *     terminals — different tid or no tid — never block.)
+ *  3. ONLY-signature (delta-r8): EVERY `terminal.status{exited}` entry in the
+ *     ring must carry `reason="no_resumable_identity"` — any exited entry
+ *     with a different or missing reason blocks, for any terminal.
+ *  4. Replacement/recovery guards (delta-r7 wire shapes): within the same
+ *     section, NO ring entry may carry `type="terminal.replaced"` whose
+ *     `tid`/`oldTid`/`newTid` names a settled terminal (real TerminalReplaced
+ *     frames carry `oldTerminalId`/`newTerminalId`, never `terminalId`), and
+ *     NO `terminal.status` entry with `status="recovering"` may carry a
+ *     settled tid — recovery activity for the crashed terminal is not
+ *     Mechanism B as accepted. Replaced entries about OTHER terminals never
+ *     block; a `terminal.replaced` carrying NO identifier fields at all is
+ *     uncorrelatable and conservatively blocks.
  *
  * The ring renders through Rust Debug (`{ignored:?}`) with escaped quotes, so
  * the log is normalized (ANSI stripped, `\"` → `"`) before parsing.
@@ -156,6 +163,25 @@ export function classifyResumeWaiver(rawLog: string): ResumeWaiverClassification
     if (settleTids.some((t) => !t)) {
       return blockOut(evidence, `\`${name}\`: settle frame lacks terminalId — cannot correlate the settle to the crashed terminal`)
     }
+
+    // delta-r8: the accepted signature is ONLY — every terminal.status{exited}
+    // entry in the ring must carry reason="no_resumable_identity". A mixed
+    // sequence (the waived reason alongside any other reason — or a
+    // reason-less exited entry, which addition #5 already blocks — for ANY
+    // terminal in the ring) is not Mechanism B as accepted.
+    const foreignSettle = entries.find(
+      (e) =>
+        e.attrs.type === 'terminal.status' &&
+        e.attrs.status === 'exited' &&
+        e.attrs.reason !== 'no_resumable_identity',
+    )
+    if (foreignSettle) {
+      return blockOut(
+        evidence,
+        `\`${name}\`: ring contains an exited settle with reason="${foreignSettle.attrs.reason ?? '<missing>'}" (tid=${foreignSettle.attrs.tid ?? '<none>'}) alongside the waivered signature — the accepted signature is ONLY no_resumable_identity settles`,
+      )
+    }
+
     evidence.push(`${name}: settle frame(s) ${settles.map((e) => e.raw).join(' | ')}`)
 
     for (const tid of settleTids) {

@@ -142,6 +142,37 @@ describe('classifyResumeWaiver (mechanism-B certification waiver)', () => {
     expect(c.evidence.join('\n')).toContain('uncorrelatable')
   })
 
+  it('blocks a mixed settle sequence: the waived reason alongside another exited reason (delta-r8)', () => {
+    const c = classifyResumeWaiver(
+      failingLog('crashing_agent_is_resumed_twice_then_settles_exited', [
+        SETTLE,
+        'type="terminal.status" tid="term-A" status="exited" reason="respawn_failed"',
+      ]),
+    )
+    expect(c.verdict).toBe('block')
+    expect(c.evidence.join('\n')).toContain('respawn_failed')
+  })
+
+  it('blocks when a different-terminal exited entry carries a non-waiver reason (ONLY-signature)', () => {
+    const c = classifyResumeWaiver(
+      failingLog('crashing_agent_is_resumed_twice_then_settles_exited', [
+        SETTLE,
+        'type="terminal.status" tid="term-OTHER" status="exited" reason="clean_exit"',
+      ]),
+    )
+    expect(c.verdict).toBe('block')
+  })
+
+  it('blocks when an exited entry carries no reason at all (addition #5: missing reason blocks)', () => {
+    const c = classifyResumeWaiver(
+      failingLog('crashing_agent_is_resumed_twice_then_settles_exited', [
+        SETTLE,
+        'type="terminal.status" tid="term-A" status="exited"',
+      ]),
+    )
+    expect(c.verdict).toBe('block')
+  })
+
   it('blocks when the settled terminal shows a recovering attempt', () => {
     const c = classifyResumeWaiver(
       failingLog('crashing_agent_is_resumed_twice_then_settles_exited', [
