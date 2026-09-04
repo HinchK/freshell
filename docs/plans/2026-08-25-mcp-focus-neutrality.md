@@ -46,6 +46,13 @@ unit/component tests, Playwright e2e against the owned RustServer wall harness.
   `FRESHELL_BIND_HOST` poisons `test/unit/vite-config.test.ts`). Prefix every
   command with:
   `env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL`
+  Task 8 addendum: when the invoking shell ALSO exports `NODE_USE_ENV_PROXY=1`
+  + `HTTPS_PROXY` (agent harness proxy), every spawned Node child prints the
+  experimental UNDICI `EnvHttpProxyAgent` warning to stderr, breaking
+  stderr-emptiness assertions (`test/e2e/update-flow.test.ts`,
+  `test/unit/lib/visible-first-audit-gate.test.ts` — 5 tests). Add
+  `-u NODE_USE_ENV_PROXY -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy`
+  for full-suite runs from such shells.
 - Focused unit/component test command shape:
   `env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL npm run test:vitest -- run <files...> --config config/vitest/vitest.config.ts`
 - E2E command shape (Rust-only specs) — execution goes through the backend
@@ -2019,7 +2026,67 @@ original pane and asserts `zoomedPane` clears (unconditional layout-invariant
 pinned on the non-activating path), and the plan doc corrections in the delta
 round 2 record below.
 
+### Task 8 (post-hoc, landed): ownership-gated mount focus + focus-steal rebuff guard
+
+Added during Stage 5's delta-round-3 fix round (5 Major + 1 Minor).
+
+**The platform findings that shaped the fix** (verified empirically in this
+environment's Chromium via Playwright experiments): `inert` on an iframe does
+NOT stop a script INSIDE the nested document from hoisting the iframe into the
+outer document's `document.activeElement` — no attribute combination does
+(tabindex=-1, sandbox ±allow-same-origin, inert ancestor all fail). The hoist
+is event-silent on the winning side but the displaced element DOES fire
+focusout (window blur covers displaced-is-body), and calling `blur()` on the
+hoisted iframe restores control.
+
+Two mechanisms close the round-3 Majors:
+
+1. **Focus-steal rebuff guard** (`src/lib/focus-steal-guard.ts`, installed once
+   via `useFocusStealGuard()` in `App()`): document `focusout` + window `blur`
+   listeners; when `document.activeElement` becomes an iframe carrying
+   `data-focus-locked`, the guard blurs it and restores the displaced element
+   (body fallback). Non-eligible browser AND extension iframes now carry both
+   `inert` AND `data-focus-locked='true'` — inert for pointer/sequential/outer-
+   programmatic entry, the guard for the inside-script hoist. (M1, M2)
+
+2. **Pane focus-ownership memory + adoption gate** (`src/lib/pane-focus-ownership.ts`
+   + `src/hooks/usePaneFocusAdoption.ts`): pane content components record at
+   teardown (layout-effect cleanup — passive cleanups run post-DOM-detach)
+   whether their `[data-pane-id]` subtree contained `document.activeElement`.
+   Eligible MOUNTS then consult `shouldFocusPaneOnEligibleMount(paneId)` —
+   unknown ids (fresh creation, first visit) default to "may focus", preserving
+   the user-create UX; a remounted pane only re-focuses if it OWNED focus before
+   teardown. False→true eligibility flips (explicit select, tab switch) bypass
+   the gate entirely. The adoption decision is consumed lazily (`mayFocusNow`)
+   so async focus targets (Monaco onMount, deferred extension iframe, terminal
+   attach) evaluate it when focus would actually happen. Adopted in all six
+   mount-focus components: TerminalView (keeper effect + the mount-initiated
+   `focus:true` layout consumption), BrowserPane (merged owns-focus effect),
+   ExtensionPane (iframe effect; now also reacts to deferred iframe readiness —
+   server start / hydration races no longer drop eligible-mount focus),
+   EditorPane, PanePicker, DirectoryPicker (gains an optional paneId prop
+   threaded from PaneContainer for identity). (M3, M4)
+
+EditorPane additionally fixes the async-selection race with a render-synced
+`focusEligibleRef` read inside `handleEditorMount` (the saved onMount callback
+captured the initial prop; a select landing before Monaco's mount completed
+left a selected editor unfocused forever). (M5)
+
+Tests: new `pane-focus-ownership.test.ts` (5) and `focus-steal-guard.test.ts`
+(4, hermetic under `sequence.shuffle`); BrowserPane remount-with/without-
+ownership pair + navigation-never-refocuses pin (Minor); TerminalView
+focusGate remount pair; ExtensionPane deferred-ready focus + data-focus-locked
+pin; EditorPane stale-closure race (flip before async mount). The ownership
+map resets globally between tests via `test/setup/dom.ts` (same pattern as
+resetWsClientForTests). Wall e2e gained §6 (split while user focus is in app
+chrome — the remounted pane must NOT reacquire it) and §7 (background browser
+pane loading a self-focusing page — hoist rebuffed, inert+locked attribute
+pins, §8 control: explicit select removes both and moves focus in).
+
 ## Fresh Eyes record
+
+- **Delta round 3 (Codex, independent; base 5b8717017): FAILED — 5 Major + 1 Minor**, all assessed valid and fixed: (1 Major) BrowserPane inert insufficient — nested-document scripts hoist the iframe into outer activeElement regardless of attribute combination; fixed by the `data-focus-locked` rebuff guard (Task 8 mechanism 1); (2 Major) ExtensionPane same → same fix; (3 Major) ExtensionPane focus effect missed deferred iframe appearance (server start / registry hydration) → effect now also keyed on iframe-readiness, adoption consumed lazily; (4 Major) PaneContainer `focusEligible` is Redux selection, not DOM-focus ownership — agent split while the user was in app chrome stole focus back on remount → Task 8 mechanism 2 (ownership record + adoption gate in all six mount-focus components) + wall e2e §6; (5 Major) EditorPane stale-closure — saved onMount captured the initial `focusEligible=false`, so a select landing before Monaco's async mount never focused → render-synced `focusEligibleRef` + adoption-aware mount focus, flip-before-mount race test; (1 Minor) BrowserPane navigation-never-refocuses regression pin added.
+  Runner report: `.worktrees/.the-usual-logs/mcp-focus-neutrality/review-logs/usual-fresheyes-20260826T161259Z-1211030.md`
 
 - **Delta round 2 (Codex, independent; base 5b8717017): FAILED — 2 Major + 3 Minor + 1 Nit**, all assessed valid and fixed: (1 Major) BrowserPane DOM-focus restoration was content-dependent — a LOADED browser pane (url set) had no focus path on explicit select or after a leaf→split remount, and ExtensionPane had no `focusEligible` support at all (same same-origin iframe steal vector Task 6 closed for browser panes) → Task 7 focus parity: BrowserPane root is now `tabIndex={-1}` with a merged owns-focus effect (empty pane → URL input, loaded pane → pane root; url tracked via ref so navigation never yanks focus), ExtensionPane threads `focusEligible` through PaneContainer's extension arm with the same inert gating + iframe focus (mount-while-eligible and false→true flip), verified by 2 new BrowserPane tests + a new `ExtensionPane.test.tsx` (638/638 pane suites green, wall e2e re-run green with the new baseline-focus step); (2 Major) plan doc no longer executable as written → EXECUTED banner at top, base note corrected for the mid-run rebase to 5b8717017; (1 Minor) e2e spec now asserts pane A owns document focus (`expect.poll(focusedPaneId).toBe(paneA)`) BEFORE tagging the identity marker, so the marker can never pin `body` or another tab's element; (2 Minor) the `activate:false` panesSlice test now pre-zooms the original pane so the unconditional zoom-clear invariant is pinned on that path; (3 Minor) Task 6's "inert via display:none" sentence corrected to the real `.tab-hidden` mechanism (`visibility:hidden` + absolute positioning + `pointer-events:none`); (1 Nit) duplicated Round 2 record entry removed.
   Runner report: `.worktrees/.the-usual-logs/mcp-focus-neutrality/review-logs/usual-fresheyes-20260826T082834Z-1938727.md`
