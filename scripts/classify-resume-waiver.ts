@@ -159,7 +159,15 @@ export function classifyResumeWaiver(rawLog: string): ResumeWaiverClassification
     evidence.push(`${name}: settle frame(s) ${settles.map((e) => e.raw).join(' | ')}`)
 
     for (const tid of settleTids) {
-      const replaced = entries.find((e) => e.attrs.type === 'terminal.replaced' && e.attrs.tid === tid)
+      // delta-r7: `terminal.replaced` carries oldTerminalId/newTerminalId,
+      // NOT terminalId. The ring renders all three (tid / oldTid / newTid);
+      // a replacement blocks when any of them names the settled terminal —
+      // checking only `tid` would let a real recovery tail be waived.
+      const replaced = entries.find(
+        (e) =>
+          e.attrs.type === 'terminal.replaced' &&
+          (e.attrs.tid === tid || e.attrs.oldTid === tid || e.attrs.newTid === tid),
+      )
       if (replaced) {
         return blockOut(evidence, `\`${name}\`: terminal.replaced observed for the settled terminal (${tid}) — recovery DID happen; not Mechanism B`)
       }
@@ -169,6 +177,19 @@ export function classifyResumeWaiver(rawLog: string): ResumeWaiverClassification
       if (recovering) {
         return blockOut(evidence, `\`${name}\`: terminal.status{recovering} observed for the settled terminal (${tid}) — a recovery attempt began; not Mechanism B`)
       }
+    }
+
+    // Conservative: a terminal.replaced carrying NO identifier fields at all
+    // cannot be correlated either way, so it cannot be certified unrelated.
+    const orphanReplaced = entries.find(
+      (e) =>
+        e.attrs.type === 'terminal.replaced' &&
+        !e.attrs.tid &&
+        !e.attrs.oldTid &&
+        !e.attrs.newTid,
+    )
+    if (orphanReplaced) {
+      return blockOut(evidence, `\`${name}\`: terminal.replaced entry carries no terminal identifiers — uncorrelatable, cannot be waived`)
     }
   }
 

@@ -143,10 +143,14 @@ async fn wait_frame_matching(
     mut pred: impl FnMut(&serde_json::Value) -> bool,
 ) -> serde_json::Value {
     // Ring of the last 10 ignored frames: parsed Text frames that failed
-    // `pred`, summarized as `type=<v>` plus `tid=<v>`/`status=<v>`/`code=<v>`/
-    // `reason=<v>`/`attempt=<v>`/`sessionRef=<v>` when the frame carries
+    // `pred`, summarized as `type=<v>` plus `tid=<v>`/`oldTid=<v>`/
+    // `newTid=<v>`/`status=<v>`/`code=<v>`/`reason=<v>`/`attempt=<v>`/
+    // `sessionRef=<v>` when the frame carries
     // those fields (the wire TerminalStatus settle/recovering shapes carry
-    // `reason`/`attempt`; error frames carry `code`). `tid` (delta-review r6):
+    // `reason`/`attempt`; error frames carry `code`; `terminal.replaced`
+    // carries `oldTerminalId`/`newTerminalId`, rendered as oldTid/newTid —
+    // delta-r7, the waiver classifier's same-terminal replacement guard).
+    // `tid` (delta-review r6):
     // the mechanism-B waiver classifier
     // (scripts/classify-resume-waiver.ts) must correlate a settle frame to
     // its terminal — without `terminalId` the ring cannot distinguish the
@@ -163,6 +167,19 @@ async fn wait_frame_matching(
                     let mut summary = format!("type={}", value["type"]);
                     if let Some(tid) = value.get("terminalId") {
                         summary.push_str(&format!(" tid={tid}"));
+                    }
+                    // delta-r7: `terminal.replaced` frames carry neither
+                    // `terminalId` nor `status` — their identifiers are
+                    // `oldTerminalId`/`newTerminalId` (server_messages.rs
+                    // TerminalReplaced). Without these, the waiver classifier
+                    // could never correlate an arrived replacement to the
+                    // settled terminal and the "no recovery" half of the
+                    // mechanism-B signature was unenforceable.
+                    if let Some(old_tid) = value.get("oldTerminalId") {
+                        summary.push_str(&format!(" oldTid={old_tid}"));
+                    }
+                    if let Some(new_tid) = value.get("newTerminalId") {
+                        summary.push_str(&format!(" newTid={new_tid}"));
                     }
                     if let Some(status) = value.get("status") {
                         summary.push_str(&format!(" status={status}"));

@@ -107,6 +107,41 @@ describe('classifyResumeWaiver (mechanism-B certification waiver)', () => {
     expect(c.evidence.join('\n')).toContain('recover')
   })
 
+  it('blocks on the real wire shape: terminal.replaced keyed by oldTerminalId/newTerminalId (delta-r7)', () => {
+    // Real terminal.replaced frames carry oldTerminalId/newTerminalId, never
+    // terminalId — the ring renders them as oldTid/newTid. The r6 guard
+    // checked only `tid` and would have waived this exact tail.
+    const c = classifyResumeWaiver(
+      failingLog('crashing_agent_is_resumed_twice_then_settles_exited', [
+        SETTLE,
+        'type="terminal.replaced" oldTid="term-A" newTid="term-B" attempt="1"',
+      ]),
+    )
+    expect(c.verdict).toBe('block')
+    expect(c.evidence.join('\n')).toContain('term-A')
+  })
+
+  it('waives when a replacement names only OTHER terminals', () => {
+    const c = classifyResumeWaiver(
+      failingLog('crashing_agent_is_resumed_twice_then_settles_exited', [
+        SETTLE,
+        'type="terminal.replaced" oldTid="term-X" newTid="term-Y" attempt="1"',
+      ]),
+    )
+    expect(c.verdict).toBe('waive')
+  })
+
+  it('blocks when a replacement entry carries no terminal identifiers at all (uncorrelatable)', () => {
+    const c = classifyResumeWaiver(
+      failingLog('crashing_agent_is_resumed_twice_then_settles_exited', [
+        SETTLE,
+        'type="terminal.replaced" attempt="1"',
+      ]),
+    )
+    expect(c.verdict).toBe('block')
+    expect(c.evidence.join('\n')).toContain('uncorrelatable')
+  })
+
   it('blocks when the settled terminal shows a recovering attempt', () => {
     const c = classifyResumeWaiver(
       failingLog('crashing_agent_is_resumed_twice_then_settles_exited', [
