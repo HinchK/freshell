@@ -330,15 +330,15 @@ afterEach(() => {
 
 describe('FreshAgentView', () => {
   describe('outgoing message queue', () => {
-    async function setup(status = 'running', canSend = true) {
+    async function setup(status = 'running', canSend = true, provider: 'codex' | 'claude' = 'codex') {
       const store = createStore()
       apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
         status, capabilities: { send: canSend, interrupt: true }, turns: [],
       })
       const content = {
-        kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const,
-        provider: 'codex' as const, createRequestId: 'queue-create',
-        sessionId: 'queue-session', status: status as 'running' | 'idle',
+        kind: 'fresh-agent' as const, sessionType: provider === 'claude' ? 'freshclaude' as const : 'freshcodex' as const,
+        provider, createRequestId: 'queue-create',
+        sessionId: provider === 'claude' ? CLAUDE_THREAD_ID : 'queue-session', status: status as 'running' | 'idle',
       }
       const view = (nextStatus: string) => (
         <Provider store={store}>
@@ -353,7 +353,7 @@ describe('FreshAgentView', () => {
       }
       return { send, store, status: (nextStatus: string) => {
         act(() => store.dispatch(setSessionStatus({
-          sessionId: 'queue-session', sessionType: 'freshcodex', provider: 'codex',
+          sessionId: content.sessionId, sessionType: content.sessionType, provider,
           status: nextStatus as 'idle',
         })))
         rendered.rerender(view(nextStatus))
@@ -402,6 +402,58 @@ describe('FreshAgentView', () => {
         queue.store.dispatch(setSessionStatus({ ...locator, status: 'idle' }))
       })
       await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+    })
+
+    it('advances after Claude streams and completes within one render', async () => {
+      const queue = await setup('idle', true, 'claude')
+      queue.send('First message')
+      queue.send('Second message')
+      const locator = { sessionId: CLAUDE_THREAD_ID, sessionType: 'freshclaude' as const, provider: 'claude' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => {
+        for (const event of [
+          { type: 'freshAgent.stream', event: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } },
+          { type: 'freshAgent.stream', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Done' } } },
+          { type: 'freshAgent.result' },
+          { type: 'freshAgent.status', status: 'idle' },
+        ]) {
+          const message = { type: 'freshAgent.event', ...locator, event }
+          handleFreshAgentMessage(queue.store.dispatch, message)
+          listener(message)
+        }
+      })
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+    })
+
+    it('advances after reconnect when a fresh idle snapshot contains the submitted turn', async () => {
+      const queue = await setup('idle')
+      queue.send('First message')
+      queue.send('Second message')
+      const first = sentFreshAgentMessages('freshAgent.send')[0]
+      const reconnect = wsMock.onReconnect.mock.calls.at(-1)?.[0] as unknown as () => void
+      act(() => queue.store.dispatch({ type: 'connection/setStatus', payload: 'disconnected' }))
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+        sessionId: 'queue-session', status: 'idle', capabilities: { send: true, interrupt: true },
+        turns: [{ id: 'completed-user-turn', role: 'user', requestId: first.requestId, items: [{ id: 'user-text', kind: 'text', text: 'First message' }] }],
+      })
+      act(() => {
+        queue.store.dispatch({ type: 'connection/setStatus', payload: 'ready' })
+        reconnect()
+      })
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+      expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Second message' })
+    })
+
+    it('keeps the reservation when a reconnect idle snapshot does not contain the submitted turn', async () => {
+      const queue = await setup('idle')
+      queue.send('Still awaiting acceptance')
+      queue.send('Later follow-up')
+      const beforeRefresh = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+      const reconnect = wsMock.onReconnect.mock.calls.at(-1)?.[0] as unknown as () => void
+      act(() => reconnect())
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeGreaterThan(beforeRefresh))
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
     })
 
     it('keeps queued work while the idle snapshot does not allow sends', async () => {

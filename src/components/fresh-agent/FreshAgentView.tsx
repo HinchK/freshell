@@ -698,7 +698,10 @@ export function FreshAgentView({
   const [queuedMessages, setQueuedMessages] = useState<string[]>([])
   // Reserve a turn synchronously: the provider's running event may arrive
   // after another submit. Only completion (or failure) releases the reservation.
-  const outgoingTurnRef = useRef<{ requestId: string; sawBusy: boolean } | null>(null)
+  const outgoingTurnRef = useRef<(LocalEcho & {
+    sawBusy: boolean
+    previousTurns: readonly FreshAgentTurn[]
+  }) | null>(null)
   const [outgoingTurnVersion, refreshOutgoingTurn] = useReducer((value: number) => value + 1, 0)
   // Transient, self-clearing banner for action feedback (rewind, shell errors).
   const [notice, setNotice] = useState<string | null>(null)
@@ -1855,6 +1858,9 @@ export function FreshAgentView({
           : undefined
         if (submittedTurnId) {
           recordPendingSendMetadata(message.requestId, { submittedTurnId })
+          if (outgoingTurnRef.current?.requestId === message.requestId) {
+            outgoingTurnRef.current.submittedTurnId = submittedTurnId
+          }
           if (echo?.requestId === message.requestId) {
             setLocalEcho({ ...echo, submittedTurnId })
           }
@@ -1923,14 +1929,16 @@ export function FreshAgentView({
       }
       if (
         message.type === 'freshAgent.event'
-        && readMessageEventType(message) === 'freshAgent.status'
         && locatorMatchesPane(message, paneContentRef.current, freshOpenCodeRouteCwdRef.current)
-        && isRecord(message.event) && typeof message.event.status === 'string'
-        && BUSY_STATES.has(message.event.status) && outgoingTurnRef.current
+        && outgoingTurnRef.current && isRecord(message.event)
       ) {
+        const event = message.event
+        const stream = isRecord(event.event) ? event.event : undefined
+        const isBusyEvent = (event.type === 'freshAgent.status' && typeof event.status === 'string' && BUSY_STATES.has(event.status))
+          || (event.type === 'freshAgent.stream' && (stream?.type === 'content_block_start' || stream?.type === 'content_block_delta'))
         // Observe fast turns even when React batches running and idle into
         // one render. The status version below still observes that final idle.
-        outgoingTurnRef.current.sawBusy = true
+        if (isBusyEvent) outgoingTurnRef.current.sawBusy = true
       }
       if (
         isSnapshotInvalidatingFreshAgentEvent(message)
@@ -2035,6 +2043,7 @@ export function FreshAgentView({
     // one key -- keying on raw initialCwd would let the N-pane fan-out survive.
     const requestCwd = freshOpenCodeRouteCwdRef.current ?? paneContentRef.current.initialCwd
     const requestAgentSessionStatusVersion = agentSessionStatusVersionRef.current
+    const requestOutgoingTurnId = outgoingTurnRef.current?.requestId
     const applySnapshot = (next: FreshAgentSnapshot) => {
       const snapshotIdentity = currentAutoTitleIdentityRef.current
       const resolved = next as FreshAgentSnapshot
@@ -2049,6 +2058,23 @@ export function FreshAgentView({
       const previousSnapshot = snapshotRef.current
       const displaySnapshot = mergeSnapshotForDisplay(previousSnapshot, resolved)
       const snapshotAccepted = displaySnapshot !== previousSnapshot
+      const outgoing = outgoingTurnRef.current
+      if (
+        outgoing && outgoing.requestId === requestOutgoingTurnId
+        && snapshotAccepted && displaySnapshot.status === 'idle'
+        && (provider !== 'opencode' || (resolved as { extensions?: { opencode?: { statusFromLiveState?: boolean } } }).extensions?.opencode?.statusFromLiveState === true)
+        && agentSessionStatusVersionRef.current === requestAgentSessionStatusVersion
+        && localEchoLanded(displaySnapshot.turns, outgoing, pendingSendMetadataRef.current.get(outgoing.requestId), {
+          allowTextMatch: true,
+          previousTurns: outgoing.previousTurns,
+        })
+      ) {
+        // Reconnect may miss every stream/status event. A current idle snapshot
+        // containing this submitted turn is sufficient evidence to advance.
+        // Snapshots requested before this send, or newer activity, cannot unlock it.
+        outgoingTurnRef.current = null
+        refreshOutgoingTurn()
+      }
       commitSnapshot(displaySnapshot)
       setSnapshotAutoTitleIdentity(snapshotIdentity)
       const echo = localEchoRef.current
@@ -2465,7 +2491,7 @@ export function FreshAgentView({
     const current = paneContentRef.current
     if (!current.sessionId) return
     const requestId = nanoid()
-    outgoingTurnRef.current = { requestId, sawBusy: false }
+    outgoingTurnRef.current = { requestId, text, sawBusy: false, previousTurns: snapshotRef.current?.turns ?? [] }
     // Task 16: a new send starts a fresh idle-incomplete re-poll budget.
     idleIncompleteRetryCountRef.current = 0
     const routeCwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
