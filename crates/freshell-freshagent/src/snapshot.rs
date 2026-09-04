@@ -172,6 +172,10 @@ async fn get_snapshot(
                         approvals,
                         questions,
                     );
+                    state
+                        .claude
+                        .apply_snapshot_metadata(&thread_id, &mut snapshot)
+                        .await;
                     Json(snapshot).into_response()
                 }
                 Err(crate::claude_snapshot::ClaudeSnapshotError::NotFound) => fail_with_code(
