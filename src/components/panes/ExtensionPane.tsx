@@ -6,6 +6,7 @@ import { useAppSelector, useAppDispatch } from '@/store/hooks'
 import { updateServerStatus } from '@/store/extensionsSlice'
 import { api } from '@/lib/api'
 import { useEnsureExtensionsRegistry } from '@/hooks/useEnsureExtensionsRegistry'
+import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
 import type { ExtensionPaneContent } from '@/store/paneTypes'
 import ExtensionError from './ExtensionError'
 
@@ -54,7 +55,7 @@ function detectIframeError(iframe: HTMLIFrameElement): string | null {
   return null
 }
 
-export default function ExtensionPane({ content, focusEligible = true }: ExtensionPaneProps) {
+export default function ExtensionPane({ paneId, content, focusEligible = true }: ExtensionPaneProps) {
   useEnsureExtensionsRegistry()
 
   const dispatch = useAppDispatch()
@@ -148,12 +149,30 @@ export default function ExtensionPane({ content, focusEligible = true }: Extensi
     }
   }, [handleIframeError, handleIframeLoad, loadAttempt])
 
+  // When the iframe will actually render. Server extensions only render their
+  // iframe once the server reports running and a port is known — potentially
+  // well AFTER mount (auto-start round-trip, registry hydration), while client
+  // extensions render immediately. The focus effect must react to this
+  // readiness signal, not just to focusEligible, or a deferred iframe would
+  // never receive its eligible-mount focus.
+  const iframeRenderable = !!extension && !loadError && (
+    extension.category === 'client'
+    || (extension.category === 'server' && !!extension.serverRunning && !!extension.serverPort)
+  )
+
   // Focus neutrality: this pane owns DOM focus (eligible mount or flip) ⇒
   // focus the iframe; when NOT eligible the iframe is inert and background
-  // extension content can neither be focused nor focus itself.
+  // extension content can neither be focused nor focus itself. Eligible
+  // mounts are gated by recorded focus ownership (agent-driven remounts must
+  // not yank focus from app chrome); eligibility flips bypass the gate.
+  const mayFocusNow = usePaneFocusAdoption(paneId, focusEligible)
   useEffect(() => {
-    if (focusEligible) iframeRef.current?.focus()
-  }, [focusEligible])
+    if (!focusEligible || !iframeRenderable) return
+    const iframe = iframeRef.current
+    if (!iframe) return
+    if (!mayFocusNow()) return
+    iframe.focus()
+  }, [focusEligible, iframeRenderable, mayFocusNow])
 
   // Reset load error on retry
   useEffect(() => {
@@ -226,7 +245,10 @@ export default function ExtensionPane({ content, focusEligible = true }: Extensi
       className="w-full h-full border-0"
       sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
       title={extension.label}
-      {...(focusEligible ? {} : ({ inert: '' } as Record<string, string>))}
+      // inert blocks outside focus entry but NOT a script inside the nested
+      // document hoisting the iframe (Chromium-verified); data-focus-locked
+      // arms the app-wide focus-steal guard's rebuff for that case.
+      {...(focusEligible ? {} : ({ inert: '', 'data-focus-locked': 'true' } as Record<string, string>))}
     />
   )
 }

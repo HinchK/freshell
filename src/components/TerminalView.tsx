@@ -106,6 +106,7 @@ import {
   type OutputBatchAcceptedSegment,
 } from '@/lib/terminal-attach-seq-state'
 import { useMobile } from '@/hooks/useMobile'
+import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
 import { useKeyboardInset } from '@/hooks/useKeyboardInset'
 import { useEnsureExtensionsRegistry } from '@/hooks/useEnsureExtensionsRegistry'
 import { findLocalFilePaths } from '@/lib/path-utils'
@@ -1274,18 +1275,27 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const shouldFocusActiveTerminal = !hidden && activeTabId === tabId && activePaneId === paneId
   shouldFocusActiveTerminalRef.current = shouldFocusActiveTerminal
 
+  // Mount-time focus adoption gate (agent focus neutrality): eligible MOUNTS
+  // only pull DOM focus if this pane owned it before teardown — an agent-driven
+  // leaf→split remount must not yank focus back from app chrome. False→true
+  // eligibility flips (explicit select / tab switch) bypass the gate. The
+  // decision is consumed lazily, so the mount-time `focus:true` layout consum-
+  // ption (which fires once the terminal actually attaches) evaluates it too.
+  const mayFocusNow = usePaneFocusAdoption(paneId, shouldFocusActiveTerminal)
+
   // Keep the active pane's terminal focused when tabs/panes switch so typing works immediately.
   useEffect(() => {
     if (!isTerminal) return
     if (!shouldFocusActiveTerminal) return
     const term = termRef.current
     if (!term) return
+    if (!mayFocusNow()) return
 
     requestAnimationFrame(() => {
       if (termRef.current !== term) return
       term.focus()
     })
-  }, [isTerminal, shouldFocusActiveTerminal])
+  }, [isTerminal, shouldFocusActiveTerminal, mayFocusNow])
 
   useEffect(() => {
     lastSessionActivityAtRef.current = 0
@@ -1711,10 +1721,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     if (shouldScrollToBottom) {
       try { term.scrollToBottom() } catch { /* disposed */ }
     }
-    if (shouldFocus && shouldFocusActiveTerminalRef.current) {
+    if (shouldFocus && shouldFocusActiveTerminalRef.current && mayFocusNow()) {
       term.focus()
     }
-  }, [suppressNetworkEffects, syncGeometryEpochForViewport, ws])
+  }, [mayFocusNow, suppressNetworkEffects, syncGeometryEpochForViewport, ws])
 
   const enqueueTerminalWrite = useCallback((data: string, onWritten?: () => void, options?: TerminalWriteQueueOptions): boolean => {
     if (!data) return false

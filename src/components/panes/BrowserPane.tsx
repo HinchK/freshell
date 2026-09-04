@@ -10,6 +10,7 @@ import { api } from '@/lib/api'
 import { registerBrowserActions } from '@/lib/pane-action-registry'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
+import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
 
 interface BrowserPaneProps {
   paneId: string
@@ -445,12 +446,16 @@ export default function BrowserPane({
   // input (user just created it), a loaded pane goes to the pane root so
   // keystrokes belong here (explicit select of a loaded browser pane, remount
   // after a leaf→split, mount while eligible). Background/ineligible panes
-  // never focus anything.
+  // never focus anything. Eligible MOUNTS are additionally gated by focus
+  // ownership: an agent-driven leaf→split remount must not yank focus back
+  // from application chrome; eligibility flips (explicit select) bypass.
+  const mayFocusNow = usePaneFocusAdoption(paneId, focusEligible)
   useEffect(() => {
     if (!focusEligible) return
+    if (!mayFocusNow()) return
     if (urlRef.current) rootRef.current?.focus()
     else inputRef.current?.focus()
-  }, [focusEligible])
+  }, [focusEligible, mayFocusNow])
 
   useEffect(() => {
     if (!refreshRequest) return
@@ -595,10 +600,14 @@ export default function BrowserPane({
               sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
               // Focus neutrality: while this pane does NOT own focus, the
               // nested document is inert — a same-origin page loading in the
-              // background cannot programmatically focus itself and seize
-              // keystrokes. Removing inert on eligibility flip does not reload
-              // the iframe (attribute only, src untouched).
-              {...(focusEligible ? {} : ({ inert: '' } as Record<string, string>))}
+              // background cannot be focused from the outside. inert does NOT
+              // stop a script INSIDE the nested document from hoisting the
+              // iframe into document.activeElement (verified empirically in
+              // Chromium), so the pane also carries data-focus-locked, which
+              // the app-wide focus-steal guard rebuffs. Removing inert on
+              // eligibility flip does not reload the iframe (attribute only,
+              // src untouched).
+              {...(focusEligible ? {} : ({ inert: '', 'data-focus-locked': 'true' } as Record<string, string>))}
               onLoad={() => setIsLoading(false)}
               onError={() => {
                 setIsLoading(false)

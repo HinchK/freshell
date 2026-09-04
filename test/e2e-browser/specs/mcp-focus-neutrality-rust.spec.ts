@@ -93,6 +93,15 @@ async function flushClientFocusScheduling(page: Page): Promise<void> {
   )
 }
 
+/** All leaf pane ids under a layout node (split nodes carry no identity of
+ *  their own for our purposes — a split keeps the original leaf's id). */
+type LayoutNodeShape = { type?: string; id?: string; children?: LayoutNodeShape[] }
+function leafIds(node: LayoutNodeShape | undefined): string[] {
+  if (!node) return []
+  if (node.type !== 'split') return node.id ? [node.id] : []
+  return (node.children ?? []).flatMap(leafIds)
+}
+
 test.describe('MCP/REST focus neutrality', () => {
   test.setTimeout(120_000)
 
@@ -195,6 +204,85 @@ test.describe('MCP/REST focus neutrality', () => {
         .toBe(newPaneId)
       await expect.poll(() => focusedPaneId(page), { timeout: 10_000 }).toBe(newPaneId)
       expect(await harness.getActiveTabId()).toBe(tabB)
+
+      // --- 6: split while the user's focus is in APP CHROME must not yank it
+      // back into the remounted pane. Redux focusEligible (tab active + pane
+      // active) is TRUE for the remounted pane, so only the pre-unmount focus-
+      // ownership record distinguishes this from section 4 (where the pane
+      // owned focus and legitimately reacquires it). Focus the TabBar's "New
+      // shell tab" button programmatically (no click — zero side effects).
+      await page.locator('button[aria-label="New shell tab"]').first().evaluate((el) => (el as HTMLElement).focus())
+      const chromeMarker = await tagActiveElement(page)
+      expect(await focusedPaneId(page)).toBeNull() // chrome is outside every pane
+      const leavesBefore6 = leafIds((await harness.getState()).panes.layouts[tabB])
+      const splitRes6 = await fetch(`${info.baseUrl}/api/panes/${newPaneId}/split`, {
+        method: 'POST',
+        headers: restApiHeaders(info),
+        body: JSON.stringify({ direction: 'horizontal', mode: 'shell' }),
+      })
+      expect(splitRes6.ok).toBe(true)
+      await expect
+        .poll(async () => leafIds((await harness.getState()).panes.layouts[tabB]).length, { timeout: 10_000 })
+        .toBe(leavesBefore6.length + 1)
+      await flushClientFocusScheduling(page)
+      expect((await harness.getState()).panes.activePane[tabB]).toBe(newPaneId)
+      // The remounted pane must NOT reacquire focus; the chrome button keeps it.
+      expect(await activeElementStillTagged(page, chromeMarker)).toBe(true)
+      expect(await focusedPaneId(page)).toBeNull()
+
+      // --- 7: a BACKGROUND (focus-ineligible, therefore inert + locked)
+      // browser pane whose nested page focuses itself must not steal focus.
+      // inert alone does NOT stop a script inside the nested document from
+      // hoisting the iframe into document.activeElement (Chromium-verified);
+      // the data-focus-locked rebuff guard restores the displaced element.
+      // The payload is a same-origin-less data: page (the hoist needs no
+      // origin relationship), so this works fully offline.
+      const payloadUrl = `data:text/html,${encodeURIComponent(
+        '<input id=x autofocus><script>setTimeout(()=>document.getElementById("x").focus(),100)</script>',
+      )}`
+      const leavesBefore7 = leafIds((await harness.getState()).panes.layouts[tabB])
+      const splitRes7 = await fetch(`${info.baseUrl}/api/panes/${newPaneId}/split`, {
+        method: 'POST',
+        headers: restApiHeaders(info),
+        body: JSON.stringify({ direction: 'vertical', browser: payloadUrl }),
+      })
+      const split7Payload = await splitRes7.json()
+      expect(splitRes7.ok, `POST /api/panes/:id/split browser: ${JSON.stringify(split7Payload)}`).toBe(true)
+      // Derive the new leaf from the folded layout (same convention as §4) —
+      // the split keeps the original leaf's id and appends one new leaf.
+      let browserPaneId: string | null = null
+      await expect
+        .poll(async () => {
+          browserPaneId = leafIds((await harness.getState()).panes.layouts[tabB])
+            .find((id) => !leavesBefore7.includes(id)) ?? null
+          return browserPaneId
+        }, { timeout: 10_000 })
+        .not.toBeNull()
+      await page.waitForSelector(`[data-pane-id="${browserPaneId}"] iframe`, { state: 'attached', timeout: 15_000 })
+      const browserIframe = page.locator(`[data-pane-id="${browserPaneId}"] iframe`).first()
+      // Ineligible => inert AND locked (live-attribute pin).
+      await expect(browserIframe).toHaveAttribute('inert', '', { timeout: 10_000 })
+      await expect(browserIframe).toHaveAttribute('data-focus-locked', 'true')
+      // Wait out the payload's focus attempt window (autofocus on load +
+      // scripted focus at ~100ms), then assert focus never stuck inside the
+      // background browser pane and the chrome element kept it.
+      await page.waitForTimeout(1_500)
+      await flushClientFocusScheduling(page)
+      expect(await activeElementStillTagged(page, chromeMarker)).toBe(true)
+      expect(await focusedPaneId(page)).not.toBe(browserPaneId)
+
+      // --- 8 (control): explicitly selecting the browser pane removes inert
+      // (attribute flip, no iframe reload) and returns DOM focus to its pane.
+      const paneSelRes8 = await fetch(`${info.baseUrl}/api/panes/${browserPaneId}/select`, {
+        method: 'POST', headers: restApiHeaders(info), body: '{}',
+      })
+      expect(paneSelRes8.ok).toBe(true)
+      await expect
+        .poll(async () => (await harness.getState()).panes.activePane[tabB], { timeout: 10_000 })
+        .toBe(browserPaneId)
+      await expect(browserIframe).not.toHaveAttribute('inert', '', { timeout: 10_000 })
+      await expect(browserIframe).not.toHaveAttribute('data-focus-locked', 'true')
+      await expect.poll(() => focusedPaneId(page), { timeout: 10_000 }).toBe(browserPaneId)
     } finally {
       await server.stop()
     }

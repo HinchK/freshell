@@ -6,6 +6,7 @@ import panesReducer, { requestPaneRefresh } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
 import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
 import BrowserPane from '@/components/panes/BrowserPane'
+import { resetPaneFocusOwnershipForTests } from '@/lib/pane-focus-ownership'
 
 // Mock clipboard
 vi.mock('@/lib/clipboard', () => ({
@@ -88,6 +89,7 @@ describe('BrowserPane', () => {
       configurable: true,
     })
     cleanup()
+    resetPaneFocusOwnershipForTests()
   })
 
   function setWindowHostname(hostname: string) {
@@ -715,6 +717,44 @@ describe('BrowserPane', () => {
         </Provider>,
       )
       expect(root).toHaveFocus()
+    })
+
+    it('remount WITHOUT prior focus ownership keeps focus where the user left it (agent split while user is in app chrome)', () => {
+      const first = renderBrowserPane({ url: 'https://example.com' })
+      expect(document.querySelector('[data-pane-id="pane-1"]')).toHaveFocus()
+      // User moved into application chrome without changing activePane.
+      const chrome = document.createElement('input')
+      document.body.appendChild(chrome)
+      chrome.focus()
+      expect(chrome).toHaveFocus()
+      // Leaf→split remount destroys and recreates the pane's React subtree.
+      first.unmount()
+      renderBrowserPane({ url: 'https://example.com' })
+      expect(chrome).toHaveFocus()
+      expect(document.querySelector('[data-pane-id="pane-1"]')).not.toHaveFocus()
+    })
+
+    it('remount WITH prior focus ownership restores the pane focus (matches user-split UX and the e2e split contract)', () => {
+      const first = renderBrowserPane({ url: 'https://example.com' })
+      const root = document.querySelector('[data-pane-id="pane-1"]')
+      expect(root).toHaveFocus()
+      first.unmount()
+      renderBrowserPane({ url: 'https://example.com' })
+      expect(document.querySelector('[data-pane-id="pane-1"]')).toHaveFocus()
+    })
+
+    it('pin: navigation never yanks focus (url change is not a focus event)', () => {
+      const { rerender, store } = renderBrowserPane({ url: 'https://example.com' })
+      const chrome = document.createElement('input')
+      document.body.appendChild(chrome)
+      chrome.focus()
+      expect(chrome).toHaveFocus()
+      rerender(
+        <Provider store={store}>
+          <BrowserPane paneId="pane-1" tabId="tab-1" browserInstanceId="browser-1" url="https://other.example.com" devToolsOpen={false} focusEligible />
+        </Provider>,
+      )
+      expect(chrome).toHaveFocus()
     })
   })
 })

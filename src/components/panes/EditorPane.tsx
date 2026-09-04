@@ -14,6 +14,7 @@ import { copyText } from '@/lib/clipboard'
 import { registerEditorActions } from '@/lib/pane-action-registry'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { createLogger } from '@/lib/client-logger'
+import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
 
 
 const log = createLogger('EditorPane')
@@ -294,10 +295,21 @@ export default function EditorPane({
     return () => clearTimeout(timer)
   }, [filePickerMessage])
 
+  // Render-synced (same pattern as connectionStatusRef above): onMount fires
+  // asynchronously with a closure captured at editor-creation time, so it must
+  // read eligibility through a ref — an explicit select that lands BEFORE the
+  // async Monaco mount otherwise leaves the selected editor unfocused forever.
+  const focusEligibleRef = useRef(focusEligible)
+  focusEligibleRef.current = focusEligible
+
+  // Eligible-mount focus is gated by recorded focus ownership (agent-driven
+  // leaf→split remounts must not yank focus from app chrome); flips bypass.
+  const mayFocusNow = usePaneFocusAdoption(paneId, focusEligible)
+
   function handleEditorMount(editor: Monaco.editor.IStandaloneCodeEditor) {
     editorRef.current = editor
     // onMount is async — eligible-at-mount focus can only happen HERE.
-    if (focusEligible) editor.focus()
+    if (focusEligibleRef.current && mayFocusNow()) editor.focus()
   }
 
   // Later false→true eligibility flips (explicit select bringing a

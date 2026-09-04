@@ -8,6 +8,7 @@ import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
+import { resetPaneFocusOwnershipForTests } from '@/lib/pane-focus-ownership'
 import type { TerminalPaneContent } from '@/store/paneTypes'
 import type { AppSettings } from '@/store/types'
 
@@ -160,6 +161,7 @@ describe('TerminalView scheduled-focus gate (agent focus neutrality)', () => {
   afterEach(() => {
     cleanup()
     vi.unstubAllGlobals()
+    resetPaneFocusOwnershipForTests()
   })
 
   it('focuses the terminal on mount when the pane owns focus (pin: user default preserved)', async () => {
@@ -195,5 +197,54 @@ describe('TerminalView scheduled-focus gate (agent focus neutrality)', () => {
     await waitFor(() => expect(terminalInstances).toHaveLength(1))
     await act(async () => { await new Promise((r) => setTimeout(r, 150)) })
     expect(terminalInstances[0].focus).not.toHaveBeenCalled()
+  })
+
+  it('remount WITHOUT prior focus ownership does NOT focus (agent split while user is in app chrome)', async () => {
+    const store = createStore()
+    const first = render(
+      <Provider store={store}>
+        <TerminalView tabId="tab-1" paneId="pane-1" paneContent={paneContent} hidden={false} />
+      </Provider>
+    )
+    await waitFor(() => expect(terminalInstances).toHaveLength(1))
+    await waitFor(() => expect(terminalInstances[0].focus).toHaveBeenCalled())
+    // User moved into application chrome without changing activePane…
+    const chrome = document.createElement('input')
+    document.body.appendChild(chrome)
+    chrome.focus()
+    // …then a leaf→split remount destroys and recreates this subtree.
+    first.unmount()
+    render(
+      <Provider store={store}>
+        <TerminalView tabId="tab-1" paneId="pane-1" paneContent={paneContent} hidden={false} />
+      </Provider>
+    )
+    await waitFor(() => expect(terminalInstances).toHaveLength(2))
+    await act(async () => { await new Promise((r) => setTimeout(r, 150)) })
+    expect(terminalInstances[1].focus).not.toHaveBeenCalled()
+    expect(chrome).toHaveFocus()
+  })
+
+  it('remount WITH prior focus ownership restores focus (user-split / e2e split contract)', async () => {
+    const store = createStore()
+    const first = render(
+      <Provider store={store}>
+        <TerminalView tabId="tab-1" paneId="pane-1" paneContent={paneContent} hidden={false} />
+      </Provider>
+    )
+    await waitFor(() => expect(terminalInstances).toHaveLength(1))
+    await waitFor(() => expect(terminalInstances[0].focus).toHaveBeenCalled())
+    // Focus something INSIDE the pane root so the ownership record reads true.
+    const inside = document.createElement('button')
+    document.querySelector('[data-pane-id="pane-1"]')!.appendChild(inside)
+    inside.focus()
+    first.unmount()
+    render(
+      <Provider store={store}>
+        <TerminalView tabId="tab-1" paneId="pane-1" paneContent={paneContent} hidden={false} />
+      </Provider>
+    )
+    await waitFor(() => expect(terminalInstances).toHaveLength(2))
+    await waitFor(() => expect(terminalInstances[1].focus).toHaveBeenCalled())
   })
 })

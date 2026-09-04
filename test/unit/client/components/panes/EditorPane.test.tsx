@@ -764,5 +764,25 @@ describe('EditorPane', () => {
       )
       await waitFor(() => expect(monacoMountControl.focus).toHaveBeenCalledTimes(1))
     })
+    it('focuses when explicitly selected BEFORE async Monaco mount completes (selection must survive the mount race)', async () => {
+      monacoMountControl.enabled = true
+      monacoMountControl.mountDelayMs = 60
+      const { rerender } = render(
+        <Provider store={store}>
+          <EditorPane paneId="pane-1" tabId="tab-1" filePath="/test.ts" language="typescript" readOnly={false} content="const x = 1" viewMode="source" focusEligible={false} />
+        </Provider>
+      )
+      await waitFor(() => expect(screen.getByTestId('monaco-mock')).toBeInTheDocument())
+      // Flip eligibility BEFORE the async mount fires. The flip effect finds
+      // editorRef.current still null; the saved onMount closure captured
+      // focusEligible=false. A stale-closure implementation leaves the
+      // explicitly-selected editor unfocused forever.
+      rerender(
+        <Provider store={store}>
+          <EditorPane paneId="pane-1" tabId="tab-1" filePath="/test.ts" language="typescript" readOnly={false} content="const x = 1" viewMode="source" focusEligible />
+        </Provider>
+      )
+      await waitFor(() => expect(monacoMountControl.focus).toHaveBeenCalledTimes(1))
+    })
   })
 })

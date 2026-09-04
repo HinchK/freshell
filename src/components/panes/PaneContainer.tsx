@@ -807,6 +807,7 @@ function PickerWrapper({
         globalDefault={globalDefault}
         onConfirm={handleDirectoryConfirm}
         onBack={() => setStep({ step: 'type' })}
+        paneId={paneId}
         focusEligible={focusEligible}
       />
     )
