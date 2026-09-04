@@ -198,6 +198,13 @@ function getFreshAgentPaneContent(store: ReturnType<typeof createStore>) {
   return layout.content
 }
 
+function finishOutgoingTurn(store: ReturnType<typeof createStore>) {
+  const content = getFreshAgentPaneContent(store)
+  const locator = { sessionId: content.sessionId!, sessionType: content.sessionType, provider: content.provider }
+  act(() => store.dispatch(setSessionStatus({ ...locator, status: 'running' })))
+  act(() => store.dispatch(setSessionStatus({ ...locator, status: 'idle' })))
+}
+
 function sentFreshAgentMessages(type: string) {
   return wsMock.send.mock.calls
     .map(([message]) => message)
@@ -322,6 +329,113 @@ afterEach(() => {
 })
 
 describe('FreshAgentView', () => {
+  describe('outgoing message queue', () => {
+    async function setup(status = 'running', canSend = true) {
+      const store = createStore()
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+        status, capabilities: { send: canSend, interrupt: true }, turns: [],
+      })
+      const content = {
+        kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const,
+        provider: 'codex' as const, createRequestId: 'queue-create',
+        sessionId: 'queue-session', status: status as 'running' | 'idle',
+      }
+      const view = (nextStatus: string) => (
+        <Provider store={store}>
+          <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={{ ...content, status: nextStatus as 'idle' }} />
+        </Provider>
+      )
+      const rendered = render(view(status))
+      await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeEnabled())
+      const send = (text: string) => {
+        fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), { target: { value: text } })
+        fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      }
+      return { send, store, status: (nextStatus: string) => {
+        act(() => store.dispatch(setSessionStatus({
+          sessionId: 'queue-session', sessionType: 'freshcodex', provider: 'codex',
+          status: nextStatus as 'idle',
+        })))
+        rendered.rerender(view(nextStatus))
+      } }
+    }
+
+    it('keeps queued work when the provider exits', async () => {
+      const queue = await setup()
+      queue.send('Keep this follow-up')
+      queue.status('exited')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+    })
+
+    it('sends queued messages one turn at a time', async () => {
+      const queue = await setup()
+      queue.send('First follow-up')
+      queue.send('Second follow-up')
+      queue.status('idle')
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1))
+      expect(sentFreshAgentMessages('freshAgent.send')[0]).toMatchObject({ text: 'First follow-up' })
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      queue.status('running')
+      queue.status('idle')
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+      expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Second follow-up' })
+    })
+
+    it('queues rapid sends before the provider reports running', async () => {
+      const queue = await setup('idle')
+      queue.send('First message')
+      queue.send('Second message')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+    })
+
+    it('advances after a fast interrupted turn whose status updates share one render', async () => {
+      const queue = await setup('idle')
+      queue.send('First message')
+      queue.send('Second message')
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => {
+        listener({ type: 'freshAgent.event', ...locator, event: { type: 'freshAgent.status', status: 'running' } })
+        queue.store.dispatch(setSessionStatus({ ...locator, status: 'running' }))
+        queue.store.dispatch(setSessionStatus({ ...locator, status: 'idle' }))
+      })
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+    })
+
+    it('keeps queued work while the idle snapshot does not allow sends', async () => {
+      const queue = await setup('running', false)
+      queue.send('Wait for permission to send')
+      queue.status('idle')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+    })
+
+    it('keeps queued work while disconnected and sends after reconnect', async () => {
+      const queue = await setup()
+      queue.send('After reconnect')
+      act(() => queue.store.dispatch({ type: 'connection/setStatus', payload: 'disconnected' }))
+      queue.status('idle')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+      act(() => queue.store.dispatch({ type: 'connection/setStatus', payload: 'ready' }))
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1))
+    })
+
+    it('checks current agent status when a shell command finishes', async () => {
+      const queue = await setup('idle')
+      let finishShell!: (result: { output: string; exitCode: number }) => void
+      apiMock.post.mockImplementationOnce(() => new Promise((resolve) => { finishShell = resolve }))
+      queue.send('!pwd')
+      queue.status('running')
+      await act(async () => finishShell({ output: '/workspace', exitCode: 0 }))
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      queue.status('idle')
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')[0]).toMatchObject({ text: expect.stringContaining('/workspace') }))
+    })
+  })
+
   it('renders freshclaude capability prompts in the shared shell and answers approvals/questions over fresh-agent WS', async () => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
@@ -2321,6 +2435,7 @@ describe('FreshAgentView', () => {
     })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
 
+    finishOutgoingTurn(store)
     fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
       target: { value: 'Second title' },
     })
@@ -2389,6 +2504,7 @@ describe('FreshAgentView', () => {
       expect(getFreshAgentSessionId()).toBe('live-session-2')
     })
 
+    finishOutgoingTurn(store)
     fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
       target: { value: 'Second durable title' },
     })
@@ -2469,6 +2585,7 @@ describe('FreshAgentView', () => {
       expect(getFreshAgentSessionId()).toBe('live-session-refine-2')
     })
 
+    finishOutgoingTurn(store)
     fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
       target: { value: 'Second refined title' },
     })
@@ -2684,6 +2801,7 @@ describe('FreshAgentView', () => {
       expect(getFreshAgentSessionId()).toBe('thread-same-identity')
     })
 
+    finishOutgoingTurn(store)
     fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
       target: { value: 'Should not replace codex same identity title' },
     })
@@ -2752,6 +2870,7 @@ describe('FreshAgentView', () => {
       expect(getFreshAgentSessionId()).toBe('live-same-durable-2')
     })
 
+    finishOutgoingTurn(store)
     fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
       target: { value: 'Should not replace durable title' },
     })
