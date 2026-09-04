@@ -16,7 +16,8 @@
 //                                    resumeDropsTurn arms the fork-time discard-guard). Covered by
 //                                    crates/freshell-ws/tests/freshagent_claude_rollback.rs + the
 //                                    rust-chromium e2e rollback spec.
-//     { type:'send',               sessionId, text }
+//     { type:'configure',          sessionId, requestId, settings }
+//     { type:'send',               sessionId, text, images? }
 //     { type:'interrupt',          sessionId }
 //     { type:'permission.respond', sessionId, requestId, decision }   // decision forwarded VERBATIM
 //     { type:'question.respond',   sessionId, requestId, answers }
@@ -25,6 +26,7 @@
 //   sidecar → Rust (stdout, one JSON per line):
 //     { type:'created',                 requestId, sessionId }            // the SDK bridge's BARE nanoid placeholder
 //     { type:'create.failed',           requestId, message }
+//     { type:'sdk.configured',          sessionId, requestId, ok, settings?, message? }
 //     { type:'sdk.session.init',        sessionId, cliSessionId, model, cwd, tools }  // durable Claude UUID
 //     { type:'sdk.assistant',           sessionId, content, model }
 //     { type:'sdk.stream',              sessionId, event, parentToolUseId }
@@ -447,7 +449,7 @@ async function handleConfigure(req) {
     emit({ type: 'sdk.configured', sessionId: req.sessionId, requestId: req.requestId, ok: true, settings })
   } catch (err) {
     logerr(`session settings failed: ${err?.message || err}`)
-    emit({ type: 'sdk.configured', sessionId: req.sessionId, requestId: req.requestId, ok: false, message: String(err?.message || err) })
+    emit({ type: 'sdk.configured', sessionId: req.sessionId, requestId: req.requestId, ok: false, settings: { ...st.settings }, message: String(err?.message || err) })
   }
 }
 

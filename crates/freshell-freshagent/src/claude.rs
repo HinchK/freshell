@@ -1131,29 +1131,36 @@ impl FreshClaudeState {
                     .into(),
             ),
         };
-        let durable = {
+        let (durable, effective) = {
             let mut sessions = self.sessions.lock().await;
             let session = sessions
                 .get_mut(map_key)
                 .ok_or("Claude session is no longer available.")?;
             session.configuration.pending = None;
             session.configuration.needs_configure = applied.is_err();
-            applied?;
-            session.configuration.settings = next.clone();
-            session.cli_session_id.clone()
+            if applied.is_ok() {
+                session.configuration.settings = next;
+            }
+            // A setter can succeed before a later setter rejects. The receipt
+            // reconciles that partial success; persist the actual runtime state
+            // even though the user's prompt must remain unsent.
+            (
+                session.cli_session_id.clone(),
+                session.configuration.settings.clone(),
+            )
         };
         if let Some(durable) = durable {
             self.adopt_session_init(
                 &durable,
                 map_key,
                 session_type,
-                Some(&next),
+                Some(&effective),
                 None,
                 self.identity_sink(),
             )
             .await;
         }
-        Ok(())
+        applied
     }
 
     // ── freshAgent.approval.respond / question.respond / compact (WS, Task 2) ─────────
@@ -1464,6 +1471,15 @@ impl FreshClaudeState {
         let Some(session) = sessions.get(&key) else {
             return;
         };
+        let status = session.current_status();
+        snapshot["status"] = json!(if status == "idle"
+            && session.in_turn.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            "running".to_string()
+        } else {
+            status
+        });
+        snapshot["extensions"]["claude"]["statusFromLiveState"] = json!(true);
         let settings = &session.configuration.settings;
         let mut fields = Map::new();
         for (key, value) in [
@@ -3194,6 +3210,26 @@ impl FreshClaudeState {
                                 })
                             {
                                 if let Some((_, tx)) = session.configuration.pending.take() {
+                                    if let Some(settings) = value["settings"].as_object() {
+                                        let current = &mut session.configuration.settings;
+                                        current.model = settings
+                                            .get("model")
+                                            .and_then(Value::as_str)
+                                            .map(str::to_owned);
+                                        current.effort = settings
+                                            .get("effort")
+                                            .and_then(Value::as_str)
+                                            .map(str::to_owned);
+                                        current.permission_mode = settings
+                                            .get("permissionMode")
+                                            .and_then(Value::as_str)
+                                            .map(str::to_owned);
+                                        if let Some(cwd) =
+                                            settings.get("cwd").and_then(Value::as_str)
+                                        {
+                                            current.cwd = Some(cwd.to_string());
+                                        }
+                                    }
                                     let result = if value["ok"].as_bool() == Some(true) {
                                         Ok(())
                                     } else {
@@ -5322,6 +5358,7 @@ const liveSessions = new Set(
 // the cancelledQueue the real sidecar reports), mirroring the real
 // cancellation authority at the pre-handoff residence.
 const compactQueue = []
+const configuredSettings = new Map()
 const rl = readline.createInterface({ input: process.stdin, terminal: false })
 rl.on('line', (line) => {
   const trimmed = line.trim()
@@ -5343,6 +5380,7 @@ rl.on('line', (line) => {
       counter += 1
       const sessionId = `fake-claude-session-${process.pid}-${counter}`
       liveSessions.add(sessionId)
+      configuredSettings.set(sessionId, { model: msg.model, effort: msg.effort, permissionMode: msg.permissionMode, cwd: msg.cwd })
       process.stdout.write(JSON.stringify({ type: 'created', sessionId }) + '\n')
       // Mirror the real sidecar's post-create init: echo resumeSessionId as the durable
       // id when present (resume continuity), else a fixed fake uuid.
@@ -5359,7 +5397,11 @@ rl.on('line', (line) => {
   } else if (msg.type === 'configure') {
     if (respondLog) fs.appendFileSync(respondLog, `${JSON.stringify(msg)}\n`)
     console.log(JSON.stringify({ type: 'sdk.session.changed', sessionId: msg.sessionId, reason: 'session-commands', commands: [{ name: 'review', description: 'Review changes' }] }))
-    console.log(JSON.stringify({ type: 'sdk.configured', sessionId: msg.sessionId, requestId: msg.requestId, ok: msg.settings?.model !== 'unavailable', message: 'Model is unavailable' }))
+    const settings = configuredSettings.get(msg.sessionId) ?? {}
+    const ok = msg.settings?.model !== 'unavailable' && msg.settings?.effort !== 'invalid'
+    if (msg.settings?.model !== 'unavailable') settings.model = msg.settings.model
+    if (ok) Object.assign(settings, msg.settings)
+    console.log(JSON.stringify({ type: 'sdk.configured', sessionId: msg.sessionId, requestId: msg.requestId, ok, settings, message: 'Model or effort is unavailable' }))
   } else if (msg.type === 'send') {
     // Test hook: lets tests kill the sidecar THROUGH the public API to exercise
     // the consumer-exit eviction path (ledger A9).
@@ -5676,11 +5718,67 @@ rl.on('line', (line) => {
             snapshot["commands"],
             json!([{ "name": "review", "description": "Review changes" }])
         );
+        assert_eq!(
+            snapshot["status"], "running",
+            "accepted input is busy before the first provider output"
+        );
+        assert_eq!(
+            snapshot["extensions"]["claude"]["statusFromLiveState"],
+            true
+        );
         let bindings = fake.bindings.lock().unwrap();
         let settings = &bindings.last().unwrap().settings;
         assert_eq!(settings.model.as_deref(), Some("sonnet"));
         assert_eq!(settings.effort.as_deref(), Some("max"));
         assert_eq!(settings.permission_mode.as_deref(), Some("plan"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_effort_records_the_model_that_already_took_effect() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (state, mut rx) = state_with_bus();
+        let fake = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+        let mut create = dedup_create_msg("partial-settings");
+        create.model = Some("opus".into());
+        create.effort = Some("high".into());
+        state.handle_create(create).await;
+        let created = await_claude_created(&mut rx, "partial-settings").await;
+        let session_id = created["sessionId"].as_str().unwrap();
+        let mut send = send_msg(session_id, "Keep this unsent");
+        send.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            model: Some("sonnet".into()),
+            effort: Some("invalid".into()),
+            cwd: None,
+            permission_mode: None,
+            sandbox: None,
+        });
+        state.handle_send(send).await;
+        assert!(await_top_level_error(&mut rx)
+            .await
+            .contains("CLAUDE_SETTINGS_FAILED"));
+        assert_eq!(
+            env.respond_log_frames(1).await.len(),
+            1,
+            "failed configuration must not send the prompt"
+        );
+        let mut snapshot = json!({"status": "idle"});
+        state
+            .apply_snapshot_metadata(session_id, &mut snapshot)
+            .await;
+        assert_eq!(snapshot["settings"]["model"], "sonnet");
+        assert_eq!(snapshot["settings"]["effort"], "high");
+        assert_eq!(snapshot["status"], "idle");
+        let bindings = fake.bindings.lock().unwrap();
+        assert_eq!(
+            bindings.last().unwrap().settings.model.as_deref(),
+            Some("sonnet")
+        );
+        assert_eq!(
+            bindings.last().unwrap().settings.effort.as_deref(),
+            Some("high")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
