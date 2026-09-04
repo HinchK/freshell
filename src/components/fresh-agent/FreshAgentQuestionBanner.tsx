@@ -15,10 +15,12 @@ type FreshAgentQuestion = {
 
 function SingleSelectQuestion({
   question,
+  answer,
   onSelect,
   disabled,
 }: {
   question: FreshAgentQuestion['questions'][number]
+  answer?: string
   onSelect: (answer: string) => void
   disabled?: boolean
 }) {
@@ -48,8 +50,10 @@ function SingleSelectQuestion({
               'fresh-agent-question-option px-3 py-1.5 text-xs rounded-md border transition-colors',
               'bg-sky-600/10 border-sky-500/30 hover:bg-sky-600/20 hover:border-sky-500/50',
               'disabled:opacity-50',
+              answer === option.label && 'bg-sky-600/30 border-sky-500/60 ring-1 ring-sky-500/40',
             )}
             aria-label={option.label}
+            aria-pressed={answer === option.label}
           >
             <span className="font-medium">{option.label}</span>
             {option.description ? (
@@ -67,6 +71,7 @@ function SingleSelectQuestion({
             'disabled:opacity-50',
           )}
           aria-label="Other"
+          aria-pressed={answer !== undefined && !question.options.some((option) => option.label === answer)}
         >
           Other
         </button>
@@ -228,6 +233,7 @@ function FreshAgentQuestionBanner({
           <SingleSelectQuestion
             key={entry.id ?? `${idx}-${entry.question}`}
             question={entry}
+            answer={answered[String(idx)]}
             onSelect={(answer) => handleAnswer(idx, answer)}
             disabled={disabled}
           />

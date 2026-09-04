@@ -101,7 +101,12 @@ export function FreshAgentModelDialog({
   const searchRef = useRef<HTMLInputElement>(null)
   const previousFocusRef = useRef<HTMLElement | null>(null)
 
-  const [probe, setProbe] = useState<FreshAgentModelCapabilitiesResponse | undefined>(undefined)
+  const probeKey = `${sessionType}:${cwdKey}`
+  const [probeResult, setProbeResult] = useState<{
+    key: string
+    response: FreshAgentModelCapabilitiesResponse
+  }>()
+  const probe = probeResult?.key === probeKey ? probeResult.response : undefined
   const [probing, setProbing] = useState(false)
   const [query, setQuery] = useState('')
   const [activeColumn, setActiveColumn] = useState<'models' | 'levels'>('models')
@@ -116,15 +121,15 @@ export function FreshAgentModelDialog({
   useEffect(() => {
     if (!open || sessionType === 'freshcodex') return
     let cancelled = false
-    setProbe(undefined)
+    setProbeResult(undefined)
     setProbing(true)
     void getFreshAgentModelCapabilities(sessionType, { cwd: paneContent.initialCwd })
       .then((result) => {
-        if (!cancelled) setProbe(result)
+        if (!cancelled) setProbeResult({ key: probeKey, response: result })
       })
       .catch(() => {
         if (cancelled) return
-        setProbe({
+        setProbeResult({ key: probeKey, response: {
           ok: false,
           sessionType,
           runtimeProvider: paneContent.provider,
@@ -132,13 +137,13 @@ export function FreshAgentModelDialog({
           fetchedAt: Date.now(),
           models: [],
           error: { code: 'CAPABILITY_PROBE_FAILED', message: 'Catalog fetch failed' },
-        })
+        } })
       })
       .finally(() => {
         if (!cancelled) setProbing(false)
       })
     return () => { cancelled = true }
-  }, [open, sessionType, paneContent.provider, paneContent.initialCwd])
+  }, [open, sessionType, paneContent.provider, paneContent.initialCwd, probeKey])
 
   const staticCapabilities = useMemo(() => getFreshAgentStaticModelCapabilities(sessionType), [sessionType])
   const capabilities = useMemo<FreshAgentModelCapabilities | undefined>(() => sessionType === 'freshopencode'

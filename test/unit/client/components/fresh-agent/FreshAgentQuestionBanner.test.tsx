@@ -28,6 +28,7 @@ describe('FreshAgentQuestionBanner', () => {
       ],
     }} />)
     fireEvent.click(screen.getByRole('button', { name: 'React' }))
+    expect(screen.getByRole('button', { name: 'React', pressed: true })).toBeVisible()
     fireEvent.click(screen.getByRole('button', { name: 'Rust' }))
     fireEvent.click(screen.getByRole('button', { name: 'Submit all answers' }))
     expect(onAnswer).toHaveBeenCalledWith({ frontend: 'React', backend: 'Rust' })

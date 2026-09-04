@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { FreshAgentModelDialog } from '@/components/fresh-agent/FreshAgentModelDialog'
 import { useAppSelector } from '@/store/hooks'
-import panesReducer, { initLayout } from '@/store/panesSlice'
+import panesReducer, { initLayout, mergePaneContent } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
 
@@ -609,6 +609,26 @@ describe('FreshAgentModelDialog (freshcodex)', () => {
 })
 
 describe('FreshAgentModelDialog (freshclaude)', () => {
+  it('does not prune another project’s recent models with the previous project’s catalog', async () => {
+    getFreshAgentModelCapabilitiesSpy.mockResolvedValueOnce({
+      ...CLAUDE_CATALOG_RESPONSE,
+      models: [{ ...CLAUDE_CATALOG_RESPONSE.models[1], id: 'old-model', displayName: 'Old model' }],
+    }).mockReturnValueOnce(new Promise(() => {}))
+    window.localStorage.setItem('freshclaude.modelMru.v2', JSON.stringify([{
+      id: 'sonnet', displayName: 'Sonnet', source: { id: 'claude', displayName: 'Claude' },
+      cwdKey: '/repo/project-b', lastVerifiedAt: Date.now(),
+    }]))
+    const store = createStore()
+    seedFreshclaudePane(store)
+    renderDialog(store, { open: true })
+    await screen.findByRole('option', { name: /^Old model$/ })
+    store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: { initialCwd: '/repo/project-b' } }))
+    await waitFor(() => expect(getFreshAgentModelCapabilitiesSpy).toHaveBeenCalledTimes(2))
+    expect(JSON.parse(window.localStorage.getItem('freshclaude.modelMru.v2') ?? '[]')).toContainEqual(
+      expect.objectContaining({ id: 'sonnet', cwdKey: '/repo/project-b' }),
+    )
+    expect(screen.queryByRole('option', { name: /^Old model$/ })).not.toBeInTheDocument()
+  })
   it('keeps typed search text when the live catalog arrives', async () => {
     let resolveProbe!: (value: typeof CLAUDE_CATALOG_RESPONSE) => void
     getFreshAgentModelCapabilitiesSpy.mockReturnValueOnce(new Promise((resolve) => { resolveProbe = resolve }))
