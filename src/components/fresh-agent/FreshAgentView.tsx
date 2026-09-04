@@ -2058,11 +2058,13 @@ export function FreshAgentView({
       const previousSnapshot = snapshotRef.current
       const displaySnapshot = mergeSnapshotForDisplay(previousSnapshot, resolved)
       const snapshotAccepted = displaySnapshot !== previousSnapshot
+      const snapshotStatusAuthoritative = provider === 'codex'
+        || resolved.extensions?.[provider]?.statusFromLiveState === true
       const outgoing = outgoingTurnRef.current
       if (
         outgoing && outgoing.requestId === requestOutgoingTurnId
         && snapshotAccepted && displaySnapshot.status === 'idle'
-        && (provider !== 'opencode' || (resolved as { extensions?: { opencode?: { statusFromLiveState?: boolean } } }).extensions?.opencode?.statusFromLiveState === true)
+        && snapshotStatusAuthoritative
         && agentSessionStatusVersionRef.current === requestAgentSessionStatusVersion
         && localEchoLanded(displaySnapshot.turns, outgoing, pendingSendMetadataRef.current.get(outgoing.requestId), {
           allowTextMatch: true,
@@ -2138,16 +2140,14 @@ export function FreshAgentView({
       const wouldRegressStatus = sessionStatus
         ? isStatusRegression(currentSessionStatus, sessionStatus)
         : false
-      const opencodeStatusFromLiveState =
-        (next as { extensions?: { opencode?: { statusFromLiveState?: unknown } } })
-          .extensions?.opencode?.statusFromLiveState === true
       const canAdoptSnapshotStatus =
         (provider === 'codex' && requestSessionType === 'freshcodex')
+        || (provider === 'claude' && snapshotStatusAuthoritative)
         || (provider === 'opencode' && requestSessionType === 'freshopencode'
           // busy (running) may always be adopted; idle (busy-CLEARING) only when
           // live-reconciled -- otherwise the restore-window idle default (untracked
           // or mid-reconcile adapter state) would clear a genuinely running turn.
-          && (snapshotIsBusy || opencodeStatusFromLiveState))
+          && (snapshotIsBusy || snapshotStatusAuthoritative))
       if (
         sessionStatus
         && nextSessionId
