@@ -32,6 +32,11 @@
  *     Mechanism B as accepted. Replaced entries about OTHER terminals never
  *     block; a `terminal.replaced` carrying NO identifier fields at all is
  *     uncorrelatable and conservatively blocks.
+ *  5. Stage gate (delta-r9): the failure must be at each test's FIRST ws
+ *     wait (FIRST_WAIT_BY_TEST). A later-stage failure proves an earlier
+ *     wait already consumed same-terminal recovery frames — recovery began,
+ *     so the no-recovery signature cannot apply even if the final ring is
+ *     clean. An unreadable stage blocks.
  *
  * The ring renders through Rust Debug (`{ignored:?}`) with escaped quotes, so
  * the log is normalized (ANSI stripped, `\"` → `"`) before parsing.
@@ -56,6 +61,22 @@ export const HARNESSED_TESTS = new Set([
   'crashing_agent_is_resumed_twice_then_settles_exited',
   'reconcile_after_replacement_attaches_to_the_new_terminal',
 ])
+
+/**
+ * Delta-r9 stage gate: the waiver covers ONLY a failure at each test's FIRST
+ * ws wait. `wait_frame_matching` returns matched frames — only non-matching
+ * ones reach the ring — so reaching a LATER wait proves an earlier wait
+ * already consumed a same-terminal recovery frame; that cross-stage tail
+ * violates the no-recovery signature even when the final ring looks clean.
+ * The stage is the panic text's awaited-frame description (both panic arms
+ * carry it). Every live mechanism-B receipt so far failed at the FIRST wait
+ * (e.g. task2-certify run 7 at `terminal.status{recovering}`), so the gate
+ * costs nothing on the real defect.
+ */
+export const FIRST_WAIT_BY_TEST: Record<string, string> = {
+  crashing_agent_is_resumed_twice_then_settles_exited: 'terminal.status{recovering}',
+  reconcile_after_replacement_attaches_to_the_new_terminal: 'terminal.replaced',
+}
 
 const ANSI = /\[[0-9;]*m/g
 
@@ -113,6 +134,17 @@ function parseRingEntries(section: string): RingEntry[] {
   return entries
 }
 
+/** The awaited-frame description from the helper's panic, i.e. the stage at
+ * which the test failed. Both panic arms carry it: the catch-all arm prints
+ * `stream ended while waiting for {what}: {other:?}; ignored frames …` and
+ * the deadline arm prints `{what} never arrived before the deadline; …`. */
+function parseFailStage(section: string): string | null {
+  const m =
+    section.match(/stream ended while waiting for (.+?): .+?; ignored frames/) ??
+    section.match(/([^\n]+?) never arrived before the deadline/)
+  return m ? m[1].trim() : null
+}
+
 function blockOut(evidence: string[], why: string): ResumeWaiverClassification {
   evidence.push(`BLOCK: ${why}`)
   return { verdict: 'block', evidence }
@@ -142,6 +174,20 @@ export function classifyResumeWaiver(rawLog: string): ResumeWaiverClassification
     if (section === null) {
       return blockOut(evidence, `no \`---- ${name} stdout ----\` section — cannot verify the settle-frame signature`)
     }
+
+    // delta-r9: stage gate BEFORE ring inspection (see FIRST_WAIT_BY_TEST).
+    const stage = parseFailStage(section)
+    if (!stage) {
+      return blockOut(evidence, `\`${name}\`: cannot read the failure stage from the panic text — the waiver requires a first-wait failure`)
+    }
+    const firstWait = FIRST_WAIT_BY_TEST[name]
+    if (stage !== firstWait) {
+      return blockOut(
+        evidence,
+        `\`${name}\` failed waiting for "${stage}" — the waiver covers only the first ws wait ("${firstWait}"); a later stage proves an earlier wait already consumed same-terminal recovery frames`,
+      )
+    }
+
     const entries = parseRingEntries(section)
 
     const settles = entries.filter((e) =>
