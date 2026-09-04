@@ -19,13 +19,16 @@ const fixture = path.resolve(process.cwd(), 'test/unit/config/fixtures/sanitize-
 //  2. Env-proxy honoring differs across supported Node builds (executed:
 //     /usr/bin/node on this host does NOT warn at all; nvm v22.21.1 warns
 //     ONLY when proxies are set). The negative-control warning assertion is
-//     therefore capability-gated on (major, minor) >= (22, 21); the universal
+//     therefore capability-gated on the documented release lines — 22.21.0+
+//     on the 22.x line or any 24.x+; Node 23.x never shipped
+//     NODE_USE_ENV_PROXY, so `major > 22` must NOT mean "supported"
+//     (delta-review r6). The universal
 //     control is var-inheritance (deterministic at any version/behavior).
 //  3. The fixture's inner child env pins the knobs explicitly — proxies set,
 //     NODE_OPTIONS cleared, NODE_USE_ENV_PROXY=1 — so ambient suppression
 //     flags can never make the control unfalsifiable.
 const [nodeMajor, nodeMinor] = process.versions.node.split('.').map(Number)
-const ENV_PROXY_SUPPORTED = nodeMajor > 22 || (nodeMajor === 22 && nodeMinor >= 21)
+const ENV_PROXY_SUPPORTED = (nodeMajor === 22 && nodeMinor >= 21) || nodeMajor >= 24
 
 const POISONED_ENV = {
   HTTP_PROXY: 'http://127.0.0.1:9',

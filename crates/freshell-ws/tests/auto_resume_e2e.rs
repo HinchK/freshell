@@ -120,10 +120,12 @@ fn format_ignored_frames(ignored: &std::collections::VecDeque<String>) -> String
 ///
 /// DEFLAKE self-diagnosis (the-usual test-flake-hardening, mechanism-B RCA —
 /// reports/mechanism-b-rca.md §0/§4): every parsed-but-non-matching Text frame
-/// is RECORDED (its `type` plus `status`/`code`/`reason`/`attempt`/
+/// is RECORDED (its `type` plus `tid`/`status`/`code`/`reason`/`attempt`/
 /// `sessionRef` when present, last 10 in a ring — the settle-diagnostic field
 /// set widened at delta-r2 plan addition #5(a) so every future mechanism-B
-/// occurrence self-names its settle tail for the follow-up task) and dumped
+/// occurrence self-names its settle tail for the follow-up task, and `tid`
+/// added at delta-r6 so the waiver classifier can correlate the settle frame
+/// to the crashed terminal) and dumped
 /// into BOTH panic arms — the catch-all `other` arm (which
 /// fires on the final `Err(Elapsed)` when the peer simply stops sending, the
 /// exact mechanism-B receipt shape; delta-review r1) and the end-of-loop
@@ -141,10 +143,14 @@ async fn wait_frame_matching(
     mut pred: impl FnMut(&serde_json::Value) -> bool,
 ) -> serde_json::Value {
     // Ring of the last 10 ignored frames: parsed Text frames that failed
-    // `pred`, summarized as `type=<v>` plus `status=<v>`/`code=<v>`/
+    // `pred`, summarized as `type=<v>` plus `tid=<v>`/`status=<v>`/`code=<v>`/
     // `reason=<v>`/`attempt=<v>`/`sessionRef=<v>` when the frame carries
     // those fields (the wire TerminalStatus settle/recovering shapes carry
-    // `reason`/`attempt`; error frames carry `code`).
+    // `reason`/`attempt`; error frames carry `code`). `tid` (delta-review r6):
+    // the mechanism-B waiver classifier
+    // (scripts/classify-resume-waiver.ts) must correlate a settle frame to
+    // its terminal — without `terminalId` the ring cannot distinguish the
+    // crashed terminal's settle tail from an unrelated terminal's frames.
     let mut ignored: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     while tokio::time::Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -155,6 +161,9 @@ async fn wait_frame_matching(
                         return value;
                     }
                     let mut summary = format!("type={}", value["type"]);
+                    if let Some(tid) = value.get("terminalId") {
+                        summary.push_str(&format!(" tid={tid}"));
+                    }
                     if let Some(status) = value.get("status") {
                         summary.push_str(&format!(" status={status}"));
                     }
@@ -470,7 +479,7 @@ async fn wait_frame_matching_silent_peer_panic_carries_the_ignored_ring() {
 /// enrichment on the mechanism-B-relevant field.
 #[tokio::test]
 #[should_panic(
-    expected = "ignored frames (last 2): [\"type=\\\"sessions.updated\\\"\", \"type=\\\"terminal.status\\\" status=\\\"exited\\\" reason=\\\"clean_exit\\\"\"]"
+    expected = "ignored frames (last 2): [\"type=\\\"sessions.updated\\\"\", \"type=\\\"terminal.status\\\" tid=\\\"t-unrelated\\\" status=\\\"exited\\\" reason=\\\"clean_exit\\\"\"]"
 )]
 async fn wait_frame_matching_unrelated_frames_panic_names_the_ring() {
     let mut ws = loopback_test_ws(|mut server_ws| async move {

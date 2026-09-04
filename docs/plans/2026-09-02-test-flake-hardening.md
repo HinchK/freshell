@@ -400,30 +400,22 @@ for i in $(seq 1 10); do
   if cargo test -p freshell-ws --locked --test auto_resume_e2e --test restore_spawn_gate --test rate_limit_retry_clock > "$CHUNKS/run-$i.log" 2>&1; then
     echo "run $i: PASS" | tee -a "$LOG"; GREEN=$((GREEN+1))
   else
-    # Exact-shape mech-B waiver (addition #5 / delta-r5): the ring is
-    # Debug-rendered with escaped quotes (`reason=\"no_resumable_identity\"`),
-    # so classify on ONE normalized copy with backslashes stripped — every
-    # keyword grep below is then quote-escape-insensitive. ALL FOUR checks
-    # must hold for a waiver; failing ANY check is a hard stop.
-    NORM="$CHUNKS/run-$i.normalized.log"
-    tr -d '\\' < "$CHUNKS/run-$i.log" > "$NORM"
-    # (1) every panic is in auto_resume_e2e (no other file may fail);
-    # (2) >=1 no_resumable_identity occurrence (bare name, escape-insensitive);
-    # (3) NO arrived terminal.replaced frame — matched type-tag-anchored
-    #     because the receipted wait's own panic preamble ("waiting for
-    #     terminal.replaced") contains the bare word; a bare grep would block
-    #     the waivered tail itself. The RE also catches raw-JSON dumps
-    #     (`"type":"terminal.replaced"`, optional space);
-    # (4) NO recovering occurrence (recovery starting then vanishing is a
-    #     different defect).
-    OTHER_FAILS=$(grep "panicked at" "$NORM" | grep -cv "tests/auto_resume_e2e.rs")
-    HAS_MECHB=$(grep -c "no_resumable_identity" "$NORM")
-    ARRIVED_REPLACED=$(grep -cE 'type"?[=:] ?"terminal\.replaced' "$NORM")
-    HAS_RECOVERING=$(grep -c "recovering" "$NORM")
-    if [ "$OTHER_FAILS" -eq 0 ] && [ "$HAS_MECHB" -ge 1 ] && [ "$ARRIVED_REPLACED" -eq 0 ] && [ "$HAS_RECOVERING" -eq 0 ]; then
-      echo "run $i: PASS(mech-B waived — settle reason no_resumable_identity; exact signature per addition #5; chunk $CHUNKS/run-$i.log)" | tee -a "$LOG"; MECHB=$((MECHB+1))
+    # Exact-shape mech-B waiver (addition #5, executable form since delta-r6):
+    # scripts/classify-resume-waiver.ts parses the chunk — failing-test
+    # identity scoped to the two harnessed auto_resume_e2e tests, the ring
+    # settle frame VERIFIED to carry reason="no_resumable_identity" WITH a
+    # terminalId, and replaced/recovering rejected only for THAT terminal —
+    # and exits 0 (waive) / 1 (block) / 2 (no failure). The grep heuristics
+    # this loop used before r6 could waive an unrelated failure or block a
+    # true signature; they no longer exist here.
+    set +e
+    npx tsx scripts/classify-resume-waiver.ts "$CHUNKS/run-$i.log" | sed "s/^/run $i classifier: /" | tee -a "$LOG"
+    C=${PIPESTATUS[0]}
+    set -e
+    if [ "$C" -eq 0 ]; then
+      echo "run $i: PASS(mech-B waived — exact signature per scripts/classify-resume-waiver.ts; chunk $CHUNKS/run-$i.log)" | tee -a "$LOG"; MECHB=$((MECHB+1))
     else
-      echo "run $i: FAIL (non-mechanism-B shape — BLOCKS; other-file panics=$OTHER_FAILS mechB-reasons=$HAS_MECHB arrived-replaced=$ARRIVED_REPLACED recovering=$HAS_RECOVERING; chunk $CHUNKS/run-$i.log)" | tee -a "$LOG"; BLOCKED=$((BLOCKED+1))
+      echo "run $i: FAIL (non-mechanism-B shape — BLOCKS; chunk $CHUNKS/run-$i.log)" | tee -a "$LOG"; BLOCKED=$((BLOCKED+1))
     fi
   fi
 done
@@ -433,7 +425,11 @@ echo "CERTIFY: $GREEN green / $MECHB mech-B-waived / $BLOCKED blocked" | tee -a 
 
 Expected: final line `CERTIFY: … / … / 0 blocked` with exit 0. Any non-mechanism-B shape yields a non-zero exit.
 
-**Plan addition #7 (delta-review round 5, 2026-09-02):** the Step-6 classifier above was rewritten after review found the waiver could neither fire nor enforce: (a) the ring is Debug-rendered, so receipts carry `reason=\"no_resumable_identity\"` with escaped quotes and the old quoted grep never matched; (b) the old checks did not reject other auto-resume failures, other settle reasons, or arrived recovering/replaced frames. The classifier now normalizes each failing chunk ONCE (`tr -d '\\'` — every keyword grep is then quote-escape-insensitive by construction) and requires ALL FOUR checks: (1) every `panicked at` line names `tests/auto_resume_e2e.rs`; (2) ≥1 `no_resumable_identity` occurrence (bare name); (3) NO arrived `terminal.replaced` frame — anchored to the `type=`-tagged arrived-frame shape because the receipted failure line itself (`stream ended while waiting for terminal.replaced: …`, task2c2-certify.log:16) contains the bare word as the awaited-frame name, so a bare-word grep would block the waivered tail itself (the waivered tail is by definition "never replaced": no replaced frame ARRIVES); (4) NO `recovering` occurrence. Standalone-verified against five synthetic chunks (clean pass; exact mech-B shape with escaped quotes waived; recovering-then-vanish, other-file panic, and arrived-replaced all blocked) — evidence: usual-sdd/delta-r5-fix-report.md.
+**Plan addition #8 (delta-review round 6, 2026-09-04):** the r5 inline-grep classifier was replaced with an executable, unit-tested classifier: `scripts/classify-resume-waiver.ts` (pure exported `classifyResumeWaiver` + CLI; exit 0/1/2 = waive/block/no-failure; tests in `test/unit/scripts/classify-resume-waiver.test.ts`). Round 6 found the grep version could still violate BOTH edges of the accepted waiver: it (a) matched `no_resumable_identity` ANYWHERE in the chunk — including panic prose or a different test's tail — so an unrelated failure could be waived, and (b) greped `recovering` across the whole chunk — including another terminal's frames or the wait's own expectation text — so a true signature could be blocked. The classifier now (1) scopes failing-test identity to the two harnessed auto_resume_e2e tests, (2) requires the ring settle frame to carry `reason="no_resumable_identity"` AND a `terminalId`, and (3) rejects `terminal.replaced`/`recovering` only when they carry the SAME terminalId as the settle. Requirement (3) needed one instrumentation refinement: the ring now records `tid` (the frame's `terminalId`) — without it the settle could never be correlated to the crashed terminal — and the existing exact-string ring-pin test was updated to pin the new field. Historical receipts (pre-tid rings, e.g. task2c2-certify.log) therefore correctly classify as `block`; future certifications under the enriched ring get the exact ruling. (Same round, minor: `ENV_PROXY_SUPPORTED` in sanitize-test-env.test.ts gated on `major > 22`, wrongly enabling the behavioral-warning assertions on Node 23.x — NODE_USE_ENV_PROXY shipped in 22.21.0 and 24.0.0, never 23.x; now `(22.21+) || (>= 24)`.)
+
+Expected: final line `CERTIFY: … / … / 0 blocked` with exit 0. Any non-mechanism-B shape yields a non-zero exit.
+
+**Plan addition #7 (delta-review round 5, 2026-09-02; superseded in executable detail by addition #8 at round 6 — the four-check grep shape below is kept as the historical record):** the Step-6 classifier above was rewritten after review found the waiver could neither fire nor enforce: (a) the ring is Debug-rendered, so receipts carry `reason=\"no_resumable_identity\"` with escaped quotes and the old quoted grep never matched; (b) the old checks did not reject other auto-resume failures, other settle reasons, or arrived recovering/replaced frames. The classifier now normalizes each failing chunk ONCE (`tr -d '\\'` — every keyword grep is then quote-escape-insensitive by construction) and requires ALL FOUR checks: (1) every `panicked at` line names `tests/auto_resume_e2e.rs`; (2) ≥1 `no_resumable_identity` occurrence (bare name); (3) NO arrived `terminal.replaced` frame — anchored to the `type=`-tagged arrived-frame shape because the receipted failure line itself (`stream ended while waiting for terminal.replaced: …`, task2c2-certify.log:16) contains the bare word as the awaited-frame name, so a bare-word grep would block the waivered tail itself (the waivered tail is by definition "never replaced": no replaced frame ARRIVES); (4) NO `recovering` occurrence. Standalone-verified against five synthetic chunks (clean pass; exact mech-B shape with escaped quotes waived; recovering-then-vanish, other-file panic, and arrived-replaced all blocked) — evidence: usual-sdd/delta-r5-fix-report.md.
 
 - [x] **Step 7: Commit the task**
 
