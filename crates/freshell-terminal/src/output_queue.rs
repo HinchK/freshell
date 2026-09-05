@@ -21,20 +21,18 @@
 //! `terminal.created`, etc. are sent directly and are never subject to
 //! eviction). ONE deliberate Rust-port deviation: `terminal.exit` ALSO
 //! travels this queue (as a non-evictable, zero-weight sequenced frame via
-//! [`OutputQueue::push_sequenced`]) because the port's connection loop
-//! drains its direct channel ahead of this queue -- a directly-sent exit
-//! would deterministically overtake still-queued replay/final output on the
-//! wire, and the client's exit teardown then discards that output (blank
-//! exited pane on attach-to-an-exited-terminal; truncated tail on a busy
-//! live exit). See `freshell-ws::backpressure`'s `route`.
+//! [`OutputQueue::push_sequenced`]) because any lane that would let it bypass
+//! still-queued replay/final output would deterministically lose that output
+//! on the wire: the client's exit teardown discards output arriving after an
+//! exit (blank exited pane on attach-to-an-exited-terminal; truncated tail on
+//! a busy live exit).
 //!
-//! The Rust port's connection loop (`freshell-ws::terminal::run`) instead
-//! multiplexes EVERY server-to-client message for a connection (all
-//! terminals + all other event families) over one `mpsc::unbounded_channel`.
-//! To preserve the SAME observable scope, the connection boundary is
-//! responsible for routing only output-shaped `ServerMessage`s (see
-//! [`output_frame_meta`]) into an `OutputQueue`, and everything else through
-//! its existing unbounded channel unchanged -- exactly mirroring which
+//! The Rust port's connection writer (`freshell-ws::terminal`'s
+//! `connection_writer`) multiplexes EVERY server-to-client message for a
+//! connection through one admission lock: output-shaped `ServerMessage`s
+//! (see [`output_frame_meta`]) and the sequenced exit go into the per-
+//! connection `OutputQueue`, and everything else goes into the writer's
+//! bounded control lane, never subject to eviction -- exactly mirroring which
 //! frames legacy subjects to the cap.
 //!
 //! Multiple concurrently-attached terminals on one connection can each
@@ -97,6 +95,11 @@ struct QueuedItem {
     /// FIFO position relative to output but is NEVER evicted and carries no
     /// queued-byte weight.
     meta: Option<OutputFrameMeta>,
+    /// Opaque admission-order stamp supplied by the caller (the connection
+    /// writer) so the pump can prove an output frame predates a control
+    /// frame before letting output leapfrog it; `None` carries no ordering
+    /// obligation. Kept on the item so eviction/discard stay consistent.
+    stamp: Option<u64>,
 }
 
 /// A pending, not-yet-delivered gap. Kept per-stream (mirrors legacy's
@@ -117,7 +120,7 @@ pub struct OutputQueue {
     max_bytes: usize,
     items: VecDeque<QueuedItem>,
     total_bytes: usize,
-    pending_gaps: Vec<PendingGap>,
+    pending_gaps: VecDeque<PendingGap>,
     dropped_frames: u64,
 }
 
@@ -131,7 +134,7 @@ impl OutputQueue {
             max_bytes: max_bytes.max(1),
             items: VecDeque::new(),
             total_bytes: 0,
-            pending_gaps: Vec::new(),
+            pending_gaps: VecDeque::new(),
             dropped_frames: 0,
         }
     }
@@ -151,13 +154,46 @@ impl OutputQueue {
     /// (mirrors `enqueue(frame, queuedBytes = frame.bytes)`). Evicts the
     /// oldest frames first if this push takes the queue over `max_bytes`.
     pub fn push(&mut self, msg: ServerMessage, bytes: usize, meta: OutputFrameMeta) {
+        self.push_inner(msg, bytes, meta, None);
+    }
+
+    /// [`Self::push`] with an admission-order stamp (see `stamp` above).
+    pub fn push_stamped(
+        &mut self,
+        msg: ServerMessage,
+        bytes: usize,
+        meta: OutputFrameMeta,
+        stamp: u64,
+    ) {
+        self.push_inner(msg, bytes, meta, Some(stamp));
+    }
+
+    fn push_inner(
+        &mut self,
+        msg: ServerMessage,
+        bytes: usize,
+        meta: OutputFrameMeta,
+        stamp: Option<u64>,
+    ) {
         self.items.push_back(QueuedItem {
             msg,
             bytes,
             meta: Some(meta),
+            stamp,
         });
         self.total_bytes += bytes;
         self.evict_overflow();
+    }
+
+    /// The admission stamp of the entry `pop_front` would return next, when
+    /// the caller stamps admissions. Synthesized gap frames and unstamped
+    /// entries report `None`: they carry no ordering obligations against
+    /// control frames.
+    pub fn front_stamp(&self) -> Option<u64> {
+        if !self.pending_gaps.is_empty() {
+            return None;
+        }
+        self.items.front().and_then(|item| item.stamp)
     }
 
     /// Push a sequenced CONTROL frame (e.g. `terminal.exit`) that must be
@@ -179,6 +215,7 @@ impl OutputQueue {
             msg,
             bytes: 0,
             meta: None,
+            stamp: None,
         });
     }
 
@@ -200,6 +237,55 @@ impl OutputQueue {
 
     pub fn has_pending(&self) -> bool {
         !self.pending_gaps.is_empty() || !self.items.is_empty()
+    }
+
+    /// Superseding attach: discard only this terminal's unsent delivery
+    /// generation, including its queued exit and gaps. The authoritative
+    /// registry retains the bytes and emits a fresh replay/exit for the new
+    /// attachment. An already leased/in-flight frame is owned by the writer.
+    pub fn discard_terminal(&mut self, terminal_id: &str) {
+        let mut removed_bytes = 0;
+        self.items.retain(|item| {
+            let meta_matches = item
+                .meta
+                .as_ref()
+                .is_some_and(|meta| meta.terminal_id == terminal_id);
+            let exit_matches = matches!(
+                &item.msg,
+                ServerMessage::TerminalExit(exit) if exit.terminal_id == terminal_id
+            );
+            let belongs = meta_matches || exit_matches;
+            if belongs {
+                removed_bytes += item.bytes;
+            }
+            !belongs
+        });
+        self.total_bytes -= removed_bytes;
+        self.pending_gaps
+            .retain(|gap| gap.terminal_id != terminal_id);
+    }
+
+    /// Lease one frame to the socket writer without removing the rest of its
+    /// backlog from queue accounting. The caller retains the returned byte
+    /// charge until that frame has actually been flushed (or the socket dies).
+    /// Gaps and sequenced controls carry zero output-budget weight, as before.
+    pub fn pop_front(&mut self) -> Option<(ServerMessage, usize)> {
+        if let Some(gap) = self.pending_gaps.pop_front() {
+            return Some((
+                ServerMessage::TerminalOutputGap(TerminalOutputGap {
+                    from_seq: gap.from_seq,
+                    to_seq: gap.to_seq,
+                    reason: TerminalOutputGapReason::QueueOverflow,
+                    stream_id: gap.stream_id,
+                    terminal_id: gap.terminal_id,
+                    attach_request_id: gap.attach_request_id,
+                }),
+                0,
+            ));
+        }
+        let item = self.items.pop_front()?;
+        self.total_bytes -= item.bytes;
+        Some((item.msg, item.bytes))
     }
 
     /// Drain everything currently queued, IN ORDER: every pending gap FIRST
@@ -253,14 +339,18 @@ impl OutputQueue {
     /// the LAST entry (not a full scan) -- evictions are always FIFO-ordered
     /// per stream, so the last entry is always the correct merge candidate.
     fn extend_gap(&mut self, meta: OutputFrameMeta) {
-        if let Some(last) = self.pending_gaps.last_mut() {
-            if last.stream_id == meta.stream_id && meta.seq_start <= last.to_seq + 1 {
+        if let Some(last) = self.pending_gaps.back_mut() {
+            if last.stream_id == meta.stream_id
+                && last.terminal_id == meta.terminal_id
+                && last.attach_request_id == meta.attach_request_id
+                && meta.seq_start <= last.to_seq.saturating_add(1)
+            {
                 last.from_seq = last.from_seq.min(meta.seq_start);
                 last.to_seq = last.to_seq.max(meta.seq_end);
                 return;
             }
         }
-        self.pending_gaps.push(PendingGap {
+        self.pending_gaps.push_back(PendingGap {
             terminal_id: meta.terminal_id,
             stream_id: meta.stream_id,
             from_seq: meta.seq_start,
