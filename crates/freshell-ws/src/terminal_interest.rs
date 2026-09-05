@@ -38,15 +38,22 @@ impl InterestState {
                 .unwrap_or(Priority::Visible)
         }
     }
-    pub(super) fn attach(
-        &mut self,
-        terminal_id: &str,
-        background: bool,
-    ) -> Result<(), &'static str> {
+    /// Pre-snapshot fallback priority. Once a snapshot revision is
+    /// authoritative the map is never consulted, so attach writes nothing.
+    /// The cap is a memory bound, not a security boundary: on overflow the
+    /// entry is skipped (that terminal then classifies as the Visible default
+    /// — the pre-feature behavior) instead of killing the connection.
+    /// Entries are pruned on detach and on exit admission, so steady-state
+    /// size tracks live terminals.
+    pub(super) fn attach(&mut self, terminal_id: &str, background: bool) {
+        if self.revision.is_some() {
+            return;
+        }
         if !self.attachments.contains_key(terminal_id)
             && self.attachments.len() >= MAX_INTEREST_TERMINALS
         {
-            return Err("Too many attached terminal delivery lanes");
+            tracing::warn!(terminal_id, "ws.interest.fallback_cap_reached");
+            return;
         }
         self.attachments.insert(
             terminal_id.to_string(),
@@ -56,7 +63,6 @@ impl InterestState {
                 Priority::Visible
             },
         );
-        Ok(())
     }
     pub(super) fn detach(&mut self, terminal_id: &str) {
         self.attachments.remove(terminal_id);
@@ -120,9 +126,9 @@ mod tests {
     #[test]
     fn existing_attach_priority_is_honored_without_new_client() {
         let mut state = InterestState::default();
-        state.attach("a", true).unwrap();
+        state.attach("a", true);
         assert_eq!(state.priority("a"), Priority::Background);
-        state.attach("a", false).unwrap();
+        state.attach("a", false);
         assert_eq!(state.priority("a"), Priority::Visible);
     }
     #[test]
@@ -167,7 +173,7 @@ mod tests {
     #[test]
     fn detach_prunes_fallback_and_snapshot_does_not_override_live_identity() {
         let mut state = InterestState::default();
-        state.attach("old", true).unwrap();
+        state.attach("old", true);
         state.detach("old");
         assert!(state.attachments.is_empty());
         state.enable();

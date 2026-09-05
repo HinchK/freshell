@@ -534,7 +534,7 @@ pub fn spawn_idle_monitor(
 /// would lose scrollback). On a truly fresh boot the registry is empty, so this stays
 /// byte-identical to the clean-boot handshake the oracle's T0/determinism tiers pin.
 pub async fn build_handshake(state: &WsState) -> Vec<ServerMessage> {
-    build_handshake_with_capabilities(state, false, false).await
+    build_handshake_with_capabilities(state, false, false, false).await
 }
 
 /// [`build_handshake`], parameterized on the connection's negotiated
@@ -556,6 +556,7 @@ pub async fn build_handshake_with_capabilities(
     state: &WsState,
     pane_reconcile_v1: bool,
     pane_reconcile_fresh_agent_v1: bool,
+    terminal_interest_v1: bool,
 ) -> Vec<ServerMessage> {
     let boot_id = state.boot_id.as_ref().clone();
     let mut messages = vec![
@@ -564,13 +565,14 @@ pub async fn build_handshake_with_capabilities(
             boot_id: Some(boot_id.clone()),
             server_instance_id: Some(state.server_instance_id.as_ref().clone()),
             build_id: ready_build_id(),
-            capabilities: (pane_reconcile_v1 || pane_reconcile_fresh_agent_v1).then_some(
-                freshell_protocol::ReadyCapabilities {
+            capabilities: (pane_reconcile_v1
+                || pane_reconcile_fresh_agent_v1
+                || terminal_interest_v1)
+                .then_some(freshell_protocol::ReadyCapabilities {
                     pane_reconcile_v1: pane_reconcile_v1.then_some(true),
                     pane_reconcile_fresh_agent_v1: pane_reconcile_fresh_agent_v1.then_some(true),
-                    terminal_interest_v1: None,
-                },
-            ),
+                    terminal_interest_v1: terminal_interest_v1.then_some(true),
+                }),
         }),
         ServerMessage::SettingsUpdated(SettingsUpdated {
             settings: state.handshake_settings.read().await.clone(),
@@ -792,23 +794,14 @@ async fn handle_socket(
     // Authenticated: emit the ordered handshake. CFG-12: the builder is
     // async + per-connection so its `settings.updated` frame resolves the
     // LIVE settings tree (see `build_handshake_with_capabilities`).
-    for mut msg in
-        build_handshake_with_capabilities(&state, pane_reconcile_v1, pane_reconcile_fresh_agent_v1)
-            .await
+    for msg in build_handshake_with_capabilities(
+        &state,
+        pane_reconcile_v1,
+        pane_reconcile_fresh_agent_v1,
+        terminal_interest_v1,
+    )
+    .await
     {
-        if terminal_interest_v1 {
-            if let ServerMessage::Ready(ready) = &mut msg {
-                let capabilities =
-                    ready
-                        .capabilities
-                        .get_or_insert(freshell_protocol::ReadyCapabilities {
-                            pane_reconcile_v1: None,
-                            pane_reconcile_fresh_agent_v1: None,
-                            terminal_interest_v1: None,
-                        });
-                capabilities.terminal_interest_v1 = Some(true);
-            }
-        }
         let json = match serde_json::to_string(&msg) {
             Ok(json) => json,
             Err(_) => return,
@@ -838,7 +831,7 @@ async fn handle_socket(
         .unwrap_or(false);
     // Handshake done: serve the terminal.* shell path (and fan out broadcast-bus
     // frames) until the client closes.
-    terminal::run_with_interest(
+    terminal::run(
         socket,
         &state,
         bcast_rx,
@@ -1027,7 +1020,7 @@ mod tests {
     #[tokio::test]
     async fn handshake_advertises_pane_reconcile_only_when_negotiated() {
         let s = state();
-        let negotiated = build_handshake_with_capabilities(&s, true, false).await;
+        let negotiated = build_handshake_with_capabilities(&s, true, false, false).await;
         let ready = serde_json::to_value(&negotiated[0]).unwrap();
         assert_eq!(
             ready["capabilities"],
@@ -1041,7 +1034,7 @@ mod tests {
             "non-negotiating hello must not change ready's shape: {ready}"
         );
         // Same shape as an explicit `false` negotiation.
-        let unnegotiated = build_handshake_with_capabilities(&s, false, false).await;
+        let unnegotiated = build_handshake_with_capabilities(&s, false, false, false).await;
         let ready2 = serde_json::to_value(&unnegotiated[0]).unwrap();
         assert!(ready2.get("capabilities").is_none());
     }

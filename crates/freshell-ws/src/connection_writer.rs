@@ -318,13 +318,17 @@ impl WriterSender {
                 unreachable!("sequenced exit only")
             };
             let priority = queues.interest.priority(&exit.terminal_id);
+            // Sequenced exits are zero-weight, exactly as legacy queued them:
+            // they can never force an eviction nor close the connection, and
+            // they still cost one service unit per frame (count-bounded by
+            // the metadata limit).
             if queues
                 .output
                 .push(
                     &exit.terminal_id,
                     priority,
                     Message::Text(json.into()),
-                    bytes,
+                    0,
                     None,
                     seq,
                 )
@@ -334,6 +338,8 @@ impl WriterSender {
                 self.fail(WriterExit::OutputCapacityExceeded);
                 return false;
             }
+            // A dead terminal never needs its attach fallback again.
+            queues.interest.detach(&exit.terminal_id);
         }
         drop(queues);
         self.shared.ready.notify_one();
@@ -378,11 +384,7 @@ impl WriterSender {
         if queues.closed {
             return;
         }
-        if queues.interest.attach(terminal_id, background).is_err() {
-            drop(queues);
-            self.fail(WriterExit::OutputCapacityExceeded);
-            return;
-        }
+        queues.interest.attach(terminal_id, background);
         let Queues {
             output, interest, ..
         } = &mut *queues;

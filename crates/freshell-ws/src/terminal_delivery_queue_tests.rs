@@ -1,5 +1,19 @@
 use super::*;
 static STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn put_at(q: &mut DeliveryQueue<(String, i64)>, id: &str, p: Priority, seq: i64, bytes: usize) {
+    q.push(
+        id,
+        p,
+        (id.to_string(), seq),
+        bytes,
+        range(seq, "g"),
+        stamp(),
+    )
+    .unwrap();
+}
+fn stamp() -> u64 {
+    STAMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 fn range(seq: i64, generation: &str) -> Option<Range> {
     Some(Range {
         stream_id: "s".into(),
@@ -413,4 +427,57 @@ fn arithmetic_overflow_does_not_create_a_phantom_index_entry() {
         _ => panic!(),
     }
     assert!(q.pop().is_none());
+}
+
+#[test]
+fn demotion_after_history_neither_steals_nor_starves() {
+    // 8:1 window check with real service history: after 1000 focused frames,
+    // demoting that lane to background (and promoting another to focused) must
+    // leave both progressing — the demoted lane inside its first window, and
+    // at roughly 8:1 bytes thereafter. A zero-carry watermark would let the
+    // long-served lane jump the promotion; a weight-SCALED carry would starve
+    // it for thousands of pops (both pinned wrong before).
+    let mut q = DeliveryQueue::new(10_000_000_000, 1_000_000);
+    for i in 0..1000 {
+        q.push("f", Priority::Focused, ("f".into(), i), 100, None, stamp())
+            .unwrap();
+        q.pop();
+    }
+    assert_eq!(q.lane_count(), 0);
+    // Enough backlog on both sides that neither lane drains inside the
+    // measured window (service would otherwise degenerate to a drained-lane
+    // free-run, which is correct behavior, not the ratio under test).
+    for i in 1000..1060 {
+        put_at(&mut q, "f", Priority::Focused, i, 100);
+    }
+    for i in 0..60 {
+        put_at(&mut q, "g", Priority::Focused, i, 100);
+    }
+    q.update_priorities(|id| {
+        if id == "g" {
+            Priority::Focused
+        } else {
+            Priority::Background
+        }
+    });
+    let (mut fs, mut gs, mut first_f) = (0usize, 0usize, None);
+    for n in 0..27 {
+        let (id, ..) = next(&mut q);
+        if id == "f" {
+            fs += 1;
+            if first_f.is_none() {
+                first_f = Some(n);
+            }
+        } else {
+            gs += 1;
+        }
+    }
+    assert!(
+        first_f.is_some_and(|n| (1..=9).contains(&n)),
+        "demoted lane must arrive within one 8:1 window of the promotion, got {first_f:?}"
+    );
+    assert!(
+        fs == 3 && gs == 24,
+        "27 saturated pops at 8:1 ⇒ exactly 3 demoted, got fs={fs} gs={gs}"
+    );
 }

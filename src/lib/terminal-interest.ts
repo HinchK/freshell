@@ -1,3 +1,7 @@
+import { createLogger } from '@/lib/client-logger'
+
+const log = createLogger('terminal-interest')
+
 /** Presentation-only interest for one WebSocket connection. No attach, detach,
  * resize, input or execution state is changed by this module. */
 export type TerminalInterestSnapshot = {
@@ -79,7 +83,13 @@ export function createInterestPublisher(options: {
     cancel?.(); cancel = null
     if (disposed) return
     const snapshot = options.read()
-    if (snapshot === null) return
+    // A refused read (selector cardinality/cycle guards) must not move the
+    // server off the last accepted snapshot — but it must also not be
+    // silent: that state is a client-side classification problem.
+    if (snapshot === null) {
+      if (lastKey !== null) log.debug('selector refused snapshot; keeping last accepted state')
+      return
+    }
     const key = JSON.stringify(snapshot)
     if (!force && key === lastKey) return
     if (options.send(snapshot)) lastKey = key

@@ -61,7 +61,7 @@ fn server_types_match_inventory_exactly() {
 }
 
 #[test]
-fn combined_surface_is_96() {
+fn combined_surface_is_97() {
     let all = all_message_types();
     assert_eq!(all.len(), 97, "37 client + 60 server = 97 discriminants");
     // sorted + unique

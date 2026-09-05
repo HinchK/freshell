@@ -224,32 +224,6 @@ pub async fn run(
     pane_reconcile_v1: bool,
     pane_reconcile_fresh_agent_v1: bool,
     origin_kind: &'static str,
-) {
-    run_with_interest(
-        socket,
-        state,
-        bcast_rx,
-        terminal_output_batch_v1,
-        ui_screenshot_v1,
-        pane_reconcile_v1,
-        pane_reconcile_fresh_agent_v1,
-        origin_kind,
-        false,
-    )
-    .await;
-}
-
-/// Additive capability-aware entry point; callers of run keep legacy behavior.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_with_interest(
-    socket: WebSocket,
-    state: &WsState,
-    bcast_rx: tokio::sync::broadcast::Receiver<String>,
-    terminal_output_batch_v1: bool,
-    ui_screenshot_v1: bool,
-    pane_reconcile_v1: bool,
-    pane_reconcile_fresh_agent_v1: bool,
-    origin_kind: &'static str,
     terminal_interest_v1: bool,
 ) {
     let (ws_tx, ws_rx) = socket.split();

@@ -205,9 +205,9 @@ impl<T> DeliveryQueue<T> {
             }
             lane.gaps.push_back(range);
             self.gap_count += 1;
-            if self.entries.len().saturating_add(self.gap_count) > self.metadata_limit {
-                return Err(CapacityError::MetadataLimit);
-            }
+            // Invariant (no post-check needed): admission keeps
+            // entries + gaps <= metadata_limit, and each eviction removes one
+            // entry while adding at most one gap.
         }
         Ok(())
     }
@@ -222,15 +222,19 @@ impl<T> DeliveryQueue<T> {
                 let dest = next.index();
                 lane.priority = next;
                 lane.served = self.lane_clock[dest];
-                // Carry the origin class's normalized service into the
-                // destination class's weight units. Without this, demoting a
-                // long-served lane leaves its new class at its old (lower)
+                // Lift the destination class to at least the origin class's
+                // watermark. class_served across classes is ONE normalized
+                // virtual clock (compared directly in select_lane), so no
+                // weight conversion may be applied. Without the lift, demoting
+                // a long-served lane leaves its new class at its old (lower)
                 // watermark: the demoted lane would then be the most
                 // "underserved" one and win reprioritization against the very
-                // lane that was just promoted.
-                let converted =
-                    self.class_served[origin].saturating_mul(WEIGHT[dest]) / WEIGHT[origin];
-                self.class_served[dest] = self.class_served[dest].max(converted);
+                // lane that was just promoted. (A weight-scaled credit instead
+                // would starve the demoted lane for a period proportional to
+                // the connection's entire prior service — caught by
+                // demotion_after_history_neither_steals_nor_starves.)
+                self.class_served[next.index()] =
+                    self.class_served[next.index()].max(self.class_served[origin]);
             }
             self.class_served[next.index()] = self.class_served[next.index()].max(self.class_clock);
         }

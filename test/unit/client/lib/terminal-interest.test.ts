@@ -1,5 +1,6 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { createInterestPublisher, selectTerminalInterest, type InterestPane, type InterestState } from '@/lib/terminal-interest'
+import { getClientLogLevel, setClientLogLevel } from '@/lib/client-logger'
 const leaf = (id: string, terminalId: string): InterestPane => ({ type: 'leaf', id, content: { kind: 'terminal', terminalId } })
 function state(): InterestState {
   return { tabs: { activeTabId: 'tab' }, panes: {
@@ -33,5 +34,26 @@ describe('terminal presentation interest', () => {
     expect(sent).toHaveLength(1)
     publisher.invalidate(); publisher.flushNow(true); expect(sent).toHaveLength(2)
     publisher.dispose(); publisher.flushNow(true); expect(sent).toHaveLength(2)
+  })
+
+  it('keeps the server on the last accepted snapshot when the selector refuses, and logs it', () => {
+    let refused = false
+    const sent: unknown[] = []
+    const debugSpy = vi.spyOn(console, 'debug').mockImplementation(() => {})
+    const previousLevel = getClientLogLevel()
+    setClientLogLevel('debug')
+    const publisher = createInterestPublisher({
+      read: () => (refused ? null : selectTerminalInterest(state(), false)),
+      send: (snapshot) => { sent.push(snapshot); return true },
+      scheduleTask: () => () => {},
+    })
+    publisher.flushNow()
+    expect(sent).toHaveLength(1)
+    refused = true
+    publisher.flushNow(true) // forced flush still must not send a null/empty state
+    expect(sent).toHaveLength(1)
+    expect(debugSpy).toHaveBeenCalled()
+    debugSpy.mockRestore()
+    setClientLogLevel(previousLevel)
   })
 })
