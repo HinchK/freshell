@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest'
 import {
   recordPaneFocusBeforeUnmount,
+  resolveRecordedFocusTarget,
   shouldFocusPaneOnEligibleMount,
   resetPaneFocusOwnershipForTests,
 } from '@/lib/pane-focus-ownership'
@@ -44,6 +45,32 @@ describe('pane-focus-ownership', () => {
     expect(document.activeElement).toBe(document.body)
     recordPaneFocusBeforeUnmount('p4')
     expect(shouldFocusPaneOnEligibleMount('p4')).toBe(false)
+  })
+
+  it('remembers WHICH element owned focus and re-resolves it inside a new subtree (descriptor restore)', () => {
+    document.body.innerHTML = `<div data-pane-id="p5"><input aria-label="Terminal search"></div>`
+    const search = document.querySelector('[aria-label="Terminal search"]') as HTMLInputElement
+    search.focus()
+    recordPaneFocusBeforeUnmount('p5')
+    // Simulate leaf→split remount: fresh subtree, same pane id.
+    document.body.innerHTML = `<div data-pane-id="p5"><div class="split-inner"><input aria-label="Terminal search"></div></div>`
+    const restored = resolveRecordedFocusTarget('p5')
+    expect(restored).toBe(document.querySelector('[aria-label="Terminal search"]'))
+  })
+
+  it('returns no restore target when the pane did not own focus', () => {
+    document.body.innerHTML = `<div data-pane-id="p6"><input aria-label="Terminal search"></div><input id="chrome">`
+    ;(document.getElementById('chrome') as HTMLInputElement).focus()
+    recordPaneFocusBeforeUnmount('p6')
+    expect(resolveRecordedFocusTarget('p6')).toBeNull()
+  })
+
+  it('returns no restore target when the element did not come back (transient in-pane UI)', () => {
+    document.body.innerHTML = `<div data-pane-id="p7"><input aria-label="Transient thing"></div>`
+    ;(document.querySelector('[aria-label="Transient thing"]') as HTMLInputElement).focus()
+    recordPaneFocusBeforeUnmount('p7')
+    document.body.innerHTML = `<div data-pane-id="p7"><p>remounted without it</p></div>`
+    expect(resolveRecordedFocusTarget('p7')).toBeNull()
   })
 
   it('trims the OLDEST entries beyond the cap instead of wiping the map', () => {

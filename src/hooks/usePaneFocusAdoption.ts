@@ -1,6 +1,7 @@
 import { useCallback, useLayoutEffect, useRef } from 'react'
 import {
   recordPaneFocusBeforeUnmount,
+  resolveRecordedFocusTarget,
   shouldFocusPaneOnEligibleMount,
 } from '@/lib/pane-focus-ownership'
 
@@ -70,6 +71,31 @@ export function usePaneFocusAdoption(
   useLayoutEffect(() => {
     if (!paneId) return
     return () => recordPaneFocusBeforeUnmount(paneId)
+  }, [paneId])
+
+  // Mount-window element restore: when the pane legitimately re-adopts focus
+  // (adoption 'allowed'), prefer the exact element that held focus before
+  // teardown (URL field, search input, composer) over the content's default
+  // target. Runs after components' own mount focus: their passive/rAF focus
+  // runs first, this lands last (rAF then macrotask). Transient UI that did
+  // not come back (open search bar, in-progress rename) simply fails to
+  // resolve and the default target stands.
+  useLayoutEffect(() => {
+    if (!paneId) return
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const frame = requestAnimationFrame(() => {
+      timer = setTimeout(() => {
+        if (cancelled || adoptionRef.current !== 'allowed') return
+        const el = resolveRecordedFocusTarget(paneId)
+        if (el?.isConnected) el.focus()
+      }, 0)
+    })
+    return () => {
+      cancelled = true
+      cancelAnimationFrame(frame)
+      if (timer !== null) clearTimeout(timer)
+    }
   }, [paneId])
 
   return mayFocusNow

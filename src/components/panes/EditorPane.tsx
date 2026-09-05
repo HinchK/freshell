@@ -181,6 +181,7 @@ export default function EditorPane({
   const editorFontSize = useAppSelector((s) => s.settings.settings.terminal?.fontSize) ?? 16
   const mountedRef = useRef(true)
   const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null)
+  const rootRef = useRef<HTMLDivElement | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const pathInputRef = useRef<HTMLInputElement>(null)
   const fileHandleRef = useRef<FileSystemFileHandle | null>(null)
@@ -316,6 +317,14 @@ export default function EditorPane({
     if (focusEligibleRef.current && mayFocusNow()) editor.focus()
   }
 
+  // Focus target for explicit selects/flips when Monaco is NOT rendered
+  // (preview mode, empty/path-less state): the pane root is tabbable to
+  // program focus, so an explicit select NEVER leaves DOM focus stranded in
+  // the previously-focused pane or app chrome.
+  const focusEditorOrRoot = useCallback(() => {
+    ;(editorRef.current ?? rootRef.current)?.focus()
+  }, [])
+
   // Later false→true eligibility flips (explicit select bringing a
   // background-mounted editor forward) — handleEditorMount never refires.
   // Same-target selects arrive as focus-epoch bumps: mayFocusNow's identity
@@ -328,11 +337,11 @@ export default function EditorPane({
     prevFocusEligibleRef.current = focusEligible
     if (!focusEligible) return
     if (!was) {
-      editorRef.current?.focus()
+      focusEditorOrRoot()
       return
     }
-    if (mayFocusNow()) editorRef.current?.focus()
-  }, [focusEligible, mayFocusNow])
+    if (mayFocusNow()) focusEditorOrRoot()
+  }, [focusEligible, mayFocusNow, focusEditorOrRoot])
 
   const debouncedPathChange = useMemo(
     () =>
@@ -977,6 +986,10 @@ export default function EditorPane({
 
   return (
     <div
+      ref={rootRef}
+      // Program-focus fallback for preview/empty-state selects (no Monaco in
+      // the tree); -1 keeps it out of sequential tab order.
+      tabIndex={-1}
       className="h-full w-full flex flex-col"
       data-testid="editor-pane"
       data-context={ContextIds.Editor}

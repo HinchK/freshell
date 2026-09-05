@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, cleanup, waitFor } from '@testing-library/react'
+import { render, cleanup, waitFor, fireEvent } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import PaneContainer from '@/components/panes/PaneContainer'
@@ -81,6 +81,14 @@ function makeStore(panesState: any) {
       opencodeActivity: opencodeActivityReducer,
       turnCompletion: turnCompletionReducer,
     },
+    middleware: (getDefaultMiddleware) =>
+      getDefaultMiddleware({
+        // sessions.expandedProjects is a Set by slice design (same ignore as
+        // PaneContainer.test.tsx / FreshAgentView.test.tsx createStore).
+        serializableCheck: {
+          ignoredPaths: ['sessions.expandedProjects'],
+        },
+      }),
     preloadedState: {
       tabs: {
         tabs: [{ id: 'tab-1', createRequestId: 'r1', title: 'T1', status: 'running', mode: 'shell', shell: 'system', createdAt: 1 }],
@@ -116,17 +124,19 @@ const editorLeaf: PaneNode = {
 const pickerLeaf: PaneNode = { type: 'leaf', id: 'pane-k', content: { kind: 'picker' } } as any
 const extensionLeaf: PaneNode = { type: 'leaf', id: 'pane-x', content: { kind: 'extension', extensionName: 'sample', props: {} } } as any
 
-function renderNode(node: PaneNode, opts: { hidden?: boolean; activePaneId?: string } = {}) {
+function renderNode(node: PaneNode, opts: { hidden?: boolean; activePaneId?: string; panesState?: Record<string, unknown> } = {}) {
   const leafId = (function firstLeaf(n: PaneNode): string { return n.type === 'leaf' ? n.id : firstLeaf(n.children[0]) })(node)
   const store = makeStore({
     layouts: { 'tab-1': node },
     activePane: { 'tab-1': opts.activePaneId ?? leafId },
+    ...(opts.panesState ?? {}),
   })
-  return render(
+  const utils = render(
     <Provider store={store}>
       <PaneContainer tabId="tab-1" node={node} hidden={opts.hidden} />
     </Provider>,
   )
+  return { store, ...utils }
 }
 
 describe('PaneContainer focusEligible wiring', () => {
@@ -208,5 +218,36 @@ describe('PaneContainer focusEligible wiring', () => {
     const split: PaneNode = { type: 'split', id: 'split-1', direction: 'horizontal', sizes: [50, 50], children: [extensionLeaf, terminalLeaf] }
     renderNode(split, { activePaneId: 'pane-t' })
     expect(captured.extension[0].focusEligible).toBe(false)
+  })
+
+  // focusEpoch hand-off: PaneContainer reads the epoch map and forwards the
+  // per-pane value into every content arm, so a same-target select re-runs
+  // focus effects. A dropped/misrouted prop on any arm silently breaks it.
+  it('wires focusEpoch from the panes store into every content arm', async () => {
+    const panesState = { focusEpochByPaneId: { 'pane-b': 7, 'pane-x': 3, 'pane-k': 5 } }
+    renderNode(browserLeaf, { panesState })
+    expect(captured.browser[0].focusEpoch).toBe(7)
+    cleanup()
+    renderNode(extensionLeaf, { panesState })
+    expect(captured.extension[0].focusEpoch).toBe(3)
+    cleanup()
+    renderNode(pickerLeaf, { panesState })
+    expect(captured.picker[0].focusEpoch).toBe(5)
+  })
+
+  it('editor arm: forwards focusEpoch', async () => {
+    renderNode(editorLeaf, { panesState: { focusEpochByPaneId: { 'pane-e': 11 } } })
+    await waitFor(() => expect(captured.editor.length).toBeGreaterThan(0))
+    expect(captured.editor[0].focusEpoch).toBe(11)
+  })
+
+  // Pointer-versus-explicit separation: a mousedown into the pane (bubbling
+  // from in-pane inputs) dispatches plain setActivePane — it must NEVER bump
+  // the epoch, or focus effects would steal focus back from rename/search.
+  it('pointer activation (Pane mousedown → handleFocus) must NOT bump the focus epoch', () => {
+    const { container, store } = renderNode(browserLeaf, { panesState: { focusEpochByPaneId: {} } })
+    fireEvent.mouseDown(container.querySelector('[data-pane-shell="true"]')!)
+    expect(store.getState().panes.activePane['tab-1']).toBe('pane-b')
+    expect(Object.keys(store.getState().panes.focusEpochByPaneId ?? {})).toHaveLength(0)
   })
 })

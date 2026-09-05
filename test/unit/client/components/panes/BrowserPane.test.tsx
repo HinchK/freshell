@@ -781,6 +781,22 @@ describe('BrowserPane', () => {
       expect(document.querySelector('[data-pane-id="pane-1"]')).toHaveFocus()
     })
 
+    it('a remount restores focus to the EXACT element that held it (URL input), not the default target', async () => {
+      const first = renderBrowserPane({ url: 'https://example.com' })
+      expect(document.querySelector('[data-pane-id="pane-1"]')).toHaveFocus()
+      // User clicked into the URL field of the loaded pane…
+      const urlInput = screen.getByPlaceholderText('Enter URL...')
+      urlInput.focus()
+      expect(urlInput).toHaveFocus()
+      // …then an agent split remounts the subtree.
+      first.unmount()
+      renderBrowserPane({ url: 'https://example.com' })
+      // Default mount focus lands on the pane root; the recorded descriptor
+      // then re-resolves and refocuses the URL input (rAF + macrotask).
+      await act(async () => { await new Promise((r) => setTimeout(r, 30)) })
+      expect(screen.getByPlaceholderText('Enter URL...')).toHaveFocus()
+    })
+
     it('an explicit re-select of the ALREADY-active pane (focus epoch bump) focuses a denied remount', () => {
       const first = renderBrowserPane({ url: 'https://example.com' })
       expect(document.querySelector('[data-pane-id="pane-1"]')).toHaveFocus()

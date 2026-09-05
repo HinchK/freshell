@@ -785,6 +785,26 @@ describe('EditorPane', () => {
       await waitFor(() => expect(monacoMountControl.focus).toHaveBeenCalledTimes(1))
     })
 
+    it('explicit select focuses the pane ROOT when Monaco is absent (preview mode — no editorRef in the tree)', async () => {
+      const { rerender } = render(
+        <Provider store={store}>
+          <EditorPane paneId="pane-1" tabId="tab-1" filePath="/a.md" language="markdown" readOnly={false} content="# Hi" viewMode="preview" focusEligible={false} />
+        </Provider>
+      )
+      const root = await screen.findByTestId('editor-pane')
+      const chrome = document.createElement('input')
+      document.body.appendChild(chrome)
+      chrome.focus()
+      rerender(
+        <Provider store={store}>
+          <EditorPane paneId="pane-1" tabId="tab-1" filePath="/a.md" language="markdown" readOnly={false} content="# Hi" viewMode="preview" focusEligible />
+        </Provider>
+      )
+      // flip paths only called editorRef.current?.focus() — null in preview —
+      // leaving the explicitly-selected editor unfocused (round-5 Major).
+      expect(root).toHaveFocus()
+    })
+
     it('refocuses the editor on a focus epoch bump (same-target explicit select of an already-active pane)', async () => {
       monacoMountControl.enabled = true
       const { rerender } = render(

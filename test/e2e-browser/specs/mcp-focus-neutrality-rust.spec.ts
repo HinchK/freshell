@@ -251,9 +251,19 @@ test.describe('MCP/REST focus neutrality', () => {
       // hoisting the iframe into document.activeElement (Chromium-verified);
       // the data-focus-locked rebuff guard restores the displaced element.
       // The payload is a same-origin-less data: page (the hoist needs no
-      // origin relationship), so this works fully offline.
+      // origin relationship), so this works fully offline. It PROVES its
+      // attempt with a postMessage handshake — a sleep-only assertion would
+      // pass vacuously if the payload never ran (CSP, sandbox, malformed URL).
+      await page.evaluate(() => {
+        ;(window as unknown as Record<string, unknown>).__focusAttempts = 0
+        window.addEventListener('message', (e) => {
+          if (e.data === 'freshell:focus-attempt') {
+            ;(window as unknown as Record<string, number>).__focusAttempts += 1
+          }
+        })
+      })
       const payloadUrl = `data:text/html,${encodeURIComponent(
-        '<input id=x autofocus><script>setTimeout(()=>document.getElementById("x").focus(),100)</script>',
+        '<input id=x autofocus><script>setTimeout(()=>{document.getElementById("x").focus();parent.postMessage("freshell:focus-attempt","*")},100)</script>',
       )}`
       const leavesBefore7 = leafIds((await harness.getState()).panes.layouts[tabB])
       const splitRes7 = await fetch(`${info.baseUrl}/api/panes/${newPaneId}/split`, {
@@ -278,10 +288,16 @@ test.describe('MCP/REST focus neutrality', () => {
       // Ineligible => inert AND locked (live-attribute pin).
       await expect(browserIframe).toHaveAttribute('inert', '', { timeout: 10_000 })
       await expect(browserIframe).toHaveAttribute('data-focus-locked', 'true')
-      // Wait out the payload's focus attempt window (autofocus on load +
-      // scripted focus at ~100ms), then assert focus never stuck inside the
-      // background browser pane and the chrome element kept it.
-      await page.waitForTimeout(1_500)
+      // The payload must PROVE it ran and attempted the hoist before the
+      // preservation assertions mean anything.
+      await expect
+        .poll(async () => page.evaluate(
+          () => (window as unknown as Record<string, number>).__focusAttempts,
+        ), { timeout: 10_000 })
+        .toBeGreaterThan(0)
+      // Wait out any residual rebuff cycle, then assert focus never stuck
+      // inside the background browser pane and the chrome element kept it.
+      await page.waitForTimeout(500)
       await flushClientFocusScheduling(page)
       expect(await activeElementStillTagged(page, chromeMarker2)).toBe(true)
       expect(await focusedPaneId(page)).not.toBe(browserPaneId)
@@ -297,6 +313,17 @@ test.describe('MCP/REST focus neutrality', () => {
         .toBe(browserPaneId)
       await expect(browserIframe).not.toHaveAttribute('inert', '', { timeout: 10_000 })
       await expect(browserIframe).not.toHaveAttribute('data-focus-locked', 'true')
+      await expect.poll(() => focusedPaneId(page), { timeout: 10_000 }).toBe(browserPaneId)
+
+      // --- 8b: same-target select on the BROWSER arm (epoch path is
+      // per-content-type; §6b pins only the terminal arm). Focus chrome
+      // first, then re-select the already-active browser pane.
+      await page.locator('button[aria-label="New shell tab"]').first().evaluate((el) => (el as HTMLElement).focus())
+      expect(await focusedPaneId(page)).toBeNull()
+      const sameTargetSel8 = await fetch(`${info.baseUrl}/api/panes/${browserPaneId}/select`, {
+        method: 'POST', headers: restApiHeaders(info), body: '{}',
+      })
+      expect(sameTargetSel8.ok).toBe(true)
       await expect.poll(() => focusedPaneId(page), { timeout: 10_000 }).toBe(browserPaneId)
     } finally {
       await server.stop()

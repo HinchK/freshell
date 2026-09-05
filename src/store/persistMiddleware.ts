@@ -600,6 +600,7 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
             deadSessionAdjudication: _dsa,
             reconcileWarming: _rw,
             reconcilePendingPanes: _rpp,
+            focusEpochByPaneId: _febp,
             ...persistablePanes
           } = state.panes
           persistablePanesSection = {

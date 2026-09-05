@@ -374,13 +374,13 @@ export interface PanesState {
    */
   refreshRequestsByPane: Record<string, Record<string, PaneRefreshRequest>>
   /**
-   * Ephemeral per-pane focus-nudge epoch. Bumped by setActivePane on EVERY
-   * activation (including same-target re-selects) and by nudgePaneFocus for
-   * the tab.select fold, so an explicit select moves DOM focus even when no
-   * eligibility transition exists (e.g. selecting the pane that is already
-   * Redux-active after a focus-neutral agent split). Optional: reducers
+   * Ephemeral per-pane focus-nudge epoch. Bumped ONLY by explicit select
+   * folds: setActivePane with `focusNudge: true` (pane.select) and
+   * nudgePaneFocus (tab.select) — including same-target re-selects — so an
+   * explicit select moves DOM focus even when no eligibility transition
+   * exists. Pointer-driven activations never bump. Optional: reducers
    * initialize on write so partial test-store preloads keep compiling.
-   * Must never be persisted.
+   * Must never be persisted (denylisted in persistMiddleware).
    */
   focusEpochByPaneId?: Record<string, number>
   /**
