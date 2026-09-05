@@ -51,11 +51,10 @@ fn output(seq: i64) -> ServerMessage {
 fn notice(text: &str) -> Message {
     Message::Text(text.to_string().into())
 }
-fn leased_text(frame: &LeasedFrame) -> String {
+fn leased_text(frame: &Message) -> String {
     match frame {
-        LeasedFrame::Control(Message::Text(text)) => text.to_string(),
-        LeasedFrame::Control(other) => format!("{other:?}"),
-        LeasedFrame::Output(msg) => serde_json::to_string(msg).unwrap(),
+        Message::Text(text) => text.to_string(),
+        other => format!("{other:?}"),
     }
 }
 
@@ -162,9 +161,7 @@ async fn preludes_always_precede_replay_and_exit_follows_output() {
     // Drive the exact queue selection used by the pump; no timing assumptions.
     let mut frames = Vec::new();
     while let Some(next) = pump.take_next().unwrap() {
-        if matches!(&next.frame, LeasedFrame::Control(Message::Text(_)))
-            || matches!(&next.frame, LeasedFrame::Output(_))
-        {
+        if matches!(&next.frame, Message::Text(_)) {
             frames.push(leased_text(&next.frame));
         }
         pump.finish_frame(next.output_bytes, next.control_bytes);
@@ -277,7 +274,7 @@ async fn saturated_streak_never_reorders_a_prelude_behind_its_replay() {
     }
     for _ in 0..CONTROL_STREAK_LIMIT {
         let next = pump.take_next().unwrap().unwrap();
-        assert!(matches!(next.frame, LeasedFrame::Control(Message::Text(_))));
+        assert!(matches!(next.frame, Message::Text(_)));
         pump.finish_frame(next.output_bytes, next.control_bytes);
     }
     // The attach prelude then replay, admitted in that order under one lock.
@@ -468,4 +465,100 @@ async fn overflow_stops_a_pending_flush_without_waiting_for_send_timeout() {
     );
     assert_eq!(join(task).await, WriterExit::ControlOverflow);
     assert_eq!(text_frames(&capture).len(), 1);
+}
+
+fn named_output(terminal_id: &str, seq: i64) -> ServerMessage {
+    let mut message = output(seq);
+    if let ServerMessage::TerminalOutput(frame) = &mut message {
+        frame.terminal_id = terminal_id.to_string();
+    }
+    message
+}
+fn interest(
+    revision: u64,
+    focused: Option<&str>,
+    visible: &[&str],
+) -> freshell_protocol::client_messages::TerminalInterest {
+    freshell_protocol::client_messages::TerminalInterest {
+        revision,
+        focused_terminal_id: focused.map(str::to_string),
+        visible_terminal_ids: visible.iter().map(|s| s.to_string()).collect(),
+    }
+}
+fn taken_terminal(pump: &WriterPump) -> String {
+    let next = pump.take_next().unwrap().unwrap();
+    let id = if let Message::Text(text) = &next.frame {
+        serde_json::from_str::<serde_json::Value>(text).unwrap()["terminalId"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    } else {
+        panic!("expected output")
+    };
+    pump.finish_frame(next.output_bytes, next.control_bytes);
+    id
+}
+
+#[tokio::test]
+async fn fresh_interest_reprioritizes_queued_output_without_an_attach() {
+    let (sender, pump) = WriterSender::new(100_000, 4096, Duration::from_secs(10));
+    sender.enable_terminal_interest();
+    sender
+        .set_terminal_interest(&interest(1, Some("a"), &["a"]))
+        .unwrap();
+    for seq in 0..10 {
+        sender.push_server(named_output("a", seq));
+        sender.push_server(named_output("b", seq));
+    }
+    sender
+        .set_terminal_interest(&interest(2, Some("b"), &["b"]))
+        .unwrap();
+    assert_eq!(taken_terminal(&pump), "b");
+}
+
+#[tokio::test]
+async fn stale_interest_does_not_undo_new_focus() {
+    let (sender, pump) = WriterSender::new(100_000, 4096, Duration::from_secs(10));
+    sender.enable_terminal_interest();
+    sender
+        .set_terminal_interest(&interest(2, Some("b"), &["b"]))
+        .unwrap();
+    sender
+        .set_terminal_interest(&interest(1, Some("a"), &["a"]))
+        .unwrap();
+    sender.push_server(named_output("a", 1));
+    sender.push_server(named_output("b", 1));
+    assert_eq!(taken_terminal(&pump), "b");
+}
+
+#[tokio::test]
+async fn focus_does_not_cancel_the_inflight_frame_or_lose_following_bytes() {
+    let (sender, pump) = WriterSender::new(100_000, 4096, Duration::from_secs(10));
+    sender.enable_terminal_interest();
+    sender
+        .set_terminal_interest(&interest(1, Some("a"), &["a"]))
+        .unwrap();
+    sender.push_server(named_output("a", 1));
+    sender.push_server(named_output("a", 2));
+    sender.push_server(named_output("b", 1));
+    let active = pump.take_next().unwrap().unwrap();
+    let before = sender.pending_output_bytes();
+    sender
+        .set_terminal_interest(&interest(2, Some("b"), &["b"]))
+        .unwrap();
+    assert_eq!(sender.pending_output_bytes(), before);
+    pump.finish_frame(active.output_bytes, active.control_bytes);
+    assert_eq!(taken_terminal(&pump), "b");
+    assert_eq!(taken_terminal(&pump), "a");
+    assert_eq!(sender.pending_output_bytes(), 0);
+}
+
+#[tokio::test]
+async fn attach_priority_works_for_clients_without_interest_capability() {
+    let (sender, pump) = WriterSender::new(100_000, 4096, Duration::from_secs(10));
+    sender.set_attachment_priority("background", true);
+    sender.set_attachment_priority("visible", false);
+    sender.push_server(named_output("background", 1));
+    sender.push_server(named_output("visible", 1));
+    assert_eq!(taken_terminal(&pump), "visible");
 }

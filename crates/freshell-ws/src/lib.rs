@@ -568,6 +568,7 @@ pub async fn build_handshake_with_capabilities(
                 freshell_protocol::ReadyCapabilities {
                     pane_reconcile_v1: pane_reconcile_v1.then_some(true),
                     pane_reconcile_fresh_agent_v1: pane_reconcile_fresh_agent_v1.then_some(true),
+                    terminal_interest_v1: None,
                 },
             ),
         }),
@@ -782,13 +783,32 @@ async fn handle_socket(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    let terminal_interest_v1 = value
+        .get("capabilities")
+        .and_then(|caps| caps.get("terminalInterestV1"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
     // Authenticated: emit the ordered handshake. CFG-12: the builder is
     // async + per-connection so its `settings.updated` frame resolves the
     // LIVE settings tree (see `build_handshake_with_capabilities`).
-    for msg in
+    for mut msg in
         build_handshake_with_capabilities(&state, pane_reconcile_v1, pane_reconcile_fresh_agent_v1)
             .await
     {
+        if terminal_interest_v1 {
+            if let ServerMessage::Ready(ready) = &mut msg {
+                let capabilities =
+                    ready
+                        .capabilities
+                        .get_or_insert(freshell_protocol::ReadyCapabilities {
+                            pane_reconcile_v1: None,
+                            pane_reconcile_fresh_agent_v1: None,
+                            terminal_interest_v1: None,
+                        });
+                capabilities.terminal_interest_v1 = Some(true);
+            }
+        }
         let json = match serde_json::to_string(&msg) {
             Ok(json) => json,
             Err(_) => return,
@@ -818,7 +838,7 @@ async fn handle_socket(
         .unwrap_or(false);
     // Handshake done: serve the terminal.* shell path (and fan out broadcast-bus
     // frames) until the client closes.
-    terminal::run(
+    terminal::run_with_interest(
         socket,
         &state,
         bcast_rx,
@@ -827,6 +847,7 @@ async fn handle_socket(
         pane_reconcile_v1,
         pane_reconcile_fresh_agent_v1,
         origin_kind,
+        terminal_interest_v1,
     )
     .await;
 }

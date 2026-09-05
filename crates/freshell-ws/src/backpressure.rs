@@ -3,10 +3,11 @@
 //! tunables and `broker.ts`'s `catastrophicBlocked`,
 //! `TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES` / `_STALL_MS`, `constants.ts:8-16`).
 //!
-//! The bounded queue itself is `freshell_terminal::output_queue::OutputQueue`,
-//! owned by the connection's socket writer (`terminal::connection_writer`):
-//! producers route output frames into it through the writer's single admission
-//! lock, and the writer leases one frame at a time to the socket.
+//! The bounded queue itself is the connection writer's byte-fair delivery
+//! queue (`terminal::connection_writer`'s `terminal_delivery_queue`), with the
+//! default cap exported from `freshell_terminal::output_queue`: producers
+//! route output frames into it through the writer's single admission lock,
+//! and the writer leases one frame at a time to the socket.
 //!
 //! ## Architectural mapping (why this differs from `broker.ts`)
 //!
