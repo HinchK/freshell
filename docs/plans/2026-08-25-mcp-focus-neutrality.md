@@ -2083,7 +2083,55 @@ chrome — the remounted pane must NOT reacquire it) and §7 (background browser
 pane loading a self-focusing page — hoist rebuffed, inert+locked attribute
 pins, §8 control: explicit select removes both and moves focus in).
 
+### Task 9 (post-hoc, landed): round-4 contract closure — fresh-agent gate, flip recovery, same-target selects
+
+Added during Stage 5's delta-round-4 fix round (3 Major + 2 Minor).
+
+1. **FreshAgentView adoption gate** (M1): the fresh-agent composer/root focus
+   effect keyed only off Redux activity — the one pane autofocus implementation
+   outside Task 8's gate, and both servers permit splitting a fresh-agent leaf.
+   Now `usePaneFocusAdoption(paneId, isActivePane, focusEpoch)` guards it; the
+   existing "don't re-focus an editable inside the pane" guard still wins.
+
+2. **Adoption latch recovery** (M2): `usePaneFocusAdoption`'s flip write was
+   `pending`-only, so a denied remount could NEVER recover — a later tab-switch
+   back (false→true flip) stayed unfocused, regressing baseline UX. Flips AND
+   epoch bumps now resolve `adoptionRef` to `'allowed'` unconditionally.
+
+3. **Same-target selects move DOM focus** (M3): `tab.select`/`pane.select`
+   folds only assigned Redux ids — selecting the ALREADY-active target produced
+   no eligibility transition and no focus effect re-run, violating "explicit
+   select moves focus". Fix: a per-pane **focus epoch**
+   (`PanesState.focusEpochByPaneId`, ephemeral, never persisted). The
+   pane.select fold dispatches `setActivePane({…, focusNudge: true})` (the ONLY
+   nudge source in setActivePane — pointer-driven activations from Pane
+   mousedown must not bump, or in-pane inputs like rename/search would lose
+   focus to the refocus effect); the tab.select fold dispatches
+   `nudgePaneFocus({tabId})` which bumps the tab's active pane.
+   `PaneContainer` reads the map once and forwards a `focusEpoch` prop into
+   every content arm; `mayFocusNow`'s callback identity changes with the
+   epoch, so consumers' focus effects simply re-run.
+
+Minors: **ownership cap** now evicts oldest entries instead of wiping the map
+(a clear() erased the record just written, re-enabling the chrome-steal at the
+512-entry boundary); **PaneContainer wiring suite** gained the extension arm
+(eligible/hidden/other-pane-active) so a dropped `focusEligible` prop on that
+arm cannot pass green.
+
+Test note: one unrelated flake sighting during this task — `test/e2e/open-tab-session-sidebar-visibility.test.tsx` "keeps direct refreshes on the visible applied search silent…" failed once in a full-suite run (call-count assertion), passed solo AND on the immediate full-suite re-run; changes here do not touch the sidebar/search flow. Recorded as a known one-off to watch.
+
+Tests: ownership cap trim; BrowserPane denied→flip recovery + denied→epoch
+re-select pins; FreshAgentView remount-denied + epoch re-select pair;
+EditorPane epoch refocus pin (its flip effect now has an epoch branch);
+panesSlice epoch/nudge semantics incl. the pointer-activation no-bump pin;
+ui-commands same-target pane.select + tab.select nudge folds. Wall e2e gained
+§6b: after the app-chrome split (focus still in chrome), a same-target
+`POST /api/panes/:id/select` moves DOM focus back into the pane.
+
 ## Fresh Eyes record
+
+- **Delta round 4 (Codex, independent; base 5b8717017): FAILED — 3 Major + 2 Minor**, all assessed valid and fixed: (1 Major) FreshAgentView composer/root focus effect keyed only off Redux activity — the sole pane autofocus outside Task 8's gate → `usePaneFocusAdoption` adopted (Task 9.1); (2 Major) adoption latch was `pending`-only — a denied remount could never recover on a later eligibility flip → flips/epoch-bumps resolve `'allowed'` unconditionally (Task 9.2); (3 Major) same-target select produced no eligibility transition and no focus → per-pane focus epoch (`focusEpochByPaneId`; pane.select fold nudges via `setActivePane focusNudge:true`, tab.select fold via `nudgePaneFocus`; PaneContainer forwards `focusEpoch` to every arm; `mayFocusNow` identity re-runs focus effects) + wall e2e §6b (Task 9.3); (1 Minor) ownership 512-cap wiped the map including the just-written record → oldest-entry eviction; (2 Minor) PaneContainer wiring suite gained the extension arm. During implementation a regression was caught pre-merge: bumping the epoch inside every setActivePane re-ran terminal focus on pointer mousedowns (rename/search focus theft) — narrowed to explicit select folds only, pinned in panesSlice tests.
+  Runner report: `.worktrees/.the-usual-logs/mcp-focus-neutrality/review-logs/usual-fresheyes-20260904T231851Z-313099.md`
 
 - **Delta round 3 (Codex, independent; base 5b8717017): FAILED — 5 Major + 1 Minor**, all assessed valid and fixed: (1 Major) BrowserPane inert insufficient — nested-document scripts hoist the iframe into outer activeElement regardless of attribute combination; fixed by the `data-focus-locked` rebuff guard (Task 8 mechanism 1); (2 Major) ExtensionPane same → same fix; (3 Major) ExtensionPane focus effect missed deferred iframe appearance (server start / registry hydration) → effect now also keyed on iframe-readiness, adoption consumed lazily; (4 Major) PaneContainer `focusEligible` is Redux selection, not DOM-focus ownership — agent split while the user was in app chrome stole focus back on remount → Task 8 mechanism 2 (ownership record + adoption gate in all six mount-focus components) + wall e2e §6; (5 Major) EditorPane stale-closure — saved onMount captured the initial `focusEligible=false`, so a select landing before Monaco's async mount never focused → render-synced `focusEligibleRef` + adoption-aware mount focus, flip-before-mount race test; (1 Minor) BrowserPane navigation-never-refocuses regression pin added.
   Runner report: `.worktrees/.the-usual-logs/mcp-focus-neutrality/review-logs/usual-fresheyes-20260826T161259Z-1211030.md`
