@@ -257,6 +257,11 @@ impl WriterSender {
         };
         let meta = output_frame_meta(&msg);
         let exit = matches!(&msg, ServerMessage::TerminalExit(_));
+        // Serialized once here for byte measurement and again by the pump at
+        // lease time: the queue stores the typed message so freshell-terminal
+        // stays wire-format-free. Carrying the JSON through would halve the
+        // serialization work on the hot output path but couples that crate to
+        // wire framing — deferred as a measured optimization, not a guess.
         let json = match serde_json::to_string(&msg) {
             Ok(json) => json,
             Err(_) => {
@@ -528,9 +533,10 @@ struct Outstanding {
 /// tick N+1 fires, or the connection is dead. Detection lands at exactly one
 /// tick boundary by construction, immune to interval-timer jitter, and
 /// healthy connections emit exactly one ping per tick. At most one ping is
-/// outstanding; a pong with NO outstanding ping still counts as the next
-/// ping's answer, mirroring the legacy boolean (a transport pong carries no
-/// cookie, so wire order vs. flush receipts is irrelevant).
+/// outstanding. A pong arrival while nothing is outstanding is consumed when
+/// the next ping is queued and grants NO exemption (legacy's initial-flag
+/// consumption has the same shape; a transport pong carries no cookie, so
+/// only arrival order matters).
 #[derive(Default)]
 pub(super) struct Keepalive {
     outstanding: Option<Outstanding>,

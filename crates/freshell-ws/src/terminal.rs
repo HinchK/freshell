@@ -552,17 +552,28 @@ async fn run_loop(
         }
     }
 
-    // A mid-dispatch admission failure lands here as the generic
-    // "send_error"; if the writer had already exited with a precise reason
-    // (stalled send, control overflow, serialization failure), adopt that
-    // reason and close code so the DIAG-01 lifecycle event stays truthful.
-    // Non-blocking peek only: the join below still owns the unfinished case.
-    if close_reason == "send_error" && !writer_finished {
+    // A mid-dispatch admission failure or a lost-keepalive-receipt lands here
+    // as the generic "send_error"/"writer_stopped"; if the writer had already
+    // exited with a precise reason (stalled send, control overflow,
+    // serialization failure), adopt that reason and close code so the DIAG-01
+    // lifecycle event stays truthful. Non-blocking peek only: the join below
+    // still owns the unfinished case. A COMPLETED handle must be marked
+    // finished on both arms: polling it again after now_or_never delivered
+    // its result panics, and a writer panic is exactly the Err arm here.
+    if matches!(close_reason, "send_error" | "writer_stopped") && !writer_finished {
         use futures_util::FutureExt;
-        if let Some(Ok(exit)) = (&mut writer_task).now_or_never() {
-            close_reason = exit.reason();
-            close_code = exit.close_code();
+        if let Some(result) = (&mut writer_task).now_or_never() {
             writer_finished = true;
+            match result {
+                Ok(exit) => {
+                    close_reason = exit.reason();
+                    close_code = exit.close_code();
+                }
+                Err(error) => {
+                    tracing::error!(connection_id = conn_id, error = %error, "ws.writer.failed");
+                    close_reason = "writer_task_failed";
+                }
+            }
         }
     }
 

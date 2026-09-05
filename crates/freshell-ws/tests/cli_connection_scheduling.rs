@@ -1,7 +1,9 @@
 //! Real WebSocket regression: a parked ordinary create cannot hold up input,
 //! attach, or app-level ping on the same connection. Uses the real router and
 //! dispatch functions, headless existing terminals, and an injected disk probe.
-//! No provider binary is executed. Run through the repository sandbox harness.
+//! No provider binary is executed. Runs as an ordinary `cargo test` target —
+//! a one-test binary, so its process-wide HOME/FRESHELL_HOME isolation below
+//! cannot leak into other tests; the repo sandbox is an optional wrapper.
 #![cfg(unix)]
 mod common;
 

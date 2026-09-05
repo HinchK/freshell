@@ -220,3 +220,54 @@ fn successful_cleanup_is_run_exactly_once() {
     });
     assert_eq!(count.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn a_create_dequeued_after_shutdown_started_is_skipped_without_a_reply() {
+    // Drives spawn()'s REAL closure (not a run_serial stub): a job dequeued
+    // after the shutdown latch must be skipped silently — no reply frame, no
+    // PTY — and its guard must still release the dedupe reservation a retry
+    // (after restart) would need.
+    let state = crate::test_ws_state();
+    state
+        .shutdown_started
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let copy = Arc::clone(&captured);
+    let sink: FrameSink = Arc::new(move |msg| copy.lock().unwrap().push(msg));
+    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    let (tx, task) = spawn(&state, &sink, cancel_rx, 7, false);
+    let origin: FrameSink = Arc::new(|_| {});
+    assert!(matches!(
+        state
+            .create_dedupe
+            .begin("req-shutdown", &origin, None, |_| true, 7),
+        crate::create_dedupe::DedupeDecision::Proceed
+    ));
+    let create: freshell_protocol::TerminalCreate = serde_json::from_value(serde_json::json!({
+        "type": "terminal.create", "requestId": "req-shutdown",
+        "mode": "shell", "shell": "system",
+        "cwd": "/tmp", "sessionRef": null
+    }))
+    .unwrap();
+    tx.send(Job::new(create, &state)).await.unwrap();
+    drop(tx);
+    bounded(task).await.unwrap();
+    assert!(
+        captured.lock().unwrap().is_empty(),
+        "a post-shutdown dequeue is skipped silently by design"
+    );
+    assert!(
+        state
+            .registry
+            .newest_by_create_request_id("req-shutdown")
+            .is_none(),
+        "nothing may be spawned after the shutdown latch"
+    );
+    assert!(
+        state
+            .create_dedupe
+            .in_flight_generation("req-shutdown")
+            .is_none(),
+        "the skipped job's guard must release its dedupe reservation"
+    );
+}

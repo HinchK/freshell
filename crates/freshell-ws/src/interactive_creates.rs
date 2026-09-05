@@ -194,6 +194,15 @@ pub(super) fn spawn(
                             let _ = tokio::task::spawn_blocking(move || registry.kill(&tid)).await;
                         }
                     }
+                    // The error/success reply was pushed into the outbox inside
+                    // handle_create, but the dedupe sentinel clears only here, at
+                    // the guard drop. Between those two points (no await — a pure
+                    // scheduling sliver) a same-connection resend is answered
+                    // `DuplicateInFlight` with no fresh reply frame; the first
+                    // attempt's reply on the same sink reaches that resender
+                    // milliseconds later under the same requestId, so the client
+                    // is never left truly silent (unlike the old inline dispatch,
+                    // where the sliver could not exist by construction).
                     drop(job);
                     limiter
                 }

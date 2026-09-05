@@ -154,14 +154,7 @@ impl OutputQueue {
     /// (mirrors `enqueue(frame, queuedBytes = frame.bytes)`). Evicts the
     /// oldest frames first if this push takes the queue over `max_bytes`.
     pub fn push(&mut self, msg: ServerMessage, bytes: usize, meta: OutputFrameMeta) {
-        self.items.push_back(QueuedItem {
-            msg,
-            bytes,
-            meta: Some(meta),
-            stamp: None,
-        });
-        self.total_bytes += bytes;
-        self.evict_overflow();
+        self.push_inner(msg, bytes, meta, None);
     }
 
     /// [`Self::push`] with an admission-order stamp (see `stamp` above).
@@ -172,11 +165,21 @@ impl OutputQueue {
         meta: OutputFrameMeta,
         stamp: u64,
     ) {
+        self.push_inner(msg, bytes, meta, Some(stamp));
+    }
+
+    fn push_inner(
+        &mut self,
+        msg: ServerMessage,
+        bytes: usize,
+        meta: OutputFrameMeta,
+        stamp: Option<u64>,
+    ) {
         self.items.push_back(QueuedItem {
             msg,
             bytes,
             meta: Some(meta),
-            stamp: Some(stamp),
+            stamp,
         });
         self.total_bytes += bytes;
         self.evict_overflow();

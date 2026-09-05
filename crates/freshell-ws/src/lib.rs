@@ -888,61 +888,66 @@ async fn send_error(
 }
 
 #[cfg(test)]
+pub(crate) fn test_ws_state() -> WsState {
+    let auth_token = Arc::new("s3cr3t-token-abcdef".to_string());
+    let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
+    WsState {
+        pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
+        layout: Default::default(),
+        identity: crate::identity::TerminalIdentityRegistry::new(),
+        terminal_meta: Default::default(),
+        auth_token: Arc::clone(&auth_token),
+        server_instance_id: Arc::new("srv-1111".to_string()),
+        boot_id: Arc::new("boot-2222".to_string()),
+        settings: Arc::new(test_settings()),
+        handshake_settings: Arc::new(tokio::sync::RwLock::new(test_settings())),
+        broadcast_tx: Arc::clone(&broadcast_tx),
+        auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+        auto_resume_cancels: Default::default(),
+        fresh_codex: freshell_freshagent::FreshCodexState::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+            serde_json::json!({ "freshAgent": { "enabled": false } }),
+        ),
+        fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
+        fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
+            freshell_freshagent::FreshAgentState::new(auth_token, Arc::clone(&broadcast_tx)),
+        ),
+        registry: freshell_terminal::TerminalRegistry::new(),
+        shutdown: Arc::new(tokio::sync::Notify::new()),
+        tabs: crate::tabs::TabsRegistry::new(),
+        screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
+        subagent_interest: Default::default(),
+        host_stats: Default::default(),
+        terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        cli_commands: Arc::new(Vec::new()),
+        ping_interval_ms: 30_000,
+        hello_timeout_ms: 5_000,
+        allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
+        ws_max_payload_bytes: 16 * 1024 * 1024,
+        term09: crate::backpressure::Term09Config::default(),
+        create_protect: crate::create_limit::CreateProtectConfig::default(),
+        spawn_gate: std::sync::Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
+        shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
+        config_fallback: None,
+        opencode_locator: None,
+        codex_locator: None,
+        activity: None,
+        session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
+        reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+        fresh_agent_respawn_counts: Default::default(),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
     fn state() -> WsState {
-        let auth_token = Arc::new("s3cr3t-token-abcdef".to_string());
-        let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
-        WsState {
-            pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
-            layout: Default::default(),
-            identity: crate::identity::TerminalIdentityRegistry::new(),
-            terminal_meta: Default::default(),
-            auth_token: Arc::clone(&auth_token),
-            server_instance_id: Arc::new("srv-1111".to_string()),
-            boot_id: Arc::new("boot-2222".to_string()),
-            settings: Arc::new(test_settings()),
-            handshake_settings: Arc::new(tokio::sync::RwLock::new(test_settings())),
-            broadcast_tx: Arc::clone(&broadcast_tx),
-            auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
-            auto_resume_cancels: Default::default(),
-            fresh_codex: freshell_freshagent::FreshCodexState::new(
-                Arc::clone(&auth_token),
-                Arc::clone(&broadcast_tx),
-                serde_json::json!({ "freshAgent": { "enabled": false } }),
-            ),
-            fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
-            fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
-                freshell_freshagent::FreshAgentState::new(auth_token, Arc::clone(&broadcast_tx)),
-            ),
-            registry: freshell_terminal::TerminalRegistry::new(),
-            shutdown: Arc::new(tokio::sync::Notify::new()),
-            tabs: crate::tabs::TabsRegistry::new(),
-            screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
-            subagent_interest: Default::default(),
-            host_stats: Default::default(),
-            terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
-            sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
-            cli_commands: Arc::new(Vec::new()),
-            ping_interval_ms: 30_000,
-            hello_timeout_ms: 5_000,
-            allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
-            ws_max_payload_bytes: 16 * 1024 * 1024,
-            term09: crate::backpressure::Term09Config::default(),
-            create_protect: crate::create_limit::CreateProtectConfig::default(),
-            spawn_gate: std::sync::Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
-            shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
-            config_fallback: None,
-            opencode_locator: None,
-            codex_locator: None,
-            activity: None,
-            session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
-            reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-            fresh_agent_respawn_counts: Default::default(),
-        }
+        test_ws_state()
     }
 
     #[test]
