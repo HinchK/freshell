@@ -2128,7 +2128,59 @@ ui-commands same-target pane.select + tab.select nudge folds. Wall e2e gained
 §6b: after the app-chrome split (focus still in chrome), a same-target
 `POST /api/panes/:id/select` moves DOM focus back into the pane.
 
+### Task 10 (post-hoc, landed): round-5 contract fidelity — element-identity restore, editor fallback, epoch wiring pins
+
+Added during Stage 5's delta-round-5 fix round (3 Major + 2 Minor + 1 Nit).
+
+1. **Element-identity focus memory** (M1): the round-4 boolean ownership record
+   let a legitimate re-adoption refocus the content's DEFAULT target even when
+   the user was typing in a different in-pane field (browser URL input, combobox
+   inputs). `pane-focus-ownership.ts` now records a best-effort stable selector
+   (id → aria-label → data-testid → placeholder → role) for the focused
+   element; `usePaneFocusAdoption` mounts schedule a restore (rAF + macrotask,
+   deliberately landing after components' own mount focus) that re-resolves the
+   element in the new subtree via `resolveRecordedFocusTarget` and refocuses
+   it. Elements that do not come back resolve to null and the default target
+   stands. Transient in-pane UI (open terminal search bar, in-progress pane
+   rename, agent splits destroy that state entirely) is pre-existing remount
+   parity — identical for user-driven splits.
+
+2. **EditorPane preview/empty-state select** (M2): flip/epoch paths only called
+   `editorRef.current?.focus()`; preview and empty branches render no Monaco,
+   so an explicit select stranded DOM focus. The pane root is now
+   `tabIndex={-1}` + `rootRef`, and flip/epoch focus goes through
+   `focusEditorOrRoot()`.
+
+3. **Epoch wiring pins** (M3): PaneContainer wiring suite now asserts
+   per-arm `focusEpoch` hand-off (browser/editor/picker/extension) seeded from
+   the store map, and a pointer-activation pin drives the real
+   `Pane.onMouseDown → handleFocus → setActivePane` path asserting no epoch
+   bump (the earlier pin dispatched the bare action, which could not catch a
+   future `focusNudge:true` on the pointer path). Epoch-bump refocus pins for
+   PanePicker, DirectoryPicker (wrapped `data-pane-id` root), and ExtensionPane
+   (same) close the per-content-type matrix; e2e §8b repeats the same-target
+   select on the browser arm (§6b pinned only the terminal arm).
+
+Minors: **persist denylist** gained `focusEpochByPaneId` (the write path
+spreads `state.panes`; the field documents "never persisted" but was not
+excluded) with a `panesPersistence.test.ts` pin; **e2e §7** now requires a
+postMessage attempt-handshake from the self-focusing payload before the
+preservation assertions (a sleep-only check could pass vacuously). Nit: the
+`focusEpochByPaneId` doc comment corrected to describe the focusNudge-only
+semantics.
+
+Note: the round-5 runner exited 2 (a report-format contract hiccup on the
+first issue entry), but the review content was complete and is treated as the
+round-5 verdict. Delta review round cap (5) is now reached — remaining
+residuals are surfaced, not iterated: (a) element-identity restore covers the
+mount window only, so async late-mounting focus targets (Monaco onMount) apply
+their own default after the restore; (b) transient in-pane UI state does not
+survive splits by design.
+
 ## Fresh Eyes record
+
+- **Delta round 5 (Codex, independent; base 5b8717017): FAILED — 3 Major + 2 Minor + 1 Nit** (runner exited 2 on a report-format contract error; review content complete and treated as the verdict), all assessed valid and fixed: (1 Major) agent split of the focused pane redirected inner-element focus to the content default → element-identity descriptor record + mount-window restore (Task 10.1); (2 Major) explicit select could not focus preview/empty editors → focusable pane root + `focusEditorOrRoot` fallback (Task 10.2); (3 Major) epoch boundaries underprotected → per-arm wiring pins, real-pointer-path no-bump pin, epoch refocus pins for picker/directory/extension, e2e §8b browser-arm same-target select (Task 10.3); (1 Minor) `focusEpochByPaneId` reached persisted layout writes → denylisted + pin; (2 Minor) e2e §7 vacuous-without-payload risk → postMessage attempt handshake gate; (1 Nit) stale "EVERY activation" doc comment corrected.
+  Runner report: `.worktrees/.the-usual-logs/mcp-focus-neutrality/review-logs/usual-fresheyes-20260905T000019Z-2003515.md`
 
 - **Delta round 4 (Codex, independent; base 5b8717017): FAILED — 3 Major + 2 Minor**, all assessed valid and fixed: (1 Major) FreshAgentView composer/root focus effect keyed only off Redux activity — the sole pane autofocus outside Task 8's gate → `usePaneFocusAdoption` adopted (Task 9.1); (2 Major) adoption latch was `pending`-only — a denied remount could never recover on a later eligibility flip → flips/epoch-bumps resolve `'allowed'` unconditionally (Task 9.2); (3 Major) same-target select produced no eligibility transition and no focus → per-pane focus epoch (`focusEpochByPaneId`; pane.select fold nudges via `setActivePane focusNudge:true`, tab.select fold via `nudgePaneFocus`; PaneContainer forwards `focusEpoch` to every arm; `mayFocusNow` identity re-runs focus effects) + wall e2e §6b (Task 9.3); (1 Minor) ownership 512-cap wiped the map including the just-written record → oldest-entry eviction; (2 Minor) PaneContainer wiring suite gained the extension arm. During implementation a regression was caught pre-merge: bumping the epoch inside every setActivePane re-ran terminal focus on pointer mousedowns (rename/search focus theft) — narrowed to explicit select folds only, pinned in panesSlice tests.
   Runner report: `.worktrees/.the-usual-logs/mcp-focus-neutrality/review-logs/usual-fresheyes-20260904T231851Z-313099.md`
