@@ -21,20 +21,18 @@
 //! `terminal.created`, etc. are sent directly and are never subject to
 //! eviction). ONE deliberate Rust-port deviation: `terminal.exit` ALSO
 //! travels this queue (as a non-evictable, zero-weight sequenced frame via
-//! [`OutputQueue::push_sequenced`]) because the port's connection loop
-//! drains its direct channel ahead of this queue -- a directly-sent exit
-//! would deterministically overtake still-queued replay/final output on the
-//! wire, and the client's exit teardown then discards that output (blank
-//! exited pane on attach-to-an-exited-terminal; truncated tail on a busy
-//! live exit). See `freshell-ws::backpressure`'s `route`.
+//! [`OutputQueue::push_sequenced`]) because any lane that would let it bypass
+//! still-queued replay/final output would deterministically lose that output
+//! on the wire: the client's exit teardown discards output arriving after an
+//! exit (blank exited pane on attach-to-an-exited-terminal; truncated tail on
+//! a busy live exit).
 //!
-//! The Rust port's connection loop (`freshell-ws::terminal::run`) instead
-//! multiplexes EVERY server-to-client message for a connection (all
-//! terminals + all other event families) over one `mpsc::unbounded_channel`.
-//! To preserve the SAME observable scope, the connection boundary is
-//! responsible for routing only output-shaped `ServerMessage`s (see
-//! [`output_frame_meta`]) into an `OutputQueue`, and everything else through
-//! its existing unbounded channel unchanged -- exactly mirroring which
+//! The Rust port's connection writer (`freshell-ws::terminal`'s
+//! `connection_writer`) multiplexes EVERY server-to-client message for a
+//! connection through one admission lock: output-shaped `ServerMessage`s
+//! (see [`output_frame_meta`]) and the sequenced exit go into the per-
+//! connection `OutputQueue`, and everything else goes into the writer's
+//! bounded control lane, never subject to eviction -- exactly mirroring which
 //! frames legacy subjects to the cap.
 //!
 //! Multiple concurrently-attached terminals on one connection can each

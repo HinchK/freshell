@@ -869,7 +869,11 @@ async fn handle_client_text(
                         let full = matches!(&error, mpsc::error::TrySendError::Full(_));
                         drop(error); // drops the job's in-flight dedupe guard
                         if !full {
-                            return false;
+                            // TrySendError::Closed: the create worker is gone
+                            // and the loop's supervision branch already closes
+                            // us as `create_worker_exited` — don't race it to
+                            // a misleading `send_error` teardown label.
+                            return true;
                         }
                         let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);
                         send_create_error(
@@ -7263,14 +7267,67 @@ mod pane_reconcile_gate_tests {
         let pong = next_text_frame(&mut client).await;
         assert_eq!(pong["type"], "pong");
     }
-}
 
-/// Task 9 (host-pressure pane): the `hoststats.subscribe` / `.unsubscribe` /
-/// `.refresh` dispatch arms. A REAL loopback websocket pair (same scaffold as
-/// `pane_reconcile_gate_tests`) drives `handle_client_text`'s real
-/// serialization + send path; the collector is a fake implementing the
-/// freshell-server-owned trait (dependency direction is frozen — freshell-ws
-/// can never import the concrete collector).
+    #[tokio::test]
+    async fn full_create_queue_gets_loud_rate_limited_reply_and_retries_clean() {
+        let (mut ws_tx, mut client) = loopback_sink_and_client().await;
+        let state = state();
+        let conn_sink: FrameSink = std::sync::Arc::new(|_| {});
+        // Capacity 1 with NO worker draining: the filler create occupies the
+        // slot, so the tested creates deterministically observe a full
+        // queue. Nothing here spawns a PTY.
+        let (interactive_create_tx, interactive_create_rx) =
+            mpsc::channel::<interactive_creates::Job>(1);
+        let (_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
+        let mut host_stats_last_refresh_at = None;
+        let filler =
+            r#"{"type":"terminal.create","requestId":"filler","mode":"shell","shell":"system"}"#;
+        let ok = handle_client_text(
+            filler,
+            &mut ws_tx,
+            &state,
+            1,
+            &conn_sink,
+            false,
+            false,
+            false,
+            &interactive_create_tx,
+            &create_cancel_rx,
+            &mut host_stats_last_refresh_at,
+        )
+        .await;
+        assert!(ok);
+
+        // Each attempt must be answered loudly (never silently queued or
+        // masked as a dead socket), and the rejected job's dedupe guard must
+        // clear so the NEXT attempt with the same requestId is judged on its
+        // own — i.e. both replies are independent RATE_LIMITED answers, not
+        // one answer followed by duplicate-in-flight silence.
+        for attempt in 0..2 {
+            let create = r#"{"type":"terminal.create","requestId":"q-full","mode":"shell","shell":"system"}"#;
+            let ok = handle_client_text(
+                create,
+                &mut ws_tx,
+                &state,
+                1,
+                &conn_sink,
+                false,
+                false,
+                false,
+                &interactive_create_tx,
+                &create_cancel_rx,
+                &mut host_stats_last_refresh_at,
+            )
+            .await;
+            assert!(ok, "attempt {attempt}: a full queue must be answered");
+            let error = next_text_frame(&mut client).await;
+            assert_eq!(error["type"], "error", "attempt {attempt}");
+            assert_eq!(error["requestId"], "q-full", "attempt {attempt}");
+            assert_eq!(error["code"], "RATE_LIMITED", "attempt {attempt}");
+        }
+        drop(interactive_create_rx);
+    }
+}
 #[cfg(test)]
 mod host_stats_dispatch_tests {
     use super::*;

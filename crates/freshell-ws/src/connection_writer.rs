@@ -5,8 +5,10 @@
 //!
 //! Each write leases only ONE queued frame. Output already handed to the socket
 //! is still included in pressure accounting until its flush finishes. Cancelling
-//! an in-progress send always terminates the socket; it is NEVER retried on that
-//! socket (SinkExt::send is not assumed cancellation-safe).
+//! an in-progress send always terminates the socket; the started frame is NEVER
+//! retried on that socket (SinkExt::send is not assumed cancellation-safe) — a
+//! stop carrying a close code first lets that one started frame finish
+//! (bounded), then attempts a whole Close frame, never a mixed byte stream.
 
 use std::collections::VecDeque;
 use std::pin::Pin;
@@ -58,10 +60,17 @@ struct Stop {
 struct Control {
     frame: Message,
     bytes: usize,
-    // Keepalive timeout begins AFTER the ping actually leaves this writer,
-    // never when a congested connection merely queues it.
+    // Keepalive observes the ping's flush receipt for liveness bookkeeping;
+    // the keepalive DEADLINE is anchored at the tick that queued the ping
+    // (see Keepalive), not at this receipt.
     flushed: Option<oneshot::Sender<Instant>>,
 }
+
+/// Consecutive control leases after which a pending output frame MUST be
+/// leased instead. Controls normally preempt (they are how the reader's
+/// answers and liveness traffic jump a backlog), but an unbounded control
+/// stream must not starve output all the way to the catastrophic monitor.
+const CONTROL_STREAK_LIMIT: usize = 8;
 
 struct Queues {
     output: OutputQueue,
@@ -69,6 +78,9 @@ struct Queues {
     // Includes a control frame currently being flushed, not just queued frames.
     control_bytes: usize,
     in_flight_output_bytes: usize,
+    /// Consecutive control frames leased since the last output frame. See
+    /// `CONTROL_STREAK_LIMIT`.
+    controls_since_last_output: usize,
     closed: bool,
 }
 
@@ -114,6 +126,7 @@ impl WriterSender {
                 controls: VecDeque::new(),
                 control_bytes: 0,
                 in_flight_output_bytes: 0,
+                controls_since_last_output: 0,
                 closed: false,
             }),
             output_limit: output_limit.max(1),
@@ -296,7 +309,15 @@ impl WriterPump {
         if queues.closed {
             return Ok(None);
         }
-        if let Some(control) = queues.controls.pop_front() {
+        let output_pending = queues.output.has_pending();
+        let control_wins = !queues.controls.is_empty()
+            && (!output_pending || queues.controls_since_last_output < CONTROL_STREAK_LIMIT);
+        if control_wins {
+            let control = queues
+                .controls
+                .pop_front()
+                .expect("control_wins implies a queued control");
+            queues.controls_since_last_output += 1;
             return Ok(Some(NextFrame {
                 frame: control.frame,
                 control_bytes: control.bytes,
@@ -307,6 +328,7 @@ impl WriterPump {
         let Some((msg, bytes)) = queues.output.pop_front() else {
             return Ok(None);
         };
+        queues.controls_since_last_output = 0;
         let json = serde_json::to_string(&msg).map_err(|_| WriterExit::SerializationFailed)?;
         queues.in_flight_output_bytes = bytes;
         Ok(Some(NextFrame {
@@ -377,13 +399,37 @@ impl WriterPump {
                 _ = self.stop.changed() => false,
             };
             if !sent {
-                // End the watch borrow before Drop acquires the queue lock.
-                let stop = self.stop.borrow();
-                let exit = stop
-                    .as_ref()
-                    .map(|stop| stop.exit)
-                    .unwrap_or(WriterExit::Stopped);
-                drop(stop);
+                let (exit, close) = {
+                    // End the watch borrow before Drop acquires the queue lock.
+                    let stop = self.stop.borrow();
+                    let exit = stop
+                        .as_ref()
+                        .map(|stop| stop.exit)
+                        .unwrap_or(WriterExit::Stopped);
+                    let close = stop.as_ref().and_then(|stop| stop.close.clone());
+                    (exit, close)
+                };
+                if let Some((code, reason)) = close {
+                    // The cancelled send may have left a started frame
+                    // buffered inside the transport; CONTINUING that flush is
+                    // unambiguous (it resumes the same frame — this is not a
+                    // retry). Only once the buffer has drained may a whole
+                    // Close frame be written. Both steps are bounded; failure
+                    // simply falls through to exit, and the peer sees the
+                    // abnormal close that real network failure always meant.
+                    let finished =
+                        tokio::time::timeout(Duration::from_millis(250), socket.flush()).await;
+                    if matches!(finished, Ok(Ok(()))) {
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(250),
+                            socket.send(Message::Close(Some(CloseFrame {
+                                code,
+                                reason: reason.into(),
+                            }))),
+                        )
+                        .await;
+                    }
+                }
                 return exit;
             }
             self.finish_frame(output_bytes, control_bytes);
@@ -406,17 +452,38 @@ impl Drop for WriterPump {
             queues.controls.clear();
             queues.control_bytes = 0;
             queues.in_flight_output_bytes = 0;
+            queues.controls_since_last_output = 0;
             queues.output = OutputQueue::new(self.shared.output_limit);
         }
     }
 }
 
-/// Tracks the keepalive transaction without treating queued-but-unsent pings
-/// as peer failures. A pong observed before the flush receipt is retained.
+struct Outstanding {
+    /// Flush receipt; `None` once the ping's flush has been confirmed (the
+    /// deadline stays anchored at `queued_at` regardless).
+    receipt: Option<oneshot::Receiver<Instant>>,
+    /// Tick time at which the ping was queued. Tick-aligned by construction,
+    /// so an unanswered ping is detected at exactly the next tick one
+    /// interval later — the legacy one-unanswered-cycle contract
+    /// (`ws.on('pong')`, ws-handler.ts:1149-1150), with no idle full-cycle
+    /// window in between.
+    queued_at: Instant,
+}
+
+/// Tracks the keepalive transaction: at most one outstanding ping, answered
+/// by any pong (a direct transport reply carries no ping cookie, so a pong
+/// observed before the flush receipt is still retained as the answer).
+///
+/// The deadline is anchored at the tick that QUEUED the ping, not at its
+/// flush receipt: anchoring on the flush would slide detection by almost a
+/// full extra interval whenever the flush lands an epsilon after its tick.
+/// A ping still unflushed one full interval after its tick means the socket
+/// could not emit a single control frame for an entire cycle — the writer's
+/// per-send stall deadline bounds that case separately, and the keepalive
+/// kill is the earlier, legacy-shaped remediation.
 #[derive(Default)]
 pub(super) struct Keepalive {
-    receipt: Option<oneshot::Receiver<Instant>>,
-    sent_at: Option<Instant>,
+    outstanding: Option<Outstanding>,
     pong: bool,
 }
 
@@ -437,30 +504,46 @@ impl Keepalive {
         now: Instant,
         interval: Duration,
     ) -> Result<(), KeepaliveError> {
-        if let Some(receipt) = &mut self.receipt {
-            match receipt.try_recv() {
-                Ok(at) => {
-                    self.sent_at = Some(at);
-                    self.receipt = None;
-                }
-                Err(oneshot::error::TryRecvError::Empty) => return Ok(()),
-                Err(oneshot::error::TryRecvError::Closed) => {
-                    return Err(KeepaliveError::Writer(WriterExit::SendFailed));
+        if let Some(outstanding) = &mut self.outstanding {
+            if let Some(receipt) = &mut outstanding.receipt {
+                match receipt.try_recv() {
+                    // Flush confirmed; the deadline stays anchored at
+                    // `queued_at`, so this receipt is liveness bookkeeping
+                    // only (no timeout relief for a late flush).
+                    Ok(_) => outstanding.receipt = None,
+                    Err(oneshot::error::TryRecvError::Empty) => {}
+                    // The pump is gone without ever flushing this ping; its
+                    // task result carries the precise cause
+                    // (SendFailed/SendTimedOut/…) — here it can only mean
+                    // "no flush receipt will arrive".
+                    Err(oneshot::error::TryRecvError::Closed) => {
+                        return Err(KeepaliveError::Writer(WriterExit::Stopped));
+                    }
                 }
             }
         }
-        if let Some(sent_at) = self.sent_at {
-            if !self.pong {
-                return if now.saturating_duration_since(sent_at) >= interval {
-                    Err(KeepaliveError::TimedOut)
-                } else {
-                    Ok(())
-                };
+        if let Some(outstanding) = &self.outstanding {
+            if self.pong {
+                // Answered within its cycle (possibly before the flush
+                // receipt — a pong needs no cookie): retire it and queue the
+                // next ping below; healthy connections emit one per tick.
+                self.outstanding = None;
+                self.pong = false;
+            } else if now.saturating_duration_since(outstanding.queued_at) >= interval {
+                // One full cycle, no pong — dead peer (flushed but
+                // unanswered) or a wedged socket (never flushed).
+                return Err(KeepaliveError::TimedOut);
+            } else {
+                // Within the outstanding ping's cycle: wait for its pong;
+                // never stack a second ping.
+                return Ok(());
             }
         }
-        self.receipt = Some(sender.queue_ping().map_err(KeepaliveError::Writer)?);
-        self.sent_at = None;
-        self.pong = false;
+        let receipt = sender.queue_ping().map_err(KeepaliveError::Writer)?;
+        self.outstanding = Some(Outstanding {
+            receipt: Some(receipt),
+            queued_at: now,
+        });
         Ok(())
     }
 }

@@ -125,6 +125,17 @@ where
     worker_state
 }
 
+/// Behavior changes relative to the old inline dispatch, all deliberate:
+///  - The sliding-window rate limiter now records DEQUEUE time (worker start)
+///    rather than socket-arrival time; queue admission is bounded separately
+///    by the channel cap (`spawn_queue_cap`), and overflow gets a loud
+///    `RATE_LIMITED` reply from the reader.
+///  - A create dequeued after server shutdown started is skipped without a
+///    reply (its dedupe reservation is released via its guard): shutdown is
+///    tearing the sockets down anyway.
+///  - A create settling after shutdown started kills the newest terminal
+///    created under its requestId — its own late lineage only — so shutdown's
+///    registry snapshot cannot straggle a PTY that outlived it.
 pub(super) fn spawn(
     state: &WsState,
     sink: &FrameSink,

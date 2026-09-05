@@ -184,49 +184,120 @@ async fn control_budget_includes_inflight_entries_and_zero_byte_messages() {
 }
 
 #[tokio::test]
-async fn keepalive_does_not_time_out_a_ping_that_has_not_been_flushed() {
-    let (sender, _pump) = WriterSender::new(4096, 4096, Duration::from_secs(10));
+async fn unanswered_ping_times_out_at_the_next_cycle_tick() {
+    let (sender, pump) = WriterSender::new(4096, 4096, Duration::from_secs(10));
     let mut keepalive = Keepalive::default();
     let now = Instant::now();
-    keepalive
-        .tick(&sender, now, Duration::from_secs(1))
+    let interval = Duration::from_secs(1);
+    keepalive.tick(&sender, now, interval).unwrap();
+    // The common case: the idle writer flushes the ping a hair after its
+    // tick. Detection must land at the NEXT tick one interval later — never
+    // slide another full cycle behind the flush delay.
+    let next = pump.take_next().unwrap().unwrap();
+    next.flushed
+        .unwrap()
+        .send(now + Duration::from_millis(5))
         .unwrap();
-    keepalive
-        .tick(
-            &sender,
-            now + Duration::from_secs(100),
-            Duration::from_secs(1),
-        )
-        .unwrap();
-    assert_eq!(sender.shared.queues.lock().unwrap().controls.len(), 1);
+    pump.finish_frame(next.output_bytes, next.control_bytes);
+    assert_eq!(
+        keepalive.tick(&sender, now + interval, interval),
+        Err(KeepaliveError::TimedOut)
+    );
 }
 
 #[tokio::test]
-async fn keepalive_deadline_starts_at_flush_and_preserves_early_pong() {
+async fn an_unflushed_ping_also_times_out_at_the_cycle_tick() {
+    let (sender, _pump) = WriterSender::new(4096, 4096, Duration::from_secs(10));
+    let mut keepalive = Keepalive::default();
+    let now = Instant::now();
+    let interval = Duration::from_secs(1);
+    keepalive.tick(&sender, now, interval).unwrap();
+    // Controls preempt output, so a ping unflushed for a full cycle means
+    // the socket could not emit a single control frame all cycle — wedged
+    // (the writer's per-send stall deadline is a separate, wider bound).
+    assert_eq!(
+        keepalive.tick(&sender, now + interval, interval),
+        Err(KeepaliveError::TimedOut)
+    );
+}
+
+#[tokio::test]
+async fn answered_ping_retires_and_the_next_tick_queues_a_fresh_one() {
     let (sender, pump) = WriterSender::new(4096, 4096, Duration::from_secs(10));
     let mut keepalive = Keepalive::default();
     let now = Instant::now();
     let interval = Duration::from_secs(1);
     keepalive.tick(&sender, now, interval).unwrap();
     let next = pump.take_next().unwrap().unwrap();
-    let at = now + Duration::from_secs(10);
-    next.flushed.unwrap().send(at).unwrap();
+    // Pong observed BEFORE the flush receipt is processed still answers the
+    // ping (a pong carries no cookie; ordering with the receipt is the
+    // transport's business).
+    keepalive.observe_pong();
+    next.flushed
+        .unwrap()
+        .send(now + Duration::from_millis(5))
+        .unwrap();
     pump.finish_frame(next.output_bytes, next.control_bytes);
-    keepalive.tick(&sender, at, interval).unwrap();
+    let next_tick = now + interval / 2;
+    keepalive.tick(&sender, next_tick, interval).unwrap();
+    // Healthy cadence: exactly one fresh ping queued for the new cycle.
+    let next = pump.take_next().unwrap().unwrap();
+    assert!(next.flushed.is_some());
+    assert!(pump.take_next().unwrap().is_none());
+    // The new ping's deadline is armed one interval from ITS queue tick.
     assert_eq!(
-        keepalive.tick(&sender, at + interval, interval),
+        keepalive.tick(&sender, next_tick + interval, interval),
         Err(KeepaliveError::TimedOut)
     );
-    keepalive.observe_pong();
-    keepalive.tick(&sender, at + interval, interval).unwrap();
-    // Pong before the new write callback must not be erased by its receipt.
-    keepalive.observe_pong();
-    let next = pump.take_next().unwrap().unwrap();
-    next.flushed.unwrap().send(at + interval).unwrap();
-    pump.finish_frame(next.output_bytes, next.control_bytes);
+}
+
+#[tokio::test]
+async fn a_lost_flush_receipt_reports_the_writer_as_gone() {
+    let (sender, pump) = WriterSender::new(4096, 4096, Duration::from_secs(10));
+    let mut keepalive = Keepalive::default();
+    let now = Instant::now();
     keepalive
-        .tick(&sender, at + interval + interval, interval)
+        .tick(&sender, now, Duration::from_secs(60))
         .unwrap();
+    // Pump teardown drops the queued ping's receipt sender unanswered.
+    drop(pump);
+    assert_eq!(
+        keepalive.tick(
+            &sender,
+            now + Duration::from_millis(1),
+            Duration::from_secs(60)
+        ),
+        Err(KeepaliveError::Writer(WriterExit::Stopped))
+    );
+}
+
+#[tokio::test]
+async fn controls_cannot_starve_output_indefinitely() {
+    let (mut sender, pump) = WriterSender::new(1 << 20, 1 << 20, Duration::from_secs(10));
+    for seq in 0..16 {
+        assert!(sender.push_server(output(seq)));
+    }
+    for _ in 0..16 {
+        sender.send(notice("c")).await.unwrap();
+    }
+    let mut order = Vec::new();
+    while let Some(next) = pump.take_next().unwrap() {
+        if let Message::Text(text) = &next.frame {
+            order.push(text.to_string());
+        }
+        pump.finish_frame(next.output_bytes, next.control_bytes);
+    }
+    let outputs: Vec<usize> = order
+        .iter()
+        .enumerate()
+        .filter_map(|(i, frame)| frame.contains("data-").then_some(i))
+        .collect();
+    assert_eq!(outputs.len(), 16, "every output frame must be delivered");
+    assert!(
+        outputs[0] <= CONTROL_STREAK_LIMIT,
+        "first output must arrive within the streak limit, got position {}",
+        outputs[0]
+    );
 }
 
 #[tokio::test(start_paused = true)]
