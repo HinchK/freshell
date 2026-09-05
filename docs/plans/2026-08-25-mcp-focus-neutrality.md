@@ -2118,7 +2118,14 @@ Minors: **ownership cap** now evicts oldest entries instead of wiping the map
 (eligible/hidden/other-pane-active) so a dropped `focusEligible` prop on that
 arm cannot pass green.
 
-Test note: one unrelated flake sighting during this task — `test/e2e/open-tab-session-sidebar-visibility.test.tsx` "keeps direct refreshes on the visible applied search silent…" failed once in a full-suite run (call-count assertion), passed solo AND on the immediate full-suite re-run; changes here do not touch the sidebar/search flow. Recorded as a known one-off to watch.
+Test note: the shuffled parallel pool has a small family of load-sensitive
+tests that intermittently exceed their timing under contention with heavyweight
+co-tenants (seen this run: `storage-migration.fresh-agent`'s 500ms migration
+budget, and `PaneContainer`'s lazily-imported-editor `findByTestId` 1s window).
+New timing assertions in this change avoid sleeps entirely and use `waitFor`
+with generous poll windows, which proved load-stable. The two pre-existing
+offenders passed solo and in the eventual green broad runs; left unmodified.
+One unrelated flake sighting during the earlier task — `test/e2e/open-tab-session-sidebar-visibility.test.tsx` "keeps direct refreshes on the visible applied search silent…" failed once in a full-suite run (call-count assertion), passed solo AND on the immediate full-suite re-run; changes here do not touch the sidebar/search flow. Recorded as a known one-off to watch.
 
 Tests: ownership cap trim; BrowserPane denied→flip recovery + denied→epoch
 re-select pins; FreshAgentView remount-denied + epoch re-select pair;
@@ -2177,7 +2184,40 @@ mount window only, so async late-mounting focus targets (Monaco onMount) apply
 their own default after the restore; (b) transient in-pane UI state does not
 survive splits by design.
 
+### Task 11 (post-hoc, landed): round-6 restoration fidelity — disposed-editor ref, async-mount race, descriptor blind spots
+
+Added during Stage 5's delta-round-6 fix round (3 Major + 2 Minor).
+
+1. **Disposed-editor ref** (M1): `@monaco-editor/react` disposes on unmount
+   silently; a source→preview/empty transition left `editorRef` pointing at a
+   dead editor, and the round-5 `focusEditorOrRoot` would call into it instead
+   of the root. `editorRendered` now tracks the render branch and an effect
+   clears the ref on unmount; the flip then falls back to the pane root.
+2. **Async Monaco mount stomping the restore** (M2): with a slow onMount, the
+   mount-window descriptor restore could land first and the delayed editor
+   autofocus would steal it back. `handleEditorMount` now skips its adoption
+   focus when a recorded descriptor still resolves in the DOM
+   (`resolveRecordedFocusTarget`) — suppressing exactly one focus, keeping the
+   restored field (e.g. the toolbar path input) focused.
+3. **Descriptor blind spots** (M3): a focused browser/extension iframe has no
+   id/aria/test/placeholder/role, so `selector:null` killed the restore and
+   dropped the user out of the embedded page. `describeInnerSelector` now walks
+   ordered candidates — id → aria-label → data-testid → placeholder → role →
+   sole-iframe → title — accepting only selectors that resolve UNIQUELY at
+   record time. Browser iframe restore is pinned (remount → embedded page
+   refocused).
+
+Minors: the cap map is true LRU now (re-recording an existing pane refreshes
+its position; `Map.set` alone kept it, letting a long-lived pane be evicted
+right after a fresh record) with a refresh-then-evict pin; the PaneContainer
+wiring suite covers focusEpoch forwarding for ALL seven arms (terminal,
+fresh-agent, and the nested directory step joined browser/editor/picker/
+extension) — a dropped prop on any arm can no longer pass green.
+
 ## Fresh Eyes record
+
+- **Delta round 6 (Codex, independent; base 5b8717017): FAILED — 3 Major + 2 Minor**, all assessed valid and fixed: (1 Major) stale `editorRef` on monaco unmount — flip called a disposed editor instead of the root fallback → `editorRendered` tracking + ref clear (Task 11.1); (2 Major) async Monaco onMount autofocus stomped the mount-window descriptor restore → `handleEditorMount` skips its adoption focus when a recorded descriptor resolves (Task 11.2); (3 Major) descriptor could not represent a focused embedded iframe (or title-only controls) → ordered unique-resolving candidates incl. sole-iframe and title, with BrowserPane embedded-page restore pinned (Task 11.3); (1 Minor) refresh-then-evict LRU defect at the 512 cap (re-recording did not refresh insertion order) → delete-then-set + pin; (2 Minor) wiring suite's "every content arm" missed terminal/fresh-agent/directory epoch forwarding → all seven arms pinned.
+  Runner report: `.worktrees/.the-usual-logs/mcp-focus-neutrality/review-logs/usual-fresheyes-20260905T004703Z-4055432.md`
 
 - **Delta round 5 (Codex, independent; base 5b8717017): FAILED — 3 Major + 2 Minor + 1 Nit** (runner exited 2 on a report-format contract error; review content complete and treated as the verdict), all assessed valid and fixed: (1 Major) agent split of the focused pane redirected inner-element focus to the content default → element-identity descriptor record + mount-window restore (Task 10.1); (2 Major) explicit select could not focus preview/empty editors → focusable pane root + `focusEditorOrRoot` fallback (Task 10.2); (3 Major) epoch boundaries underprotected → per-arm wiring pins, real-pointer-path no-bump pin, epoch refocus pins for picker/directory/extension, e2e §8b browser-arm same-target select (Task 10.3); (1 Minor) `focusEpochByPaneId` reached persisted layout writes → denylisted + pin; (2 Minor) e2e §7 vacuous-without-payload risk → postMessage attempt handshake gate; (1 Nit) stale "EVERY activation" doc comment corrected.
   Runner report: `.worktrees/.the-usual-logs/mcp-focus-neutrality/review-logs/usual-fresheyes-20260905T000019Z-2003515.md`
