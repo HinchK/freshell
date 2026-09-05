@@ -404,6 +404,52 @@ describe('FreshAgentView', () => {
       await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
     })
 
+    it('advances after real Codex snapshot lifecycle frames complete within one render', async () => {
+      const queue = await setup('idle')
+      queue.send('First message')
+      queue.send('Second message')
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => {
+        for (const status of ['running', 'idle']) {
+          const message = { type: 'freshAgent.event', ...locator, event: { type: 'freshAgent.session.snapshot', sessionId: locator.sessionId, latestTurnId: null, timelineSessionId: locator.sessionId, status } }
+          handleFreshAgentMessage(queue.store.dispatch, message)
+          listener(message)
+        }
+      })
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+      expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Second message' })
+    })
+
+    it('does not unlock the next Codex send with an earlier turn HTTP response', async () => {
+      const queue = await setup('idle')
+      queue.send('Repeat this task')
+      const first = sentFreshAgentMessages('freshAgent.send')[0]
+      const snapshot = createDeferred<ReturnType<typeof freshopencodeSnapshot>>()
+      apiMock.getFreshAgentThreadSnapshot.mockImplementationOnce(() => snapshot.promise)
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => listener({ type: 'freshAgent.send.accepted', ...locator, requestId: first.requestId }))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
+      queue.send('Repeat this task')
+      queue.send('Last follow-up')
+      act(() => {
+        for (const status of ['running', 'idle']) {
+          const message = { type: 'freshAgent.event', ...locator, event: { type: 'freshAgent.session.snapshot', sessionId: locator.sessionId, latestTurnId: null, timelineSessionId: locator.sessionId, status } }
+          handleFreshAgentMessage(queue.store.dispatch, message)
+          listener(message)
+        }
+      })
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
+      await act(async () => snapshot.resolve({
+        ...freshopencodeSnapshot('finished first turn', 1),
+        sessionType: 'freshcodex', provider: 'codex', sessionId: locator.sessionId, threadId: locator.sessionId,
+        turns: [{ id: 'first-user-turn', turnId: 'first-user-turn', role: 'user', summary: 'Repeat this task', items: [{ id: 'first-user-text', kind: 'text', text: 'Repeat this task' }] }],
+      }))
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+    })
+
     it('advances after Claude streams and completes within one render', async () => {
       const queue = await setup('idle', true, 'claude')
       queue.send('First message')

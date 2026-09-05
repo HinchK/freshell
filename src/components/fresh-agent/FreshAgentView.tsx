@@ -1934,7 +1934,8 @@ export function FreshAgentView({
       ) {
         const event = message.event
         const stream = isRecord(event.event) ? event.event : undefined
-        const isBusyEvent = (event.type === 'freshAgent.status' && typeof event.status === 'string' && BUSY_STATES.has(event.status))
+        const isBusyEvent = ((event.type === 'freshAgent.status' || event.type === 'freshAgent.session.snapshot')
+          && typeof event.status === 'string' && BUSY_STATES.has(event.status))
           || (event.type === 'freshAgent.stream' && (stream?.type === 'content_block_start' || stream?.type === 'content_block_delta'))
         // Observe fast turns even when React batches running and idle into
         // one render. The status version below still observes that final idle.
