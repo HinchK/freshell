@@ -911,7 +911,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
       await sendComposerText(page, 'RAISE_QUESTION_OTHER')
       await expect(banner).toBeVisible({ timeout: 15_000 })
       await banner.getByRole('button', { name: 'Other' }).click()
-      const otherInput = banner.getByRole('textbox', { name: 'Type your answer...' })
+      const otherInput = banner.getByRole('textbox', { name: 'Free text', exact: true })
       await otherInput.fill('Something custom')
       await banner.getByRole('button', { name: 'Submit' }).click()
       await expect
@@ -1763,9 +1763,9 @@ test.describe('fresh-agent control surfaces — opencode lane (rust)', () => {
       )
       expect(summarize.sessionId).toBe(sessionId)
       // The strict 1.18.18 schema: exactly {providerID, modelID}, derived from
-      // the pane's default catalog model (opencode-go/glm-5.2).
+      // the fake provider's configured default model (/config).
       expect(summarize.bodyKeys).toEqual(['modelID', 'providerID'])
-      expect(summarize.body).toEqual({ providerID: 'opencode-go', modelID: 'glm-5.2' })
+      expect(summarize.body).toEqual({ providerID: 'opencode', modelID: 'fake-opencode' })
 
       // Usable afterward: a follow-up turn materializes another prompt.
       await sendOpencodeTurn(page, lane.harness, lane.tabId, 'opencode post-compact turn', 2, lane.auditLogPath)
