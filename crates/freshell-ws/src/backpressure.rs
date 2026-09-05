@@ -1,3 +1,8 @@
+//! Production socket scheduling now lives in `terminal::connection_writer`.
+//! This module retains TERM-09 configuration, the pressure monitor, and its
+//! public legacy queue adapter for existing callers/tests. The historical
+//! adapter mapping below does not describe the new independently polled writer.
+//!
 //! TERM-09: per-connection terminal-output backpressure -- the async plumbing
 //! a `tokio::select!` connection loop needs around
 //! `freshell_terminal::output_queue::OutputQueue` (legacy: `ClientOutputQueue`),

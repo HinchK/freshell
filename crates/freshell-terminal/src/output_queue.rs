@@ -117,7 +117,7 @@ pub struct OutputQueue {
     max_bytes: usize,
     items: VecDeque<QueuedItem>,
     total_bytes: usize,
-    pending_gaps: Vec<PendingGap>,
+    pending_gaps: VecDeque<PendingGap>,
     dropped_frames: u64,
 }
 
@@ -131,7 +131,7 @@ impl OutputQueue {
             max_bytes: max_bytes.max(1),
             items: VecDeque::new(),
             total_bytes: 0,
-            pending_gaps: Vec::new(),
+            pending_gaps: VecDeque::new(),
             dropped_frames: 0,
         }
     }
@@ -202,6 +202,46 @@ impl OutputQueue {
         !self.pending_gaps.is_empty() || !self.items.is_empty()
     }
 
+    /// Superseding attach: discard only this terminal's unsent delivery
+    /// generation, including its queued exit and gaps. The authoritative
+    /// registry retains the bytes and emits a fresh replay/exit for the new
+    /// attachment. An already leased/in-flight frame is owned by the writer.
+    pub fn discard_terminal(&mut self, terminal_id: &str) {
+        let mut removed_bytes = 0;
+        self.items.retain(|item| {
+            let belongs = item.meta.as_ref().is_some_and(|meta| meta.terminal_id == terminal_id)
+                || matches!(&item.msg, ServerMessage::TerminalExit(exit) if exit.terminal_id == terminal_id);
+            if belongs { removed_bytes += item.bytes; }
+            !belongs
+        });
+        self.total_bytes -= removed_bytes;
+        self.pending_gaps
+            .retain(|gap| gap.terminal_id != terminal_id);
+    }
+
+    /// Lease one frame to the socket writer without removing the rest of its
+    /// backlog from queue accounting. The caller retains the returned byte
+    /// charge until that frame has actually been flushed (or the socket dies).
+    /// Gaps and sequenced controls carry zero output-budget weight, as before.
+    pub fn pop_front(&mut self) -> Option<(ServerMessage, usize)> {
+        if let Some(gap) = self.pending_gaps.pop_front() {
+            return Some((
+                ServerMessage::TerminalOutputGap(TerminalOutputGap {
+                    from_seq: gap.from_seq,
+                    to_seq: gap.to_seq,
+                    reason: TerminalOutputGapReason::QueueOverflow,
+                    stream_id: gap.stream_id,
+                    terminal_id: gap.terminal_id,
+                    attach_request_id: gap.attach_request_id,
+                }),
+                0,
+            ));
+        }
+        let item = self.items.pop_front()?;
+        self.total_bytes -= item.bytes;
+        Some((item.msg, item.bytes))
+    }
+
     /// Drain everything currently queued, IN ORDER: every pending gap FIRST
     /// (mirrors `prepareBatch`, which always emits `pendingGaps` ahead of
     /// frames, `client-output-queue.ts:76-78`), then every retained frame in
@@ -253,14 +293,18 @@ impl OutputQueue {
     /// the LAST entry (not a full scan) -- evictions are always FIFO-ordered
     /// per stream, so the last entry is always the correct merge candidate.
     fn extend_gap(&mut self, meta: OutputFrameMeta) {
-        if let Some(last) = self.pending_gaps.last_mut() {
-            if last.stream_id == meta.stream_id && meta.seq_start <= last.to_seq + 1 {
+        if let Some(last) = self.pending_gaps.back_mut() {
+            if last.stream_id == meta.stream_id
+                && last.terminal_id == meta.terminal_id
+                && last.attach_request_id == meta.attach_request_id
+                && meta.seq_start <= last.to_seq.saturating_add(1)
+            {
                 last.from_seq = last.from_seq.min(meta.seq_start);
                 last.to_seq = last.to_seq.max(meta.seq_end);
                 return;
             }
         }
-        self.pending_gaps.push(PendingGap {
+        self.pending_gaps.push_back(PendingGap {
             terminal_id: meta.terminal_id,
             stream_id: meta.stream_id,
             from_seq: meta.seq_start,

@@ -1,0 +1,346 @@
+use super::*;
+use futures_util::task::AtomicWaker;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[derive(Default)]
+struct Capture {
+    frames: Mutex<Vec<Message>>,
+    block_flush: AtomicBool,
+    fail: AtomicBool,
+    waker: AtomicWaker,
+    started: Notify,
+}
+
+struct TestSink(Arc<Capture>);
+impl Sink<Message> for TestSink {
+    type Error = ();
+    fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), ()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn start_send(self: Pin<&mut Self>, frame: Message) -> Result<(), ()> {
+        self.0.frames.lock().unwrap().push(frame);
+        self.0.started.notify_one();
+        Ok(())
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
+        self.0.waker.register(cx.waker());
+        if self.0.fail.load(Ordering::SeqCst) {
+            Poll::Ready(Err(()))
+        } else if self.0.block_flush.load(Ordering::SeqCst) {
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(()))
+        }
+    }
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
+        self.poll_flush(cx)
+    }
+}
+
+fn output(seq: i64) -> ServerMessage {
+    ServerMessage::TerminalOutput(freshell_protocol::TerminalOutput {
+        terminal_id: "term".into(),
+        stream_id: "stream".into(),
+        attach_request_id: Some("attach".into()),
+        seq_start: seq,
+        seq_end: seq,
+        data: format!("data-{seq}"),
+        source: None,
+    })
+}
+fn notice(text: &str) -> Message {
+    Message::Text(text.to_string().into())
+}
+fn text_frames(capture: &Capture) -> Vec<String> {
+    capture
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|frame| {
+            if let Message::Text(text) = frame {
+                Some(text.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+async fn started(capture: &Capture) {
+    tokio::time::timeout(Duration::from_secs(2), capture.started.notified())
+        .await
+        .unwrap();
+}
+fn unblock(capture: &Capture) {
+    capture.block_flush.store(false, Ordering::SeqCst);
+    capture.waker.wake();
+}
+async fn join(task: tokio::task::JoinHandle<WriterExit>) -> WriterExit {
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn blocked_flush_does_not_block_producers_and_is_still_accounted() {
+    let (mut sender, pump) = WriterSender::new(4096, 4096, Duration::from_secs(10));
+    let capture = Arc::new(Capture::default());
+    capture.block_flush.store(true, Ordering::SeqCst);
+    let msg = output(1);
+    let bytes = serde_json::to_string(&msg).unwrap().len();
+    assert!(sender.push_server(msg));
+    let task = tokio::spawn(pump.run(TestSink(Arc::clone(&capture))));
+    started(&capture).await;
+    assert_eq!(sender.pending_output_bytes(), bytes);
+    // This uses the same nonblocking Sink interface the reader's handlers use.
+    tokio::time::timeout(Duration::from_secs(2), sender.send(notice("control")))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(sender.push_server(output(2)));
+    assert!(sender.pending_output_bytes() > bytes);
+    sender.stop_without_close();
+    assert_eq!(join(task).await, WriterExit::Stopped);
+    assert_eq!(
+        text_frames(&capture).len(),
+        1,
+        "cancelled send is never retried"
+    );
+    assert_eq!(sender.pending_output_bytes(), 0);
+    assert!(
+        !sender.push_server(output(3)),
+        "no orphan outbox after exit"
+    );
+}
+
+#[tokio::test]
+async fn controls_preempt_the_next_frame_not_the_inflight_frame() {
+    let (mut sender, pump) = WriterSender::new(4096, 4096, Duration::from_secs(10));
+    let capture = Arc::new(Capture::default());
+    capture.block_flush.store(true, Ordering::SeqCst);
+    assert!(sender.push_server(output(1)));
+    assert!(sender.push_server(output(2)));
+    let task = tokio::spawn(pump.run(TestSink(Arc::clone(&capture))));
+    started(&capture).await;
+    sender.send(notice("urgent")).await.unwrap();
+    unblock(&capture);
+    // A ping receipt is a deterministic fence behind the urgent control.
+    let receipt = sender.queue_ping().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), receipt)
+        .await
+        .unwrap()
+        .unwrap();
+    let frames = text_frames(&capture);
+    assert!(frames[0].contains("data-1"));
+    assert_eq!(frames[1], "urgent");
+    sender.stop_without_close();
+    let _ = join(task).await;
+}
+
+#[tokio::test]
+async fn preludes_always_precede_replay_and_exit_follows_output() {
+    let (mut sender, pump) = WriterSender::new(4096, 4096, Duration::from_secs(10));
+    sender.send(notice("ready")).await.unwrap();
+    sender.send(notice("modes")).await.unwrap();
+    sender.push_server(output(1));
+    sender.push_server(output(2));
+    sender.push_server(ServerMessage::TerminalExit(
+        freshell_protocol::TerminalExit {
+            terminal_id: "term".into(),
+            exit_code: 0,
+        },
+    ));
+    // Drive the exact queue selection used by the pump; no timing assumptions.
+    let mut frames = Vec::new();
+    while let Some(next) = pump.take_next().unwrap() {
+        if let Message::Text(text) = next.frame {
+            frames.push(text.to_string());
+        }
+        pump.finish_frame(next.output_bytes, next.control_bytes);
+    }
+    assert_eq!(frames[0], "ready");
+    assert_eq!(frames[1], "modes");
+    assert!(frames[2].contains("data-1"));
+    assert!(frames[3].contains("data-2"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&frames[4]).unwrap()["type"],
+        "terminal.exit"
+    );
+}
+
+#[tokio::test]
+async fn control_budget_includes_inflight_entries_and_zero_byte_messages() {
+    let (mut sender, pump) = WriterSender::new(4096, 256, Duration::from_secs(10));
+    sender.send(Message::Ping(Vec::new().into())).await.unwrap();
+    let next = pump.take_next().unwrap().unwrap();
+    assert_eq!(next.control_bytes, 128);
+    sender.send(Message::Ping(Vec::new().into())).await.unwrap();
+    assert_eq!(
+        sender.send(Message::Ping(Vec::new().into())).await,
+        Err(WriterExit::ControlOverflow)
+    );
+    assert!(pump.stop.borrow().is_some());
+}
+
+#[tokio::test]
+async fn keepalive_does_not_time_out_a_ping_that_has_not_been_flushed() {
+    let (sender, _pump) = WriterSender::new(4096, 4096, Duration::from_secs(10));
+    let mut keepalive = Keepalive::default();
+    let now = Instant::now();
+    keepalive
+        .tick(&sender, now, Duration::from_secs(1))
+        .unwrap();
+    keepalive
+        .tick(
+            &sender,
+            now + Duration::from_secs(100),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+    assert_eq!(sender.shared.queues.lock().unwrap().controls.len(), 1);
+}
+
+#[tokio::test]
+async fn keepalive_deadline_starts_at_flush_and_preserves_early_pong() {
+    let (sender, pump) = WriterSender::new(4096, 4096, Duration::from_secs(10));
+    let mut keepalive = Keepalive::default();
+    let now = Instant::now();
+    let interval = Duration::from_secs(1);
+    keepalive.tick(&sender, now, interval).unwrap();
+    let next = pump.take_next().unwrap().unwrap();
+    let at = now + Duration::from_secs(10);
+    next.flushed.unwrap().send(at).unwrap();
+    pump.finish_frame(next.output_bytes, next.control_bytes);
+    keepalive.tick(&sender, at, interval).unwrap();
+    assert_eq!(
+        keepalive.tick(&sender, at + interval, interval),
+        Err(KeepaliveError::TimedOut)
+    );
+    keepalive.observe_pong();
+    keepalive.tick(&sender, at + interval, interval).unwrap();
+    // Pong before the new write callback must not be erased by its receipt.
+    keepalive.observe_pong();
+    let next = pump.take_next().unwrap().unwrap();
+    next.flushed.unwrap().send(at + interval).unwrap();
+    pump.finish_frame(next.output_bytes, next.control_bytes);
+    keepalive
+        .tick(&sender, at + interval + interval, interval)
+        .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_socket_times_out_and_closes_admission() {
+    let (sender, pump) = WriterSender::new(4096, 4096, Duration::from_millis(20));
+    let capture = Arc::new(Capture::default());
+    capture.block_flush.store(true, Ordering::SeqCst);
+    sender.push_server(output(1));
+    let task = tokio::spawn(pump.run(TestSink(Arc::clone(&capture))));
+    assert_eq!(join(task).await, WriterExit::SendTimedOut);
+    assert_eq!(text_frames(&capture).len(), 1);
+    assert!(!sender.push_server(output(2)));
+}
+
+#[tokio::test]
+async fn socket_failure_does_not_retry_or_keep_buffering() {
+    let (sender, pump) = WriterSender::new(4096, 4096, Duration::from_secs(10));
+    let capture = Arc::new(Capture::default());
+    capture.fail.store(true, Ordering::SeqCst);
+    sender.push_server(output(1));
+    assert_eq!(
+        join(tokio::spawn(pump.run(TestSink(Arc::clone(&capture))))).await,
+        WriterExit::SendFailed
+    );
+    assert_eq!(text_frames(&capture).len(), 1);
+    assert!(!sender.push_server(output(2)));
+}
+
+#[tokio::test]
+async fn idle_close_preserves_the_requested_close_code() {
+    let (mut sender, pump) = WriterSender::new(4096, 4096, Duration::from_secs(10));
+    let capture = Arc::new(Capture::default());
+    sender
+        .send(Message::Close(Some(CloseFrame {
+            code: 4009,
+            reason: "Server shutting down".into(),
+        })))
+        .await
+        .unwrap();
+    let _ = join(tokio::spawn(pump.run(TestSink(Arc::clone(&capture))))).await;
+    let frames = capture.frames.lock().unwrap();
+    assert!(matches!(&frames[0], Message::Close(Some(close)) if close.code == 4009));
+}
+
+#[tokio::test]
+async fn aborting_the_writer_releases_queued_memory_and_rejects_stale_sinks() {
+    let (sender, pump) = WriterSender::new(4096, 4096, Duration::from_secs(10));
+    let capture = Arc::new(Capture::default());
+    capture.block_flush.store(true, Ordering::SeqCst);
+    sender.push_server(output(1));
+    let task = tokio::spawn(pump.run(TestSink(Arc::clone(&capture))));
+    started(&capture).await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(sender.pending_output_bytes(), 0);
+    assert!(!sender.push_server(output(2)));
+}
+
+#[tokio::test]
+async fn superseding_attach_discards_old_queued_output_and_old_exit() {
+    let (sender, pump) = WriterSender::new(4096, 4096, Duration::from_secs(10));
+    sender.push_server(output(1));
+    sender.push_server(ServerMessage::TerminalExit(
+        freshell_protocol::TerminalExit {
+            terminal_id: "term".into(),
+            exit_code: 0,
+        },
+    ));
+    let ready: ServerMessage = serde_json::from_value(serde_json::json!({
+        "type":"terminal.attach.ready", "terminalId":"term", "attachRequestId":"new-attach",
+        "streamId":"stream", "headSeq":1, "replayFromSeq":1, "replayToSeq":1
+    }))
+    .unwrap();
+    sender.push_server(ready);
+    let mut replay = output(1);
+    if let ServerMessage::TerminalOutput(frame) = &mut replay {
+        frame.attach_request_id = Some("new-attach".into());
+    }
+    sender.push_server(replay);
+    sender.push_server(ServerMessage::TerminalExit(
+        freshell_protocol::TerminalExit {
+            terminal_id: "term".into(),
+            exit_code: 0,
+        },
+    ));
+    let mut kinds = Vec::new();
+    while let Some(next) = pump.take_next().unwrap() {
+        if let Message::Text(text) = next.frame {
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            kinds.push(value["type"].as_str().unwrap().to_string());
+            if value["type"] == "terminal.output" {
+                assert_eq!(value["attachRequestId"], "new-attach");
+            }
+        }
+        pump.finish_frame(next.output_bytes, next.control_bytes);
+    }
+    assert_eq!(
+        kinds,
+        vec!["terminal.attach.ready", "terminal.output", "terminal.exit"]
+    );
+}
+
+#[tokio::test]
+async fn overflow_stops_a_pending_flush_without_waiting_for_send_timeout() {
+    let (mut sender, pump) = WriterSender::new(4096, 128, Duration::from_secs(10));
+    let capture = Arc::new(Capture::default());
+    capture.block_flush.store(true, Ordering::SeqCst);
+    sender.push_server(output(1));
+    let task = tokio::spawn(pump.run(TestSink(Arc::clone(&capture))));
+    started(&capture).await;
+    assert_eq!(
+        sender.send(notice("over-budget")).await,
+        Err(WriterExit::ControlOverflow)
+    );
+    assert_eq!(join(task).await, WriterExit::ControlOverflow);
+    assert_eq!(text_frames(&capture).len(), 1);
+}
