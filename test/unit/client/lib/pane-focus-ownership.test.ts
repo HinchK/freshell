@@ -272,6 +272,56 @@ describe('pane-focus-ownership', () => {
     expect(document.querySelector('input')).toHaveFocus()
   })
 
+  it('an ACTIVATING user split does not let the restore yank focus from the new pane', async () => {
+    const store = configureStore({ reducer: { panes: panesReducer } })
+    unsubscribe = wirePaneFocusOwnershipInvalidation(store)
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'old', content: { kind: 'terminal', mode: 'shell' } }))
+    document.body.innerHTML = `<div data-pane-id="old"><input placeholder="Enter URL..."></div>`
+    const url = document.querySelector('input') as HTMLInputElement
+    url.focus()
+    // User's "Split" gesture reassigns activePane BEFORE React teardown records
+    // the old pane — the record must NOT override the new pane's mount focus.
+    store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'new-pane' }))
+    recordPaneFocusBeforeUnmount('old')
+    document.body.innerHTML = `<div data-pane-id="old"><input placeholder="Enter URL..."></div><div data-pane-id="new-pane"><input id="np"></div>`
+    schedulePaneFocusRestore('old')
+    const np = document.getElementById('np') as HTMLInputElement
+    np.focus() // the activating split's mount autofocus
+    await waitFor(() => expect(isPaneFocusRestorePendingForTests('old')).toBe(false))
+    expect(np).toHaveFocus()
+  })
+
+  it('a focus record captured BEFORE a later selection is voided for mount adoption (close-promoted sibling)', () => {
+    const store = configureStore({ reducer: { panes: panesReducer } })
+    unsubscribe = wirePaneFocusOwnershipInvalidation(store)
+    store.dispatch(initLayout({ tabId: 'tab-2', paneId: 'pa', content: { kind: 'terminal', mode: 'shell' } }))
+    document.body.innerHTML = `<div data-pane-id="pa"></div><input id="chrome">`
+    ;(document.getElementById('chrome') as HTMLInputElement).focus()
+    recordPaneFocusBeforeUnmount('pa')
+    expect(shouldFocusPaneOnEligibleMount('pa')).toBe(false)
+    // A newer explicit selection voids the stale record for future mounts.
+    store.dispatch(setActivePane({ tabId: 'tab-2', paneId: 'pb', focusNudge: true }))
+    expect(shouldFocusPaneOnEligibleMount('pa')).toBe(true)
+  })
+
+  it('epoch-entry REMOVAL (closePane/removeLayout cleanup) is not selection activity', async () => {
+    const store = configureStore({ reducer: { panes: panesReducer } })
+    unsubscribe = wirePaneFocusOwnershipInvalidation(store)
+    store.dispatch(initLayout({ tabId: 'tab-c', paneId: 'pc', content: { kind: 'terminal', mode: 'shell' } }))
+    store.dispatch(setActivePane({ tabId: 'tab-c', paneId: 'pc', focusNudge: true })) // pc now HAS an epoch entry
+    store.dispatch(initLayout({ tabId: 'tab-d', paneId: 'pd', content: { kind: 'terminal', mode: 'shell' } }))
+    document.body.innerHTML = `<div data-pane-id="pd"><input placeholder="Enter URL..."></div>`
+    const url = document.querySelector('input') as HTMLInputElement
+    url.focus()
+    recordPaneFocusBeforeUnmount('pd')
+    document.body.innerHTML = `<div data-pane-id="pd"><input placeholder="Enter URL..."></div>`
+    schedulePaneFocusRestore('pd')
+    // Cleanup deletes pc's epoch entry — must NOT void pd's restore.
+    store.dispatch(removeLayout({ tabId: 'tab-c' }))
+    await waitFor(() => expect(isPaneFocusRestorePendingForTests('pd')).toBe(false))
+    expect(document.querySelector('input')).toHaveFocus()
+  })
+
   it('trims the OLDEST entries beyond the cap instead of wiping the map', () => {
     const outside = document.createElement('input')
     document.body.appendChild(outside)

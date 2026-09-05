@@ -135,7 +135,14 @@ export function recordPaneFocusBeforeUnmount(paneId: string): void {
  *  created panes) focus as before; a remounted pane only re-focuses if it
  *  owned focus before its previous unmount. */
 export function shouldFocusPaneOnEligibleMount(paneId: string): boolean {
-  return recordByPaneId.get(paneId)?.owned !== false
+  const record = recordByPaneId.get(paneId)
+  if (!record) return true
+  // A selection newer than the record voids it for adoption: the pane mounts
+  // fresh under a new selection context (e.g. a close-promoted sibling that
+  // is already Redux-active — no flip transition will ever run), so apply
+  // unknown-pane semantics. In-flight pending windows keep their record.
+  if (!record.restorePending && record.serialAtRecord !== paneSelectionSerial) return true
+  return record.owned !== false
 }
 
 /** Post-mount restore: re-resolve the recorded inner element inside the
@@ -197,7 +204,23 @@ export function schedulePaneFocusRestore(paneId: string): () => void {
       // record was taken WINS: do not drag focus back to this pane.
       if (record && record.serialAtRecord !== paneSelectionSerial) return
       const el = resolveRecordedFocusTarget(paneId)
-      if (el?.isConnected) el.focus()
+      if (!el?.isConnected) return
+      // DOM-level supersedence: focus that landed somewhere CONCRETE since
+      // the teardown — another pane (e.g. an activating user split's new
+      // pane autofocus, which the Redux serial cannot see because the record
+      // was taken after the reassignment), a picker, app chrome the user
+      // clicked — is not ours to yank back. Only body-level (truly lost)
+      // focus, or focus still inside this pane's subtree, may be restored.
+      const root = el.closest('[data-pane-id]')
+      const active = document.activeElement
+      if (
+        active instanceof HTMLElement
+        && active !== document.body
+        && active.closest('[data-pane-id]') !== root
+      ) {
+        return
+      }
+      el.focus()
     }, 0)
   })
   return () => {
@@ -237,17 +260,17 @@ function mapChangedExistingValue(
   return false
 }
 
-/** True when `next` differs from `prev` on ANY key. Used for the focus-epoch
- *  map: every write there comes from an explicit select fold (nudge), so even
- *  a first-touch addition is genuine selection activity. */
+/** True when `next` ADDS or CHANGES any entry. Used for the focus-epoch map:
+ *  every write there comes from an explicit select fold (nudge), while
+ *  REMOVALS are lifecycle cleanup (closePane/removeLayout prune entries) and
+ *  must not masquerade as selection activity. */
 function mapChangedAnyEntry(
   prev: Record<string, number> | undefined,
   next: Record<string, number> | undefined,
 ): boolean {
   if (prev === next) return false
-  const keys = new Set([...Object.keys(prev ?? {}), ...Object.keys(next ?? {})])
-  for (const key of keys) {
-    if (prev?.[key] !== next?.[key]) return true
+  for (const key of Object.keys(next ?? {})) {
+    if (prev?.[key] !== next![key]) return true
   }
   return false
 }
