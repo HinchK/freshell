@@ -1889,6 +1889,20 @@ export const panesSlice = createSlice({
       state.zoomedPane = {}
       state.refreshRequestsByPane = {}
       state.restoreFallbackAttemptsByPane = {}
+      // Focus epochs are ephemeral select bookkeeping: prune entries of panes
+      // no longer present after the merge — unlike closePane/removeLayout,
+      // hydration can drop leaves wholesale (cross-device removals), otherwise
+      // one stale entry per remotely-removed explicitly-selected pane persists
+      // for the page lifetime and inflates every epoch-map update.
+      if (state.focusEpochByPaneId) {
+        const live = new Set<string>()
+        for (const root of Object.values(mergedLayouts)) {
+          for (const leaf of collectLeaves(root)) live.add(leaf.id)
+        }
+        for (const id of Object.keys(state.focusEpochByPaneId)) {
+          if (!live.has(id)) delete state.focusEpochByPaneId[id]
+        }
+      }
       state.deadSessionAdjudication = []
       state.reconcileWarming = null
       state.reconcilePendingPanes = {}

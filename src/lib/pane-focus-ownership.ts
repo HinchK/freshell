@@ -31,6 +31,10 @@ export interface PaneFocusRecord {
   /** Selection serial at record time; a restore skips if any explicit
    *  pane-selection activity landed since (newer selection wins). */
   serialAtRecord?: number
+  /** True when DOM focus already sat on document.body at teardown (the user
+   *  left the pane for nothing focusable). A later eligible mount honoring a
+   *  non-owned record preserves that choice — see shouldFocusPaneOnEligibleMount. */
+  bodyFocusAtRecord?: boolean
   /** Set while a mount-window restore for this pane is scheduled but has not
    *  fired. During that window a teardown must NOT overwrite the descriptor:
    *  the intermediate remount's own autofocus artifact (or blank focus) is
@@ -116,6 +120,11 @@ export function recordPaneFocusBeforeUnmount(paneId: string): void {
     owned,
     selector: owned && active instanceof HTMLElement ? describeInnerSelector(active, root) : null,
     serialAtRecord: paneSelectionSerial,
+    // "Focus was ALREADY on body at teardown" means the user deliberately left
+    // the pane for nothing focusable — their choice should survive a remount.
+    // Distinct from "body because teardown destroyed the focused element",
+    // which is only visible at read time.
+    bodyFocusAtRecord: !owned && active === document.body,
   })
   // Bound growth across long sessions (closed panes leave stale entries):
   // evict the OLDEST entries (Maps iterate in insertion order). Never wipe
@@ -142,6 +151,18 @@ export function shouldFocusPaneOnEligibleMount(paneId: string): boolean {
   // is already Redux-active — no flip transition will ever run), so apply
   // unknown-pane semantics. In-flight pending windows keep their record.
   if (!record.restorePending && record.serialAtRecord !== paneSelectionSerial) return true
+  if (record.owned === false && !record.restorePending
+    && !record.bodyFocusAtRecord
+    && document.activeElement === document.body) {
+    // Focus STRANDED on body (the focused element was destroyed with the old
+    // subtree — e.g. closing the active pane promoted THIS sibling, whose
+    // teardown record necessarily ran after the activePane reassignment). An
+    // eligible mount claiming stranded focus is the least-surprise behavior;
+    // an eligible pane that never adopts focus strands keyboard input
+    // permanently. bodyFocusAtRecord distinguishes this from a deliberate
+    // user click onto nothing (record taken with body already focused).
+    return true
+  }
   return record.owned !== false
 }
 
@@ -211,13 +232,16 @@ export function schedulePaneFocusRestore(paneId: string): () => void {
       // was taken after the reassignment), a picker, app chrome the user
       // clicked — is not ours to yank back. Only body-level (truly lost)
       // focus, or focus still inside this pane's subtree, may be restored.
-      const root = el.closest('[data-pane-id]')
+      const rootId = el.closest('[data-pane-id]')?.getAttribute('data-pane-id')
       const active = document.activeElement
       if (
         active instanceof HTMLElement
         && active !== document.body
-        && active.closest('[data-pane-id]') !== root
+        && active.closest('[data-pane-id]')?.getAttribute('data-pane-id') !== rootId
       ) {
+        // NB: pane shells and inner content roots both carry the same
+        // data-pane-id; compare IDS, not element identity — focus inside the
+        // same pane's nested roots is not supersedence.
         return
       }
       el.focus()

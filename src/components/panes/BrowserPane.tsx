@@ -460,6 +460,12 @@ export default function BrowserPane({
     if (urlRef.current) rootRef.current?.focus()
     else inputRef.current?.focus()
   }, [focusEligible, mayFocusNow])
+  // The nested-document lock follows actual focus-permission, not just Redux
+  // eligibility: an ownership-denied REMOUNT of an active pane (MCP split of
+  // a browser pane while the user works in app chrome) renders an UNLOCKED
+  // iframe whose page scripts/autofocus could hoist it to activeElement, and
+  // the app-wide guard only rebuffs LOCKED frames.
+  const iframeFocusLocked = !focusEligible || !mayFocusNow()
 
   useEffect(() => {
     if (!refreshRequest) return
@@ -611,7 +617,7 @@ export default function BrowserPane({
               // the app-wide focus-steal guard rebuffs. Removing inert on
               // eligibility flip does not reload the iframe (attribute only,
               // src untouched).
-              {...(focusEligible ? {} : ({ inert: '', 'data-focus-locked': 'true' } as Record<string, string>))}
+              {...(iframeFocusLocked ? ({ inert: '', 'data-focus-locked': 'true' } as Record<string, string>) : {})}
               onLoad={() => setIsLoading(false)}
               onError={() => {
                 setIsLoading(false)

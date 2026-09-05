@@ -176,6 +176,11 @@ export default function ExtensionPane({ paneId, content, focusEligible = true, f
     if (!mayFocusNow()) return
     iframe.focus()
   }, [focusEligible, iframeRenderable, mayFocusNow])
+  // The lock follows actual focus-permission (not just Redux eligibility):
+  // an ownership-denied remount of an active extension pane (MCP split while
+  // the user is in app chrome) must not expose an unlocked iframe to
+  // page-script focus hoists — the guard only rebuffs LOCKED frames.
+  const iframeFocusLocked = !focusEligible || !mayFocusNow()
 
   // Reset load error on retry
   useEffect(() => {
@@ -251,7 +256,7 @@ export default function ExtensionPane({ paneId, content, focusEligible = true, f
       // inert blocks outside focus entry but NOT a script inside the nested
       // document hoisting the iframe (Chromium-verified); data-focus-locked
       // arms the app-wide focus-steal guard's rebuff for that case.
-      {...(focusEligible ? {} : ({ inert: '', 'data-focus-locked': 'true' } as Record<string, string>))}
+      {...(iframeFocusLocked ? ({ inert: '', 'data-focus-locked': 'true' } as Record<string, string>) : {})}
     />
   )
 }

@@ -322,6 +322,46 @@ describe('pane-focus-ownership', () => {
     expect(document.querySelector('input')).toHaveFocus()
   })
 
+  it('close-promotion REAL ordering: record AFTER the activePane reassignment still adopts stranded body focus', () => {
+    const store = configureStore({ reducer: { panes: panesReducer } })
+    unsubscribe = wirePaneFocusOwnershipInvalidation(store)
+    store.dispatch(initLayout({ tabId: 'tab-3', paneId: 'pa', content: { kind: 'terminal', mode: 'shell' } }))
+    document.body.innerHTML = `<div data-pane-id="pa"><input id="ua"></div><div data-pane-id="pb"></div>`
+    ;(document.getElementById('ua') as HTMLElement).focus()
+    // User closes the ACTIVE pane: Redux reassigns activePane FIRST…
+    store.dispatch(setActivePane({ tabId: 'tab-3', paneId: 'pb' }))
+    // …then React's teardown records (post-reassignment serial — the record
+    // CANNOT rely on serial supersession here).
+    recordPaneFocusBeforeUnmount('pa')
+    recordPaneFocusBeforeUnmount('pb')
+    expect(shouldFocusPaneOnEligibleMount('pb')).toBe(false)
+    // The old subtree disappears; focus strands on body.
+    document.body.innerHTML = `<div data-pane-id="pb"></div>`
+    expect(document.activeElement).toBe(document.body)
+    // An eligible mount claims stranded focus — otherwise keyboard input has no home.
+    expect(shouldFocusPaneOnEligibleMount('pb')).toBe(true)
+  })
+
+  it('a record taken with body ALREADY focused denies later adoption (user left for nothing by choice)', () => {
+    document.body.innerHTML = `<div data-pane-id="pe"><input id="in-pe"></div>`
+    const inside = document.getElementById('in-pe') as HTMLElement
+    inside.focus()
+    inside.blur() // jsdom: activeElement falls back to body
+    expect(document.activeElement).toBe(document.body)
+    recordPaneFocusBeforeUnmount('pe')
+    expect(shouldFocusPaneOnEligibleMount('pe')).toBe(false)
+  })
+
+  it('restore is NOT superseded by focus moving within the SAME pane id (shell/inner roots share the id)', async () => {
+    document.body.innerHTML = `<div data-pane-id="p40"><button aria-label="Split">s</button><div data-pane-id="p40"><input id="inner"></div></div>`
+    ;(document.querySelector('button') as HTMLElement).focus()
+    recordPaneFocusBeforeUnmount('p40')
+    document.body.innerHTML = `<div data-pane-id="p40"><button aria-label="Split">s</button><div data-pane-id="p40"><input id="inner"></div></div>`
+    ;(document.getElementById('inner') as HTMLElement).focus()
+    schedulePaneFocusRestore('p40')
+    await waitFor(() => expect(document.querySelector('button')).toHaveFocus())
+  })
+
   it('trims the OLDEST entries beyond the cap instead of wiping the map', () => {
     const outside = document.createElement('input')
     document.body.appendChild(outside)

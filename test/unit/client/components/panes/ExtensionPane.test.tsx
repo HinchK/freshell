@@ -95,6 +95,19 @@ describe('ExtensionPane focus gating (agent focus neutrality)', () => {
     expect(document.activeElement).toBe(iframe)
   })
 
+  it('locks the iframe on an ownership-DENIED eligible remount (active pane, user in app chrome)', () => {
+    const first = renderPane(true)
+    const chrome = document.createElement('input')
+    document.body.appendChild(chrome)
+    chrome.focus()
+    first.unmount()
+    renderPane(true)
+    const iframe = document.querySelector('iframe') as HTMLIFrameElement
+    expect(iframe.hasAttribute('inert')).toBe(true)
+    expect(iframe.getAttribute('data-focus-locked')).toBe('true')
+    expect(chrome).toHaveFocus()
+  })
+
   it('removes inert and focuses the iframe on a false→true eligibility flip, without reload', () => {
     const { rerenderWith } = renderPane(false)
     const iframe = document.querySelector('iframe') as HTMLIFrameElement

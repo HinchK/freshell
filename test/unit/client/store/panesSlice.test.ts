@@ -2131,6 +2131,33 @@ describe('panesSlice', () => {
   })
 
   describe('hydratePanes', () => {
+    it('prunes focus-epoch entries for panes dropped by the merged layouts', () => {
+      let state = panesReducer(
+        initialState,
+        initLayout({ tabId: 'tab-x', paneId: 'keep', content: { kind: 'terminal', mode: 'shell' } })
+      )
+      state = panesReducer(state, setActivePane({ tabId: 'tab-x', paneId: 'keep', focusNudge: true }))
+      state = panesReducer(state, setActivePane({ tabId: 'tab-x', paneId: 'remote-gone', focusNudge: true }))
+      expect(state.focusEpochByPaneId?.['keep']).toBe(1)
+      expect(state.focusEpochByPaneId?.['remote-gone']).toBe(1)
+
+      const incoming: PanesState = {
+        layouts: {
+          // Cross-device sync dropped 'remote-gone'; only 'keep' survives.
+          'tab-x': { type: 'leaf', id: 'keep', content: { kind: 'terminal', mode: 'shell' } },
+        },
+        activePane: { 'tab-x': 'keep' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+      }
+      state = panesReducer(state, hydratePanes(incoming))
+      expect(state.focusEpochByPaneId?.['keep']).toBe(1)
+      expect(state.focusEpochByPaneId?.['remote-gone']).toBeUndefined()
+    })
+
     it('restores persisted state', () => {
       const savedState: PanesState = {
         layouts: {

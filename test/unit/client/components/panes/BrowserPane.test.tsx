@@ -699,6 +699,23 @@ describe('BrowserPane', () => {
       expect(iframeAfter!.getAttribute('src')).toBe(srcBefore)
     })
 
+    it('locks the iframe on an ownership-DENIED eligible remount (active pane, user in app chrome)', () => {
+      const first = renderBrowserPane({ url: 'https://example.com' })
+      // Mount autofocus claims the pane root (own-focus); the user then moves
+      // to app chrome, so the teardown record is owned:false.
+      const chrome = document.createElement('input')
+      document.body.appendChild(chrome)
+      chrome.focus()
+      first.unmount()
+      const second = renderBrowserPane({ url: 'https://example.com' })
+      const iframe = document.querySelector('iframe')
+      expect(iframe!.hasAttribute('inert')).toBe(true)
+      expect(iframe!.getAttribute('data-focus-locked')).toBe('true')
+      // …and chrome keeps focus (no yank-back from the denied remount).
+      expect(chrome).toHaveFocus()
+      second.unmount()
+    })
+
     it('focuses the pane root on mount for a loaded pane that owns focus', () => {
       renderBrowserPane({ url: 'https://example.com' })
       const root = document.querySelector('[data-pane-id="pane-1"]')
