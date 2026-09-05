@@ -740,6 +740,23 @@ describe('BrowserPane', () => {
       second.unmount()
     })
 
+    it('pointerdown on a denied-remount pane UNLOCKS the iframe (click-to-wake recovery) without stealing focus', () => {
+      const first = renderBrowserPane({ url: 'https://example.com' })
+      const chrome = document.createElement('input')
+      document.body.appendChild(chrome)
+      chrome.focus()
+      first.unmount()
+      renderBrowserPane({ url: 'https://example.com' }) // denied remount → locked
+      const iframe = document.querySelector('iframe')!
+      expect(iframe.hasAttribute('inert')).toBe(true)
+      const root = iframe.closest('[data-pane-id="pane-1"]') as HTMLElement
+      fireEvent.pointerDown(root)
+      expect(iframe.hasAttribute('inert')).toBe(false)
+      expect(iframe.getAttribute('data-focus-locked')).toBeNull()
+      // Unlock does not yank focus — the browser default for the click does.
+      expect(chrome).toHaveFocus()
+    })
+
     it('focuses the pane root on mount for a loaded pane that owns focus', () => {
       renderBrowserPane({ url: 'https://example.com' })
       const root = document.querySelector('[data-pane-id="pane-1"]')

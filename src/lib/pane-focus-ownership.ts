@@ -31,10 +31,7 @@ export interface PaneFocusRecord {
   /** Selection serial at record time; a restore skips if any explicit
    *  pane-selection activity landed since (newer selection wins). */
   serialAtRecord?: number
-  /** True when DOM focus already sat on document.body at teardown (the user
-   *  left the pane for nothing focusable). A later eligible mount honoring a
-   *  non-owned record preserves that choice — see shouldFocusPaneOnEligibleMount. */
-  bodyFocusAtRecord?: boolean
+
   /** Set while a mount-window restore for this pane is scheduled but has not
    *  fired. During that window a teardown must NOT overwrite the descriptor:
    *  the intermediate remount's own autofocus artifact (or blank focus) is
@@ -120,11 +117,6 @@ export function recordPaneFocusBeforeUnmount(paneId: string): void {
     owned,
     selector: owned && active instanceof HTMLElement ? describeInnerSelector(active, root) : null,
     serialAtRecord: paneSelectionSerial,
-    // "Focus was ALREADY on body at teardown" means the user deliberately left
-    // the pane for nothing focusable — their choice should survive a remount.
-    // Distinct from "body because teardown destroyed the focused element",
-    // which is only visible at read time.
-    bodyFocusAtRecord: !owned && active === document.body,
   })
   // Bound growth across long sessions (closed panes leave stale entries):
   // evict the OLDEST entries (Maps iterate in insertion order). Never wipe
@@ -152,15 +144,14 @@ export function shouldFocusPaneOnEligibleMount(paneId: string): boolean {
   // unknown-pane semantics. In-flight pending windows keep their record.
   if (!record.restorePending && record.serialAtRecord !== paneSelectionSerial) return true
   if (record.owned === false && !record.restorePending
-    && !record.bodyFocusAtRecord
     && document.activeElement === document.body) {
-    // Focus STRANDED on body (the focused element was destroyed with the old
-    // subtree — e.g. closing the active pane promoted THIS sibling, whose
-    // teardown record necessarily ran after the activePane reassignment). An
-    // eligible mount claiming stranded focus is the least-surprise behavior;
-    // an eligible pane that never adopts focus strands keyboard input
-    // permanently. bodyFocusAtRecord distinguishes this from a deliberate
-    // user click onto nothing (record taken with body already focused).
+    // Focus STRANDED on body: the element that held focus is gone (the old
+    // subtree was destroyed) and typing has no destination. An eligible mount
+    // must claim it — an eligible pane that never adopts focus strands
+    // keyboard input permanently. The cost side (an agent remount stealing
+    // focus a user deliberately parked on nothing-focusable) is far rarer and
+    // far cheaper than stranded focus; the two cases are indistinguishable at
+    // record time (round-14 review), so stranding always wins.
     return true
   }
   return record.owned !== false

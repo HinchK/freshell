@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect, useLayoutEffect } from 'react'
+import { useState, useRef, useCallback, useEffect } from 'react'
 import { ArrowLeft, ArrowRight, RotateCcw, X, Wrench, Loader2 } from 'lucide-react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { consumePaneRefreshRequest, updatePaneContent } from '@/store/panesSlice'
@@ -11,6 +11,7 @@ import { registerBrowserActions } from '@/lib/pane-action-registry'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
 import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
+import { useIframeFocusLock } from '@/hooks/useIframeFocusLock'
 
 interface BrowserPaneProps {
   paneId: string
@@ -464,18 +465,11 @@ export default function BrowserPane({
   // eligibility: an ownership-denied REMOUNT of an active pane (MCP split of
   // a browser pane while the user works in app chrome) renders an UNLOCKED
   // iframe whose page scripts/autofocus could hoist it to activeElement, and
-  // the app-wide guard only rebuffs LOCKED frames.
-  // The adoption read must NOT happen during render: React renders the
-  // replacement subtree BEFORE the outgoing subtree's layout cleanups run
-  // (the ownership record is written in the cleanup), so a render-time read
-  // would latch "unknown → allowed" permanently. Compute the lock in a layout
-  // effect instead — deletions (and their records) commit before the new
-  // subtree's effects, so the record is present, and the state update applies
-  // before paint.
-  const [iframeFocusLocked, setIframeFocusLocked] = useState(() => !focusEligible)
-  useLayoutEffect(() => {
-    setIframeFocusLocked(!focusEligible || !mayFocusNow())
-  }, [focusEligible, mayFocusNow])
+  // the app-wide guard only rebuffs LOCKED frames. The adoption read must NOT
+  // happen during render (render precedes the outgoing subtree's cleanup that
+  // records ownership); the hook computes the lock post-commit and lifts it
+  // on a pointerdown inside the pane (user wake intent).
+  const iframeFocusLocked = useIframeFocusLock(rootRef, focusEligible, mayFocusNow)
 
   useEffect(() => {
     if (!refreshRequest) return

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, cleanup, waitFor, act } from '@testing-library/react'
+import { render, cleanup, waitFor, act, fireEvent } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import extensionsReducer, { updateServerStatus } from '@/store/extensionsSlice'
@@ -127,6 +127,21 @@ describe('ExtensionPane focus gating (agent focus neutrality)', () => {
     const iframe = document.querySelector('iframe') as HTMLIFrameElement
     expect(iframe.hasAttribute('inert')).toBe(true)
     expect(iframe.getAttribute('data-focus-locked')).toBe('true')
+    expect(chrome).toHaveFocus()
+  })
+
+  it('pointerdown on a denied-remount pane UNLOCKS the iframe (click-to-wake recovery)', () => {
+    const first = renderPane(true)
+    const chrome = document.createElement('input')
+    document.body.appendChild(chrome)
+    chrome.focus()
+    first.unmount()
+    const { container } = renderPane(true)
+    const iframe = container.querySelector('iframe') as HTMLIFrameElement
+    expect(iframe.hasAttribute('inert')).toBe(true)
+    fireEvent.pointerDown(container.querySelector('[data-pane-id="pane-1"]') as HTMLElement)
+    expect(iframe.hasAttribute('inert')).toBe(false)
+    expect(iframe.getAttribute('data-focus-locked')).toBeNull()
     expect(chrome).toHaveFocus()
   })
 

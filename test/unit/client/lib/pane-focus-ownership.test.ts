@@ -50,9 +50,9 @@ describe('pane-focus-ownership', () => {
     expect(shouldFocusPaneOnEligibleMount('p3')).toBe(true) // still unknown/default
   })
 
-  it('records "not owned" when nothing is focused (body)', () => {
-    document.body.innerHTML = `<div data-pane-id="p4"><input id="i4"></div>`
-    expect(document.activeElement).toBe(document.body)
+  it('records "not owned" when an element OUTSIDE the pane holds focus (chrome button)', () => {
+    document.body.innerHTML = `<div data-pane-id="p4"><input id="i4"></div><button id="chrome">New tab</button>`
+    ;(document.getElementById('chrome') as HTMLElement).focus()
     recordPaneFocusBeforeUnmount('p4')
     expect(shouldFocusPaneOnEligibleMount('p4')).toBe(false)
   })
@@ -342,14 +342,37 @@ describe('pane-focus-ownership', () => {
     expect(shouldFocusPaneOnEligibleMount('pb')).toBe(true)
   })
 
-  it('a record taken with body ALREADY focused denies later adoption (user left for nothing by choice)', () => {
+  it('an eligible mount with focus stranded on body adopts focus even when the record is owned:false (stranding always loses)', () => {
+    // Covers BOTH the deliberate "user clicked nowhere" and the split/close
+    // race where the sibling's teardown observes body after the closing pane's
+    // focused DOM vanished. The cases are indistinguishable at record time and
+    // stranding is strictly worse — adoption wins.
     document.body.innerHTML = `<div data-pane-id="pe"><input id="in-pe"></div>`
     const inside = document.getElementById('in-pe') as HTMLElement
     inside.focus()
     inside.blur() // jsdom: activeElement falls back to body
     expect(document.activeElement).toBe(document.body)
     recordPaneFocusBeforeUnmount('pe')
-    expect(shouldFocusPaneOnEligibleMount('pe')).toBe(false)
+    expect(shouldFocusPaneOnEligibleMount('pe')).toBe(true)
+  })
+
+  it('split/close RACE: sibling record written after the focused pane vanished still adopts (round-14)', () => {
+    const store = configureStore({ reducer: { panes: panesReducer } })
+    unsubscribe = wirePaneFocusOwnershipInvalidation(store)
+    store.dispatch(initLayout({ tabId: 'tab-r', paneId: 'pa', content: { kind: 'terminal', mode: 'shell' } }))
+    document.body.innerHTML = `<div data-pane-id="pa"><input id="ua"></div><div data-pane-id="pb"></div>`
+    ;(document.getElementById('ua') as HTMLElement).focus()
+    // Split A's pane (agent split of focused pane A), then immediately close A
+    recordPaneFocusBeforeUnmount('pa') // split commit teardown: still owned
+    store.dispatch(setActivePane({ tabId: 'tab-r', paneId: 'pa' })) // A stays active (agent split)
+    // ...close commit: reassignment runs before teardown (closePane folds)…
+    store.dispatch(setActivePane({ tabId: 'tab-r', paneId: 'pb' }))
+    // …and by the time B's teardown runs, A's focused DOM is ALREADY gone —
+    // the record observes body.
+    document.body.innerHTML = `<div data-pane-id="pb"></div>`
+    recordPaneFocusBeforeUnmount('pb')
+    expect(document.activeElement).toBe(document.body)
+    expect(shouldFocusPaneOnEligibleMount('pb')).toBe(true)
   })
 
   it('restore is NOT superseded by focus moving within the SAME pane id (shell/inner roots share the id)', async () => {
