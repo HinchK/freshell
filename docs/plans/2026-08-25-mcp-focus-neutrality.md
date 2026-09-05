@@ -2214,7 +2214,38 @@ wiring suite covers focusEpoch forwarding for ALL seven arms (terminal,
 fresh-agent, and the nested directory step joined browser/editor/picker/
 extension) — a dropped prop on any arm can no longer pass green.
 
+### Task 12 (post-hoc, landed): round-7 restore robustness — inactive-pane focus, burst atomicity, shell/leaf blind spots
+
+Added during Stage 5's delta-round-7 fix round (3 Major + 2 Minor).
+
+1. **Redux-inactive but DOM-focused panes** (M1): `Pane`'s shell is
+   keyboard-focusable and receiving focus via Tab does NOT update
+   `activePane`; an agent split of such a pane recorded `owned` at teardown
+   but the adoption-pending replacement skipped both default focus AND the
+   restore, dropping the user to body. The mount-window restore is now
+   RECORD-driven (`schedulePaneFocusRestore` in `pane-focus-ownership.ts`),
+   independent of adoption state, with a `.tab-hidden` visibility guard so
+   background-tab remounts never pull focus.
+2. **Burst split atomicity** (M2): a scheduled restore marks its record
+   restore-pending; teardown during the window skips overwrite (the
+   intermediate frame's focus is blank or the remount's own autofocus
+   artifact — never the user's), so rapid sequential agent splits keep the
+   pre-split descriptor. Pending clears when the restore fires.
+3. **Shell/leaf blind spots** (M3): the pane shell itself is now
+   describable (`:scope` sentinel when focus was on the root), and the
+   candidate chain gained a `data-context` fallback after `title`.
+
+Minors: the descriptor-candidate test now actually reaches `title` (the
+prior iframe test had two resolution paths and always took the earlier one);
+and the Task-5 `focus-neutrality documentation` prose-containment describe in
+`freshell-tool.test.ts` is DELETED per the repo rule that prose/doc
+containment does not qualify as behavioral coverage (pre-existing doc-string
+tests elsewhere are untouched — out of scope).
+
 ## Fresh Eyes record
+
+- **Delta round 7 (Codex, independent; base 5b8717017): FAILED — 3 Major + 2 Minor**, all assessed valid and fixed: (1 Major) split of a DOM-focused but Redux-inactive pane dropped focus to body → record-driven restore independent of adoption + `.tab-hidden` guard (Task 12.1); (2 Major) consecutive splits overwrote the descriptor with intermediate autofocus artifacts → restore-pending non-overwrite window (Task 12.2); (3 Major) pane-shell focus was not representable (querySelectorAll never matches root) → `:scope` sentinel + `data-context` fallback (Task 12.3); (1 Minor) title-candidate coverage pin tightened; (2 Minor) prose-containment test block deleted per repo policy.
+  Runner report: `.worktrees/.the-usual-logs/mcp-focus-neutrality/review-logs/usual-fresheyes-20260905T011958Z-1346781.md`
 
 - **Delta round 6 (Codex, independent; base 5b8717017): FAILED — 3 Major + 2 Minor**, all assessed valid and fixed: (1 Major) stale `editorRef` on monaco unmount — flip called a disposed editor instead of the root fallback → `editorRendered` tracking + ref clear (Task 11.1); (2 Major) async Monaco onMount autofocus stomped the mount-window descriptor restore → `handleEditorMount` skips its adoption focus when a recorded descriptor resolves (Task 11.2); (3 Major) descriptor could not represent a focused embedded iframe (or title-only controls) → ordered unique-resolving candidates incl. sole-iframe and title, with BrowserPane embedded-page restore pinned (Task 11.3); (1 Minor) refresh-then-evict LRU defect at the 512 cap (re-recording did not refresh insertion order) → delete-then-set + pin; (2 Minor) wiring suite's "every content arm" missed terminal/fresh-agent/directory epoch forwarding → all seven arms pinned.
   Runner report: `.worktrees/.the-usual-logs/mcp-focus-neutrality/review-logs/usual-fresheyes-20260905T004703Z-4055432.md`
