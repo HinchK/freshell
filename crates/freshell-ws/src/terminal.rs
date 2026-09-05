@@ -224,6 +224,7 @@ pub async fn run(
     pane_reconcile_v1: bool,
     pane_reconcile_fresh_agent_v1: bool,
     origin_kind: &'static str,
+    terminal_interest_v1: bool,
 ) {
     let (ws_tx, ws_rx) = socket.split();
 
@@ -263,6 +264,7 @@ pub async fn run(
         pane_reconcile_fresh_agent_v1,
         conn_id,
         origin_kind,
+        terminal_interest_v1,
     )
     .instrument(span)
     .await;
@@ -283,6 +285,7 @@ async fn run_loop(
     pane_reconcile_fresh_agent_v1: bool,
     conn_id: u64,
     origin_kind: &'static str,
+    terminal_interest_v1: bool,
 ) {
     // One independently supervised socket writer. The read/dispatch path
     // never awaits socket capacity; output is reconsidered one frame at a time.
@@ -299,6 +302,9 @@ async fn run_loop(
         state.term09.queue_max_bytes.max(64 * 1024),
         write_timeout,
     );
+    if terminal_interest_v1 {
+        ws_tx.enable_terminal_interest();
+    }
     let mut writer_task = tokio::spawn(writer.run(socket_tx).instrument(tracing::Span::current()));
     let _writer_lifetime = connection_writer::AbortWriterOnDrop(writer_task.abort_handle());
     let mut writer_finished = false;
@@ -795,6 +801,23 @@ async fn handle_client_text(
     let Ok(message) = serde_json::from_value::<ClientMessage>(value) else {
         return true;
     };
+    match &message {
+        ClientMessage::TerminalAttach(attach)
+            if terminal_dims_in_range(attach.cols, attach.rows) =>
+        {
+            ws_tx.set_attachment_priority(
+                &attach.terminal_id,
+                matches!(
+                    attach.priority.as_ref(),
+                    Some(freshell_protocol::TerminalAttachPriority::Background)
+                ),
+            );
+        }
+        ClientMessage::TerminalDetach(detach) => {
+            ws_tx.discard_terminal_delivery(&detach.terminal_id)
+        }
+        _ => {}
+    }
     // Capability refusal table (Task 2 of the approval-respond run; the silent-drop
     // fix of bug-hunt pbh-20260807): the fresh-agent control frames (approval.respond
     // / question.respond / fork / compact) that hit a genuinely unsupported provider x
@@ -807,6 +830,27 @@ async fn handle_client_text(
         return send(ws_tx, &reply).await;
     }
     match message {
+        ClientMessage::TerminalInterest(interest) => match ws_tx.set_terminal_interest(&interest) {
+            Ok(()) => true,
+            Err(message) => {
+                send(
+                    ws_tx,
+                    &ServerMessage::Error(ErrorMsg {
+                        code: ErrorCode::InvalidMessage,
+                        message: message.to_string(),
+                        timestamp: crate::now_iso(),
+                        request_id: None,
+                        terminal_id: None,
+                        actual_session_ref: None,
+                        expected_session_ref: None,
+                        retry_after_ms: None,
+                        terminal_exit_code: None,
+                        live_terminal_id: None,
+                    }),
+                )
+                .await
+            }
+        },
         // SAFE-08: structured restore-diagnostic record, parity with
         // server/ws-handler.ts:1901-1915's `client_restore_unavailable`
         // session-lifecycle event. Server-side this is a PURE diagnostic --

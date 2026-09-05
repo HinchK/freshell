@@ -1,7 +1,10 @@
 //! One socket writer, independent of command dispatch. No socket I/O is awaited
 //! by a handler. Readiness/mode preludes and output are admitted under ONE lock,
 //! preventing a replay frame from racing ahead of its prelude. Output remains
-//! FIFO (including terminal.exit), with the existing explicit overflow gaps.
+//! FIFO within each terminal (including terminal.exit), with explicit overflow
+//! gaps. Cross-terminal scheduling uses focused/visible/background byte fairness
+//! (connection-local presentation interest; scheduling never edits terminal
+//! bytes and never attaches, resizes, spawns, or kills execution).
 //!
 //! Each write leases only ONE queued frame. Output already handed to the socket
 //! is still included in pressure accounting until its flush finishes. Cancelling
@@ -18,8 +21,14 @@ use std::time::Duration;
 
 use axum::extract::ws::{CloseFrame, Message};
 use freshell_protocol::ServerMessage;
-use freshell_terminal::output_queue::{output_frame_meta, OutputQueue};
+#[path = "terminal_delivery_queue.rs"]
+mod delivery;
+#[path = "terminal_interest.rs"]
+mod terminal_interest;
+use delivery::{Delivery, DeliveryQueue, Range};
+use freshell_terminal::output_queue::output_frame_meta;
 use futures_util::{Sink, SinkExt};
+use terminal_interest::InterestState;
 use tokio::sync::{oneshot, watch, Notify};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,6 +38,7 @@ pub(crate) enum WriterExit {
     SendTimedOut,
     ControlOverflow,
     SerializationFailed,
+    OutputCapacityExceeded,
 }
 
 impl WriterExit {
@@ -39,12 +49,13 @@ impl WriterExit {
             Self::SendTimedOut => "writer_stalled",
             Self::ControlOverflow => "control_backpressure",
             Self::SerializationFailed => "serialization_error",
+            Self::OutputCapacityExceeded => "output_capacity_exceeded",
         }
     }
 
     pub(super) fn close_code(self) -> Option<u16> {
         match self {
-            Self::SendTimedOut | Self::ControlOverflow => Some(4008),
+            Self::SendTimedOut | Self::ControlOverflow | Self::OutputCapacityExceeded => Some(4008),
             Self::SerializationFailed => Some(1011),
             _ => None,
         }
@@ -82,7 +93,8 @@ struct Control {
 const CONTROL_STREAK_LIMIT: usize = 8;
 
 struct Queues {
-    output: OutputQueue,
+    output: DeliveryQueue<Message>,
+    interest: InterestState,
     controls: VecDeque<Control>,
     // Includes a control frame currently being flushed, not just queued frames.
     control_bytes: usize,
@@ -119,18 +131,12 @@ pub(super) struct WriterPump {
 }
 
 struct NextFrame {
-    /// Control frames arrive wire-ready; output frames carry their
-    /// `ServerMessage` so serialization happens AFTER the queue lock is
-    /// released (the PTY reader and dispatch both contend on it).
-    frame: LeasedFrame,
+    /// Wire-ready frame. Gap deliveries are materialized into a
+    /// `terminal.output.gap` message at lease time.
+    frame: Message,
     output_bytes: usize,
     control_bytes: usize,
     flushed: Option<oneshot::Sender<()>>,
-}
-
-enum LeasedFrame {
-    Control(Message),
-    Output(Box<ServerMessage>),
 }
 
 impl WriterSender {
@@ -142,7 +148,8 @@ impl WriterSender {
         let (stop_tx, stop_rx) = watch::channel(None);
         let shared = Arc::new(Shared {
             queues: Mutex::new(Queues {
-                output: OutputQueue::new(output_limit),
+                output: DeliveryQueue::new(output_limit, metadata_limit(output_limit)),
+                interest: InterestState::default(),
                 controls: VecDeque::new(),
                 control_bytes: 0,
                 in_flight_output_bytes: 0,
@@ -257,11 +264,11 @@ impl WriterSender {
         };
         let meta = output_frame_meta(&msg);
         let exit = matches!(&msg, ServerMessage::TerminalExit(_));
-        // Serialized once here for byte measurement and again by the pump at
-        // lease time: the queue stores the typed message so freshell-terminal
-        // stays wire-format-free. Carrying the JSON through would halve the
-        // serialization work on the hot output path but couples that crate to
-        // wire framing — deferred as a measured optimization, not a guess.
+        // Serialized exactly once, at admission: the delivery queue stores wire
+        // frames, because byte cost and class fairness are admission-time
+        // properties and scheduling treats payloads as opaque. (This supersedes
+        // the typed-message queue's lease-time serialization, which measured at
+        // push and re-serialized at every lease.)
         let json = match serde_json::to_string(&msg) {
             Ok(json) => json,
             Err(_) => {
@@ -278,17 +285,119 @@ impl WriterSender {
         if queues.closed {
             return false;
         }
+        let seq = queues.next_seq;
+        queues.next_seq += 1;
+        let bytes = json.len();
         if let Some(meta) = meta {
-            let seq = queues.next_seq;
-            queues.next_seq += 1;
-            queues.output.push_stamped(msg, json.len(), meta, seq);
+            let range = Range {
+                stream_id: meta.stream_id,
+                attach_request_id: meta.attach_request_id,
+                from_seq: meta.seq_start,
+                to_seq: meta.seq_end,
+            };
+            let priority = queues.interest.priority(&meta.terminal_id);
+            if queues
+                .output
+                .push(
+                    &meta.terminal_id,
+                    priority,
+                    Message::Text(json.into()),
+                    bytes,
+                    Some(range),
+                    seq,
+                )
+                .is_err()
+            {
+                drop(queues);
+                self.fail(WriterExit::OutputCapacityExceeded);
+                return false;
+            }
         } else {
             // Preserve final-output -> exit. It must not use the control lane.
-            queues.output.push_sequenced(msg);
+            let ServerMessage::TerminalExit(exit) = msg else {
+                unreachable!("sequenced exit only")
+            };
+            let priority = queues.interest.priority(&exit.terminal_id);
+            // Sequenced exits are zero-weight, exactly as legacy queued them:
+            // they can never force an eviction nor close the connection, and
+            // they still cost one service unit per frame (count-bounded by
+            // the metadata limit).
+            if queues
+                .output
+                .push(
+                    &exit.terminal_id,
+                    priority,
+                    Message::Text(json.into()),
+                    0,
+                    None,
+                    seq,
+                )
+                .is_err()
+            {
+                drop(queues);
+                self.fail(WriterExit::OutputCapacityExceeded);
+                return false;
+            }
+            // A dead terminal never needs its attach fallback again.
+            queues.interest.detach(&exit.terminal_id);
         }
         drop(queues);
         self.shared.ready.notify_one();
         true
+    }
+
+    pub(super) fn enable_terminal_interest(&self) {
+        self.shared
+            .queues
+            .lock()
+            .expect("writer queue lock")
+            .interest
+            .enable();
+    }
+
+    /// Apply one full presentation-interest snapshot. A rejected snapshot is
+    /// returned without replacing the last accepted state; scheduling changes
+    /// are queued-data-only (no attach, resize, spawn, or kill).
+    pub(super) fn set_terminal_interest(
+        &self,
+        snapshot: &freshell_protocol::client_messages::TerminalInterest,
+    ) -> Result<(), &'static str> {
+        let mut queues = self.shared.queues.lock().expect("writer queue lock");
+        if queues.closed {
+            return Err("Connection writer is closed");
+        }
+        if queues.interest.apply(snapshot)? {
+            let Queues {
+                output, interest, ..
+            } = &mut *queues;
+            output.update_priorities(|id| interest.priority(id));
+        }
+        drop(queues);
+        self.shared.ready.notify_one();
+        Ok(())
+    }
+
+    /// Pre-snapshot fallback: a client that never negotiated terminalInterestV1
+    /// still gets its declared `terminal.attach.priority` honored.
+    pub(super) fn set_attachment_priority(&self, terminal_id: &str, background: bool) {
+        let mut queues = self.shared.queues.lock().expect("writer queue lock");
+        if queues.closed {
+            return;
+        }
+        queues.interest.attach(terminal_id, background);
+        let Queues {
+            output, interest, ..
+        } = &mut *queues;
+        output.update_priorities(|id| interest.priority(id));
+    }
+
+    /// Detach drops this connection's queued delivery AND its fallback
+    /// attachment priority. The next attach sets its own fallback before its
+    /// replay is admitted.
+    pub(super) fn discard_terminal_delivery(&self, terminal_id: &str) {
+        let mut queues = self.shared.queues.lock().expect("writer queue lock");
+        queues.output.discard_terminal(terminal_id);
+        queues.interest.detach(terminal_id);
     }
 
     pub(super) fn queue_ping(&self) -> Result<oneshot::Receiver<()>, WriterExit> {
@@ -332,6 +441,13 @@ impl Sink<Message> for WriterSender {
     }
 }
 
+// Count-bound metadata independently of the wire-byte budget. Gap metadata
+// and zero-byte sequenced controls (terminal.exit) cannot form an unbounded
+// queue.
+fn metadata_limit(output_limit: usize) -> usize {
+    (output_limit / 64).clamp(64, 262_144)
+}
+
 fn frame_bytes(frame: &Message) -> usize {
     match frame {
         Message::Text(text) => text.len(),
@@ -352,7 +468,10 @@ impl WriterPump {
         // Fairness never reorders a control behind output that was admitted
         // AFTER it (a prelude must stay ahead of its replay): only output
         // stamped strictly before the oldest pending control may leapfrog.
-        // Gap/exit heads carry no stamp and never leapfrog.
+        // Gap heads carry no stamp and never leapfrog; sequenced exits DO
+        // keep their admission stamp and may leapfrog a control streak —
+        // admission order (and hence exit-behind-final-output within a
+        // terminal) is preserved either way.
         let output_may_leapfrog = match (queues.output.front_stamp(), queues.controls.front()) {
             (Some(stamp), Some(control)) => stamp < control.seq,
             (Some(_), None) => true,
@@ -363,16 +482,35 @@ impl WriterPump {
                 || (queues.controls_since_last_output >= CONTROL_STREAK_LIMIT
                     && output_may_leapfrog));
         if take_output {
-            let Some((msg, bytes)) = queues.output.pop_front() else {
+            let Some(delivery) = queues.output.pop() else {
                 return Ok(None);
+            };
+            let (frame, bytes) = match delivery {
+                Delivery::Frame { payload, bytes } => (payload, bytes),
+                Delivery::Gap { terminal_id, range } => {
+                    let message =
+                        ServerMessage::TerminalOutputGap(freshell_protocol::TerminalOutputGap {
+                            terminal_id,
+                            stream_id: range.stream_id,
+                            attach_request_id: range.attach_request_id,
+                            from_seq: range.from_seq,
+                            to_seq: range.to_seq,
+                            reason: freshell_protocol::TerminalOutputGapReason::QueueOverflow,
+                        });
+                    let json = serde_json::to_string(&message)
+                        .map_err(|_| WriterExit::SerializationFailed)?;
+                    let bytes = json.len();
+                    (Message::Text(json.into()), bytes)
+                }
             };
             // The leased frame stays charged to the budget until its flush
             // finishes (or the writer dies); the rest of the backlog remains
             // queued and accounted.
             queues.in_flight_output_bytes = bytes;
+            queues.output.set_reserved_bytes(bytes);
             queues.controls_since_last_output = 0;
             return Ok(Some(NextFrame {
-                frame: LeasedFrame::Output(Box::new(msg)),
+                frame,
                 control_bytes: 0,
                 output_bytes: bytes,
                 flushed: None,
@@ -381,7 +519,7 @@ impl WriterPump {
         if let Some(control) = queues.controls.pop_front() {
             queues.controls_since_last_output += 1;
             return Ok(Some(NextFrame {
-                frame: LeasedFrame::Control(control.frame),
+                frame: control.frame,
                 control_bytes: control.bytes,
                 output_bytes: 0,
                 flushed: control.flushed,
@@ -394,6 +532,8 @@ impl WriterPump {
         let mut queues = self.shared.queues.lock().expect("writer queue lock");
         queues.control_bytes = queues.control_bytes.saturating_sub(control_bytes);
         queues.in_flight_output_bytes = queues.in_flight_output_bytes.saturating_sub(output_bytes);
+        let reserved = queues.in_flight_output_bytes;
+        queues.output.set_reserved_bytes(reserved);
     }
 
     /// Generic over the real transport so tests can stop a flush at a precise
@@ -436,17 +576,6 @@ impl WriterPump {
                 control_bytes,
                 flushed,
             } = next;
-            // Serialize leased output here, AFTER the queue lock is released
-            // (take_next holds it; the PTY reader and dispatch both contend).
-            let frame = match frame {
-                LeasedFrame::Control(frame) => frame,
-                LeasedFrame::Output(msg) => {
-                    let Ok(json) = serde_json::to_string(&msg) else {
-                        return WriterExit::SerializationFailed;
-                    };
-                    Message::Text(json.into())
-                }
-            };
             // Never cancel-and-restart a send to service another frame. Stop or
             // timeout below returns from run and drops the entire socket.
             let sent = tokio::select! {
@@ -515,7 +644,11 @@ impl Drop for WriterPump {
             queues.control_bytes = 0;
             queues.in_flight_output_bytes = 0;
             queues.controls_since_last_output = 0;
-            queues.output = OutputQueue::new(self.shared.output_limit);
+            queues.output = DeliveryQueue::new(
+                self.shared.output_limit,
+                metadata_limit(self.shared.output_limit),
+            );
+            queues.interest = InterestState::default();
         }
     }
 }

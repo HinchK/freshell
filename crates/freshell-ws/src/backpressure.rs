@@ -3,10 +3,11 @@
 //! tunables and `broker.ts`'s `catastrophicBlocked`,
 //! `TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES` / `_STALL_MS`, `constants.ts:8-16`).
 //!
-//! The bounded queue itself is `freshell_terminal::output_queue::OutputQueue`,
-//! owned by the connection's socket writer (`terminal::connection_writer`):
-//! producers route output frames into it through the writer's single admission
-//! lock, and the writer leases one frame at a time to the socket.
+//! The bounded queue itself is the connection writer's byte-fair delivery
+//! queue (`terminal::connection_writer`'s `terminal_delivery_queue`), with the
+//! default cap exported from `freshell_terminal::output_queue`: producers
+//! route output frames into it through the writer's single admission lock,
+//! and the writer leases one frame at a time to the socket.
 //!
 //! ## Architectural mapping (why this differs from `broker.ts`)
 //!
@@ -33,11 +34,14 @@
 //!
 //! Visible-first pacing / background throttling (legacy's
 //! `TERMINAL_FOREGROUND_REPLAY_BUFFERED_PAUSE_BYTES` /
-//! `TERMINAL_BACKGROUND_BUFFERED_PAUSE_BYTES` differential) is NOT ported
-//! here: it depends on the attach-priority concept (`AttachPriority`,
-//! foreground vs. background) that TERM-07 owns, and TERM-07 is not yet
-//! implemented in this port (no connection/attachment currently carries a
-//! priority at all). This module has one pacing tier, not two.
+//! `TERMINAL_BACKGROUND_BUFFERED_PAUSE_BYTES` differential) lives in the
+//! connection writer's byte-fair delivery queue
+//! (`terminal::connection_writer`'s `terminal_delivery_queue`): focused,
+//! visible, and background terminals receive roughly an 8:3:1 byte share
+//! under continuous backlog, driven by the `terminalInterestV1` client's
+//! presentation snapshots, with `terminal.attach.priority` as the
+//! pre-snapshot fallback. This module holds the caps plus the catastrophic
+//! monitor, not the scheduling.
 
 use std::time::{Duration, Instant};
 

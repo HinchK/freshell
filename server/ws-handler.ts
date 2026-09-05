@@ -3982,6 +3982,12 @@ export class WsHandler {
         // client message never triggers UNKNOWN_MESSAGE.
         return
 
+      case 'terminal.interest':
+        // Rust-only feature (terminalInterestV1, never advertised by this
+        // server): connection-local delivery-order hint. Presentation-only —
+        // accept and ignore; it must never attach, resize, or error.
+        return
+
       default:
         this.sendError(ws, { code: 'UNKNOWN_MESSAGE', message: 'Unknown message type' })
         return
