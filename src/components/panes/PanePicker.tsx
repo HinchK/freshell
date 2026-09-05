@@ -71,9 +71,12 @@ interface PanePickerProps {
   tabId?: string
   paneId?: string
   focusEligible?: boolean
+  /** Focus-nudge epoch: explicit same-target selects bump this so the focus
+   *  effect re-runs even without an eligibility transition. */
+  focusEpoch?: number
 }
 
-export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, paneId, focusEligible = true }: PanePickerProps) {
+export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, paneId, focusEligible = true, focusEpoch = 0 }: PanePickerProps) {
   useEnsureExtensionsRegistry()
 
   const platform = useAppSelector((s) => s.connection?.platform ?? null)
@@ -214,7 +217,7 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
   // work immediately; background-mounted pickers must not steal DOM focus.
   // Eligible mounts are ownership-gated (agent-driven remounts must not yank
   // focus from app chrome); eligibility flips bypass the gate.
-  const mayFocusNow = usePaneFocusAdoption(paneId, focusEligible)
+  const mayFocusNow = usePaneFocusAdoption(paneId, focusEligible, focusEpoch)
   useEffect(() => {
     if (focusEligible && mayFocusNow()) containerRef.current?.focus()
   }, [focusEligible, mayFocusNow])

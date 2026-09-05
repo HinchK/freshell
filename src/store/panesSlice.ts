@@ -1344,10 +1344,34 @@ export const panesSlice = createSlice({
 
     setActivePane: (
       state,
-      action: PayloadAction<{ tabId: string; paneId: string }>
+      action: PayloadAction<{ tabId: string; paneId: string; focusNudge?: boolean }>
     ) => {
-      const { tabId, paneId } = action.payload
+      const { tabId, paneId, focusNudge } = action.payload
       state.activePane[tabId] = paneId
+      // The epoch bump is ONLY for explicit select folds (ui-commands), where
+      // "select moves DOM focus" is the contract even without an eligibility
+      // transition. Plain pointer activations (Pane mousedown bubbles from
+      // in-pane inputs like rename/search) must NOT bump — that would re-run
+      // focus effects and steal focus back from the element just clicked.
+      if (focusNudge) {
+        state.focusEpochByPaneId ??= {}
+        state.focusEpochByPaneId[paneId] = (state.focusEpochByPaneId[paneId] ?? 0) + 1
+      }
+    },
+
+    /**
+     * tab.select fold: the tab's ACTIVE pane gets the focus nudge, so an
+     * explicit tab select re-focuses content even when the tab was already
+     * Redux-active (no eligibility transition).
+     */
+    nudgePaneFocus: (
+      state,
+      action: PayloadAction<{ tabId: string }>
+    ) => {
+      const paneId = state.activePane[action.payload.tabId]
+      if (!paneId) return
+      state.focusEpochByPaneId ??= {}
+      state.focusEpochByPaneId[paneId] = (state.focusEpochByPaneId[paneId] ?? 0) + 1
     },
 
     resizePanes: (
@@ -2411,6 +2435,7 @@ export const {
   addPane,
   closePane,
   setActivePane,
+  nudgePaneFocus,
   resizePanes,
   resizeMultipleSplits,
   resetSplit,
@@ -2458,3 +2483,12 @@ export const {
 
 export default panesSlice.reducer
 export type { PanesState }
+
+/**
+ * Per-pane focus-nudge epoch (see PanesState.focusEpochByPaneId). Tolerant by
+ * design: bare component test stores may omit the panes slice or preload a
+ * partial panes state without the optional epoch map.
+ */
+export function selectPaneFocusEpoch(state: { panes?: PanesState }, paneId: string): number {
+  return state.panes?.focusEpochByPaneId?.[paneId] ?? 0
+}

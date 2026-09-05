@@ -18,23 +18,43 @@ type AdoptionState = 'pending' | 'allowed' | 'denied'
  *
  * The decision is consumed lazily via the returned `mayFocusNow`, so
  * components whose focus target materializes asynchronously (Monaco onMount,
- * a deferred extension iframe, terminal attach) evaluate the gate when the
- * focus would actually happen, not when the effect first ran. The decision is
- * made at most once per component instance; later flips bypass it entirely.
+ * a deferred extension iframe, terminal attach) evaluate it when the focus
+ * would actually happen, not when the effect first ran.
+ *
+ * Two explicit-select signals ALWAYS resolve adoption to 'allowed', even when
+ * a mount adoption already resolved 'denied' (an agent split while the user
+ * was in app chrome must not strand the pane unfocused forever):
+ *  - false→true eligibility flips (tab switch back, pane re-activation);
+ *  - `focusEpoch` changes (the per-pane nudge bumped by same-target select
+ *    verbs, which produce no eligibility transition). Because `mayFocusNow`'s
+ *    identity changes with the epoch, consumers' focus effects simply re-run
+ *    on an explicit same-target select.
  */
-export function usePaneFocusAdoption(paneId: string | undefined, focusEligible: boolean): () => boolean {
+export function usePaneFocusAdoption(
+  paneId: string | undefined,
+  focusEligible: boolean,
+  focusEpoch = 0,
+): () => boolean {
   const adoptionRef = useRef<AdoptionState>('pending')
   const wasIneligibleRef = useRef(!focusEligible)
+  const epochRef = useRef(focusEpoch)
 
-  // Render-phase flip detection (same pattern as TerminalView's render-synced
-  // refs): an explicit select resolves adoption to 'allowed' immediately, so
-  // even a focus target that materializes later focuses unconditionally.
-  if (focusEligible && wasIneligibleRef.current && adoptionRef.current === 'pending') {
+  // Render-phase flip/epoch detection (same pattern as TerminalView's
+  // render-synced refs): an explicit select resolves adoption to 'allowed'
+  // immediately, so even a focus target that materializes later focuses
+  // unconditionally.
+  if (focusEpoch !== epochRef.current) {
+    epochRef.current = focusEpoch
+    adoptionRef.current = 'allowed'
+  } else if (focusEligible && wasIneligibleRef.current) {
     adoptionRef.current = 'allowed'
   }
   wasIneligibleRef.current = !focusEligible
 
   const mayFocusNow = useCallback((): boolean => {
+    // focusEpoch is a deliberate identity input ONLY: an epoch bump re-creates
+    // this callback so consumers' focus effects re-run on same-target selects.
+    void focusEpoch
     // Without a pane identity there is no ownership record — behave exactly
     // like a freshly created pane (which also defaults to "may focus").
     if (!paneId) return true
@@ -42,7 +62,7 @@ export function usePaneFocusAdoption(paneId: string | undefined, focusEligible: 
       adoptionRef.current = shouldFocusPaneOnEligibleMount(paneId) ? 'allowed' : 'denied'
     }
     return adoptionRef.current === 'allowed'
-  }, [paneId])
+  }, [paneId, focusEpoch])
 
   // Record ownership at teardown. MUST be a layout-effect cleanup: passive
   // cleanups run after the DOM subtree is detached and could not answer the

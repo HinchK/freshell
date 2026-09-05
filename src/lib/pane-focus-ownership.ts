@@ -25,8 +25,19 @@ export function recordPaneFocusBeforeUnmount(paneId: string): void {
   if (!root) return
   const active = document.activeElement
   ownershipByPaneId.set(paneId, Boolean(active && root.contains(active)))
-  // Bound growth across long sessions (closed panes leave stale entries).
-  if (ownershipByPaneId.size > 512) ownershipByPaneId.clear()
+  // Bound growth across long sessions (closed panes leave stale entries):
+  // evict the OLDEST entries (Maps iterate in insertion order). Never wipe
+  // the whole map — that would erase the record this very write just made,
+  // letting the pane's immediate remount focus as "unknown".
+  const CAP = 512
+  if (ownershipByPaneId.size > CAP) {
+    const evict = ownershipByPaneId.size - CAP
+    let i = 0
+    for (const key of ownershipByPaneId.keys()) {
+      if (i++ >= evict) break
+      ownershipByPaneId.delete(key)
+    }
+  }
 }
 
 /** Whether an eligible mount may pull DOM focus. Unknown pane ids (freshly

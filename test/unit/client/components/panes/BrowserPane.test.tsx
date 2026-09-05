@@ -756,5 +756,48 @@ describe('BrowserPane', () => {
       )
       expect(chrome).toHaveFocus()
     })
+
+    it('a denied remount still focuses on a later explicit eligibility flip (switch away and back)', () => {
+      const first = renderBrowserPane({ url: 'https://example.com' })
+      expect(document.querySelector('[data-pane-id="pane-1"]')).toHaveFocus()
+      const chrome = document.createElement('input')
+      document.body.appendChild(chrome)
+      chrome.focus()
+      first.unmount()
+      const { rerender, store } = renderBrowserPane({ url: 'https://example.com' })
+      expect(chrome).toHaveFocus() // denied adoption: agent split while user is in app chrome
+      rerender(
+        <Provider store={store}>
+          <BrowserPane paneId="pane-1" tabId="tab-1" browserInstanceId="browser-1" url="https://example.com" devToolsOpen={false} focusEligible={false} />
+        </Provider>,
+      )
+      rerender(
+        <Provider store={store}>
+          <BrowserPane paneId="pane-1" tabId="tab-1" browserInstanceId="browser-1" url="https://example.com" devToolsOpen={false} focusEligible />
+        </Provider>,
+      )
+      // Explicit-select flips ALWAYS bypass the ownership gate — a denied
+      // remount must not strand the pane unfocused forever.
+      expect(document.querySelector('[data-pane-id="pane-1"]')).toHaveFocus()
+    })
+
+    it('an explicit re-select of the ALREADY-active pane (focus epoch bump) focuses a denied remount', () => {
+      const first = renderBrowserPane({ url: 'https://example.com' })
+      expect(document.querySelector('[data-pane-id="pane-1"]')).toHaveFocus()
+      const chrome = document.createElement('input')
+      document.body.appendChild(chrome)
+      chrome.focus()
+      first.unmount() // records NOT owned (chrome holds focus)
+      const { rerender, store } = renderBrowserPane({ url: 'https://example.com' })
+      expect(chrome).toHaveFocus() // denied adoption (recorded not-owned)
+      // Same-target select produces no eligibility transition; PaneContainer
+      // forwards the bumped epoch — simulate that hand-off via the prop.
+      rerender(
+        <Provider store={store}>
+          <BrowserPane paneId="pane-1" tabId="tab-1" browserInstanceId="browser-1" url="https://example.com" devToolsOpen={false} focusEligible focusEpoch={1} />
+        </Provider>,
+      )
+      expect(document.querySelector('[data-pane-id="pane-1"]')).toHaveFocus()
+    })
   })
 })

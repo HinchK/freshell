@@ -784,5 +784,27 @@ describe('EditorPane', () => {
       )
       await waitFor(() => expect(monacoMountControl.focus).toHaveBeenCalledTimes(1))
     })
+
+    it('refocuses the editor on a focus epoch bump (same-target explicit select of an already-active pane)', async () => {
+      monacoMountControl.enabled = true
+      const { rerender } = render(
+        <Provider store={store}>
+          <EditorPane paneId="pane-1" tabId="tab-1" filePath="/test.ts" language="typescript" readOnly={false} content="const x = 1" viewMode="source" focusEligible />
+        </Provider>
+      )
+      await waitFor(() => expect(monacoMountControl.focus).toHaveBeenCalledTimes(1))
+      // User's DOM focus moved to app chrome; the pane is still Redux-active,
+      // so a re-select produces NO eligibility transition — only the epoch,
+      // which PaneContainer forwards as the focusEpoch prop.
+      const chrome = document.createElement('input')
+      document.body.appendChild(chrome)
+      chrome.focus()
+      rerender(
+        <Provider store={store}>
+          <EditorPane paneId="pane-1" tabId="tab-1" filePath="/test.ts" language="typescript" readOnly={false} content="const x = 1" viewMode="source" focusEligible focusEpoch={1} />
+        </Provider>
+      )
+      await waitFor(() => expect(monacoMountControl.focus).toHaveBeenCalledTimes(2))
+    })
   })
 })

@@ -33,6 +33,7 @@ const captured = vi.hoisted(() => ({
   editor: [] as any[],
   picker: [] as any[],
   directory: [] as any[],
+  extension: [] as any[],
 }))
 
 // Drives PickerWrapper from step 'type' into step 'directory' (the DirectoryPicker arm).
@@ -58,6 +59,9 @@ vi.mock('@/components/panes/PanePicker', () => {
 })
 vi.mock('@/components/panes/DirectoryPicker', () => ({
   default: (props: any) => { captured.directory.push(props); return null },
+}))
+vi.mock('@/components/panes/ExtensionPane', () => ({
+  default: (props: any) => { captured.extension.push(props); return null },
 }))
 vi.mock('@/components/TerminalView', () => ({
   default: () => null,
@@ -110,6 +114,7 @@ const editorLeaf: PaneNode = {
   content: { kind: 'editor', filePath: '/tmp/a.ts', language: 'typescript', readOnly: false, content: 'x', viewMode: 'source', wordWrap: true },
 } as any
 const pickerLeaf: PaneNode = { type: 'leaf', id: 'pane-k', content: { kind: 'picker' } } as any
+const extensionLeaf: PaneNode = { type: 'leaf', id: 'pane-x', content: { kind: 'extension', extensionName: 'sample', props: {} } } as any
 
 function renderNode(node: PaneNode, opts: { hidden?: boolean; activePaneId?: string } = {}) {
   const leafId = (function firstLeaf(n: PaneNode): string { return n.type === 'leaf' ? n.id : firstLeaf(n.children[0]) })(node)
@@ -126,7 +131,7 @@ function renderNode(node: PaneNode, opts: { hidden?: boolean; activePaneId?: str
 
 describe('PaneContainer focusEligible wiring', () => {
   beforeEach(() => {
-    captured.browser.length = captured.editor.length = captured.picker.length = captured.directory.length = 0
+    captured.browser.length = captured.editor.length = captured.picker.length = captured.directory.length = captured.extension.length = 0
     wiringControl.autoSelectProvider = null
   })
   afterEach(() => cleanup())
@@ -184,5 +189,24 @@ describe('PaneContainer focusEligible wiring', () => {
     } finally {
       wiringControl.autoSelectProvider = null
     }
+  })
+
+  // Pins the extension arm: dropping/misrouting the prop defaults to true and
+  // silently disables inert + data-focus-locked protection.
+  it('extension arm: eligible when visible + active pane', () => {
+    renderNode(extensionLeaf)
+    expect(captured.extension[0].focusEligible).toBe(true)
+  })
+
+  it('extension arm: ineligible when the tab is hidden', () => {
+    renderNode(extensionLeaf, { hidden: true })
+    expect(captured.extension[0].focusEligible).toBe(false)
+  })
+
+  it('extension arm: ineligible when another pane is active in the visible tab', () => {
+    const terminalLeaf: PaneNode = { type: 'leaf', id: 'pane-t', content: { kind: 'terminal', mode: 'shell' } } as any
+    const split: PaneNode = { type: 'split', id: 'split-1', direction: 'horizontal', sizes: [50, 50], children: [extensionLeaf, terminalLeaf] }
+    renderNode(split, { activePaneId: 'pane-t' })
+    expect(captured.extension[0].focusEligible).toBe(false)
   })
 })

@@ -7,6 +7,7 @@ import panesReducer, {
   addPane,
   closePane,
   setActivePane,
+  nudgePaneFocus,
   resizePanes,
   resizeMultipleSplits,
   updatePaneContent,
@@ -1384,6 +1385,35 @@ describe('panesSlice', () => {
       )
 
       expect(state.activePane['tab-1']).toBe('some-pane')
+    })
+
+    it('bumps the pane focus epoch ONLY for explicit select folds (focusNudge), including same-target selects', () => {
+      // Pointer-driven activations must not bump: Pane mousedown bubbles from
+      // in-pane inputs (rename, search), and a bump would re-run focus effects
+      // and steal focus back from the element just clicked.
+      let state = panesReducer(initialState, setActivePane({ tabId: 'tab-1', paneId: 'p1' }))
+      expect(state.focusEpochByPaneId?.['p1'] ?? 0).toBe(0)
+      state = panesReducer(state, setActivePane({ tabId: 'tab-1', paneId: 'p1', focusNudge: true }))
+      expect(state.focusEpochByPaneId?.['p1']).toBe(1)
+      // Same-target re-select still bumps: it is the only DOM-focus signal
+      // when no eligibility transition exists (focus-neutral split aftermath).
+      state = panesReducer(state, setActivePane({ tabId: 'tab-1', paneId: 'p1', focusNudge: true }))
+      expect(state.focusEpochByPaneId?.['p1']).toBe(2)
+      state = panesReducer(state, setActivePane({ tabId: 'tab-1', paneId: 'p2' }))
+      expect(state.focusEpochByPaneId?.['p2'] ?? 0).toBe(0)
+      expect(state.focusEpochByPaneId?.['p1']).toBe(2) // p1 untouched
+    })
+  })
+
+  describe('nudgePaneFocus', () => {
+    it("bumps the tab's ACTIVE pane epoch (tab.select fold) and no-ops without an active pane", () => {
+      let state = panesReducer(initialState, setActivePane({ tabId: 'tab-1', paneId: 'p1' }))
+      expect(state.focusEpochByPaneId?.['p1'] ?? 0).toBe(0)
+      state = panesReducer(state, nudgePaneFocus({ tabId: 'tab-1' }))
+      expect(state.focusEpochByPaneId?.['p1']).toBe(1)
+      const before = state.focusEpochByPaneId
+      state = panesReducer(state, nudgePaneFocus({ tabId: 'tab-without-active-pane' }))
+      expect(state.focusEpochByPaneId).toBe(before) // untouched map instance
     })
   })
 

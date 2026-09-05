@@ -16,6 +16,9 @@ type DirectoryPickerProps = {
   onBack: () => void
   paneId?: string
   focusEligible?: boolean
+  /** Focus-nudge epoch: explicit same-target selects bump this so the focus
+   *  effect re-runs even without an eligibility transition. */
+  focusEpoch?: number
 }
 
 type CompletionSuggestion = {
@@ -58,6 +61,7 @@ export default function DirectoryPicker({
   onBack,
   paneId,
   focusEligible = true,
+  focusEpoch = 0,
 }: DirectoryPickerProps) {
   const inputId = useId()
   const listboxId = useId()
@@ -81,7 +85,7 @@ export default function DirectoryPicker({
 
   // Eligible mounts are ownership-gated (agent-driven remounts must not yank
   // focus from app chrome); eligibility flips bypass the gate.
-  const mayFocusNow = usePaneFocusAdoption(paneId, focusEligible)
+  const mayFocusNow = usePaneFocusAdoption(paneId, focusEligible, focusEpoch)
   useEffect(() => {
     if (!focusEligible) return
     if (!mayFocusNow()) return

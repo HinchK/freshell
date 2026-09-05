@@ -230,6 +230,21 @@ test.describe('MCP/REST focus neutrality', () => {
       expect(await activeElementStillTagged(page, chromeMarker)).toBe(true)
       expect(await focusedPaneId(page)).toBeNull()
 
+      // --- 6b: an explicit SAME-TARGET select then moves DOM focus into the
+      // pane. newPaneId is already Redux-active, so the fold produces no
+      // eligibility transition — only the per-pane focus epoch bump can drive
+      // this. This is the agent flow "split, then draw the user's attention".
+      const sameTargetSel = await fetch(`${info.baseUrl}/api/panes/${newPaneId}/select`, {
+        method: 'POST', headers: restApiHeaders(info), body: '{}',
+      })
+      expect(sameTargetSel.ok).toBe(true)
+      await expect.poll(() => focusedPaneId(page), { timeout: 10_000 }).toBe(newPaneId)
+
+      // Re-anchor focus in app chrome for section 7.
+      await page.locator('button[aria-label="New shell tab"]').first().evaluate((el) => (el as HTMLElement).focus())
+      const chromeMarker2 = await tagActiveElement(page)
+      expect(await focusedPaneId(page)).toBeNull()
+
       // --- 7: a BACKGROUND (focus-ineligible, therefore inert + locked)
       // browser pane whose nested page focuses itself must not steal focus.
       // inert alone does NOT stop a script inside the nested document from
@@ -268,7 +283,7 @@ test.describe('MCP/REST focus neutrality', () => {
       // background browser pane and the chrome element kept it.
       await page.waitForTimeout(1_500)
       await flushClientFocusScheduling(page)
-      expect(await activeElementStillTagged(page, chromeMarker)).toBe(true)
+      expect(await activeElementStillTagged(page, chromeMarker2)).toBe(true)
       expect(await focusedPaneId(page)).not.toBe(browserPaneId)
 
       // --- 8 (control): explicitly selecting the browser pane removes inert

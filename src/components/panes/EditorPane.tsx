@@ -137,6 +137,9 @@ interface EditorPaneProps {
   viewMode?: 'source' | 'preview'
   wordWrap?: boolean
   focusEligible?: boolean
+  /** Focus-nudge epoch: explicit same-target selects bump this so focus moves
+   *  even without an eligibility transition. */
+  focusEpoch?: number
 }
 
 export default function EditorPane({
@@ -149,6 +152,7 @@ export default function EditorPane({
   viewMode = 'source',
   wordWrap = true,
   focusEligible = true,
+  focusEpoch = 0,
 }: EditorPaneProps) {
   const dispatch = useAppDispatch()
   const monacoTheme = useMonacoTheme()
@@ -304,7 +308,7 @@ export default function EditorPane({
 
   // Eligible-mount focus is gated by recorded focus ownership (agent-driven
   // leaf→split remounts must not yank focus from app chrome); flips bypass.
-  const mayFocusNow = usePaneFocusAdoption(paneId, focusEligible)
+  const mayFocusNow = usePaneFocusAdoption(paneId, focusEligible, focusEpoch)
 
   function handleEditorMount(editor: Monaco.editor.IStandaloneCodeEditor) {
     editorRef.current = editor
@@ -314,12 +318,21 @@ export default function EditorPane({
 
   // Later false→true eligibility flips (explicit select bringing a
   // background-mounted editor forward) — handleEditorMount never refires.
+  // Same-target selects arrive as focus-epoch bumps: mayFocusNow's identity
+  // changes, re-running this effect while `was` stays true — the else branch
+  // covers that (and a previously ownership-DENIED mount recovering on a
+  // later explicit select).
   const prevFocusEligibleRef = useRef(focusEligible)
   useEffect(() => {
     const was = prevFocusEligibleRef.current
     prevFocusEligibleRef.current = focusEligible
-    if (focusEligible && !was) editorRef.current?.focus()
-  }, [focusEligible])
+    if (!focusEligible) return
+    if (!was) {
+      editorRef.current?.focus()
+      return
+    }
+    if (mayFocusNow()) editorRef.current?.focus()
+  }, [focusEligible, mayFocusNow])
 
   const debouncedPathChange = useMemo(
     () =>

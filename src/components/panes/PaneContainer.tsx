@@ -58,6 +58,7 @@ import type { SessionLocator } from '@shared/ws-protocol'
 // Stable empty object to avoid selector memoization issues
 const EMPTY_PANE_TITLES: Record<string, string> = {}
 const EMPTY_PANE_TITLE_SET_BY_USER: Record<string, boolean> = {}
+const EMPTY_FOCUS_EPOCHS: Record<string, number> = {}
 const EMPTY_TERMINAL_META_BY_ID: Record<string, TerminalMetaRecord> = {}
 const EMPTY_PROJECTS: ProjectGroup[] = []
 const EMPTY_FRESH_AGENT_SESSIONS: Record<string, FreshAgentSessionState> = {}
@@ -196,6 +197,10 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
   const paneTitles = useAppSelector((s) => s.panes.paneTitles[tabId] ?? EMPTY_PANE_TITLES)
   const paneTitleSetByUser = useAppSelector((s) => s.panes.paneTitleSetByUser?.[tabId] ?? EMPTY_PANE_TITLE_SET_BY_USER)
+  // Focus epoch map: changed identity only when an explicit select nudges a
+  // pane (see PanesState.focusEpochByPaneId); leaf arms forward the per-pane
+  // value so same-target selects re-run focus effects.
+  const focusEpochMap = useAppSelector((s) => s.panes?.focusEpochByPaneId ?? EMPTY_FOCUS_EPOCHS)
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
   const terminalMetaById = useAppSelector(
     (s) => s.terminalMeta?.byTerminalId ?? EMPTY_TERMINAL_META_BY_ID
@@ -523,6 +528,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     // hidden (Task 1 keeps Redux activeTabId on the user's tab), so their panes
     // mount without stealing keyboard focus.
     const focusEligible = !hidden && activePane === node.id
+    const focusEpoch = focusEpochMap[node.id] ?? 0
 
     return (
       <Pane
@@ -551,7 +557,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         onRefresh={handleRefresh}
         onDoubleClickTitle={() => startRename(node.id, paneTitle)}
       >
-        {renderContent(tabId, node.id, node.content, isOnlyPane, hidden, focusEligible)}
+        {renderContent(tabId, node.id, node.content, isOnlyPane, hidden, focusEligible, focusEpoch)}
       </Pane>
     )
   }
@@ -593,11 +599,13 @@ function PickerWrapper({
   paneId,
   isOnlyPane,
   focusEligible = true,
+  focusEpoch = 0,
 }: {
   tabId: string
   paneId: string
   isOnlyPane: boolean
   focusEligible?: boolean
+  focusEpoch?: number
 }) {
   const dispatch = useAppDispatch()
   const settings = useAppSelector((s) => s.settings?.settings)
@@ -809,6 +817,7 @@ function PickerWrapper({
         onBack={() => setStep({ step: 'type' })}
         paneId={paneId}
         focusEligible={focusEligible}
+        focusEpoch={focusEpoch}
       />
     )
   }
@@ -821,6 +830,7 @@ function PickerWrapper({
       tabId={tabId}
       paneId={paneId}
       focusEligible={focusEligible}
+      focusEpoch={focusEpoch}
     />
   )
 }
@@ -832,11 +842,12 @@ function renderContent(
   isOnlyPane: boolean,
   hidden?: boolean,
   focusEligible = true,
+  focusEpoch = 0,
 ) {
   if (content.kind === 'terminal') {
     return (
       <ErrorBoundary key={paneId} label="Terminal">
-        <TerminalView tabId={tabId} paneId={paneId} paneContent={content} hidden={hidden} />
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={content} hidden={hidden} focusEpoch={focusEpoch} />
       </ErrorBoundary>
     )
   }
@@ -851,6 +862,7 @@ function renderContent(
           url={content.url}
           devToolsOpen={content.devToolsOpen}
           focusEligible={focusEligible}
+          focusEpoch={focusEpoch}
         />
       </ErrorBoundary>
     )
@@ -880,6 +892,7 @@ function renderContent(
             viewMode={content.viewMode}
             wordWrap={content.wordWrap}
             focusEligible={focusEligible}
+            focusEpoch={focusEpoch}
           />
         </Suspense>
       </ErrorBoundary>
@@ -894,6 +907,7 @@ function renderContent(
           paneId={paneId}
           paneContent={content}
           hidden={hidden}
+          focusEpoch={focusEpoch}
         />
       </ErrorBoundary>
     )
@@ -905,6 +919,7 @@ function renderContent(
         tabId={tabId}
         paneId={paneId}
         isOnlyPane={isOnlyPane}
+        focusEpoch={focusEpoch}
         focusEligible={focusEligible}
       />
     )
@@ -913,7 +928,7 @@ function renderContent(
   if (content.kind === 'extension') {
     return (
       <ErrorBoundary key={paneId} label="Extension">
-        <ExtensionPane tabId={tabId} paneId={paneId} content={content} focusEligible={focusEligible} />
+        <ExtensionPane tabId={tabId} paneId={paneId} content={content} focusEligible={focusEligible} focusEpoch={focusEpoch} />
       </ErrorBoundary>
     )
   }

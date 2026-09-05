@@ -439,6 +439,9 @@ interface TerminalViewProps {
   paneId: string
   paneContent: PaneContent
   hidden?: boolean
+  /** Focus-nudge epoch: explicit same-target selects bump this so the focus
+   *  effects re-run even without an eligibility transition. */
+  focusEpoch?: number
 }
 
 type AttachIntent = 'viewport_hydrate' | 'keepalive_delta' | 'transport_reconnect'
@@ -570,7 +573,7 @@ export function isEngagementInput(data: string): boolean {
   /* eslint-enable no-control-regex */
 }
 
-function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps) {
+function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: TerminalViewProps) {
   const dispatch = useAppDispatch()
   const appStore = useAppStore()
   const isMobile = useMobile()
@@ -1281,7 +1284,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   // eligibility flips (explicit select / tab switch) bypass the gate. The
   // decision is consumed lazily, so the mount-time `focus:true` layout consum-
   // ption (which fires once the terminal actually attaches) evaluates it too.
-  const mayFocusNow = usePaneFocusAdoption(paneId, shouldFocusActiveTerminal)
+  const mayFocusNow = usePaneFocusAdoption(paneId, shouldFocusActiveTerminal, focusEpoch)
 
   // Keep the active pane's terminal focused when tabs/panes switch so typing works immediately.
   useEffect(() => {

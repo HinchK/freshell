@@ -19,6 +19,9 @@ interface BrowserPaneProps {
   url: string
   devToolsOpen: boolean
   focusEligible?: boolean
+  /** Focus-nudge epoch: an explicit same-target select bumps this so the
+   *  owns-focus effect re-runs even without an eligibility transition. */
+  focusEpoch?: number
 }
 
 const MAX_HISTORY_SIZE = 50
@@ -182,6 +185,7 @@ export default function BrowserPane({
   url,
   devToolsOpen,
   focusEligible = true,
+  focusEpoch = 0,
 }: BrowserPaneProps) {
   const dispatch = useAppDispatch()
   const refreshRequest = useAppSelector((state) => state.panes.refreshRequestsByPane?.[tabId]?.[paneId] ?? null)
@@ -449,7 +453,7 @@ export default function BrowserPane({
   // never focus anything. Eligible MOUNTS are additionally gated by focus
   // ownership: an agent-driven leaf→split remount must not yank focus back
   // from application chrome; eligibility flips (explicit select) bypass.
-  const mayFocusNow = usePaneFocusAdoption(paneId, focusEligible)
+  const mayFocusNow = usePaneFocusAdoption(paneId, focusEligible, focusEpoch)
   useEffect(() => {
     if (!focusEligible) return
     if (!mayFocusNow()) return

@@ -123,7 +123,10 @@ describe('handleUiCommand', () => {
 
     expect(actions.map((a) => a.type)).toEqual(['tabs/setActiveTab', 'panes/setActivePane'])
     expect(actions[0].payload).toBe('t1')
-    expect(actions[1].payload).toEqual({ tabId: 't1', paneId: 'p1' })
+    // focusNudge: explicit selects must move DOM focus even for an already-
+    // active target (no eligibility transition exists to re-run focus
+    // effects); the epoch bump is that signal.
+    expect(actions[1].payload).toEqual({ tabId: 't1', paneId: 'p1', focusNudge: true })
   })
 
   it('handles pane.rename', () => {
@@ -277,5 +280,27 @@ describe('ui.command focus neutrality through a real Redux store', () => {
     handleUiCommand({ type: 'ui.command', command: 'pane.select', payload: { tabId: 'tab-A', paneId: 'pane-A2' } }, store.dispatch)
     expect(store.getState().panes.activePane['tab-A']).toBe('pane-A2')
     expect(store.getState().tabs.activeTabId).toBe('tab-A')
+  })
+
+  it('pane.select on the ALREADY-active pane still emits a focus nudge (same-target select)', () => {
+    const store = makeUiStore()
+    // pane-A1 is already the active pane of the active tab: the select fold
+    // produces no eligibility transition, so the focus epoch is the contract.
+    handleUiCommand({ type: 'ui.command', command: 'pane.select', payload: { tabId: 'tab-A', paneId: 'pane-A1' } }, store.dispatch)
+    expect(store.getState().panes.activePane['tab-A']).toBe('pane-A1')
+    expect(store.getState().panes.focusEpochByPaneId?.['pane-A1'] ?? 0).toBe(1)
+  })
+
+  it("tab.select nudges the target tab's active pane focus epoch", () => {
+    const store = makeUiStore()
+    // Same-tab select (tab-A is already active)
+    handleUiCommand({ type: 'ui.command', command: 'tab.select', payload: { id: 'tab-A' } }, store.dispatch)
+    expect(store.getState().panes.focusEpochByPaneId?.['pane-A1'] ?? 0).toBe(1)
+    // Cross-tab select also nudges the newly-active tab's pane (harmless;
+    // the eligibility flip is the primary focus path there).
+    handleUiCommand({ type: 'ui.command', command: 'tab.create', payload: { id: 'tab-B', title: 'B' } }, store.dispatch)
+    handleUiCommand({ type: 'ui.command', command: 'tab.select', payload: { id: 'tab-B' } }, store.dispatch)
+    expect(store.getState().tabs.activeTabId).toBe('tab-B')
+    expect(store.getState().panes.focusEpochByPaneId?.['pane-A1']).toBe(1) // unchanged: tab-B has no active pane
   })
 })

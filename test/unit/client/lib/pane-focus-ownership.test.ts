@@ -45,4 +45,23 @@ describe('pane-focus-ownership', () => {
     recordPaneFocusBeforeUnmount('p4')
     expect(shouldFocusPaneOnEligibleMount('p4')).toBe(false)
   })
+
+  it('trims the OLDEST entries beyond the cap instead of wiping the map', () => {
+    const outside = document.createElement('input')
+    document.body.appendChild(outside)
+    outside.focus()
+    for (let i = 0; i < 513; i++) {
+      const root = document.createElement('div')
+      root.setAttribute('data-pane-id', `p-${i}`)
+      document.body.appendChild(root)
+    }
+    for (let i = 0; i < 513; i++) recordPaneFocusBeforeUnmount(`p-${i}`)
+    // 513 inserts cross the 512 cap. A whole-map clear would ALSO erase the
+    // newest record (p-512), letting its immediate remount focus as "unknown" —
+    // exactly the chrome-steal the record exists to prevent. Only p-0 (oldest)
+    // may be evicted.
+    expect(shouldFocusPaneOnEligibleMount('p-0')).toBe(true) // evicted → unknown
+    expect(shouldFocusPaneOnEligibleMount('p-1')).toBe(false) // retained
+    expect(shouldFocusPaneOnEligibleMount('p-512')).toBe(false) // newest must survive
+  })
 })

@@ -1,5 +1,5 @@
 import { addTab, setActiveTab, closeTab, closePaneWithCleanup } from '@/store/tabsSlice'
-import { initLayout, splitPane, setActivePane, updatePaneContent, resizePanes, swapPanes } from '@/store/panesSlice'
+import { initLayout, splitPane, setActivePane, nudgePaneFocus, updatePaneContent, resizePanes, swapPanes } from '@/store/panesSlice'
 import { captureUiScreenshot } from '@/lib/ui-screenshot'
 import type { AppDispatch, RootState } from '@/store/store'
 import { applyPaneRename, applyTabRename } from '@/store/titleSync'
@@ -108,7 +108,11 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
       }
       return
     case 'tab.select':
-      return dispatch(setActiveTab(msg.payload.id))
+      dispatch(setActiveTab(msg.payload.id))
+      // Focus contract: explicit selects move DOM focus. When the tab (or its
+      // active pane) was already Redux-active there is no eligibility
+      // transition, so nudge the pane focus epoch as the DOM-focus signal.
+      return dispatch(nudgePaneFocus({ tabId: msg.payload.id }))
     case 'tab.rename':
       return dispatch(applyTabRename({ tabId: msg.payload.id, title: msg.payload.title }))
     case 'tab.close':
@@ -126,7 +130,10 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
       return dispatch(closePaneWithCleanup({ tabId: msg.payload.tabId, paneId: msg.payload.paneId }))
     case 'pane.select':
       dispatch(setActiveTab(msg.payload.tabId))
-      return dispatch(setActivePane({ tabId: msg.payload.tabId, paneId: msg.payload.paneId }))
+      // focusNudge: an explicit select moves DOM focus even when the pane is
+      // already Redux-active (no eligibility transition exists to re-run
+      // focus effects) — the epoch bump is that signal.
+      return dispatch(setActivePane({ tabId: msg.payload.tabId, paneId: msg.payload.paneId, focusNudge: true }))
     case 'pane.rename':
       return dispatch(applyPaneRename({
         tabId: msg.payload.tabId,

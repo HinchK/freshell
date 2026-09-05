@@ -15,6 +15,9 @@ interface ExtensionPaneProps {
   paneId: string
   content: ExtensionPaneContent
   focusEligible?: boolean
+  /** Focus-nudge epoch: explicit same-target selects bump this so the focus
+   *  effect re-runs even without an eligibility transition. */
+  focusEpoch?: number
 }
 
 /**
@@ -55,7 +58,7 @@ function detectIframeError(iframe: HTMLIFrameElement): string | null {
   return null
 }
 
-export default function ExtensionPane({ paneId, content, focusEligible = true }: ExtensionPaneProps) {
+export default function ExtensionPane({ paneId, content, focusEligible = true, focusEpoch = 0 }: ExtensionPaneProps) {
   useEnsureExtensionsRegistry()
 
   const dispatch = useAppDispatch()
@@ -165,7 +168,7 @@ export default function ExtensionPane({ paneId, content, focusEligible = true }:
   // extension content can neither be focused nor focus itself. Eligible
   // mounts are gated by recorded focus ownership (agent-driven remounts must
   // not yank focus from app chrome); eligibility flips bypass the gate.
-  const mayFocusNow = usePaneFocusAdoption(paneId, focusEligible)
+  const mayFocusNow = usePaneFocusAdoption(paneId, focusEligible, focusEpoch)
   useEffect(() => {
     if (!focusEligible || !iframeRenderable) return
     const iframe = iframeRef.current
