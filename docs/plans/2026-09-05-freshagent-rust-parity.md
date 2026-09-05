@@ -40,7 +40,7 @@ Fix three fresh-agent parity bugs on the Rust server, tracked as kata items te1m
 6. **Auth parity.** Every new Rust route gates auth FIRST via `crate::boot::is_authed` (x-auth-token header OR `freshell-auth` cookie) and returns `401 {"error":"Unauthorized"}` before any param validation — same order as the Node global middleware.
 7. **Rust house patterns.** New module doc comment cites the Node oracle file:lines and lists recorded divergences; handlers return `Response`; errors are `(StatusCode, Json(json!({"error": message})))` (+ optional `code`); structured `tracing` (info on saved attachment / accepted sends, warn on failures — never log attachment bytes or prompt text, per the DIAG-01 precedent); in-file `#[cfg(test)]` tests + one `tower::ServiceExt::oneshot` route-wiring test per route; `serde(rename_all = "camelCase")` where wire-casing matters.
 8. **Client house patterns.** No new toast library: reuse the view's `notice` banner (`role="alert"`, 6s auto-dismiss, `FreshAgentApprovalBanner`) via a new composer→view `onNotice` prop, the chip-level inline errors, and the diff panel's inline destructive-state pattern. ApiError conventions from `src/lib/api.ts`. A11y: real `<button>`s with `aria-label`s; `npm run lint` must pass (jsx-a11y is CI).
-9. **Test coordination.** Broad runs ONLY through repo commands (`npm test`, `npm run check`, `npm run test:unit`, `npm run test:integration`) — they hold the shared coordinator gate; set `FRESHELL_TEST_SUMMARY`. Focused vitest runs: `npm run test:vitest -- run <path>`. Rust: plain `cargo test -p <pkg> …` (not coordinated). E2E focused: `npm run test:e2e:chromium -- <spec>` (local playwright, `rust-chromium` project for rust-only specs). Never restart or deploy any server; never run production ops.
+9. **Test coordination.** Broad runs ONLY through repo commands (`npm test`, `npm run check`, `npm run test:unit`, `npm run test:integration`) — they hold the shared coordinator gate; set `FRESHELL_TEST_SUMMARY`. Focused vitest runs: `npm run test:vitest -- run <path>`. Rust: plain `cargo test -p <pkg> …` (not coordinated). Focused e2e: chromium-leg specs via `npm run test:e2e:chromium -- <spec>`; RUST-ONLY specs via the validated `npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium <spec>` form (no npm script exists for that project) — ALWAYS verify collection with `--list` first when touching a spec's registration. Never restart or deploy any server; never run production ops.
 10. **Known pre-existing flake.** `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx > snapshot scheduler integration (zrrj) > keeps the last good snapshot visible and stops fetching during 429 backoff` is a load-sensitive real-timer flake that failed once at the unmodified base under full-suite parallel load and passes in isolation (3/3 at base). If it fails in a gate/classifier run at this run's HEAD, it counts as pre-existing ONLY with a reproduction receipt at `base_ref`; do not "fix" that test in this run unless a failure is attributed to this run's changes.
 11. **docs.** No `docs/index.html` update (no major default-experience change; failure copy and a Retry button are minor). No README changes. Keep AGENTS.md untouched (its content is process, not surfaces this run changes).
 12. **Scope decision (recorded):** `POST /api/fresh-agent/exec` IS included as Task 3 — the "same gap" half of AGENT-13 that ekc6's task text names; without it the composer `!cmd` escape stays dead on production. `POST /api/fresh-agent/send` (AGENT-20) is excluded (different checklist item, MCP-only consumer).
@@ -110,6 +110,24 @@ pub fn router(state: FreshAgentExtrasApiState) -> Router {
             // route only; every other route keeps the default.
             post(post_attachment).layer(DefaultBodyLimit::max(ATTACHMENT_MAX_BYTES)),
         )
+        // Node-ordering parity (validated C8, axum 0.8.9 + main.rs:1821-1842
+        // precedent): a ROUTER-level auth gate short-circuits BEFORE route
+        // extractors, so an unauthenticated over-limit body gets 401, never
+        // 413 — mirroring the Node global httpAuthMiddleware before the
+        // extras router's parsers (server/index.ts:210-213, :832). The
+        // in-handler `is_authed` checks stay as defense-in-depth. LAST call
+        // after all .route(...) registrations; survives `.merge()`.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            |State(state): State<FreshAgentExtrasApiState>,
+             request: axum::extract::Request,
+             next: axum::middleware::Next| async move {
+                if !is_authed(request.headers(), &state.auth_token) {
+                    return unauthorized();
+                }
+                next.run(request).await
+            },
+        ))
         .with_state(state)
 }
 ```
@@ -268,6 +286,25 @@ mod tests {
         ).await.unwrap();
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
+
+    // Node-ordering pin (C8): UNAUTHENTICATED + over-limit → 401, never 413 —
+    // the router-level auth gate runs before DefaultBodyLimit, mirroring Node's
+    // global auth middleware ordering. (Chunked variant optional; known-length
+    // is sufficient here since the middleware precedes extraction entirely.)
+    #[tokio::test]
+    async fn unauthenticated_over_limit_is_401_not_413() {
+        let home = tempfile::tempdir().unwrap();
+        let app = router(state(home.path()));
+        let over = vec![b'x'; ATTACHMENT_MAX_BYTES + 1];
+        let resp = app.oneshot(
+            Request::builder().method("POST")
+                .uri("/api/fresh-agent/attachments?name=toobig.bin")
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .body(axum::body::Body::from(over)).unwrap(),
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body_json(resp).await["error"], json!("Unauthorized"));
+    }
 }
 ```
 
@@ -275,7 +312,7 @@ mod tests {
 
 Run: `cargo test -p freshell-server fresh_agent_extras`
 
-Expected: FAIL — tests compile (module + handler stub exist) but assertions fail because the stub returns 500 for everything after the auth gate ("behavior absent", not compile/setup errors). The auth test passes already (stub gates auth), which is expected and fine.
+Expected: FAIL — tests compile (module + handler stub exist) but assertions fail because the stub returns 500 for everything after the auth gate ("behavior absent", not compile/setup errors). Two tests are green already at RED by construction — the direct-call 401 test (stub gates auth) and the 401-before-413 ordering pin (the router-level middleware is part of the skeleton) — which is expected and fine.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -1431,7 +1468,7 @@ Behavior spec:
 1. `handle_send` with `msg.settings`: merge each of `model`/`permission_mode`/`effort` over the session record (settings value wins; absent field keeps the record's value — same overlay rule as codex Task 6). `settings.cwd` is ignored for claude: cwd is session-create-scoped (the client only stamps the pane's own `initialCwd`); note this in the code comment.
 2. If (and only if) the merged values differ from the record, write one `session.update` frame (carrying the changed-or-full merged trio — full-trio is simpler and idempotent; pick full-trio) and THEN the existing `send` frame, and persist the merged trio onto the session record. The client stamps settings on every send, so the diff-vs-record guard is what keeps ordinary sends single-frame; tests pin both shapes.
 3. `session.update` write failure → the same recovery as a failed `send` write (`undo_turn_op_arm` + `send_error(…, "CLAUDE_SEND_FAILED", …)` at :1019-1028) — never emit `send` after a failed update.
-4. Sidecar `session.update` case: look up the session; unknown session → `logerr` (existing convention), no crash. Otherwise call the three SDK methods for present fields, in `try/catch`; on throw, emit the file's existing session-error frame convention (the Rust stdout consumer already folds those) — never swallow.
+4. Sidecar `session.update` case: look up the session; unknown session → `logerr` (existing convention), no crash. Otherwise call the three SDK methods for present fields, in `try/catch`; on throw, emit the file's existing session-error frame convention (the Rust stdout consumer already folds those) — never swallow. Load-bearing validation C2 outcome: the SDK methods send a control request and await `control_response`, so CLI rejections surface into this `try/catch`; BUT the SDK defines no timeout, so wrap the awaited calls in a bounded timeout (~10s, `Promise.race`) that emits the same session-error frame on expiry — a never-answering CLI must not park the session.
 5. Effort: passed through verbatim (same as create-time). Invalid values surface via the SDK's error (4), never silently.
 6. Real `index.mjs` + e2e fake both implement the case, so e2e freshclaude flows keep working when the frozen client sends settings.
 
@@ -1615,6 +1652,8 @@ git commit -m "feat(rust): apply freshclaude/kilroy per-send settings via sideca
 
 Why this is sufficient honesty: after Tasks 6-7, every visible setting on every provider applies per-send on the Rust server (codex: model/effort/sandbox-at-create + permission; claude/kilroy: model/effort/permission; opencode: model/effort — with opencode's permission select already hidden by `settingsVisibility`, :133, and its sandbox absence structural). Sandbox has no picker anywhere (codex panes stamp it at create from provider settings — honest by absence; the codex dialog footer says "applies from your next message", which is true of its model/effort controls). The static client registry remains the visibility source; no server capability field is added (Global Constraint 4). The Node server's claude adapter remains create-only, but the Node server is retired and out of scope (Constraint 3).
 
+Recorded residual (load-bearing C2, accepted-path decision): claude mid-session control rests on the vendored SDK's control-request contract (`setModel`/`setPermissionMode`/`applyFlagSettings` await `control_response` and throw on rejection), but repo production code has not exercised it since 2026-06-15, and no test can prove the real claude CLI honors the requests (a live probe is out of read-only scope). The copy therefore states the SDK-contract truth; CLI-side failures are never silent — they surface through Task 7's timeout-guarded session-error frame.
+
 - [ ] **Step 1: Write the failing behavioral test**
 
 ```tsx
@@ -1676,19 +1715,32 @@ git commit -m "feat(client): honest applies-from-next-message copy across fresh-
 
 **Files:**
 - Create: `test/e2e-browser/specs/freshagent-extras-rust.spec.ts`
-- Modify: `test/e2e-browser/playwright.config.ts` (add the spec to `RUST_ONLY_SPECS` :183+ with the house comment style)
+- Modify: `test/e2e-browser/playwright.config.ts` — DUAL registration (validated C7): the spec regexp goes in BOTH `RUST_ONLY_SPECS` (:183+, excludes it from the match-all projects) AND the `rust-chromium` project's `testMatch` list (:368+) — without the second entry even the correct command matches zero tests
+- Modify: `test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs` (the REAL fixture path — validated C10; the `test/e2e-browser/fixtures/...` variant does not exist): one additive default-off knob, below
 - Test: the spec itself
 
 **Interfaces:**
-- Consumes: `RustServer` (`test/e2e-browser/helpers/rust-server.js`), `TestHarness` + `fixtures.js` `test`/`expect`, the raw-WS `WsCapture` pattern and fixture paths copied per the per-spec-ownership convention from `freshagent-settings-resume-rust.spec.ts` (helpers `:26-45`; fixtures `test/e2e-browser/fixtures/coding-cli/codex-app-server/fake-app-server.mjs`, `test/e2e-browser/fixtures/fake-claude-sidecar.mjs`), and the REST-with-token precedent (`agent-checkpoint-rewind.spec.ts:301`).
+- Consumes: `RustServer` (`test/e2e-browser/helpers/rust-server.js`), `TestHarness` + `fixtures.js` `test`/`expect`, the raw-WS `WsCapture` pattern and fixture wiring copied per the per-spec-ownership convention from `freshagent-settings-resume-rust.spec.ts` (helpers `:26-45`; claude fixture `test/e2e-browser/fixtures/fake-claude-sidecar.mjs`), and the REST-with-token precedent (`agent-checkpoint-rewind.spec.ts:301`).
 - Produces: PW-RUST executable evidence for AGENT-11/12/13's validation bullets.
+
+Codex fixture knob (C10, additivity-verified): in `test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs`, inside the `successResult` `turn/start` arm (:307-323), before shaping, add exactly:
+
+```js
+if (typeof behavior.turnStartParamsLogPath === 'string' && behavior.turnStartParamsLogPath) {
+  fs.mkdirSync(path.dirname(behavior.turnStartParamsLogPath), { recursive: true })
+  fs.appendFileSync(behavior.turnStartParamsLogPath,
+    JSON.stringify({ at: new Date().toISOString(), method: 'turn/start', threadId: params?.threadId ?? null, params }) + '\n', 'utf8')
+}
+```
+
+Default-off, orthogonal to `recordTurns`; never touches `fake-turns/*.json` or the recorded-turn schema (its two consuming specs are unaffected); unknown behavior keys are inert. The spec passes an absolute path rooted in its own mkdtemp.
 
 Design: drive the real Rust server binary directly (REST + raw WS, no browser page — the settings-resume spec's tests 1-3 precedent), plus ONE browser test for the composer loop.
 
 1. **attachments (REST):** create a fresh-agent session fixture cwd; `POST /api/fresh-agent/attachments?name=note.txt` with raw bytes + token → 200 `{path, bytes}`; file exists under the harness's isolated `HOME/.freshell/attachments/` matching `/^[0-9a-f]{8}-note\.txt$/` with byte-equal contents; `../../etc/evil.txt` → basename `evil.txt` inside the dir; missing `name` → 400 `name query parameter required`; no token → 401.
 2. **diff (REST):** mkdtemp + `git init` + commit `one\n` + overwrite `two\n`; `GET /diff?cwd&path=a.txt` → 200 containing `-one`/`+two`; nonexistent cwd → 400 `cwd does not exist: `; non-repo cwd → 500 prefix `git diff failed: `.
 3. **exec (REST):** `{"command":"echo out; echo err 1>&2; exit 7"}` → `{output: "out\nerr", exitCode: 7, truncated: false}`; missing command → 400 `command is required`.
-4. **codex per-send (WS):** hello → `freshAgent.create` (freshcodex, model A) → `freshAgent.send` plain → `freshAgent.send` with `settings{model:"small-model", effort:"low"}` → the fake codex app-server's recorded `turn/start` payloads show A then `small-model`+`low`; a third plain send keeps the merged values (stickiness).
+4. **codex per-send (WS):** hello → `freshAgent.create` (freshcodex, model A) → `freshAgent.send` plain → `freshAgent.send` with `settings{model:"small-model", effort:"low"}` → poll the fixture's `turnStartParamsLogPath` JSONL: row 1's `params.model` is A, row 2's `params.model`/`params.effort` are `small-model`/`low` (plus `sandboxPolicy`/`approvalPolicy` when the test sends them); a third plain send produces row 3 with the MERGED values (stickiness).
 5. **claude per-send (WS):** create freshclaude → send with `settings{model:"opus-b", effort:"low"}` → the fake claude sidecar's recorded stdin shows a `session.update` carrying those values immediately before the `send`.
 6. **composer loop (browser):** open the UI with the harness token, create a freshclaude pane (fake sidecar), attach a small text fixture via the file input (`setInputFiles`), chip becomes ready, send → the fake sidecar's received prompt contains `Attached files (read them from disk):` and the stored path; a >10 MiB synthetic file shows the limit error chip WITHOUT any upload request (assert no POST to `/attachments` fired).
 
@@ -1700,22 +1752,27 @@ Write the full spec (helpers copied per convention; exact frame builders from th
 
 For TDD integrity of THIS task's new assertions (401-on-no-token, exact 400 strings, sidecar frame ordering), temporarily verify against the pre-fix behavior only if cheap (e.g. run the spec on a stash of Tasks 1-3); otherwise record that RED was demonstrated incrementally by Tasks 1-7's own RED steps and run the full spec as GREEN evidence here. State the choice in the implementer report.
 
-Run: `npm run test:e2e:chromium -- test/e2e-browser/specs/freshagent-extras-rust.spec.ts` (rust-chromium project)
+Run: `npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium --list test/e2e-browser/specs/freshagent-extras-rust.spec.ts` FIRST (defeats the zero-match trap: it must list ≥1 test), then `npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium test/e2e-browser/specs/freshagent-extras-rust.spec.ts`
+
+(Validated C7/C9: `npm run test:e2e:chromium -- <rust-only-spec>` collects ZERO tests for rust-only specs — the chromium project `testIgnore`s `RUST_ONLY_SPECS`. The `--project=rust-chromium` form above is the sanctioned house invocation; no package.json script exists for it.)
 
 - [ ] **Step 3: Add the implementation**
 
-The production code exists (Tasks 1-7); "implementation" here is the spec itself + its registration:
+The production code exists (Tasks 1-7); "implementation" here is the spec itself + its DUAL registration (C7):
 
 ```ts
-// playwright.config.ts RUST_ONLY_SPECS, alongside the other entries:
+// playwright.config.ts — in RUST_ONLY_SPECS (keeps match-all chromium off it),
+// house comment style:
   // AGENT-11/12/13 (kata te1m/ekc6/z7j7): Rust-server extras routes +
   // per-send settings, wire-level through owned fixtures.
   /freshagent-extras-rust\.spec\.ts$/,
+// AND the same regexp again in the rust-chromium project's testMatch list
+// (:368+) — without this second entry the spec never runs.
 ```
 
 - [ ] **Step 4: Run the focused spec**
 
-Run: `npm run test:e2e:chromium -- test/e2e-browser/specs/freshagent-extras-rust.spec.ts`
+Run: `npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium test/e2e-browser/specs/freshagent-extras-rust.spec.ts`
 
 Expected: PASS (browser test included).
 
@@ -1725,14 +1782,14 @@ Spec hygiene: helper copies carry their donor citations; no shared-state leaks (
 
 - [ ] **Step 6: Run impacted-test verification**
 
-Run: `npm run test:e2e:chromium -- test/e2e-browser/specs/fresh-agent.spec.ts test/e2e-browser/specs/freshagent-settings-resume-rust.spec.ts test/e2e-browser/specs/freshagent-extras-rust.spec.ts`
+Run: `npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium test/e2e-browser/specs/freshagent-settings-resume-rust.spec.ts test/e2e-browser/specs/freshagent-extras-rust.spec.ts` and separately `npm run test:e2e:chromium -- test/e2e-browser/specs/fresh-agent.spec.ts` (the legacy fresh-agent spec stays on the chromium leg — it is NOT rust-only)
 
-Expected: PASS — neighboring fresh-agent rust specs unaffected (the new routes/frames didn't disturb them).
+Expected: PASS — neighboring fresh-agent specs unaffected (the new routes/frames didn't disturb them).
 
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add test/e2e-browser/specs/freshagent-extras-rust.spec.ts test/e2e-browser/playwright.config.ts
+git add test/e2e-browser/specs/freshagent-extras-rust.spec.ts test/e2e-browser/playwright.config.ts test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs
 git commit -m "test(e2e): rust-server proof of fresh-agent attachments, diff/exec, and per-send settings (AGENT-11/12/13)"
 ```
 
@@ -1745,4 +1802,12 @@ git commit -m "test(e2e): rust-server proof of fresh-agent attachments, diff/exe
 3. `cargo test -p freshell-server` and `cargo test -p freshell-freshagent`
 4. `npm run lint` and `npm run typecheck`
 5. `npm test` — coordinated full suite (`FRESHELL_TEST_SUMMARY='freshagent-rust-parity final gate'`), green excluding the ledger-recorded pre-existing flake (Global Constraint 10; attribution only via a base_ref reproduction receipt).
-6. Focused e2e set from Task 9 Step 6, green on the local backend (`FRESHELL_E2E_BACKEND` unset → local; do not switch backends).
+6. Focused e2e set from Task 9 Step 6 (the validated `--project=rust-chromium` invocation for the rust-only specs; chromium leg for `fresh-agent.spec.ts`), green on the local backend (`FRESHELL_E2E_BACKEND` unset → local; do not switch backends).
+
+## Load-bearing validation outcomes folded into this plan (Stage 2)
+
+- C1/C3/C4/C5/C6 verified during exploration (axum route-scoped body limits; Node exec maxBuffer kill semantics incl. exitCode 1 from a non-numeric code; Node diff error-with-partial-stdout resolving 200; both Rust test seams adequate) — no plan change beyond what the tasks already say.
+- C2 falsified as "production-proven": claude SDK control methods await `control_response` and throw on CLI rejection (observable), but have had no production callers since 2026-06-15 — Task 7 gained a bounded timeout + the accepted residual is recorded in Task 8.
+- C7/C9: e2e commands and Task 9 registration corrected (dual registration, `--project=rust-chromium`, `--list` first-defeat).
+- C8: Task 1 gained a router-level auth gate + the 401-before-413 ordering pin.
+- C10: Task 9 gained the additive `turnStartParamsLogPath` fixture knob and the corrected fixture path.
