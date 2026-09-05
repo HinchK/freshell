@@ -414,7 +414,7 @@ async fn run_loop(
                 break;
             }
             _ = ping_ticker.tick() => {
-                match keepalive.tick(&ws_tx, std::time::Instant::now(), ping_interval) {
+                match keepalive.tick(&ws_tx) {
                     Ok(()) => {},
                     Err(connection_writer::KeepaliveError::TimedOut) => {
                         tracing::warn!(connection_id = conn_id, missed = 1u32, "ws.keepalive.terminated");
@@ -549,6 +549,20 @@ async fn run_loop(
                     }
                 }
             }
+        }
+    }
+
+    // A mid-dispatch admission failure lands here as the generic
+    // "send_error"; if the writer had already exited with a precise reason
+    // (stalled send, control overflow, serialization failure), adopt that
+    // reason and close code so the DIAG-01 lifecycle event stays truthful.
+    // Non-blocking peek only: the join below still owns the unfinished case.
+    if close_reason == "send_error" && !writer_finished {
+        use futures_util::FutureExt;
+        if let Some(Ok(exit)) = (&mut writer_task).now_or_never() {
+            close_reason = exit.reason();
+            close_code = exit.close_code();
+            writer_finished = true;
         }
     }
 

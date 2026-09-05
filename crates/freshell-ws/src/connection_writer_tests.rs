@@ -51,6 +51,14 @@ fn output(seq: i64) -> ServerMessage {
 fn notice(text: &str) -> Message {
     Message::Text(text.to_string().into())
 }
+fn leased_text(frame: &LeasedFrame) -> String {
+    match frame {
+        LeasedFrame::Control(Message::Text(text)) => text.to_string(),
+        LeasedFrame::Control(other) => format!("{other:?}"),
+        LeasedFrame::Output(msg) => serde_json::to_string(msg).unwrap(),
+    }
+}
+
 fn text_frames(capture: &Capture) -> Vec<String> {
     capture
         .frames
@@ -154,8 +162,10 @@ async fn preludes_always_precede_replay_and_exit_follows_output() {
     // Drive the exact queue selection used by the pump; no timing assumptions.
     let mut frames = Vec::new();
     while let Some(next) = pump.take_next().unwrap() {
-        if let Message::Text(text) = next.frame {
-            frames.push(text.to_string());
+        if matches!(&next.frame, LeasedFrame::Control(Message::Text(_)))
+            || matches!(&next.frame, LeasedFrame::Output(_))
+        {
+            frames.push(leased_text(&next.frame));
         }
         pump.finish_frame(next.output_bytes, next.control_bytes);
     }
@@ -184,90 +194,133 @@ async fn control_budget_includes_inflight_entries_and_zero_byte_messages() {
 }
 
 #[tokio::test]
-async fn unanswered_ping_times_out_at_the_next_cycle_tick() {
+async fn unanswered_ping_times_out_at_the_next_tick() {
     let (sender, pump) = WriterSender::new(4096, 4096, Duration::from_secs(10));
     let mut keepalive = Keepalive::default();
-    let now = Instant::now();
-    let interval = Duration::from_secs(1);
-    keepalive.tick(&sender, now, interval).unwrap();
+    keepalive.tick(&sender).unwrap();
     // The common case: the idle writer flushes the ping a hair after its
-    // tick. Detection must land at the NEXT tick one interval later — never
-    // slide another full cycle behind the flush delay.
+    // tick. Detection still lands at the NEXT tick boundary — deadlines are
+    // cycle-counted, so a late flush never slides detection a full cycle.
     let next = pump.take_next().unwrap().unwrap();
-    next.flushed
-        .unwrap()
-        .send(now + Duration::from_millis(5))
-        .unwrap();
+    next.flushed.unwrap().send(()).unwrap();
     pump.finish_frame(next.output_bytes, next.control_bytes);
-    assert_eq!(
-        keepalive.tick(&sender, now + interval, interval),
-        Err(KeepaliveError::TimedOut)
-    );
+    assert_eq!(keepalive.tick(&sender), Err(KeepaliveError::TimedOut));
 }
 
 #[tokio::test]
-async fn an_unflushed_ping_also_times_out_at_the_cycle_tick() {
+async fn an_unflushed_ping_also_times_out_at_the_next_tick() {
     let (sender, _pump) = WriterSender::new(4096, 4096, Duration::from_secs(10));
     let mut keepalive = Keepalive::default();
-    let now = Instant::now();
-    let interval = Duration::from_secs(1);
-    keepalive.tick(&sender, now, interval).unwrap();
-    // Controls preempt output, so a ping unflushed for a full cycle means
-    // the socket could not emit a single control frame all cycle — wedged
-    // (the writer's per-send stall deadline is a separate, wider bound).
-    assert_eq!(
-        keepalive.tick(&sender, now + interval, interval),
-        Err(KeepaliveError::TimedOut)
-    );
+    keepalive.tick(&sender).unwrap();
+    // Controls preempt output, so a ping still unflushed when the next tick
+    // fires means the socket could not emit a single control frame all
+    // cycle: wedged (the writer's per-send stall is a separate, wider bound).
+    assert_eq!(keepalive.tick(&sender), Err(KeepaliveError::TimedOut));
 }
 
 #[tokio::test]
 async fn answered_ping_retires_and_the_next_tick_queues_a_fresh_one() {
     let (sender, pump) = WriterSender::new(4096, 4096, Duration::from_secs(10));
     let mut keepalive = Keepalive::default();
-    let now = Instant::now();
-    let interval = Duration::from_secs(1);
-    keepalive.tick(&sender, now, interval).unwrap();
+    keepalive.tick(&sender).unwrap();
     let next = pump.take_next().unwrap().unwrap();
     // Pong observed BEFORE the flush receipt is processed still answers the
     // ping (a pong carries no cookie; ordering with the receipt is the
     // transport's business).
     keepalive.observe_pong();
-    next.flushed
-        .unwrap()
-        .send(now + Duration::from_millis(5))
-        .unwrap();
+    next.flushed.unwrap().send(()).unwrap();
     pump.finish_frame(next.output_bytes, next.control_bytes);
-    let next_tick = now + interval / 2;
-    keepalive.tick(&sender, next_tick, interval).unwrap();
+    keepalive.tick(&sender).unwrap();
     // Healthy cadence: exactly one fresh ping queued for the new cycle.
     let next = pump.take_next().unwrap().unwrap();
     assert!(next.flushed.is_some());
     assert!(pump.take_next().unwrap().is_none());
-    // The new ping's deadline is armed one interval from ITS queue tick.
-    assert_eq!(
-        keepalive.tick(&sender, next_tick + interval, interval),
-        Err(KeepaliveError::TimedOut)
-    );
+    // The new ping's deadline is armed for this same one-cycle rule.
+    assert_eq!(keepalive.tick(&sender), Err(KeepaliveError::TimedOut));
+}
+
+#[tokio::test]
+async fn a_pong_before_any_ping_grants_no_exemption() {
+    let (sender, _pump) = WriterSender::new(4096, 4096, Duration::from_secs(10));
+    let mut keepalive = Keepalive::default();
+    keepalive.observe_pong();
+    keepalive.tick(&sender).unwrap();
+    // The stray pong was consumed by queueing; the ping it could not have
+    // answered still needs its own pong within one cycle.
+    assert_eq!(keepalive.tick(&sender), Err(KeepaliveError::TimedOut));
 }
 
 #[tokio::test]
 async fn a_lost_flush_receipt_reports_the_writer_as_gone() {
     let (sender, pump) = WriterSender::new(4096, 4096, Duration::from_secs(10));
     let mut keepalive = Keepalive::default();
-    let now = Instant::now();
-    keepalive
-        .tick(&sender, now, Duration::from_secs(60))
-        .unwrap();
+    keepalive.tick(&sender).unwrap();
     // Pump teardown drops the queued ping's receipt sender unanswered.
     drop(pump);
     assert_eq!(
-        keepalive.tick(
-            &sender,
-            now + Duration::from_millis(1),
-            Duration::from_secs(60)
-        ),
+        keepalive.tick(&sender),
         Err(KeepaliveError::Writer(WriterExit::Stopped))
+    );
+}
+
+#[tokio::test]
+async fn saturated_streak_never_reorders_a_prelude_behind_its_replay() {
+    let (mut sender, pump) = WriterSender::new(1 << 20, 1 << 20, Duration::from_secs(10));
+    // One strictly-older output frame (e.g. another terminal's live stream)
+    // predates everything below; leapfrogging IT is exactly what the
+    // fairness rule exists for.
+    assert!(sender.push_server(output(100)));
+    // Saturate the streak at the limit, as an idle connection's keepalive
+    // pings would.
+    for i in 0..CONTROL_STREAK_LIMIT {
+        sender.send(notice(&format!("k{i}"))).await.unwrap();
+    }
+    for _ in 0..CONTROL_STREAK_LIMIT {
+        let next = pump.take_next().unwrap().unwrap();
+        assert!(matches!(next.frame, LeasedFrame::Control(Message::Text(_))));
+        pump.finish_frame(next.output_bytes, next.control_bytes);
+    }
+    // The attach prelude then replay, admitted in that order under one lock.
+    let ready: ServerMessage = serde_json::from_value(serde_json::json!({
+        "type":"terminal.attach.ready", "terminalId":"term", "attachRequestId":"a2",
+        "streamId":"stream", "headSeq":1, "replayFromSeq":1, "replayToSeq":2
+    }))
+    .unwrap();
+    assert!(sender.push_server(ready));
+    assert!(sender.push_server(ServerMessage::TerminalModesSync(
+        freshell_protocol::TerminalModesSync {
+            attach_request_id: "a2".into(),
+            data: "\u{1b}[?1003h".into(),
+            stream_id: "stream".into(),
+            terminal_id: "term".into(),
+        }
+    )));
+    assert!(sender.push_server(output(1)));
+    assert!(sender.push_server(output(2)));
+    let mut kinds = Vec::new();
+    while let Some(next) = pump.take_next().unwrap() {
+        let value: serde_json::Value = serde_json::from_str(&leased_text(&next.frame)).unwrap();
+        kinds.push(value["type"].as_str().unwrap().to_string());
+        pump.finish_frame(next.output_bytes, next.control_bytes);
+    }
+    let pos = |kind: &str| kinds.iter().position(|k| k == kind).unwrap();
+    let ready_at = pos("terminal.attach.ready");
+    let sync_at = pos("terminal.modes.sync");
+    assert!(
+        ready_at < sync_at,
+        "modes.sync must never precede its attach.ready: {kinds:?}"
+    );
+    let first_replay = kinds
+        .iter()
+        .enumerate()
+        .filter(|(_, k)| **k == "terminal.output")
+        .map(|(i, _)| i)
+        // output(100) is the stale frame; the attach's replay starts after it.
+        .nth(1)
+        .unwrap();
+    assert!(
+        sync_at < first_replay,
+        "modes.sync must precede its attach's replay: {kinds:?}"
     );
 }
 
@@ -282,9 +335,7 @@ async fn controls_cannot_starve_output_indefinitely() {
     }
     let mut order = Vec::new();
     while let Some(next) = pump.take_next().unwrap() {
-        if let Message::Text(text) = &next.frame {
-            order.push(text.to_string());
-        }
+        order.push(leased_text(&next.frame));
         pump.finish_frame(next.output_bytes, next.control_bytes);
     }
     let outputs: Vec<usize> = order
@@ -385,12 +436,10 @@ async fn superseding_attach_discards_old_queued_output_and_old_exit() {
     ));
     let mut kinds = Vec::new();
     while let Some(next) = pump.take_next().unwrap() {
-        if let Message::Text(text) = next.frame {
-            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-            kinds.push(value["type"].as_str().unwrap().to_string());
-            if value["type"] == "terminal.output" {
-                assert_eq!(value["attachRequestId"], "new-attach");
-            }
+        let value: serde_json::Value = serde_json::from_str(&leased_text(&next.frame)).unwrap();
+        kinds.push(value["type"].as_str().unwrap().to_string());
+        if value["type"] == "terminal.output" {
+            assert_eq!(value["attachRequestId"], "new-attach");
         }
         pump.finish_frame(next.output_bytes, next.control_bytes);
     }
@@ -408,6 +457,11 @@ async fn overflow_stops_a_pending_flush_without_waiting_for_send_timeout() {
     sender.push_server(output(1));
     let task = tokio::spawn(pump.run(TestSink(Arc::clone(&capture))));
     started(&capture).await;
+    // An empty lane always admits ONE frame, even an oversize one (a single
+    // large legitimate control must not close an otherwise idle connection).
+    sender.send(notice("over-budget-but-first")).await.unwrap();
+    // Continued flooding while that frame is still in flight overflows
+    // loudly — without waiting for the per-send timeout.
     assert_eq!(
         sender.send(notice("over-budget")).await,
         Err(WriterExit::ControlOverflow)

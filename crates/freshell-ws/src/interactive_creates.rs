@@ -144,8 +144,10 @@ pub(super) fn spawn(
     pane_reconcile_v1: bool,
 ) -> (mpsc::Sender<Job>, JoinHandle<()>) {
     // A queue bound is necessary now that the reader can continue while a
-    // create runs. Reuse the configured pending-create count, not an unbounded
-    // task per incoming message. The restore spawn gate remains separate.
+    // create runs. Deliberately reuses the configured pending-create count
+    // (`create_limit::CreateProtectConfig::spawn_queue_cap`) as the PER-
+    // CONNECTION queue depth: one operator ceiling for "creates parked, not
+    // running", server-wide (restore gate) and per-connection (this worker).
     let (tx, rx) = mpsc::channel(state.create_protect.spawn_queue_cap.max(1));
     let state = state.clone();
     let sink = Arc::clone(sink);

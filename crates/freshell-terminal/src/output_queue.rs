@@ -95,6 +95,11 @@ struct QueuedItem {
     /// FIFO position relative to output but is NEVER evicted and carries no
     /// queued-byte weight.
     meta: Option<OutputFrameMeta>,
+    /// Opaque admission-order stamp supplied by the caller (the connection
+    /// writer) so the pump can prove an output frame predates a control
+    /// frame before letting output leapfrog it; `None` carries no ordering
+    /// obligation. Kept on the item so eviction/discard stay consistent.
+    stamp: Option<u64>,
 }
 
 /// A pending, not-yet-delivered gap. Kept per-stream (mirrors legacy's
@@ -153,9 +158,39 @@ impl OutputQueue {
             msg,
             bytes,
             meta: Some(meta),
+            stamp: None,
         });
         self.total_bytes += bytes;
         self.evict_overflow();
+    }
+
+    /// [`Self::push`] with an admission-order stamp (see `stamp` above).
+    pub fn push_stamped(
+        &mut self,
+        msg: ServerMessage,
+        bytes: usize,
+        meta: OutputFrameMeta,
+        stamp: u64,
+    ) {
+        self.items.push_back(QueuedItem {
+            msg,
+            bytes,
+            meta: Some(meta),
+            stamp: Some(stamp),
+        });
+        self.total_bytes += bytes;
+        self.evict_overflow();
+    }
+
+    /// The admission stamp of the entry `pop_front` would return next, when
+    /// the caller stamps admissions. Synthesized gap frames and unstamped
+    /// entries report `None`: they carry no ordering obligations against
+    /// control frames.
+    pub fn front_stamp(&self) -> Option<u64> {
+        if !self.pending_gaps.is_empty() {
+            return None;
+        }
+        self.items.front().and_then(|item| item.stamp)
     }
 
     /// Push a sequenced CONTROL frame (e.g. `terminal.exit`) that must be
@@ -177,6 +212,7 @@ impl OutputQueue {
             msg,
             bytes: 0,
             meta: None,
+            stamp: None,
         });
     }
 
@@ -207,9 +243,18 @@ impl OutputQueue {
     pub fn discard_terminal(&mut self, terminal_id: &str) {
         let mut removed_bytes = 0;
         self.items.retain(|item| {
-            let belongs = item.meta.as_ref().is_some_and(|meta| meta.terminal_id == terminal_id)
-                || matches!(&item.msg, ServerMessage::TerminalExit(exit) if exit.terminal_id == terminal_id);
-            if belongs { removed_bytes += item.bytes; }
+            let meta_matches = item
+                .meta
+                .as_ref()
+                .is_some_and(|meta| meta.terminal_id == terminal_id);
+            let exit_matches = matches!(
+                &item.msg,
+                ServerMessage::TerminalExit(exit) if exit.terminal_id == terminal_id
+            );
+            let belongs = meta_matches || exit_matches;
+            if belongs {
+                removed_bytes += item.bytes;
+            }
             !belongs
         });
         self.total_bytes -= removed_bytes;

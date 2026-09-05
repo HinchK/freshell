@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::extract::ws::{CloseFrame, Message};
 use freshell_protocol::ServerMessage;
@@ -60,16 +60,25 @@ struct Stop {
 struct Control {
     frame: Message,
     bytes: usize,
-    // Keepalive observes the ping's flush receipt for liveness bookkeeping;
-    // the keepalive DEADLINE is anchored at the tick that queued the ping
-    // (see Keepalive), not at this receipt.
-    flushed: Option<oneshot::Sender<Instant>>,
+    /// Admission stamp (per-connection, strictly increasing under the queue
+    /// lock): decides whether an output frame may leapfrog this control.
+    seq: u64,
+    /// Keepalive observes the ping's flush receipt for liveness bookkeeping
+    /// (pump-gone fast detection) — deadlines are tick-counted, not timed.
+    flushed: Option<oneshot::Sender<()>>,
 }
 
-/// Consecutive control leases after which a pending output frame MUST be
-/// leased instead. Controls normally preempt (they are how the reader's
-/// answers and liveness traffic jump a backlog), but an unbounded control
-/// stream must not starve output all the way to the catastrophic monitor.
+/// Consecutive control leases after which a pending output frame MAY be
+/// leased instead of the next control — but ONLY if that output frame was
+/// admitted before the oldest pending control (its admission stamp is
+/// lower). Controls normally preempt (they are how the reader's answers and
+/// liveness traffic jump a backlog), and ordering-bound admissions (an
+/// attach's `attach.ready`/`modes.sync` prelude vs. its replay, pushed in
+/// that order under one lock) must never be reordered: the stamp check keeps
+/// leapfrogging restricted to strictly-older output. An unbounded control
+/// stream therefore cannot starve old output all the way to the
+/// catastrophic monitor, while a prelude is never overtaken by its newer
+/// replay.
 const CONTROL_STREAK_LIMIT: usize = 8;
 
 struct Queues {
@@ -81,6 +90,9 @@ struct Queues {
     /// Consecutive control frames leased since the last output frame. See
     /// `CONTROL_STREAK_LIMIT`.
     controls_since_last_output: usize,
+    /// Next admission stamp. Under the same lock as the queues, so stamps
+    /// are strictly increasing in true admission order.
+    next_seq: u64,
     closed: bool,
 }
 
@@ -107,10 +119,18 @@ pub(super) struct WriterPump {
 }
 
 struct NextFrame {
-    frame: Message,
+    /// Control frames arrive wire-ready; output frames carry their
+    /// `ServerMessage` so serialization happens AFTER the queue lock is
+    /// released (the PTY reader and dispatch both contend on it).
+    frame: LeasedFrame,
     output_bytes: usize,
     control_bytes: usize,
-    flushed: Option<oneshot::Sender<Instant>>,
+    flushed: Option<oneshot::Sender<()>>,
+}
+
+enum LeasedFrame {
+    Control(Message),
+    Output(Box<ServerMessage>),
 }
 
 impl WriterSender {
@@ -127,6 +147,7 @@ impl WriterSender {
                 control_bytes: 0,
                 in_flight_output_bytes: 0,
                 controls_since_last_output: 0,
+                next_seq: 0,
                 closed: false,
             }),
             output_limit: output_limit.max(1),
@@ -176,7 +197,7 @@ impl WriterSender {
     fn push_control(
         &self,
         frame: Message,
-        flushed: Option<oneshot::Sender<Instant>>,
+        flushed: Option<oneshot::Sender<()>>,
         supersedes_terminal: Option<&str>,
     ) -> Result<(), WriterExit> {
         if let Message::Close(close) = frame {
@@ -188,17 +209,24 @@ impl WriterSender {
         }
         // Charge a fixed per-entry allowance as well: zero-byte pings must
         // not create a count-unbounded control queue. This is a memory budget.
+        // Note the worst case adds to the output cap: one connection can hold
+        // up to output_limit + control_limit bytes.
         let bytes = frame_bytes(&frame).saturating_add(128);
         let mut queues = self.shared.queues.lock().expect("writer queue lock");
         if queues.closed {
             return Err(WriterExit::Stopped);
         }
-        if bytes
+        let would_exceed = bytes
             > self
                 .shared
                 .control_limit
-                .saturating_sub(queues.control_bytes)
-        {
+                .saturating_sub(queues.control_bytes);
+        // Always admit ONE frame into an empty lane, even one larger than the
+        // budget itself (a screenshot frame can legitimately exceed a small
+        // configured budget): an oversize single control must not close an
+        // otherwise-idle connection. CONTINUED flooding still overflows —
+        // admission fails while any oversize frame remains in flight.
+        if would_exceed && queues.control_bytes > 0 {
             drop(queues);
             self.fail(WriterExit::ControlOverflow);
             return Err(WriterExit::ControlOverflow);
@@ -207,9 +235,12 @@ impl WriterSender {
             queues.output.discard_terminal(terminal_id);
         }
         queues.control_bytes += bytes;
+        let seq = queues.next_seq;
+        queues.next_seq += 1;
         queues.controls.push_back(Control {
             frame,
             bytes,
+            seq,
             flushed,
         });
         drop(queues);
@@ -243,7 +274,9 @@ impl WriterSender {
             return false;
         }
         if let Some(meta) = meta {
-            queues.output.push(msg, json.len(), meta);
+            let seq = queues.next_seq;
+            queues.next_seq += 1;
+            queues.output.push_stamped(msg, json.len(), meta, seq);
         } else {
             // Preserve final-output -> exit. It must not use the control lane.
             queues.output.push_sequenced(msg);
@@ -253,7 +286,7 @@ impl WriterSender {
         true
     }
 
-    pub(super) fn queue_ping(&self) -> Result<oneshot::Receiver<Instant>, WriterExit> {
+    pub(super) fn queue_ping(&self) -> Result<oneshot::Receiver<()>, WriterExit> {
         let (tx, rx) = oneshot::channel();
         self.push_control(Message::Ping(Vec::new().into()), Some(tx), None)?;
         Ok(rx)
@@ -310,33 +343,46 @@ impl WriterPump {
             return Ok(None);
         }
         let output_pending = queues.output.has_pending();
-        let control_wins = !queues.controls.is_empty()
-            && (!output_pending || queues.controls_since_last_output < CONTROL_STREAK_LIMIT);
-        if control_wins {
-            let control = queues
-                .controls
-                .pop_front()
-                .expect("control_wins implies a queued control");
+        let control_waiting = !queues.controls.is_empty();
+        // Fairness never reorders a control behind output that was admitted
+        // AFTER it (a prelude must stay ahead of its replay): only output
+        // stamped strictly before the oldest pending control may leapfrog.
+        // Gap/exit heads carry no stamp and never leapfrog.
+        let output_may_leapfrog = match (queues.output.front_stamp(), queues.controls.front()) {
+            (Some(stamp), Some(control)) => stamp < control.seq,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        let take_output = output_pending
+            && (!control_waiting
+                || (queues.controls_since_last_output >= CONTROL_STREAK_LIMIT
+                    && output_may_leapfrog));
+        if take_output {
+            let Some((msg, bytes)) = queues.output.pop_front() else {
+                return Ok(None);
+            };
+            // The leased frame stays charged to the budget until its flush
+            // finishes (or the writer dies); the rest of the backlog remains
+            // queued and accounted.
+            queues.in_flight_output_bytes = bytes;
+            queues.controls_since_last_output = 0;
+            return Ok(Some(NextFrame {
+                frame: LeasedFrame::Output(Box::new(msg)),
+                control_bytes: 0,
+                output_bytes: bytes,
+                flushed: None,
+            }));
+        }
+        if let Some(control) = queues.controls.pop_front() {
             queues.controls_since_last_output += 1;
             return Ok(Some(NextFrame {
-                frame: control.frame,
+                frame: LeasedFrame::Control(control.frame),
                 control_bytes: control.bytes,
                 output_bytes: 0,
                 flushed: control.flushed,
             }));
         }
-        let Some((msg, bytes)) = queues.output.pop_front() else {
-            return Ok(None);
-        };
-        queues.controls_since_last_output = 0;
-        let json = serde_json::to_string(&msg).map_err(|_| WriterExit::SerializationFailed)?;
-        queues.in_flight_output_bytes = bytes;
-        Ok(Some(NextFrame {
-            frame: Message::Text(json.into()),
-            output_bytes: bytes,
-            control_bytes: 0,
-            flushed: None,
-        }))
+        Ok(None)
     }
 
     fn finish_frame(&self, output_bytes: usize, control_bytes: usize) {
@@ -385,6 +431,17 @@ impl WriterPump {
                 control_bytes,
                 flushed,
             } = next;
+            // Serialize leased output here, AFTER the queue lock is released
+            // (take_next holds it; the PTY reader and dispatch both contend).
+            let frame = match frame {
+                LeasedFrame::Control(frame) => frame,
+                LeasedFrame::Output(msg) => {
+                    let Ok(json) = serde_json::to_string(&msg) else {
+                        return WriterExit::SerializationFailed;
+                    };
+                    Message::Text(json.into())
+                }
+            };
             // Never cancel-and-restart a send to service another frame. Stop or
             // timeout below returns from run and drops the entire socket.
             let sent = tokio::select! {
@@ -434,7 +491,7 @@ impl WriterPump {
             }
             self.finish_frame(output_bytes, control_bytes);
             if let Some(receipt) = flushed {
-                let _ = receipt.send(Instant::now());
+                let _ = receipt.send(());
             }
             // No drain-all local vector: reconsider newly admitted controls
             // between every output frame, and yield even on an always-ready sink.
@@ -459,28 +516,21 @@ impl Drop for WriterPump {
 }
 
 struct Outstanding {
-    /// Flush receipt; `None` once the ping's flush has been confirmed (the
-    /// deadline stays anchored at `queued_at` regardless).
-    receipt: Option<oneshot::Receiver<Instant>>,
-    /// Tick time at which the ping was queued. Tick-aligned by construction,
-    /// so an unanswered ping is detected at exactly the next tick one
-    /// interval later — the legacy one-unanswered-cycle contract
-    /// (`ws.on('pong')`, ws-handler.ts:1149-1150), with no idle full-cycle
-    /// window in between.
-    queued_at: Instant,
+    /// Flush receipt; `None` once the ping's flush has been observed. Pure
+    /// liveness bookkeeping (a Closed receipt detects a dead pump one tick
+    /// early) — deadlines are never derived from it.
+    receipt: Option<oneshot::Receiver<()>>,
 }
 
-/// Tracks the keepalive transaction: at most one outstanding ping, answered
-/// by any pong (a direct transport reply carries no ping cookie, so a pong
-/// observed before the flush receipt is still retained as the answer).
-///
-/// The deadline is anchored at the tick that QUEUED the ping, not at its
-/// flush receipt: anchoring on the flush would slide detection by almost a
-/// full extra interval whenever the flush lands an epsilon after its tick.
-/// A ping still unflushed one full interval after its tick means the socket
-/// could not emit a single control frame for an entire cycle — the writer's
-/// per-send stall deadline bounds that case separately, and the keepalive
-/// kill is the earlier, legacy-shaped remediation.
+/// Tracks the keepalive transaction in TICK CYCLES, not wall clock — exactly
+/// the legacy `pong_since_last_ping` contract (`ws.on('pong')`,
+/// ws-handler.ts:1149-1150): a ping queued at tick N must be answered before
+/// tick N+1 fires, or the connection is dead. Detection lands at exactly one
+/// tick boundary by construction, immune to interval-timer jitter, and
+/// healthy connections emit exactly one ping per tick. At most one ping is
+/// outstanding; a pong with NO outstanding ping still counts as the next
+/// ping's answer, mirroring the legacy boolean (a transport pong carries no
+/// cookie, so wire order vs. flush receipts is irrelevant).
 #[derive(Default)]
 pub(super) struct Keepalive {
     outstanding: Option<Outstanding>,
@@ -498,52 +548,35 @@ impl Keepalive {
         self.pong = true;
     }
 
-    pub(super) fn tick(
-        &mut self,
-        sender: &WriterSender,
-        now: Instant,
-        interval: Duration,
-    ) -> Result<(), KeepaliveError> {
+    pub(super) fn tick(&mut self, sender: &WriterSender) -> Result<(), KeepaliveError> {
         if let Some(outstanding) = &mut self.outstanding {
             if let Some(receipt) = &mut outstanding.receipt {
                 match receipt.try_recv() {
-                    // Flush confirmed; the deadline stays anchored at
-                    // `queued_at`, so this receipt is liveness bookkeeping
-                    // only (no timeout relief for a late flush).
-                    Ok(_) => outstanding.receipt = None,
+                    Ok(()) => outstanding.receipt = None, // flush observed
                     Err(oneshot::error::TryRecvError::Empty) => {}
                     // The pump is gone without ever flushing this ping; its
                     // task result carries the precise cause
-                    // (SendFailed/SendTimedOut/…) — here it can only mean
-                    // "no flush receipt will arrive".
+                    // (SendFailed/SendTimedOut/…) — "stopped" is the only
+                    // fact this edge can know.
                     Err(oneshot::error::TryRecvError::Closed) => {
                         return Err(KeepaliveError::Writer(WriterExit::Stopped));
                     }
                 }
             }
-        }
-        if let Some(outstanding) = &self.outstanding {
-            if self.pong {
-                // Answered within its cycle (possibly before the flush
-                // receipt — a pong needs no cookie): retire it and queue the
-                // next ping below; healthy connections emit one per tick.
-                self.outstanding = None;
-                self.pong = false;
-            } else if now.saturating_duration_since(outstanding.queued_at) >= interval {
-                // One full cycle, no pong — dead peer (flushed but
-                // unanswered) or a wedged socket (never flushed).
+            if !self.pong {
+                // One full cycle with no answer — dead peer (flushed but
+                // unanswered) or a wedged socket (never even flushed:
+                // controls preempt output, so a full silent cycle is never
+                // the peer's fault).
                 return Err(KeepaliveError::TimedOut);
-            } else {
-                // Within the outstanding ping's cycle: wait for its pong;
-                // never stack a second ping.
-                return Ok(());
             }
+            self.outstanding = None; // answered within its cycle
         }
         let receipt = sender.queue_ping().map_err(KeepaliveError::Writer)?;
         self.outstanding = Some(Outstanding {
             receipt: Some(receipt),
-            queued_at: now,
         });
+        self.pong = false;
         Ok(())
     }
 }
