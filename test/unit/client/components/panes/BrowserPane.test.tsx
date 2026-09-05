@@ -2,11 +2,11 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, cleanup, fireEvent, waitFor, act } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
-import panesReducer, { requestPaneRefresh } from '@/store/panesSlice'
+import panesReducer, { requestPaneRefresh, setActivePane } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
 import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
 import BrowserPane from '@/components/panes/BrowserPane'
-import { resetPaneFocusOwnershipForTests } from '@/lib/pane-focus-ownership'
+import { resetPaneFocusOwnershipForTests, wirePaneFocusOwnershipInvalidation, isPaneFocusRestorePendingForTests } from '@/lib/pane-focus-ownership'
 
 // Mock clipboard
 vi.mock('@/lib/clipboard', () => ({
@@ -836,6 +836,28 @@ describe('BrowserPane', () => {
       second.unmount() // must NOT overwrite the URL descriptor with the artifact focus
       renderBrowserPane({ url: 'https://example.com' })
       await waitFor(() => expect(screen.getByPlaceholderText('Enter URL...')).toHaveFocus(), { timeout: 2000 })
+    })
+
+    it('a restore in flight YIELDS to a newer explicit selection (split, then immediately select elsewhere)', async () => {
+      const first = renderBrowserPane({ url: 'https://example.com' })
+      const urlInput = screen.getByPlaceholderText('Enter URL...')
+      urlInput.focus()
+      first.unmount() // records the URL input
+      const { store } = renderBrowserPane({ url: 'https://example.com' }) // adoption allowed; restore scheduled
+      const unwire = wirePaneFocusOwnershipInvalidation(store)
+      try {
+        // The agent immediately selects elsewhere before the restore fires —
+        // the selection must win; the restore must not drag focus back.
+        act(() => {
+          store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-2' }))
+        })
+        // The window fired (pending spent)…
+        await waitFor(() => expect(isPaneFocusRestorePendingForTests('pane-1')).toBe(false))
+        // …but it yielded to the newer selection: URL input never grabbed focus.
+        expect(screen.getByPlaceholderText('Enter URL...')).not.toHaveFocus()
+      } finally {
+        unwire()
+      }
     })
 
     it('an explicit re-select of the ALREADY-active pane (focus epoch bump) focuses a denied remount', () => {

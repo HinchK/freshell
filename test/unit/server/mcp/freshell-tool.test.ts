@@ -12,7 +12,7 @@ vi.mock('../../../../server/mcp/http-client.js', () => ({
   createApiClient: () => mockClient,
 }))
 
-import { TOOL_DESCRIPTION, INSTRUCTIONS, INPUT_SCHEMA, executeAction } from '../../../../server/mcp/freshell-tool.js'
+import { TOOL_DESCRIPTION, INPUT_SCHEMA, executeAction } from '../../../../server/mcp/freshell-tool.js'
 
 beforeEach(() => {
   mockClient.get.mockReset()
@@ -1600,4 +1600,3 @@ describe('executeAction -- parameter validation', () => {
     expect(text).toContain('Playbook: open a URL')
   })
 })
-

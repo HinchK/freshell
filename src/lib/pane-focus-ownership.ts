@@ -28,6 +28,9 @@ export interface PaneFocusRecord {
    *  element, or null when none could be derived. ':scope' means the pane
    *  root itself held focus (the pane shell is tabbable). */
   selector: string | null
+  /** Selection serial at record time; a restore skips if any explicit
+   *  pane-selection activity landed since (newer selection wins). */
+  serialAtRecord?: number
   /** Set while a mount-window restore for this pane is scheduled but has not
    *  fired. During that window a teardown must NOT overwrite the descriptor:
    *  the intermediate remount's own autofocus artifact (or blank focus) is
@@ -37,6 +40,12 @@ export interface PaneFocusRecord {
 }
 
 const recordByPaneId = new Map<string, PaneFocusRecord>()
+
+/** Monotonic serial bumped on ANY explicit pane-selection activity (Redux
+ *  activePane change — pointer clicks included — or a focus-epoch nudge from
+ *  the select folds). A restore recorded before the activity must not fire
+ *  after it: the newer selection, user or scripted, is the truth and wins. */
+let paneSelectionSerial = 0
 
 /** Escape a value for use inside a quoted attribute selector. */
 function attrValue(value: string): string {
@@ -69,7 +78,15 @@ function describeInnerSelector(el: HTMLElement, root: Element): string | null {
   const dataContext = el.getAttribute('data-context')
   if (dataContext) candidates.push(`${tag}[data-context="${attrValue(dataContext)}"]`)
   for (const sel of candidates) {
-    if (root.querySelectorAll(sel).length === 1 && root.querySelector(sel) === el) return sel
+    // User-derived attribute text (e.g. an aria-label carrying a full chat
+    // message) can contain newlines or other CSS string terminators that make
+    // the quoted selector unparseable — skip that candidate, not the record.
+    if (/[\n\r\f]/.test(sel)) continue
+    try {
+      if (root.querySelectorAll(sel).length === 1 && root.querySelector(sel) === el) return sel
+    } catch {
+      // unbuildable selector — try the next candidate
+    }
   }
   return null
 }
@@ -98,6 +115,7 @@ export function recordPaneFocusBeforeUnmount(paneId: string): void {
   recordByPaneId.set(paneId, {
     owned,
     selector: owned && active instanceof HTMLElement ? describeInnerSelector(active, root) : null,
+    serialAtRecord: paneSelectionSerial,
   })
   // Bound growth across long sessions (closed panes leave stale entries):
   // evict the OLDEST entries (Maps iterate in insertion order). Never wipe
@@ -151,6 +169,9 @@ export function schedulePaneFocusRestore(paneId: string): () => void {
     timer = setTimeout(() => {
       if (cancelled) return
       if (record) record.restorePending = false
+      // A newer explicit selection (user click, scripted select) since the
+      // record was taken WINS: do not drag focus back to this pane.
+      if (record && record.serialAtRecord !== paneSelectionSerial) return
       const el = resolveRecordedFocusTarget(paneId)
       if (el?.isConnected) el.focus()
     }, 0)
@@ -160,6 +181,61 @@ export function schedulePaneFocusRestore(paneId: string): () => void {
     cancelAnimationFrame(frame)
     if (timer !== null) clearTimeout(timer)
   }
+}
+
+type LayoutNodeLike = { type?: string; id?: string; children?: LayoutNodeLike[] }
+
+/** Wire record invalidation + selection tracking to the live store (called
+ *  once from store.ts). Selection bumps guard the restore; panes that
+ *  disappear from every layout are forgotten — so a reopened tab whose
+ *  preserved leaf ids remount read as "unknown" (fresh UX), never consulting
+ *  a stale pre-close record, and pending flags of dead panes are GC'd. */
+export function wirePaneFocusOwnershipInvalidation(storeLike: {
+  subscribe: (listener: () => void) => () => void
+  getState: () => {
+    panes?: {
+      activePane?: Record<string, string>
+      focusEpochByPaneId?: Record<string, number>
+      layouts?: Record<string, LayoutNodeLike>
+    }
+  }
+}): () => void {
+  let prevActivePane = storeLike.getState().panes?.activePane
+  let prevEpoch = storeLike.getState().panes?.focusEpochByPaneId
+  let prevLayouts = storeLike.getState().panes?.layouts
+  return storeLike.subscribe(() => {
+    const panes = storeLike.getState().panes
+    if (!panes) return
+    if (panes.activePane !== prevActivePane || panes.focusEpochByPaneId !== prevEpoch) {
+      prevActivePane = panes.activePane
+      prevEpoch = panes.focusEpochByPaneId
+      paneSelectionSerial += 1
+    }
+    if (panes.layouts !== prevLayouts) {
+      prevLayouts = panes.layouts
+      const live = new Set<string>()
+      const walk = (node: LayoutNodeLike | undefined) => {
+        if (!node) return
+        if (node.type === 'split') {
+          for (const child of node.children ?? []) walk(child)
+        } else if (node.id) live.add(node.id)
+      }
+      for (const root of Object.values(panes.layouts ?? {})) walk(root)
+      for (const id of [...recordByPaneId.keys()]) {
+        if (!live.has(id)) recordByPaneId.delete(id)
+      }
+    }
+  })
+}
+
+/** Test-only: whether an in-flight restore window is still pending. */
+export function isPaneFocusRestorePendingForTests(paneId: string): boolean {
+  return recordByPaneId.get(paneId)?.restorePending === true
+}
+
+/** Test-only: read the selection serial (asserts restore yield behavior). */
+export function getPaneSelectionSerialForTests(): number {
+  return paneSelectionSerial
 }
 
 /** Test-only helper: erase all remembered ownership. */

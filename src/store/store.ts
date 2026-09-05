@@ -37,6 +37,7 @@ import {
   pruneTabRecencyToCurrentLayout,
   tabRecencyPruneMiddleware,
 } from './tabRecencyPruneMiddleware'
+import { wirePaneFocusOwnershipInvalidation } from '@/lib/pane-focus-ownership'
 
 enableMapSet()
 
@@ -91,6 +92,11 @@ export const store = configureStore({
 })
 
 pruneTabRecencyToCurrentLayout(store)
+
+// Pane focus-ownership memory: explicit selections (activePane changes and
+// epoch nudges) advance the restore-guard serial; panes removed from every
+// layout are forgotten so reopening a closed tab never reads a stale record.
+wirePaneFocusOwnershipInvalidation(store)
 
 // Note: Tabs and Panes are now loaded from localStorage directly in their slice
 // initial states (see tabsSlice.ts and panesSlice.ts). This ensures the state

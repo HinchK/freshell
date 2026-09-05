@@ -1,14 +1,22 @@
 import { describe, it, expect, afterEach } from 'vitest'
+import { waitFor } from '@testing-library/react'
+import { configureStore } from '@reduxjs/toolkit'
+import panesReducer, { initLayout, removeLayout, setActivePane } from '@/store/panesSlice'
 import {
   recordPaneFocusBeforeUnmount,
   resolveRecordedFocusTarget,
   schedulePaneFocusRestore,
   shouldFocusPaneOnEligibleMount,
+  wirePaneFocusOwnershipInvalidation,
+  isPaneFocusRestorePendingForTests,
   resetPaneFocusOwnershipForTests,
 } from '@/lib/pane-focus-ownership'
 
 describe('pane-focus-ownership', () => {
+  let unsubscribe: (() => void) | null = null
   afterEach(() => {
+    unsubscribe?.()
+    unsubscribe = null
     resetPaneFocusOwnershipForTests()
     document.body.innerHTML = ''
   })
@@ -143,7 +151,7 @@ describe('pane-focus-ownership', () => {
     expect(resolveRecordedFocusTarget('p11')).toBe(document.querySelector('input'))
     // After the restore fires, pending clears and the next teardown records fresh.
     const cancel2 = schedulePaneFocusRestore('p11')
-    await new Promise((r) => setTimeout(r, 30))
+    await waitFor(() => expect(isPaneFocusRestorePendingForTests('p11')).toBe(false))
     cancel2()
     document.body.innerHTML = `<div data-pane-id="p11"><div><input placeholder="Enter URL..."></div></div><input id="chrome">`
     ;(document.getElementById('chrome') as HTMLInputElement).focus()
@@ -158,6 +166,56 @@ describe('pane-focus-ownership', () => {
     recordPaneFocusBeforeUnmount('p12')
     document.body.innerHTML = `<div class="tab-hidden"><div data-pane-id="p12" tabindex="-1"></div></div>`
     expect(resolveRecordedFocusTarget('p12')).toBeNull()
+  })
+
+  it('never throws on user-derived multiline attribute text; the element falls through to null', () => {
+    document.body.innerHTML = `<div data-pane-id="p13"></div>`
+    const root = document.querySelector('[data-pane-id="p13"]')!
+    const btn = document.createElement('button')
+    btn.setAttribute('aria-label', 'glom\nthis multiline message')
+    root.appendChild(btn)
+    btn.focus()
+    expect(() => recordPaneFocusBeforeUnmount('p13')).not.toThrow()
+    // aria-label candidate unparseable, title/data-context absent → no descriptor
+    expect(resolveRecordedFocusTarget('p13')).toBeNull()
+  })
+
+  it('restore yields to a NEWER explicit selection (user click or scripted select)', async () => {
+    const store = configureStore({ reducer: { panes: panesReducer } })
+    unsubscribe = wirePaneFocusOwnershipInvalidation(store)
+    document.body.innerHTML = `<div data-pane-id="p20"><input placeholder="Enter URL..."></div>`
+    const url = document.querySelector('input') as HTMLInputElement
+    url.focus()
+    recordPaneFocusBeforeUnmount('p20')
+    schedulePaneFocusRestore('p20')
+    // The newer selection lands elsewhere (focus follows it) before the window fires.
+    const selected = document.createElement('input')
+    document.body.appendChild(selected)
+    selected.focus()
+    // Explicit selection arrives inside the restore window (serial bumps).
+    store.dispatch(setActivePane({ tabId: 'tab-x', paneId: 'p20' }))
+    // The fire ran (window spent)…
+    await waitFor(() => expect(isPaneFocusRestorePendingForTests('p20')).toBe(false))
+    // …but the newer selection kept focus; the restore yielded.
+    expect(document.activeElement).toBe(selected)
+    // The window is spent: pending cleared, later teardown records fresh.
+    const chrome = document.createElement('input')
+    document.body.appendChild(chrome)
+    chrome.focus()
+    recordPaneFocusBeforeUnmount('p20')
+    expect(shouldFocusPaneOnEligibleMount('p20')).toBe(false)
+  })
+
+  it('forgets records for panes removed from every layout (reopen mounts as fresh)', () => {
+    const store = configureStore({ reducer: { panes: panesReducer } })
+    unsubscribe = wirePaneFocusOwnershipInvalidation(store)
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'p21', content: { kind: 'terminal', mode: 'shell' } }))
+    document.body.innerHTML = `<div data-pane-id="p21"></div><input id="chrome">`
+    ;(document.getElementById('chrome') as HTMLInputElement).focus()
+    recordPaneFocusBeforeUnmount('p21')
+    expect(shouldFocusPaneOnEligibleMount('p21')).toBe(false)
+    store.dispatch(removeLayout({ tabId: 'tab-1' }))
+    expect(shouldFocusPaneOnEligibleMount('p21')).toBe(true) // forgotten → unknown
   })
 
   it('trims the OLDEST entries beyond the cap instead of wiping the map', () => {
