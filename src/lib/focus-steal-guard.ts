@@ -31,8 +31,16 @@ function isLockedIframe(el: Element | null): el is HTMLIFrameElement {
  * check runs after a task — deterministic in Chromium and jsdom alike.
  */
 export function installFocusStealGuard(): () => void {
+  // A disposed guard must never act: every pending rebuff timer is tracked and
+  // cancelled by the disposer (otherwise an unmounted App could still blur a
+  // later iframe or re-focus an obsolete displaced element). A hoist fires a
+  // focusout AND — when body was displaced — a window blur, so MULTIPLE queued
+  // rebuffs are legitimate; new events must NOT cancel pending ones (the first
+  // may be the only one carrying the displaced element to restore).
+  const pendingTimers = new Set<ReturnType<typeof setTimeout>>()
   const rebuff = (displaced: HTMLElement | null) => {
-    setTimeout(() => {
+    const timer = setTimeout(() => {
+      pendingTimers.delete(timer)
       const active = document.activeElement
       if (!isLockedIframe(active)) return
       active.blur()
@@ -42,6 +50,7 @@ export function installFocusStealGuard(): () => void {
         document.body.focus?.()
       }
     }, 0)
+    pendingTimers.add(timer)
   }
 
   const onFocusOut = (e: FocusEvent) => {
@@ -56,5 +65,7 @@ export function installFocusStealGuard(): () => void {
   return () => {
     document.removeEventListener('focusout', onFocusOut)
     window.removeEventListener('blur', onWindowBlur)
+    for (const timer of pendingTimers) clearTimeout(timer)
+    pendingTimers.clear()
   }
 }

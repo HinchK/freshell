@@ -1,7 +1,7 @@
 // Renders server and client extension panes as sandboxed iframes.
 // Server extensions are proxied through /api/proxy/http/:port/ for Docker/WSL2 compatibility.
 
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react'
 import { useAppSelector, useAppDispatch } from '@/store/hooks'
 import { updateServerStatus } from '@/store/extensionsSlice'
 import { api } from '@/lib/api'
@@ -180,7 +180,14 @@ export default function ExtensionPane({ paneId, content, focusEligible = true, f
   // an ownership-denied remount of an active extension pane (MCP split while
   // the user is in app chrome) must not expose an unlocked iframe to
   // page-script focus hoists — the guard only rebuffs LOCKED frames.
-  const iframeFocusLocked = !focusEligible || !mayFocusNow()
+  // The adoption read must NOT happen during render (render precedes the
+  // outgoing subtree's layout cleanups where the ownership record is
+  // written, and a render-time read would latch "unknown → allowed"); a
+  // layout effect computes it post-commit, before paint.
+  const [iframeFocusLocked, setIframeFocusLocked] = useState(() => !focusEligible)
+  useLayoutEffect(() => {
+    setIframeFocusLocked(!focusEligible || !mayFocusNow())
+  }, [focusEligible, mayFocusNow])
 
   // Reset load error on retry
   useEffect(() => {

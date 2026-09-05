@@ -699,6 +699,30 @@ describe('BrowserPane', () => {
       expect(iframeAfter!.getAttribute('src')).toBe(srcBefore)
     })
 
+    it('REAL split-swap commit order (new subtree renders before old cleanup): chrome keeps focus, iframe stays locked', () => {
+      const first = renderBrowserPane({ url: 'https://example.com' })
+      // Mount autofocus claims the pane root; the user then moves to app chrome.
+      const chrome = document.createElement('input')
+      document.body.appendChild(chrome)
+      chrome.focus()
+      // Single commit: wrapping div added → pane-1 subtree deleted + recreated —
+      // React renders the new tree BEFORE the old subtree's layout cleanups
+      // write the ownership record. A render-time adoption read would latch
+      // "unknown → allowed" and steal chrome's focus; post-commit reads deny it.
+      first.rerender(
+        <Provider store={first.store}>
+          <div>
+            <div data-pane-id="pane-2"><input aria-label="sibling" /></div>
+            <BrowserPane paneId="pane-1" tabId="tab-1" browserInstanceId="browser-1" url="https://example.com" devToolsOpen={false} />
+          </div>
+        </Provider>,
+      )
+      const iframe = document.querySelector('iframe')!
+      expect(iframe.hasAttribute('inert')).toBe(true)
+      expect(iframe.getAttribute('data-focus-locked')).toBe('true')
+      expect(chrome).toHaveFocus()
+    })
+
     it('locks the iframe on an ownership-DENIED eligible remount (active pane, user in app chrome)', () => {
       const first = renderBrowserPane({ url: 'https://example.com' })
       // Mount autofocus claims the pane root (own-focus); the user then moves

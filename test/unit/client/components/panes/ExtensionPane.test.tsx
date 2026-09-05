@@ -95,6 +95,28 @@ describe('ExtensionPane focus gating (agent focus neutrality)', () => {
     expect(document.activeElement).toBe(iframe)
   })
 
+  it('REAL split-swap commit order: chrome keeps focus, iframe stays locked (render-time adoption latch regression pin)', () => {
+    const first = renderPane(true)
+    const chrome = document.createElement('input')
+    document.body.appendChild(chrome)
+    chrome.focus()
+    // Parent-chain change deletes + recreates pane-1's subtree in ONE commit.
+    first.rerender(
+      <Provider store={first.store}>
+        <div>
+          <div data-pane-id="pane-2"><input aria-label="sibling" /></div>
+          <div data-pane-id="pane-1">
+            <ExtensionPane tabId="tab-1" paneId="pane-1" content={content} focusEligible />
+          </div>
+        </div>
+      </Provider>,
+    )
+    const iframe = document.querySelector('iframe') as HTMLIFrameElement
+    expect(iframe.hasAttribute('inert')).toBe(true)
+    expect(iframe.getAttribute('data-focus-locked')).toBe('true')
+    expect(chrome).toHaveFocus()
+  })
+
   it('locks the iframe on an ownership-DENIED eligible remount (active pane, user in app chrome)', () => {
     const first = renderPane(true)
     const chrome = document.createElement('input')

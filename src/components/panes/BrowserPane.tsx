@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect } from 'react'
+import { useState, useRef, useCallback, useEffect, useLayoutEffect } from 'react'
 import { ArrowLeft, ArrowRight, RotateCcw, X, Wrench, Loader2 } from 'lucide-react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { consumePaneRefreshRequest, updatePaneContent } from '@/store/panesSlice'
@@ -465,7 +465,17 @@ export default function BrowserPane({
   // a browser pane while the user works in app chrome) renders an UNLOCKED
   // iframe whose page scripts/autofocus could hoist it to activeElement, and
   // the app-wide guard only rebuffs LOCKED frames.
-  const iframeFocusLocked = !focusEligible || !mayFocusNow()
+  // The adoption read must NOT happen during render: React renders the
+  // replacement subtree BEFORE the outgoing subtree's layout cleanups run
+  // (the ownership record is written in the cleanup), so a render-time read
+  // would latch "unknown → allowed" permanently. Compute the lock in a layout
+  // effect instead — deletions (and their records) commit before the new
+  // subtree's effects, so the record is present, and the state update applies
+  // before paint.
+  const [iframeFocusLocked, setIframeFocusLocked] = useState(() => !focusEligible)
+  useLayoutEffect(() => {
+    setIframeFocusLocked(!focusEligible || !mayFocusNow())
+  }, [focusEligible, mayFocusNow])
 
   useEffect(() => {
     if (!refreshRequest) return

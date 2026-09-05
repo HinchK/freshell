@@ -33,6 +33,25 @@ describe('focus-steal-guard', () => {
     document.body.removeAttribute('tabindex')
   })
 
+  it('a disposed guard never acts on a queued hoist (pending rebuff cancelled)', async () => {
+    dispose = installFocusStealGuard()
+    document.body.innerHTML = `
+      <input id="real-g9">
+      <iframe data-focus-locked="true"></iframe>`
+    const real = document.getElementById('real-g9') as HTMLInputElement
+    const iframe = document.querySelector('iframe') as HTMLIFrameElement
+    real.focus()
+    // Hoist begins: displaced element fires focusout, queuing the rebuff…
+    displacedFocusout(real)
+    // …the guard is disposed BEFORE the timer fires (e.g. App unmount)…
+    dispose()
+    // …and the hoist completes. Without cancellation the stale rebuff would
+    // blur the win and re-focus the displaced element.
+    iframe.focus()
+    await flushGuard()
+    expect(document.activeElement).toBe(iframe)
+  })
+
   it('blurs a locked iframe that displaced a focused element, and restores that element', async () => {
     dispose = installFocusStealGuard()
     document.body.innerHTML = `
