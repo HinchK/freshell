@@ -468,7 +468,10 @@ impl WriterPump {
         // Fairness never reorders a control behind output that was admitted
         // AFTER it (a prelude must stay ahead of its replay): only output
         // stamped strictly before the oldest pending control may leapfrog.
-        // Gap/exit heads carry no stamp and never leapfrog.
+        // Gap heads carry no stamp and never leapfrog; sequenced exits DO
+        // keep their admission stamp and may leapfrog a control streak —
+        // admission order (and hence exit-behind-final-output within a
+        // terminal) is preserved either way.
         let output_may_leapfrog = match (queues.output.front_stamp(), queues.controls.front()) {
             (Some(stamp), Some(control)) => stamp < control.seq,
             (Some(_), None) => true,

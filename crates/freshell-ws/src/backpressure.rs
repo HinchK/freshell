@@ -34,11 +34,14 @@
 //!
 //! Visible-first pacing / background throttling (legacy's
 //! `TERMINAL_FOREGROUND_REPLAY_BUFFERED_PAUSE_BYTES` /
-//! `TERMINAL_BACKGROUND_BUFFERED_PAUSE_BYTES` differential) is NOT ported
-//! here: it depends on the attach-priority concept (`AttachPriority`,
-//! foreground vs. background) that TERM-07 owns, and TERM-07 is not yet
-//! implemented in this port (no connection/attachment currently carries a
-//! priority at all). This module has one pacing tier, not two.
+//! `TERMINAL_BACKGROUND_BUFFERED_PAUSE_BYTES` differential) lives in the
+//! connection writer's byte-fair delivery queue
+//! (`terminal::connection_writer`'s `terminal_delivery_queue`): focused,
+//! visible, and background terminals receive roughly an 8:3:1 byte share
+//! under continuous backlog, driven by the `terminalInterestV1` client's
+//! presentation snapshots, with `terminal.attach.priority` as the
+//! pre-snapshot fallback. This module holds the caps plus the catastrophic
+//! monitor, not the scheduling.
 
 use std::time::{Duration, Instant};
 

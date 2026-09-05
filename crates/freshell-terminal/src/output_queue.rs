@@ -4,10 +4,11 @@
 //! itself lives in `freshell-ws::terminal::connection_writer`'s
 //! `terminal_delivery_queue` module: connection-local focused/visible/
 //! background scheduling with a global-oldest evictable index, generation-
-//! scoped gap coalescing, and non-evictable sequenced controls
-//! (`terminal.exit` can never be dropped; a connection whose sequenced
-//! controls alone exceed the cap is closed with 4008 instead of growing
-//! without bound). This module keeps only the pieces that are referenced
+//! scoped gap coalescing, and non-evictable ZERO-WEIGHT sequenced controls
+//! (`terminal.exit` can never be dropped, evicted, or trip the byte cap;
+//! it is count-bounded by the independent metadata limit). Connection death
+//! with 4008 happens only when evictable output is exhausted while over the
+//! cap. This module keeps only the pieces that are referenced
 //! across crate boundaries: the default cap and the output-frame metadata
 //! extraction the writer needs to classify and (on eviction) synthesize a
 //! [`ServerMessage::TerminalOutputGap`] with
