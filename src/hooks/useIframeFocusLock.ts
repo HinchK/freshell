@@ -24,24 +24,27 @@ import { useLayoutEffect, useState } from 'react'
  * works — standard "click to wake" recovery).
  */
 export function useIframeFocusLock(
-  paneRootRef: { readonly current: HTMLElement | null },
+  paneRoot: HTMLElement | null,
   focusEligible: boolean,
   mayFocusNow: () => boolean,
 ): boolean {
   const [locked, setLocked] = useState(() => !focusEligible)
 
+  // paneRoot comes from a callback-ref STATE (not a ref object): the effect
+  // re-runs the moment a deferred element (e.g. a server extension iframe
+  // waiting on serverRunning) finally mounts, so the unlock listener always
+  // ends up attached to a real DOM node.
   useLayoutEffect(() => {
     setLocked(!focusEligible || !mayFocusNow())
     // With inert applied, hit tests against the locked subtree retarget to the
     // closest NON-inert ancestor — the pane shell — so listen there (fall back
-    // to the ref target itself when no shell exists, e.g. bare unit renders).
-    const root = paneRootRef.current
-    const listenTarget = (root?.closest('[data-pane-id]') as HTMLElement | null) ?? root
+    // to the element itself when no shell exists, e.g. bare unit renders).
+    const listenTarget = (paneRoot?.closest('[data-pane-id]') as HTMLElement | null) ?? paneRoot
     if (!listenTarget || !focusEligible) return
     const unlock = () => setLocked(false)
     listenTarget.addEventListener('pointerdown', unlock, true)
     return () => listenTarget.removeEventListener('pointerdown', unlock, true)
-  }, [paneRootRef, focusEligible, mayFocusNow])
+  }, [paneRoot, focusEligible, mayFocusNow])
 
   return locked
 }

@@ -192,7 +192,15 @@ export default function BrowserPane({
   const refreshRequest = useAppSelector((state) => state.panes.refreshRequestsByPane?.[tabId]?.[paneId] ?? null)
   const iframeRef = useRef<HTMLIFrameElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
-  const rootRef = useRef<HTMLDivElement>(null)
+  const rootRef = useRef<HTMLDivElement | null>(null)
+  // Callback-ref STATE mirror: the iframe-focus-lock effect keys on the
+  // element, so it re-runs exactly when the node (re)mounts — unlike a ref
+  // read, element identity participates in effect deps.
+  const [rootEl, setRootEl] = useState<HTMLDivElement | null>(null)
+  const setRootNode = useCallback((el: HTMLDivElement | null) => {
+    rootRef.current = el
+    setRootEl(el)
+  }, [])
   const [inputUrl, setInputUrl] = useState(url)
   const [isLoading, setIsLoading] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -469,7 +477,7 @@ export default function BrowserPane({
   // happen during render (render precedes the outgoing subtree's cleanup that
   // records ownership); the hook computes the lock post-commit and lifts it
   // on a pointerdown inside the pane (user wake intent).
-  const iframeFocusLocked = useIframeFocusLock(rootRef, focusEligible, mayFocusNow)
+  const iframeFocusLocked = useIframeFocusLock(rootEl, focusEligible, mayFocusNow)
 
   useEffect(() => {
     if (!refreshRequest) return
@@ -511,7 +519,7 @@ export default function BrowserPane({
 
   return (
     <div
-      ref={rootRef}
+      ref={setRootNode}
       tabIndex={-1}
       className="flex flex-col h-full w-full bg-background"
       data-context={ContextIds.Browser}

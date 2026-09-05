@@ -75,7 +75,15 @@ export default function ExtensionPane({ paneId, content, focusEligible = true, f
   // Iframe load error state
   const [loadError, setLoadError] = useState<string | null>(null)
   const [loadAttempt, setLoadAttempt] = useState(0)
-  const iframeRef = useRef<HTMLIFrameElement>(null)
+  const iframeRef = useRef<HTMLIFrameElement | null>(null)
+  // Callback-ref STATE mirror: the focus-lock effect re-runs exactly when the
+  // iframe mounts — server extensions render the iframe only after
+  // serverRunning flips true, so a ref-read effect would never see it.
+  const [iframeEl, setIframeEl] = useState<HTMLIFrameElement | null>(null)
+  const setIframeNode = useCallback((el: HTMLIFrameElement | null) => {
+    iframeRef.current = el
+    setIframeEl(el)
+  }, [])
 
   // Auto-start server extensions that aren't running
   useEffect(() => {
@@ -185,7 +193,7 @@ export default function ExtensionPane({ paneId, content, focusEligible = true, f
   // subtree's cleanup that records ownership); the hook computes the lock
   // post-commit and lifts it on a pointerdown inside the pane (user wake
   // intent — inert swallows the click; the NEXT click enters the iframe).
-  const iframeFocusLocked = useIframeFocusLock(iframeRef, focusEligible, mayFocusNow)
+  const iframeFocusLocked = useIframeFocusLock(iframeEl, focusEligible, mayFocusNow)
 
   // Reset load error on retry
   useEffect(() => {
@@ -253,7 +261,7 @@ export default function ExtensionPane({ paneId, content, focusEligible = true, f
   return (
     <iframe
       key={loadAttempt}
-      ref={iframeRef}
+      ref={setIframeNode}
       src={src}
       className="w-full h-full border-0"
       sandbox="allow-scripts allow-same-origin allow-forms allow-popups"

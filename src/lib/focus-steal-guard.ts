@@ -38,14 +38,39 @@ export function installFocusStealGuard(): () => void {
   // rebuffs are legitimate; new events must NOT cancel pending ones (the first
   // may be the only one carrying the displaced element to restore).
   const pendingTimers = new Set<ReturnType<typeof setTimeout>>()
+  // Within a burst, only the NEWEST timer restores focus, using the last
+  // displaced element the burst saw — otherwise an ordinary A→B transition's
+  // queued timer would restore the stale A after a hoist displaced B, and a
+  // trailing window-blur (null displaced) would undo a correct restore by
+  // targeting body.
+  let burstDisplaced: HTMLElement | null = null
+  let hoistObservedInBurst = false
   const rebuff = (displaced: HTMLElement | null) => {
+    // Blurring the hoisted iframe fires ITS focusout — never capture the locked
+    // iframe itself as the burst's displaced element, or the newest timer would
+    // "restore" focus right back onto it.
+    if (displaced && !isLockedIframe(displaced)) burstDisplaced = displaced
     const timer = setTimeout(() => {
       pendingTimers.delete(timer)
+      const isNewestInBurst = pendingTimers.size === 0
       const active = document.activeElement
-      if (!isLockedIframe(active)) return
-      active.blur()
-      if (displaced && document.contains(displaced)) {
-        displaced.focus()
+      if (isLockedIframe(active)) {
+        active.blur()
+        hoistObservedInBurst = true
+      }
+      if (!isNewestInBurst) {
+        // Older timer: blur done above; the restore belongs to the newest
+        // timer (correct displaced attribution).
+        return
+      }
+      // The burst closes here: restore only if a hoist actually happened.
+      const target = burstDisplaced
+      burstDisplaced = null
+      const wasHoist = hoistObservedInBurst
+      hoistObservedInBurst = false
+      if (!wasHoist) return
+      if (target && document.contains(target)) {
+        target.focus()
       } else {
         document.body.focus?.()
       }

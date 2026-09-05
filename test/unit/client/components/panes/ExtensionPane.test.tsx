@@ -175,6 +175,37 @@ describe('ExtensionPane focus gating (agent focus neutrality)', () => {
     await waitFor(() => expect(document.activeElement).toBe(iframe))
   })
 
+  it('a denied remount of a DEFERRED server extension is pointer-unlockable once its iframe appears', async () => {
+    vi.mocked(api.post).mockImplementation(() => new Promise(() => {})) // auto-start in flight
+    const store = makeServerStore()
+    const first = render(
+      <Provider store={store}>
+        <div data-pane-id="pane-ext">
+          <ExtensionPane tabId="tab-1" paneId="pane-ext" content={serverContent} focusEligible />
+        </div>
+      </Provider>,
+    )
+    act(() => {
+      store.dispatch(updateServerStatus({ name: 'weatherServer', serverRunning: true, serverPort: 4242 }))
+    })
+    await waitFor(() => expect(document.querySelector('iframe')).not.toBeNull())
+    const chrome = document.createElement('input')
+    document.body.appendChild(chrome)
+    chrome.focus()
+    first.unmount() // records owned:false
+    const second = render(
+      <Provider store={store}>
+        <div data-pane-id="pane-ext">
+          <ExtensionPane tabId="tab-1" paneId="pane-ext" content={serverContent} focusEligible />
+        </div>
+      </Provider>,
+    )
+    const iframe = document.querySelector('iframe') as HTMLIFrameElement
+    expect(iframe.hasAttribute('inert')).toBe(true) // denied remount is locked
+    fireEvent.pointerDown(second.container.querySelector('[data-pane-id="pane-ext"]') as HTMLElement)
+    expect(iframe.hasAttribute('inert')).toBe(false)
+  })
+
   it('marks its iframe data-focus-locked while ineligible (feeds the focus-steal rebuff guard)', () => {
     renderPane(false)
     const iframe = document.querySelector('iframe') as HTMLIFrameElement

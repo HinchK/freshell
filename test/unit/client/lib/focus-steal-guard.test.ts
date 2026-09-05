@@ -33,6 +33,26 @@ describe('focus-steal-guard', () => {
     document.body.removeAttribute('tabindex')
   })
 
+  it('a hoist mid-burst restores the element IT displaced, not an earlier-queued transition target', async () => {
+    dispose = installFocusStealGuard()
+    document.body.innerHTML = `
+      <input id="a-g10">
+      <input id="b-g10">
+      <iframe data-focus-locked="true"></iframe>`
+    const a = document.getElementById('a-g10') as HTMLInputElement
+    const b = document.getElementById('b-g10') as HTMLInputElement
+    const iframe = document.querySelector('iframe') as HTMLIFrameElement
+    a.focus()
+    // Ordinary A→B transition queues displaced=A…
+    displacedFocusout(a)
+    b.focus()
+    // …then a hoist displaces B before the timers fire.
+    displacedFocusout(b)
+    iframe.focus()
+    await flushGuard()
+    expect(document.activeElement).toBe(b) // never the stale A
+  })
+
   it('a disposed guard never acts on a queued hoist (pending rebuff cancelled)', async () => {
     dispose = installFocusStealGuard()
     document.body.innerHTML = `
