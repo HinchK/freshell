@@ -792,9 +792,21 @@ describe('BrowserPane', () => {
       first.unmount()
       renderBrowserPane({ url: 'https://example.com' })
       // Default mount focus lands on the pane root; the recorded descriptor
-      // then re-resolves and refocuses the URL input (rAF + macrotask).
-      await act(async () => { await new Promise((r) => setTimeout(r, 30)) })
-      expect(screen.getByPlaceholderText('Enter URL...')).toHaveFocus()
+      // then re-resolves and refocuses the URL input (rAF + macrotask — poll,
+      // do not sleep: jsdom rAF lands late under pool load).
+      await waitFor(() => expect(screen.getByPlaceholderText('Enter URL...')).toHaveFocus(), { timeout: 2000 })
+    })
+
+    it('a remount restores focus to the EMBEDDED iframe when the user was inside the page (descriptor: sole iframe)', async () => {
+      const first = renderBrowserPane({ url: 'https://example.com' })
+      const iframe = document.querySelector('iframe') as HTMLIFrameElement
+      iframe.focus()
+      expect(iframe).toHaveFocus()
+      first.unmount()
+      renderBrowserPane({ url: 'https://example.com' })
+      // Default mount focus lands on the pane root; the descriptor restore
+      // then refocuses the iframe (rAF + macrotask — poll, do not sleep).
+      await waitFor(() => expect(document.querySelector('iframe')).toHaveFocus(), { timeout: 2000 })
     })
 
     it('an explicit re-select of the ALREADY-active pane (focus epoch bump) focuses a denied remount', () => {

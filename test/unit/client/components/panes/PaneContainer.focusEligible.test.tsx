@@ -34,6 +34,8 @@ const captured = vi.hoisted(() => ({
   picker: [] as any[],
   directory: [] as any[],
   extension: [] as any[],
+  terminal: [] as any[],
+  freshAgent: [] as any[],
 }))
 
 // Drives PickerWrapper from step 'type' into step 'directory' (the DirectoryPicker arm).
@@ -64,7 +66,11 @@ vi.mock('@/components/panes/ExtensionPane', () => ({
   default: (props: any) => { captured.extension.push(props); return null },
 }))
 vi.mock('@/components/TerminalView', () => ({
-  default: () => null,
+  default: (props: any) => { captured.terminal.push(props); return null },
+}))
+vi.mock('@/components/fresh-agent/FreshAgentView', () => ({
+  default: (props: any) => { captured.freshAgent.push(props); return null },
+  FreshAgentView: (props: any) => { captured.freshAgent.push(props); return null },
 }))
 
 function makeStore(panesState: any) {
@@ -123,6 +129,8 @@ const editorLeaf: PaneNode = {
 } as any
 const pickerLeaf: PaneNode = { type: 'leaf', id: 'pane-k', content: { kind: 'picker' } } as any
 const extensionLeaf: PaneNode = { type: 'leaf', id: 'pane-x', content: { kind: 'extension', extensionName: 'sample', props: {} } } as any
+const terminalLeafFixed: PaneNode = { type: 'leaf', id: 'pane-t', content: { kind: 'terminal', mode: 'shell' } } as any
+const freshAgentLeaf: PaneNode = { type: 'leaf', id: 'pane-f', content: { kind: 'fresh-agent', sessionType: 'freshcodex', provider: 'codex', createRequestId: 'req-w', status: 'idle' } } as any
 
 function renderNode(node: PaneNode, opts: { hidden?: boolean; activePaneId?: string; panesState?: Record<string, unknown> } = {}) {
   const leafId = (function firstLeaf(n: PaneNode): string { return n.type === 'leaf' ? n.id : firstLeaf(n.children[0]) })(node)
@@ -141,7 +149,7 @@ function renderNode(node: PaneNode, opts: { hidden?: boolean; activePaneId?: str
 
 describe('PaneContainer focusEligible wiring', () => {
   beforeEach(() => {
-    captured.browser.length = captured.editor.length = captured.picker.length = captured.directory.length = captured.extension.length = 0
+    captured.browser.length = captured.editor.length = captured.picker.length = captured.directory.length = captured.extension.length = captured.terminal.length = captured.freshAgent.length = 0
     wiringControl.autoSelectProvider = null
   })
   afterEach(() => cleanup())
@@ -239,6 +247,27 @@ describe('PaneContainer focusEligible wiring', () => {
     renderNode(editorLeaf, { panesState: { focusEpochByPaneId: { 'pane-e': 11 } } })
     await waitFor(() => expect(captured.editor.length).toBeGreaterThan(0))
     expect(captured.editor[0].focusEpoch).toBe(11)
+  })
+
+  it('terminal arm: forwards focusEpoch', () => {
+    renderNode(terminalLeafFixed, { panesState: { focusEpochByPaneId: { 'pane-t': 4 } } })
+    expect(captured.terminal[0].focusEpoch).toBe(4)
+  })
+
+  it('fresh-agent arm: forwards focusEpoch', () => {
+    renderNode(freshAgentLeaf, { panesState: { focusEpochByPaneId: { 'pane-f': 9 } } })
+    expect(captured.freshAgent[0].focusEpoch).toBe(9)
+  })
+
+  it('directory step: forwards focusEpoch into DirectoryPicker', async () => {
+    wiringControl.autoSelectProvider = 'claude'
+    try {
+      renderNode(pickerLeaf, { panesState: { focusEpochByPaneId: { 'pane-k': 5 } } })
+      await waitFor(() => expect(captured.directory.length).toBeGreaterThan(0))
+      expect(captured.directory[0].focusEpoch).toBe(5)
+    } finally {
+      wiringControl.autoSelectProvider = null
+    }
   })
 
   // Pointer-versus-explicit separation: a mousedown into the pane (bubbling

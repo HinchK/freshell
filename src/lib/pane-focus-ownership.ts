@@ -36,21 +36,30 @@ function attrValue(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
 }
 
-/** Derive the most stable selector for `el` that re-resolves within `root`. */
+/** Derive the most stable UNIQUELY-resolving selector for `el` within `root`.
+ *  Candidate order: id → aria-label → data-testid → placeholder → role →
+ *  sole-iframe → title. A candidate is only accepted when it matches exactly
+ *  one element, so re-resolution after a remount can never land on a sibling. */
 function describeInnerSelector(el: HTMLElement, root: Element): string | null {
   const tag = el.tagName.toLowerCase()
-  if (el.id) {
-    const sel = `#${CSS.escape(el.id)}`
-    if (root.querySelector(sel) === el) return sel
-  }
+  const candidates: string[] = []
+  if (el.id) candidates.push(`#${CSS.escape(el.id)}`)
   const ariaLabel = el.getAttribute('aria-label')
-  if (ariaLabel) return `${tag}[aria-label="${attrValue(ariaLabel)}"]`
+  if (ariaLabel) candidates.push(`${tag}[aria-label="${attrValue(ariaLabel)}"]`)
   const testId = el.getAttribute('data-testid')
-  if (testId) return `[data-testid="${attrValue(testId)}"]`
+  if (testId) candidates.push(`[data-testid="${attrValue(testId)}"]`)
   const placeholder = el.getAttribute('placeholder')
-  if (placeholder) return `${tag}[placeholder="${attrValue(placeholder)}"]`
+  if (placeholder) candidates.push(`${tag}[placeholder="${attrValue(placeholder)}"]`)
   const role = el.getAttribute('role')
-  if (role) return `${tag}[role="${attrValue(role)}"]`
+  if (role) candidates.push(`${tag}[role="${attrValue(role)}"]`)
+  // Embedded pages: a focused browser/extension iframe carries no other usable
+  // attribute, and these panes host exactly one.
+  if (tag === 'iframe' && root.querySelectorAll('iframe').length === 1) candidates.push('iframe')
+  const title = el.getAttribute('title')
+  if (title) candidates.push(`${tag}[title="${attrValue(title)}"]`)
+  for (const sel of candidates) {
+    if (root.querySelectorAll(sel).length === 1 && root.querySelector(sel) === el) return sel
+  }
   return null
 }
 
@@ -65,6 +74,10 @@ export function recordPaneFocusBeforeUnmount(paneId: string): void {
   if (!root) return
   const active = document.activeElement
   const owned = Boolean(active && root.contains(active))
+  // LRU: refreshing an existing pane must move it to newest — `Map.set` on an
+  // existing key keeps its original position, which would let a long-lived,
+  // freshly re-recorded pane be evicted at the cap ahead of true ancients.
+  if (recordByPaneId.has(paneId)) recordByPaneId.delete(paneId)
   recordByPaneId.set(paneId, {
     owned,
     selector: owned && active instanceof HTMLElement ? describeInnerSelector(active, root) : null,

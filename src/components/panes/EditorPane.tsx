@@ -15,6 +15,7 @@ import { registerEditorActions } from '@/lib/pane-action-registry'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { createLogger } from '@/lib/client-logger'
 import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
+import { resolveRecordedFocusTarget } from '@/lib/pane-focus-ownership'
 
 
 const log = createLogger('EditorPane')
@@ -217,6 +218,14 @@ export default function EditorPane({
   const defaultBrowseRoot = firstTerminalCwd || defaultCwd || null
   const isHtmlPreview = isHtml(filePath, currentLanguage)
   const showEmptyState = !filePath && !editorValue
+  // The <Editor> branch renders only in source mode with content; preview and
+  // empty states render no Monaco. @monaco-editor/react disposes the editor
+  // on unmount but never tells us — clear the ref, or flip/epoch focus paths
+  // would focus() a disposed editor instead of falling back to the pane root.
+  const editorRendered = !showEmptyState && !(currentViewMode === 'preview' && showPreviewToggle)
+  useEffect(() => {
+    if (!editorRendered) editorRef.current = null
+  }, [editorRendered])
 
   const resolvePath = useCallback((pathValue: string | null): string | null => {
     if (!pathValue) return null
@@ -314,7 +323,11 @@ export default function EditorPane({
   function handleEditorMount(editor: Monaco.editor.IStandaloneCodeEditor) {
     editorRef.current = editor
     // onMount is async — eligible-at-mount focus can only happen HERE.
-    if (focusEligibleRef.current && mayFocusNow()) editor.focus()
+    // EXCEPT when a recorded focus descriptor still resolves: a remount's
+    // restore pass is about to refocus that exact element (e.g. the toolbar
+    // path field the user was typing in), and a late async Monaco focus would
+    // stomp it. The descriptor only suppresses this one adoption focus.
+    if (focusEligibleRef.current && mayFocusNow() && !resolveRecordedFocusTarget(paneId)) editor.focus()
   }
 
   // Focus target for explicit selects/flips when Monaco is NOT rendered

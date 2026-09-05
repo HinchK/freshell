@@ -73,6 +73,38 @@ describe('pane-focus-ownership', () => {
     expect(resolveRecordedFocusTarget('p7')).toBeNull()
   })
 
+  it('describes a sole embedded iframe (no aria/test/placeholder attributes) so embedded-page focus restores', () => {
+    document.body.innerHTML = `<div data-pane-id="p8"><iframe title="Browser content"></iframe></div>`
+    const iframe = document.querySelector('iframe') as HTMLIFrameElement
+    iframe.focus()
+    recordPaneFocusBeforeUnmount('p8')
+    document.body.innerHTML = `<div data-pane-id="p8"><div><iframe title="Browser content"></iframe></div></div>`
+    expect(resolveRecordedFocusTarget('p8')).toBe(document.querySelector('iframe'))
+  })
+
+  it('refreshing an existing record moves it to newest before cap eviction (true LRU)', () => {
+    const outside = document.createElement('input')
+    document.body.appendChild(outside)
+    outside.focus()
+    for (let i = 0; i < 512; i++) {
+      const root = document.createElement('div')
+      root.setAttribute('data-pane-id', `q-${i}`)
+      document.body.appendChild(root)
+    }
+    for (let i = 0; i < 512; i++) recordPaneFocusBeforeUnmount(`q-${i}`)
+    // Re-record the oldest pane — it just unmounted again, so its record is
+    // FRESH and must not be the first eviction victim.
+    recordPaneFocusBeforeUnmount('q-0')
+    // Cross the cap once.
+    const extra = document.createElement('div')
+    extra.setAttribute('data-pane-id', 'q-512')
+    document.body.appendChild(extra)
+    recordPaneFocusBeforeUnmount('q-512')
+    expect(shouldFocusPaneOnEligibleMount('q-0')).toBe(false) // refreshed record survives
+    expect(shouldFocusPaneOnEligibleMount('q-1')).toBe(true) // actual oldest evicted → unknown
+    expect(shouldFocusPaneOnEligibleMount('q-512')).toBe(false) // newest survives
+  })
+
   it('trims the OLDEST entries beyond the cap instead of wiping the map', () => {
     const outside = document.createElement('input')
     document.body.appendChild(outside)

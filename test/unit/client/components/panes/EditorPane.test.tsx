@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { useEffect } from 'react'
-import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, cleanup, fireEvent, waitFor, act } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
@@ -803,6 +803,62 @@ describe('EditorPane', () => {
       // flip paths only called editorRef.current?.focus() — null in preview —
       // leaving the explicitly-selected editor unfocused (round-5 Major).
       expect(root).toHaveFocus()
+    })
+
+    it('falls back to the pane root when a previously-mounted editor was unmounted (source → empty state), never calling a disposed editor', async () => {
+      monacoMountControl.enabled = true
+      const { rerender } = render(
+        <Provider store={store}>
+          <EditorPane paneId="pane-1" tabId="tab-1" filePath="/test.ts" language="typescript" readOnly={false} content="const x = 1" viewMode="source" focusEligible />
+        </Provider>
+      )
+      await waitFor(() => expect(monacoMountControl.focus).toHaveBeenCalledTimes(1))
+      // Switch to the empty state: the conditional <Editor> unmounts and
+      // @monaco-editor/react disposes the editor instance.
+      rerender(
+        <Provider store={store}>
+          <EditorPane paneId="pane-1" tabId="tab-1" filePath={null} language={null} readOnly={false} content="" viewMode="source" focusEligible={false} />
+        </Provider>
+      )
+      const chrome = document.createElement('input')
+      document.body.appendChild(chrome)
+      chrome.focus()
+      rerender(
+        <Provider store={store}>
+          <EditorPane paneId="pane-1" tabId="tab-1" filePath={null} language={null} readOnly={false} content="" viewMode="source" focusEligible />
+        </Provider>
+      )
+      const root = await screen.findByTestId('editor-pane')
+      expect(root).toHaveFocus()
+      // The disposed editor was never focused again.
+      expect(monacoMountControl.focus).toHaveBeenCalledTimes(1)
+    })
+
+    it('restore wins over a late async Monaco autofocus: remount while the path field was focused keeps the path field focused', async () => {
+      monacoMountControl.enabled = true
+      const first = render(
+        <Provider store={store}>
+          <EditorPane paneId="pane-1" tabId="tab-1" filePath="/test.ts" language="typescript" readOnly={false} content="const x = 1" viewMode="source" focusEligible />
+        </Provider>
+      )
+      await waitFor(() => expect(monacoMountControl.focus).toHaveBeenCalledTimes(1))
+      // User clicked into the toolbar path field…
+      const pathInput = screen.getByPlaceholderText('Enter file path...')
+      pathInput.focus()
+      expect(pathInput).toHaveFocus()
+      // …then an agent split remounts the subtree, and Monaco mounts SLOWLY.
+      first.unmount()
+      monacoMountControl.mountDelayMs = 60
+      render(
+        <Provider store={store}>
+          <EditorPane paneId="pane-1" tabId="tab-1" filePath="/test.ts" language="typescript" readOnly={false} content="const x = 1" viewMode="source" focusEligible />
+        </Provider>
+      )
+      // Past the delayed onMount: without the skip, the async Monaco mount
+      // would steal focus back from the restored path field.
+      await waitFor(() => expect(screen.getByPlaceholderText('Enter file path...')).toHaveFocus(), { timeout: 2000 })
+      await act(async () => { await new Promise((r) => setTimeout(r, 150)) }) // cover the delayed mount
+      expect(monacoMountControl.focus).toHaveBeenCalledTimes(1)
     })
 
     it('refocuses the editor on a focus epoch bump (same-target explicit select of an already-active pane)', async () => {
