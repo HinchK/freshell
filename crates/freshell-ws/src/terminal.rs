@@ -1210,11 +1210,18 @@ async fn handle_client_text(
         // freshAgent.approval.respond / question.respond / compact (approval-respond
         // Task 2): the refusal table already answered every unsupported provider x op
         // cell before this match; the remaining cells route to real handlers.
-        // Claude/kilroy route to the FreshClaudeState sidecar handlers as DETACHED
+        // Claude/kilroy and Codex route to their sidecar handlers as DETACHED
         // tasks (same shape as FreshAgentSend above — a sidecar stdin write never
-        // blocks this connection's select loop). Non-claude cells here are
-        // unreachable post-refusal; the `if` keeps the arm total defensively.
+        // blocks this connection's select loop).
         ClientMessage::FreshAgentApprovalRespond(respond) => {
+            if respond.provider == freshell_protocol::AgentProvider::Codex {
+                let fresh_codex = state.fresh_codex.clone();
+                tokio::spawn(
+                    async move { fresh_codex.handle_approval_respond(respond).await }
+                        .instrument(tracing::Span::current()),
+                );
+                return true;
+            }
             if respond.provider == freshell_protocol::AgentProvider::Claude {
                 let fresh_claude = state.fresh_claude.clone();
                 tokio::spawn(
@@ -1225,6 +1232,14 @@ async fn handle_client_text(
             true
         }
         ClientMessage::FreshAgentQuestionRespond(respond) => {
+            if respond.provider == freshell_protocol::AgentProvider::Codex {
+                let fresh_codex = state.fresh_codex.clone();
+                tokio::spawn(
+                    async move { fresh_codex.handle_question_respond(respond).await }
+                        .instrument(tracing::Span::current()),
+                );
+                return true;
+            }
             if respond.provider == freshell_protocol::AgentProvider::Claude {
                 let fresh_claude = state.fresh_claude.clone();
                 tokio::spawn(
@@ -5216,7 +5231,7 @@ fn session_type_wire(session_type: SessionType) -> &'static str {
 /// freshAgent.error{code:'UNSUPPORTED_CAPABILITY', message:<parity text>}})` ONLY for
 /// the genuinely unsupported provider x op cells, with the legacy `runtime-manager.ts`
 /// wording (`"Approvals are not supported for <sessionType>"`, `"Questions are …"`,
-/// `"Fork is …"`, `"Compact is …"`): approvals/questions are claude-only, fork is
+/// `"Fork is …"`, `"Compact is …"`): approvals/questions support Claude and Codex, fork is
 /// refused for claude (permanently — the claude path has no fork) and amplifier
 /// (always); the opencode fork arm landed in Task 5 and the codex arm in Task 6.
 /// Compact is refused ONLY for amplifier (every other provider has a real
@@ -5229,14 +5244,14 @@ fn session_type_wire(session_type: SessionType) -> &'static str {
 pub(crate) fn fresh_agent_control_refusal(message: &ClientMessage) -> Option<ServerMessage> {
     let (refused, wording, provider, session_id, session_type) = match message {
         ClientMessage::FreshAgentApprovalRespond(m) => (
-            m.provider != AgentProvider::Claude,
+            !matches!(m.provider, AgentProvider::Claude | AgentProvider::Codex),
             "Approvals are",
             m.provider,
             m.session_id.as_str(),
             m.session_type,
         ),
         ClientMessage::FreshAgentQuestionRespond(m) => (
-            m.provider != AgentProvider::Claude,
+            !matches!(m.provider, AgentProvider::Claude | AgentProvider::Codex),
             "Questions are",
             m.provider,
             m.session_id.as_str(),
