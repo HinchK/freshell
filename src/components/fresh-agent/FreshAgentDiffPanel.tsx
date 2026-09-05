@@ -40,22 +40,22 @@ function FreshAgentFileDiff({
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
 
-  const load = useCallback(() => {
-    // The success guard is one-shot; a failed load leaves diff null so the
-    // Retry affordance can call load() again. Callers gate on prerequisites
-    // (cwd + summary.path) — missing prerequisites are an explicit inline
-    // state, never a silent no-op.
+  // Prerequisites are enforced structurally: every caller must hand over a
+  // present cwd + path, so no cast or in-load check is needed. The success
+  // guard is one-shot; a failed load leaves diff null so the Retry
+  // affordance can call load() again.
+  const load = useCallback((cwd: string, path: string) => {
     if (loading || diff !== null) return
     setLoading(true)
     setError(null)
     void Promise
       .resolve(api.get<{ diff: string }>(
-        `/api/fresh-agent/diff?cwd=${encodeURIComponent(cwd as string)}&path=${encodeURIComponent(summary.path as string)}`
+        `/api/fresh-agent/diff?cwd=${encodeURIComponent(cwd)}&path=${encodeURIComponent(path)}`
       ))
       .then((result) => setDiff(result?.diff ?? ''))
       .catch((err: unknown) => setError(mapDiffLoadError(err)))
       .finally(() => setLoading(false))
-  }, [cwd, diff, loading, summary.path])
+  }, [diff, loading])
 
   const label = summary.title ?? summary.path ?? summary.id
   const lines = diff !== null && diff.trim() ? diff.split('\n') : null
@@ -69,7 +69,7 @@ function FreshAgentFileDiff({
         aria-label={`Diff: ${label}`}
         onClick={() => {
           setExpanded((value) => !value)
-          if (!expanded && cwd && summary.path) load()
+          if (!expanded && cwd && summary.path) load(cwd, summary.path)
         }}
       >
         <ChevronRight className={cn('h-3 w-3 shrink-0 transition-transform', expanded && 'rotate-90')} />
@@ -86,7 +86,9 @@ function FreshAgentFileDiff({
                 type="button"
                 aria-label="Retry loading diff"
                 className="underline hover:text-destructive/80"
-                onClick={() => load()}
+                onClick={() => {
+                  if (cwd && summary.path) load(cwd, summary.path)
+                }}
               >
                 Retry
               </button>

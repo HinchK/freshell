@@ -69,6 +69,10 @@ describe('FreshAgentDiffPanel', () => {
       await userEvent.click(retry)
       await screen.findByText('later')
       expect(apiGet).toHaveBeenCalledTimes(2)
+      // Discrimination pin: a successful retry must clear the prior error
+      // (load() calls setError(null)); without the clear the stale error
+      // block would stay visible alongside the recovered diff.
+      expect(screen.queryByText(/git diff failed/)).not.toBeInTheDocument()
     })
 
     it('expand → 404 shows the unsupported-server copy', async () => {
@@ -82,6 +86,38 @@ describe('FreshAgentDiffPanel', () => {
       render(<FreshAgentDiffPanel diffs={[entry]} cwd={undefined} />)
       await userEvent.click(screen.getByRole('button', { name: 'Diff: src/a.ts' }))
       await screen.findByText(/Diff unavailable for this file/)
+      expect(apiGet).not.toHaveBeenCalled()
+    })
+
+    it('missing path renders an explicit inline state and never fetches', async () => {
+      render(<FreshAgentDiffPanel diffs={[{ id: 'd1', status: 'modified' }]} cwd="/repo" />)
+      await userEvent.click(screen.getByRole('button', { name: 'Diff: d1' }))
+      await screen.findByText(/Diff unavailable for this file/)
+      expect(apiGet).not.toHaveBeenCalled()
+    })
+
+    it('a loaded diff is one-shot: collapse + re-expand does not refetch', async () => {
+      apiGet.mockResolvedValue({ diff: '@@ -1 +1 @@\n-one\n+two' })
+      render(<FreshAgentDiffPanel diffs={[entry]} cwd="/repo" />)
+      const trigger = screen.getByRole('button', { name: 'Diff: src/a.ts' })
+      await userEvent.click(trigger)
+      await screen.findByText('+two')
+      await userEvent.click(trigger) // collapse
+      await userEvent.click(trigger) // re-expand
+      await screen.findByText('+two')
+      expect(apiGet).toHaveBeenCalledTimes(1)
+    })
+
+    it('retry is gated on prerequisites present at click time', async () => {
+      apiGet.mockRejectedValue(new ApiError(500, 'git diff failed', { error: 'git diff failed' }))
+      const { rerender } = render(<FreshAgentDiffPanel diffs={[entry]} cwd="/repo" />)
+      await userEvent.click(screen.getByRole('button', { name: 'Diff: src/a.ts' }))
+      await screen.findByText(/git diff failed/)
+      apiGet.mockClear()
+      // Props are snapshot-fed; if a later snapshot drops cwd, Retry must not
+      // fire a prerequisite-less fetch.
+      rerender(<FreshAgentDiffPanel diffs={[entry]} cwd={undefined} />)
+      await userEvent.click(screen.getByRole('button', { name: 'Retry loading diff' }))
       expect(apiGet).not.toHaveBeenCalled()
     })
 
