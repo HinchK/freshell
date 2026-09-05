@@ -2,6 +2,7 @@ import { describe, it, expect, afterEach } from 'vitest'
 import {
   recordPaneFocusBeforeUnmount,
   resolveRecordedFocusTarget,
+  schedulePaneFocusRestore,
   shouldFocusPaneOnEligibleMount,
   resetPaneFocusOwnershipForTests,
 } from '@/lib/pane-focus-ownership'
@@ -103,6 +104,60 @@ describe('pane-focus-ownership', () => {
     expect(shouldFocusPaneOnEligibleMount('q-0')).toBe(false) // refreshed record survives
     expect(shouldFocusPaneOnEligibleMount('q-1')).toBe(true) // actual oldest evicted → unknown
     expect(shouldFocusPaneOnEligibleMount('q-512')).toBe(false) // newest survives
+  })
+
+  it('describes the pane ROOT itself when the shell held focus (:scope sentinel)', () => {
+    document.body.innerHTML = `<div data-pane-id="p9" tabindex="-1"><input></div>`
+    const root = document.querySelector('[data-pane-id="p9"]') as HTMLElement
+    root.focus()
+    expect(document.activeElement).toBe(root)
+    recordPaneFocusBeforeUnmount('p9')
+    document.body.innerHTML = `<div data-pane-id="p9" tabindex="-1"><input></div>`
+    expect(resolveRecordedFocusTarget('p9')).toBe(document.querySelector('[data-pane-id="p9"]'))
+  })
+
+  it('falls back to the title attribute for title-only controls (pin: title candidate is reached)', () => {
+    document.body.innerHTML = `<div data-pane-id="p10"><span title="Sole title" tabindex="-1"></span><iframe></iframe></div>`
+    const titled = document.querySelector('[title="Sole title"]') as HTMLElement
+    titled.focus()
+    recordPaneFocusBeforeUnmount('p10')
+    document.body.innerHTML = `<div data-pane-id="p10"><span title="Sole title" tabindex="-1"></span><iframe></iframe></div>`
+    expect(resolveRecordedFocusTarget('p10')?.getAttribute('title')).toBe('Sole title')
+  })
+
+  it('does NOT overwrite the pre-split descriptor while a restore is in flight (burst splits)', async () => {
+    document.body.innerHTML = `<div data-pane-id="p11"><input placeholder="Enter URL..."></div>`
+    const url = document.querySelector('input') as HTMLInputElement
+    url.focus()
+    recordPaneFocusBeforeUnmount('p11')
+    // Mount schedules a restore; descriptor is now protected…
+    document.body.innerHTML = `<div data-pane-id="p11"><div><input placeholder="Enter URL..."></div></div>`
+    const cancel = schedulePaneFocusRestore('p11')
+    // …and a second teardown inside the burst must not overwrite with the
+    // intermediate frame's focus (here: root-focused remount artifact).
+    const root2 = document.querySelector('[data-pane-id="p11"]') as HTMLElement
+    root2.focus()
+    recordPaneFocusBeforeUnmount('p11')
+    cancel()
+    document.body.innerHTML = `<div data-pane-id="p11"><div><input placeholder="Enter URL..."></div></div>`
+    expect(resolveRecordedFocusTarget('p11')).toBe(document.querySelector('input'))
+    // After the restore fires, pending clears and the next teardown records fresh.
+    const cancel2 = schedulePaneFocusRestore('p11')
+    await new Promise((r) => setTimeout(r, 30))
+    cancel2()
+    document.body.innerHTML = `<div data-pane-id="p11"><div><input placeholder="Enter URL..."></div></div><input id="chrome">`
+    ;(document.getElementById('chrome') as HTMLInputElement).focus()
+    recordPaneFocusBeforeUnmount('p11')
+    expect(shouldFocusPaneOnEligibleMount('p11')).toBe(false)
+  })
+
+  it('refuses to restore into a hidden tab', () => {
+    document.body.innerHTML = `<div data-pane-id="p12" tabindex="-1"></div>`
+    const root = document.querySelector('[data-pane-id="p12"]') as HTMLElement
+    root.focus()
+    recordPaneFocusBeforeUnmount('p12')
+    document.body.innerHTML = `<div class="tab-hidden"><div data-pane-id="p12" tabindex="-1"></div></div>`
+    expect(resolveRecordedFocusTarget('p12')).toBeNull()
   })
 
   it('trims the OLDEST entries beyond the cap instead of wiping the map', () => {

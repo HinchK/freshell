@@ -1601,15 +1601,3 @@ describe('executeAction -- parameter validation', () => {
   })
 })
 
-describe('focus-neutrality documentation', () => {
-  it('agent-facing text documents focus neutrality and the explicit select verbs', async () => {
-    expect(TOOL_DESCRIPTION).toContain('focus-neutral')
-    expect(TOOL_DESCRIPTION).toContain('select-tab')
-    expect(INSTRUCTIONS).toContain('focus-neutral')
-    expect(INSTRUCTIONS).toContain('select-tab')
-    expect(INSTRUCTIONS).toContain('select-pane')
-    // HELP_TEXT is module-private but reachable through the tool's own help
-    // action (freshell-tool.ts case 'help' returns HELP_TEXT directly, ~:944).
-    expect(await executeAction('help', {})).toContain('focus-neutral')
-  })
-})

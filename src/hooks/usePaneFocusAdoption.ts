@@ -1,7 +1,7 @@
 import { useCallback, useLayoutEffect, useRef } from 'react'
 import {
   recordPaneFocusBeforeUnmount,
-  resolveRecordedFocusTarget,
+  schedulePaneFocusRestore,
   shouldFocusPaneOnEligibleMount,
 } from '@/lib/pane-focus-ownership'
 
@@ -73,29 +73,16 @@ export function usePaneFocusAdoption(
     return () => recordPaneFocusBeforeUnmount(paneId)
   }, [paneId])
 
-  // Mount-window element restore: when the pane legitimately re-adopts focus
-  // (adoption 'allowed'), prefer the exact element that held focus before
-  // teardown (URL field, search input, composer) over the content's default
-  // target. Runs after components' own mount focus: their passive/rAF focus
-  // runs first, this lands last (rAF then macrotask). Transient UI that did
-  // not come back (open search bar, in-progress rename) simply fails to
-  // resolve and the default target stands.
+  // Mount-window element restore: a pane that OWNED DOM focus before teardown
+  // gets the exact recorded element back (URL field, search input, composer,
+  // the pane shell itself) — preferring it over the content's default target.
+  // This is RECORD-driven, not adoption-gated: Redux-ineligible panes restore
+  // too (the pane shell is keyboard-focusable without becoming activePane, so
+  // a split of such a pane must return its focus). Runs after components' own
+  // mount focus (their passive/rAF focus runs first; this lands last).
   useLayoutEffect(() => {
     if (!paneId) return
-    let cancelled = false
-    let timer: ReturnType<typeof setTimeout> | null = null
-    const frame = requestAnimationFrame(() => {
-      timer = setTimeout(() => {
-        if (cancelled || adoptionRef.current !== 'allowed') return
-        const el = resolveRecordedFocusTarget(paneId)
-        if (el?.isConnected) el.focus()
-      }, 0)
-    })
-    return () => {
-      cancelled = true
-      cancelAnimationFrame(frame)
-      if (timer !== null) clearTimeout(timer)
-    }
+    return schedulePaneFocusRestore(paneId)
   }, [paneId])
 
   return mayFocusNow

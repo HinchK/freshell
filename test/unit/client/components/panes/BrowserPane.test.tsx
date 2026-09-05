@@ -809,6 +809,35 @@ describe('BrowserPane', () => {
       await waitFor(() => expect(document.querySelector('iframe')).toHaveFocus(), { timeout: 2000 })
     })
 
+    it('restores focus for a Redux-INACTIVE pane that held DOM focus via keyboard (split must not drop it to body)', async () => {
+      // Pane shells are keyboard-focusable without changing activePane; focus
+      // via Tab never dispatches setActivePane.
+      const first = renderBrowserPane({ url: 'https://example.com', focusEligible: false })
+      const shell = document.querySelector('[data-pane-id="pane-1"]') as HTMLElement
+      shell.focus()
+      expect(shell).toHaveFocus()
+      first.unmount()
+      renderBrowserPane({ url: 'https://example.com', focusEligible: false })
+      // The content focus effect early-returns (ineligible); the record-driven
+      // restore must still hand focus back to the replacement shell.
+      await waitFor(
+        () => expect(document.querySelector('[data-pane-id="pane-1"]')).toHaveFocus(),
+        { timeout: 2000 },
+      )
+    })
+
+    it('burst splits preserve the pre-split focus target (descriptor survives intermediate remounts)', async () => {
+      const first = renderBrowserPane({ url: 'https://example.com' })
+      const urlInput = screen.getByPlaceholderText('Enter URL...')
+      urlInput.focus()
+      first.unmount() // records the URL input
+      const second = renderBrowserPane({ url: 'https://example.com' }) // default root focus; restore pending
+      // Second split lands BEFORE the restore fires.
+      second.unmount() // must NOT overwrite the URL descriptor with the artifact focus
+      renderBrowserPane({ url: 'https://example.com' })
+      await waitFor(() => expect(screen.getByPlaceholderText('Enter URL...')).toHaveFocus(), { timeout: 2000 })
+    })
+
     it('an explicit re-select of the ALREADY-active pane (focus epoch bump) focuses a denied remount', () => {
       const first = renderBrowserPane({ url: 'https://example.com' })
       expect(document.querySelector('[data-pane-id="pane-1"]')).toHaveFocus()
