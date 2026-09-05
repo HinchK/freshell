@@ -185,11 +185,65 @@ export function schedulePaneFocusRestore(paneId: string): () => void {
 
 type LayoutNodeLike = { type?: string; id?: string; children?: LayoutNodeLike[] }
 
+function collectLivePaneIds(layouts: Record<string, LayoutNodeLike> | undefined): Set<string> {
+  const live = new Set<string>()
+  const walk = (node: LayoutNodeLike | undefined) => {
+    if (!node) return
+    if (node.type === 'split') {
+      for (const child of node.children ?? []) walk(child)
+    } else if (node.id) live.add(node.id)
+  }
+  for (const root of Object.values(layouts ?? {})) walk(root)
+  return live
+}
+
+/** True when `next` changes or removes any entry that existed in `prev`.
+ *  Pure ADDITIONS (e.g. a focus-neutral background `tab.create` writing
+ *  activePane for its own new tab) are NOT selection activity — they must not
+ *  void an unrelated pane's pending restore. */
+function mapChangedExistingEntry(
+  prev: Record<string, string | number> | undefined,
+  next: Record<string, string | number> | undefined,
+): boolean {
+  if (prev === next) return false
+  for (const key of Object.keys(prev ?? {})) {
+    if (!next || !(key in next) || next[key] !== prev![key]) return true
+  }
+  return false
+}
+
+/** True when `next` differs from `prev` on ANY key. Used for the focus-epoch
+ *  map: every write there comes from an explicit select fold (nudge), so even
+ *  a first-touch addition is genuine selection activity. */
+function mapChangedAnyEntry(
+  prev: Record<string, number> | undefined,
+  next: Record<string, number> | undefined,
+): boolean {
+  if (prev === next) return false
+  const keys = new Set([...Object.keys(prev ?? {}), ...Object.keys(next ?? {})])
+  for (const key of keys) {
+    if (prev?.[key] !== next?.[key]) return true
+  }
+  return false
+}
+
 /** Wire record invalidation + selection tracking to the live store (called
- *  once from store.ts). Selection bumps guard the restore; panes that
- *  disappear from every layout are forgotten — so a reopened tab whose
- *  preserved leaf ids remount read as "unknown" (fresh UX), never consulting
- *  a stale pre-close record, and pending flags of dead panes are GC'd. */
+ *  once from store.ts).
+ *
+ *  Selection serial: bumped when an EXISTING activePane entry (or per-pane
+ *  focus-epoch value) changes or is removed — pointer clicks and select folds
+ *  alike — but NOT on new-key additions (background tab creation is
+ *  focus-neutral and must not cancel an unrelated in-flight restore).
+ *
+ *  Record invalidation: forget records for panes that (re)APPEAR in the
+ *  layout set. Forgetting on arrival — rather than on removal — is immune to
+ *  commit ordering: React's teardown record for a closing pane lands AFTER
+ *  the store update, so removal-deletion would always be undone by the
+ *  record. Closing tabs can leave a lingering owned:false record; if the tab
+ *  is reopened (reopenClosedTab preserves leaf ids) arrival-forgetting clears
+ *  it so the restored pane mounts as fresh "unknown" (normal mount focus),
+ *  and pending flags of dead panes are GC'd the next time their pane id
+ *  reappears. */
 export function wirePaneFocusOwnershipInvalidation(storeLike: {
   subscribe: (listener: () => void) => () => void
   getState: () => {
@@ -203,27 +257,30 @@ export function wirePaneFocusOwnershipInvalidation(storeLike: {
   let prevActivePane = storeLike.getState().panes?.activePane
   let prevEpoch = storeLike.getState().panes?.focusEpochByPaneId
   let prevLayouts = storeLike.getState().panes?.layouts
+  let prevLive = collectLivePaneIds(prevLayouts)
   return storeLike.subscribe(() => {
     const panes = storeLike.getState().panes
     if (!panes) return
-    if (panes.activePane !== prevActivePane || panes.focusEpochByPaneId !== prevEpoch) {
+    if (
+      panes.activePane !== prevActivePane
+      || panes.focusEpochByPaneId !== prevEpoch
+    ) {
+      if (
+        mapChangedExistingEntry(prevActivePane, panes.activePane)
+        || mapChangedAnyEntry(prevEpoch, panes.focusEpochByPaneId)
+      ) {
+        paneSelectionSerial += 1
+      }
       prevActivePane = panes.activePane
       prevEpoch = panes.focusEpochByPaneId
-      paneSelectionSerial += 1
     }
     if (panes.layouts !== prevLayouts) {
       prevLayouts = panes.layouts
-      const live = new Set<string>()
-      const walk = (node: LayoutNodeLike | undefined) => {
-        if (!node) return
-        if (node.type === 'split') {
-          for (const child of node.children ?? []) walk(child)
-        } else if (node.id) live.add(node.id)
+      const nextLive = collectLivePaneIds(panes.layouts)
+      for (const id of nextLive) {
+        if (!prevLive.has(id)) recordByPaneId.delete(id)
       }
-      for (const root of Object.values(panes.layouts ?? {})) walk(root)
-      for (const id of [...recordByPaneId.keys()]) {
-        if (!live.has(id)) recordByPaneId.delete(id)
-      }
+      prevLive = nextLive
     }
   })
 }

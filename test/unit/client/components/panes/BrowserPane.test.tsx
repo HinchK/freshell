@@ -848,8 +848,9 @@ describe('BrowserPane', () => {
       try {
         // The agent immediately selects elsewhere before the restore fires —
         // the selection must win; the restore must not drag focus back.
+        // (focusNudge: mirrors the pane.select fold's epoch path.)
         act(() => {
-          store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-2' }))
+          store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-2', focusNudge: true }))
         })
         // The window fired (pending spent)…
         await waitFor(() => expect(isPaneFocusRestorePendingForTests('pane-1')).toBe(false))

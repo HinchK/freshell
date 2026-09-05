@@ -183,6 +183,8 @@ describe('pane-focus-ownership', () => {
   it('restore yields to a NEWER explicit selection (user click or scripted select)', async () => {
     const store = configureStore({ reducer: { panes: panesReducer } })
     unsubscribe = wirePaneFocusOwnershipInvalidation(store)
+    // Establish an existing activePane entry so the later select is a real change.
+    store.dispatch(initLayout({ tabId: 'tab-x', paneId: 'p20', content: { kind: 'terminal', mode: 'shell' } }))
     document.body.innerHTML = `<div data-pane-id="p20"><input placeholder="Enter URL..."></div>`
     const url = document.querySelector('input') as HTMLInputElement
     url.focus()
@@ -193,7 +195,7 @@ describe('pane-focus-ownership', () => {
     document.body.appendChild(selected)
     selected.focus()
     // Explicit selection arrives inside the restore window (serial bumps).
-    store.dispatch(setActivePane({ tabId: 'tab-x', paneId: 'p20' }))
+    store.dispatch(setActivePane({ tabId: 'tab-x', paneId: 'pane-else' }))
     // The fire ran (window spent)…
     await waitFor(() => expect(isPaneFocusRestorePendingForTests('p20')).toBe(false))
     // …but the newer selection kept focus; the restore yielded.
@@ -206,7 +208,24 @@ describe('pane-focus-ownership', () => {
     expect(shouldFocusPaneOnEligibleMount('p20')).toBe(false)
   })
 
-  it('forgets records for panes removed from every layout (reopen mounts as fresh)', () => {
+  it('a background tab create (activePane addition) does NOT void an unrelated pending restore', async () => {
+    const store = configureStore({ reducer: { panes: panesReducer } })
+    unsubscribe = wirePaneFocusOwnershipInvalidation(store)
+    store.dispatch(initLayout({ tabId: 'tab-a', paneId: 'p20', content: { kind: 'terminal', mode: 'shell' } }))
+    document.body.innerHTML = `<div data-pane-id="p20"><input placeholder="Enter URL..."></div>`
+    const url = document.querySelector('input') as HTMLInputElement
+    url.focus()
+    recordPaneFocusBeforeUnmount('p20')
+    document.body.innerHTML = `<div data-pane-id="p20"><input placeholder="Enter URL..."></div>`
+    schedulePaneFocusRestore('p20')
+    // Focus-neutral background creation: a NEW tab's activePane addition must
+    // not read as selection activity for an existing pane.
+    store.dispatch(initLayout({ tabId: 'tab-bg', paneId: 'p-bg', content: { kind: 'terminal', mode: 'shell' } }))
+    await waitFor(() => expect(isPaneFocusRestorePendingForTests('p20')).toBe(false))
+    expect(document.querySelector('input')).toHaveFocus() // restore fired, not voided
+  })
+
+  it('close-time records linger but a reopen (pane id re-appearing) forgets them', () => {
     const store = configureStore({ reducer: { panes: panesReducer } })
     unsubscribe = wirePaneFocusOwnershipInvalidation(store)
     store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'p21', content: { kind: 'terminal', mode: 'shell' } }))
@@ -214,8 +233,14 @@ describe('pane-focus-ownership', () => {
     ;(document.getElementById('chrome') as HTMLInputElement).focus()
     recordPaneFocusBeforeUnmount('p21')
     expect(shouldFocusPaneOnEligibleMount('p21')).toBe(false)
+    // Removal alone does NOT forget: React's teardown re-record lands AFTER
+    // the store update, and its record intentionally lingers (LRU-bounded).
     store.dispatch(removeLayout({ tabId: 'tab-1' }))
-    expect(shouldFocusPaneOnEligibleMount('p21')).toBe(true) // forgotten → unknown
+    recordPaneFocusBeforeUnmount('p21') // layout-cleanup order: after removeLayout
+    expect(shouldFocusPaneOnEligibleMount('p21')).toBe(false)
+    // Re-appearing in any layout (e.g. reopened tab keeping leaf ids) forgets.
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'p21', content: { kind: 'terminal', mode: 'shell' } }))
+    expect(shouldFocusPaneOnEligibleMount('p21')).toBe(true) // forgotten → fresh mount focus
   })
 
   it('trims the OLDEST entries beyond the cap instead of wiping the map', () => {
