@@ -7,6 +7,7 @@ import {
   resolveRecordedFocusTarget,
   schedulePaneFocusRestore,
   shouldFocusPaneOnEligibleMount,
+  shouldRecordSuppressAutofocus,
   wirePaneFocusOwnershipInvalidation,
   isPaneFocusRestorePendingForTests,
   resetPaneFocusOwnershipForTests,
@@ -241,6 +242,34 @@ describe('pane-focus-ownership', () => {
     // Re-appearing in any layout (e.g. reopened tab keeping leaf ids) forgets.
     store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'p21', content: { kind: 'terminal', mode: 'shell' } }))
     expect(shouldFocusPaneOnEligibleMount('p21')).toBe(true) // forgotten → fresh mount focus
+  })
+
+  it('restore abandons a descriptor that is no longer UNIQUE in the rebuilt subtree', () => {
+    document.body.innerHTML = `<div data-pane-id="p30"><button aria-label="Go"></button></div>`
+    ;(document.querySelector('button') as HTMLElement).focus()
+    recordPaneFocusBeforeUnmount('p30')
+    // Remount introduced a second identical control (e.g. split/resize) —
+    // resolving to a first-match guess could steal focus for a sibling.
+    document.body.innerHTML = `<div data-pane-id="p30"><button aria-label="Go">a</button><button aria-label="Go">b</button></div>`
+    expect(resolveRecordedFocusTarget('p30')).toBeNull()
+    expect(shouldRecordSuppressAutofocus('p30')).toBe(false)
+  })
+
+  it('removals of OTHER tab entries are not selection activity (cross-tab sync must not void a restore)', async () => {
+    const store = configureStore({ reducer: { panes: panesReducer } })
+    unsubscribe = wirePaneFocusOwnershipInvalidation(store)
+    store.dispatch(initLayout({ tabId: 'tab-a', paneId: 'p31', content: { kind: 'terminal', mode: 'shell' } }))
+    store.dispatch(initLayout({ tabId: 'tab-b', paneId: 'p-b', content: { kind: 'terminal', mode: 'shell' } }))
+    document.body.innerHTML = `<div data-pane-id="p31"><input placeholder="Enter URL..."></div>`
+    const url = document.querySelector('input') as HTMLInputElement
+    url.focus()
+    recordPaneFocusBeforeUnmount('p31')
+    document.body.innerHTML = `<div data-pane-id="p31"><input placeholder="Enter URL..."></div>`
+    schedulePaneFocusRestore('p31')
+    // Another tab's layout removal (close elsewhere / hydrate delta) must not cancel the restore.
+    store.dispatch(removeLayout({ tabId: 'tab-b' }))
+    await waitFor(() => expect(isPaneFocusRestorePendingForTests('p31')).toBe(false))
+    expect(document.querySelector('input')).toHaveFocus()
   })
 
   it('trims the OLDEST entries beyond the cap instead of wiping the map', () => {

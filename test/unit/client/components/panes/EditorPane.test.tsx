@@ -5,7 +5,8 @@ import userEvent from '@testing-library/user-event'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import EditorPane from '@/components/panes/EditorPane'
-import panesReducer from '@/store/panesSlice'
+import panesReducer, { setActivePane } from '@/store/panesSlice'
+import { wirePaneFocusOwnershipInvalidation } from '@/lib/pane-focus-ownership'
 import settingsReducer from '@/store/settingsSlice'
 import connectionReducer, { setStatus } from '@/store/connectionSlice'
 
@@ -859,6 +860,40 @@ describe('EditorPane', () => {
       await waitFor(() => expect(screen.getByPlaceholderText('Enter file path...')).toHaveFocus(), { timeout: 2000 })
       await act(async () => { await new Promise((r) => setTimeout(r, 150)) }) // cover the delayed mount
       expect(monacoMountControl.focus).toHaveBeenCalledTimes(1)
+    })
+
+    it('a selection landing BEFORE the delayed Monaco mount lets onMount focus the editor (stale descriptor must not suppress the select)', async () => {
+      monacoMountControl.enabled = true
+      const unwire = wirePaneFocusOwnershipInvalidation(store)
+      try {
+        const first = render(
+          <Provider store={store}>
+            <EditorPane paneId="pane-1" tabId="tab-1" filePath="/test.ts" language="typescript" readOnly={false} content="const x = 1" viewMode="source" focusEligible />
+          </Provider>
+        )
+        await waitFor(() => expect(monacoMountControl.focus).toHaveBeenCalledTimes(1))
+        // User click into the toolbar path field → unmount records a descriptor.
+        screen.getByPlaceholderText('Enter file path...').focus()
+        first.unmount()
+        // Remount (split race); Monaco mounts SLOWLY this time.
+        monacoMountControl.mountDelayMs = 60
+        monacoMountControl.focus.mockClear()
+        render(
+          <Provider store={store}>
+            <EditorPane paneId="pane-1" tabId="tab-1" filePath="/test.ts" language="typescript" readOnly={false} content="const x = 1" viewMode="source" focusEligible />
+          </Provider>
+        )
+        // EXPLICIT SELECTION lands while Monaco is still mounting: the in-effect
+        // focus path hit only the pane root (editorRef null) — the select contract
+        // next completes via this mount focus, and the stale descriptor must NOT
+        // suppress it.
+        act(() => {
+          store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-1', focusNudge: true }))
+        })
+        await waitFor(() => expect(monacoMountControl.focus).toHaveBeenCalled(), { timeout: 2000 })
+      } finally {
+        unwire()
+      }
     })
 
     it('refocuses the editor on a focus epoch bump (same-target explicit select of an already-active pane)', async () => {

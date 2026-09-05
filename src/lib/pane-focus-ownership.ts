@@ -148,8 +148,32 @@ export function resolveRecordedFocusTarget(paneId: string): HTMLElement | null {
   if (!record?.owned || !record.selector) return null
   const root = document.querySelector(`[data-pane-id="${CSS.escape(paneId)}"]`)
   if (!root || root.closest('.tab-hidden')) return null
-  const el = record.selector === ':scope' ? root : root.querySelector(record.selector)
+  let el: Element | null
+  if (record.selector === ':scope') {
+    el = root
+  } else {
+    // Uniqueness was verified at record time, but the tree was rebuilt since:
+    // re-verify in the CURRENT subtree — a non-unique hit (e.g. a second
+    // identically-labelled control materialized after a split/resize) is
+    // ambiguous, so resolving to the first match could steal focus for a
+    // sibling. Ambiguity abandons the restore rather than guessing.
+    const matches = root.querySelectorAll(record.selector)
+    el = matches.length === 1 ? matches[0] : null
+  }
   return el instanceof HTMLElement ? el : null
+}
+
+/** True when the pane's recorded descriptor still speaks for the CURRENT
+ *  window: it resolves in the live subtree AND no explicit selection has
+ *  landed since the record (selection serial unchanged). Components whose
+ *  autofocus completes asynchronously (Monaco onMount) must defer to the
+ *  scheduled descriptor restore ONLY in that case — once a newer selection
+ *  lands, that selection's own focus path owns the outcome and the component
+ *  may autofocus its normal target. */
+export function shouldRecordSuppressAutofocus(paneId: string): boolean {
+  const record = recordByPaneId.get(paneId)
+  if (!record || record.serialAtRecord !== paneSelectionSerial) return false
+  return resolveRecordedFocusTarget(paneId) !== null
 }
 
 /** Schedule the mount-window restore for a pane: marks the record
@@ -197,17 +221,18 @@ function collectLivePaneIds(layouts: Record<string, LayoutNodeLike> | undefined)
   return live
 }
 
-/** True when `next` changes or removes any entry that existed in `prev`.
- *  Pure ADDITIONS (e.g. a focus-neutral background `tab.create` writing
- *  activePane for its own new tab) are NOT selection activity — they must not
- *  void an unrelated pane's pending restore. */
-function mapChangedExistingEntry(
+/** True when `next` CHANGES the value of any entry that existed in `prev`.
+ *  Pure ADDITIONS (a focus-neutral background `tab.create` writing its own
+ *  new tab's entry) and REMOVALS (closes / cross-tab-sync hydration delta)
+ *  are NOT local selection activity — neither must void another pane's
+ *  pending restore. */
+function mapChangedExistingValue(
   prev: Record<string, string | number> | undefined,
   next: Record<string, string | number> | undefined,
 ): boolean {
   if (prev === next) return false
   for (const key of Object.keys(prev ?? {})) {
-    if (!next || !(key in next) || next[key] !== prev![key]) return true
+    if (next && key in next && next[key] !== prev![key]) return true
   }
   return false
 }
@@ -266,7 +291,7 @@ export function wirePaneFocusOwnershipInvalidation(storeLike: {
       || panes.focusEpochByPaneId !== prevEpoch
     ) {
       if (
-        mapChangedExistingEntry(prevActivePane, panes.activePane)
+        mapChangedExistingValue(prevActivePane, panes.activePane)
         || mapChangedAnyEntry(prevEpoch, panes.focusEpochByPaneId)
       ) {
         paneSelectionSerial += 1

@@ -15,7 +15,7 @@ import { registerEditorActions } from '@/lib/pane-action-registry'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { createLogger } from '@/lib/client-logger'
 import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
-import { resolveRecordedFocusTarget } from '@/lib/pane-focus-ownership'
+import { shouldRecordSuppressAutofocus } from '@/lib/pane-focus-ownership'
 
 
 const log = createLogger('EditorPane')
@@ -323,11 +323,14 @@ export default function EditorPane({
   function handleEditorMount(editor: Monaco.editor.IStandaloneCodeEditor) {
     editorRef.current = editor
     // onMount is async — eligible-at-mount focus can only happen HERE.
-    // EXCEPT when a recorded focus descriptor still resolves: a remount's
-    // restore pass is about to refocus that exact element (e.g. the toolbar
-    // path field the user was typing in), and a late async Monaco focus would
-    // stomp it. The descriptor only suppresses this one adoption focus.
-    if (focusEligibleRef.current && mayFocusNow() && !resolveRecordedFocusTarget(paneId)) editor.focus()
+    // EXCEPT when a recorded focus descriptor still speaks for this window
+    // (resolves AND no newer explicit selection landed): a remount's restore
+    // pass is about to refocus that exact element (e.g. the toolbar path
+    // field the user was typing in), and a late async Monaco focus would
+    // stomp it. A newer selection owns the outcome instead — its in-effect
+    // focus may have hit only the pane root because editorRef was not yet
+    // set, so THIS mount focus is the select contract completing.
+    if (focusEligibleRef.current && mayFocusNow() && !shouldRecordSuppressAutofocus(paneId)) editor.focus()
   }
 
   // Focus target for explicit selects/flips when Monaco is NOT rendered

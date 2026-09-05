@@ -1338,6 +1338,11 @@ export const panesSlice = createSlice({
           delete state.zoomedPane[tabId]
         }
 
+        // Drop the closed pane's ephemeral focus-epoch entry.
+        if (state.focusEpochByPaneId) {
+          delete state.focusEpochByPaneId[paneId]
+        }
+
         reconcileRefreshRequestsForTab(state, tabId)
       }
     },
@@ -1814,7 +1819,14 @@ export const panesSlice = createSlice({
       action: PayloadAction<{ tabId: string }>
     ) => {
       const { tabId } = action.payload
+      const removedRoot = state.layouts[tabId]
       delete state.layouts[tabId]
+      // Any restored tab gets fresh selection bookkeeping for its panes.
+      if (removedRoot && state.focusEpochByPaneId) {
+        for (const leaf of collectLeaves(removedRoot)) {
+          delete state.focusEpochByPaneId[leaf.id]
+        }
+      }
       delete state.activePane[tabId]
       delete state.paneTitles[tabId]
       if (state.zoomedPane) {

@@ -58,7 +58,6 @@ import type { SessionLocator } from '@shared/ws-protocol'
 // Stable empty object to avoid selector memoization issues
 const EMPTY_PANE_TITLES: Record<string, string> = {}
 const EMPTY_PANE_TITLE_SET_BY_USER: Record<string, boolean> = {}
-const EMPTY_FOCUS_EPOCHS: Record<string, number> = {}
 const EMPTY_TERMINAL_META_BY_ID: Record<string, TerminalMetaRecord> = {}
 const EMPTY_PROJECTS: ProjectGroup[] = []
 const EMPTY_FRESH_AGENT_SESSIONS: Record<string, FreshAgentSessionState> = {}
@@ -197,10 +196,13 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
   const paneTitles = useAppSelector((s) => s.panes.paneTitles[tabId] ?? EMPTY_PANE_TITLES)
   const paneTitleSetByUser = useAppSelector((s) => s.panes.paneTitleSetByUser?.[tabId] ?? EMPTY_PANE_TITLE_SET_BY_USER)
-  // Focus epoch map: changed identity only when an explicit select nudges a
-  // pane (see PanesState.focusEpochByPaneId); leaf arms forward the per-pane
-  // value so same-target selects re-run focus effects.
-  const focusEpochMap = useAppSelector((s) => s.panes?.focusEpochByPaneId ?? EMPTY_FOCUS_EPOCHS)
+  // Per-leaf focus-epoch subscription: an explicit select nudges ONE pane's
+  // epoch (see PanesState.focusEpochByPaneId); subscribing per leaf means a
+  // select re-renders only that pane's container. (The previous whole-map
+  // subscription re-rendered every mounted pane tree on each select.)
+  const focusEpoch = useAppSelector((s) =>
+    node.type === 'leaf' ? (s.panes?.focusEpochByPaneId?.[node.id] ?? 0) : 0
+  )
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
   const terminalMetaById = useAppSelector(
     (s) => s.terminalMeta?.byTerminalId ?? EMPTY_TERMINAL_META_BY_ID
@@ -528,7 +530,6 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     // hidden (Task 1 keeps Redux activeTabId on the user's tab), so their panes
     // mount without stealing keyboard focus.
     const focusEligible = !hidden && activePane === node.id
-    const focusEpoch = focusEpochMap[node.id] ?? 0
 
     return (
       <Pane

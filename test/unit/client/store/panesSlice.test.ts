@@ -1403,6 +1403,47 @@ describe('panesSlice', () => {
       expect(state.focusEpochByPaneId?.['p2'] ?? 0).toBe(0)
       expect(state.focusEpochByPaneId?.['p1']).toBe(2) // p1 untouched
     })
+
+    it('closePane drops the closed pane\'s focus-epoch entry', () => {
+      let state = panesReducer(
+        initialState,
+        initLayout({ tabId: 'tab-close', paneId: 'p1', content: { kind: 'terminal', mode: 'shell' } })
+      )
+      state = panesReducer(state, splitPane({
+        tabId: 'tab-close',
+        paneId: 'p1',
+        direction: 'horizontal',
+        newContent: { kind: 'terminal', mode: 'shell' },
+      }))
+      const split = state.layouts['tab-close'] as Extract<PaneNode, { type: 'split' }>
+      const newPaneId = (split.children[1] as Extract<PaneNode, { type: 'leaf' }>).id
+      state = panesReducer(state, setActivePane({ tabId: 'tab-close', paneId: newPaneId, focusNudge: true }))
+      expect(state.focusEpochByPaneId?.[newPaneId]).toBe(1)
+      state = panesReducer(state, closePane({ tabId: 'tab-close', paneId: newPaneId }))
+      expect(state.focusEpochByPaneId?.[newPaneId]).toBeUndefined()
+    })
+
+    it('removeLayout drops focus-epoch entries for every removed leaf', () => {
+      let state = panesReducer(
+        initialState,
+        initLayout({ tabId: 'tab-gone', paneId: 'pa', content: { kind: 'terminal', mode: 'shell' } })
+      )
+      state = panesReducer(state, splitPane({
+        tabId: 'tab-gone',
+        paneId: 'pa',
+        direction: 'horizontal',
+        newContent: { kind: 'terminal', mode: 'shell' },
+      }))
+      const split = state.layouts['tab-gone'] as Extract<PaneNode, { type: 'split' }>
+      const pb = (split.children[1] as Extract<PaneNode, { type: 'leaf' }>).id
+      state = panesReducer(state, setActivePane({ tabId: 'tab-gone', paneId: 'pa', focusNudge: true }))
+      state = panesReducer(state, setActivePane({ tabId: 'tab-gone', paneId: pb, focusNudge: true }))
+      expect(state.focusEpochByPaneId?.['pa']).toBeDefined()
+      expect(state.focusEpochByPaneId?.[pb]).toBeDefined()
+      state = panesReducer(state, removeLayout({ tabId: 'tab-gone' }))
+      expect(state.focusEpochByPaneId?.['pa']).toBeUndefined()
+      expect(state.focusEpochByPaneId?.[pb]).toBeUndefined()
+    })
   })
 
   describe('nudgePaneFocus', () => {
