@@ -1137,7 +1137,10 @@ async fn handle_client_text(
         ClientMessage::FreshAgentApprovalRespond(respond) => {
             if respond.provider == freshell_protocol::AgentProvider::Codex {
                 let fresh_codex = state.fresh_codex.clone();
-                tokio::spawn(async move { fresh_codex.handle_approval_respond(respond).await }.instrument(tracing::Span::current()));
+                tokio::spawn(
+                    async move { fresh_codex.handle_approval_respond(respond).await }
+                        .instrument(tracing::Span::current()),
+                );
                 return true;
             }
             if respond.provider == freshell_protocol::AgentProvider::Claude {
@@ -1152,7 +1155,10 @@ async fn handle_client_text(
         ClientMessage::FreshAgentQuestionRespond(respond) => {
             if respond.provider == freshell_protocol::AgentProvider::Codex {
                 let fresh_codex = state.fresh_codex.clone();
-                tokio::spawn(async move { fresh_codex.handle_question_respond(respond).await }.instrument(tracing::Span::current()));
+                tokio::spawn(
+                    async move { fresh_codex.handle_question_respond(respond).await }
+                        .instrument(tracing::Span::current()),
+                );
                 return true;
             }
             if respond.provider == freshell_protocol::AgentProvider::Claude {

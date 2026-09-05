@@ -72,7 +72,11 @@ impl fmt::Display for RpcError {
 #[derive(Clone, Debug, PartialEq)]
 pub enum IncomingMessage {
     /// A provider request that needs a user decision, distinct from a notification.
-    Request { id: RequestId, method: String, params: Value },
+    Request {
+        id: RequestId,
+        method: String,
+        params: Value,
+    },
     /// `{ id, result }` — resolves the pending request `id`.
     Response { id: RequestId, result: Value },
     /// `{ id, error }` — rejects the pending request `id`.
@@ -97,7 +101,11 @@ pub struct CodexTurnEvent {
 /// A classified server→client notification (the fan-out in `client.ts:576-615`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum CodexNotification {
-    ServerRequest { id: RequestId, method: String, params: Value },
+    ServerRequest {
+        id: RequestId,
+        method: String,
+        params: Value,
+    },
     /// `thread/started` (`protocol.ts:350-355`) — carries the thread handle.
     ThreadStarted { thread: Value },
     /// `thread/closed` (`protocol.ts:359-364`).
@@ -205,8 +213,13 @@ pub fn parse_incoming_frame(raw: &str) -> Option<IncomingMessage> {
 #[cfg(test)]
 #[test]
 fn server_approval_requests_are_not_dropped_as_malformed_responses() {
-    let incoming = parse_incoming_frame(r#"{"id":42,"method":"item/commandExecution/requestApproval","params":{"threadId":"thread-1","command":"npm test"}}"#);
-    assert!(incoming.is_some(), "An approval is a server request that must reach the user");
+    let incoming = parse_incoming_frame(
+        r#"{"id":42,"method":"item/commandExecution/requestApproval","params":{"threadId":"thread-1","command":"npm test"}}"#,
+    );
+    assert!(
+        incoming.is_some(),
+        "An approval is a server request that must reach the user"
+    );
 }
 
 /// A client→server frame decoded from the SERVER's perspective — a request

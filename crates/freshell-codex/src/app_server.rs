@@ -561,16 +561,25 @@ impl CodexAppServerClient {
             .send(json!({ "id": id.to_json(), "result": result }).to_string())
             .await
             .map_err(|message| CodexAppServerError::Transport {
-                method: "server-request/respond".into(), message,
+                method: "server-request/respond".into(),
+                message,
             })
     }
 
-    pub async fn reject_request(&self, id: &RequestId, message: &str) -> Result<(), CodexAppServerError> {
+    pub async fn reject_request(
+        &self,
+        id: &RequestId,
+        message: &str,
+    ) -> Result<(), CodexAppServerError> {
         self.transport
-            .send(json!({ "id": id.to_json(), "error": { "code": -32601, "message": message } }).to_string())
+            .send(
+                json!({ "id": id.to_json(), "error": { "code": -32601, "message": message } })
+                    .to_string(),
+            )
             .await
             .map_err(|message| CodexAppServerError::Transport {
-                method: "server-request/reject".into(), message,
+                method: "server-request/reject".into(),
+                message,
             })
     }
 
@@ -753,7 +762,9 @@ pub struct ChannelPeer {
 impl ChannelPeer {
     /// Send a provider-initiated request to exercise the bidirectional RPC path.
     pub fn request_client(&self, id: &RequestId, method: &str, params: Value) {
-        let _ = self.to_client.send(build_request_frame(id, method, &params));
+        let _ = self
+            .to_client
+            .send(build_request_frame(id, method, &params));
     }
 
     pub async fn next_raw_frame(&self) -> Option<Value> {
