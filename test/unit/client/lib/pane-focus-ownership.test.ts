@@ -1,9 +1,12 @@
 import { describe, it, expect, afterEach } from 'vitest'
-import { waitFor } from '@testing-library/react'
+import { render, waitFor, cleanup as rtlCleanup } from '@testing-library/react'
+import { useEffect, createElement } from 'react'
 import { configureStore } from '@reduxjs/toolkit'
 import panesReducer, { initLayout, removeLayout, setActivePane } from '@/store/panesSlice'
+import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
 import {
   recordPaneFocusBeforeUnmount,
+  paneSelectionMiddleware,
   resolveRecordedFocusTarget,
   schedulePaneFocusRestore,
   shouldFocusPaneOnEligibleMount,
@@ -12,6 +15,13 @@ import {
   isPaneFocusRestorePendingForTests,
   resetPaneFocusOwnershipForTests,
 } from '@/lib/pane-focus-ownership'
+
+function makePanesStore() {
+  return configureStore({
+    reducer: { panes: panesReducer },
+    middleware: (getDefault) => getDefault().concat(paneSelectionMiddleware as never),
+  })
+}
 
 describe('pane-focus-ownership', () => {
   let unsubscribe: (() => void) | null = null
@@ -182,7 +192,7 @@ describe('pane-focus-ownership', () => {
   })
 
   it('restore yields to a NEWER explicit selection (user click or scripted select)', async () => {
-    const store = configureStore({ reducer: { panes: panesReducer } })
+    const store = makePanesStore()
     unsubscribe = wirePaneFocusOwnershipInvalidation(store)
     // Establish an existing activePane entry so the later select is a real change.
     store.dispatch(initLayout({ tabId: 'tab-x', paneId: 'p20', content: { kind: 'terminal', mode: 'shell' } }))
@@ -210,7 +220,7 @@ describe('pane-focus-ownership', () => {
   })
 
   it('a background tab create (activePane addition) does NOT void an unrelated pending restore', async () => {
-    const store = configureStore({ reducer: { panes: panesReducer } })
+    const store = makePanesStore()
     unsubscribe = wirePaneFocusOwnershipInvalidation(store)
     store.dispatch(initLayout({ tabId: 'tab-a', paneId: 'p20', content: { kind: 'terminal', mode: 'shell' } }))
     document.body.innerHTML = `<div data-pane-id="p20"><input placeholder="Enter URL..."></div>`
@@ -227,7 +237,7 @@ describe('pane-focus-ownership', () => {
   })
 
   it('close-time records linger but a reopen (pane id re-appearing) forgets them', () => {
-    const store = configureStore({ reducer: { panes: panesReducer } })
+    const store = makePanesStore()
     unsubscribe = wirePaneFocusOwnershipInvalidation(store)
     store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'p21', content: { kind: 'terminal', mode: 'shell' } }))
     document.body.innerHTML = `<div data-pane-id="p21"></div><input id="chrome">`
@@ -256,7 +266,7 @@ describe('pane-focus-ownership', () => {
   })
 
   it('removals of OTHER tab entries are not selection activity (cross-tab sync must not void a restore)', async () => {
-    const store = configureStore({ reducer: { panes: panesReducer } })
+    const store = makePanesStore()
     unsubscribe = wirePaneFocusOwnershipInvalidation(store)
     store.dispatch(initLayout({ tabId: 'tab-a', paneId: 'p31', content: { kind: 'terminal', mode: 'shell' } }))
     store.dispatch(initLayout({ tabId: 'tab-b', paneId: 'p-b', content: { kind: 'terminal', mode: 'shell' } }))
@@ -273,7 +283,7 @@ describe('pane-focus-ownership', () => {
   })
 
   it('an ACTIVATING user split does not let the restore yank focus from the new pane', async () => {
-    const store = configureStore({ reducer: { panes: panesReducer } })
+    const store = makePanesStore()
     unsubscribe = wirePaneFocusOwnershipInvalidation(store)
     store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'old', content: { kind: 'terminal', mode: 'shell' } }))
     document.body.innerHTML = `<div data-pane-id="old"><input placeholder="Enter URL..."></div>`
@@ -292,7 +302,7 @@ describe('pane-focus-ownership', () => {
   })
 
   it('a focus record captured BEFORE a later selection is voided for mount adoption (close-promoted sibling)', () => {
-    const store = configureStore({ reducer: { panes: panesReducer } })
+    const store = makePanesStore()
     unsubscribe = wirePaneFocusOwnershipInvalidation(store)
     store.dispatch(initLayout({ tabId: 'tab-2', paneId: 'pa', content: { kind: 'terminal', mode: 'shell' } }))
     document.body.innerHTML = `<div data-pane-id="pa"></div><input id="chrome">`
@@ -305,7 +315,7 @@ describe('pane-focus-ownership', () => {
   })
 
   it('epoch-entry REMOVAL (closePane/removeLayout cleanup) is not selection activity', async () => {
-    const store = configureStore({ reducer: { panes: panesReducer } })
+    const store = makePanesStore()
     unsubscribe = wirePaneFocusOwnershipInvalidation(store)
     store.dispatch(initLayout({ tabId: 'tab-c', paneId: 'pc', content: { kind: 'terminal', mode: 'shell' } }))
     store.dispatch(setActivePane({ tabId: 'tab-c', paneId: 'pc', focusNudge: true })) // pc now HAS an epoch entry
@@ -323,7 +333,7 @@ describe('pane-focus-ownership', () => {
   })
 
   it('close-promotion REAL ordering: record AFTER the activePane reassignment still adopts stranded body focus', () => {
-    const store = configureStore({ reducer: { panes: panesReducer } })
+    const store = makePanesStore()
     unsubscribe = wirePaneFocusOwnershipInvalidation(store)
     store.dispatch(initLayout({ tabId: 'tab-3', paneId: 'pa', content: { kind: 'terminal', mode: 'shell' } }))
     document.body.innerHTML = `<div data-pane-id="pa"><input id="ua"></div><div data-pane-id="pb"></div>`
@@ -357,7 +367,7 @@ describe('pane-focus-ownership', () => {
   })
 
   it('split/close RACE: sibling record written after the focused pane vanished still adopts (round-14)', () => {
-    const store = configureStore({ reducer: { panes: panesReducer } })
+    const store = makePanesStore()
     unsubscribe = wirePaneFocusOwnershipInvalidation(store)
     store.dispatch(initLayout({ tabId: 'tab-r', paneId: 'pa', content: { kind: 'terminal', mode: 'shell' } }))
     document.body.innerHTML = `<div data-pane-id="pa"><input id="ua"></div><div data-pane-id="pb"></div>`
@@ -383,6 +393,33 @@ describe('pane-focus-ownership', () => {
     ;(document.getElementById('inner') as HTMLElement).focus()
     schedulePaneFocusRestore('p40')
     await waitFor(() => expect(document.querySelector('button')).toHaveFocus())
+  })
+
+  it('HOOK lifecycle: owned:false record + restore scheduled synchronously at mount still adopts stranded body focus', () => {
+    // The real lifecycle: the hook's mount layout effect marks the record
+    // restore-pending BEFORE a component's passive focus effect consults the
+    // gate — the strand exception must apply anyway (round-16 review).
+    let adoption: boolean | null = null
+    function Probe() {
+      const mayFocusNow = usePaneFocusAdoption('pw', true)
+      useEffect(() => { adoption = mayFocusNow() }, [mayFocusNow])
+      return createElement('div', { 'data-pane-id': 'pw' }, createElement('input', { 'aria-label': 'probe' }))
+    }
+    document.body.innerHTML = `<div data-pane-id="pw"></div>`
+    const chrome = document.createElement('input')
+    document.body.appendChild(chrome)
+    chrome.focus()
+    recordPaneFocusBeforeUnmount('pw') // not owned; chrome holds focus
+    // Teardown destroys both: focus strands on body, then the pane remounts.
+    document.body.innerHTML = ''
+    ;(chrome as HTMLInputElement | null)?.blur()
+    expect(document.activeElement).toBe(document.body)
+    try {
+      render(createElement(Probe))
+      expect(adoption).toBe(true)
+    } finally {
+      rtlCleanup()
+    }
   })
 
   it('trims the OLDEST entries beyond the cap instead of wiping the map', () => {

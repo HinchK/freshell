@@ -143,15 +143,17 @@ export function shouldFocusPaneOnEligibleMount(paneId: string): boolean {
   // is already Redux-active — no flip transition will ever run), so apply
   // unknown-pane semantics. In-flight pending windows keep their record.
   if (!record.restorePending && record.serialAtRecord !== paneSelectionSerial) return true
-  if (record.owned === false && !record.restorePending
-    && document.activeElement === document.body) {
+  if (record.owned === false && document.activeElement === document.body) {
     // Focus STRANDED on body: the element that held focus is gone (the old
     // subtree was destroyed) and typing has no destination. An eligible mount
     // must claim it — an eligible pane that never adopts focus strands
     // keyboard input permanently. The cost side (an agent remount stealing
     // focus a user deliberately parked on nothing-focusable) is far rarer and
     // far cheaper than stranded focus; the two cases are indistinguishable at
-    // record time (round-14 review), so stranding always wins.
+    // record time (round-14 review), so stranding always wins. restorePending
+    // is irrelevant here: the hook schedules it synchronously at mount, BEFORE
+    // components' passive focus effects call mayFocusNow, so needing this
+    // exception always coincides with pending (round-16 review).
     return true
   }
   return record.owned !== false
@@ -259,84 +261,53 @@ function collectLivePaneIds(layouts: Record<string, LayoutNodeLike> | undefined)
   return live
 }
 
-/** True when `next` CHANGES the value of any entry that existed in `prev`.
- *  Pure ADDITIONS (a focus-neutral background `tab.create` writing its own
- *  new tab's entry) and REMOVALS (closes / cross-tab-sync hydration delta)
- *  are NOT local selection activity — neither must void another pane's
- *  pending restore. */
-function mapChangedExistingValue(
-  prev: Record<string, string | number> | undefined,
-  next: Record<string, string | number> | undefined,
-): boolean {
-  if (prev === next) return false
-  for (const key of Object.keys(prev ?? {})) {
-    if (next && key in next && next[key] !== prev![key]) return true
+/** Middleware-side selection tracking: any setActivePane/nudgePaneFocus
+ *  dispatch bumps the selection serial — EXCEPT capture-internal moves
+ *  (ui-screenshot passes `capture: true` on its own interim dispatches, so a
+ *  screenshot's boarding ladder can't void the restore taken by someone who
+ *  selected panes mid-capture). State-subscription comparison cannot tell
+ *  capture moves from pointer clicks, hence this is action-driven. */
+export const paneSelectionMiddleware = () => (next: (action: unknown) => unknown) => (action: unknown) => {
+  const a = action as { type?: string; payload?: { capture?: boolean } } | null
+  if (
+    (a?.type === 'panes/setActivePane' && a?.payload?.capture !== true)
+    || a?.type === 'panes/nudgePaneFocus'
+  ) {
+    paneSelectionSerial += 1
   }
-  return false
+  return next(action)
 }
 
-/** True when `next` ADDS or CHANGES any entry. Used for the focus-epoch map:
- *  every write there comes from an explicit select fold (nudge), while
- *  REMOVALS are lifecycle cleanup (closePane/removeLayout prune entries) and
- *  must not masquerade as selection activity. */
-function mapChangedAnyEntry(
-  prev: Record<string, number> | undefined,
-  next: Record<string, number> | undefined,
-): boolean {
-  if (prev === next) return false
-  for (const key of Object.keys(next ?? {})) {
-    if (prev?.[key] !== next![key]) return true
-  }
-  return false
+/** Bump the selection serial directly (exported for tests wiring adoption
+ *  records into stores that lack the paneSelectionMiddleware). */
+export function notePaneSelectionActivity(): void {
+  paneSelectionSerial += 1
 }
 
-/** Wire record invalidation + selection tracking to the live store (called
- *  once from store.ts).
+/** Wire record invalidation to the live store (called once from store.ts;
+ *  selection tracking lives in paneSelectionMiddleware).
  *
- *  Selection serial: bumped when an EXISTING activePane entry (or per-pane
- *  focus-epoch value) changes or is removed — pointer clicks and select folds
- *  alike — but NOT on new-key additions (background tab creation is
- *  focus-neutral and must not cancel an unrelated in-flight restore).
- *
- *  Record invalidation: forget records for panes that (re)APPEAR in the
- *  layout set. Forgetting on arrival — rather than on removal — is immune to
- *  commit ordering: React's teardown record for a closing pane lands AFTER
- *  the store update, so removal-deletion would always be undone by the
- *  record. Closing tabs can leave a lingering owned:false record; if the tab
- *  is reopened (reopenClosedTab preserves leaf ids) arrival-forgetting clears
- *  it so the restored pane mounts as fresh "unknown" (normal mount focus),
- *  and pending flags of dead panes are GC'd the next time their pane id
- *  reappears. */
+ *  Forget records for panes that (re)APPEAR in the layout set. Forgetting on
+ *  arrival — rather than on removal — is immune to commit ordering: React's
+ *  teardown record for a closing pane lands AFTER the store update, so
+ *  removal-deletion would always be undone by the record. Closing tabs can
+ *  leave a lingering owned:false record; if the tab is reopened
+ *  (reopenClosedTab preserves leaf ids) arrival-forgetting clears it so the
+ *  restored pane mounts as fresh "unknown" (normal mount focus), and pending
+ *  flags of dead panes are GC'd the next time their pane id reappears. */
 export function wirePaneFocusOwnershipInvalidation(storeLike: {
   subscribe: (listener: () => void) => () => void
   getState: () => {
     panes?: {
-      activePane?: Record<string, string>
-      focusEpochByPaneId?: Record<string, number>
       layouts?: Record<string, LayoutNodeLike>
     }
   }
 }): () => void {
-  let prevActivePane = storeLike.getState().panes?.activePane
-  let prevEpoch = storeLike.getState().panes?.focusEpochByPaneId
   let prevLayouts = storeLike.getState().panes?.layouts
   let prevLive = collectLivePaneIds(prevLayouts)
   return storeLike.subscribe(() => {
     const panes = storeLike.getState().panes
     if (!panes) return
-    if (
-      panes.activePane !== prevActivePane
-      || panes.focusEpochByPaneId !== prevEpoch
-    ) {
-      if (
-        mapChangedExistingValue(prevActivePane, panes.activePane)
-        || mapChangedAnyEntry(prevEpoch, panes.focusEpochByPaneId)
-      ) {
-        paneSelectionSerial += 1
-      }
-      prevActivePane = panes.activePane
-      prevEpoch = panes.focusEpochByPaneId
-    }
     if (panes.layouts !== prevLayouts) {
       prevLayouts = panes.layouts
       const nextLive = collectLivePaneIds(panes.layouts)
@@ -353,8 +324,11 @@ export function isPaneFocusRestorePendingForTests(paneId: string): boolean {
   return recordByPaneId.get(paneId)?.restorePending === true
 }
 
-/** Test-only: read the selection serial (asserts restore yield behavior). */
-export function getPaneSelectionSerialForTests(): number {
+/** The monotonic selection serial — bumped by every explicit pane-selection
+ *  activity (wired via wirePaneFocusOwnershipInvalidation). Async operators
+ *  that capture-and-restore focus (ui-screenshot) compare before/after and
+ *  MUST NOT roll back a selection that landed mid-flight. */
+export function getPaneSelectionSerial(): number {
   return paneSelectionSerial
 }
 

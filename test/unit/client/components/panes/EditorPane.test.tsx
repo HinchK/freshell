@@ -6,7 +6,7 @@ import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import EditorPane from '@/components/panes/EditorPane'
 import panesReducer, { setActivePane } from '@/store/panesSlice'
-import { wirePaneFocusOwnershipInvalidation } from '@/lib/pane-focus-ownership'
+import { wirePaneFocusOwnershipInvalidation, paneSelectionMiddleware } from '@/lib/pane-focus-ownership'
 import settingsReducer from '@/store/settingsSlice'
 import connectionReducer, { setStatus } from '@/store/connectionSlice'
 
@@ -107,6 +107,7 @@ const createMockStore = (overrides?: { theme?: string }) => {
       settings: settingsReducer,
       connection: connectionReducer,
     },
+    middleware: (getDefault) => getDefault().concat(paneSelectionMiddleware as never),
     preloadedState: overrides
       ? {
           settings: {

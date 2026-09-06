@@ -37,7 +37,10 @@ import {
   pruneTabRecencyToCurrentLayout,
   tabRecencyPruneMiddleware,
 } from './tabRecencyPruneMiddleware'
-import { wirePaneFocusOwnershipInvalidation } from '@/lib/pane-focus-ownership'
+import {
+  wirePaneFocusOwnershipInvalidation,
+  paneSelectionMiddleware,
+} from '@/lib/pane-focus-ownership'
 
 enableMapSet()
 
@@ -78,6 +81,7 @@ export const store = configureStore({
         ignoredPaths: ['sessions.expandedProjects'],
       },
     }).concat(
+      paneSelectionMiddleware,
       perfMiddleware,
       tabFallbackIdentityMiddleware,
       tabRecencyPruneMiddleware,

@@ -9,14 +9,15 @@ import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { createElement } from 'react'
 import html2canvas from 'html2canvas'
-import tabsReducer, { setActiveTab, removeTab } from '@/store/tabsSlice'
-import panesReducer, { splitPane, closePane } from '@/store/panesSlice'
+import tabsReducer, { setActiveTab, removeTab, addTab } from '@/store/tabsSlice'
+import panesReducer, { splitPane, closePane, setActivePane } from '@/store/panesSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { captureUiScreenshot, restoreFocus } from '../../../src/lib/ui-screenshot'
+import { getPaneSelectionSerial, paneSelectionMiddleware, wirePaneFocusOwnershipInvalidation } from '@/lib/pane-focus-ownership'
 
 vi.mock('html2canvas', () => ({
   default: vi.fn(),
@@ -424,7 +425,7 @@ describe('restoreFocus deleted-target hardening', () => {
   function createFocusStore() {
     return configureStore({
       reducer: { tabs: tabsReducer, panes: panesReducer },
-      middleware: (getDefault) => getDefault({ serializableCheck: false }),
+      middleware: (getDefault) => getDefault({ serializableCheck: false }).concat(paneSelectionMiddleware as never),
       preloadedState: {
         tabs: {
           tabs: [
@@ -457,8 +458,9 @@ describe('restoreFocus deleted-target hardening', () => {
     const spy = vi.spyOn(store, 'dispatch')
     const ok = await restoreFocus(
       { dispatch: store.dispatch, getState: store.getState },
-      { activeTabId: 'tab-1', activePaneByTab: {} },
+      { selectionSerial: getPaneSelectionSerial(), activeTabId: 'tab-1', activePaneByTab: {} },
       new Set(),
+      'tab-2', // the capture's own switch — restorable
     )
     expect(ok).toBe(true)
     expect(store.getState().tabs.activeTabId).toBe('tab-1')
@@ -472,7 +474,7 @@ describe('restoreFocus deleted-target hardening', () => {
     // the snapshot says pane-2 owned focus.
     const ok = await restoreFocus(
       { dispatch: store.dispatch, getState: store.getState },
-      { activeTabId: 'tab-1', activePaneByTab: { 'tab-2': 'pane-2' } },
+      { selectionSerial: getPaneSelectionSerial(), activeTabId: 'tab-1', activePaneByTab: { 'tab-2': 'pane-2' } },
       new Set(['tab-2']),
     )
     expect(ok).toBe(true)
@@ -486,7 +488,7 @@ describe('restoreFocus deleted-target hardening', () => {
     const spy = vi.spyOn(store, 'dispatch') // spy AFTER setup: only restore dispatches are observed
     const ok = await restoreFocus(
       { dispatch: store.dispatch, getState: store.getState },
-      { activeTabId: 'tab-1', activePaneByTab: {} },
+      { selectionSerial: getPaneSelectionSerial(), activeTabId: 'tab-1', activePaneByTab: {} },
       new Set(),
     )
     expect(ok).toBe(false)
@@ -502,7 +504,7 @@ describe('restoreFocus deleted-target hardening', () => {
     const spy = vi.spyOn(store, 'dispatch')
     const ok = await restoreFocus(
       { dispatch: store.dispatch, getState: store.getState },
-      { activeTabId: 'tab-1', activePaneByTab: { 'tab-2': 'pane-2' } },
+      { selectionSerial: getPaneSelectionSerial(), activeTabId: 'tab-1', activePaneByTab: { 'tab-2': 'pane-2' } },
       new Set(['tab-2']),
     )
     expect(ok).toBe(false)
@@ -518,8 +520,9 @@ describe('restoreFocus deleted-target hardening', () => {
     const spy = vi.spyOn(store, 'dispatch')
     const ok = await restoreFocus(
       { dispatch: store.dispatch, getState: store.getState },
-      { activeTabId: 'tab-1', activePaneByTab: { 'tab-2': 'pane-2' } },
+      { selectionSerial: getPaneSelectionSerial(), activeTabId: 'tab-1', activePaneByTab: { 'tab-2': 'pane-2' } },
       new Set(['tab-2']),
+      'tab-2', // the capture's own switch — restorable
     )
     expect(ok).toBe(false)                                   // incomplete restore, honestly reported
     expect(store.getState().tabs.activeTabId).toBe('tab-1')  // surviving tab focus STILL restored
@@ -537,10 +540,68 @@ describe('restoreFocus deleted-target hardening', () => {
     requestAnimationFrame(() => { store.dispatch(removeTab('tab-2')) })
     const ok = await restoreFocus(
       { dispatch: store.dispatch, getState: store.getState },
-      { activeTabId: 'tab-1', activePaneByTab: { 'tab-2': 'pane-2' } },
+      { selectionSerial: getPaneSelectionSerial(), activeTabId: 'tab-1', activePaneByTab: { 'tab-2': 'pane-2' } },
       new Set(['tab-2']),
     )
     expect(ok).toBe(false)
+  })
+
+  it('yields the pane restore when a NEWER explicit selection landed mid-capture', async () => {
+    const store = createFocusStore()
+    const unwire = wirePaneFocusOwnershipInvalidation(store)
+    try {
+      store.dispatch(splitPane({ tabId: 'tab-2', paneId: 'pane-2', direction: 'horizontal', newContent: { kind: 'terminal', mode: 'shell' }, newPaneId: 'pane-2b' }))
+      const s0 = getPaneSelectionSerial()
+      const before = { selectionSerial: s0, activeTabId: 'tab-1', activePaneByTab: { 'tab-2': 'pane-2' } }
+      // User (or agent) explicitly selects the OTHER pane mid-capture.
+      store.dispatch(setActivePane({ tabId: 'tab-2', paneId: 'pane-2b', focusNudge: true }))
+      const dispatchSpy = vi.spyOn(store, 'dispatch')
+      const ok = await restoreFocus(
+        { dispatch: store.dispatch, getState: store.getState },
+        before,
+        new Set(['tab-2']),
+      )
+      expect(ok).toBe(true) // superseded by the newer selection, not incomplete
+      expect(store.getState().panes.activePane['tab-2']).toBe('pane-2b')
+      expect(dispatchSpy.mock.calls.map(([a]) => (a as any)?.type)).not.toContain('panes/setActivePane')
+    } finally {
+      unwire()
+    }
+  })
+
+  it('yields the tab restore when the user clicked a different tab mid-capture', async () => {
+    const store = createFocusStore()
+    // Snapshot: user was on tab-1. The capture switched to tab-2…
+    store.dispatch(setActiveTab('tab-2'))
+    // …then the user clicked a THIRD tab while capture was in flight. Plain
+    // tab clicks carry no epoch, so the restore tells the user's click apart
+    // from the capture's own switch via captureSelectedTabId.
+    store.dispatch(addTab({}))
+    const userTab = store.getState().tabs.tabs.at(-1)!.id
+    store.dispatch(setActiveTab(userTab))
+    const spy = vi.spyOn(store, 'dispatch')
+    const ok = await restoreFocus(
+      { dispatch: store.dispatch, getState: store.getState },
+      { selectionSerial: getPaneSelectionSerial(), activeTabId: 'tab-1', activePaneByTab: {} },
+      new Set(),
+      'tab-2', // capture's own switch — must not match to be restorable
+    )
+    expect(ok).toBe(true)
+    expect(spy.mock.calls.filter(([a]) => (a as any)?.type === 'tabs/setActiveTab').length).toBe(0)
+    expect(store.getState().tabs.activeTabId).toBe(userTab)
+  })
+
+    it("restores the capture's own tab switch when nothing changed mid-capture", async () => {
+    const store = createFocusStore()
+    store.dispatch(setActiveTab('tab-2')) // capture's own switch
+    const ok = await restoreFocus(
+      { dispatch: store.dispatch, getState: store.getState },
+      { selectionSerial: getPaneSelectionSerial(), activeTabId: 'tab-1', activePaneByTab: {} },
+      new Set(),
+      'tab-2',
+    )
+    expect(ok).toBe(true)
+    expect(store.getState().tabs.activeTabId).toBe('tab-1')
   })
 
   it('reports false when the restore target is deleted DURING the restore window (race pin)', async () => {
@@ -553,8 +614,9 @@ describe('restoreFocus deleted-target hardening', () => {
     requestAnimationFrame(() => { store.dispatch(removeTab('tab-1')) })
     const ok = await restoreFocus(
       { dispatch: store.dispatch, getState: store.getState },
-      { activeTabId: 'tab-1', activePaneByTab: {} },
+      { selectionSerial: getPaneSelectionSerial(), activeTabId: 'tab-1', activePaneByTab: {} },
       new Set(),
+      'tab-2', // the capture's own switch — restorable
     )
     expect(ok).toBe(false)
   })

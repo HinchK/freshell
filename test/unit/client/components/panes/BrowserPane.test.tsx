@@ -6,7 +6,7 @@ import panesReducer, { requestPaneRefresh, setActivePane } from '@/store/panesSl
 import settingsReducer from '@/store/settingsSlice'
 import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
 import BrowserPane from '@/components/panes/BrowserPane'
-import { resetPaneFocusOwnershipForTests, wirePaneFocusOwnershipInvalidation, isPaneFocusRestorePendingForTests } from '@/lib/pane-focus-ownership'
+import { resetPaneFocusOwnershipForTests, wirePaneFocusOwnershipInvalidation, isPaneFocusRestorePendingForTests, paneSelectionMiddleware } from '@/lib/pane-focus-ownership'
 
 // Mock clipboard
 vi.mock('@/lib/clipboard', () => ({
@@ -35,6 +35,7 @@ const createMockStore = () =>
       settings: settingsReducer,
       paneRuntimeActivity: paneRuntimeActivityReducer,
     },
+    middleware: (getDefault) => getDefault().concat(paneSelectionMiddleware as never),
     preloadedState: {
       panes: {
         layouts: {},

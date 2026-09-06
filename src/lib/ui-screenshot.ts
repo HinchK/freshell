@@ -2,6 +2,7 @@ import html2canvas from 'html2canvas'
 import { setActivePane } from '@/store/panesSlice'
 import { setActiveTab } from '@/store/tabsSlice'
 import { suspendTerminalRenderersForScreenshot } from '@/lib/screenshot-capture-env'
+import { getPaneSelectionSerial } from '@/lib/pane-focus-ownership'
 import type { PaneNode } from '@/store/paneTypes'
 import type { AppDispatch, RootState } from '@/store/store'
 
@@ -36,6 +37,9 @@ type RuntimeContext = {
 }
 
 export type FocusSnapshot = {
+  /** Selection serial at capture start — any newer explicit select during the
+   *  CAPTURE suspends both pane and tab restores (newer selection wins). */
+  selectionSerial: number
   activeTabId: string | null
   activePaneByTab: Record<string, string>
 }
@@ -61,6 +65,7 @@ function afterPaint(): Promise<void> {
 
 function snapshotFocus(state: RootState): FocusSnapshot {
   return {
+    selectionSerial: getPaneSelectionSerial(),
     activeTabId: state.tabs.activeTabId,
     activePaneByTab: { ...state.panes.activePane },
   }
@@ -290,8 +295,18 @@ function findTabIdForPane(state: RootState, paneId: string): string | undefined 
   return undefined
 }
 
-export async function restoreFocus(ctx: RuntimeContext, before: FocusSnapshot, paneTabsToRestore: Set<string>): Promise<boolean> {
+export async function restoreFocus(
+  ctx: RuntimeContext,
+  before: FocusSnapshot,
+  paneTabsToRestore: Set<string>,
+  captureSelectedTabId?: string | null,
+): Promise<boolean> {
+  // A newer explicit selection during the capture wins over the restore —
+  // roll nothing back. (The capture's own tab/pane moves never bump the
+  // serial: only explicit select folds and pointer activations do.)
+  if (getPaneSelectionSerial() !== before.selectionSerial) return true
   let incomplete = false
+  let tabSkippedByUser = false
   try {
     for (const tabId of paneTabsToRestore) {
       const originalPaneId = before.activePaneByTab[tabId]
@@ -316,7 +331,15 @@ export async function restoreFocus(ctx: RuntimeContext, before: FocusSnapshot, p
       const state = ctx.getState()
       if (!state.tabs.tabs.some((t) => t.id === before.activeTabId)) {
         incomplete = true
-      } else if (state.tabs.activeTabId !== before.activeTabId) {
+        tabSkippedByUser = false
+      } else if (state.tabs.activeTabId === before.activeTabId) {
+        // nothing to do
+        tabSkippedByUser = false
+      } else if (state.tabs.activeTabId !== captureSelectedTabId) {
+        // Tab clicks carry no epoch: distinguish the capture's own switch
+        // (restore it) from the user's mid-capture tab click (leave it alone).
+        tabSkippedByUser = true
+      } else {
         ctx.dispatch(setActiveTab(before.activeTabId))
       }
     }
@@ -324,7 +347,7 @@ export async function restoreFocus(ctx: RuntimeContext, before: FocusSnapshot, p
     await afterPaint()
 
     const after = ctx.getState()
-    if (before.activeTabId) {
+    if (before.activeTabId && !tabSkippedByUser) {
       if (!after.tabs.tabs.some((t) => t.id === before.activeTabId)) {
         incomplete = true // deleted during the restore window
       } else if (after.tabs.activeTabId !== before.activeTabId) return false
@@ -353,17 +376,21 @@ export async function captureUiScreenshot(request: ScreenshotRequest, ctx: Runti
   const paneTabsToRestore = new Set<string>()
   let changedFocus = false
   let restoredFocus = false
+  let captureSelectedTabId: string | null = null
 
   const setActiveTabIfNeeded = async (tabId: string) => {
     if (ctx.getState().tabs.activeTabId === tabId) return
     ctx.dispatch(setActiveTab(tabId))
+    captureSelectedTabId = tabId
     changedFocus = true
     await afterPaint()
   }
 
   const setActivePaneIfNeeded = async (tabId: string, paneId: string) => {
     if (ctx.getState().panes.activePane[tabId] === paneId) return
-    ctx.dispatch(setActivePane({ tabId, paneId }))
+    // Capture-internal activation: must not bump the selection serial — the
+    // restore contract attributes serial changes to user/agent selections.
+    ctx.dispatch(setActivePane({ tabId, paneId, capture: true }))
     paneTabsToRestore.add(tabId)
     changedFocus = true
     await afterPaint()
@@ -450,7 +477,7 @@ export async function captureUiScreenshot(request: ScreenshotRequest, ctx: Runti
   await restoreRenderers()
 
   if (changedFocus) {
-    restoredFocus = await restoreFocus(ctx, focusBefore, paneTabsToRestore)
+    restoredFocus = await restoreFocus(ctx, focusBefore, paneTabsToRestore, captureSelectedTabId)
   }
 
   return {
