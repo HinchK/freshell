@@ -315,8 +315,25 @@ async fn fresh_pane_locator_one_batch_drain_records_turn_complete() {
 
     let terminal_id = send_create(&mut ws, "codex").await;
 
+    // First Enter: opens the 2s window, re-snapshots known_files (no rollout).
+    // Wait for the server's `codex.activity.updated` with `phase: "pending"`
+    // (proves note_possible_submit completed the re-snapshot AND note_input set
+    // Pending) instead of a blind sleep — the re-snapshot MUST finish before
+    // the rollout is written, or it would be permanently excluded.
     common::send_input(&mut ws, &terminal_id, "\r").await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    let pending = wait_for_frame(&mut ws, |v| {
+        v["type"] == "codex.activity.updated"
+            && v["upsert"]
+                .as_array()
+                .map(|u| u.iter().any(|r| r["terminalId"] == terminal_id.as_str() && r["phase"] == "pending"))
+                .unwrap_or(false)
+    })
+    .await;
+    assert!(pending, "expected codex.activity.updated with phase=pending after the first Enter");
+
+    // Let the 2s Enter-anchored window resolve with zero candidates (the sweep
+    // runs every 150ms; 2.2s covers the 2s window + one sweep).
+    tokio::time::sleep(Duration::from_millis(2200)).await;
 
     let cwd = std::env::temp_dir().to_string_lossy().to_string();
     let rollout = sessions_day.join(format!("rollout-2026-07-24T12-00-00-{THREAD}.jsonl"));
