@@ -29,7 +29,8 @@ completion — matching the already-green separate-batch path. The Idle
 
 - Work only in the `the-usual/pkvz-deflake` worktree at
   `/home/dan/code/freshell/.worktrees/pkvz-deflake` on branch
-  `the-usual/pkvz-deflake` (base `9d3da1e69`).
+  `the-usual/pkvz-deflake` (base `b710d6ec8` = `origin/main`, which includes PR
+  #744's 30s→120s budget bump).
 - Do NOT widen the `wait_for_frame` budget further. `origin/main` (base of this
   branch) already bumped it 30s→120s via PR #744 (`707530ca0`); that bump is the
   baseline here, and it did NOT stop the flake (the root cause is the one-batch
@@ -40,17 +41,12 @@ completion — matching the already-green separate-batch path. The Idle
   semantic: a one-batch start+complete on an Idle (historical, not-watched)
   terminal stays Idle and records nothing (resume-busy seeding must not ring a
   turn that ended before the tracker watched).
-- Do NOT touch the parallel `fix/ci-rust-test-flakes` branch
-  (`ef30f5faf`, the 30s→120s budget bump). It is a separate effort; the user
-  chooses at PR time. No conflict avoidance edits — both branches may touch
-  `codex_locator_activity.rs`; the user/merge resolves.
 - Red/Green/Refactor TDD: the new unit test fails first on the current code for
   the stated reason, passes after the fix.
 - No comments in production code unless asked; the fix's rationale lives in the
   plan and the test, plus one short in-code note anchoring the phase-conditional
   to pkvz (the existing code is heavily commented; match that style minimally).
-- Run cargo commands from the worktree. Avoid running heavy cargo while a
-  foreign cargo test is in flight on the same box (coordination, not a blocker).
+- Run cargo commands from the worktree.
 
 ## Requirements
 
@@ -367,28 +363,161 @@ reconcile_ignores_an_already_resolved_rollout."
 
 **Behavior:**
 - `fresh_pane_locator_identity_reaches_activity_and_turn_complete` passes
-  reliably in isolation and under repeated runs (the one-batch path now records
-  the completion regardless of hub drain timing).
+  reliably in isolation (non-regression guard).
+- A NEW deterministic integration test forces the one-batch drain path: it
+  writes `session_meta` + `task_started` + `task_complete` ALL AT ONCE before
+  the locator resolves, so `CodexAttach`'s initial drain reads all three lines
+  in one batch regardless of hub timing. This is the load-induced scenario
+  reproduced deterministically — no load dependence, no cargo-concurrency
+  assumptions. It fails before the Task 1 fix (suppression) and passes after.
 - The broader `freshell-ws` codex/locator integration surface stays green.
 
 **Files:**
-- No source changes. (Test-only verification.)
+- Modify: `crates/freshell-ws/tests/codex_locator_activity.rs` (add one new
+  `#[tokio::test]` that reuses the existing harness helpers:
+  `write_fake_codex`, `codex_capture_spec`,
+  `spawn_server_with_specs_activity_and_codex_locator`,
+  `connect_and_capture_inventory`, `send_create`, `send_input`,
+  `wait_for_frame`, `now_ms`, `codex_event_line`.)
 
 **Interfaces:**
-- Consumes: the Task 1 fix via the real server's `CodexActivityTracker`.
+- Consumes: the Task 1 fix via the real server's `CodexActivityTracker`; the
+  existing test helpers in `codex_locator_activity.rs` and `tests/common/mod.rs`.
 
 **Test cases:**
-- Run the flaky integration test 5× in isolation → 5/5 PASS.
-- Run the whole `freshell-ws` crate 3× (the original flake scenario: all
-  integration binaries contending for the blocking pool under one `cargo test`
-  invocation) → the pkvz test passes every time, 120s budget unchanged.
+- Run the flaky integration test 5× in isolation → 5/5 PASS (non-regression).
+- Run the new deterministic one-batch integration test once → PASS (fails
+  before the fix, passes after; the root-cause end-to-end proof).
 - Run the `freshell-activity` crate and the codex/locator integration surface →
   PASS.
 
-- [ ] **Step 1: Isolated repeat stability**
+- [ ] **Step 1: Write the deterministic one-batch integration test**
 
-Run the flaky test 5 times in isolation (`--test-threads=1` keeps the binary's
-process-global env ownership clean):
+In `crates/freshell-ws/tests/codex_locator_activity.rs`, add a new test after
+`fresh_pane_locator_identity_reaches_activity_and_turn_complete`. It writes
+ALL THREE rollout lines (session_meta + task_started + task_complete) before
+the locator resolves, so `CodexAttach`'s initial drain (offset 0→EOF for files
+≤ 256 KB) reads them in ONE batch — the exact suppression path, reproduced
+deterministically without load:
+
+```rust
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn fresh_pane_locator_one_batch_drain_records_turn_complete() {
+    // pkvz deterministic reproduction: the load-induced flake happens when
+    // CodexAttach's initial drain reads task_started+task_complete in ONE
+    // batch (the hub delayed between CodexBind and CodexAttach, and the test
+    // appended both before the drain ran). This test forces that one-batch
+    // drain deterministically by writing session_meta + task_started +
+    // task_complete ALL AT ONCE before the locator resolves. The initial
+    // drain then folds both events into one reconcile_rollout call. Without
+    // the Task 1 fix, the same-batch clear shadows the start promotion,
+    // accepted_start_at stays None, and terminal.turn.complete never fires.
+    const THREAD: &str = "22222222-3333-4444-5555-666666666666";
+
+    let codex_home = tempfile::tempdir().expect("codex home");
+    let sessions_day = codex_home
+        .path()
+        .join("sessions")
+        .join("2026")
+        .join("07")
+        .join("24");
+    std::fs::create_dir_all(&sessions_day).expect("sessions tree");
+    std::env::set_var("CODEX_HOME", codex_home.path());
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
+    let capture = std::env::temp_dir().join(format!(
+        "codex-locator-one-batch-argv-{}.txt",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&capture);
+    std::env::set_var("CODEX_ARGV_CAPTURE_PATH", &capture);
+
+    let (url, registry) = common::spawn_server_with_specs_activity_and_codex_locator(
+        vec![codex_capture_spec()],
+        &codex_home.path().join("sessions"),
+    )
+    .await;
+    let (mut ws, _inventory) = common::connect_and_capture_inventory(&url).await;
+
+    let terminal_id = send_create(&mut ws, "codex").await;
+
+    // First Enter: opens the 2s window, re-snapshots known_files (no rollout).
+    common::send_input(&mut ws, &terminal_id, "\r").await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Write ALL THREE lines at once: session_meta + task_started + task_complete.
+    // The locator probes only the FIRST line (session_meta) for identity; the
+    // adoption tail's initial drain reads ALL lines and folds them into one
+    // reconcile_rollout call — the one-batch path.
+    let cwd = std::env::temp_dir().to_string_lossy().to_string();
+    let rollout = sessions_day.join(format!("rollout-2026-07-24T12-00-00-{THREAD}.jsonl"));
+    let ts = now_ms();
+    std::fs::write(
+        &rollout,
+        format!(
+            "{{\"timestamp\":\"2026-07-24T12:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{THREAD}\",\"cwd\":\"{cwd}\"}}}}\n{}\n{}\n",
+            codex_event_line("task_started", ts),
+            codex_event_line("task_complete", ts + 100),
+        ),
+    )
+    .unwrap();
+
+    // Second Enter: re-opens a resolved window WITHOUT re-snapshotting, so
+    // the file written above is the sole new candidate.
+    common::send_input(&mut ws, &terminal_id, "\r").await;
+
+    // The locator resolves and the adoption tail emits codex.activity.updated.
+    let bound = wait_for_frame(&mut ws, |v| {
+        v["type"] == "codex.activity.updated"
+            && v["upsert"]
+                .as_array()
+                .map(|u| {
+                    u.iter().any(|r| {
+                        r["terminalId"] == terminal_id.as_str() && r["sessionId"] == THREAD
+                    })
+                })
+                .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        bound,
+        "expected codex.activity.updated carrying the locator-resolved sessionId"
+    );
+
+    // The initial drain at CodexAttach read all three lines in ONE batch. The
+    // fix makes the one-batch start+clear record the completion; without it,
+    // the same-batch clear shadows the promotion and no turn.complete fires.
+    let completed = wait_for_frame(&mut ws, |v| {
+        v["type"] == "terminal.turn.complete"
+            && v["terminalId"] == terminal_id.as_str()
+            && v["provider"] == "codex"
+            && v["sessionId"] == THREAD
+    })
+    .await;
+    assert!(
+        completed,
+        "expected terminal.turn.complete from the one-batch initial drain (pkvz root cause)"
+    );
+
+    registry.kill(&terminal_id);
+    std::env::remove_var("CODEX_HOME");
+    std::env::remove_var("CODEX_ARGV_CAPTURE_PATH");
+}
+```
+
+- [ ] **Step 2: Run the new test and verify the intended failure (RED)**
+
+```bash
+cd /home/dan/code/freshell/.worktrees/pkvz-deflake && \
+  cargo test -p freshell-ws --test codex_locator_activity \
+  fresh_pane_locator_one_batch_drain_records_turn_complete -- --exact --test-threads=1 --nocapture
+```
+
+Expected: FAIL at the `assert!(completed, ...)` — the one-batch suppression
+prevents `terminal.turn.complete` from firing within the 120s budget. This is
+the deterministic root-cause reproduction: no load dependence.
+
+- [ ] **Step 3: Run the existing integration test (non-regression, pre-fix)**
 
 ```bash
 cd /home/dan/code/freshell/.worktrees/pkvz-deflake && \
@@ -399,32 +528,23 @@ cd /home/dan/code/freshell/.worktrees/pkvz-deflake && \
   done; echo "5/5 PASS"
 ```
 
-Expected: 5/5 PASS. (Pre-fix this would still mostly pass in isolation — the
-flake is load-dependent — so this is a non-regression guard, not the load
-proof.)
+Expected: 5/5 PASS (the existing test is green in isolation; the flake is
+load-dependent. This confirms the Task 1 fix didn't break the existing path.)
 
-- [ ] **Step 2: Whole-crate load stability (the original flake scenario)**
+- [ ] **Step 4: Run the new test after the Task 1 fix (GREEN)**
 
-The kata reports the flake under "full workspace cargo run on a loaded 96-core
-box." The closest faithful reproduction without a full `cargo test --workspace`
-is running the whole `freshell-ws` crate — `cargo test -p freshell-ws` with no
-`--test` filter, so ALL its integration binaries run concurrently and contend
-for the blocking pool and tokio workers in one invocation. This is the
-contention that produced the one-batch drain. Run it 3 times:
+After Task 1 is complete, re-run the deterministic one-batch test:
 
 ```bash
 cd /home/dan/code/freshell/.worktrees/pkvz-deflake && \
-  for i in 1 2 3; do \
-    cargo test -p freshell-ws || \
-      { echo "FAIL on whole-crate run $i"; exit 1; }; \
-  done; echo "3/3 whole-crate PASS"
+  cargo test -p freshell-ws --test codex_locator_activity \
+  fresh_pane_locator_one_batch_drain_records_turn_complete -- --exact --test-threads=1 --nocapture
 ```
 
-Expected: 3/3 PASS with the 120s `wait_for_frame` budget unchanged. If the pkvz
-test still fails, that is a failed R1 (pkvz is not resolved) — investigate and
-fix; do not widen the budget.
+Expected: PASS — the one-batch initial drain now records the completion and
+`terminal.turn.complete` fires with `provider=codex` and `sessionId=THREAD`.
 
-- [ ] **Step 3: Broader suite non-regression**
+- [ ] **Step 5: Broader suite non-regression**
 
 Run the codex/locator integration surface and the activity unit crate together:
 
@@ -438,9 +558,23 @@ cd /home/dan/code/freshell/.worktrees/pkvz-deflake && \
 
 Expected: all PASS.
 
-- [ ] **Step 4: No commit (verification-only task)**
+- [ ] **Step 6: Commit the new test**
 
-Task 2 makes no source changes. If any step reveals a remaining flake in
+```bash
+cd /home/dan/code/freshell/.worktrees/pkvz-deflake && \
+  git add crates/freshell-ws/tests/codex_locator_activity.rs && \
+  git commit -m "test(codex-locator): deterministic one-batch drain integration test (kata pkvz)
+
+Forces the load-induced one-batch path deterministically: writes session_meta +
+task_started + task_complete ALL AT ONCE before the locator resolves, so
+CodexAttach's initial drain reads all three lines in one reconcile_rollout call.
+Fails before the Task 1 fix (same-batch clear shadows the promotion); passes
+after. No load dependence — the root-cause end-to-end proof."
+```
+
+- [ ] **Step 7: No further commit (verification complete)**
+
+If any step reveals a remaining flake in
 `fresh_pane_locator_identity_reaches_activity_and_turn_complete`, that is a
 failed R1 (pkvz is not resolved), not an out-of-scope finding. Investigate and
 fix before claiming completion. Do not widen the budget.
@@ -449,30 +583,43 @@ fix before claiming completion. Do not widen the budget.
 
 ## Self-review
 
-1. **Spec coverage:** R1 (flake gone) → Task 1 root-cause fix + Task 2 Steps 1-2
-   stability. R2 (root-cause, not budget bump; Idle and historical-rollout
-   suppression preserved) → Task 1 Step 3 temporally-restricted guard + Task 1
-   Step 6 re-runs `reconcile_ignores_an_already_resolved_rollout`. R3 (new unit
-   tests + no regression) → Task 1 Step 1 (three new tests, including the
-   historical-start regression guard) + Task 2 Step 3 (broader suite).
+1. **Spec coverage:** R1 (flake gone) → Task 1 root-cause fix + Task 2 Step 4
+   (deterministic one-batch integration test, the end-to-end root-cause proof).
+   R2 (root-cause, not budget bump; Idle and historical-rollout suppression
+   preserved) → Task 1 Step 3 temporally-restricted guard + Task 1 Step 6 re-runs
+   `reconcile_ignores_an_already_resolved_rollout`. R3 (new unit tests + new
+   integration test + no regression) → Task 1 Step 1 (three unit tests, including
+   the historical-start regression guard) + Task 2 Step 1 (deterministic
+   one-batch integration test) + Task 2 Step 5 (broader suite).
 2. **No silent deferrals:** No stubs, mocks, or seams. The fix is production
-   code in `reconcile_rollout`; the integration test uses the real server.
+   code in `reconcile_rollout`; the integration tests use the real server.
 3. **File and interface consistency:** `effective_clear` is the only production
    change; it is consumed only by the promotion guard at `codex.rs:395-397`. The
    clear branch at 418-467 is unchanged and already handles the post-promotion
    Busy clear. Test helpers `started`/`completed`/`phases`/`completions` are
    defined in-module. `note_input("\r", at)` drives Pending + queued submit
-   (confirmed at `codex.rs:530`). The older-start and historical-start tests
-   use `tracker.list()[0].phase` (not `phases()`) for Pending→Pending net
+   (confirmed at `codex.rs:530`). The older-start and historical-start unit
+   tests use `tracker.list()[0].phase` (not `phases()`) for Pending→Pending net
    transitions, since `changed()` (codex.rs:190-198) suppresses the `Changed`
-   effect when the public record starts and ends Pending.
-4. **Executable tests:** The first new test fails first for the stated reason
+   effect when the public record starts and ends Pending. The new integration
+   test reuses the existing `codex_locator_activity.rs` helpers
+   (`write_fake_codex`, `codex_capture_spec`, `send_create`, `send_input`,
+   `wait_for_frame`, `now_ms`, `codex_event_line`,
+   `spawn_server_with_specs_activity_and_codex_locator`,
+   `connect_and_capture_inventory`). Cargo commands use one positional TESTNAME
+   each; `--exact` names include the `codex::tests::` module path for unit tests.
+4. **Executable tests:** The first unit test fails first for the stated reason
    (zero completions — the one-batch suppression) and passes after the guard
-   change. The second test passes before and after (re-arm parity). The third
-   test (historical start before pending submit) passes before and after
-   (suppression preserved — the temporal restriction keeps the same-batch clear
-   in the guard for starts that predate the pending submit). The Idle test is
-   re-run, not duplicated. Cargo commands use one positional TESTNAME each.
+   change. The second unit test passes before and after (re-arm parity). The
+   third unit test (historical start before pending submit) passes before and
+   after (suppression preserved — the temporal restriction keeps the same-batch
+   clear in the guard for starts that predate the pending submit). The Idle test
+   is re-run, not duplicated. The new integration test fails before the fix (RED,
+   Step 2) and passes after (GREEN, Step 4) — the deterministic one-batch
+   end-to-end proof. The existing integration test stays green (Step 3,
+   non-regression). Cargo runs test-target binaries serially (not concurrently),
+   so the load condition is reproduced deterministically by writing all three
+   rollout lines upfront, not by running multiple binaries.
 5. **Placeholder scan:** No TBD/TODO/"later". All commands are runnable as
    written.
 6. **Operational completeness:** No migrations, no config, no docs changes
@@ -482,5 +629,5 @@ fix before claiming completion. Do not widen the budget.
 7. **Task relevance:** Task 1 serves R1/R2/R3; Task 2 serves R1/R3. Both
    necessary; neither removable.
 8. **Task size:** Task 1 is one production conditional + three unit tests — one
-   coherent TDD change. Task 2 is verification-only. Each is independently
-   reviewable.
+   coherent TDD change. Task 2 is one new integration test + verification — one
+   coherent TDD addition. Each is independently reviewable.
