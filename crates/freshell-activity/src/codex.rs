@@ -391,17 +391,16 @@ impl CodexActivityTracker {
             // codex-activity-tracker.ts:446), the same-batch clear must NOT
             // shadow the start promotion. Historical (Idle / start before the
             // pending submit) rollouts keep the same-batch clear.
-            let effective_clear =
-                if state.phase == CodexPhase::Pending
-                    && events
-                        .latest_task_started_at
-                        .zip(state.pending_submit_at)
-                        .is_some_and(|(started, pending)| started >= pending)
-                {
-                    state.last_cleared_at
-                } else {
-                    max_ts(observed_clear, state.last_cleared_at)
-                };
+            let effective_clear = if state.phase == CodexPhase::Pending
+                && events
+                    .latest_task_started_at
+                    .zip(state.pending_submit_at)
+                    .is_some_and(|(started, pending)| started >= pending)
+            {
+                state.last_cleared_at
+            } else {
+                max_ts(observed_clear, state.last_cleared_at)
+            };
             if is_new
                 && state
                     .accepted_start_at
@@ -1704,7 +1703,7 @@ mod tests {
         tracker.track_terminal("t1", Some("thread-1"), 0);
         tracker.note_input("t1", "\r", 10); // pending submit at 10
         let events = CodexTaskEvents {
-            latest_task_started_at: Some(5), // BEFORE the pending submit
+            latest_task_started_at: Some(5),   // BEFORE the pending submit
             latest_task_completed_at: Some(7), // BEFORE the pending submit
             ..Default::default()
         };

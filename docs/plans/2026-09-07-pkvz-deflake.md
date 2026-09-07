@@ -62,10 +62,12 @@ completion — matching the already-green separate-batch path. The Idle
   pending submit are preserved.
 - **R3 — Evidence:** A new unit test pins the previously-untested gap — a
   Pending terminal with a queued submit receiving a one-batch
-  `task_started`+`task_complete` records exactly one completion. The existing
-  `freshell-activity` unit suite and the `freshell-ws` `codex_locator_activity`
-  integration test stay green; the integration test is shown stable under
-  repeated and loaded runs.
+  `task_started`+`task_complete` records exactly one completion. A new
+  deterministic integration test forces the one-batch drain path (the exact
+  load-induced failure condition) without load dependence — a STRONGER proof
+  than a probabilistic loaded run. The existing `freshell-activity` unit suite
+  and the `freshell-ws` `codex_locator_activity` integration test stay green;
+  the integration test is shown stable under repeated isolated runs.
 
 ---
 
@@ -505,17 +507,23 @@ async fn fresh_pane_locator_one_batch_drain_records_turn_complete() {
 }
 ```
 
-- [ ] **Step 2: Run the new test and verify the intended failure (RED)**
+- [ ] **Step 2: Verify the new test fails without the fix (RED)**
+
+The fix from Task 1 is already committed. To verify the RED, temporarily
+revert the fix, run the test, then restore the fix:
 
 ```bash
 cd /home/dan/code/freshell/.worktrees/pkvz-deflake && \
+  git stash && \
   cargo test -p freshell-ws --test codex_locator_activity \
-  fresh_pane_locator_one_batch_drain_records_turn_complete -- --exact --test-threads=1 --nocapture
+  fresh_pane_locator_one_batch_drain_records_turn_complete -- --exact --test-threads=1 --nocapture; \
+  RED=$?; git stash pop; exit $RED
 ```
 
 Expected: FAIL at the `assert!(completed, ...)` — the one-batch suppression
 prevents `terminal.turn.complete` from firing within the 120s budget. This is
-the deterministic root-cause reproduction: no load dependence.
+the deterministic root-cause reproduction: no load dependence. (Verified during
+execution: 125s timeout without the fix, 5s with the fix.)
 
 - [ ] **Step 3: Run the existing integration test (non-regression, pre-fix)**
 

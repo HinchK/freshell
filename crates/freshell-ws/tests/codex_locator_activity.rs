@@ -325,15 +325,29 @@ async fn fresh_pane_locator_one_batch_drain_records_turn_complete() {
         v["type"] == "codex.activity.updated"
             && v["upsert"]
                 .as_array()
-                .map(|u| u.iter().any(|r| r["terminalId"] == terminal_id.as_str() && r["phase"] == "pending"))
+                .map(|u| {
+                    u.iter()
+                        .any(|r| r["terminalId"] == terminal_id.as_str() && r["phase"] == "pending")
+                })
                 .unwrap_or(false)
     })
     .await;
-    assert!(pending, "expected codex.activity.updated with phase=pending after the first Enter");
+    assert!(
+        pending,
+        "expected codex.activity.updated with phase=pending after the first Enter"
+    );
 
-    // Let the 2s Enter-anchored window resolve with zero candidates (the sweep
-    // runs every 150ms; 2.2s covers the 2s window + one sweep).
-    tokio::time::sleep(Duration::from_millis(2200)).await;
+    // Let the 2s Enter-anchored window resolve with zero candidates. The
+    // pending frame above proves the first Enter was processed (note_input set
+    // Pending AND the locator's re-snapshot completed). The 2s window opens at
+    // the first Enter; the 150ms sweep resolves it at most 2.15s later. This
+    // test runs in isolation (ENV_LOCK serializes the two tests; no other
+    // test binary contends for the blocking pool), so the 3s sleep gives 850ms
+    // margin over the worst-case 2.15s resolution — matching the existing
+    // test's proven margin at line 181. After this, the locator marks the
+    // terminal resolved=true; the second Enter re-opens the window WITHOUT
+    // re-snapshotting, so the rollout written below is the sole new candidate.
+    tokio::time::sleep(Duration::from_secs(3)).await;
 
     let cwd = std::env::temp_dir().to_string_lossy().to_string();
     let rollout = sessions_day.join(format!("rollout-2026-07-24T12-00-00-{THREAD}.jsonl"));
