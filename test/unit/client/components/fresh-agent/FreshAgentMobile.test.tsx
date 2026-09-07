@@ -306,6 +306,39 @@ describe('turn gestures inside the global ContextMenuProvider (single overlay, r
     releaseOverSheet(article)
   })
 
+  it('late native contextmenu retargeted onto the sheet (Android): still only the sheet, release stays suppressed', () => {
+    renderTranscriptInProvider()
+    const article = screen.getByRole('article', { name: 'You transcript turn' })
+    elementFromPointMock.mockReturnValue(article)
+
+    act(() => {
+      simulateTouch('touchstart', article, 100, 100)
+    })
+    // The transcript's 450ms long-press opens the full-screen sheet first.
+    act(() => {
+      vi.advanceTimersByTime(450)
+    })
+    const sheet = screen.getByRole('menu', { name: /fix the bug/ })
+    expect(sheet).toBeInTheDocument()
+
+    // The provider's 500ms timer fires now — inert for this turn-owned gesture.
+    act(() => {
+      vi.advanceTimersByTime(100)
+    })
+    expect(screen.getAllByRole('menu')).toHaveLength(1)
+    expect(elementFromPointMock).not.toHaveBeenCalled()
+
+    // Chromium dispatches the LATE native contextmenu via a fresh hit test
+    // against the CURRENT DOM: the target is the open sheet, NOT the turn
+    // article the gesture started on. Ownership must come from the gesture's
+    // original target, so the provider must not stack its menu on the sheet.
+    fireEvent.contextMenu(sheet)
+    expect(screen.getAllByRole('menu')).toHaveLength(1)
+    expect(screen.getByRole('menu', { name: /fix the bug/ })).toBeInTheDocument()
+
+    releaseOverSheet(article)
+  })
+
   it('keeps release suppression when the transcript rerenders mid-gesture (new actions identity)', () => {
     stubCoarsePointer(true)
     const store = createMenuTestStore()

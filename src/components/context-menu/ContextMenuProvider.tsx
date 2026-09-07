@@ -1109,14 +1109,29 @@ export function ContextMenuProvider({
     // handlers so handleContextMenu can coordinate with the touch session.
     let longPressTimer: ReturnType<typeof setTimeout> | null = null
     let touchStartPos: { x: number; y: number } | null = null
+    // The gesture's original touchstart target, persisted for the WHOLE
+    // in-flight gesture on the touchStartPos clearing discipline. A LATE
+    // native Android contextmenu can arrive after the transcript's sheet has
+    // opened; Chromium's fresh hit test then targets the sheet/backdrop, so
+    // handleContextMenu resolves turn ownership against this target instead
+    // (see its carve-out).
+    let touchGestureTarget: HTMLElement | null = null
     let suppressNextTouchEnd = false
 
     const handleContextMenu = (e: MouseEvent) => {
       const target = e.target as HTMLElement | null
       // Turn articles own their contextmenu gesture (see predicate comment) —
       // no openMenu and deliberately no preventDefault: the transcript's
-      // bubble-phase handler owns the event now.
-      if (isFreshAgentTurnTarget(target)) return
+      // bubble-phase handler owns the event now. While a touch gesture is in
+      // flight (the Android-race case-B condition below), resolve ownership
+      // against the gesture's ORIGINAL target, not e.target: a late native
+      // contextmenu retargeted onto the transcript's action sheet would
+      // otherwise bypass this check and stack the provider menu on top. For
+      // non-turn gestures the recorded target fails the predicate identically
+      // to e.target, so their behavior is unchanged.
+      const gestureInFlight = touchStartPos !== null || longPressTimer !== null
+      const ownershipTarget = gestureInFlight ? touchGestureTarget : target
+      if (isFreshAgentTurnTarget(ownershipTarget)) return
       const contextEl = findContextElement(target)
       const contextId = resolveContextId(contextEl?.dataset.context)
       if (shouldUseNativeMenu(target, contextId, contextEl, e)) return
@@ -1139,7 +1154,7 @@ export function ContextMenuProvider({
       // Chromium, and it hardens against engines reporting drifted or
       // degenerate contextmenu coordinates.
       let position = { x: e.clientX, y: e.clientY }
-      if (touchStartPos !== null || longPressTimer !== null) {
+      if (gestureInFlight) {
         if (touchStartPos) {
           position = { x: touchStartPos.x, y: touchStartPos.y }
         }
@@ -1148,6 +1163,7 @@ export function ContextMenuProvider({
           longPressTimer = null
         }
         touchStartPos = null
+        touchGestureTarget = null
         suppressNextTouchEnd = true
       }
 
@@ -1196,7 +1212,10 @@ export function ContextMenuProvider({
       // Capture the gesture target ONCE here: by the time the 500ms timer
       // fires, a transcript-owned long-press (450ms) has already opened the
       // action sheet, so a live elementFromPoint probe would hit the sheet.
+      // The same target also carries turn ownership for handleContextMenu
+      // across a late, retargeted native contextmenu (see its carve-out).
       const gestureTarget = e.target as HTMLElement | null
+      touchGestureTarget = gestureTarget
 
       longPressTimer = setTimeout(() => {
         longPressTimer = null
@@ -1205,8 +1224,13 @@ export function ContextMenuProvider({
         // (the transcript's touch handlers own release suppression). Hybrid-
         // input devices never set data-longpress-owned, so they keep the
         // provider fallback below, which stays byte-identical.
+        //
+        // The gesture bookkeeping deliberately SURVIVES this exit (cleared
+        // only on touchend/touchcancel): a LATE native contextmenu can still
+        // arrive while the finger stays down, retargeted onto the just-opened
+        // sheet, and handleContextMenu must still observe this gesture as in
+        // flight so ownership resolves to the gesture's original target.
         if (isFreshAgentLongPressOwnedTarget(gestureTarget)) {
-          touchStartPos = null
           return
         }
         const startPos = touchStartPos
@@ -1219,11 +1243,11 @@ export function ContextMenuProvider({
         if (!contextId) return
 
         // Respect native context menu for inputs, links, iframes, etc.
-        if (contextEl?.dataset.nativeContext === 'true') { touchStartPos = null; return }
-        if (target.closest?.('[data-native-context="true"]')) { touchStartPos = null; return }
-        if (target.tagName === 'IFRAME') { touchStartPos = null; return }
-        if (isTextInputLike(target) && ![ContextIds.Editor, ContextIds.Terminal].includes(contextId as any)) { touchStartPos = null; return }
-        if (target.closest?.('a[href]')) { touchStartPos = null; return }
+        if (contextEl?.dataset.nativeContext === 'true') { touchStartPos = null; touchGestureTarget = null; return }
+        if (target.closest?.('[data-native-context="true"]')) { touchStartPos = null; touchGestureTarget = null; return }
+        if (target.tagName === 'IFRAME') { touchStartPos = null; touchGestureTarget = null; return }
+        if (isTextInputLike(target) && ![ContextIds.Editor, ContextIds.Terminal].includes(contextId as any)) { touchStartPos = null; touchGestureTarget = null; return }
+        if (target.closest?.('a[href]')) { touchStartPos = null; touchGestureTarget = null; return }
 
         const dataset = contextEl?.dataset ? copyDataset(contextEl.dataset) : {}
         const parsed = parseContextTarget(contextId as any, dataset)
@@ -1239,6 +1263,7 @@ export function ContextMenuProvider({
           dataset,
         })
         touchStartPos = null
+        touchGestureTarget = null
       }, 500)
     }
 
@@ -1252,6 +1277,7 @@ export function ContextMenuProvider({
         clearTimeout(longPressTimer)
         longPressTimer = null
         touchStartPos = null
+        touchGestureTarget = null
         suppressNextTouchEnd = false
       }
     }
@@ -1263,6 +1289,7 @@ export function ContextMenuProvider({
         longPressTimer = null
       }
       touchStartPos = null
+      touchGestureTarget = null
       suppressNextTouchEnd = false
       if (shouldSuppressRelease) {
         if (e.cancelable) e.preventDefault()
