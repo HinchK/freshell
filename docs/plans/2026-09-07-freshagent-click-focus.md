@@ -144,11 +144,19 @@ Append this new `describe` block at the end of the top-level `describe` that con
       expect(scroller.scrollTop).toBe(660)
     })
 
-    it('still funnels plain-text keys to the composer when the transcript holds focus', async () => {
+    it('still funnels plain-text keys to the composer and re-focuses it', async () => {
       const { scroller, textbox } = await setupActivePane()
       scroller.focus()
+      expect(document.activeElement).toBe(scroller)
       fireEvent(scroller, createEvent.keyDown(scroller, { key: 'h' }))
       expect(textbox.value).toBe('h')
+      // appendText schedules textareaRef.focus() on the next animation frame;
+      // flush it and assert focus returns to the composer (the load-bearing
+      // refocus, assumption L3), so a regression that broke refocus would fail.
+      await act(async () => {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+      })
+      expect(document.activeElement).toBe(textbox)
     })
 
     it('still focuses the composer when the pane is (re)activated after a transcript click', async () => {
@@ -418,9 +426,12 @@ test.describe('Fresh Agent click-to-defocus', () => {
     await page.keyboard.press('PageDown')
     await expect.poll(async () => scroller.evaluate((el: HTMLElement) => el.scrollTop), { timeout: 5_000 }).toBeGreaterThan(before)
 
-    // End jumps back to the bottom.
+    // End jumps back to the bottom. Browsers clamp scrollTop to scrollHeight -
+    // clientHeight (the repo uses this exact formula in resume-button.spec.ts),
+    // so assert against the real maximum, not scrollHeight itself.
     await page.keyboard.press('End')
-    await expect.poll(async () => scroller.evaluate((el: HTMLElement) => el.scrollTop), { timeout: 5_000 }).toBe(await scroller.evaluate((el: HTMLElement) => el.scrollHeight))
+    const maxScroll = await scroller.evaluate((el: HTMLElement) => el.scrollHeight - el.clientHeight)
+    await expect.poll(async () => scroller.evaluate((el: HTMLElement) => el.scrollTop), { timeout: 5_000 }).toBe(maxScroll)
 
     // Re-activating the pane (switching away and back) refocuses the composer.
     await page.evaluate(({ currentTabId }) => {
@@ -451,7 +462,7 @@ Run: `npm run test:e2e:local -- test/e2e-browser/specs/freshagent-click-focus.sp
 
 Expected (before Task 1, or if run in isolation without Task 1): FAIL because clicking the transcript does not move focus to it (no `tabindex`), so `data-context` of `activeElement` is not `fresh-agent-transcript`, and the subsequent nav keys do nothing (the composer still has focus; the nav-key handler sees an interactive target and does not scroll).
 
-Expected (after Task 1 is committed): PASS — focus moves to the transcript on click, Home jumps to top (scrollTop=0), PageDown scrolls down (scrollTop>0), End jumps to bottom (scrollTop=scrollHeight), and re-activation refocuses the composer.
+Expected (after Task 1 is committed): PASS — focus moves to the transcript on click, Home jumps to top (scrollTop=0), PageDown scrolls down (scrollTop>0), End jumps to bottom (scrollTop=scrollHeight-clientHeight), and re-activation refocuses the composer.
 
 - [ ] **Step 3: Add no production implementation (it already exists from Task 1)**
 
