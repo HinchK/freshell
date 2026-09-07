@@ -276,11 +276,11 @@ Expected: no matches.
 
 - [ ] **Step 6: Run impacted-test verification**
 
-This change touches FreshAgentView focus/pointer behavior. The impacted set is the whole fresh-agent component test suite (callers of `FreshAgentView`, and tests that render it) plus the typecheck:
+This change touches FreshAgentView focus/pointer behavior. The impacted set is the whole fresh-agent component test suite (callers of `FreshAgentView`, and tests that render it) plus the typecheck and the repo-required a11y lint (the `tabIndex={-1}` addition must not trip `eslint-plugin-jsx-a11y` — a `<div>` scroll container with `tabIndex={-1}` is a permitted non-interactive tabstop, but confirm via lint):
 
-Run: `npm run typecheck 2>&1 && npm run test:vitest -- run test/unit/client/components/fresh-agent 2>&1`
+Run: `npm run typecheck 2>&1 && npm run lint 2>&1 && npm run test:vitest -- run test/unit/client/components/fresh-agent 2>&1`
 
-Expected: PASS (typecheck clean; all 440+ fresh-agent unit tests green, including the existing `faz3` keyboard-scroll tests and `0bc6` activation-focus tests which must not regress).
+Expected: PASS (typecheck clean; lint clean; all 440+ fresh-agent unit tests green, including the existing `faz3` keyboard-scroll tests and `0bc6` activation-focus tests which must not regress).
 
 - [ ] **Step 7: Commit the task**
 
@@ -319,13 +319,14 @@ Create `test/e2e-browser/specs/freshagent-click-focus.spec.ts`:
 import { test, expect } from '../helpers/fixtures.js'
 
 test.describe('Fresh Agent click-to-defocus', () => {
-  test('clicking the transcript moves focus off the composer so scroll keys work, and re-activation refocuses the composer', async ({ freshellPage: _freshellPage, page, harness, terminal }) => {
+  test('clicking the transcript moves focus off the composer so scroll keys work, and real pane re-activation refocuses the composer', async ({ freshellPage: _freshellPage, page, harness, terminal }) => {
     await terminal.waitForTerminal()
     const tabId = await harness.getActiveTabId()
     expect(tabId).toBeTruthy()
     const layout = await harness.getPaneLayout(tabId!)
     expect(layout?.type).toBe('leaf')
-    const paneId = layout.id as string
+    const terminalPaneId = layout.id as string
+    const freshPaneId = 'pane-c1fa-e2e'
 
     const sessionId = '63333000-0000-4333-8333-00000000c1fa'
 
@@ -372,14 +373,20 @@ test.describe('Fresh Agent click-to-defocus', () => {
       })
     })
 
-    await page.evaluate(({ currentTabId, currentPaneId, currentSessionId }) => {
-      window.__FRESHELL_TEST_HARNESS__?.setFreshAgentNetworkEffectsSuppressed(currentPaneId, true)
+    // Split the terminal pane: the original stays a terminal (a real second pane
+    // to click away to), the new pane is the fresh-agent. This lets the
+    // reactivation proof exercise a genuine click-to-activate path instead of a
+    // direct Redux dispatch.
+    await page.evaluate(({ currentTabId, currentTerminalPaneId, currentFreshPaneId, currentSessionId }) => {
+      window.__FRESHELL_TEST_HARNESS__?.setFreshAgentNetworkEffectsSuppressed(currentFreshPaneId, true)
       window.__FRESHELL_TEST_HARNESS__?.dispatch({
-        type: 'panes/updatePaneContent',
+        type: 'panes/splitPane',
         payload: {
           tabId: currentTabId,
-          paneId: currentPaneId,
-          content: {
+          paneId: currentTerminalPaneId,
+          direction: 'horizontal',
+          newPaneId: currentFreshPaneId,
+          newContent: {
             kind: 'fresh-agent',
             sessionType: 'freshclaude',
             provider: 'claude',
@@ -392,16 +399,16 @@ test.describe('Fresh Agent click-to-defocus', () => {
           },
         },
       })
-    }, { currentTabId: tabId, currentPaneId: paneId, currentSessionId: sessionId })
+    }, { currentTabId: tabId, currentTerminalPaneId: terminalPaneId, currentFreshPaneId: freshPaneId, currentSessionId: sessionId })
 
-    const paneRoot = page.locator('[data-context="fresh-agent"]')
-    await expect(paneRoot).toBeVisible({ timeout: 10_000 })
-    const scroller = paneRoot.locator('[data-context="fresh-agent-transcript"]')
+    const freshPane = page.locator(`[data-context="fresh-agent"][data-pane-id="${freshPaneId}"]`)
+    await expect(freshPane).toBeVisible({ timeout: 10_000 })
+    const scroller = freshPane.locator('[data-context="fresh-agent-transcript"]')
     await expect(scroller).toBeVisible({ timeout: 10_000 })
-    const input = paneRoot.getByRole('textbox', { name: 'Chat message input' })
+    const input = freshPane.getByRole('textbox', { name: 'Chat message input' })
     await expect(input).toBeEnabled({ timeout: 10_000 })
 
-    // On activation the composer holds focus.
+    // On activation the new fresh-agent pane's composer holds focus.
     await expect.poll(async () => page.evaluate(() => {
       const el = document.activeElement
       return el ? el.getAttribute('aria-label') : null
@@ -433,19 +440,23 @@ test.describe('Fresh Agent click-to-defocus', () => {
     const maxScroll = await scroller.evaluate((el: HTMLElement) => el.scrollHeight - el.clientHeight)
     await expect.poll(async () => scroller.evaluate((el: HTMLElement) => el.scrollTop), { timeout: 5_000 }).toBe(maxScroll)
 
-    // Re-activating the pane (switching away and back) refocuses the composer.
-    await page.evaluate(({ currentTabId }) => {
-      window.__FRESHELL_TEST_HARNESS__?.dispatch({
-        type: 'panes/setActivePane',
-        payload: { tabId: currentTabId, paneId: 'pane-other' },
-      })
-    }, { currentTabId: tabId })
-    await page.evaluate(({ currentTabId, currentPaneId }) => {
-      window.__FRESHELL_TEST_HARNESS__?.dispatch({
-        type: 'panes/setActivePane',
-        payload: { tabId: currentTabId, paneId: currentPaneId },
-      })
-    }, { currentTabId: tabId, currentPaneId: paneId })
+    // Real pane re-activation: click the sibling terminal pane's xterm (the
+    // repo's standard click-to-focus-a-terminal pattern, e.g.
+    // page.locator('.xterm').first().click() in silent-input-loss-rust.spec.ts),
+    // which focuses the terminal and deactivates + defocuses the fresh-agent
+    // composer. Then click back into the fresh-agent transcript: the mousedown
+    // dispatches setActivePane -> isActivePane flips true -> the activation
+    // effect refocuses the composer, overriding the transcript's click-focus.
+    // This is the genuine user-facing path the request requires, not a direct
+    // Redux dispatch.
+    const terminalPane = page.locator(`[data-context="pane"][data-pane-id="${terminalPaneId}"]`)
+    await terminalPane.locator('.xterm').click()
+    await expect.poll(async () => page.evaluate(() => {
+      const el = document.activeElement
+      return el ? el.getAttribute('aria-label') : null
+    }), { timeout: 5_000 }).not.toBe('Chat message input')
+
+    await scroller.click()
     await expect.poll(async () => page.evaluate(() => {
       const el = document.activeElement
       return el ? el.getAttribute('aria-label') : null
@@ -462,7 +473,7 @@ Run: `npm run test:e2e:local -- test/e2e-browser/specs/freshagent-click-focus.sp
 
 Expected (before Task 1, or if run in isolation without Task 1): FAIL because clicking the transcript does not move focus to it (no `tabindex`), so `data-context` of `activeElement` is not `fresh-agent-transcript`, and the subsequent nav keys do nothing (the composer still has focus; the nav-key handler sees an interactive target and does not scroll).
 
-Expected (after Task 1 is committed): PASS — focus moves to the transcript on click, Home jumps to top (scrollTop=0), PageDown scrolls down (scrollTop>0), End jumps to bottom (scrollTop=scrollHeight-clientHeight), and re-activation refocuses the composer.
+Expected (after Task 1 is committed): PASS — the fresh-agent pane splits alongside a terminal pane; on activation its composer holds focus; clicking the transcript moves focus to the scroller; Home jumps to top (scrollTop=0); PageDown scrolls down (scrollTop>0); End jumps to bottom (scrollTop=scrollHeight-clientHeight); clicking the terminal pane deactivates and defocuses the composer; clicking the fresh-agent transcript re-activates the pane and the activation effect refocuses the composer.
 
 - [ ] **Step 3: Add no production implementation (it already exists from Task 1)**
 
@@ -480,7 +491,7 @@ No refactor needed — the spec is a single linear test. Confirm the spec file i
 
 - [ ] **Step 6: Run impacted-test verification**
 
-The impacted set for an e2e-only addition is the new spec plus the existing `fresh-agent.spec.ts` (the closest neighbor that uses the same stubbed-thread + suppressed-sidecar pattern) to confirm no shared-fixture regression. The broader fresh-agent e2e regression is covered by the Stage-4 full-suite gate.
+The impacted set for an e2e-only addition is the new spec plus the existing `fresh-agent.spec.ts` (the closest neighbor that uses the same stubbed-thread + suppressed-sidecar pattern) to confirm no shared-fixture regression. The broader regression (full coordinated e2e + unit + server suite) is run once on the final `HEAD` by the usual workflow's execution stage (Stage 4) full-suite gate after all tasks complete; this task's Step 6 is the focused per-task gate, not that final gate.
 
 Run: `npm run test:e2e:local -- test/e2e-browser/specs/freshagent-click-focus.spec.ts test/e2e-browser/specs/fresh-agent.spec.ts 2>&1`
 
