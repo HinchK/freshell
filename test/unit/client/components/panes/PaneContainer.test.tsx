@@ -894,6 +894,9 @@ describe('PaneContainer', () => {
       mockApiPatch.mockResolvedValueOnce({
         status: 'ok',
         message: 'pane not found',
+      }).mockResolvedValue({
+        status: 'ok',
+        message: 'pane not found',
       })
 
       const leafNode: PaneNode = {
@@ -922,10 +925,48 @@ describe('PaneContainer', () => {
       await waitFor(() => {
         expect(mockApiPatch).toHaveBeenCalledWith('/api/panes/pane-1', { name: 'Ops desk' })
       })
+      await waitFor(() => {
+        expect(screen.getByRole('alert')).toHaveTextContent('pane not found')
+      }, { timeout: 5_000 })
+      expect(mockApiPatch).toHaveBeenCalledTimes(4)
       expect(await screen.findByLabelText('Rename pane')).toHaveValue('Ops desk')
-      expect(screen.getByRole('alert')).toHaveTextContent('pane not found')
       expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).toBe('Shell')
       expect(store.getState().tabs.tabs[0].title).toBe('Tab 1')
+    })
+
+    it('retries the rename when the pane is not yet mirrored and commits once it lands', async () => {
+      mockApiPatch
+        .mockResolvedValueOnce({ status: 'ok', message: 'pane not found' })
+        .mockResolvedValueOnce({
+          status: 'ok',
+          data: { tabId: 'tab-1', paneId: 'pane-1', tabRenamed: true },
+          message: 'pane renamed',
+        })
+
+      const leafNode: PaneNode = {
+        type: 'leaf',
+        id: 'pane-1',
+        content: createTerminalContent({ terminalId: 'term-1' }),
+      }
+      const store = createStore({
+        layouts: { 'tab-1': leafNode },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
+        renameRequestTabId: 'tab-1',
+        renameRequestPaneId: 'pane-1',
+      })
+      renderWithStore(<PaneContainer tabId="tab-1" node={leafNode} />, store)
+
+      const renameInput = await screen.findByLabelText('Rename pane')
+      fireEvent.change(renameInput, { target: { value: 'Ops desk' } })
+      fireEvent.blur(renameInput)
+
+      await waitFor(() => {
+        expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).toBe('Ops desk')
+      }, { timeout: 5_000 })
+      expect(mockApiPatch).toHaveBeenCalledTimes(2)
+      expect(mockApiPatch).toHaveBeenNthCalledWith(2, '/api/panes/pane-1', { name: 'Ops desk' })
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
     })
 
     it('does not update local pane titles when the pane rename API rejects the request', async () => {
@@ -2108,7 +2149,7 @@ describe('PaneContainer', () => {
           expect(paneContent.sessionType).toBe('freshcodex')
           expect(paneContent.provider).toBe('codex')
           expect(paneContent.initialCwd).toBe('/home/user/freshcodex-project')
-          expect(paneContent.model).toBe('gpt-5.5')
+          expect(paneContent.model).toBe('gpt-6-astra')
           expect(paneContent.effort).toBe('max')
         }
       })
@@ -2121,12 +2162,12 @@ describe('PaneContainer', () => {
       }))
     })
 
-    it('normalizes stale Freshcodex effort from provider settings against the active model', async () => {
+    it('normalizes saved Freshcodex effort from provider settings against the active model', async () => {
       const node = createPickerNode('pane-1')
       const store = createStoreWithClaude(
         node,
         undefined,
-        { codex: { model: 'gpt-5.4-flash' } },
+        { codex: { model: 'gpt-5.6-luna' } },
         ['claude', 'codex'],
         { claude: true, codex: true },
         { freshcodex: { effort: 'xhigh' } },
@@ -2150,8 +2191,8 @@ describe('PaneContainer', () => {
         const paneContent = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).content
         expect(paneContent.kind).toBe('fresh-agent')
         if (paneContent.kind === 'fresh-agent') {
-          expect(paneContent.model).toBe('gpt-5.4-flash')
-          expect(paneContent.effort).toBe('high')
+          expect(paneContent.model).toBe('gpt-5.6-luna')
+          expect(paneContent.effort).toBe('max')
         }
       })
     })

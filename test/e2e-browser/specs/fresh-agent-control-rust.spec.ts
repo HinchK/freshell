@@ -1030,6 +1030,68 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
     }
   })
+  test('per-send settings reach the claude sidecar before the send (freshclaude)', async ({ page, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    const lane = await bootClaudeLane(page, 'freshclaude')
+    try {
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      const paneSessionId = (await paneLeaf(lane.harness, lane.tabId))?.content?.sessionId as string
+      expect(paneSessionId, 'the pane bridge session id must be known before the send').toBeTruthy()
+
+      // Change the permission mode BETWEEN sends through the pane's real
+      // settings gear: freshclaude's registry default is 'default', so picking
+      // 'acceptEdits' is a REAL change the next send must apply.
+      await page.getByRole('button', { name: 'Agent settings' }).click()
+      await page.getByRole('combobox', { name: 'Permission mode' }).selectOption('acceptEdits')
+      await page.keyboard.press('Escape')
+      await expect
+        .poll(async () => (await paneLeaf(lane.harness, lane.tabId))?.content?.permissionMode ?? null)
+        .toBe('acceptEdits')
+
+      await sendComposerText(page, 'settings probe')
+
+      // Canonical machinery: the settings-bearing send routes through
+      // configure_for_send, which writes a `configure` frame and awaits the
+      // sidecar's ack BEFORE the user message frame — the stdin audit proves
+      // strict ordering (the knobs provably land before the turn starts).
+      await waitForStdinFrame(
+        lane.stdinLog,
+        (f) => f?.type === 'configure' && f?.settings?.permissionMode === 'acceptEdits',
+        'configure frame carrying permissionMode:acceptEdits',
+      )
+      await waitForStdinFrame(
+        lane.stdinLog,
+        (f) => f?.type === 'send' && f?.text === 'settings probe',
+        'send frame for "settings probe"',
+      )
+      const frames = readStdinFrames(lane.stdinLog)
+      const configureIdx = frames.findIndex(
+        (f) => f?.type === 'configure' && f?.settings?.permissionMode === 'acceptEdits',
+      )
+      const sendIdx = frames.findIndex((f) => f?.type === 'send' && f?.text === 'settings probe')
+      expect(configureIdx, 'the per-send configure frame must exist in the audit').toBeGreaterThanOrEqual(0)
+      expect(sendIdx, 'the probe send must exist in the audit').toBeGreaterThanOrEqual(0)
+      expect(configureIdx, 'configure must land strictly BEFORE the send it applies to').toBeLessThan(sendIdx)
+
+      // The fake sidecar answers with sdk.configured carrying the applied
+      // settings (the ack configure_for_send awaits): the wire-row proves the
+      // ack as well as the ordering.
+      const ack = await waitForLogEntry(
+        lane.eventsLog,
+        (e) => e.kind === 'wire'
+          && e.frame?.type === 'sdk.configured'
+          && e.frame?.ok === true
+          && e.frame?.settings?.permissionMode === 'acceptEdits'
+          && e.frame?.sessionId === paneSessionId,
+        'sdk.configured wire row acknowledging permissionMode:acceptEdits',
+      )
+      expect(ack.frame.ok).toBe(true)
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+    } finally {
+      await lane.server.stop().catch(() => {})
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1236,7 +1298,14 @@ function projectSlugOf(cwd: string): string {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Boot a freshcodex pane against the behavior-driven fake codex app-server. */
-async function bootCodexLane(page: Page, behavior: Record<string, unknown> = {}): Promise<{
+async function bootCodexLane(
+  page: Page,
+  // Per-test behavior knobs merged INTO FAKE_CODEX_APP_SERVER_BEHAVIOR
+  // (e.g. turnCompleteDelayMs to wedge a mid-flight turn).
+  behavior: Record<string, unknown> = {},
+  // Per-test server env (e.g. FRESHELL_FRESHCODEX_QUIET_WINDOW_MS).
+  extraEnv: Record<string, string> = {},
+): Promise<{
   server: RustServer
   info: TestServerInfo
   harness: TestHarness
@@ -1264,6 +1333,7 @@ async function bootCodexLane(page: Page, behavior: Record<string, unknown> = {})
           appendClientResponseLogPath: responseLogPath,
           ...behavior,
         }),
+        ...extraEnv,
       },
       setupHome: seedWallConfig({ providers: ['codex'], freshAgent: true }),
     })
@@ -1282,6 +1352,18 @@ async function bootCodexLane(page: Page, behavior: Record<string, unknown> = {})
 
 function readCodexOps(opLogPath: string): any[] {
   return readJsonl(opLogPath)
+}
+
+/** Read a freshAgent session's status from the harness store — the exact
+ * `agentSession.status` the stuck card's `effectiveStatus` renders from. */
+async function readFreshAgentSessionStatus(
+  harness: TestHarness,
+  sessionId: string,
+): Promise<string | null> {
+  const state = await harness.getState()
+  const sessions = state?.freshAgent?.sessions ?? {}
+  const session = Object.values(sessions).find((s: any) => s?.sessionId === sessionId) as any
+  return session?.status ?? null
 }
 
 /**
@@ -1660,6 +1742,167 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
         }, { timeout: 30_000, message: 'post-restart resume+read evidence for BOTH source and child' })
         .toBe(true)
       sourceRestartWs.close()
+    } finally {
+      await lane.server.stop().catch(() => {})
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
+  // Wedged-sidecar deadman (r47n): the fake's turnCompleteDelayMs keeps the
+  // process alive but the turn/completed broadcast effectively never lands
+  // (3.6e6 ms), so the quiet window must surface the stuck state with recovery
+  // instead of an eternal spinner.
+  test('wedged sidecar: quiet window surfaces the stuck state with recovery, not an eternal spinner', async ({ page, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    const lane = await bootCodexLane(
+      page,
+      { turnCompleteDelayMs: 3_600_000 },
+      { FRESHELL_FRESHCODEX_QUIET_WINDOW_MS: '4000' },
+    )
+    try {
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      const paneRoot = page.locator('[data-context="fresh-agent"]').last()
+      const stuckAlert = paneRoot.getByRole('alert').filter({ hasText: /appears stuck/i })
+      const threadId = ((await paneLeaf(lane.harness, lane.tabId))?.content?.sessionId ?? '') as string
+      expect(threadId, 'freshcodex thread id materialized before the send').toBeTruthy()
+
+      await sendComposerText(page, 'run a turn that will wedge')
+
+      // Within the bound (2s < 4s window, measured from the send — the
+      // deadman arms when the send's turn/start RPC lands): no stuck state.
+      await page.waitForTimeout(2000)
+      await expect(stuckAlert).toHaveCount(0)
+
+      // Past the bound: the stuck notice surfaces (role=alert), and the pane
+      // stops asserting "working" — the session status the card reads is now
+      // 'stuck', never a fabricated idle/turn-complete.
+      await expect(stuckAlert, 'stuck notice after the quiet window').toBeVisible({ timeout: 25_000 })
+      await expect
+        .poll(
+          () => readFreshAgentSessionStatus(lane.harness, threadId),
+          { timeout: 15_000, message: 'session status stops asserting busy (stuck)' },
+        )
+        .toBe('stuck')
+
+      // The wedge is a live, in-flight turn: exactly one recorded turn
+      // renders (user + assistant rows) and nothing ever completes it.
+      await expect(
+        paneRoot.locator('article[data-turn-index]'),
+        'exactly one wedged turn renders (user+assistant rows), alive but silent',
+      ).toHaveCount(2, { timeout: 30_000 })
+
+      // Recovery: restart the sidecar and resume the durable thread. Truthful
+      // terminal state = idle with transcript intact, or idle with the explicit
+      // memory-loss alert (both are acceptance-valid).
+      await stuckAlert.getByRole('button', { name: /restart sidecar/i }).click()
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      await expect(stuckAlert).toHaveCount(0)
+      const opsAfter = readCodexOps(lane.opLogPath).map((op: any) => op.method)
+      const resumed = opsAfter.includes('thread/resume')
+      const respawnedFresh = opsAfter.filter((m: string) => m === 'thread/start').length >= 2
+      expect(resumed || respawnedFresh).toBe(true)
+      if (respawnedFresh && !resumed) {
+        // Respawn-as-new surfaces through the existing restore-error alert
+        // machinery (getRestoreErrorMessage, FreshAgentView.tsx).
+        await expect(paneRoot.getByRole('alert').filter({ hasText: /cannot be resumed|no longer has memory/i })).toBeVisible()
+      }
+    } finally {
+      await lane.server.stop().catch(() => {})
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
+  test('long turn within the quiet window completes normally and never shows the stuck state', async ({ page, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    const lane = await bootCodexLane(
+      page,
+      { turnCompleteDelayMs: 3_000 },
+      { FRESHELL_FRESHCODEX_QUIET_WINDOW_MS: '8000' },
+    )
+    try {
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      const paneRoot = page.locator('[data-context="fresh-agent"]').last()
+      const stuckAlert = paneRoot.getByRole('alert').filter({ hasText: /appears stuck/i })
+
+      await sendComposerText(page, 'a slow but healthy turn')
+      const sentAt = Date.now()
+
+      // The turn runs and renders (user + assistant rows = exactly one
+      // recorded turn) and completes within the 8s window: the pane returns
+      // to a truthful idle (turn/completed at ~3s disarms the deadman).
+      await expect(
+        paneRoot.locator('article[data-turn-index]'),
+        'the slow turn renders and is tracked',
+      ).toHaveCount(2, { timeout: 30_000 })
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+
+      // ... and stays stuck-free PAST the bound (measured from the send): a
+      // completed turn must never fire the deadman — an alert here would be
+      // exactly the false positive the bound exists to prevent.
+      await page.waitForTimeout(Math.max(0, 11_000 - (Date.now() - sentAt)))
+      await expect(stuckAlert).toHaveCount(0)
+    } finally {
+      await lane.server.stop().catch(() => {})
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
+  test('per-send settings alter the turn payload against the Rust server (freshcodex)', async ({ page, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    const lane = await bootCodexLane(page)
+    try {
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      // Turn 1 rides the pane's untouched defaults.
+      await sendCodexTurnAndWaitRows(page, 2, 'codex turn one')
+      const threadId = (await paneLeaf(lane.harness, lane.tabId))?.content?.sessionId as string
+      expect(threadId, 'the durable codex thread id must be known before turn two').toBeTruthy()
+
+      // Change model + effort BETWEEN sends through the real settings UI:
+      // gear popover → Model row ("Change…") → the two-column model dialog →
+      // pick GPT-5.4 Flash, stage its `low` thinking level, commit.
+      await page.getByRole('button', { name: 'Agent settings' }).click()
+      const popover = page.getByRole('dialog', { name: 'Agent settings' })
+      await expect(popover).toBeVisible({ timeout: 10_000 })
+      await popover.getByRole('button', { name: /Change/ }).click()
+      const dialog = page.getByRole('dialog', { name: 'Model and thinking level' })
+      await expect(dialog).toBeVisible({ timeout: 10_000 })
+      await dialog.getByRole('option', { name: 'GPT-5.4 Flash' }).click()
+      const levelsList = dialog.getByRole('listbox', { name: 'Thinking levels for GPT-5.4 Flash' })
+      await expect(levelsList).toBeVisible()
+      await levelsList.getByRole('option', { name: 'low', exact: true }).click()
+      await dialog.getByRole('button', { name: 'Use GPT-5.4 Flash · low' }).click()
+      await expect(dialog).toHaveCount(0)
+      // The commit leaves the settings popover open behind the dialog; close it.
+      await page.keyboard.press('Escape')
+      await expect(popover).toHaveCount(0, { timeout: 10_000 })
+      await expect
+        .poll(async () => {
+          const content = (await paneLeaf(lane.harness, lane.tabId))?.content
+          return content ? `${content.model ?? ''}|${content.effort ?? ''}` : ''
+        })
+        .toBe('gpt-5.4-flash|low')
+
+      // Turn 2 must now carry the changed knobs (canonical's codex.rs merges
+      // msg.settings over the session baseline before turn/start).
+      await sendCodexTurnAndWaitRows(page, 4, 'codex turn two')
+
+      // Ground truth: the fake's recorded-turns file under the lane's isolated
+      // CODEX_HOME (<home>/.codex/fake-turns/<threadId>.json). Each recorded
+      // turn carries its captured turn/start params additively under `start` —
+      // turn 2 carries the per-send selection while turn 1 kept the defaults
+      // (gpt-5.5 / the default 'max' effort, wire-mapped 'xhigh' by
+      // to_codex_reasoning_effort).
+      const turnsPath = path.join(lane.info.homeDir, '.codex', 'fake-turns', `${threadId}.json`)
+      await expect(async () => {
+        const turns = JSON.parse(await fs.readFile(turnsPath, 'utf8')) as any[]
+        expect(turns, 'exactly the two recorded turns').toHaveLength(2)
+        expect(turns[1]?.start?.model).toBe('gpt-5.4-flash')
+        expect(turns[1]?.start?.effort).toBe('low')
+        expect(turns[0]?.start?.model).toBe('gpt-5.5')
+        expect(turns[0]?.start?.effort).toBe('xhigh')
+        expect(turns[0]?.start?.model).not.toBe(turns[1]?.start?.model)
+        expect(turns[0]?.start?.effort).not.toBe(turns[1]?.start?.effort)
+      }).toPass({ timeout: 15_000 })
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})

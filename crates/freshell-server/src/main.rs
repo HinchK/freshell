@@ -18,6 +18,7 @@
 
 mod ai_router;
 mod ai_title;
+mod attachments;
 mod auto_title;
 mod auto_title_sweep;
 mod boot;
@@ -90,61 +91,6 @@ const APP_VERSION: &str = "0.7.0";
 /// matching `dotenv/config`'s own silent-missing-file behavior.
 fn load_dotenv_from(dir: &Path) {
     let _ = dotenvy::from_path(dir.join(".env"));
-}
-
-/// Task 16 (`PATCH /api/panes/:id` cascade): the production
-/// [`freshell_freshagent::RenamePersistence`] — `persistSyncableTerminalRename`'s
-/// `configStore` writes (`server/agent-api/router.ts:681-683`) through the
-/// live settings store. The terminal write is a plain `{titleOverride}`
-/// patch (terminal overrides have no source ladder). The session write
-/// carries `titleSource:'user'` — a DELIBERATE divergence from Node's plain
-/// `{titleOverride}` patch (`persistSyncableTerminalRename`,
-/// `router.ts:679-681`), ledgered as EDEV-10 in `port/oracle/DEVIATIONS.md`:
-/// a pane rename is a USER rename, and leaving the ladder rung unfinalized
-/// lets the auto-title sweep's first-message pass permanently steal a rename
-/// that lands before the session finalizes (pinned RED-first by
-/// `auto_title_sweep::tests::pane_rename_cascade_before_finalization_survives_next_sweep_pass`).
-/// This matches the `user` rung both servers already write on the
-/// terminals-route cascade (`terminals.rs:1000-1004`; Node
-/// `rename-cascade.ts:26`).
-struct SettingsRenamePersistence(settings_store::SettingsStore);
-
-impl freshell_freshagent::RenamePersistence for SettingsRenamePersistence {
-    fn patch_terminal_override_title(
-        &self,
-        terminal_id: &str,
-        title: &str,
-    ) -> freshell_freshagent::BoxFuture<()> {
-        let store = self.0.clone();
-        let terminal_id = terminal_id.to_string();
-        let title = serde_json::json!(title);
-        Box::pin(async move {
-            let _ = store
-                .patch_terminal_override(&terminal_id, &[("titleOverride", Some(title))])
-                .await;
-        })
-    }
-
-    fn patch_session_override_title(
-        &self,
-        key: &str,
-        title: &str,
-    ) -> freshell_freshagent::BoxFuture<()> {
-        let store = self.0.clone();
-        let key = key.to_string();
-        let title = serde_json::json!(title);
-        Box::pin(async move {
-            let _ = store
-                .patch_session_override(
-                    &key,
-                    &[
-                        ("titleOverride", Some(title)),
-                        ("titleSource", Some(serde_json::json!("user"))),
-                    ],
-                )
-                .await;
-        })
-    }
 }
 
 /// Delta-r6-r4 (focused-episode-6 round 3, Finding 2): the close-evidence
@@ -680,12 +626,6 @@ async fn main() -> ExitCode {
         .with_cli_commands(Arc::clone(&cli_commands))
         .with_opencode_locator(opencode_locator.clone())
         .with_codex_locator(codex_locator.clone())
-        // Task 16 (`PATCH /api/panes/:id` cascade): the configStore seam over
-        // the live settings store, plus the SAME handler-scoped
-        // `terminals.changed` revision counter the WS lifecycle and REST
-        // `/api/terminals` broadcasts stamp — one monotonic sequence.
-        .with_rename_persistence(Arc::new(SettingsRenamePersistence(settings_store.clone())))
-        .with_shared_terminals_revision(Arc::clone(&terminals_revision))
         // Fix round 1 (Task 23 gap): REST-pipeline creates (`POST /api/tabs`,
         // pane split, restore) get the SAME create-time meta seed -> async git
         // enrich -> `terminal.meta.updated` broadcast the WS `terminal.create`
@@ -1159,6 +1099,13 @@ async fn main() -> ExitCode {
                 "pane_ledger_boot: rows quarantined (see per-row errors above)"
             );
         }
+        if !report.scan_errors.is_empty() {
+            tracing::error!(
+                count = report.scan_errors.len(),
+                "pane_ledger_boot: store scan faults during boot hygiene \
+                 (see per-path pane_ledger_scan_fault errors above)"
+            );
+        }
     }
 
     // Codex sidecar boot reconcile (Task 10, katas ynfn/da92): load the
@@ -1616,6 +1563,17 @@ async fn main() -> ExitCode {
         home: Arc::new(home.clone().unwrap_or_else(|| PathBuf::from("."))),
     };
 
+    // `POST /api/fresh-agent/attachments` (`fresh-agent-extras-router.ts:260-287`):
+    // the paperclip upload route the fresh-agent composer POSTs raw file bytes
+    // to before every attachment-bearing send. `home` is the SAME boot-resolved
+    // value as checkpoints above (uploads live under
+    // `<home>/.freshell/attachments/`) -- a `None` home falls back to the
+    // cwd-relative `.` likewise.
+    let attachments_state = attachments::AttachmentsApiState {
+        auth_token: Arc::clone(&auth_token),
+        home: Arc::new(home.clone().unwrap_or_else(|| PathBuf::from("."))),
+    };
+
     // SAFE-02: the global authenticated API rate limiter (checklist:
     // `docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md:539`).
     // ONE process-wide token bucket, wired below as the outermost-but-one
@@ -1646,6 +1604,7 @@ async fn main() -> ExitCode {
         .merge(freshell_freshagent::snapshot::router(snapshot_state))
         .merge(session_metadata::router(session_metadata_state))
         .merge(checkpoints::router(checkpoints_state))
+        .merge(attachments::router(attachments_state))
         // R1/R2/R3/R4: the ONE `/api/settings` router (GET+PATCH+PUT), backed by
         // the live `settings_store` \u2014 replaces the old split between this boot
         // module's frozen GET and the freshcodex slice's disconnected PATCH.

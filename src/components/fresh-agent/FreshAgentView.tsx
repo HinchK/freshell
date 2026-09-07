@@ -69,6 +69,10 @@ import { refreshActiveSessionWindow } from '@/store/sessionsThunks'
 import FreshAgentModelDialog from '@/components/fresh-agent/FreshAgentModelDialog'
 import { buildRestoreError, type RestoreErrorReason } from '@shared/session-contract'
 import { isDurableProviderSessionId } from '@shared/session-flavor'
+import {
+  getCanonicalPaneResumeSessionId,
+  getFreshAgentSnapshotThreadId,
+} from '@/lib/fresh-agent-snapshot-thread'
 import { DEFAULT_FRESH_AGENT_STYLE, normalizeFreshAgentStyle } from '@shared/settings'
 import {
   checkpointLabelForText,
@@ -88,6 +92,9 @@ import { FreshAgentStatusStrip } from './FreshAgentStatusStrip'
 
 const EARLY_STATES = new Set(['creating', 'starting'])
 const BUSY_STATES = new Set(['running', 'compacting'])
+// Copy for the stuck-notice card (role="alert") shown while the store carries
+// the deadman's 'stuck' status; recovery actions live on the card itself.
+const FRESH_AGENT_STUCK_NOTICE_TEXT = 'Agent appears stuck — no events from the agent process for a while.'
 
 // Task 14: SESSION_RESERVED bounded re-drive. The window must outlast the
 // server lease TTL (20s) with margin -- same arithmetic as TerminalView's
@@ -249,24 +256,14 @@ function isStatusRegression(current: string, next: string): boolean {
   return !EARLY_STATES.has(current) && EARLY_STATES.has(next)
 }
 
-function getCanonicalPaneResumeSessionId(pane: FreshAgentPaneContent): string | undefined {
-  if (pane.sessionRef?.provider === 'claude' && isValidClaudeSessionId(pane.sessionRef.sessionId)) {
-    return pane.sessionRef.sessionId
-  }
-  if (isValidClaudeSessionId(pane.resumeSessionId)) {
-    return pane.resumeSessionId
-  }
-  if (pane.provider === 'claude' && isValidClaudeSessionId(pane.sessionId)) {
-    return pane.sessionId
-  }
-  return undefined
-}
-
 // Codex fresh-agent threads don't have a UUID-format validator the way Claude
 // does (isValidClaudeSessionId), so this mirrors getCanonicalPaneResumeSessionId's
 // fallback chain (sessionRef -> resumeSessionId -> sessionId) without that
 // claude-specific format check. Used only to let a lost codex session attempt
 // a bounded resume instead of being permanently abandoned (see triggerRecovery).
+// (getCanonicalPaneResumeSessionId and getFreshAgentSnapshotThreadId live in
+// @/lib/fresh-agent-snapshot-thread — shared with the settings popover's
+// settingScopes probe.)
 function getCanonicalCodexResumeSessionId(pane: FreshAgentPaneContent): string | undefined {
   if (pane.sessionRef?.provider === 'codex' && pane.sessionRef.sessionId) {
     return pane.sessionRef.sessionId
@@ -278,39 +275,6 @@ function getCanonicalCodexResumeSessionId(pane: FreshAgentPaneContent): string |
     return pane.sessionId
   }
   return undefined
-}
-
-function isFreshOpencodePlaceholderId(pane: FreshAgentPaneContent, sessionId: string | undefined): boolean {
-  return pane.provider === 'opencode'
-    && pane.sessionType === 'freshopencode'
-    && typeof sessionId === 'string'
-    && sessionId.startsWith('freshopencode-')
-}
-
-function getFreshAgentSnapshotThreadId(
-  pane: FreshAgentPaneContent,
-  claudeSession: Parameters<typeof getCanonicalDurableSessionId>[0],
-): string | undefined {
-  if (pane.provider === 'claude') {
-    // Snapshot history is keyed by Claude's durable UUID. Runtime-only live
-    // handles stay interactive through the WS transport, but should not hit
-    // the snapshot route or surface history-load errors.
-    return getCanonicalDurableSessionId(claudeSession)
-      ?? getCanonicalPaneResumeSessionId(pane)
-  }
-  if (EARLY_STATES.has(pane.status)) {
-    // While a new session is still being created, avoid reading an older durable ref.
-    return pane.sessionId
-  }
-  const sessionRefId = pane.sessionRef?.provider === pane.provider ? pane.sessionRef.sessionId : undefined
-  if (!pane.sessionId && isFreshOpencodePlaceholderId(pane, sessionRefId)) {
-    // Legacy Freshopencode panes could persist only the placeholder sessionRef.
-    // Let freshAgent.create/resume repair it before snapshot loading; otherwise
-    // the placeholder 404 races the promotion and marks the pane unrecoverable.
-    return undefined
-  }
-  return pane.sessionId
-    ?? sessionRefId
 }
 
 function getCreatedResumeSessionId(
@@ -1480,6 +1444,24 @@ export function FreshAgentView({
       },
     }))
   }, [claudeSession, dispatch, paneId, tabId])
+
+  // Stuck-card recovery: kill the wedged sidecar (same kill-frame shape as
+  // startNewConversation), then re-mint the pane through the existing
+  // triggerRecovery path so the canonical resume id keeps the durable thread.
+  const restartStuckSidecar = useCallback(() => {
+    const current = paneContentRef.current
+    if (current.sessionId) {
+      const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
+      sendFreshAgentMessage({
+        type: 'freshAgent.kill',
+        sessionId: current.sessionId,
+        sessionType: current.sessionType,
+        provider: current.provider,
+        ...(cwd ? { cwd } : {}),
+      })
+    }
+    triggerRecovery()
+  }, [sendFreshAgentMessage, triggerRecovery])
 
   // Capability-gated .lost resolution (paneReconcileFreshAgentV1): a lost
   // session asks the SERVER for the pane's true state via a single-pane
@@ -2801,6 +2783,32 @@ export function FreshAgentView({
                 </div>
               ) : null}
               {sessionErrorMessage ? <FreshAgentApprovalBanner text={`Agent error: ${sessionErrorMessage}`} /> : null}
+              {effectiveStatus === 'stuck' ? (
+                <div
+                  className="fresh-agent-stuck-card flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
+                  role="alert"
+                >
+                  <span>{FRESH_AGENT_STUCK_NOTICE_TEXT}</span>
+                  <div className="flex shrink-0 gap-2">
+                    <button
+                      type="button"
+                      className="fresh-agent-stuck-action shrink-0 rounded border border-border/70 px-2 py-1 text-xs"
+                      aria-label="Restart sidecar and resume session"
+                      onClick={restartStuckSidecar}
+                    >
+                      Restart sidecar
+                    </button>
+                    <button
+                      type="button"
+                      className="fresh-agent-stuck-action shrink-0 rounded border border-border/70 px-2 py-1 text-xs"
+                      aria-label="Start new conversation"
+                      onClick={startNewConversation}
+                    >
+                      Start new conversation
+                    </button>
+                  </div>
+                </div>
+              ) : null}
               {sessionEnded ? (
                 <div className="fresh-agent-session-ended-card flex items-center justify-between gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm">
                   <span>This session has ended{sessionErrorMessage ? '' : ' (the agent process exited)'}.</span>
@@ -2978,6 +2986,7 @@ export function FreshAgentView({
               open={modelDialogOpen}
               onClose={closeModelDialog}
               onCatalogUnavailable={handleModelCatalogUnavailable}
+              settingScopes={snapshot?.capabilities?.settingScopes}
             />
           </div>
           <FreshAgentSidebar
@@ -3019,6 +3028,7 @@ export function FreshAgentView({
     paneContent,
     pendingCreateFailure,
     queuedMessages,
+    restartStuckSidecar,
     rewindToTurn,
     runShellCommand,
     sessionEnded,
