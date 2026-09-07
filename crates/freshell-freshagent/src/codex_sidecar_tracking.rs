@@ -62,7 +62,16 @@ pub(crate) async fn record_spawned_sidecar(ownership_id: &str, pid: u32, ws_url:
     // Pre-exec /proc mirrors our own argv; accept evidence only after it
     // differs (exec landed). A sidecar whose real argv equals ours is
     // impossible: we are freshell-server/test harness, the child is the CLI.
-    let own_argv: Vec<String> = std::env::args().collect();
+    // Read our own argv through the SAME parser: proc_cmdline drops empty
+    // args and lossily decodes, while env::args() keeps empties and PANICS on
+    // non-Unicode — a representation mismatch must not recreate the race.
+    let own_argv = proc_cmdline(std::process::id() as i32)
+        .filter(|a| !a.is_empty())
+        .unwrap_or_else(|| {
+            std::env::args_os()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        });
     let deadline = std::time::Instant::now() + EVIDENCE_POLL_BUDGET;
     let evidence = loop {
         match (proc_starttime(pid as i32), proc_cmdline(pid as i32)) {
@@ -70,8 +79,19 @@ pub(crate) async fn record_spawned_sidecar(ownership_id: &str, pid: u32, ws_url:
             // Child vanished pre-evidence (bad binary, spawn raced an exit):
             // fail fast instead of burning the budget on a dead pid.
             (None, _) => break None,
-            _ if std::time::Instant::now() >= deadline => break None,
-            _ => tokio::time::sleep(EVIDENCE_POLL_STEP).await,
+            _ => {
+                // Sleep capped at the remaining budget, and never accept a
+                // sample taken past the deadline — the budget is a ceiling,
+                // not a hint (overrun otherwise unbounded by scheduler delay).
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break None;
+                }
+                tokio::time::sleep(EVIDENCE_POLL_STEP.min(deadline - now)).await;
+                if std::time::Instant::now() >= deadline {
+                    break None;
+                }
+            }
         }
     };
     let Some((starttime, cmdline)) = evidence else {
