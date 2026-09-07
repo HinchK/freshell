@@ -250,13 +250,9 @@ describe('turn gestures inside the global ContextMenuProvider (single overlay, r
 
   function releaseOverSheet(article: Element) {
     const release = simulateTouch('touchend', article, 100, 100)
+    // The release was suppressed, so no compatibility click is synthesized and
+    // the sheet survives the gesture untouched (window dispatch below).
     expect(release.defaultPrevented).toBe(true)
-    if (!release.defaultPrevented) {
-      // Engines that synthesize a compat click deliver it now; prove it can
-      // neither dismiss the freshly-opened sheet nor activate a row.
-      const firstRow = screen.queryByRole('menuitem')
-      firstRow?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
-    }
     expect(screen.getByRole('menu', { name: /fix the bug/ })).toBeInTheDocument()
   }
 
