@@ -1989,6 +1989,11 @@ describe('ws protocol', () => {
       ws,
       (m) => m.type === 'ui.command' && m.command === 'screenshot.capture',
     )
+    // The server stamps the round-trip deadline so the client drops capture
+    // work that could only answer a request already failed server-side.
+    expect(typeof req.payload.deadlineAtMs).toBe('number')
+    expect(req.payload.deadlineAtMs).toBeGreaterThan(Date.now())
+    expect(req.payload.deadlineAtMs).toBeLessThanOrEqual(Date.now() + 11_000)
 
     ws.send(JSON.stringify({
       type: 'ui.screenshot.result',

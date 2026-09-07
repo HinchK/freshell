@@ -48,6 +48,36 @@ const recordByPaneId = new Map<string, PaneFocusRecord>()
  *  after it: the newer selection, user or scripted, is the truth and wins. */
 let paneSelectionSerial = 0
 
+/** Selection coordinates for the per-coordinate supersession restore. The
+ *  active tab is the single global coordinate; each tab's active pane is its
+ *  own coordinate (pane:<tabId>). */
+export const TAB_SELECTION_COORDINATE = 'tab:active'
+export function paneSelectionCoordinate(tabId: string): string {
+  return `pane:${tabId}`
+}
+
+/** LRU map: coordinate key → the serial at which user/agent selection
+ *  activity last touched it. Bounded like the focus records; pane/tab ids
+ *  churn freely, so this must not grow without limit. */
+const SELECTION_TOUCH_CAP = 512
+const selectionCoordinateTouchedAt = new Map<string, number>()
+
+function touchSelectionCoordinate(coord: string): void {
+  selectionCoordinateTouchedAt.delete(coord)
+  selectionCoordinateTouchedAt.set(coord, paneSelectionSerial)
+  if (selectionCoordinateTouchedAt.size > SELECTION_TOUCH_CAP) {
+    const oldest = selectionCoordinateTouchedAt.keys().next().value
+    if (oldest !== undefined) selectionCoordinateTouchedAt.delete(oldest)
+  }
+}
+
+/** True when the coordinate saw selection activity strictly AFTER `serial`
+ *  was sampled — i.e. a newer selection answered who owns that coordinate. */
+export function wasSelectionCoordinateTouchedSince(coord: string, serial: number): boolean {
+  const at = selectionCoordinateTouchedAt.get(coord)
+  return at !== undefined && at > serial
+}
+
 /** Escape a value for use inside a quoted attribute selector. */
 function attrValue(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
@@ -312,12 +342,22 @@ export const paneSelectionMiddleware =
       || a?.type === 'tabs/setActiveTab'
     ) {
       paneSelectionSerial += 1
+      // Per-coordinate attribution (restore supersession granularity): the
+      // user touched ONLY this coordinate.
+      if (a?.type === 'tabs/setActiveTab') {
+        touchSelectionCoordinate(TAB_SELECTION_COORDINATE)
+      } else if (a?.payload?.tabId) {
+        touchSelectionCoordinate(paneSelectionCoordinate(a.payload.tabId))
+      }
       return next(action)
     }
     if (a?.type && TAB_SELECTION_ACTIONS.has(a.type)) {
       const before = store.getState().tabs?.activeTabId
       const result = next(action)
-      if (store.getState().tabs?.activeTabId !== before) paneSelectionSerial += 1
+      if (store.getState().tabs?.activeTabId !== before) {
+        paneSelectionSerial += 1
+        touchSelectionCoordinate(TAB_SELECTION_COORDINATE)
+      }
       return result
     }
     if (a?.type && PANE_SELECTION_ACTIONS.has(a.type)) {
@@ -325,7 +365,10 @@ export const paneSelectionMiddleware =
       if (!tabId) return next(action)
       const before = store.getState().panes?.activePane?.[tabId]
       const result = next(action)
-      if (store.getState().panes?.activePane?.[tabId] !== before) paneSelectionSerial += 1
+      if (store.getState().panes?.activePane?.[tabId] !== before) {
+        paneSelectionSerial += 1
+        touchSelectionCoordinate(paneSelectionCoordinate(tabId))
+      }
       return result
     }
     return next(action)
@@ -385,7 +428,8 @@ export function getPaneSelectionSerial(): number {
   return paneSelectionSerial
 }
 
-/** Test-only helper: erase all remembered ownership. */
+/** Test-only helper: erase all remembered ownership and touch recency. */
 export function resetPaneFocusOwnershipForTests(): void {
   recordByPaneId.clear()
+  selectionCoordinateTouchedAt.clear()
 }

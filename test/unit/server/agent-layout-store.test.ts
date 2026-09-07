@@ -101,6 +101,34 @@ describe('LayoutStore (read)', () => {
     })
   })
 
+  it('createTab does not move the server cursor (agent creates are focus-neutral)', () => {
+    const store = new LayoutStore()
+    store.updateFromUi(snapshot, 'conn1')
+    const { tabId } = store.createTab({ title: 'agent tab' })
+    const snap = store.getNormalizedSnapshot()
+    // The user is still on tab_a — REST/MCP cursor-relative operations
+    // (next/prev tab, omitted targets) address the USER's selection during the
+    // layout-mirror window, not the background tab an agent just created.
+    expect(snap.activeTabId).toBe('tab_a')
+    expect(snap.activePane[tabId]).toBeDefined() // the new tab's own pane coordinate exists
+  })
+
+  it('createTab activates the FIRST tab (nothing to steal yet)', () => {
+    const store = new LayoutStore()
+    const { tabId } = store.createTab({ title: 'first' })
+    expect(store.getNormalizedSnapshot().activeTabId).toBe(tabId)
+  })
+
+  it('splitPane keeps the pre-split activePane (agent splits are focus-neutral)', () => {
+    const store = new LayoutStore()
+    store.updateFromUi(snapshot, 'conn1')
+    const result = store.splitPane({ paneId: 'pane_1', direction: 'horizontal' })
+    expect(result).not.toEqual({ message: 'pane not found' })
+    const snap = store.getNormalizedSnapshot()
+    expect(snap.layouts.tab_a.type).toBe('split')
+    expect(snap.activePane.tab_a).toBe('pane_1') // unchanged — stays with the original pane
+  })
+
   it('normalizes legacy agent-chat panes in normalized snapshots', () => {
     const store = new LayoutStore()
     store.updateFromUi({

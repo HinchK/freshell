@@ -1126,6 +1126,9 @@ export class WsHandler {
           scope: opts.scope,
           tabId: opts.tabId,
           paneId: opts.paneId,
+          // Round-trip deadline for the client: capture work that could only
+          // answer a request we've already failed must expire, not mutate UI.
+          deadlineAtMs: Date.now() + timeoutMs,
         },
       })
     })

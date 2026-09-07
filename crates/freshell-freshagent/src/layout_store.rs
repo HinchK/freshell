@@ -462,7 +462,13 @@ impl LayoutStore {
                 content: content.clone(),
             },
         );
-        snapshot.active_tab_id = Some(tab_id.clone());
+        // Focus neutrality is a server contract: agent-created tabs stay in
+        // the background so REST/MCP cursor-relative operations keep
+        // addressing the USER's selection (mirrors the client's addTab fold
+        // with `activate: false`, including its first-tab auto-activation).
+        if snapshot.active_tab_id.is_none() {
+            snapshot.active_tab_id = Some(tab_id.clone());
+        }
         snapshot.active_pane.insert(tab_id.clone(), pane_id.clone());
         seed_pane_title(snapshot, &tab_id, &pane_id, &content);
         (tab_id, pane_id)
@@ -723,9 +729,9 @@ impl LayoutStore {
                 };
                 let root = snapshot.layouts.get_mut(&tab_id).expect("root exists");
                 if replace_node(root, pane_id, &split) {
-                    snapshot
-                        .active_pane
-                        .insert(tab_id.clone(), new_pane_id.clone());
+                    // Agent splits are focus-neutral even on the server cursor:
+                    // keep the pre-split active pane (the client's splitPane
+                    // fold carries activate:false).
                     seed_pane_title(snapshot, &tab_id, &new_pane_id, &new_content);
                     first.get_or_insert(tab_id);
                     break;

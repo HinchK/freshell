@@ -159,15 +159,23 @@ impl ScreenshotBroker {
     /// Broadcast the `screenshot.capture` `ui.command` to every connection; the
     /// capable SPA client renders + replies. Frame shape is byte-compatible with
     /// `ws-handler.ts:1072` (`{type, command, payload:{requestId, scope, tabId?,
-    /// paneId?}}`), matching `ui-commands.ts#handleScreenshotCapture`.
+    /// paneId?, deadlineAtMs}}`), matching `ui-commands.ts#handleScreenshotCapture`.
+    /// `deadline_at_ms` is the server-stamped absolute round-trip deadline (epoch
+    /// ms): the client expires queued/stalled capture work past it instead of
+    /// mutating focus for a caller the server already failed.
     pub fn send_capture(
         &self,
         request_id: &str,
         scope: &str,
         tab_id: Option<&str>,
         pane_id: Option<&str>,
+        deadline_at_ms: u64,
     ) {
-        let mut payload = json!({ "requestId": request_id, "scope": scope });
+        let mut payload = json!({
+            "requestId": request_id,
+            "scope": scope,
+            "deadlineAtMs": deadline_at_ms,
+        });
         if let Some(tab_id) = tab_id {
             payload["tabId"] = json!(tab_id);
         }
@@ -260,7 +268,7 @@ mod tests {
     fn send_capture_frame_matches_ui_command_shape() {
         let b = broker();
         let mut rx = b.inner.broadcast_tx.subscribe();
-        b.send_capture("req-9", "view", None, None);
+        b.send_capture("req-9", "view", None, None, 1_760_000_000_000);
         let frame = rx.try_recv().expect("frame broadcast");
         let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(v["type"], "ui.command");
@@ -268,9 +276,12 @@ mod tests {
         assert_eq!(v["payload"]["requestId"], "req-9");
         assert_eq!(v["payload"]["scope"], "view");
         assert!(v["payload"].get("tabId").is_none());
+        // The round-trip deadline rides along so the client drops capture work
+        // that could only answer a request already failed server-side.
+        assert_eq!(v["payload"]["deadlineAtMs"], 1_760_000_000_000_i64);
 
         // Pane scope carries tabId + paneId.
-        b.send_capture("req-10", "pane", Some("tab-1"), Some("pane-1"));
+        b.send_capture("req-10", "pane", Some("tab-1"), Some("pane-1"), 2);
         let frame = rx.try_recv().expect("frame broadcast");
         let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(v["payload"]["tabId"], "tab-1");

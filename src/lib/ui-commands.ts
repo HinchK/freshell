@@ -42,9 +42,14 @@ async function handleScreenshotCapture(msg: any, runtime: UiCommandRuntime): Pro
 
   const paneId = typeof payload.paneId === 'string' ? payload.paneId : undefined
   const tabId = typeof payload.tabId === 'string' ? payload.tabId : undefined
+  // The server stamps its round-trip deadline so capture work that could only
+  // answer an already-failed request expires instead of mutating the UI.
+  const deadlineAtMs = typeof payload.deadlineAtMs === 'number' && Number.isFinite(payload.deadlineAtMs)
+    ? payload.deadlineAtMs
+    : undefined
 
   try {
-    const capture = await captureUiScreenshot({ scope, paneId, tabId }, {
+    const capture = await captureUiScreenshot({ scope, paneId, tabId, deadlineAtMs }, {
       dispatch: runtime.dispatch as AppDispatch,
       getState: runtime.getState,
     })

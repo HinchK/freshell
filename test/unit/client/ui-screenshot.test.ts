@@ -618,10 +618,40 @@ describe('restoreFocus deleted-target hardening', () => {
       { dispatch: store.dispatch, getState: store.getState },
       { selectionSerial: getPaneSelectionSerial(), activeTabId: 'tab-1', activePaneByTab: {} },
       new Set(),
-      'tab-2',
+      { tab: 'tab-2', paneByTab: new Map() },
     )
     expect(ok).toBe(true)
     expect(store.getState().tabs.activeTabId).toBe('tab-1')
+  })
+
+  it('yields ONLY the superseded coordinate when the user selected elsewhere, still restoring capture-owned background coordinates', async () => {
+    const store = createFocusStore()
+    store.dispatch(splitPane({
+      tabId: 'tab-2',
+      paneId: 'pane-2',
+      direction: 'horizontal',
+      newContent: { kind: 'terminal', mode: 'shell' },
+      newPaneId: 'pane-2b',
+      activate: false,
+    }))
+    const before = { selectionSerial: getPaneSelectionSerial(), activeTabId: 'tab-1', activePaneByTab: { 'tab-2': 'pane-2' } }
+    // The capture's own moves (serial-invisible).
+    store.dispatch(selectTabForCapture('tab-2'))
+    store.dispatch(setActivePane({ tabId: 'tab-2', paneId: 'pane-2b', capture: true }))
+    // The user's newer selection is a NEW tab — it touches ONLY the tab
+    // coordinate. The zoomed tab-2's active pane (a capture-owned background
+    // coordinate) must STILL be restored, or tab-2 later opens on the capture's
+    // pane instead of the user's.
+    store.dispatch(addTab({ id: 'tab-3', title: 'Three' }))
+    const ok = await restoreFocus(
+      { dispatch: store.dispatch, getState: store.getState },
+      before,
+      new Set(['tab-2']),
+      { tab: 'tab-2', paneByTab: new Map([['tab-2', 'pane-2b']]) },
+    )
+    expect(ok).toBe(true)
+    expect(store.getState().tabs.activeTabId).toBe('tab-3') // user's newer selection preserved
+    expect(store.getState().panes.activePane['tab-2']).toBe('pane-2') // capture-owned background coordinate restored
   })
 
   it('reports false when the restore target is deleted DURING the restore window (race pin)', async () => {
@@ -643,8 +673,16 @@ describe('restoreFocus deleted-target hardening', () => {
 
 describe('captureUiScreenshot newer-selection supersession', () => {
   beforeEach(() => {
-    vi.clearAllMocks()
     document.body.innerHTML = ''
+    // Full reset — clearAllMocks leaves mockImplementation(+once queues) in
+    // place, and another test's orphaned once-impl/html2canvas body otherwise
+    // leaks into the capture-path outcomes these tests assert on.
+    vi.resetAllMocks()
+    // Restore the module-factory defaults the capture path relies on: renderer
+    // suspension resolves to a no-op restore, and html2canvas returns
+    // undefined (the capture then fails its encode step — the baseline these
+    // tests build their scenarios on).
+    vi.mocked(suspendTerminalRenderersForScreenshot).mockImplementation(async () => async () => {})
   })
 
   it('never moves the active tab when a newer user selection landed during renderer suspension', async () => {
@@ -730,6 +768,93 @@ describe('captureUiScreenshot newer-selection supersession', () => {
     expect(store.getState().tabs.activeTabId).toBe('tab-1') // user's selection survives both captures
   })
 
+  it('expires a capture whose server-stamped deadline already passed at dequeue (first-in-queue included)', async () => {
+    const store = createFocusStore()
+    const result = await captureUiScreenshot(
+      { scope: 'tab', tabId: 'tab-2', deadlineAtMs: Date.now() - 1 },
+      { dispatch: store.dispatch, getState: store.getState } as any,
+    )
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/deadline/)
+    expect(vi.mocked(suspendTerminalRenderersForScreenshot)).not.toHaveBeenCalled()
+    expect(store.getState().tabs.activeTabId).toBe('tab-1')
+  })
+
+  it('aborts mid-capture before any focus write once the server-stamped deadline elapses', async () => {
+    const store = createFocusStore()
+    // The renderer suspension (real frames on a busy main thread) eats the
+    // remaining deadline; the capture must NOT move focus afterwards.
+    vi.mocked(suspendTerminalRenderersForScreenshot).mockImplementationOnce(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 250))
+      return async () => {}
+    })
+    const result = await captureUiScreenshot(
+      { scope: 'tab', tabId: 'tab-2', deadlineAtMs: Date.now() + 60 },
+      { dispatch: store.dispatch, getState: store.getState } as any,
+    )
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/deadline/)
+    expect(store.getState().tabs.activeTabId).toBe('tab-1')
+    expect(result.changedFocus).toBe(false)
+  })
+
+  it('resolves a queued capture at its deadline even when the capture ahead stalls forever', async () => {
+    const store = createFocusStore()
+    let releaseHead!: (restore: () => Promise<void>) => void
+    const suspendMock = vi.mocked(suspendTerminalRenderersForScreenshot)
+    suspendMock.mockImplementationOnce(
+      () => new Promise((resolve) => { releaseHead = resolve }), // head parks until released
+    )
+    const first = captureUiScreenshot(
+      { scope: 'tab', tabId: 'tab-2' },
+      { dispatch: store.dispatch, getState: store.getState } as any,
+    )
+    // A loaded box can backlog this test's head behind a previous test's tail:
+    // proceed only once the head is actually parked inside its suspension.
+    await waitFor(() => expect(suspendMock).toHaveBeenCalledTimes(1), { timeout: 10_000 })
+    const second = await captureUiScreenshot(
+      { scope: 'tab', tabId: 'tab-2', deadlineAtMs: Date.now() + 120 },
+      { dispatch: store.dispatch, getState: store.getState } as any,
+    )
+    expect(second.ok).toBe(false)
+    expect(second.error).toMatch(/deadline/)
+    expect(store.getState().tabs.activeTabId).toBe('tab-1')
+    // Drain the tail for subsequent tests: release the head, let it fail its
+    // (absent-DOM) target lookup on its own.
+    releaseHead(async () => {})
+    await first
+  })
+
+  it('a capture that never settles neither starves LATER captures nor blocks them past its own deadline', async () => {
+    const store = createFocusStore()
+    document.body.innerHTML = '<div data-tab-content-id="tab-2" id="tab2-el"></div>'
+    setRect(document.getElementById('tab2-el')!, 200, 200)
+    let releaseHead!: (restore: () => Promise<void>) => void
+    const suspendMock = vi.mocked(suspendTerminalRenderersForScreenshot)
+    suspendMock.mockImplementationOnce(
+      () => new Promise((resolve) => { releaseHead = resolve }), // head parks until released
+    )
+    const first = captureUiScreenshot(
+      { scope: 'tab', tabId: 'tab-2', deadlineAtMs: Date.now() + 60 },
+      { dispatch: store.dispatch, getState: store.getState } as any,
+    )
+    await waitFor(() => expect(suspendMock).toHaveBeenCalledTimes(1), { timeout: 10_000 })
+    // The tail abandons the wedged head once ITS deadline + grace elapse, so
+    // the next capture runs instead of expiring in starvation. Its own
+    // deadline is deliberately generous-but-bounded so timer drift on a loaded
+    // box can't flip the race.
+    const second = await captureUiScreenshot(
+      { scope: 'tab', tabId: 'tab-2', deadlineAtMs: Date.now() + 4000 },
+      { dispatch: store.dispatch, getState: store.getState } as any,
+    )
+    expect(second.error).not.toMatch(/deadline/)
+    expect(second.error).not.toMatch(/expired/)
+    expect(suspendMock).toHaveBeenCalledTimes(2)
+    // Release the abandoned head so it cannot linger into later tests' tails.
+    releaseHead(async () => {})
+    await first
+  })
+
   it('expires queued captures that outlived the server request window instead of mutating the UI after the caller already failed', async () => {
     const store = createFocusStore()
     // Visible tab-2 element: the first capture completes without focus moves
@@ -750,8 +875,9 @@ describe('captureUiScreenshot newer-selection supersession', () => {
         { dispatch: store.dispatch, getState: store.getState } as any,
       )
       // Let the FIRST job start and pass its own staleness check at T0 (it is
-      // gated inside the renderer suspension).
-      await new Promise((resolve) => setTimeout(resolve, 0))
+      // gated inside the renderer suspension; a loaded box can backlog its
+      // start behind a previous test's tail).
+      await waitFor(() => expect(vi.mocked(suspendTerminalRenderersForScreenshot)).toHaveBeenCalledTimes(1), { timeout: 10_000 })
       // The second capture queues. Before the first releases, time passes
       // beyond the servers' ~10s pending-request timeout — its caller has
       // already received failure.
@@ -764,7 +890,7 @@ describe('captureUiScreenshot newer-selection supersession', () => {
       const [firstResult, secondResult] = await Promise.all([first, second])
       expect(firstResult).toBeDefined()
       expect(secondResult.ok).toBe(false)
-      expect(secondResult.error).toMatch(/expired while queued/)
+      expect(secondResult.error).toMatch(/past its server deadline/)
       // The expired job never ran: no renderer suspension, no focus mutation.
       expect(suspendMock).toHaveBeenCalledTimes(1)
       expect(store.getState().tabs.activeTabId).toBe('tab-1')

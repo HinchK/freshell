@@ -109,11 +109,19 @@ async fn create_screenshot(
     }
 
     // Drive the round-trip: register → broadcast capture → await the UI reply.
+    // The deadline stamped into the frame matches our own wait budget; the
+    // client expires capture work that outlived it instead of mutating focus
+    // for a caller we've already failed.
     let request_id = uuid::Uuid::new_v4().to_string();
     let rx = state.broker.register(request_id.clone());
+    let deadline_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+        + SCREENSHOT_TIMEOUT.as_millis() as u64;
     state
         .broker
-        .send_capture(&request_id, scope, tab_id, pane_id);
+        .send_capture(&request_id, scope, tab_id, pane_id, deadline_at_ms);
 
     let result = match tokio::time::timeout(SCREENSHOT_TIMEOUT, rx).await {
         Ok(Ok(result)) => result,

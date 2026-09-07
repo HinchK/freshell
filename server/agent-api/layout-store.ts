@@ -453,7 +453,11 @@ export class LayoutStore {
       id: resolvedPaneId,
       content,
     }
-    snapshot.activeTabId = resolvedTabId
+    // Focus neutrality is a server contract: agent-created tabs stay in the
+    // background so REST/MCP cursor-relative operations keep addressing the
+    // USER's selection. Mirrors the client's addTab fold (`activate: false`)
+    // and its first-tab auto-activation.
+    if (!snapshot.activeTabId) snapshot.activeTabId = resolvedTabId
     snapshot.activePane[resolvedTabId] = resolvedPaneId
     this.seedPaneTitle(resolvedTabId, resolvedPaneId, content)
     return { tabId: resolvedTabId, paneId: resolvedPaneId }
@@ -490,7 +494,8 @@ export class LayoutStore {
       const replaced = this.findAndReplace(root, opts.paneId, splitNode)
       if (replaced) {
         snapshot.layouts[tab.id] = replaced
-        snapshot.activePane[tab.id] = newPaneId
+        // Agent splits are focus-neutral even on the server cursor: keep the
+        // pre-split activePane (the client's splitPane carries activate:false).
         this.seedPaneTitle(tab.id, newPaneId, newContent)
         return { tabId: tab.id, newPaneId }
       }

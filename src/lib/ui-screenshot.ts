@@ -2,7 +2,12 @@ import html2canvas from 'html2canvas'
 import { setActivePane } from '@/store/panesSlice'
 import { setActiveTab, selectTabForCapture } from '@/store/tabsSlice'
 import { suspendTerminalRenderersForScreenshot } from '@/lib/screenshot-capture-env'
-import { getPaneSelectionSerial } from '@/lib/pane-focus-ownership'
+import {
+  getPaneSelectionSerial,
+  paneSelectionCoordinate,
+  TAB_SELECTION_COORDINATE,
+  wasSelectionCoordinateTouchedSince,
+} from '@/lib/pane-focus-ownership'
 import type { PaneNode } from '@/store/paneTypes'
 import type { AppDispatch, RootState } from '@/store/store'
 
@@ -18,6 +23,10 @@ export type ScreenshotRequest = {
   scope: ScreenshotScope
   paneId?: string
   tabId?: string
+  /** Server-stamped absolute round-trip deadline (epoch ms). When absent
+   *  (older servers), queue waits are bounded by CAPTURE_QUEUE_TTL_MS measured
+   *  from when THIS client received the request. */
+  deadlineAtMs?: number
 }
 
 export type ScreenshotResult = {
@@ -295,19 +304,48 @@ function findTabIdForPane(state: RootState, paneId: string): string | undefined 
   return undefined
 }
 
+/** Which coordinates the capture itself moved, and to what. Consulted ONLY
+ *  under supersession (a newer user selection during the capture). */
+export type CaptureMoves = {
+  /** The tab the capture activated (null when it never switched tabs). */
+  tab: string | null
+  /** tabId → the pane the capture activated there. */
+  paneByTab: Map<string, string>
+}
+
 export async function restoreFocus(
   ctx: RuntimeContext,
   before: FocusSnapshot,
   paneTabsToRestore: Set<string>,
+  captureMoves?: CaptureMoves,
 ): Promise<boolean> {
-  // A newer explicit selection during the capture wins over the restore —
-  // roll nothing back. The serial is bumped by selection folds (setActivePane
-  // incl. pointer activations, nudgePaneFocus, setActiveTab) AND by other
-  // user gestures that move the selection (default-activating addTab,
-  // keyboard tab navigation, default-activating splitPane / addPane); the
-  // capture's own moves use capture:true / selectTabForCapture, which never
-  // bump it, and agent folds pass activate:false.
-  if (getPaneSelectionSerial() !== before.selectionSerial) return true
+  // A newer explicit selection during the capture supersedes the restore —
+  // but only for the coordinates the user actually touched. The serial is
+  // bumped by selection folds (setActivePane incl. pointer activations,
+  // nudgePaneFocus, setActiveTab) AND by other user gestures that move the
+  // selection (default-activating addTab, keyboard tab navigation, default-
+  // activating splitPane / addPane, active-close fallbacks); the capture's
+  // own moves use capture:true / selectTabForCapture, which never bump it,
+  // and agent folds pass activate:false.
+  const superseded = getPaneSelectionSerial() !== before.selectionSerial
+  // Under supersession, restore a coordinate only when the USER never touched
+  // it AND it still sits exactly on the capture's own move target (a third
+  // party moved it → leave it alone). This preserves the user's newer
+  // selection while still rolling back capture-owned background coordinates
+  // (e.g. a zoomed tab's active pane), which the all-or-nothing global check
+  // used to abandon.
+  const shouldRestoreTab = (state: RootState): boolean =>
+    !superseded
+    || (!wasSelectionCoordinateTouchedSince(TAB_SELECTION_COORDINATE, before.selectionSerial)
+      && captureMoves?.tab != null
+      && state.tabs.activeTabId === captureMoves.tab)
+  const shouldRestorePane = (state: RootState, tabId: string): boolean =>
+    !superseded
+    || (!wasSelectionCoordinateTouchedSince(paneSelectionCoordinate(tabId), before.selectionSerial)
+      && captureMoves?.paneByTab.get(tabId) !== undefined
+      && state.panes.activePane[tabId] === captureMoves?.paneByTab.get(tabId))
+  const restoredPaneTabs: string[] = []
+  let restoredTab = false
   let incomplete = false
   try {
     for (const tabId of paneTabsToRestore) {
@@ -324,31 +362,35 @@ export async function restoreFocus(
         incomplete = true
         continue
       }
+      if (!shouldRestorePane(state, tabId)) continue
       if (state.panes.activePane[tabId] !== originalPaneId) {
         ctx.dispatch(setActivePane({ tabId, paneId: originalPaneId }))
       }
+      restoredPaneTabs.push(tabId)
     }
 
     if (before.activeTabId) {
       const state = ctx.getState()
       if (!state.tabs.tabs.some((t) => t.id === before.activeTabId)) {
         incomplete = true
-      } else if (state.tabs.activeTabId !== before.activeTabId) {
-        ctx.dispatch(setActiveTab(before.activeTabId))
+      } else if (shouldRestoreTab(state)) {
+        if (state.tabs.activeTabId !== before.activeTabId) {
+          ctx.dispatch(setActiveTab(before.activeTabId))
+        }
+        restoredTab = true
       }
     }
 
     await afterPaint()
 
     const after = ctx.getState()
-    if (before.activeTabId) {
+    if (restoredTab && before.activeTabId) {
       if (!after.tabs.tabs.some((t) => t.id === before.activeTabId)) {
         incomplete = true // deleted during the restore window
       } else if (after.tabs.activeTabId !== before.activeTabId) return false
     }
-    for (const tabId of paneTabsToRestore) {
+    for (const tabId of restoredPaneTabs) {
       const originalPaneId = before.activePaneByTab[tabId]
-      if (!originalPaneId) continue
       // The OWNING TAB may have been deleted during the restore window while
       // stale pane layout/activePane entries linger (removeTab and the pane
       // cleanup are separate slices) — that must ALSO be incomplete, not true.
@@ -373,35 +415,60 @@ export async function restoreFocus(
 // client-side.
 let captureTail: Promise<unknown> = Promise.resolve()
 
-// Both servers drop a pending screenshot request ~10s after sending it
-// (server/ws-handler.ts: opts.timeoutMs ?? 10_000;
-// crates/freshell-server/src/screenshots.rs: SCREENSHOT_TIMEOUT). A queued
-// capture that starts AFTER that window mutates focus for a caller that
-// already failed and sends an orphaned reply — expire it at dequeue time
-// instead of executing it. The TTL must stay under the server window.
+// Both servers drop a pending screenshot request ~10s after SENDING it
+// (server/ws-handler.ts: opts.timeoutMs ?? 10_000, stamped as payload
+// .deadlineAtMs; crates/freshell-server/src/screenshots.rs: SCREENSHOT_TIMEOUT)
+// — and the server clock starts BEFORE the frame reaches this client. Any
+// queue/execution age must therefore be measured against the stamped deadline
+// (when present), never against local receipt time. When the deadline is
+// absent (older servers), bound queue waits client-side:
 const CAPTURE_QUEUE_TTL_MS = 8000
+// A job whose execution blows past its deadline is wedged (a hung renderer,
+// html2canvas, ...). It cannot be cancelled, so the tail abandons it after a
+// grace window — one stalled capture must not starve every later screenshot
+// the caller might still succeed at.
+const CAPTURE_ABANDON_GRACE_MS = 2000
 
-export async function captureUiScreenshot(request: ScreenshotRequest, ctx: RuntimeContext): Promise<ScreenshotResult> {
-  const enqueuedAt = Date.now()
-  const result: Promise<ScreenshotResult> = captureTail.then(() => {
-    if (Date.now() - enqueuedAt > CAPTURE_QUEUE_TTL_MS) {
-      return {
-        ok: false,
-        changedFocus: false,
-        restoredFocus: false,
-        error: `screenshot request expired while queued (waited > ${CAPTURE_QUEUE_TTL_MS} ms)`,
-      }
-    }
-    return performUiScreenshotCapture(request, ctx)
-  })
-  // The next capture must run regardless of whether this one succeeded.
-  captureTail = result.then(() => undefined, () => undefined)
-  return result
+function expiredDeadlineResult(): ScreenshotResult {
+  return {
+    ok: false,
+    changedFocus: false,
+    restoredFocus: false,
+    error: 'screenshot request expired: past its server deadline',
+  }
 }
 
-async function performUiScreenshotCapture(request: ScreenshotRequest, ctx: RuntimeContext): Promise<ScreenshotResult> {
+export async function captureUiScreenshot(request: ScreenshotRequest, ctx: RuntimeContext): Promise<ScreenshotResult> {
+  const deadlineAtMs = request.deadlineAtMs ?? (Date.now() + CAPTURE_QUEUE_TTL_MS)
+  const job: Promise<ScreenshotResult> = captureTail.then(() => {
+    if (Date.now() >= deadlineAtMs) return expiredDeadlineResult()
+    return performUiScreenshotCapture(request, ctx, deadlineAtMs)
+  })
+  // The tail advances when the job settles — or walks past it entirely once
+  // the job has blown its deadline plus grace (wedged capture, never settled).
+  captureTail = Promise.race([
+    job,
+    new Promise<unknown>((resolve) => setTimeout(resolve, Math.max(0, deadlineAtMs + CAPTURE_ABANDON_GRACE_MS - Date.now()))),
+  ]).then(() => undefined, () => undefined)
+  // A stalled head must not park this caller past the deadline: answer with
+  // the expiry result; the queued job later hits its dequeue gate and no-ops.
+  const remaining = deadlineAtMs - Date.now()
+  if (remaining <= 0) return expiredDeadlineResult()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const expiry = new Promise<ScreenshotResult>((resolve) => {
+    timer = setTimeout(() => resolve(expiredDeadlineResult()), remaining)
+  })
+  return Promise.race([job, expiry]).finally(() => { if (timer !== undefined) clearTimeout(timer) })
+}
+
+async function performUiScreenshotCapture(request: ScreenshotRequest, ctx: RuntimeContext, deadlineAtMs: number): Promise<ScreenshotResult> {
   const focusBefore = snapshotFocus(ctx.getState())
   const paneTabsToRestore = new Set<string>()
+  // Every capture-internal move is ALSO recorded here, keyed by what the
+  // capture moved each coordinate TO — restoreFocus consults this under
+  // supersession to restore only coordinates the user never touched.
+  const capturePaneTargets = new Map<string, string>()
+  let captureTabTarget: string | null = null
   let changedFocus = false
   let restoredFocus = false
   // The serial is sampled at snapshot time, but the renderer suspension below
@@ -411,24 +478,33 @@ async function performUiScreenshotCapture(request: ScreenshotRequest, ctx: Runti
   // the screenshot (partial moves are handled by restoreFocus, whose serial
   // mismatch deliberately skips the rollback).
   const selectionSuperseded = () => getPaneSelectionSerial() !== focusBefore.selectionSerial
+  // The stamped deadline likewise expires mid-flight: never move focus (or
+  // render) for a caller the server has already failed.
+  const deadlineExceeded = () => Date.now() >= deadlineAtMs
+  const throwIfStale = () => {
+    if (selectionSuperseded()) throw new Error('screenshot superseded by a newer user selection')
+    if (deadlineExceeded()) throw new Error('screenshot aborted: exceeded its server deadline mid-capture')
+  }
 
   const setActiveTabIfNeeded = async (tabId: string) => {
     if (ctx.getState().tabs.activeTabId === tabId) return
-    if (selectionSuperseded()) throw new Error('screenshot superseded by a newer user selection')
+    throwIfStale()
     // Capture-internal: invisible to the selection serial, so it cannot void
     // the restore of a user/agent selection landing mid-capture.
     ctx.dispatch(selectTabForCapture(tabId))
+    captureTabTarget = tabId
     changedFocus = true
     await afterPaint()
   }
 
   const setActivePaneIfNeeded = async (tabId: string, paneId: string) => {
     if (ctx.getState().panes.activePane[tabId] === paneId) return
-    if (selectionSuperseded()) throw new Error('screenshot superseded by a newer user selection')
+    throwIfStale()
     // Capture-internal activation: must not bump the selection serial — the
     // restore contract attributes serial changes to user/agent selections.
     ctx.dispatch(setActivePane({ tabId, paneId, capture: true }))
     paneTabsToRestore.add(tabId)
+    capturePaneTargets.set(tabId, paneId)
     changedFocus = true
     await afterPaint()
   }
@@ -475,6 +551,7 @@ async function performUiScreenshotCapture(request: ScreenshotRequest, ctx: Runti
       target = visibleTarget
     }
 
+    throwIfStale()
     const scale = Math.max(1, window.devicePixelRatio || 1)
     const preparedIframes = await prepareIframeCapture(target, scale)
     let canvas: HTMLCanvasElement
@@ -514,7 +591,10 @@ async function performUiScreenshotCapture(request: ScreenshotRequest, ctx: Runti
   await restoreRenderers()
 
   if (changedFocus) {
-    restoredFocus = await restoreFocus(ctx, focusBefore, paneTabsToRestore)
+    restoredFocus = await restoreFocus(ctx, focusBefore, paneTabsToRestore, {
+      tab: captureTabTarget,
+      paneByTab: capturePaneTargets,
+    })
   }
 
   return {

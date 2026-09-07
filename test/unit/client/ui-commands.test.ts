@@ -209,7 +209,7 @@ describe('handleUiCommand', () => {
     await Promise.resolve()
 
     expect(captureUiScreenshot).toHaveBeenCalledWith(
-      { scope: 'view', paneId: undefined, tabId: undefined },
+      { scope: 'view', paneId: undefined, tabId: undefined, deadlineAtMs: undefined },
       expect.objectContaining({ dispatch, getState }),
     )
     expect(send).toHaveBeenCalledWith(expect.objectContaining({
@@ -219,6 +219,35 @@ describe('handleUiCommand', () => {
       changedFocus: false,
       restoredFocus: false,
     }))
+  })
+
+  it('passes the server-stamped deadlineAtMs through to the capture', async () => {
+    const dispatch = vi.fn()
+    const send = vi.fn()
+    const getState = vi.fn(() => ({}))
+
+    vi.mocked(captureUiScreenshot).mockResolvedValue({
+      ok: false,
+      changedFocus: false,
+      restoredFocus: false,
+      error: 'expired',
+    })
+
+    handleUiCommand(
+      {
+        type: 'ui.command',
+        command: 'screenshot.capture',
+        payload: { requestId: 'req-9', scope: 'view', deadlineAtMs: 1_760_000_000_000 },
+      },
+      { dispatch: dispatch as any, getState, send },
+    )
+
+    await Promise.resolve()
+
+    expect(captureUiScreenshot).toHaveBeenCalledWith(
+      expect.objectContaining({ deadlineAtMs: 1_760_000_000_000 }),
+      expect.anything(),
+    )
   })
 })
 
