@@ -257,3 +257,100 @@ async fn fresh_pane_locator_identity_reaches_activity_and_turn_complete() {
     std::env::remove_var("CODEX_HOME");
     std::env::remove_var("CODEX_ARGV_CAPTURE_PATH");
 }
+
+/// pkvz deterministic reproduction: the load-induced flake happens when
+/// `CodexAttach`'s initial drain reads `task_started`+`task_complete` in ONE
+/// batch (the hub delayed between `CodexBind` and `CodexAttach`, and the test
+/// appended both before the drain ran). This test forces that one-batch drain
+/// deterministically by writing `session_meta` + `task_started` +
+/// `task_complete` ALL AT ONCE before the locator resolves. The initial drain
+/// (offset 0→EOF for files ≤ 256 KB) then folds both events into one
+/// `reconcile_rollout` call. Without the fix, the same-batch clear shadows the
+/// start promotion, `accepted_start_at` stays `None`, and
+/// `terminal.turn.complete` never fires. No load dependence.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn fresh_pane_locator_one_batch_drain_records_turn_complete() {
+    const THREAD: &str = "22222222-3333-4444-5555-666666666666";
+
+    let codex_home = tempfile::tempdir().expect("codex home");
+    let sessions_day = codex_home
+        .path()
+        .join("sessions")
+        .join("2026")
+        .join("07")
+        .join("24");
+    std::fs::create_dir_all(&sessions_day).expect("sessions tree");
+    std::env::set_var("CODEX_HOME", codex_home.path());
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
+    let capture = std::env::temp_dir().join(format!(
+        "codex-locator-one-batch-argv-{}.txt",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&capture);
+    std::env::set_var("CODEX_ARGV_CAPTURE_PATH", &capture);
+
+    let (url, registry) = common::spawn_server_with_specs_activity_and_codex_locator(
+        vec![codex_capture_spec()],
+        &codex_home.path().join("sessions"),
+    )
+    .await;
+    let (mut ws, _inventory) = common::connect_and_capture_inventory(&url).await;
+
+    let terminal_id = send_create(&mut ws, "codex").await;
+
+    common::send_input(&mut ws, &terminal_id, "\r").await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let cwd = std::env::temp_dir().to_string_lossy().to_string();
+    let rollout = sessions_day.join(format!("rollout-2026-07-24T12-00-00-{THREAD}.jsonl"));
+    // Use far-future timestamps so task_started > queued_submit_at (the second
+    // Enter's server-side note_input time), matching the original flake's
+    // timeline where task_started is appended AFTER both Enters. The tracker
+    // only compares timestamps; it doesn't validate them against wall clock.
+    let ts = 9_999_999_999_999;
+    std::fs::write(
+        &rollout,
+        format!(
+            "{{\"timestamp\":\"2026-07-24T12:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{THREAD}\",\"cwd\":\"{cwd}\"}}}}\n{}\n{}\n",
+            codex_event_line("task_started", ts),
+            codex_event_line("task_complete", ts + 100),
+        ),
+    )
+    .unwrap();
+
+    common::send_input(&mut ws, &terminal_id, "\r").await;
+
+    let bound = wait_for_frame(&mut ws, |v| {
+        v["type"] == "codex.activity.updated"
+            && v["upsert"]
+                .as_array()
+                .map(|u| {
+                    u.iter().any(|r| {
+                        r["terminalId"] == terminal_id.as_str() && r["sessionId"] == THREAD
+                    })
+                })
+                .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        bound,
+        "expected codex.activity.updated carrying the locator-resolved sessionId"
+    );
+
+    let completed = wait_for_frame(&mut ws, |v| {
+        v["type"] == "terminal.turn.complete"
+            && v["terminalId"] == terminal_id.as_str()
+            && v["provider"] == "codex"
+            && v["sessionId"] == THREAD
+    })
+    .await;
+    assert!(
+        completed,
+        "expected terminal.turn.complete from the one-batch initial drain (pkvz root cause)"
+    );
+
+    registry.kill(&terminal_id);
+    std::env::remove_var("CODEX_HOME");
+    std::env::remove_var("CODEX_ARGV_CAPTURE_PATH");
+}
