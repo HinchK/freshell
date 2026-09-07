@@ -128,7 +128,12 @@ ENV FRESHELL_E2E_RUST_SERVER_BIN=/app/target/release/freshell-server
 # Copy the entrypoint script (after COPY . . so it's not overwritten by
 # a stale copy in the source tree).
 COPY docker/cloud-run/entrypoint.sh /usr/local/bin/e2e-entrypoint.sh
-RUN chmod +x /usr/local/bin/e2e-entrypoint.sh
+# Pin the mode, not just the x bit: this path is NOT covered by the
+# `chown -R node:node /app` below, so a checkout whose umask narrowed the
+# source (e.g. umask 077 → 700 root-owned in the build context) leaves the
+# runtime `node` user without read+execute and the job dies at entry with
+# `bash: /usr/local/bin/e2e-entrypoint.sh: Permission denied`.
+RUN chmod 0755 /usr/local/bin/e2e-entrypoint.sh
 
 # Switch to non-root user for runtime (node:22-bookworm provides UID 1000).
 # This is required by server-side tests that verify permission errors
