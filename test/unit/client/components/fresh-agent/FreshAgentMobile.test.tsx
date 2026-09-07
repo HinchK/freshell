@@ -305,6 +305,68 @@ describe('turn gestures inside the global ContextMenuProvider (single overlay, r
 
     releaseOverSheet(article)
   })
+
+  it('keeps release suppression when the transcript rerenders mid-gesture (new actions identity)', () => {
+    stubCoarsePointer(true)
+    const store = createMenuTestStore()
+    // Identical TURNS/content across renders; only the onForkFromTurn identity
+    // changes. That rebuilds the transcript's per-turn `actions` object the
+    // same way live snapshot refreshes (FreshAgentView state streaming) do.
+    const tree = (onForkFromTurn: (turnId: string) => void) => (
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.FreshAgent}
+            data-tab-id="tab-1"
+            data-pane-id="pane-1"
+            data-session-id="sess-1"
+            data-provider="claude"
+            data-session-type="freshclaude"
+          >
+            <FreshAgentTranscript turns={TURNS} canFork={false} onForkFromTurn={onForkFromTurn} />
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+    const { rerender } = render(tree(vi.fn()))
+    const article = screen.getByRole('article', { name: 'You transcript turn' })
+    elementFromPointMock.mockReturnValue(article)
+
+    act(() => {
+      simulateTouch('touchstart', article, 100, 100)
+    })
+    // 100ms into the 450ms press a live-refresh rerender lands: same turn
+    // content, new `actions` identity on the article. The gesture's armed
+    // timer and suppression state must survive it.
+    act(() => {
+      vi.advanceTimersByTime(100)
+    })
+    rerender(tree(vi.fn()))
+    // Sanity (assertion-state, not introspection): the article did not remount.
+    expect(screen.getByRole('article', { name: 'You transcript turn' })).toBe(article)
+
+    // The single long-press timer completes and opens the sheet for turn-1.
+    act(() => {
+      vi.advanceTimersByTime(350)
+    })
+    expect(screen.getByRole('menu', { name: /fix the bug/ })).toBeInTheDocument()
+
+    // The provider's 500ms timer fires now and must not stack a second menu.
+    act(() => {
+      vi.advanceTimersByTime(100)
+    })
+    expect(screen.getAllByRole('menu')).toHaveLength(1)
+    expect(screen.getByRole('menu', { name: /fix the bug/ })).toBeInTheDocument()
+    expect(elementFromPointMock).not.toHaveBeenCalled()
+
+    // The release still hits the closure that armed the gesture: suppressed.
+    releaseOverSheet(article)
+  })
 })
 
 describe('mobile coarse-pointer composer keyboard behavior', () => {
