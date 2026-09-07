@@ -1121,17 +1121,24 @@ export function ContextMenuProvider({
     const handleContextMenu = (e: MouseEvent) => {
       const target = e.target as HTMLElement | null
       // Turn articles own their contextmenu gesture (see predicate comment) —
-      // no openMenu and deliberately no preventDefault: the transcript's
-      // bubble-phase handler owns the event now. While a touch gesture is in
-      // flight (the Android-race case-B condition below), resolve ownership
-      // against the gesture's ORIGINAL target, not e.target: a late native
-      // contextmenu retargeted onto the transcript's action sheet would
-      // otherwise bypass this check and stack the provider menu on top. For
-      // non-turn gestures the recorded target fails the predicate identically
-      // to e.target, so their behavior is unchanged.
+      // no openMenu, and we cancel the event on the early return: for an
+      // article-targeted event the transcript's bubble-phase handler cancels
+      // it too (a harmless double cancel — opening the transcript's menu does
+      // not depend on defaultPrevented), while a late sheet-targeted event has
+      // no transcript handler at all, so the provider must cancel it here or
+      // the browser shows its native context menu over the sheet. While a
+      // touch gesture is in flight (the Android-race case-B condition below),
+      // resolve ownership against the gesture's ORIGINAL target, not e.target:
+      // a late native contextmenu retargeted onto the transcript's action
+      // sheet would otherwise bypass this check and stack the provider menu on
+      // top. For non-turn gestures the recorded target fails the predicate
+      // identically to e.target, so their behavior is unchanged.
       const gestureInFlight = touchStartPos !== null || longPressTimer !== null
       const ownershipTarget = gestureInFlight ? touchGestureTarget : target
-      if (isFreshAgentTurnTarget(ownershipTarget)) return
+      if (isFreshAgentTurnTarget(ownershipTarget)) {
+        if (e.cancelable) e.preventDefault()
+        return
+      }
       const contextEl = findContextElement(target)
       const contextId = resolveContextId(contextEl?.dataset.context)
       if (shouldUseNativeMenu(target, contextId, contextEl, e)) return

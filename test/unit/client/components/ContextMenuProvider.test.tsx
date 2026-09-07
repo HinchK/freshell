@@ -2754,9 +2754,12 @@ describe('fresh-agent turn carve-out', () => {
     })
 
     expect(screen.queryByRole('menu')).toBeNull()
-    // The transcript's bubble-phase handler owns the gesture — the provider
-    // must leave the event alone (no preventDefault from its capture listener).
-    expect(event.defaultPrevented).toBe(false)
+    // The provider's capture-phase carve-out cancels the event: for a real
+    // article-targeted event the transcript's bubble-phase handler cancels it
+    // too (harmless double cancel), and a late Android contextmenu retargeted
+    // onto the transcript's sheet has no transcript handler at all — the
+    // provider must preventDefault or the browser's native menu opens.
+    expect(event.defaultPrevented).toBe(true)
   })
 
   it('still opens the pane menu for contextmenu in the pane container outside any turn article', () => {

@@ -332,7 +332,12 @@ describe('turn gestures inside the global ContextMenuProvider (single overlay, r
     // against the CURRENT DOM: the target is the open sheet, NOT the turn
     // article the gesture started on. Ownership must come from the gesture's
     // original target, so the provider must not stack its menu on the sheet.
-    fireEvent.contextMenu(sheet)
+    // No transcript handler runs for a sheet-targeted event, so the provider's
+    // carve-out early return must also cancel it — otherwise the browser's
+    // native context menu opens on top of the sheet.
+    const lateContextMenu = new MouseEvent('contextmenu', { bubbles: true, cancelable: true })
+    sheet.dispatchEvent(lateContextMenu)
+    expect(lateContextMenu.defaultPrevented).toBe(true)
     expect(screen.getAllByRole('menu')).toHaveLength(1)
     expect(screen.getByRole('menu', { name: /fix the bug/ })).toBeInTheDocument()
 
