@@ -43,7 +43,7 @@ Common params: target (ID or name), name, mode, direction, keys, url, scope.
 Fresh agents (in-app): use new-tab/split-pane with agent="opencode" (also "claude"/"codex"), optional model=, effort=, cwd=. Then drive the pane with send-keys (the prompt; blocks until the turn completes), read it with capture-pane (returns the transcript), and optionally wait-for (reports idle). Example:
   new-tab { agent: "opencode", model: "umans-ai-coding-plan/umans-kimi-k2.7", prompt: "Summarize README.md" }
 
-Creation actions (new-tab, split-pane) are focus-neutral; use select-tab to move the user's focus explicitly.`
+Creation actions (new-tab, split-pane) are focus-neutral; use select-tab to move to a different tab, and select-pane to draw focus to a specific new pane (split-pane returns the new pane's id).`
 
 export const INSTRUCTIONS = `Freshell is a browser-accessible terminal multiplexer and session organizer.
 

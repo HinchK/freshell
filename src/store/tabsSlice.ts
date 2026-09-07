@@ -334,6 +334,16 @@ export const tabsSlice = createSlice({
     setActiveTab: (state, action: PayloadAction<string>) => {
       state.activeTabId = action.payload
     },
+    /**
+     * Same reducer as setActiveTab but invisible to the focus-selection serial
+     * (paneSelectionMiddleware): a screenshot capture needs to switch tabs
+     * transiently without that move looking like user/agent selection, which
+     * would cancel the focus restore (newer selection wins). Only
+     * ui-screenshot dispatches this.
+     */
+    selectTabForCapture: (state, action: PayloadAction<string>) => {
+      state.activeTabId = action.payload
+    },
     requestTabRename: (state, action: PayloadAction<string>) => {
       state.renameRequestTabId = action.payload
     },
@@ -447,6 +457,7 @@ export const tabsSlice = createSlice({
 export const {
   addTab,
   setActiveTab,
+  selectTabForCapture,
   requestTabRename,
   clearTabRenameRequest,
   updateTab,

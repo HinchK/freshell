@@ -272,6 +272,10 @@ export const paneSelectionMiddleware = () => (next: (action: unknown) => unknown
   if (
     (a?.type === 'panes/setActivePane' && a?.payload?.capture !== true)
     || a?.type === 'panes/nudgePaneFocus'
+    // Plain tab clicks are selection activity too; the screenshot capture's
+    // own tab moves use the selectTabForCapture alias (excluded here),
+    // mirroring setActivePane's capture:true marker.
+    || a?.type === 'tabs/setActiveTab'
   ) {
     paneSelectionSerial += 1
   }
