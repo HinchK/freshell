@@ -1,106 +1,111 @@
-# Fresh-Agent Slash Menu Blank-Lines Fix Implementation Plan
+# Fresh-Agent Turn Right-Click Double-Menu Fix Implementation Plan
 
 > **For agentic workers:** Execute this plan task by task with a fresh
 > implementer and a specification-plus-quality review after every task. Track
 > progress with the checkbox steps below.
 
-**Goal:** The fresh-agent composer slash-command menu never shows a blank line between entries — provider catalog rows with empty descriptions render as compact single-line rows.
+**Goal:** Right-clicking (or long-pressing) a fresh-agent transcript turn opens exactly one menu — the transcript's own turn menu / action sheet — instead of two overlapping menus stacked at the same point.
 
-**Architecture:** The composer's slash menu renders every row as two stacked spans (command name + description). Provider-advertised session commands legitimately arrive with `description: ''` (Claude SDK catalog coercion in `server/sdk-bridge.ts:118-129`; Rust sidecar `crates/freshell-claude-sidecar/index.mjs:177-193`; opencode `null → ''` in `server/fresh-agent/adapters/opencode/commands-catalog.ts:35`; wire schema `shared/fresh-agent-contract.ts` FreshAgentSessionCommandSchema documents `description: z.string()` as possibly empty). The fix is presentation-only: render the subtitle span only when the description is non-blank. No server, contract, or catalog changes — the data stays verbatim, commands stay in the menu.
+**Architecture:** `ContextMenuProvider` registers its `contextmenu` listener on `document` in the **capture** phase (`ContextMenuProvider.tsx:1232`, unchanged since the original implementation 39cb1f96d — capture is load-bearing for xterm/Monaco surfaces that swallow bubble-phase contextmenu). `FreshAgentTranscript` owns turn-level context menu handling on its `article[data-turn-role]` elements with `preventDefault() + stopPropagation()` in the bubble phase — which can never beat capture. Result: on every turn right-click the provider opens the pane menu AND the transcript opens the turn menu at the same coordinates. The turn menu was invisible until PR #723 defined the `popover` tokens, so the collision became user-visible then ("formatted strangely with blank lines between entries"). Fix: the provider skips events originating inside `article[data-turn-role]` — a boundary owned exclusively by `FreshAgentTranscript` (verified: sole producer of the attribute), which always installs exactly one turn handler per pointer kind (menu for fine pointers, action sheet for coarse).
 
-**Tech Stack:** React 18 + TypeScript client, Vitest + Testing Library, Playwright e2e, Tailwind tokens.
+**Tech Stack:** React 18 + TypeScript client, Vitest + Testing Library, Playwright e2e.
 
 ## Global Constraints
 
-- Do not drop or filter commands whose description is empty — the row must remain visible and actionable (name line only).
-- Preserve the existing two-line layout for rows that DO have descriptions, the `Pane actions` / `Agent session` group dividers, and all keyboard behavior (arrow nav, Enter dispatch vs insert, Tab completion).
-- Preserve the mobile touch-target floor (`min-h-[2.75rem]` below the `sm` breakpoint).
+- Do not change the provider's capture-phase registration or the ordering of any existing global listener.
+- Do not change the transcript's turn-menu/action-sheet behavior itself.
 - Work happens only in `/home/dan/code/freshell/.worktrees/popup-blank-lines` on branch `the-usual/popup-blank-lines`.
 
 ## Requirements
 
-- **R1 — Outcome:** Slash-command menu rows with an empty or whitespace-only description render as a single line (command name only); no blank line is visible between entries.
-- **R2 — Constraint:** Rows with real descriptions keep the two-line layout; menu grouping, row order, keyboard interactions, and touch targets are unchanged; empty-description rows are still rendered and usable.
-- **R3 — Evidence:** Unit tests red-before/green-after, and a Playwright e2e pin against the real browser DOM red-before/green-after.
+- **R1 — Outcome:** A right-click on a fresh-agent transcript turn produces exactly one `role="menu"` element, and it is the turn menu ("Turn context menu"). Long-press on a turn likewise opens only the transcript's action sheet, not also the provider's pane menu.
+- **R2 — Constraint:** Right-clicking anywhere else in a fresh-agent pane (outside a turn article), and right-clicking in terminal/editor/picker panes, still opens the provider's normal context menu. All existing menu behavior, touch long-press menus for non-turn surfaces, and keyboard Shift+F10 path are unchanged.
+- **R3 — Evidence:** Unit tests red-before/green-after, and the existing Playwright turn-menu pin extended to assert the single-menu invariant red-before/green-after.
 
 ---
 
-### Task 1: Gate the slash-menu subtitle on a non-blank description
+### Task 1: Provider carve-out for transcript turn contextmenu events
 
 **Requirements served:** R1, R2, R3
 
 **Behavior:**
-- In `src/components/fresh-agent/FreshAgentComposer.tsx`, the subtitle `<span className="text-xs text-muted-foreground">{...description}</span>` renders only when the row's description contains non-whitespace text.
-- Applies to both row renderers: `renderActionMenuItem` (currently ~line 603-618, all statics have real descriptions today — gate is defensive and keeps one presentational rule) and `renderSessionMenuItem` (~line 620-638, where provider `''` descriptions occur).
-- A shared module-scope predicate, e.g. `const hasMenuSubtitle = (text: string | undefined): boolean => (text ?? '').trim().length > 0`, used by both renderers.
-- Description text is NOT trimmed when displayed — the gate checks blankness only; non-blank descriptions render verbatim.
+- In `src/components/context-menu/ContextMenuProvider.tsx`, the provider's `handleContextMenu` returns early (no `openMenu`, no `preventDefault` — leave the event for the transcript's handler) when the event target is inside `article[data-turn-role]`.
+- The same predicate guards the provider's touch long-press path (`handleTouchStart`), so Android/hold gestures on a turn open only the transcript's action sheet.
+- Implement as one small module-scope predicate in `ContextMenuProvider.tsx`, e.g. `isFreshAgentTurnTarget(el: HTMLElement | null): boolean { return !!el?.closest?.('article[data-turn-role]') }`, used by both paths.
 
 **Files:**
-- Modify: `src/components/fresh-agent/FreshAgentComposer.tsx`
-- Test (unit): `test/unit/client/components/fresh-agent/FreshAgentComposer.test.tsx`
-- Test (e2e): `test/e2e-browser/specs/fresh-agent.spec.ts` (extend `stubFreshclaudeThread` with an optional `commands` parameter, additive/backward-compatible)
+- Modify: `src/components/context-menu/ContextMenuProvider.tsx` (handleContextMenu near the start, after `const target = e.target as HTMLElement | null`; handleTouchStart where the long-press timer is armed)
+- Test (unit): `test/unit/client/components/ContextMenuProvider.test.tsx`
+- Test (e2e): `test/e2e-browser/specs/fresh-agent.spec.ts` (extend the existing `turn context menu renders on an opaque popover surface` test)
 
 **Interfaces:**
-- Consumes: existing `FreshAgentSlashCommand` / `FreshAgentSessionMenuRow` types from `@shared/fresh-agent-slash-commands` (both have `description: string`); existing `stubFreshclaudeThread(page, sessionId, turns?)` e2e helper.
-- Produces: `hasMenuSubtitle` predicate (module-private in FreshAgentComposer.tsx); `stubFreshclaudeThread(page, sessionId, turns?, commands?)` — when `commands` is provided it is included verbatim as the stubbed snapshot's `commands` field.
+- Consumes: `article[data-turn-role]` markup contract from `src/components/fresh-agent/FreshAgentTranscript.tsx`'s turn `article`.
+- Produces: `isFreshAgentTurnTarget` (module-private).
 
 **Test cases:**
-- Unit — session row with `description: ''` → row contains exactly one span (the name line); no blank subtitle element.
-- Unit — session row with `description: '   '` (whitespace-only) → exactly one span.
-- Unit — session row with a real description → two spans (name + subtitle), description text visible (existing behavior preserved).
-- Unit — action rows still render their static subtitles (R2 regression guard).
-- e2e — freshclaude pane whose stubbed snapshot catalog includes `{ name: 'goal', description: '' }` and `{ name: 'review', description: 'Review the current diff' }`: opening the slash menu (type `/` in the composer) shows both rows; the `/goal` row has exactly one `span` child and is shorter than the two-line `/review` row. Pre-fix this is red (the `/goal` row has a second, empty span).
+- Unit — `fireEvent.contextMenu` on an element inside `<article data-turn-role="user">` within a `<div data-context="fresh-agent" data-tab-id=… data-pane-id=…>` → provider renders no app menu.
+- Unit — same event one level up, inside the fresh-agent pane container but OUTSIDE any turn article → provider menu opens (pane entries such as "Reopen as Claude CLI" present). (Mirror the existing pane-menu test fixtures in ContextMenuProvider.test.tsx.)
+- e2e — in the existing turn-menu pin (freshclaude stub with one user turn): after `turnText.click({ button: 'right' })`, assert `page.getByRole('menu')` has count 1 and it is named "Turn context menu". (Pre-fix this is red: two menus exist.)
 
 - [ ] **Step 1: Write the failing behavioral test**
 
-Add a new test inside `describe('grouped slash menu (provider session commands)')` in `test/unit/client/components/fresh-agent/FreshAgentComposer.test.tsx`, modelled on the existing block at line ~241: render `<FreshAgentComposer commands={{ action: COMMANDS, session: [goal-row-empty-description, status-row-whitespace-description, review-row-real-description] }} onCommand={vi.fn()} />`, `fireEvent.change(getInput(), { target: { value: '/' } })`, then in menu `Slash commands` assert `within(menu).getByRole('menuitem', { name: '/goal' }).querySelectorAll('span')` has length 1, same for the whitespace row, and the described `/review` row has exactly 2 spans and shows its description text.
+Add to `test/unit/client/components/ContextMenuProvider.test.tsx` a test (new `describe('fresh-agent turn carve-out')`): render the provider around a fresh-agent pane container with a turn article inside (as in Test cases), `fireEvent.contextMenu` on the inner turn element, assert the provider opened no menu (no element with `role="menu"` attributed to the provider — the provider's menu is portaled with `aria-orientation="vertical"`). Add the control test (outside the article → menu opens).
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentComposer.test.tsx`
+Run: `npm run test:vitest -- run test/unit/client/components/ContextMenuProvider.test.tsx`
 
-Expected: FAIL because the empty-description row currently renders 2 spans (the second being the empty subtitle) — the gate does not exist yet.
+Expected: FAIL on the carve-out test because the provider currently opens its pane menu for turn targets; the control test passes.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-In `src/components/fresh-agent/FreshAgentComposer.tsx`: add module-scope `hasMenuSubtitle` predicate; wrap the description `<span>` in both `renderActionMenuItem` and `renderSessionMenuItem` with `{hasMenuSubtitle(command.description) ? (<span className="text-xs text-muted-foreground">{command.description}</span>) : null}`.
+Add `isFreshAgentTurnTarget` in `ContextMenuProvider.tsx`; early-return in `handleContextMenu` and skip arming the long-press timer in `handleTouchStart` when it matches.
 
 - [ ] **Step 4: Run the focused test**
 
-Run: `npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentComposer.test.tsx`
+Run: `npm run test:vitest -- run test/unit/client/components/ContextMenuProvider.test.tsx`
 
-Expected: PASS (whole file — new test plus all pre-existing composer behavior).
+Expected: PASS (new tests plus all pre-existing provider tests — watch the long-press/contextmenu-race cases especially, since the touch path changes).
 
 - [ ] **Step 5: Refactor while green**
 
-Verify both renderers use the single shared predicate; no unrelated edits; confirm no conditional class on the row depends on the subtitle's presence (row layout is `flex-col justify-center` — single-line rows remain vertically centered and keep the mobile `min-h-[2.75rem]` floor).
+One predicate, two call sites, comment referencing the transcript's ownership contract. No other edits.
 
 - [ ] **Step 6: Run broader verification**
 
-6a. Extend `stubFreshclaudeThread(page, sessionId, turns?, commands?)` in `test/e2e-browser/specs/fresh-agent.spec.ts` and add the e2e pin described in Test cases (assert span counts + relative row heights in the real browser).
+6a. Extend the e2e pin (count-1 + named assertion) and run:
 
-Run: `bash scripts/e2e-cloud.sh run --local --project=chromium --grep='slash menu' test/e2e-browser/specs/fresh-agent.spec.ts`
+Run: `bash scripts/e2e-cloud.sh run --local --project=chromium --grep='turn context menu' test/e2e-browser/specs/fresh-agent.spec.ts`
 
-Expected: PASS (this grep also re-runs any pre-existing slash-menu e2e if its title matches; else only the new pin).
+Expected: PASS.
 
-6b. Typecheck + build: `npm run build` (covers `typecheck:client`).
+6b. Also verify no regression in the pane-menu flows: `bash scripts/e2e-cloud.sh run --local --project=chromium --grep='context menu' test/e2e-browser/specs/` only if such a cross-spec grep matches real tests (check first) — otherwise the unit coverage in step 4 plus the targeted e2e suffice, and the broad `npm test` at delta-review time covers the rest.
+
+6c. Typecheck + build: `npm run build`.
 
 Expected: PASS.
 
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add src/components/fresh-agent/FreshAgentComposer.tsx test/unit/client/components/fresh-agent/FreshAgentComposer.test.tsx test/e2e-browser/specs/fresh-agent.spec.ts
-git commit -m "fix(fresh-agent): slash menu omits blank subtitle line for undescribed provider commands"
+git add src/components/context-menu/ContextMenuProvider.tsx test/unit/client/components/ContextMenuProvider.test.tsx test/e2e-browser/specs/fresh-agent.spec.ts
+git commit -m "fix(fresh-agent): provider skips turn contextmenu events so right-clicking a turn opens only the turn menu"
 ```
 
 ---
 
+## Stage-2 revision record
+
+Supersedes the initial composer-subtitle plan. Findings:
+
+- **Falsified (LB-1/LB-2):** the composer slash menu renders empty-description rows without visual blank lines (empty spans are zero-height), and the real Claude catalog (76 commands probed live via the Agent SDK) contains no empty or whitespace-only descriptions. The live slash menu was observed healthy (shot-09). The description-gate idea is recorded as an out-of-scope hygiene finding.
+- **Verified (LB-3):** the defect is the double-open of provider pane menu + transcript turn menu on turn right-click; previously masked by the missing `popover` surface and exposed by PR #723. Evidence: two `div[role="menu"]` at identical origin in the live app DOM; screenshot evidence in run logs (shot-18, menu-composite-2x).
+- **Verified (LB-4):** `article[data-turn-role]` belongs exclusively to FreshAgentTranscript, which always handles the gesture itself (turn menu for fine pointers, action sheet for coarse).
+- **Accepted (LB-5):** rejected switching the provider listener to bubble phase (blast radius on xterm/Monaco surfaces); carve-out is the minimal safe variant.
+
 ## Self-review record
 
-- **Spec coverage:** R1/R3 proven by unit red/green (Step 1-4) and browser red/green (Step 6a); R2 guarded by the described-row + action-row test cases and the untouched grouping/keyboard code.
-- **No silent deferrals:** none — no stubs or seams; the e2e runs against the production-built client.
-- **File/interface consistency:** file paths, helper signature, and test locations verified against the base tree (composer renderers at ~603-638; grouped-menu describe block at ~241; `stubFreshclaudeThread` at fresh-agent.spec.ts:221).
-- **Executable tests:** unit red predicated on the currently-unconditional span; e2e red predicated on the same DOM fact in a real browser.
-- **Operational completeness:** no migrations/logging/docs surface; deploy is client-only (`scripts/launch-rust.sh --client-only`) after merge.
-- **Cross-check (explorers):** reports/menu-surfaces-inventory.md ruled out every other popup surface (model dialog, global context menu, turn menu, action sheet, settings popover); reports/catalog-descriptions.md confirmed empty descriptions occur on both servers and the live Rust binary behaves identically at HEAD.
+- **Spec coverage:** R1 proven by unit red/green + e2e count-1; R2 by the unit control test and unmodified listener ordering; R3 by the two named suites.
+- **No silent deferrals:** none.
+- **File/interface consistency:** predicate, call sites, attribute contract, and test locations verified against the base tree (provider registration at ContextMenuProvider.tsx:1232; turn article rendered in FreshAgentTranscript.tsx with `data-turn-role`; e2e pin exists at fresh-agent.spec.ts in `describe('Fresh Agent')`).
+- **Executable tests:** unit red predicated on the currently-missing early return; e2e red predicated on the currently-present second menu (directly observed at the base commit).
