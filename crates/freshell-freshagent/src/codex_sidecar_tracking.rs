@@ -15,8 +15,13 @@ use freshell_codex::sidecar_store::{
 
 const PROVIDER: &str = "freshcodex";
 
-/// Poll budget for `/proc/<pid>` evidence right after spawn: the fork/exec
-/// window (empty cmdline) closes in milliseconds.
+/// Poll budget for `/proc/<pid>` evidence right after spawn. The fork/exec
+/// window closes in milliseconds, but between fork() and execve()
+/// /proc/<pid>/cmdline mirrors the SPAWNER's argv (not empty!), so "wait for
+/// non-empty" is not enough — the evidence is usable only once it stops
+/// matching our own process's argv (kata w0xf / CI receipt: a record written
+/// mid-window carried the server/test binary's argv and read as Mismatch at
+/// the next boot's reconcile).
 const EVIDENCE_POLL_BUDGET: std::time::Duration = std::time::Duration::from_millis(2000);
 const EVIDENCE_POLL_STEP: std::time::Duration = std::time::Duration::from_millis(20);
 
@@ -54,10 +59,17 @@ pub(crate) async fn record_spawned_sidecar(ownership_id: &str, pid: u32, ws_url:
         return;
     }
 
+    // Pre-exec /proc mirrors our own argv; accept evidence only after it
+    // differs (exec landed). A sidecar whose real argv equals ours is
+    // impossible: we are freshell-server/test harness, the child is the CLI.
+    let own_argv: Vec<String> = std::env::args().collect();
     let deadline = std::time::Instant::now() + EVIDENCE_POLL_BUDGET;
     let evidence = loop {
         match (proc_starttime(pid as i32), proc_cmdline(pid as i32)) {
-            (Some(st), Some(cl)) if !cl.is_empty() => break Some((st, cl)),
+            (Some(st), Some(cl)) if !cl.is_empty() && cl != own_argv => break Some((st, cl)),
+            // Child vanished pre-evidence (bad binary, spawn raced an exit):
+            // fail fast instead of burning the budget on a dead pid.
+            (None, _) => break None,
             _ if std::time::Instant::now() >= deadline => break None,
             _ => tokio::time::sleep(EVIDENCE_POLL_STEP).await,
         }
