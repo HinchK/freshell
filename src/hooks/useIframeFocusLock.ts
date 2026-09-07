@@ -19,9 +19,16 @@ import { useLayoutEffect, useState } from 'react'
  * Pointer unlock: there is NO eligibility transition or epoch bump when the
  * user clicks an already-active pane — so without this hook's listener, a
  * denied remount would keep the iframe inert forever. A pointerdown inside the
- * pane root is the user's intent to use the pane; the lock lifts (the click
+ * pane shell is the user's intent to use the pane; the lock lifts (the click
  * itself is absorbed by the inert subtree; the NEXT click into the iframe
  * works — standard "click to wake" recovery).
+ *
+ * Keyboard unlock: Enter/Space on the focused pane shell is Pane.tsx's
+ * keyboard activation contract — it dispatches a SAME-target setActivePane,
+ * which produces no eligibility transition or epoch bump, so the lock effect
+ * would never rerun and the iframe would be keyboard-inaccessible until a
+ * switch-away-and-back. Keyboard users get the same wake: Enter/Space targeted
+ * at the shell lifts the lock.
  */
 export function useIframeFocusLock(
   paneRoot: HTMLElement | null,
@@ -36,14 +43,34 @@ export function useIframeFocusLock(
   // ends up attached to a real DOM node.
   useLayoutEffect(() => {
     setLocked(!focusEligible || !mayFocusNow())
-    // With inert applied, hit tests against the locked subtree retarget to the
-    // closest NON-inert ancestor — the pane shell — so listen there (fall back
-    // to the element itself when no shell exists, e.g. bare unit renders).
-    const listenTarget = (paneRoot?.closest('[data-pane-id]') as HTMLElement | null) ?? paneRoot
+    // Prefer the pane SHELL ([data-pane-shell]; wraps the whole pane including
+    // header chrome): with inert applied, pointer hit tests inside the locked
+    // subtree retarget to the closest NON-inert ancestor, and the shell is
+    // ALSO Pane.tsx's keyboard-activation surface (Enter/Space on the focused
+    // shell). The pane component's own root never sees a shell-targeted
+    // keydown (capture descends no further than the event target). Fall back
+    // to the inner [data-pane-id] carrier, then the element itself, for bare
+    // unit renders without a shell.
+    const listenTarget =
+      (paneRoot?.closest('[data-pane-shell="true"]') as HTMLElement | null)
+      ?? (paneRoot?.closest('[data-pane-id]') as HTMLElement | null)
+      ?? paneRoot
     if (!listenTarget || !focusEligible) return
     const unlock = () => setLocked(false)
+    const unlockOnShellActivation = (event: KeyboardEvent) => {
+      // Mirror Pane.tsx's shell keydown contract: only an activation key
+      // targeted at the shell itself (e.target === e.currentTarget there)
+      // counts, not keys bubbling out of inner focusable content.
+      if (event.target === listenTarget && (event.key === 'Enter' || event.key === ' ')) {
+        setLocked(false)
+      }
+    }
     listenTarget.addEventListener('pointerdown', unlock, true)
-    return () => listenTarget.removeEventListener('pointerdown', unlock, true)
+    listenTarget.addEventListener('keydown', unlockOnShellActivation, true)
+    return () => {
+      listenTarget.removeEventListener('pointerdown', unlock, true)
+      listenTarget.removeEventListener('keydown', unlockOnShellActivation, true)
+    }
   }, [paneRoot, focusEligible, mayFocusNow])
 
   return locked

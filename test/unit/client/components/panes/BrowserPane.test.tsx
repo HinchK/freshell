@@ -758,6 +758,22 @@ describe('BrowserPane', () => {
       expect(chrome).toHaveFocus()
     })
 
+    it('keyboard activation (Enter/Space on the pane shell) UNLOCKS a denied-remount iframe (keyboard access parity with pointer wake)', () => {
+      const first = renderBrowserPane({ url: 'https://example.com' })
+      const chrome = document.createElement('input')
+      document.body.appendChild(chrome)
+      chrome.focus()
+      first.unmount()
+      renderBrowserPane({ url: 'https://example.com' }) // denied remount → locked
+      const iframe = document.querySelector('iframe')!
+      expect(iframe.hasAttribute('inert')).toBe(true)
+      const root = iframe.closest('[data-pane-id="pane-1"]') as HTMLElement
+      fireEvent.keyDown(root, { key: 'Enter' })
+      expect(iframe.hasAttribute('inert')).toBe(false)
+      expect(iframe.getAttribute('data-focus-locked')).toBeNull()
+      expect(chrome).toHaveFocus() // unlock is not a focus steal
+    })
+
     it('focuses the pane root on mount for a loaded pane that owns focus', () => {
       renderBrowserPane({ url: 'https://example.com' })
       const root = document.querySelector('[data-pane-id="pane-1"]')

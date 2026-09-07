@@ -2,7 +2,8 @@ import { describe, it, expect, afterEach } from 'vitest'
 import { render, waitFor, cleanup as rtlCleanup } from '@testing-library/react'
 import { useEffect, createElement } from 'react'
 import { configureStore } from '@reduxjs/toolkit'
-import panesReducer, { initLayout, removeLayout, setActivePane } from '@/store/panesSlice'
+import panesReducer, { initLayout, removeLayout, setActivePane, splitPane, addPane } from '@/store/panesSlice'
+import tabsReducer, { addTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
 import {
   recordPaneFocusBeforeUnmount,
@@ -14,6 +15,7 @@ import {
   wirePaneFocusOwnershipInvalidation,
   isPaneFocusRestorePendingForTests,
   resetPaneFocusOwnershipForTests,
+  getPaneSelectionSerial,
 } from '@/lib/pane-focus-ownership'
 
 function makePanesStore() {
@@ -439,5 +441,105 @@ describe('pane-focus-ownership', () => {
     expect(shouldFocusPaneOnEligibleMount('p-0')).toBe(true) // evicted → unknown
     expect(shouldFocusPaneOnEligibleMount('p-1')).toBe(false) // retained
     expect(shouldFocusPaneOnEligibleMount('p-512')).toBe(false) // newest must survive
+  })
+})
+
+describe('paneSelectionMiddleware selection-serial coverage', () => {
+  afterEach(() => {
+    resetPaneFocusOwnershipForTests()
+    document.body.innerHTML = ''
+  })
+
+  function makeTabsPanesStore() {
+    return configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+      middleware: (getDefault) => getDefault({ serializableCheck: false }).concat(paneSelectionMiddleware as never),
+      preloadedState: {
+        tabs: {
+          tabs: [
+            { id: 'tab-1', createRequestId: 'req-1', title: 'One', status: 'running' as const, mode: 'shell' as const, shell: 'system' as const, createdAt: 1 },
+          ],
+          activeTabId: 'tab-1',
+          renameRequestTabId: null,
+        },
+        panes: {
+          layouts: {
+            'tab-1': { type: 'leaf' as const, id: 'pane-1', content: { kind: 'terminal' as const, mode: 'shell' as const, status: 'running' as const, terminalId: 'term-1' } },
+          },
+          activePane: { 'tab-1': 'pane-1' },
+          paneTitles: { 'tab-1': { 'pane-1': 'One' } },
+          paneTitleSetByUser: {},
+          renameRequestTabId: null,
+          renameRequestPaneId: null,
+          zoomedPane: {},
+          refreshRequestsByPane: {},
+        },
+      } as any,
+    })
+  }
+
+  it('user new-tab (default-activating addTab) counts as selection activity', () => {
+    const store = makeTabsPanesStore()
+    const s0 = getPaneSelectionSerial()
+    store.dispatch(addTab({ id: 'tab-2', title: 'Two' }))
+    expect(store.getState().tabs.activeTabId).toBe('tab-2')
+    expect(getPaneSelectionSerial()).toBe(s0 + 1)
+  })
+
+  it('agent new-tab (activate:false) does NOT count as selection activity', () => {
+    const store = makeTabsPanesStore()
+    const s0 = getPaneSelectionSerial()
+    store.dispatch(addTab({ id: 'tab-2', title: 'Two', activate: false }))
+    expect(store.getState().tabs.activeTabId).toBe('tab-1')
+    expect(getPaneSelectionSerial()).toBe(s0)
+  })
+
+  it('keyboard tab navigation (switchToNextTab/switchToPrevTab) counts as selection activity', () => {
+    const store = makeTabsPanesStore()
+    store.dispatch(addTab({ id: 'tab-2', title: 'Two', activate: false }))
+    const s0 = getPaneSelectionSerial()
+    store.dispatch(switchToNextTab())
+    expect(store.getState().tabs.activeTabId).toBe('tab-2')
+    expect(getPaneSelectionSerial()).toBe(s0 + 1)
+    store.dispatch(switchToPrevTab())
+    expect(store.getState().tabs.activeTabId).toBe('tab-1')
+    expect(getPaneSelectionSerial()).toBe(s0 + 2)
+  })
+
+  it('a user split (default-activating splitPane) counts as selection activity', () => {
+    const store = makeTabsPanesStore()
+    const s0 = getPaneSelectionSerial()
+    store.dispatch(splitPane({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      direction: 'horizontal',
+      newContent: { kind: 'terminal', mode: 'shell' },
+      newPaneId: 'pane-2',
+    }))
+    expect(store.getState().panes.activePane['tab-1']).toBe('pane-2')
+    expect(getPaneSelectionSerial()).toBe(s0 + 1)
+  })
+
+  it('an agent split (splitPane activate:false) is NOT selection activity', () => {
+    const store = makeTabsPanesStore()
+    const s0 = getPaneSelectionSerial()
+    store.dispatch(splitPane({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      direction: 'horizontal',
+      newContent: { kind: 'terminal', mode: 'shell' },
+      newPaneId: 'pane-2',
+      activate: false,
+    }))
+    expect(store.getState().panes.activePane['tab-1']).toBe('pane-1')
+    expect(getPaneSelectionSerial()).toBe(s0)
+  })
+
+  it('addPane (local pane splitting) counts as selection activity', () => {
+    const store = makeTabsPanesStore()
+    const s0 = getPaneSelectionSerial()
+    store.dispatch(addPane({ tabId: 'tab-1', newContent: { kind: 'terminal', mode: 'shell' } }))
+    expect(store.getState().panes.activePane['tab-1']).not.toBe('pane-1')
+    expect(getPaneSelectionSerial()).toBe(s0 + 1)
   })
 })

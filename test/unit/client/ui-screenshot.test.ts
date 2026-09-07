@@ -18,6 +18,7 @@ import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvid
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { captureUiScreenshot, restoreFocus } from '../../../src/lib/ui-screenshot'
 import { getPaneSelectionSerial, paneSelectionMiddleware, wirePaneFocusOwnershipInvalidation } from '@/lib/pane-focus-ownership'
+import { suspendTerminalRenderersForScreenshot } from '../../../src/lib/screenshot-capture-env'
 
 vi.mock('html2canvas', () => ({
   default: vi.fn(),
@@ -421,36 +422,37 @@ describe('captureUiScreenshot iframe handling', () => {
   })
 })
 
+function createFocusStore() {
+  return configureStore({
+    reducer: { tabs: tabsReducer, panes: panesReducer },
+    middleware: (getDefault) => getDefault({ serializableCheck: false }).concat(paneSelectionMiddleware as never),
+    preloadedState: {
+      tabs: {
+        tabs: [
+          { id: 'tab-1', createRequestId: 'req-1', title: 'One', status: 'running' as const, mode: 'shell' as const, shell: 'system' as const, createdAt: 1 },
+          { id: 'tab-2', createRequestId: 'req-2', title: 'Two', status: 'running' as const, mode: 'shell' as const, shell: 'system' as const, createdAt: 2 },
+        ],
+        activeTabId: 'tab-1',
+        renameRequestTabId: null,
+      },
+      panes: {
+        layouts: {
+          'tab-1': { type: 'leaf' as const, id: 'pane-1', content: { kind: 'terminal' as const, mode: 'shell' as const, status: 'running' as const, terminalId: 'term-1' } },
+          'tab-2': { type: 'leaf' as const, id: 'pane-2', content: { kind: 'terminal' as const, mode: 'shell' as const, status: 'running' as const, terminalId: 'term-2' } },
+        },
+        activePane: { 'tab-1': 'pane-1', 'tab-2': 'pane-2' },
+        paneTitles: { 'tab-1': { 'pane-1': 'One' }, 'tab-2': { 'pane-2': 'Two' } },
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+      },
+    } as any,
+  })
+}
+
 describe('restoreFocus deleted-target hardening', () => {
-  function createFocusStore() {
-    return configureStore({
-      reducer: { tabs: tabsReducer, panes: panesReducer },
-      middleware: (getDefault) => getDefault({ serializableCheck: false }).concat(paneSelectionMiddleware as never),
-      preloadedState: {
-        tabs: {
-          tabs: [
-            { id: 'tab-1', createRequestId: 'req-1', title: 'One', status: 'running' as const, mode: 'shell' as const, shell: 'system' as const, createdAt: 1 },
-            { id: 'tab-2', createRequestId: 'req-2', title: 'Two', status: 'running' as const, mode: 'shell' as const, shell: 'system' as const, createdAt: 2 },
-          ],
-          activeTabId: 'tab-1',
-          renameRequestTabId: null,
-        },
-        panes: {
-          layouts: {
-            'tab-1': { type: 'leaf' as const, id: 'pane-1', content: { kind: 'terminal' as const, mode: 'shell' as const, status: 'running' as const, terminalId: 'term-1' } },
-            'tab-2': { type: 'leaf' as const, id: 'pane-2', content: { kind: 'terminal' as const, mode: 'shell' as const, status: 'running' as const, terminalId: 'term-2' } },
-          },
-          activePane: { 'tab-1': 'pane-1', 'tab-2': 'pane-2' },
-          paneTitles: { 'tab-1': { 'pane-1': 'One' }, 'tab-2': { 'pane-2': 'Two' } },
-          paneTitleSetByUser: {},
-          renameRequestTabId: null,
-          renameRequestPaneId: null,
-          zoomedPane: {},
-          refreshRequestsByPane: {},
-        },
-      } as any,
-    })
-  }
 
   it('restores a still-valid snapshot and reports success (pin)', async () => {
     const store = createFocusStore()
@@ -567,16 +569,19 @@ describe('restoreFocus deleted-target hardening', () => {
     }
   })
 
-  it('yields the tab restore when the user clicked a different tab mid-capture', async () => {
+  it('yields the tab restore when the user opened a NEW tab mid-capture (default-activating addTab is selection activity)', async () => {
     const store = createFocusStore()
     // The capture switched to tab-2 (capture-marker action — serial-invisible)…
     store.dispatch(selectTabForCapture('tab-2'))
     // …snapshot taken at capture start…
     const before = { selectionSerial: getPaneSelectionSerial(), activeTabId: 'tab-1', activePaneByTab: {} }
-    // …then the user clicked a THIRD tab while the capture was in flight.
+    // …then the user opened a new tab mid-capture. User new-tab gestures
+    // default-activate WITHOUT a setActiveTab — the serial must count addTab
+    // itself (an earlier version of this test followed with an explicit
+    // setActiveTab, masking the gap).
     store.dispatch(addTab({}))
     const userTab = store.getState().tabs.tabs.at(-1)!.id
-    store.dispatch(setActiveTab(userTab))
+    expect(store.getState().tabs.activeTabId).toBe(userTab) // addTab default-activated it
     const spy = vi.spyOn(store, 'dispatch')
     const ok = await restoreFocus(
       { dispatch: store.dispatch, getState: store.getState },
@@ -633,5 +638,73 @@ describe('restoreFocus deleted-target hardening', () => {
       new Set()
     )
     expect(ok).toBe(false)
+  })
+})
+
+describe('captureUiScreenshot newer-selection supersession', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    document.body.innerHTML = ''
+  })
+
+  it('never moves the active tab when a newer user selection landed during renderer suspension', async () => {
+    const store = createFocusStore()
+    // The user re-selects their current tab WHILE the capture suspends WebGL
+    // renderers (the awaited window between the focus snapshot and the first
+    // capture-internal focus write).
+    vi.mocked(suspendTerminalRenderersForScreenshot).mockImplementationOnce(async () => {
+      store.dispatch(setActiveTab('tab-1'))
+      return async () => {}
+    })
+    const result = await captureUiScreenshot(
+      { scope: 'tab', tabId: 'tab-2' },
+      { dispatch: store.dispatch, getState: store.getState } as any,
+    )
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/superseded/)
+    expect(store.getState().tabs.activeTabId).toBe('tab-1') // user's selection not stomped
+    expect(result.changedFocus).toBe(false)
+  })
+
+  it('never moves the active pane when a newer user selection lands between the capture tab and pane moves', async () => {
+    const store = createFocusStore()
+    store.dispatch(splitPane({
+      tabId: 'tab-2',
+      paneId: 'pane-2',
+      direction: 'horizontal',
+      newContent: { kind: 'terminal', mode: 'shell' },
+      newPaneId: 'pane-2b',
+    })) // setup only — completes before the capture snapshot
+    // Interpose: the user clicks pane-2b AFTER the capture's tab switch but
+    // BEFORE its pane switch.
+    let intercepted = false
+    const dispatch = (action: any) => {
+      const result = store.dispatch(action)
+      if (!intercepted && (action as any)?.type === 'tabs/selectTabForCapture') {
+        intercepted = true
+        store.dispatch(setActivePane({ tabId: 'tab-2', paneId: 'pane-2b' }))
+      }
+      return result
+    }
+    const result = await captureUiScreenshot(
+      { scope: 'pane', tabId: 'tab-2', paneId: 'pane-2' },
+      { dispatch, getState: store.getState } as any,
+    )
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/superseded/)
+    expect(store.getState().panes.activePane['tab-2']).toBe('pane-2b') // user's pane preserved
+  })
+
+  it('still performs the focus move and restores it when no newer selection intervenes', async () => {
+    const store = createFocusStore()
+    // No DOM tab elements exist, so the capture fails target lookup AFTER
+    // moving — the move/restore ladder is what this pins.
+    const result = await captureUiScreenshot(
+      { scope: 'tab', tabId: 'tab-2' },
+      { dispatch: store.dispatch, getState: store.getState } as any,
+    )
+    expect(store.getState().tabs.activeTabId).toBe('tab-1') // restored
+    expect(result.changedFocus).toBe(true)
+    expect(result.restoredFocus).toBe(true)
   })
 })

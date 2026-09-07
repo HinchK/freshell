@@ -145,6 +145,21 @@ describe('ExtensionPane focus gating (agent focus neutrality)', () => {
     expect(chrome).toHaveFocus()
   })
 
+  it('keyboard activation (Enter/Space on the pane shell) UNLOCKS a denied-remount iframe (keyboard access parity with pointer wake)', () => {
+    const first = renderPane(true)
+    const chrome = document.createElement('input')
+    document.body.appendChild(chrome)
+    chrome.focus()
+    first.unmount()
+    const { container } = renderPane(true)
+    const iframe = container.querySelector('iframe') as HTMLIFrameElement
+    expect(iframe.hasAttribute('inert')).toBe(true)
+    fireEvent.keyDown(container.querySelector('[data-pane-id="pane-1"]') as HTMLElement, { key: 'Enter' })
+    expect(iframe.hasAttribute('inert')).toBe(false)
+    expect(iframe.getAttribute('data-focus-locked')).toBeNull()
+    expect(chrome).toHaveFocus()
+  })
+
   it('removes inert and focuses the iframe on a false→true eligibility flip, without reload', () => {
     const { rerenderWith } = renderPane(false)
     const iframe = document.querySelector('iframe') as HTMLIFrameElement

@@ -261,26 +261,57 @@ function collectLivePaneIds(layouts: Record<string, LayoutNodeLike> | undefined)
   return live
 }
 
-/** Middleware-side selection tracking: any setActivePane/nudgePaneFocus
- *  dispatch bumps the selection serial — EXCEPT capture-internal moves
- *  (ui-screenshot passes `capture: true` on its own interim dispatches, so a
- *  screenshot's boarding ladder can't void the restore taken by someone who
- *  selected panes mid-capture). State-subscription comparison cannot tell
- *  capture moves from pointer clicks, hence this is action-driven. */
-export const paneSelectionMiddleware = () => (next: (action: unknown) => unknown) => (action: unknown) => {
-  const a = action as { type?: string; payload?: { capture?: boolean } } | null
-  if (
-    (a?.type === 'panes/setActivePane' && a?.payload?.capture !== true)
-    || a?.type === 'panes/nudgePaneFocus'
-    // Plain tab clicks are selection activity too; the screenshot capture's
-    // own tab moves use the selectTabForCapture alias (excluded here),
-    // mirroring setActivePane's capture:true marker.
-    || a?.type === 'tabs/setActiveTab'
-  ) {
-    paneSelectionSerial += 1
+/** Middleware-side selection tracking: explicit selection folds
+ *  (setActivePane / nudgePaneFocus / setActiveTab) bump the selection serial
+ *  — EXCEPT capture-internal moves (ui-screenshot passes `capture: true` /
+ *  `selectTabForCapture`, so a screenshot's boarding ladder can't void the
+ *  restore taken by someone who selected panes mid-capture). State-
+ *  subscription comparison cannot tell capture moves from pointer clicks,
+ *  hence this is action-driven.
+ *
+ *  Other user gestures reach the selection WITHOUT those folds: default-
+ *  activating addTab (new-tab shortcut / mobile strip / first tab),
+ *  switchToNextTab/switchToPrevTab (keyboard navigation), default-activating
+ *  splitPane (user split), addPane (local split). Those bump the serial only
+ *  when the selection coordinate ACTUALLY moved — agent folds pass
+ *  activate:false and stay serial-invisible. */
+export const paneSelectionMiddleware =
+  (store: {
+    getState: () => {
+      tabs?: { activeTabId?: string | null }
+      panes?: { activePane?: Record<string, string> }
+    }
+  }) =>
+  (next: (action: unknown) => unknown) =>
+  (action: unknown): unknown => {
+    const a = action as { type?: string; payload?: { capture?: boolean; tabId?: string } } | null
+    if (
+      (a?.type === 'panes/setActivePane' && a?.payload?.capture !== true)
+      || a?.type === 'panes/nudgePaneFocus'
+      // Plain tab clicks are selection activity too; the screenshot capture's
+      // own tab moves use the selectTabForCapture alias (excluded here),
+      // mirroring setActivePane's capture:true marker.
+      || a?.type === 'tabs/setActiveTab'
+    ) {
+      paneSelectionSerial += 1
+      return next(action)
+    }
+    if (a?.type === 'tabs/addTab' || a?.type === 'tabs/switchToNextTab' || a?.type === 'tabs/switchToPrevTab') {
+      const before = store.getState().tabs?.activeTabId
+      const result = next(action)
+      if (store.getState().tabs?.activeTabId !== before) paneSelectionSerial += 1
+      return result
+    }
+    if (a?.type === 'panes/splitPane' || a?.type === 'panes/addPane') {
+      const tabId = a?.payload?.tabId
+      if (!tabId) return next(action)
+      const before = store.getState().panes?.activePane?.[tabId]
+      const result = next(action)
+      if (store.getState().panes?.activePane?.[tabId] !== before) paneSelectionSerial += 1
+      return result
+    }
+    return next(action)
   }
-  return next(action)
-}
 
 /** Bump the selection serial directly (exported for tests wiring adoption
  *  records into stores that lack the paneSelectionMiddleware). */

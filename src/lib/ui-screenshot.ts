@@ -301,9 +301,12 @@ export async function restoreFocus(
   paneTabsToRestore: Set<string>,
 ): Promise<boolean> {
   // A newer explicit selection during the capture wins over the restore —
-  // roll nothing back. The serial is bumped by pane selections (folds AND
-  // pointer activations) and plain tab clicks; the capture's own moves use
-  // capture:true / selectTabForCapture, which never bump it.
+  // roll nothing back. The serial is bumped by selection folds (setActivePane
+  // incl. pointer activations, nudgePaneFocus, setActiveTab) AND by other
+  // user gestures that move the selection (default-activating addTab,
+  // keyboard tab navigation, default-activating splitPane / addPane); the
+  // capture's own moves use capture:true / selectTabForCapture, which never
+  // bump it, and agent folds pass activate:false.
   if (getPaneSelectionSerial() !== before.selectionSerial) return true
   let incomplete = false
   try {
@@ -367,8 +370,17 @@ export async function captureUiScreenshot(request: ScreenshotRequest, ctx: Runti
   const paneTabsToRestore = new Set<string>()
   let changedFocus = false
   let restoredFocus = false
+  // The serial is sampled at snapshot time, but the renderer suspension below
+  // awaits two animation frames — a user selection can land in that gap (or
+  // between the tab move and the pane move). Re-check before every capture-
+  // internal focus write: stomping the newer selection is worse than aborting
+  // the screenshot (partial moves are handled by restoreFocus, whose serial
+  // mismatch deliberately skips the rollback).
+  const selectionSuperseded = () => getPaneSelectionSerial() !== focusBefore.selectionSerial
+
   const setActiveTabIfNeeded = async (tabId: string) => {
     if (ctx.getState().tabs.activeTabId === tabId) return
+    if (selectionSuperseded()) throw new Error('screenshot superseded by a newer user selection')
     // Capture-internal: invisible to the selection serial, so it cannot void
     // the restore of a user/agent selection landing mid-capture.
     ctx.dispatch(selectTabForCapture(tabId))
@@ -378,6 +390,7 @@ export async function captureUiScreenshot(request: ScreenshotRequest, ctx: Runti
 
   const setActivePaneIfNeeded = async (tabId: string, paneId: string) => {
     if (ctx.getState().panes.activePane[tabId] === paneId) return
+    if (selectionSuperseded()) throw new Error('screenshot superseded by a newer user selection')
     // Capture-internal activation: must not bump the selection serial — the
     // restore contract attributes serial changes to user/agent selections.
     ctx.dispatch(setActivePane({ tabId, paneId, capture: true }))
