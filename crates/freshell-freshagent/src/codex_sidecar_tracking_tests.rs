@@ -282,6 +282,7 @@ async fn build_recorded_watch(
         kill_rx,
         Arc::new(AtomicBool::new(false)),
         Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
+        crate::codex::QuietDeadman::new_shared(),
     );
     (watcher, kill_tx, pid)
 }
@@ -331,6 +332,7 @@ async fn unrequested_exit_arm_removes_the_record() {
         kill_rx,
         exited.clone(),
         Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
+        crate::codex::QuietDeadman::new_shared(),
     );
     watcher.await.expect("watcher completes");
 

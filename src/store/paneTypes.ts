@@ -176,7 +176,7 @@ export type HostStatsPaneContent = {
 }
 
 /** SDK session statuses — richer than TerminalStatus to reflect Claude Code lifecycle */
-export type SdkSessionStatus = 'creating' | 'starting' | 'connected' | 'running' | 'idle' | 'compacting' | 'exited' | 'create-failed'
+export type SdkSessionStatus = 'creating' | 'starting' | 'connected' | 'running' | 'idle' | 'compacting' | 'exited' | 'stuck' | 'create-failed'
 
 export type FreshAgentCreateError = {
   code: string
