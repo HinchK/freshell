@@ -30,9 +30,12 @@ completion — matching the already-green separate-batch path. The Idle
 - Work only in the `the-usual/pkvz-deflake` worktree at
   `/home/dan/code/freshell/.worktrees/pkvz-deflake` on branch
   `the-usual/pkvz-deflake` (base `9d3da1e69`).
-- Do NOT widen the `wait_for_frame` budget. The 30s budget stays. A genuinely
-  missing frame must still fail. (Merged precedent `f2c505e9f`; AGENTS.md:
-  "fix the system over the symptom.")
+- Do NOT widen the `wait_for_frame` budget further. `origin/main` (base of this
+  branch) already bumped it 30s→120s via PR #744 (`707530ca0`); that bump is the
+  baseline here, and it did NOT stop the flake (the root cause is the one-batch
+  state-machine suppression, not the budget). The 120s budget stays; a genuinely
+  missing frame still fails, 120s later. (AGENTS.md: "fix the system over the
+  symptom.")
 - Preserve the existing `reconcile_ignores_an_already_resolved_rollout`
   semantic: a one-batch start+complete on an Idle (historical, not-watched)
   terminal stays Idle and records nothing (resume-busy seeding must not ring a
@@ -57,9 +60,10 @@ completion — matching the already-green separate-batch path. The Idle
   `sessionId`) is emitted reliably even when the rollout's
   `task_started`+`task_complete` are read in one reconcile batch.
 - **R2 — Constraint:** The fix targets the root-cause state-machine suppression
-  in `reconcile_rollout`, not a wait-budget bump. The 30s `wait_for_frame` budget
-  is unchanged. Existing one-batch semantics for Idle (historical) rollouts are
-  preserved.
+  in `reconcile_rollout`, not a wait-budget bump. The 120s `wait_for_frame` budget
+  (landed by PR #744 on `origin/main`) is unchanged. Existing one-batch
+  semantics for Idle (historical) rollouts and historical rollouts predating the
+  pending submit are preserved.
 - **R3 — Evidence:** A new unit test pins the previously-untested gap — a
   Pending terminal with a queued submit receiving a one-batch
   `task_started`+`task_complete` records exactly one completion. The existing
@@ -217,23 +221,30 @@ fn reconcile_one_batch_historical_start_before_pending_submit_records_nothing() 
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run the three new tests. Cargo accepts one positional TESTNAME before `--`, so
-use separate invocations. The `newer_start` test is the red; the other two pass
-on current code:
+The tests live in `mod tests` inside `mod codex`, so libtest's `--exact`
+requires the full path `codex::tests::<name>`. Run the RED test first (expected
+to fail), then the two baseline tests (expected to pass on current code):
 
 ```bash
 cd /home/dan/code/freshell/.worktrees/pkvz-deflake && \
   cargo test -p freshell-activity --lib \
-    reconcile_one_batch_start_and_clear_on_a_pending_turn_with_newer_start_completes -- --exact --nocapture && \
-  cargo test -p freshell-activity --lib \
-    reconcile_one_batch_start_and_clear_on_a_pending_turn_with_older_start_rearms -- --exact --nocapture && \
-  cargo test -p freshell-activity --lib \
-    reconcile_one_batch_historical_start_before_pending_submit_records_nothing -- --exact --nocapture
+    codex::tests::reconcile_one_batch_start_and_clear_on_a_pending_turn_with_newer_start_completes -- --exact --nocapture
 ```
 
-Expected: the FIRST test FAILs with `assertion failed: ... == [1]` but got `[]`
-(zero completions) — the one-batch suppression. The SECOND and THIRD tests PASS
-on current code (re-arm and historical suppression are the current behavior).
+Expected: FAIL with `assertion failed: ... == [1]` but got `[]` (zero
+completions) — the one-batch suppression.
+
+```bash
+cd /home/dan/code/freshell/.worktrees/pkvz-deflake && \
+  cargo test -p freshell-activity --lib \
+    codex::tests::reconcile_one_batch_start_and_clear_on_a_pending_turn_with_older_start_rearms -- --exact --nocapture && \
+  cargo test -p freshell-activity --lib \
+    codex::tests::reconcile_one_batch_historical_start_before_pending_submit_records_nothing -- --exact --nocapture
+```
+
+Expected: both PASS on current code (re-arm and historical suppression are the
+current behavior). Each invocation passes exactly one `--exact` name (cargo
+accepts a single positional TESTNAME before `--`).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -288,16 +299,16 @@ start → Pending re-arm → no completion).
 
 - [ ] **Step 4: Run the focused test**
 
-Run the three new tests (separate invocations — one positional TESTNAME each):
+Run the three new tests (each invocation passes exactly one `--exact` name):
 
 ```bash
 cd /home/dan/code/freshell/.worktrees/pkvz-deflake && \
   cargo test -p freshell-activity --lib \
-    reconcile_one_batch_start_and_clear_on_a_pending_turn_with_newer_start_completes -- --exact --nocapture && \
+    codex::tests::reconcile_one_batch_start_and_clear_on_a_pending_turn_with_newer_start_completes -- --exact --nocapture && \
   cargo test -p freshell-activity --lib \
-    reconcile_one_batch_start_and_clear_on_a_pending_turn_with_older_start_rearms -- --exact --nocapture && \
+    codex::tests::reconcile_one_batch_start_and_clear_on_a_pending_turn_with_older_start_rearms -- --exact --nocapture && \
   cargo test -p freshell-activity --lib \
-    reconcile_one_batch_historical_start_before_pending_submit_records_nothing -- --exact --nocapture
+    codex::tests::reconcile_one_batch_historical_start_before_pending_submit_records_nothing -- --exact --nocapture
 ```
 
 Expected: all three PASS. The first records exactly one completion and lands
@@ -368,9 +379,9 @@ reconcile_ignores_an_already_resolved_rollout."
 
 **Test cases:**
 - Run the flaky integration test 5× in isolation → 5/5 PASS.
-- Run the whole `freshell-ws` crate 3× (the original flake scenario: many
-  integration tests contending for the blocking pool under one `cargo test`
-  invocation) → the pkvz test passes every time, 30s budget unchanged.
+- Run the whole `freshell-ws` crate 3× (the original flake scenario: all
+  integration binaries contending for the blocking pool under one `cargo test`
+  invocation) → the pkvz test passes every time, 120s budget unchanged.
 - Run the `freshell-activity` crate and the codex/locator integration surface →
   PASS.
 
@@ -396,22 +407,22 @@ proof.)
 
 The kata reports the flake under "full workspace cargo run on a loaded 96-core
 box." The closest faithful reproduction without a full `cargo test --workspace`
-is running the whole `freshell-ws` crate (many integration tests contending for
-the blocking pool in one invocation) 3 times and confirming the pkvz test passes
-each time. This is the exact scenario that originally exposed the flake:
+is running the whole `freshell-ws` crate — `cargo test -p freshell-ws` with no
+`--test` filter, so ALL its integration binaries run concurrently and contend
+for the blocking pool and tokio workers in one invocation. This is the
+contention that produced the one-batch drain. Run it 3 times:
 
 ```bash
 cd /home/dan/code/freshell/.worktrees/pkvz-deflake && \
   for i in 1 2 3; do \
-    cargo test -p freshell-ws --test codex_locator_activity || \
+    cargo test -p freshell-ws || \
       { echo "FAIL on whole-crate run $i"; exit 1; }; \
   done; echo "3/3 whole-crate PASS"
 ```
 
-Expected: 3/3 PASS with the 30s `wait_for_frame` budget unchanged. The whole
-`codex_locator_activity` test file runs all its tests concurrently, contending
-for the blocking pool and tokio workers — the conditions that produced the
-one-batch drain.
+Expected: 3/3 PASS with the 120s `wait_for_frame` budget unchanged. If the pkvz
+test still fails, that is a failed R1 (pkvz is not resolved) — investigate and
+fix; do not widen the budget.
 
 - [ ] **Step 3: Broader suite non-regression**
 
