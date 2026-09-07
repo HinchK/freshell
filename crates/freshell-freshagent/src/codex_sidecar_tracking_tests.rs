@@ -57,11 +57,30 @@ fn fake_codex_cmd() -> String {
     )
 }
 
-fn spawn_sleep_child() -> tokio::process::Child {
+async fn spawn_sleep_child() -> tokio::process::Child {
     let mut cmd = tokio::process::Command::new("sleep");
     cmd.arg("300");
     cmd.kill_on_drop(true);
-    cmd.spawn().expect("spawn sleep fixture")
+    let child = cmd.spawn().expect("spawn sleep fixture");
+    // Fork/exec window (kata w0xf): between fork() and execve(),
+    // /proc/<pid>/cmdline still shows the PARENT's argv, so a proc-identity
+    // read immediately after spawn can capture the test-harness binary
+    // instead of `sleep` (observed 2/2 on CI under load). wait_for_exec
+    // returns AFTER execve, so the block below is micro-fast in practice.
+    let pid = child.id().expect("spawned pid") as i32;
+    let started = std::time::Instant::now();
+    loop {
+        let cmdline = proc_cmdline(pid).unwrap_or_default();
+        if cmdline.first().is_some_and(|a| a == "sleep" || a.ends_with("/sleep")) {
+            break;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "sleep fixture did not exec within 2s (cmdline: {cmdline:?})"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    child
 }
 
 fn tracking_state() -> (FreshCodexState, tokio::sync::broadcast::Receiver<String>) {
@@ -131,7 +150,7 @@ async fn create_tracked_session_with_resume(
 async fn spawn_record_carries_verifiable_proc_identity_and_freshagent_lane() {
     let _env = ENV_LOCK.lock().await;
     let guard = TrackingStoreGuard::install();
-    let mut child = spawn_sleep_child();
+    let mut child = spawn_sleep_child().await;
     let pid = child.id().expect("spawned pid");
 
     record_spawned_sidecar("codex-sidecar-wfah-t2", pid, "ws://127.0.0.1:1").await;
@@ -161,7 +180,7 @@ async fn record_is_skipped_cleanly_when_no_store_is_installed() {
     let guard = TrackingStoreGuard::install();
     // Stage the disabled posture the same way production falls back to it.
     drop(guard);
-    let mut child = spawn_sleep_child();
+    let mut child = spawn_sleep_child().await;
     let pid = child.id().expect("spawned pid");
     record_spawned_sidecar("codex-sidecar-wfah-disabled", pid, "ws://127.0.0.1:1").await;
     // No panic, no record write possible; the disabled store swallows writes.
@@ -269,7 +288,7 @@ async fn build_recorded_watch(
     tokio::sync::oneshot::Sender<()>,
     u32,
 ) {
-    let child = spawn_sleep_child();
+    let child = spawn_sleep_child().await;
     let pid = child.id().expect("spawned pid");
     record_spawned_sidecar(ownership_id, pid, "ws://127.0.0.1:1").await;
     let (tx, _rx) = tokio::sync::broadcast::channel::<String>(8);
@@ -311,7 +330,7 @@ async fn requested_kill_arm_removes_the_record() {
 async fn unrequested_exit_arm_removes_the_record() {
     let _env = ENV_LOCK.lock().await;
     let guard = TrackingStoreGuard::install();
-    let mut child = spawn_sleep_child();
+    let mut child = spawn_sleep_child().await;
     let pid = child.id().expect("spawned pid");
     record_spawned_sidecar("codex-sidecar-wfah-t3-crash", pid, "ws://127.0.0.1:1").await;
     assert_eq!(
