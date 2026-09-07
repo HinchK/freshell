@@ -61,16 +61,20 @@ unit/component tests, Playwright e2e against the owned RustServer wall harness.
   `env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL bash scripts/e2e-cloud.sh run --local --project=rust-chromium <spec-basename>`
   The wall harness boots its OWN RustServer on an ephemeral port — never touch
   the live self-hosted server (port 3001).
-- **No runtime BEHAVIOR changes under `server/` or `crates/`.** The behavior
-  fix is client-only; it deploys via `scripts/launch-rust.sh --client-only` +
-  browser hard-refresh, no server restart. Task 5's ONLY server-tree edit is
-  doc strings in `server/mcp/freshell-tool.ts` (agent-facing instructions):
-  those ship to MCP agents the next time the MCP server binary is
-  rebuilt/deployed (production MCP prefers `dist/server/mcp/server.js`), do
-  not affect runtime behavior, and are NOT required for the behavior fix — no
-  server restart is implied by this plan. The frozen WS contract
+- **As-built (rounds 21–24 supersede the original client-only plan): this
+  delta now changes BOTH servers and the client.** Server-side: the two layout
+  stores hold focus-neutral cursors for agent creates/splits
+  (`server/agent-api/layout-store.ts`, `crates/freshell-freshagent/src/layout_store.rs`),
+  and the screenshot round-trip stamps its RELATIVE budget
+  (`server/ws-handler.ts`, `crates/freshell-ws/src/screenshot.rs`,
+  `crates/freshell-server/src/screenshots.rs`). Deployment therefore requires
+  rebuilding + restarting the Rust server (`scripts/launch-rust.sh`), not a
+  client-only refresh. Task 5's doc-string edit in `server/mcp/freshell-tool.ts`
+  (agent-facing instructions) still ships with the MCP server binary as before.
+  The frozen WS contract
   (`port/contract/ws-server-messages.schema.json:3205-3221`, `"payload": true`)
-  is untouched.
+  remains untouched: the screenshot payload's added `ttlMs` key carries inside
+  the free-form payload field, no schema shape change.
 - **Base sync first.** At plan-write time the branch is 2 commits behind
   `origin/main`. Before executing Task 1: `git fetch origin` and
   fast-forward/rebase the branch onto `origin/main`, update run-state's base
@@ -2243,6 +2247,9 @@ containment does not qualify as behavioral coverage (pre-existing doc-string
 tests elsewhere are untouched — out of scope).
 
 ## Fresh Eyes record
+
+- **Delta round 24 (Codex, independent; base 5b8717017): FAILED — 4 Majors + 1 Minor**, all assessed valid and fixed: (M1) the r23 capture-scoped focusin listener treated EVERY pane focusin as user selection, including the capture's own capture-induced eligibility autofocus (components programmatically focus on flip) → the capture superseded itself / its own restore vetoed its targets. RESTATED with platform truth from focus-steal-guard.ts: nested-iframe engagement is a HoIST (activeElement becomes the iframe, no focusin fires parent-side) — the listener now observes focusout + window blur and attributes only when activeElement IS an iframe inside a pane subtree; the negative pin (in-pane input focus during capture fully restores) and the genuine-hoist pin both ride a real jsdom focus() instead of a fabricated focusin; (M2) the r23 test fabricated a parent-document focusin — impossible in Chromium — replaced by displacement-focusout observation (above); (M3) an abandoned capture's delayed iframe-marker cleanup could erase its successor's markers (`previousMarkers` restore unconditional) → cleanup now restores only markers it still owns (iframe→our marker map); (M4) even relative budgets started at COMMAND-HANDLING time, letting queued frames bank a full window → budget is now capped at receipt against the client-internal 8s ceiling (stale delivery can no longer inflate the window; fully enclosing skew would need clock negotiation — threat model); (Minor) the plan doc's "no runtime changes under server/ or crates/" claim was contradicted by rounds 21–23 — rewritten to state the as-built deployment (Rust server rebuild+restart required; frozen WS contract still untouched because ui.command payload is free-form).
+  Runner report: `.worktrees/.the-usual-logs/mcp-focus-neutrality/review-logs/usual-fresheyes-20260907T164856Z-1385121.md`
 
 - **Delta round 23 (Codex, independent; base 5b8717017): FAILED — 4 Majors**, all assessed valid and fixed: (M1) suspension depth incremented AFTER the suspend+paint window, so an abandon landing mid-acquisition (rAF can stall in background tabs) left the successor seeing depth 0: it re-suspended handlers and replace the resume bookkeeping → depth now increments at ENTRY and the acquisition paint/join logic skips re-collection; the capture registers its exactly-once wind-down fence BEFORE beginning suspension, with a late-resumer handoff when abandonment lands mid-acquisition (pinned by a same-tick double-entry test); (M2) the restore's own plain dispatches (r22 co-touch active-tab attribution) made pane restores mark the TAB coordinate touched, vetoing the tab restore that follows → restores now use the serial-invisible capture actions (setActivePane capture:true / selectTabForCapture), pinned by a "restore never self-poisons" test; (M3) the absolute server-epoch deadline compared against browser clocks — cross-device/phone clients share no wall clock → both servers now stamp a RELATIVE ttlMs budget and the client converts it to a local deadline at receipt (ws-protocol + broker payload tests updated); stale deadlineAtMs support dropped (never deployed); (M4) user interaction INSIDE an unlocked browser/extension iframe is invisible to shell handlers (nested-document events don't bubble) → during captures a document focusin (capture-phase) listener attributes focus landing inside any pane to its coordinates via noteDomPaneSelection (pane coordinate always, tab coordinate when that tab is active), pinned by a click-into-iframe-during-capture test. Test-hygiene: two park-then-release patterns now release in `finally`, and the supersession describe drains the capture queue in afterEach so deadline+grace deference cannot bleed across shuffled tests under suite load.
   Runner report: `.worktrees/.the-usual-logs/mcp-focus-neutrality/review-logs/usual-fresheyes-20260907T153404Z-2637181.md`

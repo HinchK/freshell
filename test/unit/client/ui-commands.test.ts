@@ -7,6 +7,7 @@ import panesReducer from '../../../src/store/panesSlice'
 
 vi.mock('../../../src/lib/ui-screenshot', () => ({
   captureUiScreenshot: vi.fn(),
+  CAPTURE_QUEUE_TTL_MS: 8000,
 }))
 
 describe('handleUiCommand', () => {
@@ -249,6 +250,35 @@ describe('handleUiCommand', () => {
     // wall clock between server and browser device.
     expect(call.deadlineAtMs).toBeGreaterThan(Date.now())
     expect(call.deadlineAtMs).toBeLessThanOrEqual(Date.now() + 7_500 + 1_000)
+  })
+
+  it('caps the server-stamped budget at the internal ceiling (stale delivery cannot inflate remaining time)', async () => {
+    const dispatch = vi.fn()
+    const send = vi.fn()
+    const getState = vi.fn(() => ({}))
+
+    vi.mocked(captureUiScreenshot).mockResolvedValue({
+      ok: false,
+      changedFocus: false,
+      restoredFocus: false,
+      error: 'expired',
+    })
+
+    const atReceipt = Date.now()
+    handleUiCommand(
+      {
+        type: 'ui.command',
+        command: 'screenshot.capture',
+        payload: { requestId: 'req-9', scope: 'view', ttlMs: 60_000 },
+      },
+      { dispatch: dispatch as any, getState, send },
+    )
+
+    await Promise.resolve()
+
+    const call = vi.mocked(captureUiScreenshot).mock.calls[0]![0] as any
+    expect(call.deadlineAtMs).toBeLessThanOrEqual(atReceipt + 9_000) // 8s internal ceiling + slack
+    expect(call.deadlineAtMs).toBeGreaterThan(Date.now())
   })
 
   it('leaves deadlineAtMs unset when the server stamped no budget (fallback internal TTL applies)', async () => {

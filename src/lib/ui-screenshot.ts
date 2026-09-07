@@ -227,7 +227,7 @@ function buildIframeReplacementElement(
   return container
 }
 
-async function prepareIframeCapture(target: HTMLElement, scale: number, throwIfStale?: () => void): Promise<PreparedIframeCapture> {
+export async function prepareIframeCapture(target: HTMLElement, scale: number, throwIfStale?: () => void): Promise<PreparedIframeCapture> {
   const iframes = Array.from(target.querySelectorAll('iframe'))
   if (iframes.length === 0) {
     return {
@@ -238,6 +238,9 @@ async function prepareIframeCapture(target: HTMLElement, scale: number, throwIfS
 
   const markedIframes = new Map<string, HTMLIFrameElement>()
   const previousMarkers = new Map<HTMLIFrameElement, string | null>()
+  // iframe → the marker WE stamped, so cleanup restores only our own marks:
+  // an abandoned capture's late cleanup must never erase the successor's.
+  const ourMarkerByIframe = new Map<HTMLIFrameElement, string>()
   const replacements = new Map<string, IframeReplacement>()
   const markerPrefix = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 
@@ -246,6 +249,7 @@ async function prepareIframeCapture(target: HTMLElement, scale: number, throwIfS
     const marker = `shot-iframe-${markerPrefix}-${i}`
     previousMarkers.set(iframe, iframe.getAttribute(IFRAME_MARKER_ATTR))
     iframe.setAttribute(IFRAME_MARKER_ATTR, marker)
+    ourMarkerByIframe.set(iframe, marker)
     markedIframes.set(marker, iframe)
   }
 
@@ -270,6 +274,10 @@ async function prepareIframeCapture(target: HTMLElement, scale: number, throwIfS
     },
     cleanup: () => {
       for (const [iframe, previous] of previousMarkers) {
+        const ours = ourMarkerByIframe.get(iframe)
+        // A successor capture re-stamped this marker while we were away:
+        // restoring our recorded previous value would erase ITS marker.
+        if (ours !== undefined && iframe.getAttribute(IFRAME_MARKER_ATTR) !== ours) continue
         if (previous === null) {
           iframe.removeAttribute(IFRAME_MARKER_ATTR)
         } else {
@@ -427,7 +435,7 @@ let captureTail: Promise<unknown> = Promise.resolve()
 // queue/execution age must therefore be measured against the stamped deadline
 // (when present), never against local receipt time. When the deadline is
 // absent (older servers), bound queue waits client-side:
-const CAPTURE_QUEUE_TTL_MS = 8000
+export const CAPTURE_QUEUE_TTL_MS = 8000
 // A job whose execution blows past its deadline is wedged (a hung renderer,
 // html2canvas, ...). It cannot be cancelled, so the tail abandons it after a
 // grace window — one stalled capture must not starve every later screenshot
@@ -558,26 +566,35 @@ async function performUiScreenshotCapture(request: ScreenshotRequest, ctx: Runti
   let restoreRenderersFn: (() => Promise<void>) | null = null
   let resumeAfterAcquire = false
 
-  // Focus landing INSIDE a pane during the capture (including reaching into a
-  // nested iframe — those events never bubble to the shell's React handlers)
-  // is user selection activity for the supersession machinery.
-  const handleCaptureFocusIn = (event: Event) => {
-    const el = event.target as HTMLElement | null
-    if (!el || typeof el.closest !== 'function') return
+  // User engagement reaching INTO a pane's nested iframe during a capture is
+  // user selection activity — but it must be detected with platform truth:
+  // nested-document engagement is a HOIST (activeElement becomes the iframe);
+  // focus/focusin never fire parent-side for it (Chromium-verified, see
+  // focus-steal-guard.ts). The observables are focusout on the displaced
+  // element and window blur (when body was displaced). Checking after a task
+  // because the activeElement reassignment is mid-flight during dispatch.
+  // focusin would ALSO catch the capture's own programmatic focus writes —
+  // this never confuses hoisting with eligibility autofocus.
+  const checkForIframeHoist = () => {
+    const el = document.activeElement as HTMLElement | null
+    if (!el || el.tagName !== 'IFRAME' || typeof el.closest !== 'function') return
     const paneHost = el.closest('[data-pane-id]') as HTMLElement | null
     if (!paneHost) return
-    const tabId = (paneHost.closest('[data-tab-id]') as HTMLElement | null)?.getAttribute('data-tab-id')
-      ?? el.closest('[data-tab-id]')?.getAttribute('data-tab-id')
+    const tabId = (paneHost.closest('[data-tab-id]') as HTMLElement | null)
+      ?.getAttribute('data-tab-id')
       ?? null
     noteDomPaneSelection(tabId, ctx.getState().tabs.activeTabId === tabId)
   }
-  document.addEventListener('focusin', handleCaptureFocusIn, true)
+  const onHoistSignal = () => { setTimeout(checkForIframeHoist, 0) }
+  document.addEventListener('focusout', onHoistSignal)
+  window.addEventListener('blur', onHoistSignal)
 
   const windDown = async () => {
     if (windDownDone) return
     windDownDone = true
     pendingWindDown.delete(epoch)
-    document.removeEventListener('focusin', handleCaptureFocusIn, true)
+    document.removeEventListener('focusout', onHoistSignal)
+    window.removeEventListener('blur', onHoistSignal)
     // Restore Redux selection state BEFORE releasing the renderers: the
     // successor's snapshot must see the rollback, and restoreFocus dispatches
     // synchronously up to its paint await, while renderer resume only frees

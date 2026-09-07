@@ -16,7 +16,7 @@ import connectionReducer from '@/store/connectionSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
-import { captureUiScreenshot, drainCaptureQueueForTests, restoreFocus } from '../../../src/lib/ui-screenshot'
+import { captureUiScreenshot, drainCaptureQueueForTests, prepareIframeCapture, restoreFocus } from '../../../src/lib/ui-screenshot'
 import { getPaneSelectionSerial, paneSelectionMiddleware, wirePaneFocusOwnershipInvalidation } from '@/lib/pane-focus-ownership'
 import { suspendTerminalRenderersForScreenshot } from '../../../src/lib/screenshot-capture-env'
 
@@ -451,6 +451,31 @@ function createFocusStore() {
     } as any,
   })
 }
+
+describe('prepareIframeCapture marker fencing', () => {
+  beforeEach(() => { document.body.innerHTML = '' })
+
+  it("an abandoned capture's cleanup restores ONLY its own markers (never the successor's)", async () => {
+    document.body.innerHTML = '<div id="scope"><iframe id="fr"></iframe></div>'
+    const scope = document.getElementById('scope')!
+    const iframe = document.getElementById('fr') as HTMLIFrameElement
+    setRect(iframe, 100, 100)
+    const prepA = await prepareIframeCapture(scope, 1)
+    const markerA = iframe.getAttribute('data-screenshot-iframe-marker')
+    expect(markerA).toBeTruthy()
+    // The successor's prep interleaves with the abandoned capture's cleanup.
+    const prepB = await prepareIframeCapture(scope, 1)
+    const markerB = iframe.getAttribute('data-screenshot-iframe-marker')!
+    expect(markerB).not.toBe(markerA)
+    prepA.cleanup() // abandoned capture ending late — must not touch B's marker
+    expect(iframe.getAttribute('data-screenshot-iframe-marker')).toBe(markerB)
+    // B's cleanup restores what predated B — in this overlapped crime scene
+    // that is A's marker (in the un-abandoned world it is the pre-capture
+    // null). A stale marker then harms nothing: the next capture re-marks.
+    prepB.cleanup()
+    expect(iframe.getAttribute('data-screenshot-iframe-marker')).toBe(markerA)
+  })
+})
 
 describe('restoreFocus deleted-target hardening', () => {
 
@@ -1016,39 +1041,70 @@ describe('captureUiScreenshot newer-selection supersession', () => {
     }
   })
 
-  it('user interaction INSIDE an iframe of the capture-exposed pane keeps both coordinates (nested-document events never bubble to shell handlers)', async () => {
+  it('user engagement reaching INTO an iframe of the capture-exposed pane keeps both coordinates (Chromium: hoist fires focusout on the displaced element)', async () => {
     const store = createFocusStore()
-    // Pane shell subtree for tab-2 (mirrors the real DOM contract: the shell
-    // carries data-tab-id + data-pane-id; the iframe never bubbles focusin).
     document.body.innerHTML = `
-      <div data-pane-shell="true" data-tab-id="tab-2" data-pane-id="pane-2"></div>
+      <div data-pane-shell="true" data-tab-id="tab-2" data-pane-id="pane-2">
+        <input id="url-field" placeholder="Enter URL...">
+      </div>
       <div data-tab-content-id="tab-2" style="display:none" id="tab2-target"></div>`
     const shell = document.querySelector('[data-pane-shell]')!
     const iframe = document.createElement('iframe')
     iframe.title = 'Framed page'
     shell.appendChild(iframe)
+    const urlField = document.getElementById('url-field')!
     const tabEl = document.getElementById('tab2-target')!
     setRect(tabEl, 300, 200)
-    // The capture moving to tab-2 makes its content visible.
     const unsubscribe = store.subscribe(() => {
-      if (store.getState().tabs.activeTabId === 'tab-2') tabEl.style.display = 'block'
+      if (store.getState().tabs.activeTabId !== 'tab-2') return
+      tabEl.style.display = 'block'
+      // The user is already in the pane's URL field when the capture is
+      // showing…
+      urlField.focus()
     })
     try {
       const capturing = captureUiScreenshot(
         { scope: 'tab', tabId: 'tab-2' },
         { dispatch: store.dispatch, getState: store.getState } as any,
       )
-      // The user clicks/keys INSIDE the iframe while the capture shows tab-2 —
-      // focus lands on the frame element; nothing reaches the pane shell's own
-      // handlers.
       await waitFor(() => expect(store.getState().tabs.activeTabId).toBe('tab-2'), { timeout: 10_000 })
-      iframe.dispatchEvent(new FocusEvent('focusin', { bubbles: true }))
+      // …and then clicks INTO the embedded page. The parent sees the
+      // displacement: focusout on the URL field, activeElement becomes iframe.
+      iframe.focus()
       const result = await capturing
-      // next tick drain for restore
       await waitFor(() => expect(store.getState().tabs.activeTabId).toBe('tab-2'), { timeout: 10_000 })
-      expect(result.ok).toBe(false) // no real png in jsdom — the rollback contract is what matters
       expect(result.changedFocus).toBe(true)
       expect(store.getState().tabs.activeTabId).toBe('tab-2') // user stayed on the tab they were engaging
+    } finally {
+      unsubscribe()
+    }
+  })
+
+  it('in-pane INPUT focus during the capture never reads as user selection (only genuine in-iframe engagement does)', async () => {
+    const store = createFocusStore()
+    document.body.innerHTML = `
+      <div data-pane-shell="true" data-tab-id="tab-2" data-pane-id="pane-2">
+        <input id="url-field" placeholder="Enter URL...">
+      </div>
+      <div data-tab-content-id="tab-2" style="display:none" id="tab2-target"></div>`
+    const urlField = document.getElementById('url-field')!
+    const tabEl = document.getElementById('tab2-target')!
+    setRect(tabEl, 300, 200)
+    // The capture's eligibility flip arrives → a component programmatically
+    // focuses its own surface (capture-induced, NOT the user).
+    const unsubscribe = store.subscribe(() => {
+      if (store.getState().tabs.activeTabId !== 'tab-2') return
+      tabEl.style.display = 'block'
+      urlField.focus()
+    })
+    try {
+      const result = await captureUiScreenshot(
+        { scope: 'tab', tabId: 'tab-2' },
+        { dispatch: store.dispatch, getState: store.getState } as any,
+      )
+      expect(result.changedFocus).toBe(true)
+      expect(result.restoredFocus).toBe(true)
+      expect(store.getState().tabs.activeTabId).toBe('tab-1') // full rollback — no supersession misfire
     } finally {
       unsubscribe()
     }

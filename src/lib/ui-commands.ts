@@ -1,6 +1,6 @@
 import { addTab, setActiveTab, closeTab, closePaneWithCleanup } from '@/store/tabsSlice'
 import { initLayout, splitPane, setActivePane, nudgePaneFocus, updatePaneContent, resizePanes, swapPanes } from '@/store/panesSlice'
-import { captureUiScreenshot } from '@/lib/ui-screenshot'
+import { captureUiScreenshot, CAPTURE_QUEUE_TTL_MS } from '@/lib/ui-screenshot'
 import type { AppDispatch, RootState } from '@/store/store'
 import { applyPaneRename, applyTabRename } from '@/store/titleSync'
 
@@ -45,9 +45,11 @@ async function handleScreenshotCapture(msg: any, runtime: UiCommandRuntime): Pro
   // The server stamps its RELATIVE round-trip budget so capture work that
   // could only answer an already-failed request expires instead of mutating
   // the UI. Convert to a local deadline at receipt — browsers on other
-  // devices/phones share no wall clock with the server.
+  // devices/phones share no wall clock with the server, and stale delivery
+  // (queued frames on a frozen tab) is capped at the internal ceiling so a
+  // frame arriving long after it left can never bank a full server window.
   const deadlineAtMs = typeof payload.ttlMs === 'number' && Number.isFinite(payload.ttlMs)
-    ? Date.now() + Math.max(0, payload.ttlMs)
+    ? Date.now() + Math.max(0, Math.min(payload.ttlMs, CAPTURE_QUEUE_TTL_MS))
     : undefined
 
   try {
