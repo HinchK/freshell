@@ -18,7 +18,7 @@
 
 ## Requirements
 
-- **R1 — Outcome:** A right-click on a fresh-agent transcript turn produces exactly one `role="menu"` element, and it is the turn menu ("Turn context menu"). A long-press on a turn opens only the transcript's action sheet (never also the provider's pane menu), and the gesture's release does not dismiss the just-opened sheet or activate an item.
+- **R1 — Outcome:** A right-click on a fresh-agent transcript turn produces exactly one `role="menu"` element, and it is the turn menu ("Turn context menu"). On touch-primary (coarse-pointer) devices — the only devices where the transcript owns a touch turn gesture — a long-press on a turn opens only the transcript's action sheet (never also the provider's pane menu), and the gesture's release does not dismiss the just-opened sheet or activate an item, including when the transcript rerenders mid-gesture. (Scope note, delta-review round 1: hybrid devices with a fine primary pointer + touch, e.g. iPad + trackpad, never had a transcript turn gesture — the pre-existing provider long-press → pane-menu fallback there is unchanged by design and is R2 territory, not R1.)
 - **R2 — Constraint:** Right-clicking anywhere else in a fresh-agent pane (outside a turn article), and right-clicking in terminal/editor/picker panes, still opens the provider's normal context menu. All existing menu behavior, long-press menus for non-turn surfaces (including their release suppression), and the keyboard Shift+F10 path are unchanged.
 - **R3 — Evidence:** Unit tests red-before/green-after; the existing Playwright turn-menu pin extended to assert the single-menu invariant, run and recorded RED before the production change and GREEN after.
 
@@ -42,6 +42,11 @@
   - `onTouchEnd(event)` (signature gains the event): when `overlayOpenedDuringTouch` is set and the event is cancelable, call `event.preventDefault()` — cancelling the synthesized compatibility click that would otherwise dismiss the freshly-opened sheet or activate a row. Pending/aborted presses (tap, move, cancel) behave exactly as today: no preventDefault.
   - `onTouchCancel` clears both flags without preventing anything.
   - `buildLongPressHandlers` has no other consumer (repo-wide search: `FreshAgentTranscript` only), so no other surface changes behavior.
+  - **Gesture state must survive transcript rerenders (delta-review round 1):** the current `useMemo([actions, actionTurn])` rebuilds the closure with fresh state whenever the view streams new snapshots — an in-flight gesture (timer armed / overlay flag set) would be orphaned and the following release unsuppressed. The turn article instead:
+    - keeps the builder product in a `useRef` created at most once per mounted article;
+    - feeds the open callback the LATEST handler/turn through refs (`onOpenActionsRef.current?.(turnRef.current)`), so state survives while behavior stays current;
+    - the `handlers` spread and `data-longpress-owned` key off the current `actions.onOpenActions` presence as before;
+    - one regression test proves it: combined touch gesture where the transcript is RERENDERED (e.g. `rerender()` with an updated unrelated prop) between `touchstart` and `touchend` — sheet opens once, release still preventDefault'd, sheet stays open.
 
 **Files:**
 - Modify: `src/components/context-menu/ContextMenuProvider.tsx`
