@@ -98,7 +98,7 @@ jobs:
       - name: Rust workspace tests
         env:
           FRESHELL_SERVER_BIN: ${{ github.workspace }}/target/debug/freshell-server
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
 
       # Dedicated Tauri smoke with --nocapture so the CI log visibly shows
       # "using server binary:" (confirming the test exercised the real binary,
