@@ -2048,6 +2048,7 @@ async fn plan_codex_managed_launch(
         model: plan_model.as_deref(),
         sandbox: plan_sandbox.as_deref(),
         approval_policy: plan_approval.as_deref(),
+        sidecar_context: freshell_codex::launch_plan::CodexSidecarLaunchContext::default(),
     };
     let manager = freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global();
     let result = match cancel {

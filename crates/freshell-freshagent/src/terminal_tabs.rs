@@ -1563,6 +1563,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                 model: model.as_deref(),
                 sandbox: sandbox.as_deref(),
                 approval_policy: permission_mode.as_deref(),
+                sidecar_context: freshell_codex::launch_plan::CodexSidecarLaunchContext::default(),
             };
             match freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
                 .plan_create_with_retry_uncancellable(
