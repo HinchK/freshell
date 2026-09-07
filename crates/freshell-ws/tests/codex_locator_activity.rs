@@ -270,16 +270,16 @@ async fn fresh_pane_locator_identity_reaches_activity_and_turn_complete() {
     std::env::remove_var("CODEX_ARGV_CAPTURE_PATH");
 }
 
-/// pkvz deterministic reproduction: the load-induced flake happens when
-/// `CodexAttach`'s initial drain reads `task_started`+`task_complete` in ONE
-/// batch (the hub delayed between `CodexBind` and `CodexAttach`, and the test
-/// appended both before the drain ran). This test forces that one-batch drain
-/// deterministically by writing `session_meta` + `task_started` +
-/// `task_complete` ALL AT ONCE before the locator resolves. The initial drain
-/// (offset 0→EOF for files ≤ 256 KB) then folds both events into one
-/// `reconcile_rollout` call. Without the fix, the same-batch clear shadows the
-/// start promotion, `accepted_start_at` stays `None`, and
-/// `terminal.turn.complete` never fires. No load dependence.
+/// pkvz end-to-end non-regression guard: proves the one-batch drain path
+/// (session_meta + task_started + task_complete in one `reconcile_rollout`
+/// call) produces a `terminal.turn.complete` end-to-end through the real
+/// server, socket, PTY, inotify watcher, and activity hub. The deterministic
+/// RED/GREEN evidence for the one-batch SUPPRESSION is in the three unit tests
+/// in `freshell-activity/src/codex.rs` (which deterministically set the
+/// `queued_submit_at` state the suppression requires). This integration test
+/// does NOT reproduce the suppression (the queued-submit race is not
+/// deterministically controllable from the WS client); it proves the
+/// one-batch drain path works end-to-end after the fix.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn fresh_pane_locator_one_batch_drain_records_turn_complete() {
@@ -318,8 +318,8 @@ async fn fresh_pane_locator_one_batch_drain_records_turn_complete() {
     // First Enter: opens the 2s window, re-snapshots known_files (no rollout).
     // Wait for the server's `codex.activity.updated` with `phase: "pending"`
     // (proves note_possible_submit completed the re-snapshot AND note_input set
-    // Pending) instead of a blind sleep — the re-snapshot MUST finish before
-    // the rollout is written, or it would be permanently excluded.
+    // Pending) — the re-snapshot MUST finish before the rollout is written, or
+    // it would be permanently excluded.
     common::send_input(&mut ws, &terminal_id, "\r").await;
     let pending = wait_for_frame(&mut ws, |v| {
         v["type"] == "codex.activity.updated"
@@ -337,24 +337,12 @@ async fn fresh_pane_locator_one_batch_drain_records_turn_complete() {
         "expected codex.activity.updated with phase=pending after the first Enter"
     );
 
-    // Let the 2s Enter-anchored window resolve with zero candidates. The
-    // pending frame above proves the first Enter was processed (note_input set
-    // Pending AND the locator's re-snapshot completed). The 2s window opens at
-    // the first Enter; the 150ms sweep resolves it at most 2.15s later. This
-    // test runs in isolation (ENV_LOCK serializes the two tests; no other
-    // test binary contends for the blocking pool), so the 3s sleep gives 850ms
-    // margin over the worst-case 2.15s resolution — matching the existing
-    // test's proven margin at line 181. After this, the locator marks the
-    // terminal resolved=true; the second Enter re-opens the window WITHOUT
-    // re-snapshotting, so the rollout written below is the sole new candidate.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
+    // Write the rollout WITHIN the 2s window (the pending frame above proves
+    // the re-snapshot completed, so this file is a new candidate). The 150ms
+    // locator sweep will find it and bind it; CodexAttach's initial drain reads
+    // all three lines in ONE reconcile_rollout call — the one-batch path.
     let cwd = std::env::temp_dir().to_string_lossy().to_string();
     let rollout = sessions_day.join(format!("rollout-2026-07-24T12-00-00-{THREAD}.jsonl"));
-    // Use far-future timestamps so task_started > queued_submit_at (the second
-    // Enter's server-side note_input time), matching the original flake's
-    // timeline where task_started is appended AFTER both Enters. The tracker
-    // only compares timestamps; it doesn't validate them against wall clock.
     let ts = 9_999_999_999_999;
     std::fs::write(
         &rollout,
@@ -366,8 +354,7 @@ async fn fresh_pane_locator_one_batch_drain_records_turn_complete() {
     )
     .unwrap();
 
-    common::send_input(&mut ws, &terminal_id, "\r").await;
-
+    // The sweep (150ms) finds the rollout within the 2s window and binds it.
     let bound = wait_for_frame(&mut ws, |v| {
         v["type"] == "codex.activity.updated"
             && v["upsert"]
@@ -385,6 +372,7 @@ async fn fresh_pane_locator_one_batch_drain_records_turn_complete() {
         "expected codex.activity.updated carrying the locator-resolved sessionId"
     );
 
+    // The one-batch initial drain records a `terminal.turn.complete`.
     let completed = wait_for_frame(&mut ws, |v| {
         v["type"] == "terminal.turn.complete"
             && v["terminalId"] == terminal_id.as_str()
@@ -394,7 +382,7 @@ async fn fresh_pane_locator_one_batch_drain_records_turn_complete() {
     .await;
     assert!(
         completed,
-        "expected terminal.turn.complete from the one-batch initial drain (pkvz root cause)"
+        "expected terminal.turn.complete from the one-batch initial drain"
     );
 
     registry.kill(&terminal_id);

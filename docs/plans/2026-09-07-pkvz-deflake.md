@@ -444,16 +444,29 @@ async fn fresh_pane_locator_one_batch_drain_records_turn_complete() {
     let terminal_id = send_create(&mut ws, "codex").await;
 
     // First Enter: opens the 2s window, re-snapshots known_files (no rollout).
+    // Wait for the server's codex.activity.updated with phase=pending (proves
+    // the re-snapshot completed before the rollout is written).
     common::send_input(&mut ws, &terminal_id, "\r").await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    let pending = wait_for_frame(&mut ws, |v| {
+        v["type"] == "codex.activity.updated"
+            && v["upsert"]
+                .as_array()
+                .map(|u| {
+                    u.iter()
+                        .any(|r| r["terminalId"] == terminal_id.as_str() && r["phase"] == "pending")
+                })
+                .unwrap_or(false)
+    })
+    .await;
+    assert!(pending, "expected codex.activity.updated with phase=pending");
 
-    // Write ALL THREE lines at once: session_meta + task_started + task_complete.
-    // The locator probes only the FIRST line (session_meta) for identity; the
-    // adoption tail's initial drain reads ALL lines and folds them into one
-    // reconcile_rollout call — the one-batch path.
+    // Write the rollout WITHIN the 2s window (the pending frame proves the
+    // re-snapshot completed, so this file is a new candidate). The 150ms
+    // locator sweep finds it and binds it; CodexAttach's initial drain reads
+    // all three lines in ONE reconcile_rollout call — the one-batch path.
     let cwd = std::env::temp_dir().to_string_lossy().to_string();
     let rollout = sessions_day.join(format!("rollout-2026-07-24T12-00-00-{THREAD}.jsonl"));
-    let ts = 9_999_999_999_999; // far-future so task_started > queued_submit_at
+    let ts = 9_999_999_999_999;
     std::fs::write(
         &rollout,
         format!(
@@ -464,11 +477,7 @@ async fn fresh_pane_locator_one_batch_drain_records_turn_complete() {
     )
     .unwrap();
 
-    // Second Enter: re-opens a resolved window WITHOUT re-snapshotting, so
-    // the file written above is the sole new candidate.
-    common::send_input(&mut ws, &terminal_id, "\r").await;
-
-    // The locator resolves and the adoption tail emits codex.activity.updated.
+    // The sweep (150ms) finds the rollout within the 2s window and binds it.
     let bound = wait_for_frame(&mut ws, |v| {
         v["type"] == "codex.activity.updated"
             && v["upsert"]
@@ -486,9 +495,7 @@ async fn fresh_pane_locator_one_batch_drain_records_turn_complete() {
         "expected codex.activity.updated carrying the locator-resolved sessionId"
     );
 
-    // The initial drain at CodexAttach read all three lines in ONE batch. The
-    // fix makes the one-batch start+clear record the completion; without it,
-    // the same-batch clear shadows the promotion and no turn.complete fires.
+    // The one-batch initial drain records a terminal.turn.complete.
     let completed = wait_for_frame(&mut ws, |v| {
         v["type"] == "terminal.turn.complete"
             && v["terminalId"] == terminal_id.as_str()
@@ -498,7 +505,7 @@ async fn fresh_pane_locator_one_batch_drain_records_turn_complete() {
     .await;
     assert!(
         completed,
-        "expected terminal.turn.complete from the one-batch initial drain (pkvz root cause)"
+        "expected terminal.turn.complete from the one-batch initial drain"
     );
 
     registry.kill(&terminal_id);
@@ -507,25 +514,25 @@ async fn fresh_pane_locator_one_batch_drain_records_turn_complete() {
 }
 ```
 
-- [ ] **Step 2: Verify the new test fails without the fix (RED)**
+- [ ] **Step 2: Run the new test (non-regression guard)**
 
-The fix from Task 1 is already committed. To verify the RED, temporarily
-revert the fix, run the test, then restore the fix:
+This integration test is a non-regression guard, NOT a RED/GREEN test. The
+deterministic RED/GREEN evidence for the one-batch suppression is in the three
+unit tests in Task 1 (which deterministically set the `queued_submit_at` state
+the suppression requires). This integration test proves the one-batch drain
+path works end-to-end through the real server, socket, PTY, inotify watcher,
+and activity hub.
 
 ```bash
 cd /home/dan/code/freshell/.worktrees/pkvz-deflake && \
-  git stash && \
   cargo test -p freshell-ws --test codex_locator_activity \
-  fresh_pane_locator_one_batch_drain_records_turn_complete -- --exact --test-threads=1 --nocapture; \
-  RED=$?; git stash pop; exit $RED
+  fresh_pane_locator_one_batch_drain_records_turn_complete -- --exact --test-threads=1 --nocapture
 ```
 
-Expected: FAIL at the `assert!(completed, ...)` — the one-batch suppression
-prevents `terminal.turn.complete` from firing within the 120s budget. This is
-the deterministic root-cause reproduction: no load dependence. (Verified during
-execution: 125s timeout without the fix, 5s with the fix.)
+Expected: PASS — the one-batch initial drain records the completion and
+`terminal.turn.complete` fires with `provider=codex` and `sessionId=THREAD`.
 
-- [ ] **Step 3: Run the existing integration test (non-regression, pre-fix)**
+- [ ] **Step 3: Run the existing integration test (non-regression)**
 
 ```bash
 cd /home/dan/code/freshell/.worktrees/pkvz-deflake && \
@@ -539,20 +546,7 @@ cd /home/dan/code/freshell/.worktrees/pkvz-deflake && \
 Expected: 5/5 PASS (the existing test is green in isolation; the flake is
 load-dependent. This confirms the Task 1 fix didn't break the existing path.)
 
-- [ ] **Step 4: Run the new test after the Task 1 fix (GREEN)**
-
-After Task 1 is complete, re-run the deterministic one-batch test:
-
-```bash
-cd /home/dan/code/freshell/.worktrees/pkvz-deflake && \
-  cargo test -p freshell-ws --test codex_locator_activity \
-  fresh_pane_locator_one_batch_drain_records_turn_complete -- --exact --test-threads=1 --nocapture
-```
-
-Expected: PASS — the one-batch initial drain now records the completion and
-`terminal.turn.complete` fires with `provider=codex` and `sessionId=THREAD`.
-
-- [ ] **Step 5: Broader suite non-regression**
+- [ ] **Step 4: Broader suite non-regression**
 
 Run the codex/locator integration surface and the activity unit crate together:
 
@@ -566,21 +560,22 @@ cd /home/dan/code/freshell/.worktrees/pkvz-deflake && \
 
 Expected: all PASS.
 
-- [ ] **Step 6: Commit the new test**
+- [ ] **Step 5: Commit the new test**
 
 ```bash
 cd /home/dan/code/freshell/.worktrees/pkvz-deflake && \
   git add crates/freshell-ws/tests/codex_locator_activity.rs && \
-  git commit -m "test(codex-locator): deterministic one-batch drain integration test (kata pkvz)
+  git commit -m "test(codex-locator): one-batch drain end-to-end non-regression guard (kata pkvz)
 
-Forces the load-induced one-batch path deterministically: writes session_meta +
-task_started + task_complete ALL AT ONCE before the locator resolves, so
-CodexAttach's initial drain reads all three lines in one reconcile_rollout call.
-Fails before the Task 1 fix (same-batch clear shadows the promotion); passes
-after. No load dependence — the root-cause end-to-end proof."
+Proves the one-batch drain path (session_meta + task_started + task_complete in
+one reconcile_rollout call) produces a terminal.turn.complete end-to-end through
+the real server, socket, PTY, inotify watcher, and activity hub. The deterministic
+RED/GREEN evidence for the one-batch suppression is in the three unit tests in
+freshell-activity/src/codex.rs (which deterministically set the queued_submit_at
+state the suppression requires)."
 ```
 
-- [ ] **Step 7: No further commit (verification complete)**
+- [ ] **Step 6: No further commit (verification complete)**
 
 If any step reveals a remaining flake in
 `fresh_pane_locator_identity_reaches_activity_and_turn_complete`, that is a
