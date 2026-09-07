@@ -31,12 +31,14 @@
 **Behavior:**
 - **Half 1 — provider carve-out** (`src/components/context-menu/ContextMenuProvider.tsx`):
   - `handleContextMenu` (capture phase) returns early — no `openMenu`, no `preventDefault` — when the event target is inside `article[data-turn-role]`.
-  - `handleTouchStart` captures the gesture target (`e.target as HTMLElement | null`); when the 500ms long-press timer fires, if the ORIGINAL gesture target is inside `article[data-turn-role]`, the provider does nothing for this gesture: no `elementFromPoint` re-probe (by fire time the transcript's sheet is already open at 450ms and the probe would hit it), no haptic, no `openMenu`, and no `suppressNextTouchEnd` arming. For all other targets the current behavior is byte-identical.
-  - One module-scope predicate: `isFreshAgentTurnTarget(el: HTMLElement | null): boolean { return !!el?.closest?.('article[data-turn-role]') }`.
+  - `handleTouchStart` captures the gesture target (`e.target as HTMLElement | null`); when the 500ms long-press timer fires, if the ORIGINAL gesture target is inside `article[data-turn-role][data-longpress-owned="true"]`, the provider does nothing for this gesture: no `elementFromPoint` re-probe (by fire time the transcript's sheet is already open at 450ms and the probe would hit it), no haptic, no `openMenu`, and no `suppressNextTouchEnd` arming. For all other targets the current behavior is byte-identical.
+  - **Ownership boundary (review-mandated):** the transcript adds `data-longpress-owned="true"` to its turn articles exactly when it installed its own long-press handlers (the coarse-pointer `onOpenActions` path — `FreshAgentTranscript.tsx` ~766-770). The provider's touch carve-out keys on that attribute, NOT bare `data-turn-role`: hybrid-input devices (iPad + trackpad: fine primary pointer — repository notes at `src/lib/pointer.ts:5-9`, MDN `pointer` = primary device only) install no transcript long-press and fire no iOS contextmenu, so they keep today's provider long-press fallback untouched. The `handleContextMenu` carve-out keys on bare `article[data-turn-role]` — safe everywhere, because whenever a `contextmenu` event reaches a turn article the transcript always handles it (turn menu on fine pointers, action sheet on coarse).
+  - Two module-scope predicates in ContextMenuProvider.tsx: `isFreshAgentTurnTarget(el)` = `article[data-turn-role]`, `isFreshAgentLongPressOwnedTarget(el)` = `article[data-turn-role][data-longpress-owned="true"]`.
 - **Half 2 — transcript release suppression, covering BOTH sheet-open routes** (`src/lib/pointer.ts`, `buildLongPressHandlers`):
   - The builder tracks touch gesture state per closure: `touchActive` (set on `onTouchStart` with a single touch, cleared on end/cancel) and `overlayOpenedDuringTouch`.
   - Timer route (450ms long-press completes → callback opens the sheet): the builder marks `overlayOpenedDuringTouch = true` at completion.
   - Android native-`contextmenu` route (sheet opens mid-gesture before any timer): the builder exposes a new returned member `notifyOverlayOpened()`; the transcript's coarse-pointer `onContextMenu` branch (FreshAgentTranscript.tsx ~line 784-789) calls `longPress?.notifyOverlayOpened?.()` when it calls `actions.onOpenActions`. `notifyOverlayOpened` sets the flag only while a touch is active.
+  - **DOM-spread hazard (review-mandated):** the turn article spreads the builder's handlers (`{...(longPress ?? {})}`), so `notifyOverlayOpened` must NOT land in that spread — the transcript memo returns `{ handlers: { onTouchStart, onTouchMove, onTouchEnd, onTouchCancel }, notifyOverlayOpened }` (or destructures before spreading). React would otherwise warn about an unknown DOM prop and `test/setup/dom.ts` fails the suite on unexpected console.error.
   - `onTouchEnd(event)` (signature gains the event): when `overlayOpenedDuringTouch` is set and the event is cancelable, call `event.preventDefault()` — cancelling the synthesized compatibility click that would otherwise dismiss the freshly-opened sheet or activate a row. Pending/aborted presses (tap, move, cancel) behave exactly as today: no preventDefault.
   - `onTouchCancel` clears both flags without preventing anything.
   - `buildLongPressHandlers` has no other consumer (repo-wide search: `FreshAgentTranscript` only), so no other surface changes behavior.
@@ -52,13 +54,14 @@
 
 **Interfaces:**
 - Consumes: `article[data-turn-role]` markup contract from `src/components/fresh-agent/FreshAgentTranscript.tsx`; `FreshAgentActionSheet` opened via `onOpenActions`.
-- Produces: `isFreshAgentTurnTarget` (module-private in ContextMenuProvider.tsx); `buildLongPressHandlers` extended with touch-state tracking + returned `notifyOverlayOpened()`; transcript coarse-path calls it alongside `onOpenActions`.
+- Produces: `isFreshAgentTurnTarget(el)` and `isFreshAgentLongPressOwnedTarget(el)` (module-private in ContextMenuProvider.tsx); `buildLongPressHandlers` extended with touch-state tracking + returned `notifyOverlayOpened()`; transcript coarse-path calls it alongside `onOpenActions`; transcript articles carry `data-longpress-owned="true"` when their own long-press is installed.
 
 **Test cases:**
 - Unit (provider) — `fireEvent.contextMenu` on an element inside `<article data-turn-role="user">` within a `<div data-context="fresh-agent" data-tab-id=… data-pane-id=…>` → provider renders no app menu. Control: same event inside the pane container but OUTSIDE any turn article → provider menu opens.
 - Unit (pointer helper) — long-press timer completes → next `onTouchEnd` receives a preventDefault'd event; `notifyOverlayOpened()` during an active touch (the contextmenu route) → next `onTouchEnd` preventDefault'd; tap / moved / cancelled press → no preventDefault.
 - Unit (combined touch gesture, in FreshAgentMobile.test.tsx) — mount a coarse-pointer transcript (existing `stubCoarsePointer(true)` + TURNS harness) INSIDE the provider (the renderWithProvider wrapper pattern from ContextMenuProvider.test.tsx): `touchstart` on a turn → advance past 450ms (sheet opens) → advance past 500ms (provider timer) → assert exactly one overlay exists and it is the action sheet (no provider `role="menu"`); `touchend` (cancelable) → assert `defaultPrevented === true`; follow the existing provider-test convention and, when the event WAS prevented, do not synthesize a click — and when not prevented, synthesize the compat click over the sheet's actionable row to prove activation does not occur (assert the sheet remains and no item ran).
 - Unit (combined, Android contextmenu route) — same harness: `touchstart` on a turn, `fireEvent.contextMenu` on the turn BEFORE 450ms (sheet opens via the contextmenu route), `touchend` cancelable → `defaultPrevented === true`, sheet remains open.
+- Unit (hybrid-input regression) — provider long-press on a turn article WITHOUT `data-longpress-owned` (iPad-with-trackpad shape: fine primary pointer, no transcript long-press): the provider's long-press menu still opens (today's fallback preserved); and with `data-longpress-owned="true"`, it does not.
 - e2e — in the existing turn-menu pin: after a right click on the turn, assert `page.getByRole('menu')` count is exactly 1 and it is named "Turn context menu".
 
 - [ ] **Step 1: Write the failing behavioral tests + record the e2e RED first**
@@ -98,7 +101,7 @@ Run: `bash scripts/e2e-cloud.sh run --local --project=chromium --grep='turn cont
 
 Expected: PASS.
 
-6b. Typecheck + build: `npm run build`.
+6b. Typecheck + build + lint: `npm run build && npm run lint` (lint is repository-mandated before merging, AGENTS.md a11y section).
 
 Expected: PASS.
 
