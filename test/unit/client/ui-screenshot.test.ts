@@ -730,6 +730,49 @@ describe('captureUiScreenshot newer-selection supersession', () => {
     expect(store.getState().tabs.activeTabId).toBe('tab-1') // user's selection survives both captures
   })
 
+  it('expires queued captures that outlived the server request window instead of mutating the UI after the caller already failed', async () => {
+    const store = createFocusStore()
+    // Visible tab-2 element: the first capture completes without focus moves
+    // or visibility waits (which depend on Date.now — faked below).
+    document.body.innerHTML = '<div data-tab-content-id="tab-2" id="tab2-el"></div>'
+    setRect(document.getElementById('tab2-el')!, 200, 200)
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      let releaseFirst!: () => void
+      const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve })
+      const suspendMock = vi.mocked(suspendTerminalRenderersForScreenshot)
+      suspendMock.mockImplementationOnce(async () => {
+        await firstGate
+        return async () => {}
+      })
+      const first = captureUiScreenshot(
+        { scope: 'tab', tabId: 'tab-2' },
+        { dispatch: store.dispatch, getState: store.getState } as any,
+      )
+      // Let the FIRST job start and pass its own staleness check at T0 (it is
+      // gated inside the renderer suspension).
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      // The second capture queues. Before the first releases, time passes
+      // beyond the servers' ~10s pending-request timeout — its caller has
+      // already received failure.
+      const second = captureUiScreenshot(
+        { scope: 'tab', tabId: 'tab-2' },
+        { dispatch: store.dispatch, getState: store.getState } as any,
+      )
+      vi.setSystemTime(Date.now() + 9000)
+      releaseFirst()
+      const [firstResult, secondResult] = await Promise.all([first, second])
+      expect(firstResult).toBeDefined()
+      expect(secondResult.ok).toBe(false)
+      expect(secondResult.error).toMatch(/expired while queued/)
+      // The expired job never ran: no renderer suspension, no focus mutation.
+      expect(suspendMock).toHaveBeenCalledTimes(1)
+      expect(store.getState().tabs.activeTabId).toBe('tab-1')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('still performs the focus move and restores it when no newer selection intervenes', async () => {
     const store = createFocusStore()
     // No DOM tab elements exist, so the capture fails target lookup AFTER

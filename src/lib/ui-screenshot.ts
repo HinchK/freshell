@@ -373,15 +373,30 @@ export async function restoreFocus(
 // client-side.
 let captureTail: Promise<unknown> = Promise.resolve()
 
-function enqueueCapture<T>(run: () => Promise<T>): Promise<T> {
-  const result = captureTail.then(run, run)
+// Both servers drop a pending screenshot request ~10s after sending it
+// (server/ws-handler.ts: opts.timeoutMs ?? 10_000;
+// crates/freshell-server/src/screenshots.rs: SCREENSHOT_TIMEOUT). A queued
+// capture that starts AFTER that window mutates focus for a caller that
+// already failed and sends an orphaned reply — expire it at dequeue time
+// instead of executing it. The TTL must stay under the server window.
+const CAPTURE_QUEUE_TTL_MS = 8000
+
+export async function captureUiScreenshot(request: ScreenshotRequest, ctx: RuntimeContext): Promise<ScreenshotResult> {
+  const enqueuedAt = Date.now()
+  const result: Promise<ScreenshotResult> = captureTail.then(() => {
+    if (Date.now() - enqueuedAt > CAPTURE_QUEUE_TTL_MS) {
+      return {
+        ok: false,
+        changedFocus: false,
+        restoredFocus: false,
+        error: `screenshot request expired while queued (waited > ${CAPTURE_QUEUE_TTL_MS} ms)`,
+      }
+    }
+    return performUiScreenshotCapture(request, ctx)
+  })
   // The next capture must run regardless of whether this one succeeded.
   captureTail = result.then(() => undefined, () => undefined)
   return result
-}
-
-export async function captureUiScreenshot(request: ScreenshotRequest, ctx: RuntimeContext): Promise<ScreenshotResult> {
-  return enqueueCapture(() => performUiScreenshotCapture(request, ctx))
 }
 
 async function performUiScreenshotCapture(request: ScreenshotRequest, ctx: RuntimeContext): Promise<ScreenshotResult> {
