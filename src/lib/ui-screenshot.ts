@@ -1,9 +1,10 @@
 import html2canvas from 'html2canvas'
 import { setActivePane } from '@/store/panesSlice'
-import { setActiveTab, selectTabForCapture } from '@/store/tabsSlice'
+import { selectTabForCapture } from '@/store/tabsSlice'
 import { suspendTerminalRenderersForScreenshot } from '@/lib/screenshot-capture-env'
 import {
   getPaneSelectionSerial,
+  noteDomPaneSelection,
   paneSelectionCoordinate,
   TAB_SELECTION_COORDINATE,
   wasSelectionCoordinateTouchedSince,
@@ -366,7 +367,10 @@ export async function restoreFocus(
       }
       if (!shouldRestorePane(state, tabId)) continue
       if (state.panes.activePane[tabId] !== originalPaneId) {
-        ctx.dispatch(setActivePane({ tabId, paneId: originalPaneId }))
+        // Restore dispatches are capture-internal too: a real-looking pane
+        // fold here would co-touch the tab coordinate (active-tab co-touch
+        // rule) and veto the tab restore that follows.
+        ctx.dispatch(setActivePane({ tabId, paneId: originalPaneId, capture: true }))
       }
       restoredPaneTabs.push(tabId)
     }
@@ -377,7 +381,7 @@ export async function restoreFocus(
         incomplete = true
       } else if (shouldRestoreTab(state)) {
         if (state.tabs.activeTabId !== before.activeTabId) {
-          ctx.dispatch(setActiveTab(before.activeTabId))
+          ctx.dispatch(selectTabForCapture(before.activeTabId))
         }
         restoredTab = true
       }
@@ -411,10 +415,9 @@ export async function restoreFocus(
 
 // Captures mutate app-wide focus/tab state and suspend renderers, so two
 // captures MUST NOT overlap: an interleaved capture's interim moves/restores
-// look like user selections to the other capture's supersession checks (its
-// restoreFocus even dispatches plain setActiveTab, which bumps the serial),
-// and the renderer suspension is not overlap-safe. Serialize captures
-// client-side.
+// and renderer resume boundaries interleave otherwise. Serialize captures
+// client-side (capture-internal dispatches — moves AND restores — are
+// serial-invisible by construction).
 let captureTail: Promise<unknown> = Promise.resolve()
 
 // Both servers drop a pending screenshot request ~10s after SENDING it
@@ -445,6 +448,17 @@ function expiredDeadlineResult(): ScreenshotResult {
     changedFocus: false,
     restoredFocus: false,
     error: 'screenshot request expired: past its server deadline',
+  }
+}
+
+/** Test-only: await the capture queue until fully drained (including abandon
+ *  timers and fenced wind-downs). Tests that drive parked/abandoned captures
+ *  call this in afterEach so no test inherits another test's deferred tail. */
+export async function drainCaptureQueueForTests(): Promise<void> {
+  while (true) {
+    const tail = captureTail
+    await tail.catch(() => undefined)
+    if (captureTail === tail) return
   }
 }
 
@@ -532,17 +546,38 @@ async function performUiScreenshotCapture(request: ScreenshotRequest, ctx: Runti
   }
 
   let result: Omit<ScreenshotResult, 'changedFocus' | 'restoredFocus'>
-  const restoreRenderers = await suspendTerminalRenderersForScreenshot()
 
   // Exactly-once wind-down: renderer resume + focus rollback happen at normal
   // completion OR at abandonment (the fence the tail timer invokes) —
   // whichever comes first. An abandoned job that eventually settles does NOT
   // wind down a second time, so it can never overlap its successor's capture.
+  // The fence is registered BEFORE renderer suspension ACQUISITION (which can
+  // sit in an rAF-starved paint window in background tabs): an abandonment
+  // landing mid-acquisition arms the late-resume handoff below.
   let windDownDone = false
+  let restoreRenderersFn: (() => Promise<void>) | null = null
+  let resumeAfterAcquire = false
+
+  // Focus landing INSIDE a pane during the capture (including reaching into a
+  // nested iframe — those events never bubble to the shell's React handlers)
+  // is user selection activity for the supersession machinery.
+  const handleCaptureFocusIn = (event: Event) => {
+    const el = event.target as HTMLElement | null
+    if (!el || typeof el.closest !== 'function') return
+    const paneHost = el.closest('[data-pane-id]') as HTMLElement | null
+    if (!paneHost) return
+    const tabId = (paneHost.closest('[data-tab-id]') as HTMLElement | null)?.getAttribute('data-tab-id')
+      ?? el.closest('[data-tab-id]')?.getAttribute('data-tab-id')
+      ?? null
+    noteDomPaneSelection(tabId, ctx.getState().tabs.activeTabId === tabId)
+  }
+  document.addEventListener('focusin', handleCaptureFocusIn, true)
+
   const windDown = async () => {
     if (windDownDone) return
     windDownDone = true
     pendingWindDown.delete(epoch)
+    document.removeEventListener('focusin', handleCaptureFocusIn, true)
     // Restore Redux selection state BEFORE releasing the renderers: the
     // successor's snapshot must see the rollback, and restoreFocus dispatches
     // synchronously up to its paint await, while renderer resume only frees
@@ -553,9 +588,18 @@ async function performUiScreenshotCapture(request: ScreenshotRequest, ctx: Runti
         paneByTab: capturePaneTargets,
       })
     }
-    await restoreRenderers()
+    if (restoreRenderersFn) {
+      await restoreRenderersFn()
+    } else {
+      resumeAfterAcquire = true
+    }
   }
   pendingWindDown.set(epoch, windDown)
+  const restoreRenderers = await suspendTerminalRenderersForScreenshot()
+  restoreRenderersFn = restoreRenderers
+  // The fence may HAVE fired while the suspension was being acquired: hand the
+  // resumer off so the balance closes exactly once.
+  if (resumeAfterAcquire) await restoreRenderers()
 
   try {
     let target: HTMLElement | null = null

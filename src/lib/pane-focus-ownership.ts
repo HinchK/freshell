@@ -388,6 +388,18 @@ export function notePaneSelectionActivity(): void {
   paneSelectionSerial += 1
 }
 
+/** Selection activity observed via raw DOM events (e.g. focus landing inside
+ *  a nested iframe, which never bubbles to the pane shell's React handlers).
+ *  Marks the pane coordinate — and the tab coordinate when that tab is the
+ *  currently-active one (engaging with what's visible IS a selection). */
+export function noteDomPaneSelection(paneTabId: string | null, tabIsActive: boolean): void {
+  paneSelectionSerial += 1
+  if (paneTabId) {
+    touchSelectionCoordinate(paneSelectionCoordinate(paneTabId))
+    if (tabIsActive) touchSelectionCoordinate(TAB_SELECTION_COORDINATE)
+  }
+}
+
 /** Wire record invalidation to the live store (called once from store.ts;
  *  selection tracking lives in paneSelectionMiddleware).
  *

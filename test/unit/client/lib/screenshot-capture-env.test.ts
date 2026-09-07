@@ -43,6 +43,28 @@ describe('suspendTerminalRenderersForScreenshot refcounting', () => {
     detach()
   })
 
+  it('a suspension entering DURING another suspension\'s acquisition joins it — handlers are suspended exactly once', async () => {
+    detach = registerTerminalCaptureHandler('pane-1', {
+      suspendWebgl: () => { events.push('suspend'); return true },
+      resumeWebgl: () => { events.push('resume') },
+    })
+
+    // B enters while A's acquisition (suspend + paint window, two animation
+    // frames) is still pending — same tick, so deterministically so. A second
+    // collect would re-suspend the already-suspended handlers.
+    const aPromise = suspendTerminalRenderersForScreenshot()
+    const bPromise = suspendTerminalRenderersForScreenshot()
+    const [resumeA, resumeB] = await Promise.all([aPromise, bPromise])
+    expect(events).toEqual(['suspend'])
+
+    await resumeA() // out-of-order: depth must still hold — NO release event
+    expect(events).toEqual(['suspend'])
+
+    await resumeB() // final release
+    expect(events).toEqual(['suspend', 'resume'])
+    detach()
+  })
+
   it('a fresh suspension after full release resumes cleanly', async () => {
     detach = registerTerminalCaptureHandler('pane-1', {
       suspendWebgl: () => { events.push('suspend'); return true },

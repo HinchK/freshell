@@ -1989,11 +1989,14 @@ describe('ws protocol', () => {
       ws,
       (m) => m.type === 'ui.command' && m.command === 'screenshot.capture',
     )
-    // The server stamps the round-trip deadline so the client drops capture
-    // work that could only answer a request already failed server-side.
-    expect(typeof req.payload.deadlineAtMs).toBe('number')
-    expect(req.payload.deadlineAtMs).toBeGreaterThan(Date.now())
-    expect(req.payload.deadlineAtMs).toBeLessThanOrEqual(Date.now() + 11_000)
+    // The server stamps the REMAINING round-trip budget so the client drops
+    // capture work that could only answer a request already failed server-side.
+    // RELATIVE (ttlMs), never an absolute server epoch: browsers on other
+    // devices/phones cannot share a wall clock with the server.
+    expect(typeof req.payload.ttlMs).toBe('number')
+    expect(req.payload.ttlMs).toBeGreaterThan(0)
+    expect(req.payload.ttlMs).toBeLessThanOrEqual(10_000)
+    expect(req.payload.deadlineAtMs).toBeUndefined()
 
     ws.send(JSON.stringify({
       type: 'ui.screenshot.result',

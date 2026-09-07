@@ -26,15 +26,18 @@ export function registerTerminalCaptureHandler(paneId: string, handler: Terminal
 
 // Reference counting for overlapping suspensions: captures are serialized
 // through a queue, but a capture that blew its deadline is abandoned by the
-// tail and may resume WHILE its successor holds a suspension. Each suspend
-// increments the depth; resumes only release the renderers when the LAST one
-// lands, and each resumer is idempotent (its own end-of-capture call and the
-// abandon fence can both reach it).
+// tail and may resume WHILE its successor holds a suspension. The depth
+// increments BEFORE the suspend work and its paint await, so a suspension
+// entering DURING another's acquisition window joins the same cycle and never
+// re-suspends the handlers. Resumes only release the renderers when the LAST
+// one lands, and each resumer is idempotent (its own end-of-capture call and
+// the abandon fence can both reach it).
 let suspensionDepth = 0
 let suspendedPaneIds: string[] = []
 
 export async function suspendTerminalRenderersForScreenshot(): Promise<() => Promise<void>> {
-  if (suspensionDepth === 0) {
+  suspensionDepth += 1
+  if (suspensionDepth === 1) {
     const ids: string[] = []
     for (const [paneId, handler] of terminalCaptureHandlers) {
       try {
@@ -46,11 +49,10 @@ export async function suspendTerminalRenderersForScreenshot(): Promise<() => Pro
       }
     }
     suspendedPaneIds = ids
-    if (ids.length > 0) {
-      await afterPaint()
-    }
   }
-  suspensionDepth += 1
+  if (suspendedPaneIds.length > 0) {
+    await afterPaint()
+  }
 
   let resumed = false
   return async () => {

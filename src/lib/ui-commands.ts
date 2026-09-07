@@ -42,10 +42,12 @@ async function handleScreenshotCapture(msg: any, runtime: UiCommandRuntime): Pro
 
   const paneId = typeof payload.paneId === 'string' ? payload.paneId : undefined
   const tabId = typeof payload.tabId === 'string' ? payload.tabId : undefined
-  // The server stamps its round-trip deadline so capture work that could only
-  // answer an already-failed request expires instead of mutating the UI.
-  const deadlineAtMs = typeof payload.deadlineAtMs === 'number' && Number.isFinite(payload.deadlineAtMs)
-    ? payload.deadlineAtMs
+  // The server stamps its RELATIVE round-trip budget so capture work that
+  // could only answer an already-failed request expires instead of mutating
+  // the UI. Convert to a local deadline at receipt — browsers on other
+  // devices/phones share no wall clock with the server.
+  const deadlineAtMs = typeof payload.ttlMs === 'number' && Number.isFinite(payload.ttlMs)
+    ? Date.now() + Math.max(0, payload.ttlMs)
     : undefined
 
   try {

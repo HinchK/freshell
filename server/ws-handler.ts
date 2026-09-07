@@ -1126,9 +1126,11 @@ export class WsHandler {
           scope: opts.scope,
           tabId: opts.tabId,
           paneId: opts.paneId,
-          // Round-trip deadline for the client: capture work that could only
-          // answer a request we've already failed must expire, not mutate UI.
-          deadlineAtMs: Date.now() + timeoutMs,
+          // Round-trip budget for the client, RELATIVE: capture work that
+          // could only answer a request we've already failed must expire, not
+          // mutate UI. Never an absolute server epoch — browsers on other
+          // devices/phones share no wall clock with this server.
+          ttlMs: timeoutMs,
         },
       })
     })

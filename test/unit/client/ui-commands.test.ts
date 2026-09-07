@@ -221,7 +221,7 @@ describe('handleUiCommand', () => {
     }))
   })
 
-  it('passes the server-stamped deadlineAtMs through to the capture', async () => {
+  it('converts the server-stamped relative budget (ttlMs) into a local deadline', async () => {
     const dispatch = vi.fn()
     const send = vi.fn()
     const getState = vi.fn(() => ({}))
@@ -237,17 +237,45 @@ describe('handleUiCommand', () => {
       {
         type: 'ui.command',
         command: 'screenshot.capture',
-        payload: { requestId: 'req-9', scope: 'view', deadlineAtMs: 1_760_000_000_000 },
+        payload: { requestId: 'req-9', scope: 'view', ttlMs: 7_500 },
       },
       { dispatch: dispatch as any, getState, send },
     )
 
     await Promise.resolve()
 
-    expect(captureUiScreenshot).toHaveBeenCalledWith(
-      expect.objectContaining({ deadlineAtMs: 1_760_000_000_000 }),
-      expect.anything(),
+    const call = vi.mocked(captureUiScreenshot).mock.calls[0]![0] as any
+    // Local deadline ≈ receipt + 7500ms — relative conversion with no shared
+    // wall clock between server and browser device.
+    expect(call.deadlineAtMs).toBeGreaterThan(Date.now())
+    expect(call.deadlineAtMs).toBeLessThanOrEqual(Date.now() + 7_500 + 1_000)
+  })
+
+  it('leaves deadlineAtMs unset when the server stamped no budget (fallback internal TTL applies)', async () => {
+    const dispatch = vi.fn()
+    const send = vi.fn()
+    const getState = vi.fn(() => ({}))
+
+    vi.mocked(captureUiScreenshot).mockResolvedValue({
+      ok: false,
+      changedFocus: false,
+      restoredFocus: false,
+      error: 'expired',
+    })
+
+    handleUiCommand(
+      {
+        type: 'ui.command',
+        command: 'screenshot.capture',
+        payload: { requestId: 'req-9', scope: 'view' },
+      },
+      { dispatch: dispatch as any, getState, send },
     )
+
+    await Promise.resolve()
+
+    const call = vi.mocked(captureUiScreenshot).mock.calls[0]![0] as any
+    expect(call.deadlineAtMs).toBeUndefined()
   })
 })
 
