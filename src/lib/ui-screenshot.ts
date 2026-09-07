@@ -365,7 +365,26 @@ export async function restoreFocus(
   }
 }
 
+// Captures mutate app-wide focus/tab state and suspend renderers, so two
+// captures MUST NOT overlap: an interleaved capture's interim moves/restores
+// look like user selections to the other capture's supersession checks (its
+// restoreFocus even dispatches plain setActiveTab, which bumps the serial),
+// and the renderer suspension is not overlap-safe. Serialize captures
+// client-side.
+let captureTail: Promise<unknown> = Promise.resolve()
+
+function enqueueCapture<T>(run: () => Promise<T>): Promise<T> {
+  const result = captureTail.then(run, run)
+  // The next capture must run regardless of whether this one succeeded.
+  captureTail = result.then(() => undefined, () => undefined)
+  return result
+}
+
 export async function captureUiScreenshot(request: ScreenshotRequest, ctx: RuntimeContext): Promise<ScreenshotResult> {
+  return enqueueCapture(() => performUiScreenshotCapture(request, ctx))
+}
+
+async function performUiScreenshotCapture(request: ScreenshotRequest, ctx: RuntimeContext): Promise<ScreenshotResult> {
   const focusBefore = snapshotFocus(ctx.getState())
   const paneTabsToRestore = new Set<string>()
   let changedFocus = false

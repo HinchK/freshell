@@ -2,8 +2,8 @@ import { describe, it, expect, afterEach } from 'vitest'
 import { render, waitFor, cleanup as rtlCleanup } from '@testing-library/react'
 import { useEffect, createElement } from 'react'
 import { configureStore } from '@reduxjs/toolkit'
-import panesReducer, { initLayout, removeLayout, setActivePane, splitPane, addPane } from '@/store/panesSlice'
-import tabsReducer, { addTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
+import panesReducer, { initLayout, removeLayout, setActivePane, splitPane, addPane, closePane } from '@/store/panesSlice'
+import tabsReducer, { addTab, switchToNextTab, switchToPrevTab, removeTab } from '@/store/tabsSlice'
 import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
 import {
   recordPaneFocusBeforeUnmount,
@@ -541,5 +541,53 @@ describe('paneSelectionMiddleware selection-serial coverage', () => {
     store.dispatch(addPane({ tabId: 'tab-1', newContent: { kind: 'terminal', mode: 'shell' } }))
     expect(store.getState().panes.activePane['tab-1']).not.toBe('pane-1')
     expect(getPaneSelectionSerial()).toBe(s0 + 1)
+  })
+
+  it('closing the ACTIVE tab (removeTab fallback selection) counts as selection activity', () => {
+    const store = makeTabsPanesStore()
+    store.dispatch(addTab({ id: 'tab-2', title: 'Two' })) // activates tab-2
+    const s0 = getPaneSelectionSerial()
+    store.dispatch(removeTab('tab-2')) // falls back to tab-1
+    expect(store.getState().tabs.activeTabId).toBe('tab-1')
+    expect(getPaneSelectionSerial()).toBe(s0 + 1)
+  })
+
+  it('closing a BACKGROUND tab does NOT count as selection activity', () => {
+    const store = makeTabsPanesStore()
+    store.dispatch(addTab({ id: 'tab-2', title: 'Two' })) // active: tab-2
+    const s0 = getPaneSelectionSerial()
+    store.dispatch(removeTab('tab-1')) // background close — selection unmoved
+    expect(store.getState().tabs.activeTabId).toBe('tab-2')
+    expect(getPaneSelectionSerial()).toBe(s0)
+  })
+
+  it('closing the ACTIVE pane (sibling promotion) counts as selection activity', () => {
+    const store = makeTabsPanesStore()
+    store.dispatch(splitPane({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      direction: 'horizontal',
+      newContent: { kind: 'terminal', mode: 'shell' },
+      newPaneId: 'pane-2',
+    })) // activates pane-2
+    const s0 = getPaneSelectionSerial()
+    store.dispatch(closePane({ tabId: 'tab-1', paneId: 'pane-2' })) // promotes sibling pane-1
+    expect(store.getState().panes.activePane['tab-1']).toBe('pane-1')
+    expect(getPaneSelectionSerial()).toBe(s0 + 1)
+  })
+
+  it('closing a NON-active pane does NOT count as selection activity', () => {
+    const store = makeTabsPanesStore()
+    store.dispatch(splitPane({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      direction: 'horizontal',
+      newContent: { kind: 'terminal', mode: 'shell' },
+      newPaneId: 'pane-2',
+    })) // active: pane-2
+    const s0 = getPaneSelectionSerial()
+    store.dispatch(closePane({ tabId: 'tab-1', paneId: 'pane-1' })) // background close
+    expect(store.getState().panes.activePane['tab-1']).toBe('pane-2')
+    expect(getPaneSelectionSerial()).toBe(s0)
   })
 })

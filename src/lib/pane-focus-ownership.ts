@@ -272,9 +272,27 @@ function collectLivePaneIds(layouts: Record<string, LayoutNodeLike> | undefined)
  *  Other user gestures reach the selection WITHOUT those folds: default-
  *  activating addTab (new-tab shortcut / mobile strip / first tab),
  *  switchToNextTab/switchToPrevTab (keyboard navigation), default-activating
- *  splitPane (user split), addPane (local split). Those bump the serial only
- *  when the selection coordinate ACTUALLY moved — agent folds pass
- *  activate:false and stay serial-invisible. */
+ *  splitPane (user split), addPane (local split), and the fallback selection
+ *  when removeTab/closePane removes the ACTIVE item (Alt+W, close buttons).
+ *  Those bump the serial only when the selection coordinate ACTUALLY moved —
+ *  agent folds pass activate:false and close-path fallback for background
+ *  items moves nothing, so both stay serial-invisible. */
+const TAB_SELECTION_ACTIONS = new Set([
+  'tabs/addTab',
+  'tabs/switchToNextTab',
+  'tabs/switchToPrevTab',
+  // Closing the ACTIVE tab selects a survivor (removeTab fallback) — that
+  // movement is selection activity; background closes move nothing.
+  'tabs/removeTab',
+])
+
+const PANE_SELECTION_ACTIONS = new Set([
+  'panes/splitPane',
+  'panes/addPane',
+  // Closing the ACTIVE pane promotes a sibling — selection activity.
+  'panes/closePane',
+])
+
 export const paneSelectionMiddleware =
   (store: {
     getState: () => {
@@ -296,13 +314,13 @@ export const paneSelectionMiddleware =
       paneSelectionSerial += 1
       return next(action)
     }
-    if (a?.type === 'tabs/addTab' || a?.type === 'tabs/switchToNextTab' || a?.type === 'tabs/switchToPrevTab') {
+    if (a?.type && TAB_SELECTION_ACTIONS.has(a.type)) {
       const before = store.getState().tabs?.activeTabId
       const result = next(action)
       if (store.getState().tabs?.activeTabId !== before) paneSelectionSerial += 1
       return result
     }
-    if (a?.type === 'panes/splitPane' || a?.type === 'panes/addPane') {
+    if (a?.type && PANE_SELECTION_ACTIONS.has(a.type)) {
       const tabId = a?.payload?.tabId
       if (!tabId) return next(action)
       const before = store.getState().panes?.activePane?.[tabId]

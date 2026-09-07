@@ -695,6 +695,41 @@ describe('captureUiScreenshot newer-selection supersession', () => {
     expect(store.getState().panes.activePane['tab-2']).toBe('pane-2b') // user's pane preserved
   })
 
+  it('serializes concurrent captures end-to-end (a second capture starts only after the first fully restores)', async () => {
+    const store = createFocusStore()
+    // Interleaving captures corrupt one another: the other's interim moves and
+    // restores look like user selections to the supersession checks, and the
+    // renderer suspension is not overlap-safe. Captures MUST queue.
+    let releaseFirst!: () => void
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve })
+    const suspendMock = vi.mocked(suspendTerminalRenderersForScreenshot)
+    suspendMock.mockImplementationOnce(async () => {
+      await firstGate
+      return async () => {}
+    })
+    let secondSuspendCalled = false
+    suspendMock.mockImplementationOnce(async () => {
+      secondSuspendCalled = true
+      return async () => {}
+    })
+    const first = captureUiScreenshot(
+      { scope: 'tab', tabId: 'tab-2' },
+      { dispatch: store.dispatch, getState: store.getState } as any,
+    )
+    const second = captureUiScreenshot(
+      { scope: 'tab', tabId: 'tab-2' },
+      { dispatch: store.dispatch, getState: store.getState } as any,
+    )
+    await new Promise((resolve) => setTimeout(resolve, 10)) // let micro/macrotasks run
+    expect(secondSuspendCalled).toBe(false) // second capture is still queued
+    releaseFirst()
+    const [firstResult, secondResult] = await Promise.all([first, second])
+    expect(secondSuspendCalled).toBe(true)
+    expect(firstResult.error).toBeDefined() // jsdom has no real tab targets
+    expect(secondResult.error).toBeDefined()
+    expect(store.getState().tabs.activeTabId).toBe('tab-1') // user's selection survives both captures
+  })
+
   it('still performs the focus move and restores it when no newer selection intervenes', async () => {
     const store = createFocusStore()
     // No DOM tab elements exist, so the capture fails target lookup AFTER
