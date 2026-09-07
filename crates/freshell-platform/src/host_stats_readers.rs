@@ -725,9 +725,10 @@ pub fn read_pids_constraint(proc_root: &Path, cgroup_root: &Path) -> Option<Pids
     let leaf = resolve_cgroup_leaf(proc_root, "pids")?;
     // Deepest-first chain; the fs-root segment is never read (no limit files).
     let segments: Vec<&str> = match &leaf {
-        CgroupLeaf::V2(path) | CgroupLeaf::V1(path) => {
-            path.split('/').filter(|segment| !segment.is_empty()).collect()
-        }
+        CgroupLeaf::V2(path) | CgroupLeaf::V1(path) => path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect(),
     };
     let mut best: Option<PidsConstraint> = None;
     let mut best_ratio = -1.0_f64;

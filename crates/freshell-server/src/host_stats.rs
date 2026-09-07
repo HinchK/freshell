@@ -1689,7 +1689,11 @@ mod tests {
             "user.slice/user-1000.slice/user@1000.service/app.slice/freshell.service/pids.max",
             "max\n",
         );
-        write_rel(&cgroup_root, "user.slice/user-1000.slice/pids.max", "678924\n");
+        write_rel(
+            &cgroup_root,
+            "user.slice/user-1000.slice/pids.max",
+            "678924\n",
+        );
         write_rel(
             &cgroup_root,
             "user.slice/user-1000.slice/pids.current",
@@ -1729,7 +1733,10 @@ mod tests {
         write_rel(&cgroup_root, "slices/pids.current", "500\n");
         assert_eq!(
             readers::read_pids_constraint(&proc_root, &cgroup_root),
-            Some(readers::PidsConstraint { current: 90, max: 100 })
+            Some(readers::PidsConstraint {
+                current: 90,
+                max: 100
+            })
         );
 
         // Ancestor 600/1000 (0.6) beats leaf 400/1000 (0.4).
@@ -1779,8 +1786,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let proc_root = tmp.path().join("proc");
         let cgroup_root = tmp.path().join("cgroup");
-        write_rel(&proc_root, "self/cgroup", "3:pids:/limited.slice/svc.service\n");
-        write_rel(&cgroup_root, "pids/limited.slice/svc.service/pids.max", "777\n");
+        write_rel(
+            &proc_root,
+            "self/cgroup",
+            "3:pids:/limited.slice/svc.service\n",
+        );
+        write_rel(
+            &cgroup_root,
+            "pids/limited.slice/svc.service/pids.max",
+            "777\n",
+        );
         write_rel(
             &cgroup_root,
             "pids/limited.slice/svc.service/pids.current",
