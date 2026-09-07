@@ -319,7 +319,7 @@ test.describe('Fresh Agent click-to-defocus', () => {
     expect(layout?.type).toBe('leaf')
     const paneId = layout.id as string
 
-    const sessionId = '63333000-0000-4333-8333-000000000c1fa'
+    const sessionId = '63333000-0000-4333-8333-00000000c1fa'
 
     await page.route(`**/api/fresh-agent/threads/freshclaude/claude/${sessionId}*`, async (route) => {
       await route.fulfill({
@@ -407,15 +407,20 @@ test.describe('Fresh Agent click-to-defocus', () => {
       return el ? el.getAttribute('data-context') : null
     }), { timeout: 5_000 }).toBe('fresh-agent-transcript')
 
-    // With focus on the transcript, PageDown scrolls it (the existing nav key
-    // handler now receives a non-interactive target). Scroll must increase.
+    // With focus on the transcript, the existing nav-key handler now receives a
+    // non-interactive target. The transcript loads at the BOTTOM (atBottom=true;
+    // a layout effect pins scrollTop=scrollHeight on signature change), so first
+    // jump to the TOP with Home, then prove PageDown scrolls DOWN from there.
+    await page.keyboard.press('Home')
+    await expect.poll(async () => scroller.evaluate((el: HTMLElement) => el.scrollTop), { timeout: 5_000 }).toBe(0)
+
     const before = await scroller.evaluate((el: HTMLElement) => el.scrollTop)
     await page.keyboard.press('PageDown')
     await expect.poll(async () => scroller.evaluate((el: HTMLElement) => el.scrollTop), { timeout: 5_000 }).toBeGreaterThan(before)
 
-    // Home jumps to the top.
-    await page.keyboard.press('Home')
-    await expect.poll(async () => scroller.evaluate((el: HTMLElement) => el.scrollTop), { timeout: 5_000 }).toBe(0)
+    // End jumps back to the bottom.
+    await page.keyboard.press('End')
+    await expect.poll(async () => scroller.evaluate((el: HTMLElement) => el.scrollTop), { timeout: 5_000 }).toBe(await scroller.evaluate((el: HTMLElement) => el.scrollHeight))
 
     // Re-activating the pane (switching away and back) refocuses the composer.
     await page.evaluate(({ currentTabId }) => {
@@ -444,9 +449,9 @@ This task depends on Task 1's production change being committed. The repo-owned 
 
 Run: `npm run test:e2e:local -- test/e2e-browser/specs/freshagent-click-focus.spec.ts 2>&1`
 
-Expected (before Task 1, or if run in isolation without Task 1): FAIL because clicking the transcript does not move focus to it (no `tabindex`), so `data-context` of `activeElement` is not `fresh-agent-transcript`, and PageDown does not scroll (the composer still has focus; the nav-key handler sees an interactive target and does nothing).
+Expected (before Task 1, or if run in isolation without Task 1): FAIL because clicking the transcript does not move focus to it (no `tabindex`), so `data-context` of `activeElement` is not `fresh-agent-transcript`, and the subsequent nav keys do nothing (the composer still has focus; the nav-key handler sees an interactive target and does not scroll).
 
-Expected (after Task 1 is committed): PASS — focus moves to the transcript on click, PageDown scrolls, Home jumps to top, and re-activation refocuses the composer.
+Expected (after Task 1 is committed): PASS — focus moves to the transcript on click, Home jumps to top (scrollTop=0), PageDown scrolls down (scrollTop>0), End jumps to bottom (scrollTop=scrollHeight), and re-activation refocuses the composer.
 
 - [ ] **Step 3: Add no production implementation (it already exists from Task 1)**
 
