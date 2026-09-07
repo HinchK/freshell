@@ -2775,6 +2775,87 @@ describe('fresh-agent turn carve-out', () => {
     expect(screen.getByRole('menu')).toBeInTheDocument()
   })
 
+  describe('specialized sub-region partition', () => {
+    function renderSpecializedFixture() {
+      return renderWithProvider(
+        <div
+          data-context={ContextIds.FreshAgent}
+          data-tab-id="tab-1"
+          data-pane-id="pane-1"
+          data-session-id="sess-1"
+          data-provider="claude"
+          data-session-type="freshclaude"
+        >
+          <article data-turn-role="assistant">
+            <div className="prose prose-sm" data-markdown-body="">
+              <pre><code>const answer = 42</code></pre>
+            </div>
+            <pre data-tool-output="">tool output line</pre>
+            <div data-diff="" data-file-path="/tmp/a.ts">
+              <span>diff body</span>
+            </div>
+            <p>Plain turn text</p>
+          </article>
+        </div>,
+      )
+    }
+
+    function rightClick(target: Element) {
+      const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 100, clientY: 100 })
+      act(() => {
+        target.dispatchEvent(event)
+      })
+      return event
+    }
+
+    it('opens the provider context-sensitive menu (not the turn menu) for a right-click on a code block inside a turn', () => {
+      const { container } = renderSpecializedFixture()
+
+      const codeEl = container.querySelector('.prose pre code') as HTMLElement
+      const event = rightClick(codeEl)
+
+      expect(event.defaultPrevented).toBe(true)
+      // Exactly one menu, and it is the PROVIDER's context-sensitive fresh-
+      // agent menu — the whole-turn "Turn context menu" must not open here
+      // (the transcript article yields on specialized sub-regions).
+      expect(screen.getAllByRole('menu')).toHaveLength(1)
+      expect(screen.queryByRole('menu', { name: 'Turn context menu' })).toBeNull()
+      expect(screen.getByRole('menuitem', { name: 'Copy code block' })).toBeInTheDocument()
+    })
+
+    it('opens the provider context-sensitive menu for tool output inside a turn', () => {
+      const { container } = renderSpecializedFixture()
+
+      const outputEl = container.querySelector('[data-tool-output]') as HTMLElement
+      const event = rightClick(outputEl)
+
+      expect(event.defaultPrevented).toBe(true)
+      expect(screen.getAllByRole('menu')).toHaveLength(1)
+      expect(screen.queryByRole('menu', { name: 'Turn context menu' })).toBeNull()
+      expect(screen.getByRole('menuitem', { name: 'Copy output' })).toBeInTheDocument()
+    })
+
+    it('opens the provider context-sensitive menu for a diff inside a turn', () => {
+      renderSpecializedFixture()
+
+      const event = rightClick(screen.getByText('diff body'))
+
+      expect(event.defaultPrevented).toBe(true)
+      expect(screen.getAllByRole('menu')).toHaveLength(1)
+      expect(screen.queryByRole('menu', { name: 'Turn context menu' })).toBeNull()
+      expect(screen.getByRole('menuitem', { name: 'Copy new version' })).toBeInTheDocument()
+    })
+
+    it('keeps the whole-turn carve-out for plain turn text inside the specialized fixture (control)', () => {
+      renderSpecializedFixture()
+
+      const event = rightClick(screen.getByText('Plain turn text'))
+
+      expect(event.defaultPrevented).toBe(true)
+      expect(screen.queryByRole('menu')).toBeNull()
+    })
+  })
+
   // These two tests drive the provider's 500ms long-press timer, so they need
   // fake timers. They are scoped to this nested describe ONLY (restore in its
   // afterEach): the outer suite stays real-timers by design.

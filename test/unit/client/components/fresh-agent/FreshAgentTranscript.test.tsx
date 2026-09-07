@@ -1513,6 +1513,42 @@ describe('FreshAgentTranscript', () => {
       expect(onFork).toHaveBeenCalledWith('turn-2')
     })
 
+    it('yields to the provider menu for a fine-pointer right-click on a code block inside a turn', () => {
+      const { container } = render(
+        <FreshAgentTranscript
+          canFork={false}
+          turns={[{
+            id: 'turn-code',
+            turnId: 'turn-code',
+            role: 'assistant' as const,
+            summary: 'code answer',
+            items: [{
+              id: 'item-code',
+              kind: 'text' as const,
+              text: 'Here is the fix:\n\n```ts\nconst x: number = 1\n```',
+            }],
+          }]}
+        />,
+      )
+
+      // Assistant text renders as markdown: the fenced code block produces the
+      // specialized `.prose pre code` sub-region.
+      const codeEl = container.querySelector('article .prose pre code') as HTMLElement | null
+      expect(codeEl, 'assistant fenced code block renders .prose pre code').not.toBeNull()
+
+      // The transcript article yields WITHOUT preventDefault and without its
+      // turn menu — the provider's capture-phase handler already opened the
+      // context-sensitive fresh-agent menu for this gesture.
+      const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true })
+      act(() => {
+        codeEl!.dispatchEvent(event)
+      })
+
+      expect(event.defaultPrevented).toBe(false)
+      expect(screen.queryByRole('menu', { name: 'Turn context menu' })).not.toBeInTheDocument()
+      expect(screen.queryByRole('menu')).not.toBeInTheDocument()
+    })
+
     it('offers rewind only on user turns and passes the turn through', () => {
       const onRewind = vi.fn()
       render(<FreshAgentTranscript turns={TURNS} canFork={false} onRewindToTurn={onRewind} />)

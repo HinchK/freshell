@@ -62,7 +62,7 @@ import type { ContextTarget } from './context-menu-types'
 import { ContextMenu } from './ContextMenu'
 import { ContextIds } from './context-menu-constants'
 import { buildMenuItems } from './menu-defs'
-import { copyDataset, isTextInputLike, parseContextTarget } from './context-menu-utils'
+import { copyDataset, isFreshAgentSpecializedRegion, isTextInputLike, parseContextTarget } from './context-menu-utils'
 import {
   copyFreshAgentCodeBlock,
   copyFreshAgentToolInput,
@@ -1135,7 +1135,16 @@ export function ContextMenuProvider({
       // identically to e.target, so their behavior is unchanged.
       const gestureInFlight = touchStartPos !== null || longPressTimer !== null
       const ownershipTarget = gestureInFlight ? touchGestureTarget : target
-      if (isFreshAgentTurnTarget(ownershipTarget)) {
+      // Fine-pointer (no touch gesture in flight) right-clicks into the turn's
+      // specialized sub-regions (markdown code blocks, tool input/output,
+      // diffs) fall through to the normal fresh-agent menu below so their
+      // context-sensitive items ("Copy code block", "Copy output", ...) stay
+      // available — the transcript article yields this gesture to us. A touch
+      // gesture in flight (early or late Android contextmenu) keeps the
+      // carve-out: the transcript's action sheet owns the whole turn on
+      // coarse pointers, which never install specialized-region menus.
+      if (isFreshAgentTurnTarget(ownershipTarget)
+        && !(isFreshAgentSpecializedRegion(ownershipTarget) && !gestureInFlight)) {
         if (e.cancelable) e.preventDefault()
         return
       }

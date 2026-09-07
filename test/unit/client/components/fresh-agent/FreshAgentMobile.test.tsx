@@ -63,7 +63,13 @@ const TURNS = [
     turnId: 'turn-2',
     role: 'assistant' as const,
     summary: 'answer',
-    items: [{ id: 'item-2', kind: 'text' as const, text: 'done' }],
+    items: [
+      { id: 'item-2', kind: 'text' as const, text: 'done' },
+      // Fenced code block: assistant text renders as markdown, producing the
+      // specialized `.prose pre code` sub-region used by the coarse-pointer
+      // partition guard below.
+      { id: 'item-2b', kind: 'text' as const, text: '```bash\nnpm test\n```' },
+    ],
   },
 ]
 
@@ -342,6 +348,39 @@ describe('turn gestures inside the global ContextMenuProvider (single overlay, r
     expect(screen.getByRole('menu', { name: /fix the bug/ })).toBeInTheDocument()
 
     releaseOverSheet(article)
+  })
+
+  it('coarse guard: native contextmenu on a code block inside a turn still opens only the action sheet', () => {
+    renderTranscriptInProvider()
+    const codeEl = document.querySelector('article[data-turn-role="assistant"] .prose pre code') as HTMLElement | null
+    expect(codeEl, 'assistant fenced code block renders .prose pre code').not.toBeNull()
+    const article = codeEl!.closest('article') as HTMLElement
+    elementFromPointMock.mockReturnValue(article)
+
+    act(() => {
+      simulateTouch('touchstart', codeEl!, 100, 100)
+    })
+    // Android fires the native contextmenu mid-gesture, targeted at the
+    // specialized element. Coarse pointers keep the transcript sheet as the
+    // owner of the whole turn: specialized regions never yield to the
+    // provider's context-sensitive menu (that partition is fine-pointer only).
+    fireEvent.contextMenu(codeEl!)
+    expect(screen.getAllByRole('menu')).toHaveLength(1)
+    expect(screen.getByRole('menu', { name: /^done/ })).toBeInTheDocument()
+
+    // The provider's 500ms timer fires now — inert for this turn-owned gesture.
+    act(() => {
+      vi.advanceTimersByTime(500)
+    })
+    expect(screen.getAllByRole('menu')).toHaveLength(1)
+    expect(elementFromPointMock).not.toHaveBeenCalled()
+
+    // Release suppression is still owned by the transcript's long-press
+    // closure: the cancelable release is preventDefault'd and the sheet stays.
+    const release = simulateTouch('touchend', codeEl!, 100, 100)
+    expect(release.defaultPrevented).toBe(true)
+    expect(screen.getAllByRole('menu')).toHaveLength(1)
+    expect(screen.getByRole('menu', { name: /^done/ })).toBeInTheDocument()
   })
 
   it('keeps release suppression when the transcript rerenders mid-gesture (new actions identity)', () => {

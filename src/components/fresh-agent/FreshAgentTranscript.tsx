@@ -20,6 +20,7 @@ import {
   type FreshAgentTurnContextMenuState,
 } from './FreshAgentTurnActions'
 import { FreshAgentActionSheet } from './FreshAgentActionSheet'
+import { isFreshAgentSpecializedRegion } from '@/components/context-menu/context-menu-utils'
 import { buildLongPressHandlers, useCoarsePointer } from '@/lib/pointer'
 import { getFreshAgentDisplayTurnKey, turnSummaryIsAuthored } from '@shared/fresh-agent-turns'
 
@@ -830,6 +831,13 @@ function FreshAgentTurnArticle({
           return
         }
         if (!actions.onTurnContextMenu) return
+        // Fine-pointer right-click into a specialized sub-region (markdown
+        // code block, tool input/output, diff): yield WITHOUT cancelling the
+        // event or opening the turn menu — the provider's capture-phase
+        // handler already opened its context-sensitive fresh-agent menu for
+        // this gesture (on coarse pointers the sheet branch above owns the
+        // whole turn and never yields).
+        if (isFreshAgentSpecializedRegion(event.target as HTMLElement | null)) return
         event.preventDefault()
         event.stopPropagation()
         actions.onTurnContextMenu(event, actionTurn)
