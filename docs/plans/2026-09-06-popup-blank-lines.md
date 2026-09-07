@@ -33,24 +33,32 @@
   - `handleContextMenu` (capture phase) returns early — no `openMenu`, no `preventDefault` — when the event target is inside `article[data-turn-role]`.
   - `handleTouchStart` captures the gesture target (`e.target as HTMLElement | null`); when the 500ms long-press timer fires, if the ORIGINAL gesture target is inside `article[data-turn-role]`, the provider does nothing for this gesture: no `elementFromPoint` re-probe (by fire time the transcript's sheet is already open at 450ms and the probe would hit it), no haptic, no `openMenu`, and no `suppressNextTouchEnd` arming. For all other targets the current behavior is byte-identical.
   - One module-scope predicate: `isFreshAgentTurnTarget(el: HTMLElement | null): boolean { return !!el?.closest?.('article[data-turn-role]') }`.
-- **Half 2 — transcript release suppression** (`src/lib/pointer.ts`, `buildLongPressHandlers`): when the long-press timer COMPLETED (sheet opened via the callback), the gesture's `onTouchEnd(event)` calls `event.preventDefault()` (when cancelable) so the synthesized compatibility click cannot dismiss the freshly-opened sheet or activate an item under the finger. A still-pending (canned/aborted) press leaves `onTouchEnd` behavior exactly as today. This mirrors the protection the provider's `suppressNextTouchEnd` path used to give this surface, moved to the layer that knows the sheet actually opened (sole consumer of `buildLongPressHandlers` is `FreshAgentTranscript`, confirmed by repo-wide search — no other caller's behavior changes).
+- **Half 2 — transcript release suppression, covering BOTH sheet-open routes** (`src/lib/pointer.ts`, `buildLongPressHandlers`):
+  - The builder tracks touch gesture state per closure: `touchActive` (set on `onTouchStart` with a single touch, cleared on end/cancel) and `overlayOpenedDuringTouch`.
+  - Timer route (450ms long-press completes → callback opens the sheet): the builder marks `overlayOpenedDuringTouch = true` at completion.
+  - Android native-`contextmenu` route (sheet opens mid-gesture before any timer): the builder exposes a new returned member `notifyOverlayOpened()`; the transcript's coarse-pointer `onContextMenu` branch (FreshAgentTranscript.tsx ~line 784-789) calls `longPress?.notifyOverlayOpened?.()` when it calls `actions.onOpenActions`. `notifyOverlayOpened` sets the flag only while a touch is active.
+  - `onTouchEnd(event)` (signature gains the event): when `overlayOpenedDuringTouch` is set and the event is cancelable, call `event.preventDefault()` — cancelling the synthesized compatibility click that would otherwise dismiss the freshly-opened sheet or activate a row. Pending/aborted presses (tap, move, cancel) behave exactly as today: no preventDefault.
+  - `onTouchCancel` clears both flags without preventing anything.
+  - `buildLongPressHandlers` has no other consumer (repo-wide search: `FreshAgentTranscript` only), so no other surface changes behavior.
 
 **Files:**
 - Modify: `src/components/context-menu/ContextMenuProvider.tsx`
 - Modify: `src/lib/pointer.ts`
+- Modify: `src/components/fresh-agent/FreshAgentTranscript.tsx` (coarse `onContextMenu` branch calls `notifyOverlayOpened`)
 - Test (unit, provider): `test/unit/client/components/ContextMenuProvider.test.tsx`
-- Test (unit, pointer helper): `test/unit/client/lib/pointer.test.tsx` (create if absent; match repo conventions for lib tests)
-- Test (unit, combined touch gesture): extend the coarse-pointer transcript harness in `test/unit/client/components/fresh-agent/FreshAgentMobile.test.tsx` (provider-wrapped; see Test cases) — or a sibling new file if the harness does not compose.
+- Test (unit, pointer helper): `test/unit/client/lib/pointer.test.tsx` (create if absent; match repo conventions for lib tests — the file path differs only if a pointer test file already exists, in which case extend it; either way Steps 2/4/7 list the concrete file used)
+- Test (unit, combined touch gesture): extend the coarse-pointer transcript harness in `test/unit/client/components/fresh-agent/FreshAgentMobile.test.tsx` (exactly this file — no sibling option)
 - Test (e2e): `test/e2e-browser/specs/fresh-agent.spec.ts` (extend the existing `turn context menu renders on an opaque popover surface` test)
 
 **Interfaces:**
 - Consumes: `article[data-turn-role]` markup contract from `src/components/fresh-agent/FreshAgentTranscript.tsx`; `FreshAgentActionSheet` opened via `onOpenActions`.
-- Produces: `isFreshAgentTurnTarget` (module-private in ContextMenuProvider.tsx); completed-press release suppression in `buildLongPressHandlers` (same type signature; `onTouchEnd` gains the event parameter).
+- Produces: `isFreshAgentTurnTarget` (module-private in ContextMenuProvider.tsx); `buildLongPressHandlers` extended with touch-state tracking + returned `notifyOverlayOpened()`; transcript coarse-path calls it alongside `onOpenActions`.
 
 **Test cases:**
 - Unit (provider) — `fireEvent.contextMenu` on an element inside `<article data-turn-role="user">` within a `<div data-context="fresh-agent" data-tab-id=… data-pane-id=…>` → provider renders no app menu. Control: same event inside the pane container but OUTSIDE any turn article → provider menu opens.
-- Unit (pointer helper) — completed long-press → next `onTouchEnd` receives a preventDefault'd event (spy on the event's preventDefault); moved/cancelled/short press → no preventDefault.
-- Unit (combined touch gesture, review-mandated) — mount a coarse-pointer transcript (existing FreshAgentMobile harness pattern) INSIDE the provider (existing renderWithProvider pattern): fire `touchstart` on a turn, advance past 450ms (sheet opens), advance past 500ms (provider timer), assert exactly one overlay exists and it is the action sheet (no provider `role="menu"`); fire `touchend` and assert the sheet remains and no menu item activated.
+- Unit (pointer helper) — long-press timer completes → next `onTouchEnd` receives a preventDefault'd event; `notifyOverlayOpened()` during an active touch (the contextmenu route) → next `onTouchEnd` preventDefault'd; tap / moved / cancelled press → no preventDefault.
+- Unit (combined touch gesture, in FreshAgentMobile.test.tsx) — mount a coarse-pointer transcript (existing `stubCoarsePointer(true)` + TURNS harness) INSIDE the provider (the renderWithProvider wrapper pattern from ContextMenuProvider.test.tsx): `touchstart` on a turn → advance past 450ms (sheet opens) → advance past 500ms (provider timer) → assert exactly one overlay exists and it is the action sheet (no provider `role="menu"`); `touchend` (cancelable) → assert `defaultPrevented === true`; follow the existing provider-test convention and, when the event WAS prevented, do not synthesize a click — and when not prevented, synthesize the compat click over the sheet's actionable row to prove activation does not occur (assert the sheet remains and no item ran).
+- Unit (combined, Android contextmenu route) — same harness: `touchstart` on a turn, `fireEvent.contextMenu` on the turn BEFORE 450ms (sheet opens via the contextmenu route), `touchend` cancelable → `defaultPrevented === true`, sheet remains open.
 - e2e — in the existing turn-menu pin: after a right click on the turn, assert `page.getByRole('menu')` count is exactly 1 and it is named "Turn context menu".
 
 - [ ] **Step 1: Write the failing behavioral tests + record the e2e RED first**
@@ -97,8 +105,8 @@ Expected: PASS.
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add src/components/context-menu/ContextMenuProvider.tsx src/lib/pointer.ts test/unit/client/components/ContextMenuProvider.test.tsx test/unit/client/lib/pointer.test.tsx test/unit/client/components/fresh-agent/FreshAgentMobile.test.tsx test/e2e-browser/specs/fresh-agent.spec.ts
-git commit -m "fix(fresh-agent): provider skips turn gestures; transcript suppresses release click after long-press"
+git add src/components/context-menu/ContextMenuProvider.tsx src/lib/pointer.ts src/components/fresh-agent/FreshAgentTranscript.tsx test/unit/client/components/ContextMenuProvider.test.tsx test/unit/client/lib/pointer.test.tsx test/unit/client/components/fresh-agent/FreshAgentMobile.test.tsx test/e2e-browser/specs/fresh-agent.spec.ts
+git commit -m "fix(fresh-agent): provider skips turn gestures; transcript suppresses release click after sheet open"
 ```
 
 ---
