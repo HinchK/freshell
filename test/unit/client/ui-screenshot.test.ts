@@ -624,6 +624,35 @@ describe('restoreFocus deleted-target hardening', () => {
     expect(store.getState().tabs.activeTabId).toBe('tab-1')
   })
 
+  it('user pane interaction on the capture-exposed tab protects BOTH coordinates from rollback', async () => {
+    const store = createFocusStore()
+    store.dispatch(splitPane({
+      tabId: 'tab-2',
+      paneId: 'pane-2',
+      direction: 'horizontal',
+      newContent: { kind: 'terminal', mode: 'shell' },
+      newPaneId: 'pane-2b',
+      activate: false,
+    }))
+    const before = { selectionSerial: getPaneSelectionSerial(), activeTabId: 'tab-1', activePaneByTab: { 'tab-2': 'pane-2' } }
+    // The capture exposes tab-2 and shows pane-2b.
+    store.dispatch(selectTabForCapture('tab-2'))
+    store.dispatch(setActivePane({ tabId: 'tab-2', paneId: 'pane-2b', capture: true }))
+    // The user clicks into pane-2b of the tab the capture is showing — they
+    // are engaged with BOTH the pane AND the tab now. Rolling the tab back
+    // would hide the pane they just clicked into.
+    store.dispatch(setActivePane({ tabId: 'tab-2', paneId: 'pane-2b' }))
+    const ok = await restoreFocus(
+      { dispatch: store.dispatch, getState: store.getState },
+      before,
+      new Set(['tab-2']),
+      { tab: 'tab-2', paneByTab: new Map([['tab-2', 'pane-2b']]) },
+    )
+    expect(ok).toBe(true)
+    expect(store.getState().panes.activePane['tab-2']).toBe('pane-2b') // user's pane preserved
+    expect(store.getState().tabs.activeTabId).toBe('tab-2') // the tab the user engaged with preserved
+  })
+
   it('yields ONLY the superseded coordinate when the user selected elsewhere, still restoring capture-owned background coordinates', async () => {
     const store = createFocusStore()
     store.dispatch(splitPane({
@@ -853,6 +882,45 @@ describe('captureUiScreenshot newer-selection supersession', () => {
     // Release the abandoned head so it cannot linger into later tests' tails.
     releaseHead(async () => {})
     await first
+  })
+
+  it('the deadline gates EVERY render: expiry during iframe preparation stops the remaining iframe renders and the main render', async () => {
+    const store = createFocusStore()
+    document.body.innerHTML = `
+      <div data-tab-content-id="tab-2">
+        <iframe id="fr1" title="one"></iframe>
+        <iframe id="fr2" title="two"></iframe>
+      </div>`
+    setRect(document.querySelector('[data-tab-content-id="tab-2"]')!, 300, 200)
+    setRect(document.getElementById('fr1')!, 100, 100)
+    setRect(document.getElementById('fr2')!, 100, 100)
+    let html2canvasCalls = 0
+    vi.mocked(html2canvas).mockImplementation(async () => {
+      html2canvasCalls += 1
+      if (html2canvasCalls === 1) {
+        // The first iframe render is mid-flight; the deadline elapses NOW —
+        // the gate before iframe #2 (and the main render) must stop the rest.
+        vi.setSystemTime(Date.now() + 5000)
+      }
+      return undefined as any
+    })
+    // Fake the clock: the deadline is fixed at job START; time "passes" only
+    // inside the first iframe render — startup latency on a loaded box cannot
+    // preempt the scenario. Real-time expiry-race slack is deliberately wide.
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      const deadlineAtMs = Date.now() + 500
+      const result = await captureUiScreenshot(
+        { scope: 'tab', tabId: 'tab-2', deadlineAtMs },
+        { dispatch: store.dispatch, getState: store.getState } as any,
+      )
+      expect(result.ok).toBe(false)
+      expect(result.error).toMatch(/deadline/)
+      expect(html2canvasCalls).toBe(1) // no iframe #2, no main render
+      expect(store.getState().tabs.activeTabId).toBe('tab-1')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('expires queued captures that outlived the server request window instead of mutating the UI after the caller already failed', async () => {

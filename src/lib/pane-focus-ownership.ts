@@ -343,11 +343,16 @@ export const paneSelectionMiddleware =
     ) {
       paneSelectionSerial += 1
       // Per-coordinate attribution (restore supersession granularity): the
-      // user touched ONLY this coordinate.
+      // user touched ONLY this coordinate. Interacting with a pane of the
+      // CURRENTLY-VISIBLE tab is ALSO engagement with that tab itself — a
+      // later capture rollback must not hide the pane the user clicked into.
       if (a?.type === 'tabs/setActiveTab') {
         touchSelectionCoordinate(TAB_SELECTION_COORDINATE)
       } else if (a?.payload?.tabId) {
         touchSelectionCoordinate(paneSelectionCoordinate(a.payload.tabId))
+        if (store.getState().tabs?.activeTabId === a.payload.tabId) {
+          touchSelectionCoordinate(TAB_SELECTION_COORDINATE)
+        }
       }
       return next(action)
     }
@@ -368,6 +373,9 @@ export const paneSelectionMiddleware =
       if (store.getState().panes?.activePane?.[tabId] !== before) {
         paneSelectionSerial += 1
         touchSelectionCoordinate(paneSelectionCoordinate(tabId))
+        if (store.getState().tabs?.activeTabId === tabId) {
+          touchSelectionCoordinate(TAB_SELECTION_COORDINATE)
+        }
       }
       return result
     }

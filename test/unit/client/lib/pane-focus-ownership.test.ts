@@ -631,4 +631,21 @@ describe('paneSelectionMiddleware selection-serial coverage', () => {
     store.dispatch(removeTab('tab-2')) // active-close fallback → touches the tab coordinate
     expect(wasSelectionCoordinateTouchedSince(TAB_SELECTION_COORDINATE, s1)).toBe(true)
   })
+
+  it('pane selection on the ACTIVE tab also touches the tab coordinate (the user is engaged with that tab)', () => {
+    const store = makeTabsPanesStore()
+    const s0 = getPaneSelectionSerial()
+    store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-1' })) // active tab's pane
+    expect(wasSelectionCoordinateTouchedSince(paneSelectionCoordinate('tab-1'), s0)).toBe(true)
+    expect(wasSelectionCoordinateTouchedSince(TAB_SELECTION_COORDINATE, s0)).toBe(true)
+  })
+
+  it('pane selection on a BACKGROUND tab touches ONLY the pane coordinate', () => {
+    const store = makeTabsPanesStore()
+    store.dispatch(addTab({ id: 'tab-2', title: 'Two', activate: false })) // background
+    const s0 = getPaneSelectionSerial()
+    store.dispatch(setActivePane({ tabId: 'tab-2', paneId: 'pane-2' }))
+    expect(wasSelectionCoordinateTouchedSince(paneSelectionCoordinate('tab-2'), s0)).toBe(true)
+    expect(wasSelectionCoordinateTouchedSince(TAB_SELECTION_COORDINATE, s0)).toBe(false)
+  })
 })

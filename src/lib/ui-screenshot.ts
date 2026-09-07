@@ -226,7 +226,7 @@ function buildIframeReplacementElement(
   return container
 }
 
-async function prepareIframeCapture(target: HTMLElement, scale: number): Promise<PreparedIframeCapture> {
+async function prepareIframeCapture(target: HTMLElement, scale: number, throwIfStale?: () => void): Promise<PreparedIframeCapture> {
   const iframes = Array.from(target.querySelectorAll('iframe'))
   if (iframes.length === 0) {
     return {
@@ -250,6 +250,8 @@ async function prepareIframeCapture(target: HTMLElement, scale: number): Promise
 
   for (const [marker, iframe] of markedIframes) {
     if (!isElementVisible(iframe)) continue
+    // Each iframe is its own html2canvas render; the deadline gates EVERY one.
+    throwIfStale?.()
     replacements.set(marker, await captureIframeReplacement(iframe, scale))
   }
 
@@ -426,8 +428,16 @@ const CAPTURE_QUEUE_TTL_MS = 8000
 // A job whose execution blows past its deadline is wedged (a hung renderer,
 // html2canvas, ...). It cannot be cancelled, so the tail abandons it after a
 // grace window — one stalled capture must not starve every later screenshot
-// the caller might still succeed at.
+// the caller might still succeed at. Abandonment is FENCED: the abandoned
+// job's wind-down (renderer resume + focus rollback) is driven once, at
+// abandonment, before the successor starts — never again at the job's
+// eventual end, so it cannot overlap its successor's capture.
 const CAPTURE_ABANDON_GRACE_MS = 2000
+
+let captureEpoch = 0
+/** epoch → exactly-once wind-down (renderer resume + focus rollback), driven
+ *  at normal completion OR at abandonment, whichever comes first. */
+const pendingWindDown = new Map<number, () => Promise<void>>()
 
 function expiredDeadlineResult(): ScreenshotResult {
   return {
@@ -440,15 +450,27 @@ function expiredDeadlineResult(): ScreenshotResult {
 
 export async function captureUiScreenshot(request: ScreenshotRequest, ctx: RuntimeContext): Promise<ScreenshotResult> {
   const deadlineAtMs = request.deadlineAtMs ?? (Date.now() + CAPTURE_QUEUE_TTL_MS)
+  const epoch = ++captureEpoch
   const job: Promise<ScreenshotResult> = captureTail.then(() => {
     if (Date.now() >= deadlineAtMs) return expiredDeadlineResult()
-    return performUiScreenshotCapture(request, ctx, deadlineAtMs)
+    return performUiScreenshotCapture(request, ctx, deadlineAtMs, epoch)
   })
   // The tail advances when the job settles — or walks past it entirely once
   // the job has blown its deadline plus grace (wedged capture, never settled).
+  // Walking past it FENCES it: its wind-down runs here, not at its own end.
   captureTail = Promise.race([
     job,
-    new Promise<unknown>((resolve) => setTimeout(resolve, Math.max(0, deadlineAtMs + CAPTURE_ABANDON_GRACE_MS - Date.now()))),
+    new Promise<unknown>((resolve) => setTimeout(() => {
+      const wind = pendingWindDown.get(epoch)
+      if (!wind) {
+        resolve(undefined)
+        return
+      }
+      // The tail advances only once the abandoned job's wind-down is fully
+      // settled — the successor neither sees a half-restored selection nor
+      // shares renderer suspension with the abandoned job.
+      void wind().then(resolve, resolve)
+    }, Math.max(0, deadlineAtMs + CAPTURE_ABANDON_GRACE_MS - Date.now()))),
   ]).then(() => undefined, () => undefined)
   // A stalled head must not park this caller past the deadline: answer with
   // the expiry result; the queued job later hits its dequeue gate and no-ops.
@@ -461,7 +483,7 @@ export async function captureUiScreenshot(request: ScreenshotRequest, ctx: Runti
   return Promise.race([job, expiry]).finally(() => { if (timer !== undefined) clearTimeout(timer) })
 }
 
-async function performUiScreenshotCapture(request: ScreenshotRequest, ctx: RuntimeContext, deadlineAtMs: number): Promise<ScreenshotResult> {
+async function performUiScreenshotCapture(request: ScreenshotRequest, ctx: RuntimeContext, deadlineAtMs: number, epoch: number): Promise<ScreenshotResult> {
   const focusBefore = snapshotFocus(ctx.getState())
   const paneTabsToRestore = new Set<string>()
   // Every capture-internal move is ALSO recorded here, keyed by what the
@@ -511,6 +533,30 @@ async function performUiScreenshotCapture(request: ScreenshotRequest, ctx: Runti
 
   let result: Omit<ScreenshotResult, 'changedFocus' | 'restoredFocus'>
   const restoreRenderers = await suspendTerminalRenderersForScreenshot()
+
+  // Exactly-once wind-down: renderer resume + focus rollback happen at normal
+  // completion OR at abandonment (the fence the tail timer invokes) —
+  // whichever comes first. An abandoned job that eventually settles does NOT
+  // wind down a second time, so it can never overlap its successor's capture.
+  let windDownDone = false
+  const windDown = async () => {
+    if (windDownDone) return
+    windDownDone = true
+    pendingWindDown.delete(epoch)
+    // Restore Redux selection state BEFORE releasing the renderers: the
+    // successor's snapshot must see the rollback, and restoreFocus dispatches
+    // synchronously up to its paint await, while renderer resume only frees
+    // pixels (paint-time only).
+    if (changedFocus) {
+      restoredFocus = await restoreFocus(ctx, focusBefore, paneTabsToRestore, {
+        tab: captureTabTarget,
+        paneByTab: capturePaneTargets,
+      })
+    }
+    await restoreRenderers()
+  }
+  pendingWindDown.set(epoch, windDown)
+
   try {
     let target: HTMLElement | null = null
 
@@ -553,9 +599,10 @@ async function performUiScreenshotCapture(request: ScreenshotRequest, ctx: Runti
 
     throwIfStale()
     const scale = Math.max(1, window.devicePixelRatio || 1)
-    const preparedIframes = await prepareIframeCapture(target, scale)
+    const preparedIframes = await prepareIframeCapture(target, scale, throwIfStale)
     let canvas: HTMLCanvasElement
     try {
+      throwIfStale() // prep can cross the deadline — re-gate the main render
       canvas = await html2canvas(target, {
         backgroundColor: null,
         allowTaint: true,
@@ -588,14 +635,7 @@ async function performUiScreenshotCapture(request: ScreenshotRequest, ctx: Runti
     }
   }
 
-  await restoreRenderers()
-
-  if (changedFocus) {
-    restoredFocus = await restoreFocus(ctx, focusBefore, paneTabsToRestore, {
-      tab: captureTabTarget,
-      paneByTab: capturePaneTargets,
-    })
-  }
+  await windDown()
 
   return {
     ...result,
