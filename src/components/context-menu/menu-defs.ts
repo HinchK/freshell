@@ -744,6 +744,8 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
     const hasSelection = !!(selection && selection.toString().trim())
 
     // Detect sub-region from click target using closest()
+    // KEEP IN SYNC: these selectors must mirror isFreshAgentSpecializedRegion
+    // in context-menu-utils.ts EXACTLY — edit both together.
     const codeBlock = clickTarget?.closest?.('.prose pre code') as HTMLElement | null
     const toolInput = clickTarget?.closest?.('[data-tool-input]') as HTMLElement | null
     const toolOutput = clickTarget?.closest?.('[data-tool-output]') as HTMLElement | null
