@@ -84,7 +84,7 @@ completion — matching the already-green separate-batch path. The Idle
 - An Idle terminal receiving the same one-batch start+complete STILL suppresses
   the promotion and records nothing — `reconcile_ignores_an_already_resolved_rollout`
   (`codex.rs:1393`) is unchanged.
-- The 30s `wait_for_frame` budget in `codex_locator_activity.rs` is unchanged.
+- The 120s `wait_for_frame` budget in `codex_locator_activity.rs` (landed by PR #744) is unchanged.
 
 **Files:**
 - Modify: `crates/freshell-activity/src/codex.rs:389` (the `effective_clear`
@@ -451,7 +451,7 @@ async fn fresh_pane_locator_one_batch_drain_records_turn_complete() {
     // reconcile_rollout call — the one-batch path.
     let cwd = std::env::temp_dir().to_string_lossy().to_string();
     let rollout = sessions_day.join(format!("rollout-2026-07-24T12-00-00-{THREAD}.jsonl"));
-    let ts = now_ms();
+    let ts = 9_999_999_999_999; // far-future so task_started > queued_submit_at
     std::fs::write(
         &rollout,
         format!(
