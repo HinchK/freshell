@@ -132,13 +132,13 @@ fn reconcile_one_batch_start_and_clear_on_a_pending_turn_with_newer_start_comple
     // instead of recording the completion -- terminal.turn.complete never
     // fired. The separate-batch path was green because the promotion landed
     // before the clear. This pins the one-batch path: a LIVE (Pending) turn
-    // whose start postdates the queued submit completes in one batch.
+    // whose start is at/after the pending submit completes in one batch.
     let mut tracker = CodexActivityTracker::new();
     tracker.track_terminal("t1", Some("thread-1"), 0);
     tracker.note_input("t1", "\r", 10); // turn 1 pending
     tracker.note_input("t1", "\r", 20); // queued submit (turn 2)
     let events = CodexTaskEvents {
-        latest_task_started_at: Some(40), // newer than the queued submit
+        latest_task_started_at: Some(40), // at/after the pending submit (10)
         latest_task_completed_at: Some(60),
         ..Default::default()
     };
@@ -146,7 +146,7 @@ fn reconcile_one_batch_start_and_clear_on_a_pending_turn_with_newer_start_comple
     assert_eq!(
         completions(&effects),
         vec![1],
-        "one-batch live turn (start newer than queued submit) completes exactly once"
+        "one-batch live turn (start >= pending submit) completes exactly once"
     );
     assert_eq!(
         phases(&effects),
@@ -176,22 +176,64 @@ fn reconcile_one_batch_start_and_clear_on_a_pending_turn_with_older_start_rearms
         completions(&clear).is_empty(),
         "re-arm to the queued turn is not a turn end (one-batch parity with separate-batch)"
     );
-    assert_eq!(phases(&clear), vec![CodexPhase::Pending]);
+    // Pending->Pending is not a public change: changed() suppresses the Changed
+    // effect, so phases(&clear) is []. Inspect the tracker state directly.
+    assert_eq!(
+        tracker.list()[0].phase,
+        CodexPhase::Pending,
+        "re-armed to Pending, not Idle"
+    );
+}
+
+#[test]
+fn reconcile_one_batch_historical_start_before_pending_submit_records_nothing() {
+    // pkvz regression guard (plan review round 1, finding 1): a historical
+    // rollout whose start (5) and clear (7) both predate the pending submit
+    // (10) must NOT promote or record a completion. The temporal restriction
+    // (started_at >= pending_submit_at) keeps the same-batch clear in the
+    // guard for this case, so the suppression is preserved. Without the
+    // restriction, the Pending bypass would promote on start=5 and ring a
+    // false completion for a turn that ended before the user submitted.
+    let mut tracker = CodexActivityTracker::new();
+    tracker.track_terminal("t1", Some("thread-1"), 0);
+    tracker.note_input("t1", "\r", 10); // pending submit at 10
+    let events = CodexTaskEvents {
+        latest_task_started_at: Some(5), // BEFORE the pending submit
+        latest_task_completed_at: Some(7), // BEFORE the pending submit
+        ..Default::default()
+    };
+    let effects = tracker.reconcile_rollout("t1", &events, 20);
+    assert!(
+        completions(&effects).is_empty(),
+        "historical rollout predating the pending submit must not ring"
+    );
+    assert_eq!(
+        tracker.list()[0].phase,
+        CodexPhase::Pending,
+        "the live pending turn is not consumed by a historical rollout"
+    );
 }
 ```
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run:
+Run the three new tests. Cargo accepts one positional TESTNAME before `--`, so
+use separate invocations. The `newer_start` test is the red; the other two pass
+on current code:
+
 ```bash
 cd /home/dan/code/freshell/.worktrees/pkvz-deflake && \
-  cargo test -p freshell-activity --lib codex:: reconcile_one_batch_start_and_clear_on_a_pending_turn_with_newer_start_completes reconcile_one_batch_start_and_clear_on_a_pending_turn_with_older_start_rearms -- --exact --nocapture
+  cargo test -p freshell-activity --lib \
+    reconcile_one_batch_start_and_clear_on_a_pending_turn_with_newer_start_completes -- --exact --nocapture && \
+  cargo test -p freshell-activity --lib \
+    reconcile_one_batch_start_and_clear_on_a_pending_turn_with_older_start_rearms -- --exact --nocapture && \
+  cargo test -p freshell-activity --lib \
+    reconcile_one_batch_historical_start_before_pending_submit_records_nothing -- --exact --nocapture
 ```
 
 Expected: the FIRST test FAILs with `assertion failed: ... == [1]` but got `[]`
-(zero completions) and phase `Pending` (re-armed) — the one-batch suppression.
-The SECOND test PASSes on current code (re-arm is the current behavior for the
-older-start case). The first test is the red.
+(zero completions) — the one-batch suppression. The SECOND and THIRD tests PASS
+on current code (re-arm and historical suppression are the current behavior).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -202,25 +244,38 @@ computation in `reconcile_rollout` (line 389):
 let effective_clear = max_ts(observed_clear, state.last_cleared_at);
 ```
 
-with a phase-conditional form — a same-batch clear must NOT shadow the start
-promotion of a LIVE (Pending) turn (the start-then-clear is a complete turn
-cycle for the pending submit, not a stale echo); historical (Idle) rollouts keep
-the same-batch clear in the guard so an already-resolved turn stays un-rung:
+with a temporally-restricted phase-conditional form. A same-batch clear must NOT
+shadow the start promotion of a LIVE (Pending) turn **whose start belongs to the
+pending submit** (`started_at >= pending_submit_at`, matching the frozen TS
+reference's `nextStartedAt >= state.pendingSubmitAt` at
+`codex-activity-tracker.ts:446`). A historical rollout whose start predates the
+pending submit keeps the same-batch clear in the guard (the suppression is
+preserved — no false completion). Idle (historical, not-watched) rollouts keep
+the same-batch clear unconditionally:
 
 ```rust
 // pkvz: under load the hub drains the just-attached rollout in ONE batch
-// (session_meta + task_started + task_complete). For a LIVE (Pending) turn the
-// same-batch clear must NOT shadow the start promotion -- the start-then-clear
-// is the pending submit's complete turn cycle, not a stale echo. Prior clears
-// (`last_cleared_at`) still gate it. Idle (historical, not-watched) rollouts
-// keep the same-batch clear in the guard so resume-busy seeding does not ring
-// a turn that ended before the tracker watched
-// (`reconcile_ignores_an_already_resolved_rollout`).
-let effective_clear = if state.phase == CodexPhase::Pending {
-    state.last_cleared_at
-} else {
-    max_ts(observed_clear, state.last_cleared_at)
-};
+// (session_meta + task_started + task_complete). For a LIVE (Pending) turn
+// whose start belongs to the pending submit (started_at >= pending_submit_at,
+// matching the TS reference codex-activity-tracker.ts:446), the same-batch
+// clear must NOT shadow the start promotion -- the start-then-clear is the
+// pending submit's complete turn cycle, not a stale echo. Prior clears
+// (`last_cleared_at`) still gate it. A historical rollout whose start predates
+// the pending submit keeps the same-batch clear in the guard (no false
+// completion for a turn that ended before the user submitted). Idle (historical,
+// not-watched) rollouts keep the same-batch clear unconditionally so
+// resume-busy seeding does not ring a turn that ended before the tracker
+// watched (`reconcile_ignores_an_already_resolved_rollout`).
+let starts_at_or_after_pending_submit = events
+    .latest_task_started_at
+    .zip(state.pending_submit_at)
+    .is_some_and(|(started, pending)| started >= pending);
+let effective_clear =
+    if state.phase == CodexPhase::Pending && starts_at_or_after_pending_submit {
+        state.last_cleared_at
+    } else {
+        max_ts(observed_clear, state.last_cleared_at)
+    };
 ```
 
 No other production change. The clear branch (lines 418-467) already handles the
@@ -233,14 +288,21 @@ start → Pending re-arm → no completion).
 
 - [ ] **Step 4: Run the focused test**
 
-Run:
+Run the three new tests (separate invocations — one positional TESTNAME each):
+
 ```bash
 cd /home/dan/code/freshell/.worktrees/pkvz-deflake && \
-  cargo test -p freshell-activity --lib codex:: reconcile_one_batch_start_and_clear_on_a_pending_turn_with_newer_start_completes reconcile_one_batch_start_and_clear_on_a_pending_turn_with_older_start_rearms -- --exact --nocapture
+  cargo test -p freshell-activity --lib \
+    reconcile_one_batch_start_and_clear_on_a_pending_turn_with_newer_start_completes -- --exact --nocapture && \
+  cargo test -p freshell-activity --lib \
+    reconcile_one_batch_start_and_clear_on_a_pending_turn_with_older_start_rearms -- --exact --nocapture && \
+  cargo test -p freshell-activity --lib \
+    reconcile_one_batch_historical_start_before_pending_submit_records_nothing -- --exact --nocapture
 ```
 
-Expected: both PASS. The first test now records exactly one completion and
-lands Idle; the second re-arms to Pending with no completion.
+Expected: all three PASS. The first records exactly one completion and lands
+Idle; the second re-arms to Pending with no completion; the third suppresses the
+historical rollout and stays Pending.
 
 - [ ] **Step 5: Refactor while green**
 
@@ -262,7 +324,7 @@ cd /home/dan/code/freshell/.worktrees/pkvz-deflake && \
   cargo test -p freshell-activity --lib
 ```
 
-Expected: PASS (all existing tests green; the two new tests green).
+Expected: PASS (all existing tests green; the three new tests green).
 
 - [ ] **Step 7: Commit the task**
 
@@ -276,11 +338,14 @@ observed_clear, so a LIVE (Pending) turn whose rollout was drained in one batch
 (task_started+task_complete together, the load-induced hub drain ordering) had
 its promotion shadowed by its own clear: accepted_start_at stayed None, the
 Pending clear branch re-armed via has_queued_submit's unwrap_or(true), and
-terminal.turn.complete never fired (kata pkvz). Scope the guard to prior clears
-(last_cleared_at) only when the phase is Pending, so the one-batch live turn
-promotes-then-clears and records exactly one completion -- matching the
-already-green separate-batch path. Idle (historical) rollouts keep the same-batch
-clear in the guard, preserving reconcile_ignores_an_already_resolved_rollout."
+terminal.turn.complete never fired (kata pkvz). Bypass the same-batch clear for
+a Pending turn whose start belongs to the pending submit (started_at >=
+pending_submit_at, matching the TS reference codex-activity-tracker.ts:446), so
+the one-batch live turn promotes-then-clears and records exactly one completion
+-- matching the already-green separate-batch path. Historical rollouts whose
+start predates the pending submit keep the same-batch clear in the guard (no
+false completion), and Idle rollouts keep it unconditionally, preserving
+reconcile_ignores_an_already_resolved_rollout."
 ```
 
 ---
@@ -302,51 +367,51 @@ clear in the guard, preserving reconcile_ignores_an_already_resolved_rollout."
 - Consumes: the Task 1 fix via the real server's `CodexActivityTracker`.
 
 **Test cases:**
-- Run the flaky integration test 10× in isolation → 10/10 PASS.
-- Run the flaky integration test once under deliberate whole-workspace load
-  (a parallel `cargo build` or a second `cargo test` of an unrelated crate) →
-  PASS within the unchanged 30s `wait_for_frame` budget.
-- Run the whole `freshell-ws` `codex_locator_activity` test file and the
-  `freshell-activity` crate → PASS.
+- Run the flaky integration test 5× in isolation → 5/5 PASS.
+- Run the whole `freshell-ws` crate 3× (the original flake scenario: many
+  integration tests contending for the blocking pool under one `cargo test`
+  invocation) → the pkvz test passes every time, 30s budget unchanged.
+- Run the `freshell-activity` crate and the codex/locator integration surface →
+  PASS.
 
 - [ ] **Step 1: Isolated repeat stability**
 
-Run the flaky test 10 times in isolation (single test, repeat via a shell loop;
-`--test-threads=1` keeps the binary's process-global env ownership clean):
+Run the flaky test 5 times in isolation (`--test-threads=1` keeps the binary's
+process-global env ownership clean):
 
 ```bash
 cd /home/dan/code/freshell/.worktrees/pkvz-deflake && \
-  for i in $(seq 1 10); do \
+  for i in $(seq 1 5); do \
     cargo test -p freshell-ws --test codex_locator_activity \
       fresh_pane_locator_identity_reaches_activity_and_turn_complete -- --exact --test-threads=1 || \
       { echo "FAIL on run $i"; exit 1; }; \
-  done; echo "10/10 PASS"
+  done; echo "5/5 PASS"
 ```
 
-Expected: 10/10 PASS. (Pre-fix this would still mostly pass in isolation — the
+Expected: 5/5 PASS. (Pre-fix this would still mostly pass in isolation — the
 flake is load-dependent — so this is a non-regression guard, not the load
 proof.)
 
-- [ ] **Step 2: Load stability**
+- [ ] **Step 2: Whole-crate load stability (the original flake scenario)**
 
-Run the flaky test once while a deliberate load generator saturates the box
-(mimics the whole-workspace `cargo test` contention that originally exposed the
-flake). Use a parallel `cargo build -p freshell-server` (or
-`cargo test -p freshell-sessions -- --run` if a build is already warm) to
-contend for the blocking pool and tokio workers:
+The kata reports the flake under "full workspace cargo run on a loaded 96-core
+box." The closest faithful reproduction without a full `cargo test --workspace`
+is running the whole `freshell-ws` crate (many integration tests contending for
+the blocking pool in one invocation) 3 times and confirming the pkvz test passes
+each time. This is the exact scenario that originally exposed the flake:
 
 ```bash
 cd /home/dan/code/freshell/.worktrees/pkvz-deflake && \
-  ( cargo build -p freshell-server 2>/dev/null & LOAD=$!; \
-    cargo test -p freshell-ws --test codex_locator_activity \
-      fresh_pane_locator_identity_reaches_activity_and_turn_complete -- --exact --test-threads=1; \
-    STATUS=$?; wait $LOAD; exit $STATUS )
+  for i in 1 2 3; do \
+    cargo test -p freshell-ws --test codex_locator_activity || \
+      { echo "FAIL on whole-crate run $i"; exit 1; }; \
+  done; echo "3/3 whole-crate PASS"
 ```
 
-Expected: PASS within the 30s budget. If it still flakes, capture the failure
-log and re-examine (the one-batch path is now fixed; a remaining flake would be
-a DIFFERENT race — record it in out-of-scope-findings.md and do not widen the
-budget).
+Expected: 3/3 PASS with the 30s `wait_for_frame` budget unchanged. The whole
+`codex_locator_activity` test file runs all its tests concurrently, contending
+for the blocking pool and tokio workers — the conditions that produced the
+one-batch drain.
 
 - [ ] **Step 3: Broader suite non-regression**
 
@@ -364,19 +429,21 @@ Expected: all PASS.
 
 - [ ] **Step 4: No commit (verification-only task)**
 
-Task 2 makes no source changes. If Step 2 reveals a residual flake, add a
-finding to `<logs-dir>/out-of-scope-findings.md` (a different race, not pkvz)
-and continue. Do not commit a budget bump.
+Task 2 makes no source changes. If any step reveals a remaining flake in
+`fresh_pane_locator_identity_reaches_activity_and_turn_complete`, that is a
+failed R1 (pkvz is not resolved), not an out-of-scope finding. Investigate and
+fix before claiming completion. Do not widen the budget.
 
 ---
 
 ## Self-review
 
 1. **Spec coverage:** R1 (flake gone) → Task 1 root-cause fix + Task 2 Steps 1-2
-   stability. R2 (root-cause, not budget bump; Idle preserved) → Task 1 Step 3
-   phase-conditional guard + Task 1 Step 6 re-runs
-   `reconcile_ignores_an_already_resolved_rollout`. R3 (new unit test + no
-   regression) → Task 1 Step 1 (two new tests) + Task 2 Step 3 (broader suite).
+   stability. R2 (root-cause, not budget bump; Idle and historical-rollout
+   suppression preserved) → Task 1 Step 3 temporally-restricted guard + Task 1
+   Step 6 re-runs `reconcile_ignores_an_already_resolved_rollout`. R3 (new unit
+   tests + no regression) → Task 1 Step 1 (three new tests, including the
+   historical-start regression guard) + Task 2 Step 3 (broader suite).
 2. **No silent deferrals:** No stubs, mocks, or seams. The fix is production
    code in `reconcile_rollout`; the integration test uses the real server.
 3. **File and interface consistency:** `effective_clear` is the only production
@@ -384,11 +451,17 @@ and continue. Do not commit a budget bump.
    clear branch at 418-467 is unchanged and already handles the post-promotion
    Busy clear. Test helpers `started`/`completed`/`phases`/`completions` are
    defined in-module. `note_input("\r", at)` drives Pending + queued submit
-   (confirmed at `codex.rs:530`).
+   (confirmed at `codex.rs:530`). The older-start and historical-start tests
+   use `tracker.list()[0].phase` (not `phases()`) for Pending→Pending net
+   transitions, since `changed()` (codex.rs:190-198) suppresses the `Changed`
+   effect when the public record starts and ends Pending.
 4. **Executable tests:** The first new test fails first for the stated reason
-   (zero completions, phase Pending — the suppression) and passes after the
-   guard change. The second test passes before and after (re-arm parity). The
-   Idle test is re-run, not duplicated.
+   (zero completions — the one-batch suppression) and passes after the guard
+   change. The second test passes before and after (re-arm parity). The third
+   test (historical start before pending submit) passes before and after
+   (suppression preserved — the temporal restriction keeps the same-batch clear
+   in the guard for starts that predate the pending submit). The Idle test is
+   re-run, not duplicated. Cargo commands use one positional TESTNAME each.
 5. **Placeholder scan:** No TBD/TODO/"later". All commands are runnable as
    written.
 6. **Operational completeness:** No migrations, no config, no docs changes
@@ -397,6 +470,6 @@ and continue. Do not commit a budget bump.
    user/approved step, not by this plan.
 7. **Task relevance:** Task 1 serves R1/R2/R3; Task 2 serves R1/R3. Both
    necessary; neither removable.
-8. **Task size:** Task 1 is one production conditional + two unit tests — one
+8. **Task size:** Task 1 is one production conditional + three unit tests — one
    coherent TDD change. Task 2 is verification-only. Each is independently
    reviewable.
