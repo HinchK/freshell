@@ -1,5 +1,14 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { configureStore } from '@reduxjs/toolkit'
+import { Provider } from 'react-redux'
+import tabsReducer from '@/store/tabsSlice'
+import panesReducer from '@/store/panesSlice'
+import sessionsReducer from '@/store/sessionsSlice'
+import connectionReducer from '@/store/connectionSlice'
+import settingsReducer from '@/store/settingsSlice'
+import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
+import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { FreshAgentActionSheet } from '@/components/fresh-agent/FreshAgentActionSheet'
 import { FreshAgentTranscript } from '@/components/fresh-agent/FreshAgentTranscript'
 import { FreshAgentComposer } from '@/components/fresh-agent/FreshAgentComposer'
@@ -15,6 +24,22 @@ vi.mock('@/components/markdown/LazyMarkdown', async () => {
 
 vi.mock('@/lib/api', () => ({
   api: { get: vi.fn(), post: vi.fn() },
+}))
+
+// Only needed by the ContextMenuProvider wrapper in the combined-gesture
+// describe below; mirrors the minimal harness in ContextMenu.longpress.test.tsx.
+vi.mock('@/lib/ws-client', () => ({
+  getWsClient: () => ({
+    send: vi.fn(),
+    connect: vi.fn().mockResolvedValue(undefined),
+    onMessage: vi.fn().mockReturnValue(() => {}),
+    onReconnect: vi.fn().mockReturnValue(() => {}),
+    setHelloExtensionProvider: vi.fn(),
+  }),
+}))
+
+vi.mock('@/lib/clipboard', () => ({
+  copyText: vi.fn().mockResolvedValue(undefined),
 }))
 
 function stubCoarsePointer(matches: boolean) {
@@ -116,6 +141,173 @@ describe('mobile coarse-pointer transcript behavior', () => {
     expect(screen.queryByRole('button', { name: 'Turn actions menu' })).not.toBeInTheDocument()
     fireEvent.contextMenu(screen.getByRole('article', { name: 'You transcript turn' }))
     expect(screen.getByRole('menu', { name: 'Turn context menu' })).toBeInTheDocument()
+  })
+})
+
+describe('turn gestures inside the global ContextMenuProvider (single overlay, release-safe)', () => {
+  let elementFromPointMock: ReturnType<typeof vi.fn>
+  let originalElementFromPoint: typeof document.elementFromPoint
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    originalElementFromPoint = document.elementFromPoint
+    elementFromPointMock = vi.fn().mockReturnValue(null)
+    document.elementFromPoint = elementFromPointMock
+  })
+
+  afterEach(() => {
+    cleanup()
+    document.elementFromPoint = originalElementFromPoint
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+
+  function createMenuTestStore() {
+    return configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        sessions: sessionsReducer,
+        connection: connectionReducer,
+        settings: settingsReducer,
+      },
+      middleware: (getDefaultMiddleware) =>
+        getDefaultMiddleware({ serializableCheck: false }),
+      preloadedState: {
+        tabs: {
+          tabs: [
+            {
+              id: 'tab-1',
+              createRequestId: 'tab-1',
+              title: 'Tab One',
+              status: 'running',
+              mode: 'shell',
+              shell: 'system',
+              createdAt: 1,
+            },
+          ],
+          activeTabId: 'tab-1',
+          renameRequestTabId: null,
+        },
+        panes: {
+          layouts: {},
+          activePane: {},
+          paneTitles: {},
+        },
+        sessions: {
+          projects: [],
+          expandedProjects: new Set<string>(),
+        },
+        connection: {
+          status: 'ready',
+          platform: null,
+        },
+      },
+    })
+  }
+
+  function renderTranscriptInProvider() {
+    stubCoarsePointer(true)
+    render(
+      <Provider store={createMenuTestStore()}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.FreshAgent}
+            data-tab-id="tab-1"
+            data-pane-id="pane-1"
+            data-session-id="sess-1"
+            data-provider="claude"
+            data-session-type="freshclaude"
+          >
+            <FreshAgentTranscript turns={TURNS} canFork={false} />
+          </div>
+        </ContextMenuProvider>
+      </Provider>,
+    )
+  }
+
+  function simulateTouch(
+    type: 'touchstart' | 'touchmove' | 'touchend' | 'touchcancel',
+    target: Element,
+    clientX = 100,
+    clientY = 100,
+  ) {
+    const touch = { clientX, clientY, identifier: 0, target }
+    const touchEvent = new TouchEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      touches: type === 'touchend' || type === 'touchcancel' ? [] : [touch as any],
+      changedTouches: [touch as any],
+    })
+    target.dispatchEvent(touchEvent)
+    return touchEvent
+  }
+
+  function releaseOverSheet(article: Element) {
+    const release = simulateTouch('touchend', article, 100, 100)
+    expect(release.defaultPrevented).toBe(true)
+    if (!release.defaultPrevented) {
+      // Engines that synthesize a compat click deliver it now; prove it can
+      // neither dismiss the freshly-opened sheet nor activate a row.
+      const firstRow = screen.queryByRole('menuitem')
+      firstRow?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    }
+    expect(screen.getByRole('menu', { name: /fix the bug/ })).toBeInTheDocument()
+  }
+
+  it('long-press route: only the action sheet opens, and the gesture release is suppressed', () => {
+    renderTranscriptInProvider()
+    const article = screen.getByRole('article', { name: 'You transcript turn' })
+    elementFromPointMock.mockReturnValue(article)
+
+    act(() => {
+      simulateTouch('touchstart', article, 100, 100)
+    })
+    // The transcript's 450ms long-press opens the sheet first.
+    act(() => {
+      vi.advanceTimersByTime(450)
+    })
+    expect(screen.getByRole('menu', { name: /fix the bug/ })).toBeInTheDocument()
+
+    // The global provider's 500ms long-press timer fires now — it must not
+    // stack its pane menu on top of the turn's sheet.
+    act(() => {
+      vi.advanceTimersByTime(100)
+    })
+    expect(screen.getAllByRole('menu')).toHaveLength(1)
+    expect(screen.getByRole('menu', { name: /fix the bug/ })).toBeInTheDocument()
+    // The provider never re-probes the point (the sheet already covers it).
+    expect(elementFromPointMock).not.toHaveBeenCalled()
+
+    releaseOverSheet(article)
+  })
+
+  it('native-contextmenu route (Android): only the action sheet opens, and the gesture release is suppressed', () => {
+    renderTranscriptInProvider()
+    const article = screen.getByRole('article', { name: 'You transcript turn' })
+    elementFromPointMock.mockReturnValue(article)
+
+    act(() => {
+      simulateTouch('touchstart', article, 100, 100)
+    })
+    // Android fires a real contextmenu mid-gesture, before the transcript's
+    // 450ms long-press timer completes.
+    fireEvent.contextMenu(article)
+    expect(screen.getByRole('menu', { name: /fix the bug/ })).toBeInTheDocument()
+
+    act(() => {
+      vi.advanceTimersByTime(500)
+    })
+    expect(screen.getAllByRole('menu')).toHaveLength(1)
+    expect(screen.getByRole('menu', { name: /fix the bug/ })).toBeInTheDocument()
+    expect(elementFromPointMock).not.toHaveBeenCalled()
+
+    releaseOverSheet(article)
   })
 })
 

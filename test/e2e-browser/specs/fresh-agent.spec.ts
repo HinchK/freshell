@@ -623,6 +623,12 @@ test.describe('Fresh Agent', () => {
     await expect(turnText).toBeVisible({ timeout: 10_000 })
     await turnText.click({ button: 'right' })
 
+    // Single-menu invariant: exactly ONE menu may open for a turn gesture.
+    // Before the provider carve-out, right-clicking a turn stacked the global
+    // pane menu and the transcript's turn menu at the same coordinates (the
+    // "popup with blank lines" bug — two overlapping menus).
+    await expect(page.getByRole('menu')).toHaveCount(1)
+
     // Fine-pointer desktop: right-clicking a turn opens the floating turn menu.
     const menu = page.getByRole('menu', { name: 'Turn context menu' })
     await expect(menu).toBeVisible()

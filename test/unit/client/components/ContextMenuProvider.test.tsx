@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act, render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { configureStore } from '@reduxjs/toolkit'
@@ -2699,5 +2699,153 @@ describe('ContextMenuProvider', () => {
       expect(call[0]).toEqual({ preventScroll: true })
     }
     focusSpy.mockRestore()
+  })
+})
+
+describe('fresh-agent turn carve-out', () => {
+  afterEach(() => {
+    cleanup()
+    vi.clearAllMocks()
+  })
+
+  function simulateTouch(
+    type: 'touchstart' | 'touchmove' | 'touchend' | 'touchcancel',
+    target: Element,
+    clientX = 100,
+    clientY = 100,
+  ) {
+    const touch = { clientX, clientY, identifier: 0, target }
+    const touchEvent = new TouchEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      touches: type === 'touchend' || type === 'touchcancel' ? [] : [touch as any],
+      changedTouches: [touch as any],
+    })
+    target.dispatchEvent(touchEvent)
+    return touchEvent
+  }
+
+  function renderFreshAgentFixture(turnArticleAttrs: Record<string, string> = {}) {
+    return renderWithProvider(
+      <div
+        data-context={ContextIds.FreshAgent}
+        data-tab-id="tab-1"
+        data-pane-id="pane-1"
+        data-session-id="sess-1"
+        data-provider="claude"
+        data-session-type="freshclaude"
+      >
+        <article data-turn-role="assistant" {...turnArticleAttrs}>
+          <p>Turn body text</p>
+        </article>
+        <div>Pane background</div>
+      </div>,
+    )
+  }
+
+  it('opens no provider menu for contextmenu inside article[data-turn-role]', () => {
+    renderFreshAgentFixture()
+
+    const target = screen.getByText('Turn body text')
+    const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 100, clientY: 100 })
+    act(() => {
+      target.dispatchEvent(event)
+    })
+
+    expect(screen.queryByRole('menu')).toBeNull()
+    // The transcript's bubble-phase handler owns the gesture — the provider
+    // must leave the event alone (no preventDefault from its capture listener).
+    expect(event.defaultPrevented).toBe(false)
+  })
+
+  it('still opens the pane menu for contextmenu in the pane container outside any turn article', () => {
+    renderFreshAgentFixture()
+
+    const target = screen.getByText('Pane background')
+    const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 100, clientY: 100 })
+    act(() => {
+      target.dispatchEvent(event)
+    })
+
+    expect(event.defaultPrevented).toBe(true)
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+  })
+
+  // These two tests drive the provider's 500ms long-press timer, so they need
+  // fake timers. They are scoped to this nested describe ONLY (restore in its
+  // afterEach): the outer suite stays real-timers by design.
+  describe('hybrid-input long-press', () => {
+    let elementFromPointMock: ReturnType<typeof vi.fn>
+    let originalElementFromPoint: typeof document.elementFromPoint
+
+    beforeEach(() => {
+      vi.useFakeTimers()
+      originalElementFromPoint = document.elementFromPoint
+      elementFromPointMock = vi.fn().mockReturnValue(null)
+      document.elementFromPoint = elementFromPointMock
+    })
+
+    afterEach(() => {
+      document.elementFromPoint = originalElementFromPoint
+      vi.useRealTimers()
+    })
+
+    it('still opens the provider long-press menu on a turn article WITHOUT data-longpress-owned (iPad-like fallback preserved)', () => {
+      renderFreshAgentFixture()
+
+      const article = screen.getByText('Turn body text').closest('article')!
+      elementFromPointMock.mockReturnValue(article)
+
+      act(() => {
+        simulateTouch('touchstart', article, 100, 100)
+      })
+      act(() => {
+        vi.advanceTimersByTime(500)
+      })
+
+      expect(elementFromPointMock).toHaveBeenCalled()
+      expect(screen.getByRole('menu')).toBeInTheDocument()
+    })
+
+    it('leaves the whole gesture alone on a turn article WITH data-longpress-owned="true"', () => {
+      renderFreshAgentFixture({ 'data-longpress-owned': 'true' })
+
+      const article = screen.getByText('Turn body text').closest('article')!
+      const outside = screen.getByText('Pane background')
+      elementFromPointMock.mockReturnValue(article)
+
+      act(() => {
+        simulateTouch('touchstart', article, 100, 100)
+      })
+      act(() => {
+        vi.advanceTimersByTime(500)
+      })
+
+      // The transcript's own long-press owns this gesture: no probe, no menu,
+      // no release suppression from the provider.
+      expect(elementFromPointMock).not.toHaveBeenCalled()
+      expect(screen.queryByRole('menu')).toBeNull()
+
+      const release = simulateTouch('touchend', article, 100, 100)
+      expect(release.defaultPrevented).toBe(false)
+
+      // The skipped gesture must not corrupt the provider's touch-session
+      // tracking: a following long-press outside the turn works normally.
+      elementFromPointMock.mockReturnValue(outside)
+      act(() => {
+        simulateTouch('touchstart', outside, 100, 100)
+      })
+      act(() => {
+        vi.advanceTimersByTime(500)
+      })
+
+      const menu = screen.getByRole('menu')
+      expect(menu).toBeInTheDocument()
+
+      // That menu's own release suppression still works after the skipped gesture.
+      const secondRelease = simulateTouch('touchend', outside, 100, 100)
+      expect(secondRelease.defaultPrevented).toBe(true)
+      expect(screen.getByRole('menu')).toBeInTheDocument()
+    })
   })
 })

@@ -763,11 +763,16 @@ function FreshAgentTurnArticle({
   // Long-press opens the action sheet on touch devices (iOS fires no
   // contextmenu event; Android does — both paths land on onOpenActions and
   // the second call is a no-op re-set of the same state).
-  const longPress = useMemo(() => (
-    actions.onOpenActions
-      ? buildLongPressHandlers<HTMLElement>(() => actions.onOpenActions?.(actionTurn))
-      : null
-  ), [actions, actionTurn])
+  // The memo returns { handlers, notifyOverlayOpened } rather than the raw
+  // builder product: notifyOverlayOpened is NOT a DOM handler and must never
+  // land in the article's prop spread (React warns on unknown DOM props).
+  const longPress = useMemo(() => {
+    if (!actions.onOpenActions) return null
+    const { notifyOverlayOpened, ...handlers } = buildLongPressHandlers<HTMLElement>(
+      () => actions.onOpenActions?.(actionTurn),
+    )
+    return { handlers, notifyOverlayOpened }
+  }, [actions, actionTurn])
   return (
     <article
       className={cn(
@@ -778,6 +783,12 @@ function FreshAgentTurnArticle({
       data-turn-role={turn.role}
       data-turn-index={index}
       data-turn-continuation={continuation ? 'true' : 'false'}
+      // Ownership marker for the global ContextMenuProvider: present exactly
+      // when this article's own long-press handlers exist (coarse pointers),
+      // so the provider skips its long-press/probe path for turn gestures.
+      // Fine pointers (incl. hybrid iPad+trackpad) never set it and keep the
+      // provider's long-press fallback.
+      data-longpress-owned={longPress ? 'true' : undefined}
       aria-label={`${turnLabel} transcript turn`}
       onContextMenu={(event) => {
         // stopPropagation matters: freshell has a global contextmenu handler
@@ -785,6 +796,10 @@ function FreshAgentTurnArticle({
         if (actions.onOpenActions) {
           event.preventDefault()
           event.stopPropagation()
+          // The sheet opens mid-touch via this native-contextmenu route (no
+          // long-press timer involved): mark the overlay open so the gesture's
+          // touchend suppresses the synthesized compat click.
+          longPress?.notifyOverlayOpened?.()
           actions.onOpenActions(actionTurn)
           return
         }
@@ -793,7 +808,7 @@ function FreshAgentTurnArticle({
         event.stopPropagation()
         actions.onTurnContextMenu(event, actionTurn)
       }}
-      {...(longPress ?? {})}
+      {...(longPress?.handlers ?? {})}
     >
       <FreshAgentTurnActions
         turn={actionTurn}

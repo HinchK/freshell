@@ -145,6 +145,29 @@ function findContextElement(start: HTMLElement | null): HTMLElement | null {
   return null
 }
 
+/**
+ * Fresh-agent transcript turn articles (sole producer: FreshAgentTranscript)
+ * own their contextmenu gesture entirely — the transcript always installs a
+ * turn handler per pointer kind (turn menu on fine pointers, action sheet on
+ * coarse). The provider's capture-phase document listener would otherwise
+ * beat that bubble-phase handler and stack its pane menu at the same point.
+ */
+function isFreshAgentTurnTarget(el: HTMLElement | null): boolean {
+  return !!el?.closest?.('article[data-turn-role]')
+}
+
+/**
+ * A turn article carries data-longpress-owned="true" exactly when the
+ * transcript installed its own long-press handlers (coarse pointers). The
+ * provider's long-press carve-out keys on this attribute — NOT bare
+ * data-turn-role — so hybrid-input devices (fine primary pointer, e.g. iPad +
+ * trackpad: the transcript installs no long-press there) keep the provider's
+ * long-press fallback untouched.
+ */
+function isFreshAgentLongPressOwnedTarget(el: HTMLElement | null): boolean {
+  return !!el?.closest?.('article[data-turn-role][data-longpress-owned="true"]')
+}
+
 function resolveContextId(value: string | undefined): ContextId {
   return isKnownContextId(value) ? value : ContextIds.Global
 }
@@ -1090,6 +1113,10 @@ export function ContextMenuProvider({
 
     const handleContextMenu = (e: MouseEvent) => {
       const target = e.target as HTMLElement | null
+      // Turn articles own their contextmenu gesture (see predicate comment) —
+      // no openMenu and deliberately no preventDefault: the transcript's
+      // bubble-phase handler owns the event now.
+      if (isFreshAgentTurnTarget(target)) return
       const contextEl = findContextElement(target)
       const contextId = resolveContextId(contextEl?.dataset.context)
       if (shouldUseNativeMenu(target, contextId, contextEl, e)) return
@@ -1166,9 +1193,22 @@ export function ContextMenuProvider({
       if (!touch) return
       suppressNextTouchEnd = false
       touchStartPos = { x: touch.clientX, y: touch.clientY }
+      // Capture the gesture target ONCE here: by the time the 500ms timer
+      // fires, a transcript-owned long-press (450ms) has already opened the
+      // action sheet, so a live elementFromPoint probe would hit the sheet.
+      const gestureTarget = e.target as HTMLElement | null
 
       longPressTimer = setTimeout(() => {
         longPressTimer = null
+        // The transcript's own long-press owns this gesture entirely: no
+        // probe, no haptic, no openMenu, and no suppressNextTouchEnd arming
+        // (the transcript's touch handlers own release suppression). Hybrid-
+        // input devices never set data-longpress-owned, so they keep the
+        // provider fallback below, which stays byte-identical.
+        if (isFreshAgentLongPressOwnedTarget(gestureTarget)) {
+          touchStartPos = null
+          return
+        }
         const startPos = touchStartPos
         if (!startPos) return
         const target = document.elementFromPoint(startPos.x, startPos.y) as HTMLElement | null
