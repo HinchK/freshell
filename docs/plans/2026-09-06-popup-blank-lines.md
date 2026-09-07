@@ -115,12 +115,25 @@ Expected: PASS.
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task** — as executed (see record below)
 
-```bash
-git add src/components/context-menu/ContextMenuProvider.tsx src/lib/pointer.ts src/components/fresh-agent/FreshAgentTranscript.tsx test/unit/client/components/ContextMenuProvider.test.tsx test/unit/client/lib/pointer.test.tsx test/unit/client/components/fresh-agent/FreshAgentMobile.test.tsx test/e2e-browser/specs/fresh-agent.spec.ts
-git commit -m "fix(fresh-agent): provider skips turn gestures; transcript suppresses release click after sheet open"
-```
+The workflow split execution into per-task commits, each committed by its own brief. **As-built commit inventory (authoritative; delta-review-round-5 correction — the original command omitted context-menu-utils.ts, menu-defs.ts, and FreshAgentTranscript.test.tsx):**
+
+| Commit | Content |
+|---|---|
+| `cf0fe6e4b` | Task 1: provider carve-out predicates + transcript `notifyOverlayOpened` plumbing + pointer.ts release suppression + unit/e2e tests (e2e pin run RED first) |
+| `e23b8c6de` | Review nits: two stale comments corrected |
+| `9cb2ffb0e` | Review nit: dead test-helper branch removed |
+| `32fa40095` | Task 002: ref-persisted gesture bundle in FreshAgentTurnArticle + rerender-mid-gesture regression test |
+| `042aa3c61` | Plan round-2 corrections + stale helper comment fix |
+| `7022c9f327` | Task 003: gesture-target ownership across late retargeted Android contextmenu + test |
+| `cf509d4a4` | Plan round-3 corrections (preventDefault wording + two-predicate refactor wording) |
+| `26abd4e5c` | Task 004: preventDefault on the carve-out early return + assertions |
+| `9071da1dc` | Plan round-4 corrections (specialized sub-region partition) |
+| `650d63b5a` | Task 005: specialized-region partition (`context-menu-utils.ts` predicate + provider exception + transcript yield) + unit/e2e coverage; keep-in-sync comments in `context-menu-utils.ts` and `menu-defs.ts` |
+| `11bf339d9` | Plan round-1 corrections (R1 coarse-pointer scoping; ref-persistence design) |
+
+Complete delta file set (base 7307b834045e → final): `src/components/context-menu/ContextMenuProvider.tsx`, `src/components/context-menu/context-menu-utils.ts`, `src/components/context-menu/menu-defs.ts` (comment only), `src/lib/pointer.ts`, `src/components/fresh-agent/FreshAgentTranscript.tsx`, `test/unit/client/components/ContextMenuProvider.test.tsx`, `test/unit/client/lib/pointer.test.tsx`, `test/unit/client/components/fresh-agent/FreshAgentMobile.test.tsx`, `test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx`, `test/e2e-browser/specs/fresh-agent.spec.ts`, this plan.
 
 ---
 
