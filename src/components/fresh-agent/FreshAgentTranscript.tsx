@@ -791,8 +791,10 @@ function FreshAgentTurnArticle({
       data-longpress-owned={longPress ? 'true' : undefined}
       aria-label={`${turnLabel} transcript turn`}
       onContextMenu={(event) => {
-        // stopPropagation matters: freshell has a global contextmenu handler
-        // that renders the app menu over ours otherwise (live-test finding).
+        // The global ContextMenuProvider's document listener is capture-phase,
+        // so stopPropagation could never beat it — the real protection today is
+        // the provider's early-return carve-out for article[data-turn-role]
+        // targets. stopPropagation is kept as cheap, correct event hygiene.
         if (actions.onOpenActions) {
           event.preventDefault()
           event.stopPropagation()

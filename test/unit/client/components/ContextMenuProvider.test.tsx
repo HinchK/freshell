@@ -773,8 +773,9 @@ describe('ContextMenuProvider', () => {
     await user.pointer({ target: screen.getByText('Tab One'), keys: '[MouseRight]' })
     expect(screen.getByRole('menu')).toBeInTheDocument()
 
-    // Wait out the 500ms post-open grace window (this suite uses real
-    // timers by design — do not add fake timers to this file).
+    // Wait out the 500ms post-open grace window (the OUTER suite uses real
+    // timers by design — only the nested 'hybrid-input long-press' describe
+    // uses fake timers, scoped by its own setup/cleanup).
     await new Promise((resolve) => setTimeout(resolve, 550))
 
     act(() => {
