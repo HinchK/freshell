@@ -1112,6 +1112,7 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
     <div className="relative min-h-0 flex-1">
       <div
         ref={scrollerRef}
+        tabIndex={-1}
         className="fresh-agent-transcript-scroll flex h-full flex-col gap-0 overflow-x-hidden overflow-y-auto overscroll-contain px-3 py-3"
         data-context="fresh-agent-transcript"
         onScroll={(event) => {
