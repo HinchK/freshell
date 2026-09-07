@@ -5,7 +5,10 @@
 //!
 //! Harness copied from the (retired) codex_candidate_activity.rs: real
 //! server, real socket, real PTY running a fake codex binary, CODEX_HOME
-//! pointed at a tempdir.
+//! pointed at a tempdir. Both tests mutate process-wide env (`CODEX_HOME`,
+//! `CODEX_ARGV_CAPTURE_PATH`) and share a PID-only fake-script path, so they
+//! are serialized via `ENV_LOCK` (the repo's convention, e.g.
+//! `codex_fork_rebind.rs`).
 
 #[cfg(unix)]
 mod common;
@@ -18,6 +21,11 @@ use serde_json::json;
 use std::time::Duration;
 #[cfg(unix)]
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+/// Serializes tests that mutate process-wide env (`CODEX_HOME`,
+/// `CODEX_ARGV_CAPTURE_PATH`) and share the PID-only fake-script path.
+#[cfg(unix)]
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Fake codex: records argv to $CODEX_ARGV_CAPTURE_PATH (atomic tmp+mv) then
 /// sleeps. Copied from the (retired) tests/codex_candidate_persisted.rs.
@@ -136,7 +144,11 @@ fn codex_event_line(payload_type: &str, at_ms: i64) -> String {
 async fn fresh_pane_locator_identity_reaches_activity_and_turn_complete() {
     const THREAD: &str = "11111111-2222-3333-4444-555555555555";
 
-    // ---- env setup (single sequential test: this binary owns process env) ----
+    // Serialize env mutation with the one-batch test (both mutate CODEX_HOME
+    // and share the PID-only fake-script path).
+    let _env = ENV_LOCK.lock().await;
+
+    // ---- env setup (serialized via ENV_LOCK: this binary owns process env) ----
     // CODEX_HOME tempdir; the sessions day tree exists but holds NO rollout
     // yet — the locator's FIRST-submit re-snapshot must see zero files.
     let codex_home = tempfile::tempdir().expect("codex home");
@@ -272,6 +284,10 @@ async fn fresh_pane_locator_identity_reaches_activity_and_turn_complete() {
 #[tokio::test(flavor = "multi_thread")]
 async fn fresh_pane_locator_one_batch_drain_records_turn_complete() {
     const THREAD: &str = "22222222-3333-4444-5555-666666666666";
+
+    // Serialize env mutation with the identity-reaches test (both mutate
+    // CODEX_HOME and share the PID-only fake-script path).
+    let _env = ENV_LOCK.lock().await;
 
     let codex_home = tempfile::tempdir().expect("codex home");
     let sessions_day = codex_home

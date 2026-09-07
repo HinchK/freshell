@@ -386,20 +386,11 @@ impl CodexActivityTracker {
                 .unwrap_or(true);
             state.last_seen_task_started_at =
                 max_ts(state.last_seen_task_started_at, Some(started_at));
-            // pkvz: under load the hub drains the just-attached rollout in ONE
-            // batch (session_meta + task_started + task_complete). For a LIVE
-            // (Pending) turn whose start belongs to the pending submit
-            // (started_at >= pending_submit_at, matching the TS reference
+            // pkvz: for a LIVE (Pending) turn whose start belongs to the
+            // pending submit (started_at >= pending_submit_at, matching
             // codex-activity-tracker.ts:446), the same-batch clear must NOT
-            // shadow the start promotion -- the start-then-clear is the pending
-            // submit's complete turn cycle, not a stale echo. Prior clears
-            // (`last_cleared_at`) still gate it. A historical rollout whose
-            // start predates the pending submit keeps the same-batch clear in
-            // the guard (no false completion for a turn that ended before the
-            // user submitted). Idle (historical, not-watched) rollouts keep the
-            // same-batch clear unconditionally so resume-busy seeding does not
-            // ring a turn that ended before the tracker watched
-            // (`reconcile_ignores_an_already_resolved_rollout`).
+            // shadow the start promotion. Historical (Idle / start before the
+            // pending submit) rollouts keep the same-batch clear.
             let effective_clear =
                 if state.phase == CodexPhase::Pending
                     && events
