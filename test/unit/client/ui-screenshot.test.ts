@@ -1078,7 +1078,7 @@ describe('captureUiScreenshot newer-selection supersession', () => {
       // keydown (Tab focus chain) or pointer motion over the pane. Capture-side
       // eligibility autofocus never has one — that is the classifier's ground
       // truth distinguishing user engagement from programmatic iframe focus.
-      document.body.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true }))
+      document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true }))
       // The parent sees the displacement: focusout on the URL field,
       // activeElement becomes the iframe.
       iframe.focus()
@@ -1158,6 +1158,52 @@ describe('captureUiScreenshot newer-selection supersession', () => {
     }
   })
 
+  it('unrelated input in the user pane plus a programmatic hoist in the captured pane never reads as engagement', async () => {
+    const store = createFocusStore()
+    document.body.innerHTML = `
+      <div data-tab-content-id="tab-1">
+        <div data-pane-shell="true" data-tab-id="tab-1" data-pane-id="pane-1">
+          <input id="user-field" placeholder="typing here...">
+        </div>
+      </div>
+      <div data-tab-content-id="tab-2" style="display:none" id="tab2-target">
+      </div>
+      <div data-pane-shell="true" data-tab-id="tab-2" data-pane-id="pane-2">
+        <input id="url-field" placeholder="Enter URL...">
+      </div>`
+    const userField = document.getElementById('user-field')!
+    const iframe = document.createElement('iframe')
+    iframe.title = 'Extension content'
+    document.querySelector('[data-pane-id="pane-2"]')!.appendChild(iframe)
+    const urlField = document.getElementById('url-field')!
+    const tabEl = document.getElementById('tab2-target')!
+    setRect(tabEl, 300, 200)
+    const unsubscribe = store.subscribe(() => {
+      if (store.getState().tabs.activeTabId !== 'tab-2') return
+      tabEl.style.display = 'block'
+      // The user is actively typing / pointing in THEIR OWN pane (pane-1) —
+      // ongoing input whose timestamps overlap the eligibility flip. Evidence
+      // elsewhere must not launder this PROGRAMMATIC hoist into engagement.
+      userField.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', bubbles: true, cancelable: true }))
+      userField.dispatchEvent(new Event('pointermove', { bubbles: true }))
+      urlField.focus()
+      iframe.focus() // extension eligibility autofocus — NOT the user
+    })
+    try {
+      const capturing = captureUiScreenshot(
+        { scope: 'tab', tabId: 'tab-2' },
+        { dispatch: store.dispatch, getState: store.getState } as any,
+      )
+      await waitFor(() => expect(store.getState().tabs.activeTabId).toBe('tab-2'), { timeout: 10_000 })
+      const result = await capturing
+      expect(result.changedFocus).toBe(true)
+      expect(result.restoredFocus).toBe(true)
+      expect(store.getState().tabs.activeTabId).toBe('tab-1') // rollback held
+    } finally {
+      unsubscribe()
+    }
+  })
+
   it('a server screenshot.cancel for an in-flight capture aborts it at the next gate', async () => {
     const store = createFocusStore()
     document.body.innerHTML = `<div data-tab-content-id="tab-2" style="display:none" id="tab2-target"></div>`
@@ -1180,6 +1226,36 @@ describe('captureUiScreenshot newer-selection supersession', () => {
       expect(store.getState().tabs.activeTabId).toBe('tab-1')
     } finally {
       unsubscribe()
+    }
+  })
+
+  it('a cancel landing DURING the main render unwinds the capture instead of waiting out html2canvas', async () => {
+    const store = createFocusStore()
+    document.body.innerHTML = '<div data-tab-content-id="tab-2" id="tab2-el"></div>'
+    setRect(document.getElementById('tab2-el')!, 200, 200)
+    let releaseRender!: () => void
+    const renderGate = new Promise<void>((resolve) => { releaseRender = resolve })
+    vi.mocked(html2canvas).mockImplementation(async () => {
+      await renderGate
+      // Late-settling render side effect: its onclone edits only touch the
+      // clone document — safe to abandon mid-flight.
+      return undefined as any
+    })
+    try {
+      const capturing = captureUiScreenshot(
+        { scope: 'tab', tabId: 'tab-2', requestId: 'req-mid-render' },
+        { dispatch: store.dispatch, getState: store.getState } as any,
+      )
+      await waitFor(() => expect(vi.mocked(html2canvas)).toHaveBeenCalledTimes(1), { timeout: 10_000 })
+      // The Rust broker just resolved another client: this one unwinds at
+      // the next CANCEL-OBSERVABLE point — which must include a parked render.
+      cancelUiScreenshot('req-mid-render')
+      const result = await capturing
+      expect(result.ok).toBe(false)
+      expect(result.error).toMatch(/cancelled by server/)
+      expect(store.getState().tabs.activeTabId).toBe('tab-1')
+    } finally {
+      releaseRender?.()
     }
   })
 

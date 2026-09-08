@@ -231,7 +231,7 @@ function buildIframeReplacementElement(
   return container
 }
 
-export async function prepareIframeCapture(target: HTMLElement, scale: number, throwIfStale?: () => void): Promise<PreparedIframeCapture> {
+export async function prepareIframeCapture(target: HTMLElement, scale: number, throwIfStale?: () => void, raceCancellation?: <T>(work: Promise<T>) => Promise<T>): Promise<PreparedIframeCapture> {
   const iframes = Array.from(target.querySelectorAll('iframe'))
   if (iframes.length === 0) {
     return {
@@ -274,9 +274,11 @@ export async function prepareIframeCapture(target: HTMLElement, scale: number, t
   try {
     for (const [marker, iframe] of markedIframes) {
       if (!isElementVisible(iframe)) continue
-      // Each iframe is its own html2canvas render; the deadline gates EVERY one.
+      // Each iframe is its own html2canvas render; the deadline gates EVERY
+      // one, and a cancel lands mid-render via the race, not at its end.
       throwIfStale?.()
-      replacements.set(marker, await captureIframeReplacement(iframe, scale))
+      const work = captureIframeReplacement(iframe, scale)
+      replacements.set(marker, raceCancellation ? await raceCancellation(work) : await work)
     }
   } catch (err) {
     // The caller never receives our cleanup handle when we throw — reclaim
@@ -484,6 +486,11 @@ export function cancelUiScreenshot(requestId: string): void {
   // Bounded: a cancel for a frame that never arrived would linger forever.
   if (cancelledCaptures.size >= 1024) cancelledCaptures.clear()
   cancelledCaptures.add(requestId)
+  const waiters = cancellationWaiters.get(requestId)
+  if (waiters) {
+    cancellationWaiters.delete(requestId)
+    for (const resolve of waiters) resolve()
+  }
 }
 
 function cancelledScreenshotResult(): ScreenshotResult {
@@ -495,6 +502,34 @@ function consumeCancellation(requestId: string | undefined): boolean {
   if (!requestId || !cancelledCaptures.has(requestId)) return false
   cancelledCaptures.delete(requestId)
   return true
+}
+
+/** Async waiters for in-flight work the discrete gates cannot reach — a
+ *  capture parked inside a MULTI-SECOND html2canvas render must still unwind
+ *  promptly when its cancel lands (the Rust broker's first-client resolve
+ *  cancels losers mid-render; html2canvas itself cannot be cancelled, but
+ *  racing it abandons the result — its onclone only mutates the clone). */
+const cancellationWaiters = new Map<string, Set<() => void>>()
+
+function watchCancellation(requestId: string | undefined): { promise: Promise<void>; release: () => void } | null {
+  if (!requestId) return null
+  if (cancelledCaptures.has(requestId)) {
+    // Already cancelled before registration: surface immediately but leave
+    // the marker — the gate-side consume is single-owner for auditability.
+    return { promise: Promise.resolve(), release: () => {} }
+  }
+  let resolveRef: (() => void) | undefined
+  const promise = new Promise<void>((resolve) => { resolveRef = resolve })
+  const set = cancellationWaiters.get(requestId) ?? new Set<() => void>()
+  set.add(resolveRef!)
+  cancellationWaiters.set(requestId, set)
+  const release = () => {
+    const live = cancellationWaiters.get(requestId)
+    if (!live) return
+    live.delete(resolveRef!)
+    if (live.size === 0) cancellationWaiters.delete(requestId)
+  }
+  return { promise, release }
 }
 
 /** Test-only: await the capture queue until fully drained (including abandon
@@ -574,6 +609,19 @@ async function performUiScreenshotCapture(request: ScreenshotRequest, ctx: Runti
     if (deadlineExceeded()) throw new Error('screenshot aborted: exceeded its server deadline mid-capture')
   }
 
+  // In-flight cancellation beyond the discrete gates: race every long render
+  // against the cancel signal (a losing client unwinds mid-render, not at the
+  // render's own pace). Abandoning html2canvas is safe — its onclone edits
+  // only touch the clone document. Released in wind-down.
+  const cancellation = watchCancellation(request.requestId)
+  const raceCancellation = <T,>(work: Promise<T>): Promise<T> => {
+    if (!cancellation) return work
+    return Promise.race([
+      work,
+      cancellation.promise.then(() => { throw new Error('screenshot cancelled by server') }),
+    ])
+  }
+
   const setActiveTabIfNeeded = async (tabId: string) => {
     if (ctx.getState().tabs.activeTabId === tabId) return
     throwIfStale()
@@ -617,23 +665,40 @@ async function performUiScreenshotCapture(request: ScreenshotRequest, ctx: Runti
   // focus-steal-guard.ts). The observables are focusout on the displaced
   // element and window blur (when body was displaced). Checking after a task
   // because the activeElement reassignment is mid-flight during dispatch.
-  // A hoist only counts as USER engagement when real input preceded it —
-  // sequential-nav keydown landing on the parent document, or pointer
-  // activity over the app. Capture-side eligibility autofocus ALSO hoists
-  // programmatically (ExtensionPane focuses its iframe on a flip) but has no
-  // input trail; counting it would veto this capture's own rollback.
+  // A hoist only counts as USER engagement when real bound input preceded it:
+  // a FOCUS-NAVIGATION keydown (Tab — typing letters anywhere must not count),
+  // or pointer activity over THE SAME PANE the hoist landed in (typing/mousing
+  // in the user's own pane must not launder programmatic eligibility autofocus
+  // in the captured pane into 'user engagement'). Programmatic autofocus
+  // (ExtensionPane focusing its iframe on a flip) has no input trail at all.
   const INTENT_WINDOW_MS = 1500
-  let lastUserIntentAtMs = -Infinity
-  const noteUserIntent = () => { lastUserIntentAtMs = Date.now() }
-  document.addEventListener('keydown', noteUserIntent, true)
-  document.addEventListener('pointerdown', noteUserIntent, true)
-  document.addEventListener('pointermove', noteUserIntent, { capture: true, passive: true })
+  let lastNavKeyAtMs = -Infinity
+  const panePointerAtMs = new Map<string, number>()
+  const noteKeyIntent = (event: Event) => {
+    if ((event as KeyboardEvent).key !== 'Tab') return
+    lastNavKeyAtMs = Date.now()
+  }
+  const notePointerIntent = (event: Event) => {
+    const paneHost = (event.target as Element | null)?.closest?.('[data-pane-id]') as HTMLElement | null
+    const paneId = paneHost?.getAttribute('data-pane-id')
+    if (!paneId) return
+    if (panePointerAtMs.size >= 256) panePointerAtMs.clear() // pane churn is tiny; keep bounded
+    panePointerAtMs.set(paneId, Date.now())
+  }
+  document.addEventListener('keydown', noteKeyIntent, true)
+  document.addEventListener('pointerdown', notePointerIntent, true)
+  document.addEventListener('pointermove', notePointerIntent, { capture: true, passive: true })
   const checkForIframeHoist = () => {
-    if (Date.now() - lastUserIntentAtMs > INTENT_WINDOW_MS) return
     const el = document.activeElement as HTMLElement | null
     if (!el || el.tagName !== 'IFRAME' || typeof el.closest !== 'function') return
     const paneHost = el.closest('[data-pane-id]') as HTMLElement | null
     if (!paneHost) return
+    const paneId = paneHost.getAttribute('data-pane-id') ?? ''
+    const now = Date.now()
+    const hasIntent =
+      now - lastNavKeyAtMs <= INTENT_WINDOW_MS
+      || now - (panePointerAtMs.get(paneId) ?? -Infinity) <= INTENT_WINDOW_MS
+    if (!hasIntent) return // capture-side autofocus, not engagement
     const tabId = (paneHost.closest('[data-tab-id]') as HTMLElement | null)
       ?.getAttribute('data-tab-id')
       ?? null
@@ -651,11 +716,12 @@ async function performUiScreenshotCapture(request: ScreenshotRequest, ctx: Runti
   const windDown = (): Promise<void> => {
     if (!windDownPromise) {
       windDownPromise = (async () => {
+        cancellation?.release()
         document.removeEventListener('focusout', onHoistSignal)
         window.removeEventListener('blur', onHoistSignal)
-        document.removeEventListener('keydown', noteUserIntent, true)
-        document.removeEventListener('pointerdown', noteUserIntent, true)
-        document.removeEventListener('pointermove', noteUserIntent, true)
+        document.removeEventListener('keydown', noteKeyIntent, true)
+        document.removeEventListener('pointerdown', notePointerIntent, true)
+        document.removeEventListener('pointermove', notePointerIntent, true)
         // Restore Redux selection state BEFORE releasing the renderers: the
         // successor's snapshot must see the rollback, and restoreFocus dispatches
         // synchronously up to its paint await, while renderer resume only frees
@@ -728,11 +794,11 @@ async function performUiScreenshotCapture(request: ScreenshotRequest, ctx: Runti
 
     throwIfStale()
     const scale = Math.max(1, window.devicePixelRatio || 1)
-    const preparedIframes = await prepareIframeCapture(target, scale, throwIfStale)
+    const preparedIframes = await prepareIframeCapture(target, scale, throwIfStale, raceCancellation)
     let canvas: HTMLCanvasElement
     try {
       throwIfStale() // prep can cross the deadline — re-gate the main render
-      canvas = await html2canvas(target, {
+      canvas = await raceCancellation(html2canvas(target, {
         backgroundColor: null,
         allowTaint: true,
         useCORS: true,
@@ -741,7 +807,7 @@ async function performUiScreenshotCapture(request: ScreenshotRequest, ctx: Runti
         onclone: (doc) => {
           preparedIframes.onclone(doc)
         },
-      })
+      }))
     } finally {
       preparedIframes.cleanup()
     }
