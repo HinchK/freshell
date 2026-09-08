@@ -510,6 +510,10 @@ export async function drainCaptureQueueForTests(): Promise<void> {
 
 export async function captureUiScreenshot(request: ScreenshotRequest, ctx: RuntimeContext): Promise<ScreenshotResult> {
   const deadlineAtMs = request.deadlineAtMs ?? (Date.now() + CAPTURE_QUEUE_TTL_MS)
+  // A request cancelled BEFORE its frame even ran here must never enqueue
+  // work — queueing first and fast-failing second would let the entry consume
+  // eat the marker out from under the tail-scheduled job's own dequeue gate.
+  if (consumeCancellation(request.requestId)) return cancelledScreenshotResult()
   const epoch = ++captureEpoch
   const job: Promise<ScreenshotResult> = captureTail.then(() => {
     if (consumeCancellation(request.requestId)) return cancelledScreenshotResult()
@@ -536,7 +540,6 @@ export async function captureUiScreenshot(request: ScreenshotRequest, ctx: Runti
   // A stalled head must not park this caller past the deadline: answer with
   // the expiry result; the queued job later hits its dequeue gate and no-ops.
   const remaining = deadlineAtMs - Date.now()
-  if (consumeCancellation(request.requestId)) return cancelledScreenshotResult()
   if (remaining <= 0) return expiredDeadlineResult()
   let timer: ReturnType<typeof setTimeout> | undefined
   const expiry = new Promise<ScreenshotResult>((resolve) => {
@@ -603,7 +606,7 @@ async function performUiScreenshotCapture(request: ScreenshotRequest, ctx: Runti
   // The fence is registered BEFORE renderer suspension ACQUISITION (which can
   // sit in an rAF-starved paint window in background tabs): an abandonment
   // landing mid-acquisition arms the late-resume handoff below.
-  let windDownDone = false
+  let windDownPromise: Promise<void> | null = null
   let restoreRenderersFn: (() => Promise<void>) | null = null
   let resumeAfterAcquire = false
 
@@ -640,30 +643,41 @@ async function performUiScreenshotCapture(request: ScreenshotRequest, ctx: Runti
   document.addEventListener('focusout', onHoistSignal)
   window.addEventListener('blur', onHoistSignal)
 
-  const windDown = async () => {
-    if (windDownDone) return
-    windDownDone = true
-    pendingWindDown.delete(epoch)
-    document.removeEventListener('focusout', onHoistSignal)
-    window.removeEventListener('blur', onHoistSignal)
-    document.removeEventListener('keydown', noteUserIntent, true)
-    document.removeEventListener('pointerdown', noteUserIntent, true)
-    document.removeEventListener('pointermove', noteUserIntent, true)
-    // Restore Redux selection state BEFORE releasing the renderers: the
-    // successor's snapshot must see the rollback, and restoreFocus dispatches
-    // synchronously up to its paint await, while renderer resume only frees
-    // pixels (paint-time only).
-    if (changedFocus) {
-      restoredFocus = await restoreFocus(ctx, focusBefore, paneTabsToRestore, {
-        tab: captureTabTarget,
-        paneByTab: capturePaneTargets,
-      })
+  // Wind-down is a SHARED PROMISE, started exactly once and joined by every
+  // caller (natural completion AND the abandonment timer): whoever starts
+  // second must WAIT for the in-flight restore + renderer resume, never walk
+  // past it. The map entry survives until the promise fully settles so the
+  // timer still finds it mid-wind-down.
+  const windDown = (): Promise<void> => {
+    if (!windDownPromise) {
+      windDownPromise = (async () => {
+        document.removeEventListener('focusout', onHoistSignal)
+        window.removeEventListener('blur', onHoistSignal)
+        document.removeEventListener('keydown', noteUserIntent, true)
+        document.removeEventListener('pointerdown', noteUserIntent, true)
+        document.removeEventListener('pointermove', noteUserIntent, true)
+        // Restore Redux selection state BEFORE releasing the renderers: the
+        // successor's snapshot must see the rollback, and restoreFocus dispatches
+        // synchronously up to its paint await, while renderer resume only frees
+        // pixels (paint-time only).
+        if (changedFocus) {
+          restoredFocus = await restoreFocus(ctx, focusBefore, paneTabsToRestore, {
+            tab: captureTabTarget,
+            paneByTab: capturePaneTargets,
+          })
+        }
+        if (restoreRenderersFn) {
+          await restoreRenderersFn()
+        } else {
+          resumeAfterAcquire = true
+        }
+      })()
+      const clearEntry = () => {
+        if (pendingWindDown.get(epoch) === windDown) pendingWindDown.delete(epoch)
+      }
+      void windDownPromise.then(clearEntry, clearEntry)
     }
-    if (restoreRenderersFn) {
-      await restoreRenderersFn()
-    } else {
-      resumeAfterAcquire = true
-    }
+    return windDownPromise
   }
   pendingWindDown.set(epoch, windDown)
   const restoreRenderers = await suspendTerminalRenderersForScreenshot()

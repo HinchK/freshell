@@ -1197,6 +1197,63 @@ describe('captureUiScreenshot newer-selection supersession', () => {
     expect(result.ok).toBe(false)
     expect(result.error).toMatch(/cancelled by server/)
     expect(store.getState().tabs.activeTabId).toBe('tab-1')
+    // The fast-cancel must not leave a tail-scheduled job that still runs the
+    // capture afterwards (the entry consume would have eaten the marker out
+    // from under the dequeue gate): drain fully, then prove nothing moved.
+    await drainCaptureQueueForTests()
+    expect(store.getState().tabs.activeTabId).toBe('tab-1')
+    expect(vi.mocked(suspendTerminalRenderersForScreenshot)).not.toHaveBeenCalled()
+  })
+
+  it('the successor waits for an in-flight wind-down — the abandon timer never walks past restore/resume', async () => {
+    const store = createFocusStore()
+    document.body.innerHTML = '<div data-tab-content-id="tab-2" id="tab2-el"></div>'
+    setRect(document.getElementById('tab2-el')!, 200, 200)
+    const events: string[] = []
+    let releaseResume!: () => void
+    const resumeGate = new Promise<void>((resolve) => { releaseResume = resolve })
+    const suspendMock = vi.mocked(suspendTerminalRenderersForScreenshot)
+    let suspensionCount = 0
+    suspendMock.mockImplementation(async () => {
+      const n = ++suspensionCount
+      events.push(`suspend-begin:${n}`)
+      return async () => {
+        events.push(`resume-begin:${n}`)
+        if (n === 1) await resumeGate // first wind-down held mid-restore/resume
+        events.push(`resume-end:${n}`)
+      }
+    })
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout'] })
+    let first: Promise<any> | undefined
+    let second: Promise<any> | undefined
+    try {
+      const t0 = Date.now()
+      first = captureUiScreenshot(
+        { scope: 'tab', tabId: 'tab-2', deadlineAtMs: t0 + 1_000 },
+        { dispatch: store.dispatch, getState: store.getState } as any,
+      )
+      second = captureUiScreenshot(
+        { scope: 'tab', tabId: 'tab-2', deadlineAtMs: t0 + 60_000 },
+        { dispatch: store.dispatch, getState: store.getState } as any,
+      )
+      // Virtual time sweeps past the caller expiry (t+1000) and the abandon
+      // timer (deadline + 2s grace, t0+3000). The first job completes its
+      // capture phase and parks in its gated wind-down DURING this sweep.
+      await vi.advanceTimersByTimeAsync(4000)
+      expect(events).toContain('resume-begin:1')
+      expect(events).not.toContain('resume-end:1')
+      // INVARIANT: suspension #2 may only begin after #1's wind-down ended —
+      // neither the natural-completion nor the timer side may walk past it.
+      expect(events).not.toContain('suspend-begin:2')
+      releaseResume()
+      await vi.advanceTimersByTimeAsync(600)
+      expect(events).toContain('resume-end:1')
+      expect(events).toContain('suspend-begin:2')
+    } finally {
+      releaseResume?.()
+      await Promise.allSettled([first, second])
+      vi.useRealTimers()
+    }
   })
 
   it('still performs the focus move and restores it when no newer selection intervenes', async () => {

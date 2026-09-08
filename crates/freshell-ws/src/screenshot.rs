@@ -127,32 +127,49 @@ impl ScreenshotBroker {
 
     /// Route an inbound `ui.screenshot.result` to its waiting REST handler. Unknown
     /// / already-resolved `requestId`s are ignored (a late duplicate from a second
-    /// capable client).
+    /// capable client — the cancel broadcast from the first resolution tells those
+    /// clients to unwind anyway; a duplicate arriving first is the same unwind).
     pub fn resolve_from(&self, connection_id: u64, request_id: &str, result: ScreenshotResult) {
-        let mut pending = self.inner.pending.lock().unwrap();
-        let matches = pending.get(request_id).is_some_and(|request| {
-            request
-                .expected_client_id
-                .is_none_or(|id| id == connection_id)
-        });
-        if matches {
-            if let Some(request) = pending.remove(request_id) {
-                let _ = request.sender.send(result);
+        let sender = {
+            let mut pending = self.inner.pending.lock().unwrap();
+            let matches = pending.get(request_id).is_some_and(|request| {
+                request
+                    .expected_client_id
+                    .is_none_or(|id| id == connection_id)
+            });
+            if matches {
+                pending.remove(request_id).map(|request| request.sender)
+            } else {
+                None
             }
+        };
+        if let Some(sender) = sender {
+            let _ = sender.send(result);
+            // The capture frame broadcast went to EVERY capable client — only
+            // this one answered. Every other client's queued/in-flight capture
+            // for the request is now unanswerable: unwind it before it mutates
+            // focus on another device.
+            self.send_cancel(request_id);
         }
     }
 
     /// Test/compatibility helper for request producers with no target binding.
     /// Target-bound restore requests cannot be resolved through this path.
     pub fn resolve(&self, request_id: &str, result: ScreenshotResult) {
-        let mut pending = self.inner.pending.lock().unwrap();
-        let is_unbound = pending
-            .get(request_id)
-            .is_some_and(|request| request.expected_client_id.is_none());
-        if is_unbound {
-            if let Some(request) = pending.remove(request_id) {
-                let _ = request.sender.send(result);
+        let sender = {
+            let mut pending = self.inner.pending.lock().unwrap();
+            let is_unbound = pending
+                .get(request_id)
+                .is_some_and(|request| request.expected_client_id.is_none());
+            if is_unbound {
+                pending.remove(request_id).map(|request| request.sender)
+            } else {
+                None
             }
+        };
+        if let Some(sender) = sender {
+            let _ = sender.send(result);
+            self.send_cancel(request_id);
         }
     }
 
@@ -314,5 +331,31 @@ mod tests {
         assert_eq!(v["type"], "ui.command");
         assert_eq!(v["command"], "screenshot.cancel");
         assert_eq!(v["payload"]["requestId"], "req-dead");
+    }
+
+    #[test]
+    fn first_resolution_broadcasts_cancel_to_unwind_other_clients_work() {
+        // send_capture goes to EVERY connected client; the first result wins
+        // the waiter and drops the pending record — but the other clients'
+        // queued/in-flight captures remain alive unless we cancel them.
+        let b = broker();
+        let mut rx = b.inner.broadcast_tx.subscribe();
+        let mut reply_rx = b.register("req-multi".to_string());
+        b.send_capture("req-multi", "view", None, None, 10_000);
+        let frame = rx.try_recv().expect("capture frame broadcast");
+        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["command"], "screenshot.capture");
+
+        b.resolve_from(7, "req-multi", ScreenshotResult {
+            ok: true,
+            ..Default::default()
+        });
+
+        let frame = rx.try_recv().expect("cancel frame broadcast after resolution");
+        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["command"], "screenshot.cancel");
+        assert_eq!(v["payload"]["requestId"], "req-multi");
+        // The winner's waiter still got the result.
+        assert!(matches!(reply_rx.try_recv(), Ok(_)));
     }
 }
