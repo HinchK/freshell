@@ -2098,6 +2098,34 @@ describe('ws protocol', () => {
 
     await closeWebSocket(ws)
   })
+
+  it('pushes screenshot.cancel to the client when a screenshot request times out', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+    ws.send(JSON.stringify({
+      type: 'hello',
+      token: 'testtoken-testtoken',
+      protocolVersion: WS_PROTOCOL_VERSION,
+      capabilities: { uiScreenshotV1: true },
+    }))
+    await waitForMessage(ws, (m) => m.type === 'ready')
+
+    const pending = handler.requestUiScreenshot({ scope: 'view', timeoutMs: 100 })
+    const req = await waitForMessage(
+      ws,
+      (m) => m.type === 'ui.command' && m.command === 'screenshot.capture',
+    )
+    await expect(pending).rejects.toThrow('Timed out waiting for UI screenshot response')
+    // The server must unwind any client-side capture work it can no longer
+    // answer: delivery delay must not translate into UI mutation.
+    const cancel = await waitForMessage(
+      ws,
+      (m) => m.type === 'ui.command' && m.command === 'screenshot.cancel',
+    )
+    expect(cancel.payload).toEqual({ requestId: req.payload.requestId })
+
+    await closeWebSocket(ws)
+  })
 })
 
 describe('claude activity protocol', () => {

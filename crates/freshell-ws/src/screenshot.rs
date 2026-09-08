@@ -192,6 +192,19 @@ impl ScreenshotBroker {
         // and reports the same "no UI answered" outcome the original would.
         let _ = self.inner.broadcast_tx.send(frame.to_string());
     }
+
+    /// Broadcast `screenshot.cancel` for a request the server can no longer
+    /// answer (timeout, closed downstream). Any queued/queued-or-running
+    /// capture on a client — including a cancelled-then-delivered frame on a
+    /// stalled tab — unwinds instead of mutating UI for a dead request.
+    pub fn send_cancel(&self, request_id: &str) {
+        let frame = json!({
+            "type": "ui.command",
+            "command": "screenshot.cancel",
+            "payload": { "requestId": request_id },
+        });
+        let _ = self.inner.broadcast_tx.send(frame.to_string());
+    }
 }
 
 #[cfg(test)]
@@ -289,5 +302,17 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(v["payload"]["tabId"], "tab-1");
         assert_eq!(v["payload"]["paneId"], "pane-1");
+    }
+
+    #[test]
+    fn send_cancel_broadcasts_ui_command_frame() {
+        let b = broker();
+        let mut rx = b.inner.broadcast_tx.subscribe();
+        b.send_cancel("req-dead");
+        let frame = rx.try_recv().expect("frame broadcast");
+        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["type"], "ui.command");
+        assert_eq!(v["command"], "screenshot.cancel");
+        assert_eq!(v["payload"]["requestId"], "req-dead");
     }
 }

@@ -1,12 +1,13 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import { handleUiCommand } from '../../../src/lib/ui-commands'
-import { captureUiScreenshot } from '../../../src/lib/ui-screenshot'
+import { captureUiScreenshot, cancelUiScreenshot } from '../../../src/lib/ui-screenshot'
 import tabsReducer from '../../../src/store/tabsSlice'
 import panesReducer from '../../../src/store/panesSlice'
 
 vi.mock('../../../src/lib/ui-screenshot', () => ({
   captureUiScreenshot: vi.fn(),
+  cancelUiScreenshot: vi.fn(),
   CAPTURE_QUEUE_TTL_MS: 8000,
 }))
 
@@ -210,7 +211,7 @@ describe('handleUiCommand', () => {
     await Promise.resolve()
 
     expect(captureUiScreenshot).toHaveBeenCalledWith(
-      { scope: 'view', paneId: undefined, tabId: undefined, deadlineAtMs: undefined },
+      { scope: 'view', paneId: undefined, tabId: undefined, deadlineAtMs: undefined, requestId: 'req-1' },
       expect.objectContaining({ dispatch, getState }),
     )
     expect(send).toHaveBeenCalledWith(expect.objectContaining({
@@ -279,6 +280,51 @@ describe('handleUiCommand', () => {
     const call = vi.mocked(captureUiScreenshot).mock.calls[0]![0] as any
     expect(call.deadlineAtMs).toBeLessThanOrEqual(atReceipt + 9_000) // 8s internal ceiling + slack
     expect(call.deadlineAtMs).toBeGreaterThan(Date.now())
+  })
+
+  it('threads the payload requestId into captureUiScreenshot so cancel frames can target in-flight work', async () => {
+    const dispatch = vi.fn()
+    const send = vi.fn()
+    const getState = vi.fn(() => ({}))
+
+    vi.mocked(captureUiScreenshot).mockResolvedValue({
+      ok: true,
+      changedFocus: false,
+      restoredFocus: false,
+    })
+
+    handleUiCommand(
+      {
+        type: 'ui.command',
+        command: 'screenshot.capture',
+        payload: { requestId: 'req-thread', scope: 'view', ttlMs: 8_000 },
+      },
+      { dispatch: dispatch as any, getState, send },
+    )
+    await Promise.resolve()
+
+    const call = vi.mocked(captureUiScreenshot).mock.calls[0]![0] as any
+    expect(call.requestId).toBe('req-thread')
+  })
+
+  it('routes screenshot.cancel to the capture machinery (server-side timeout unwinds client-side work)', async () => {
+    const dispatch = vi.fn()
+    const send = vi.fn()
+    const getState = vi.fn(() => ({}))
+
+    handleUiCommand(
+      {
+        type: 'ui.command',
+        command: 'screenshot.cancel',
+        payload: { requestId: 'req-dead' },
+      },
+      { dispatch: dispatch as any, getState, send },
+    )
+
+    expect(vi.mocked(cancelUiScreenshot)).toHaveBeenCalledWith('req-dead')
+    // A cancel produces no screenshot result — the server already gave up.
+    expect(vi.mocked(captureUiScreenshot)).not.toHaveBeenCalled()
+    expect(send).not.toHaveBeenCalled()
   })
 
   it('leaves deadlineAtMs unset when the server stamped no budget (fallback internal TTL applies)', async () => {

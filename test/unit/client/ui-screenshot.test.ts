@@ -16,7 +16,7 @@ import connectionReducer from '@/store/connectionSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
-import { captureUiScreenshot, drainCaptureQueueForTests, prepareIframeCapture, restoreFocus } from '../../../src/lib/ui-screenshot'
+import { captureUiScreenshot, cancelUiScreenshot, drainCaptureQueueForTests, prepareIframeCapture, restoreFocus } from '../../../src/lib/ui-screenshot'
 import { getPaneSelectionSerial, paneSelectionMiddleware, wirePaneFocusOwnershipInvalidation } from '@/lib/pane-focus-ownership'
 import { suspendTerminalRenderersForScreenshot } from '../../../src/lib/screenshot-capture-env'
 
@@ -992,6 +992,11 @@ describe('captureUiScreenshot newer-selection supersession', () => {
       expect(result.error).toMatch(/deadline/)
       expect(html2canvasCalls).toBe(1) // no iframe #2, no main render
       expect(store.getState().tabs.activeTabId).toBe('tab-1')
+      // Markers stamped before the thrown deadline are reclaimed: a capture
+      // that dies inside preparation must not litter the live DOM — later
+      // captures re-mark, and stale markers would survive every one.
+      expect(document.getElementById('fr1')!.hasAttribute('data-screenshot-iframe-marker')).toBe(false)
+      expect(document.getElementById('fr2')!.hasAttribute('data-screenshot-iframe-marker')).toBe(false)
     } finally {
       vi.useRealTimers()
     }
@@ -1068,8 +1073,14 @@ describe('captureUiScreenshot newer-selection supersession', () => {
         { dispatch: store.dispatch, getState: store.getState } as any,
       )
       await waitFor(() => expect(store.getState().tabs.activeTabId).toBe('tab-2'), { timeout: 10_000 })
-      // …and then clicks INTO the embedded page. The parent sees the
-      // displacement: focusout on the URL field, activeElement becomes iframe.
+      // …and then moves INTO the embedded page. Real user engagement always
+      // has an input event land on the parent document first: sequential-nav
+      // keydown (Tab focus chain) or pointer motion over the pane. Capture-side
+      // eligibility autofocus never has one — that is the classifier's ground
+      // truth distinguishing user engagement from programmatic iframe focus.
+      document.body.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true }))
+      // The parent sees the displacement: focusout on the URL field,
+      // activeElement becomes the iframe.
       iframe.focus()
       const result = await capturing
       await waitFor(() => expect(store.getState().tabs.activeTabId).toBe('tab-2'), { timeout: 10_000 })
@@ -1108,6 +1119,84 @@ describe('captureUiScreenshot newer-selection supersession', () => {
     } finally {
       unsubscribe()
     }
+  })
+
+  it('programmatic eligibility autofocus of a nested iframe during the capture never reads as user engagement', async () => {
+    const store = createFocusStore()
+    document.body.innerHTML = `
+      <div data-pane-shell="true" data-tab-id="tab-2" data-pane-id="pane-2">
+        <input id="url-field" placeholder="Enter URL...">
+      </div>
+      <div data-tab-content-id="tab-2" style="display:none" id="tab2-target"></div>`
+    const shell = document.querySelector('[data-pane-shell]')!
+    const iframe = document.createElement('iframe')
+    iframe.title = 'Extension content'
+    shell.appendChild(iframe)
+    const urlField = document.getElementById('url-field')!
+    const tabEl = document.getElementById('tab2-target')!
+    setRect(tabEl, 300, 200)
+    // ExtensionPane behavior on an eligibility flip: focus shifts INTO the
+    // extension frame programmatically, with NO preceding user input event.
+    // The hoist is real (activeElement becomes the iframe, focusout fires on
+    // the displaced field) but it is capture-induced — the rollback must hold.
+    const unsubscribe = store.subscribe(() => {
+      if (store.getState().tabs.activeTabId !== 'tab-2') return
+      tabEl.style.display = 'block'
+      urlField.focus()
+      iframe.focus()
+    })
+    try {
+      const result = await captureUiScreenshot(
+        { scope: 'tab', tabId: 'tab-2' },
+        { dispatch: store.dispatch, getState: store.getState } as any,
+      )
+      expect(result.changedFocus).toBe(true)
+      expect(result.restoredFocus).toBe(true)
+      expect(store.getState().tabs.activeTabId).toBe('tab-1') // full rollback
+    } finally {
+      unsubscribe()
+    }
+  })
+
+  it('a server screenshot.cancel for an in-flight capture aborts it at the next gate', async () => {
+    const store = createFocusStore()
+    document.body.innerHTML = `<div data-tab-content-id="tab-2" style="display:none" id="tab2-target"></div>`
+    const tabEl = document.getElementById('tab2-target')!
+    setRect(tabEl, 300, 200)
+    const unsubscribe = store.subscribe(() => {
+      if (store.getState().tabs.activeTabId !== 'tab-2') return
+      tabEl.style.display = 'block'
+      // The server already timed out the requester and pushes a cancel frame —
+      // capture work that could only answer a dead request unwinds immediately.
+      cancelUiScreenshot('req-cancelled')
+    })
+    try {
+      const result = await captureUiScreenshot(
+        { scope: 'tab', tabId: 'tab-2', requestId: 'req-cancelled' },
+        { dispatch: store.dispatch, getState: store.getState } as any,
+      )
+      expect(result.ok).toBe(false)
+      expect(result.error).toMatch(/cancelled by server/)
+      expect(store.getState().tabs.activeTabId).toBe('tab-1')
+    } finally {
+      unsubscribe()
+    }
+  })
+
+  it('a cancel landing before its capture frame aborts at receipt (late-delivery ordering)', async () => {
+    const store = createFocusStore()
+    document.body.innerHTML = `<div data-tab-content-id="tab-2" id="tab2-el"></div>`
+    setRect(document.getElementById('tab2-el')!, 200, 200)
+    // Delivery ordering is not guaranteed for a stalling client: the cancel
+    // can precede its capture frame. The receipt-side gate must still fail it.
+    cancelUiScreenshot('req-early')
+    const result = await captureUiScreenshot(
+      { scope: 'tab', tabId: 'tab-2', requestId: 'req-early' },
+      { dispatch: store.dispatch, getState: store.getState } as any,
+    )
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/cancelled by server/)
+    expect(store.getState().tabs.activeTabId).toBe('tab-1')
   })
 
   it('still performs the focus move and restores it when no newer selection intervenes', async () => {

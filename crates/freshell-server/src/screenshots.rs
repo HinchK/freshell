@@ -123,6 +123,8 @@ async fn create_screenshot(
         Ok(Ok(result)) => result,
         Ok(Err(_)) => {
             state.broker.cancel(&request_id);
+            // Unwind any client-side capture work for a request nobody waits on.
+            state.broker.send_cancel(&request_id);
             return fail(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "UI connection closed before screenshot response",
@@ -130,6 +132,9 @@ async fn create_screenshot(
         }
         Err(_) => {
             state.broker.cancel(&request_id);
+            // Delivery delay (stalled client) must never translate into UI
+            // mutation: tell the client to unwind queued/in-flight work.
+            state.broker.send_cancel(&request_id);
             return fail(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Timed out waiting for UI screenshot response",

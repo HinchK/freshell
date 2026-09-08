@@ -1,6 +1,6 @@
 import { addTab, setActiveTab, closeTab, closePaneWithCleanup } from '@/store/tabsSlice'
 import { initLayout, splitPane, setActivePane, nudgePaneFocus, updatePaneContent, resizePanes, swapPanes } from '@/store/panesSlice'
-import { captureUiScreenshot, CAPTURE_QUEUE_TTL_MS } from '@/lib/ui-screenshot'
+import { captureUiScreenshot, cancelUiScreenshot, CAPTURE_QUEUE_TTL_MS } from '@/lib/ui-screenshot'
 import type { AppDispatch, RootState } from '@/store/store'
 import { applyPaneRename, applyTabRename } from '@/store/titleSync'
 
@@ -53,7 +53,7 @@ async function handleScreenshotCapture(msg: any, runtime: UiCommandRuntime): Pro
     : undefined
 
   try {
-    const capture = await captureUiScreenshot({ scope, paneId, tabId, deadlineAtMs }, {
+    const capture = await captureUiScreenshot({ scope, paneId, tabId, deadlineAtMs, requestId }, {
       dispatch: runtime.dispatch as AppDispatch,
       getState: runtime.getState,
     })
@@ -81,6 +81,15 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
 
   if (msg.command === 'screenshot.capture') {
     void handleScreenshotCapture(msg, runtime)
+    return
+  }
+
+  // The server no longer waits on this request (timeout / waiter gone): any
+  // queued or in-flight capture work for it must unwind immediately rather
+  // than mutate UI for a caller already failed.
+  if (msg.command === 'screenshot.cancel') {
+    const requestId = typeof msg.payload?.requestId === 'string' ? msg.payload.requestId : ''
+    if (requestId) cancelUiScreenshot(requestId)
     return
   }
 

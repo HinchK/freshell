@@ -1108,6 +1108,18 @@ export class WsHandler {
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.screenshotRequests.delete(requestId)
+        // The waiter is failed; any capture work still queued/running on the
+        // client (frozen-tab delivery delay) must unwind instead of mutating
+        // UI for a request nobody waits on anymore.
+        try {
+          this.send(targetWs, {
+            type: 'ui.command',
+            command: 'screenshot.cancel',
+            payload: { requestId },
+          })
+        } catch {
+          // A dead socket here only means the client work never started.
+        }
         reject(createScreenshotError('SCREENSHOT_TIMEOUT', 'Timed out waiting for UI screenshot response'))
       }, timeoutMs)
 

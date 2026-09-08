@@ -24,6 +24,10 @@ export type ScreenshotRequest = {
   scope: ScreenshotScope
   paneId?: string
   tabId?: string
+  /** The server's request identity, so a later screenshot.cancel frame (the
+   *  server gave up waiting — timeout or closed waiter) can unwind any
+   *  queued/in-flight work for it. */
+  requestId?: string
   /** Server-stamped absolute round-trip deadline (epoch ms). When absent
    *  (older servers), queue waits are bounded by CAPTURE_QUEUE_TTL_MS measured
    *  from when THIS client received the request. */
@@ -253,11 +257,33 @@ export async function prepareIframeCapture(target: HTMLElement, scale: number, t
     markedIframes.set(marker, iframe)
   }
 
-  for (const [marker, iframe] of markedIframes) {
-    if (!isElementVisible(iframe)) continue
-    // Each iframe is its own html2canvas render; the deadline gates EVERY one.
-    throwIfStale?.()
-    replacements.set(marker, await captureIframeReplacement(iframe, scale))
+  const restoreMarkers = () => {
+    for (const [iframe, previous] of previousMarkers) {
+      const ours = ourMarkerByIframe.get(iframe)
+      // A successor capture re-stamped this marker while we were away:
+      // restoring our recorded previous value would erase ITS marker.
+      if (ours !== undefined && iframe.getAttribute(IFRAME_MARKER_ATTR) !== ours) continue
+      if (previous === null) {
+        iframe.removeAttribute(IFRAME_MARKER_ATTR)
+      } else {
+        iframe.setAttribute(IFRAME_MARKER_ATTR, previous)
+      }
+    }
+  }
+
+  try {
+    for (const [marker, iframe] of markedIframes) {
+      if (!isElementVisible(iframe)) continue
+      // Each iframe is its own html2canvas render; the deadline gates EVERY one.
+      throwIfStale?.()
+      replacements.set(marker, await captureIframeReplacement(iframe, scale))
+    }
+  } catch (err) {
+    // The caller never receives our cleanup handle when we throw — reclaim
+    // the markers we already stamped so a dead pre-render capture leaves no
+    // litter in the live DOM.
+    restoreMarkers()
+    throw err
   }
 
   return {
@@ -272,19 +298,7 @@ export async function prepareIframeCapture(target: HTMLElement, scale: number, t
         cloneIframe.replaceWith(buildIframeReplacementElement(doc, cloneIframe, replacement))
       }
     },
-    cleanup: () => {
-      for (const [iframe, previous] of previousMarkers) {
-        const ours = ourMarkerByIframe.get(iframe)
-        // A successor capture re-stamped this marker while we were away:
-        // restoring our recorded previous value would erase ITS marker.
-        if (ours !== undefined && iframe.getAttribute(IFRAME_MARKER_ATTR) !== ours) continue
-        if (previous === null) {
-          iframe.removeAttribute(IFRAME_MARKER_ATTR)
-        } else {
-          iframe.setAttribute(IFRAME_MARKER_ATTR, previous)
-        }
-      }
-    },
+    cleanup: restoreMarkers,
   }
 }
 
@@ -459,6 +473,30 @@ function expiredDeadlineResult(): ScreenshotResult {
   }
 }
 
+/** Server-side timeout unwind: the server already failed the waiter for this
+ *  id, so any queued/in-flight capture for it must not mutate UI. Consulted
+ *  entry-side AND at every staleness gate, because on a stalled client the
+ *  cancel frame can arrive before its capture frame. */
+const cancelledCaptures = new Set<string>()
+
+export function cancelUiScreenshot(requestId: string): void {
+  if (!requestId) return
+  // Bounded: a cancel for a frame that never arrived would linger forever.
+  if (cancelledCaptures.size >= 1024) cancelledCaptures.clear()
+  cancelledCaptures.add(requestId)
+}
+
+function cancelledScreenshotResult(): ScreenshotResult {
+  return { ok: false, changedFocus: false, restoredFocus: false, error: 'screenshot cancelled by server' }
+}
+
+/** Consume-and-check: a consumed id cannot poison a later, unrelated run. */
+function consumeCancellation(requestId: string | undefined): boolean {
+  if (!requestId || !cancelledCaptures.has(requestId)) return false
+  cancelledCaptures.delete(requestId)
+  return true
+}
+
 /** Test-only: await the capture queue until fully drained (including abandon
  *  timers and fenced wind-downs). Tests that drive parked/abandoned captures
  *  call this in afterEach so no test inherits another test's deferred tail. */
@@ -474,6 +512,7 @@ export async function captureUiScreenshot(request: ScreenshotRequest, ctx: Runti
   const deadlineAtMs = request.deadlineAtMs ?? (Date.now() + CAPTURE_QUEUE_TTL_MS)
   const epoch = ++captureEpoch
   const job: Promise<ScreenshotResult> = captureTail.then(() => {
+    if (consumeCancellation(request.requestId)) return cancelledScreenshotResult()
     if (Date.now() >= deadlineAtMs) return expiredDeadlineResult()
     return performUiScreenshotCapture(request, ctx, deadlineAtMs, epoch)
   })
@@ -497,6 +536,7 @@ export async function captureUiScreenshot(request: ScreenshotRequest, ctx: Runti
   // A stalled head must not park this caller past the deadline: answer with
   // the expiry result; the queued job later hits its dequeue gate and no-ops.
   const remaining = deadlineAtMs - Date.now()
+  if (consumeCancellation(request.requestId)) return cancelledScreenshotResult()
   if (remaining <= 0) return expiredDeadlineResult()
   let timer: ReturnType<typeof setTimeout> | undefined
   const expiry = new Promise<ScreenshotResult>((resolve) => {
@@ -526,6 +566,7 @@ async function performUiScreenshotCapture(request: ScreenshotRequest, ctx: Runti
   // render) for a caller the server has already failed.
   const deadlineExceeded = () => Date.now() >= deadlineAtMs
   const throwIfStale = () => {
+    if (consumeCancellation(request.requestId)) throw new Error('screenshot cancelled by server')
     if (selectionSuperseded()) throw new Error('screenshot superseded by a newer user selection')
     if (deadlineExceeded()) throw new Error('screenshot aborted: exceeded its server deadline mid-capture')
   }
@@ -573,9 +614,19 @@ async function performUiScreenshotCapture(request: ScreenshotRequest, ctx: Runti
   // focus-steal-guard.ts). The observables are focusout on the displaced
   // element and window blur (when body was displaced). Checking after a task
   // because the activeElement reassignment is mid-flight during dispatch.
-  // focusin would ALSO catch the capture's own programmatic focus writes —
-  // this never confuses hoisting with eligibility autofocus.
+  // A hoist only counts as USER engagement when real input preceded it —
+  // sequential-nav keydown landing on the parent document, or pointer
+  // activity over the app. Capture-side eligibility autofocus ALSO hoists
+  // programmatically (ExtensionPane focuses its iframe on a flip) but has no
+  // input trail; counting it would veto this capture's own rollback.
+  const INTENT_WINDOW_MS = 1500
+  let lastUserIntentAtMs = -Infinity
+  const noteUserIntent = () => { lastUserIntentAtMs = Date.now() }
+  document.addEventListener('keydown', noteUserIntent, true)
+  document.addEventListener('pointerdown', noteUserIntent, true)
+  document.addEventListener('pointermove', noteUserIntent, { capture: true, passive: true })
   const checkForIframeHoist = () => {
+    if (Date.now() - lastUserIntentAtMs > INTENT_WINDOW_MS) return
     const el = document.activeElement as HTMLElement | null
     if (!el || el.tagName !== 'IFRAME' || typeof el.closest !== 'function') return
     const paneHost = el.closest('[data-pane-id]') as HTMLElement | null
@@ -595,6 +646,9 @@ async function performUiScreenshotCapture(request: ScreenshotRequest, ctx: Runti
     pendingWindDown.delete(epoch)
     document.removeEventListener('focusout', onHoistSignal)
     window.removeEventListener('blur', onHoistSignal)
+    document.removeEventListener('keydown', noteUserIntent, true)
+    document.removeEventListener('pointerdown', noteUserIntent, true)
+    document.removeEventListener('pointermove', noteUserIntent, true)
     // Restore Redux selection state BEFORE releasing the renderers: the
     // successor's snapshot must see the rollback, and restoreFocus dispatches
     // synchronously up to its paint await, while renderer resume only frees
