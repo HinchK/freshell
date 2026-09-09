@@ -8,6 +8,12 @@
  *
  * Rust-only: owns a RustServer directly (registered in RUST_ONLY_SPECS +
  * rust-chromium testMatch, mirroring silent-input-loss-rust.spec.ts).
+ *
+ * The 6-minute timeout covers RustServer.start()'s synchronous cold
+ * `cargo build --release` on the first local run (observed ~2.5 min; the cloud
+ * lane prebuilds the binary and never compiles). server.start() runs inside
+ * the try/finally so a timeout or boot failure still stops the server and
+ * removes the isolated home.
  */
 import { randomUUID } from 'node:crypto'
 import { test, expect, type Page } from '@playwright/test'
@@ -29,15 +35,16 @@ async function countInputFrames(page: Page, terminalId: string, data: string): P
 }
 
 test.describe('terminal Escape key single ingress', () => {
-  test.setTimeout(120_000)
+  test.setTimeout(360_000)
 
   test('real Escape keydown sends exactly one ESC terminal.input frame', async ({ page }) => {
     const server = new RustServer({ verbose: false })
-    const info = await server.start()
-    expect(info.port).not.toBe(3001)
-    expect(info.port).not.toBe(3002)
 
     try {
+      const info = await server.start()
+      expect(info.port).not.toBe(3001)
+      expect(info.port).not.toBe(3002)
+
       await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
       const harness = new TestHarness(page)
       const terminal = new TerminalHelper(page)
