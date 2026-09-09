@@ -570,9 +570,19 @@ describe('captureUiScreenshot off-DOM capture of background tabs', () => {
     iframeDoc?.write('<!doctype html><html><body><p>Hidden-tab proxied content</p></body></html>')
     iframeDoc?.close()
 
+    // Order pin: the suspension must bracket ONLY the main render — terminal
+    // renderers stay active through target resolution and iframe pre-render.
+    const order: string[] = []
+    vi.mocked(suspendTerminalRenderersForScreenshot).mockImplementation(async () => {
+      order.push('suspend')
+      return async () => {
+        order.push('resume')
+      }
+    })
     let clonedHtml = ''
     vi.mocked(html2canvas).mockImplementation(async (el: any, opts: any = {}) => {
       if (typeof opts.onclone === 'function') {
+        order.push('main-render')
         const cloneDoc = document.implementation.createHTMLDocument('clone')
         const cloneTarget = (el as HTMLElement).cloneNode(true) as HTMLElement
         cloneDoc.body.appendChild(cloneTarget)
@@ -584,6 +594,7 @@ describe('captureUiScreenshot off-DOM capture of background tabs', () => {
           toDataURL: () => 'data:image/png;base64,HIDDENPNG',
         } as any
       }
+      order.push('iframe-render')
       return {
         width: 500,
         height: 300,
@@ -599,6 +610,8 @@ describe('captureUiScreenshot off-DOM capture of background tabs', () => {
     expect(vi.mocked(html2canvas)).toHaveBeenCalledTimes(2)
     expect(clonedHtml).toContain('data-screenshot-iframe-image="true"')
     expect(clonedHtml).not.toContain('<iframe')
+    // Renderers stay active through pre-render; frozen only for the main render.
+    expect(order).toEqual(['iframe-render', 'suspend', 'main-render', 'resume'])
   })
 
   it('applies no iframe replacements when the pane tree changed between preparation and clone', async () => {

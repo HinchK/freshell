@@ -2251,6 +2251,9 @@ tests elsewhere are untouched — out of scope).
 
 ## Fresh Eyes record
 
+- **Simplification episode, focused round S3 (GPT, independent; repair base 91e407cfb): PASSED — 0 blocking, 1 advisory Minor + 1 advisory Nit**, both addressed post-pass: (Minor, addressed) the never-found-target test pinned only "no suspension" — it did not pin that renderers stay ACTIVE through iframe pre-render and freeze only for the main render; the hidden-tab iframe test now pins the full order (`iframe-render → suspend → main-render → resume`). (Nit, addressed) the out-of-scope annotation miscounted the broadcast bullet ("fourth" vs third); reworded to name it. The the-usual focused loop halts at the pass. This is the first PASSED review of the entire branch (after r18–r27 and S1 all failed).
+  Runner report: `.worktrees/.the-usual-logs/mcp-focus-neutrality/review-logs/usual-fresheyes-20260909T081933Z-2053010.md`
+
 - **Simplification episode, delta round S2 (GPT, independent; base 5b8717017): FAILED — 3 Majors + 4 Minors + 2 Nits**, fixed/declined: (M1+M2, valid, FIXED) both servers' `closeTab`/`close_tab` set the cursor to the FIRST remaining tab unconditionally — a failed agent create (terminal spawn failure) rolls the layout back and moved the server cursor to tab 1 even when the user sat on tab 2. Both mirrors now follow the client's `removeTab` semantics exactly: a BACKGROUND close never moves the cursor (rollback lands on the user's tab); only closing the cursor's own tab selects a survivor (previous neighbor, else the new first). RED-verified both stacks (new tests fail on the old code), pinned by layout-store tests on each side (Node `agent-layout-store.test.ts`, Rust `layout_store_tests.rs::close_tab_preserves_cursor_for_background_closes_and_advances_on_active_close`). (M3, valid, FIXED) the wall e2e only pixel-checked the TAB-scope capture; the pane-scope response was dimension-checked only, so a blank pane PNG passed. Both scopes now get the in-page pixel-variance proof. (m1, valid, FIXED) index+src iframe correlation could still mismatch same-URL iframes after a mid-capture tree change; the fingerprint now includes the owning PANE id (`iframe.closest('[data-pane-id]')` — each browser/extension pane hosts exactly one iframe), pinned by a same-src-different-pane no-replacement test. (m3, valid, FIXED) the renderer suspension started before target resolution and iframe pre-render, freezing terminal rendering for the full wait; it now starts immediately before the MAIN render only (the only step that reads WebGL canvases), and a never-found target suspends nothing at all. (m2, DECLINED) the body-stranded adoption exception ("an eligible mount with focus stranded on document.body adopts focus even when its record says owned:false") is the documented round-14/16 trade — permanent stranded keyboard input is worse than a rare honest refocus, and the reviewer notes it is tested as desired behavior. (m4+n1+n2, doc/nit, FIXED) plan doc's "Out of scope" superseded-items annotated, `screenshot-capture-env.ts` queue/deadline comment rewritten to the refcount-only reality, Rust `split_pane` doc comment no longer promises activation.
   Runner report: `.worktrees/.the-usual-logs/mcp-focus-neutrality/review-logs/usual-fresheyes-20260909T073738Z-1009951.md`
 
@@ -2405,9 +2408,9 @@ tests elsewhere are untouched — out of scope).
 > (both layout stores became focus-neutral for agent creates/splits), and
 > round S2 of the simplification episode additionally fixed the closeTab
 > ROLLBACK path (background closes keep the cursor; active closes select the
-> previous neighbor). The fourth bullet (Rust broadcast vs Node unicast) is
-> moot for captures: the client renders off-DOM and a losing client's stray
-> result is ignored as an unknown requestId. Retained as history.
+> previous neighbor). The Rust-broadcast-vs-Node-unicast bullet is moot for
+> captures: the client renders off-DOM and a losing client's stray result is
+> ignored as an unknown requestId. Retained as history.
 
 - **Server-side layout mirrors self-activate on create/split**
   (`server/…/layout-store` and `crates/freshell-…/layout_store.rs:446-465`):
