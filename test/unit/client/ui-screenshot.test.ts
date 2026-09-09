@@ -699,6 +699,59 @@ describe('captureUiScreenshot off-DOM capture of background tabs', () => {
     expect(clonedHtml).not.toContain('data-screenshot-iframe-image')
   })
 
+  it('applies no iframe replacements when a same-src iframe now lives in a different pane (pane-id fingerprint)', async () => {
+    document.body.innerHTML = `
+      <div data-context="global">
+        <div data-pane-id="pane-x">
+          <iframe id="same-src-frame" src="/api/proxy/http/3000/"></iframe>
+        </div>
+      </div>
+    `
+    const target = document.querySelector('[data-context="global"]') as HTMLElement
+    const iframe = document.getElementById('same-src-frame') as HTMLIFrameElement
+    setRect(target, 800, 500)
+    setRect(iframe, 500, 300)
+
+    const iframeDoc = iframe.contentDocument
+    expect(iframeDoc).toBeTruthy()
+    iframeDoc?.open()
+    iframeDoc?.write('<!doctype html><html><body><p>Content</p></body></html>')
+    iframeDoc?.close()
+
+    let clonedHtml = ''
+    vi.mocked(html2canvas).mockImplementation(async (el: any, opts: any = {}) => {
+      if (typeof opts.onclone === 'function') {
+        const cloneDoc = document.implementation.createHTMLDocument('clone')
+        const cloneTarget = (el as HTMLElement).cloneNode(true) as HTMLElement
+        // Same count, same src — but the tree changed between preparation and
+        // clone and the iframe now belongs to a different pane: index+src
+        // alone could not tell, the owning-pane fingerprint can.
+        cloneTarget
+          .querySelector('[data-pane-id]')
+          ?.setAttribute('data-pane-id', 'pane-swapped-in')
+        cloneDoc.body.appendChild(cloneTarget)
+        opts.onclone(cloneDoc, cloneTarget)
+        clonedHtml = cloneTarget.innerHTML
+        return {
+          width: 800,
+          height: 500,
+          toDataURL: () => 'data:image/png;base64,ROOTPNG',
+        } as any
+      }
+      return {
+        width: 500,
+        height: 300,
+        toDataURL: () => 'data:image/png;base64,IFRAMEPNG',
+      } as any
+    })
+
+    const result = await captureUiScreenshot({ scope: 'view' })
+
+    expect(result.ok).toBe(true)
+    expect(clonedHtml).toContain('<iframe')
+    expect(clonedHtml).not.toContain('data-screenshot-iframe-image')
+  })
+
   it('fails honestly when the capture target never appears', async () => {
     vi.useFakeTimers({ toFake: ['Date', 'setTimeout'] })
     try {
@@ -718,9 +771,10 @@ describe('captureUiScreenshot off-DOM capture of background tabs', () => {
       expect(result.ok).toBe(false)
       expect(result.error).toBe('capture target not found')
       expect(result.changedFocus).toBe(false)
-      // The renderer suspension is balanced even on the failure path.
-      expect(suspends).toHaveLength(1)
-      expect(resumes).toHaveLength(1)
+      // A never-found target suspends nothing at all — the renderer
+      // suspension starts only around the main render, after resolution.
+      expect(suspends).toHaveLength(0)
+      expect(resumes).toHaveLength(0)
     } finally {
       vi.useRealTimers()
     }

@@ -484,16 +484,27 @@ impl LayoutStore {
         }
         let mut found = false;
         for snapshot in inner.snapshots_mut() {
-            let before = snapshot.tabs.len();
-            snapshot.tabs.retain(|t| t.id != tab_id);
-            if snapshot.tabs.len() == before {
+            let Some(removed_index) = snapshot.tabs.iter().position(|t| t.id == tab_id) else {
                 continue;
-            }
+            };
+            // Cursor parity with the client's removeTab reducer: a BACKGROUND
+            // close never moves the selection (a failed agent create rolls the
+            // layout back to exactly the user's tab); only closing the cursor's
+            // own tab selects a survivor (previous neighbor, else the new first).
+            let was_active = snapshot.active_tab_id.as_deref() == Some(tab_id);
+            snapshot.tabs.remove(removed_index);
             snapshot.layouts.remove(tab_id);
             snapshot.active_pane.remove(tab_id);
             snapshot.pane_titles.remove(tab_id);
             snapshot.pane_title_set_by_user.remove(tab_id);
-            snapshot.active_tab_id = snapshot.tabs.first().map(|t| t.id.clone());
+            if was_active {
+                let next_index = if removed_index > 0 { removed_index - 1 } else { 0 };
+                snapshot.active_tab_id = snapshot
+                    .tabs
+                    .get(next_index)
+                    .or_else(|| snapshot.tabs.first())
+                    .map(|t| t.id.clone());
+            }
             found = true;
         }
         if found {
@@ -687,10 +698,12 @@ impl LayoutStore {
         None
     }
 
-    /// Binary split 50/50; the new pane becomes active and gets a seeded title
-    /// (`splitPane`, `layout-store.ts:462-499`). Applied (with the SAME new
-    /// ids) to every client snapshot containing the source pane; the reported
-    /// tab comes from the first (most-recent) match.
+    /// Binary split 50/50; the new pane is seeded with a title but does NOT
+    /// become active (`splitPane`, `layout-store.ts:462-499` — the cursor
+    /// stays on the user's pane; focus moves only via explicit selects).
+    /// Applied (with the SAME new ids) to every client snapshot containing
+    /// the source pane; the reported tab comes from the first (most-recent)
+    /// match.
     pub fn split_pane(
         &self,
         pane_id: &str,

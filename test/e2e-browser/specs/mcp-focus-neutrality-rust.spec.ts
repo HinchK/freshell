@@ -404,32 +404,38 @@ test.describe('MCP/REST focus neutrality', () => {
       expect(await activeElementStillTagged(page, marker)).toBe(true)
       expect(await focusedPaneId(page)).toBe(paneA)
 
-      // --- 3: content proof — the saved PNG is not a blank frame. A capture
+      // --- 3: content proof — the saved PNGs are not blank frames. A capture
       // that failed to reveal the hidden tab (html2canvas skips
       // visibility:hidden subtrees) would come back uniform; a rendered
       // terminal + pane chrome has pixel variance. Decode in-page and sample.
-      const b64 = fs.readFileSync(shotBody.data.path as string).toString('base64')
-      const uniformity = await page.evaluate(async (dataUrl: string) => {
-        const img = new Image()
-        img.src = dataUrl
-        await img.decode()
-        const canvas = document.createElement('canvas')
-        canvas.width = img.width
-        canvas.height = img.height
-        const ctx = canvas.getContext('2d')!
-        ctx.drawImage(img, 0, 0)
-        const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data
-        const r0 = data[0]
-        const g0 = data[1]
-        const b0 = data[2]
-        for (let i = 4; i < data.length; i += 4) {
-          if (data[i] !== r0 || data[i + 1] !== g0 || data[i + 2] !== b0) {
-            return { uniform: false }
+      // BOTH scopes get the check: pane scope exercises the pane-shell target
+      // and its own ancestor reveal, which dimensions alone cannot prove.
+      const assertNonUniformPng = async (pngPath: string, label: string) => {
+        const b64 = fs.readFileSync(pngPath).toString('base64')
+        const uniformity = await page.evaluate(async (dataUrl: string) => {
+          const img = new Image()
+          img.src = dataUrl
+          await img.decode()
+          const canvas = document.createElement('canvas')
+          canvas.width = img.width
+          canvas.height = img.height
+          const ctx = canvas.getContext('2d')!
+          ctx.drawImage(img, 0, 0)
+          const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data
+          const r0 = data[0]
+          const g0 = data[1]
+          const b0 = data[2]
+          for (let i = 4; i < data.length; i += 4) {
+            if (data[i] !== r0 || data[i + 1] !== g0 || data[i + 2] !== b0) {
+              return { uniform: false }
+            }
           }
-        }
-        return { uniform: true }
-      }, `data:image/png;base64,${b64}`)
-      expect(uniformity.uniform, 'background-tab screenshot must contain rendered content, not a blank frame').toBe(false)
+          return { uniform: true }
+        }, `data:image/png;base64,${b64}`)
+        expect(uniformity.uniform, `${label} must contain rendered content, not a blank frame`).toBe(false)
+      }
+      await assertNonUniformPng(shotBody.data.path as string, 'tab-scope background screenshot')
+      await assertNonUniformPng(paneShotBody.data.path as string, 'pane-scope background screenshot')
     } finally {
       await server.stop()
     }

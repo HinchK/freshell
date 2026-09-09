@@ -581,13 +581,22 @@ export class LayoutStore {
 
   closeTab(tabId: string) {
     if (!this.snapshot) return { message: 'no layout snapshot' as const }
+    const removedIndex = this.snapshot.tabs.findIndex((t) => t.id === tabId)
+    if (removedIndex === -1) return { message: 'tab not found' as const }
+    // Cursor parity with the client's removeTab reducer: a BACKGROUND close
+    // never moves the selection — a failed agent create rolls the layout
+    // back to exactly the user's tab — and only closing the cursor's own
+    // tab selects a survivor (previous neighbor, else the new first).
+    const wasActive = this.snapshot.activeTabId === tabId
     const nextTabs = this.snapshot.tabs.filter((t) => t.id !== tabId)
-    if (nextTabs.length === this.snapshot.tabs.length) return { message: 'tab not found' as const }
     delete this.snapshot.layouts[tabId]
     delete this.snapshot.activePane[tabId]
     this.removeTabMetadata(tabId)
     this.snapshot.tabs = nextTabs
-    this.snapshot.activeTabId = nextTabs[0]?.id || null
+    if (wasActive) {
+      const nextIndex = removedIndex > 0 ? removedIndex - 1 : 0
+      this.snapshot.activeTabId = nextTabs[nextIndex]?.id ?? nextTabs[0]?.id ?? null
+    }
     return { tabId }
   }
 

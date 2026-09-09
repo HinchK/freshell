@@ -247,17 +247,19 @@ function revealClonedTargetChain(clonedTarget: HTMLElement): void {
  *  Clone-side correlation: the replacement list is built from the LIVE
  *  target's iframes in document order, and applied to the CLONED target's
  *  iframes in document order. The two lists are verified to still describe
- *  the same tree (count + src fingerprints) at clone time — the pane tree can
- *  change between preparation and clone (a concurrent split), and a mismatch
- *  applies NO replacements rather than risk an image landing on the wrong
- *  iframe. No marker attributes are stamped on the live DOM at all. */
+ *  the same tree at clone time — same count AND same per-index fingerprint
+ *  (owning pane id + src) — because the pane tree can change between
+ *  preparation and clone (a concurrent split), and a mismatch applies NO
+ *  replacements rather than risk an image landing on the wrong iframe. The
+ *  pane id disambiguates same-URL iframes (each browser/extension pane hosts
+ *  exactly one). No marker attributes are stamped on the live DOM at all. */
 async function prepareIframeCapture(target: HTMLElement, scale: number): Promise<PreparedIframeCapture> {
   const iframes = Array.from(target.querySelectorAll('iframe'))
   if (iframes.length === 0) {
     return { onclone: () => {} }
   }
 
-  const originalSrcs = iframes.map((iframe) => iframe.getAttribute('src'))
+  const originalFingerprints = iframes.map((iframe) => iframeFingerprint(iframe))
   const replacements: (IframeReplacement | null)[] = []
   for (const iframe of iframes) {
     // Layout-gated, not paint-gated: a background tab's iframe is
@@ -271,7 +273,7 @@ async function prepareIframeCapture(target: HTMLElement, scale: number): Promise
       const cloneIframes = Array.from(clonedTarget.querySelectorAll('iframe'))
       if (cloneIframes.length !== iframes.length) return
       for (let i = 0; i < cloneIframes.length; i += 1) {
-        if (cloneIframes[i].getAttribute('src') !== originalSrcs[i]) return
+        if (iframeFingerprint(cloneIframes[i]) !== originalFingerprints[i]) return
       }
       for (let i = 0; i < cloneIframes.length; i += 1) {
         const replacement = replacements[i]
@@ -281,6 +283,14 @@ async function prepareIframeCapture(target: HTMLElement, scale: number): Promise
       }
     },
   }
+}
+
+/** Stable iframe identity across the live DOM and its html2canvas clone: the
+ *  owning pane's id (unique; empty when the iframe sits outside pane shells,
+ *  e.g. app-level chrome in view scope) plus the raw src attribute. */
+function iframeFingerprint(iframe: HTMLIFrameElement): string {
+  const paneId = iframe.closest('[data-pane-id]')?.getAttribute('data-pane-id') ?? ''
+  return `${paneId}\u0000${iframe.getAttribute('src') ?? ''}`
 }
 
 async function resolveCaptureTarget(request: ScreenshotRequest): Promise<HTMLElement> {
@@ -303,48 +313,54 @@ async function resolveCaptureTarget(request: ScreenshotRequest): Promise<HTMLEle
 
 export async function captureUiScreenshot(request: ScreenshotRequest): Promise<ScreenshotResult> {
   let result: Omit<ScreenshotResult, 'changedFocus' | 'restoredFocus'>
-  // Web canvases (xterm's WebGL renderer) are only reliably readable around a
-  // fresh synchronous render — the refcounted suspension forces one and
-  // freezes the renderers while html2canvas copies each canvas into its
-  // clone. Balanced in `finally`, including every failure path.
-  const restoreRenderers = await suspendTerminalRenderersForScreenshot()
   try {
     const target = await resolveCaptureTarget(request)
     const scale = Math.max(1, window.devicePixelRatio || 1)
     // Armed live-side: only a target with a hidden ancestor chain (a
     // background tab) needs the clone reveal; visible targets skip it.
     const needsReveal = chainHiddenFromPaint(target)
+    // Iframe pre-render needs no frozen renderers (it renders nested documents,
+    // not terminal canvases), so the suspension starts as late as possible —
+    // exactly around the main render, the only step that reads the WebGL
+    // canvases — and a never-found target suspends nothing at all.
     const preparedIframes = await prepareIframeCapture(target, scale)
-    const canvas = await html2canvas(target, {
-      backgroundColor: null,
-      allowTaint: true,
-      useCORS: true,
-      logging: false,
-      scale,
-      onclone: (doc, clonedTarget) => {
-        if (needsReveal) revealClonedTargetChain(clonedTarget)
-        preparedIframes.onclone(doc, clonedTarget)
-      },
-    })
+    // Web canvases (xterm's WebGL renderer) are only reliably readable around
+    // a fresh synchronous render — the refcounted suspension forces one and
+    // freezes the renderers while html2canvas copies each canvas into its
+    // clone. Balanced in `finally`, including every failure path.
+    const restoreRenderers = await suspendTerminalRenderersForScreenshot()
+    try {
+      const canvas = await html2canvas(target, {
+        backgroundColor: null,
+        allowTaint: true,
+        useCORS: true,
+        logging: false,
+        scale,
+        onclone: (doc, clonedTarget) => {
+          if (needsReveal) revealClonedTargetChain(clonedTarget)
+          preparedIframes.onclone(doc, clonedTarget)
+        },
+      })
 
-    const dataUrl = canvas.toDataURL('image/png')
-    const prefix = 'data:image/png;base64,'
-    if (!dataUrl.startsWith(prefix)) throw new Error('failed to encode png screenshot')
+      const dataUrl = canvas.toDataURL('image/png')
+      const prefix = 'data:image/png;base64,'
+      if (!dataUrl.startsWith(prefix)) throw new Error('failed to encode png screenshot')
 
-    result = {
-      ok: true,
-      mimeType: 'image/png',
-      imageBase64: dataUrl.slice(prefix.length),
-      width: canvas.width,
-      height: canvas.height,
+      result = {
+        ok: true,
+        mimeType: 'image/png',
+        imageBase64: dataUrl.slice(prefix.length),
+        width: canvas.width,
+        height: canvas.height,
+      }
+    } finally {
+      await restoreRenderers()
     }
   } catch (err: any) {
     result = {
       ok: false,
       error: err?.message || 'failed to capture screenshot',
     }
-  } finally {
-    await restoreRenderers()
   }
 
   return {

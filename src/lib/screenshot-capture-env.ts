@@ -24,14 +24,12 @@ export function registerTerminalCaptureHandler(paneId: string, handler: Terminal
   }
 }
 
-// Reference counting for overlapping suspensions: captures are serialized
-// through a queue, but a capture that blew its deadline is abandoned by the
-// tail and may resume WHILE its successor holds a suspension. The depth
+// Reference counting for overlapping suspensions: concurrent captures (or a
+// capture racing a manual one) can each hold a suspension; the depth
 // increments BEFORE the suspend work and its paint await, so a suspension
 // entering DURING another's acquisition window joins the same cycle and never
 // re-suspends the handlers. Resumes only release the renderers when the LAST
-// one lands, and each resumer is idempotent (its own end-of-capture call and
-// the abandon fence can both reach it).
+// one lands, and each resumer is idempotent.
 let suspensionDepth = 0
 let suspendedPaneIds: string[] = []
 

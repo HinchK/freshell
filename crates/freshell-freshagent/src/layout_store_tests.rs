@@ -253,6 +253,43 @@ fn mutations_without_snapshot_report_no_layout_snapshot_but_create_tab_bootstrap
 }
 
 #[test]
+fn close_tab_preserves_cursor_for_background_closes_and_advances_on_active_close() {
+    // Cursor parity with the client's removeTab reducer: a failed agent
+    // create rolls the layout back to exactly the USER's tab (never the
+    // first), and only closing the cursor's own tab selects a survivor.
+    let store = LayoutStore::default();
+    let sync = sync_from(json!({
+        "tabs": [{ "id": "t1" }, { "id": "t2" }, { "id": "t3" }],
+        "activeTabId": "t3",
+        "layouts": {
+            "t1": leaf("p1", json!({ "kind": "terminal", "terminalId": "term-1" })),
+            "t2": leaf("p2", json!({ "kind": "terminal", "terminalId": "term-2" })),
+            "t3": leaf("p3", json!({ "kind": "terminal", "terminalId": "term-3" })),
+        },
+        "activePane": { "t1": "p1", "t2": "p2", "t3": "p3" },
+        "timestamp": 1,
+    }));
+    store.update_from_ui(&sync, "c");
+
+    // Background close (a failed agent create's rollback): cursor unmoved.
+    let (bg, _) = store.create_tab(None);
+    assert_eq!(store.close_tab(&bg).tab_id.as_deref(), Some(bg.as_str()));
+    assert_eq!(
+        store.get_normalized_snapshot(None)["activeTabId"],
+        json!("t3"),
+        "background closeTab must not move the cursor"
+    );
+
+    // Active close: the PREVIOUS neighbor inherits, not the first tab.
+    assert_eq!(store.close_tab("t3").tab_id.as_deref(), Some("t3"));
+    assert_eq!(
+        store.get_normalized_snapshot(None)["activeTabId"],
+        json!("t2"),
+        "active closeTab advances to the previous neighbor (client parity)"
+    );
+}
+
+#[test]
 fn swap_pane_exchanges_content_and_title_maps() {
     let store = LayoutStore::default();
     let sync = sync_from(json!({

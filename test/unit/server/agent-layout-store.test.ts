@@ -129,6 +129,50 @@ describe('LayoutStore (read)', () => {
     expect(snap.activePane.tab_a).toBe('pane_1') // unchanged — stays with the original pane
   })
 
+  it('closeTab of a BACKGROUND tab never moves the server cursor (failed-create rollback is focus-neutral)', () => {
+    const store = new LayoutStore()
+    store.updateFromUi({
+      tabs: [
+        { id: 'tab_a', title: 'alpha' },
+        { id: 'tab_b', title: 'beta' },
+      ],
+      activeTabId: 'tab_b',
+      layouts: {
+        tab_a: { type: 'leaf', id: 'pane_a', content: { kind: 'terminal', terminalId: 'term_a' } },
+        tab_b: { type: 'leaf', id: 'pane_b', content: { kind: 'terminal', terminalId: 'term_b' } },
+      },
+      activePane: { tab_a: 'pane_a', tab_b: 'pane_b' },
+    }, 'conn1')
+    // An agent create appended a background tab and its terminal spawn then
+    // failed — the router's rollback (closeTab of the appended tab) must land
+    // the cursor back on the USER's tab (tab_b), never on the first tab.
+    const { tabId } = store.createTab({ title: 'failed agent tab' })
+    expect(store.closeTab(tabId)).toEqual({ tabId })
+    expect(store.getNormalizedSnapshot().activeTabId).toBe('tab_b')
+  })
+
+  it('closeTab of the CURSOR tab selects the previous neighbor (client removeTab parity)', () => {
+    const store = new LayoutStore()
+    store.updateFromUi({
+      tabs: [
+        { id: 'tab_a', title: 'alpha' },
+        { id: 'tab_b', title: 'beta' },
+        { id: 'tab_c', title: 'gamma' },
+      ],
+      activeTabId: 'tab_c',
+      layouts: {
+        tab_a: { type: 'leaf', id: 'pane_a', content: { kind: 'terminal', terminalId: 'term_a' } },
+        tab_b: { type: 'leaf', id: 'pane_b', content: { kind: 'terminal', terminalId: 'term_b' } },
+        tab_c: { type: 'leaf', id: 'pane_c', content: { kind: 'terminal', terminalId: 'term_c' } },
+      },
+      activePane: { tab_a: 'pane_a', tab_b: 'pane_b', tab_c: 'pane_c' },
+    }, 'conn1')
+    expect(store.closeTab('tab_c')).toEqual({ tabId: 'tab_c' })
+    // The client's removeTab picks the previous neighbor of the removed tab,
+    // not the first tab — the server mirror must match.
+    expect(store.getNormalizedSnapshot().activeTabId).toBe('tab_b')
+  })
+
   it('normalizes legacy agent-chat panes in normalized snapshots', () => {
     const store = new LayoutStore()
     store.updateFromUi({
