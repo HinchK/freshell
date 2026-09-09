@@ -126,9 +126,8 @@ tab.create/pane.split ACTIVATED the new tab/pane on every client. As of
 activate:false into addTab/splitPane, so they never change the user's active
 tab or per-tab active pane (bootstrap exception: the client's very first tab
 still activates). Focus changes remain exclusive to the explicit verbs
-(tab.select, pane.select; REST /tabs/next|prev and MCP next-tab/prev-tab fold into tab.select). Screenshot capture still moves and
-auto-restores focus, and now reports restoredFocus:false when a snapshot
-target was deleted mid-capture instead of resurrecting dead ids. See
+(tab.select, pane.select; REST /tabs/next|prev and MCP next-tab/prev-tab fold into tab.select). Screenshot capture (2026-09-09) renders through an
+off-DOM html2canvas clone and never moves focus or selection at all. See
 docs/plans/2026-08-25-mcp-focus-neutrality.md.
 
 **Rust status of this mechanism:** the frame type already exists — `freshell-protocol` `ServerMessage::UiCommand(UiCommand{ command:String, payload:Option<Value> })` at `crates/freshell-protocol/src/server_messages.rs:928` (camelCase serde), broadcast onto the shared `tokio::sync::broadcast` bus that `freshell-ws` fans out. The OpenCode create path already emits `ui.command{tab.create}` (`freshell-freshagent/src/lib.rs:1065`). **The wire + broadcast plumbing is done; only the additional commands/payload shapes and the client-fold parity remain** (the Rust port serves the frozen `src/` client, so `handleUiCommand` fold logic is already correct — the Rust server just has to emit the same commands with the same payloads).

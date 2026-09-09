@@ -61,20 +61,23 @@ unit/component tests, Playwright e2e against the owned RustServer wall harness.
   `env -u FRESHELL_BIND_HOST -u FRESHELL_PANE_ID -u FRESHELL_TAB_ID -u FRESHELL_TERMINAL_ID -u FRESHELL_TOKEN -u FRESHELL_URL bash scripts/e2e-cloud.sh run --local --project=rust-chromium <spec-basename>`
   The wall harness boots its OWN RustServer on an ephemeral port — never touch
   the live self-hosted server (port 3001).
-- **As-built (rounds 21–24 supersede the original client-only plan): this
-  delta now changes BOTH servers and the client.** Server-side: the two layout
+- **As-built (rounds 21–24 supersede the original client-only plan; the
+  2026-09-09 simplification supersedes the round-21–27 screenshot machinery):
+  this delta changes BOTH servers and the client.** Server-side: the two layout
   stores hold focus-neutral cursors for agent creates/splits
-  (`server/agent-api/layout-store.ts`, `crates/freshell-freshagent/src/layout_store.rs`),
-  and the screenshot round-trip stamps its RELATIVE budget
+  (`server/agent-api/layout-store.ts`, `crates/freshell-freshagent/src/layout_store.rs`);
+  the screenshot round-trip carries NO budget/cancel protocol anymore — the
+  client renders through an off-DOM clone and never mutates UI, so the servers
   (`server/ws-handler.ts`, `crates/freshell-ws/src/screenshot.rs`,
-  `crates/freshell-server/src/screenshots.rs`). Deployment therefore requires
+  `crates/freshell-server/src/screenshots.rs`) just broadcast the capture frame
+  and await the reply. Deployment therefore requires
   rebuilding + restarting the Rust server (`scripts/launch-rust.sh`), not a
   client-only refresh. Task 5's doc-string edit in `server/mcp/freshell-tool.ts`
   (agent-facing instructions) still ships with the MCP server binary as before.
   The frozen WS contract
   (`port/contract/ws-server-messages.schema.json:3205-3221`, `"payload": true`)
-  remains untouched: the screenshot payload's added `ttlMs` key carries inside
-  the free-form payload field, no schema shape change.
+  remains untouched: the screenshot payload is free-form in the schema, no
+  shape change on either side.
 - **Base sync first.** At plan-write time the branch is 2 commits behind
   `origin/main`. Before executing Task 1: `git fetch origin` and
   fast-forward/rebase the branch onto `origin/main`, update run-state's base
@@ -2248,9 +2251,11 @@ tests elsewhere are untouched — out of scope).
 
 ## Fresh Eyes record
 
+- **Simplification (user-approved, 2026-09-09; after r18–r27 exhausted the 10-round budget without a pass): the entire screenshot capture-activation machinery was REPLACED by off-DOM clone rendering.** Root insight: `.tab-hidden` is CSS `visibility: hidden`, not `display: none` (kept that way so xterm can measure), so background tabs remain mounted AND fully laid out — html2canvas parses the target's bounds from its CLONE of the document and skips visibility-hidden subtrees while painting, so an inline `visibility: visible` on the cloned target's ancestor chain (via `onclone`, armed live-side only when the target actually has a hidden ancestor) renders the background tab without touching the live page. `captureUiScreenshot` now dispatches NOTHING: no tab/pane activation, no restore, no serial interaction — which deletes the whole apparatus the ten failed rounds kept patching: the capture queue + serialization, deadline/TTL budgets, `ttlMs` stamping, `screenshot.cancel` frames + client cancellation sets/waiters/render races, iframe-hoist/intent detection (focusout/blur listeners, Tab-key/pointer evidence windows), per-coordinate touched maps + co-touch rules, fenced abandonment + shared wind-down promises, `restoreFocus`, `selectTabForCapture`, `setActivePane`'s `capture:` flag, and the middleware's coordinate bookkeeping (the serial itself STAYS — it serves the ownership/adoption records). What remains: refcounted renderer suspension around the render (WebGL canvases need a fresh synchronous draw before clone readback), iframe pre-render with clone-side index+src-fingerprint correlation (no live-DOM markers; a tree that changed between prep and clone gets NO replacements rather than a wrong one), and the layout-gated (not paint-gated) iframe prep so hidden-tab iframes still capture. Server-side: Node `ws-handler.ts` and the Rust broker dropped cancel broadcasts and ttl stamping (no client state left to unwind; a stale capture is now a harmless clone render whose reply is ignored). `changedFocus`/`restoredFocus` stay on the wire/REST envelope (compat), always false. E2E: new wall-spec test proves a REST screenshot of a background tab (tab AND pane scope) returns a real non-blank render (in-page pixel-variance check on the saved PNG) while the user's active tab and exact DOM focus identity stay anchored. All gates green at the simplification commit; a fresh delta review episode starts here.
+
 - **Delta round 27 (Codex, independent; base 5b8717017): FAILED — 2 Majors**, both assessed valid and fixed: (M1) the r25 intent window was GLOBAL — any keydown/pointermove anywhere counted — so a user typing in their own pane while the capture's flip triggered ExtensionPane autofocus launders that programmatic hoist into 'user engagement' (realistic false positive → no rollback → user stranded on the captured tab). Evidence is now BOUND: keyboard evidence only for focus-navigation Tab keydowns; pointer evidence only for activity over the SAME pane the hoist lands in. Pinned by a deterministic unrelated-input-elsewhere scenario (evidence dispatches inside the flip subscription, before the autofocus). (M2) r26's first-resolve cancel only reached discrete gates — a losing client parked in a multi-second html2canvas main render kept the capture selection for up to ~10s. Renders are now raced against a requestId-keyed cancel signal (watchCancellation/cancellationWaiters, released in wind-down; html2canvas abandonment is safe because onclone only mutates the clone). Both directions pinned (cancel DURING main render resolves with /cancelled by server/ immediately, instead of waiting out the render).
   Runner report: `.worktrees/.the-usual-logs/mcp-focus-neutrality/review-logs/usual-fresheyes-20260908T090251Z-4049718.md`
-  **Budget status:** r27 fixes landed; this was the 10th authorized review round (r18–r27). The pass condition never triggered. Awaiting user decision: extend the review budget, rescope (defensible partials below), or land the current state. Every gate is green at HEAD; known-open majors are fixed at HEAD but UNREVIEWED.
+  **Budget status:** r27 fixes landed; this was the 10th authorized review round (r18–r27). The pass condition never triggered. **Resolution (2026-09-09): the user chose simplification** — see the Simplification entry above; the capture-activation machinery those rounds patched was replaced wholesale, and a fresh review episode reviews the simplified delta.
 
 - **Delta round 26 (Codex, independent; base 5b8717017): FAILED — 3 Majors**, all assessed valid and fixed: (M1) the r25 receipt-side `consumeCancellation` ran synchronously at call time, eating the marker before the tail-scheduled job's own dequeue gate — the job then proceeded anyway. The check now runs BEFORE any job is enqueued (a cancel-before-frame consumes the marker and no work is ever created); the pin drains the queue and proves no renderer suspension/selection move happened. (M2) wind-down exactly-once was a DONE-flag + map-delete-at-start, creating two collision windows (natural-completion wind-down in flight when the abandon timer fires → timer saw no entry and advanced the tail mid-restore; timer-first wind-down in flight → job's own completion call returned early and won the tail race mid-wind-down). Wind-down is now a shared promise both drivers join, and the map entry survives until FULL settle (abandon timer waits on the same promise). Pinned by a fake-Date+setTimeout choreography asserting suspension #2 never begins before wind-down #1 ends. (M3) the Rust broker broadcasts captures to EVERY capable client but cancelled only on failure paths; the FIRST resolve left the other clients' queued/in-flight captures unanswerable. `resolve_from`/`resolve` now broadcast `screenshot.cancel` after answering the waiter (the winner's own finished job no-ops on it; losers unwind at the next gate). Node targets a single socket so it had no multi-client leak.
   Runner report: `.worktrees/.the-usual-logs/mcp-focus-neutrality/review-logs/usual-fresheyes-20260908T082159Z-3068235.md`
