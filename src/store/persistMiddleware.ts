@@ -255,6 +255,9 @@ function stripTransientSessionFields(content: any): any {
     pendingReconcile: _pendingReconcile,
     reconcileNotice: _reconcileNotice,
     reconcileEpoch: _reconcileEpoch,
+    // Delta-r7-r3 (F2): the close-gate failure surface is volatile too —
+    // the unconfirmed close stands (the pane reloads), the banner does not.
+    closeError: _closeError,
     ...rest
   } = content
 
@@ -601,6 +604,8 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
             reconcileWarming: _rw,
             reconcilePendingPanes: _rpp,
             focusEpochByPaneId: _febp,
+            closingTabs: _ct,
+            closingPanes: _cp,
             ...persistablePanes
           } = state.panes
           persistablePanesSection = {

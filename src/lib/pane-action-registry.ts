@@ -1,3 +1,5 @@
+import type { ActionSheetItem } from '@/components/fresh-agent/FreshAgentActionSheet'
+
 export type TerminalActions = {
   copySelection: () => Promise<void> | void
   paste: () => Promise<void> | void
@@ -34,6 +36,60 @@ export type BrowserActions = {
 const terminalRegistry = new Map<string, TerminalActions>()
 const editorRegistry = new Map<string, EditorActions>()
 const browserRegistry = new Map<string, BrowserActions>()
+
+/** kata 1wxv: fresh-agent pane rollback actions (undo/redo last turn), consumed
+ * by the pane context menu. undoSupported/redoSupported stamp the provider's
+ * snapshot capabilities (codex is undo-only) and decide ROW PRESENCE; canUndo/
+ * canRedo are stamped per registration from the owning view's busy state and
+ * decide ENABLED state on shown rows. */
+export type FreshAgentPaneActions = {
+  undo: () => void
+  redo: () => void
+  canUndo: boolean
+  canRedo: boolean
+  undoSupported: boolean
+  redoSupported: boolean
+}
+
+const freshAgentActionsRegistry = new Map<string, FreshAgentPaneActions>()
+
+export function registerFreshAgentPaneActions(paneId: string, actions: FreshAgentPaneActions): () => void {
+  freshAgentActionsRegistry.set(paneId, actions)
+  return () => {
+    freshAgentActionsRegistry.delete(paneId)
+  }
+}
+
+export function getFreshAgentPaneActions(paneId: string): FreshAgentPaneActions | undefined {
+  return freshAgentActionsRegistry.get(paneId)
+}
+
+/**
+ * Per-turn action items for the unified fresh-agent context menu, keyed by the
+ * owning pane. Registered by FreshAgentTranscript (the one place that can map
+ * a rendered article index to its action turn through the merged-line layout);
+ * consumed by the global ContextMenuProvider's fresh-agent menu builder, which
+ * prepends them for plain-text turn regions. Shares the item vocabulary with
+ * the touch action sheet (both flow from buildTurnActionItems), so desktop and
+ * mobile never drift. null/undefined means "no turn at that article index" —
+ * the menu then shows only its region/base rows.
+ */
+export type FreshAgentTurnItemsBuilder = (articleIndex: number) => ActionSheetItem[] | null
+
+const freshAgentTurnItemsRegistry = new Map<string, FreshAgentTurnItemsBuilder>()
+
+export function registerFreshAgentTurnItems(paneId: string, builder: FreshAgentTurnItemsBuilder): () => void {
+  freshAgentTurnItemsRegistry.set(paneId, builder)
+  return () => {
+    if (freshAgentTurnItemsRegistry.get(paneId) === builder) {
+      freshAgentTurnItemsRegistry.delete(paneId)
+    }
+  }
+}
+
+export function getFreshAgentTurnItemsBuilder(paneId: string): FreshAgentTurnItemsBuilder | undefined {
+  return freshAgentTurnItemsRegistry.get(paneId)
+}
 
 export function registerTerminalActions(paneId: string, actions: TerminalActions): () => void {
   terminalRegistry.set(paneId, actions)

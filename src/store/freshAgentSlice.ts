@@ -127,21 +127,6 @@ function requestRestoreHydrationRestart(session: FreshAgentSessionState): void {
   session.restoreHydrationRequestId = (session.restoreHydrationRequestId ?? 0) + 1
 }
 
-function summarizeFreshAgentItems(items: FreshAgentContentBlock[]): string {
-  const text = items
-    .map((item) => {
-      if (item.kind === 'text') return item.text
-      if (item.kind === 'thinking') return item.text
-      if (item.kind === 'tool_use') return item.name
-      if (item.kind === 'tool_result') return typeof item.content === 'string' ? item.content : JSON.stringify(item.content)
-      return item.kind
-    })
-    .filter(Boolean)
-    .join(' ')
-    .trim()
-  return text || 'Agent activity'
-}
-
 function normalizeLegacyContentBlock(block: Record<string, unknown>, index: number): FreshAgentContentBlock | undefined {
   const id = typeof block.id === 'string' && block.id.length > 0
     ? block.id
@@ -414,7 +399,9 @@ const freshAgentSlice = createSlice({
       // A terminal/idle status ends the turn: clear streaming too, else busy stays
       // true (isFreshAgentBusy = streamingActive || running) and the pane is stuck
       // blue after a natural stream-end / freshAgent.status:idle broadcast.
-      if (action.payload.status === 'idle' || action.payload.status === 'exited') {
+      // 'stuck' (wedged-sidecar deadman) ends the busy assertion the same way —
+      // without emitting any completion edge.
+      if (action.payload.status === 'idle' || action.payload.status === 'exited' || action.payload.status === 'stuck') {
         session.streamingActive = false
       }
     },
@@ -592,7 +579,10 @@ const freshAgentSlice = createSlice({
         turnId,
         role: 'assistant',
         model: action.payload.model,
-        summary: summarizeFreshAgentItems(items),
+        // Server-authoritative provenance: the client no longer summarizes
+        // fresh-agent items (the write-only summarizer was deleted); the
+        // Rust server tags every turn's summaryKind itself.
+        summary: '',
         items,
       })
       session.historyItems = session.turns

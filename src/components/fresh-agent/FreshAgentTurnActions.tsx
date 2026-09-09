@@ -1,10 +1,9 @@
-import { useCallback, useEffect, useState } from 'react'
-import { Check, Copy, GitFork, History, MoreHorizontal } from 'lucide-react'
+import { useCallback, useState } from 'react'
+import { Check, Copy, GitFork, History, MoreHorizontal, Undo2 } from 'lucide-react'
 import { copyText } from '@/lib/clipboard'
 import type { FreshAgentTurn } from '@shared/fresh-agent-contract'
 import { stripSystemReminders } from './FreshAgentItemCard'
 import type { ActionSheetItem } from './FreshAgentActionSheet'
-import { cn } from '@/lib/utils'
 
 export function turnPlainText(turn: FreshAgentTurn): string {
   const text = turn.items
@@ -17,13 +16,22 @@ export function turnPlainText(turn: FreshAgentTurn): string {
 
 export type TurnActionCallbacks = {
   canFork: boolean
+  /** kata 1wxv: snapshot-stamped `capabilities.undo` — absent/false hides the icon. */
+  canRollback?: boolean
+  /** Mid-turn: the advisory pre-flight gate disables the affordance (decision 7). */
+  rollbackBusy?: boolean
+  canRedo?: boolean
   onForkFromTurn?: (turnId: string) => void
   onRewindToTurn?: (turn: FreshAgentTurn) => void
+  onRollbackToTurn?: (turnId: string) => void
+  onRedoToTurn?: (turnId: string) => void
 }
 
 /**
- * One source of truth for what you can do to a turn — consumed by the desktop
- * context menu and the mobile action sheet so they never drift apart.
+ * One source of truth for what you can do to a turn — consumed by the mobile
+ * action sheet directly and by the desktop unified context menu through the
+ * transcript's pane-registered FreshAgentTurnItemsBuilder, so the two
+ * surfaces never drift apart.
  */
 export function buildTurnActionItems(turn: FreshAgentTurn, callbacks: TurnActionCallbacks): ActionSheetItem[] {
   return [
@@ -37,6 +45,15 @@ export function buildTurnActionItems(turn: FreshAgentTurn, callbacks: TurnAction
       run: () => callbacks.onForkFromTurn?.(turn.turnId ?? turn.id),
     },
     {
+      // kata 1wxv decision 3: "undo to here" — one N-step rollback to just before
+      // this user turn. Conversation-only, so deliberately NOT marked `destructive`
+      // (the file-rewind sibling owns that flag). Redo rows for the rolled-back
+      // bucket are built by the transcript section, not here.
+      label: 'Undo to here',
+      disabled: callbacks.canRollback !== true || callbacks.rollbackBusy === true || !callbacks.onRollbackToTurn || turn.role !== 'user',
+      run: () => callbacks.onRollbackToTurn?.(turn.turnId ?? turn.id),
+    },
+    {
       label: 'Rewind code to here',
       disabled: callbacks.onRewindToTurn === undefined || turn.role !== 'user',
       destructive: true,
@@ -48,14 +65,20 @@ export function buildTurnActionItems(turn: FreshAgentTurn, callbacks: TurnAction
 /**
  * Per-turn affordances. Pointer-capability aware:
  * - hover/fine: a hover toolbar (copy / fork / rewind) — hidden entirely on
- *   no-hover devices via the (hover:none) media variant;
+ *   no-hover devices via the (hover:none) media variant; right-click is owned
+ *   by the global ContextMenuProvider's unified fresh-agent menu (the turn
+ *   rows ride in through the pane-registered builder the transcript registers
+ *   around buildTurnActionItems);
  * - touch/no-hover: an always-visible ⋯ button (44px target) that opens the
  *   bottom action sheet; long-press on the turn does the same.
  */
 export function FreshAgentTurnActions({
   turn,
   canFork,
+  canRollback,
+  rollbackBusy,
   onForkFromTurn,
+  onRollbackToTurn,
   onRewindToTurn,
   onOpenActions,
 }: TurnActionCallbacks & {
@@ -100,6 +123,18 @@ export function FreshAgentTurnActions({
             <GitFork className="h-3 w-3" />
           </button>
         ) : null}
+        {canRollback && onRollbackToTurn && turn.role === 'user' ? (
+          <button
+            type="button"
+            onClick={() => onRollbackToTurn(turn.turnId ?? turn.id)}
+            disabled={rollbackBusy === true}
+            className="rounded p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground disabled:cursor-not-allowed disabled:opacity-40"
+            aria-label="Undo to here"
+            title={`Roll back this turn and everything after “${turn.summary.slice(0, 60)}” — conversation only; files stay as they are`}
+          >
+            <Undo2 className="h-3 w-3" />
+          </button>
+        ) : null}
         {canRewind ? (
           <button
             type="button"
@@ -129,67 +164,4 @@ export function FreshAgentTurnActions({
   )
 }
 
-type ContextMenuState = { x: number; y: number; turn: FreshAgentTurn } | null
 
-/**
- * Floating right-click menu for fine pointers. Touch devices use
- * FreshAgentActionSheet instead (same items via buildTurnActionItems).
- */
-export function FreshAgentTurnContextMenu({
-  state,
-  canFork,
-  onForkFromTurn,
-  onRewindToTurn,
-  onClose,
-}: TurnActionCallbacks & {
-  state: ContextMenuState
-  onClose: () => void
-}) {
-  useEffect(() => {
-    if (!state) return
-    const handle = () => onClose()
-    document.addEventListener('click', handle)
-    document.addEventListener('contextmenu', handle)
-    return () => {
-      document.removeEventListener('click', handle)
-      document.removeEventListener('contextmenu', handle)
-    }
-  }, [onClose, state])
-
-  if (!state) return null
-
-  const items = buildTurnActionItems(state.turn, { canFork, onForkFromTurn, onRewindToTurn })
-
-  return (
-    <div
-      role="menu"
-      aria-label="Turn context menu"
-      className="fixed z-50 min-w-[220px] rounded-md border border-border bg-popover p-1 text-sm shadow-lg"
-      style={{
-        left: Math.min(state.x, typeof window !== 'undefined' ? window.innerWidth - 240 : state.x),
-        top: Math.min(state.y, typeof window !== 'undefined' ? window.innerHeight - 150 : state.y),
-      }}
-    >
-      {items.map((item) => (
-        <button
-          key={item.label}
-          type="button"
-          role="menuitem"
-          disabled={item.disabled}
-          className={cn(
-            'block w-full rounded px-3 py-1.5 text-left transition-colors',
-            item.disabled ? 'cursor-not-allowed opacity-40' : 'hover:bg-accent hover:text-accent-foreground',
-          )}
-          onClick={() => {
-            onClose()
-            if (!item.disabled) item.run()
-          }}
-        >
-          {item.label}
-        </button>
-      ))}
-    </div>
-  )
-}
-
-export type { ContextMenuState as FreshAgentTurnContextMenuState }

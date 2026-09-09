@@ -1,11 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { KeyboardShortcutsDialog } from '@/components/KeyboardShortcutsDialog'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
-import { addTab, closeTab, reopenClosedTab, closePaneWithCleanup, reorderTabs, updateTab, setActiveTab, openSessionTab, requestTabRename } from '@/store/tabsSlice'
+import { addTab, closeTab, reopenClosedTab, closePaneWithCleanup, replacePaneWithCleanup, reorderTabs, updateTab, setActiveTab, openSessionTab, requestTabRename } from '@/store/tabsSlice'
 import {
   addPane,
   initLayout,
-  replacePane,
   requestPaneRefresh,
   requestPaneRename,
   requestTabRefresh,
@@ -15,10 +14,10 @@ import {
   updatePaneContent,
   updatePaneTitleByTerminalId,
 } from '@/store/panesSlice'
-import { applySessionRenameCascade } from '@/store/titleSync'
+import { applySessionRenameCascade, clearSessionTitleOverride } from '@/store/titleSync'
 import { removeSessionFromProjects, setProjectExpanded } from '@/store/sessionsSlice'
 import { getWsClient } from '@/lib/ws-client'
-import { sendTerminalKill } from '@/lib/terminal-kill'
+import { sendTerminalKillAndAwait, sendFreshAgentKillAndAwait } from '@/lib/kill-ack'
 import { api, setSessionMetadata } from '@/lib/api'
 import { refreshActiveSessionWindow } from '@/store/sessionsThunks'
 import { getAuthToken } from '@/lib/auth'
@@ -144,6 +143,30 @@ function findContextElement(start: HTMLElement | null): HTMLElement | null {
     node = node.parentElement
   }
   return null
+}
+
+/**
+ * True when the target sits inside a fresh-agent transcript turn article
+ * (sole producer: FreshAgentTranscript). Because the transcript installs a
+ * per-article contextmenu handler only for its touch action sheet, the
+ * provider's capture-phase listener uses this predicate for the remaining
+ * gesture-scoped carve-out: while a touch gesture is in flight on a turn, the
+ * sheet owns it and no provider menu may open.
+ */
+function isFreshAgentTurnTarget(el: HTMLElement | null): boolean {
+  return !!el?.closest?.('article[data-turn-role]')
+}
+
+/**
+ * A turn article carries data-longpress-owned="true" exactly when the
+ * transcript installed its own long-press handlers (coarse pointers). The
+ * provider's long-press carve-out keys on this attribute — NOT bare
+ * data-turn-role — so hybrid-input devices (fine primary pointer, e.g. iPad +
+ * trackpad: the transcript installs no long-press there) keep the provider's
+ * long-press fallback untouched.
+ */
+function isFreshAgentLongPressOwnedTarget(el: HTMLElement | null): boolean {
+  return !!el?.closest?.('article[data-turn-role][data-longpress-owned="true"]')
 }
 
 function resolveContextId(value: string | undefined): ContextId {
@@ -328,7 +351,12 @@ export function ContextMenuProvider({
   }, [dispatch])
 
   const replacePaneAction = useCallback((tabId: string, paneId: string) => {
-    dispatch(replacePane({ tabId, paneId }))
+    // Delta-r7-r3 (focused-episode-7 round 2, Finding F2): replace discards
+    // the pane's identity — a pane CLOSE in every respect that matters to
+    // the recovery ledger — so it routes through the acknowledged close gate
+    // (the pane becomes a picker only once the durable close evidence is
+    // confirmed; on failure the content stays and wears the error).
+    dispatch(replacePaneWithCleanup({ tabId, paneId }))
   }, [dispatch])
 
   const closeTabById = useCallback((tabId: string) => {
@@ -587,6 +615,38 @@ export function ContextMenuProvider({
         // no longer removes vanished sessions — propagate the delete
         // explicitly and immediately.
         dispatch(removeSessionFromProjects({ provider: provider || info.session.provider, sessionId }))
+        await dispatch(refreshActiveSessionWindow() as any)
+      },
+    })
+  }, [dispatch, getSessionInfo, menuState?.target])
+
+  const resetSessionTitle = useCallback((sessionId: string, provider?: string) => {
+    const info = getSessionInfo(sessionId, provider, menuState?.target)
+    if (!info) return
+    const resolvedProvider = provider || info.session.provider || 'claude'
+    setConfirmState({
+      title: 'Reset to provider title?',
+      confirmLabel: 'Reset title',
+      body: (
+        <div className="space-y-2">
+          <div className="text-xs">This removes the custom title override for this session only. A backup of the previous config is kept in config.backup.json.</div>
+          <div className="text-xs">Current title: {info.session.title || '(untitled)'}</div>
+          <div className="text-xs">Provider title: {info.session.providerTitle || '(none yet — the next generated title will show)'}</div>
+        </div>
+      ),
+      onConfirm: async () => {
+        try {
+          await clearSessionTitleOverride(resolvedProvider, sessionId)
+        } catch (err) {
+          // SESSION-03: failed reset must not LOOK like success — keep the
+          // dialog open and announce the failure.
+          const message = err instanceof Error ? err.message : 'Reset failed'
+          setConfirmState((prev) =>
+            prev ? { ...prev, error: `Failed to reset title: ${message}` } : prev,
+          )
+          return
+        }
+        setConfirmState(null)
         await dispatch(refreshActiveSessionWindow() as any)
       },
     })
@@ -971,8 +1031,17 @@ export function ContextMenuProvider({
       },
     )
 
+    // Focused-episode-6 round 2 (Findings 6+7): AWAIT the old session's
+    // durable close before starting its replacement conversation — a close
+    // the server cannot record durably is not a close, and swapping the pane
+    // content anyway would leave a live server session open on no tab. On
+    // failure the pane keeps its current conversation (the terminal pane's
+    // xterm notice / the fresh-agent session-error banner carries the reason).
     if (latest.content.kind === 'terminal' && latest.content.terminalId) {
-      sendTerminalKill(latest.content.terminalId)
+      const ack = await sendTerminalKillAndAwait(latest.content.terminalId, {
+        createRequestId: latest.content.createRequestId ?? null,
+      })
+      if (!ack.ok) return
     } else if (latest.content.kind === 'fresh-agent' && latest.content.sessionId) {
       const cwd = getFreshOpenCodeRouteCwd(
         latest.content,
@@ -982,13 +1051,13 @@ export function ContextMenuProvider({
           fallbackCwd: resolvedCwd,
         },
       )
-      ws.send({
-        type: 'freshAgent.kill',
+      const ack = await sendFreshAgentKillAndAwait({
         sessionId: latest.content.sessionId,
         sessionType: latest.content.sessionType,
         provider: latest.content.provider,
         ...(cwd ? { cwd } : {}),
       })
+      if (!ack.ok) return
     }
 
     dispatch(updatePaneContent({
@@ -1017,7 +1086,6 @@ export function ContextMenuProvider({
   }, [
     appStore,
     dispatch,
-    ws,
   ])
 
   const shouldUseNativeMenu = useCallback((targetEl: HTMLElement | null, contextId: string, contextEl: HTMLElement | null, evt: MouseEvent | KeyboardEvent) => {
@@ -1042,10 +1110,40 @@ export function ContextMenuProvider({
     // handlers so handleContextMenu can coordinate with the touch session.
     let longPressTimer: ReturnType<typeof setTimeout> | null = null
     let touchStartPos: { x: number; y: number } | null = null
+    // The gesture's original touchstart target, persisted for the WHOLE
+    // in-flight gesture on the touchStartPos clearing discipline. A LATE
+    // native Android contextmenu can arrive after the transcript's sheet has
+    // opened; Chromium's fresh hit test then targets the sheet/backdrop, so
+    // handleContextMenu resolves turn ownership against this target instead
+    // (see its carve-out).
+    let touchGestureTarget: HTMLElement | null = null
     let suppressNextTouchEnd = false
 
     const handleContextMenu = (e: MouseEvent) => {
       const target = e.target as HTMLElement | null
+      // One menu system owns every fresh-agent right-click: fine-pointer
+      // turns, specialized sub-regions, and pane background all flow through
+      // the fresh-agent menu builder below (it selects region- and turn-aware
+      // items). The transcript's bubble-phase article handler installs no
+      // handler at all on fine pointers. The carve-out that remains is
+      // gesture-scoped: while a touch gesture is in flight on a turn article,
+      // the transcript's long-press action sheet owns the whole turn, and we
+      // must not stack a menu on it. We still cancel the event on the early
+      // return: for an article-targeted event the transcript's bubble-phase
+      // handler cancels it too (a harmless double cancel), while a late
+      // sheet-targeted event has no transcript handler at all — without a
+      // cancel here the browser shows its native context menu over the sheet.
+      // Since a late native contextmenu can arrive retargeted onto the
+      // just-opened sheet (Android-race case B below), ownership resolves
+      // against the gesture's ORIGINAL target, not e.target. For non-turn
+      // gestures the recorded target fails the predicate identically to
+      // e.target, so their behavior is unchanged.
+      const gestureInFlight = touchStartPos !== null || longPressTimer !== null
+      const ownershipTarget = gestureInFlight ? touchGestureTarget : target
+      if (gestureInFlight && isFreshAgentTurnTarget(ownershipTarget)) {
+        if (e.cancelable) e.preventDefault()
+        return
+      }
       const contextEl = findContextElement(target)
       const contextId = resolveContextId(contextEl?.dataset.context)
       if (shouldUseNativeMenu(target, contextId, contextEl, e)) return
@@ -1068,7 +1166,7 @@ export function ContextMenuProvider({
       // Chromium, and it hardens against engines reporting drifted or
       // degenerate contextmenu coordinates.
       let position = { x: e.clientX, y: e.clientY }
-      if (touchStartPos !== null || longPressTimer !== null) {
+      if (gestureInFlight) {
         if (touchStartPos) {
           position = { x: touchStartPos.x, y: touchStartPos.y }
         }
@@ -1077,6 +1175,7 @@ export function ContextMenuProvider({
           longPressTimer = null
         }
         touchStartPos = null
+        touchGestureTarget = null
         suppressNextTouchEnd = true
       }
 
@@ -1122,9 +1221,30 @@ export function ContextMenuProvider({
       if (!touch) return
       suppressNextTouchEnd = false
       touchStartPos = { x: touch.clientX, y: touch.clientY }
+      // Capture the gesture target ONCE here: by the time the 500ms timer
+      // fires, a transcript-owned long-press (450ms) has already opened the
+      // action sheet, so a live elementFromPoint probe would hit the sheet.
+      // The same target also carries turn ownership for handleContextMenu
+      // across a late, retargeted native contextmenu (see its carve-out).
+      const gestureTarget = e.target as HTMLElement | null
+      touchGestureTarget = gestureTarget
 
       longPressTimer = setTimeout(() => {
         longPressTimer = null
+        // The transcript's own long-press owns this gesture entirely: no
+        // probe, no haptic, no openMenu, and no suppressNextTouchEnd arming
+        // (the transcript's touch handlers own release suppression). Hybrid-
+        // input devices never set data-longpress-owned, so they keep the
+        // provider fallback below, which stays byte-identical.
+        //
+        // The gesture bookkeeping deliberately SURVIVES this exit (cleared
+        // only on touchend/touchcancel): a LATE native contextmenu can still
+        // arrive while the finger stays down, retargeted onto the just-opened
+        // sheet, and handleContextMenu must still observe this gesture as in
+        // flight so ownership resolves to the gesture's original target.
+        if (isFreshAgentLongPressOwnedTarget(gestureTarget)) {
+          return
+        }
         const startPos = touchStartPos
         if (!startPos) return
         const target = document.elementFromPoint(startPos.x, startPos.y) as HTMLElement | null
@@ -1135,11 +1255,11 @@ export function ContextMenuProvider({
         if (!contextId) return
 
         // Respect native context menu for inputs, links, iframes, etc.
-        if (contextEl?.dataset.nativeContext === 'true') { touchStartPos = null; return }
-        if (target.closest?.('[data-native-context="true"]')) { touchStartPos = null; return }
-        if (target.tagName === 'IFRAME') { touchStartPos = null; return }
-        if (isTextInputLike(target) && ![ContextIds.Editor, ContextIds.Terminal].includes(contextId as any)) { touchStartPos = null; return }
-        if (target.closest?.('a[href]')) { touchStartPos = null; return }
+        if (contextEl?.dataset.nativeContext === 'true') { touchStartPos = null; touchGestureTarget = null; return }
+        if (target.closest?.('[data-native-context="true"]')) { touchStartPos = null; touchGestureTarget = null; return }
+        if (target.tagName === 'IFRAME') { touchStartPos = null; touchGestureTarget = null; return }
+        if (isTextInputLike(target) && ![ContextIds.Editor, ContextIds.Terminal].includes(contextId as any)) { touchStartPos = null; touchGestureTarget = null; return }
+        if (target.closest?.('a[href]')) { touchStartPos = null; touchGestureTarget = null; return }
 
         const dataset = contextEl?.dataset ? copyDataset(contextEl.dataset) : {}
         const parsed = parseContextTarget(contextId as any, dataset)
@@ -1155,6 +1275,7 @@ export function ContextMenuProvider({
           dataset,
         })
         touchStartPos = null
+        touchGestureTarget = null
       }, 500)
     }
 
@@ -1168,6 +1289,7 @@ export function ContextMenuProvider({
         clearTimeout(longPressTimer)
         longPressTimer = null
         touchStartPos = null
+        touchGestureTarget = null
         suppressNextTouchEnd = false
       }
     }
@@ -1179,6 +1301,7 @@ export function ContextMenuProvider({
         longPressTimer = null
       }
       touchStartPos = null
+      touchGestureTarget = null
       suppressNextTouchEnd = false
       if (shouldSuppressRelease) {
         if (e.cancelable) e.preventDefault()
@@ -1350,6 +1473,7 @@ export function ContextMenuProvider({
         openSessionInNewTab,
         openSessionInThisTab,
         renameSession,
+        resetSessionTitle,
         generateSessionTitle,
         toggleArchiveSession,
         deleteSession,
@@ -1422,6 +1546,7 @@ export function ContextMenuProvider({
     openSessionInNewTab,
     openSessionInThisTab,
     renameSession,
+    resetSessionTitle,
     toggleArchiveSession,
     deleteSession,
     copySessionId,

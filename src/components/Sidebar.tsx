@@ -24,7 +24,7 @@ import {
   type SidebarSessionItem,
 } from '@/store/selectors/sidebarSelectors'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
-import { getActiveSessionRefForTab, collectSessionRefsFromTabs } from '@/lib/session-utils'
+import { getActiveSessionRefForTab, collectSessionRefsFromTabs, getTabSessionRefs } from '@/lib/session-utils'
 import { useStableArray } from '@/hooks/useStableArray'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { fetchSessionWindow } from '@/store/sessionsThunks'
@@ -34,6 +34,9 @@ import { selectRemoteSessionActivity, selectSameDeviceSessionKeys } from '@/stor
 import { selectPrimaryTerminalIdForTab } from '@/store/selectors/paneTerminalSelectors'
 import type { FreshAgentSessionState } from '@/store/freshAgentTypes'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
+import RepoIcon, { type RepoIconInfo } from '@/components/icons/RepoIcon'
+import { fetchRepoIconMeta } from '@/store/repoIconsSlice'
+import { pathBasename, buildRepoIconUrl } from '@/lib/repo-icon'
 
 const EMPTY_TERMINALS: BackgroundTerminal[] = []
 const EMPTY_LAYOUTS: Record<string, never> = {}
@@ -42,6 +45,7 @@ const EMPTY_CLAUDE_ACTIVITY_BY_ID = {}
 const EMPTY_AMPLIFIER_ACTIVITY_BY_ID = {}
 const EMPTY_OPENCODE_ACTIVITY_BY_ID = {}
 const EMPTY_FRESH_AGENT_SESSIONS: Record<string, FreshAgentSessionState> = {}
+const EMPTY_ATTENTION: Record<string, boolean> = {}
 const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
 
 /** Non-color carriers for the remote status ring (a11y): tooltip line + sr-only hint. */
@@ -154,6 +158,7 @@ function isSessionItemEqual(a: SessionItem, b: SessionItem): boolean {
     a.archived === b.archived &&
     a.projectColor === b.projectColor &&
     a.cwd === b.cwd &&
+    a.repoPath === b.repoPath &&
     a.projectPath === b.projectPath &&
     a.isFallback === b.isFallback &&
     a.ratchetedActivity === b.ratchetedActivity &&
@@ -224,6 +229,9 @@ export default function Sidebar({
     return `${ref.provider}:${ref.sessionId}`
   })
   const selectSortedItems = useMemo(() => makeSelectSortedSessionItems(), [])
+
+  const repoIconsOnTabs = useAppSelector((s) => s.settings.settings.panes?.repoIconsOnTabs ?? true)
+  const repoIconsByCwd = useAppSelector((s) => s.repoIcons?.byCwd ?? {})
 
   const sidebarWindow = useAppSelector((s) => s.sessions.windows?.sidebar)
   const terminals = useAppSelector((state) => (
@@ -383,6 +391,47 @@ export default function Sidebar({
     freshAgentSessions: state.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS,
   }), shallowEqual)
   const busySessionKeySet = useMemo(() => new Set(busySessionKeys), [busySessionKeys])
+
+  const attentionByTab = useAppSelector((s) => s.turnCompletion?.attentionByTab) ?? EMPTY_ATTENTION
+  const allTabs = useAppSelector((s) => s.tabs.tabs)
+  const allPanes = useAppSelector((s) => s.panes)
+  const attentionSessionKeySet = useMemo(() => {
+    const out = new Set<string>()
+    for (const tab of allTabs) {
+      if (!attentionByTab[tab.id]) continue
+      for (const ref of getTabSessionRefs({ tabs: allTabs, panes: allPanes } as any, tab.id)) {
+        out.add(`${ref.provider}:${ref.sessionId}`)
+      }
+    }
+    return out
+  }, [attentionByTab, allTabs, allPanes])
+
+  const repoIconInfoByCwd = useMemo(() => {
+    if (!repoIconsOnTabs) return {}
+    const out: Record<string, RepoIconInfo> = {}
+    for (const [cwd, entry] of Object.entries(repoIconsByCwd)) {
+      if (entry.status === 'loading') continue
+      const repoKey = entry.repoRoot || cwd
+      out[cwd] = {
+        repoKey,
+        repoName: entry.repoName || pathBasename(repoKey),
+        iconUrl: entry.hasIcon ? buildRepoIconUrl(cwd) : undefined,
+      }
+    }
+    return out
+  }, [repoIconsOnTabs, repoIconsByCwd])
+
+  useEffect(() => {
+    if (!repoIconsOnTabs) return
+    const cwds = new Set<string>()
+    for (const item of sortedItems) {
+      const cwd = item.repoPath ?? item.cwd
+      if (cwd) cwds.add(cwd)
+    }
+    for (const cwd of cwds) {
+      if (!repoIconsByCwd[cwd]) void dispatch(fetchRepoIconMeta(cwd))
+    }
+  }, [sortedItems, repoIconsOnTabs, repoIconsByCwd, dispatch])
 
   // Remote status rings (R3): a ring appears only when the session is NOT open
   // on this device. Remote activity comes from other devices' pushed registry
@@ -746,41 +795,40 @@ export default function Sidebar({
       </div>
 
       {/* Search */}
-      <div className="px-3 pb-3">
-        <div className="relative">
-          <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
+      <div className="px-[12px] pb-3">
+        <div className="sidebar-search-row flex min-h-[44px] items-center gap-[4px] overflow-x-clip rounded-md bg-muted/50 focus-within:ring-1 focus-within:ring-border md:min-h-0 md:h-8">
+          <Search className="ml-[10px] h-[14px] w-[14px] shrink-0 text-muted-foreground" />
           <input
             type="text"
             placeholder="Search..."
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
             aria-busy={showSearchLoading}
-            className="w-full h-8 pl-8 pr-36 text-sm bg-muted/50 border-0 rounded-md placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-border"
+            className="min-w-0 flex-1 self-stretch border-0 bg-transparent text-sm placeholder:text-muted-foreground/60 focus:outline-none"
           />
-          <div className="absolute right-2 top-1/2 flex w-28 -translate-y-1/2 items-center justify-end gap-1">
-            {showSearchLoading ? (
-              <span
-                role="status"
-                data-testid="search-loading"
-                className="inline-flex items-center gap-1 text-xs text-muted-foreground"
-              >
-                <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
-                <span>Searching...</span>
-              </span>
-            ) : null}
-            {filter ? (
-              <button
-                aria-label="Clear search"
-                onClick={() => setFilter('')}
-                className="p-0.5 min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center rounded hover:bg-muted text-muted-foreground hover:text-foreground"
-              >
-                <X className="h-3.5 w-3.5" />
-              </button>
-            ) : null}
-          </div>
+          {showSearchLoading ? (
+            <span
+              role="status"
+              data-testid="search-loading"
+              className="inline-flex min-w-0 shrink items-center gap-[4px] overflow-hidden text-xs text-muted-foreground"
+            >
+              <Loader2 className="h-[14px] w-[14px] shrink-0 animate-spin" aria-hidden="true" />
+              <span className="sidebar-search-loading-text min-w-0 truncate">Searching...</span>
+            </span>
+          ) : null}
+          {filter ? (
+            <button
+              type="button"
+              aria-label="Clear search"
+              onClick={() => setFilter('')}
+              className="shrink-0 p-[2px] pr-[4px] min-h-[44px] min-w-[44px] md:min-h-0 md:min-w-0 flex items-center justify-center rounded hover:bg-muted text-muted-foreground hover:text-foreground"
+            >
+              <X className="h-[14px] w-[14px]" />
+            </button>
+          ) : null}
         </div>
         {repoOptions.length > 0 && (
-          <div className="mt-2 flex items-center gap-1">
+          <div className="mt-[12px] flex items-center gap-1">
             <select
               aria-label="Repo filter"
               value={repoFilter}
@@ -942,7 +990,7 @@ export default function Sidebar({
                   })
 
                   return (
-                    <div key={sessionKey} className="pb-0.5">
+                    <div key={sessionKey}>
                       <SidebarItem
                         item={item}
                         isActiveTab={isActive}
@@ -953,6 +1001,10 @@ export default function Sidebar({
                             : remoteActivityBySessionKey[sessionKey]
                         }
                         showProjectBadge={settings.sidebar?.showProjectBadges}
+                        repoIconInfo={
+                          repoIconInfoByCwd[item.repoPath ?? item.cwd ?? '']
+                        }
+                        needsAttention={attentionSessionKeySet.has(sessionKey)}
                         onClick={() => handleItemClick(item)}
                         timestampTick={timestampTick}
                       />
@@ -999,6 +1051,10 @@ interface SidebarItemProps {
   /** 'busy' (blue ring) or 'open' (green ring) on another device; absent when no ring. */
   remoteStatus?: 'busy' | 'open'
   showProjectBadge?: boolean
+  /** Repo icon info for this session's repo; absent when repoIconsOnTabs is off or no cwd. */
+  repoIconInfo?: RepoIconInfo
+  /** True when the session's tab has turn-complete attention (green treatment). */
+  needsAttention?: boolean
   onClick: () => void
   /** Changing tick value breaks memo equality to refresh relative timestamps. */
   timestampTick?: number
@@ -1014,6 +1070,10 @@ function areSidebarItemPropsEqual(prev: SidebarItemProps, next: SidebarItemProps
   if (prev.remoteStatus !== next.remoteStatus) return false
   if (prev.showProjectBadge !== next.showProjectBadge) return false
   if (prev.timestampTick !== next.timestampTick) return false
+  if (prev.repoIconInfo?.repoKey !== next.repoIconInfo?.repoKey) return false
+  if (prev.repoIconInfo?.repoName !== next.repoIconInfo?.repoName) return false
+  if (prev.repoIconInfo?.iconUrl !== next.repoIconInfo?.iconUrl) return false
+  if (prev.needsAttention !== next.needsAttention) return false
 
   const a = prev.item, b = next.item
   return (
@@ -1030,13 +1090,14 @@ function areSidebarItemPropsEqual(prev: SidebarItemProps, next: SidebarItemProps
     a.archived === b.archived &&
     a.projectColor === b.projectColor &&
     a.cwd === b.cwd &&
+    a.repoPath === b.repoPath &&
     a.projectPath === b.projectPath &&
     a.isFallback === b.isFallback
   )
 }
 
 export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
-  const { item, isActiveTab, isBusy = false, remoteStatus, showProjectBadge, onClick } = props
+  const { item, isActiveTab, isBusy = false, remoteStatus, showProjectBadge, repoIconInfo, needsAttention, onClick } = props
   const extensionEntries = useAppSelector((s) => s.extensions?.entries)
   const { icon: SessionIcon, label: sessionLabel } = resolveSessionTypeConfig(item.sessionType, extensionEntries)
   return (
@@ -1045,10 +1106,14 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
         <button
           onClick={onClick}
           className={cn(
-            'w-full flex items-center gap-2 px-2 py-3 md:py-2 rounded-md text-left transition-colors group',
-            isActiveTab
-              ? 'bg-muted'
-              : 'hover:bg-muted/50'
+            'w-full flex items-center gap-2 px-2 py-2 md:py-1.5 rounded-md text-left transition-colors group border-l-2',
+            needsAttention && !isBusy
+              ? isActiveTab
+                ? 'bg-emerald-100 dark:bg-emerald-900/40 border-l-emerald-500'
+                : 'bg-emerald-50 dark:bg-emerald-900/20 border-l-emerald-500/70 hover:bg-emerald-100 dark:hover:bg-emerald-900/30'
+              : isActiveTab
+                ? 'bg-muted border-l-transparent'
+                : 'hover:bg-muted/50 border-l-transparent'
           )}
           data-context={ContextIds.SidebarSession}
           data-session-id={item.sessionId}
@@ -1059,8 +1124,11 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
           data-has-tab={item.hasTab ? 'true' : 'false'}
           data-remote-status={remoteStatus}
         >
-          {/* Provider icon */}
-          <div className="flex-shrink-0">
+          {/* Repo icon + provider icon */}
+          <div className="flex-shrink-0 flex items-center gap-1">
+            {repoIconInfo && (
+              <RepoIcon info={repoIconInfo} className="h-3.5 w-3.5 shrink-0" />
+            )}
             <div className="relative">
               <SessionIcon
                 className={cn(

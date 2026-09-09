@@ -162,6 +162,17 @@ describe('TerminalView scheduled-focus gate (agent focus neutrality)', () => {
     cleanup()
     vi.unstubAllGlobals()
     resetPaneFocusOwnershipForTests()
+    // Tests here run shuffled and some append + focus stray elements directly
+    // on document.body (e.g. the app-chrome input of the no-ownership
+    // remount). jsdom keeps that focus across tests, and the programmatic-
+    // focus yield policy (terminal/focus-policy.ts) then suppresses every
+    // later test's terminal focus — drop strays and reset focus to body.
+    for (const el of Array.from(document.body.querySelectorAll(':scope > input, :scope > button'))) {
+      el.remove()
+    }
+    if (document.activeElement instanceof HTMLElement && document.activeElement !== document.body) {
+      document.activeElement.blur()
+    }
   })
 
   it('focuses the terminal on mount when the pane owns focus (pin: user default preserved)', async () => {

@@ -16,6 +16,8 @@ import type { PaneNode, PaneContent } from '@/store/paneTypes'
 import { buildPaneRefreshTarget, findPaneContent } from '@/lib/pane-utils'
 import { collectSessionRefsFromNode } from '@/lib/session-utils'
 import type { TerminalActions, EditorActions, BrowserActions } from '@/lib/pane-action-registry'
+import { getFreshAgentPaneActions, getFreshAgentTurnItemsBuilder } from '@/lib/pane-action-registry'
+import type { ActionSheetItem } from '@/components/fresh-agent/FreshAgentActionSheet'
 import { buildResumeCommand, isResumeCommandProvider, type ResumeCommandProvider } from '@/lib/coding-cli-utils'
 import {
   resolveReopenPaneSessionTarget,
@@ -52,6 +54,7 @@ export type MenuActions = {
   openSessionInNewTab: (sessionId: string, provider?: string) => void
   openSessionInThisTab: (sessionId: string, provider?: string) => void
   renameSession: (sessionId: string, provider?: string, withSummary?: boolean) => void
+  resetSessionTitle: (sessionId: string, provider?: string) => void
   generateSessionTitle: (sessionId: string, provider?: string) => void
   toggleArchiveSession: (sessionId: string, provider: string | undefined, next: boolean) => void
   deleteSession: (sessionId: string, provider?: string) => void
@@ -434,7 +437,14 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       { type: 'item', id: 'split-right', label: 'Split right', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'horizontal') },
       { type: 'item', id: 'split-down', label: 'Split down', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'vertical') },
       { type: 'separator', id: 'pane-split-sep' },
-      { type: 'item', id: 'rename-pane', label: 'Rename pane', onSelect: () => actions.renamePane(target.tabId, target.paneId) },
+      {
+        type: 'item',
+        id: 'rename-pane',
+        label: 'Rename pane',
+        onSelect: () => actions.renamePane(target.tabId, target.paneId),
+        // The host-stats pane is always named by the app ('System Status').
+        disabled: paneContent?.kind === 'host-stats',
+      },
       { type: 'separator', id: 'pane-replace-sep' },
       { type: 'item', id: 'replace-pane', label: 'Replace pane', onSelect: () => actions.replacePane(target.tabId, target.paneId) },
     ]
@@ -626,6 +636,20 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       { type: 'item', id: 'session-open-new', label: 'Open in new tab', onSelect: () => actions.openSessionInNewTab(target.sessionId, target.provider) },
       { type: 'item', id: 'session-open-this', label: 'Open in this tab', onSelect: () => actions.openSessionInThisTab(target.sessionId, target.provider) },
       { type: 'item', id: 'session-rename', label: 'Rename', onSelect: () => actions.renameSession(target.sessionId, target.provider) },
+      // Reviewed reset (b5fb): offered only when an override is applied AND its
+      // recorded source is not a sweep rung ('first-message'/'dir') the
+      // auto-title sweep would instantly re-apply. Source-less historical
+      // (pane-era) overrides still qualify.
+      ...(sessionInfo?.session.titleOverridden
+          && sessionInfo.session.titleOverrideSource !== 'first-message'
+          && sessionInfo.session.titleOverrideSource !== 'dir'
+        ? [{
+            type: 'item' as const,
+            id: 'session-reset-title',
+            label: 'Reset to provider title',
+            onSelect: () => actions.resetSessionTitle(target.sessionId, target.provider),
+          }]
+        : []),
       ...(ctx.aiEnabled
         ? [{ type: 'item' as const, id: 'session-generate-title', label: 'Generate title', onSelect: () => actions.generateSessionTitle(target.sessionId, target.provider) }]
         : []),
@@ -674,6 +698,16 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
     return [
       { type: 'item', id: 'history-session-open', label: 'Open session', onSelect: () => actions.openSessionInNewTab(target.sessionId, target.provider) },
       { type: 'item', id: 'history-session-rename', label: 'Rename', onSelect: () => actions.renameSession(target.sessionId, target.provider, true) },
+      ...(sessionInfo?.session.titleOverridden
+          && sessionInfo.session.titleOverrideSource !== 'first-message'
+          && sessionInfo.session.titleOverrideSource !== 'dir'
+        ? [{
+            type: 'item' as const,
+            id: 'history-session-reset-title',
+            label: 'Reset to provider title',
+            onSelect: () => actions.resetSessionTitle(target.sessionId, target.provider),
+          }]
+        : []),
       { type: 'item', id: 'history-session-delete', label: 'Delete session', onSelect: () => actions.deleteSession(target.sessionId, target.provider), danger: true, disabled: isOpen },
       { type: 'separator', id: 'history-session-sep' },
       { type: 'item', id: 'history-session-copy-id', label: 'Copy session ID', onSelect: () => actions.copySessionId(target.sessionId) },
@@ -710,11 +744,17 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
     const selection = window.getSelection()
     const hasSelection = !!(selection && selection.toString().trim())
 
-    // Detect sub-region from click target using closest()
+    // One menu, region-aware items: the specialized sub-region partition
+    // (markdown code blocks, tool input/output rows, diff views) selects WHICH
+    // rows this menu shows — it no longer decides which menu renders. Plain
+    // turn regions (inside a turn article but outside every specialized
+    // sub-region) prepend the pane-registered per-turn actions; specialized
+    // sub-regions keep their context-sensitive rows and gain no turn rows.
     const codeBlock = clickTarget?.closest?.('.prose pre code') as HTMLElement | null
     const toolInput = clickTarget?.closest?.('[data-tool-input]') as HTMLElement | null
     const toolOutput = clickTarget?.closest?.('[data-tool-output]') as HTMLElement | null
     const diffView = clickTarget?.closest?.('[data-diff]') as HTMLElement | null
+    const isSpecializedRegion = !!(codeBlock || toolInput || toolOutput || diffView)
 
     const items: MenuItem[] = [
       {
@@ -814,6 +854,26 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       items.push(...buildReopenPaneAsItem(target.tabId, target.paneId, paneContent, tab, ctx))
     }
 
+    // kata 1wxv: conversation rollback entry point (alongside the /undo /redo slash
+    // commands and the per-turn undo-to-here icon). Rows appear only for the
+    // capabilities the pane stamped — codex is undo-only, so its menu NEVER
+    // renders a dead "Redo last turn" row; with neither capability the section
+    // (separator included) is omitted entirely. Within a shown row, canUndo/
+    // canRedo gate enabled state (busy, no live session, nothing to redo yet).
+    if (target.paneId) {
+      const freshAgentActions = getFreshAgentPaneActions(target.paneId)
+      const rollbackItems: MenuItem[] = []
+      if (freshAgentActions?.undoSupported === true) {
+        rollbackItems.push({ type: 'item', id: 'fresh-agent-undo', label: 'Undo last turn', disabled: !freshAgentActions.canUndo, onSelect: () => freshAgentActions.undo() })
+      }
+      if (freshAgentActions?.redoSupported === true) {
+        rollbackItems.push({ type: 'item', id: 'fresh-agent-redo', label: 'Redo last turn', disabled: !freshAgentActions.canRedo, onSelect: () => freshAgentActions.redo() })
+      }
+      if (rollbackItems.length > 0) {
+        items.push({ type: 'separator', id: 'fc-rollback-sep' }, ...rollbackItems)
+      }
+    }
+
     const sessionId = target.sessionId
     if (sessionId) {
       items.push(
@@ -822,8 +882,37 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       )
     }
 
+    // Plain-text region of a turn article: prepend the per-turn rows the pane
+    // registered (single item builder, buildTurnActionItems — the same builder
+    // the touch action sheet consumes). Specialized sub-regions above stay
+    // turn-row-free, exactly as the PR-#735 partition decided; it now selects
+    // items within this one menu instead of handing the gesture between menus.
+    const turnArticle = clickTarget?.closest?.('article[data-turn-role]') as HTMLElement | null
+    const turnArticleIndex = turnArticle?.getAttribute('data-turn-index')
+    if (target.paneId && turnArticle && !isSpecializedRegion && turnArticleIndex != null) {
+      const index = Number(turnArticleIndex)
+      const turnItems = Number.isNaN(index)
+        ? null
+        : getFreshAgentTurnItemsBuilder(target.paneId)?.(index)
+      if (turnItems && turnItems.length > 0) {
+        return [...turnActionItemsToMenuItems(turnItems), { type: 'separator', id: 'fc-turn-sep' }, ...items]
+      }
+    }
+
     return items
   }
 
   return []
+}
+
+/** Adapt the shared turn-action sheet vocabulary onto the context-menu row shape. */
+function turnActionItemsToMenuItems(items: ActionSheetItem[]): MenuItem[] {
+  return items.map((item) => ({
+    type: 'item',
+    id: `fc-turn-${item.label.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
+    label: item.label,
+    disabled: item.disabled,
+    danger: item.destructive,
+    onSelect: () => item.run(),
+  }))
 }
