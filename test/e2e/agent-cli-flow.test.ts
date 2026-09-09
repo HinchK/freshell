@@ -406,6 +406,9 @@ describe('cli e2e flow', () => {
     try {
       const first = await runCliJson<{ data: { tabId: string } }>(server.url, ['new-tab', '-n', 'Backlog'])
       const second = await runCliJson<{ data: { tabId: string } }>(server.url, ['new-tab', '-n', 'Active'])
+      // Agent creates are focus-neutral: the cursor stays on the first tab
+      // until an explicit select moves it.
+      await runCli(server.url, ['select-tab', second.data.tabId])
 
       const renamed = await runCli(server.url, ['rename-tab', 'Release prep'])
 
@@ -421,19 +424,21 @@ describe('cli e2e flow', () => {
     }
   })
 
-  it('renames a non-active tab when a target id is provided', async () => {
+  it('renames a background tab by id without moving the cursor', async () => {
     const server = await startTestServerWithRealLayoutStore()
     try {
       const first = await runCliJson<{ data: { tabId: string } }>(server.url, ['new-tab', '-n', 'Backlog'])
       const second = await runCliJson<{ data: { tabId: string } }>(server.url, ['new-tab', '-n', 'Active'])
 
-      await runCli(server.url, ['rename-tab', first.data.tabId, 'Release', 'board'])
+      // The cursor never moved (creates are focus-neutral) — the second tab
+      // is the background one; rename it by id.
+      await runCli(server.url, ['rename-tab', second.data.tabId, 'Release', 'board'])
 
       await waitForExpect(() => {
         const snapshot = (server.layoutStore as any).snapshot
-        expect(snapshot.activeTabId).toBe(second.data.tabId)
-        expect(snapshot.tabs.find((tab: any) => tab.id === first.data.tabId)?.title).toBe('Release board')
-        expect(snapshot.tabs.find((tab: any) => tab.id === second.data.tabId)?.title).toBe('Active')
+        expect(snapshot.activeTabId).toBe(first.data.tabId)
+        expect(snapshot.tabs.find((tab: any) => tab.id === second.data.tabId)?.title).toBe('Release board')
+        expect(snapshot.tabs.find((tab: any) => tab.id === first.data.tabId)?.title).toBe('Backlog')
       })
     } finally {
       await server.close()

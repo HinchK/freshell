@@ -6590,6 +6590,92 @@ describe('FreshAgentView transcript font size', () => {
       await waitFor(() => expect(document.activeElement).toBe(root))
       expect(focusSpy).not.toHaveBeenCalled()
     })
+
+    it('does NOT re-focus the composer after a remount that lacked focus ownership (agent split while user is in app chrome)', async () => {
+      const store = createStore()
+      const content = {
+        kind: 'fresh-agent' as const,
+        sessionType: 'freshcodex' as const,
+        provider: 'codex' as const,
+        createRequestId: 'req-remount-gate',
+        sessionId: 'thread-remount-gate',
+        status: 'idle' as const,
+      }
+      const first = render(
+        <Provider store={store}>
+          <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={content} />
+        </Provider>,
+      )
+      const textbox = await screen.findByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+      await waitFor(() => expect(textbox).not.toBeDisabled())
+      act(() => {
+        store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-1' }))
+      })
+      await waitFor(() => expect(document.activeElement).toBe(textbox))
+      // User moved into application chrome without changing activePane…
+      const chrome = document.createElement('input')
+      document.body.appendChild(chrome)
+      chrome.focus()
+      // …then a leaf→split remount destroys and recreates this subtree.
+      first.unmount()
+      render(
+        <Provider store={store}>
+          <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={content} />
+        </Provider>,
+      )
+      const textbox2 = await screen.findByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+      await waitFor(() => expect(textbox2).not.toBeDisabled())
+      await flushFrames()
+      expect(document.activeElement).toBe(chrome)
+    })
+
+    it('re-focuses the composer when the ALREADY-active pane is explicitly re-selected (same-target select / focus epoch bump)', async () => {
+      const store = createStore()
+      const content = {
+        kind: 'fresh-agent' as const,
+        sessionType: 'freshcodex' as const,
+        provider: 'codex' as const,
+        createRequestId: 'req-epoch-reselect',
+        sessionId: 'thread-epoch-reselect',
+        status: 'idle' as const,
+      }
+      const first = render(
+        <Provider store={store}>
+          <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={content} />
+        </Provider>,
+      )
+      const textbox = await screen.findByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+      await waitFor(() => expect(textbox).not.toBeDisabled())
+      act(() => {
+        store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-1' }))
+      })
+      await waitFor(() => expect(document.activeElement).toBe(textbox))
+      const chrome = document.createElement('input')
+      document.body.appendChild(chrome)
+      chrome.focus()
+      first.unmount()
+      const second = render(
+        <Provider store={store}>
+          <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={content} />
+        </Provider>,
+      )
+      const textbox2 = await screen.findByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+      await waitFor(() => expect(textbox2).not.toBeDisabled())
+      await flushFrames()
+      expect(document.activeElement).toBe(chrome) // denied adoption
+      // Same-target select: no eligibility transition exists, so the focus
+      // epoch bump is the only signal that can legitimately move DOM focus.
+      // PaneContainer forwards the bumped epoch — simulate that hand-off via
+      // the prop (the fold→epoch-bump wiring is covered in ui-commands and
+      // panesSlice tests; e2e §6b covers the full path).
+      second.rerender(
+        <Provider store={store}>
+          <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={content} focusEpoch={1} />
+        </Provider>,
+      )
+      await flushFrames()
+      await waitFor(() => expect(document.activeElement).toBe(textbox2))
+    })
   })
 
   describe('click-to-defocus transcript focus (c1fa)', () => {

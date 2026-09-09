@@ -290,6 +290,13 @@ type AddTabPayload = {
   forceNew?: boolean
   createRequestId?: string
   titleSetByUser?: boolean
+  /**
+   * Server-driven creates (ui.command tab.create) pass activate:false so an
+   * agent/MCP action never steals the user's focus. Local creates omit the
+   * flag and keep the historical auto-activation. Bootstrap exception: the
+   * very first tab always becomes active — nothing else promotes it.
+   */
+  activate?: boolean
 }
 
 export const tabsSlice = createSlice({
@@ -323,7 +330,9 @@ export const tabsSlice = createSlice({
         lastInputAt: undefined,
       }
       state.tabs.push(tab)
-      state.activeTabId = id
+      if (payload.activate !== false || state.tabs.length === 1) {
+        state.activeTabId = id
+      }
     },
     setActiveTab: (state, action: PayloadAction<string>) => {
       state.activeTabId = action.payload

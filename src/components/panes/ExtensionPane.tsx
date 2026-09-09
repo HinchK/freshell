@@ -6,6 +6,8 @@ import { useAppSelector, useAppDispatch } from '@/store/hooks'
 import { updateServerStatus } from '@/store/extensionsSlice'
 import { api } from '@/lib/api'
 import { useEnsureExtensionsRegistry } from '@/hooks/useEnsureExtensionsRegistry'
+import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
+import { useIframeFocusLock } from '@/hooks/useIframeFocusLock'
 import type { ExtensionPaneContent } from '@/store/paneTypes'
 import ExtensionError from './ExtensionError'
 
@@ -13,6 +15,10 @@ interface ExtensionPaneProps {
   tabId: string
   paneId: string
   content: ExtensionPaneContent
+  focusEligible?: boolean
+  /** Focus-nudge epoch: explicit same-target selects bump this so the focus
+   *  effect re-runs even without an eligibility transition. */
+  focusEpoch?: number
 }
 
 /**
@@ -53,7 +59,7 @@ function detectIframeError(iframe: HTMLIFrameElement): string | null {
   return null
 }
 
-export default function ExtensionPane({ content }: ExtensionPaneProps) {
+export default function ExtensionPane({ paneId, content, focusEligible = true, focusEpoch = 0 }: ExtensionPaneProps) {
   useEnsureExtensionsRegistry()
 
   const dispatch = useAppDispatch()
@@ -69,7 +75,15 @@ export default function ExtensionPane({ content }: ExtensionPaneProps) {
   // Iframe load error state
   const [loadError, setLoadError] = useState<string | null>(null)
   const [loadAttempt, setLoadAttempt] = useState(0)
-  const iframeRef = useRef<HTMLIFrameElement>(null)
+  const iframeRef = useRef<HTMLIFrameElement | null>(null)
+  // Callback-ref STATE mirror: the focus-lock effect re-runs exactly when the
+  // iframe mounts — server extensions render the iframe only after
+  // serverRunning flips true, so a ref-read effect would never see it.
+  const [iframeEl, setIframeEl] = useState<HTMLIFrameElement | null>(null)
+  const setIframeNode = useCallback((el: HTMLIFrameElement | null) => {
+    iframeRef.current = el
+    setIframeEl(el)
+  }, [])
 
   // Auto-start server extensions that aren't running
   useEffect(() => {
@@ -147,6 +161,40 @@ export default function ExtensionPane({ content }: ExtensionPaneProps) {
     }
   }, [handleIframeError, handleIframeLoad, loadAttempt])
 
+  // When the iframe will actually render. Server extensions only render their
+  // iframe once the server reports running and a port is known — potentially
+  // well AFTER mount (auto-start round-trip, registry hydration), while client
+  // extensions render immediately. The focus effect must react to this
+  // readiness signal, not just to focusEligible, or a deferred iframe would
+  // never receive its eligible-mount focus.
+  const iframeRenderable = !!extension && !loadError && (
+    extension.category === 'client'
+    || (extension.category === 'server' && !!extension.serverRunning && !!extension.serverPort)
+  )
+
+  // Focus neutrality: this pane owns DOM focus (eligible mount or flip) ⇒
+  // focus the iframe; when NOT eligible the iframe is inert and background
+  // extension content can neither be focused nor focus itself. Eligible
+  // mounts are gated by recorded focus ownership (agent-driven remounts must
+  // not yank focus from app chrome); eligibility flips bypass the gate.
+  const mayFocusNow = usePaneFocusAdoption(paneId, focusEligible, focusEpoch)
+  useEffect(() => {
+    if (!focusEligible || !iframeRenderable) return
+    const iframe = iframeRef.current
+    if (!iframe) return
+    if (!mayFocusNow()) return
+    iframe.focus()
+  }, [focusEligible, iframeRenderable, mayFocusNow])
+  // The lock follows actual focus-permission (not just Redux eligibility):
+  // an ownership-denied remount of an active extension pane (MCP split while
+  // the user is in app chrome) must not expose an unlocked iframe to
+  // page-script focus hoists — the guard only rebuffs LOCKED frames. The
+  // adoption read must NOT happen during render (render precedes the outgoing
+  // subtree's cleanup that records ownership); the hook computes the lock
+  // post-commit and lifts it on a pointerdown inside the pane (user wake
+  // intent — inert swallows the click; the NEXT click enters the iframe).
+  const iframeFocusLocked = useIframeFocusLock(iframeEl, focusEligible, mayFocusNow)
+
   // Reset load error on retry
   useEffect(() => {
     setLoadError(null)
@@ -213,11 +261,15 @@ export default function ExtensionPane({ content }: ExtensionPaneProps) {
   return (
     <iframe
       key={loadAttempt}
-      ref={iframeRef}
+      ref={setIframeNode}
       src={src}
       className="w-full h-full border-0"
       sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
       title={extension.label}
+      // inert blocks outside focus entry but NOT a script inside the nested
+      // document hoisting the iframe (Chromium-verified); data-focus-locked
+      // arms the app-wide focus-steal guard's rebuff for that case.
+      {...(iframeFocusLocked ? ({ inert: '', 'data-focus-locked': 'true' } as Record<string, string>) : {})}
     />
   )
 }

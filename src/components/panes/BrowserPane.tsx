@@ -10,6 +10,8 @@ import { api } from '@/lib/api'
 import { registerBrowserActions } from '@/lib/pane-action-registry'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
+import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
+import { useIframeFocusLock } from '@/hooks/useIframeFocusLock'
 
 interface BrowserPaneProps {
   paneId: string
@@ -17,6 +19,10 @@ interface BrowserPaneProps {
   browserInstanceId: string
   url: string
   devToolsOpen: boolean
+  focusEligible?: boolean
+  /** Focus-nudge epoch: an explicit same-target select bumps this so the
+   *  owns-focus effect re-runs even without an eligibility transition. */
+  focusEpoch?: number
 }
 
 const MAX_HISTORY_SIZE = 50
@@ -179,11 +185,22 @@ export default function BrowserPane({
   browserInstanceId,
   url,
   devToolsOpen,
+  focusEligible = true,
+  focusEpoch = 0,
 }: BrowserPaneProps) {
   const dispatch = useAppDispatch()
   const refreshRequest = useAppSelector((state) => state.panes.refreshRequestsByPane?.[tabId]?.[paneId] ?? null)
   const iframeRef = useRef<HTMLIFrameElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
+  const rootRef = useRef<HTMLDivElement | null>(null)
+  // Callback-ref STATE mirror: the iframe-focus-lock effect keys on the
+  // element, so it re-runs exactly when the node (re)mounts — unlike a ref
+  // read, element identity participates in effect deps.
+  const [rootEl, setRootEl] = useState<HTMLDivElement | null>(null)
+  const setRootNode = useCallback((el: HTMLDivElement | null) => {
+    rootRef.current = el
+    setRootEl(el)
+  }, [])
   const [inputUrl, setInputUrl] = useState(url)
   const [isLoading, setIsLoading] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -432,13 +449,35 @@ export default function BrowserPane({
     }
   }
 
+  // Track the current url in a ref so flip-time focus sees the latest page
+  // WITHOUT making this effect navigation-reactive (navigation must never yank
+  // focus — existing UX).
+  const urlRef = useRef(url)
+  urlRef.current = url
+
+  // Owns-focus ⇒ DOM focus belongs to this pane: an empty pane goes to the URL
+  // input (user just created it), a loaded pane goes to the pane root so
+  // keystrokes belong here (explicit select of a loaded browser pane, remount
+  // after a leaf→split, mount while eligible). Background/ineligible panes
+  // never focus anything. Eligible MOUNTS are additionally gated by focus
+  // ownership: an agent-driven leaf→split remount must not yank focus back
+  // from application chrome; eligibility flips (explicit select) bypass.
+  const mayFocusNow = usePaneFocusAdoption(paneId, focusEligible, focusEpoch)
   useEffect(() => {
-    // Focus the URL input only when there's no initial URL (user just created a new browser pane)
-    // This is more accessible than autoFocus and allows users to manually control focus
-    if (!url && inputRef.current) {
-      inputRef.current.focus()
-    }
-  }, [url])
+    if (!focusEligible) return
+    if (!mayFocusNow()) return
+    if (urlRef.current) rootRef.current?.focus()
+    else inputRef.current?.focus()
+  }, [focusEligible, mayFocusNow])
+  // The nested-document lock follows actual focus-permission, not just Redux
+  // eligibility: an ownership-denied REMOUNT of an active pane (MCP split of
+  // a browser pane while the user works in app chrome) renders an UNLOCKED
+  // iframe whose page scripts/autofocus could hoist it to activeElement, and
+  // the app-wide guard only rebuffs LOCKED frames. The adoption read must NOT
+  // happen during render (render precedes the outgoing subtree's cleanup that
+  // records ownership); the hook computes the lock post-commit and lifts it
+  // on a pointerdown inside the pane (user wake intent).
+  const iframeFocusLocked = useIframeFocusLock(rootEl, focusEligible, mayFocusNow)
 
   useEffect(() => {
     if (!refreshRequest) return
@@ -480,6 +519,8 @@ export default function BrowserPane({
 
   return (
     <div
+      ref={setRootNode}
+      tabIndex={-1}
       className="flex flex-col h-full w-full bg-background"
       data-context={ContextIds.Browser}
       data-pane-id={paneId}
@@ -579,6 +620,16 @@ export default function BrowserPane({
               src={resolvedSrc}
               className="w-full h-full border-0 bg-white"
               sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
+              // Focus neutrality: while this pane does NOT own focus, the
+              // nested document is inert — a same-origin page loading in the
+              // background cannot be focused from the outside. inert does NOT
+              // stop a script INSIDE the nested document from hoisting the
+              // iframe into document.activeElement (verified empirically in
+              // Chromium), so the pane also carries data-focus-locked, which
+              // the app-wide focus-steal guard rebuffs. Removing inert on
+              // eligibility flip does not reload the iframe (attribute only,
+              // src untouched).
+              {...(iframeFocusLocked ? ({ inert: '', 'data-focus-locked': 'true' } as Record<string, string>) : {})}
               onLoad={() => setIsLoading(false)}
               onError={() => {
                 setIsLoading(false)

@@ -12,6 +12,7 @@ import { nanoid } from 'nanoid'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import type { PaneReconcileRequest } from '@shared/ws-protocol'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
+import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
 import { getWsClient, RECONCILE_VERDICT_WAIT_MS } from '@/lib/ws-client'
 import { KILL_ACK_TIMEOUT_MESSAGE, KILL_FAILED_MESSAGE, sendFreshAgentKillAndAwait } from '@/lib/kill-ack'
 import { createLogger } from '@/lib/client-logger'
@@ -560,11 +561,15 @@ export function FreshAgentView({
   paneId,
   paneContent,
   hidden,
+  focusEpoch = 0,
 }: {
   tabId: string
   paneId: string
   paneContent: FreshAgentPaneContent
   hidden?: boolean
+  /** Focus-nudge epoch: explicit same-target selects bump this so the focus
+   *  effect re-runs even without an eligibility transition. */
+  focusEpoch?: number
 }) {
   const dispatch = useAppDispatch()
   const ws = getWsClient()
@@ -657,6 +662,11 @@ export function FreshAgentView({
   // reconnect even when every other dep is unchanged.
   const connectionStatus = useAppSelector((s) => s.connection.status)
   const isActivePane = !hidden && activeTabId === tabId && activePaneId === paneId
+  // Mount-time focus adoption gate (agent focus neutrality): an eligible
+  // REMOUNT only re-focuses if this pane owned DOM focus before teardown — an
+  // agent-driven split while the user is in app chrome must not yank it back.
+  // Eligibility flips and focus-epoch bumps (explicit selects) bypass.
+  const mayFocusNow = usePaneFocusAdoption(paneId, isActivePane, focusEpoch)
   const [snapshot, setSnapshot] = useState<FreshAgentSnapshot | null>(null)
   const snapshotRef = useRef<FreshAgentSnapshot | null>(null)
   const commitSnapshot = useCallback((next: FreshAgentSnapshot | null) => {
@@ -2493,6 +2503,7 @@ export function FreshAgentView({
       if (active instanceof HTMLElement
         && paneRootRef.current?.contains(active)
         && isEditableTarget(active)) return
+      if (!mayFocusNow()) return
       if (composerDisabled) {
         paneRootRef.current?.focus()
         return
@@ -2500,7 +2511,7 @@ export function FreshAgentView({
       composerRef.current?.focus()
     })
     return () => cancelAnimationFrame(frame)
-  }, [isActivePane, composerDisabled])
+  }, [isActivePane, composerDisabled, mayFocusNow])
 
   // Fallback poll while the agent is (or claims to be) working: if a
   // transport event is missed, the pane self-heals within a few seconds

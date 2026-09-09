@@ -190,6 +190,21 @@ describe('tabsSlice', () => {
       const secondTabId = state.tabs[1].id
       expect(state.activeTabId).toBe(secondTabId)
     })
+
+    it('activate: false does not change the active tab', () => {
+      let state = tabsReducer(initialState, addTab({ title: 'One' }))
+      const firstActiveId = state.activeTabId
+      state = tabsReducer(state, addTab({ title: 'Two', activate: false }))
+
+      expect(state.tabs).toHaveLength(2)
+      expect(state.activeTabId).toBe(firstActiveId)
+    })
+
+    it('activate: false still activates when this is the first tab (bootstrap edge)', () => {
+      const state = tabsReducer(initialState, addTab({ title: 'Only', activate: false }))
+      expect(state.tabs).toHaveLength(1)
+      expect(state.activeTabId).toBe(state.tabs[0].id)
+    })
   })
 
   describe('setActiveTab', () => {

@@ -1990,6 +1990,11 @@ describe('ws protocol', () => {
       ws,
       (m) => m.type === 'ui.command' && m.command === 'screenshot.capture',
     )
+    // No budget field rides along: the client renders through an off-DOM
+    // clone and never mutates the user's UI, so capture work that outlives
+    // the server's wait is harmless and needs no expiry unwinding.
+    expect(req.payload.ttlMs).toBeUndefined()
+    expect(req.payload.deadlineAtMs).toBeUndefined()
 
     ws.send(JSON.stringify({
       type: 'ui.screenshot.result',
