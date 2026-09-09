@@ -3,7 +3,7 @@ import { render, waitFor, cleanup as rtlCleanup } from '@testing-library/react'
 import { useEffect, createElement } from 'react'
 import { configureStore } from '@reduxjs/toolkit'
 import panesReducer, { initLayout, removeLayout, setActivePane, splitPane, addPane, closePane } from '@/store/panesSlice'
-import tabsReducer, { addTab, switchToNextTab, switchToPrevTab, removeTab, selectTabForCapture, setActiveTab } from '@/store/tabsSlice'
+import tabsReducer, { addTab, switchToNextTab, switchToPrevTab, removeTab, setActiveTab } from '@/store/tabsSlice'
 import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
 import {
   recordPaneFocusBeforeUnmount,
@@ -16,9 +16,6 @@ import {
   isPaneFocusRestorePendingForTests,
   resetPaneFocusOwnershipForTests,
   getPaneSelectionSerial,
-  paneSelectionCoordinate,
-  TAB_SELECTION_COORDINATE,
-  wasSelectionCoordinateTouchedSince,
 } from '@/lib/pane-focus-ownership'
 
 function makePanesStore() {
@@ -594,58 +591,13 @@ describe('paneSelectionMiddleware selection-serial coverage', () => {
     expect(getPaneSelectionSerial()).toBe(s0)
   })
 
-  it('selection activity attributes TOUCHED coordinates precisely (tab vs pane, recency)', () => {
-    const store = makeTabsPanesStore()
-    store.dispatch(addTab({ id: 'tab-2', title: 'Two' })) // activates → touches tab coordinate
-    store.dispatch(splitPane({
-      tabId: 'tab-1',
-      paneId: 'pane-1',
-      direction: 'horizontal',
-      newContent: { kind: 'terminal', mode: 'shell' },
-      newPaneId: 'pane-2',
-    })) // activates → touches pane-slot:tab-1
-    const atSnapshot = getPaneSelectionSerial()
-    store.dispatch(setActiveTab('tab-2')) // user gesture AFTER the snapshot — tab coordinate only
-    expect(wasSelectionCoordinateTouchedSince(TAB_SELECTION_COORDINATE, atSnapshot)).toBe(true)
-    expect(wasSelectionCoordinateTouchedSince(paneSelectionCoordinate('tab-1'), atSnapshot)).toBe(false)
-    expect(wasSelectionCoordinateTouchedSince(paneSelectionCoordinate('tab-2'), atSnapshot)).toBe(false)
-    // The pre-snapshot gestures ARE visible when asked with an older serial.
-    expect(wasSelectionCoordinateTouchedSince(TAB_SELECTION_COORDINATE, atSnapshot - 1)).toBe(true)
-    expect(wasSelectionCoordinateTouchedSince(paneSelectionCoordinate('tab-1'), atSnapshot - 1)).toBe(true)
-  })
-
-  it('capture-marker actions never mark a coordinate touched', () => {
-    const store = makeTabsPanesStore()
-    const s0 = getPaneSelectionSerial()
-    store.dispatch(selectTabForCapture('tab-2'))
-    store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-1', capture: true }))
-    expect(getPaneSelectionSerial()).toBe(s0)
-    expect(wasSelectionCoordinateTouchedSince(TAB_SELECTION_COORDINATE, s0)).toBe(false)
-    expect(wasSelectionCoordinateTouchedSince(paneSelectionCoordinate('tab-1'), s0)).toBe(false)
-  })
-
-  it('close fallback selection touches its coordinate', () => {
-    const store = makeTabsPanesStore()
-    store.dispatch(addTab({ id: 'tab-2', title: 'Two' })) // active: tab-2
-    const s1 = getPaneSelectionSerial()
-    store.dispatch(removeTab('tab-2')) // active-close fallback → touches the tab coordinate
-    expect(wasSelectionCoordinateTouchedSince(TAB_SELECTION_COORDINATE, s1)).toBe(true)
-  })
-
-  it('pane selection on the ACTIVE tab also touches the tab coordinate (the user is engaged with that tab)', () => {
-    const store = makeTabsPanesStore()
-    const s0 = getPaneSelectionSerial()
-    store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-1' })) // active tab's pane
-    expect(wasSelectionCoordinateTouchedSince(paneSelectionCoordinate('tab-1'), s0)).toBe(true)
-    expect(wasSelectionCoordinateTouchedSince(TAB_SELECTION_COORDINATE, s0)).toBe(true)
-  })
-
-  it('pane selection on a BACKGROUND tab touches ONLY the pane coordinate', () => {
+  it('explicit select folds (setActivePane / setActiveTab) count as selection activity', () => {
     const store = makeTabsPanesStore()
     store.dispatch(addTab({ id: 'tab-2', title: 'Two', activate: false })) // background
     const s0 = getPaneSelectionSerial()
     store.dispatch(setActivePane({ tabId: 'tab-2', paneId: 'pane-2' }))
-    expect(wasSelectionCoordinateTouchedSince(paneSelectionCoordinate('tab-2'), s0)).toBe(true)
-    expect(wasSelectionCoordinateTouchedSince(TAB_SELECTION_COORDINATE, s0)).toBe(false)
+    expect(getPaneSelectionSerial()).toBe(s0 + 1)
+    store.dispatch(setActiveTab('tab-2'))
+    expect(getPaneSelectionSerial()).toBe(s0 + 2)
   })
 })

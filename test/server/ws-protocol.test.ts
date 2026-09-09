@@ -1989,13 +1989,10 @@ describe('ws protocol', () => {
       ws,
       (m) => m.type === 'ui.command' && m.command === 'screenshot.capture',
     )
-    // The server stamps the REMAINING round-trip budget so the client drops
-    // capture work that could only answer a request already failed server-side.
-    // RELATIVE (ttlMs), never an absolute server epoch: browsers on other
-    // devices/phones cannot share a wall clock with the server.
-    expect(typeof req.payload.ttlMs).toBe('number')
-    expect(req.payload.ttlMs).toBeGreaterThan(0)
-    expect(req.payload.ttlMs).toBeLessThanOrEqual(10_000)
+    // No budget field rides along: the client renders through an off-DOM
+    // clone and never mutates the user's UI, so capture work that outlives
+    // the server's wait is harmless and needs no expiry unwinding.
+    expect(req.payload.ttlMs).toBeUndefined()
     expect(req.payload.deadlineAtMs).toBeUndefined()
 
     ws.send(JSON.stringify({
@@ -2095,34 +2092,6 @@ describe('ws protocol', () => {
 
     await expect(handler.requestUiScreenshot({ scope: 'view', timeoutMs: 10_000 }))
       .rejects.toThrow('No screenshot-capable UI client connected')
-
-    await closeWebSocket(ws)
-  })
-
-  it('pushes screenshot.cancel to the client when a screenshot request times out', async () => {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
-    await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-    ws.send(JSON.stringify({
-      type: 'hello',
-      token: 'testtoken-testtoken',
-      protocolVersion: WS_PROTOCOL_VERSION,
-      capabilities: { uiScreenshotV1: true },
-    }))
-    await waitForMessage(ws, (m) => m.type === 'ready')
-
-    const pending = handler.requestUiScreenshot({ scope: 'view', timeoutMs: 100 })
-    const req = await waitForMessage(
-      ws,
-      (m) => m.type === 'ui.command' && m.command === 'screenshot.capture',
-    )
-    await expect(pending).rejects.toThrow('Timed out waiting for UI screenshot response')
-    // The server must unwind any client-side capture work it can no longer
-    // answer: delivery delay must not translate into UI mutation.
-    const cancel = await waitForMessage(
-      ws,
-      (m) => m.type === 'ui.command' && m.command === 'screenshot.cancel',
-    )
-    expect(cancel.payload).toEqual({ requestId: req.payload.requestId })
 
     await closeWebSocket(ws)
   })

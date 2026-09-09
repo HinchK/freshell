@@ -87,7 +87,7 @@ FRESHELL_URL and FRESHELL_TOKEN are already set in your environment.
 - **Always screenshot with \`screenshot({ scope: "tab", target: tabId })\` after open-browser.** Network errors, CORS issues, or server problems can cause blank pages. open-browser returns a tabId — use it immediately to screenshot and confirm the page rendered before proceeding.
 - send-keys: use literal mode (literal: true + keys as a string) for natural-language prompts or multi-word text. Do NOT append "ENTER" as literal text -- send the command with literal:true, then send ["ENTER"] as a separate call in token mode.
 - wait-for with stable (seconds of no output) is more reliable than pattern matching across different CLI providers.
-- Editor panes show "Loading..." until the tab is visited in the browser. When screenshotting multiple tabs, visit each tab first (select-tab), then loop back for screenshots.
+- Editor panes show "Loading..." until the tab is visited in the browser. Screenshots never switch tabs (background tabs capture in place, off-DOM) — do NOT select-tab just to screenshot; an editor pane whose tab was never visited may still show its loading state, so give it a moment and screenshot again if needed.
 - Browser pane screenshots: proxied localhost URLs render actual content in the iframe. Truly cross-origin URLs (e.g. https://example.com) render a placeholder with the source URL instead of a blank region.
 - Freshell has a 50 PTY limit. Scripted runs accumulate orphan terminals silently. Clean up with list-terminals and kill unneeded tabs/panes.
 - **Focus neutrality:** new-tab, split-pane, and every pane/tab creation are focus-neutral — they never change which tab or pane the user is looking at. Use select-tab / select-pane when you explicitly intend to move the user's focus. send-keys, capture-pane, and wait-for all target panes without moving focus.
@@ -582,7 +582,7 @@ Use new-tab/split-pane with agent="opencode" (also "claude"/"codex"), optional m
 - Use a dedicated canary tab when validating screenshot behavior so live project panes are not contaminated.
 - Close temporary tabs/panes after verification unless user asked to keep them open.
 - Browser panes: proxied localhost URLs render actual content in the iframe screenshot. Truly cross-origin URLs (e.g. https://example.com) render a placeholder message with the source URL instead of a blank region.
-- Editor panes show "Loading..." until visited. When screenshotting multiple tabs, visit each tab once first (select-tab), then loop back for screenshots.
+- Editor panes show "Loading..." until visited. Screenshots never switch tabs (background tabs capture in place, off-DOM) — do NOT select-tab just to screenshot; an editor pane whose tab was never visited may still show its loading state, so give it a moment and screenshot again if needed.
 
 ## Gotchas
 

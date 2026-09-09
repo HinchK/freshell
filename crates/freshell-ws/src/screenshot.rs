@@ -1,18 +1,21 @@
 //! UI-screenshot request/response broker (Phase 3.18).
 //!
 //! Ports the `wsHandler.requestUiScreenshot` round-trip of `server/ws-handler.ts`
-//! (line 1045) that `POST /api/screenshots` (`server/agent-api/router.ts:1070`)
-//! drives:
+//! that `POST /api/screenshots` (`server/agent-api/router.ts`) drives:
 //!
 //! 1. the REST handler [`register`]s a `requestId` and gets a [`oneshot`] receiver;
 //! 2. it [`send_capture`]s a `{type:"ui.command", command:"screenshot.capture",
 //!    payload:{requestId, scope, tabId?, paneId?}}` frame onto the shared broadcast
-//!    bus (the exact shape `src/lib/ui-commands.ts:73` dispatches);
+//!    bus (the exact shape `src/lib/ui-commands.ts` dispatches);
 //! 3. the screenshot-capable SPA client renders the DOM (`captureUiScreenshot` /
 //!    html2canvas) and replies `{type:"ui.screenshot.result", requestId, ...}`
-//!    (`src/lib/ui-commands.ts:51`);
+//!    (`src/lib/ui-commands.ts`);
 //! 4. the `/ws` inbound loop routes that reply through [`resolve_from`], waking the
 //!    awaiting REST handler with the base64 PNG.
+//!
+//! The client renders through an html2canvas CLONE of the document (revealing
+//! background tabs inside the clone only), so a capture never moves the user's
+//! selection or focus and needs no server-side cancel unwinding.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -127,8 +130,8 @@ impl ScreenshotBroker {
 
     /// Route an inbound `ui.screenshot.result` to its waiting REST handler. Unknown
     /// / already-resolved `requestId`s are ignored (a late duplicate from a second
-    /// capable client — the cancel broadcast from the first resolution tells those
-    /// clients to unwind anyway; a duplicate arriving first is the same unwind).
+    /// capable client — that client's capture rendered off-DOM and mutated
+    /// nothing, so a stray duplicate is harmless).
     pub fn resolve_from(&self, connection_id: u64, request_id: &str, result: ScreenshotResult) {
         let sender = {
             let mut pending = self.inner.pending.lock().unwrap();
@@ -145,11 +148,6 @@ impl ScreenshotBroker {
         };
         if let Some(sender) = sender {
             let _ = sender.send(result);
-            // The capture frame broadcast went to EVERY capable client — only
-            // this one answered. Every other client's queued/in-flight capture
-            // for the request is now unanswerable: unwind it before it mutates
-            // focus on another device.
-            self.send_cancel(request_id);
         }
     }
 
@@ -169,30 +167,17 @@ impl ScreenshotBroker {
         };
         if let Some(sender) = sender {
             let _ = sender.send(result);
-            self.send_cancel(request_id);
         }
     }
 
     /// Broadcast the `screenshot.capture` `ui.command` to every connection; the
     /// capable SPA client renders + replies. Frame shape is byte-compatible with
-    /// `ws-handler.ts:1072` (`{type, command, payload:{requestId, scope, tabId?,
-    /// paneId?, ttlMs}}`), matching `ui-commands.ts#handleScreenshotCapture`.
-    /// `ttl_ms` is the server-stamped RELATIVE round-trip budget: the client
-    /// converts it into a local deadline on receipt (browsers on other devices
-    /// share no wall clock with this server) and expires queued/stalled capture
-    /// work past it instead of mutating focus for a caller we already failed.
-    pub fn send_capture(
-        &self,
-        request_id: &str,
-        scope: &str,
-        tab_id: Option<&str>,
-        pane_id: Option<&str>,
-        ttl_ms: u64,
-    ) {
+    /// `ws-handler.ts` (`{type, command, payload:{requestId, scope, tabId?,
+    /// paneId?}}`), matching `ui-commands.ts#handleScreenshotCapture`.
+    pub fn send_capture(&self, request_id: &str, scope: &str, tab_id: Option<&str>, pane_id: Option<&str>) {
         let mut payload = json!({
             "requestId": request_id,
             "scope": scope,
-            "ttlMs": ttl_ms,
         });
         if let Some(tab_id) = tab_id {
             payload["tabId"] = json!(tab_id);
@@ -207,19 +192,6 @@ impl ScreenshotBroker {
         });
         // A send error only means no live subscribers; the REST side then times out
         // and reports the same "no UI answered" outcome the original would.
-        let _ = self.inner.broadcast_tx.send(frame.to_string());
-    }
-
-    /// Broadcast `screenshot.cancel` for a request the server can no longer
-    /// answer (timeout, closed downstream). Any queued/queued-or-running
-    /// capture on a client — including a cancelled-then-delivered frame on a
-    /// stalled tab — unwinds instead of mutating UI for a dead request.
-    pub fn send_cancel(&self, request_id: &str) {
-        let frame = json!({
-            "type": "ui.command",
-            "command": "screenshot.cancel",
-            "payload": { "requestId": request_id },
-        });
         let _ = self.inner.broadcast_tx.send(frame.to_string());
     }
 }
@@ -299,7 +271,7 @@ mod tests {
     fn send_capture_frame_matches_ui_command_shape() {
         let b = broker();
         let mut rx = b.inner.broadcast_tx.subscribe();
-        b.send_capture("req-9", "view", None, None, 10_000);
+        b.send_capture("req-9", "view", None, None);
         let frame = rx.try_recv().expect("frame broadcast");
         let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(v["type"], "ui.command");
@@ -307,55 +279,13 @@ mod tests {
         assert_eq!(v["payload"]["requestId"], "req-9");
         assert_eq!(v["payload"]["scope"], "view");
         assert!(v["payload"].get("tabId").is_none());
-        // The round-trip budget rides along RELATIVELY (ttlMs) so the client
-        // drops capture work that could only answer a request already failed
-        // server-side — browsers on other devices share no wall clock.
-        assert_eq!(v["payload"]["ttlMs"], json!(10_000));
-        assert!(v["payload"].get("deadlineAtMs").is_none());
+        assert!(v["payload"].get("paneId").is_none());
 
         // Pane scope carries tabId + paneId.
-        b.send_capture("req-10", "pane", Some("tab-1"), Some("pane-1"), 10_000);
+        b.send_capture("req-10", "pane", Some("tab-1"), Some("pane-1"));
         let frame = rx.try_recv().expect("frame broadcast");
         let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(v["payload"]["tabId"], "tab-1");
         assert_eq!(v["payload"]["paneId"], "pane-1");
-    }
-
-    #[test]
-    fn send_cancel_broadcasts_ui_command_frame() {
-        let b = broker();
-        let mut rx = b.inner.broadcast_tx.subscribe();
-        b.send_cancel("req-dead");
-        let frame = rx.try_recv().expect("frame broadcast");
-        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
-        assert_eq!(v["type"], "ui.command");
-        assert_eq!(v["command"], "screenshot.cancel");
-        assert_eq!(v["payload"]["requestId"], "req-dead");
-    }
-
-    #[test]
-    fn first_resolution_broadcasts_cancel_to_unwind_other_clients_work() {
-        // send_capture goes to EVERY connected client; the first result wins
-        // the waiter and drops the pending record — but the other clients'
-        // queued/in-flight captures remain alive unless we cancel them.
-        let b = broker();
-        let mut rx = b.inner.broadcast_tx.subscribe();
-        let mut reply_rx = b.register("req-multi".to_string());
-        b.send_capture("req-multi", "view", None, None, 10_000);
-        let frame = rx.try_recv().expect("capture frame broadcast");
-        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
-        assert_eq!(v["command"], "screenshot.capture");
-
-        b.resolve_from(7, "req-multi", ScreenshotResult {
-            ok: true,
-            ..Default::default()
-        });
-
-        let frame = rx.try_recv().expect("cancel frame broadcast after resolution");
-        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
-        assert_eq!(v["command"], "screenshot.cancel");
-        assert_eq!(v["payload"]["requestId"], "req-multi");
-        // The winner's waiter still got the result.
-        assert!(matches!(reply_rx.try_recv(), Ok(_)));
     }
 }

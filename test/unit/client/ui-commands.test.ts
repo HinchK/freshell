@@ -1,14 +1,12 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import { handleUiCommand } from '../../../src/lib/ui-commands'
-import { captureUiScreenshot, cancelUiScreenshot } from '../../../src/lib/ui-screenshot'
+import { captureUiScreenshot } from '../../../src/lib/ui-screenshot'
 import tabsReducer from '../../../src/store/tabsSlice'
 import panesReducer from '../../../src/store/panesSlice'
 
 vi.mock('../../../src/lib/ui-screenshot', () => ({
   captureUiScreenshot: vi.fn(),
-  cancelUiScreenshot: vi.fn(),
-  CAPTURE_QUEUE_TTL_MS: 8000,
 }))
 
 describe('handleUiCommand', () => {
@@ -187,7 +185,6 @@ describe('handleUiCommand', () => {
   it('delegates screenshot.capture and sends ui.screenshot.result', async () => {
     const dispatch = vi.fn()
     const send = vi.fn()
-    const getState = vi.fn(() => ({}) as any)
 
     vi.mocked(captureUiScreenshot).mockResolvedValue({
       ok: true,
@@ -205,14 +202,13 @@ describe('handleUiCommand', () => {
         command: 'screenshot.capture',
         payload: { requestId: 'req-1', scope: 'view' },
       },
-      { dispatch: dispatch as any, getState, send },
+      { dispatch: dispatch as any, send },
     )
 
     await Promise.resolve()
 
     expect(captureUiScreenshot).toHaveBeenCalledWith(
-      { scope: 'view', paneId: undefined, tabId: undefined, deadlineAtMs: undefined, requestId: 'req-1' },
-      expect.objectContaining({ dispatch, getState }),
+      { scope: 'view', paneId: undefined, tabId: undefined },
     )
     expect(send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'ui.screenshot.result',
@@ -223,135 +219,61 @@ describe('handleUiCommand', () => {
     }))
   })
 
-  it('converts the server-stamped relative budget (ttlMs) into a local deadline', async () => {
+  it('rejects an invalid screenshot scope with an error result frame', async () => {
     const dispatch = vi.fn()
     const send = vi.fn()
-    const getState = vi.fn(() => ({}))
-
-    vi.mocked(captureUiScreenshot).mockResolvedValue({
-      ok: false,
-      changedFocus: false,
-      restoredFocus: false,
-      error: 'expired',
-    })
 
     handleUiCommand(
       {
         type: 'ui.command',
         command: 'screenshot.capture',
-        payload: { requestId: 'req-9', scope: 'view', ttlMs: 7_500 },
+        payload: { requestId: 'req-bad', scope: 'universe' },
       },
-      { dispatch: dispatch as any, getState, send },
+      { dispatch: dispatch as any, send },
     )
 
     await Promise.resolve()
 
-    const call = vi.mocked(captureUiScreenshot).mock.calls[0]![0] as any
-    // Local deadline ≈ receipt + 7500ms — relative conversion with no shared
-    // wall clock between server and browser device.
-    expect(call.deadlineAtMs).toBeGreaterThan(Date.now())
-    expect(call.deadlineAtMs).toBeLessThanOrEqual(Date.now() + 7_500 + 1_000)
-  })
-
-  it('caps the server-stamped budget at the internal ceiling (stale delivery cannot inflate remaining time)', async () => {
-    const dispatch = vi.fn()
-    const send = vi.fn()
-    const getState = vi.fn(() => ({}))
-
-    vi.mocked(captureUiScreenshot).mockResolvedValue({
-      ok: false,
-      changedFocus: false,
-      restoredFocus: false,
-      error: 'expired',
-    })
-
-    const atReceipt = Date.now()
-    handleUiCommand(
-      {
-        type: 'ui.command',
-        command: 'screenshot.capture',
-        payload: { requestId: 'req-9', scope: 'view', ttlMs: 60_000 },
-      },
-      { dispatch: dispatch as any, getState, send },
-    )
-
-    await Promise.resolve()
-
-    const call = vi.mocked(captureUiScreenshot).mock.calls[0]![0] as any
-    expect(call.deadlineAtMs).toBeLessThanOrEqual(atReceipt + 9_000) // 8s internal ceiling + slack
-    expect(call.deadlineAtMs).toBeGreaterThan(Date.now())
-  })
-
-  it('threads the payload requestId into captureUiScreenshot so cancel frames can target in-flight work', async () => {
-    const dispatch = vi.fn()
-    const send = vi.fn()
-    const getState = vi.fn(() => ({}))
-
-    vi.mocked(captureUiScreenshot).mockResolvedValue({
-      ok: true,
-      changedFocus: false,
-      restoredFocus: false,
-    })
-
-    handleUiCommand(
-      {
-        type: 'ui.command',
-        command: 'screenshot.capture',
-        payload: { requestId: 'req-thread', scope: 'view', ttlMs: 8_000 },
-      },
-      { dispatch: dispatch as any, getState, send },
-    )
-    await Promise.resolve()
-
-    const call = vi.mocked(captureUiScreenshot).mock.calls[0]![0] as any
-    expect(call.requestId).toBe('req-thread')
-  })
-
-  it('routes screenshot.cancel to the capture machinery (server-side timeout unwinds client-side work)', async () => {
-    const dispatch = vi.fn()
-    const send = vi.fn()
-    const getState = vi.fn(() => ({}))
-
-    handleUiCommand(
-      {
-        type: 'ui.command',
-        command: 'screenshot.cancel',
-        payload: { requestId: 'req-dead' },
-      },
-      { dispatch: dispatch as any, getState, send },
-    )
-
-    expect(vi.mocked(cancelUiScreenshot)).toHaveBeenCalledWith('req-dead')
-    // A cancel produces no screenshot result — the server already gave up.
     expect(vi.mocked(captureUiScreenshot)).not.toHaveBeenCalled()
-    expect(send).not.toHaveBeenCalled()
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'ui.screenshot.result',
+      requestId: 'req-bad',
+      ok: false,
+      error: 'invalid screenshot scope',
+    }))
   })
 
-  it('leaves deadlineAtMs unset when the server stamped no budget (fallback internal TTL applies)', async () => {
+  it('forwards a failing capture honestly on the result frame', async () => {
     const dispatch = vi.fn()
     const send = vi.fn()
-    const getState = vi.fn(() => ({}))
 
     vi.mocked(captureUiScreenshot).mockResolvedValue({
       ok: false,
       changedFocus: false,
       restoredFocus: false,
-      error: 'expired',
+      error: 'capture target not found',
     })
 
     handleUiCommand(
       {
         type: 'ui.command',
         command: 'screenshot.capture',
-        payload: { requestId: 'req-9', scope: 'view' },
+        payload: { requestId: 'req-err', scope: 'pane', paneId: 'pane-x' },
       },
-      { dispatch: dispatch as any, getState, send },
+      { dispatch: dispatch as any, send },
     )
 
     await Promise.resolve()
 
-    const call = vi.mocked(captureUiScreenshot).mock.calls[0]![0] as any
-    expect(call.deadlineAtMs).toBeUndefined()
+    expect(captureUiScreenshot).toHaveBeenCalledWith(
+      { scope: 'pane', paneId: 'pane-x', tabId: undefined },
+    )
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'ui.screenshot.result',
+      requestId: 'req-err',
+      ok: false,
+      error: 'capture target not found',
+    }))
   })
 })
 

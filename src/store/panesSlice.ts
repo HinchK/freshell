@@ -1349,10 +1349,7 @@ export const panesSlice = createSlice({
 
     setActivePane: (
       state,
-      // capture: screenshots' interim tab/pane activations mark their own
-      // dispatches so the focus-selection serial (paneSelectionMiddleware)
-      // ignores them — a capture must not void a mid-flight user/agent select.
-      action: PayloadAction<{ tabId: string; paneId: string; focusNudge?: boolean; capture?: boolean }>
+      action: PayloadAction<{ tabId: string; paneId: string; focusNudge?: boolean }>
     ) => {
       const { tabId, paneId, focusNudge } = action.payload
       state.activePane[tabId] = paneId

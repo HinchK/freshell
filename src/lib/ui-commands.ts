@@ -1,7 +1,7 @@
 import { addTab, setActiveTab, closeTab, closePaneWithCleanup } from '@/store/tabsSlice'
 import { initLayout, splitPane, setActivePane, nudgePaneFocus, updatePaneContent, resizePanes, swapPanes } from '@/store/panesSlice'
-import { captureUiScreenshot, cancelUiScreenshot, CAPTURE_QUEUE_TTL_MS } from '@/lib/ui-screenshot'
-import type { AppDispatch, RootState } from '@/store/store'
+import { captureUiScreenshot } from '@/lib/ui-screenshot'
+import type { RootState } from '@/store/store'
 import { applyPaneRename, applyTabRename } from '@/store/titleSync'
 
 type DispatchFn = (action: any) => any
@@ -25,7 +25,7 @@ async function handleScreenshotCapture(msg: any, runtime: UiCommandRuntime): Pro
     : {}
 
   const requestId = typeof payload.requestId === 'string' ? payload.requestId : ''
-  if (!requestId || !runtime.send || !runtime.getState) return
+  if (!requestId || !runtime.send) return
 
   const scope = payload.scope
   if (scope !== 'pane' && scope !== 'tab' && scope !== 'view') {
@@ -42,21 +42,11 @@ async function handleScreenshotCapture(msg: any, runtime: UiCommandRuntime): Pro
 
   const paneId = typeof payload.paneId === 'string' ? payload.paneId : undefined
   const tabId = typeof payload.tabId === 'string' ? payload.tabId : undefined
-  // The server stamps its RELATIVE round-trip budget so capture work that
-  // could only answer an already-failed request expires instead of mutating
-  // the UI. Convert to a local deadline at receipt — browsers on other
-  // devices/phones share no wall clock with the server, and stale delivery
-  // (queued frames on a frozen tab) is capped at the internal ceiling so a
-  // frame arriving long after it left can never bank a full server window.
-  const deadlineAtMs = typeof payload.ttlMs === 'number' && Number.isFinite(payload.ttlMs)
-    ? Date.now() + Math.max(0, Math.min(payload.ttlMs, CAPTURE_QUEUE_TTL_MS))
-    : undefined
 
   try {
-    const capture = await captureUiScreenshot({ scope, paneId, tabId, deadlineAtMs, requestId }, {
-      dispatch: runtime.dispatch as AppDispatch,
-      getState: runtime.getState,
-    })
+    // Renders through an off-DOM clone: the user's selection, focus, and
+    // screen never move, background tabs included.
+    const capture = await captureUiScreenshot({ scope, paneId, tabId })
     runtime.send({
       type: 'ui.screenshot.result',
       requestId,
@@ -81,15 +71,6 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
 
   if (msg.command === 'screenshot.capture') {
     void handleScreenshotCapture(msg, runtime)
-    return
-  }
-
-  // The server no longer waits on this request (timeout / waiter gone): any
-  // queued or in-flight capture work for it must unwind immediately rather
-  // than mutate UI for a caller already failed.
-  if (msg.command === 'screenshot.cancel') {
-    const requestId = typeof msg.payload?.requestId === 'string' ? msg.payload.requestId : ''
-    if (requestId) cancelUiScreenshot(requestId)
     return
   }
 

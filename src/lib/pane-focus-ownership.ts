@@ -48,36 +48,6 @@ const recordByPaneId = new Map<string, PaneFocusRecord>()
  *  after it: the newer selection, user or scripted, is the truth and wins. */
 let paneSelectionSerial = 0
 
-/** Selection coordinates for the per-coordinate supersession restore. The
- *  active tab is the single global coordinate; each tab's active pane is its
- *  own coordinate (pane:<tabId>). */
-export const TAB_SELECTION_COORDINATE = 'tab:active'
-export function paneSelectionCoordinate(tabId: string): string {
-  return `pane:${tabId}`
-}
-
-/** LRU map: coordinate key → the serial at which user/agent selection
- *  activity last touched it. Bounded like the focus records; pane/tab ids
- *  churn freely, so this must not grow without limit. */
-const SELECTION_TOUCH_CAP = 512
-const selectionCoordinateTouchedAt = new Map<string, number>()
-
-function touchSelectionCoordinate(coord: string): void {
-  selectionCoordinateTouchedAt.delete(coord)
-  selectionCoordinateTouchedAt.set(coord, paneSelectionSerial)
-  if (selectionCoordinateTouchedAt.size > SELECTION_TOUCH_CAP) {
-    const oldest = selectionCoordinateTouchedAt.keys().next().value
-    if (oldest !== undefined) selectionCoordinateTouchedAt.delete(oldest)
-  }
-}
-
-/** True when the coordinate saw selection activity strictly AFTER `serial`
- *  was sampled — i.e. a newer selection answered who owns that coordinate. */
-export function wasSelectionCoordinateTouchedSince(coord: string, serial: number): boolean {
-  const at = selectionCoordinateTouchedAt.get(coord)
-  return at !== undefined && at > serial
-}
-
 /** Escape a value for use inside a quoted attribute selector. */
 function attrValue(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
@@ -292,19 +262,16 @@ function collectLivePaneIds(layouts: Record<string, LayoutNodeLike> | undefined)
 }
 
 /** Middleware-side selection tracking: explicit selection folds
- *  (setActivePane / nudgePaneFocus / setActiveTab) bump the selection serial
- *  — EXCEPT capture-internal moves (ui-screenshot passes `capture: true` /
- *  `selectTabForCapture`, so a screenshot's boarding ladder can't void the
- *  restore taken by someone who selected panes mid-capture). State-
- *  subscription comparison cannot tell capture moves from pointer clicks,
- *  hence this is action-driven.
+ *  (setActivePane / nudgePaneFocus / setActiveTab) bump the selection serial.
+ *  State-subscription comparison cannot tell a pointer click from anything
+ *  else, hence this is action-driven.
  *
  *  Other user gestures reach the selection WITHOUT those folds: default-
  *  activating addTab (new-tab shortcut / mobile strip / first tab),
  *  switchToNextTab/switchToPrevTab (keyboard navigation), default-activating
  *  splitPane (user split), addPane (local split), and the fallback selection
  *  when removeTab/closePane removes the ACTIVE item (Alt+W, close buttons).
- *  Those bump the serial only when the selection coordinate ACTUALLY moved —
+ *  Those bump the serial only when the selection ACTUALLY moved —
  *  agent folds pass activate:false and close-path fallback for background
  *  items moves nothing, so both stay serial-invisible. */
 const TAB_SELECTION_ACTIONS = new Set([
@@ -332,28 +299,13 @@ export const paneSelectionMiddleware =
   }) =>
   (next: (action: unknown) => unknown) =>
   (action: unknown): unknown => {
-    const a = action as { type?: string; payload?: { capture?: boolean; tabId?: string } } | null
+    const a = action as { type?: string; payload?: { tabId?: string } } | null
     if (
-      (a?.type === 'panes/setActivePane' && a?.payload?.capture !== true)
+      a?.type === 'panes/setActivePane'
       || a?.type === 'panes/nudgePaneFocus'
-      // Plain tab clicks are selection activity too; the screenshot capture's
-      // own tab moves use the selectTabForCapture alias (excluded here),
-      // mirroring setActivePane's capture:true marker.
       || a?.type === 'tabs/setActiveTab'
     ) {
       paneSelectionSerial += 1
-      // Per-coordinate attribution (restore supersession granularity): the
-      // user touched ONLY this coordinate. Interacting with a pane of the
-      // CURRENTLY-VISIBLE tab is ALSO engagement with that tab itself — a
-      // later capture rollback must not hide the pane the user clicked into.
-      if (a?.type === 'tabs/setActiveTab') {
-        touchSelectionCoordinate(TAB_SELECTION_COORDINATE)
-      } else if (a?.payload?.tabId) {
-        touchSelectionCoordinate(paneSelectionCoordinate(a.payload.tabId))
-        if (store.getState().tabs?.activeTabId === a.payload.tabId) {
-          touchSelectionCoordinate(TAB_SELECTION_COORDINATE)
-        }
-      }
       return next(action)
     }
     if (a?.type && TAB_SELECTION_ACTIONS.has(a.type)) {
@@ -361,7 +313,6 @@ export const paneSelectionMiddleware =
       const result = next(action)
       if (store.getState().tabs?.activeTabId !== before) {
         paneSelectionSerial += 1
-        touchSelectionCoordinate(TAB_SELECTION_COORDINATE)
       }
       return result
     }
@@ -372,10 +323,6 @@ export const paneSelectionMiddleware =
       const result = next(action)
       if (store.getState().panes?.activePane?.[tabId] !== before) {
         paneSelectionSerial += 1
-        touchSelectionCoordinate(paneSelectionCoordinate(tabId))
-        if (store.getState().tabs?.activeTabId === tabId) {
-          touchSelectionCoordinate(TAB_SELECTION_COORDINATE)
-        }
       }
       return result
     }
@@ -386,18 +333,6 @@ export const paneSelectionMiddleware =
  *  records into stores that lack the paneSelectionMiddleware). */
 export function notePaneSelectionActivity(): void {
   paneSelectionSerial += 1
-}
-
-/** Selection activity observed via raw DOM events (e.g. focus landing inside
- *  a nested iframe, which never bubbles to the pane shell's React handlers).
- *  Marks the pane coordinate — and the tab coordinate when that tab is the
- *  currently-active one (engaging with what's visible IS a selection). */
-export function noteDomPaneSelection(paneTabId: string | null, tabIsActive: boolean): void {
-  paneSelectionSerial += 1
-  if (paneTabId) {
-    touchSelectionCoordinate(paneSelectionCoordinate(paneTabId))
-    if (tabIsActive) touchSelectionCoordinate(TAB_SELECTION_COORDINATE)
-  }
 }
 
 /** Wire record invalidation to the live store (called once from store.ts;
@@ -441,15 +376,14 @@ export function isPaneFocusRestorePendingForTests(paneId: string): boolean {
 }
 
 /** The monotonic selection serial — bumped by every explicit pane-selection
- *  activity (wired via wirePaneFocusOwnershipInvalidation). Async operators
- *  that capture-and-restore focus (ui-screenshot) compare before/after and
- *  MUST NOT roll back a selection that landed mid-flight. */
+ *  activity (wired via paneSelectionMiddleware). Focus-ownership records
+ *  captured before a later selection are voided for adoption/restore: the
+ *  newer selection, user or scripted, is the truth and wins. */
 export function getPaneSelectionSerial(): number {
   return paneSelectionSerial
 }
 
-/** Test-only helper: erase all remembered ownership and touch recency. */
+/** Test-only helper: erase all remembered ownership. */
 export function resetPaneFocusOwnershipForTests(): void {
   recordByPaneId.clear()
-  selectionCoordinateTouchedAt.clear()
 }

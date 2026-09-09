@@ -17,6 +17,7 @@ import { test, expect } from '../helpers/fixtures.js'
 import { RustServer, type TestServerInfo } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import type { Page } from '@playwright/test'
+import fs from 'node:fs'
 import os from 'node:os'
 
 /** Dismiss the initial pane-type picker by choosing the first visible shell. */
@@ -325,6 +326,110 @@ test.describe('MCP/REST focus neutrality', () => {
       })
       expect(sameTargetSel8.ok).toBe(true)
       await expect.poll(() => focusedPaneId(page), { timeout: 10_000 }).toBe(browserPaneId)
+    } finally {
+      await server.stop()
+    }
+  })
+
+  test('REST screenshot of a background tab renders it without stealing selection or focus', async ({ page, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    const { server, harness, info } = await bootWall(page)
+    try {
+      await selectShellIfPickerShowing(page)
+      const tabA = (await harness.getActiveTabId())!
+      expect(tabA).toBeTruthy()
+      await expect(page.locator('.xterm:visible').first()).toBeVisible({ timeout: 15_000 })
+      await expect
+        .poll(async () => (await harness.getPaneLayout(tabA))?.content?.terminalId ?? null, { timeout: 15_000 })
+        .not.toBeNull()
+      await flushClientFocusScheduling(page)
+      const paneA = ((await harness.getState()).panes.layouts[tabA])?.id
+      expect(paneA).toBeTruthy()
+      await expect.poll(() => focusedPaneId(page), { timeout: 10_000 }).toBe(paneA)
+      const marker = await tagActiveElement(page)
+
+      // Background shell tab via REST (focus-neutral create) with real
+      // content: run a command in it while it stays background.
+      const tabB = await createTabViaRest(info, { mode: 'shell', cwd: os.tmpdir() })
+      await harness.waitForTabCount(2)
+      const paneB = ((await harness.getState()).panes.layouts[tabB])?.id
+      expect(paneB).toBeTruthy()
+      await page.waitForSelector(`[data-pane-id="${paneB}"]`, { state: 'attached', timeout: 15_000 })
+      await expect
+        .poll(async () => (await harness.getPaneLayout(tabB))?.content?.terminalId ?? null, { timeout: 15_000 })
+        .not.toBeNull()
+      const sendRes = await fetch(`${info.baseUrl}/api/panes/${paneB}/send-keys`, {
+        method: 'POST',
+        headers: restApiHeaders(info),
+        body: JSON.stringify({ data: 'echo BG_TAB_CANARY\r' }),
+      })
+      expect(sendRes.ok).toBe(true)
+      // Let the background tab's shell render the echo output before capturing.
+      await page.waitForTimeout(700)
+
+      // --- 1: tab-scope screenshot of the BACKGROUND tab.
+      const shot = await fetch(`${info.baseUrl}/api/screenshots`, {
+        method: 'POST',
+        headers: restApiHeaders(info),
+        body: JSON.stringify({ scope: 'tab', tabId: tabB, name: 'bg-tab-shot', overwrite: true }),
+      })
+      const shotBody = await shot.json()
+      expect(shot.status, `POST /api/screenshots: ${JSON.stringify(shotBody)}`).toBe(200)
+      expect(shotBody.status).toBe('ok')
+      expect(shotBody.data?.width).toBeGreaterThan(0)
+      expect(shotBody.data?.height).toBeGreaterThan(0)
+
+      // Focus neutrality held THROUGH the capture: the screenshot rendered
+      // via the html2canvas clone, so the user's selection and exact DOM
+      // focus identity never moved.
+      await flushClientFocusScheduling(page)
+      expect(await harness.getActiveTabId()).toBe(tabA)
+      expect(await activeElementStillTagged(page, marker)).toBe(true)
+      expect(await focusedPaneId(page)).toBe(paneA)
+
+      // --- 2: pane scope of the same background tab (pane-shell target with
+      // a hidden ancestor chain) behaves identically.
+      const paneShot = await fetch(`${info.baseUrl}/api/screenshots`, {
+        method: 'POST',
+        headers: restApiHeaders(info),
+        body: JSON.stringify({ scope: 'pane', paneId: paneB, name: 'bg-pane-shot', overwrite: true }),
+      })
+      const paneShotBody = await paneShot.json()
+      expect(paneShot.status, `POST /api/screenshots: ${JSON.stringify(paneShotBody)}`).toBe(200)
+      expect(paneShotBody.status).toBe('ok')
+      expect(paneShotBody.data?.width).toBeGreaterThan(0)
+      expect(paneShotBody.data?.height).toBeGreaterThan(0)
+      await flushClientFocusScheduling(page)
+      expect(await harness.getActiveTabId()).toBe(tabA)
+      expect(await activeElementStillTagged(page, marker)).toBe(true)
+      expect(await focusedPaneId(page)).toBe(paneA)
+
+      // --- 3: content proof — the saved PNG is not a blank frame. A capture
+      // that failed to reveal the hidden tab (html2canvas skips
+      // visibility:hidden subtrees) would come back uniform; a rendered
+      // terminal + pane chrome has pixel variance. Decode in-page and sample.
+      const b64 = fs.readFileSync(shotBody.data.path as string).toString('base64')
+      const uniformity = await page.evaluate(async (dataUrl: string) => {
+        const img = new Image()
+        img.src = dataUrl
+        await img.decode()
+        const canvas = document.createElement('canvas')
+        canvas.width = img.width
+        canvas.height = img.height
+        const ctx = canvas.getContext('2d')!
+        ctx.drawImage(img, 0, 0)
+        const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data
+        const r0 = data[0]
+        const g0 = data[1]
+        const b0 = data[2]
+        for (let i = 4; i < data.length; i += 4) {
+          if (data[i] !== r0 || data[i + 1] !== g0 || data[i + 2] !== b0) {
+            return { uniform: false }
+          }
+        }
+        return { uniform: true }
+      }, `data:image/png;base64,${b64}`)
+      expect(uniformity.uniform, 'background-tab screenshot must contain rendered content, not a blank frame').toBe(false)
     } finally {
       await server.stop()
     }

@@ -1,20 +1,8 @@
 import html2canvas from 'html2canvas'
-import { setActivePane } from '@/store/panesSlice'
-import { selectTabForCapture } from '@/store/tabsSlice'
 import { suspendTerminalRenderersForScreenshot } from '@/lib/screenshot-capture-env'
-import {
-  getPaneSelectionSerial,
-  noteDomPaneSelection,
-  paneSelectionCoordinate,
-  TAB_SELECTION_COORDINATE,
-  wasSelectionCoordinateTouchedSince,
-} from '@/lib/pane-focus-ownership'
-import type { PaneNode } from '@/store/paneTypes'
-import type { AppDispatch, RootState } from '@/store/store'
 
-const VISIBLE_WAIT_TIMEOUT_MS = 1500
-const VISIBLE_WAIT_INTERVAL_MS = 50
-const IFRAME_MARKER_ATTR = 'data-screenshot-iframe-marker'
+const ELEMENT_WAIT_TIMEOUT_MS = 1500
+const ELEMENT_WAIT_INTERVAL_MS = 50
 const IFRAME_IMAGE_ATTR = 'data-screenshot-iframe-image'
 const IFRAME_PLACEHOLDER_ATTR = 'data-screenshot-iframe-placeholder'
 
@@ -24,14 +12,6 @@ export type ScreenshotRequest = {
   scope: ScreenshotScope
   paneId?: string
   tabId?: string
-  /** The server's request identity, so a later screenshot.cancel frame (the
-   *  server gave up waiting — timeout or closed waiter) can unwind any
-   *  queued/in-flight work for it. */
-  requestId?: string
-  /** Server-stamped absolute round-trip deadline (epoch ms). When absent
-   *  (older servers), queue waits are bounded by CAPTURE_QUEUE_TTL_MS measured
-   *  from when THIS client received the request. */
-  deadlineAtMs?: number
 }
 
 export type ScreenshotResult = {
@@ -40,22 +20,12 @@ export type ScreenshotResult = {
   imageBase64?: string
   width?: number
   height?: number
+  /** Always false: captures render through an off-DOM clone and never move
+   *  the user's selection or focus. The fields stay for wire/REST envelope
+   *  compatibility (POST /api/screenshots echoes both). */
   changedFocus: boolean
   restoredFocus: boolean
   error?: string
-}
-
-type RuntimeContext = {
-  dispatch: AppDispatch
-  getState: () => RootState
-}
-
-export type FocusSnapshot = {
-  /** Selection serial at capture start — any newer explicit select during the
-   *  CAPTURE suspends both pane and tab restores (newer selection wins). */
-  selectionSerial: number
-  activeTabId: string | null
-  activePaneByTab: Record<string, string>
 }
 
 type IframeReplacement =
@@ -63,44 +33,11 @@ type IframeReplacement =
   | { kind: 'placeholder'; message: string; src: string }
 
 type PreparedIframeCapture = {
-  onclone: (doc: Document) => void
-  cleanup: () => void
+  onclone: (doc: Document, clonedTarget: HTMLElement) => void
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
-function afterPaint(): Promise<void> {
-  return new Promise((resolve) => {
-    requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
-  })
-}
-
-function snapshotFocus(state: RootState): FocusSnapshot {
-  return {
-    selectionSerial: getPaneSelectionSerial(),
-    activeTabId: state.tabs.activeTabId,
-    activePaneByTab: { ...state.panes.activePane },
-  }
-}
-
-function isElementVisible(element: HTMLElement): boolean {
-  if (!element.isConnected) return false
-  const style = window.getComputedStyle(element)
-  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false
-  const rect = element.getBoundingClientRect()
-  return rect.width >= 2 && rect.height >= 2
-}
-
-async function waitForVisibleElement(getElement: () => HTMLElement | null, timeoutMs = VISIBLE_WAIT_TIMEOUT_MS): Promise<HTMLElement | null> {
-  const startedAt = Date.now()
-  while (Date.now() - startedAt < timeoutMs) {
-    const candidate = getElement()
-    if (candidate && isElementVisible(candidate)) return candidate
-    await sleep(VISIBLE_WAIT_INTERVAL_MS)
-  }
-  return null
 }
 
 function escapeSelectorValue(value: string): string {
@@ -231,79 +168,6 @@ function buildIframeReplacementElement(
   return container
 }
 
-export async function prepareIframeCapture(target: HTMLElement, scale: number, throwIfStale?: () => void, raceCancellation?: <T>(work: Promise<T>) => Promise<T>): Promise<PreparedIframeCapture> {
-  const iframes = Array.from(target.querySelectorAll('iframe'))
-  if (iframes.length === 0) {
-    return {
-      onclone: () => {},
-      cleanup: () => {},
-    }
-  }
-
-  const markedIframes = new Map<string, HTMLIFrameElement>()
-  const previousMarkers = new Map<HTMLIFrameElement, string | null>()
-  // iframe → the marker WE stamped, so cleanup restores only our own marks:
-  // an abandoned capture's late cleanup must never erase the successor's.
-  const ourMarkerByIframe = new Map<HTMLIFrameElement, string>()
-  const replacements = new Map<string, IframeReplacement>()
-  const markerPrefix = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
-
-  for (let i = 0; i < iframes.length; i += 1) {
-    const iframe = iframes[i]
-    const marker = `shot-iframe-${markerPrefix}-${i}`
-    previousMarkers.set(iframe, iframe.getAttribute(IFRAME_MARKER_ATTR))
-    iframe.setAttribute(IFRAME_MARKER_ATTR, marker)
-    ourMarkerByIframe.set(iframe, marker)
-    markedIframes.set(marker, iframe)
-  }
-
-  const restoreMarkers = () => {
-    for (const [iframe, previous] of previousMarkers) {
-      const ours = ourMarkerByIframe.get(iframe)
-      // A successor capture re-stamped this marker while we were away:
-      // restoring our recorded previous value would erase ITS marker.
-      if (ours !== undefined && iframe.getAttribute(IFRAME_MARKER_ATTR) !== ours) continue
-      if (previous === null) {
-        iframe.removeAttribute(IFRAME_MARKER_ATTR)
-      } else {
-        iframe.setAttribute(IFRAME_MARKER_ATTR, previous)
-      }
-    }
-  }
-
-  try {
-    for (const [marker, iframe] of markedIframes) {
-      if (!isElementVisible(iframe)) continue
-      // Each iframe is its own html2canvas render; the deadline gates EVERY
-      // one, and a cancel lands mid-render via the race, not at its end.
-      throwIfStale?.()
-      const work = captureIframeReplacement(iframe, scale)
-      replacements.set(marker, raceCancellation ? await raceCancellation(work) : await work)
-    }
-  } catch (err) {
-    // The caller never receives our cleanup handle when we throw — reclaim
-    // the markers we already stamped so a dead pre-render capture leaves no
-    // litter in the live DOM.
-    restoreMarkers()
-    throw err
-  }
-
-  return {
-    onclone: (doc: Document) => {
-      const cloneIframes = Array.from(doc.querySelectorAll(`iframe[${IFRAME_MARKER_ATTR}]`))
-      for (const candidate of cloneIframes) {
-        const cloneIframe = candidate as HTMLIFrameElement
-        const marker = cloneIframe.getAttribute(IFRAME_MARKER_ATTR)
-        if (!marker) continue
-        const replacement = replacements.get(marker)
-        if (!replacement) continue
-        cloneIframe.replaceWith(buildIframeReplacementElement(doc, cloneIframe, replacement))
-      }
-    },
-    cleanup: restoreMarkers,
-  }
-}
-
 function findPaneElement(paneId: string): HTMLElement | null {
   const escaped = escapeSelectorValue(paneId)
   return document.querySelector(`[data-pane-shell="true"][data-pane-id="${escaped}"]`) as HTMLElement | null
@@ -318,499 +182,150 @@ function findViewElement(): HTMLElement | null {
   return (document.querySelector('[data-context="global"]') as HTMLElement | null) || document.body
 }
 
-function nodeContainsPane(node: PaneNode | undefined, paneId: string): boolean {
-  if (!node) return false
-  if (node.type === 'leaf') return node.id === paneId
-  return nodeContainsPane(node.children[0], paneId) || nodeContainsPane(node.children[1], paneId)
+/** Background tabs stay fully LAID OUT while hidden — `.tab-hidden` is
+ *  `visibility: hidden` (not `display: none`) precisely so xterm can keep
+ *  measuring — which is what lets a capture render them without activating
+ *  the tab: html2canvas parses the target's bounds and paints from its CLONE
+ *  of the document, and skips visibility-hidden subtrees while painting. */
+function hasLayout(element: HTMLElement): boolean {
+  if (!element.isConnected) return false
+  const rect = element.getBoundingClientRect()
+  return rect.width >= 1 && rect.height >= 1
 }
 
-function findTabIdForPane(state: RootState, paneId: string): string | undefined {
-  for (const [tabId, root] of Object.entries(state.panes.layouts)) {
-    if (nodeContainsPane(root, paneId)) return tabId
+async function waitForLaidOutElement(
+  getElement: () => HTMLElement | null,
+  timeoutMs = ELEMENT_WAIT_TIMEOUT_MS,
+): Promise<HTMLElement | null> {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < timeoutMs) {
+    const candidate = getElement()
+    if (candidate && hasLayout(candidate)) return candidate
+    await sleep(ELEMENT_WAIT_INTERVAL_MS)
   }
-  return undefined
+  return null
 }
 
-/** Which coordinates the capture itself moved, and to what. Consulted ONLY
- *  under supersession (a newer user selection during the capture). */
-export type CaptureMoves = {
-  /** The tab the capture activated (null when it never switched tabs). */
-  tab: string | null
-  /** tabId → the pane the capture activated there. */
-  paneByTab: Map<string, string>
+function isHiddenFromPaint(el: HTMLElement): boolean {
+  const view = el.ownerDocument.defaultView
+  if (!view) return false
+  const visibility = view.getComputedStyle(el).visibility
+  return visibility === 'hidden' || visibility === 'collapse'
 }
 
-export async function restoreFocus(
-  ctx: RuntimeContext,
-  before: FocusSnapshot,
-  paneTabsToRestore: Set<string>,
-  captureMoves?: CaptureMoves,
-): Promise<boolean> {
-  // A newer explicit selection during the capture supersedes the restore —
-  // but only for the coordinates the user actually touched. The serial is
-  // bumped by selection folds (setActivePane incl. pointer activations,
-  // nudgePaneFocus, setActiveTab) AND by other user gestures that move the
-  // selection (default-activating addTab, keyboard tab navigation, default-
-  // activating splitPane / addPane, active-close fallbacks); the capture's
-  // own moves use capture:true / selectTabForCapture, which never bump it,
-  // and agent folds pass activate:false.
-  const superseded = getPaneSelectionSerial() !== before.selectionSerial
-  // Under supersession, restore a coordinate only when the USER never touched
-  // it AND it still sits exactly on the capture's own move target (a third
-  // party moved it → leave it alone). This preserves the user's newer
-  // selection while still rolling back capture-owned background coordinates
-  // (e.g. a zoomed tab's active pane), which the all-or-nothing global check
-  // used to abandon.
-  const shouldRestoreTab = (state: RootState): boolean =>
-    !superseded
-    || (!wasSelectionCoordinateTouchedSince(TAB_SELECTION_COORDINATE, before.selectionSerial)
-      && captureMoves?.tab != null
-      && state.tabs.activeTabId === captureMoves.tab)
-  const shouldRestorePane = (state: RootState, tabId: string): boolean =>
-    !superseded
-    || (!wasSelectionCoordinateTouchedSince(paneSelectionCoordinate(tabId), before.selectionSerial)
-      && captureMoves?.paneByTab.get(tabId) !== undefined
-      && state.panes.activePane[tabId] === captureMoves?.paneByTab.get(tabId))
-  const restoredPaneTabs: string[] = []
-  let restoredTab = false
-  let incomplete = false
-  try {
-    for (const tabId of paneTabsToRestore) {
-      const originalPaneId = before.activePaneByTab[tabId]
-      if (!originalPaneId) continue
-      const state = ctx.getState()
-      // Best-effort: a pane/tab deleted mid-capture can never receive focus
-      // back — skip it (dispatching the restore would resurrect a dead
-      // activePane entry and blank the tab's work area), mark the restore
-      // incomplete, and KEEP restoring the surviving targets rather than
-      // leaving the user parked on a capture-selected tab/pane.
-      if (!state.tabs.tabs.some((t) => t.id === tabId)
-        || !nodeContainsPane(state.panes.layouts[tabId], originalPaneId)) {
-        incomplete = true
-        continue
-      }
-      if (!shouldRestorePane(state, tabId)) continue
-      if (state.panes.activePane[tabId] !== originalPaneId) {
-        // Restore dispatches are capture-internal too: a real-looking pane
-        // fold here would co-touch the tab coordinate (active-tab co-touch
-        // rule) and veto the tab restore that follows.
-        ctx.dispatch(setActivePane({ tabId, paneId: originalPaneId, capture: true }))
-      }
-      restoredPaneTabs.push(tabId)
-    }
+/** Whether any ancestor of the LIVE target (target included, up to body) is
+ *  hidden from paint — i.e. the target sits in a background tab and the clone
+ *  reveal must be armed for it. Computed on the live DOM where the window's
+ *  real stylesheet resolution is available. */
+function chainHiddenFromPaint(target: HTMLElement): boolean {
+  for (let el = target as HTMLElement | null; el && el !== el.ownerDocument.documentElement; el = el.parentElement) {
+    if (isHiddenFromPaint(el)) return true
+  }
+  return false
+}
 
-    if (before.activeTabId) {
-      const state = ctx.getState()
-      if (!state.tabs.tabs.some((t) => t.id === before.activeTabId)) {
-        incomplete = true
-      } else if (shouldRestoreTab(state)) {
-        if (state.tabs.activeTabId !== before.activeTabId) {
-          ctx.dispatch(selectTabForCapture(before.activeTabId))
-        }
-        restoredTab = true
-      }
-    }
-
-    await afterPaint()
-
-    const after = ctx.getState()
-    if (restoredTab && before.activeTabId) {
-      if (!after.tabs.tabs.some((t) => t.id === before.activeTabId)) {
-        incomplete = true // deleted during the restore window
-      } else if (after.tabs.activeTabId !== before.activeTabId) return false
-    }
-    for (const tabId of restoredPaneTabs) {
-      const originalPaneId = before.activePaneByTab[tabId]
-      // The OWNING TAB may have been deleted during the restore window while
-      // stale pane layout/activePane entries linger (removeTab and the pane
-      // cleanup are separate slices) — that must ALSO be incomplete, not true.
-      if (!after.tabs.tabs.some((t) => t.id === tabId)
-        || !nodeContainsPane(after.panes.layouts[tabId], originalPaneId)) {
-        incomplete = true // deleted during the restore window
-        continue
-      }
-      if (after.panes.activePane[tabId] !== originalPaneId) return false
-    }
-    return !incomplete
-  } catch {
-    return false
+/** Clone-side reveal: an inline `visibility: visible` on every ancestor of
+ *  the cloned target (up to body) beats the `.tab-hidden` class rule, making
+ *  the background tab paintable inside html2canvas's clone. Only the clone
+ *  changes — the live DOM, the user's selection, and DOM focus never move,
+ *  which is the whole point: a screenshot must never steal the user's tab. */
+function revealClonedTargetChain(clonedTarget: HTMLElement): void {
+  for (
+    let el = clonedTarget as HTMLElement | null;
+    el && el !== el.ownerDocument.documentElement;
+    el = el.parentElement
+  ) {
+    el.style.visibility = 'visible'
   }
 }
 
-// Captures mutate app-wide focus/tab state and suspend renderers, so two
-// captures MUST NOT overlap: an interleaved capture's interim moves/restores
-// and renderer resume boundaries interleave otherwise. Serialize captures
-// client-side (capture-internal dispatches — moves AND restores — are
-// serial-invisible by construction).
-let captureTail: Promise<unknown> = Promise.resolve()
+/** html2canvas cannot paint (or reliably clone) iframe content inside the
+ *  main render, so each iframe's document is pre-rendered separately and the
+ *  clone swaps the iframe for the resulting image (or an explicit
+ *  placeholder when the document is inaccessible, e.g. cross-origin).
+ *
+ *  Clone-side correlation: the replacement list is built from the LIVE
+ *  target's iframes in document order, and applied to the CLONED target's
+ *  iframes in document order. The two lists are verified to still describe
+ *  the same tree (count + src fingerprints) at clone time — the pane tree can
+ *  change between preparation and clone (a concurrent split), and a mismatch
+ *  applies NO replacements rather than risk an image landing on the wrong
+ *  iframe. No marker attributes are stamped on the live DOM at all. */
+async function prepareIframeCapture(target: HTMLElement, scale: number): Promise<PreparedIframeCapture> {
+  const iframes = Array.from(target.querySelectorAll('iframe'))
+  if (iframes.length === 0) {
+    return { onclone: () => {} }
+  }
 
-// Both servers drop a pending screenshot request ~10s after SENDING it
-// (server/ws-handler.ts: opts.timeoutMs ?? 10_000, stamped as payload
-// .deadlineAtMs; crates/freshell-server/src/screenshots.rs: SCREENSHOT_TIMEOUT)
-// — and the server clock starts BEFORE the frame reaches this client. Any
-// queue/execution age must therefore be measured against the stamped deadline
-// (when present), never against local receipt time. When the deadline is
-// absent (older servers), bound queue waits client-side:
-export const CAPTURE_QUEUE_TTL_MS = 8000
-// A job whose execution blows past its deadline is wedged (a hung renderer,
-// html2canvas, ...). It cannot be cancelled, so the tail abandons it after a
-// grace window — one stalled capture must not starve every later screenshot
-// the caller might still succeed at. Abandonment is FENCED: the abandoned
-// job's wind-down (renderer resume + focus rollback) is driven once, at
-// abandonment, before the successor starts — never again at the job's
-// eventual end, so it cannot overlap its successor's capture.
-const CAPTURE_ABANDON_GRACE_MS = 2000
+  const originalSrcs = iframes.map((iframe) => iframe.getAttribute('src'))
+  const replacements: (IframeReplacement | null)[] = []
+  for (const iframe of iframes) {
+    // Layout-gated, not paint-gated: a background tab's iframe is
+    // visibility-hidden yet fully laid out, and its same-origin document is
+    // readable regardless of CSS visibility.
+    replacements.push(hasLayout(iframe) ? await captureIframeReplacement(iframe, scale) : null)
+  }
 
-let captureEpoch = 0
-/** epoch → exactly-once wind-down (renderer resume + focus rollback), driven
- *  at normal completion OR at abandonment, whichever comes first. */
-const pendingWindDown = new Map<number, () => Promise<void>>()
-
-function expiredDeadlineResult(): ScreenshotResult {
   return {
-    ok: false,
-    changedFocus: false,
-    restoredFocus: false,
-    error: 'screenshot request expired: past its server deadline',
-  }
-}
-
-/** Server-side timeout unwind: the server already failed the waiter for this
- *  id, so any queued/in-flight capture for it must not mutate UI. Consulted
- *  entry-side AND at every staleness gate, because on a stalled client the
- *  cancel frame can arrive before its capture frame. */
-const cancelledCaptures = new Set<string>()
-
-export function cancelUiScreenshot(requestId: string): void {
-  if (!requestId) return
-  // Bounded: a cancel for a frame that never arrived would linger forever.
-  if (cancelledCaptures.size >= 1024) cancelledCaptures.clear()
-  cancelledCaptures.add(requestId)
-  const waiters = cancellationWaiters.get(requestId)
-  if (waiters) {
-    cancellationWaiters.delete(requestId)
-    for (const resolve of waiters) resolve()
-  }
-}
-
-function cancelledScreenshotResult(): ScreenshotResult {
-  return { ok: false, changedFocus: false, restoredFocus: false, error: 'screenshot cancelled by server' }
-}
-
-/** Consume-and-check: a consumed id cannot poison a later, unrelated run. */
-function consumeCancellation(requestId: string | undefined): boolean {
-  if (!requestId || !cancelledCaptures.has(requestId)) return false
-  cancelledCaptures.delete(requestId)
-  return true
-}
-
-/** Async waiters for in-flight work the discrete gates cannot reach — a
- *  capture parked inside a MULTI-SECOND html2canvas render must still unwind
- *  promptly when its cancel lands (the Rust broker's first-client resolve
- *  cancels losers mid-render; html2canvas itself cannot be cancelled, but
- *  racing it abandons the result — its onclone only mutates the clone). */
-const cancellationWaiters = new Map<string, Set<() => void>>()
-
-function watchCancellation(requestId: string | undefined): { promise: Promise<void>; release: () => void } | null {
-  if (!requestId) return null
-  if (cancelledCaptures.has(requestId)) {
-    // Already cancelled before registration: surface immediately but leave
-    // the marker — the gate-side consume is single-owner for auditability.
-    return { promise: Promise.resolve(), release: () => {} }
-  }
-  let resolveRef: (() => void) | undefined
-  const promise = new Promise<void>((resolve) => { resolveRef = resolve })
-  const set = cancellationWaiters.get(requestId) ?? new Set<() => void>()
-  set.add(resolveRef!)
-  cancellationWaiters.set(requestId, set)
-  const release = () => {
-    const live = cancellationWaiters.get(requestId)
-    if (!live) return
-    live.delete(resolveRef!)
-    if (live.size === 0) cancellationWaiters.delete(requestId)
-  }
-  return { promise, release }
-}
-
-/** Test-only: await the capture queue until fully drained (including abandon
- *  timers and fenced wind-downs). Tests that drive parked/abandoned captures
- *  call this in afterEach so no test inherits another test's deferred tail. */
-export async function drainCaptureQueueForTests(): Promise<void> {
-  while (true) {
-    const tail = captureTail
-    await tail.catch(() => undefined)
-    if (captureTail === tail) return
-  }
-}
-
-export async function captureUiScreenshot(request: ScreenshotRequest, ctx: RuntimeContext): Promise<ScreenshotResult> {
-  const deadlineAtMs = request.deadlineAtMs ?? (Date.now() + CAPTURE_QUEUE_TTL_MS)
-  // A request cancelled BEFORE its frame even ran here must never enqueue
-  // work — queueing first and fast-failing second would let the entry consume
-  // eat the marker out from under the tail-scheduled job's own dequeue gate.
-  if (consumeCancellation(request.requestId)) return cancelledScreenshotResult()
-  const epoch = ++captureEpoch
-  const job: Promise<ScreenshotResult> = captureTail.then(() => {
-    if (consumeCancellation(request.requestId)) return cancelledScreenshotResult()
-    if (Date.now() >= deadlineAtMs) return expiredDeadlineResult()
-    return performUiScreenshotCapture(request, ctx, deadlineAtMs, epoch)
-  })
-  // The tail advances when the job settles — or walks past it entirely once
-  // the job has blown its deadline plus grace (wedged capture, never settled).
-  // Walking past it FENCES it: its wind-down runs here, not at its own end.
-  captureTail = Promise.race([
-    job,
-    new Promise<unknown>((resolve) => setTimeout(() => {
-      const wind = pendingWindDown.get(epoch)
-      if (!wind) {
-        resolve(undefined)
-        return
+    onclone: (doc, clonedTarget) => {
+      const cloneIframes = Array.from(clonedTarget.querySelectorAll('iframe'))
+      if (cloneIframes.length !== iframes.length) return
+      for (let i = 0; i < cloneIframes.length; i += 1) {
+        if (cloneIframes[i].getAttribute('src') !== originalSrcs[i]) return
       }
-      // The tail advances only once the abandoned job's wind-down is fully
-      // settled — the successor neither sees a half-restored selection nor
-      // shares renderer suspension with the abandoned job.
-      void wind().then(resolve, resolve)
-    }, Math.max(0, deadlineAtMs + CAPTURE_ABANDON_GRACE_MS - Date.now()))),
-  ]).then(() => undefined, () => undefined)
-  // A stalled head must not park this caller past the deadline: answer with
-  // the expiry result; the queued job later hits its dequeue gate and no-ops.
-  const remaining = deadlineAtMs - Date.now()
-  if (remaining <= 0) return expiredDeadlineResult()
-  let timer: ReturnType<typeof setTimeout> | undefined
-  const expiry = new Promise<ScreenshotResult>((resolve) => {
-    timer = setTimeout(() => resolve(expiredDeadlineResult()), remaining)
-  })
-  return Promise.race([job, expiry]).finally(() => { if (timer !== undefined) clearTimeout(timer) })
-}
-
-async function performUiScreenshotCapture(request: ScreenshotRequest, ctx: RuntimeContext, deadlineAtMs: number, epoch: number): Promise<ScreenshotResult> {
-  const focusBefore = snapshotFocus(ctx.getState())
-  const paneTabsToRestore = new Set<string>()
-  // Every capture-internal move is ALSO recorded here, keyed by what the
-  // capture moved each coordinate TO — restoreFocus consults this under
-  // supersession to restore only coordinates the user never touched.
-  const capturePaneTargets = new Map<string, string>()
-  let captureTabTarget: string | null = null
-  let changedFocus = false
-  let restoredFocus = false
-  // The serial is sampled at snapshot time, but the renderer suspension below
-  // awaits two animation frames — a user selection can land in that gap (or
-  // between the tab move and the pane move). Re-check before every capture-
-  // internal focus write: stomping the newer selection is worse than aborting
-  // the screenshot (partial moves are handled by restoreFocus, whose serial
-  // mismatch deliberately skips the rollback).
-  const selectionSuperseded = () => getPaneSelectionSerial() !== focusBefore.selectionSerial
-  // The stamped deadline likewise expires mid-flight: never move focus (or
-  // render) for a caller the server has already failed.
-  const deadlineExceeded = () => Date.now() >= deadlineAtMs
-  const throwIfStale = () => {
-    if (consumeCancellation(request.requestId)) throw new Error('screenshot cancelled by server')
-    if (selectionSuperseded()) throw new Error('screenshot superseded by a newer user selection')
-    if (deadlineExceeded()) throw new Error('screenshot aborted: exceeded its server deadline mid-capture')
-  }
-
-  // In-flight cancellation beyond the discrete gates: race every long render
-  // against the cancel signal (a losing client unwinds mid-render, not at the
-  // render's own pace). Abandoning html2canvas is safe — its onclone edits
-  // only touch the clone document. Released in wind-down.
-  const cancellation = watchCancellation(request.requestId)
-  const raceCancellation = <T,>(work: Promise<T>): Promise<T> => {
-    if (!cancellation) return work
-    return Promise.race([
-      work,
-      cancellation.promise.then(() => { throw new Error('screenshot cancelled by server') }),
-    ])
-  }
-
-  const setActiveTabIfNeeded = async (tabId: string) => {
-    if (ctx.getState().tabs.activeTabId === tabId) return
-    throwIfStale()
-    // Capture-internal: invisible to the selection serial, so it cannot void
-    // the restore of a user/agent selection landing mid-capture.
-    ctx.dispatch(selectTabForCapture(tabId))
-    captureTabTarget = tabId
-    changedFocus = true
-    await afterPaint()
-  }
-
-  const setActivePaneIfNeeded = async (tabId: string, paneId: string) => {
-    if (ctx.getState().panes.activePane[tabId] === paneId) return
-    throwIfStale()
-    // Capture-internal activation: must not bump the selection serial — the
-    // restore contract attributes serial changes to user/agent selections.
-    ctx.dispatch(setActivePane({ tabId, paneId, capture: true }))
-    paneTabsToRestore.add(tabId)
-    capturePaneTargets.set(tabId, paneId)
-    changedFocus = true
-    await afterPaint()
-  }
-
-  let result: Omit<ScreenshotResult, 'changedFocus' | 'restoredFocus'>
-
-  // Exactly-once wind-down: renderer resume + focus rollback happen at normal
-  // completion OR at abandonment (the fence the tail timer invokes) —
-  // whichever comes first. An abandoned job that eventually settles does NOT
-  // wind down a second time, so it can never overlap its successor's capture.
-  // The fence is registered BEFORE renderer suspension ACQUISITION (which can
-  // sit in an rAF-starved paint window in background tabs): an abandonment
-  // landing mid-acquisition arms the late-resume handoff below.
-  let windDownPromise: Promise<void> | null = null
-  let restoreRenderersFn: (() => Promise<void>) | null = null
-  let resumeAfterAcquire = false
-
-  // User engagement reaching INTO a pane's nested iframe during a capture is
-  // user selection activity — but it must be detected with platform truth:
-  // nested-document engagement is a HOIST (activeElement becomes the iframe);
-  // focus/focusin never fire parent-side for it (Chromium-verified, see
-  // focus-steal-guard.ts). The observables are focusout on the displaced
-  // element and window blur (when body was displaced). Checking after a task
-  // because the activeElement reassignment is mid-flight during dispatch.
-  // A hoist only counts as USER engagement when real bound input preceded it:
-  // a FOCUS-NAVIGATION keydown (Tab — typing letters anywhere must not count),
-  // or pointer activity over THE SAME PANE the hoist landed in (typing/mousing
-  // in the user's own pane must not launder programmatic eligibility autofocus
-  // in the captured pane into 'user engagement'). Programmatic autofocus
-  // (ExtensionPane focusing its iframe on a flip) has no input trail at all.
-  const INTENT_WINDOW_MS = 1500
-  let lastNavKeyAtMs = -Infinity
-  const panePointerAtMs = new Map<string, number>()
-  const noteKeyIntent = (event: Event) => {
-    if ((event as KeyboardEvent).key !== 'Tab') return
-    lastNavKeyAtMs = Date.now()
-  }
-  const notePointerIntent = (event: Event) => {
-    const paneHost = (event.target as Element | null)?.closest?.('[data-pane-id]') as HTMLElement | null
-    const paneId = paneHost?.getAttribute('data-pane-id')
-    if (!paneId) return
-    if (panePointerAtMs.size >= 256) panePointerAtMs.clear() // pane churn is tiny; keep bounded
-    panePointerAtMs.set(paneId, Date.now())
-  }
-  document.addEventListener('keydown', noteKeyIntent, true)
-  document.addEventListener('pointerdown', notePointerIntent, true)
-  document.addEventListener('pointermove', notePointerIntent, { capture: true, passive: true })
-  const checkForIframeHoist = () => {
-    const el = document.activeElement as HTMLElement | null
-    if (!el || el.tagName !== 'IFRAME' || typeof el.closest !== 'function') return
-    const paneHost = el.closest('[data-pane-id]') as HTMLElement | null
-    if (!paneHost) return
-    const paneId = paneHost.getAttribute('data-pane-id') ?? ''
-    const now = Date.now()
-    const hasIntent =
-      now - lastNavKeyAtMs <= INTENT_WINDOW_MS
-      || now - (panePointerAtMs.get(paneId) ?? -Infinity) <= INTENT_WINDOW_MS
-    if (!hasIntent) return // capture-side autofocus, not engagement
-    const tabId = (paneHost.closest('[data-tab-id]') as HTMLElement | null)
-      ?.getAttribute('data-tab-id')
-      ?? null
-    noteDomPaneSelection(tabId, ctx.getState().tabs.activeTabId === tabId)
-  }
-  const onHoistSignal = () => { setTimeout(checkForIframeHoist, 0) }
-  document.addEventListener('focusout', onHoistSignal)
-  window.addEventListener('blur', onHoistSignal)
-
-  // Wind-down is a SHARED PROMISE, started exactly once and joined by every
-  // caller (natural completion AND the abandonment timer): whoever starts
-  // second must WAIT for the in-flight restore + renderer resume, never walk
-  // past it. The map entry survives until the promise fully settles so the
-  // timer still finds it mid-wind-down.
-  const windDown = (): Promise<void> => {
-    if (!windDownPromise) {
-      windDownPromise = (async () => {
-        cancellation?.release()
-        document.removeEventListener('focusout', onHoistSignal)
-        window.removeEventListener('blur', onHoistSignal)
-        document.removeEventListener('keydown', noteKeyIntent, true)
-        document.removeEventListener('pointerdown', notePointerIntent, true)
-        document.removeEventListener('pointermove', notePointerIntent, true)
-        // Restore Redux selection state BEFORE releasing the renderers: the
-        // successor's snapshot must see the rollback, and restoreFocus dispatches
-        // synchronously up to its paint await, while renderer resume only frees
-        // pixels (paint-time only).
-        if (changedFocus) {
-          restoredFocus = await restoreFocus(ctx, focusBefore, paneTabsToRestore, {
-            tab: captureTabTarget,
-            paneByTab: capturePaneTargets,
-          })
-        }
-        if (restoreRenderersFn) {
-          await restoreRenderersFn()
-        } else {
-          resumeAfterAcquire = true
-        }
-      })()
-      const clearEntry = () => {
-        if (pendingWindDown.get(epoch) === windDown) pendingWindDown.delete(epoch)
-      }
-      void windDownPromise.then(clearEntry, clearEntry)
-    }
-    return windDownPromise
-  }
-  pendingWindDown.set(epoch, windDown)
-  const restoreRenderers = await suspendTerminalRenderersForScreenshot()
-  restoreRenderersFn = restoreRenderers
-  // The fence may HAVE fired while the suspension was being acquired: hand the
-  // resumer off so the balance closes exactly once.
-  if (resumeAfterAcquire) await restoreRenderers()
-
-  try {
-    let target: HTMLElement | null = null
-
-    if (request.scope === 'view') {
-      target = findViewElement()
-    } else if (request.scope === 'tab') {
-      const tabId = request.tabId
-      if (!tabId) throw new Error('tabId required for tab scope')
-
-      target = findTabElement(tabId)
-      if (!target || !isElementVisible(target)) {
-        await setActiveTabIfNeeded(tabId)
-        target = await waitForVisibleElement(() => findTabElement(tabId))
-      }
-    } else {
-      const paneId = request.paneId
-      if (!paneId) throw new Error('paneId required for pane scope')
-
-      target = findPaneElement(paneId)
-      if (!target || !isElementVisible(target)) {
-        const targetTabId = request.tabId || findTabIdForPane(ctx.getState(), paneId)
-        if (!targetTabId) throw new Error('pane tab not found')
-
-        await setActiveTabIfNeeded(targetTabId)
-        target = findPaneElement(paneId)
-
-        if (!target || !isElementVisible(target)) {
-          await setActivePaneIfNeeded(targetTabId, paneId)
-          target = await waitForVisibleElement(() => findPaneElement(paneId))
+      for (let i = 0; i < cloneIframes.length; i += 1) {
+        const replacement = replacements[i]
+        if (replacement) {
+          cloneIframes[i].replaceWith(buildIframeReplacementElement(doc, cloneIframes[i], replacement))
         }
       }
-    }
+    },
+  }
+}
 
+async function resolveCaptureTarget(request: ScreenshotRequest): Promise<HTMLElement> {
+  if (request.scope === 'view') {
+    const target = findViewElement()
     if (!target) throw new Error('capture target not found')
-    if (!isElementVisible(target)) {
-      const visibleTarget = await waitForVisibleElement(() => target)
-      if (!visibleTarget) throw new Error('capture target is not visible')
-      target = visibleTarget
-    }
+    return target
+  }
+  if (request.scope === 'tab') {
+    if (!request.tabId) throw new Error('tabId required for tab scope')
+    const target = await waitForLaidOutElement(() => findTabElement(request.tabId!))
+    if (!target) throw new Error('capture target not found')
+    return target
+  }
+  if (!request.paneId) throw new Error('paneId required for pane scope')
+  const target = await waitForLaidOutElement(() => findPaneElement(request.paneId!))
+  if (!target) throw new Error('capture target not found')
+  return target
+}
 
-    throwIfStale()
+export async function captureUiScreenshot(request: ScreenshotRequest): Promise<ScreenshotResult> {
+  let result: Omit<ScreenshotResult, 'changedFocus' | 'restoredFocus'>
+  // Web canvases (xterm's WebGL renderer) are only reliably readable around a
+  // fresh synchronous render — the refcounted suspension forces one and
+  // freezes the renderers while html2canvas copies each canvas into its
+  // clone. Balanced in `finally`, including every failure path.
+  const restoreRenderers = await suspendTerminalRenderersForScreenshot()
+  try {
+    const target = await resolveCaptureTarget(request)
     const scale = Math.max(1, window.devicePixelRatio || 1)
-    const preparedIframes = await prepareIframeCapture(target, scale, throwIfStale, raceCancellation)
-    let canvas: HTMLCanvasElement
-    try {
-      throwIfStale() // prep can cross the deadline — re-gate the main render
-      canvas = await raceCancellation(html2canvas(target, {
-        backgroundColor: null,
-        allowTaint: true,
-        useCORS: true,
-        logging: false,
-        scale,
-        onclone: (doc) => {
-          preparedIframes.onclone(doc)
-        },
-      }))
-    } finally {
-      preparedIframes.cleanup()
-    }
+    // Armed live-side: only a target with a hidden ancestor chain (a
+    // background tab) needs the clone reveal; visible targets skip it.
+    const needsReveal = chainHiddenFromPaint(target)
+    const preparedIframes = await prepareIframeCapture(target, scale)
+    const canvas = await html2canvas(target, {
+      backgroundColor: null,
+      allowTaint: true,
+      useCORS: true,
+      logging: false,
+      scale,
+      onclone: (doc, clonedTarget) => {
+        if (needsReveal) revealClonedTargetChain(clonedTarget)
+        preparedIframes.onclone(doc, clonedTarget)
+      },
+    })
 
     const dataUrl = canvas.toDataURL('image/png')
     const prefix = 'data:image/png;base64,'
@@ -828,13 +343,13 @@ async function performUiScreenshotCapture(request: ScreenshotRequest, ctx: Runti
       ok: false,
       error: err?.message || 'failed to capture screenshot',
     }
+  } finally {
+    await restoreRenderers()
   }
-
-  await windDown()
 
   return {
     ...result,
-    changedFocus,
-    restoredFocus,
+    changedFocus: false,
+    restoredFocus: false,
   }
 }

@@ -109,22 +109,17 @@ async fn create_screenshot(
     }
 
     // Drive the round-trip: register → broadcast capture → await the UI reply.
-    // The RELATIVE budget stamped into the frame mirrors our own wait budget;
-    // the client converts it to a local deadline on receipt and expires
-    // capture work that outlived it instead of mutating focus for a caller
-    // we've already failed.
+    // The client renders through an html2canvas clone (never mutating the
+    // user's selection), so a timeout or late duplicate needs no client-side
+    // unwinding — the dropped pending record simply ignores stray results.
     let request_id = uuid::Uuid::new_v4().to_string();
     let rx = state.broker.register(request_id.clone());
-    state
-        .broker
-        .send_capture(&request_id, scope, tab_id, pane_id, SCREENSHOT_TIMEOUT.as_millis() as u64);
+    state.broker.send_capture(&request_id, scope, tab_id, pane_id);
 
     let result = match tokio::time::timeout(SCREENSHOT_TIMEOUT, rx).await {
         Ok(Ok(result)) => result,
         Ok(Err(_)) => {
             state.broker.cancel(&request_id);
-            // Unwind any client-side capture work for a request nobody waits on.
-            state.broker.send_cancel(&request_id);
             return fail(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "UI connection closed before screenshot response",
@@ -132,9 +127,6 @@ async fn create_screenshot(
         }
         Err(_) => {
             state.broker.cancel(&request_id);
-            // Delivery delay (stalled client) must never translate into UI
-            // mutation: tell the client to unwind queued/in-flight work.
-            state.broker.send_cancel(&request_id);
             return fail(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Timed out waiting for UI screenshot response",
