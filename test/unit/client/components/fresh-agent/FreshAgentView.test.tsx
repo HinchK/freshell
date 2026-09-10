@@ -9527,4 +9527,60 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
     }, { timeout: 5_000 })
     expect(apiMock.requestSessionHandoff).toHaveBeenCalledTimes(1)
   })
+
+  it('every typed handoff-failure code composes: the banner renders the typed message with a Retry that re-invokes the same identity', async () => {
+    // Task-009 review Minor 1: the per-code fold matrix lives in the
+    // ContextMenu suite; this loop gives EVERY typed code — including
+    // REAP_TIMEOUT — the composed banner-render + Retry assertion.
+    const typedFailures: Array<{ code: string; message: string }> = [
+      { code: 'REAP_TIMEOUT', message: 'the prior runtime did not confirm its exit in time' },
+      { code: 'TARGET_SPAWN_FAILED', message: 'the target runtime failed to start' },
+      { code: 'STALE_GENERATION', message: 'observed ownership fence is stale; refresh and retry' },
+      { code: 'HANDOFF_IN_PROGRESS', message: 'a lifecycle operation is in flight; retry after it settles' },
+    ]
+
+    for (const failure of typedFailures) {
+      apiMock.requestSessionHandoff.mockClear()
+      const store = createStore()
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: divergencePaneContent() }))
+      store.dispatch(setPaneHandoffError({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        error: {
+          code: failure.code,
+          message: failure.message,
+          retryable: true,
+          generation: 4,
+        },
+      }))
+      // The retry's handoff fails again (retryable) — the pane must STAY a
+      // fresh-agent pane wearing the banner; only the invocation is asserted.
+      apiMock.requestSessionHandoff.mockResolvedValue({
+        ok: false,
+        error: { code: failure.code, message: 'still failing', retryable: true, ownerGeneration: 5 },
+      })
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+
+      const banner = await screen.findByRole('alert')
+      expect(banner).toHaveTextContent(new RegExp(failure.message, 'i'))
+      const retry = within(banner).getByRole('button', { name: /retry reopening/i })
+
+      fireEvent.click(retry)
+      await waitFor(() => {
+        expect(apiMock.requestSessionHandoff).toHaveBeenCalledTimes(1)
+      }, { timeout: 5_000 })
+
+      expect(apiMock.requestSessionHandoff).toHaveBeenCalledWith(expect.objectContaining({
+        provider: 'codex',
+        sessionId: DIV_SESSION_ID,
+        targetKind: 'terminal',
+        mode: 'codex',
+      }))
+      cleanup()
+    }
+  })
 })

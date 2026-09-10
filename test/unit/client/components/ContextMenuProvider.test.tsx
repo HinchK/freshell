@@ -1764,7 +1764,8 @@ describe('ContextMenuProvider', () => {
       const user = userEvent.setup()
       apiMocks.requestSessionHandoff.mockClear()
       const store = createTestStore()
-      store.dispatch(initLayout({        tabId: 'tab-1',
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
         paneId: 'pane-1',
         content: {
           kind: 'fresh-agent',
