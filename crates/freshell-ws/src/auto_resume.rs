@@ -330,6 +330,13 @@ pub(crate) fn spawn_hub_with_driver<D: AutoResumeDriver + Sync>(
     })
 }
 
+/// The create-answer hold's poll cadence: how long the hub parks between
+/// requeue rotations of a crash event whose originating create is still
+/// unanswered. Keeps an otherwise-idle crash-event channel from hot-spinning
+/// while the create's post-spawn tail (spawn-blocking hops, durable ledger
+/// writes, coordinator settle) runs to its `terminal.created` reply.
+const CREATE_ANSWER_HOLD_POLL_MS: u64 = 10;
+
 /// One incarnation of the hub loop. Returns only when the crash-event channel
 /// closes; a driver panic unwinds out to the supervisor in
 /// [`spawn_hub_with_driver`], which restarts this body with the same `rx` and
@@ -351,6 +358,32 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
         // tiny, and full serialization is the strongest anti-storm property
         // (one respawn in flight, ever).
         'events: while let Some(ev) = rx.recv().await {
+            // CREATE-ANSWER ORDERING GUARD (Gate 1): a terminal whose
+            // originating `terminal.create` has not yet answered must not
+            // have its crash lifecycle broadcast. The client learns the
+            // terminalId from the `terminal.created` reply; a
+            // recovering/settled frame that is admitted to the creating
+            // connection's outbox BEFORE that reply is unassociatable and
+            // silently lost (the crash can beat the reply because the
+            // create worker's post-spawn tail — durable ledger writes,
+            // coordinator settle — awaits AFTER the PTY's exit watcher is
+            // already armed). Hold the event until the create-dedupe
+            // sentinel reports the create answered (settle follows the
+            // reply's admission; every failure/cancel path clears it), by
+            // requeueing it to the BACK of the channel: other terminals'
+            // events keep flowing, the event survives hub-body restarts
+            // (it lives in the channel, not hub-local state), and the
+            // short sleep keeps an otherwise-idle channel from hot-spinning.
+            if let Some(key) = ev.create_request_id.as_deref() {
+                if driver.create_reply_pending(key) {
+                    driver.requeue_crash_event(ev);
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        CREATE_ANSWER_HOLD_POLL_MS,
+                    ))
+                    .await;
+                    continue 'events;
+                }
+            }
             let mut sref = driver.resumable_session_ref(&ev.terminal_id);
             // Identity grace (kata kmbs): `no_resumable_identity` used to be
             // a one-shot, never-reconsidered settle — a permanently dead pane
@@ -628,6 +661,29 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
 /// path). A sync signature would force blocking a runtime worker.
 pub(crate) trait AutoResumeDriver: Send + 'static {
     fn cap_exhausted(&self, create_request_id: &str) -> bool;
+
+    /// CREATE-ANSWER ORDERING GUARD (Gate 1): true while the originating
+    /// `terminal.create` for this request id has not yet answered its client
+    /// — the server-wide create-dedupe sentinel is still InFlight, meaning
+    /// the `terminal.created` reply naming the terminal has not been
+    /// admitted to the creating connection's outbox. A terminal-scoped
+    /// crash broadcast (recovering/settled/replaced) that precedes that
+    /// reply is UNASSOCIABLE by the client (it keys auto-resume state by a
+    /// terminalId it has not learned yet) and is silently lost — exactly the
+    /// gate-1 e2e failure where the first `terminal.status{recovering}`
+    /// landed before `terminal.created` and the test (like the SPA) could
+    /// only match the attempt-2 frame naming the replacement. The hub HOLDS
+    /// the crash event while this returns true.
+    fn create_reply_pending(&self, create_request_id: &str) -> bool;
+
+    /// Return a held [`CrashEvent`] to the BACK of the crash-event channel
+    /// (the create-answer hold's requeue): other terminals' events keep
+    /// flowing while one create is unanswered, and the held event is retried
+    /// on the hub's next poll instead of being dropped or processed early.
+    /// Living in the channel (not a hub-local stash) also keeps the event
+    /// alive across a driver-panic body restart.
+    fn requeue_crash_event(&self, ev: CrashEvent);
+
     /// (provider, session_id, cwd)
     fn resumable_session_ref(&self, terminal_id: &str) -> Option<(String, String, Option<String>)>;
     /// Post-backoff guard. Some(reason) aborts the resume and settles with that
@@ -735,6 +791,20 @@ fn session_locator(provider: &str, session_id: &str) -> freshell_protocol::Sessi
 impl AutoResumeDriver for WsAutoResumeDriver {
     fn cap_exhausted(&self, create_request_id: &str) -> bool {
         self.state.registry.respawn_exhausted(create_request_id)
+    }
+
+    fn create_reply_pending(&self, create_request_id: &str) -> bool {
+        // The create-dedupe InFlight sentinel is installed at create
+        // receipt and flips to Settled only AFTER the `terminal.created`
+        // reply has been admitted to the creating connection's outbox
+        // (terminal.rs settle ordering); every failure/cancel path clears
+        // it (the interactive Job's Drop guard / create_gate's clears), so
+        // the hold is bounded by the create's own lifetime.
+        self.state.create_dedupe.is_in_flight(create_request_id)
+    }
+
+    fn requeue_crash_event(&self, ev: CrashEvent) {
+        let _ = self.state.auto_resume_tx.send(ev);
     }
 
     /// Identity registry first (retired-inclusive — the exit hook retires
@@ -1477,6 +1547,14 @@ mod tests {
         /// Terminal ids retired by the hub's unconditional iteration-tail
         /// retires (delta fix 1) — the restored crash invariant.
         retired: Vec<String>,
+        /// Gate-1 hold knobs: request ids whose originating create is still
+        /// unanswered (`create_reply_pending`), and the channel a held event
+        /// is requeued onto (None = record the requeue but drop the event —
+        /// tests that don't drive the hold don't need the loopback).
+        unanswered: std::collections::HashSet<String>,
+        requeue_tx: Option<tokio::sync::mpsc::UnboundedSender<CrashEvent>>,
+        /// Terminal ids the hub requeued through the create-answer hold.
+        requeued: Vec<String>,
     }
 
     /// Records every orchestrator effect; each knob is mutable mid-test so
@@ -1509,6 +1587,9 @@ mod tests {
                     settled: Vec::new(),
                     settled_frames: Vec::new(),
                     retired: Vec::new(),
+                    unanswered: std::collections::HashSet::new(),
+                    requeue_tx: None,
+                    requeued: Vec::new(),
                 })),
             }
         }
@@ -1543,6 +1624,23 @@ mod tests {
         }
         fn set_insert_cancel_on_respawn(&self, v: bool) {
             self.lock().insert_cancel_on_respawn = v;
+        }
+        /// Gate-1 hold: mark this create's reply as still pending (the
+        /// create-dedupe InFlight sentinel, faked).
+        fn hold_create_reply(&self, create_request_id: &str) {
+            self.lock().unanswered.insert(create_request_id.to_string());
+        }
+        /// Gate-1 hold: the create answered (sentinel Settled/cleared).
+        fn answer_create(&self, create_request_id: &str) {
+            self.lock().unanswered.remove(create_request_id);
+        }
+        /// Install the loopback a held event is requeued onto.
+        fn install_requeue_tx(&self, tx: tokio::sync::mpsc::UnboundedSender<CrashEvent>) {
+            self.lock().requeue_tx = Some(tx);
+        }
+        /// Terminal ids the hub requeued through the create-answer hold.
+        fn requeued(&self) -> Vec<String> {
+            self.lock().requeued.clone()
         }
         /// Pending (unconsumed) cancel entries — the leak the fresh-eyes
         /// review flagged: must drain to zero on every settle/replaced tail.
@@ -1597,6 +1695,19 @@ mod tests {
     impl AutoResumeDriver for FakeDriver {
         fn cap_exhausted(&self, _create_request_id: &str) -> bool {
             self.lock().cap_exhausted
+        }
+        fn create_reply_pending(&self, create_request_id: &str) -> bool {
+            self.lock().unanswered.contains(create_request_id)
+        }
+        fn requeue_crash_event(&self, ev: CrashEvent) {
+            let tx = {
+                let mut s = self.lock();
+                s.requeued.push(ev.terminal_id.clone());
+                s.requeue_tx.clone()
+            };
+            if let Some(tx) = tx {
+                let _ = tx.send(ev);
+            }
         }
         fn resumable_session_ref(
             &self,
@@ -1753,6 +1864,66 @@ mod tests {
         // — the unconditional pre-emit tail retire must still restore the
         // crash invariant.
         assert!(fake.retired().contains(&"t1".to_string()));
+    }
+
+    /// Gate-1 pin (create-answer ordering guard): a crash whose originating
+    /// `terminal.create` has not yet answered is HELD — no
+    /// recovering/replaced/settled frame may reach the wire before the
+    /// `terminal.created` reply that names the terminal, because the client
+    /// (and the e2e helper) keys that state by a terminalId it has not
+    /// learned yet and silently drops the frame. Other terminals' crashes
+    /// keep flowing while the hold is pending, and the held event is
+    /// processed — original content intact — once the create answers.
+    #[tokio::test(start_paused = true)]
+    async fn crash_event_for_an_unanswered_create_is_held_until_the_create_answers() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fake = FakeDriver::healthy();
+        fake.hold_create_reply("cr-held");
+        fake.install_requeue_tx(tx.clone());
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, test_cfg(vec![2_000, 10_000]));
+
+        // The held terminal's crash arrives FIRST, an unrelated terminal's
+        // crash second: the hub must not let the first event block the
+        // second (requeue-to-back, not a head-of-line stall). Drive the
+        // hub segment by segment under the paused clock: one yield parks it
+        // on the hold's first poll sleep, the advance fires that poll, the
+        // next yield lets it dequeue t-other and broadcast its recovering
+        // (then park on t-other's 2s backoff).
+        tx.send(crash("t-held", 1, "claude", Some("cr-held"), 5_000))
+            .unwrap();
+        tx.send(crash("t-other", 1, "claude", Some("cr-other"), 5_000))
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
+
+        // (1) The unrelated terminal's resume is in flight (recovering
+        // broadcast, backoff pending); the held one broadcast NOTHING and
+        // was requeued, never dropped.
+        assert_eq!(
+            fake.recovering_calls(),
+            vec![("t-other".into(), 1u32, 2u32)],
+            "the unanswered create's crash must not broadcast; other terminals keep flowing"
+        );
+        assert!(fake.respawn_calls().is_empty(), "t-other is mid-backoff");
+        assert!(fake.requeued().contains(&"t-held".to_string()));
+
+        // (2) The create answers: with t-other's backoff fired, the hub
+        // completes t-other's replacement and then processes the HELD
+        // event on its next dequeue — original content intact (attempt 1
+        // for the ORIGINAL terminal id).
+        fake.answer_create("cr-held");
+        tokio::time::advance(std::time::Duration::from_millis(2_050)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            fake.replaced_calls(),
+            vec![("t-other".into(), "t-new".into(), 1u32)]
+        );
+        assert!(
+            fake.recovering_calls()
+                .contains(&("t-held".into(), 1u32, 2u32)),
+            "the held crash must be processed once the create answers"
+        );
     }
 
     /// Delta-fix-1: a revival landing DURING the resume backoff (after the

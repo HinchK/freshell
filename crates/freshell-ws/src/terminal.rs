@@ -2954,7 +2954,10 @@ pub(crate) async fn handle_create(
                 // cross-connection waiters with PTY_SPAWN_FAILED despite the
                 // success — and a later same-requestId resend begins fresh
                 // instead of replaying, letting a NON-negotiated (frozen)
-                // connection's blind resend spawn a duplicate PTY.
+                // connection's blind resend spawn a duplicate PTY. The
+                // settle runs AFTER the reply's admission (see the main
+                // spawn path's dedupe-settle note).
+                let sent = out.send(&created).await;
                 state.create_dedupe.settle(
                     &dedupe_request_id,
                     &existing,
@@ -2962,7 +2965,7 @@ pub(crate) async fn handle_create(
                     create.restore,
                     |tid| state.registry.is_pty_running(tid),
                 );
-                return out.send(&created).await;
+                return sent;
             }
             if state.registry.begin_keyed_create(&create.request_id) {
                 keyed_create_guard = Some(KeyedCreateGuard {
@@ -3205,6 +3208,11 @@ pub(crate) async fn handle_create(
                                 }
                             }
                         }
+                        // Settle AFTER the reply's admission (see the main
+                        // spawn path's dedupe-settle note): the sentinel
+                        // must not report the create answered before the
+                        // `terminal.created` frame is in the outbox.
+                        let sent = out.send(&created).await;
                         state.create_dedupe.settle(
                             &dedupe_request_id,
                             &terminal_id,
@@ -3212,7 +3220,7 @@ pub(crate) async fn handle_create(
                             create.restore,
                             |tid| state.registry.is_pty_running(tid),
                         );
-                        return out.send(&created).await;
+                        return sent;
                     }
                     SessionRefClaim::Held { retry_after_ms } => {
                         // kata b8ke Task 4: the loser reply names the
@@ -4597,8 +4605,17 @@ pub(crate) async fn handle_create(
         session_ref: state.identity.session_ref_for(&terminal_id_for_meta),
     });
     // Record the settled create (server-wide requestId dedupe) and forward
-    // the frame to any cross-connection waiters BEFORE the origin reply —
-    // both are non-blocking sink pushes, so ordering here is cosmetic.
+    // the frame to any cross-connection waiters — AFTER the origin reply's
+    // ADMISSION. The order is load-bearing for the auto-resume hub's
+    // create-answer hold (Gate 1): the create-dedupe InFlight sentinel is
+    // what tells the hub a terminal's `terminal.created` reply has not gone
+    // out yet, and the hub holds the terminal's crash lifecycle (no
+    // recovering/settled broadcast) while that is true. Settling before the
+    // reply is admitted would release that hold a scheduling sliver early —
+    // letting a crash-lifecycle broadcast overtake the created frame on the
+    // creating connection, where the client cannot associate it. Both the
+    // settle and the waiter forwards are non-blocking sink pushes.
+    let sent = out.send(&created).await;
     state.create_dedupe.settle(
         &dedupe_request_id,
         &dedupe_terminal_id,
@@ -4607,7 +4624,6 @@ pub(crate) async fn handle_create(
         |tid| state.registry.is_pty_running(tid),
     );
     log_create_settled(conn_id, &dedupe_request_id, &dedupe_terminal_id, "spawned");
-    let sent = out.send(&created).await;
     // "Notify all clients that list changed" (`ws-handler.ts:2570`); the original's
     // failed-delivery arm (`ws:2553`) broadcasts too, so once the terminal record
     // exists this is unconditional. Live-pinned frame order (exit-orig.json):
