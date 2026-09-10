@@ -24,7 +24,10 @@
 //!   `BlockedHandoff` — the caller must NOT kill. During `Starting` or
 //!   `Stopping` the typed `NotLive` result carries the in-flight state and
 //!   licenses NO kill: the in-flight operation (or the watchdog) owns the
-//!   transition.
+//!   transition. A stop abandoned before the kill (runtime confirmed still
+//!   alive) unwinds via `abort_stop` — `Stopping` → `Live` at the owner's
+//!   pre-stop generation (Task 4 review F1: every granted stop reaches
+//!   commit or abort; nothing strands).
 //! - Release fencing (round-1 review): watcher/TTL releases carry
 //!   `(operation_id, generation, runtime identity)` and are no-ops on any
 //!   mismatch — a delayed watcher can never erase a newer owner or an
@@ -269,6 +272,12 @@ pub enum OwnershipState {
     },
     Stopping {
         owner: Option<OwnerIdentity>,
+        /// The generation the owner held when the stop began (Task 4 review
+        /// F1): `abort_stop` restores `Live` at THIS generation — the fence
+        /// baseline a pre-stop observer (retained stamp, snapshot) still
+        /// carries. `None` for the watchdog's zombie-`Starting` synthesis
+        /// (no prior Live era — not abortable to `Live`).
+        prior_generation: Option<u64>,
         operation_id: String,
         generation: u64,
         initiator: String,
@@ -307,6 +316,19 @@ pub enum BeginOutcome {
 pub enum CommitOutcome {
     Committed,
     StaleGeneration { current_generation: u64 },
+    ForeignOperation,
+}
+
+/// Outcome of [`RuntimeOwnershipRegistry::abort_stop`] (Task 4 review F1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AbortStopOutcome {
+    /// The stop was rolled back; the key is `Live` again (the owner restored
+    /// at its pre-stop generation).
+    Aborted,
+    /// The carried generation no longer matches the record.
+    StaleGeneration { current_generation: u64 },
+    /// The record is not this operation's restorable `Stopping` (moved on,
+    /// or a watchdog-synthesized stop with no prior Live era).
     ForeignOperation,
 }
 
@@ -995,6 +1017,11 @@ impl RuntimeOwnershipRegistry {
                 record.generation += 1;
                 record.state = OwnershipState::Stopping {
                     owner: Some(owner.clone()),
+                    // The PRE-stop Live generation — `abort_stop`'s restore
+                    // target (Task 4 review F1: a stop abandoned with the
+                    // runtime still alive must unwind to a fence-coherent
+                    // `Live`, never the bumped record generation).
+                    prior_generation: Some(generation),
                     operation_id: operation_id.to_string(),
                     generation: record.generation,
                     initiator: initiator.to_string(),
@@ -1056,6 +1083,64 @@ impl RuntimeOwnershipRegistry {
                 CommitOutcome::Committed
             }
             _ => CommitOutcome::ForeignOperation,
+        }
+    }
+
+    /// Abort a GRANTED stop whose kill was abandoned BEFORE the reap (Task 4
+    /// review F1): the stopper began, then exited without killing — the
+    /// runtime is CONFIRMED still alive (e.g. the terminal lane's durable
+    /// ledger close failed cleanly and the kill deliberately left the
+    /// terminal running). `Stopping{op}` → `Live`, restoring the captured
+    /// owner at its PRE-STOP generation so every fence a pre-stop observer
+    /// carries (retained stamp, snapshot) stays coherent — the same
+    /// discipline as the failed-handoff restore (M3/M3-R: never the bumped
+    /// record generation, never a rollback of the record's monotonic
+    /// counter). Fenced on (operation_id, generation) exactly like
+    /// `commit_stop`; a watchdog-synthesized `Stopping` (no prior Live era)
+    /// is a typed `ForeignOperation` no-op — the host's abort/settle/commit
+    /// owns that transition.
+    pub fn abort_stop(
+        &self,
+        provider: &str,
+        session_id: &str,
+        operation_id: &str,
+        generation: u64,
+    ) -> AbortStopOutcome {
+        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let key = SessionKey::new(provider, session_id);
+        let Some(record) = inner.get_mut(&key) else {
+            return AbortStopOutcome::ForeignOperation;
+        };
+        if generation != record.generation {
+            return AbortStopOutcome::StaleGeneration {
+                current_generation: record.generation,
+            };
+        }
+        let initiator = record.state.initiator().unwrap_or_default();
+        match record.state.clone() {
+            OwnershipState::Stopping {
+                owner: Some(owner),
+                prior_generation: Some(prior_generation),
+                operation_id: op,
+                since_ms,
+                ..
+            } if op == operation_id => {
+                let duration_ms = now_epoch_ms().saturating_sub(since_ms);
+                record.state = OwnershipState::Live {
+                    owner: owner.clone(),
+                    generation: prior_generation,
+                    since_ms: now_epoch_ms(),
+                };
+                tracing::warn!(target: "freshell_ownership",
+                    event = "ownership.stop.aborted", operation_id, provider, session_id,
+                    initiator, from_kind = ?owner.kind,
+                    runtime_id = ?owner.terminal_id, pid = ?owner.pid,
+                    epoch = self.epoch, generation, restored_generation = prior_generation,
+                    outcome = "restored_live", duration_ms,
+                    failure_reason = "STOP_ABANDONED_RUNTIME_ALIVE");
+                AbortStopOutcome::Aborted
+            }
+            _ => AbortStopOutcome::ForeignOperation,
         }
     }
 
@@ -1260,6 +1345,10 @@ impl RuntimeOwnershipRegistry {
                     let partial_runtime = record.partial_runtime.take();
                     record.state = OwnershipState::Stopping {
                         owner: partial_runtime.clone(),
+                        // A zombie-`Starting` synthesis has no prior Live
+                        // era — the host's abort/settle/commit owns this
+                        // transition; `abort_stop` is a typed no-op here.
+                        prior_generation: None,
                         operation_id: operation_id.clone(),
                         generation,
                         initiator: initiator.clone(),
@@ -2390,6 +2479,172 @@ mod tests {
             && rec.session_id == "sid"
             && rec.generation >= generation
             && rec.owner_kind == "vacant"));
+    }
+
+    /// Task 4 review F1 (fix): a GRANTED stop abandoned before the kill (the
+    /// runtime confirmed still alive) must roll back to `Live` — at the
+    /// owner's PRE-STOP generation, the same coherence discipline as the
+    /// failed-handoff restore (M3/M3-R) — so a fenced retry carrying the
+    /// retained/snapshot baseline is Granted again (no StaleClaim liveness
+    /// corner), and the aborted stop is consumed (a late commit is foreign).
+    #[test]
+    fn abort_stop_restores_the_live_owner_at_its_pre_stop_generation() {
+        let (r, owner, live_gen) = registry_with_live_terminal();
+        let StopOutcome::Granted {
+            generation: stop_gen,
+        } = r.begin_stop(
+            PROVIDER,
+            "sid",
+            "kill-1",
+            &stop_claim(&owner, r.boot_epoch(), live_gen),
+            "test",
+            2_000,
+        )
+        else {
+            panic!("expected Granted")
+        };
+        assert!(
+            stop_gen > live_gen,
+            "begin_stop bumps the record generation entering Stopping"
+        );
+        // Mid-stop: the wedge shape — a competing start is Blocked.
+        assert!(matches!(
+            r.begin_start(
+                PROVIDER,
+                "sid",
+                RuntimeOwnerKind::FreshAgent,
+                "op-x",
+                None,
+                "test",
+                3_000
+            ),
+            BeginOutcome::Blocked { .. }
+        ));
+        assert_eq!(
+            r.abort_stop(PROVIDER, "sid", "kill-1", stop_gen),
+            AbortStopOutcome::Aborted
+        );
+        match r.observe(PROVIDER, "sid").state {
+            OwnershipState::Live {
+                owner: restored,
+                generation,
+                ..
+            } => {
+                assert_eq!(restored, stamped(owner.clone(), "op-1"));
+                assert_eq!(
+                    generation, live_gen,
+                    "the restored Live keeps the owner's PRE-stop generation"
+                );
+            }
+            other => panic!("abort must restore Live, got {other:?}"),
+        }
+        // The aborted stop is consumed: a late commit for it is foreign.
+        assert_eq!(
+            r.commit_stop(PROVIDER, "sid", "kill-1", stop_gen),
+            CommitOutcome::ForeignOperation
+        );
+        // Fence coherence: a retry carrying the PRE-stop observed pair (the
+        // retained stamp's baseline) is Granted — never a StaleClaim loop —
+        // and that retry still commits normally.
+        let StopOutcome::Granted {
+            generation: retry_gen,
+        } = r.begin_stop(
+            PROVIDER,
+            "sid",
+            "kill-2",
+            &stop_claim(&owner, r.boot_epoch(), live_gen),
+            "test",
+            4_000,
+        )
+        else {
+            panic!("expected Granted on the post-abort retry")
+        };
+        assert!(matches!(
+            r.commit_stop(PROVIDER, "sid", "kill-2", retry_gen),
+            CommitOutcome::Committed
+        ));
+        assert_eq!(r.observe(PROVIDER, "sid").state, OwnershipState::Vacant);
+    }
+
+    /// Task 4 review F1 (fix): `abort_stop` is fenced exactly like
+    /// `commit_stop` — a foreign operation id or a stale generation is a
+    /// typed no-op that changes nothing — and a watchdog-synthesized
+    /// `Stopping` (zombie `Starting`, no prior Live era) is NEVER
+    /// restorable: the host's abort/settle/commit owns that transition.
+    #[test]
+    fn abort_stop_is_fenced_and_never_restores_a_zombie_watchdog_stop() {
+        let (r, owner, live_gen) = registry_with_live_terminal();
+        let StopOutcome::Granted {
+            generation: stop_gen,
+        } = r.begin_stop(
+            PROVIDER,
+            "sid",
+            "kill-1",
+            &stop_claim(&owner, r.boot_epoch(), live_gen),
+            "test",
+            2_000,
+        )
+        else {
+            panic!("expected Granted")
+        };
+        assert_eq!(
+            r.abort_stop(PROVIDER, "sid", "kill-other", stop_gen),
+            AbortStopOutcome::ForeignOperation
+        );
+        assert_eq!(
+            r.abort_stop(PROVIDER, "sid", "kill-1", stop_gen + 7),
+            AbortStopOutcome::StaleGeneration {
+                current_generation: stop_gen
+            }
+        );
+        assert!(matches!(
+            r.observe(PROVIDER, "sid").state,
+            OwnershipState::Stopping { .. }
+        ));
+        // The no-ops changed nothing: the original stop still aborts.
+        assert_eq!(
+            r.abort_stop(PROVIDER, "sid", "kill-1", stop_gen),
+            AbortStopOutcome::Aborted
+        );
+        // An unknown key is foreign.
+        assert_eq!(
+            r.abort_stop(PROVIDER, "sid-unknown", "kill-1", stop_gen),
+            AbortStopOutcome::ForeignOperation
+        );
+
+        // The watchdog's zombie-Starting synthesis: abort is foreign, the
+        // host's commit still works, and post-commit abort stays foreign.
+        let r2 = RuntimeOwnershipRegistry::new();
+        let BeginOutcome::Granted { generation } = r2.begin_start(
+            PROVIDER,
+            "sid-2",
+            RuntimeOwnerKind::Terminal,
+            "op-z",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("expected Granted")
+        };
+        let recovered = r2.recover_stale_starts(10_000, 0);
+        assert_eq!(recovered.len(), 1, "the zombie start is swept");
+        assert_eq!(
+            r2.abort_stop(PROVIDER, "sid-2", "op-z", generation),
+            AbortStopOutcome::ForeignOperation,
+            "a watchdog-synthesized stop has no prior Live era to restore"
+        );
+        assert!(matches!(
+            r2.observe(PROVIDER, "sid-2").state,
+            OwnershipState::Stopping { .. }
+        ));
+        assert!(matches!(
+            r2.commit_stop(PROVIDER, "sid-2", "op-z", generation),
+            CommitOutcome::Committed
+        ));
+        assert_eq!(
+            r2.abort_stop(PROVIDER, "sid-2", "op-z", generation),
+            AbortStopOutcome::ForeignOperation
+        );
     }
 
     #[test]

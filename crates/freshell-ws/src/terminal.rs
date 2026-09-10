@@ -6581,8 +6581,10 @@ async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) ->
             return send(ws_tx, &msg).await;
         }
     }
-    // The stop's second half (commit_stop after the confirmed reap) runs at
-    // every successful `kill_and_broadcast` below.
+    // The stop's second half (commit_stop after the confirmed reap — or the
+    // abort rollback on the clean-close failure below) runs at every exit
+    // past this point: a granted stop never strands `Stopping` (Task 4
+    // review F1).
 
     let create_request_id = state
         .registry
@@ -6627,6 +6629,13 @@ async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) ->
         }
     };
     if close_outcome_is_clean_failure(&close_outcome) {
+        // Task 4 review F1: the clean failure leaves the terminal RUNNING
+        // (the close contract) — the granted stop must roll back to Live
+        // HERE, or the key wedges `Stopping` forever (every later kill is
+        // typed-refused `NotLive{Stopping}`, every create Blocked, and
+        // nothing recovers it: the watchdog sweeps `Starting` only, the
+        // fenced exit-watcher release matches `Live` only).
+        abort_terminal_stop(state, &mut stop_commit);
         const CLOSE_FAILURE_COPY: &str =
             "the terminal close could not be recorded durably; the terminal was left running";
         if let Some(request_id) = &kill.request_id {
@@ -6665,9 +6674,18 @@ async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) ->
     const PERSISTED_CLOSE_COPY: &str =
         "the terminal close is recorded durably, but the ledger reported an error; \
          the terminal was closed to keep state consistent";
+    // Task 4 review F1: the stop's second half runs at EVERY exit that
+    // reaches the kill core — including the already-reaped arm (the registry
+    // kill returning false: the natural-exit race removed the row after the
+    // retained claim was read; the runtime is dead and the pending
+    // (operation_id, generation) matches the record exactly, while
+    // `commit_stop`'s own fence keeps a key that moved on a typed no-op).
+    // The clean-close-failure arm above rolled back via `abort_terminal_stop`
+    // instead — that terminal was left RUNNING, so its key must return to
+    // Live, never Vacant.
+    let existed = kill_and_broadcast(state, &kill.terminal_id);
+    commit_terminal_stop(state, &mut stop_commit);
     if let Some(request_id) = &kill.request_id {
-        let existed = kill_and_broadcast(state, &kill.terminal_id);
-        commit_terminal_stop(state, existed, &mut stop_commit);
         let msg = ServerMessage::TerminalKilled(freshell_protocol::TerminalKilled {
             request_id: request_id.clone(),
             terminal_id: kill.terminal_id,
@@ -6676,8 +6694,7 @@ async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) ->
         });
         return send(ws_tx, &msg).await;
     }
-    if kill_and_broadcast(state, &kill.terminal_id) {
-        commit_terminal_stop(state, true, &mut stop_commit);
+    if existed {
         if persisted_despite_error {
             let msg = ServerMessage::Error(ErrorMsg {
                 owner_kind: None,
@@ -6713,28 +6730,19 @@ fn close_outcome_is_clean_failure(
 /// kata b8ke Task 4: the explicit kill's stop-sequence SECOND HALF —
 /// `commit_stop` after the confirmed reap (this port's registry kill is an
 /// immediate SIGKILL-and-reap, so `kill_and_broadcast` returning IS the
-/// confirmation). `existed == false` (unknown id / already reaped) skips the
-/// commit: the key may have moved on under a newer owner, and a foreign
-/// commit is a typed no-op anyway.
-fn commit_terminal_stop(
-    state: &WsState,
-    existed: bool,
-    stop_commit: &mut Option<(String, String, String, u64)>,
-) {
+/// confirmation). Runs UNCONDITIONALLY once the kill core executed (Task 4
+/// review F1): a registry row already reaped by a natural exit (the registry
+/// kill returning false) still commits — the runtime is dead and the
+/// pending stop matches the record exactly — while `commit_stop`'s own
+/// (operation_id, generation) fence keeps a key that moved on a typed
+/// no-op.
+fn commit_terminal_stop(state: &WsState, stop_commit: &mut Option<(String, String, String, u64)>) {
     let Some((provider, session_id, operation_id, generation)) = stop_commit.take() else {
         return;
     };
     let Some(ownership) = state.ownership.as_ref() else {
         return;
     };
-    if !existed {
-        tracing::warn!(target: "freshell_ws::terminal",
-            provider = %provider, session_id = %session_id,
-            operation_id = %operation_id, generation,
-            "terminal_kill_stop_commit_skipped: the registry row was already gone"
-        );
-        return;
-    }
     let outcome = ownership.commit_stop(&provider, &session_id, &operation_id, generation);
     if !matches!(outcome, freshell_ownership::CommitOutcome::Committed) {
         tracing::warn!(target: "freshell_ws::terminal",
@@ -6742,6 +6750,32 @@ fn commit_terminal_stop(
             operation_id = %operation_id, generation,
             outcome = ?outcome,
             "terminal_kill_stop_commit_foreign: the stop state moved on before the reap"
+        );
+    }
+}
+
+/// kata b8ke Task 4 review F1: the granted stop's CLEAN-failure rollback —
+/// the durable ledger close failed cleanly, so the kill is abandoned with
+/// the terminal left RUNNING (the close contract). `abort_stop` returns the
+/// key to `Live` (the owner restored at its pre-stop generation, fence
+/// coherent) — without this the stop strands `Stopping` forever: every later
+/// kill is typed-refused `NotLive{Stopping}` and every create Blocked, and
+/// nothing recovers it (the watchdog sweeps `Starting` only; the fenced
+/// exit-watcher release matches `Live` only).
+fn abort_terminal_stop(state: &WsState, stop_commit: &mut Option<(String, String, String, u64)>) {
+    let Some((provider, session_id, operation_id, generation)) = stop_commit.take() else {
+        return;
+    };
+    let Some(ownership) = state.ownership.as_ref() else {
+        return;
+    };
+    let outcome = ownership.abort_stop(&provider, &session_id, &operation_id, generation);
+    if !matches!(outcome, freshell_ownership::AbortStopOutcome::Aborted) {
+        tracing::warn!(target: "freshell_ws::terminal",
+            provider = %provider, session_id = %session_id,
+            operation_id = %operation_id, generation,
+            outcome = ?outcome,
+            "terminal_kill_stop_abort_foreign: the stop state moved on before the rollback"
         );
     }
 }
@@ -7825,6 +7859,222 @@ mod terminals_changed_tests {
                 .is_empty(),
             "unknown ids must never enter the cancel set"
         );
+    }
+}
+
+/// kata b8ke Task 4 review F1 (fix): `handle_kill` has two NON-refusal exits
+/// that strand a GRANTED stop in `Stopping` forever — the clean ledger-close
+/// failure (the terminal is left RUNNING by the close contract, so the stop
+/// must roll BACK to `Live`) and the already-reaped registry row (the
+/// natural-exit race: the terminal is dead, so the stop must still COMMIT to
+/// `Vacant`). Nothing else recovers a wedged `Stopping`: the watchdog sweeps
+/// `Starting` only, the fenced exit-watcher release matches `Live` only, and
+/// every later kill is typed-refused `NotLive{Stopping}`.
+#[cfg(test)]
+mod terminal_kill_stop_wedge_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    const KILL_PROVIDER: &str = "codex";
+    const KILL_SESSION: &str = "sid-kill-wedge";
+
+    /// A `WsState` whose coordinator + registry hold one committed
+    /// `Live{Terminal}` owner with a RETAINED claim and NO registry row —
+    /// exactly what `handle_kill` observes in the natural-exit race (the
+    /// reaper consumed the row after the retained claim was read), and a
+    /// legal kill target for the clean-close-failure shape (the terminal
+    /// outlives the abandoned kill).
+    fn state_with_live_terminal_owner(
+        pane_ledger: crate::pane_ledger::PaneLedger,
+    ) -> (
+        WsState,
+        Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+        String,
+    ) {
+        let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let registry =
+            freshell_terminal::TerminalRegistry::new().with_ownership(Arc::clone(&ownership));
+        let freshell_ownership::BeginOutcome::Granted { generation } = ownership.begin_start(
+            KILL_PROVIDER,
+            KILL_SESSION,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-commit-1",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("expected Granted");
+        };
+        let locator = freshell_protocol::SessionLocator {
+            provider: KILL_PROVIDER.to_string(),
+            session_id: KILL_SESSION.to_string(),
+        };
+        assert!(matches!(
+            registry.commit_session_ref_ownership(
+                &locator,
+                "op-commit-1",
+                generation,
+                "t-kill-wedge",
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        ));
+        let auth_token = Arc::new("s3cr3t-token-abcdef".to_string());
+        let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
+        let state = WsState {
+            pane_ledger: Arc::new(pane_ledger),
+            layout: Default::default(),
+            identity: crate::identity::TerminalIdentityRegistry::new(),
+            terminal_meta: Default::default(),
+            auth_token: Arc::clone(&auth_token),
+            server_instance_id: Arc::new("srv-1111".to_string()),
+            boot_id: Arc::new("boot-2222".to_string()),
+            settings: Arc::new(crate::test_settings()),
+            handshake_settings: Arc::new(tokio::sync::RwLock::new(crate::test_settings())),
+            broadcast_tx: Arc::clone(&broadcast_tx),
+            auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+            auto_resume_cancels: Default::default(),
+            fresh_codex: freshell_freshagent::FreshCodexState::new(
+                Arc::clone(&auth_token),
+                Arc::clone(&broadcast_tx),
+                serde_json::json!({ "freshAgent": { "enabled": false } }),
+            ),
+            fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
+            fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
+                freshell_freshagent::FreshAgentState::new(auth_token, Arc::clone(&broadcast_tx)),
+            ),
+            registry,
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+            tabs: crate::tabs::TabsRegistry::new(),
+            screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
+            subagent_interest: Default::default(),
+            host_stats: Default::default(),
+            terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            cli_commands: Arc::new(Vec::new()),
+            ping_interval_ms: 30_000,
+            hello_timeout_ms: 5_000,
+            allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
+            ws_max_payload_bytes: 16 * 1024 * 1024,
+            term09: crate::backpressure::Term09Config::default(),
+            create_protect: crate::create_limit::CreateProtectConfig::default(),
+            spawn_gate: std::sync::Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
+            shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
+            config_fallback: None,
+            opencode_locator: None,
+            codex_locator: None,
+            activity: None,
+            session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
+            reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+            fresh_agent_respawn_counts: Default::default(),
+            ownership: Some(Arc::clone(&ownership)),
+        };
+        (state, ownership, "t-kill-wedge".to_string())
+    }
+
+    /// A closed-outbox sink: replies enqueue as typed closed errors (the
+    /// handler completes its state mutations regardless — these tests assert
+    /// the COORDINATOR state, not the reply frames).
+    fn test_sink() -> WsSink {
+        let (sender, pump) =
+            connection_writer::WriterSender::new(4096, 4096, std::time::Duration::from_secs(10));
+        drop(pump);
+        sender
+    }
+
+    fn kill_for(terminal_id: &str) -> TerminalKill {
+        TerminalKill {
+            terminal_id: terminal_id.to_string(),
+            request_id: Some("req-kill-wedge".to_string()),
+            create_request_id: None,
+            observed_epoch: None,
+            observed_generation: None,
+        }
+    }
+
+    /// F1 path 2 — the natural-exit race: the PTY died on its own during the
+    /// ledger close, so the reaper removed the registry row (the retained
+    /// claim was already read; its fenced release no-ops on `Stopping`). The
+    /// granted stop must still COMMIT — the runtime is dead and the pending
+    /// (operation_id, generation) matches the record exactly.
+    #[tokio::test]
+    async fn kill_whose_row_was_already_reaped_commits_the_granted_stop() {
+        let (state, ownership, terminal_id) =
+            state_with_live_terminal_owner(crate::pane_ledger::PaneLedger::disabled());
+        let mut ws_tx = test_sink();
+        handle_kill(kill_for(&terminal_id), &mut ws_tx, &state).await;
+        assert!(
+            matches!(
+                ownership.observe(KILL_PROVIDER, KILL_SESSION).state,
+                freshell_ownership::OwnershipState::Vacant
+            ),
+            "the reaped terminal's granted stop must commit to Vacant, never strand Stopping"
+        );
+        assert!(
+            matches!(
+                ownership.begin_start(
+                    KILL_PROVIDER,
+                    KILL_SESSION,
+                    freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    "op-after-kill",
+                    None,
+                    "test",
+                    2_000,
+                ),
+                freshell_ownership::BeginOutcome::Granted { .. }
+            ),
+            "a committed stop must reopen the key for the next writer — the wedge symptom is a Blocked-forever key"
+        );
+    }
+
+    /// F1 path 1 — the clean ledger-close failure: the kill is abandoned and
+    /// the terminal is left RUNNING by the close contract. The granted stop
+    /// must roll BACK to `Live` (the owner restored at its pre-stop
+    /// generation, so the retained stamp's fence stays coherent) — and the
+    /// user's kill RETRY must then be granted and complete.
+    #[tokio::test]
+    async fn kill_with_a_clean_close_failure_rolls_the_granted_stop_back_to_live() {
+        let root = std::env::temp_dir().join(format!(
+            "freshell-kill-wedge-{}-{}.d",
+            std::process::id(),
+            now_ms(),
+        ));
+        std::fs::create_dir_all(&root).expect("create ledger root");
+        let ledger = crate::pane_ledger::PaneLedger::new(Some(root.clone()));
+        ledger.fail_next_close_envelope_writes(1);
+        let (state, ownership, terminal_id) = state_with_live_terminal_owner(ledger);
+        let mut ws_tx = test_sink();
+        handle_kill(kill_for(&terminal_id), &mut ws_tx, &state).await;
+        match ownership.observe(KILL_PROVIDER, KILL_SESSION).state {
+            freshell_ownership::OwnershipState::Live {
+                owner, generation, ..
+            } => {
+                assert_eq!(
+                    owner.terminal_id.as_deref(),
+                    Some(terminal_id.as_str()),
+                    "the restored Live must be the abandoned kill's own terminal owner"
+                );
+                assert_eq!(
+                    generation, 1,
+                    "the restored Live keeps the owner's PRE-stop generation (fence coherence)"
+                );
+            }
+            other => {
+                panic!("clean-close failure must roll the granted stop back to Live, got {other:?}")
+            }
+        }
+        // The retry (the ledger's injected failure was one-shot) must be
+        // granted and complete — the full unwedge, end to end.
+        let mut ws_tx = test_sink();
+        handle_kill(kill_for(&terminal_id), &mut ws_tx, &state).await;
+        assert!(
+            matches!(
+                ownership.observe(KILL_PROVIDER, KILL_SESSION).state,
+                freshell_ownership::OwnershipState::Vacant
+            ),
+            "the retried kill must complete the stop sequence to Vacant"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
