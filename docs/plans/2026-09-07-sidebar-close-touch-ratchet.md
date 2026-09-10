@@ -2081,19 +2081,67 @@ async function getSessionTabId(
 Then append inside the single serial test, after the Phase-5 final order assertion (`await expectSidebarOrder(page, [S_GREY, S_OPEN, S_BUSY], 30_000)`) and before the closing `})`:
 
 ```ts
-    // Phase 6 — close-touch acceptance pin (the Requested result): close
-    // S_OPEN's local tab — the OLDEST seeded timestamps (T(3.5)/T(3)), so
-    // grey recency alone sinks it below the newer-seeded pristine-grey
-    // S_BUSY ([S_GREY, S_BUSY, S_OPEN]); only a close-time touch floats it
-    // to the top of the grey section: [S_GREY, S_OPEN, S_BUSY]. S_GREY
-    // stays local-open (tier 1, unchanged above grey).
+    // Phase 6 — close-touch acceptance pin (the Requested result), in two
+    // ordered steps:
     //
-    // KNOWN COVERAGE BOUNDARY: the close-time touch here is
-    // over-determined — the closeTab ratchet (Task 2) and the pre-existing
-    // grey-transition watcher (store/sessionGreyTouch.ts) write the SAME
-    // canonical key with max-wins semantics, so this phase pins the
+    // (a) Clear S_OPEN from device B's registry FIRST, while the local tab
+    //     is still open. Phase 2's pushed snapshot still carries it, and a
+    //     local close against that stale record demotes S_OPEN
+    //     local-open → REMOTE-open (rank 3), which outranks grey (rank 4)
+    //     with no touch at all — the float assertion would pass vacuously.
+    //     records: [] replaces the device snapshot wholesale
+    //     (replace_client_snapshot, crates/freshell-ws/src/tabs.rs:146),
+    //     and the page absorbs it on its next 30s registry query
+    //     (QUERY_INTERVAL_MS, src/store/tabRegistrySync.ts:24) — so the
+    //     poll below reads the client store directly (the row's remote ring
+    //     is suppressed while the session is locally open; the DOM cannot
+    //     show the removal). Local-open wins over remote, making this a
+    //     visually inert stability step: order unchanged.
+    // (b) Close S_OPEN's local tab through the real TabBar close button.
+    //     With no local tab AND no remote record anywhere, S_OPEN is
+    //     GENUINELY grey carrying the OLDEST seeded timestamps (T(3.5)/T(3));
+    //     only a close-time touch floats it above S_BUSY to the top of the
+    //     grey section. S_GREY stays local-open (tier 1, above grey).
+    //
+    // NON-VACUITY: with the close-time touch lost entirely (both the Task 2
+    // closeTab ratchet and the pre-existing grey-transition watcher dead at
+    // the close), S_OPEN falls into grey on its seeded timestamps while
+    // S_BUSY's grey recency is at least its newer seeds (T(2.5)/T(2)) and
+    // at most its Phase-2 watcher touch — either way S_BUSY outranks S_OPEN
+    // and the order settles to [S_GREY, S_BUSY, S_OPEN], failing the final
+    // assertion. The asserted order can only hold through a close-time
+    // touch on S_OPEN.
+    //
+    // KNOWN COVERAGE BOUNDARY: that close-time touch is over-determined —
+    // the closeTab ratchet (Task 2) and the grey-transition watcher
+    // (store/sessionGreyTouch.ts) write the SAME canonical key with
+    // max-wins semantics at this transition, so this phase pins the
     // user-visible float, not the ratchet in isolation (mechanism
     // isolation lives in the unit tests' watcher-gap shapes, Task 2).
+    await deviceB.pushSnapshot({
+      deviceId: DEVICE_B_ID,
+      deviceLabel: 'E2E Device B',
+      clientInstanceId: DEVICE_B_CLIENT,
+      records: [],
+    })
+    // Remote-driven liveness (the spec's 30s query model, poll ≤45s): the
+    // page's remote registry must no longer carry claude:S_OPEN BEFORE the
+    // close, or the vacuity this phase exists to remove comes back through
+    // the stale record.
+    await expect
+      .poll(
+        () =>
+          page.evaluate((key) => {
+            const remoteOpen = window.__FRESHELL_TEST_HARNESS__?.getState?.()?.tabRegistry?.remoteOpen ?? []
+            return remoteOpen.some((record: any) =>
+              (record?.panes ?? []).some((pane: any) =>
+                (pane?.payload?.sessionKeys ?? []).includes(key)))
+          }, `claude:${S_OPEN}`),
+        { timeout: 45_000 },
+      )
+      .toBe(false)
+    // Stability: the clear changed nothing — local-open still owns the top.
+    await expectSidebarOrder(page, [S_GREY, S_OPEN, S_BUSY])
     const sOpenTabId = await getSessionTabId(page, S_OPEN)
     const sOpenTab = page.locator(`[data-context="tab"][data-tab-id="${sOpenTabId}"]`)
     // Plain click = the evidence-gated detach-close (the button's title is
@@ -2123,7 +2171,7 @@ None by design — a test-only task: the pinned close-float behavior shipped in 
 env -u FRESHELL_BIND_HOST npm run test:e2e -- --grep "status-tier sort"
 ```
 
-Expected: PASS (1 test) — all phases green in one serial run; the appended phase must not destabilize the earlier phases (shared 300s test budget; the phase adds ~2-5s).
+Expected: PASS (1 test) — all phases green in one serial run; the appended phase must not destabilize the earlier phases (shared 300s test budget; the phase adds up to ~45s, dominated by the remote-snapshot absorption poll waiting out the page's 30s registry-query interval — the same remote-driven liveness model Phases 1-2 already use).
 
 - [ ] **Step 5: Refactor while green** — No-op by design: the helper duplicates the `getSessionTerminalId` walk VERBATIM per this suite's per-spec-ownership convention (helpers are copied, not imported); extracting a shared walk would violate it.
 
