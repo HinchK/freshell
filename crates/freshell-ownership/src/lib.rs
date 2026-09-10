@@ -143,16 +143,18 @@ fn runtime_matches(owner: &OwnerIdentity, claim: &ReleaseClaim) -> bool {
 /// for Live keys the Live STATE's own generation. A prior owner restored
 /// by a failed handoff keeps its ORIGINAL generation in the Live state
 /// while the record's generation was already bumped by the handoff, and
-/// `begin_stop` compares stop fences against the Live state's generation —
-/// so reporting the record's value for a restored key would leave a
-/// snapshot-derived fence permanently stale (a StaleClaim loop: fail-closed
-/// liveness corner, no safety violation). Remedy chosen over rolling the
-/// record's generation back on restore: the record's generation is the
-/// per-key monotonic counter (never resets — see the crate doc), and a
-/// rollback would let distinct handoff eras reuse a generation number,
-/// weakening the stale-request fence for every consumer. For every
-/// non-Live state the record's generation always equals the state's own
-/// (they are written together), so this only diverges for restored keys.
+/// every fence comparison — begin_stop's stale-claim check and
+/// begin_start/begin_handoff's stale-generation check (M3-R) — uses the
+/// Live state's generation, so reporting the record's value for a
+/// restored key would leave a snapshot-derived fence permanently stale
+/// (a StaleGeneration/StaleClaim loop: fail-closed liveness corner, no
+/// safety violation). Remedy chosen over rolling the record's generation
+/// back on restore: the record's generation is the per-key monotonic
+/// counter (never resets — see the crate doc), and a rollback would let
+/// distinct handoff eras reuse a generation number, weakening the
+/// stale-request fence for every consumer. For every non-Live state the
+/// record's generation always equals the state's own (they are written
+/// together), so this only diverges for restored keys.
 fn snapshot_generation(record: &SessionRecord) -> u64 {
     match &record.state {
         OwnershipState::Live { generation, .. } => *generation,
@@ -614,7 +616,10 @@ impl RuntimeOwnershipRegistry {
         // create ownership — not even a Vacant replay entry for a key it
         // never legitimately touched.
         if let Some(fence) = observed {
-            let current_generation = inner.get(&key).map_or(0, |record| record.generation);
+            // The coherent fence baseline (M3-R): the same value a
+            // snapshot-derived fence carries, so refreshing from
+            // observe()/snapshot_records() converges on restored keys.
+            let current_generation = inner.get(&key).map_or(0, snapshot_generation);
             if fence.epoch != self.epoch || fence.generation < current_generation {
                 tracing::warn!(target: "freshell_ownership",
                     event = "ownership.begin_start.stale_generation",
@@ -707,7 +712,10 @@ impl RuntimeOwnershipRegistry {
         // Fence check BEFORE creating the record (same discipline as
         // begin_start: a stale request creates nothing).
         if let Some(fence) = observed {
-            let current_generation = inner.get(&key).map_or(0, |record| record.generation);
+            // The coherent fence baseline (M3-R): the same value a
+            // snapshot-derived fence carries, so refreshing from
+            // observe()/snapshot_records() converges on restored keys.
+            let current_generation = inner.get(&key).map_or(0, snapshot_generation);
             if fence.epoch != self.epoch || fence.generation < current_generation {
                 tracing::warn!(target: "freshell_ownership",
                     event = "ownership.begin_handoff.stale_generation",
@@ -2667,6 +2675,79 @@ mod tests {
             CommitOutcome::Committed
         );
         assert_eq!(r.observe(PROVIDER, "sid").state, OwnershipState::Vacant);
+    }
+
+    #[test]
+    fn snapshot_fence_satisfies_begin_start_and_handoff_after_a_failed_handoff_restore() {
+        // M3-R (re-review of M3's remedy): begin_start/begin_handoff
+        // compared fences against the RECORD's generation, which a failed
+        // handoff leaves bumped above the restored Live state's own — so
+        // a snapshot-fenced start/handoff was permanently StaleGeneration
+        // on restored keys (refreshing from the snapshot loops). All fence
+        // comparisons must use the same coherent baseline.
+        let (r, _owner, live_gen) = registry_with_live_terminal(); // Live, generation 1
+        let BeginOutcome::Granted { generation: ho_gen } = r.begin_handoff(
+            PROVIDER,
+            "sid",
+            RuntimeOwnerKind::FreshAgent,
+            "ho-1",
+            None,
+            "test",
+            2,
+        ) else {
+            panic!()
+        };
+        assert_eq!(ho_gen, live_gen + 1);
+        assert_eq!(
+            r.fail(PROVIDER, "sid", "ho-1", ho_gen, /* prior_confirmed_live: */ true),
+            FailOutcome::RestoredPriorOwner
+        );
+        // The fence a snapshot consumer derives: snapshot_records reports
+        // the Live state's generation for the restored key.
+        let rec = r
+            .snapshot_records()
+            .into_iter()
+            .find(|rec| rec.provider == PROVIDER && rec.session_id == "sid")
+            .expect("the restored key must replay");
+        assert_eq!(
+            rec.generation, live_gen,
+            "the replay record's generation for a restored-Live key is the Live state's own"
+        );
+        // begin_start: the state machine allows AdoptLive for the same
+        // kind — the snapshot fence must not be StaleGeneration.
+        let start = r.begin_start(
+            PROVIDER,
+            "sid",
+            RuntimeOwnerKind::Terminal,
+            "op-2",
+            Some(ObservedFence {
+                epoch: rec.epoch,
+                generation: rec.generation,
+            }),
+            "test",
+            3,
+        );
+        assert!(
+            matches!(start, BeginOutcome::AdoptLive { .. }),
+            "a snapshot-derived fence must satisfy begin_start on a restored key (got {start:?})"
+        );
+        // begin_handoff: granted from Live of any kind.
+        let handoff = r.begin_handoff(
+            PROVIDER,
+            "sid",
+            RuntimeOwnerKind::FreshAgent,
+            "ho-2",
+            Some(ObservedFence {
+                epoch: rec.epoch,
+                generation: rec.generation,
+            }),
+            "test",
+            4,
+        );
+        assert!(
+            matches!(handoff, BeginOutcome::Granted { .. }),
+            "a snapshot-derived fence must satisfy begin_handoff on a restored key (got {handoff:?})"
+        );
     }
 
     #[test]
