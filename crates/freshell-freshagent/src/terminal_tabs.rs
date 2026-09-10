@@ -713,9 +713,7 @@ pub(crate) struct TerminalSpawnResult {
     /// ONLY when the spawn ran UNDER a handoff ticket — the settle task
     /// skipped its own coordinator commit and the HANDOFF RUNNER (Task 6)
     /// performs the one `commit_live` with this identity. `None` on every
-    /// ordinary spawn (the settle task committed itself). Task 6's runner is
-    /// the consumer; until it lands the field is write-only plumbing.
-    #[allow(dead_code)] // consumed by Task 6's handoff runner
+    /// ordinary spawn (the settle task committed itself).
     pub(crate) owner_identity: Option<freshell_ownership::OwnerIdentity>,
 }
 
@@ -985,7 +983,9 @@ pub(crate) async fn spawn_terminal_pane(
 /// cleanup-then-error contract (`router.ts:817-831`, `:1387-1393`) without needing an
 /// explicit cleanup step, PLUS the MCP-config cleanup the original also performs on a
 /// failed create (`router.ts:819`, `cw:429-448`).
-async fn spawn_terminal_pane_with_handoff(
+/// kata b8ke Task 6: the handoff runner's spawn entry (under-ticket mode —
+/// the settle surfaces the terminal's `OwnerIdentity` instead of committing).
+pub(crate) async fn spawn_terminal_pane_with_handoff(
     state: &FreshAgentState,
     body: &Value,
     tab_id: &str,

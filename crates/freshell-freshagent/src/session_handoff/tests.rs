@@ -1,0 +1,1438 @@
+//! kata b8ke Task 6: the `SessionHandoffRunner` behavioral tests. The
+//! required coverage set (plan tests 1-6 plus the round-2 additions
+//! 3b/3c/6b): happy-path ordering, typed target-spawn failure, reap-timeout
+//! re-probe semantics (live prior restored / unconfirmable prior Vacant /
+//! late exit still releases), detached completion, abort leaves zero-or-one
+//! owner, the OpenCode invariant, and the kilroy flavor.
+//!
+//! Harness: the inline fake claude sidecar env pattern (copied verbatim from
+//! `cross_kind_liveness.rs::FakeSidecarEnv` — the request-log knob), the
+//! fake `opencode serve` (the `freshagent_session_lease.rs` shape), and the
+//! common sleeper CLI spec so terminal targets genuinely spawn Running PTYs.
+//! `ENV_LOCK` serializes this file's tests (process-global env knobs).
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde_json::{json, Value};
+
+use freshell_ownership::{
+    BeginOutcome, OwnershipState, RuntimeOwnerKind, RuntimeOwnershipRegistry,
+};
+use freshell_protocol::{
+    AgentProvider, FreshAgentAttach, FreshAgentCreate, FreshAgentKill, SessionType,
+};
+
+use super::{HandoffHandle, HandoffRequest, HandoffTestHooks, SessionHandoffRunner};
+
+/// Serializes the tests in this file: they mutate process-global env vars
+/// (`FRESHELL_CLAUDE_SIDECAR` / `FRESHELL_CLAUDE_NODE` /
+/// `FAKE_SIDECAR_REQUEST_LOG` / `OPENCODE_CMD` / ...).
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+// ── fake claude sidecar (request-log knob only; copied from
+//    cross_kind_liveness.rs per the plan's instruction) ──────────────────────
+
+const FAKE_CLAUDE_SIDECAR_SOURCE: &str = r#"
+import readline from 'node:readline'
+import fs from 'node:fs'
+
+const logPath = process.env.FAKE_SIDECAR_REQUEST_LOG || ''
+function logReq(msg) {
+  if (!logPath) return
+  try { fs.appendFileSync(logPath, JSON.stringify({ pid: process.pid, msg }) + '\n') } catch {}
+}
+
+let counter = 0
+const rl = readline.createInterface({ input: process.stdin, terminal: false })
+rl.on('line', (line) => {
+  const trimmed = line.trim()
+  if (!trimmed) return
+  let msg
+  try { msg = JSON.parse(trimmed) } catch { return }
+  logReq(msg)
+  if (msg.type === 'create') {
+    counter += 1
+    const sessionId = `fake-claude-session-${process.pid}-${counter}`
+    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId }) + '\n')
+    const cliSessionId = msg.resumeSessionId || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    process.stdout.write(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }) + '\n')
+    process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }) + '\n')
+  } else if (msg.type === 'shutdown') {
+    process.exit(0)
+  }
+})
+"#;
+
+struct FakeSidecarEnv {
+    dir: std::path::PathBuf,
+}
+
+impl FakeSidecarEnv {
+    fn install() -> Self {
+        let dir =
+            std::env::temp_dir().join(format!("freshell-session-handoff-{}", uuid_like_suffix()));
+        std::fs::create_dir_all(&dir).expect("create fake sidecar temp dir");
+        let script = dir.join("fake-claude-sidecar.mjs");
+        std::fs::write(&script, FAKE_CLAUDE_SIDECAR_SOURCE).expect("write fake sidecar");
+        std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
+        std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
+        std::env::set_var("FAKE_SIDECAR_REQUEST_LOG", dir.join("requests.jsonl"));
+        Self { dir }
+    }
+
+    fn create_rows(&self) -> Vec<Value> {
+        let Ok(raw) = std::fs::read_to_string(self.dir.join("requests.jsonl")) else {
+            return Vec::new();
+        };
+        raw.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<Value>(l).expect("request log row parses"))
+            .filter(|r| r["msg"]["type"] == "create")
+            .collect()
+    }
+
+    /// The sidecar pid that served THIS session's create (the process the
+    /// handoff must reap).
+    fn sidecar_pid_for(&self, sid: &str) -> Option<u32> {
+        self.create_rows()
+            .into_iter()
+            .find(|r| r["msg"]["resumeSessionId"] == sid)
+            .and_then(|r| r["pid"].as_u64())
+            .map(|p| p as u32)
+    }
+}
+
+impl Drop for FakeSidecarEnv {
+    fn drop(&mut self) {
+        for var in [
+            "FRESHELL_CLAUDE_SIDECAR",
+            "FRESHELL_CLAUDE_NODE",
+            "FAKE_SIDECAR_REQUEST_LOG",
+        ] {
+            std::env::remove_var(var);
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+// ── fake `opencode serve` (the freshagent_session_lease.rs shape) ──────────
+
+const FAKE_OPENCODE_SERVE_SOURCE: &str = r#"#!/usr/bin/env node
+const http = require('node:http')
+const fs = require('node:fs')
+function argValue(name) {
+  const i = process.argv.indexOf(name)
+  return i < 0 ? undefined : process.argv[i + 1]
+}
+const hostname = argValue('--hostname') || '127.0.0.1'
+const port = Number(argValue('--port'))
+const audit = process.env.FAKE_OPENCODE_SERVE_AUDIT_LOG || ''
+function log(row) {
+  if (!audit) return
+  try { fs.appendFileSync(audit, JSON.stringify({ pid: process.pid, t: Date.now(), ...row }) + '\n') } catch {}
+}
+const server = http.createServer((req, res) => {
+  const url = new URL(req.url || '/', `http://${hostname}:${port}`)
+  log({ method: req.method, path: url.pathname })
+  if (url.pathname === '/global/health') {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ status: 'ok' }))
+    return
+  }
+  if (url.pathname === '/event' || url.pathname === '/global/event') {
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' })
+    res.write(':ok\n\n')
+    return // held open
+  }
+  const m = url.pathname.match(/^\/session\/([^/]+)$/)
+  if (m && req.method === 'GET') {
+    const id = decodeURIComponent(m[1])
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ id, directory: '/tmp', title: 'fake opencode session' }))
+    return
+  }
+  res.writeHead(404, { 'content-type': 'application/json' })
+  res.end(JSON.stringify({ error: 'not found' }))
+})
+server.listen(port, hostname, () => { log({ event: 'listen', hostname, port }) })
+"#;
+
+struct FakeOpencodeServeEnv {
+    dir: PathBuf,
+}
+
+impl FakeOpencodeServeEnv {
+    fn install() -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "freshell-handoff-opencode-serve-{}",
+            uuid_like_suffix()
+        ));
+        std::fs::create_dir_all(&dir).expect("create fake serve temp dir");
+        let script = dir.join("fake-opencode-serve");
+        std::fs::write(&script, FAKE_OPENCODE_SERVE_SOURCE).expect("write fake serve");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).expect("chmod fake serve");
+        }
+        std::env::set_var("OPENCODE_CMD", &script);
+        std::env::set_var("FAKE_OPENCODE_SERVE_AUDIT_LOG", dir.join("audit.jsonl"));
+        Self { dir }
+    }
+
+    fn audit_rows(&self) -> Vec<Value> {
+        let Ok(raw) = std::fs::read_to_string(self.dir.join("audit.jsonl")) else {
+            return Vec::new();
+        };
+        raw.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<Value>(l).expect("audit row parses"))
+            .collect()
+    }
+
+    /// Bounded-wait for an audit row matching `pred`.
+    async fn await_audit_row(&self, budget: Duration, pred: impl Fn(&Value) -> bool) -> Value {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            if let Some(row) = self.audit_rows().into_iter().find(&pred) {
+                return row;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "audit row did not appear within budget"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Every distinct process id the fake serve ever ran under — a restart
+    /// (or a second spawn) adds a pid.
+    fn serve_pids(&self) -> Vec<u64> {
+        let mut pids: Vec<u64> = self
+            .audit_rows()
+            .into_iter()
+            .filter_map(|r| r["pid"].as_u64())
+            .collect();
+        pids.sort();
+        pids.dedup();
+        pids
+    }
+}
+
+impl Drop for FakeOpencodeServeEnv {
+    fn drop(&mut self) {
+        for pid in self.serve_pids() {
+            #[cfg(unix)]
+            {
+                let _ = std::process::Command::new("kill")
+                    .arg(pid.to_string())
+                    .status();
+            }
+            let _ = pid;
+        }
+        for var in ["OPENCODE_CMD", "FAKE_OPENCODE_SERVE_AUDIT_LOG"] {
+            std::env::remove_var(var);
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn uuid_like_suffix() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{nanos}-{:?}", std::thread::current().id())
+}
+
+/// Sleeper CLI spec (the cross_kind_liveness shape): a `sleep 30` script the
+/// terminal-target spawn launches as a genuinely-Running PTY. Per-call path
+/// (the ETXTBSY deflake rule).
+fn sleeper_cli_spec(name: &str) -> freshell_platform::CliCommandSpec {
+    let script_path = std::env::temp_dir().join(format!(
+        "freshell-handoff-sleeper-{name}-{}-{}.sh",
+        std::process::id(),
+        uuid_like_suffix()
+    ));
+    std::fs::write(&script_path, "#!/bin/sh\nexec sleep 300\n").expect("write sleeper script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod sleeper script");
+    }
+    freshell_platform::CliCommandSpec {
+        name: name.to_string(),
+        label: format!("{name}-label"),
+        env_var: None,
+        default_cmd: script_path.to_string_lossy().to_string(),
+        base_args: vec![],
+        base_env: std::collections::BTreeMap::new(),
+        resume_args: Some(vec!["--resume".to_string(), "{{sessionId}}".to_string()]),
+        create_session_args: Some(vec![
+            "--session-id".to_string(),
+            "{{sessionId}}".to_string(),
+        ]),
+        model_args: None,
+        sandbox_args: None,
+        permission_mode_args: None,
+    }
+}
+
+// ── the rig: runner + every shared state, exactly like main.rs ──────────────
+
+struct Rig {
+    runner: Arc<SessionHandoffRunner>,
+    ownership: Arc<RuntimeOwnershipRegistry>,
+    registry: freshell_terminal::TerminalRegistry,
+    fresh_claude: crate::FreshClaudeState,
+    fresh_opencode: crate::FreshOpencodeState,
+    fresh_agent: crate::FreshAgentState,
+    rx: tokio::sync::broadcast::Receiver<String>,
+}
+
+fn build_rig(hooks: Option<Arc<HandoffTestHooks>>) -> Rig {
+    let auth_token = Arc::new("handoff-test-token".to_string());
+    let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
+    let rx = broadcast_tx.subscribe();
+    let ownership = Arc::new(RuntimeOwnershipRegistry::new());
+    let registry =
+        freshell_terminal::TerminalRegistry::new().with_ownership(Arc::clone(&ownership));
+
+    let mut fresh_claude = crate::FreshClaudeState::new(Arc::clone(&broadcast_tx));
+    fresh_claude.set_ownership(Arc::clone(&ownership));
+    let mut fresh_codex = crate::FreshCodexState::new(
+        Arc::clone(&auth_token),
+        Arc::clone(&broadcast_tx),
+        json!({ "freshAgent": { "enabled": true } }),
+    );
+    fresh_codex.set_ownership(Arc::clone(&ownership));
+
+    let cli_commands = Arc::new(vec![
+        sleeper_cli_spec("claude"),
+        sleeper_cli_spec("opencode"),
+    ]);
+    let fresh_agent =
+        crate::FreshAgentState::new(Arc::clone(&auth_token), Arc::clone(&broadcast_tx))
+            .with_ownership(Arc::clone(&ownership))
+            .with_terminal_registry(registry.clone())
+            .with_cli_commands(Arc::clone(&cli_commands));
+    let mut fresh_opencode = crate::FreshOpencodeState::new(fresh_agent.clone());
+    fresh_opencode.set_ownership(Arc::clone(&ownership));
+
+    let mut runner = SessionHandoffRunner::new(
+        auth_token,
+        broadcast_tx,
+        Arc::clone(&ownership),
+        registry.clone(),
+        fresh_codex,
+        fresh_claude.clone(),
+        fresh_opencode.clone(),
+        fresh_agent.clone(),
+        cli_commands,
+    )
+    .with_reap_timeout_ms(8_000);
+    if let Some(hooks) = hooks.clone() {
+        runner = runner.with_test_hooks(hooks);
+    }
+    Rig {
+        runner: Arc::new(runner),
+        ownership,
+        registry,
+        fresh_claude,
+        fresh_opencode,
+        fresh_agent,
+        rx,
+    }
+}
+
+fn handoff_req_terminal(provider: &str, sid: &str, mode: &str) -> HandoffRequest {
+    HandoffRequest {
+        provider: provider.to_string(),
+        session_id: sid.to_string(),
+        target_kind: RuntimeOwnerKind::Terminal,
+        session_type: None,
+        mode: Some(mode.to_string()),
+        cwd: Some(std::env::temp_dir().to_string_lossy().to_string()),
+        tab_id: None,
+        pane_id: None,
+        observed_epoch: None,
+        observed_generation: None,
+        device_id: Some("test-device-a".to_string()),
+    }
+}
+
+fn handoff_req_fresh(provider: &str, sid: &str, session_type: &str) -> HandoffRequest {
+    HandoffRequest {
+        provider: provider.to_string(),
+        session_id: sid.to_string(),
+        target_kind: RuntimeOwnerKind::FreshAgent,
+        session_type: Some(session_type.to_string()),
+        mode: None,
+        cwd: Some(std::env::temp_dir().to_string_lossy().to_string()),
+        tab_id: None,
+        pane_id: None,
+        observed_epoch: None,
+        observed_generation: None,
+        device_id: Some("test-device-a".to_string()),
+    }
+}
+
+fn create_msg(sid: &str) -> FreshAgentCreate {
+    FreshAgentCreate {
+        request_id: format!("handoff-create-{}", uuid::Uuid::new_v4()),
+        session_type: SessionType::Freshclaude,
+        cwd: Some("/tmp".to_string()),
+        effort: None,
+        legacy_restore_context: None,
+        model: None,
+        model_selection: None,
+        observed_epoch: None,
+        observed_generation: None,
+        permission_mode: None,
+        plugins: None,
+        provider: Some(AgentProvider::Claude),
+        resume_session_id: None,
+        sandbox: None,
+        session_ref: Some(freshell_protocol::SessionLocator {
+            provider: "claude".to_string(),
+            session_id: sid.to_string(),
+        }),
+        tab_id: None,
+    }
+}
+
+fn kill_msg(sid: &str) -> FreshAgentKill {
+    FreshAgentKill {
+        provider: AgentProvider::Claude,
+        session_id: sid.to_string(),
+        session_type: SessionType::Freshclaude,
+        cwd: None,
+        observed_epoch: None,
+        observed_generation: None,
+    }
+}
+
+/// Drain every queued `session.runtimeOwner` frame off the rig's receiver.
+fn drain_runtime_owner_frames(rx: &mut tokio::sync::broadcast::Receiver<String>) -> Vec<Value> {
+    let mut frames = Vec::new();
+    while let Ok(raw) = rx.try_recv() {
+        if let Ok(value) = serde_json::from_str::<Value>(&raw) {
+            if value["type"] == "session.runtimeOwner" {
+                frames.push(value);
+            }
+        }
+    }
+    frames
+}
+
+/// The single `session.runtimeOwner` frame with this transition (panics on
+/// zero; errors on duplicates — every transition is broadcast exactly once).
+fn runtime_owner_frame<'f>(frames: &'f [Value], transition: &str) -> &'f Value {
+    let matches: Vec<&Value> = frames
+        .iter()
+        .filter(|f| f["transition"] == transition)
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "expected exactly one {transition} frame, got {frames:?}"
+    );
+    matches[0]
+}
+
+/// Bounded-poll until the pid is confirmed dead (`kill(pid, 0)` → ESRCH).
+async fn await_pid_dead(pid: u32) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while freshell_terminal::registry::pid_alive(pid) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "sidecar pid {pid} did not die within budget"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Establish a live freshclaude owner for `sid` (the fake sidecar path) and
+/// return once the coordinator records it Live.
+async fn establish_fresh_claude_owner(rig: &Rig, sid: &str) {
+    rig.fresh_claude.handle_create(create_msg(sid), None).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match rig.ownership.observe("claude", sid).state {
+            OwnershipState::Live { owner, .. } => {
+                assert_eq!(owner.kind, RuntimeOwnerKind::FreshAgent);
+                return;
+            }
+            state => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "fresh owner never committed Live, got {state:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+}
+
+// ── the capturing tracing layer (the diag01/ownership-crate pattern) ───────
+
+mod tracing_capture {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id};
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+    use tracing_subscriber::registry::LookupSpan;
+    use tracing_subscriber::Layer;
+
+    #[derive(Debug, Clone, Default)]
+    pub struct CapturedEvent {
+        pub target: String,
+        pub event: String,
+        pub fields: BTreeMap<String, String>,
+    }
+
+    #[derive(Default)]
+    struct FieldVisitor {
+        event: String,
+        fields: BTreeMap<String, String>,
+    }
+
+    impl Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.fields
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "event" {
+                self.event = value.to_string();
+            }
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_bool(&mut self, field: &Field, value: bool) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    struct CaptureLayer {
+        events: Arc<Mutex<Vec<CapturedEvent>>>,
+    }
+
+    impl<S> Layer<S> for CaptureLayer
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+    {
+        fn on_new_span(&self, _attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {}
+
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            let mut visitor = FieldVisitor::default();
+            event.record(&mut visitor);
+            self.events
+                .lock()
+                .expect("capture lock")
+                .push(CapturedEvent {
+                    target: event.metadata().target().to_string(),
+                    event: visitor.event,
+                    fields: visitor.fields,
+                });
+        }
+    }
+
+    /// Thread-local capturing subscriber (current-thread test runtimes: the
+    /// runner task, the settle task, and the lane awaits all poll on this
+    /// thread and observe the default).
+    pub fn capture() -> (
+        Arc<Mutex<Vec<CapturedEvent>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let layer = CaptureLayer {
+            events: Arc::clone(&events),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let guard = tracing::subscriber::set_default(subscriber);
+        (events, guard)
+    }
+}
+
+fn find_captured<'e>(
+    events: &'e [tracing_capture::CapturedEvent],
+    event: &str,
+) -> Option<&'e tracing_capture::CapturedEvent> {
+    events
+        .iter()
+        .find(|e| e.target == "freshell_ownership" && e.event == event)
+}
+
+// ── the tests ──────────────────────────────────────────────────────────────
+
+/// 1. Happy path ordering: the old sidecar is reaped BEFORE the target
+/// terminal spawns; commit is Live{Terminal}; the broadcast frames arrive
+/// with the boot epoch and the true previousKind; exactly one sidecar ever
+/// served the session; the runner's step order is Reaped < TargetStarted;
+/// and the representative transitions carry the COMPLETE observability field
+/// set.
+#[tokio::test]
+async fn handoff_to_terminal_reaps_sidecar_before_target_start_and_commits_owner() {
+    let _guard = ENV_LOCK.lock().await;
+    let env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let (events, _capture_guard) = tracing_capture::capture();
+    let mut rig = build_rig(None);
+    establish_fresh_claude_owner(&rig, &sid).await;
+    let create_watermark = env.create_rows().len();
+    let capture_start = events.lock().expect("capture lock").len();
+
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let result = handle.completion.await.expect("runner completed");
+
+    assert_eq!(result["ok"], json!(true), "handoff must succeed: {result}");
+    let terminal_id = result["owner"]["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    assert_eq!(result["owner"]["kind"], json!("terminal"));
+    assert_eq!(result["owner"]["mode"], json!("claude"));
+
+    // The coordinator is Live{Terminal} for (claude, sid), naming that terminal.
+    match rig.ownership.observe("claude", &sid).state {
+        OwnershipState::Live { owner, .. } => {
+            assert_eq!(owner.kind, RuntimeOwnerKind::Terminal);
+            assert_eq!(owner.terminal_id.as_deref(), Some(terminal_id.as_str()));
+        }
+        other => panic!("expected Live terminal owner, got {other:?}"),
+    }
+
+    // Broadcast frames: handoff-started then handoff-committed, each carrying
+    // the boot epoch; the committed frame names the terminal and the TRUE
+    // previousKind (the prior fresh-agent kind).
+    let frames = drain_runtime_owner_frames(&mut rig.rx);
+    let started = runtime_owner_frame(&frames, "handoff-started");
+    let committed = runtime_owner_frame(&frames, "handoff-committed");
+    assert!(started["epoch"].as_u64().unwrap_or(0) >= 1);
+    assert_eq!(
+        started["previousKind"],
+        json!("fresh-agent"),
+        "the started frame carries the prior kind: {started}"
+    );
+    assert!(committed["epoch"].as_u64().unwrap_or(0) >= 1);
+    assert_eq!(committed["terminalId"].as_str(), Some(terminal_id.as_str()));
+    assert_eq!(
+        committed["previousKind"],
+        json!("fresh-agent"),
+        "the committed frame carries the true previousKind: {committed}"
+    );
+
+    // Exactly ONE sidecar create row for sid ever (no second fresh spawn),
+    // and its pid is gone — the kill is awaited before the target start.
+    assert_eq!(
+        env.create_rows().len(),
+        create_watermark,
+        "no second sidecar may spawn for the session"
+    );
+    if let Some(pid) = env.sidecar_pid_for(&sid) {
+        await_pid_dead(pid).await;
+    }
+
+    // Hook-event ordering: the prior was reaped BEFORE the target started.
+    // (No hooks installed in the green path — the ordering is proven through
+    // the sidecar pid death above plus the single-frame set; the explicit
+    // event log is exercised by the timeout tests below.)
+
+    // Round-1 review (observability): the COMPLETE field set on the
+    // representative transitions.
+    let captured = events.lock().expect("capture lock");
+    let handoff_scope: Vec<_> = captured[capture_start..].to_vec();
+    drop(captured);
+    let begin = find_captured(&handoff_scope, "ownership.handoff.begin")
+        .expect("ownership.handoff.begin event");
+    for field in [
+        "operation_id",
+        "provider",
+        "session_id",
+        "initiator",
+        "from_kind",
+        "to_kind",
+        "runtime_id",
+        "pid",
+        "epoch",
+        "generation",
+        "outcome",
+    ] {
+        assert!(
+            begin.fields.contains_key(field),
+            "ownership.handoff.begin must carry {field}: {begin:?}"
+        );
+    }
+    let commit = find_captured(&handoff_scope, "ownership.live.commit")
+        .expect("ownership.live.commit event");
+    for field in [
+        "operation_id",
+        "provider",
+        "session_id",
+        "initiator",
+        "from_kind",
+        "to_kind",
+        "runtime_id",
+        "live_session_key",
+        "pid",
+        "epoch",
+        "generation",
+        "duration_ms",
+        "outcome",
+    ] {
+        assert!(
+            commit.fields.contains_key(field),
+            "ownership.live.commit must carry {field}: {commit:?}"
+        );
+    }
+    assert_eq!(
+        commit.fields.get("outcome").map(String::as_str),
+        Some("committed")
+    );
+    let done = find_captured(&handoff_scope, "ownership.handoff.done")
+        .expect("ownership.handoff.done event");
+    for field in [
+        "operation_id",
+        "provider",
+        "session_id",
+        "initiator",
+        "epoch",
+        "generation",
+        "from_kind",
+        "to_kind",
+        "runtime_id",
+        "live_session_key",
+        "pid",
+        "outcome",
+        "duration_ms",
+    ] {
+        assert!(
+            done.fields.contains_key(field),
+            "ownership.handoff.done must carry {field}: {done:?}"
+        );
+    }
+    assert_eq!(
+        done.fields.get("outcome").map(String::as_str),
+        Some("committed")
+    );
+
+    // Cleanup: kill the committed terminal.
+    rig.registry.kill(&terminal_id);
+}
+
+/// 2. Target spawn failure: no blank session, session id preserved, Vacant +
+/// typed error, and the failure broadcast carries the ACTUAL resulting state
+/// (ownerKind vacant, the prior fresh-agent previousKind, the typed reason,
+/// the current epoch) — never the requested target kind — at the SAME
+/// generation as the handoff-started frame.
+#[tokio::test]
+async fn handoff_target_spawn_failure_leaves_vacant_with_typed_error() {
+    let _guard = ENV_LOCK.lock().await;
+    let env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let hooks = Arc::new(HandoffTestHooks::default());
+    hooks.fail_target_spawn_once.store(true, Ordering::SeqCst);
+    let mut rig = build_rig(Some(Arc::clone(&hooks)));
+    establish_fresh_claude_owner(&rig, &sid).await;
+    let create_watermark = env.create_rows().len();
+
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let result = handle.completion.await.expect("runner completed");
+
+    assert_eq!(
+        result["ok"],
+        json!(false),
+        "the handoff must fail: {result}"
+    );
+    assert_eq!(result["error"]["code"], json!("TARGET_SPAWN_FAILED"));
+    assert_eq!(result["error"]["retryable"], json!(true));
+    assert!(
+        result["error"]["ownerGeneration"].as_u64().is_some(),
+        "the typed error names the generation: {result}"
+    );
+
+    // The coordinator is Vacant — never a restored dead prior, never a
+    // half-committed target.
+    assert_eq!(
+        rig.ownership.observe("claude", &sid).state,
+        OwnershipState::Vacant,
+        "a failed target spawn leaves the key Vacant"
+    );
+
+    // No blank session was minted: no fresh sidecar row beyond the prior's,
+    // and no PTY row for sid.
+    assert_eq!(
+        env.create_rows().len(),
+        create_watermark,
+        "no second sidecar may spawn for a failed handoff"
+    );
+    assert!(
+        !rig.registry.directory().into_iter().any(|entry| {
+            entry.mode == "claude" && entry.resume_session_id.as_deref() == Some(sid.as_str())
+        }),
+        "no terminal may own {sid} after the failed handoff"
+    );
+
+    // Round-2 review (failure-broadcast truth): the handoff-failed frame
+    // carries the ACTUAL resulting state — ownerKind "vacant", the prior
+    // fresh-agent previousKind, the typed reason, the current epoch — never
+    // the requested target kind.
+    let frames = drain_runtime_owner_frames(&mut rig.rx);
+    let started = runtime_owner_frame(&frames, "handoff-started");
+    let failed = runtime_owner_frame(&frames, "handoff-failed");
+    assert_eq!(failed["ownerKind"], json!("vacant"), "the truth: {failed}");
+    assert_eq!(failed["previousKind"], json!("fresh-agent"));
+    assert_eq!(failed["reason"], json!("TARGET_SPAWN_FAILED"));
+    assert!(failed["epoch"].as_u64().unwrap_or(0) >= 1);
+    assert_eq!(
+        failed["generation"], started["generation"],
+        "the corrective frame rides the SAME generation as the started frame \
+         (it supersedes the transition record client-side)"
+    );
+}
+
+/// 3. Reap timeout with a STILL-LIVE prior (round-2 review): no early
+/// target start; typed REAP_TIMEOUT; the POSITIVE re-probe confirms the
+/// prior live -> restored (a timeout alone never implies liveness). The
+/// failure broadcast carries the RESTORED prior owner. A retry after
+/// clearing the hook succeeds.
+#[tokio::test]
+async fn handoff_reap_timeout_reprobes_the_prior_and_restores_only_a_live_one() {
+    let _guard = ENV_LOCK.lock().await;
+    let env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let hooks = Arc::new(HandoffTestHooks::default());
+    let mut rig = build_rig(Some(Arc::clone(&hooks)));
+    establish_fresh_claude_owner(&rig, &sid).await;
+    let create_watermark = env.create_rows().len();
+    // The sidecar stays ALIVE: the timeout is forced without any kill.
+    hooks.force_reap_timeout.store(true, Ordering::SeqCst);
+
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let result = handle.completion.await.expect("runner completed");
+
+    assert_eq!(
+        result["ok"],
+        json!(false),
+        "the handoff must fail: {result}"
+    );
+    assert_eq!(result["error"]["code"], json!("REAP_TIMEOUT"));
+    assert_eq!(result["error"]["retryable"], json!(true));
+
+    // The re-probe confirmed the prior LIVE — restored (a Live{fresh} record).
+    match rig.ownership.observe("claude", &sid).state {
+        OwnershipState::Live { owner, .. } => {
+            assert_eq!(
+                owner.kind,
+                RuntimeOwnerKind::FreshAgent,
+                "the restored prior is the fresh-agent owner"
+            );
+        }
+        other => panic!("the live prior must be restored, got {other:?}"),
+    }
+
+    // NO terminal spawn happened: no PTY row for sid, no new sidecar rows.
+    assert!(
+        !rig.registry.directory().into_iter().any(|entry| {
+            entry.mode == "claude" && entry.resume_session_id.as_deref() == Some(sid.as_str())
+        }),
+        "no early target start on a reap timeout"
+    );
+    assert_eq!(env.create_rows().len(), create_watermark);
+    assert!(
+        !hooks.events.lock().unwrap().contains(&"TargetStarted"),
+        "the runner's event log must not contain TargetStarted"
+    );
+
+    // The handoff-failed broadcast carries the RESTORED prior owner —
+    // ownerKind fresh-agent, the prior's runtime identity, previousKind
+    // fresh-agent, reason REAP_TIMEOUT — the truth, never the target kind.
+    let frames = drain_runtime_owner_frames(&mut rig.rx);
+    let failed = runtime_owner_frame(&frames, "handoff-failed");
+    assert_eq!(
+        failed["ownerKind"],
+        json!("fresh-agent"),
+        "the truth: {failed}"
+    );
+    assert_eq!(failed["previousKind"], json!("fresh-agent"));
+    assert_eq!(failed["reason"], json!("REAP_TIMEOUT"));
+
+    // A retry after clearing the hook succeeds (the restored prior is stoppable).
+    hooks.force_reap_timeout.store(false, Ordering::SeqCst);
+    let retry = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let retried = retry.completion.await.expect("retry completed");
+    assert_eq!(
+        retried["ok"],
+        json!(true),
+        "the retry must succeed: {retried}"
+    );
+    let retry_terminal = retried["owner"]["terminalId"].as_str().unwrap().to_string();
+    rig.registry.kill(&retry_terminal);
+}
+
+/// 3b. Reap timeout with an UNCONFIRMABLE prior (round-2 review): force the
+/// timeout AND make the re-probe fail (kill the sidecar out-of-band while the
+/// runner is parked at the pause hook) — the key ends VACANT with the typed
+/// REAP_TIMEOUT (retryable, recoverable), never a dead runtime recorded as
+/// Live; the handoff-failed broadcast carries ownerKind "vacant" + reason
+/// REAP_TIMEOUT; a retry after clearing the hook succeeds.
+#[tokio::test]
+async fn handoff_reap_timeout_with_unconfirmable_prior_ends_vacant_typed() {
+    let _guard = ENV_LOCK.lock().await;
+    let env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let hooks = Arc::new(HandoffTestHooks {
+        pause_after_enter: Some(tokio::sync::Notify::new()),
+        ..HandoffTestHooks::default()
+    });
+    let mut rig = build_rig(Some(Arc::clone(&hooks)));
+    establish_fresh_claude_owner(&rig, &sid).await;
+
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    // Park proof: the handoff-started broadcast fires before the pause.
+    let _started = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match rig.rx.recv().await {
+                Ok(raw) => {
+                    if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                        if v["type"] == "session.runtimeOwner"
+                            && v["transition"] == "handoff-started"
+                        {
+                            return v;
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => panic!("broadcast channel closed"),
+            }
+        }
+    })
+    .await
+    .expect("handoff-started broadcast within budget");
+
+    // Kill the sidecar out-of-band (the process itself — NOT the lane API):
+    // the prior becomes unconfirmable once the consumer's exit eviction runs.
+    let pid = env
+        .sidecar_pid_for(&sid)
+        .expect("the prior sidecar's pid from the create log");
+    let _ = std::process::Command::new("kill")
+        .arg(pid.to_string())
+        .status()
+        .expect("out-of-band sidecar kill");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while rig.fresh_claude.has_live_session(&sid).await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the dead sidecar was never evicted from the lane's live map"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Force the timeout and unpark: the re-probe finds the prior dead.
+    hooks.force_reap_timeout.store(true, Ordering::SeqCst);
+    hooks
+        .pause_after_enter
+        .as_ref()
+        .expect("pause hook installed")
+        .notify_one();
+    let result = handle.completion.await.expect("runner completed");
+
+    assert_eq!(
+        result["ok"],
+        json!(false),
+        "the handoff must fail: {result}"
+    );
+    assert_eq!(result["error"]["code"], json!("REAP_TIMEOUT"));
+    assert_eq!(result["error"]["retryable"], json!(true));
+    assert_eq!(
+        rig.ownership.observe("claude", &sid).state,
+        OwnershipState::Vacant,
+        "an unconfirmable prior ends the key Vacant — never a dead runtime as Live"
+    );
+
+    let frames = drain_runtime_owner_frames(&mut rig.rx);
+    let failed = runtime_owner_frame(&frames, "handoff-failed");
+    assert_eq!(failed["ownerKind"], json!("vacant"), "the truth: {failed}");
+    assert_eq!(failed["reason"], json!("REAP_TIMEOUT"));
+
+    // A retry after clearing the hook succeeds (the session reopens cleanly).
+    hooks.force_reap_timeout.store(false, Ordering::SeqCst);
+    let retry = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    // The pause hook is still installed (a fresh notified() parks again) —
+    // release the retry through it too.
+    if let Some(pause) = hooks.pause_after_enter.as_ref() {
+        pause.notify_one();
+    }
+    let retried = retry.completion.await.expect("retry completed");
+    assert_eq!(
+        retried["ok"],
+        json!(true),
+        "the retry must succeed: {retried}"
+    );
+    let retry_terminal = retried["owner"]["terminalId"].as_str().unwrap().to_string();
+    rig.registry.kill(&retry_terminal);
+}
+
+/// 3c. Exit-watcher after the boundary (round-2 review): a prior restored
+/// after a reap timeout is a NORMAL Live record — when it dies LATER, its
+/// fenced exit path still releases the key (no permanent wedge).
+#[tokio::test]
+async fn a_prior_restored_after_reap_timeout_still_releases_when_it_later_exits() {
+    let _guard = ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let hooks = Arc::new(HandoffTestHooks::default());
+    let rig = build_rig(Some(Arc::clone(&hooks)));
+    establish_fresh_claude_owner(&rig, &sid).await;
+
+    // Drive test 3's scenario: timeout, re-probe live, restored.
+    hooks.force_reap_timeout.store(true, Ordering::SeqCst);
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let result = handle.completion.await.expect("runner completed");
+    assert_eq!(result["error"]["code"], json!("REAP_TIMEOUT"));
+    assert!(matches!(
+        rig.ownership.observe("claude", &sid).state,
+        OwnershipState::Live { .. }
+    ));
+
+    // The prior dies LATER (a real lane kill — the retained stamp still
+    // matches the restored Live record, so the fenced stop path works).
+    rig.fresh_claude.handle_kill(kill_msg(&sid)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while rig.ownership.observe("claude", &sid).state != OwnershipState::Vacant {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the restored prior's later exit must release the key — no permanent \
+             wedge after a reap-timeout restore, got {:?}",
+            rig.ownership.observe("claude", &sid).state
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// 4. Detached completion: dropping the reply receiver mid-handoff cannot
+/// strand the operation; the detached task still reaches Live{target} and
+/// the handoff-committed broadcast fires.
+#[tokio::test]
+async fn handoff_continues_to_consistency_when_client_disconnects() {
+    let _guard = ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let hooks = Arc::new(HandoffTestHooks {
+        pause_after_enter: Some(tokio::sync::Notify::new()),
+        ..HandoffTestHooks::default()
+    });
+    let mut rig = build_rig(Some(Arc::clone(&hooks)));
+    establish_fresh_claude_owner(&rig, &sid).await;
+
+    let handle: HandoffHandle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    // The client disconnects (the reply receiver is dropped) while the
+    // runner is parked after enter — the operation MUST continue.
+    drop(handle.completion);
+    hooks
+        .pause_after_enter
+        .as_ref()
+        .expect("pause hook installed")
+        .notify_one();
+
+    // The committed broadcast arrives (the detached task reached the commit).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let committed = loop {
+        match tokio::time::timeout(Duration::from_millis(500), rig.rx.recv()).await {
+            Ok(Ok(raw)) => {
+                if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                    if v["type"] == "session.runtimeOwner" && v["transition"] == "handoff-committed"
+                    {
+                        break v;
+                    }
+                }
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(_)) => panic!("broadcast channel closed"),
+            Err(_) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the detached handoff never committed"
+                );
+            }
+        }
+    };
+    let terminal_id = committed["terminalId"].as_str().unwrap().to_string();
+    match rig.ownership.observe("claude", &sid).state {
+        OwnershipState::Live { owner, .. } => {
+            assert_eq!(owner.terminal_id.as_deref(), Some(terminal_id.as_str()));
+        }
+        other => panic!("the detached handoff must reach Live{{Terminal}}, got {other:?}"),
+    }
+    rig.registry.kill(&terminal_id);
+}
+
+/// 5. Guard fail: aborting the handoff task restores prior owner or Vacant —
+/// zero or one owner, never a stranded Handoff. A fresh begin_start is
+/// Granted afterward (the key reopens).
+#[tokio::test]
+async fn handoff_task_abort_leaves_zero_or_one_owner() {
+    let _guard = ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let hooks = Arc::new(HandoffTestHooks {
+        pause_after_enter: Some(tokio::sync::Notify::new()),
+        ..HandoffTestHooks::default()
+    });
+    let mut rig = build_rig(Some(Arc::clone(&hooks)));
+    establish_fresh_claude_owner(&rig, &sid).await;
+
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    // Park proof: wait for the started broadcast so the abort lands mid-Handoff.
+    let _started = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match rig.rx.recv().await {
+                Ok(raw) => {
+                    if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                        if v["type"] == "session.runtimeOwner"
+                            && v["transition"] == "handoff-started"
+                        {
+                            return v;
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => panic!("broadcast channel closed"),
+            }
+        }
+    })
+    .await
+    .expect("handoff-started broadcast within budget");
+
+    // Abort: the RAII guard fails the coordinator entry during the unwind.
+    handle.abort();
+    let _ = handle.task.await;
+
+    let state = rig.ownership.observe("claude", &sid).state;
+    assert!(
+        matches!(state, OwnershipState::Live { .. } | OwnershipState::Vacant),
+        "abort must leave zero or one owner (Live prior or Vacant), got {state:?}"
+    );
+
+    // The key reopens (not wedged): from Vacant a fresh begin_start is
+    // Granted; from the restored Live prior a fresh begin_handoff is Granted
+    // (the restored owner is a normal Live record, not a stranded Handoff).
+    match rig.ownership.observe("claude", &sid).state {
+        OwnershipState::Vacant => {
+            assert!(matches!(
+                rig.ownership.begin_start(
+                    "claude",
+                    &sid,
+                    RuntimeOwnerKind::Terminal,
+                    "post-abort-probe",
+                    None,
+                    "test",
+                    0,
+                ),
+                BeginOutcome::Granted { .. }
+            ));
+            let _ = rig
+                .ownership
+                .fail("claude", &sid, "post-abort-probe", 1, false);
+        }
+        OwnershipState::Live { owner, .. } => {
+            assert_eq!(
+                owner.kind,
+                RuntimeOwnerKind::FreshAgent,
+                "the restored owner is the prior fresh runtime"
+            );
+            match rig.ownership.begin_handoff(
+                "claude",
+                &sid,
+                RuntimeOwnerKind::Terminal,
+                "post-abort-probe",
+                None,
+                "test",
+                0,
+            ) {
+                BeginOutcome::Granted { generation } => {
+                    // Roll the probe back to the live prior (the abort's own
+                    // outcome) under the generation it was granted.
+                    let _ =
+                        rig.ownership
+                            .fail("claude", &sid, "post-abort-probe", generation, true);
+                }
+                other => panic!("expected Granted from the probe handoff, got {other:?}"),
+            }
+        }
+        other => panic!("already asserted Live-or-Vacant, got {other:?}"),
+    }
+
+    // Cleanup: kill the sidecar so nothing leaks.
+    rig.fresh_claude.handle_kill(kill_msg(&sid)).await;
+}
+
+/// 6. opencode: handoff never kills the shared serve and never changes the
+/// id. The serve manager instance is the SAME before/after (exactly one
+/// serve pid across both handoffs — a restart would add one); the `ses_*`
+/// id is unchanged in every coordinator record and response.
+#[tokio::test]
+async fn opencode_handoff_keeps_shared_serve_alive_and_session_id_stable() {
+    let _guard = ENV_LOCK.lock().await;
+    let env = FakeOpencodeServeEnv::install();
+    let sid = format!("ses_handoff_{}", uuid::Uuid::new_v4().simple());
+    let rig = build_rig(None);
+
+    // Fresh owner: a durable opencode session, registered through the shared
+    // serve (the attach-resume lane — get_session on the fake serve answers).
+    rig.fresh_opencode
+        .handle_attach(FreshAgentAttach {
+            provider: AgentProvider::Opencode,
+            session_id: sid.clone(),
+            session_type: SessionType::Freshopencode,
+            cwd: Some("/tmp".to_string()),
+            observed_epoch: None,
+            observed_generation: None,
+            resume_session_id: None,
+            session_ref: None,
+        })
+        .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        match rig.ownership.observe("opencode", &sid).state {
+            OwnershipState::Live { owner, .. } => {
+                assert_eq!(owner.kind, RuntimeOwnerKind::FreshAgent);
+                break;
+            }
+            state => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the opencode attach never committed Live, got {state:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+    // The shared serve is up (exactly one pid so far).
+    env.await_audit_row(Duration::from_secs(20), |r| r["event"] == "listen")
+        .await;
+    assert_eq!(env.serve_pids().len(), 1, "one shared serve instance");
+
+    // Handoff opencode -> terminal (mode opencode: the CLI mode that resumes
+    // `ses_*` ids — a mismatched mode would fail the session-ID preservation
+    // check by design).
+    let to_terminal = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("opencode", &sid, "opencode"));
+    let result = to_terminal.completion.await.expect("handoff completed");
+    assert_eq!(result["ok"], json!(true), "handoff to terminal: {result}");
+    let terminal_id = result["owner"]["terminalId"].as_str().unwrap().to_string();
+    // (The terminal-owner response carries terminalId+mode; the canonical
+    // ses_* id is proven by the coordinator record below — and by the
+    // runner's own session-ID preservation check, which already had to pass
+    // for the spawn to be accepted.)
+    match rig.ownership.observe("opencode", &sid).state {
+        OwnershipState::Live { owner, .. } => {
+            assert_eq!(owner.kind, RuntimeOwnerKind::Terminal);
+            assert_eq!(owner.terminal_id.as_deref(), Some(terminal_id.as_str()));
+        }
+        other => panic!("expected Live terminal owner, got {other:?}"),
+    }
+
+    // Handoff BACK to freshopencode — through the SAME shared serve.
+    let back = rig
+        .runner
+        .spawn_handoff(handoff_req_fresh("opencode", &sid, "freshopencode"));
+    let result = back.completion.await.expect("handoff completed");
+    assert_eq!(result["ok"], json!(true), "handoff back to fresh: {result}");
+    assert_eq!(
+        result["owner"]["sessionId"],
+        json!(sid),
+        "the ses_* id is unchanged in the response"
+    );
+    match rig.ownership.observe("opencode", &sid).state {
+        OwnershipState::Live { owner, .. } => {
+            assert_eq!(owner.kind, RuntimeOwnerKind::FreshAgent);
+            assert_eq!(
+                owner.live_session_key.as_deref(),
+                Some(sid.as_str()),
+                "the coordinator record keeps the canonical ses_* id"
+            );
+        }
+        other => panic!("expected Live fresh owner, got {other:?}"),
+    }
+
+    // The serve manager instance is the SAME before/after: no restart, no
+    // kill — exactly ONE serve pid across both handoffs, and its health
+    // endpoint kept answering (the audit rows below prove liveness).
+    assert_eq!(
+        env.serve_pids().len(),
+        1,
+        "the shared serve was never killed or restarted: pids {:?}",
+        env.serve_pids()
+    );
+    let health_pid = env
+        .await_audit_row(Duration::from_secs(10), |r| r["path"] == "/global/health")
+        .await["pid"]
+        .as_u64()
+        .expect("health probe pid");
+    assert_eq!(
+        env.serve_pids(),
+        vec![health_pid],
+        "the health-check probes kept hitting the SAME live serve instance"
+    );
+
+    // Cleanup: kill the resumed session's lane bookkeeping (never the serve)
+    // — the runner retained the stamp, so the lane kill path works.
+    let _ = rig
+        .fresh_opencode
+        .opencode_kill_for_handoff(&sid, "test-cleanup")
+        .await;
+}
+
+/// 6b. kilroy (round-2 review): handoff TO a kilroy fresh-agent target — the
+/// claude-lane resume keeps the kilroy flavor (the resumed session's frames
+/// carry sessionType kilroy; the coordinator owner record serves the same
+/// canonical (claude, sessionId)); the broadcast ownerKind is fresh-agent.
+/// Never map by provider alone (freshclaude would lose the kilroy identity).
+#[tokio::test]
+async fn handoff_to_a_kilroy_target_resumes_as_kilroy_on_the_claude_lane() {
+    let _guard = ENV_LOCK.lock().await;
+    let env = FakeSidecarEnv::install();
+    // The claude-lane resume path gates on transcript presence — install a
+    // fake transcript store root for the session.
+    let store_dir = std::env::temp_dir().join(format!(
+        "freshell-handoff-kilroy-store-{}",
+        uuid_like_suffix()
+    ));
+    let project_dir = store_dir.join("projects").join("slug");
+    std::fs::create_dir_all(&project_dir).expect("create transcript project dir");
+    let sid = uuid::Uuid::new_v4().to_string();
+    std::fs::write(
+        project_dir.join(format!("{sid}.jsonl")),
+        "{\"cwd\": \"/tmp\"}\n",
+    )
+    .expect("write fake transcript");
+    std::env::set_var("CLAUDE_CONFIG_DIR", &store_dir);
+
+    let mut rig = build_rig(None);
+
+    // Terminal owner first (mode claude — the sleeper spec spawns a real
+    // Running PTY that self-commits Live{Terminal} for the canonical key).
+    let spawn_body = json!({
+        "mode": "claude",
+        "cwd": std::env::temp_dir().to_string_lossy(),
+        "sessionRef": { "provider": "claude", "sessionId": sid },
+    });
+    let spawned = crate::terminal_tabs::spawn_terminal_pane(
+        &rig.fresh_agent,
+        &spawn_body,
+        "handoff-kilroy-tab",
+        "handoff-kilroy-pane",
+    )
+    .await
+    .expect("terminal prior spawn");
+    let prior_terminal = spawned.terminal_id.clone();
+    assert!(
+        matches!(
+            rig.ownership.observe("claude", &sid).state,
+            OwnershipState::Live { .. }
+        ),
+        "the terminal prior must commit Live"
+    );
+
+    // Handoff { targetKind: fresh-agent, sessionType: kilroy }.
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_fresh("claude", &sid, "kilroy"));
+    let result = handle.completion.await.expect("runner completed");
+    assert_eq!(result["ok"], json!(true), "the kilroy handoff: {result}");
+    assert_eq!(result["owner"]["kind"], json!("fresh-agent"));
+    assert_eq!(result["owner"]["sessionType"], json!("kilroy"));
+    assert_eq!(result["owner"]["sessionId"], json!(sid));
+
+    // The prior terminal is dead.
+    assert!(rig.registry.terminal_is_dead(&prior_terminal));
+
+    // The created/resumed session's frames carry sessionType "kilroy".
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut saw_kilroy_frame = false;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(250), rig.rx.recv()).await {
+            Ok(Ok(raw)) => {
+                if raw.contains("\"sessionType\":\"kilroy\"") && raw.contains(&sid) {
+                    saw_kilroy_frame = true;
+                    break;
+                }
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(_)) => break,
+            Err(_) => {}
+        }
+    }
+    assert!(
+        saw_kilroy_frame,
+        "the resumed session's frames must keep the kilroy flavor"
+    );
+
+    // observe() == Live{FreshAgent} for (claude, sessionId).
+    match rig.ownership.observe("claude", &sid).state {
+        OwnershipState::Live { owner, .. } => {
+            assert_eq!(owner.kind, RuntimeOwnerKind::FreshAgent);
+        }
+        other => panic!("expected Live fresh owner, got {other:?}"),
+    }
+
+    // The broadcast frames carry epoch + ownerKind fresh-agent.
+    let frames = drain_runtime_owner_frames(&mut rig.rx);
+    let committed = runtime_owner_frame(&frames, "handoff-committed");
+    assert!(committed["epoch"].as_u64().unwrap_or(0) >= 1);
+    assert_eq!(committed["ownerKind"], json!("fresh-agent"));
+    assert_eq!(committed["previousKind"], json!("terminal"));
+
+    // Cleanup: the runner retained the lane stamp — the lane kill works.
+    let _ = rig
+        .fresh_claude
+        .kill_for_handoff(&sid, "test-cleanup")
+        .await;
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+    let _ = env;
+    let _ = std::fs::remove_dir_all(&store_dir);
+}

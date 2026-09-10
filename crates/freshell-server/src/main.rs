@@ -1653,6 +1653,24 @@ async fn main() -> ExitCode {
         fresh_claude_state.clone(),
     );
 
+    // kata b8ke Task 6: the atomic session handoff runner + its
+    // `POST /api/sessions/handoff` router. Minted with the SAME fresh
+    // states, terminal registry, coordinator, broadcast bus, and CLI specs
+    // every other lane holds (the REST spawn state is the fully-wired
+    // `fresh_agent_state` — the terminal-target pipeline needs its registry
+    // and CLI-spec wiring; the opencode slice carries the shared serve).
+    let handoff_runner = Arc::new(freshell_freshagent::SessionHandoffRunner::new(
+        Arc::clone(&auth_token),
+        Arc::clone(&broadcast_tx),
+        Arc::clone(&ownership),
+        registry.clone(),
+        fresh_codex_state.clone(),
+        fresh_claude_state.clone(),
+        fresh_opencode_state.clone(),
+        fresh_agent_state.clone(),
+        Arc::clone(&cli_commands),
+    ));
+
     // `POST /api/session-metadata` (`server/sessions-router.ts:220-244` +
     // `session-metadata-store.ts`): persists sidebar/fresh-agent `sessionType` tags to
     // `<home>/.freshell/session-metadata.json` through the SAME store instance Task 20's
@@ -1718,6 +1736,9 @@ async fn main() -> ExitCode {
         .merge(freshell_ws::router(ws_state))
         .merge(freshell_freshagent::router(fresh_agent_state.clone()))
         .merge(freshell_freshagent::snapshot::router(snapshot_state))
+        .merge(freshell_freshagent::session_handoff::handoff_router(
+            handoff_runner,
+        ))
         .merge(session_metadata::router(session_metadata_state))
         .merge(checkpoints::router(checkpoints_state))
         .merge(attachments::router(attachments_state))

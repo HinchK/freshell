@@ -201,6 +201,18 @@ impl OwnershipState {
             | OwnershipState::Stopping { since_ms, .. } => Some(*since_ms),
         }
     }
+
+    /// The `Handoff` state's captured prior owner plus the generation it held
+    /// when it went Live (kata b8ke Task 6): the handoff runner's stop/restore
+    /// source — the identity to stop, and the generation a restored prior
+    /// resumes at. `None` for every other state (only `Handoff` carries a
+    /// prior; a Vacant-entered handoff captures `None` too).
+    pub fn prior_owner(&self) -> Option<(OwnerIdentity, u64)> {
+        match self {
+            OwnershipState::Handoff { prior, .. } => prior.clone(),
+            _ => None,
+        }
+    }
 }
 
 /// The delayed-request fence (round-2 review): the `(epoch, generation)`
@@ -1704,6 +1716,57 @@ mod tests {
             r.observe(PROVIDER, "sid").state,
             OwnershipState::Live { .. }
         ));
+    }
+
+    /// kata b8ke Task 6: the handoff runner reads the captured prior (and its
+    /// pre-handoff Live generation) off the `Handoff` state — and only there.
+    #[test]
+    fn prior_owner_is_the_handoff_states_captured_prior_and_its_generation() {
+        let (r, owner, live_gen) = registry_with_live_terminal();
+        let BeginOutcome::Granted { .. } = r.begin_handoff(
+            PROVIDER,
+            "sid",
+            RuntimeOwnerKind::FreshAgent,
+            "ho-1",
+            None,
+            "test",
+            2_000,
+        ) else {
+            panic!("expected Granted")
+        };
+        let snap = r.observe(PROVIDER, "sid");
+        assert_eq!(
+            snap.state.prior_owner(),
+            Some((stamped(owner, "op-1"), live_gen)),
+            "the Handoff state carries the pre-handoff Live owner and ITS generation"
+        );
+        // Every other state carries no prior (Vacant before any claim; the
+        // Live and Starting states of a fresh key).
+        assert_eq!(OwnershipState::Vacant.prior_owner(), None);
+        let r2 = RuntimeOwnershipRegistry::new();
+        let BeginOutcome::Granted { generation } = r2.begin_start(
+            PROVIDER,
+            "other",
+            RuntimeOwnerKind::Terminal,
+            "op-a",
+            None,
+            "test",
+            1,
+        ) else {
+            panic!("expected Granted")
+        };
+        let _ = r2.commit_live(
+            PROVIDER,
+            "other",
+            "op-a",
+            generation,
+            fresh_agent_owner(4321),
+        );
+        assert_eq!(
+            r2.observe(PROVIDER, "other").state.prior_owner(),
+            None,
+            "Live is not a handoff — no prior"
+        );
     }
 
     #[test]

@@ -125,7 +125,7 @@ pub struct FreshClaudeState {
     /// canonical durable id → the stamp its `commit_live` left — the kill
     /// `StopClaim` / consumer-eviction `ReleaseClaim` source (round-2
     /// review).
-    ownership_stamps: crate::ownership_lane::OwnershipStamps,
+    pub(crate) ownership_stamps: crate::ownership_lane::OwnershipStamps,
     /// Task 13b: cross-kind liveness -- true when a live terminal PTY owns
     /// `(provider, session_id)`. Wired by `main.rs`; defaults to always-false.
     terminal_liveness: crate::TerminalLivenessProbe,
@@ -655,6 +655,180 @@ impl FreshClaudeState {
         false
     }
 
+    /// kata b8ke Task 6: the handoff runner's PRIOR-stop entry point. Thin
+    /// `handle_kill`-shaped lane teardown for ONE session — NO coordinator
+    /// stop (the runner owns the in-flight `Handoff`; `begin_stop` would be
+    /// `BlockedHandoff`), NO durable-row retire (the session CONTINUES as
+    /// the handoff's target kind), NO `freshAgent.killed` broadcast (the
+    /// pane transition is the client-side `session.runtimeOwner` fold,
+    /// Task 8). Resolves the canonical durable to its sessions-map key
+    /// (alias, never moved), removes the session, aborts the consumer, and
+    /// runs the standard teardown (graceful shutdown line + directed tree
+    /// kill + ownership reap) — the awaited teardown IS the confirmed reap.
+    /// The runner bounds this call with the handoff's reap timeout. Takes
+    /// the retained stamp: the runner folds the exit.
+    pub(crate) async fn kill_for_handoff(
+        &self,
+        session_id: &str,
+        initiator: &str,
+    ) -> crate::session_handoff::StopResult {
+        tracing::info!(target: "freshell_freshagent::claude",
+            session_id = %session_id, initiator,
+            "freshagent.claude.handoff_stop: stopping the prior freshclaude/kilroy runtime for handoff"
+        );
+        crate::ownership_lane::take_retained_stamp(&self.ownership_stamps, session_id);
+        let Some(map_key) = self.resolve_session_key(session_id).await else {
+            return crate::session_handoff::StopResult::AlreadyGone;
+        };
+        let removed = self.sessions.lock().await.remove(&map_key);
+        self.close_pending
+            .lock()
+            .expect("close-pending lock")
+            .remove(&map_key);
+        let Some(session) = removed else {
+            return crate::session_handoff::StopResult::AlreadyGone;
+        };
+        session.consumer.abort();
+        teardown_removed_session(session).await;
+        self.evict_cli_index_aliases(&map_key).await;
+        self.leases.clear_binding(PROVIDER, session_id);
+        crate::session_handoff::StopResult::Reaped
+    }
+
+    /// kata b8ke Task 6: the handoff runner's TARGET-resume entry point —
+    /// the attach-resume path ([`Self::resume_for_attach`]) driven with a
+    /// synthetic attach for the CANONICAL durable id, UNDER-TICKET (no lane
+    /// claim, no lane commit — the runner performs the ONE `commit_live`)
+    /// and with the round-2 flavor param: `session_type` selects freshclaude
+    /// vs kilroy, so a kilroy session resumes AS kilroy (the created/snapshot
+    /// frames keep the flavor; never map by provider alone). Registers under
+    /// the durable id itself and returns the constructed owner identity.
+    pub(crate) async fn resume_for_handoff(
+        &self,
+        session_type: &str,
+        session_id: &str,
+        cwd: Option<&str>,
+        operation_id: &str,
+        generation: u64,
+    ) -> Result<freshell_ownership::OwnerIdentity, (String, String)> {
+        let _ = (operation_id, generation); // the under-ticket seam: the runner holds the claim
+        let Some(flavor) = session_type_from_flavor(session_type) else {
+            return Err((
+                "unsupported claude-lane sessionType for handoff".to_string(),
+                session_type.to_string(),
+            ));
+        };
+        {
+            let mut resuming = self.resuming.lock().await;
+            if !resuming.insert(session_id.to_string()) {
+                return Err((
+                    "another resume is in flight for this session".to_string(),
+                    session_id.to_string(),
+                ));
+            }
+        }
+        // D8 same-kind lease claim (the provider backstop — the coordinator
+        // claim is the runner's, under-ticket).
+        let resume_request_id = format!("handoff-resume-{}", uuid::Uuid::new_v4());
+        let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
+        for round in 0..2u8 {
+            match self.leases.claim(
+                PROVIDER,
+                session_id,
+                &resume_request_id,
+                crate::session_lease::now_epoch_ms(),
+            ) {
+                crate::session_lease::FreshSessionClaim::Acquired => {
+                    lease_guard = Some(crate::FreshSessionLeaseGuard::armed(
+                        Arc::clone(&self.leases),
+                        PROVIDER,
+                        session_id,
+                        &resume_request_id,
+                    ));
+                    break;
+                }
+                crate::session_lease::FreshSessionClaim::BoundLive { .. }
+                | crate::session_lease::FreshSessionClaim::Held { .. } => {
+                    self.resuming.lock().await.remove(session_id);
+                    return Err((
+                        "another lifecycle operation holds this session's lease".to_string(),
+                        session_id.to_string(),
+                    ));
+                }
+                crate::session_lease::FreshSessionClaim::ExpiredNeedsKill { pid, ownership_id } => {
+                    if round == 0
+                        && crate::session_lease::kill_and_confirm_tree_dead(
+                            pid,
+                            CLAUDE_SIDECAR_OWNERSHIP_ENV,
+                            &ownership_id,
+                        )
+                        .await
+                    {
+                        self.leases
+                            .force_release_after_confirmed_kill(PROVIDER, session_id);
+                        continue;
+                    }
+                    self.resuming.lock().await.remove(session_id);
+                    return Err((
+                        "the prior lease holder expired and could not be confirmed dead"
+                            .to_string(),
+                        session_id.to_string(),
+                    ));
+                }
+            }
+        }
+        let msg = FreshAgentAttach {
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: session_id.to_string(),
+            session_type: flavor,
+            cwd: cwd.map(str::to_string),
+            observed_epoch: None,
+            observed_generation: None,
+            resume_session_id: None,
+            session_ref: Some(freshell_protocol::SessionLocator {
+                provider: PROVIDER.to_string(),
+                session_id: session_id.to_string(),
+            }),
+        };
+        // UNDER-TICKET: no lane claim (own_ticket None), so the registration
+        // tail's commit is a no-op — the runner performs the one commit_live.
+        let mut own_ticket: Option<freshell_ownership::OperationTicket> = None;
+        let outcome = self
+            .resume_for_attach(&msg, session_id, &mut lease_guard, &mut own_ticket)
+            .await;
+        self.resuming.lock().await.remove(session_id);
+        if let Some(mut g) = lease_guard.take() {
+            // A leftover armed guard means the resume ended WITHOUT a
+            // registration (its own teardown already ran).
+            g.fail();
+        }
+        drop(own_ticket);
+        match outcome {
+            Ok(()) => {
+                let pid = self
+                    .sessions
+                    .lock()
+                    .await
+                    .get(session_id)
+                    .and_then(|s| s.child.id());
+                Ok(freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some(session_id.to_string()),
+                    pid,
+                    ownership_id: None,
+                })
+            }
+            Err(ResumeClaudeError::NotFound) => Err((
+                "claude transcript not found for this session".to_string(),
+                session_id.to_string(),
+            )),
+            Err(ResumeClaudeError::Transient(detail)) => {
+                Err(("claude resume failed".to_string(), detail))
+            }
+        }
+    }
+
     /// kata b8ke Task 3: begin this lane's coordinator claim. See
     /// [`crate::ownership_lane::begin_lane_claim`].
     fn begin_lane_claim_at(
@@ -834,14 +1008,21 @@ impl FreshClaudeState {
         // consume it; every failure return drops it (RAII typed fail).
         let mut own_ticket: Option<freshell_ownership::OperationTicket> = None;
         if let Some(sid) = resume_sid.as_deref() {
-            // Task 13b (cross-kind liveness): a live terminal PTY owning `(claude, sid)`
-            // is the one writer on that JSONL -- refuse the resume with the retryable
-            // loser answer (the terminal may be closing); NO lease claim, NO spawn.
+            // Task 13b (cross-kind liveness): a live terminal PTY owning
+            // `(claude, sid)` is the one writer on that JSONL -- refuse the
+            // resume with the retryable loser answer (the terminal may be
+            // closing); NO lease claim, NO spawn. kata b8ke Task 6: the
+            // refusal carries the coordinator's additive owner fields when it
+            // can name the owner (the post-handoff refusal says the terminal
+            // owner — an attachable target, never a dead-end).
             if (self.terminal_liveness)(PROVIDER, sid) {
                 tracing::warn!(target: "freshell_freshagent::claude", session_id = sid,
                     request_id = %request_id,
                     "fresh_agent_create_refused: a live terminal PTY owns this session (Task 13b cross-kind live-guard)");
-                self.fail_create_session_reserved(&request_id);
+                let owner_fields = crate::ownership_lane::terminal_owner_fields_from_snapshot(
+                    &self.ownership_snapshot(PROVIDER, sid),
+                );
+                self.fail_create_session_reserved_with_owner(&request_id, owner_fields.as_ref());
                 return;
             }
             // Fast-path ADOPT (V1: new server behavior): the durable id already has a
@@ -872,12 +1053,22 @@ impl FreshClaudeState {
                 }
                 crate::ownership_lane::LaneClaim::Refused(outcome) => {
                     tracing::warn!(target: "freshell_freshagent::claude",
-                        session_id = sid, request_id = %request_id,
+                        session_id = %sid, request_id = %request_id,
                         outcome = ?outcome,
                         "fresh_agent_create_refused: the ownership coordinator refused the \
                          claim (kata b8ke cross-kind authority)"
                     );
-                    self.fail_create_session_reserved(&request_id);
+                    // The additive owner fields ride the refusal when the
+                    // coordinator can name the owner (Task 6: the post-handoff
+                    // refusal says the terminal owner).
+                    let owner_fields = crate::ownership_lane::terminal_owner_fields_from_outcome(
+                        &self.ownership,
+                        &outcome,
+                    );
+                    self.fail_create_session_reserved_with_owner(
+                        &request_id,
+                        owner_fields.as_ref(),
+                    );
                     return;
                 }
             }
@@ -1301,6 +1492,37 @@ impl FreshClaudeState {
                 owner_kind: None,
                 owner_generation: None,
                 owner_epoch: None,
+                code: "SESSION_RESERVED".to_string(),
+                message: "Another resume for this session is in flight".to_string(),
+                request_id: request_id.to_string(),
+                retryable: Some(true),
+            },
+        ));
+    }
+
+    /// [`Self::fail_create_session_reserved`] + the coordinator's additive
+    /// owner fields when the refusal can name the owner (kata b8ke Task 6:
+    /// the cross-kind refusal after a handoff must say WHO owns the session —
+    /// a terminal owner — so the pane can offer the attach instead of a
+    /// dead-end).
+    fn fail_create_session_reserved_with_owner(
+        &self,
+        request_id: &str,
+        owner: Option<&crate::ownership_lane::TerminalOwnerFields>,
+    ) {
+        let (owner_kind, owner_generation, owner_epoch) = match owner {
+            Some(fields) => (
+                Some(fields.owner_kind.to_string()),
+                Some(fields.owner_generation),
+                Some(fields.owner_epoch),
+            ),
+            None => (None, None, None),
+        };
+        self.broadcast(&ServerMessage::FreshAgentCreateFailed(
+            FreshAgentCreateFailed {
+                owner_kind,
+                owner_generation,
+                owner_epoch,
                 code: "SESSION_RESERVED".to_string(),
                 message: "Another resume for this session is in flight".to_string(),
                 request_id: request_id.to_string(),
@@ -5725,6 +5947,18 @@ fn session_type_str(session_type: SessionType) -> &'static str {
     match session_type {
         SessionType::Kilroy => "kilroy",
         _ => "freshclaude",
+    }
+}
+
+/// kata b8ke Task 6 (round-2 review): the claude lane covers BOTH flavors —
+/// `freshclaude` and `kilroy` — and the flavor is a PARAM, so the handoff
+/// runner's `resume_for_handoff` maps its wire string back to the enum
+/// (never by provider alone: a kilroy session must resume AS kilroy).
+fn session_type_from_flavor(flavor: &str) -> Option<SessionType> {
+    match flavor {
+        "freshclaude" => Some(SessionType::Freshclaude),
+        "kilroy" => Some(SessionType::Kilroy),
+        _ => None,
     }
 }
 

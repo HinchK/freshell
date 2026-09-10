@@ -48,6 +48,7 @@ pub mod opencode_ws;
 pub mod pane_ops;
 mod pane_resize;
 pub mod rollback_record;
+pub mod session_handoff;
 pub mod session_lease;
 pub mod snapshot;
 pub mod spawn_gate;
@@ -699,6 +700,12 @@ use freshell_protocol::{
 };
 
 use crate::summary::{truncate_summary, SUMMARY_KIND_ECHO};
+
+/// kata b8ke Task 6: the atomic handoff runner + its `POST /api/sessions/handoff`
+/// router (minted in `freshell-server::main` beside the other REST routers).
+pub use session_handoff::{
+    handoff_router, HandoffHandle, HandoffRequest, HandoffTestHooks, SessionHandoffRunner,
+};
 
 /// The opencode fresh-agent `sessionType` (`AGENT_SESSION_TYPES.opencode`, `router.ts:541`).
 const SESSION_TYPE: &str = "freshopencode";
@@ -2262,7 +2269,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-fn authorized(headers: &HeaderMap, token: &str) -> bool {
+pub(crate) fn authorized(headers: &HeaderMap, token: &str) -> bool {
     headers
         .get("x-auth-token")
         .and_then(|v| v.to_str().ok())

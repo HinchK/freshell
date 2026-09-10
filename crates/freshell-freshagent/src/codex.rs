@@ -191,7 +191,7 @@ pub struct FreshCodexState {
     /// This lane's retained coordinator commit stamps (kata b8ke Task 3):
     /// canonical thread id → the stamp its `commit_live` left — the kill
     /// `StopClaim` / exit-watcher `ReleaseClaim` source (round-2 review).
-    ownership_stamps: crate::ownership_lane::OwnershipStamps,
+    pub(crate) ownership_stamps: crate::ownership_lane::OwnershipStamps,
     /// Task 13b: cross-kind liveness -- true when a live terminal PTY owns
     /// `(provider, session_id)`. Wired by `main.rs`; defaults to always-false.
     terminal_liveness: crate::TerminalLivenessProbe,
@@ -581,6 +581,79 @@ impl FreshCodexState {
             .await;
         }
         false
+    }
+
+    /// kata b8ke Task 6: the handoff runner's PRIOR-stop entry point. Thin
+    /// `handle_kill`-shaped lane teardown for ONE session — NO coordinator
+    /// stop (the runner owns the in-flight `Handoff` state; `begin_stop`
+    /// would be `BlockedHandoff`), NO durable-row retire (the session
+    /// CONTINUES as the handoff's target kind — the row stays Bound), NO
+    /// `freshAgent.killed` broadcast (the pane transition is the client-side
+    /// `session.runtimeOwner` fold, Task 8). Removes the session, aborts the
+    /// consumer, closes the client, signals the exit watcher, and AWAITS
+    /// it — the awaited watcher IS the confirmed reap. The runner bounds this
+    /// call with the handoff's reap timeout. Takes the retained stamp: the
+    /// runner folds the exit (the watcher's own release is a fenced no-op
+    /// during `Handoff` by Task 1's construction).
+    pub(crate) async fn kill_for_handoff(
+        &self,
+        session_id: &str,
+        initiator: &str,
+    ) -> crate::session_handoff::StopResult {
+        tracing::info!(target: "freshell_freshagent::codex",
+            session_id = %session_id, initiator,
+            "freshagent.codex.handoff_stop: stopping the prior freshcodex runtime for handoff"
+        );
+        crate::ownership_lane::take_retained_stamp(&self.ownership_stamps, session_id);
+        self.clear_controls(session_id).await;
+        self.leases.clear_binding(PROVIDER, session_id);
+        let removed = self.sessions.lock().await.remove(session_id);
+        let Some(session) = removed else {
+            return crate::session_handoff::StopResult::AlreadyGone;
+        };
+        session.consumer.abort();
+        session.client.close().await;
+        if let Some(kill_tx) = session.kill_tx {
+            let _ = kill_tx.send(());
+        }
+        // The exit-watcher performs start_kill + reap on this requested-kill
+        // path; awaiting it is the CONFIRMED reap.
+        let _ = session.watcher.await;
+        crate::session_handoff::StopResult::Reaped
+    }
+
+    /// kata b8ke Task 6: the handoff runner's TARGET-resume entry point —
+    /// [`Self::ensure_session_resumable`] in UNDER-TICKET mode (the runner
+    /// holds the claim and performs the ONE `commit_live`; this lane skips
+    /// both its own claim and its own commit) and the constructed owner
+    /// identity surfaced to the runner. Same id, never a remint.
+    pub(crate) async fn resume_for_handoff(
+        &self,
+        session_id: &str,
+        cwd: Option<&str>,
+        operation_id: &str,
+        generation: u64,
+    ) -> Result<freshell_ownership::OwnerIdentity, (String, String)> {
+        match self
+            .ensure_session_resumable(session_id, cwd, None, Some((operation_id, generation)))
+            .await
+        {
+            Ok(resumed) => resumed.owner_identity.ok_or((
+                "handoff resume returned no owner identity".to_string(),
+                "the under-ticket lane skipped its identity handoff".to_string(),
+            )),
+            Err(ResumeSessionError::NotFound) => Err((
+                "codex thread not resumable".to_string(),
+                session_id.to_string(),
+            )),
+            Err(ResumeSessionError::Reserved) => Err((
+                "codex thread reserved by another lifecycle operation".to_string(),
+                session_id.to_string(),
+            )),
+            Err(ResumeSessionError::Transient(detail)) => {
+                Err(("codex resume failed".to_string(), detail))
+            }
+        }
     }
 
     /// kata b8ke Task 3: begin this lane's coordinator claim. See

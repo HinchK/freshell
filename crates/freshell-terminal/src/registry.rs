@@ -2179,6 +2179,19 @@ impl TerminalRegistry {
         })
     }
 
+    /// kata b8ke Task 6: is this terminal's row GONE (the kill path removes
+    /// rows) or no longer `Running` (the natural-exit path RETAINS the row as
+    /// `Exited` via [`Self::finish_pty_exit`], which makes the death
+    /// observable)? The handoff runner's bounded reap loop polls this
+    /// predicate; it stays SYNC because this crate is tokio-free by design —
+    /// the awaitable loop lives in the caller (`session_handoff.rs`).
+    pub fn terminal_is_dead(&self, terminal_id: &str) -> bool {
+        match self.probe(terminal_id) {
+            None => true,
+            Some(row) => row.status != TerminalRunStatus::Running,
+        }
+    }
+
     /// §5.4 single-flight claim: reserve `key` for an in-flight keyed create.
     /// `false` means another create currently holds the reservation — the
     /// caller should re-check for a live terminal (adopt) instead of
@@ -3240,6 +3253,43 @@ mod tests {
         assert_eq!(
             exited.fields.get("exit_code").map(String::as_str),
             Some("3")
+        );
+    }
+
+    /// kata b8ke Task 6: the handoff runner's terminal-reap probe. A Running
+    /// row is NOT dead; the kill path REMOVES the row (dead); the natural-exit
+    /// path RETAINS it as `Exited` (dead — `finish_pty_exit`'s row retention
+    /// makes the death observable); an unknown id is dead.
+    #[test]
+    fn terminal_is_dead_reports_running_alive_and_both_death_shapes_dead() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T-dead-running", "S-1");
+        reg.insert_headless("T-dead-exited", "S-2");
+        reg.insert_headless("T-dead-killed", "S-3");
+
+        assert!(
+            !reg.terminal_is_dead("T-dead-running"),
+            "a Running row is alive"
+        );
+
+        assert!(
+            reg.finish_pty_exit("T-dead-exited", 0),
+            "natural exit retains the row"
+        );
+        assert!(
+            reg.terminal_is_dead("T-dead-exited"),
+            "a retained Exited row is dead"
+        );
+
+        assert!(reg.kill("T-dead-killed"));
+        assert!(
+            reg.terminal_is_dead("T-dead-killed"),
+            "a killed (removed) row is dead"
+        );
+
+        assert!(
+            reg.terminal_is_dead("T-dead-never-existed"),
+            "an unknown id is dead"
         );
     }
 

@@ -843,6 +843,7 @@ impl FreshOpencodeState {
                     provenance.clone(),
                     // kata b8ke Task 3: the create's delayed-request fence.
                     crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation),
+                    None,
                 )
                 .await
             {
@@ -1385,6 +1386,127 @@ impl FreshOpencodeState {
                 None,
             ))),
         );
+    }
+
+    // ── kata b8ke Task 6: the handoff runner's opencode entry points ────────
+
+    /// The handoff runner's PRIOR-stop entry point. Thin `handle_kill`-shaped
+    /// lane teardown for ONE session — NO coordinator stop (the runner owns
+    /// the in-flight `Handoff`), NO durable-row retire (the session CONTINUES
+    /// as the handoff's target kind), NO `freshAgent.killed` broadcast (the
+    /// pane transition is the client-side `session.runtimeOwner` fold,
+    /// Task 8), and NEVER a touch of the shared `opencode serve` daemon
+    /// (OpenCode invariant): the per-session turn task + serve-SSE bridge are
+    /// aborted and settled, the map keys (placeholder AND durable aliases of
+    /// the same Arc) are removed, and the lease binding is cleared. The
+    /// awaited turn-task settle IS the confirmed reap.
+    pub(crate) async fn opencode_kill_for_handoff(
+        &self,
+        session_id: &str,
+        initiator: &str,
+    ) -> crate::session_handoff::StopResult {
+        tracing::info!(target: "freshell_freshagent::opencode",
+            session_id = %session_id, initiator,
+            "freshagent.opencode.handoff_stop: stopping the prior freshopencode session for \
+             handoff (the shared serve is never touched)"
+        );
+        // The canonical stamp key: a durable `ses_*` directly; a placeholder
+        // resolves through the live session's real id (handle_kill's rule).
+        let session_arc = {
+            let guard = self.sessions.lock().await;
+            guard.get(session_id).cloned()
+        };
+        let canonical = if session_id.starts_with("ses_") {
+            Some(session_id.to_string())
+        } else {
+            match session_arc.as_ref() {
+                Some(arc) => arc.lock().await.real_session_id.clone(),
+                None => None,
+            }
+        };
+        if let Some(canonical) = canonical.as_deref() {
+            crate::ownership_lane::take_retained_stamp(
+                &self.fresh_agent.ownership_stamps,
+                canonical,
+            );
+        }
+        let Some(session_arc) = session_arc else {
+            return crate::session_handoff::StopResult::AlreadyGone;
+        };
+        let (turn_task, bridge, real) = {
+            let mut s = session_arc.lock().await;
+            s.killed.store(true, Ordering::SeqCst);
+            (
+                s.turn_task.take(),
+                s.serve_bridge.take(),
+                s.real_session_id.clone(),
+            )
+        };
+        // The map removal: its own short synchronous section (every key
+        // aliasing this Arc goes; the killed flag has gated sends).
+        {
+            let mut guard = self.sessions.lock().await;
+            guard.retain(|_, candidate| !Arc::ptr_eq(candidate, &session_arc));
+        }
+        // The settlement awaits (phase 5 of `handle_kill`): the turn task's
+        // abort + settle, then the serve-SSE bridge teardown.
+        if let Some(task) = turn_task {
+            task.abort_and_settle().await;
+        }
+        if let Some(bridge) = bridge {
+            bridge.abort();
+        }
+        if let Some(real) = real.as_deref() {
+            self.leases.clear_binding(PROVIDER, real);
+        }
+        crate::session_handoff::StopResult::Reaped
+    }
+
+    /// The handoff runner's TARGET-resume entry point —
+    /// [`Self::resume_durable_session`] in UNDER-TICKET mode (the runner
+    /// holds the claim and performs the ONE `commit_live`; this lane skips
+    /// both its own claim and its own commit) against the SHARED serve. The
+    /// `ses_*` id is unchanged by construction (serve-side resume only);
+    /// pid stays `None` (the shared serve is never the per-session writer —
+    /// OpenCode invariant).
+    pub(crate) async fn opencode_resume_for_handoff(
+        &self,
+        session_id: &str,
+        cwd: Option<&str>,
+        operation_id: &str,
+        generation: u64,
+    ) -> Result<freshell_ownership::OwnerIdentity, (String, String)> {
+        match self
+            .resume_durable_session(
+                session_id,
+                cwd,
+                None,
+                None,
+                Some((operation_id, generation)),
+            )
+            .await
+        {
+            Ok(_session) => Ok(freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                terminal_id: None,
+                live_session_key: Some(session_id.to_string()),
+                // OpenCode invariant: the shared serve daemon is not the
+                // per-session writer — never a kill target, never the pid.
+                pid: None,
+                ownership_id: None,
+            }),
+            Err(ResumeOpencodeError::NotFound) => Err((
+                "opencode session not known to the shared serve".to_string(),
+                session_id.to_string(),
+            )),
+            Err(ResumeOpencodeError::Manager(err)) => {
+                Err(("opencode serve failure".to_string(), err.to_string()))
+            }
+            Err(ResumeOpencodeError::Reserved) => Err((
+                "opencode session reserved by another lifecycle operation".to_string(),
+                session_id.to_string(),
+            )),
+        }
     }
 
     // ── freshAgent.kill (WS) ────────────────────────────────────────────────
@@ -3135,6 +3257,7 @@ impl FreshOpencodeState {
                     // (round-2 lifecycle audit — attach can cold-resume an
                     // untracked session, registering a runtime).
                     crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation),
+                    None,
                 )
                 .await
             {
@@ -3236,6 +3359,11 @@ impl FreshOpencodeState {
         // kata b8ke Task 3: the calling lifecycle message's delayed-request
         // fence (`None` = legacy unfenced sender — still cross-kind-checked).
         observed: Option<freshell_ownership::ObservedFence>,
+        // kata b8ke Task 6: `Some((operation_id, generation))` when invoked
+        // as a handoff continuation — the runner holds the claim and
+        // performs the ONE `commit_live`, so this lane skips both its own
+        // claim and its own commit (under-ticket mode).
+        handoff: Option<(&str, u64)>,
     ) -> Result<Arc<TokioMutex<OpencodeSession>>, ResumeOpencodeError> {
         // D8 (focused-ep1-r5 Finding 2): "meaningful provenance" only — a
         // HOLLOW `Some` (a partially initialized client's hello) behaves like
@@ -3269,30 +3397,36 @@ impl FreshOpencodeState {
         // provider lease — so the resume window is cross-kind-authoritative.
         // AdoptLive adopts the winner's live session (the lease's BoundLive
         // twin); every refusal answers the established retryable code.
-        let mut own_ticket = match self.begin_lane_claim_at(
-            session_id,
-            &resume_request_id,
-            observed,
-            "freshopencode/attach-resume",
-        ) {
-            crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
-            crate::ownership_lane::LaneClaim::Unwired => None,
-            crate::ownership_lane::LaneClaim::Adopt => {
-                // A same-kind live runtime the map fast-path missed — adopt
-                // it if it registered, else the claim is stale lane info the
-                // resume must not spawn over.
-                if let Some(existing) = self.sessions.lock().await.get(session_id) {
-                    return Ok(existing.clone());
+        // Task 6: under-ticket mode (handoff continuation) skips the claim —
+        // the runner holds it.
+        let mut own_ticket = if handoff.is_some() {
+            None
+        } else {
+            match self.begin_lane_claim_at(
+                session_id,
+                &resume_request_id,
+                observed,
+                "freshopencode/attach-resume",
+            ) {
+                crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+                crate::ownership_lane::LaneClaim::Unwired => None,
+                crate::ownership_lane::LaneClaim::Adopt => {
+                    // A same-kind live runtime the map fast-path missed — adopt
+                    // it if it registered, else the claim is stale lane info the
+                    // resume must not spawn over.
+                    if let Some(existing) = self.sessions.lock().await.get(session_id) {
+                        return Ok(existing.clone());
+                    }
+                    return Err(ResumeOpencodeError::Reserved);
                 }
-                return Err(ResumeOpencodeError::Reserved);
-            }
-            crate::ownership_lane::LaneClaim::Refused(outcome) => {
-                tracing::warn!(target: "freshell_freshagent::opencode",
-                    session_id = %session_id, outcome = ?outcome,
-                    "fresh_agent_resume_refused: the ownership coordinator refused the \
-                     claim (kata b8ke cross-kind authority)"
-                );
-                return Err(ResumeOpencodeError::Reserved);
+                crate::ownership_lane::LaneClaim::Refused(outcome) => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %session_id, outcome = ?outcome,
+                        "fresh_agent_resume_refused: the ownership coordinator refused the \
+                         claim (kata b8ke cross-kind authority)"
+                    );
+                    return Err(ResumeOpencodeError::Reserved);
+                }
             }
         };
         let mut lease_guard = match self.leases.claim(
@@ -3505,34 +3639,42 @@ impl FreshOpencodeState {
         // kata b8ke Task 3: the resume's registration survived every
         // teardown gate — commit `Live{FreshAgent}` under the durable
         // `ses_*` key (the stamp lands in the SHARED map: the kill/exit
-        // claim source for BOTH the REST and WS surfaces).
-        if let Err(outcome) = self.commit_lane_claim_at(&mut own_ticket, session_id) {
-            tracing::error!(target: "invariant",
-                provider = PROVIDER, session_id = %session_id,
-                outcome = ?outcome,
-                "freshagent.opencode.resume_commit_stale: the coordinator moved on while the \
-                 resume registered; the uncommitted session is torn down"
-            );
-            let removed = {
-                let mut guard = self.sessions.lock().await;
-                guard.remove(session_id)
-            };
-            if let Some(removed) = removed {
-                let mut s = removed.lock().await;
-                s.killed.store(true, Ordering::SeqCst);
-                if let Some(task) = s.turn_task.take() {
-                    task.abort_and_settle().await;
+        // claim source for BOTH the REST and WS surfaces). Task 6:
+        // under-ticket mode (handoff continuation) SKIPS the commit — the
+        // handoff runner performs the ONE `commit_live` (single commit
+        // authority).
+        if handoff.is_none() {
+            if let Err(outcome) = self.commit_lane_claim_at(&mut own_ticket, session_id) {
+                tracing::error!(target: "invariant",
+                    provider = PROVIDER, session_id = %session_id,
+                    outcome = ?outcome,
+                    "freshagent.opencode.resume_commit_stale: the coordinator moved on while the \
+                     resume registered; the uncommitted session is torn down"
+                );
+                let removed = {
+                    let mut guard = self.sessions.lock().await;
+                    guard.remove(session_id)
+                };
+                if let Some(removed) = removed {
+                    let mut s = removed.lock().await;
+                    s.killed.store(true, Ordering::SeqCst);
+                    if let Some(task) = s.turn_task.take() {
+                        task.abort_and_settle().await;
+                    }
+                    if let Some(bridge) = s.serve_bridge.take() {
+                        bridge.abort();
+                    }
                 }
-                if let Some(bridge) = s.serve_bridge.take() {
-                    bridge.abort();
-                }
+                return Err(ResumeOpencodeError::Manager(
+                    freshell_opencode::ServeError::Transport(format!(
+                        "opencode session {session_id} ownership changed during resume; torn down"
+                    )),
+                ));
             }
-            return Err(ResumeOpencodeError::Manager(
-                freshell_opencode::ServeError::Transport(format!(
-                    "opencode session {session_id} ownership changed during resume; torn down"
-                )),
-            ));
         }
+        // Under-ticket mode leaves own_ticket None (never claimed); in the
+        // normal mode the commit above consumed or disarmed it, and every
+        // early error return drops it armed for the RAII typed fail.
 
         // P1.13 (Task 8): refresh the binding row after a successful resume -- AWAITED
         // (durable-before-answer). The SETTINGS payload rides only when a record was
@@ -4222,7 +4364,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let out = state
-            .resume_durable_session("ses_wedged_1", None, None, None)
+            .resume_durable_session("ses_wedged_1", None, None, None, None)
             .await;
         std::env::remove_var("FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS");
         assert!(

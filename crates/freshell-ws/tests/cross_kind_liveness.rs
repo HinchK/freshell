@@ -484,8 +484,9 @@ struct MergedHarness {
 }
 
 async fn spawn_merged_server() -> MergedHarness {
-    let (state, _registry, fresh_agent_state) =
-        build_ws_state(vec![sleeper_cli_spec("claude"), sleeper_cli_spec("codex")]).await;
+    let cli_commands = Arc::new(vec![sleeper_cli_spec("claude"), sleeper_cli_spec("codex")]);
+    let (state, registry, fresh_agent_state) =
+        build_ws_state(cli_commands.iter().cloned().collect()).await;
 
     // The snapshot REST door shares the WS door's state slices (main.rs's
     // `SnapshotState::new` wiring: same auth token, same codex/claude
@@ -493,11 +494,33 @@ async fn spawn_merged_server() -> MergedHarness {
     let snapshot_state = freshell_freshagent::SnapshotState::new(
         Arc::new(AUTH_TOKEN.to_string()),
         state.fresh_codex.clone(),
-        fresh_agent_state,
+        fresh_agent_state.clone(),
         state.fresh_claude.clone(),
     );
+    // kata b8ke Task 6: the handoff runner — the SAME fresh states, registry,
+    // coordinator, broadcast bus, and CLI specs (main.rs's mint shape; the
+    // REST spawn state additionally wired with the registry + specs the
+    // terminal-target pipeline needs).
+    let ownership = state.ownership.clone().expect("coordinator wired");
+    let handoff_runner = Arc::new(freshell_freshagent::SessionHandoffRunner::new(
+        Arc::new(AUTH_TOKEN.to_string()),
+        state.broadcast_tx.clone(),
+        ownership,
+        registry.clone(),
+        state.fresh_codex.clone(),
+        state.fresh_claude.clone(),
+        state.fresh_opencode.clone(),
+        fresh_agent_state
+            .with_ownership(state.ownership.clone().expect("coordinator wired"))
+            .with_terminal_registry(registry.clone())
+            .with_cli_commands(Arc::clone(&cli_commands)),
+        Arc::clone(&cli_commands),
+    ));
     let app = freshell_ws::router(state.clone())
-        .merge(freshell_freshagent::snapshot::router(snapshot_state));
+        .merge(freshell_freshagent::snapshot::router(snapshot_state))
+        .merge(freshell_freshagent::session_handoff::handoff_router(
+            handoff_runner,
+        ));
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -542,6 +565,58 @@ async fn http_get_json(base_url: &str, path: &str) -> (u16, serde_json::Value) {
         .expect("write HTTP GET");
     let mut raw = Vec::new();
     tokio::time::timeout(Duration::from_secs(15), stream.read_to_end(&mut raw))
+        .await
+        .expect("HTTP response within deadline")
+        .expect("read HTTP response");
+    let text = String::from_utf8(raw).expect("utf8 HTTP response");
+    let (head, response_body) = text
+        .split_once("\r\n\r\n")
+        .expect("HTTP header/body separator");
+    let status: u16 = head
+        .split_whitespace()
+        .nth(1)
+        .expect("status code in status line")
+        .parse()
+        .expect("numeric status code");
+    let json = serde_json::from_str(response_body.trim()).unwrap_or(serde_json::Value::Null);
+    (status, json)
+}
+
+/// A parsed minimal HTTP POST response: `(status, JSON body)` — the GET
+/// helper's POST twin (same raw-TcpStream pattern), for the handoff REST
+/// endpoint the merged harness serves (kata b8ke Task 6).
+async fn http_post_json(
+    base_url: &str,
+    path: &str,
+    body: &serde_json::Value,
+) -> (u16, serde_json::Value) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let host = base_url
+        .strip_prefix("http://")
+        .expect("base_url is http://{addr}");
+    let payload = body.to_string();
+    let request = format!(
+        "POST {path} HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         x-auth-token: {token}\r\n\
+         content-type: application/json\r\n\
+         content-length: {len}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {payload}",
+        token = AUTH_TOKEN,
+        len = payload.len(),
+    );
+    let mut stream = tokio::net::TcpStream::connect(host)
+        .await
+        .expect("connect to merged server");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write HTTP POST");
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(35), stream.read_to_end(&mut raw))
         .await
         .expect("HTTP response within deadline")
         .expect("read HTTP response");
@@ -2027,4 +2102,119 @@ async fn snapshot_get_for_a_vacant_untracked_session_never_spawns() {
             && r["threadId"].as_str() == Some(sid.as_str())),
         "the explicit freshAgent.create — not the GET — performed the resume: {rows:?}"
     );
+}
+
+// ── kata b8ke Task 6: the atomic handoff endpoint (end-to-end) ──────────────
+
+/// End-to-end fresh→terminal handoff over the real REST endpoint against the
+/// in-process server with both kinds live: the old sidecar is reaped, the
+/// coordinator flips Live{FreshAgent} → Live{Terminal}, both
+/// `session.runtimeOwner` transitions broadcast on the WS (the committed
+/// frame carrying the boot epoch, the true previousKind, and the owning
+/// terminal id), and a subsequent `freshAgent.create` for the session is
+/// typed-refused with the terminal owner.
+#[tokio::test]
+async fn fresh_agent_to_terminal_handoff_is_atomic_and_broadcast() {
+    let _guard = ENV_LOCK.lock().await;
+    let sidecar = FakeSidecarEnv::install(); // SYNC at base — no .await
+    let mut h = spawn_merged_server().await;
+    let sid = format!("ho-e2e-{}", uuid::Uuid::new_v4());
+    // Fresh owner.
+    send_json(
+        &mut h.ws,
+        &json!({
+            "type": "freshAgent.create", "requestId": "ho-f1",
+            "sessionType": "freshclaude", "provider": "claude",
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+    let _ = await_frame(&mut h.ws, Duration::from_secs(20), |v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("freshAgent.created")
+            && v.get("requestId").and_then(|r| r.as_str()) == Some("ho-f1")
+    })
+    .await;
+    assert!(
+        matches!(
+            h.ws_state
+                .fresh_claude
+                .ownership_snapshot("claude", &sid)
+                .state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ),
+        "the fresh owner must be Live before the handoff"
+    );
+
+    // Handoff to terminal via REST.
+    let (status, body) = http_post_json(
+        &h.base_url,
+        "/api/sessions/handoff",
+        &json!({
+            "provider": "claude", "sessionId": sid, "targetKind": "terminal",
+            "mode": "claude", "deviceId": "test-device-a",
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", body);
+    assert_eq!(body["ok"], serde_json::json!(true), "{}", body);
+    let terminal_id = body["owner"]["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+
+    // The coordinator is Live{Terminal} for (claude, sid).
+    let snap = h.ws_state.fresh_claude.ownership_snapshot("claude", &sid);
+    assert!(
+        matches!(snap.state, freshell_ownership::OwnershipState::Live { ref owner, .. }
+            if owner.terminal_id.as_deref() == Some(terminal_id.as_str())),
+        "expected Live terminal owner naming the spawned terminal, got {:?}",
+        snap.state
+    );
+
+    // Both broadcast transitions arrived on the WS.
+    let _started = await_frame(&mut h.ws, Duration::from_secs(10), |v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("session.runtimeOwner")
+            && v.get("transition").and_then(|t| t.as_str()) == Some("handoff-started")
+    })
+    .await;
+    let committed = await_frame(&mut h.ws, Duration::from_secs(20), |v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("session.runtimeOwner")
+            && v.get("transition").and_then(|t| t.as_str()) == Some("handoff-committed")
+    })
+    .await;
+    assert_eq!(
+        committed.get("terminalId").and_then(|t| t.as_str()),
+        Some(terminal_id.as_str())
+    );
+    // Round-2 review: the frame carries the boot epoch and the true
+    // previousKind (the prior fresh-agent kind).
+    assert!(committed.get("epoch").and_then(|e| e.as_u64()).unwrap_or(0) >= 1);
+    assert_eq!(
+        committed.get("previousKind").and_then(|k| k.as_str()),
+        Some("fresh-agent")
+    );
+
+    // A subsequent freshAgent.create for the session is typed-refused with
+    // the terminal owner (Task 3's lane claim; the claude snapshot GET is a
+    // disk read and is not the refusal surface).
+    send_json(
+        &mut h.ws,
+        &json!({
+            "type": "freshAgent.create", "requestId": "ho-f2",
+            "sessionType": "freshclaude", "provider": "claude",
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+    let refused = await_frame(&mut h.ws, Duration::from_secs(20), |v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("freshAgent.create.failed")
+            && v.get("requestId").and_then(|r| r.as_str()) == Some("ho-f2")
+    })
+    .await;
+    assert_eq!(
+        refused.get("ownerKind").and_then(|k| k.as_str()),
+        Some("terminal"),
+        "the refusal names the terminal owner: {refused}"
+    );
+    let _ = sidecar;
 }
