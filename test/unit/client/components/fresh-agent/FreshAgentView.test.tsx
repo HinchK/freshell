@@ -5,7 +5,7 @@ import { configureStore } from '@reduxjs/toolkit'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { previewServerSettingsPatch, updateSettingsLocal } from '@/store/settingsSlice'
 import sessionsReducer, { applySessionsPatch, applyContextUsageExtras } from '@/store/sessionsSlice'
-import freshAgentReducer, { sessionInit, setSessionStatus, markSessionLost } from '@/store/freshAgentSlice'
+import freshAgentReducer, { applyRuntimeOwner, sessionInit, setSessionStatus, markSessionLost } from '@/store/freshAgentSlice'
 import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import { FreshAgentView, IDLE_INCOMPLETE_MAX_RETRIES } from '@/components/fresh-agent/FreshAgentView'
@@ -16,6 +16,7 @@ import { updateTab } from '@/store/tabsSlice'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
 import { ApiError } from '@/lib/api'
 import { resetSnapshotSchedulerForTests, SNAPSHOT_DEBOUNCE_MS } from '@/lib/fresh-agent-snapshot-scheduler'
+import { resetRebindQueueForTests } from '@/lib/rebind-queue'
 import {
   ROLLBACK_BUSY_REDO_NOTICE,
   ROLLBACK_BUSY_UNDO_NOTICE,
@@ -6944,6 +6945,245 @@ describe('snapshot scheduler integration (zrrj)', () => {
     // 4th positional arg is the query/options bag ({ revision?, cwd?, signal? }).
     const options = apiMock.getFreshAgentThreadSnapshot.mock.calls[0][3]
     expect(options?.signal).toBeUndefined()
+  })
+
+  // ── kata b8ke: runtime-owner convergence + scheduler/rebind fencing ──
+
+  function terminalOwnerFrame(overrides: Record<string, unknown> = {}) {
+    return {
+      type: 'session.runtimeOwner',
+      provider: 'opencode',
+      sessionId: SCHED_SESSION_ID,
+      epoch: 1,
+      generation: 1,
+      ownerKind: 'terminal',
+      terminalId: 't-1',
+      operationId: 'handoff-1',
+      transition: 'handoff-committed',
+      ...overrides,
+    }
+  }
+
+  it('runtime-owner transition stops old-kind snapshot scheduling immediately (no abort signal involved)', async () => {
+    vi.useFakeTimers()
+    try {
+      const store = createStore()
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(freshopencodeSnapshot('done', 10))
+
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: schedulerPaneContent('req-owner-stop') }))
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      // Mount identity fetch only.
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+
+      // Busy pane arms the 3s fallback poll…
+      act(() => store.dispatch(setSessionStatus({
+        sessionId: SCHED_SESSION_ID,
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        status: 'running',
+      })))
+      // …then the session is handed to a terminal runtime elsewhere.
+      act(() => store.dispatch(applyRuntimeOwner(terminalOwnerFrame())))
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+
+      // The poll interval is gone (effect re-armed and early-returned) and
+      // in-flight results are stale-guarded: no further snapshot GETs.
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+      // Fencing is result-application guards, never signals: the pinned
+      // no-AbortSignal contract above stays intact for every fetch that
+      // DOES happen.
+      const options = apiMock.getFreshAgentThreadSnapshot.mock.calls[0][3]
+      expect(options?.signal).toBeUndefined()
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      vi.useRealTimers()
+    }
+  })
+
+  it('same-mode multi-device attachment keeps polling (same-kind owner does not diverge)', async () => {
+    vi.useFakeTimers()
+    try {
+      const store = createStore()
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(freshopencodeSnapshot('done', 10))
+
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: schedulerPaneContent('req-owner-same') }))
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+
+      act(() => store.dispatch(setSessionStatus({
+        sessionId: SCHED_SESSION_ID,
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        status: 'running',
+      })))
+      // Another device's fresh-agent pane owning the same session is the
+      // same-mode multi-device attachment shape — no divergence, polling
+      // (and the attach path) must keep working.
+      act(() => store.dispatch(applyRuntimeOwner(terminalOwnerFrame({
+        ownerKind: 'fresh-agent',
+        terminalId: undefined,
+      }))))
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_200) })
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeGreaterThan(1)
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      vi.useRealTimers()
+    }
+  })
+
+  it('stale scheduled callback cannot issue lifecycle-start for an old generation', async () => {
+    vi.useFakeTimers()
+    try {
+      resetRebindQueueForTests()
+      const store = createStore()
+      const content = {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-owner-stale',
+        sessionRef: { provider: 'codex', sessionId: 'sid-owner-stale' },
+        status: 'creating',
+      } as const
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: { ...content } }))
+
+      render(
+        <Provider store={store}>
+          <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={content} hidden />
+        </Provider>,
+      )
+      // The hidden pane's create is armed in the rebind queue (pump pending).
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+
+      // BEFORE it fires, the canonical session becomes terminal-owned at
+      // generation 2 — the queued create is now a stale-kind lifecycle-start.
+      act(() => store.dispatch(applyRuntimeOwner({
+        type: 'session.runtimeOwner',
+        provider: 'codex',
+        sessionId: 'sid-owner-stale',
+        epoch: 3,
+        generation: 2,
+        ownerKind: 'terminal',
+        terminalId: 't-cli-1',
+        operationId: 'handoff-9',
+        transition: 'handoff-committed',
+      })))
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_000) })
+      // The pre-send divergence check suppressed the create — the pane keeps
+      // its identity and renders the divergence state instead (Task 9's card).
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+      expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(0)
+    } finally {
+      cleanup()
+      resetRebindQueueForTests()
+      vi.useRealTimers()
+    }
+  })
+
+  it('create and attach carries the observed (epoch, generation) fence from the runtime-owner record', async () => {
+    vi.useFakeTimers()
+    try {
+      resetRebindQueueForTests()
+      const store = createStore()
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(freshopencodeSnapshot('done', 10))
+      // A known fresh-agent owner for the pane's canonical session: the
+      // same-kind owner does not diverge, and the lifecycle sends are fenced
+      // with the record's (epoch, generation) pair.
+      act(() => store.dispatch(applyRuntimeOwner({
+        type: 'session.runtimeOwner',
+        provider: 'opencode',
+        sessionId: 'ses-fence-create',
+        epoch: 7,
+        generation: 5,
+        ownerKind: 'fresh-agent',
+        operationId: 'handoff-2',
+        transition: 'handoff-committed',
+      })))
+
+      const content = {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-fence-create',
+        sessionRef: { provider: 'opencode', sessionId: 'ses-fence-create' },
+        status: 'creating',
+      } as const
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: { ...content } }))
+      render(
+        <Provider store={store}>
+          <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={content} />
+        </Provider>,
+      )
+      await act(async () => { await vi.advanceTimersByTimeAsync(100) })
+      const creates = sentFreshAgentMessages('freshAgent.create')
+      expect(creates).toHaveLength(1)
+      expect(creates[0]).toMatchObject({
+        requestId: 'req-fence-create',
+        observedEpoch: 7,
+        observedGeneration: 5,
+      })
+    } finally {
+      cleanup()
+      resetRebindQueueForTests()
+      resetSnapshotSchedulerForTests()
+      vi.useRealTimers()
+    }
+  })
+
+  it('the mount-time attach carries the observed (epoch, generation) fence', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(freshopencodeSnapshot('done', 10))
+    act(() => store.dispatch(applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'opencode',
+      sessionId: 'ses-fence-attach',
+      epoch: 4,
+      generation: 11,
+      ownerKind: 'fresh-agent',
+      operationId: 'handoff-3',
+      transition: 'handoff-committed',
+    })))
+
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-fence-attach',
+        sessionId: 'ses-fence-attach',
+        sessionRef: { provider: 'opencode', sessionId: 'ses-fence-attach' },
+        resumeSessionId: 'ses-fence-attach',
+        status: 'idle',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => {
+      const attaches = sentFreshAgentMessages('freshAgent.attach')
+      expect(attaches.length).toBeGreaterThanOrEqual(1)
+      expect(attaches[0]).toMatchObject({
+        sessionId: 'ses-fence-attach',
+        observedEpoch: 4,
+        observedGeneration: 11,
+      })
+    })
   })
 })
 

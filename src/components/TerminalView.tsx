@@ -31,6 +31,10 @@ import {
 } from '@/store/panesSlice'
 import { buildReconcileRequestForPanes, foldVerdicts } from '@/lib/pane-reconcile'
 import type { PaneReconcileRequest } from '@shared/ws-protocol'
+import {
+  derivePaneOwnerDivergence,
+  selectSessionRuntimeOwner,
+} from '@/store/selectors/runtimeOwner'
 import { updateSessionActivity } from '@/store/sessionActivitySlice'
 import { recordPaneTabActivity } from '@/store/tabRecencySlice'
 import { updateSettingsLocal } from '@/store/settingsSlice'
@@ -772,6 +776,24 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   // Extract terminal-specific fields (safe because we check kind later)
   const isTerminal = paneContent.kind === 'terminal'
   const terminalContent = isTerminal ? paneContent : null
+
+  // kata b8ke (round-1 review: convergence is bidirectional): a TERMINAL
+  // pane observing a FRESH-AGENT owner for its canonical session — the
+  // session was handed to a fresh-agent runtime and this pane's terminal was
+  // reaped by the handoff. Subscribe to the record (a stable store
+  // reference) and derive the divergence locally (the FreshAgentView
+  // contract, mirrored); while divergent the pane stops treating its dead
+  // terminal as live (no attach / auto-reattach attempts) and Task 9's
+  // terminal-side recovery card renders with the direct "Open as Fresh
+  // Agent here" action.
+  const terminalRuntimeOwner = useAppSelector((s) => (
+    terminalContent?.sessionRef
+      ? selectSessionRuntimeOwner(s, terminalContent.sessionRef.provider, terminalContent.sessionRef.sessionId)
+      : undefined
+  ))
+  const freshAgentOwnerDivergence = derivePaneOwnerDivergence(terminalRuntimeOwner, 'terminal')
+  const freshAgentOwnerDivergenceRef = useRef(freshAgentOwnerDivergence)
+  freshAgentOwnerDivergenceRef.current = freshAgentOwnerDivergence
 
   // Register live terminal text reader for Stream Deck previews (classic tile style)
   useTerminalTextRegistration(terminalContent?.terminalId, termRef)
@@ -2837,6 +2859,21 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     opts?: AttachTerminalOptions,
   ) => {
     if (suppressNetworkEffects) return
+    // kata b8ke (round-1 review — convergence is bidirectional): while the
+    // canonical session's runtime owner is a FRESH-AGENT runtime, this pane's
+    // terminal was reaped by the handoff — stop treating it as live. The
+    // single choke point covers every attach path (mount, transport
+    // reconnect, hydration pump grants, refresh attaches); same-mode
+    // multi-device attachment is untouched (a terminal owner never
+    // diverges a terminal pane).
+    if (freshAgentOwnerDivergenceRef.current !== null) {
+      log.debug('attach gate declined: the session is owned by a fresh-agent runtime', {
+        terminalId: tid,
+        paneId: paneIdRef.current,
+        intent,
+      })
+      return
+    }
     // Never attach a terminal the layouts no longer reference: the layout-diff
     // middleware can only release subscriptions it saw acquired. Covers the
     // close-during-create race and stale deferred re-attach timers.
@@ -4965,6 +5002,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             && typeof reqId === 'string'
             && typeof msg.liveTerminalId === 'string'
             && reviveAttemptedRef.current !== reqId
+            // kata b8ke: never revive onto a live handle whose session a
+            // fresh-agent runtime now owns — the handoff reaped this pane's
+            // kind; the divergence state (Task 9's card) owns the recovery.
+            && freshAgentOwnerDivergenceRef.current === null
           ) {
             reviveAttemptedRef.current = reqId
             dispatch(applyReattachToLiveTerminal({
@@ -5421,7 +5462,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         // branch. A died-before-attach target heals through the ordinary
         // INVALID_TERMINAL_ID reconnect (dead-live-handle recovery or a
         // resume create).
-        const reattachTarget = consumeRecoveredLiveTerminalTarget(tabId, paneIdRef.current)
+        // kata b8ke: while the session is owned by a fresh-agent runtime the
+        // reattach target is NOT consumed — the terminal was reaped by the
+        // handoff (the target stays armed for a later non-divergent run).
+        const reattachTarget = freshAgentOwnerDivergenceRef.current === null
+          ? consumeRecoveredLiveTerminalTarget(tabId, paneIdRef.current)
+          : null
         if (reattachTarget) {
           dispatch(applyReattachToLiveTerminal({
             tabId,

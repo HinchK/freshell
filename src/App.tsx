@@ -20,7 +20,9 @@ import { fetchTerminalDirectoryWindow } from '@/store/terminalDirectoryThunks'
 import { createTerminalInvalidationHandler } from '@/lib/terminal-invalidation-handler'
 import { buildReconcileRequest, collectTerminalPaneTargets, foldVerdicts, RECONCILE_RESULT_WAIT_MS, setFreshAgentReconcileActive } from '@/lib/pane-reconcile'
 import { reassertAllOpenPanes } from '@/lib/kill-ack'
-import { PaneReconcileResultSchema, type PaneReconcileRequest, type HostStatsRefreshResponseMessage, type HostStatsSnapshotMessage } from '@shared/ws-protocol'
+import { foldReadyRuntimeOwners, foldSessionRuntimeOwnerFrame } from '@/lib/fresh-agent-ws'
+import { selectOwnerFence, selectPaneOwnerDivergence } from '@/store/selectors/runtimeOwner'
+import { PaneReconcileResultSchema, type PaneReconcileRequest, type HostStatsRefreshResponseMessage, type HostStatsSnapshotMessage, type SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import { getShareAction, ensureShareUrlToken, isRemoteAccessEnabledStatus } from '@/lib/share-utils'
 import { getWsClient } from '@/lib/ws-client'
 import { collectSessionLocatorsFromTabs, getSessionsForHello } from '@/lib/session-utils'
@@ -178,6 +180,19 @@ const ReadyMessageSchema = z.object({
   // loose record: an unexpected capabilities shape must never fail the WHOLE
   // ready frame and silently disable restart detection.
   capabilities: z.record(z.string(), z.unknown()).optional(),
+  // kata b8ke: the handshake's runtime-owner replay (additive/optional —
+  // old servers omit it). Same ready-frame doctrine: `.catch(undefined)`
+  // degrades a malformed replay to "no owners folded" (the reconcile gate
+  // stays open; the server-side generation fence is the backstop) instead
+  // of failing the WHOLE ready frame.
+  runtimeOwners: z.array(z.object({
+    provider: z.string().min(1),
+    sessionId: z.string().min(1),
+    epoch: z.number().int().nonnegative(),
+    generation: z.number().int().nonnegative(),
+    ownerKind: z.enum(['terminal', 'fresh-agent', 'vacant']),
+    terminalId: z.string().optional(),
+  })).optional().catch(undefined),
 })
 
 export default function App() {
@@ -1096,6 +1111,16 @@ export default function App() {
             if (serverRestarted || instanceChanged || firstReadyBaseline) {
               dispatch(resetCompletionDedupeBaselines())
             }
+            // kata b8ke (reconnect owner discovery, T1 rec A4): fold the
+            // server's owner replay BEFORE the reconcile request is built —
+            // the respawn fold (pane-reconcile) gates on this store state, so
+            // a device that missed the handoff broadcast (offline during
+            // handoff, lag-4008, page reload) converges on its very first
+            // post-reconnect reconcile. Round-2 review: the fold RESETS first
+            // — the client's owner/generation state is server-authoritative
+            // per connection lifetime; a restarted server's newer generations
+            // must never be ignored in favor of stale pre-reconnect records.
+            foldReadyRuntimeOwners(dispatch, ready.data.runtimeOwners)
             // pane.reconcile adoption: capability re-captured per connection,
             // and the request re-sent on EVERY ready — a result is not
             // guaranteed (deferral, drop, error frame), so reconnect covers
@@ -1205,6 +1230,15 @@ export default function App() {
           // by the view with the same requestId).
           const outcome = foldVerdicts(dispatch, pending, parsed.data, {
             onVerdictFolded: (createRequestId) => ws.cancelCreate(createRequestId),
+            // kata b8ke (T1 rec A5): the reconcile divergence gate — a
+            // terminal-owned session must not re-arm a stale-kind
+            // freshAgent.create after reconnect. Store-agnostic probe, wired
+            // here to the runtimeOwners state the ready fold just produced.
+            getOwnerDivergence: (pane) => selectPaneOwnerDivergence(appStore.getState(), {
+              paneKind: 'fresh-agent',
+              provider: pane.mode,
+              sessionRef: pane.sessionRef,
+            }),
           })
           // Fold reducers self-clear per-pane pending flags; these two catch
           // what they can't — skipped verdicts and cardinality-violation
@@ -1536,7 +1570,23 @@ export default function App() {
           }
         }
 
-        handleFreshAgentMessage(dispatch, msg as Record<string, unknown>, ws)
+        // kata b8ke: the runtime-owner broadcast fold. session.runtimeOwner
+        // is not a freshAgent.* frame — the explicit case ahead of the
+        // fresh-agent catch-all; nothing awaits an answer (reactive fold
+        // like freshAgent.turn.complete, protocol version stays put).
+        if (msg.type === 'session.runtimeOwner') {
+          foldSessionRuntimeOwnerFrame(dispatch, msg as SessionRuntimeOwnerMessage)
+        }
+
+        // Round-3 F6: the catch-all's lifecycle producers (the cancelled-
+        // create cleanup kill) read the observed ownership fence from the
+        // store so a stale callback can never issue an unfenced kill.
+        handleFreshAgentMessage(
+          dispatch,
+          msg as Record<string, unknown>,
+          ws,
+          (provider, sessionId) => selectOwnerFence(appStore.getState(), provider, sessionId),
+        )
       })
 
       cleanup = () => {

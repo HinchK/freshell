@@ -34,6 +34,14 @@ import { cn } from '@/lib/utils'
 import { collectPaneEntries, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
 import { getCanonicalDurableSessionId, getPreferredResumeSessionId } from '@/store/persistControl'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
+import {
+  canonicalPaneSession,
+  derivePaneOwnerDivergence,
+  isLifecycleStartSuperseded,
+  selectPaneOwnerFence,
+  selectSessionRuntimeOwner,
+  type ObservedOwnerFence,
+} from '@/store/selectors/runtimeOwner'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
 import {
@@ -341,7 +349,11 @@ function effectiveSessionRef(content: FreshAgentPaneContent) {
   return undefined
 }
 
-function buildFreshAgentAttachMessage(content: FreshAgentPaneContent, cwd?: string) {
+function buildFreshAgentAttachMessage(
+  content: FreshAgentPaneContent,
+  cwd?: string,
+  observedFence?: ObservedOwnerFence,
+) {
   const sessionRef = effectiveSessionRef(content)
   return {
     type: 'freshAgent.attach',
@@ -350,6 +362,9 @@ function buildFreshAgentAttachMessage(content: FreshAgentPaneContent, cwd?: stri
     provider: content.provider,
     ...(sessionRef ? { sessionRef } : {}),
     ...(cwd ? { cwd } : {}),
+    ...(observedFence
+      ? { observedEpoch: observedFence.epoch, observedGeneration: observedFence.generation }
+      : {}),
   } as const
 }
 
@@ -656,6 +671,18 @@ export function FreshAgentView({
   // to 'ready' after handshake, so a dep flip re-runs the driver on a fresh
   // reconnect even when every other dep is unchanged.
   const connectionStatus = useAppSelector((s) => s.connection.status)
+  // kata b8ke: the pane's canonical session's runtime-owner record. Subscribe
+  // to the RECORD (a stable store reference) and derive the divergence
+  // locally — a derived object inside the selector would re-render on every
+  // store notification. Null divergence = same-mode multi-device attachment
+  // (or no owner known) — the pane keeps operating exactly as before.
+  const runtimeOwner = useAppSelector((state) => {
+    const canonical = canonicalPaneSession(paneContent)
+    return canonical ? selectSessionRuntimeOwner(state, canonical.provider, canonical.sessionId) : undefined
+  })
+  const ownerDivergence = derivePaneOwnerDivergence(runtimeOwner, 'fresh-agent')
+  const ownerDivergenceRef = useRef(ownerDivergence)
+  ownerDivergenceRef.current = ownerDivergence
   const isActivePane = !hidden && activeTabId === tabId && activePaneId === paneId
   const [snapshot, setSnapshot] = useState<FreshAgentSnapshot | null>(null)
   const snapshotRef = useRef<FreshAgentSnapshot | null>(null)
@@ -1033,6 +1060,22 @@ export function FreshAgentView({
     setSnapshotRefreshNonce((value) => value + 1)
   }, [])
 
+  // kata b8ke (round-3 F6): the ONE fenced attach sender — every
+  // freshAgent.attach producer (mount rebind, reconnect re-attach,
+  // SESSION_RESERVED redrive) goes through this. Attach is a lifecycle start
+  // (it can cold-resume an untracked session): suppressed while the
+  // canonical session diverges (owned by the other kind — the pane renders
+  // the divergence state instead), otherwise carrying the observed
+  // (epoch, generation) fence so a delayed attach naming superseded
+  // ownership is typed-refused server-side.
+  const sendFencedFreshAgentAttach = useCallback((content: FreshAgentPaneContent) => {
+    if (!content.sessionId) return
+    if (isLifecycleStartSuperseded(appStore.getState(), 'fresh-agent', content, undefined)) return
+    const state = appStore.getState()
+    const cwd = getFreshOpenCodeRouteCwd(content, { sessionCwd: freshOpenCodeRouteCwdRef.current })
+    sendFreshAgentMessage(buildFreshAgentAttachMessage(content, cwd, selectPaneOwnerFence(state, content)))
+  }, [appStore, sendFreshAgentMessage])
+
   useEffect(() => () => {
     if (rateLimitRetryTimerRef.current !== null) {
       window.clearTimeout(rateLimitRetryTimerRef.current)
@@ -1202,7 +1245,7 @@ export function FreshAgentView({
     snapshotConfirmsUserTurns,
   ])
 
-  const buildCreateMessage = useCallback((content: FreshAgentPaneContent) => {
+  const buildCreateMessage = useCallback((content: FreshAgentPaneContent, observedFence?: ObservedOwnerFence) => {
     const legacyRestoreContext = content.provider === 'opencode'
       ? buildLegacyRestoreContext(tabRestoreSource)
       : undefined
@@ -1223,6 +1266,13 @@ export function FreshAgentView({
       // D8 (restore-open-sessions-only): the server composes the ledger row's
       // tabKey as `deviceId:tabId` from the connection identity + this field.
       tabId,
+      // kata b8ke delayed-request fence (round-2 review: the fence is the
+      // (epoch, generation) PAIR from the runtime-owner record observed when
+      // the create was decided). A pair sent together is the fence;
+      // neither-sent is legacy-unfenced.
+      ...(observedFence
+        ? { observedEpoch: observedFence.epoch, observedGeneration: observedFence.generation }
+        : {}),
     } as const
   }, [providerDefaults, tabRestoreSource, tabId])
 
@@ -1237,12 +1287,18 @@ export function FreshAgentView({
     void (async () => {
       if (current.sessionId) {
         const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
+        // kata b8ke (round-3 F6): the kill is a lifecycle producer — carry
+        // the observed (epoch, generation) fence so a delayed kill naming
+        // superseded ownership is typed-refused instead of killing the
+        // wrong runtime.
+        const fence = selectPaneOwnerFence(appStore.getState(), current)
         const ack = await sendFreshAgentKillAndAwait(
           {
             sessionId: current.sessionId,
             sessionType: current.sessionType,
             provider: current.provider,
             ...(cwd ? { cwd } : {}),
+            ...(fence ? { observedEpoch: fence.epoch, observedGeneration: fence.generation } : {}),
           },
           { send: (m) => sendFreshAgentMessage(m as Record<string, unknown>) },
         )
@@ -1279,7 +1335,7 @@ export function FreshAgentView({
         },
       }))
     })()
-  }, [commitSnapshot, dispatch, paneId, sendFreshAgentMessage, setLocalEcho, tabId])
+  }, [appStore, commitSnapshot, dispatch, paneId, sendFreshAgentMessage, setLocalEcho, tabId])
 
   const sendFork = useCallback((atTurnId?: string) => {
     const current = paneContentRef.current
@@ -1476,16 +1532,20 @@ export function FreshAgentView({
     const current = paneContentRef.current
     if (current.sessionId) {
       const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
+      // kata b8ke (round-3 F6): the kill carries the observed
+      // (epoch, generation) fence like every lifecycle producer.
+      const fence = selectPaneOwnerFence(appStore.getState(), current)
       sendFreshAgentMessage({
         type: 'freshAgent.kill',
         sessionId: current.sessionId,
         sessionType: current.sessionType,
         provider: current.provider,
         ...(cwd ? { cwd } : {}),
+        ...(fence ? { observedEpoch: fence.epoch, observedGeneration: fence.generation } : {}),
       })
     }
     triggerRecovery()
-  }, [sendFreshAgentMessage, triggerRecovery])
+  }, [appStore, sendFreshAgentMessage, triggerRecovery])
 
   // Capability-gated .lost resolution (paneReconcileFreshAgentV1): a lost
   // session asks the SERVER for the pane's true state via a single-pane
@@ -1542,17 +1602,17 @@ export function FreshAgentView({
       state.timer = null
       const current = paneContentRef.current
       if (current.sessionId) {
-        // Attach loser: re-send the attach directly (the attach effect keys on
-        // sessionId, which has not changed -- a content nudge cannot re-fire it).
-        const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
-        sendFreshAgentMessage(buildFreshAgentAttachMessage(current, cwd))
+        // Attach loser: re-send the (fenced, divergence-gated) attach
+        // directly — the attach effect keys on sessionId, which has not
+        // changed, so a content nudge cannot re-fire it.
+        sendFencedFreshAgentAttach(current)
         return
       }
       createSentRef.current = false // re-arm the create effect
       lastCreateArmKeyRef.current = '' // force the render-phase re-arm
       dispatch(updatePaneContent({ tabId, paneId, content: { ...paneContentRef.current } })) // nudge the effect
     }, FRESH_AGENT_RESERVE_RETRY_FLOOR_MS)
-  }, [clearReserveRedrive, dispatch, paneId, reconcileLostPane, sendFreshAgentMessage, tabId])
+  }, [clearReserveRedrive, dispatch, paneId, reconcileLostPane, sendFencedFreshAgentAttach, tabId])
 
   useEffect(() => {
     if (paneContent.sessionId) return
@@ -1582,6 +1642,12 @@ export function FreshAgentView({
     }
     if (createSentRef.current) return
     createSentRef.current = true
+    // kata b8ke: the observed fence — the (epoch, generation) pair from the
+    // runtime-owner record at effect time (the decision moment). Carried on
+    // the create so the server stale-rejects a delayed create naming
+    // superseded ownership; undefined means no owner is known
+    // (legacy-unfenced).
+    const observedFence = selectPaneOwnerFence(appStore.getState(), paneContent)
     const runCreate = (release?: () => void) => {
       if (!isMountedRef.current) {
         // Pane closed while this job sat in the queue: creating the session
@@ -1591,6 +1657,15 @@ export function FreshAgentView({
       }
       const current = paneContentRef.current
       if (current.sessionId) {
+        release?.()
+        return
+      }
+      // kata b8ke pre-send divergence check: a stale callback (rebind-queue
+      // run, reconnect resend) must not issue a lifecycle-start for a
+      // session the runtime-owner store now shows as owned by the other
+      // kind. The pane keeps its identity and renders the divergence state
+      // (Task 9's card) instead; the server-side fence is the backstop.
+      if (isLifecycleStartSuperseded(appStore.getState(), 'fresh-agent', current, observedFence)) {
         release?.()
         return
       }
@@ -1608,7 +1683,7 @@ export function FreshAgentView({
         releasePendingRebind()
         pendingRebindReleaseRef.current = release
       }
-      sendFreshAgentMessage(buildCreateMessage(current))
+      sendFreshAgentMessage(buildCreateMessage(current, observedFence))
     }
     if (hiddenRef.current) {
       getRebindQueue().enqueue({
@@ -1621,6 +1696,7 @@ export function FreshAgentView({
       runCreate()
     }
   }, [
+    appStore,
     buildCreateMessage,
     dispatch,
     paneId,
@@ -1652,11 +1728,18 @@ export function FreshAgentView({
           release?.()
           return
         }
+        // kata b8ke: reconnect resends are stale-callback lifecycle starts —
+        // capture the fence at the resend decision, suppress on divergence.
+        const observedFence = selectPaneOwnerFence(appStore.getState(), latest)
+        if (isLifecycleStartSuperseded(appStore.getState(), 'fresh-agent', latest, observedFence)) {
+          release?.()
+          return
+        }
         if (release) {
           releasePendingRebind()
           pendingRebindReleaseRef.current = release
         }
-        sendFreshAgentMessage(buildCreateMessage(latest))
+        sendFreshAgentMessage(buildCreateMessage(latest, observedFence))
       }
       if (hiddenRef.current) {
         getRebindQueue().enqueue({ key: `freshagent:${paneId}:create:${current.createRequestId}`, run: resend })
@@ -1665,6 +1748,7 @@ export function FreshAgentView({
       }
     })
   }, [
+    appStore,
     buildCreateMessage,
     paneId,
     paneContent.sessionId,
@@ -1677,10 +1761,7 @@ export function FreshAgentView({
   useEffect(() => {
     if (!paneContent.sessionId) return
     const sendAttach = () => {
-      const current = paneContentRef.current
-      if (!current.sessionId) return
-      const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
-      sendFreshAgentMessage(buildFreshAgentAttachMessage(current, cwd))
+      sendFencedFreshAgentAttach(paneContentRef.current)
     }
     if (hiddenRef.current) {
       // Hidden: cheap session rebind still happens, but paced through the
@@ -1705,7 +1786,7 @@ export function FreshAgentView({
     paneContent.sessionRef?.provider,
     paneContent.sessionRef?.sessionId,
     paneContent.sessionType,
-    sendFreshAgentMessage,
+    sendFencedFreshAgentAttach,
   ])
 
   useEffect(() => {
@@ -1715,10 +1796,7 @@ export function FreshAgentView({
       const current = paneContentRef.current
       if (!current.sessionId) return
       const sendAttach = () => {
-        const latest = paneContentRef.current
-        if (!latest.sessionId) return
-        const cwd = getFreshOpenCodeRouteCwd(latest, { sessionCwd: freshOpenCodeRouteCwdRef.current })
-        sendFreshAgentMessage(buildFreshAgentAttachMessage(latest, cwd))
+        sendFencedFreshAgentAttach(paneContentRef.current)
       }
       if (hiddenRef.current) {
         getRebindQueue().enqueue({
@@ -1736,7 +1814,7 @@ export function FreshAgentView({
         requestSnapshotRefresh('reconnect')
       }
     })
-  }, [paneId, paneContent.sessionId, requestSnapshotRefresh, sendFreshAgentMessage, ws])
+  }, [paneId, paneContent.sessionId, requestSnapshotRefresh, sendFencedFreshAgentAttach, ws])
 
   // F8: consume the deferred snapshot refresh on reveal.
   useEffect(() => {
@@ -2054,6 +2132,11 @@ export function FreshAgentView({
 
   useEffect(() => {
     if (!snapshotThreadId) return
+    // kata b8ke: a divergent pane (the canonical session's runtime owner is
+    // the other kind) stops ALL old-kind snapshot traffic — polling, event
+    // refreshes, and this identity fetch alike. Read via the ref so the
+    // identity-deps discipline below is not disturbed.
+    if (ownerDivergenceRef.current) return
     // agentSession is the provider-agnostic session-meta selector (see above);
     // for claude it's the same entry as claudeSession, so this also covers
     // claude's existing behavior. Skip the snapshot fetch while a resumable
@@ -2070,6 +2153,11 @@ export function FreshAgentView({
       || paneContentRef.current.provider !== provider
       || paneContentRef.current.sessionType !== requestSessionType
       || snapshotThreadIdRef.current !== sessionId
+      // kata b8ke: a divergence flip (the session's runtime owner became the
+      // other kind while this request was in flight) makes the result stale —
+      // result-application fencing, never an AbortSignal (the run-closure
+      // contract).
+      || ownerDivergenceRef.current !== null
     )
     // A1: resolve the cwd ONCE (route cwd falls through initialCwd -> session
     // cwd) and use the SAME value for both the scheduler key and the request,
@@ -2507,12 +2595,18 @@ export function FreshAgentView({
   // instead of stranding on an empty turn with a stop button.
   useEffect(() => {
     if (hidden || !paneContent.sessionId) return
+    // kata b8ke: the runtime-owner transition stops old-kind scheduling
+    // IMMEDIATELY — while the canonical session is owned by the other kind,
+    // no fallback poll re-arms (the effect re-runs on the divergence flip
+    // and clears any live interval). Same-mode multi-device attachment is
+    // untouched: a same-kind owner does not diverge.
+    if (ownerDivergence) return
     if (!isBusy && !EARLY_STATES.has(effectiveStatus)) return
     const timer = window.setInterval(() => {
       requestSnapshotRefresh('poll')
     }, 3000)
     return () => window.clearInterval(timer)
-  }, [effectiveStatus, hidden, isBusy, paneContent.sessionId, requestSnapshotRefresh])
+  }, [effectiveStatus, hidden, isBusy, ownerDivergence, paneContent.sessionId, requestSnapshotRefresh])
 
   useEffect(() => {
     if (!notice) return

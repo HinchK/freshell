@@ -3,8 +3,14 @@ import { configureStore } from '@reduxjs/toolkit'
 import freshAgentReducer, { materializeSession } from '@/store/freshAgentSlice'
 import panesReducer, { initLayout, materializeFreshAgentSession, type PanesState } from '@/store/panesSlice'
 import turnCompletionReducer, { markPaneAttention, markTabAttention } from '@/store/turnCompletionSlice'
-import { handleFreshAgentMessage, registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
+import {
+  foldReadyRuntimeOwners,
+  foldSessionRuntimeOwnerFrame,
+  handleFreshAgentMessage,
+  registerFreshAgentCreate,
+} from '@/lib/fresh-agent-ws'
 import { cancelCreate, _resetCancelledCreates } from '@/lib/create-cancellation'
+import type { SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { normalizeFreshAgentProviderEvent } from '../../../../server/fresh-agent/sdk-events'
 import { parseServeEvent, serveEventToSdk } from '../../../../server/fresh-agent/adapters/opencode/serve-events'
@@ -906,5 +912,152 @@ describe('rollback folds (kata 1wxv)', () => {
     })).toBe(true)
 
     expect(actionTypes).toEqual([])
+  })
+})
+
+describe('runtime-owner folds (kata b8ke)', () => {
+  beforeEach(() => {
+    _resetCancelledCreates()
+  })
+
+  function ownerFrame(overrides: Partial<SessionRuntimeOwnerMessage> = {}): SessionRuntimeOwnerMessage {
+    return {
+      type: 'session.runtimeOwner',
+      provider: 'codex',
+      sessionId: 'sid-own-1',
+      epoch: 7,
+      generation: 3,
+      ownerKind: 'terminal',
+      operationId: 'handoff-1',
+      transition: 'handoff-committed',
+      ...overrides,
+    }
+  }
+
+  it('session.runtimeOwner frames dispatch applyRuntimeOwner (the App fold path)', () => {
+    const store = createFreshAgentStore()
+    foldSessionRuntimeOwnerFrame(store.dispatch, ownerFrame({
+      terminalId: 't-9',
+      generation: 4,
+    }))
+    expect(store.getState().freshAgent.runtimeOwners['codex:sid-own-1']).toMatchObject({
+      ownerKind: 'terminal',
+      terminalId: 't-9',
+      epoch: 7,
+      generation: 4,
+      transition: 'handoff-committed',
+    })
+  })
+
+  it('ready frame carrying runtimeOwners resets then folds — stale pre-ready records are GONE', () => {
+    const store = createFreshAgentStore()
+    // Stale pre-reconnect records: a newer-epoch replay must replace the
+    // replayed key, and the reset must drop keys the server no longer tracks.
+    foldSessionRuntimeOwnerFrame(store.dispatch, ownerFrame({
+      sessionId: 'sid-r',
+      epoch: 6,
+      generation: 10,
+    }))
+    foldSessionRuntimeOwnerFrame(store.dispatch, ownerFrame({
+      sessionId: 'sid-stale-other',
+      epoch: 6,
+      generation: 4,
+    }))
+    foldReadyRuntimeOwners(store.dispatch, [
+      { provider: 'codex', sessionId: 'sid-r', epoch: 9, generation: 2, ownerKind: 'terminal', terminalId: 't-3' },
+    ])
+    const owners = store.getState().freshAgent.runtimeOwners
+    expect(owners['codex:sid-r']).toMatchObject({
+      epoch: 9,
+      generation: 2,
+      terminalId: 't-3',
+      ownerKind: 'terminal',
+    })
+    expect(owners['codex:sid-stale-other']).toBeUndefined()
+    expect(Object.keys(owners)).toEqual(['codex:sid-r'])
+  })
+
+  it('a ready fold with no replay entries still resets (empty owner map)', () => {
+    const store = createFreshAgentStore()
+    foldSessionRuntimeOwnerFrame(store.dispatch, ownerFrame({ sessionId: 'sid-gone' }))
+    foldReadyRuntimeOwners(store.dispatch, undefined)
+    expect(store.getState().freshAgent.runtimeOwners).toEqual({})
+  })
+
+  it('freshAgent.create.failed owner fields are preserved in the fold (typed conflict → recovery UI)', () => {
+    const store = createFreshAgentStore()
+    registerFreshAgentCreate(store.dispatch, 'req-owner-conflict', {
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    })
+    const handled = handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.create.failed',
+      requestId: 'req-owner-conflict',
+      code: 'SESSION_OWNED_BY_TERMINAL',
+      message: 'the session is owned by a terminal runtime',
+      retryable: false,
+      ownerKind: 'terminal',
+      ownerGeneration: 6,
+      ownerEpoch: 2,
+    })
+    expect(handled).toBe(true)
+    expect(store.getState().freshAgent.pendingCreateFailures['req-owner-conflict']).toMatchObject({
+      code: 'SESSION_OWNED_BY_TERMINAL',
+      message: 'the session is owned by a terminal runtime',
+      retryable: false,
+      ownerKind: 'terminal',
+      ownerGeneration: 6,
+      ownerEpoch: 2,
+    })
+  })
+
+  it('the cancelled-create cleanup kill carries the observed ownership fence', () => {
+    const store = createFreshAgentStore()
+    const ws = { send: vi.fn() }
+    registerFreshAgentCreate(store.dispatch, 'req-orphan-fence', {
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    })
+    cancelCreate('req-orphan-fence')
+    const handled = handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.created',
+      requestId: 'req-orphan-fence',
+      sessionId: 'thread-orphan-fence',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    }, ws, (provider, sessionId) => (
+      provider === 'codex' && sessionId === 'thread-orphan-fence'
+        ? { epoch: 4, generation: 9 }
+        : undefined
+    ))
+    expect(handled).toBe(true)
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.kill',
+      sessionId: 'thread-orphan-fence',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      observedEpoch: 4,
+      observedGeneration: 9,
+    }))
+  })
+
+  it('the cancelled-create cleanup kill stays legacy-unfenced when no owner record is known', () => {
+    const store = createFreshAgentStore()
+    const ws = { send: vi.fn() }
+    registerFreshAgentCreate(store.dispatch, 'req-orphan-plain', {
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    })
+    cancelCreate('req-orphan-plain')
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.created',
+      requestId: 'req-orphan-plain',
+      sessionId: 'thread-orphan-plain',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    }, ws, () => undefined)
+    const sent = ws.send.mock.calls[0][0] as Record<string, unknown>
+    expect(sent.observedEpoch).toBeUndefined()
+    expect(sent.observedGeneration).toBeUndefined()
   })
 })

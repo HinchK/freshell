@@ -5,6 +5,7 @@ import {
   type FreshAgentSessionType,
 } from '@shared/fresh-agent'
 import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
+import type { SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import type {
   FreshAgentContentBlock,
   FreshAgentPermissionRequest,
@@ -36,6 +37,7 @@ const initialState: FreshAgentState = {
   pendingCreates: {},
   pendingCreateFailures: {},
   availableModels: [],
+  runtimeOwners: {},
 }
 
 function sessionKey(locator: FreshAgentSessionPayload): string {
@@ -487,6 +489,9 @@ const freshAgentSlice = createSlice({
         code: action.payload.code,
         message: action.payload.message,
         retryable: action.payload.retryable,
+        ...(action.payload.ownerKind !== undefined ? { ownerKind: action.payload.ownerKind } : {}),
+        ...(action.payload.ownerGeneration !== undefined ? { ownerGeneration: action.payload.ownerGeneration } : {}),
+        ...(action.payload.ownerEpoch !== undefined ? { ownerEpoch: action.payload.ownerEpoch } : {}),
       }
     },
 
@@ -618,6 +623,46 @@ const freshAgentSlice = createSlice({
       if (!key) return
       writeSessionStatus(state.sessions[key], 'exited')
     },
+
+    /**
+     * kata b8ke: fold one `session.runtimeOwner` broadcast (or ready-replay
+     * entry) into the per-(provider, sessionId) owner record. Epoch-aware
+     * monotonic fold (round-2 review): within the SAME epoch, older
+     * generations are ignored — but a frame from a DIFFERENT epoch always
+     * wins (a restarted server's generation 1 beats a pre-restart 10).
+     * Same-epoch/same-generation frames are ALWAYS applied — the corrective
+     * handoff-failed/released frames arrive at the same generation as the
+     * transition they supersede, and the fold never drops them.
+     */
+    applyRuntimeOwner(state, action: PayloadAction<SessionRuntimeOwnerMessage>) {
+      const f = action.payload
+      const key = `${f.provider}:${f.sessionId}`
+      const existing = state.runtimeOwners[key]
+      if (existing && existing.epoch === f.epoch && f.generation < existing.generation) return
+      state.runtimeOwners[key] = {
+        provider: f.provider,
+        sessionId: f.sessionId,
+        epoch: f.epoch,
+        generation: f.generation,
+        ownerKind: f.ownerKind,
+        ...(f.previousKind !== undefined ? { previousKind: f.previousKind } : {}),
+        ...(f.terminalId !== undefined ? { terminalId: f.terminalId } : {}),
+        transition: f.transition,
+        ...(f.reason !== undefined ? { reason: f.reason } : {}),
+        updatedAt: Date.now(),
+      }
+    },
+
+    /**
+     * kata b8ke (round-2 review): the ready handler dispatches this BEFORE
+     * folding the ready.runtimeOwners replay — the client resets its
+     * owner/generation state on every (re)connect so a restarted server's
+     * newer generations are never ignored in favor of stale pre-reconnect
+     * records.
+     */
+    resetRuntimeOwners(state) {
+      state.runtimeOwners = {}
+    },
   },
 })
 
@@ -627,6 +672,7 @@ export const {
   addQuestionRequest,
   addUserMessage,
   appendStreamDelta,
+  applyRuntimeOwner,
   clearPendingCreate,
   clearPendingCreateFailure,
   clearPendingCreateFailureForSession,
@@ -640,6 +686,7 @@ export const {
   removePermission,
   removeQuestion,
   removeSession,
+  resetRuntimeOwners,
   restoreRetryRequested,
   sessionCreated,
   sessionError,
@@ -656,5 +703,7 @@ export const {
   turnBodyReceived,
   turnResult,
 } = freshAgentSlice.actions
+
+export type { RuntimeOwnerRecord } from './freshAgentTypes'
 
 export default freshAgentSlice.reducer
