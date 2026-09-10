@@ -320,6 +320,15 @@ async fn main() -> ExitCode {
     fresh_codex_state.set_session_leases(Arc::clone(&fresh_agent_leases));
     fresh_claude_state.set_session_leases(Arc::clone(&fresh_agent_leases));
 
+    // kata b8ke: the ONE server-wide runtime-ownership coordinator shared
+    // by the terminal lane and every fresh-agent provider (Task 3 wires the
+    // fresh-agent lanes; Task 4 adds the WsState field for the terminal
+    // lane). The per-boot epoch is minted at construction (see
+    // `freshell_ownership`'s crate doc).
+    let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+    fresh_codex_state.set_ownership(Arc::clone(&ownership));
+    fresh_claude_state.set_ownership(Arc::clone(&ownership));
+
     // SESSION-09 fix-forward: mint the shared `sessions.changed` revision
     // counter BEFORE `fresh_agent_state` so it can be wired into both
     // producers -- see `FreshAgentState::with_shared_sessions_revision`'s doc
@@ -343,12 +352,17 @@ async fn main() -> ExitCode {
     let fresh_agent_state =
         FreshAgentState::new(Arc::clone(&auth_token), Arc::clone(&broadcast_tx))
             .with_shared_sessions_revision(Arc::clone(&sessions_revision))
-            .with_layout(layout_store.clone());
+            .with_layout(layout_store.clone())
+            .with_ownership(Arc::clone(&ownership));
     // The freshopencode WS fresh-agent slice: the post-handshake loop dispatches
     // `freshAgent.create`/`send`/`kill`/`interrupt` (opencode) here.
     let mut fresh_opencode_state =
         freshell_freshagent::FreshOpencodeState::new(fresh_agent_state.clone());
     fresh_opencode_state.set_session_leases(Arc::clone(&fresh_agent_leases));
+    // kata b8ke Task 3: the SAME ONE coordinator (the registry + the retained
+    // stamp map live on the shared `FreshAgentState`, so the REST and WS
+    // opencode surfaces see identical ownership state).
+    fresh_opencode_state.set_ownership(Arc::clone(&ownership));
 
     // The shared, connection-independent terminal registry: terminals are owned by
     // `terminalId` here (not by the socket that created them), so a second/reconnected
@@ -530,6 +544,97 @@ async fn main() -> ExitCode {
     let fresh_claude_state = fresh_claude_state;
     let fresh_codex_state = fresh_codex_state;
     let fresh_opencode_state = fresh_opencode_state;
+
+    // kata b8ke Task 3: the bounded Starting-state timeout watchdog (5s
+    // sweep, 30s max age) — the RAII tickets handle panics; this backstop
+    // recovers leaked tickets (e.g. a detached task killed without unwind)
+    // so a stranded Starting claim can never wedge a session.
+    // Round-2 review: the sweep CANCELS FIRST — it never flips a live spawn
+    // to Vacant underneath it. Per recovered record the host: aborts the
+    // operation (its registered cancellation handle — the fresh-agent lanes
+    // spawn inline in request-handler tasks, so they register no abort
+    // handle; the raw teardown below IS the cancellation), awaits its settle
+    // (bounded 5s; none registered for the same reason), kills the
+    // registered partial runtime if any via the lane's raw teardown, and
+    // only then commit_stop → Vacant with the typed
+    // ownership.start.recovered failure log (failure_reason =
+    // STARTING_TIMEOUT).
+    {
+        let ownership = Arc::clone(&ownership);
+        let registry = registry.clone();
+        let fresh_codex = fresh_codex_state.clone();
+        let fresh_claude = fresh_claude_state.clone();
+        let fresh_opencode = fresh_opencode_state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                for rec in ownership.recover_stale_starts(now, 30_000) {
+                    if let Some(settle) = rec.settle {
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            Box::into_pin(settle),
+                        )
+                        .await;
+                    }
+                    if let Some(partial) = rec.partial_runtime.as_ref() {
+                        // Raw teardown of the uncommitted partial runtime
+                        // (the lane helpers key off the session id; a
+                        // terminal partial is killed by terminal id).
+                        match partial.kind {
+                            freshell_ownership::RuntimeOwnerKind::Terminal => {
+                                if let Some(tid) = partial.terminal_id.as_deref() {
+                                    let _ = registry.kill(tid);
+                                }
+                            }
+                            freshell_ownership::RuntimeOwnerKind::FreshAgent => {
+                                match rec.provider.as_str() {
+                                    "codex" => {
+                                        let _ = fresh_codex
+                                            .kill_raw_for_watchdog(&rec.session_id)
+                                            .await;
+                                    }
+                                    "claude" => {
+                                        let _ = fresh_claude
+                                            .kill_raw_for_watchdog(&rec.session_id)
+                                            .await;
+                                    }
+                                    "opencode" => {
+                                        // OpenCode: the shared serve is
+                                        // never a kill target — there is
+                                        // no partial runtime to reap.
+                                        let _ = fresh_opencode
+                                            .fresh_agent()
+                                            .opencode_kill_raw_for_watchdog(&rec.session_id)
+                                            .await;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    let _ = ownership.commit_stop(
+                        &rec.provider,
+                        &rec.session_id,
+                        &rec.operation_id,
+                        rec.generation,
+                    );
+                    tracing::warn!(target: "freshell_ownership",
+                        event = "ownership.start.recovered",
+                        operation_id = %rec.operation_id,
+                        provider = %rec.provider, session_id = %rec.session_id,
+                        initiator = %rec.initiator, from_kind = ?rec.kind,
+                        epoch = ownership.boot_epoch(), generation = rec.generation,
+                        outcome = "recovered_vacant",
+                        failure_reason = "STARTING_TIMEOUT");
+                }
+            }
+        });
+    }
     // Task 18 (DEV-0008 closure): the shared terminal-metadata registry (the
     // port of `server/terminal-metadata-service.ts`, `freshell_ws::terminal_meta`).
     // Written by the WS create/kill/exit paths and the association drains

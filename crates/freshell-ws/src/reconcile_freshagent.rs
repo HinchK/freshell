@@ -42,6 +42,25 @@ use freshell_protocol::{PaneVerdict, ReconcilePane, ReconcileVerdict, SessionLoc
 
 pub const FRESH_AGENT_RESPAWN_CAP: u32 = 3;
 
+/// kata b8ke: skip the respawn-counter burn when the coordinator shows the
+/// key owned by the OTHER kind or transitioning — the freshAgent.create the
+/// respawn verdict arms would be typed-refused anyway, and burning would let
+/// reconnect loops march a divergent pane toward a false
+/// `dead_session{respawn_exhausted}`.
+fn respawn_burn_skipped(state: &freshell_ownership::OwnershipState) -> bool {
+    use freshell_ownership::OwnershipState;
+    matches!(
+        state,
+        OwnershipState::Live { owner, .. }
+            if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal
+    ) || matches!(
+        state,
+        OwnershipState::Starting { .. }
+            | OwnershipState::Handoff { .. }
+            | OwnershipState::Stopping { .. }
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FreshAgentPresence {
     Live,
@@ -128,6 +147,30 @@ pub async fn build_snapshot(
             "opencode" => state.fresh_opencode.has_live_session(&session_id).await,
             _ => false,
         };
+        // kata b8ke Task 3: the coordinator's view of the key (via each
+        // fresh state's side-effect-free `ownership_snapshot`) — the
+        // respawn-counter guard consults it below.
+        let ownership_state = match sref.provider.as_str() {
+            "codex" => {
+                state
+                    .fresh_codex
+                    .ownership_snapshot("codex", &session_id)
+                    .state
+            }
+            "claude" => {
+                state
+                    .fresh_claude
+                    .ownership_snapshot("claude", &session_id)
+                    .state
+            }
+            "opencode" => {
+                state
+                    .fresh_opencode
+                    .ownership_snapshot("opencode", &session_id)
+                    .state
+            }
+            _ => freshell_ownership::OwnershipState::Vacant,
+        };
         use crate::existence::SessionExistence as E;
         let presence = if live {
             FreshAgentPresence::Live
@@ -166,6 +209,12 @@ pub async fn build_snapshot(
         // respawn (see verdict_for_pane) — so "this answer will be respawn"
         // is known at increment time. Mutation stays in this async builder,
         // OUTSIDE derive_verdicts' catch_unwind.
+        //
+        // kata b8ke Task 3: when the coordinator owns the key elsewhere
+        // (Live{Terminal}) or a lifecycle transition is in flight, the armed
+        // create is typed-refused anyway — NO burn (a reconnect loop must
+        // never march a divergent pane toward a false
+        // `dead_session{respawn_exhausted}`).
         let respawn_exhausted = match presence {
             FreshAgentPresence::Live => {
                 state
@@ -176,16 +225,20 @@ pub async fn build_snapshot(
                 false
             }
             FreshAgentPresence::OnDisk | FreshAgentPresence::Unknown => {
-                let mut counts = state
-                    .fresh_agent_respawn_counts
-                    .lock()
-                    .expect("respawn counts poisoned");
-                let c = counts.entry(key).or_insert(0);
-                if *c >= FRESH_AGENT_RESPAWN_CAP {
-                    true // this answer becomes dead_session{respawn_exhausted}; no burn
+                if respawn_burn_skipped(&ownership_state) {
+                    false // the coordinator owns elsewhere — no burn
                 } else {
-                    *c += 1; // this answer goes out as `respawn` — burn one
-                    false
+                    let mut counts = state
+                        .fresh_agent_respawn_counts
+                        .lock()
+                        .expect("respawn counts poisoned");
+                    let c = counts.entry(key).or_insert(0);
+                    if *c >= FRESH_AGENT_RESPAWN_CAP {
+                        true // this answer becomes dead_session{respawn_exhausted}; no burn
+                    } else {
+                        *c += 1; // this answer goes out as `respawn` — burn one
+                        false
+                    }
                 }
             }
             FreshAgentPresence::GoneObserved | FreshAgentPresence::NeverObserved => false,
@@ -426,5 +479,42 @@ mod tests {
             "answer carries the terminus id, not the retired claim"
         );
         assert_eq!(v.corrected, Some(true));
+    }
+
+    #[test]
+    fn respawn_counter_does_not_burn_when_the_coordinator_owns_elsewhere() {
+        use freshell_ownership::{OwnershipState, RuntimeOwnerKind};
+        fn owner_of(kind: RuntimeOwnerKind) -> freshell_ownership::OwnerIdentity {
+            freshell_ownership::OwnerIdentity {
+                kind,
+                terminal_id: Some("t-1".into()),
+                live_session_key: None,
+                pid: None,
+                ownership_id: None,
+            }
+        }
+        // Live same-kind (fresh-agent): respawn still burns (a same-kind rebind).
+        assert!(!respawn_burn_skipped(&OwnershipState::Live {
+            owner: owner_of(RuntimeOwnerKind::FreshAgent),
+            generation: 1,
+            since_ms: 0,
+        }));
+        // Live cross-kind (terminal): the armed create is typed-refused — no burn.
+        assert!(respawn_burn_skipped(&OwnershipState::Live {
+            owner: owner_of(RuntimeOwnerKind::Terminal),
+            generation: 2,
+            since_ms: 0,
+        }));
+        // A lifecycle transition in flight: no burn.
+        assert!(respawn_burn_skipped(&OwnershipState::Handoff {
+            prior: None,
+            to_kind: RuntimeOwnerKind::Terminal,
+            operation_id: "ho-1".into(),
+            generation: 3,
+            initiator: "test".into(),
+            since_ms: 0,
+        }));
+        // Vacant: normal respawn accounting.
+        assert!(!respawn_burn_skipped(&OwnershipState::Vacant));
     }
 }

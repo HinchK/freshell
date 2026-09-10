@@ -116,6 +116,16 @@ pub struct FreshClaudeState {
     /// replaces the default with the ONE server-wide shared map via
     /// [`Self::set_session_leases`]; keys are provider-namespaced either way.
     leases: Arc<crate::session_lease::FreshAgentSessionLeases>,
+    /// The ONE server-wide runtime-ownership coordinator (kata b8ke Task 3),
+    /// wired from freshell-server::main next to `fresh_agent_leases`.
+    /// `None` (every pre-existing test) = the lane skips coordinator
+    /// bookkeeping and keeps its current probe-based behavior only.
+    ownership: Option<Arc<freshell_ownership::RuntimeOwnershipRegistry>>,
+    /// This lane's retained coordinator commit stamps (kata b8ke Task 3):
+    /// canonical durable id → the stamp its `commit_live` left — the kill
+    /// `StopClaim` / consumer-eviction `ReleaseClaim` source (round-2
+    /// review).
+    ownership_stamps: crate::ownership_lane::OwnershipStamps,
     /// Task 13b: cross-kind liveness -- true when a live terminal PTY owns
     /// `(provider, session_id)`. Wired by `main.rs`; defaults to always-false.
     terminal_liveness: crate::TerminalLivenessProbe,
@@ -580,6 +590,8 @@ impl FreshClaudeState {
             resuming: Arc::new(TokioMutex::new(std::collections::HashSet::new())),
             identity_sink: Arc::new(std::sync::OnceLock::new()),
             leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
+            ownership: None,
+            ownership_stamps: Arc::new(std::sync::Mutex::new(HashMap::new())),
             terminal_liveness: Arc::new(|_, _| false),
             rollback_in_flight: crate::InFlightRegistry::new(),
             alias_tombstones: Arc::new(std::sync::Mutex::new(AliasTombstones::default())),
@@ -602,6 +614,94 @@ impl FreshClaudeState {
         leases: Arc<crate::session_lease::FreshAgentSessionLeases>,
     ) {
         self.leases = leases;
+    }
+
+    /// Wire the ONE server-wide runtime-ownership coordinator (kata b8ke
+    /// Task 3; called by `main.rs` next to `set_session_leases`).
+    pub fn set_ownership(&mut self, registry: Arc<freshell_ownership::RuntimeOwnershipRegistry>) {
+        self.ownership = Some(registry);
+    }
+
+    /// Side-effect-free coordinator read for `(provider, session_id)`
+    /// (kata b8ke Task 3). `Vacant`/0 when the registry is unwired.
+    pub fn ownership_snapshot(
+        &self,
+        provider: &str,
+        session_id: &str,
+    ) -> freshell_ownership::OwnershipSnapshot {
+        match &self.ownership {
+            Some(registry) => registry.observe(provider, session_id),
+            None => freshell_ownership::OwnershipSnapshot {
+                epoch: 0,
+                generation: 0,
+                state: freshell_ownership::OwnershipState::Vacant,
+            },
+        }
+    }
+
+    /// The watchdog's raw-teardown hook (kata b8ke Task 3): kill the
+    /// uncommitted in-flight spawn's sidecar tree for `session_id` — the
+    /// `(pid, ownership tag)` pair the spawn's lease armed, killed with the
+    /// same confirmed-tree-dead primitive the TTL expiry path uses.
+    pub async fn kill_raw_for_watchdog(&self, session_id: &str) -> bool {
+        if let Some((pid, ownership_id)) = self.leases.peek_kill_handle(PROVIDER, session_id) {
+            return crate::session_lease::kill_and_confirm_tree_dead(
+                pid,
+                CLAUDE_SIDECAR_OWNERSHIP_ENV,
+                &ownership_id,
+            )
+            .await;
+        }
+        false
+    }
+
+    /// kata b8ke Task 3: begin this lane's coordinator claim. See
+    /// [`crate::ownership_lane::begin_lane_claim`].
+    fn begin_lane_claim_at(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+        observed: Option<freshell_ownership::ObservedFence>,
+        initiator: &str,
+    ) -> crate::ownership_lane::LaneClaim {
+        crate::ownership_lane::begin_lane_claim(
+            &self.ownership,
+            PROVIDER,
+            session_id,
+            operation_id,
+            observed,
+            initiator,
+            crate::session_lease::now_epoch_ms(),
+        )
+    }
+
+    /// kata b8ke Task 3: commit this lane's claim and retain the stamp. See
+    /// [`crate::ownership_lane::commit_lane_claim`].
+    fn commit_lane_claim_at(
+        &self,
+        ticket: &mut Option<freshell_ownership::OperationTicket>,
+        session_id: &str,
+        live_session_key: &str,
+        pid: Option<u32>,
+    ) -> Result<(), freshell_ownership::CommitOutcome> {
+        crate::ownership_lane::commit_lane_claim(
+            &self.ownership,
+            &self.ownership_stamps,
+            PROVIDER,
+            session_id,
+            ticket,
+            live_session_key,
+            pid,
+        )
+    }
+
+    /// The initiator label for a coordinator transition event: the
+    /// connection's device id when the provenance carries one, else the lane
+    /// label (diagnostic, not audit-grade).
+    fn initiator_for(provenance: Option<&crate::BindProvenance>, lane: &str) -> String {
+        provenance
+            .and_then(|p| p.device_id.clone())
+            .unwrap_or_else(|| lane.to_string())
     }
 
     /// Wire the P1.13 identity-event sink (set-once; later calls are no-ops).
@@ -727,6 +827,12 @@ impl FreshClaudeState {
                     .filter(|s| !s.is_empty())
             });
         let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
+        // kata b8ke Task 3: the coordinator claim ticket (resume lane only —
+        // a fresh create has no canonical durable id until
+        // `sdk.session.init`, and the claim happens under the resume id).
+        // Hoisted to this scope so the commit at the registration tail can
+        // consume it; every failure return drops it (RAII typed fail).
+        let mut own_ticket: Option<freshell_ownership::OperationTicket> = None;
         if let Some(sid) = resume_sid.as_deref() {
             // Task 13b (cross-kind liveness): a live terminal PTY owning `(claude, sid)`
             // is the one writer on that JSONL -- refuse the resume with the retryable
@@ -743,6 +849,37 @@ impl FreshClaudeState {
             if self.has_live_session(sid).await {
                 self.adopt_live_create(&request_id, sid, session_type).await;
                 return;
+            }
+            // kata b8ke Task 3: the coordinator claim comes FIRST — before
+            // the provider lease — so the cross-kind authority decides
+            // atomically. The wire pair on `freshAgent.create` is the
+            // delayed-request fence (`None` = legacy unfenced sender, still
+            // cross-kind-checked).
+            let claim_op_id = format!("create-resume-{request_id}");
+            match self.begin_lane_claim_at(
+                sid,
+                &claim_op_id,
+                crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation),
+                &Self::initiator_for(provenance.as_ref(), "freshclaude/create-resume"),
+            ) {
+                crate::ownership_lane::LaneClaim::Granted(ticket) => own_ticket = Some(ticket),
+                crate::ownership_lane::LaneClaim::Unwired => {}
+                crate::ownership_lane::LaneClaim::Adopt => {
+                    // A same-kind live runtime the map fast-path missed —
+                    // adopt it, spawn nothing.
+                    self.adopt_live_create(&request_id, sid, session_type).await;
+                    return;
+                }
+                crate::ownership_lane::LaneClaim::Refused(outcome) => {
+                    tracing::warn!(target: "freshell_freshagent::claude",
+                        session_id = sid, request_id = %request_id,
+                        outcome = ?outcome,
+                        "fresh_agent_create_refused: the ownership coordinator refused the \
+                         claim (kata b8ke cross-kind authority)"
+                    );
+                    self.fail_create_session_reserved(&request_id);
+                    return;
+                }
             }
             for round in 0..2u8 {
                 match self.leases.claim(
@@ -829,6 +966,20 @@ impl FreshClaudeState {
             if let Some(pid) = child.id() {
                 g.set_kill_handle(pid, &ownership_id);
             }
+        }
+        // kata b8ke Task 3: the spawn's partial runtime (the watchdog's
+        // reap target) + the pid for the commit's owner identity (captured
+        // before `child` moves into the session entry).
+        let sidecar_pid = child.id();
+        if let Some(sid) = resume_sid.as_deref() {
+            crate::ownership_lane::register_partial_fresh_runtime(
+                &self.ownership,
+                PROVIDER,
+                sid,
+                &own_ticket,
+                sid,
+                sidecar_pid,
+            );
         }
 
         // P1.13: FULL settings snapshot for the binding row the consumer writes at
@@ -1072,6 +1223,36 @@ impl FreshClaudeState {
             }
         }
 
+        // kata b8ke Task 3: the create's registration survived every teardown
+        // gate — commit `Live{FreshAgent}` under the claimed durable id (the
+        // sessions-map key is the `created` placeholder; the stamp lands in
+        // the lane's retained map under the CANONICAL durable). The FRESH
+        // create lane (no resume id) never claimed — nothing to commit (the
+        // canonical durable id only materializes at `sdk.session.init`; the
+        // residual is covered by the D7 probe backstop).
+        if let Some(sid) = resume_sid.as_deref() {
+            if let Err(outcome) =
+                self.commit_lane_claim_at(&mut own_ticket, sid, &created, sidecar_pid)
+            {
+                tracing::error!(target: "invariant",
+                    provider = PROVIDER, session_id = %sid, request_id = %request_id,
+                    outcome = ?outcome,
+                    "freshagent.claude.create_commit_stale: the coordinator moved on while \
+                     the create registered; the uncommitted session is torn down"
+                );
+                if let Some(session) = self.sessions.lock().await.remove(&created) {
+                    teardown_removed_session(session).await;
+                }
+                self.evict_cli_index_aliases(&created).await;
+                self.fail_create(
+                    &request_id,
+                    "FRESH_AGENT_CREATE_FAILED",
+                    "session ownership changed during create; torn down",
+                );
+                return;
+            }
+        }
+
         // Cache the completed create for requestId dedup BEFORE responding (mirrors
         // codex/opencode: a duplicate `create` arriving right after this point must see
         // the cache populated, never race past this guard's release and spawn a second
@@ -1277,6 +1458,112 @@ impl FreshClaudeState {
         }
         let main_close_reported_failure =
             close_answer == crate::identity_sink::CloseAnswer::Persisted;
+        // kata b8ke Task 3: the fenced coordinator stop — placed AFTER the
+        // durable close envelope (a Clean-failure close aborts the kill with
+        // the session left live, which must never strand the coordinator in
+        // `Stopping`) and BEFORE any live-state destruction below. The claim is built
+        // from the lane's OWN retained stamp (its believed runtime identity
+        // plus the `(epoch, generation)` its `commit_live` stamped; the wire
+        // pair on `freshAgent.kill` feeds the same fence when present) —
+        // resolved for the wire id (a durable) or through the live
+        // session's recorded cli id (a placeholder-addressed kill).
+        // `BlockedHandoff` / `StaleClaim` / an in-flight `Starting`/`Stopping`
+        // are typed refusals: the caller does NOT kill. `NotLive{Vacant}`:
+        // the kill proceeds (idempotent lane cleanup) and skips the
+        // commit. No retained stamp: lane-local cleanup, no transition.
+        let stop_fence =
+            crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation);
+        let mut stop_generation: Option<u64> = None;
+        let mut stop_op_id: Option<String> = None;
+        let mut stop_key: Option<String> = None;
+        if let Some(registry) = self.ownership.as_ref() {
+            let stop_stamp = match crate::ownership_lane::peek_retained_stamp(
+                &self.ownership_stamps,
+                &session_id,
+            ) {
+                Some(stamp) => Some((session_id.clone(), stamp)),
+                None => {
+                    let map_key = self.resolve_session_key(&session_id).await;
+                    match map_key {
+                        Some(map_key) => {
+                            let durable = self
+                                .sessions
+                                .lock()
+                                .await
+                                .get(&map_key)
+                                .and_then(|s| s.cli_session_id.clone());
+                            durable.and_then(|d| {
+                                crate::ownership_lane::peek_retained_stamp(
+                                    &self.ownership_stamps,
+                                    &d,
+                                )
+                                .map(|st| (d, st))
+                            })
+                        }
+                        None => None,
+                    }
+                }
+            };
+            if let Some((stop_session_id, stamp)) = stop_stamp {
+                let claim = crate::ownership_lane::stop_claim_from_stamp(&stamp, stop_fence);
+                let kill_op_id = format!("kill-{}", uuid::Uuid::new_v4());
+                let stop_outcome = crate::ownership_lane::begin_fresh_agent_stop(
+                    registry,
+                    PROVIDER,
+                    &stop_session_id,
+                    &kill_op_id,
+                    &claim,
+                    "freshclaude/kill",
+                    crate::session_lease::now_epoch_ms(),
+                );
+                let refused = match &stop_outcome {
+                    freshell_ownership::StopOutcome::Granted { generation } => {
+                        crate::ownership_lane::take_retained_stamp(
+                            &self.ownership_stamps,
+                            &stop_session_id,
+                        );
+                        stop_generation = Some(*generation);
+                        stop_op_id = Some(kill_op_id);
+                        stop_key = Some(stop_session_id);
+                        None
+                    }
+                    freshell_ownership::StopOutcome::NotLive {
+                        state: freshell_ownership::OwnershipState::Vacant,
+                    } => {
+                        crate::ownership_lane::take_retained_stamp(
+                            &self.ownership_stamps,
+                            &stop_session_id,
+                        );
+                        None
+                    }
+                    freshell_ownership::StopOutcome::NotLive { state } => Some(format!(
+                        "a lifecycle operation is in flight ({state:?}); retry after it settles"
+                    )),
+                    freshell_ownership::StopOutcome::BlockedHandoff { .. } => Some(
+                        "a handoff owns this session's transition; retry after it settles"
+                            .to_string(),
+                    ),
+                    freshell_ownership::StopOutcome::StaleClaim { .. } => {
+                        Some("ownership moved to a newer runtime; refresh and retry".to_string())
+                    }
+                };
+                if let Some(_reason) = refused {
+                    tracing::warn!(target: "freshell_freshagent::claude",
+                        session_id = %session_id, outcome = ?stop_outcome,
+                        "fresh_agent_kill_refused: the ownership coordinator refused the \
+                         stop (kata b8ke) — nothing is killed"
+                    );
+                    self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                        provider: PROVIDER.to_string(),
+                        session_id,
+                        session_type: session_type.to_string(),
+                        success: false,
+                    }));
+                    return;
+                }
+            }
+        }
+
         // Live-state destruction begins (every durable id the one envelope
         // covers is durably closed by this point). The consumer ABORT stays
         // synchronous (the minter channel closes).
@@ -1345,6 +1632,20 @@ impl FreshClaudeState {
         // that has since COMMITTED (its fence-clearing transition beat this
         // sweep) is a genuine reopen and is spared.
         self.sweep_late_claim_orphans(&retire_ids).await;
+
+        // kata b8ke Task 3: the teardown (the reap — consumer abort, child
+        // kill, ownership sweep) is done — commit the stop (Stopping →
+        // Vacant). NEVER before the reap (round-1 review).
+        if let (Some(registry), Some(generation), Some(op_id), Some(key)) = (
+            self.ownership.as_ref(),
+            stop_generation,
+            stop_op_id.as_deref(),
+            stop_key.as_deref(),
+        ) {
+            let _ = crate::ownership_lane::commit_fresh_agent_stop(
+                registry, PROVIDER, key, op_id, generation,
+            );
+        }
 
         self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
             provider: PROVIDER.to_string(),
@@ -2785,7 +3086,39 @@ impl FreshClaudeState {
         // Lease discipline: claim the OLD durable id exactly like the
         // create-resume path so a concurrent attach cannot bind the pre-rollback
         // id mid-fork. A REFUSAL LEG — before any record write or teardown.
+        // kata b8ke Task 3: the coordinator claim comes FIRST — before the
+        // provider lease — so the rollback window (kill + re-resume of the
+        // same durable lane) is cross-kind-authoritative. The "we ARE the
+        // bound live owner" case surfaces as AdoptLive (same-kind live).
         let rollback_lease_id = format!("rollback-{}", uuid::Uuid::new_v4());
+        let mut own_ticket = match self.begin_lane_claim_at(
+            &durable_id,
+            &rollback_lease_id,
+            None,
+            "freshclaude/rollback",
+        ) {
+            crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+            crate::ownership_lane::LaneClaim::Unwired => None,
+            crate::ownership_lane::LaneClaim::Adopt => {
+                // Same-kind live under this exact id (the lease arm's "we
+                // ARE the bound live owner" twin): proceed WITHOUT a claim
+                // — the binding already names this lane.
+                None
+            }
+            crate::ownership_lane::LaneClaim::Refused(outcome) => {
+                tracing::warn!(target: "freshell_freshagent::claude",
+                    session_id = %durable_id, outcome = ?outcome,
+                    "fresh_agent_rollback_refused: the ownership coordinator refused the \
+                     claim (kata b8ke cross-kind authority)"
+                );
+                reply_sink(rollback_error_frame(
+                    &op,
+                    "SESSION_RESERVED",
+                    "Another resume for this session is in flight",
+                ));
+                return;
+            }
+        };
         let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
         for round in 0..2u8 {
             match self.leases.claim(
@@ -3466,6 +3799,18 @@ impl FreshClaudeState {
             preseeded_init,
             cli_id,
         } = spawned;
+        // kata b8ke Task 3: the respawn's partial runtime (the watchdog's
+        // reap target) + the pid for the commit's owner identity (captured
+        // before `child` moves into the session entry).
+        let sidecar_pid = child.id();
+        crate::ownership_lane::register_partial_fresh_runtime(
+            &self.ownership,
+            PROVIDER,
+            &durable_id,
+            &own_ticket,
+            &map_key,
+            sidecar_pid,
+        );
 
         // Register the replacement session under the SAME map key, INHERITING
         // the turn lock + busy truth handles (a mid-rollback send serializes on
@@ -3563,6 +3908,31 @@ impl FreshClaudeState {
                 ));
                 return;
             }
+        }
+
+        // kata b8ke Task 3: the rollback's replacement session is registered —
+        // commit `Live{FreshAgent}` under the (same) durable lane. The
+        // adopted durable id (`adopted_id` below) supersedes it in the LEDGER
+        // only; the coordinator key stays the lane's canonical pre-rollback
+        // durable (the runtime writer identity did not move).
+        if let Err(outcome) =
+            self.commit_lane_claim_at(&mut own_ticket, &durable_id, &map_key, sidecar_pid)
+        {
+            tracing::error!(target: "invariant",
+                provider = PROVIDER, session_id = %durable_id,
+                outcome = ?outcome,
+                "freshagent.claude.rollback_commit_stale: the coordinator moved on while \
+                 the rollback registered; the uncommitted session is torn down"
+            );
+            self.compensate_rollback_record(&durable_id, existing.clone())
+                .await;
+            self.teardown_rollback_fork(&map_key).await;
+            reply_sink(rollback_error_frame(
+                &op,
+                "INTERNAL_ERROR",
+                "session ownership changed during rollback; torn down",
+            ));
+            return;
         }
 
         // Pane re-key: the existing materialized broadcast (old → new) goes out
@@ -3676,6 +4046,50 @@ impl FreshClaudeState {
             );
             return;
         }
+        // kata b8ke Task 3: the coordinator claim comes FIRST — before the
+        // provider lease — with the attach's delayed-request fence (round-2
+        // lifecycle audit: attach can cold-resume an untracked session,
+        // registering a runtime). AdoptLive converges via the same rebind
+        // arm the lease's BoundLive uses.
+        let mut own_ticket = match self.begin_lane_claim_at(
+            &durable,
+            &format!("attach-{}", uuid::Uuid::new_v4()),
+            crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation),
+            "freshclaude/attach",
+        ) {
+            crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+            crate::ownership_lane::LaneClaim::Unwired => None,
+            crate::ownership_lane::LaneClaim::Adopt => {
+                self.resuming.lock().await.remove(&durable);
+                if !self
+                    .try_rebind_to_live(&durable, session_type_str(msg.session_type))
+                    .await
+                {
+                    self.emit_fresh_agent_error(
+                        &msg.session_id,
+                        session_type_str(msg.session_type),
+                        "SESSION_RESERVED",
+                        "Another resume for this session is in flight",
+                    );
+                }
+                return;
+            }
+            crate::ownership_lane::LaneClaim::Refused(outcome) => {
+                tracing::warn!(target: "freshell_freshagent::claude",
+                    session_id = %durable, outcome = ?outcome,
+                    "fresh_agent_attach_refused: the ownership coordinator refused the \
+                     claim (kata b8ke cross-kind authority)"
+                );
+                self.resuming.lock().await.remove(&durable);
+                self.emit_fresh_agent_error(
+                    &msg.session_id,
+                    session_type_str(msg.session_type),
+                    "SESSION_RESERVED",
+                    "Another resume for this session is in flight",
+                );
+                return;
+            }
+        };
         let attach_request_id = format!("attach-{}", uuid::Uuid::new_v4());
         let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
         for round in 0..2u8 {
@@ -3750,7 +4164,7 @@ impl FreshClaudeState {
             }
         }
         let outcome = self
-            .resume_for_attach(&msg, &durable, &mut lease_guard)
+            .resume_for_attach(&msg, &durable, &mut lease_guard, &mut own_ticket)
             .await;
         self.resuming.lock().await.remove(&durable);
         // Any leftover armed guard means the resume ended WITHOUT registering a session
@@ -3758,6 +4172,9 @@ impl FreshClaudeState {
         if let Some(mut g) = lease_guard.take() {
             g.fail();
         }
+        // kata b8ke Task 3: same for the coordinator ticket — a leftover
+        // (uncommitted) claim drops here (RAII typed fail reopens the key).
+        drop(own_ticket);
         match outcome {
             Ok(()) => {}
             Err(ResumeClaudeError::NotFound) => {
@@ -3818,6 +4235,10 @@ impl FreshClaudeState {
         msg: &FreshAgentAttach,
         durable: &str,
         lease_guard: &mut Option<crate::FreshSessionLeaseGuard>,
+        // kata b8ke Task 3: the attach's coordinator claim ticket — committed
+        // at the registration tail below; every error return leaves it armed
+        // for the caller's drop (RAII typed fail).
+        own_ticket: &mut Option<freshell_ownership::OperationTicket>,
     ) -> Result<(), ResumeClaudeError> {
         if crate::claude_snapshot::claude_home_candidates().is_empty() {
             // No store root resolvable at all: we cannot CHECK, so we must not DENY.
@@ -3887,6 +4308,18 @@ impl FreshClaudeState {
                 g.set_kill_handle(pid, &ownership_id);
             }
         }
+        // kata b8ke Task 3: the spawn's partial runtime (the watchdog's reap
+        // target) + the pid for the commit's owner identity (captured before
+        // `child` moves into the session entry).
+        let sidecar_pid = child.id();
+        crate::ownership_lane::register_partial_fresh_runtime(
+            &self.ownership,
+            PROVIDER,
+            durable,
+            own_ticket,
+            durable,
+            sidecar_pid,
+        );
         let request_id = format!("attach-resume-{}", uuid::Uuid::new_v4());
         let create_req = json!({
             "type": "create",
@@ -4081,6 +4514,27 @@ impl FreshClaudeState {
                     "session lease revoked during attach-resume; torn down".to_string(),
                 ));
             }
+        }
+
+        // kata b8ke Task 3: the attach-resume's registration survived every
+        // teardown gate — commit `Live{FreshAgent}` under the durable id
+        // (the sessions-map key is the CLIENT's msg.session_id).
+        if let Err(outcome) =
+            self.commit_lane_claim_at(own_ticket, durable, &msg.session_id, sidecar_pid)
+        {
+            tracing::error!(target: "invariant",
+                provider = PROVIDER, session_id = %durable,
+                outcome = ?outcome,
+                "freshagent.claude.attach_commit_stale: the coordinator moved on while the \
+                 resume registered; the uncommitted session is torn down"
+            );
+            if let Some(session) = self.sessions.lock().await.remove(&msg.session_id) {
+                teardown_removed_session(session).await;
+            }
+            self.evict_cli_index_aliases(&msg.session_id).await;
+            return Err(ResumeClaudeError::Transient(
+                "session ownership changed during attach-resume; torn down".to_string(),
+            ));
         }
 
         // Read the tracked status through the same `current_status()` helper the
@@ -4697,6 +5151,18 @@ impl FreshClaudeState {
                 // sessionRef stays adopt-only forever.
                 for durable in &removed_durables {
                     state.leases.clear_binding(PROVIDER, durable);
+                    // kata b8ke Task 3: an UNREQUESTED sidecar death releases
+                    // the retained coordinator stamp with its fenced claim
+                    // (round-1 review) — the durable key reopens for the next
+                    // claimant. A delayed eviction can never erase a newer
+                    // owner (the registry no-ops on mismatch).
+                    crate::ownership_lane::release_retained_stamp(
+                        &state.ownership,
+                        &state.ownership_stamps,
+                        PROVIDER,
+                        durable,
+                        "freshclaude/consumer-exit",
+                    );
                 }
                 // Adapter-asymmetry fix (bug-hunt pbh-20260807): an UNREQUESTED sidecar
                 // death must never be TOTAL SILENCE. The codex sibling broadcasts its

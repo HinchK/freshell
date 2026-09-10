@@ -202,8 +202,10 @@ fn test_settings_value() -> serde_json::Value {
 }
 
 /// Server with BOTH kinds live: a sleeper `claude` terminal CLI spec AND the
-/// fresh-agent runtimes (freshAgent enabled). Returns the ws URL + the registry.
-async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
+/// fresh-agent runtimes (freshAgent enabled). Returns the ws URL, the registry,
+/// and the `WsState` clone (kata b8ke Task 3: the shared ownership
+/// coordinator is minted HERE, exactly like `main.rs` injects it).
+async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry, WsState) {
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let settings =
@@ -242,12 +244,20 @@ async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
         json!({ "freshAgent": { "enabled": true } }),
     );
     fresh_codex.set_terminal_liveness(Arc::clone(&terminal_liveness));
-    let mut fresh_opencode =
-        freshell_freshagent::FreshOpencodeState::new(freshell_freshagent::FreshAgentState::new(
-            Arc::clone(&auth_token),
-            Arc::clone(&broadcast_tx),
-        ));
+    let fresh_agent_state = freshell_freshagent::FreshAgentState::new(
+        Arc::clone(&auth_token),
+        Arc::clone(&broadcast_tx),
+    );
+    let mut fresh_opencode = freshell_freshagent::FreshOpencodeState::new(fresh_agent_state);
     fresh_opencode.set_terminal_liveness(Arc::clone(&terminal_liveness));
+
+    // kata b8ke Task 3: mint the ONE ownership coordinator and inject it into
+    // every fresh state (mirrors main.rs — the cross-kind authority the lanes
+    // claim through).
+    let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+    fresh_codex.set_ownership(Arc::clone(&ownership));
+    fresh_claude.set_ownership(Arc::clone(&ownership));
+    fresh_opencode.set_ownership(Arc::clone(&ownership));
 
     let state = WsState {
         layout: Default::default(),
@@ -294,7 +304,7 @@ async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
         fresh_agent_respawn_counts: Default::default(),
     };
 
-    let router = freshell_ws::router(state);
+    let router = freshell_ws::router(state.clone());
     // Ephemeral loopback port only -- NEVER the self-hosted 3001/3002 ports.
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -304,7 +314,7 @@ async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
         let _ = axum::serve(listener, router).await;
     });
 
-    (format!("ws://{addr}/ws"), registry)
+    (format!("ws://{addr}/ws"), registry, state)
 }
 
 type TestWs =
@@ -384,7 +394,7 @@ async fn freshagent_resume_is_refused_while_a_terminal_pty_owns_the_session() {
     let _guard = ENV_LOCK.lock().await;
     let env = FakeSidecarEnv::install();
 
-    let (url, _registry) = spawn_server().await;
+    let (url, _registry, _ws_state) = spawn_server().await;
     let mut ws = connect(&url).await;
 
     // 1. A fresh claude terminal reaches Running, owning preallocated session S.
@@ -462,7 +472,7 @@ async fn freshagent_session_ref_resume_is_refused_while_a_terminal_pty_owns_the_
     let _guard = ENV_LOCK.lock().await;
     let env = FakeSidecarEnv::install();
 
-    let (url, _registry) = spawn_server().await;
+    let (url, _registry, _ws_state) = spawn_server().await;
     let mut ws = connect(&url).await;
 
     // 1. A fresh claude terminal reaches Running, owning preallocated session S.
@@ -534,7 +544,7 @@ async fn terminal_create_is_refused_while_a_live_sidecar_owns_the_session() {
     let env = FakeSidecarEnv::install();
 
     let durable = "cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd";
-    let (url, registry) = spawn_server().await;
+    let (url, registry, _ws_state) = spawn_server().await;
     let mut ws = connect(&url).await;
 
     // 1. A fresh-agent resume of S goes live (the fake sidecar answers `created`).
@@ -611,7 +621,7 @@ async fn d7_cross_kind_refusal_omits_live_terminal_id() {
     let env = FakeSidecarEnv::install();
 
     let durable = "abababab-cdcd-4dcd-8dcd-cdcdcdcdcdcd";
-    let (url, registry) = spawn_server().await;
+    let (url, registry, _ws_state) = spawn_server().await;
     let mut ws = connect(&url).await;
 
     // 1. A fresh-agent resume of S goes live (the fake sidecar answers `created`).
@@ -676,4 +686,54 @@ async fn d7_cross_kind_refusal_omits_live_terminal_id() {
         }),
         "no terminal may own {durable} -- the sidecar is the one writer"
     );
+}
+
+/// kata b8ke Task 3: a real freshclaude create/kill drives the shared
+/// coordinator — Live{FreshAgent} while alive, Vacant after the awaited kill.
+#[tokio::test]
+async fn fresh_agent_create_and_kill_drive_the_shared_coordinator() {
+    let _guard = ENV_LOCK.lock().await;
+    let sidecar = FakeSidecarEnv::install(); // SYNC at base — no .await
+    let (url, _registry, ws_state) = spawn_server().await;
+    let mut ws = connect(&url).await;
+    let sid = format!("coord-{}", uuid::Uuid::new_v4());
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "freshAgent.create", "requestId": "req-coord-1",
+            "sessionType": "freshclaude", "provider": "claude",
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+    let _created = await_frame(&mut ws, Duration::from_secs(20), |v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("freshAgent.created")
+    })
+    .await;
+    let snap = ws_state.fresh_claude.ownership_snapshot("claude", &sid);
+    assert!(
+        matches!(snap.state, freshell_ownership::OwnershipState::Live { .. }),
+        "expected Live fresh-agent owner, got {:?}",
+        snap.state
+    );
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "freshAgent.kill", "sessionId": sid,
+            "sessionType": "freshclaude", "provider": "claude",
+        }),
+    )
+    .await;
+    let _killed = await_frame(&mut ws, Duration::from_secs(20), |v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("freshAgent.killed")
+            && v.get("sessionId").and_then(|s| s.as_str()) == Some(sid.as_str())
+    })
+    .await;
+    let snap = ws_state.fresh_claude.ownership_snapshot("claude", &sid);
+    assert_eq!(
+        snap.state,
+        freshell_ownership::OwnershipState::Vacant,
+        "kill must release ownership only after the confirmed reap"
+    );
+    let _ = sidecar;
 }

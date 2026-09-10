@@ -374,6 +374,19 @@ impl FreshAgentSessionLeases {
         inner.leases.remove(&key);
         inner.bindings.remove(&key);
     }
+
+    /// kata b8ke Task 3: the CURRENT holder's armed kill handle, if any —
+    /// the ownership watchdog's `kill_raw_for_watchdog` reaps an
+    /// uncommitted, over-aged spawn's sidecar with the same `(pid,
+    /// ownership tag)` pair the TTL expiry path kills by. Read-only; the
+    /// lease itself is untouched.
+    pub fn peek_kill_handle(&self, provider: &str, session_id: &str) -> Option<(u32, String)> {
+        let inner = self.inner.lock().expect("fresh-agent lease lock poisoned");
+        inner
+            .leases
+            .get(&lease_key(provider, session_id))
+            .and_then(|lease| lease.kill_handle.clone())
+    }
 }
 
 #[cfg(test)]

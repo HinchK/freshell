@@ -20,6 +20,10 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+# kata b8ke Task 3: the runtime-ownership coordinator whose snapshots the
+# fresh-agent reconcile verdicts consult (respawn-counter burn guard) and
+# Task 4's WsState field threads to the terminal lane.
+freshell-ownership = { path = "../freshell-ownership" }
 # The frozen wire types this crate emits (ready/settings.updated/etc.) + the
 # client-message types it parses (terminal.create/attach/input/kill/…).
 freshell-protocol = { path = "../freshell-protocol" }

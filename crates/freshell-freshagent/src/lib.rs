@@ -119,6 +119,427 @@ pub(crate) struct RestSpawnGate {
     pub(crate) timeout: std::time::Duration,
 }
 
+/// One call shape for every fresh-agent provider's coordinator claim (kata
+/// b8ke Task 3). The claim happens FIRST (before the provider lease) at every
+/// lifecycle entry point — the coordinator is the cross-kind authority; the
+/// provider lease stays as the same-kind/TTL backstop.
+pub mod ownership_lane {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use freshell_ownership::{
+        BeginOutcome, CommitOutcome, FailOutcome, ObservedFence, OperationTicket, OwnerIdentity,
+        ReleaseClaim, RuntimeOwnerKind, RuntimeOwnershipRegistry, StopClaim, StopOutcome,
+    };
+
+    /// The stamp a lane retains beside its live-session entry after
+    /// `commit_live` (round-2 review): the later `StopClaim` (explicit kill)
+    /// and `ReleaseClaim` (exit watcher) source — the believed runtime
+    /// identity plus the `(epoch, generation)` its commit stamped.
+    #[derive(Clone, Debug)]
+    pub struct OwnershipStamp {
+        pub epoch: u64,
+        pub generation: u64,
+        pub operation_id: String,
+        pub owner: OwnerIdentity,
+    }
+
+    impl OwnershipStamp {
+        /// The fenced stop claim an explicit `freshAgent.kill` carries
+        /// (round-2 review): the lane's believed runtime identity plus the
+        /// `(epoch, generation)` its `commit_live` stamped.
+        pub fn stop_claim(&self) -> StopClaim {
+            StopClaim {
+                expected_kind: RuntimeOwnerKind::FreshAgent,
+                expected_runtime: Some(self.owner.clone()),
+                observed: ObservedFence {
+                    epoch: self.epoch,
+                    generation: self.generation,
+                },
+            }
+        }
+
+        /// The fenced release claim an exit watcher carries (round-1 review):
+        /// a delayed watcher event can never erase a newer owner or an
+        /// in-flight handoff — the registry no-ops on any mismatch.
+        pub fn release_claim(&self) -> ReleaseClaim {
+            ReleaseClaim {
+                operation_id: self.operation_id.clone(),
+                generation: self.generation,
+                runtime: Some(self.owner.clone()),
+            }
+        }
+    }
+
+    /// The per-lane retained-commit index: canonical session id → the stamp
+    /// its `commit_live` left (round-2 review: kill paths build their fenced
+    /// `StopClaim`s from here; exit watchers take + release theirs). Shared
+    /// between the REST state and the WS opencode slice (a REST-materialized
+    /// `ses_*` can be killed through the WS lane and vice versa).
+    pub type OwnershipStamps = Arc<Mutex<HashMap<String, OwnershipStamp>>>;
+
+    /// What an exit watcher needs to release coordinator ownership on
+    /// natural exit (kata b8ke Task 3): the registry + the lane's retained
+    /// stamps, captured at spawn time; the watcher takes the stamp at exit
+    /// and releases with its fenced claim (a delayed watcher can never
+    /// erase a newer owner or an in-flight handoff — the registry no-ops on
+    /// mismatch).
+    #[derive(Clone)]
+    pub struct OwnershipWatch {
+        pub registry: Arc<RuntimeOwnershipRegistry>,
+        pub stamps: OwnershipStamps,
+        pub provider: &'static str,
+    }
+
+    impl OwnershipWatch {
+        /// Take the retained stamp (if any) and release it — the exit
+        /// watcher's natural-death hook.
+        pub fn release(&self, session_id: &str, initiator: &str) {
+            release_retained_stamp(
+                &Some(Arc::clone(&self.registry)),
+                &self.stamps,
+                self.provider,
+                session_id,
+                initiator,
+            );
+        }
+    }
+
+    /// The `(epoch, generation)` wire pair a lifecycle message carried, as
+    /// the fence the coordinator consumes. Neither field sent (legacy
+    /// unfenced sender) → `None` — still cross-kind-checked, just not
+    /// stale-fenced.
+    pub fn wire_fence(epoch: Option<u64>, generation: Option<u64>) -> Option<ObservedFence> {
+        match (epoch, generation) {
+            (Some(epoch), Some(generation)) => Some(ObservedFence { epoch, generation }),
+            _ => None,
+        }
+    }
+
+    /// Claim; on Granted the caller wraps the result in an `OperationTicket`
+    /// (Task 1's RAII guard — drop = typed fail) so a panicked spawn cannot
+    /// wedge the session.
+    pub fn claim_fresh_agent_ownership(
+        registry: &Arc<RuntimeOwnershipRegistry>,
+        provider: &str,
+        session_id: &str,
+        operation_id: &str,
+        observed: Option<ObservedFence>,
+        initiator: &str,
+        now_ms: u64,
+    ) -> BeginOutcome {
+        registry.begin_start(
+            provider,
+            session_id,
+            RuntimeOwnerKind::FreshAgent,
+            operation_id,
+            observed,
+            initiator,
+            now_ms,
+        )
+    }
+
+    pub fn commit_fresh_agent_ownership(
+        registry: &Arc<RuntimeOwnershipRegistry>,
+        provider: &str,
+        session_id: &str,
+        operation_id: &str,
+        generation: u64,
+        owner: OwnerIdentity,
+    ) -> CommitOutcome {
+        registry.commit_live(provider, session_id, operation_id, generation, owner)
+    }
+
+    pub fn fail_fresh_agent_ownership(
+        registry: &Arc<RuntimeOwnershipRegistry>,
+        provider: &str,
+        session_id: &str,
+        operation_id: &str,
+        generation: u64,
+    ) -> FailOutcome {
+        registry.fail(
+            provider,
+            session_id,
+            operation_id,
+            generation,
+            /* prior_confirmed_live */ false,
+        )
+    }
+
+    /// Kill path, FIRST HALF (round-1 review): `Live{fresh-agent}` →
+    /// `Stopping` (blocks competing starts). FENCED (round-2 review): the
+    /// lane passes its `StopClaim` — the believed runtime identity from its
+    /// own live-session entry plus the `(epoch, generation)` its
+    /// `commit_live` stamped (retained beside that entry; the wire pair on
+    /// `freshAgent.kill` feeds it when present). The CALLER then performs
+    /// the kill while `Stopping` and finishes with `commit_fresh_agent_stop`
+    /// ONLY after the awaited, confirmed reap — never Vacant before the
+    /// reap. `BlockedHandoff`: the caller must NOT kill (an in-flight
+    /// handoff owns the transition). `StaleClaim`: the caller must NOT kill
+    /// (the current owner does not match the lane's believed runtime/fence —
+    /// round-2 review). `NotLive` during another transition: the caller may
+    /// still kill its own runtime but skips the commit.
+    pub fn begin_fresh_agent_stop(
+        registry: &Arc<RuntimeOwnershipRegistry>,
+        provider: &str,
+        session_id: &str,
+        operation_id: &str,
+        claim: &StopClaim,
+        initiator: &str,
+        now_ms: u64,
+    ) -> StopOutcome {
+        registry.begin_stop(provider, session_id, operation_id, claim, initiator, now_ms)
+    }
+
+    /// Kill path, SECOND HALF: `Stopping{op}` → `Vacant` after the caller
+    /// has confirmed the reap (the awaited sidecar/serve exit).
+    pub fn commit_fresh_agent_stop(
+        registry: &Arc<RuntimeOwnershipRegistry>,
+        provider: &str,
+        session_id: &str,
+        operation_id: &str,
+        generation: u64,
+    ) -> CommitOutcome {
+        registry.commit_stop(provider, session_id, operation_id, generation)
+    }
+
+    /// Exit-watcher release (round-1 review: FENCED). The watcher captures
+    /// the `ReleaseClaim` (operation id, generation, runtime identity) when
+    /// it registers; a delayed event can never erase a newer owner or an
+    /// in-flight handoff — the registry no-ops on mismatch.
+    pub fn release_fresh_agent_ownership(
+        registry: &Arc<RuntimeOwnershipRegistry>,
+        provider: &str,
+        session_id: &str,
+        claim: &ReleaseClaim,
+        initiator: &str,
+    ) {
+        registry.release(provider, session_id, claim, initiator);
+    }
+
+    // ── lane bindings: the per-state plumbing every provider shares ────────
+
+    /// The lane-claim answer for [`begin_lane_claim`]: `Granted` wraps the
+    /// RAII ticket (drop without `disarm()` performs the typed fail, so a
+    /// panicked spawn cannot wedge the session in `Starting`); `Adopt` means
+    /// a same-kind live runtime exists (adopt, never spawn); `Unwired` is
+    /// the legacy no-coordinator behavior (every pre-existing test); the
+    /// typed `Refused` outcomes (OwnedByOtherKind / Blocked /
+    /// StaleGeneration) are mapped by the caller onto its existing
+    /// retryable wire answers.
+    pub enum LaneClaim {
+        Granted(OperationTicket),
+        Adopt,
+        Unwired,
+        Refused(BeginOutcome),
+    }
+
+    /// Begin a lane claim on the shared coordinator (kata b8ke Task 3).
+    /// The claim happens FIRST — before the provider lease — at every
+    /// lifecycle entry point that spawns; the provider lease stays as the
+    /// same-kind/TTL backstop.
+    pub fn begin_lane_claim(
+        registry: &Option<Arc<RuntimeOwnershipRegistry>>,
+        provider: &str,
+        session_id: &str,
+        operation_id: &str,
+        observed: Option<ObservedFence>,
+        initiator: &str,
+        now_ms: u64,
+    ) -> LaneClaim {
+        let Some(registry) = registry.as_ref() else {
+            return LaneClaim::Unwired;
+        };
+        match claim_fresh_agent_ownership(
+            registry,
+            provider,
+            session_id,
+            operation_id,
+            observed,
+            initiator,
+            now_ms,
+        ) {
+            BeginOutcome::Granted { generation } => LaneClaim::Granted(OperationTicket::new(
+                Arc::clone(registry),
+                provider,
+                session_id,
+                operation_id,
+                RuntimeOwnerKind::FreshAgent,
+                generation,
+                initiator,
+            )),
+            BeginOutcome::AdoptLive { .. } => LaneClaim::Adopt,
+            outcome => LaneClaim::Refused(outcome),
+        }
+    }
+
+    /// Register the in-flight spawn's partial-runtime identity (round-2
+    /// watchdog cancellation): the lane calls this the moment its child
+    /// exists but before `commit_live`, so the watchdog host can kill it
+    /// during settle. Fenced to the ticket's operation id + generation;
+    /// no-op when there is no ticket.
+    pub fn register_partial_fresh_runtime(
+        registry: &Option<Arc<RuntimeOwnershipRegistry>>,
+        provider: &str,
+        session_id: &str,
+        ticket: &Option<OperationTicket>,
+        live_session_key: &str,
+        pid: Option<u32>,
+    ) {
+        let Some(registry) = registry.as_ref() else {
+            return;
+        };
+        let Some(ticket) = ticket.as_ref() else {
+            return;
+        };
+        registry.register_partial_runtime(
+            provider,
+            session_id,
+            ticket.operation_id(),
+            ticket.generation(),
+            OwnerIdentity {
+                kind: RuntimeOwnerKind::FreshAgent,
+                terminal_id: None,
+                live_session_key: Some(live_session_key.to_string()),
+                pid,
+                ownership_id: None,
+            },
+        );
+    }
+
+    /// Commit a lane claim and retain the stamp: builds the fresh-agent
+    /// owner identity (the lane's sessions-map key + the sidecar pid),
+    /// commits, and inserts the stamp into `stamps` (the kill/exit
+    /// `StopClaim`/`ReleaseClaim` source — round-2 review). `Ok(())` when
+    /// there is no ticket (unwired, or an adopt that never claimed) or the
+    /// commit landed; `Err(outcome)` on `StaleGeneration`/`ForeignOperation`
+    /// — the caller must tear its just-registered session down (its
+    /// uncommitted child with it) exactly like its existing
+    /// claim-refusal paths.
+    pub fn commit_lane_claim(
+        registry: &Option<Arc<RuntimeOwnershipRegistry>>,
+        stamps: &OwnershipStamps,
+        provider: &str,
+        session_id: &str,
+        ticket: &mut Option<OperationTicket>,
+        live_session_key: &str,
+        pid: Option<u32>,
+    ) -> Result<(), CommitOutcome> {
+        let Some(registry) = registry.as_ref() else {
+            return Ok(());
+        };
+        let Some(held) = ticket.as_ref() else {
+            return Ok(());
+        };
+        let (operation_id, generation) = (held.operation_id().to_string(), held.generation());
+        let owner = OwnerIdentity {
+            kind: RuntimeOwnerKind::FreshAgent,
+            terminal_id: None,
+            live_session_key: Some(live_session_key.to_string()),
+            pid,
+            ownership_id: Some(operation_id.clone()),
+        };
+        let outcome = commit_fresh_agent_ownership(
+            registry,
+            provider,
+            session_id,
+            &operation_id,
+            generation,
+            owner.clone(),
+        );
+        match outcome {
+            CommitOutcome::Committed => {
+                stamps.lock().expect("ownership stamps lock").insert(
+                    session_id.to_string(),
+                    OwnershipStamp {
+                        epoch: registry.boot_epoch(),
+                        generation,
+                        operation_id,
+                        owner,
+                    },
+                );
+                if let Some(held) = ticket.as_mut() {
+                    held.disarm();
+                }
+                Ok(())
+            }
+            CommitOutcome::StaleGeneration { .. } | CommitOutcome::ForeignOperation => {
+                // The commit decision is final either way — disarm so the
+                // ticket's drop does not double-report; the caller owns the
+                // teardown (the key was never ours to keep).
+                if let Some(held) = ticket.as_mut() {
+                    held.disarm();
+                }
+                Err(outcome)
+            }
+        }
+    }
+
+    /// Take the retained stamp for a canonical session id (the explicit-kill
+    /// `StopClaim` source). The taker owns the release/commit that follows.
+    pub fn take_retained_stamp(
+        stamps: &OwnershipStamps,
+        session_id: &str,
+    ) -> Option<OwnershipStamp> {
+        stamps
+            .lock()
+            .expect("ownership stamps lock")
+            .remove(session_id)
+    }
+
+    /// Peek (without taking) the retained stamp for a canonical session id.
+    pub fn peek_retained_stamp(
+        stamps: &OwnershipStamps,
+        session_id: &str,
+    ) -> Option<OwnershipStamp> {
+        stamps
+            .lock()
+            .expect("ownership stamps lock")
+            .get(session_id)
+            .cloned()
+    }
+
+    /// The fenced stop claim for an explicit kill: the lane's believed
+    /// runtime identity plus the `(epoch, generation)` its `commit_live`
+    /// stamped — with the wire pair a delayed client carried taking
+    /// precedence when present (round-2 review).
+    pub fn stop_claim_from_stamp(
+        stamp: &OwnershipStamp,
+        observed: Option<ObservedFence>,
+    ) -> StopClaim {
+        StopClaim {
+            expected_kind: RuntimeOwnerKind::FreshAgent,
+            expected_runtime: Some(stamp.owner.clone()),
+            observed: observed.unwrap_or(ObservedFence {
+                epoch: stamp.epoch,
+                generation: stamp.generation,
+            }),
+        }
+    }
+
+    /// Exit-watcher release of a retained stamp: takes the stamp (if any)
+    /// and releases with its fenced claim — a delayed watcher can never
+    /// erase a newer owner or an in-flight handoff. No-op when unwired or
+    /// the stamp is absent (the runtime never committed through the
+    /// coordinator).
+    pub fn release_retained_stamp(
+        registry: &Option<Arc<RuntimeOwnershipRegistry>>,
+        stamps: &OwnershipStamps,
+        provider: &str,
+        session_id: &str,
+        initiator: &str,
+    ) {
+        let Some(registry) = registry.as_ref() else {
+            return;
+        };
+        let Some(stamp) = take_retained_stamp(stamps, session_id) else {
+            return;
+        };
+        let claim = stamp.release_claim();
+        release_fresh_agent_ownership(registry, provider, session_id, &claim, initiator);
+    }
+}
+
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -345,6 +766,16 @@ pub struct FreshAgentState {
     /// Configured via [`Self::set_resume_probe_timeout_ms_for_test`].
     #[cfg(test)]
     resume_probe_timeout_ms: Arc<Mutex<Option<u64>>>,
+    /// The ONE server-wide runtime-ownership coordinator (kata b8ke Task 3),
+    /// wired from freshell-server::main next to `fresh_agent_leases`.
+    /// `None` (every pre-existing test) = the lane skips coordinator
+    /// bookkeeping and keeps its current probe-based behavior only.
+    pub(crate) ownership: Option<Arc<freshell_ownership::RuntimeOwnershipRegistry>>,
+    /// The lane's retained coordinator commit stamps (kata b8ke Task 3):
+    /// canonical `ses_*` id → the stamp its `commit_live` left — the
+    /// kill/exit `StopClaim`/`ReleaseClaim` source. Shared with the WS
+    /// opencode slice (this state is the single object both surfaces wrap).
+    pub(crate) ownership_stamps: ownership_lane::OwnershipStamps,
 }
 
 /// What [`terminal_tabs::spawn_terminal_pane`] hands the injected
@@ -441,7 +872,51 @@ impl FreshAgentState {
             )),
             #[cfg(test)]
             resume_probe_timeout_ms: Arc::new(Mutex::new(None)),
+            ownership: None,
+            ownership_stamps: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Wire the ONE server-wide runtime-ownership coordinator (kata b8ke
+    /// Task 3). Builder form — matches the neighboring `with_*` seams.
+    pub fn with_ownership(
+        mut self,
+        ownership: Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+    ) -> Self {
+        self.ownership = Some(ownership);
+        self
+    }
+
+    /// Side-effect-free coordinator read for `(provider, session_id)`
+    /// (kata b8ke Task 3): the lane's snapshot of who owns the key.
+    /// `Vacant`/0 when the registry is unwired (every pre-existing test).
+    pub fn ownership_snapshot(
+        &self,
+        provider: &str,
+        session_id: &str,
+    ) -> freshell_ownership::OwnershipSnapshot {
+        match &self.ownership {
+            Some(registry) => registry.observe(provider, session_id),
+            None => freshell_ownership::OwnershipSnapshot {
+                epoch: 0,
+                generation: 0,
+                state: freshell_ownership::OwnershipState::Vacant,
+            },
+        }
+    }
+
+    /// The watchdog's raw-teardown hook for opencode (kata b8ke Task 3): the
+    /// shared `opencode serve` daemon is NOT the per-session writer and must
+    /// NEVER be killed (OpenCode invariant); an uncommitted `Starting`
+    /// record holds no bridge/turn of its own yet, so there is genuinely
+    /// nothing to reap. Returns `true` (nothing-to-do is success).
+    pub async fn opencode_kill_raw_for_watchdog(&self, session_id: &str) -> bool {
+        tracing::info!(
+            provider = PROVIDER,
+            session_id,
+            "freshagent.opencode.watchdog_reap_noop: the shared serve is never a kill target"
+        );
+        true
     }
 
     /// Install a scripted model-catalog probe (tests) — the registry's
@@ -2326,6 +2801,62 @@ async fn send_keys(
         };
         let durable_id = created.id;
 
+        // kata b8ke Task 3: the placeholder→durable materialization MINTS
+        // the canonical `ses_*` key — claim Starting under a ticket NOW
+        // (before anything else registers runtime state for it) so the
+        // coordinator is the cross-kind authority from the session's
+        // first moment. A minted id cannot collide with an observed key,
+        // so no fence is carried (round-2 lifecycle audit).
+        let materialize_op = format!("rest-materialize-{durable_id}");
+        let mut own_ticket = match ownership_lane::begin_lane_claim(
+            &state.ownership,
+            PROVIDER,
+            &durable_id,
+            &materialize_op,
+            None,
+            "freshopencode/rest-materialize",
+            session_lease::now_epoch_ms(),
+        ) {
+            ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+            ownership_lane::LaneClaim::Unwired => None,
+            ownership_lane::LaneClaim::Adopt => {
+                // A minted `ses_*` id cannot be live under another
+                // operation — treat the impossible adopt as reserved.
+                tracing::warn!(target: "freshell_freshagent::opencode",
+                    provider = PROVIDER, session_id = %durable_id,
+                    "freshagent.opencode.materialize_claim_refused: the coordinator \
+                     refused the materialization claim; the pane is not materialized"
+                );
+                return fail_json(
+                    StatusCode::CONFLICT,
+                    "SESSION_RESERVED: another lifecycle operation owns this session".to_string(),
+                );
+            }
+            ownership_lane::LaneClaim::Refused(outcome) => {
+                tracing::warn!(target: "freshell_freshagent::opencode",
+                    provider = PROVIDER, session_id = %durable_id,
+                    outcome = ?outcome,
+                    "freshagent.opencode.materialize_claim_refused: the coordinator \
+                     refused the materialization claim; the pane is not materialized"
+                );
+                return fail_json(
+                    StatusCode::CONFLICT,
+                    "SESSION_RESERVED: another lifecycle operation owns this session".to_string(),
+                );
+            }
+        };
+        // The shared `opencode serve` daemon is NOT the per-session writer
+        // and must never be killed — pid stays `None` (OpenCode
+        // invariant): the watchdog has no partial runtime to reap.
+        ownership_lane::register_partial_fresh_runtime(
+            &state.ownership,
+            PROVIDER,
+            &durable_id,
+            &own_ticket,
+            &durable_id,
+            None,
+        );
+
         // Persist the durable id back onto the pane (so /capture and the next
         // `send-keys` on this pane can reuse it instead of re-materializing).
         if let Some(entry) = state.panes.lock().expect("panes mutex").get_mut(&pane_id) {
@@ -2421,6 +2952,36 @@ async fn send_keys(
         // shared revision sequence as `freshell-ws`'s sweep when the server wires
         // `with_shared_sessions_revision` (see that method's doc comment).
         state.broadcast_sessions_changed();
+
+        // kata b8ke Task 3: the materialization's registration is complete —
+        // commit `Live{FreshAgent}` for the minted `ses_*` key (the stamp
+        // lands in the shared map: the kill/exit claim source). OpenCode
+        // passes `pid: None` — the shared serve daemon is never a kill
+        // handle (OpenCode invariant).
+        if let Err(outcome) = ownership_lane::commit_lane_claim(
+            &state.ownership,
+            &state.ownership_stamps,
+            PROVIDER,
+            &durable_id,
+            &mut own_ticket,
+            &durable_id,
+            None,
+        ) {
+            // A stale/foreign commit means the key was recovered out from
+            // under us mid-materialization (watchdog) — the materialized
+            // pane state above is pane-local bookkeeping (no sidecar of its
+            // own to kill); reopen honestly by failing the turn.
+            tracing::error!(target: "invariant",
+                provider = PROVIDER, session_id = %durable_id,
+                outcome = ?outcome,
+                "freshagent.opencode.materialize_commit_stale: the coordinator moved on \
+                 while the materialization registered"
+            );
+            return fail_json(
+                StatusCode::CONFLICT,
+                "SESSION_RESERVED: session ownership changed during materialization".to_string(),
+            );
+        }
 
         durable_id
     };
@@ -4351,6 +4912,10 @@ mod tests {
 #[cfg(test)]
 #[path = "rename_route_tests.rs"]
 mod rename_route_tests;
+
+#[cfg(test)]
+#[path = "ownership_wiring_tests.rs"]
+mod ownership_wiring_tests;
 
 #[cfg(test)]
 mod rename_pane_tests {

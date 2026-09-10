@@ -181,6 +181,15 @@ pub struct FreshCodexState {
     /// ALWAYS ON at this runtime seam (never capability-gated). `main.rs` replaces the
     /// default with the ONE server-wide shared map via [`Self::set_session_leases`].
     leases: Arc<crate::session_lease::FreshAgentSessionLeases>,
+    /// The ONE server-wide runtime-ownership coordinator (kata b8ke Task 3),
+    /// wired from freshell-server::main next to `fresh_agent_leases`.
+    /// `None` (every pre-existing test) = the lane skips coordinator
+    /// bookkeeping and keeps its current probe-based behavior only.
+    ownership: Option<Arc<freshell_ownership::RuntimeOwnershipRegistry>>,
+    /// This lane's retained coordinator commit stamps (kata b8ke Task 3):
+    /// canonical thread id → the stamp its `commit_live` left — the kill
+    /// `StopClaim` / exit-watcher `ReleaseClaim` source (round-2 review).
+    ownership_stamps: crate::ownership_lane::OwnershipStamps,
     /// Task 13b: cross-kind liveness -- true when a live terminal PTY owns
     /// `(provider, session_id)`. Wired by `main.rs`; defaults to always-false.
     terminal_liveness: crate::TerminalLivenessProbe,
@@ -410,6 +419,13 @@ enum EnsureAliveError {
 struct ResumedCodexSession {
     client: Arc<CodexAppServerClient>,
     active_turn: Arc<StdMutex<Option<String>>>,
+    /// kata b8ke Task 3 (under-ticket mode): set ONLY when
+    /// [`FreshCodexState::ensure_session_resumable`] ran as a handoff
+    /// continuation — the constructed owner identity the handoff runner
+    /// (Task 6) commits itself (single commit authority; this lane skips
+    /// its own commit under a `handoff` parameter).
+    #[allow(dead_code)] // read by Task 6's handoff runner (the single commit authority)
+    owner_identity: Option<freshell_ownership::OwnerIdentity>,
 }
 
 /// Why [`FreshCodexState::ensure_session_resumable`] could not produce a live session for
@@ -453,6 +469,8 @@ impl FreshCodexState {
             create_dedup: Arc::new(FreshAgentCreateDedup::new()),
             identity_sink: Arc::new(std::sync::OnceLock::new()),
             leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
+            ownership: None,
+            ownership_stamps: Arc::new(std::sync::Mutex::new(HashMap::new())),
             terminal_liveness: Arc::new(|_, _| false),
             fork_in_flight: crate::InFlightRegistry::new(),
             codex_quiet_window_ms: Arc::new(AtomicU64::new(codex_quiet_window_ms_from_env())),
@@ -488,6 +506,108 @@ impl FreshCodexState {
         leases: Arc<crate::session_lease::FreshAgentSessionLeases>,
     ) {
         self.leases = leases;
+    }
+
+    /// Wire the ONE server-wide runtime-ownership coordinator (kata b8ke
+    /// Task 3; called by `main.rs` next to `set_session_leases`).
+    pub fn set_ownership(&mut self, registry: Arc<freshell_ownership::RuntimeOwnershipRegistry>) {
+        self.ownership = Some(registry);
+    }
+
+    /// Side-effect-free coordinator read for `(provider, session_id)`
+    /// (kata b8ke Task 3). `Vacant`/0 when the registry is unwired.
+    pub fn ownership_snapshot(
+        &self,
+        provider: &str,
+        session_id: &str,
+    ) -> freshell_ownership::OwnershipSnapshot {
+        match &self.ownership {
+            Some(registry) => registry.observe(provider, session_id),
+            None => freshell_ownership::OwnershipSnapshot {
+                epoch: 0,
+                generation: 0,
+                state: freshell_ownership::OwnershipState::Vacant,
+            },
+        }
+    }
+
+    /// The watchdog's raw-teardown hook (kata b8ke Task 3): kill the
+    /// uncommitted in-flight spawn's sidecar tree for `session_id` — the
+    /// `(pid, ownership tag)` pair the spawn's lease armed, killed with the
+    /// same confirmed-tree-dead primitive the TTL expiry path uses. Never
+    /// touches committed sessions (the watchdog only recovers `Starting`
+    /// records). Returns whether a handle was found and confirmed dead.
+    pub async fn kill_raw_for_watchdog(&self, session_id: &str) -> bool {
+        if let Some((pid, ownership_id)) = self.leases.peek_kill_handle(PROVIDER, session_id) {
+            return crate::session_lease::kill_and_confirm_tree_dead(
+                pid,
+                CODEX_SIDECAR_OWNERSHIP_ENV,
+                &ownership_id,
+            )
+            .await;
+        }
+        false
+    }
+
+    /// kata b8ke Task 3: begin this lane's coordinator claim. See
+    /// [`crate::ownership_lane::begin_lane_claim`].
+    fn begin_lane_claim_at(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+        observed: Option<freshell_ownership::ObservedFence>,
+        initiator: &str,
+    ) -> crate::ownership_lane::LaneClaim {
+        crate::ownership_lane::begin_lane_claim(
+            &self.ownership,
+            PROVIDER,
+            session_id,
+            operation_id,
+            observed,
+            initiator,
+            crate::session_lease::now_epoch_ms(),
+        )
+    }
+
+    /// kata b8ke Task 3: commit this lane's claim and retain the stamp. See
+    /// [`crate::ownership_lane::commit_lane_claim`].
+    fn commit_lane_claim_at(
+        &self,
+        ticket: &mut Option<freshell_ownership::OperationTicket>,
+        session_id: &str,
+        live_session_key: &str,
+        pid: Option<u32>,
+    ) -> Result<(), freshell_ownership::CommitOutcome> {
+        crate::ownership_lane::commit_lane_claim(
+            &self.ownership,
+            &self.ownership_stamps,
+            PROVIDER,
+            session_id,
+            ticket,
+            live_session_key,
+            pid,
+        )
+    }
+
+    /// The initiator label for a coordinator transition event: the
+    /// connection's device id when the provenance carries one, else the lane
+    /// label (diagnostic, not audit-grade).
+    fn initiator_for(provenance: Option<&crate::BindProvenance>, lane: &str) -> String {
+        provenance
+            .and_then(|p| p.device_id.clone())
+            .unwrap_or_else(|| lane.to_string())
+    }
+
+    /// kata b8ke Task 3: the exit watchers' ownership release handle (the
+    /// registry + this lane's retained stamps). `None` when unwired.
+    fn ownership_watch(&self) -> Option<crate::ownership_lane::OwnershipWatch> {
+        self.ownership
+            .as_ref()
+            .map(|registry| crate::ownership_lane::OwnershipWatch {
+                registry: Arc::clone(registry),
+                stamps: Arc::clone(&self.ownership_stamps),
+                provider: PROVIDER,
+            })
     }
 
     /// Wire the P1.13 identity-event sink (set-once; later calls are no-ops).
@@ -876,6 +996,39 @@ impl FreshCodexState {
                     .await;
                 return;
             }
+            // kata b8ke Task 3: the coordinator claim comes FIRST — before
+            // the provider lease — so the cross-kind authority decides
+            // atomically (no check-then-act window the terminal-lane probe
+            // regime left). The wire pair on `freshAgent.create` is the
+            // delayed-request fence (`None` = legacy unfenced sender, still
+            // cross-kind-checked).
+            let claim_op_id = format!("create-resume-{request_id}");
+            let own_ticket = match self.begin_lane_claim_at(
+                &resume_session_id,
+                &claim_op_id,
+                crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation),
+                &Self::initiator_for(provenance.as_ref(), "freshcodex/create-resume"),
+            ) {
+                crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+                crate::ownership_lane::LaneClaim::Unwired => None,
+                crate::ownership_lane::LaneClaim::Adopt => {
+                    // A same-kind live runtime the map fast-path missed —
+                    // adopt it, spawn nothing.
+                    self.adopt_live_create(&request_id, &resume_session_id, provenance.clone())
+                        .await;
+                    return;
+                }
+                crate::ownership_lane::LaneClaim::Refused(outcome) => {
+                    tracing::warn!(target: "freshell_freshagent::codex",
+                        session_id = %resume_session_id, request_id = %request_id,
+                        outcome = ?outcome,
+                        "fresh_agent_create_refused: the ownership coordinator refused the \
+                         claim (kata b8ke cross-kind authority)"
+                    );
+                    self.fail_create_session_reserved(&request_id);
+                    return;
+                }
+            };
             let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
             for round in 0..2u8 {
                 match self.leases.claim(
@@ -937,6 +1090,7 @@ impl FreshCodexState {
                 sandbox,
                 permission_mode,
                 lease_guard,
+                own_ticket,
                 provenance,
             )
             .await;
@@ -977,6 +1131,61 @@ impl FreshCodexState {
             }
         };
 
+        // kata b8ke Task 3: the plain create MINTS the canonical thread id —
+        // claim it under the NEW key (no fence: a minted id was never
+        // observed by anyone) before `finish_create` registers + commits the
+        // runtime. The claim cannot meet a competitor on a fresh UUID; it
+        // exists so the coordinator is authoritative from the session's
+        // first registered moment.
+        let claim_op_id = format!("create-{request_id}");
+        let own_ticket = match self.begin_lane_claim_at(
+            &thread_id,
+            &claim_op_id,
+            None,
+            &Self::initiator_for(provenance.as_ref(), "freshcodex/create"),
+        ) {
+            crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+            crate::ownership_lane::LaneClaim::Unwired => None,
+            crate::ownership_lane::LaneClaim::Adopt => {
+                // Unreachable on a fresh UUID in practice — the adopt answer
+                // names a live runtime under a brand-new id; honored by
+                // tearing our own spawn down and refusing the create.
+                client.close().await;
+                let mut child = child;
+                let _ = child.start_kill();
+                reap_owned_codex_sidecars(&ownership_id);
+                crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
+                self.fail_create_session_reserved(&request_id);
+                return;
+            }
+            crate::ownership_lane::LaneClaim::Refused(outcome) => {
+                // Unreachable on a fresh UUID in practice (nothing else can
+                // hold it) — honored as a typed refusal regardless.
+                tracing::warn!(target: "freshell_freshagent::codex",
+                    session_id = %thread_id, request_id = %request_id,
+                    outcome = ?outcome,
+                    "fresh_agent_create_refused: the ownership coordinator refused the \
+                     minted-key claim (kata b8ke)"
+                );
+                client.close().await;
+                let mut child = child;
+                let _ = child.start_kill();
+                reap_owned_codex_sidecars(&ownership_id);
+                crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
+                self.fail_create_session_reserved(&request_id);
+                return;
+            }
+        };
+        let sidecar_pid = child.id();
+        crate::ownership_lane::register_partial_fresh_runtime(
+            &self.ownership,
+            PROVIDER,
+            &thread_id,
+            &own_ticket,
+            &thread_id,
+            sidecar_pid,
+        );
+
         self.finish_create(
             request_id,
             thread_id,
@@ -992,6 +1201,7 @@ impl FreshCodexState {
             None,
             // Threads freshell starts are paginated (we SET the mode at start).
             Some(HistoryMode::Paginated),
+            own_ticket,
             provenance,
             // The plain create lane never commits a claim — nothing to roll back.
             None,
@@ -1032,10 +1242,15 @@ impl FreshCodexState {
         sandbox: Option<String>,
         permission_mode: Option<String>,
         mut lease_guard: Option<crate::FreshSessionLeaseGuard>,
+        // kata b8ke Task 3: the coordinator claim ticket from
+        // `handle_create`'s resume lane — every failure return below drops
+        // it (RAII typed fail); `finish_create` commits + disarms it.
+        mut own_ticket: Option<freshell_ownership::OperationTicket>,
         // D8: the creating connection's provenance (a resume-create is still a
         // connection-scoped create: this pane IS open in that client's tab).
         provenance: Option<crate::BindProvenance>,
     ) {
+        let _ = &mut own_ticket; // moved to finish_create below on the success path
         if self.is_known_dead_thread(&resume_session_id).await {
             if let Some(mut g) = lease_guard.take() {
                 g.fail();
@@ -1188,6 +1403,18 @@ impl FreshCodexState {
             }
         };
 
+        // kata b8ke Task 3: register the spawn's partial runtime for the
+        // watchdog (the resume lane's claim happened in `handle_create`).
+        let sidecar_pid = child.id();
+        crate::ownership_lane::register_partial_fresh_runtime(
+            &self.ownership,
+            PROVIDER,
+            &thread_id,
+            &own_ticket,
+            &thread_id,
+            sidecar_pid,
+        );
+
         self.finish_create(
             request_id,
             thread_id.clone(),
@@ -1202,6 +1429,7 @@ impl FreshCodexState {
             permission_mode,
             lease_guard,
             history_mode,
+            own_ticket,
             provenance,
             // This lane committed the claim above: its lease-revoke arm in
             // `finish_create` must roll the commit back, and the
@@ -1236,6 +1464,11 @@ impl FreshCodexState {
         // Kata 1wxv Task 2: the thread's durable history mode — `Some(Paginated)`
         // for threads freshell started, the rollout-meta parse for resumes.
         history_mode: Option<HistoryMode>,
+        // kata b8ke Task 3: the coordinator claim ticket (both create lanes
+        // claim before this tail). Committed + disarmed below once the
+        // registration survives every teardown gate; every failure return
+        // drops it (RAII typed fail reopens the key).
+        mut own_ticket: Option<freshell_ownership::OperationTicket>,
         // D8: the creating connection's provenance for the binding write below
         // (`None` on conn-less lanes; the ledger merge keeps prior stamps).
         provenance: Option<crate::BindProvenance>,
@@ -1250,11 +1483,15 @@ impl FreshCodexState {
         // committed — nothing to roll back or re-check).
         claim: Option<(&str, Option<i64>)>,
     ) {
-        // D8 (focused-ep1-r5 Finding 2): a HOLLOW `Some` (a partially
-        // initialized client's hello — all fields absent) behaves like `None`
-        // on every decision below: the park, the eviction-guard adopt, and
-        // the binding write's stamps.
+        let _ = &mut own_ticket; // consumed at the commit below on the success path
+                                 // D8 (focused-ep1-r5 Finding 2): a HOLLOW `Some` (a partially
+                                 // initialized client's hello — all fields absent) behaves like `None`
+                                 // on every decision below: the park, the eviction-guard adopt, and
+                                 // the binding write's stamps.
         let provenance = provenance.filter(|p| p.is_meaningful());
+        // kata b8ke Task 3: the sidecar pid for the commit's owner identity
+        // (captured before `child` moves into the exit watcher).
+        let sidecar_pid = child.id();
 
         // Task 12 EVICTION GUARD: on base this tail REPLACED a live incumbent under the
         // same threadId -- orphaning the winner's sidecar and stealing its binding
@@ -1332,6 +1569,7 @@ impl FreshCodexState {
             exited.clone(),
             Arc::clone(&self.leases),
             quiet_deadman.clone(),
+            self.ownership_watch(),
         );
 
         self.sessions.lock().await.insert(
@@ -1425,6 +1663,40 @@ impl FreshCodexState {
                 );
                 return;
             }
+        }
+
+        // kata b8ke Task 3: the registration survived every teardown gate —
+        // commit `Live{FreshAgent}` and retain the stamp (the kill/exit
+        // claim source). A stale/foreign commit means the key was recovered
+        // out from under us mid-create (watchdog): tear the just-registered
+        // session down exactly like the lease-revoke arm — a stale
+        // post-spawn commit must reap its uncommitted child.
+        if let Err(outcome) =
+            self.commit_lane_claim_at(&mut own_ticket, &thread_id, &thread_id, sidecar_pid)
+        {
+            tracing::error!(target: "invariant",
+                provider = PROVIDER, session_id = %thread_id, request_id = %request_id,
+                outcome = ?outcome,
+                "freshagent.codex.create_commit_stale: the coordinator moved on while the \
+                 create registered; the uncommitted session is torn down"
+            );
+            if let Some(session) = self.sessions.lock().await.remove(&thread_id) {
+                session.consumer.abort();
+                session.client.close().await;
+                if let Some(kill_tx) = session.kill_tx {
+                    let _ = kill_tx.send(());
+                }
+                let _ = session.watcher.await;
+            }
+            if let Some(mut g) = lease_guard.take() {
+                g.fail();
+            }
+            self.fail_create(
+                &request_id,
+                "FRESH_AGENT_CREATE_FAILED",
+                "session ownership changed during create; torn down",
+            );
+            return;
         }
 
         // P1.13 identity event (Task 4): the ledger binding row for this create,
@@ -2670,6 +2942,51 @@ impl FreshCodexState {
             return;
         }
 
+        // kata b8ke Task 3 (carried finding): fork MINTS a new session id —
+        // claim Starting under a ticket on the NEW child key BEFORE creating
+        // the child runtime (the sidecar below). No observed fence needed
+        // (a minted id was never observed); it still goes through the
+        // coordinator so the child is cross-kind-authoritative from birth.
+        let fork_op_id = format!("fork-child-{}", uuid::Uuid::new_v4());
+        let mut own_ticket = match self.begin_lane_claim_at(
+            &child_id,
+            &fork_op_id,
+            None,
+            &Self::initiator_for(fork_provenance.as_ref(), "freshcodex/fork"),
+        ) {
+            crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+            crate::ownership_lane::LaneClaim::Unwired => None,
+            crate::ownership_lane::LaneClaim::Adopt => {
+                // Unreachable on a fresh child id in practice — honored by
+                // the same containment the refusal leg uses.
+                let _ = parent_client.unarchive_thread(&child_id).await;
+                reply_sink(fork_error_frame_with_code(
+                    &parent_id,
+                    "SESSION_RESERVED",
+                    "Another resume for this session is in flight",
+                ));
+                return;
+            }
+            crate::ownership_lane::LaneClaim::Refused(outcome) => {
+                // The archive already happened — the failure containment
+                // below (unarchive-best-effort + reply) applies, with no
+                // child runtime ever created.
+                tracing::warn!(target: "freshell_freshagent::codex",
+                    parent_session_id = %parent_id, session_id = %child_id,
+                    outcome = ?outcome,
+                    "fresh_agent_fork_refused: the ownership coordinator refused the \
+                     child-key claim (kata b8ke)"
+                );
+                let _ = parent_client.unarchive_thread(&child_id).await;
+                reply_sink(fork_error_frame_with_code(
+                    &parent_id,
+                    "SESSION_RESERVED",
+                    "Another resume for this session is in flight",
+                ));
+                return;
+            }
+        };
+
         // ── post-archive (failure containment applies to every step below) ──
         let child_parts = match self.spawn_sidecar(eff_cwd.as_deref()).await {
             Ok(parts) => parts,
@@ -2686,6 +3003,18 @@ impl FreshCodexState {
             }
         };
         let (child_client, child_notifs, child_ownership_id, mut child_proc) = child_parts;
+
+        // kata b8ke Task 3: the child sidecar exists — register its partial
+        // runtime for the watchdog (before the commit below).
+        let child_pid = child_proc.id();
+        crate::ownership_lane::register_partial_fresh_runtime(
+            &self.ownership,
+            PROVIDER,
+            &child_id,
+            &own_ticket,
+            &child_id,
+            child_pid,
+        );
 
         if let Err(err) = child_client.unarchive_thread(&child_id).await {
             shut_down_fork_child(&child_client, &mut child_proc, &child_ownership_id).await;
@@ -2788,6 +3117,35 @@ impl FreshCodexState {
         )
         .await;
 
+        // kata b8ke Task 3: the child's registration is complete — commit
+        // `Live{FreshAgent}` under the NEW child key (the stamp lands in the
+        // lane's retained map). A stale/foreign commit tears the child down
+        // through the same containment the failure legs use.
+        if let Err(outcome) =
+            self.commit_lane_claim_at(&mut own_ticket, &child_id, &child_id, child_pid)
+        {
+            tracing::error!(target: "invariant",
+                provider = PROVIDER, session_id = %child_id, parent_session_id = %parent_id,
+                outcome = ?outcome,
+                "freshagent.codex.fork_commit_stale: the coordinator moved on while the \
+                 fork child registered; the uncommitted child is torn down"
+            );
+            if let Some(session) = self.sessions.lock().await.remove(&child_id) {
+                session.consumer.abort();
+                session.client.close().await;
+                if let Some(kill_tx) = session.kill_tx {
+                    let _ = kill_tx.send(());
+                }
+                let _ = session.watcher.await;
+            }
+            let _ = parent_client.unarchive_thread(&child_id).await;
+            reply_sink(fork_error_frame(
+                &parent_id,
+                "session ownership changed during fork; the child was torn down",
+            ));
+            return;
+        }
+
         // DIAG-01: lifecycle metadata only.
         tracing::info!(
             provider = PROVIDER,
@@ -2858,6 +3216,90 @@ impl FreshCodexState {
         }
         let close_reported_failure = close_answer == crate::identity_sink::CloseAnswer::Persisted;
 
+        // kata b8ke Task 3: the fenced coordinator stop — placed AFTER the
+        // durable close decision (a Clean-failure close aborts the kill with
+        // the session left live, which must never strand the coordinator in
+        // `Stopping`) and BEFORE any live-state mutation below. The claim is built
+        // from the lane's OWN retained stamp (its believed runtime identity
+        // plus the `(epoch, generation)` its `commit_live` stamped; the wire
+        // pair on `freshAgent.kill` feeds the same fence when present).
+        // `BlockedHandoff` / `StaleClaim` / an in-flight `Starting`/`Stopping`
+        // are typed refusals: the caller does NOT kill (an in-flight handoff
+        // owns the transition, or ownership moved under a newer generation —
+        // round-2 review). `NotLive{Vacant}`: the kill proceeds (idempotent
+        // lane cleanup; nothing to stop in the coordinator) and skips the
+        // commit. No retained stamp (never claimed through the
+        // coordinator): the kill is lane-local cleanup, no transition.
+        let stop_fence =
+            crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation);
+        let mut stop_generation: Option<u64> = None;
+        let mut stop_op_id: Option<String> = None;
+        if let Some(registry) = self.ownership.as_ref() {
+            if let Some(stamp) =
+                crate::ownership_lane::peek_retained_stamp(&self.ownership_stamps, &session_id)
+            {
+                let claim = crate::ownership_lane::stop_claim_from_stamp(&stamp, stop_fence);
+                let kill_op_id = format!("kill-{}", uuid::Uuid::new_v4());
+                let stop_outcome = crate::ownership_lane::begin_fresh_agent_stop(
+                    registry,
+                    PROVIDER,
+                    &session_id,
+                    &kill_op_id,
+                    &claim,
+                    "freshcodex/kill",
+                    crate::session_lease::now_epoch_ms(),
+                );
+                let refused = match &stop_outcome {
+                    freshell_ownership::StopOutcome::Granted { generation } => {
+                        // Consume the stamp; the commit follows the
+                        // confirmed reap below.
+                        crate::ownership_lane::take_retained_stamp(
+                            &self.ownership_stamps,
+                            &session_id,
+                        );
+                        stop_generation = Some(*generation);
+                        stop_op_id = Some(kill_op_id);
+                        None
+                    }
+                    freshell_ownership::StopOutcome::NotLive {
+                        state: freshell_ownership::OwnershipState::Vacant,
+                    } => {
+                        // Already reopened (e.g. the exit watcher released
+                        // it): proceed with the kill, skip the commit.
+                        crate::ownership_lane::take_retained_stamp(
+                            &self.ownership_stamps,
+                            &session_id,
+                        );
+                        None
+                    }
+                    freshell_ownership::StopOutcome::NotLive { state } => Some(format!(
+                        "a lifecycle operation is in flight ({state:?}); retry after it settles"
+                    )),
+                    freshell_ownership::StopOutcome::BlockedHandoff { .. } => Some(
+                        "a handoff owns this session's transition; retry after it settles"
+                            .to_string(),
+                    ),
+                    freshell_ownership::StopOutcome::StaleClaim { .. } => {
+                        Some("ownership moved to a newer runtime; refresh and retry".to_string())
+                    }
+                };
+                if let Some(_reason) = refused {
+                    tracing::warn!(target: "freshell_freshagent::codex",
+                        session_id = %session_id, outcome = ?stop_outcome,
+                        "fresh_agent_kill_refused: the ownership coordinator refused the \
+                         stop (kata b8ke) — nothing is killed"
+                    );
+                    self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                        provider: PROVIDER.to_string(),
+                        session_id,
+                        session_type: SESSION_TYPE.to_string(),
+                        success: false,
+                    }));
+                    return;
+                }
+            }
+        }
+
         self.clear_controls(&session_id).await;
 
         // Task 12: an explicitly-killed session must reopen its durable id (the watcher
@@ -2874,6 +3316,22 @@ impl FreshCodexState {
             // The exit-watcher performs start_kill + reap on this requested-kill path; wait
             // for it so the sidecar is actually gone before we broadcast success.
             let _ = session.watcher.await;
+        }
+
+        // kata b8ke Task 3: the awaited, confirmed reap is done — commit the
+        // stop (Stopping → Vacant). NEVER before the reap (round-1 review).
+        if let (Some(registry), Some(generation), Some(op_id)) = (
+            self.ownership.as_ref(),
+            stop_generation,
+            stop_op_id.as_deref(),
+        ) {
+            let _ = crate::ownership_lane::commit_fresh_agent_stop(
+                registry,
+                PROVIDER,
+                &session_id,
+                op_id,
+                generation,
+            );
         }
 
         // Explicit kill evicts this session's requestId dedup cache entries (mirrors
@@ -3020,7 +3478,15 @@ impl FreshCodexState {
             (resolved_id, active_turn_present, should_emit_snapshot)
         } else {
             match self
-                .ensure_session_resumable(&msg.session_id, msg.cwd.as_deref())
+                .ensure_session_resumable(
+                    &msg.session_id,
+                    msg.cwd.as_deref(),
+                    // kata b8ke Task 3: the attach's delayed-request fence
+                    // (round-2 lifecycle audit — attach can cold-resume an
+                    // untracked session, registering a runtime).
+                    crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation),
+                    None,
+                )
                 .await
             {
                 Ok(resumed) => {
@@ -3193,10 +3659,43 @@ impl FreshCodexState {
                 "fresh_agent_respawn_refused: a live terminal PTY owns this session (Task 13b cross-kind live-guard)");
             return Err(EnsureAliveError::Reserved);
         }
+        // kata b8ke Task 3: crash recovery FENCES through the coordinator —
+        // claims/commits, no bypass (the cross-kind coverage constraint).
+        // Lease/fence ONLY: the pre-existing thread-remint semantics of the
+        // respawn are deliberately NOT changed (Global Constraints,
+        // crash-recovery scoping). No wire fence: this is a server-internal
+        // self-heal triggered by send/attach on an exited session.
+        let alive_request_id = format!("attach-alive-{}", uuid::Uuid::new_v4());
+        let mut own_ticket = match self.begin_lane_claim_at(
+            session_id,
+            &alive_request_id,
+            None,
+            "freshcodex/crash-recovery",
+        ) {
+            crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+            crate::ownership_lane::LaneClaim::Unwired => None,
+            crate::ownership_lane::LaneClaim::Adopt => {
+                // A same-kind live runtime the map fast-path missed — the
+                // double-check above already returned for map-live; the
+                // coordinator knows better: treat as recovered/reserved by
+                // the live map one more time.
+                if self.has_live_session(session_id).await {
+                    return Ok(EnsureAliveOutcome::Recovered);
+                }
+                return Err(EnsureAliveError::Reserved);
+            }
+            crate::ownership_lane::LaneClaim::Refused(outcome) => {
+                tracing::warn!(target: "freshell_freshagent::codex",
+                    session_id = %session_id, outcome = ?outcome,
+                    "fresh_agent_respawn_refused: the ownership coordinator refused the \
+                     claim (kata b8ke cross-kind authority)"
+                );
+                return Err(EnsureAliveError::Reserved);
+            }
+        };
         // Task 13 (D8): the exited->respawn arm SPAWNS -- claim the per-sessionRef
         // lease first (the per-thread lock above covers in-process races; the lease
         // serializes against CREATE-path holders for the same durable id).
-        let alive_request_id = format!("attach-alive-{}", uuid::Uuid::new_v4());
         let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
         for round in 0..2u8 {
             match self.leases.claim(
@@ -3255,6 +3754,10 @@ impl FreshCodexState {
         // attempt (and the sidecar it would burn to re-prove it) and go straight to the
         // mint-new-thread fallback, which needs a fresh sidecar of its own regardless.
         if self.is_known_dead_thread(session_id).await {
+            // kata b8ke Task 3: the mint-new fallback registers under a NEW
+            // thread id — fail this OLD key's coordinator claim (RAII drop)
+            // so it reopens; the fallback claims the new key itself.
+            drop(own_ticket.take());
             return self
                 .respawn_as_new_thread_after_crash(
                     session_id,
@@ -3284,6 +3787,16 @@ impl FreshCodexState {
                 g.set_kill_handle(pid, &ownership_id);
             }
         }
+        // kata b8ke Task 3: the spawn's partial runtime for the watchdog.
+        let sidecar_pid = child.id();
+        crate::ownership_lane::register_partial_fresh_runtime(
+            &self.ownership,
+            PROVIDER,
+            session_id,
+            &own_ticket,
+            session_id,
+            sidecar_pid,
+        );
 
         // `toCodexResumeInput` (adapter.ts:151-162): forward only settings this process
         // actually has recorded for the thread. An empty `model` means `handle_send` never
@@ -3341,6 +3854,10 @@ impl FreshCodexState {
                 // a later attach/create against it fails fast instead of repeating this same
                 // spawn-resume-fail cycle.
                 self.mark_thread_dead(session_id).await;
+                // kata b8ke Task 3: the mint-new fallback registers under a
+                // NEW thread id — fail this OLD key's coordinator claim
+                // (RAII drop) so it reopens.
+                drop(own_ticket.take());
                 return self
                     .respawn_as_new_thread_after_crash(
                         session_id,
@@ -3415,6 +3932,7 @@ impl FreshCodexState {
             exited.clone(),
             Arc::clone(&self.leases),
             quiet_deadman.clone(),
+            self.ownership_watch(),
         );
 
         // `HashMap::insert` on an existing key overwrites in place, dropping the old (dead
@@ -3488,6 +4006,32 @@ impl FreshCodexState {
                 // has-live fast paths adopt it from here.
                 g.fail();
             }
+        }
+
+        // kata b8ke Task 3: crash recovery's resume-first path recovered the
+        // SAME id — commit `Live{FreshAgent}` under it (the lease-revoked arm
+        // above KEEPS the recovered session, so the commit is truthful either
+        // way). The stamp lands in the lane's retained map.
+        if let Err(outcome) =
+            self.commit_lane_claim_at(&mut own_ticket, session_id, session_id, sidecar_pid)
+        {
+            tracing::error!(target: "invariant",
+                provider = PROVIDER, session_id = %session_id,
+                outcome = ?outcome,
+                "freshagent.codex.recovery_commit_stale: the coordinator moved on while \
+                 the crash recovery registered; the uncommitted session is torn down"
+            );
+            if let Some(session) = self.sessions.lock().await.remove(session_id) {
+                session.consumer.abort();
+                session.client.close().await;
+                if let Some(kill_tx) = session.kill_tx {
+                    let _ = kill_tx.send(());
+                }
+                let _ = session.watcher.await;
+            }
+            return Err(EnsureAliveError::RespawnFailed(
+                "session ownership changed during crash recovery; torn down".to_string(),
+            ));
         }
 
         // DIAG-01: crash recovery took the resume-first path -- the durable
@@ -3566,6 +4110,63 @@ impl FreshCodexState {
             }
         };
 
+        // kata b8ke Task 3: the mint-new fallback MINTS the canonical thread
+        // id — claim it under the NEW key (no fence: a minted id was never
+        // observed) before the registration below (the caller already
+        // dropped the OLD key's claim).
+        let respawn_op_id = format!("crash-respawn-{}", uuid::Uuid::new_v4());
+        let mut own_ticket = match self.begin_lane_claim_at(
+            &new_thread_id,
+            &respawn_op_id,
+            None,
+            "freshcodex/crash-respawn",
+        ) {
+            crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+            crate::ownership_lane::LaneClaim::Unwired => None,
+            crate::ownership_lane::LaneClaim::Adopt => {
+                // Unreachable on a fresh UUID in practice — honored by
+                // tearing the spawn down and answering the typed refusal.
+                client.close().await;
+                let mut child = child;
+                let _ = child.start_kill();
+                reap_owned_codex_sidecars(&ownership_id);
+                crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
+                if let Some(mut g) = lease_guard.take() {
+                    g.fail();
+                }
+                return Err(EnsureAliveError::Reserved);
+            }
+            crate::ownership_lane::LaneClaim::Refused(outcome) => {
+                // Unreachable on a fresh UUID in practice — honored as a
+                // typed refusal regardless (never a blank-session spawn
+                // over a refused key).
+                tracing::warn!(target: "freshell_freshagent::codex",
+                    session_id = %new_thread_id, old_session_id = %old_session_id,
+                    outcome = ?outcome,
+                    "fresh_agent_respawn_refused: the ownership coordinator refused the \
+                     minted-key claim (kata b8ke)"
+                );
+                client.close().await;
+                let mut child = child;
+                let _ = child.start_kill();
+                reap_owned_codex_sidecars(&ownership_id);
+                crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
+                if let Some(mut g) = lease_guard.take() {
+                    g.fail();
+                }
+                return Err(EnsureAliveError::Reserved);
+            }
+        };
+        let sidecar_pid = child.id();
+        crate::ownership_lane::register_partial_fresh_runtime(
+            &self.ownership,
+            PROVIDER,
+            &new_thread_id,
+            &own_ticket,
+            &new_thread_id,
+            sidecar_pid,
+        );
+
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let quiet_deadman = QuietDeadman::new_shared();
         let compact_in_flight = Arc::new(AtomicBool::new(false));
@@ -3589,6 +4190,7 @@ impl FreshCodexState {
             exited.clone(),
             Arc::clone(&self.leases),
             quiet_deadman.clone(),
+            self.ownership_watch(),
         );
 
         {
@@ -3628,6 +4230,32 @@ impl FreshCodexState {
                 // reopen the key -- has-live fast paths adopt from here.
                 g.fail();
             }
+        }
+
+        // kata b8ke Task 3: the mint-new registration survived its gates —
+        // commit `Live{FreshAgent}` under the NEW key (the lease-revoked arm
+        // above KEEPS the live session, so the commit is truthful either
+        // way).
+        if let Err(outcome) =
+            self.commit_lane_claim_at(&mut own_ticket, &new_thread_id, &new_thread_id, sidecar_pid)
+        {
+            tracing::error!(target: "invariant",
+                provider = PROVIDER, session_id = %new_thread_id,
+                old_session_id = %old_session_id, outcome = ?outcome,
+                "freshagent.codex.respawn_commit_stale: the coordinator moved on while the \
+                 crash respawn registered; the uncommitted session is torn down"
+            );
+            if let Some(session) = self.sessions.lock().await.remove(&new_thread_id) {
+                session.consumer.abort();
+                session.client.close().await;
+                if let Some(kill_tx) = session.kill_tx {
+                    let _ = kill_tx.send(());
+                }
+                let _ = session.watcher.await;
+            }
+            return Err(EnsureAliveError::RespawnFailed(
+                "session ownership changed during crash respawn; torn down".to_string(),
+            ));
         }
 
         // P1.13 identity event (Task 4): NEW ledger row under the new thread id with
@@ -4129,7 +4757,15 @@ impl FreshCodexState {
         thread_id: &str,
         cwd: Option<&str>,
     ) -> Result<(Arc<CodexAppServerClient>, bool), CodexSnapshotError> {
-        match self.ensure_session_resumable(thread_id, cwd).await {
+        // kata b8ke Task 3: the snapshot GET's temporary compatibility
+        // cold-start — through the shared coordinator (unfenced: no lifecycle
+        // message observed anything), so it can never spawn when another
+        // kind owns or is transitioning the session. Task 5 removes this
+        // cold-start entirely.
+        match self
+            .ensure_session_resumable(thread_id, cwd, None, None)
+            .await
+        {
             Ok(resumed) => {
                 let active_turn_present = resumed
                     .active_turn
@@ -4228,6 +4864,15 @@ impl FreshCodexState {
         &self,
         thread_id: &str,
         cwd: Option<&str>,
+        // kata b8ke Task 3: the delayed-request fence the calling lifecycle
+        // message carried (`None` = legacy unfenced sender / the snapshot
+        // cold-start — still cross-kind-checked, just not stale-fenced).
+        observed: Option<freshell_ownership::ObservedFence>,
+        // kata b8ke Task 3 (round-1 review): `Some((operation_id,
+        // generation))` when invoked as a handoff continuation — the runner
+        // holds the ticket and performs the ONE `commit_live`, so this lane
+        // skips both its own claim and its own commit (under-ticket mode).
+        handoff: Option<(&str, u64)>,
     ) -> Result<ResumedCodexSession, ResumeSessionError> {
         if let Some(resumed) = self.live_resumed_session(thread_id).await {
             return Ok(resumed);
@@ -4269,10 +4914,45 @@ impl FreshCodexState {
                 "fresh_agent_attach_resume_refused: a live terminal PTY owns this session (Task 13b cross-kind live-guard)");
             return Err(ResumeSessionError::Reserved);
         }
+        // kata b8ke Task 3: the coordinator claim comes FIRST — before the
+        // provider lease — at every lifecycle entry point that spawns
+        // (cross-kind authority; the lease stays as the same-kind/TTL
+        // backstop). Under-ticket mode (handoff continuation): the runner
+        // already holds the claim — skip.
+        let resume_request_id = format!("attach-resume-{}", uuid::Uuid::new_v4());
+        let mut own_ticket: Option<freshell_ownership::OperationTicket> = if handoff.is_some() {
+            None
+        } else {
+            match self.begin_lane_claim_at(
+                thread_id,
+                &resume_request_id,
+                observed,
+                "freshcodex/attach-resume",
+            ) {
+                crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+                crate::ownership_lane::LaneClaim::Unwired => None,
+                crate::ownership_lane::LaneClaim::Adopt => {
+                    // A same-kind live runtime the map fast-path missed —
+                    // re-check the live map; else the claim is stale info the
+                    // lane must not spawn over.
+                    if let Some(resumed) = self.live_resumed_session(thread_id).await {
+                        return Ok(resumed);
+                    }
+                    return Err(ResumeSessionError::Reserved);
+                }
+                crate::ownership_lane::LaneClaim::Refused(outcome) => {
+                    tracing::warn!(target: "freshell_freshagent::codex",
+                        session_id = %thread_id, outcome = ?outcome,
+                        "fresh_agent_attach_resume_refused: the ownership coordinator \
+                         refused the claim (kata b8ke cross-kind authority)"
+                    );
+                    return Err(ResumeSessionError::Reserved);
+                }
+            }
+        };
         // Task 13 (D8): this arm SPAWNS -- claim the per-sessionRef lease first. The
         // per-thread lock above covers in-process attach-vs-attach; the lease
         // serializes against CREATE-path holders for the same durable id.
-        let resume_request_id = format!("attach-resume-{}", uuid::Uuid::new_v4());
         let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
         for round in 0..2u8 {
             match self.leases.claim(
@@ -4341,6 +5021,18 @@ impl FreshCodexState {
                 g.set_kill_handle(pid, &ownership_id);
             }
         }
+        // kata b8ke Task 3: register the spawn's partial runtime (the
+        // watchdog's reap target) the moment the child exists — before the
+        // commit.
+        let sidecar_pid = child.id();
+        crate::ownership_lane::register_partial_fresh_runtime(
+            &self.ownership,
+            PROVIDER,
+            thread_id,
+            &own_ticket,
+            thread_id,
+            sidecar_pid,
+        );
 
         // P1.13 (Task 5, R3): recover this thread's recorded settings snapshot BEFORE
         // issuing `thread/resume`, gated per V7/A10.
@@ -4563,6 +5255,48 @@ impl FreshCodexState {
             }
         }
 
+        // kata b8ke Task 3: the resume's registration survived every teardown
+        // gate — commit `Live{FreshAgent}` and retain the stamp. Under-ticket
+        // mode (handoff continuation): SKIP the commit — return the
+        // constructed owner identity to the runner (the single commit
+        // authority; no double commits).
+        let handoff_owner_identity = match handoff {
+            Some(_) => Some(freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                terminal_id: None,
+                live_session_key: Some(thread_id.to_string()),
+                pid: sidecar_pid,
+                ownership_id: None,
+            }),
+            None => {
+                if let Err(outcome) =
+                    self.commit_lane_claim_at(&mut own_ticket, thread_id, thread_id, sidecar_pid)
+                {
+                    tracing::error!(target: "invariant",
+                        provider = PROVIDER, session_id = %thread_id,
+                        outcome = ?outcome,
+                        "freshagent.codex.resume_commit_stale: the coordinator moved on \
+                         while the resume registered; the uncommitted session is torn down"
+                    );
+                    if let Some(session) = self.sessions.lock().await.remove(thread_id) {
+                        session.consumer.abort();
+                        session.client.close().await;
+                        if let Some(kill_tx) = session.kill_tx {
+                            let _ = kill_tx.send(());
+                        }
+                        let _ = session.watcher.await;
+                    }
+                    if let Some(mut g) = lease_guard.take() {
+                        g.fail();
+                    }
+                    return Err(ResumeSessionError::Transient(
+                        "session ownership changed during attach-resume; torn down".to_string(),
+                    ));
+                }
+                None
+            }
+        };
+
         // P1.13 identity event (Task 5, R3): refresh write re-persisting the RECOVERED
         // live values, `supersedes: None` -- GATED on an actual recovery. On a miss it
         // must NOT run: writing would launder blank defaults into the ledger and
@@ -4588,6 +5322,7 @@ impl FreshCodexState {
         Ok(ResumedCodexSession {
             client,
             active_turn,
+            owner_identity: handoff_owner_identity,
         })
     }
 
@@ -4644,6 +5379,7 @@ impl FreshCodexState {
             exited.clone(),
             Arc::clone(&self.leases),
             quiet_deadman.clone(),
+            self.ownership_watch(),
         );
         self.sessions.lock().await.insert(
             thread_id.to_string(),
@@ -4678,6 +5414,7 @@ impl FreshCodexState {
         guard.get(thread_id).map(|session| ResumedCodexSession {
             client: session.client.clone(),
             active_turn: session.active_turn.clone(),
+            owner_identity: None,
         })
     }
 
@@ -4711,6 +5448,7 @@ impl FreshCodexState {
             exited.clone(),
             Arc::clone(&self.leases),
             quiet_deadman.clone(),
+            self.ownership_watch(),
         );
         self.sessions.lock().await.insert(
             thread_id.to_string(),
@@ -5522,6 +6260,9 @@ pub(crate) fn spawn_exit_watcher(
     exited: Arc<AtomicBool>,
     leases: Arc<crate::session_lease::FreshAgentSessionLeases>,
     quiet_deadman: Arc<StdMutex<QuietDeadman>>,
+    // kata b8ke Task 3: release the retained coordinator stamp on exit with
+    // its fenced claim (None when the lane is unwired — pre-existing tests).
+    ownership: Option<crate::ownership_lane::OwnershipWatch>,
 ) -> tokio::task::JoinHandle<()> {
     // wfah: the thread id is fixed by the time the watcher is constructed at
     // every successful spawn site; enrich the durable record once, here.
@@ -5546,6 +6287,13 @@ pub(crate) fn spawn_exit_watcher(
                 crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                 // Task 12: the bound session is gone -- reopen its durable id.
                 leases.clear_binding(PROVIDER, &thread_id);
+                // kata b8ke Task 3: the requested-kill path's coordinator
+                // transition is the kill flow's own `commit_stop` (the
+                // release here is fenced and no-ops during `Stopping`); the
+                // stamp is consumed either way.
+                if let Some(watch) = &ownership {
+                    watch.release(&thread_id, "freshcodex/watcher-requested-kill");
+                }
                 tracing::info!(provider = PROVIDER, session_id = %thread_id, "freshagent.sidecar.reaped");
             }
             _ = child.wait() => {
@@ -5559,6 +6307,12 @@ pub(crate) fn spawn_exit_watcher(
                 // durable id (the entry stays mapped for PR-4 lazy respawn, which
                 // re-claims through the attach/send seams).
                 leases.clear_binding(PROVIDER, &thread_id);
+                // kata b8ke Task 3: an UNREQUESTED exit releases the retained
+                // coordinator stamp with its fenced claim (round-1 review) —
+                // the key reopens for the next claimant.
+                if let Some(watch) = &ownership {
+                    watch.release(&thread_id, "freshcodex/watcher-exit");
+                }
                 tracing::info!(provider = PROVIDER, session_id = %thread_id, "freshagent.sidecar.reaped");
                 // DIAG-01: an UNREQUESTED exit -- the crash/disconnect self-heal
                 // edge (`kill_rx` firing instead would mean a requested kill,
@@ -6763,6 +7517,7 @@ pub(crate) mod tests {
             exited.clone(),
             Arc::clone(&state.leases),
             quiet_deadman.clone(),
+            None,
         );
         state.sessions.lock().await.insert(
             thread_id.to_string(),
@@ -6836,6 +7591,7 @@ pub(crate) mod tests {
             exited.clone(),
             Arc::clone(&state.leases),
             quiet_deadman.clone(),
+            None,
         );
         state.sessions.lock().await.insert(
             thread_id.to_string(),
@@ -10905,6 +11661,10 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            None,
+            // kata b8ke Task 3: no coordinator claim in this direct-drive
+            // test path (the lease-claim skip mirrors handle_create's
+            // pre-claim fast paths).
             None,
             Some(crate::BindProvenance::for_create(
                 Some("client-new"),
