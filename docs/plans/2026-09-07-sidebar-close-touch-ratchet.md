@@ -37,8 +37,8 @@ The brief's stated baseline `de1662095` is an ancestor of this worktree HEAD (`g
 6. **`terminalDirectoryThunks.ts` / slice current state.** `fetchTerminalDirectoryWindow` (:55-109) fetches a page, checks abort (:83), and applies it via `setTerminalDirectoryWindowData` (:85-91) — no folds. Sidebar feeds `state.terminalDirectory.windows.sidebar.items` as the `terminals` selector input (src/components/Sidebar.tsx:237-239), and `buildSessionItems` still rows identity-less running terminals under `<mode>:terminal:<terminalId>` (sidebarSelectors.ts:481-534). Refreshes reach the thunk on every `terminals.changed` / `terminal.meta.updated` broadcast (src/lib/terminal-invalidation-handler.ts:64-119 — debounced `runRefresh`) and on connect (App.tsx:1341-1343), mounted or not. **Fold insert point: between the abort check (:83) and the `setTerminalDirectoryWindowData` dispatch (:85).**
 7. **Test harnesses verified.** tabsSlice.test.ts: ws mock answers `panes.closed.result` success (:41-75); `closeTab` completes; stores compose tabs/panes (+connection). terminal-session-association.test.ts: `createState(content, tabOverrides)` harness (:7-27). terminalDirectoryThunks.test.ts: `getTerminalDirectoryPage` mocked (:10-20). Sidebar.test.tsx: `createTestStore` (:122-300) supports `projects/tabs/terminals/sessionActivity/sortMode` with inferred running pane content (:171-184); `renderSidebar(store, terminals)` (:308-320); its ws mock does NOT answer close acks (:51-57) and no existing test dispatches a close thunk (verified by grep) — Task 2 upgrades the mock inertly. activity-sort.test.tsx: localStorage round-trip integration home (:16-34). sessionGreyTouch.test.ts: watcher harness (:121-169).
 8. **Residual verification (decision E — all five still true at the current base).** (1) Placeholder rows are built from `panes.layouts` (sidebarSelectors.ts:384-479) so they vanish on close; the projects loop fills `ratchetedActivity` once the server indexes the session (:254/:274). (2) The folds are runtime dispatches; persistence stores pre-fold keys, and a post-reload first directory sighting has no previous-window evidence of the superseded identity. (3) Shell-mode content yields no locator and no fallback key (pane-activity.ts:385, session-utils.ts:129). (4) Mirrored closes flow through the same client thunk (ui-commands.ts:117-118). (5) Non-activity modes get `EMPTY_ACTIVITY` (sidebarSelectors.ts:68-72). No wording adjustments required through the dispatcher.
-9. **Prior-run behavior classes (brief item 3) — port/drop dispositions, with evidence.** The five classes were encoded in repair commits `632cb3338`, `5c74ab168`, `6d33b9d2b`, `c65962158`, `803a050f7` on `origin/the-usual/sidebar-pinned-status-sort` (HEAD `803a050f7`, 8 commits; `git show 803a050f7 --stat` read in full). (a) canonical session refs — **ported** (Task 2 canonical loop; preserves the reviewed unconditional semantics the watcher does not fully cover, e.g. a session still open in another local tab); (b) identity-less live-terminal fallback rows — **ported** (Task 1+2 terminal-key branches; the watcher only covers the content-running variant per pane-activity.ts:383); (c) registry-only canonical identities — **ported** (Task 1+2 registry sessionRef / codex durability branches; the tier map cannot see registry identity, sessionStatusTiers.ts:48-57); (d) terminal-directory load gaps — **ported** (Task 1+2 content-branch fallback key, keyed regardless of content status or directory presence); (e) alias→canonical folds on late identity binding (association reconcile path AND the independent codex-durability directory path) and canonical→canonical rebinds (codex fork handoffs, including silent directory-snapshot identity swaps for disconnected clients) — **ported in full** (Tasks 3-4; nothing equivalent exists on main per notes 5-6). No class dropped: every trigger condition still exists at the current base. The prior branch's interim TerminalView fold call was superseded within that branch itself (`c65962158` moved it to the directory thunk) and is not ported.
-10. **Deviations from coordinator decisions A-E: none.** A: no changes to `statusTiers` / `sessionStatusTierRank` / `compareByStatusTiers` / `makeSelectSessionStatusTiers` — the verified grey-tier comparator already surfaces `ratchetedActivity`-first within grey (note 1), so the float composes with main's actual comparator and no redesign is needed. B: all five reviewed classes ported with ratchet-only semantics (note 9). C: test levels per task below; **no new e2e spec** — the close-touch float is a pure client-side composition of data whose production paths (busy/tier derivation, directory refresh, close-evidence gate) already have coverage; a meaningful e2e would need a real streaming agent session and two tab closes to demonstrate ordering, adding cost without exercising any new production path — unit (thunk + helper), integration (persistence debounce), and component (Sidebar float) levels cover every new branch with observable verification. D: no settings, toggles, docs pages, or UI beyond ordering; **`docs/index.html` not updated** — the mock does not encode row-order semantics and no new control, section, or visual affordance is introduced; ring visuals and busy/green icon logic untouched. E: residuals carried verbatim and each verified true (note 8).
+9. **Prior-run behavior classes (brief item 3) — port/drop dispositions, with evidence.** The five classes were encoded in repair commits `632cb3338`, `5c74ab168`, `6d33b9d2b`, `c65962158`, `803a050f7` on `origin/the-usual/sidebar-pinned-status-sort` (HEAD `803a050f7`, 8 commits; `git show 803a050f7 --stat` read in full). (a) canonical session refs — **ported** (Task 2 canonical loop; preserves the reviewed unconditional semantics the watcher does not fully cover, e.g. a session still open in another local tab); (b) identity-less live-terminal fallback rows — **ported** (Task 1+2 terminal-key branches; the watcher only covers the content-running variant per pane-activity.ts:383); (c) registry-only canonical identities — **ported** (Task 1+2 registry sessionRef / codex durability branches; the tier map cannot see registry identity, sessionStatusTiers.ts:48-57); (d) terminal-directory load gaps — **ported** (Task 1+2 content-branch fallback key, keyed regardless of content status or directory presence); (e) alias→canonical folds on late identity binding (association reconcile path AND the directory-apply path, which folds every provider's `<provider>:terminal:<terminalId>` alias onto the applied item's canonical identity — codex durability AND non-codex sessionRef bindings, the latter stranded when the association frame passes during closeTab's ack wait, before the close-time ratchet writes the alias) and canonical→canonical rebinds (codex fork handoffs, including silent directory-snapshot identity swaps for disconnected clients) — **ported in full** (Tasks 3-4; nothing equivalent exists on main per notes 5-6). No class dropped: every trigger condition still exists at the current base. The prior branch's interim TerminalView fold call was superseded within that branch itself (`c65962158` moved it to the directory thunk) and is not ported.
+10. **Deviations from coordinator decisions A-E: none.** A: no changes to `statusTiers` / `sessionStatusTierRank` / `compareByStatusTiers` / `makeSelectSessionStatusTiers` — the verified grey-tier comparator already surfaces `ratchetedActivity`-first within grey (note 1), so the float composes with main's actual comparator and no redesign is needed. B: all five reviewed classes ported with ratchet-only semantics (note 9). C: test levels per task below PLUS a seeded e2e phase — Task 5 appends a close-touch phase to the existing `test/e2e-browser/specs/sidebar-status-tier-sort-rust.spec.ts` (registered in RUST_ONLY_SPECS and NOT in CLOUD_SKIP_SPECS, so it covers both the local rust-chromium project and the cloud backend): that harness already seeds JSONL sessions with a fake claude CLI, opens local tabs by row clicks, and asserts exact sidebar order, so the phase is ~20-40 lines — close the OLDEST-seeded session's tab through the real TabBar close button (the real Rust server answers the batch ack) and assert it floats to the top of the grey section. The phase pins the user-visible Requested result end-to-end (real close-ack path included); its known boundary — it cannot isolate the closeTab ratchet from the pre-existing grey-transition watcher (same canonical key, max-wins) — is stated plainly in Task 5's text, with mechanism isolation remaining in the unit tests' watcher-gap shapes. Unit (thunk + helper), integration (persistence debounce), and component (Sidebar float) levels still cover every new branch with observable verification. (Decision C's original "a meaningful e2e would need a real streaming agent session" premise was falsified against that harness by the Stage-2 load-bearing review; see `/home/dan/code/freshell/.worktrees/.the-usual-logs/sidebar-close-touch-ratchet/reports/load-bearing-strategist.md`, LB-3.) D: no settings, toggles, docs pages, or UI beyond ordering; **`docs/index.html` not updated** — the mock does not encode row-order semantics and no new control, section, or visual affordance is introduced; ring visuals and busy/green icon logic untouched. E: residuals carried verbatim and each verified true (note 8).
 
 ## Global Constraints
 
@@ -1212,11 +1212,14 @@ function foldSessionActivityFromKey({
  * lib/session-utils.ts — the sidebar's identity-less live-terminal row key).
  * When the terminal later acquires canonical identity, the sidebar rekeys
  * the row to `<provider>:<sessionId>` and reads activity only from there,
- * so the alias timestamp must be folded across at each binding point
- * (sessionRef association here; codex durability identity in
- * fetchTerminalDirectoryWindow in store/terminalDirectoryThunks.ts — the
+ * so the alias timestamp must be folded across at each binding point:
+ * sessionRef association here, and every applied directory page in
+ * fetchTerminalDirectoryWindow (store/terminalDirectoryThunks.ts) — the
  * store-level directory-apply choke point, reached by every
- * terminals.changed refresh whether or not any pane is mounted).
+ * terminals.changed refresh whether or not any pane is mounted — folding
+ * ANY provider's alias, not only codex durability (a binding whose
+ * association frame passed before the ratchet wrote the alias has no
+ * other fold opportunity).
  */
 export function foldTerminalAliasActivity({
   dispatch,
@@ -1332,15 +1335,15 @@ Expected: PASS. App.tsx and TerminalView.tsx are `reconcileTerminalSessionAssoci
 git add src/lib/terminal-session-association.ts test/unit/client/lib/terminal-session-association.test.ts && git commit -m "feat(client): fold close-touch activity across identity binds and rebinds"
 ```
 
-### Task 4: Directory-level folds — codex durability alias and canonical snapshot swap on every applied page
+### Task 4: Directory-level folds — all-provider alias and canonical snapshot swap on every applied page
 
 **Files:**
 - Modify: src/store/terminalDirectoryThunks.ts:1-16 (add the fold imports and the `TerminalDirectoryItem` type import), insert `directoryItemCanonicalIdentity` before the `TerminalDirectorySurface` type (line 18), insert the fold block between the abort check (line 83) and the `setTerminalDirectoryWindowData` dispatch (line 85)
-- Test: test/unit/client/store/terminalDirectoryThunks.test.ts (add the sessionActivity reducer import; append two new describes at end of file)
+- Test: test/unit/client/store/terminalDirectoryThunks.test.ts (add the sessionActivity, tabs, and panes reducer imports plus `addTab`/`closeTab`/`initLayout` and `reconcileTerminalSessionAssociation`; add a hoisted ws-client mock with a mid-wait hook beside the existing `@/lib/api` mock; append the new describes at end of file)
 
 **Interfaces:**
-- Consumes: `foldTerminalAliasActivity` / `foldCanonicalSessionActivity` (Task 3), `fetchTerminalDirectoryWindow(args: { surface, priority, append?, cursor? })` (:55), `TerminalDirectoryItem` (src/store/terminalDirectorySlice.ts:4), `getTerminalDirectoryPage` (mocked in the test file), the store's `terminalDirectory.windows[surface].items` previous-window state.
-- Produces: no new exported names; behavior: every applied directory page folds (i) alias→canonical for codex items that acquired durability identity and (ii) canonical→canonical when the same terminalId's canonical identity changed between the previous window and the applied page — both ratchet-only.
+- Consumes: `foldTerminalAliasActivity` / `foldCanonicalSessionActivity` (Task 3), `fetchTerminalDirectoryWindow(args: { surface, priority, append?, cursor? })` (:55), `TerminalDirectoryItem` (src/store/terminalDirectorySlice.ts:4), `getTerminalDirectoryPage` (mocked in the test file), the store's `terminalDirectory.windows[surface].items` previous-window state. The stranding scenario test additionally composes the real `closeTab` thunk (src/store/tabsSlice.ts) with `addTab`/`initLayout` (src/store/panesSlice.ts) and routes a mid-wait binding through `reconcileTerminalSessionAssociation` (src/lib/terminal-session-association.ts — the same routing App.tsx performs for `terminal.session.associated`).
+- Produces: no new exported names; behavior: every applied directory page folds (i) alias→canonical for EVERY item carrying a canonical identity — sessionRef for any provider, codex durability for codex terminals, both via `directoryItemCanonicalIdentity` — whenever an alias activity entry exists under `<provider>:terminal:<terminalId>`, and (ii) canonical→canonical when the same terminalId's canonical identity changed between the previous window and the applied page — both ratchet-only (max wins). The all-provider alias fold is the heal for a binding that arrived during closeTab's ack wait: the association-reconcile fold's single opportunity passed before the close-time ratchet wrote the alias, and the once-per-binding broadcast never re-fires.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
@@ -1348,22 +1351,64 @@ In test/unit/client/store/terminalDirectoryThunks.test.ts, add after the line-3 
 
 ```ts
 import sessionActivityReducer from '@/store/sessionActivitySlice'
+import tabsReducer, { addTab, closeTab } from '@/store/tabsSlice'
+import panesReducer, { initLayout } from '@/store/panesSlice'
+import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
 ```
 
-Append at the end of the file:
+Then add the hoisted ws-client mock after the existing `vi.mock('@/lib/api', ...)` block (it answers the evidence-gated `closeTab` inline, mirroring tabsSlice.test.ts:41-75, and carries the mid-wait hook the stranding scenario installs; inert for every other test in the file — nothing else here touches the ws client):
 
 ```ts
-describe('codex durability alias fold on directory application', () => {
-  // A codex terminal closed while identity-less had its close-tab touch
-  // recorded under codex:terminal:<terminalId> (liveTerminalRowIdentity's
-  // fallback row key). When the still-running terminal later gains codex
-  // durability identity, the sidebar rekeys the row to
-  // codex:<durabilitySessionId> (mirroring getCodexDurabilitySessionId in
-  // selectors/sidebarSelectors.ts). Every terminal.codex.durability.updated
-  // broadcast is followed by terminals.changed, which refreshes the
-  // directory regardless of whether any pane is still mounted — so the
-  // applied directory page is the store-level binding point that must fold
-  // the alias across.
+const { paneCloseAckHandlers, midWaitAssociation } = vi.hoisted(() => ({
+  paneCloseAckHandlers: new Set<(msg: unknown) => void>(),
+  midWaitAssociation: { onPanesClosed: null as null | (() => void) },
+}))
+
+vi.mock('@/lib/ws-client', () => ({
+  getWsClient: () => ({
+    send: (msg: unknown) => {
+      const m = msg as { type?: string; requestId?: string }
+      if (m?.type === 'panes.closed' && m.requestId) {
+        // The mid-ack-wait moment: after closeTab captured its frozen
+        // snapshot and sent the batch close, BEFORE the ack answers —
+        // exactly when App.tsx would route a terminal.session.associated
+        // frame (App.tsx:1278-1296).
+        midWaitAssociation.onPanesClosed?.()
+        for (const handler of [...paneCloseAckHandlers]) {
+          handler({ type: 'panes.closed.result', requestId: m.requestId, success: true })
+        }
+      }
+    },
+    onMessage: (handler: (msg: unknown) => void) => {
+      paneCloseAckHandlers.add(handler)
+      return () => {
+        paneCloseAckHandlers.delete(handler)
+      }
+    },
+  }),
+  resetWsClientForTests: vi.fn(),
+}))
+```
+
+Then append at the end of the file (the first describe covers all providers, with the codex durability tests as the codex-specific cases inside):
+
+```ts
+describe('directory alias fold on application (all providers)', () => {
+  // A terminal closed while identity-less had its close-tab touch recorded
+  // under <provider>:terminal:<terminalId> (liveTerminalRowIdentity's
+  // identity-less live-terminal row key). When the still-running terminal
+  // later gains canonical identity — a sessionRef for ANY provider, or codex
+  // durability for codex terminals — the sidebar rekeys the row to the
+  // canonical key (mirroring directoryItemCanonicalIdentity /
+  // buildSessionItems' runningSessionMap in selectors/sidebarSelectors.ts),
+  // so the applied page must fold the alias across. Refreshes reach the
+  // thunk on every terminals.changed / terminal.meta.updated broadcast and
+  // on (re)connect, regardless of whether any pane is still mounted — the
+  // applied directory page is the store-level binding point. The all-provider
+  // pass is also the ONLY heal for a binding that arrived during closeTab's
+  // ack wait (see the mid-ack-wait stranding describe below): its
+  // association-reconcile fold ran before the ratchet wrote the alias, and
+  // the once-per-binding broadcast never re-fires.
 
   beforeEach(() => {
     getTerminalDirectoryPage.mockReset()
@@ -1488,6 +1533,61 @@ describe('codex durability alias fold on directory application', () => {
     // not be folded onto a session that does not exist.
     expect(store.getState().sessionActivity.sessions['codex:terminal:term-cx-1']).toBe(3333)
     expect(Object.keys(store.getState().sessionActivity.sessions)).toHaveLength(1)
+  })
+
+  it('folds the alias timestamp into <provider>:<sessionId> for non-codex sessionRef identity (all providers)', async () => {
+    // The mid-ack-wait stranding class for non-codex providers: a claude/
+    // opencode binding that lands after the close wrote the alias has no
+    // codex durability lane — the sessionRef-keyed applied page is the only
+    // fold this alias ever gets.
+    getTerminalDirectoryPage.mockResolvedValue({
+      items: [{
+        terminalId: 'term-op-9',
+        title: 'OpenCode',
+        createdAt: 1,
+        lastActivityAt: 10,
+        status: 'running',
+        hasClients: false,
+        mode: 'opencode',
+        sessionRef: { provider: 'opencode', sessionId: 's-op-9' },
+      }],
+      nextCursor: null,
+      revision: 16,
+    })
+
+    const store = createStoreWithActivity({ 'opencode:terminal:term-op-9': 5555 })
+    await store.dispatch(fetchTerminalDirectoryWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+    }) as any)
+
+    expect(store.getState().sessionActivity.sessions['opencode:s-op-9']).toBe(5555)
+  })
+
+  it('writes nothing for a non-codex item with no alias activity entry (the common case)', async () => {
+    getTerminalDirectoryPage.mockResolvedValue({
+      items: [{
+        terminalId: 'term-cl-4',
+        title: 'Claude',
+        createdAt: 1,
+        lastActivityAt: 10,
+        status: 'running',
+        hasClients: false,
+        mode: 'claude',
+        sessionRef: { provider: 'claude', sessionId: 's-cl-4' },
+      }],
+      nextCursor: null,
+      revision: 17,
+    })
+
+    const store = createStoreWithActivity({})
+    await store.dispatch(fetchTerminalDirectoryWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+    }) as any)
+
+    expect(store.getState().sessionActivity.sessions['claude:s-cl-4']).toBeUndefined()
+    expect(Object.keys(store.getState().sessionActivity.sessions)).toHaveLength(0)
   })
 })
 
@@ -1642,6 +1742,106 @@ describe('canonical rebind fold on directory refresh (snapshot swap)', () => {
     expect(store.getState().sessionActivity.sessions).toEqual({ 'claude:claude-1': 4444 })
   })
 })
+
+describe('mid-ack-wait identity binding stranding (composition)', () => {
+  // LB-1 composition, end to end through the real thunks: an identity
+  // binding delivered during closeTab's <=5s ack wait is routed through
+  // reconcileTerminalSessionAssociation BEFORE the close-commit ratchet
+  // writes the alias key, so Task 3's fold is a no-op on an empty source,
+  // and the once-per-binding broadcast never re-fires. The ratchet then
+  // reads the FROZEN identity-less directory snapshot and writes the alias
+  // key — stranded. The next applied directory page carries the bound
+  // identity, and the all-provider directory alias fold is the heal.
+
+  beforeEach(() => {
+    getTerminalDirectoryPage.mockReset()
+    _resetTerminalDirectoryThunkControllers()
+    midWaitAssociation.onPanesClosed = null
+  })
+
+  function identityLessOpencodeItem() {
+    return {
+      terminalId: 't-strand',
+      title: 'OpenCode pane',
+      createdAt: 1,
+      lastActivityAt: 1,
+      status: 'running',
+      hasClients: true,
+      mode: 'opencode',
+    }
+  }
+
+  function boundOpencodeItem() {
+    return {
+      ...identityLessOpencodeItem(),
+      sessionRef: { provider: 'opencode', sessionId: 's-strand' },
+    }
+  }
+
+  it('heals a mid-ack-wait binding: the alias written by the close ratchet folds to canonical on the next applied page', async () => {
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        sessionActivity: sessionActivityReducer,
+        terminalDirectory: terminalDirectoryReducer,
+      },
+      preloadedState: {
+        // The frozen directory window the ratchet reads at close-commit:
+        // the terminal is identity-less here.
+        terminalDirectory: {
+          windows: { sidebar: { items: [identityLessOpencodeItem()] } },
+          searches: {},
+        },
+      },
+    })
+    store.dispatch(addTab({ mode: 'opencode' }))
+    const tabId = store.getState().tabs.tabs[0].id
+    store.dispatch(initLayout({
+      tabId,
+      content: { kind: 'terminal', mode: 'opencode', terminalId: 't-strand' },
+    }))
+
+    // The binding lands mid-wait: the ws mock routes it through the real
+    // reconcile the moment the batch close is sent (before the ack
+    // answers), exactly as App.tsx routes a terminal.session.associated
+    // frame. Task 3's fold no-ops — the alias does not exist yet.
+    midWaitAssociation.onPanesClosed = () => {
+      reconcileTerminalSessionAssociation({
+        dispatch: store.dispatch,
+        getState: store.getState,
+        terminalId: 't-strand',
+        sessionRef: { provider: 'opencode', sessionId: 's-strand' },
+      })
+    }
+    const beforeClose = Date.now()
+    await store.dispatch(closeTab(tabId))
+
+    // The stranding (characterization): the ratchet wrote the alias under
+    // the frozen identity-less directory item, and the association's one
+    // fold opportunity already passed — the canonical key is untouched.
+    const sessions = store.getState().sessionActivity.sessions
+    expect(sessions['opencode:terminal:t-strand']).toBeGreaterThanOrEqual(beforeClose)
+    expect(sessions['opencode:s-strand']).toBeUndefined()
+
+    // The next applied page carries the bound identity — the directory
+    // alias fold must land the alias's value on the canonical key.
+    getTerminalDirectoryPage.mockResolvedValue({
+      items: [boundOpencodeItem()],
+      nextCursor: null,
+      revision: 31,
+    })
+    await store.dispatch(fetchTerminalDirectoryWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+    }) as any)
+
+    const folded = store.getState().sessionActivity.sessions
+    expect(folded['opencode:s-strand']).toBe(sessions['opencode:terminal:t-strand'])
+    // Ratchet-only: the source entry stays (pruned by existing retention).
+    expect(folded['opencode:terminal:t-strand']).toBe(sessions['opencode:terminal:t-strand'])
+  })
+})
 ```
 
 - [ ] **Step 2: Run the test and verify the intended failure**
@@ -1650,7 +1850,7 @@ describe('canonical rebind fold on directory refresh (snapshot swap)', () => {
 npm run test:vitest -- run test/unit/client/store/terminalDirectoryThunks.test.ts
 ```
 
-FAIL because `fetchTerminalDirectoryWindow` applies pages without any fold: `sessions['codex:durable-1']` / `sessions['codex:cand-1']` / `sessions['codex:child-1']` read `undefined` after the fetches (and the untouched-map tests fail only if a mis-implementation over-folds).
+FAIL because `fetchTerminalDirectoryWindow` applies pages without any fold: `sessions['codex:durable-1']` / `sessions['codex:cand-1']` / `sessions['codex:child-1']` read `undefined` after the fetches, `sessions['opencode:s-op-9']` reads `undefined` (a non-codex sessionRef item a codex-gated fold would skip), and the stranding scenario's post-fetch `folded['opencode:s-strand']` reads `undefined` (the stranded alias never folds) — while the scenario's mid-close assertions (alias written, canonical still absent) hold, pinning the stranding itself (and the untouched-map tests fail only if a mis-implementation over-folds).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -1674,7 +1874,9 @@ Insert before the `TerminalDirectorySurface` type (before line 18):
  * selectors/sidebarSelectors.ts: sessionRef first, then the codex durability
  * id for codex terminals (getCodexDurabilitySessionId). Items with neither
  * are rowed under the identity-less `<mode>:terminal:<terminalId>` fallback
- * key, which is not a canonical identity.
+ * key, which is not a canonical identity. This identity is ALSO the alias
+ * fold's target: a touch recorded under that fallback key folds onto the
+ * key the row actually reads once an applied page carries this identity.
  */
 function directoryItemCanonicalIdentity(
   item: TerminalDirectoryItem,
@@ -1708,8 +1910,11 @@ Then replace the `try` block's dispatch section (lines 83-91) — insert the fol
       // (buildSessionItems reads terminalDirectory.windows.sidebar.items;
       // the directory never passes through
       // reconcileTerminalSessionAssociation), and the refresh fires on every
-      // terminals.changed broadcast as well as on (re)connect, mounted or
-      // not. Two folds, both ratchet-only:
+      // terminals.changed / terminal.meta.updated broadcast as well as on
+      // (re)connect, mounted or not. Two folds over every applied item
+      // carrying a canonical identity (directoryItemCanonicalIdentity —
+      // sessionRef for any provider, codex durability for codex terminals),
+      // both ratchet-only:
       //
       // 1. Canonical-to-canonical: the terminal.session.associated frame
       //    carrying previousSessionId is a single transient broadcast, so a
@@ -1717,10 +1922,18 @@ Then replace the `try` block's dispatch section (lines 83-91) — insert the fol
       //    handoff as the SAME terminalId swapping canonical identity between
       //    two applied pages. The previous window is the only record of the
       //    superseded identity — fold its activity onto the new one.
-      // 2. Alias-to-canonical: a codex terminal closed while identity-less
-      //    had its touch recorded under codex:terminal:<terminalId>; once the
-      //    refreshed item carries durability identity the row rekeys to
-      //    codex:<durabilitySessionId>, so fold the alias across.
+      // 2. Alias-to-canonical, ALL providers: a terminal closed while
+      //    identity-less had its touch recorded under
+      //    `<provider>:terminal:<terminalId>`; once the applied item carries
+      //    a canonical identity the row rekeys, so fold the alias across
+      //    (onto the same key the sidebar rows the item under — the
+      //    sessionRef identity wins over durability when both exist, exactly
+      //    like the row derivation). This is the only heal for a binding
+      //    that arrived during closeTab's ack wait: its
+      //    association-reconcile fold ran before the ratchet wrote the
+      //    alias (a no-op on an empty source), and the once-per-binding
+      //    broadcast never re-fires — without it, a non-codex alias stays
+      //    stranded until a reconnect/attach re-reconcile.
       const items = Array.isArray(response?.items) ? response.items : []
       const stateBeforeFold = getState()
       const previousIdentityByTerminalId = new Map<string, { provider: string; sessionId: string }>()
@@ -1732,32 +1945,27 @@ Then replace the `try` block's dispatch section (lines 83-91) — insert the fol
       for (const item of items) {
         if (typeof item?.terminalId !== 'string') continue
         const identity = directoryItemCanonicalIdentity(item)
-        if (identity) {
-          const previous = previousIdentityByTerminalId.get(item.terminalId)
-          if (
-            previous
-            && previous.provider === identity.provider
-            && previous.sessionId !== identity.sessionId
-          ) {
-            foldCanonicalSessionActivity({
-              dispatch,
-              state: stateBeforeFold,
-              provider: identity.provider,
-              previousSessionId: previous.sessionId,
-              sessionId: identity.sessionId,
-            })
-          }
+        if (!identity) continue
+        const previous = previousIdentityByTerminalId.get(item.terminalId)
+        if (
+          previous
+          && previous.provider === identity.provider
+          && previous.sessionId !== identity.sessionId
+        ) {
+          foldCanonicalSessionActivity({
+            dispatch,
+            state: stateBeforeFold,
+            provider: identity.provider,
+            previousSessionId: previous.sessionId,
+            sessionId: identity.sessionId,
+          })
         }
-        if (item?.mode !== 'codex') continue
-        const durabilitySessionId = item.codexDurability?.durableThreadId
-          ?? item.codexDurability?.candidate?.candidateThreadId
-        if (!durabilitySessionId) continue
         foldTerminalAliasActivity({
           dispatch,
           state: stateBeforeFold,
           terminalId: item.terminalId,
-          provider: 'codex',
-          sessionId: durabilitySessionId,
+          provider: identity.provider,
+          sessionId: identity.sessionId,
         })
       }
 
@@ -1776,9 +1984,9 @@ Then replace the `try` block's dispatch section (lines 83-91) — insert the fol
 npm run test:vitest -- run test/unit/client/store/terminalDirectoryThunks.test.ts
 ```
 
-Expected: PASS — the two new describes plus every pre-existing describe in the file (non-codex, identity-less, or identity-stable pages dispatch no folds at all).
+Expected: PASS — the new describes plus every pre-existing describe in the file (pages whose items carry no canonical identity, or no alias activity entry under their row keys, dispatch no folds at all).
 
-- [ ] **Step 5: Refactor while green** — No-op by design: the two fold loops share Task 3's core helpers, the canonical-identity derivation is already extracted as `directoryItemCanonicalIdentity`, and the `items` hoist removes the duplicated array-guard expression.
+- [ ] **Step 5: Refactor while green** — No-op by design: the single fold loop shares Task 3's core helpers, the canonical-identity derivation is already extracted as `directoryItemCanonicalIdentity` and now drives both folds (the alias fold targets the same key the sidebar rows the item under), and the `items` hoist removes the duplicated array-guard expression.
 
 - [ ] **Step 6: Run impacted-test verification** — the directory consumers:
 
@@ -1786,12 +1994,151 @@ Expected: PASS — the two new describes plus every pre-existing describe in the
 npm run test:vitest -- run test/unit/client/store/terminalDirectoryThunks.test.ts test/unit/client/lib/terminal-session-association.test.ts test/unit/client/components/Sidebar.test.tsx
 ```
 
-Expected: PASS. Sidebar renders from the applied window (its mocked `getTerminalDirectoryPage` responses contain no codex durability identity, so the fold loops are no-ops there); the association suite pins the shared fold core.
+Expected: PASS. Sidebar renders from the applied window (its directory items carry no alias-activity entries under their row keys, so the folds are no-ops there); the association suite pins the shared fold core; the stranding scenario's ws mock and mid-wait hook are scoped to its own describe and reset in its `beforeEach`.
 
 - [ ] **Step 7: Commit the task**
 
 ```bash
 git add src/store/terminalDirectoryThunks.ts test/unit/client/store/terminalDirectoryThunks.test.ts && git commit -m "feat(client): fold close-touch activity at terminal directory apply"
+```
+
+### Task 5: E2E close-touch phase — append the close-float acceptance pin to the seeded tier-sort spec
+
+**Files:**
+- Modify: test/e2e-browser/specs/sidebar-status-tier-sort-rust.spec.ts (add the `getSessionTabId` helper after `getSessionTerminalId`, before `test.describe.serial` (between :415 and :417); append the Phase-6 block inside the single serial test, after the Phase-5 final order assertion `await expectSidebarOrder(page, [S_GREY, S_OPEN, S_BUSY], 30_000)` (:569), before the test's closing `})`)
+
+**Interfaces:**
+- Consumes: the spec's existing machinery — the seeded sessions S_GREY/S_BUSY/S_OPEN with fixed timestamps (S_OPEN is the OLDEST: T(3.5)/T(3)), the `rowOpen` locator (:489), `expectSidebarOrder` (:334-350), the `getSessionTerminalId` store-walk pattern (:357-415), and the TabBar close-button precedent (tab-management.spec.ts:61-73 — a plain click on the tab's `title="Close (Shift+Click to kill)"` button dispatches the evidence-gated `closeTab`, which the real Rust server acks). The spec is registered in RUST_ONLY_SPECS (playwright.config.ts:364) and NOT in CLOUD_SKIP_SPECS, so the phase covers both the local rust-chromium project and the cloud backend.
+- Produces: no production changes; one new spec phase (the close-touch acceptance pin) and one helper (`getSessionTabId`).
+
+**Known coverage boundary (stated plainly):** the phase pins the user-visible close-float, not the closeTab ratchet in isolation. The pre-existing grey-transition watcher (`src/store/sessionGreyTouch.ts`) touches the same canonical key on `removeTab` for this shape, and both writers are ratchet-only (max wins) — the phase passes on the watcher alone and cannot attribute the float to either writer. Mechanism isolation (the watcher's gap shapes: a session still open in another local tab, registry-only identity, non-running content) lives in the Task 2 unit tests. The phase's non-vacuity is against losing the close-time touch ENTIRELY: with neither writer, grey recency alone sinks the OLDEST-seeded S_OPEN below S_BUSY (`[S_GREY, S_BUSY, S_OPEN]`), so the asserted `[S_GREY, S_OPEN, S_BUSY]` can only hold through a touch.
+
+- [ ] **Step 1: Write the behavioral test**
+
+In test/e2e-browser/specs/sidebar-status-tier-sort-rust.spec.ts, add after `getSessionTerminalId` (before `test.describe.serial`):
+
+```ts
+/**
+ * The tabId of the page's own local claude tab for sessionId, read from the
+ * client pane-layout store (the layouts map is keyed by tabId). Sibling of
+ * getSessionTerminalId above — same store walk, returning the owning tab's
+ * id instead of the leaf's terminalId (copied-and-adapted per this suite's
+ * per-spec-ownership convention: helpers are copied, not imported).
+ */
+async function getSessionTabId(
+  page: import('@playwright/test').Page,
+  sessionId: string,
+): Promise<string> {
+  await expect
+    .poll(
+      async () =>
+        page.evaluate((sid) => {
+          const state = window.__FRESHELL_TEST_HARNESS__?.getState?.()
+          const layouts = state?.panes?.layouts ?? {}
+          for (const [tabId, layout] of Object.entries(layouts)) {
+            const collect = (node: any): any[] => {
+              if (!node) return []
+              if (node.type === 'leaf') return [node]
+              if (node.type === 'split') return [...collect(node.children?.[0]), ...collect(node.children?.[1])]
+              return []
+            }
+            const hit = collect(layout).find(
+              (leaf: any) =>
+                leaf?.content?.kind === 'terminal' &&
+                leaf?.content?.sessionRef?.provider === 'claude' &&
+                leaf?.content?.sessionRef?.sessionId === sid,
+            )
+            if (hit) return tabId
+          }
+          return null
+        }, sessionId),
+      { timeout: 30_000 },
+    )
+    .not.toBeNull()
+  return (await page.evaluate((sid) => {
+    const state = window.__FRESHELL_TEST_HARNESS__?.getState?.()
+    const layouts = state?.panes?.layouts ?? {}
+    for (const [tabId, layout] of Object.entries(layouts)) {
+      const collect = (node: any): any[] => {
+        if (!node) return []
+        if (node.type === 'leaf') return [node]
+        if (node.type === 'split') return [...collect(node.children?.[0]), ...collect(node.children?.[1])]
+        return []
+      }
+      const hit = collect(layout).find(
+        (leaf: any) =>
+          leaf?.content?.kind === 'terminal' &&
+          leaf?.content?.sessionRef?.provider === 'claude' &&
+          leaf?.content?.sessionRef?.sessionId === sid,
+      )
+      if (hit) return tabId
+    }
+    return null
+  }, sessionId)) as string
+}
+```
+
+Then append inside the single serial test, after the Phase-5 final order assertion (`await expectSidebarOrder(page, [S_GREY, S_OPEN, S_BUSY], 30_000)`) and before the closing `})`:
+
+```ts
+    // Phase 6 — close-touch acceptance pin (the Requested result): close
+    // S_OPEN's local tab — the OLDEST seeded timestamps (T(3.5)/T(3)), so
+    // grey recency alone sinks it below the newer-seeded pristine-grey
+    // S_BUSY ([S_GREY, S_BUSY, S_OPEN]); only a close-time touch floats it
+    // to the top of the grey section: [S_GREY, S_OPEN, S_BUSY]. S_GREY
+    // stays local-open (tier 1, unchanged above grey).
+    //
+    // KNOWN COVERAGE BOUNDARY: the close-time touch here is
+    // over-determined — the closeTab ratchet (Task 2) and the pre-existing
+    // grey-transition watcher (store/sessionGreyTouch.ts) write the SAME
+    // canonical key with max-wins semantics, so this phase pins the
+    // user-visible float, not the ratchet in isolation (mechanism
+    // isolation lives in the unit tests' watcher-gap shapes, Task 2).
+    const sOpenTabId = await getSessionTabId(page, S_OPEN)
+    const sOpenTab = page.locator(`[data-context="tab"][data-tab-id="${sOpenTabId}"]`)
+    // Plain click = the evidence-gated detach-close (the button's title is
+    // "Close (Shift+Click to kill)"); the real Rust server answers the
+    // batch ack, the close commits, and the touch composes into the grey
+    // order. tab-management.spec.ts:61-73 is the close-button precedent.
+    await sOpenTab.getByRole('button', { name: /close/i }).click()
+    await expect(rowOpen).toHaveAttribute('data-has-tab', 'false', { timeout: 30_000 })
+    await expectSidebarOrder(page, [S_GREY, S_OPEN, S_BUSY], 15_000)
+```
+
+- [ ] **Step 2: Run the test and verify the intended failure mode**
+
+```bash
+env -u FRESHELL_BIND_HOST npm run test:e2e -- --grep "status-tier sort"
+```
+
+Unlike Tasks 1-4 there is no red-first run to observe here: the phase is an acceptance pin over a close-touch composition whose writers — the Task 2 ratchet and the pre-existing grey-transition watcher — BOTH pre-exist this task (the known coverage boundary above; disabling either one alone leaves the float, and disabling the watcher also breaks the spec's own Phase 2). The first run is therefore expected GREEN: PASS (1 test, all phases). The failure the phase exists to catch is the composition loss — a regression that drops the close-time touch entirely leaves the OLDEST-seeded S_OPEN below S_BUSY (`[S_GREY, S_BUSY, S_OPEN]`), the non-vacuity anchor documented in the phase comment. If the run fails, diagnose per phase (the spec header explains each expected state); never weaken assertions, widen deadlines beyond the documented liveness/grace model, or drop phases. Run through `npm run test:e2e` so the configured `FRESHELL_E2E_BACKEND` (local|cloud) applies — per repo rules, if that variable is unset, confirm the backend choice with the user before the first e2e run. The first local run in this worktree may compile the Rust release server inside `beforeAll` (600s hook budget; the cloud image ships a prebuilt binary).
+
+- [ ] **Step 3: Add the minimal production implementation**
+
+None by design — a test-only task: the pinned close-float behavior shipped in Task 2 (and, for this shape, on main via the watcher — the known coverage boundary). Do not touch production files.
+
+- [ ] **Step 4: Run the focused test**
+
+```bash
+env -u FRESHELL_BIND_HOST npm run test:e2e -- --grep "status-tier sort"
+```
+
+Expected: PASS (1 test) — all phases green in one serial run; the appended phase must not destabilize the earlier phases (shared 300s test budget; the phase adds ~2-5s).
+
+- [ ] **Step 5: Refactor while green** — No-op by design: the helper duplicates the `getSessionTerminalId` walk VERBATIM per this suite's per-spec-ownership convention (helpers are copied, not imported); extracting a shared walk would violate it.
+
+- [ ] **Step 6: Run impacted-test verification** — the sibling spec sharing the copied raw-device harness convention (guards against accidental cross-edits), same backend:
+
+```bash
+env -u FRESHELL_BIND_HOST npm run test:e2e -- --grep "status-tier sort|remote status rings"
+```
+
+Expected: PASS (both files green). The repo-wide gate is the final gate below, not this step.
+
+- [ ] **Step 7: Commit the task**
+
+```bash
+git add test/e2e-browser/specs/sidebar-status-tier-sort-rust.spec.ts && git commit -m "test(e2e): pin the close-tab grey-section float in the seeded tier-sort spec"
 ```
 
 ## Final gate (after the last task, before any PR)
@@ -1805,5 +2152,13 @@ FRESHELL_TEST_SUMMARY="sidebar-close-touch-ratchet final gate" npm run check
 
 Expected: both exit 0.
 
-- [ ] Confirm dispositions: no new e2e spec and no `docs/index.html` update (rationales in planner notes 9/10); no settings, toggles, or visual changes (decision D); no changes to the tier-sort machinery, remote-ring render suppression, ring visuals, or busy/green icon logic (decision A — none of `sidebarSelectors.ts`, `sessionStatusTiers.ts`, or `sessionGreyTouch.ts` is touched).
+- [ ] E2E close-touch phase on the configured backend (`npm run check` does NOT run Playwright):
+
+```bash
+env -u FRESHELL_BIND_HOST npm run test:e2e -- --grep "status-tier sort"
+```
+
+Expected: exit 0 — the spec (rust-chromium project; cloud-runnable, not in CLOUD_SKIP_SPECS) green including the Task 5 close-touch phase.
+
+- [ ] Confirm dispositions: e2e coverage is the Task 5 phase appended to the existing seeded tier-sort spec (no new spec file; decision C as amended in planner note 10); no `docs/index.html` update (planner note 10); no settings, toggles, or visual changes (decision D); no changes to the tier-sort machinery, remote-ring render suppression, ring visuals, or busy/green icon logic (decision A — none of `sidebarSelectors.ts`, `sessionStatusTiers.ts`, or `sessionGreyTouch.ts` is touched).
 - [ ] Stop before `gh pr create`: PR creation requires explicit user approval per repo rules.
