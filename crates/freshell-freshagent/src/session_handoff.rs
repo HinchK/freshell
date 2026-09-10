@@ -35,6 +35,20 @@ pub(crate) const HANDOFF_ROUTE: &str = "/api/sessions/handoff";
 pub struct HandoffTestHooks {
     /// Park the runner right after the coordinator enter (before the stop).
     pub pause_after_enter: Option<tokio::sync::Notify>,
+    /// Park the runner after the TERMINAL prior's registry kill is ISSUED but
+    /// before the dead-poll confirms it (round-3 review I-1: the prior-reap
+    /// window's abort-test hold; terminal arm only — the fresh arm's hold is
+    /// the lane-side `handoff_kill_pause` seam on `FreshClaudeState`).
+    pub pause_after_terminal_prior_kill: Option<tokio::sync::Notify>,
+    /// Park the under-ticket terminal-target SETTLE after it publishes the
+    /// spawned terminal (round-3 review I-1: the target-spawn window's
+    /// abort-test hold). The runner embeds this into the `HandoffSpawnWatch`
+    /// it hands the settle.
+    pub pause_in_target_spawn: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// The runner deposits the terminal-target spawn watch here at
+    /// `start_target` entry, so a test can observe the settle's publication
+    /// deterministically.
+    pub spawn_watch_slot: std::sync::Mutex<Option<crate::terminal_tabs::HandoffSpawnWatch>>,
     /// Short-circuit `stop_runtime` to `ReapTimeout` WITHOUT issuing any
     /// kill — the deterministic reap-timeout test path (the prior stays
     /// exactly as alive as the test made it). Atomic so a test can clear it
@@ -50,6 +64,9 @@ impl Default for HandoffTestHooks {
     fn default() -> Self {
         Self {
             pause_after_enter: None,
+            pause_after_terminal_prior_kill: None,
+            pause_in_target_spawn: None,
+            spawn_watch_slot: std::sync::Mutex::new(None),
             force_reap_timeout: std::sync::atomic::AtomicBool::new(false),
             fail_target_spawn_once: std::sync::atomic::AtomicBool::new(false),
             events: std::sync::Mutex::new(Vec::new()),
@@ -235,25 +252,33 @@ impl SessionHandoffRunner {
                 );
             }
         };
-        let mut guard = HandoffGuard {
-            runner: Arc::clone(self),
-            provider: req.provider.clone(),
-            session_id: req.session_id.clone(),
-            operation_id: operation_id.clone(),
-            generation,
-            // Flipped false once the awaited reap confirms the prior died; set
-            // from the POSITIVE re-probe on a reap timeout (round-2 review).
-            prior_still_live: true,
-            target_runtime: None,
-            disarmed: false,
-        };
-        // The prior owner captured at enter (the stop/restore source).
+        // The prior owner captured at enter (the stop/restore source) —
+        // WITH its Live generation (the stamp-repair source, round-3
+        // review I-1). Read before the guard so the guard carries it.
         let prior = self
             .ownership
             .observe(&req.provider, &req.session_id)
             .state
             .prior_owner();
         let prior_kind = prior.as_ref().map(|(owner, _)| owner.kind);
+        let mut guard = HandoffGuard {
+            runner: Arc::clone(self),
+            provider: req.provider.clone(),
+            session_id: req.session_id.clone(),
+            operation_id: operation_id.clone(),
+            generation,
+            prior: prior.clone(),
+            // Flipped false once the awaited reap confirms the prior died;
+            // set from the POSITIVE re-probe on a reap timeout (round-2
+            // review).
+            prior_still_live: prior.is_some(),
+            prior_stop: PriorStopPhase::NotIssued,
+            target_kind: req.target_kind,
+            target_runtime: None,
+            target_spawn_watch: None,
+            target_spawn_begun: false,
+            disarmed: false,
+        };
         // 2. Broadcast the transition (all devices stop old-kind scheduling).
         // Every frame carries the boot epoch; the started frame's
         // previousKind is the prior owner's kind (round-2 review).
@@ -275,10 +300,14 @@ impl SessionHandoffRunner {
         // 3+4. Stop the prior runtime and await confirmed reap (bounded).
         // Exit-watcher events arriving DURING Handoff are folded HERE:
         // `release` is fenced to a no-op in Handoff state (Task 1), so this
-        // awaited kill/reap is the single fold point.
+        // awaited kill/reap is the single fold point. The phase marks the
+        // kill as IN FLIGHT across the await — an abort landing inside it
+        // must re-probe before any restore (round-3 review I-1).
         if let Some((owner, _)) = prior.as_ref() {
+            guard.prior_stop = PriorStopPhase::KillInFlight;
             match self.stop_runtime(&req, owner, &initiator).await {
                 StopOutcomePriv::Reaped => {
+                    guard.prior_stop = PriorStopPhase::Reaped;
                     guard.prior_still_live = false; // the runner folded the exit event
                     if let Some(hooks) = self.test_hooks.as_ref() {
                         hooks.record("Reaped");
@@ -293,9 +322,24 @@ impl SessionHandoffRunner {
                     // permanent wedge); unconfirmable -> end Vacant with the
                     // typed REAP_TIMEOUT (retryable, recoverable — never
                     // record a dead runtime as Live).
-                    let prior_live = self.probe_prior_live(&req, owner).await;
+                    let prior_live = self
+                        .probe_prior_live(&req.provider, &req.session_id, owner)
+                        .await;
                     guard.prior_still_live = prior_live;
-                    let _ = guard.disarm_and_fail();
+                    let fail_outcome = guard.disarm_and_fail();
+                    // Round-3 review I-1 (stamp repair): a restored fresh
+                    // prior whose retained stamp the lane kill already took
+                    // (a real timeout — the forced-hook shape short-circuits
+                    // before any kill) must get the stamp BACK, or its later
+                    // exit/kill paths can never release the record.
+                    if prior_live && matches!(fail_outcome, FailOutcome::RestoredPriorOwner) {
+                        self.repair_restored_prior_stamp(
+                            &req.provider,
+                            &req.session_id,
+                            owner,
+                            prior.as_ref().map(|(_, gen)| *gen).unwrap_or_default(),
+                        );
+                    }
                     // Failure-broadcast truth (round-2 review): the frame
                     // carries the ACTUAL resulting state — the restored prior
                     // owner with its kind/runtime identity, or Vacant — plus
@@ -389,12 +433,37 @@ impl SessionHandoffRunner {
                 );
             }
         }
-        match self.start_target(&req, &operation_id, generation).await {
+        // Round-3 review I-1 (target-spawn window): for a terminal target,
+        // arm the guard-visible spawn watch BEFORE the await — an abort
+        // landing anywhere inside `start_target` leaves the settle running
+        // detached, and the guard's cleanup needs the watch to find (and
+        // reap) the terminal it publishes.
+        let mut target_spawn_watch = None;
+        if req.target_kind == RuntimeOwnerKind::Terminal {
+            let watch = crate::terminal_tabs::HandoffSpawnWatch::new(
+                self.test_hooks
+                    .as_ref()
+                    .and_then(|hooks| hooks.pause_in_target_spawn.clone()),
+            );
+            if let Some(hooks) = self.test_hooks.as_ref() {
+                *hooks.spawn_watch_slot.lock().expect("spawn watch slot") = Some(watch.clone());
+            }
+            guard.target_spawn_watch = Some(watch.clone());
+            target_spawn_watch = Some(watch);
+        }
+        guard.target_spawn_begun = true;
+        match self
+            .start_target(&req, &operation_id, generation, target_spawn_watch)
+            .await
+        {
             Ok(owner) => {
                 // The cancellation-safety window: a spawned-but-uncommitted
                 // target is reaped by the guard if the runner is aborted
-                // before the commit (round-1 review).
+                // before the commit (round-1 review). The precise identity
+                // supersedes the spawn watch (no further await precedes the
+                // commit, so no abort can land between them).
                 guard.target_runtime = Some(owner.clone());
+                guard.target_spawn_watch = None;
                 // 6. THE single commit Live(targetKind) + broadcast owner
                 // identity.
                 match self.ownership.commit_live(
@@ -537,11 +606,17 @@ impl SessionHandoffRunner {
     }
 
     /// Round-2 review: a POSITIVE liveness re-probe of the prior runtime (a
-    /// reap timeout does NOT imply liveness). Terminal priors: the registry
-    /// row's Running status (the same join `live_session_owner` uses); fresh
-    /// priors: the lane's `has_live_session` probe (the same probe the D7
-    /// guard uses).
-    async fn probe_prior_live(&self, req: &HandoffRequest, owner: &OwnerIdentity) -> bool {
+    /// reap timeout does NOT imply liveness — and neither does an abort
+    /// inside the prior-kill await, round-3 review I-1). Terminal priors:
+    /// the registry row's Running status (the same join
+    /// `live_session_owner` uses); fresh priors: the lane's
+    /// `has_live_session` probe (the same probe the D7 guard uses).
+    async fn probe_prior_live(
+        &self,
+        provider: &str,
+        session_id: &str,
+        owner: &OwnerIdentity,
+    ) -> bool {
         match owner.kind {
             RuntimeOwnerKind::Terminal => owner
                 .terminal_id
@@ -552,13 +627,60 @@ impl SessionHandoffRunner {
                     })
                 })
                 .unwrap_or(false),
-            RuntimeOwnerKind::FreshAgent => match req.provider.as_str() {
-                "codex" => self.fresh_codex.has_live_session(&req.session_id).await,
-                "claude" => self.fresh_claude.has_live_session(&req.session_id).await,
-                "opencode" => self.fresh_opencode.has_live_session(&req.session_id).await,
+            RuntimeOwnerKind::FreshAgent => match provider {
+                "codex" => self.fresh_codex.has_live_session(session_id).await,
+                "claude" => self.fresh_claude.has_live_session(session_id).await,
+                "opencode" => self.fresh_opencode.has_live_session(session_id).await,
                 _ => false,
             },
         }
+    }
+
+    /// Round-3 review I-1 (stamp repair): re-retain the stamp a lane's
+    /// `kill_for_handoff` took, for a prior the abort/reap-timeout path is
+    /// RESTORING as Live. The repaired stamp matches the restored record
+    /// exactly (same owner identity, its original generation and committing
+    /// operation id), so the lane's later kill/exit-watcher release paths
+    /// keep working — the taken stamp can never permanently block repair.
+    /// Fresh priors only: terminal priors release through the terminal
+    /// registry's own exit/kill paths, which never consult fresh stamps.
+    fn repair_restored_prior_stamp(
+        &self,
+        provider: &str,
+        session_id: &str,
+        owner: &OwnerIdentity,
+        prior_generation: u64,
+    ) {
+        if owner.kind != RuntimeOwnerKind::FreshAgent {
+            return;
+        }
+        let Some(operation_id) = owner.ownership_id.clone() else {
+            // No committing operation id on the identity: no fenced claim
+            // can ever match it (commit_live stamps one) — nothing to
+            // repair against.
+            return;
+        };
+        let stamp = crate::ownership_lane::OwnershipStamp {
+            epoch: self.ownership.boot_epoch(),
+            generation: prior_generation,
+            operation_id,
+            owner: owner.clone(),
+        };
+        let stamps = match provider {
+            "codex" => &self.fresh_codex.ownership_stamps,
+            "claude" => &self.fresh_claude.ownership_stamps,
+            _ => &self.fresh_opencode.fresh_agent().ownership_stamps,
+        };
+        stamps
+            .lock()
+            .expect("ownership stamps lock")
+            .insert(session_id.to_string(), stamp);
+        tracing::warn!(target: "freshell_ownership",
+            event = "ownership.handoff.stamp_repaired",
+            provider, session_id,
+            generation = prior_generation,
+            outcome = "stamp_retained",
+            "handoff restored a live prior whose retained stamp the lane kill had taken");
     }
 
     /// Round-2 review (failure-broadcast truth): AFTER `disarm_and_fail`,
@@ -622,6 +744,193 @@ impl SessionHandoffRunner {
         }
     }
 
+    /// A minimal synthetic request for the cleanup paths (the Drop cannot
+    /// reach the original — only the pieces `reap_uncommitted_target`'s
+    /// stop dispatch reads are needed).
+    fn cleanup_request(
+        &self,
+        provider: &str,
+        session_id: &str,
+        kind: RuntimeOwnerKind,
+    ) -> HandoffRequest {
+        HandoffRequest {
+            provider: provider.to_string(),
+            session_id: session_id.to_string(),
+            target_kind: kind,
+            session_type: None,
+            mode: None,
+            cwd: None,
+            tab_id: None,
+            pane_id: None,
+            observed_epoch: None,
+            observed_generation: None,
+            device_id: Some("handoff-guard-cleanup".into()),
+        }
+    }
+
+    /// Round-3 review I-1: the abort/panic cleanup's coordinator half, run
+    /// on the Drop's detached task when the prior kill was ISSUED but its
+    /// confirmed reap was lost to the abort. Re-probe the prior's liveness
+    /// BEFORE any restore (the reap-timeout discipline): confirmed live →
+    /// restore (and repair the retained stamp the lane kill took, so the
+    /// exit watcher can still release later); unconfirmable → typed Vacant
+    /// (never a dying prior recorded as Live). Then the target half.
+    async fn abort_cleanup(&self, payload: AbortPayload) {
+        let AbortPayload {
+            provider,
+            session_id,
+            operation_id,
+            generation,
+            prior,
+            target_kind,
+            target_spawn_begun,
+            target,
+            spawn_watch,
+        } = payload;
+        let confirmed_live = match prior.as_ref() {
+            Some((owner, prior_gen)) => {
+                let live = self.probe_prior_live(&provider, &session_id, owner).await;
+                let outcome =
+                    self.ownership
+                        .fail(&provider, &session_id, &operation_id, generation, live);
+                if live && matches!(outcome, FailOutcome::RestoredPriorOwner) {
+                    self.repair_restored_prior_stamp(&provider, &session_id, owner, *prior_gen);
+                }
+                live
+            }
+            None => {
+                let _ =
+                    self.ownership
+                        .fail(&provider, &session_id, &operation_id, generation, false);
+                false
+            }
+        };
+        tracing::warn!(target: "freshell_ownership",
+            event = "ownership.handoff.abort_settled",
+            operation_id = %operation_id, provider = %provider, session_id = %session_id,
+            epoch = self.ownership.boot_epoch(), generation,
+            outcome = if confirmed_live { "restored_prior_owner" } else { "vacant" },
+            failure_reason = "RUNNER_ABORTED",
+            "handoff runner aborted inside the prior-reap window; liveness re-probed before restore");
+        self.abort_reap_uncommitted_target(AbortPayload {
+            provider,
+            session_id,
+            operation_id,
+            generation,
+            prior,
+            target_kind,
+            target_spawn_begun,
+            target,
+            spawn_watch,
+        })
+        .await;
+    }
+
+    /// Round-3 review I-1: the abort/panic cleanup's target half — reap the
+    /// uncommitted target runtime so no live unowned writer survives:
+    /// (a) the KNOWN identity (the spawn returned but the commit never
+    ///     happened — round-1 review's window),
+    /// (b) the in-flight terminal settle (the spawn await was dropped; the
+    ///     settle runs detached to completion — wait for its settlement,
+    ///     then reap the terminal it published, with the registry
+    ///     sessionRef sweep as the backstop),
+    /// (c) a fresh target's registered session (the dropped resume skipped
+    ///     its in-function cleanup — the lane kill is idempotent and only
+    ///     reached once `start_target` was entered, so the reaped prior can
+    ///     never be its victim).
+    async fn abort_reap_uncommitted_target(&self, payload: AbortPayload) {
+        let AbortPayload {
+            provider,
+            session_id,
+            target_kind,
+            target_spawn_begun,
+            target,
+            spawn_watch,
+            ..
+        } = payload;
+        if let Some(target) = target.as_ref() {
+            let req = self.cleanup_request(&provider, &session_id, target.kind);
+            self.reap_uncommitted_target(&req, target).await;
+        }
+        if let Some(watch) = spawn_watch.as_ref() {
+            watch.wait_settled().await;
+            if let Some(terminal_id) = watch.published_terminal() {
+                self.kill_and_confirm_terminal(&terminal_id).await;
+            }
+            // Backstop: any registry row still holding the canonical
+            // sessionRef is an uncommitted spawn for this handoff — reap it.
+            for entry in self.registry.directory() {
+                if entry.resume_session_id.as_deref() == Some(session_id.as_str()) {
+                    self.kill_and_confirm_terminal(&entry.terminal_id).await;
+                }
+            }
+        }
+        if target_spawn_begun && target_kind == RuntimeOwnerKind::FreshAgent {
+            let initiator = "handoff-guard-cleanup";
+            let reaped = match provider.as_str() {
+                "codex" => {
+                    self.fresh_codex
+                        .kill_for_handoff(&session_id, initiator)
+                        .await
+                        == StopResult::Reaped
+                }
+                "claude" => {
+                    self.fresh_claude
+                        .kill_for_handoff(&session_id, initiator)
+                        .await
+                        == StopResult::Reaped
+                }
+                "opencode" => {
+                    self.fresh_opencode
+                        .opencode_kill_for_handoff(&session_id, initiator)
+                        .await
+                        == StopResult::Reaped
+                }
+                _ => false,
+            };
+            if reaped {
+                // The aborted resume's lease guard dropped ARMED with its
+                // kill handle set (the child existed), so the lease is held
+                // for TTL recovery — but the teardown we just awaited IS
+                // the confirmed tree death, so the precise release applies
+                // and the typed RETRYABLE failure stays honestly retryable.
+                self.release_fresh_lane_lease(&provider, &session_id);
+            }
+        }
+    }
+
+    /// Release a fresh lane's held sessionRef lease after a CONFIRMED tree
+    /// kill (the `force_release_after_confirmed_kill` contract). No-op for
+    /// unknown providers (nothing was reaped).
+    fn release_fresh_lane_lease(&self, provider: &str, session_id: &str) {
+        match provider {
+            "codex" => self
+                .fresh_codex
+                .leases()
+                .force_release_after_confirmed_kill(provider, session_id),
+            "claude" => self
+                .fresh_claude
+                .leases()
+                .force_release_after_confirmed_kill(provider, session_id),
+            "opencode" => self
+                .fresh_opencode
+                .leases
+                .force_release_after_confirmed_kill(provider, session_id),
+            _ => {}
+        }
+    }
+
+    /// Registry kill + bounded confirmed death (the runner's reap shape).
+    async fn kill_and_confirm_terminal(&self, terminal_id: &str) {
+        if self.registry.kill(terminal_id) {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(self.reap_timeout_ms),
+                await_terminal_dead(&self.registry, terminal_id),
+            )
+            .await;
+        }
+    }
+
     /// Stop the prior runtime and await the CONFIRMED reap (bounded by
     /// `reap_timeout_ms`). Terminal priors: the registry group-kill +
     /// dead-poll (the `kill_session_ref_holder_and_confirm` discipline);
@@ -651,6 +960,15 @@ impl SessionHandoffRunner {
                 if !self.registry.kill(terminal_id) {
                     // Already gone (killed/exited elsewhere): the row is dead.
                     return StopOutcomePriv::Reaped;
+                }
+                // Round-3 review I-1 (prior-reap window): the kill is now
+                // ISSUED (SIGKILL sent) but unconfirmed — the abort-window
+                // test's deterministic hold parks HERE, inside the window
+                // where a dropped runner must re-probe before any restore.
+                if let Some(hooks) = self.test_hooks.as_ref() {
+                    if let Some(pause) = hooks.pause_after_terminal_prior_kill.as_ref() {
+                        let _ = pause.notified().await;
+                    }
                 }
                 match tokio::time::timeout(budget, await_terminal_dead(&self.registry, terminal_id))
                     .await
@@ -699,6 +1017,7 @@ impl SessionHandoffRunner {
         req: &HandoffRequest,
         operation_id: &str,
         generation: u64,
+        target_spawn_watch: Option<crate::terminal_tabs::HandoffSpawnWatch>,
     ) -> Result<OwnerIdentity, (String, String)> {
         match req.target_kind {
             RuntimeOwnerKind::Terminal => {
@@ -719,6 +1038,8 @@ impl SessionHandoffRunner {
                 let token = crate::terminal_tabs::HandoffToken {
                     operation_id: operation_id.to_string(),
                     generation,
+                    watch: target_spawn_watch
+                        .unwrap_or_else(|| crate::terminal_tabs::HandoffSpawnWatch::new(None)),
                 };
                 let spawned = crate::terminal_tabs::spawn_terminal_pane_with_handoff(
                     &self.fresh_agent,
@@ -1003,6 +1324,40 @@ async fn await_terminal_dead(registry: &freshell_terminal::TerminalRegistry, ter
     }
 }
 
+/// The prior-stop phase at abort time (round-3 review I-1 — the
+/// cancellation-safety windows). The Drop's restore discipline keys off it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PriorStopPhase {
+    /// The stop was never issued (the abort landed before the kill await):
+    /// the prior is untouched — restore it directly (test 5's window; its
+    /// retained stamp is intact, so its exit watcher still releases).
+    NotIssued,
+    /// The stop was issued but its confirmed reap was lost to the abort:
+    /// re-probe prior liveness BEFORE any restore (the reap-timeout
+    /// discipline) — a dying prior is never restored as Live; a
+    /// confirmed-live one is restored WITH its retained stamp repaired (the
+    /// lane kill already took it).
+    KillInFlight,
+    /// Confirmed reaped (or there never was a prior): never restore — the
+    /// runner folded the exit; the key ends Vacant.
+    Reaped,
+}
+
+/// The Drop's detached abort payload (round-3 review I-1): everything the
+/// cleanup needs, moved out of the guard when the task is cancelled or
+/// panics mid-flight.
+struct AbortPayload {
+    provider: String,
+    session_id: String,
+    operation_id: String,
+    generation: u64,
+    prior: Option<(OwnerIdentity, u64)>,
+    target_kind: RuntimeOwnerKind,
+    target_spawn_begun: bool,
+    target: Option<OwnerIdentity>,
+    spawn_watch: Option<crate::terminal_tabs::HandoffSpawnWatch>,
+}
+
 /// RAII: fail the coordinator entry if the handoff task is cancelled or
 /// panics before commit (armed + not disarmed => fail on Drop) — the
 /// `FreshSessionLeaseGuard` drop-discipline precedent. Round-1 review: the
@@ -1016,16 +1371,33 @@ async fn await_terminal_dead(registry: &freshell_terminal::TerminalRegistry, ter
 /// re-probe before failing, and an exit watcher arriving after the boundary
 /// still releases/repairs the key (a restored prior is a normal Live
 /// record; its fenced watcher fires on the real exit — no permanent wedge).
+/// Round-3 review I-1: the phase refines the abort semantics — a kill
+/// issued but unconfirmed (`KillInFlight`) defers the restore decision to
+/// the Drop's detached cleanup (re-probe, then restore-only-a-confirmed-
+/// live prior, repairing the retained stamp the lane kill took).
 /// `target_runtime`: a spawned-but-uncommitted target runtime is REAPED on
-/// Drop (the cancellation-safety window between spawn and commit).
+/// Drop (the cancellation-safety window between spawn and commit);
+/// `target_spawn_watch`/`target_spawn_begun` cover the window INSIDE the
+/// spawn await itself (an in-flight settle, or a fresh resume that already
+/// registered its session).
 struct HandoffGuard {
     runner: Arc<SessionHandoffRunner>,
     provider: String,
     session_id: String,
     operation_id: String,
     generation: u64,
+    /// The prior owner captured at enter, WITH its Live generation (the
+    /// stamp-repair source).
+    prior: Option<(OwnerIdentity, u64)>,
     prior_still_live: bool,
+    prior_stop: PriorStopPhase,
+    target_kind: RuntimeOwnerKind,
     target_runtime: Option<OwnerIdentity>,
+    target_spawn_watch: Option<crate::terminal_tabs::HandoffSpawnWatch>,
+    /// `true` once `start_target` was entered — gates the fresh-lane
+    /// uncommitted-session sweep (never before: the prior may still be
+    /// live on that lane).
+    target_spawn_begun: bool,
     disarmed: bool,
 }
 
@@ -1044,6 +1416,34 @@ impl HandoffGuard {
             self.prior_still_live,
         )
     }
+
+    /// Move the full abort payload out (the prior-reap window's deferred
+    /// cleanup consumes everything).
+    fn take_abort_payload(&mut self) -> AbortPayload {
+        let target = self.target_runtime.take();
+        let spawn_watch = self.target_spawn_watch.take();
+        self.abort_payload_with(target, spawn_watch)
+    }
+
+    /// The target-half payload: the given target identity + spawn watch in
+    /// place of the guard's own (already-taken) ones.
+    fn abort_payload_with(
+        &self,
+        target: Option<OwnerIdentity>,
+        spawn_watch: Option<crate::terminal_tabs::HandoffSpawnWatch>,
+    ) -> AbortPayload {
+        AbortPayload {
+            provider: self.provider.clone(),
+            session_id: self.session_id.clone(),
+            operation_id: self.operation_id.clone(),
+            generation: self.generation,
+            prior: self.prior.clone(),
+            target_kind: self.target_kind,
+            target_spawn_begun: self.target_spawn_begun,
+            target,
+            spawn_watch,
+        }
+    }
 }
 
 impl Drop for HandoffGuard {
@@ -1051,34 +1451,50 @@ impl Drop for HandoffGuard {
         if self.disarmed {
             return;
         }
+        let reactor = tokio::runtime::Handle::try_current();
+        if matches!(self.prior_stop, PriorStopPhase::KillInFlight) && reactor.is_ok() {
+            // Round-3 review I-1 (prior-reap window): the kill was issued
+            // but its confirmed reap was lost to the abort. DEFER the
+            // restore decision to the detached cleanup — it re-probes the
+            // prior's liveness first (a dying prior is never restored as
+            // Live) and repairs the retained stamp on a confirmed-live
+            // restore. The record stays Handoff only for the probe's
+            // microsecond-to-millisecond duration — retryable, never
+            // wedged.
+            let runner = Arc::clone(&self.runner);
+            let payload = self.take_abort_payload();
+            self.disarmed = true;
+            tokio::spawn(async move {
+                runner.abort_cleanup(payload).await;
+            });
+            return;
+        }
+        // Sync fail: NotIssued restores the untouched prior (true); Reaped
+        // never restores (false); KillInFlight with NO reactor (runtime
+        // shutdown — nothing can be spawned) fails CLOSED to Vacant — never
+        // restore a possibly-dying prior, and the OS reaps the children
+        // with the process anyway.
+        if matches!(self.prior_stop, PriorStopPhase::KillInFlight) {
+            self.prior_still_live = false;
+        }
         let _ = self.disarm_and_fail();
         // Cancellation/panic mid-flight: a spawned-but-uncommitted target
         // runtime has no owner record — reap it on a detached task (Drop is
-        // sync; the lanes' teardowns are async). The fresh lanes' teardown
-        // and the registry kill are both idempotent, so racing an explicit
-        // reap is harmless. `Handle::try_current` guards the shutdown edge:
-        // during runtime teardown the drop runs with no reactor — nothing
-        // can be spawned (the OS reaps the children with the process).
-        if let Some(target) = self.target_runtime.take() {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        // sync; the lanes' teardowns are async). The fresh-lane sweep and
+        // the settle-watch reap ride the same cleanup. Racing an explicit
+        // reap is harmless: the lanes' teardowns and the registry kill are
+        // idempotent.
+        let target = self.target_runtime.take();
+        let spawn_watch = self.target_spawn_watch.take();
+        if target.is_some()
+            || spawn_watch.is_some()
+            || (self.target_spawn_begun && self.target_kind == RuntimeOwnerKind::FreshAgent)
+        {
+            if let Ok(handle) = reactor {
                 let runner = Arc::clone(&self.runner);
-                let provider = self.provider.clone();
-                let session_id = self.session_id.clone();
+                let payload = self.abort_payload_with(target, spawn_watch);
                 handle.spawn(async move {
-                    let req = HandoffRequest {
-                        provider,
-                        session_id,
-                        target_kind: target.kind,
-                        session_type: None,
-                        mode: None,
-                        cwd: None,
-                        tab_id: None,
-                        pane_id: None,
-                        observed_epoch: None,
-                        observed_generation: None,
-                        device_id: Some("handoff-guard-cleanup".into()),
-                    };
-                    runner.reap_uncommitted_target(&req, &target).await;
+                    runner.abort_reap_uncommitted_target(payload).await;
                 });
             }
         }
@@ -1152,11 +1568,13 @@ async fn handoff_handler(
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     if !crate::authorized(&headers, &runner.auth_token) {
+        // Round-3 review N-2: the typed code now matches the status (the
+        // plan sketch's "BAD_REQUEST" read oddly for a 401).
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({
                 "ok": false,
-                "error": { "code": "BAD_REQUEST", "message": "unauthorized", "retryable": false }
+                "error": { "code": "UNAUTHORIZED", "message": "unauthorized", "retryable": false }
             })),
         );
     }

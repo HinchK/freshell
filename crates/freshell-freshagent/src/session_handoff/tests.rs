@@ -298,6 +298,20 @@ struct Rig {
 }
 
 fn build_rig(hooks: Option<Arc<HandoffTestHooks>>) -> Rig {
+    build_rig_with_claude_pauses(hooks, None, None)
+}
+
+/// [`build_rig`] plus the claude lane's handoff test pauses (round-3 review
+/// I-1's abort-window holds): `kill_pause` parks `kill_for_handoff` after it
+/// takes the retained stamp (the prior-reap window); `resume_pause` parks
+/// `resume_for_attach` right after the target session registers (the
+/// fresh-arm target-spawn window). Both must be armed BEFORE the runner is
+/// minted — the states are cloned into it.
+fn build_rig_with_claude_pauses(
+    hooks: Option<Arc<HandoffTestHooks>>,
+    kill_pause: Option<Arc<tokio::sync::Notify>>,
+    resume_pause: Option<Arc<tokio::sync::Notify>>,
+) -> Rig {
     let auth_token = Arc::new("handoff-test-token".to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let rx = broadcast_tx.subscribe();
@@ -307,6 +321,7 @@ fn build_rig(hooks: Option<Arc<HandoffTestHooks>>) -> Rig {
 
     let mut fresh_claude = crate::FreshClaudeState::new(Arc::clone(&broadcast_tx));
     fresh_claude.set_ownership(Arc::clone(&ownership));
+    fresh_claude.set_handoff_test_pauses(kill_pause, resume_pause);
     let mut fresh_codex = crate::FreshCodexState::new(
         Arc::clone(&auth_token),
         Arc::clone(&broadcast_tx),
@@ -459,6 +474,60 @@ async fn await_pid_dead(pid: u32) {
     }
 }
 
+/// Await the single `session.runtimeOwner` frame with this transition
+/// (bounded; skips unrelated frames — the tests 3b/4/5 inline loops,
+/// factored for the round-3 abort-window tests).
+async fn await_owner_frame(
+    rx: &mut tokio::sync::broadcast::Receiver<String>,
+    transition: &str,
+) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match tokio::time::timeout(Duration::from_millis(250), rx.recv()).await {
+            Ok(Ok(raw)) => {
+                if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                    if v["type"] == "session.runtimeOwner" && v["transition"] == transition {
+                        return v;
+                    }
+                }
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(_)) => panic!("broadcast channel closed"),
+            Err(_) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the {transition} broadcast never arrived within budget"
+                );
+            }
+        }
+    }
+}
+
+/// Bounded-poll until the predicate holds (the async abort-cleanup settles).
+async fn await_cond(desc: &str, pred: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !pred() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "condition never held within budget: {desc}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Bounded-poll the claude lane's live-session probe until it flips to
+/// `want` (the async abort-cleanup settles).
+async fn await_live_session(state: &crate::FreshClaudeState, sid: &str, want: bool, desc: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while state.has_live_session(sid).await != want {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "condition never held within budget: {desc}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// Establish a live freshclaude owner for `sid` (the fake sidecar path) and
 /// return once the coordinator records it Live.
 async fn establish_fresh_claude_owner(rig: &Rig, sid: &str) {
@@ -598,10 +667,19 @@ fn find_captured<'e>(
 #[tokio::test]
 async fn handoff_to_terminal_reaps_sidecar_before_target_start_and_commits_owner() {
     let _guard = ENV_LOCK.lock().await;
+    // The claude-lane env surface this file's tests mutate
+    // (FRESHELL_CLAUDE_SIDECAR/NODE, FAKE_SIDECAR_REQUEST_LOG,
+    // CLAUDE_CONFIG_DIR) is process-global and shared with claude.rs's and
+    // snapshot.rs's tests through THEIR lock — hold it too: our own
+    // ENV_LOCK only serializes this file against itself.
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
     let env = FakeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let (events, _capture_guard) = tracing_capture::capture();
-    let mut rig = build_rig(None);
+    // M-1 (round-3 review): hooks installed so the runner's step order is
+    // ASSERTED (the plan's event-log ordering requirement), not just implied.
+    let hooks = Arc::new(HandoffTestHooks::default());
+    let mut rig = build_rig(Some(Arc::clone(&hooks)));
     establish_fresh_claude_owner(&rig, &sid).await;
     let create_watermark = env.create_rows().len();
     let capture_start = events.lock().expect("capture lock").len();
@@ -742,6 +820,14 @@ async fn handoff_to_terminal_reaps_sidecar_before_target_start_and_commits_owner
         Some("committed")
     );
 
+    // Hook-event ordering (M-1, round-3 review — the plan's explicit
+    // assertion): the prior was reaped BEFORE the target spawned.
+    assert_eq!(
+        *hooks.events.lock().unwrap(),
+        vec!["Reaped", "TargetStarted"],
+        "the runner's step order must be Reaped then TargetStarted"
+    );
+
     // Cleanup: kill the committed terminal.
     rig.registry.kill(&terminal_id);
 }
@@ -754,6 +840,12 @@ async fn handoff_to_terminal_reaps_sidecar_before_target_start_and_commits_owner
 #[tokio::test]
 async fn handoff_target_spawn_failure_leaves_vacant_with_typed_error() {
     let _guard = ENV_LOCK.lock().await;
+    // The claude-lane env surface this file's tests mutate
+    // (FRESHELL_CLAUDE_SIDECAR/NODE, FAKE_SIDECAR_REQUEST_LOG,
+    // CLAUDE_CONFIG_DIR) is process-global and shared with claude.rs's and
+    // snapshot.rs's tests through THEIR lock — hold it too: our own
+    // ENV_LOCK only serializes this file against itself.
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
     let env = FakeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let hooks = Arc::new(HandoffTestHooks::default());
@@ -827,6 +919,12 @@ async fn handoff_target_spawn_failure_leaves_vacant_with_typed_error() {
 #[tokio::test]
 async fn handoff_reap_timeout_reprobes_the_prior_and_restores_only_a_live_one() {
     let _guard = ENV_LOCK.lock().await;
+    // The claude-lane env surface this file's tests mutate
+    // (FRESHELL_CLAUDE_SIDECAR/NODE, FAKE_SIDECAR_REQUEST_LOG,
+    // CLAUDE_CONFIG_DIR) is process-global and shared with claude.rs's and
+    // snapshot.rs's tests through THEIR lock — hold it too: our own
+    // ENV_LOCK only serializes this file against itself.
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
     let env = FakeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let hooks = Arc::new(HandoffTestHooks::default());
@@ -911,6 +1009,12 @@ async fn handoff_reap_timeout_reprobes_the_prior_and_restores_only_a_live_one() 
 #[tokio::test]
 async fn handoff_reap_timeout_with_unconfirmable_prior_ends_vacant_typed() {
     let _guard = ENV_LOCK.lock().await;
+    // The claude-lane env surface this file's tests mutate
+    // (FRESHELL_CLAUDE_SIDECAR/NODE, FAKE_SIDECAR_REQUEST_LOG,
+    // CLAUDE_CONFIG_DIR) is process-global and shared with claude.rs's and
+    // snapshot.rs's tests through THEIR lock — hold it too: our own
+    // ENV_LOCK only serializes this file against itself.
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
     let env = FakeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let hooks = Arc::new(HandoffTestHooks {
@@ -1015,6 +1119,12 @@ async fn handoff_reap_timeout_with_unconfirmable_prior_ends_vacant_typed() {
 #[tokio::test]
 async fn a_prior_restored_after_reap_timeout_still_releases_when_it_later_exits() {
     let _guard = ENV_LOCK.lock().await;
+    // The claude-lane env surface this file's tests mutate
+    // (FRESHELL_CLAUDE_SIDECAR/NODE, FAKE_SIDECAR_REQUEST_LOG,
+    // CLAUDE_CONFIG_DIR) is process-global and shared with claude.rs's and
+    // snapshot.rs's tests through THEIR lock — hold it too: our own
+    // ENV_LOCK only serializes this file against itself.
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
     let _env = FakeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let hooks = Arc::new(HandoffTestHooks::default());
@@ -1054,6 +1164,12 @@ async fn a_prior_restored_after_reap_timeout_still_releases_when_it_later_exits(
 #[tokio::test]
 async fn handoff_continues_to_consistency_when_client_disconnects() {
     let _guard = ENV_LOCK.lock().await;
+    // The claude-lane env surface this file's tests mutate
+    // (FRESHELL_CLAUDE_SIDECAR/NODE, FAKE_SIDECAR_REQUEST_LOG,
+    // CLAUDE_CONFIG_DIR) is process-global and shared with claude.rs's and
+    // snapshot.rs's tests through THEIR lock — hold it too: our own
+    // ENV_LOCK only serializes this file against itself.
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
     let _env = FakeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let hooks = Arc::new(HandoffTestHooks {
@@ -1113,6 +1229,12 @@ async fn handoff_continues_to_consistency_when_client_disconnects() {
 #[tokio::test]
 async fn handoff_task_abort_leaves_zero_or_one_owner() {
     let _guard = ENV_LOCK.lock().await;
+    // The claude-lane env surface this file's tests mutate
+    // (FRESHELL_CLAUDE_SIDECAR/NODE, FAKE_SIDECAR_REQUEST_LOG,
+    // CLAUDE_CONFIG_DIR) is process-global and shared with claude.rs's and
+    // snapshot.rs's tests through THEIR lock — hold it too: our own
+    // ENV_LOCK only serializes this file against itself.
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
     let _env = FakeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let hooks = Arc::new(HandoffTestHooks {
@@ -1209,6 +1331,374 @@ async fn handoff_task_abort_leaves_zero_or_one_owner() {
     rig.fresh_claude.handle_kill(kill_msg(&sid)).await;
 }
 
+/// 5b. Prior-reap window (round-3 review I-1): an abort landing inside the
+/// prior-kill await — AFTER the lane kill took the retained stamp but
+/// BEFORE it removed the session — must RE-PROBE the prior's liveness
+/// before any restore: the probe confirms it live (the kill future was
+/// dropped before the map removal), so the prior is restored — and the
+/// taken stamp is REPAIRED, so the lane's later kill/exit paths can still
+/// release the record (no permanent block).
+#[tokio::test]
+async fn handoff_abort_during_prior_kill_reprobes_and_repairs_the_stamp() {
+    let _guard = ENV_LOCK.lock().await;
+    // The claude-lane env surface this file's tests mutate
+    // (FRESHELL_CLAUDE_SIDECAR/NODE, FAKE_SIDECAR_REQUEST_LOG,
+    // CLAUDE_CONFIG_DIR) is process-global and shared with claude.rs's and
+    // snapshot.rs's tests through THEIR lock — hold it too: our own
+    // ENV_LOCK only serializes this file against itself.
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let kill_pause = Arc::new(tokio::sync::Notify::new());
+    let rig = build_rig_with_claude_pauses(None, Some(Arc::clone(&kill_pause)), None);
+    establish_fresh_claude_owner(&rig, &sid).await;
+    let prior_pid = env.sidecar_pid_for(&sid).expect("the prior sidecar's pid");
+
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    // Park proof: the lane kill ISSUED — the retained stamp is gone (the
+    // deterministic observable that the kill entered its pause; the session
+    // itself is still registered and alive).
+    await_cond("the lane kill must issue (take the stamp)", || {
+        crate::ownership_lane::peek_retained_stamp(&rig.fresh_claude.ownership_stamps, &sid)
+            .is_none()
+    })
+    .await;
+
+    // ABORT inside the prior-kill await.
+    handle.abort();
+    let _ = handle.task.await;
+
+    // The abort path re-probed and RESTORED the confirmed-live prior.
+    await_cond("the abort cleanup must settle the record", || {
+        matches!(
+            rig.ownership.observe("claude", &sid).state,
+            OwnershipState::Live { .. }
+        )
+    })
+    .await;
+    match rig.ownership.observe("claude", &sid).state {
+        OwnershipState::Live { owner, .. } => {
+            assert_eq!(
+                owner.kind,
+                RuntimeOwnerKind::FreshAgent,
+                "the re-probed-live prior is restored"
+            );
+        }
+        other => panic!("the restored prior must be Live, got {other:?}"),
+    }
+    assert!(
+        rig.fresh_claude.has_live_session(&sid).await,
+        "the prior was never actually killed (the kill future dropped before teardown)"
+    );
+    // The stamp was TAKEN by the kill and REPAIRED by the abort path.
+    await_cond("the retained stamp must be repaired", || {
+        crate::ownership_lane::peek_retained_stamp(&rig.fresh_claude.ownership_stamps, &sid)
+            .is_some()
+    })
+    .await;
+
+    // No permanent block: the lane's OWN kill path still works through the
+    // repaired stamp — the key releases to Vacant on the real exit.
+    rig.fresh_claude.handle_kill(kill_msg(&sid)).await;
+    await_cond("the later lane kill must release the key", || {
+        rig.ownership.observe("claude", &sid).state == OwnershipState::Vacant
+    })
+    .await;
+    await_pid_dead(prior_pid).await;
+}
+
+/// 5c. Prior-reap window (round-3 review I-1): an abort landing after the
+/// TERMINAL prior's registry kill was issued and the prior is CONFIRMED
+/// DEAD must end the key VACANT — the abort path's re-probe finds the row
+/// gone, so a dying/dead prior is never restored as `Live` (the exact
+/// wedge the carried finding names).
+#[tokio::test]
+async fn handoff_abort_after_terminal_prior_kill_never_restores_a_dead_prior() {
+    let _guard = ENV_LOCK.lock().await;
+    // The claude-lane env surface this file's tests mutate
+    // (FRESHELL_CLAUDE_SIDECAR/NODE, FAKE_SIDECAR_REQUEST_LOG,
+    // CLAUDE_CONFIG_DIR) is process-global and shared with claude.rs's and
+    // snapshot.rs's tests through THEIR lock — hold it too: our own
+    // ENV_LOCK only serializes this file against itself.
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let hooks = Arc::new(HandoffTestHooks {
+        pause_after_terminal_prior_kill: Some(tokio::sync::Notify::new()),
+        ..HandoffTestHooks::default()
+    });
+    let mut rig = build_rig(Some(Arc::clone(&hooks)));
+    let sid = uuid::Uuid::new_v4().to_string();
+
+    // Terminal prior (the 6b pattern): a real Running PTY that
+    // self-commits Live{Terminal} for the canonical key.
+    let spawn_body = json!({
+        "mode": "claude",
+        "cwd": std::env::temp_dir().to_string_lossy(),
+        "sessionRef": { "provider": "claude", "sessionId": sid },
+    });
+    let spawned = crate::terminal_tabs::spawn_terminal_pane(
+        &rig.fresh_agent,
+        &spawn_body,
+        "handoff-abort-terminal-tab",
+        "handoff-abort-terminal-pane",
+    )
+    .await
+    .expect("terminal prior spawn");
+    let prior_terminal = spawned.terminal_id.clone();
+    assert!(matches!(
+        rig.ownership.observe("claude", &sid).state,
+        OwnershipState::Live { .. }
+    ));
+
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_fresh("claude", &sid, "freshclaude"));
+    // Park proof: the runner passed the enter and issued the registry
+    // kill (parked inside the window); the SIGKILL always lands.
+    let _started = await_owner_frame(&mut rig.rx, "handoff-started").await;
+    await_cond("the prior terminal must die after the issued kill", || {
+        rig.registry.terminal_is_dead(&prior_terminal)
+    })
+    .await;
+
+    // ABORT inside the prior-kill await: the kill was issued, the prior is
+    // dead — never restore it as Live.
+    handle.abort();
+    let _ = handle.task.await;
+
+    await_cond("the abort cleanup must settle the record Vacant", || {
+        rig.ownership.observe("claude", &sid).state == OwnershipState::Vacant
+    })
+    .await;
+
+    // The key reopens (not wedged).
+    assert!(matches!(
+        rig.ownership.begin_start(
+            "claude",
+            &sid,
+            RuntimeOwnerKind::Terminal,
+            "post-abort-probe",
+            None,
+            "test",
+            0,
+        ),
+        BeginOutcome::Granted { .. }
+    ));
+    let _ = rig
+        .ownership
+        .fail("claude", &sid, "post-abort-probe", 1, false);
+}
+
+/// 5d. Target-spawn window (round-3 review I-1): an abort landing inside the
+/// terminal-target spawn await — the settle is parked AFTER publishing the
+/// spawned terminal — must let the guard's cleanup wait for the settle's
+/// completion and REAP the uncommitted terminal: no live unowned writer, the
+/// key Vacant, the registry clean.
+#[tokio::test]
+async fn handoff_abort_during_target_spawn_reaps_the_uncommitted_terminal() {
+    let _guard = ENV_LOCK.lock().await;
+    // The claude-lane env surface this file's tests mutate
+    // (FRESHELL_CLAUDE_SIDECAR/NODE, FAKE_SIDECAR_REQUEST_LOG,
+    // CLAUDE_CONFIG_DIR) is process-global and shared with claude.rs's and
+    // snapshot.rs's tests through THEIR lock — hold it too: our own
+    // ENV_LOCK only serializes this file against itself.
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let pause = Arc::new(tokio::sync::Notify::new());
+    let hooks = Arc::new(HandoffTestHooks {
+        pause_in_target_spawn: Some(Arc::clone(&pause)),
+        ..HandoffTestHooks::default()
+    });
+    let rig = build_rig(Some(Arc::clone(&hooks)));
+    establish_fresh_claude_owner(&rig, &sid).await;
+    let prior_pid = env.sidecar_pid_for(&sid).expect("the prior sidecar's pid");
+
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    // Park proof: the runner deposited its spawn watch, and the settle
+    // PUBLISHED the spawned terminal (then parked at the seam — it cannot
+    // pass without the test's notify).
+    let watch = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(watch) = hooks.spawn_watch_slot.lock().unwrap().clone() {
+                if let Some(terminal_id) = watch.published_terminal() {
+                    break (watch, terminal_id);
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the settle never published the spawned terminal"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    let target_terminal = watch.1;
+
+    // ABORT inside the target-spawn await (the runner is parked awaiting
+    // the settle).
+    handle.abort();
+    let _ = handle.task.await;
+
+    // The key ends Vacant (the prior was reaped; the sync fail ran in Drop).
+    assert_eq!(
+        rig.ownership.observe("claude", &sid).state,
+        OwnershipState::Vacant,
+        "the aborted handoff must leave the key Vacant"
+    );
+
+    // Release the settle: it completes UNDER-TICKET (no commit — the
+    // runner is gone) and marks settlement, waking the cleanup.
+    pause.notify_one();
+
+    // The cleanup reaped the uncommitted terminal: its row is gone and no
+    // registry row holds the canonical sessionRef.
+    await_cond("the uncommitted target terminal must be reaped", || {
+        rig.registry.terminal_is_dead(&target_terminal)
+    })
+    .await;
+    assert!(
+        !rig.registry
+            .directory()
+            .into_iter()
+            .any(|entry| entry.resume_session_id.as_deref() == Some(sid.as_str())),
+        "no terminal may own {sid} after the aborted handoff"
+    );
+
+    // The key reopens (not wedged).
+    assert!(matches!(
+        rig.ownership.begin_start(
+            "claude",
+            &sid,
+            RuntimeOwnerKind::Terminal,
+            "post-abort-probe",
+            None,
+            "test",
+            0,
+        ),
+        BeginOutcome::Granted { .. }
+    ));
+    let _ = rig
+        .ownership
+        .fail("claude", &sid, "post-abort-probe", 1, false);
+    await_pid_dead(prior_pid).await;
+}
+
+/// 5e. Target-spawn window, fresh arm (round-3 review I-1): an abort landing
+/// inside the fresh-target resume await — parked right AFTER the target
+/// session registered — must reap the registered-but-uncommitted session
+/// (the dropped resume skipped its in-function cleanup) and must not leak
+/// the lane's `resuming` single-flight flag: a retry of the same handoff
+/// succeeds.
+#[tokio::test]
+async fn handoff_abort_during_fresh_target_resume_reaps_the_registered_session_and_keeps_retryability(
+) {
+    let _guard = ENV_LOCK.lock().await;
+    // The claude-lane env surface this file's tests mutate
+    // (FRESHELL_CLAUDE_SIDECAR/NODE, FAKE_SIDECAR_REQUEST_LOG,
+    // CLAUDE_CONFIG_DIR) is process-global and shared with claude.rs's and
+    // snapshot.rs's tests through THEIR lock — hold it too: our own
+    // ENV_LOCK only serializes this file against itself.
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let env = FakeSidecarEnv::install();
+    // The claude-lane resume gates on transcript presence (the 6b pattern).
+    let store_dir = std::env::temp_dir().join(format!(
+        "freshell-handoff-abort-fresh-store-{}",
+        uuid_like_suffix()
+    ));
+    let project_dir = store_dir.join("projects").join("slug");
+    std::fs::create_dir_all(&project_dir).expect("create transcript project dir");
+    let sid = uuid::Uuid::new_v4().to_string();
+    std::fs::write(
+        project_dir.join(format!("{sid}.jsonl")),
+        "{\"cwd\": \"/tmp\"}\n",
+    )
+    .expect("write fake transcript");
+    std::env::set_var("CLAUDE_CONFIG_DIR", &store_dir);
+
+    let resume_pause = Arc::new(tokio::sync::Notify::new());
+    let rig = build_rig_with_claude_pauses(None, None, Some(Arc::clone(&resume_pause)));
+    establish_fresh_claude_owner(&rig, &sid).await;
+    let prior_pid = env.sidecar_pid_for(&sid).expect("the prior sidecar's pid");
+
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_fresh("claude", &sid, "freshclaude"));
+    // Park proof: the prior was reaped (its sidecar is dead) and the TARGET
+    // resume registered its session (the park is right after registration —
+    // the resume cannot pass it).
+    await_pid_dead(prior_pid).await;
+    await_live_session(
+        &rig.fresh_claude,
+        &sid,
+        true,
+        "the target resume must register its session",
+    )
+    .await;
+
+    // ABORT inside the fresh-target resume await.
+    handle.abort();
+    let _ = handle.task.await;
+
+    // The key ends Vacant (the prior was reaped; the sync fail ran in Drop).
+    assert_eq!(
+        rig.ownership.observe("claude", &sid).state,
+        OwnershipState::Vacant,
+        "the aborted handoff must leave the key Vacant"
+    );
+    // The registered-but-uncommitted target session was reaped by the
+    // cleanup's lane sweep — no live unowned writer.
+    await_live_session(
+        &rig.fresh_claude,
+        &sid,
+        false,
+        "the uncommitted target session must be reaped",
+    )
+    .await;
+    // The target sidecar's process is dead too (the sweep's teardown).
+    let target_pid = env
+        .create_rows()
+        .into_iter()
+        .filter(|r| r["msg"]["resumeSessionId"] == sid)
+        .filter_map(|r| r["pid"].as_u64())
+        .find(|pid| *pid != prior_pid as u64)
+        .expect("the target sidecar's create row") as u32;
+    await_pid_dead(target_pid).await;
+
+    // Retryability (the `resuming` flag did not leak): a retry of the same
+    // handoff succeeds — it registers (parking at the same seam), the test
+    // releases it, and the runner commits.
+    let retry = rig
+        .runner
+        .spawn_handoff(handoff_req_fresh("claude", &sid, "freshclaude"));
+    await_live_session(
+        &rig.fresh_claude,
+        &sid,
+        true,
+        "the retry must register its session",
+    )
+    .await;
+    resume_pause.notify_one();
+    let result = retry.completion.await.expect("retry completed");
+    assert_eq!(
+        result["ok"],
+        json!(true),
+        "the retry must succeed: {result}"
+    );
+    assert_eq!(result["owner"]["sessionId"], json!(sid));
+
+    // Cleanup: the runner retained the stamp — the lane kill works.
+    let _ = rig
+        .fresh_claude
+        .kill_for_handoff(&sid, "test-cleanup")
+        .await;
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+    let _ = std::fs::remove_dir_all(&store_dir);
+}
+
 /// 6. opencode: handoff never kills the shared serve and never changes the
 /// id. The serve manager instance is the SAME before/after (exactly one
 /// serve pid across both handoffs — a restart would add one); the `ses_*`
@@ -1216,6 +1706,12 @@ async fn handoff_task_abort_leaves_zero_or_one_owner() {
 #[tokio::test]
 async fn opencode_handoff_keeps_shared_serve_alive_and_session_id_stable() {
     let _guard = ENV_LOCK.lock().await;
+    // The claude-lane env surface this file's tests mutate
+    // (FRESHELL_CLAUDE_SIDECAR/NODE, FAKE_SIDECAR_REQUEST_LOG,
+    // CLAUDE_CONFIG_DIR) is process-global and shared with claude.rs's and
+    // snapshot.rs's tests through THEIR lock — hold it too: our own
+    // ENV_LOCK only serializes this file against itself.
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
     let env = FakeOpencodeServeEnv::install();
     let sid = format!("ses_handoff_{}", uuid::Uuid::new_v4().simple());
     let rig = build_rig(None);
@@ -1335,6 +1831,12 @@ async fn opencode_handoff_keeps_shared_serve_alive_and_session_id_stable() {
 #[tokio::test]
 async fn handoff_to_a_kilroy_target_resumes_as_kilroy_on_the_claude_lane() {
     let _guard = ENV_LOCK.lock().await;
+    // The claude-lane env surface this file's tests mutate
+    // (FRESHELL_CLAUDE_SIDECAR/NODE, FAKE_SIDECAR_REQUEST_LOG,
+    // CLAUDE_CONFIG_DIR) is process-global and shared with claude.rs's and
+    // snapshot.rs's tests through THEIR lock — hold it too: our own
+    // ENV_LOCK only serializes this file against itself.
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
     let env = FakeSidecarEnv::install();
     // The claude-lane resume path gates on transcript presence — install a
     // fake transcript store root for the session.
@@ -1435,4 +1937,71 @@ async fn handoff_to_a_kilroy_target_resumes_as_kilroy_on_the_claude_lane() {
     std::env::remove_var("CLAUDE_CONFIG_DIR");
     let _ = env;
     let _ = std::fs::remove_dir_all(&store_dir);
+}
+
+// ── the router's typed 401/400 surface (round-3 review N-2) ────────────────
+
+/// POST the handoff route with or without the auth header (the
+/// `tower::ServiceExt::oneshot` shape the pane_ops tests use).
+async fn post_handoff_route(
+    router: axum::Router,
+    body: Value,
+    auth: bool,
+) -> (axum::http::StatusCode, Value) {
+    use tower::util::ServiceExt;
+    let mut req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/sessions/handoff")
+        .header("content-type", "application/json");
+    if auth {
+        req = req.header("x-auth-token", "handoff-test-token");
+    }
+    let resp = router
+        .oneshot(req.body(axum::body::Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+/// Round-3 review N-2: the 401 answers with a typed code that matches the
+/// status (`UNAUTHORIZED` — the plan sketch's `BAD_REQUEST` read oddly).
+#[tokio::test]
+async fn handoff_route_requires_auth_with_typed_unauthorized_code() {
+    let rig = build_rig(None);
+    let router = super::handoff_router(Arc::clone(&rig.runner));
+    let (status, body) = post_handoff_route(
+        router,
+        json!({ "provider": "claude", "sessionId": "sid", "targetKind": "terminal" }),
+        false,
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"]["code"], json!("UNAUTHORIZED"));
+    assert_eq!(body["error"]["retryable"], json!(false));
+}
+
+/// The typed 400 validation surface (pinned beside the 401: no handoff is
+/// ever spawned for an invalid body — the coordinator is untouched).
+#[tokio::test]
+async fn handoff_route_validates_target_kind_typed() {
+    let rig = build_rig(None);
+    let sid = uuid::Uuid::new_v4().to_string();
+    let router = super::handoff_router(Arc::clone(&rig.runner));
+    let (status, body) = post_handoff_route(
+        router,
+        json!({ "provider": "claude", "sessionId": sid, "targetKind": "bogus" }),
+        true,
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], json!("BAD_REQUEST"));
+    assert_eq!(
+        rig.ownership.observe("claude", &sid).state,
+        OwnershipState::Vacant,
+        "an invalid body must never touch the coordinator"
+    );
 }

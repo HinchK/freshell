@@ -103,7 +103,20 @@ pub struct FreshClaudeState {
     /// Single-flight guard for resume-on-attach, keyed by DURABLE id (codex's
     /// `resuming` analog, simplified: contenders return immediately instead of
     /// waiting -- the winner's frames broadcast to every client anyway).
-    resuming: Arc<TokioMutex<std::collections::HashSet<String>>>,
+    /// std::sync (not tokio): every scope is a one-statement lock, and the
+    /// handoff resume's RAII drop-guard must be able to remove its flag from
+    /// a synchronous Drop (an aborted resume future — round-3 review I-1).
+    resuming: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Test seam (Task 6 round-3 review I-1): park `kill_for_handoff` with
+    /// the kill ISSUED (retained stamp taken) but nothing else disturbed —
+    /// the prior-reap-window abort test's deterministic hold. `None` in
+    /// production and every other test.
+    handoff_kill_pause: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// Test seam (Task 6 round-3 review I-1): park `resume_for_attach`
+    /// right after the target session is REGISTERED — the fresh-arm
+    /// target-spawn-window abort test's deterministic hold. `None` in
+    /// production and every other test.
+    handoff_resume_pause: Option<std::sync::Arc<tokio::sync::Notify>>,
     /// P1.13 identity-event sink (the pane-ledger bridge,
     /// [`crate::identity_sink`]). Clone-shared + set-once: the state is cloned
     /// into consumer tasks, so the `OnceLock` sits behind an `Arc`. Wired
@@ -579,6 +592,28 @@ impl ClaudeSession {
     }
 }
 
+/// Round-3 review I-1 (cancellation-safety): RAII removal for the
+/// `resuming` single-flight flag inside [`FreshClaudeState::resume_for_handoff`].
+/// An aborted handoff runner drops the resume future mid-flight — every
+/// manual removal would be skipped, and the leaked flag would refuse every
+/// later retry with "another resume is in flight" forever. Dropping this
+/// guard removes the flag; the function's manual early-return removals
+/// were dropped in its favor (removal is idempotent — every exit path now
+/// goes through Drop).
+struct ResumingFlagGuard {
+    resuming: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    session_id: String,
+}
+
+impl Drop for ResumingFlagGuard {
+    fn drop(&mut self) {
+        self.resuming
+            .lock()
+            .expect("resuming lock")
+            .remove(&self.session_id);
+    }
+}
+
 impl FreshClaudeState {
     /// Build the state around the shared broadcast bus.
     pub fn new(broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>) -> Self {
@@ -587,7 +622,7 @@ impl FreshClaudeState {
             sessions: Arc::new(TokioMutex::new(HashMap::new())),
             cli_index: Arc::new(TokioMutex::new(HashMap::new())),
             create_dedup: Arc::new(FreshAgentCreateDedup::new()),
-            resuming: Arc::new(TokioMutex::new(std::collections::HashSet::new())),
+            resuming: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             identity_sink: Arc::new(std::sync::OnceLock::new()),
             leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
             ownership: None,
@@ -596,7 +631,22 @@ impl FreshClaudeState {
             rollback_in_flight: crate::InFlightRegistry::new(),
             alias_tombstones: Arc::new(std::sync::Mutex::new(AliasTombstones::default())),
             close_pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            handoff_kill_pause: None,
+            handoff_resume_pause: None,
         }
+    }
+
+    /// Test seam (Task 6 round-3 review I-1): arm the deterministic holds
+    /// for the handoff abort-window tests — `kill_for_handoff` parks after
+    /// taking the retained stamp, `resume_for_attach` parks after
+    /// registering the target session. `None`/`None` in production.
+    pub fn set_handoff_test_pauses(
+        &mut self,
+        kill_pause: Option<std::sync::Arc<tokio::sync::Notify>>,
+        resume_pause: Option<std::sync::Arc<tokio::sync::Notify>>,
+    ) {
+        self.handoff_kill_pause = kill_pause;
+        self.handoff_resume_pause = resume_pause;
     }
 
     /// Wire the cross-kind terminal-liveness probe (Task 13b; called by `main.rs`
@@ -620,6 +670,13 @@ impl FreshClaudeState {
     /// Task 3; called by `main.rs` next to `set_session_leases`).
     pub fn set_ownership(&mut self, registry: Arc<freshell_ownership::RuntimeOwnershipRegistry>) {
         self.ownership = Some(registry);
+    }
+
+    /// This lane's sessionRef lease map (kata b8ke Task 6, round-3 review
+    /// I-1: the handoff guard's abort cleanup releases the lease a dropped
+    /// resume left held after its confirmed tree kill).
+    pub fn leases(&self) -> &crate::session_lease::FreshAgentSessionLeases {
+        &self.leases
     }
 
     /// Side-effect-free coordinator read for `(provider, session_id)`
@@ -677,6 +734,13 @@ impl FreshClaudeState {
             "freshagent.claude.handoff_stop: stopping the prior freshclaude/kilroy runtime for handoff"
         );
         crate::ownership_lane::take_retained_stamp(&self.ownership_stamps, session_id);
+        // Test seam (Task 6 round-3 review I-1): park with the kill ISSUED
+        // (the retained stamp taken) but nothing else disturbed — the
+        // prior-reap-window abort test's deterministic hold. None in
+        // production and every other test.
+        if let Some(pause) = self.handoff_kill_pause.as_ref() {
+            let _ = pause.notified().await;
+        }
         let Some(map_key) = self.resolve_session_key(session_id).await else {
             return crate::session_handoff::StopResult::AlreadyGone;
         };
@@ -718,15 +782,24 @@ impl FreshClaudeState {
                 session_type.to_string(),
             ));
         };
-        {
-            let mut resuming = self.resuming.lock().await;
+        // Round-3 review I-1 (cancellation-safety): the single-flight flag
+        // is RAII — an aborted handoff runner drops this resume mid-flight,
+        // and a leaked flag would refuse every later retry with "another
+        // resume is in flight" forever. The guard removes it on every exit
+        // path, drop included.
+        let _resuming_flag = {
+            let mut resuming = self.resuming.lock().expect("resuming lock");
             if !resuming.insert(session_id.to_string()) {
                 return Err((
                     "another resume is in flight for this session".to_string(),
                     session_id.to_string(),
                 ));
             }
-        }
+            ResumingFlagGuard {
+                resuming: Arc::clone(&self.resuming),
+                session_id: session_id.to_string(),
+            }
+        };
         // D8 same-kind lease claim (the provider backstop — the coordinator
         // claim is the runner's, under-ticket).
         let resume_request_id = format!("handoff-resume-{}", uuid::Uuid::new_v4());
@@ -749,7 +822,6 @@ impl FreshClaudeState {
                 }
                 crate::session_lease::FreshSessionClaim::BoundLive { .. }
                 | crate::session_lease::FreshSessionClaim::Held { .. } => {
-                    self.resuming.lock().await.remove(session_id);
                     return Err((
                         "another lifecycle operation holds this session's lease".to_string(),
                         session_id.to_string(),
@@ -768,7 +840,6 @@ impl FreshClaudeState {
                             .force_release_after_confirmed_kill(PROVIDER, session_id);
                         continue;
                     }
-                    self.resuming.lock().await.remove(session_id);
                     return Err((
                         "the prior lease holder expired and could not be confirmed dead"
                             .to_string(),
@@ -796,7 +867,6 @@ impl FreshClaudeState {
         let outcome = self
             .resume_for_attach(&msg, session_id, &mut lease_guard, &mut own_ticket)
             .await;
-        self.resuming.lock().await.remove(session_id);
         if let Some(mut g) = lease_guard.take() {
             // A leftover armed guard means the resume ended WITHOUT a
             // registration (its own teardown already ran).
@@ -4270,7 +4340,7 @@ impl FreshClaudeState {
             return;
         }
         {
-            let mut resuming = self.resuming.lock().await;
+            let mut resuming = self.resuming.lock().expect("resuming lock");
             if !resuming.insert(durable.clone()) {
                 return; // a concurrent attach is resuming this exact durable id
             }
@@ -4286,7 +4356,10 @@ impl FreshClaudeState {
         if (self.terminal_liveness)(PROVIDER, &durable) {
             tracing::warn!(target: "freshell_freshagent::claude", session_id = %durable,
                 "fresh_agent_attach_refused: a live terminal PTY owns this session (Task 13b cross-kind live-guard)");
-            self.resuming.lock().await.remove(&durable);
+            self.resuming
+                .lock()
+                .expect("resuming lock")
+                .remove(&durable);
             self.emit_fresh_agent_error(
                 &msg.session_id,
                 session_type_str(msg.session_type),
@@ -4309,7 +4382,10 @@ impl FreshClaudeState {
             crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
             crate::ownership_lane::LaneClaim::Unwired => None,
             crate::ownership_lane::LaneClaim::Adopt => {
-                self.resuming.lock().await.remove(&durable);
+                self.resuming
+                    .lock()
+                    .expect("resuming lock")
+                    .remove(&durable);
                 if !self
                     .try_rebind_to_live(&durable, session_type_str(msg.session_type))
                     .await
@@ -4329,7 +4405,10 @@ impl FreshClaudeState {
                     "fresh_agent_attach_refused: the ownership coordinator refused the \
                      claim (kata b8ke cross-kind authority)"
                 );
-                self.resuming.lock().await.remove(&durable);
+                self.resuming
+                    .lock()
+                    .expect("resuming lock")
+                    .remove(&durable);
                 self.emit_fresh_agent_error(
                     &msg.session_id,
                     session_type_str(msg.session_type),
@@ -4362,7 +4441,10 @@ impl FreshClaudeState {
                     // rebind + ack the cli_index arm performs; if the binding is stale
                     // (session just died), answer RESERVED -- the client re-drive
                     // converges on the reopened key.
-                    self.resuming.lock().await.remove(&durable);
+                    self.resuming
+                        .lock()
+                        .expect("resuming lock")
+                        .remove(&durable);
                     if !self
                         .try_rebind_to_live(&durable, session_type_str(msg.session_type))
                         .await
@@ -4377,7 +4459,10 @@ impl FreshClaudeState {
                     return;
                 }
                 crate::session_lease::FreshSessionClaim::Held { .. } => {
-                    self.resuming.lock().await.remove(&durable);
+                    self.resuming
+                        .lock()
+                        .expect("resuming lock")
+                        .remove(&durable);
                     self.emit_fresh_agent_error(
                         &msg.session_id,
                         session_type_str(msg.session_type),
@@ -4401,7 +4486,10 @@ impl FreshClaudeState {
                     }
                     tracing::error!(target: "invariant", pid, session_id = %durable,
                         "fresh_agent_lease_expired_kill_unconfirmed: holding closed");
-                    self.resuming.lock().await.remove(&durable);
+                    self.resuming
+                        .lock()
+                        .expect("resuming lock")
+                        .remove(&durable);
                     self.emit_fresh_agent_error(
                         &msg.session_id,
                         session_type_str(msg.session_type),
@@ -4415,7 +4503,10 @@ impl FreshClaudeState {
         let outcome = self
             .resume_for_attach(&msg, &durable, &mut lease_guard, &mut own_ticket)
             .await;
-        self.resuming.lock().await.remove(&durable);
+        self.resuming
+            .lock()
+            .expect("resuming lock")
+            .remove(&durable);
         // Any leftover armed guard means the resume ended WITHOUT registering a session
         // (its own teardown already ran on every error path) -- release the key.
         if let Some(mut g) = lease_guard.take() {
@@ -4701,6 +4792,13 @@ impl FreshClaudeState {
             .lock()
             .await
             .insert(durable.to_string(), msg.session_id.clone());
+        // Test seam (Task 6 round-3 review I-1): park with the target
+        // session REGISTERED (map + cli_index) but the resume unreturned —
+        // the fresh-arm target-spawn-window abort test's deterministic
+        // hold. None in production and every other test.
+        if let Some(pause) = self.handoff_resume_pause.as_ref() {
+            let _ = pause.notified().await;
+        }
         // Round 6 (Finding 2): the alias mapping is durable at registration.
         if let Some(sink) = self.identity_sink() {
             if let Err(e) = sink

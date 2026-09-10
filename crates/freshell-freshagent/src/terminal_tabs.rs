@@ -953,6 +953,99 @@ pub(crate) struct HandoffToken {
     /// operation id).
     #[allow(dead_code)] // consumed by Task 6's handoff runner
     pub generation: u64,
+    /// Round-3 review I-1 (cancellation-safety, target-spawn window): the
+    /// guard-visible watch the settle publishes the spawned terminal into —
+    /// an aborted runner's Drop cleanup consumes it to reap the
+    /// spawned-but-uncommitted terminal.
+    pub watch: HandoffSpawnWatch,
+}
+
+/// The handoff runner's guard-visible view of an under-ticket terminal
+/// target spawn (kata b8ke Task 6, round-3 review I-1): the settle task
+/// publishes the spawned terminal id the moment it exists-and-is-kept (the
+/// under-ticket surface point — every earlier failure path tears its own
+/// child down) and marks settlement when it finishes, success or failure.
+/// An aborted runner's `HandoffGuard` Drop cleanup waits for settlement and
+/// reaps the published id, so the target-spawn window can never strand a
+/// live unowned writer the coordinator cannot see.
+#[derive(Clone)]
+pub struct HandoffSpawnWatch {
+    inner: std::sync::Arc<HandoffSpawnWatchInner>,
+}
+
+struct HandoffSpawnWatchInner {
+    terminal_id: std::sync::Mutex<Option<String>>,
+    settled: std::sync::atomic::AtomicBool,
+    settled_notify: tokio::sync::Notify,
+    /// Test seam (rides the constructor like the runner's
+    /// `HandoffTestHooks`; `None` in production): park the settle AFTER
+    /// publication, before the result surfaces — the deterministic
+    /// abort-inside-the-window hold.
+    pause_before_surface: Option<std::sync::Arc<tokio::sync::Notify>>,
+}
+
+impl HandoffSpawnWatch {
+    pub(crate) fn new(pause_before_surface: Option<std::sync::Arc<tokio::sync::Notify>>) -> Self {
+        Self {
+            inner: std::sync::Arc::new(HandoffSpawnWatchInner {
+                terminal_id: std::sync::Mutex::new(None),
+                settled: std::sync::atomic::AtomicBool::new(false),
+                settled_notify: tokio::sync::Notify::new(),
+                pause_before_surface,
+            }),
+        }
+    }
+
+    /// The settle's publication point: the terminal exists and will be kept.
+    fn publish(&self, terminal_id: &str) {
+        *self.inner.terminal_id.lock().expect("spawn watch lock") = Some(terminal_id.to_string());
+    }
+
+    /// The id the settle published, if any — the abort cleanup's reap
+    /// target (also the test's observable for "the spawn happened").
+    pub(crate) fn published_terminal(&self) -> Option<String> {
+        self.inner
+            .terminal_id
+            .lock()
+            .expect("spawn watch lock")
+            .clone()
+    }
+
+    /// Park the settle after publication when the test seam is armed.
+    async fn pause_if_armed(&self) {
+        if let Some(pause) = self.inner.pause_before_surface.as_ref() {
+            let _ = pause.notified().await;
+        }
+    }
+
+    /// The settle finished — wake any cleanup waiter. `notify_one` stores a
+    /// permit when no waiter is registered yet, so a cleanup that checks
+    /// `settled` then awaits still observes the finish.
+    fn settle_finished(&self) {
+        self.inner
+            .settled
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.inner.settled_notify.notify_one();
+    }
+
+    /// Resolve once the settle finished. Generously bounded: a settle that
+    /// somehow outlives the bound still leaves the caller the registry
+    /// sessionRef sweep as its backstop (the terminal itself stays
+    /// findable by its sessionRef row).
+    pub(crate) async fn wait_settled(&self) {
+        if self
+            .inner
+            .settled
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            self.inner.settled_notify.notified(),
+        )
+        .await;
+    }
 }
 
 /// [`spawn_terminal_pane`], parameterized on an in-flight handoff's spawn
@@ -1398,6 +1491,12 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                 })
         });
     let mut session_ref_lease: Option<RestSessionRefLease> = None;
+    let under_handoff_ticket = handoff.is_some();
+    // Round-3 review I-1: the token's guard-visible spawn watch — the settle
+    // publishes the spawned terminal into it (see the under-ticket surface
+    // below); the runner's HandoffGuard holds a clone across the await so
+    // an abort's cleanup can wait for settlement and reap the publication.
+    let handoff_spawn_watch = handoff.map(|t| t.watch.clone());
     // kata b8ke Task 4: the REST rung's coordinator claim — UNCONDITIONAL
     // (REST callers are programmatic; no capability gate), BEFORE the D7
     // check-then-spawn guard and BEFORE the registry lease, with the body's
@@ -1410,7 +1509,6 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
     // terminal (refusal with `liveTerminalId`, or the attach-shaped
     // BoundElsewhere refusal).
     let mut ownership_claim: Option<RestOwnershipClaim> = None;
-    let under_handoff_ticket = handoff.is_some();
     if let Some(locator) = guard_locator.clone() {
         let operation_id = handoff
             .map(|t| t.operation_id.clone())
@@ -1590,7 +1688,7 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
     // detached, an aborted create is FULLY BOOKKEPT — never a
     // half-initialized orphan. (The WS door solves the same hazard by
     // spawning its settled restore create: `spawn_gated_restore_create`.)
-    let settle = tokio::spawn(settle_gated_create(GatedSettleInputs {
+    let inputs = GatedSettleInputs {
         state: state.clone(),
         body: body.clone(),
         tab_id: tab_id.to_string(),
@@ -1609,11 +1707,26 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
         ownership_claim,
         claim_locator: guard_locator.clone(),
         under_handoff_ticket,
+        handoff_spawn_watch,
         registry,
         host_os,
         is_wsl,
         amplifier_stub,
-    }));
+    };
+    let settle = {
+        // Round-3 review I-1: the settle marks settlement (success or
+        // failure) on the handoff's spawn watch, waking an aborted runner's
+        // Drop cleanup — its only signal that the detached settle is done
+        // and the publication (if any) is final.
+        let settle_watch = inputs.handoff_spawn_watch.clone();
+        tokio::spawn(async move {
+            let result = settle_gated_create(inputs).await;
+            if let Some(watch) = settle_watch.as_ref() {
+                watch.settle_finished();
+            }
+            result
+        })
+    };
     match settle.await {
         Ok(result) => result,
         // JoinError = panic inside the settle task (the task's own
@@ -1673,6 +1786,10 @@ struct GatedSettleInputs {
     /// anyway and the settle must claim for the surviving terminal).
     claim_locator: Option<SessionLocator>,
     under_handoff_ticket: bool,
+    /// Round-3 review I-1: the handoff's guard-visible spawn watch — the
+    /// settle publishes the spawned terminal id into it (and parks on its
+    /// test seam) at the under-ticket surface point.
+    handoff_spawn_watch: Option<HandoffSpawnWatch>,
     registry: freshell_terminal::TerminalRegistry,
     /// Hoisted spawn-environment inputs (Task 11): computed ONCE in
     /// [`spawn_terminal_pane`] so the amplifier windows-arm guard there and
@@ -1717,6 +1834,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         mut ownership_claim,
         claim_locator,
         under_handoff_ticket,
+        handoff_spawn_watch,
         registry,
         host_os,
         is_wsl,
@@ -2474,6 +2592,18 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         if under_handoff_ticket {
             let mut ticket = claim.ticket;
             ticket.disarm();
+            // Round-3 review I-1 (cancellation-safety, target-spawn
+            // window): publish the spawned terminal into the handoff's
+            // guard-visible watch the moment it exists-and-is-kept — an
+            // aborted runner's Drop cleanup waits for this settle to
+            // finish and reaps the published id, so the uncommitted
+            // terminal never survives as a live unowned writer. (Every
+            // earlier failure path tore its own child down, so this is
+            // the single publication point.)
+            if let Some(watch) = handoff_spawn_watch.as_ref() {
+                watch.publish(&terminal_id);
+                watch.pause_if_armed().await;
+            }
             surfaced_owner_identity = Some(freshell_ownership::OwnerIdentity {
                 kind: freshell_ownership::RuntimeOwnerKind::Terminal,
                 terminal_id: Some(terminal_id.clone()),

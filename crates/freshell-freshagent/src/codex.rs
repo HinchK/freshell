@@ -548,6 +548,13 @@ impl FreshCodexState {
         self.ownership = Some(registry);
     }
 
+    /// This lane's sessionRef lease map (kata b8ke Task 6, round-3 review
+    /// I-1: the handoff guard's abort cleanup releases the lease a dropped
+    /// resume left held after its confirmed tree kill).
+    pub fn leases(&self) -> &crate::session_lease::FreshAgentSessionLeases {
+        &self.leases
+    }
+
     /// Side-effect-free coordinator read for `(provider, session_id)`
     /// (kata b8ke Task 3). `Vacant`/0 when the registry is unwired.
     pub fn ownership_snapshot(
