@@ -139,6 +139,27 @@ fn runtime_matches(owner: &OwnerIdentity, claim: &ReleaseClaim) -> bool {
         && owner.ownership_id.as_deref() == Some(claim.operation_id.as_str())
 }
 
+/// The generation a snapshot/replay consumer fences against (review M3):
+/// for Live keys the Live STATE's own generation. A prior owner restored
+/// by a failed handoff keeps its ORIGINAL generation in the Live state
+/// while the record's generation was already bumped by the handoff, and
+/// `begin_stop` compares stop fences against the Live state's generation —
+/// so reporting the record's value for a restored key would leave a
+/// snapshot-derived fence permanently stale (a StaleClaim loop: fail-closed
+/// liveness corner, no safety violation). Remedy chosen over rolling the
+/// record's generation back on restore: the record's generation is the
+/// per-key monotonic counter (never resets — see the crate doc), and a
+/// rollback would let distinct handoff eras reuse a generation number,
+/// weakening the stale-request fence for every consumer. For every
+/// non-Live state the record's generation always equals the state's own
+/// (they are written together), so this only diverges for restored keys.
+fn snapshot_generation(record: &SessionRecord) -> u64 {
+    match &record.state {
+        OwnershipState::Live { generation, .. } => *generation,
+        _ => record.generation,
+    }
+}
+
 impl OwnershipState {
     /// The recorded initiator of the in-flight operation (round-1 review
     /// observability: commit/fail/stop events emit it from the record).
@@ -610,6 +631,18 @@ impl RuntimeOwnershipRegistry {
         let record = inner.entry(key).or_default();
         match record.state.clone() {
             OwnershipState::Vacant => {
+                // Every entry into `Starting` goes through this arm, so
+                // resetting the registration fields here is the single
+                // choke point guaranteeing a later Starting operation can
+                // never inherit its DEAD predecessor's cancellation/settle/
+                // partial-runtime handles (a predecessor that exited via
+                // fail/commit_live/force_release leaves them behind; only
+                // the sweep takes them) — the watchdog's RecoveredStart
+                // must only ever carry handles the CURRENT resident
+                // registered itself.
+                record.cancellation = None;
+                record.settle = None;
+                record.partial_runtime = None;
                 record.generation += 1;
                 record.state = OwnershipState::Starting {
                     kind,
@@ -759,9 +792,16 @@ impl RuntimeOwnershipRegistry {
             return CommitOutcome::ForeignOperation;
         };
         if generation != record.generation {
-            tracing::error!(target: "invariant", provider, session_id, operation_id,
-                generation, current_generation = record.generation,
-                "ownership.commit_live.stale_generation: caller must tear down its child");
+            // A stale-generation commit is a typed, anticipated race
+            // outcome (the delayed caller tears down its own child) —
+            // warn on the crate's diagnostic target; error!/invariant is
+            // reserved for genuine contract violations (e.g.
+            // force_release during Handoff below).
+            tracing::warn!(target: "freshell_ownership",
+                event = "ownership.commit_live.stale_generation",
+                operation_id, provider, session_id,
+                epoch = self.epoch, generation, current_generation = record.generation,
+                outcome = "refused", failure_reason = "STALE_GENERATION");
             return CommitOutcome::StaleGeneration {
                 current_generation: record.generation,
             };
@@ -826,6 +866,7 @@ impl RuntimeOwnershipRegistry {
             OwnershipState::Starting {
                 operation_id: op,
                 kind,
+                since_ms,
                 ..
             } if op == operation_id => {
                 record.state = OwnershipState::Vacant;
@@ -833,6 +874,7 @@ impl RuntimeOwnershipRegistry {
                     event = "ownership.start.failed", operation_id, provider, session_id,
                     initiator, from_kind = ?kind,
                     epoch = self.epoch, generation, outcome = "released",
+                    duration_ms = now_epoch_ms().saturating_sub(since_ms),
                     failure_reason = "START_FAILED");
                 FailOutcome::Released
             }
@@ -934,7 +976,11 @@ impl RuntimeOwnershipRegistry {
                         outcome = "refused", failure_reason = "STALE_STOP_CLAIM");
                     return StopOutcome::StaleClaim {
                         current_epoch: self.epoch,
-                        current_generation: record.generation,
+                        // The Live STATE's generation — the exact value a
+                        // refreshed stop fence must carry to satisfy
+                        // begin_stop (M3: for a restored prior owner it is
+                        // lower than the record's bumped generation).
+                        current_generation: generation,
                         state: record.state.clone(),
                     };
                 }
@@ -1238,12 +1284,14 @@ impl RuntimeOwnershipRegistry {
     }
 
     /// Side-effect-free read for snapshot GETs and reconcile verdicts.
+    /// The reported `generation` is the fence-relevant one (see
+    /// [`snapshot_generation`]): the Live state's own for Live keys.
     pub fn observe(&self, provider: &str, session_id: &str) -> OwnershipSnapshot {
         let inner = self.inner.lock().expect("ownership lock poisoned");
         match inner.get(&SessionKey::new(provider, session_id)) {
             Some(record) => OwnershipSnapshot {
                 epoch: self.epoch,
-                generation: record.generation,
+                generation: snapshot_generation(record),
                 state: record.state.clone(),
             },
             None => OwnershipSnapshot {
@@ -1281,7 +1329,7 @@ impl RuntimeOwnershipRegistry {
                     provider: key.provider.clone(),
                     session_id: key.session_id.clone(),
                     epoch: self.epoch,
-                    generation: record.generation,
+                    generation: snapshot_generation(record),
                     owner_kind: owner_kind.to_string(),
                     terminal_id,
                 }
@@ -1366,6 +1414,92 @@ mod tests {
     fn stamped(mut owner: OwnerIdentity, operation_id: &str) -> OwnerIdentity {
         owner.ownership_id = Some(operation_id.to_string());
         owner
+    }
+
+    /// One captured `tracing` event: the level, target, the crate-convention
+    /// `event` field's value, and every visited field name. The M2/N1
+    /// log-hygiene regression tests assert through this.
+    #[derive(Debug, Clone)]
+    struct CapturedEvent {
+        level: tracing::Level,
+        target: String,
+        event: Option<String>,
+        fields: Vec<String>,
+    }
+
+    /// A subscriber capturing every event fired on the installing thread.
+    /// The crate never installs its own subscriber (the host owns the
+    /// global one), so tests pin log levels and field presence through a
+    /// thread-local `set_default`.
+    #[derive(Clone, Default)]
+    struct EventCapture {
+        events: Arc<Mutex<Vec<CapturedEvent>>>,
+    }
+
+    impl EventCapture {
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            tracing::subscriber::set_default(self.clone())
+        }
+
+        fn events(&self) -> Vec<CapturedEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl tracing::Subscriber for EventCapture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = EventFieldVisitor::default();
+            event.record(&mut visitor);
+            self.events.lock().unwrap().push(CapturedEvent {
+                level: *event.metadata().level(),
+                target: event.metadata().target().to_string(),
+                event: visitor.event,
+                fields: visitor.fields,
+            });
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Collects every visited field name plus the `event` field's value.
+    /// `record_debug` is the `Visit` trait's only required method — the
+    /// typed `record_*` defaults all funnel through it — so implementing
+    /// `record_debug` and `record_str` (raw string for the `event` name)
+    /// sees every field the macros record.
+    #[derive(Default)]
+    struct EventFieldVisitor {
+        event: Option<String>,
+        fields: Vec<String>,
+    }
+
+    impl tracing::field::Visit for EventFieldVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "event" {
+                self.event = Some(format!("{value:?}"));
+            }
+            self.fields.push(field.name().to_string());
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "event" {
+                self.event = Some(value.to_string());
+            }
+            self.fields.push(field.name().to_string());
+        }
     }
 
     #[test]
@@ -1944,6 +2078,10 @@ mod tests {
             epoch: restarted.boot_epoch(),
             generation: 1,
         });
+        // "sid2" is a FRESH key (its record's generation is 0), so the
+        // fence's generation 1 is NEWER than the key's current — allowed by
+        // the not-yet-superseded rule (the request observed the future it
+        // may create), not the equality case.
         assert!(
             matches!(
                 restarted.begin_start(
@@ -1957,6 +2095,44 @@ mod tests {
                 ),
                 BeginOutcome::Granted { .. }
             ),
+            "an observed generation NEWER than the key's current one is fresh, not stale"
+        );
+        // The TRUE equality case: "sid" is already claimed (held by op-b at
+        // generation 1), and the fence observes exactly that generation.
+        // The fence is fresh — it passes the staleness check — so the STATE
+        // MACHINE answers, not the fence: a different operation is Blocked
+        // as a second writer, and the holding operation's own re-claim is
+        // Granted.
+        let equal_same_epoch = Some(ObservedFence {
+            epoch: restarted.boot_epoch(),
+            generation: 1,
+        });
+        assert!(
+            matches!(
+                restarted.begin_start(
+                    PROVIDER,
+                    "sid",
+                    RuntimeOwnerKind::Terminal,
+                    "op-e",
+                    equal_same_epoch,
+                    "test",
+                    2
+                ),
+                BeginOutcome::Blocked { .. }
+            ),
+            "an equal fence is fresh: the second writer is Blocked by the state machine, not fenced as stale"
+        );
+        let re = restarted.begin_start(
+            PROVIDER,
+            "sid",
+            RuntimeOwnerKind::Terminal,
+            "op-b",
+            equal_same_epoch,
+            "test",
+            2,
+        );
+        assert!(
+            matches!(re, BeginOutcome::Granted { generation: 1 }),
             "an observed generation equal to the current one is fresh, not stale"
         );
     }
@@ -2277,5 +2453,258 @@ mod tests {
             CommitOutcome::Committed
         );
         assert_eq!(r.observe(PROVIDER, "sid").state, OwnershipState::Vacant);
+    }
+
+    #[test]
+    fn sweep_never_hands_a_dead_operations_registration_to_a_later_start() {
+        // M1 (review): the cancellation/settle/partial_runtime registration
+        // fields must never outlive the Starting operation that registered
+        // them. Op A registers its handles, then FAILS (Starting→Vacant);
+        // op B enters Starting WITHOUT registering (the grant→register
+        // window, or a register-immediately discipline violation). The
+        // sweep must hand the host op B's handles — None — never dead op
+        // A's (the host would abort and await the WRONG, already-settled
+        // resources).
+        let r = RuntimeOwnershipRegistry::new();
+        let BeginOutcome::Granted { generation: g_a } = r.begin_start(
+            PROVIDER,
+            "sid",
+            RuntimeOwnerKind::Terminal,
+            "op-a",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("expected Granted")
+        };
+        let aborted = Arc::new(AtomicBool::new(false));
+        let abort = {
+            let aborted = Arc::clone(&aborted);
+            Arc::new(move || aborted.store(true, Ordering::SeqCst))
+        };
+        r.register_start_cancellation(
+            PROVIDER,
+            "sid",
+            "op-a",
+            g_a,
+            abort,
+            Box::new(std::future::ready(())),
+        );
+        r.register_partial_runtime(
+            PROVIDER,
+            "sid",
+            "op-a",
+            g_a,
+            OwnerIdentity {
+                kind: RuntimeOwnerKind::Terminal,
+                terminal_id: Some("t-dead".into()),
+                live_session_key: None,
+                pid: Some(1111),
+                ownership_id: None,
+            },
+        );
+        assert_eq!(
+            r.fail(PROVIDER, "sid", "op-a", g_a, false),
+            FailOutcome::Released
+        );
+        // Op B enters Starting on the same key and never registers.
+        let BeginOutcome::Granted { generation: g_b } = r.begin_start(
+            PROVIDER,
+            "sid",
+            RuntimeOwnerKind::FreshAgent,
+            "op-b",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("expected Granted")
+        };
+        let recovered = r.recover_stale_starts(11_000, 5_000); // op B is over-aged
+        let rec = recovered
+            .iter()
+            .find(|rec| rec.operation_id == "op-b")
+            .expect("the sweep must recover the over-aged op-b");
+        assert!(
+            rec.cancellation.is_none(),
+            "the sweep must not hand dead op A's abort handle to the host as op B's"
+        );
+        assert!(
+            rec.settle.is_none(),
+            "the sweep must not hand dead op A's settle future to the host as op B's"
+        );
+        assert!(
+            rec.partial_runtime.is_none(),
+            "the sweep must not hand dead op A's partial runtime to the host as op B's"
+        );
+        assert!(
+            !aborted.load(Ordering::SeqCst),
+            "nothing may have invoked the dead operation's abort handle"
+        );
+        // Reopen the key through the host's confirmed-stop path.
+        assert_eq!(
+            r.commit_stop(PROVIDER, "sid", "op-b", g_b),
+            CommitOutcome::Committed
+        );
+        assert_eq!(r.observe(PROVIDER, "sid").state, OwnershipState::Vacant);
+    }
+
+    #[test]
+    fn stale_generation_commit_live_logs_warn_not_an_invariant_error() {
+        // M2 (review): a stale-generation commit_live is a typed,
+        // anticipated race outcome (the delayed caller tears down its own
+        // child) — the refusal must log at warn on the crate's diagnostic
+        // target, NOT as an error-level `invariant` event. Error-level
+        // invariant events are reserved for genuine contract violations
+        // (force_release during Handoff).
+        let (r, _owner, _) = registry_with_live_terminal(); // Live, generation 1
+        let BeginOutcome::Granted { .. } = r.begin_handoff(
+            PROVIDER,
+            "sid",
+            RuntimeOwnerKind::FreshAgent,
+            "ho-1",
+            None,
+            "test",
+            2,
+        ) else {
+            panic!()
+        };
+        let capture = EventCapture::default();
+        let _guard = capture.install();
+        let stale_owner = OwnerIdentity {
+            kind: RuntimeOwnerKind::Terminal,
+            terminal_id: Some("t-late".into()),
+            live_session_key: None,
+            pid: None,
+            ownership_id: None,
+        };
+        assert_eq!(
+            r.commit_live(PROVIDER, "sid", "op-slow", 1, stale_owner),
+            CommitOutcome::StaleGeneration {
+                current_generation: 2
+            }
+        );
+        let events = capture.events();
+        assert!(
+            events.iter().any(|e| e.level == tracing::Level::WARN
+                && e.target == "freshell_ownership"
+                && e.event.as_deref() == Some("ownership.commit_live.stale_generation")),
+            "the anticipated stale refusal must warn on freshell_ownership, got {events:?}"
+        );
+        assert!(
+            events.iter().all(|e| e.level != tracing::Level::ERROR),
+            "an expected stale commit must not emit error-level events, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_fence_satisfies_begin_stop_after_a_failed_handoff_restore() {
+        // M3 (review): a failed handoff restores the prior owner at its
+        // ORIGINAL generation while the record's generation keeps the
+        // handoff's bump. begin_stop compares stop fences against the Live
+        // STATE's generation, so a fence derived from observe()/
+        // snapshot_records() must report the Live state's generation —
+        // otherwise a snapshot-fenced stopper loops on StaleClaim forever
+        // (fail-closed liveness corner; no safety violation, no kill
+        // licensed).
+        let (r, owner, live_gen) = registry_with_live_terminal(); // Live, generation 1
+        let BeginOutcome::Granted { generation: ho_gen } = r.begin_handoff(
+            PROVIDER,
+            "sid",
+            RuntimeOwnerKind::FreshAgent,
+            "ho-1",
+            None,
+            "test",
+            2,
+        ) else {
+            panic!()
+        };
+        assert_eq!(
+            ho_gen,
+            live_gen + 1,
+            "the handoff bumped the record's generation above the Live state's"
+        );
+        assert_eq!(
+            r.fail(PROVIDER, "sid", "ho-1", ho_gen, /* prior_confirmed_live: */ true),
+            FailOutcome::RestoredPriorOwner
+        );
+        // The snapshot a stopper derives its fence from must be coherent
+        // with begin_stop's comparison target: the Live state's own
+        // generation (the restored prior's original).
+        let snap = r.observe(PROVIDER, "sid");
+        assert!(matches!(snap.state, OwnershipState::Live { .. }));
+        assert_eq!(
+            snap.generation, live_gen,
+            "the snapshot generation for a restored-Live key is the Live state's own"
+        );
+        let rec = r
+            .snapshot_records()
+            .into_iter()
+            .find(|rec| rec.provider == PROVIDER && rec.session_id == "sid")
+            .expect("the restored key must replay");
+        assert_eq!(
+            rec.generation, live_gen,
+            "the replay record's generation for a restored-Live key is the Live state's own"
+        );
+        // A stopper fences from the snapshot and stops the restored owner:
+        // no permanent StaleClaim loop.
+        let stop = r.begin_stop(
+            PROVIDER,
+            "sid",
+            "kill-1",
+            &stop_claim(&owner, rec.epoch, rec.generation),
+            "test",
+            3,
+        );
+        assert!(
+            matches!(stop, StopOutcome::Granted { .. }),
+            "a snapshot-derived fence must satisfy begin_stop on a restored key (got {stop:?})"
+        );
+        let StopOutcome::Granted { generation } = stop else {
+            unreachable!("asserted Granted above")
+        };
+        assert_eq!(
+            r.commit_stop(PROVIDER, "sid", "kill-1", generation),
+            CommitOutcome::Committed
+        );
+        assert_eq!(r.observe(PROVIDER, "sid").state, OwnershipState::Vacant);
+    }
+
+    #[test]
+    fn start_failed_event_carries_duration_ms() {
+        // N1 (review): the Starting-fail observability event carries the
+        // terminal-transition duration (`duration_ms`), matching the
+        // Handoff-fail arm — the field is part of the event field set the
+        // module's observability contract promises.
+        let r = RuntimeOwnershipRegistry::new();
+        let BeginOutcome::Granted { generation } = r.begin_start(
+            PROVIDER,
+            "sid",
+            RuntimeOwnerKind::Terminal,
+            "op-1",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("expected Granted")
+        };
+        let capture = EventCapture::default();
+        let _guard = capture.install();
+        assert_eq!(
+            r.fail(PROVIDER, "sid", "op-1", generation, false),
+            FailOutcome::Released
+        );
+        let start_failed = capture
+            .events()
+            .into_iter()
+            .find(|e| {
+                e.target == "freshell_ownership"
+                    && e.event.as_deref() == Some("ownership.start.failed")
+            })
+            .expect("the Starting-fail event must fire on freshell_ownership");
+        assert!(
+            start_failed.fields.contains(&"duration_ms".to_string()),
+            "ownership.start.failed must carry duration_ms (got fields {:?})",
+            start_failed.fields
+        );
     }
 }
