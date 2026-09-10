@@ -3,7 +3,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `npm run contract:generate`. Each entry is a JSON Schema for one server→client message shape, keyed by its `type` discriminant and synthesized from the ServerMessage union via the TypeScript type checker. Opaque values (unknown / index signatures / any) are intentionally permissive — see nondeterministic-fields.md. The wire contract is frozen for the Rust port.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "messageCount": 64,
+  "messageCount": 65,
   "messages": {
     "amplifier.activity.list.response": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -601,6 +601,19 @@
         "message": {
           "type": "string"
         },
+        "ownerEpoch": {
+          "type": "number"
+        },
+        "ownerGeneration": {
+          "type": "number"
+        },
+        "ownerKind": {
+          "enum": [
+            "terminal",
+            "fresh-agent"
+          ],
+          "type": "string"
+        },
         "requestId": {
           "type": "string"
         },
@@ -878,6 +891,19 @@
           "type": "string"
         },
         "message": {
+          "type": "string"
+        },
+        "ownerEpoch": {
+          "type": "number"
+        },
+        "ownerGeneration": {
+          "type": "number"
+        },
+        "ownerKind": {
+          "enum": [
+            "terminal",
+            "fresh-agent"
+          ],
           "type": "string"
         },
         "requestId": {
@@ -2641,6 +2667,45 @@
           },
           "type": "object"
         },
+        "runtimeOwners": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "epoch": {
+                "type": "number"
+              },
+              "generation": {
+                "type": "number"
+              },
+              "ownerKind": {
+                "enum": [
+                  "terminal",
+                  "fresh-agent",
+                  "vacant"
+                ],
+                "type": "string"
+              },
+              "provider": {
+                "type": "string"
+              },
+              "sessionId": {
+                "type": "string"
+              },
+              "terminalId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "epoch",
+              "generation",
+              "ownerKind",
+              "provider",
+              "sessionId"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
         "serverInstanceId": {
           "type": "string"
         },
@@ -2696,6 +2761,72 @@
       "required": [
         "event",
         "sessionId",
+        "type"
+      ],
+      "type": "object"
+    },
+    "session.runtimeOwner": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "epoch": {
+          "type": "number"
+        },
+        "generation": {
+          "type": "number"
+        },
+        "operationId": {
+          "type": "string"
+        },
+        "ownerKind": {
+          "enum": [
+            "terminal",
+            "fresh-agent",
+            "vacant"
+          ],
+          "type": "string"
+        },
+        "previousKind": {
+          "enum": [
+            "terminal",
+            "fresh-agent"
+          ],
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "terminalId": {
+          "type": "string"
+        },
+        "transition": {
+          "enum": [
+            "handoff-started",
+            "handoff-committed",
+            "handoff-failed",
+            "released"
+          ],
+          "type": "string"
+        },
+        "type": {
+          "const": "session.runtimeOwner",
+          "type": "string"
+        }
+      },
+      "required": [
+        "epoch",
+        "generation",
+        "operationId",
+        "ownerKind",
+        "provider",
+        "sessionId",
+        "transition",
         "type"
       ],
       "type": "object"

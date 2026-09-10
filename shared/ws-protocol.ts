@@ -477,6 +477,12 @@ export const TerminalCreateSchema = z.object({
   recoveryIntent: z.literal('fresh_after_restore_unavailable').optional(),
   tabId: z.string().min(1).optional(),
   paneId: z.string().min(1).optional(),
+  /** kata b8ke delayed-request fence: the (epoch, generation) pair the
+   *  client observed when it decided to act. A pair sent together is the
+   *  fence (the server stale-rejects pre-restart epochs and superseded
+   *  generations); neither-sent is legacy-unfenced. */
+  observedEpoch: z.number().int().nonnegative().optional(),
+  observedGeneration: z.number().int().nonnegative().optional(),
 }).strict()
 
 export const TerminalCodexCandidatePersistedSchema = z.object({
@@ -771,6 +777,11 @@ export const FreshAgentCreateSchema = z.object({
   /** D8: the creating tab's client-side id; the server composes the ledger row's
    * `tabKey` as `deviceId:tabId`. Non-strict schema — tolerated by older servers. */
   tabId: z.string().min(1).optional(),
+  /** kata b8ke delayed-request fence: the (epoch, generation) pair the
+   *  client observed when it decided to act. A pair sent together is the
+   *  fence; neither-sent is legacy-unfenced. */
+  observedEpoch: z.number().int().nonnegative().optional(),
+  observedGeneration: z.number().int().nonnegative().optional(),
 })
 
 export const FreshAgentAttachSchema = z.object({
@@ -782,6 +793,11 @@ export const FreshAgentAttachSchema = z.object({
   resumeSessionId: z.string().optional(),
   cwd: z.string().optional(),
   sessionRef: SessionLocatorSchema.optional(),
+  /** kata b8ke delayed-request fence: attach can cold-resume an untracked
+   *  session (registering a runtime), so it carries the observed
+   *  (epoch, generation) pair. */
+  observedEpoch: z.number().int().nonnegative().optional(),
+  observedGeneration: z.number().int().nonnegative().optional(),
 })
 
 export const FreshAgentSendSchema = z.object({
@@ -848,6 +864,10 @@ export const FreshAgentKillSchema = z.object({
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
   cwd: z.string().optional(),
+  /** kata b8ke delayed-request fence: kill feeds the fenced stop claim, so
+   *  it carries the observed (epoch, generation) pair. */
+  observedEpoch: z.number().int().nonnegative().optional(),
+  observedGeneration: z.number().int().nonnegative().optional(),
 })
 
 export const FreshAgentForkSchema = z.object({
@@ -1056,6 +1076,20 @@ export type ReadyMessage = {
   buildId?: string
   /** Present iff the client's hello opted in via capabilities.paneReconcileV1. */
   capabilities?: ReadyCapabilities
+  /** kata b8ke: current runtime-owner state for every recorded
+   *  (provider, sessionId) — replayed so a device that missed a handoff
+   *  broadcast (offline, lag-4008, reload) learns the authoritative owner
+   *  from the handshake alone. Omitted from the wire when empty. */
+  runtimeOwners?: Array<{
+    provider: string
+    sessionId: string
+    /** The emitting server's boot epoch — the client resets its generation
+     *  state on epoch change instead of ignoring newer generations. */
+    epoch: number
+    generation: number
+    ownerKind: 'terminal' | 'fresh-agent' | 'vacant'
+    terminalId?: string
+  }>
 }
 
 export type PongMessage = {
@@ -1076,6 +1110,13 @@ export type ErrorMessage = {
   retryAfterMs?: number
   /** RESTORE_UNAVAILABLE only (D7): the live terminal that owns the refused session, so the create-error fold can reattach instead of dead-ending. Additive; omitted everywhere else. */
   liveTerminalId?: string
+  /** kata b8ke: ownership-conflict refusals only — the owning kind, its
+   *  generation, and the emitting server's boot epoch, so the client can
+   *  refresh its observed fence from the refusal itself. Additive; omitted
+   *  everywhere else (the terminal lane's refusal surface). */
+  ownerKind?: 'terminal' | 'fresh-agent'
+  ownerGeneration?: number
+  ownerEpoch?: number
   timestamp: string
 }
 
@@ -1519,12 +1560,49 @@ export type SdkRestoreFailureCode =
 
 export type FreshAgentServerMessage =
   | { type: 'freshAgent.created'; requestId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string } }
-  | { type: 'freshAgent.create.failed'; requestId: string; code: string; message: string; retryable?: boolean }
+  | { type: 'freshAgent.create.failed'; requestId: string; code: string; message: string; retryable?: boolean
+      /** kata b8ke: ownership-conflict refusals only — the owning kind, its
+       *  generation, and the emitting server's boot epoch, so the client
+       *  can refresh its observed fence from the refusal itself. Additive;
+       *  omitted everywhere else (the fresh-agent lane's refusal surface). */
+      ownerKind?: 'terminal' | 'fresh-agent'
+      ownerGeneration?: number
+      ownerEpoch?: number }
   | { type: 'freshAgent.send.accepted'; requestId: string; sessionId: string; sessionType: string; provider: string; submittedTurnId?: string; cwd?: string }
   | { type: 'freshAgent.event'; sessionId: string; sessionType: string; provider: string; event: unknown }
   | { type: 'freshAgent.session.materialized'; previousSessionId: string; sessionId: string; sessionType: string; provider: string; sessionRef?: { provider: string; sessionId: string } }
   | { type: 'freshAgent.forked'; requestId?: string; parentSessionId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string } }
   | { type: 'freshAgent.killed'; sessionId: string; sessionType: string; provider: string; success: boolean }
+
+/**
+ * kata b8ke: one server-authoritative runtime owner per canonical
+ * (provider, sessionId), shared by the terminal lane and every Fresh Agent
+ * provider. Broadcast at every ownership transition (handoff
+ * started/committed/failed, release) so every device holding a matching
+ * sessionRef pane converges on the same owner — clients fold these
+ * reactively (like `freshAgent.turn.complete`), nothing awaits an answer,
+ * so the protocol version stays 10. `epoch` is the emitting server's boot
+ * epoch: fenced comparisons use (epoch, generation), and a client that sees
+ * a different epoch resets its generation state instead of ignoring newer
+ * generations.
+ */
+export type SessionRuntimeOwnerMessage = {
+  type: 'session.runtimeOwner'
+  provider: string
+  sessionId: string
+  /** The emitting server's boot epoch. */
+  epoch: number
+  generation: number
+  ownerKind: 'terminal' | 'fresh-agent' | 'vacant'
+  previousKind?: 'terminal' | 'fresh-agent'
+  /** The owning terminal runtime (terminal-owner frames only). */
+  terminalId?: string
+  /** The coordinator operation that produced this transition. */
+  operationId: string
+  transition: 'handoff-started' | 'handoff-committed' | 'handoff-failed' | 'released'
+  /** Machine-readable failure reason (handoff-failed frames). */
+  reason?: string
+}
 
 // -- Extensions --
 
@@ -1632,6 +1710,7 @@ export type ServerMessage =
   | CodingCliStderrMessage
   | CodingCliKilledMessage
   | FreshAgentServerMessage
+  | SessionRuntimeOwnerMessage
   | ExtensionRegistryMessage
   | ExtensionServerStartingMessage
   | ExtensionServerReadyMessage

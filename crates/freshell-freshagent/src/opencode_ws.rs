@@ -582,6 +582,9 @@ impl FreshOpencodeState {
     fn fail_create(&self, request_id: &str, code: &str, message: &str) {
         self.broadcast(&ServerMessage::FreshAgentCreateFailed(
             FreshAgentCreateFailed {
+                owner_kind: None,
+                owner_generation: None,
+                owner_epoch: None,
                 code: code.to_string(),
                 message: message.to_string(),
                 request_id: request_id.to_string(),
@@ -592,6 +595,9 @@ impl FreshOpencodeState {
 
     fn send_error(&self, request_id: &Option<String>, code: &str, message: &str) {
         self.broadcast(&ServerMessage::Error(ErrorMsg {
+            owner_kind: None,
+            owner_generation: None,
+            owner_epoch: None,
             code: ErrorCode::InternalError,
             message: format!("{code}: {message}"),
             timestamp: now_iso(),
@@ -3787,6 +3793,8 @@ mod tests {
 
     fn create_msg(request_id: &str) -> FreshAgentCreate {
         FreshAgentCreate {
+            observed_epoch: None,
+            observed_generation: None,
             request_id: request_id.to_string(),
             session_type: SessionType::Freshopencode,
             cwd: None,
@@ -4094,6 +4102,8 @@ mod tests {
         );
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: AgentProvider::Opencode,
             session_id: placeholder.to_string(),
             session_type: SessionType::Freshopencode,
@@ -4162,6 +4172,8 @@ mod tests {
         };
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: AgentProvider::Opencode,
             session_id: placeholder.to_string(),
             session_type: SessionType::Freshopencode,
@@ -4208,6 +4220,8 @@ mod tests {
         );
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: AgentProvider::Opencode,
             session_id: placeholder.to_string(),
             session_type: SessionType::Freshopencode,
@@ -4250,6 +4264,8 @@ mod tests {
         // The evicted-session arm: a durable id no longer in the session map
         // still retires the row it names (idempotent when no row exists).
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: AgentProvider::Opencode,
             session_id: "ses_evicted".to_string(),
             session_type: SessionType::Freshopencode,
@@ -4308,6 +4324,8 @@ mod tests {
         let st2 = st.clone();
         let kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: AgentProvider::Opencode,
                 session_id: placeholder.to_string(),
                 session_type: SessionType::Freshopencode,
@@ -4388,6 +4406,8 @@ mod tests {
         let ph = placeholder.to_string();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: ph,
                 session_type: SessionType::Freshopencode,
@@ -4473,6 +4493,8 @@ mod tests {
         // The ledger fails every write (disk-full/permission shape).
         fake.set_fail_writes(true);
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Opencode,
             session_id: placeholder.to_string(),
             session_type: SessionType::Freshopencode,
@@ -4560,6 +4582,8 @@ mod tests {
         fake.fail_retires_as_persisted
             .store(true, std::sync::atomic::Ordering::SeqCst);
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Opencode,
             session_id: placeholder.to_string(),
             session_type: SessionType::Freshopencode,
@@ -4632,6 +4656,8 @@ mod tests {
         );
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Opencode,
             session_id: placeholder.to_string(),
             session_type: SessionType::Freshopencode,
@@ -4694,6 +4720,8 @@ mod tests {
         let ph = placeholder.to_string();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: ph,
                 session_type: SessionType::Freshopencode,
@@ -4772,6 +4800,8 @@ mod tests {
         let ph = placeholder.to_string();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: ph,
                 session_type: SessionType::Freshopencode,
@@ -4850,6 +4880,8 @@ mod tests {
         let ph = placeholder.to_string();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: ph,
                 session_type: SessionType::Freshopencode,
@@ -4923,6 +4955,8 @@ mod tests {
         // The close the user MEANT (before this attach): row Closed + fence.
         state
             .handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: AgentProvider::Opencode,
                 session_id: DURABLE_ID.to_string(),
                 session_type: SessionType::Freshopencode,
@@ -5062,6 +5096,8 @@ mod tests {
         let st2 = st.clone();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: placeholder.to_string(),
                 session_type: SessionType::Freshopencode,
@@ -5149,6 +5185,8 @@ mod tests {
         let ph = placeholder.to_string();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: ph,
                 session_type: SessionType::Freshopencode,
@@ -5240,6 +5278,8 @@ mod tests {
         let ph = placeholder.to_string();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: ph,
                 session_type: SessionType::Freshopencode,
@@ -5555,6 +5595,8 @@ mod tests {
 
     fn attach_msg(session_id: &str) -> FreshAgentAttach {
         FreshAgentAttach {
+            observed_epoch: None,
+            observed_generation: None,
             provider: AgentProvider::Opencode,
             session_id: session_id.to_string(),
             session_type: SessionType::Freshopencode,
@@ -5919,6 +5961,8 @@ mod tests {
         let real_id = session_arc.lock().await.real_session_id.clone().unwrap();
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: AgentProvider::Opencode,
             session_id: real_id.clone(),
             session_type: SessionType::Freshopencode,
@@ -5942,6 +5986,8 @@ mod tests {
         let st = FreshOpencodeState::new(fresh_agent);
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: AgentProvider::Opencode,
             session_id: "does-not-exist".to_string(),
             session_type: SessionType::Freshopencode,
@@ -6280,6 +6326,8 @@ mod tests {
         // the map never held this session; the row is durable).
         state
             .handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: DURABLE_ID.to_string(),
                 session_type: SessionType::Freshopencode,
@@ -6423,6 +6471,8 @@ mod tests {
         // durable serve session the local map never tracked — retired by name).
         state
             .handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: DURABLE_ID.to_string(),
                 session_type: SessionType::Freshopencode,
@@ -6507,6 +6557,8 @@ mod tests {
         // The close the user will MEAN: row Closed + fence, before the resume.
         state
             .handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: DURABLE_ID.to_string(),
                 session_type: SessionType::Freshopencode,
@@ -6541,6 +6593,8 @@ mod tests {
         // the commit decides.
         state
             .handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: DURABLE_ID.to_string(),
                 session_type: SessionType::Freshopencode,
@@ -9424,6 +9478,8 @@ mod tests {
         await_summarize_posted(&http).await;
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: AgentProvider::Opencode,
             session_id: "ses_1".to_string(),
             session_type: SessionType::Freshopencode,
@@ -9601,6 +9657,8 @@ mod tests {
         // The ownership invariant holds end-to-end: a kill mid-compact aborts the
         // registered drive — no false completion after the gate releases.
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: AgentProvider::Opencode,
             session_id: "ses_1".to_string(),
             session_type: SessionType::Freshopencode,

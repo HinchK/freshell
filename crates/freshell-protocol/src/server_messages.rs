@@ -1,4 +1,5 @@
-//! Server → client messages (`ServerMessage`, 63 discriminants).
+//! Server → client messages (`ServerMessage`, 66 discriminants: 65 frozen
+//! inventory types + the `durability.degraded` extension).
 //!
 //! These are TypeScript-typed (not runtime-validated) on the wire; their frozen
 //! shape authority is `port/contract/ws-server-messages.schema.json`.
@@ -94,6 +95,11 @@ pub enum ServerMessage {
     Ready(Ready),
     #[serde(rename = "session.repair.activity")]
     SessionRepairActivity(SessionRepairActivity),
+    // kata b8ke: the runtime-ownership broadcast (see [`SessionRuntimeOwner`]).
+    // Additive via the frozen route — SERVER_MESSAGE_TYPES / the generated
+    // inventory carry it; no protocol version bump (nothing awaits it).
+    #[serde(rename = "session.runtimeOwner")]
+    SessionRuntimeOwner(SessionRuntimeOwner),
     #[serde(rename = "session.status")]
     SessionStatus(SessionStatus),
     #[serde(rename = "sessions.changed")]
@@ -174,7 +180,7 @@ pub enum ServerMessage {
 
 /// The exact `type` discriminants of every server→client message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const SERVER_MESSAGE_TYPES: [&str; 64] = [
+pub const SERVER_MESSAGE_TYPES: [&str; 65] = [
     "amplifier.activity.list.response",
     "amplifier.activity.updated",
     "claude.activity.list.response",
@@ -212,6 +218,7 @@ pub const SERVER_MESSAGE_TYPES: [&str; 64] = [
     "pong",
     "ready",
     "session.repair.activity",
+    "session.runtimeOwner",
     "session.status",
     "sessions.changed",
     "settings.updated",
@@ -648,6 +655,21 @@ pub struct ErrorMsg {
     /// omitted everywhere else.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub live_terminal_id: Option<String>,
+    /// kata b8ke: ownership-conflict refusals only — the owning kind
+    /// ("terminal" | "fresh-agent"). Additive and omitted everywhere else, so
+    /// every non-ownership error frame stays byte-identical on the wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_kind: Option<String>,
+    /// kata b8ke: the owner's generation at refusal time — with
+    /// `owner_epoch`, lets the client refresh its observed fence from the
+    /// refusal itself. Additive and omitted everywhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_generation: Option<u64>,
+    /// kata b8ke: the emitting server's boot epoch for the owner fields (a
+    /// fence pair from a different epoch is always stale). Additive and
+    /// omitted everywhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_epoch: Option<u64>,
 }
 
 // --- extension.* ------------------------------------------------------------
@@ -738,6 +760,16 @@ pub struct FreshAgentCreateFailed {
     pub request_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retryable: Option<bool>,
+    /// kata b8ke (carried finding): fresh-agent refusals ride THIS frame,
+    /// not ErrorMessage — the typed owner fields appear here so the client's
+    /// refusal fold sees them on the fresh-agent lane. Omitted everywhere
+    /// else, so legacy refusal frames stay byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_epoch: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -917,6 +949,69 @@ pub struct Ready {
     /// received advertised the capability.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<ReadyCapabilities>,
+    /// kata b8ke reconnect-owner discovery: current runtime-owner state for
+    /// every recorded (provider, sessionId), so a device that missed a
+    /// handoff broadcast (offline, lag-4008, page reload) learns the
+    /// authoritative owner from the handshake alone. Omitted when `None`
+    /// (frozen-client inertness — same rule as `boot_id`/`build_id`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_owners: Option<Vec<RuntimeOwnerReplay>>,
+}
+
+/// One `ready.runtimeOwners` replay record (kata b8ke reconnect-owner
+/// discovery). `owner_kind` is the free wire string "terminal" |
+/// "fresh-agent" | "vacant"; the emission site converts from
+/// `freshell_ownership::RuntimeOwnerReplayRecord` (this crate stays
+/// serde-only with no workspace deps).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeOwnerReplay {
+    pub provider: String,
+    pub session_id: String,
+    /// The emitting server's boot epoch (round-2 review) — the client resets
+    /// its generation state on epoch change instead of ignoring newer
+    /// generations.
+    pub epoch: u64,
+    pub generation: u64,
+    /// "terminal" | "fresh-agent" | "vacant"
+    pub owner_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+}
+
+/// `session.runtimeOwner` — kata b8ke: one server-authoritative runtime
+/// owner per canonical `(provider, sessionId)`, broadcast at every ownership
+/// transition (handoff started/committed/failed, release) so every device
+/// holding a matching sessionRef pane converges on the same owner. The
+/// client folds these reactively (like `freshAgent.turn.complete`);
+/// nothing awaits an answer, so no protocol version bump. `owner_kind` /
+/// `transition` are free wire strings ("terminal" | "fresh-agent" |
+/// "vacant"; "handoff-started" | "handoff-committed" | "handoff-failed" |
+/// "released") — the emission site converts from `freshell_ownership`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRuntimeOwner {
+    pub provider: String,
+    pub session_id: String,
+    /// The emitting server's boot epoch (round-2 review): fenced
+    /// comparisons use (epoch, generation), and a client that sees a
+    /// different epoch resets its generation state.
+    pub epoch: u64,
+    pub generation: u64,
+    /// "terminal" | "fresh-agent" | "vacant"
+    pub owner_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_kind: Option<String>,
+    /// The owning terminal runtime (terminal-owner frames only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+    /// The coordinator operation that produced this transition.
+    pub operation_id: String,
+    /// "handoff-started" | "handoff-committed" | "handoff-failed" | "released"
+    pub transition: String,
+    /// Machine-readable failure reason (handoff-failed frames).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1575,4 +1670,168 @@ pub struct HostStatsRefreshResponse {
     pub manual: Option<HostStatsManual>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub error: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_runtime_owner_frame_round_trips_with_the_frozen_tag() {
+        let msg = ServerMessage::SessionRuntimeOwner(SessionRuntimeOwner {
+            provider: "codex".into(),
+            session_id: "01a0828d".into(),
+            epoch: 41,
+            generation: 7,
+            owner_kind: "terminal".into(),
+            previous_kind: Some("fresh-agent".into()),
+            terminal_id: Some("t-91".into()),
+            operation_id: "handoff-abc".into(),
+            transition: "handoff-committed".into(),
+            reason: None,
+        });
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(
+            json.contains(r#""type":"session.runtimeOwner""#),
+            "wire tag must be exact: {json}"
+        );
+        assert!(
+            json.contains(r#""sessionId":"01a0828d""#),
+            "fields must be camelCase: {json}"
+        );
+        let back: ServerMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn error_message_accepts_additive_owner_fields_without_changing_the_frozen_text() {
+        // The REAL repo type is `ErrorMsg` with its existing required +
+        // optional fields — `timestamp` is REQUIRED (no skip_serializing_if);
+        // fill the full real field set plus the three new additive ones
+        // (round-1 review: the earlier `Error` sketch did not compile
+        // against the repo type).
+        let msg = ServerMessage::Error(ErrorMsg {
+            code: ErrorCode::RestoreUnavailable,
+            message: "Session 01a0828d is still running on the server.".into(),
+            timestamp: "2026-09-09T00:00:00Z".into(),
+            actual_session_ref: None,
+            expected_session_ref: None,
+            request_id: Some("req-1".into()),
+            retry_after_ms: None,
+            terminal_exit_code: None,
+            terminal_id: None,
+            live_terminal_id: None,
+            owner_kind: Some("fresh-agent".into()),
+            owner_generation: Some(7),
+            owner_epoch: Some(41),
+        });
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(json.contains(r#""ownerKind":"fresh-agent""#), "{json}");
+        assert!(json.contains(r#""ownerEpoch":41"#), "{json}");
+        assert!(json.contains("is still running on the server."));
+        let back: ServerMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, msg);
+        // Additive-optional: a legacy error frame with no owner fields stays
+        // byte-identical on the wire (the frozen refusal surface).
+        let legacy = ServerMessage::Error(ErrorMsg {
+            code: ErrorCode::InternalError,
+            message: "unrelated".into(),
+            timestamp: "2026-09-09T00:00:00Z".into(),
+            actual_session_ref: None,
+            expected_session_ref: None,
+            request_id: None,
+            retry_after_ms: None,
+            terminal_exit_code: None,
+            terminal_id: None,
+            live_terminal_id: None,
+            owner_kind: None,
+            owner_generation: None,
+            owner_epoch: None,
+        });
+        let legacy_json = serde_json::to_string(&legacy).expect("serialize");
+        assert!(
+            !legacy_json.contains("ownerKind"),
+            "omit-when-absent keeps legacy error frames byte-identical: {legacy_json}"
+        );
+    }
+
+    #[test]
+    fn fresh_agent_create_failed_accepts_additive_owner_fields() {
+        // Carried finding (independent plan review): fresh-agent refusals
+        // ride `freshAgent.create.failed`, not ErrorMessage — the typed
+        // owner fields must appear on THIS frame for the client's refusal
+        // fold to see them. The terminal lane's refusal stays ErrorMessage
+        // (covered above).
+        let msg = ServerMessage::FreshAgentCreateFailed(FreshAgentCreateFailed {
+            code: "RESTORE_UNAVAILABLE".into(),
+            message: "Session 01a0828d is still running on the server.".into(),
+            request_id: "req-9".into(),
+            retryable: Some(true),
+            owner_kind: Some("terminal".into()),
+            owner_generation: Some(7),
+            owner_epoch: Some(41),
+        });
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(json.contains(r#""ownerKind":"terminal""#), "{json}");
+        assert!(json.contains(r#""ownerEpoch":41"#), "{json}");
+        let back: ServerMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, msg);
+        // Additive-optional: the legacy refusal shape stays byte-identical.
+        let legacy = ServerMessage::FreshAgentCreateFailed(FreshAgentCreateFailed {
+            code: "RESTORE_UNAVAILABLE".into(),
+            message: "boom".into(),
+            request_id: "req-10".into(),
+            retryable: None,
+            owner_kind: None,
+            owner_generation: None,
+            owner_epoch: None,
+        });
+        let legacy_json = serde_json::to_string(&legacy).expect("serialize");
+        assert!(
+            !legacy_json.contains("ownerKind"),
+            "omit-when-absent keeps legacy refusals byte-identical: {legacy_json}"
+        );
+    }
+
+    #[test]
+    fn ready_frame_round_trips_additive_runtime_owners() {
+        // kata b8ke reconnect-owner discovery (T1 rec A2): the ready frame
+        // replays current runtime-owner state; omit-when-empty keeps legacy
+        // frames byte-identical. Matches `Ready`'s real field set.
+        let msg = ServerMessage::Ready(Ready {
+            timestamp: "2026-09-09T00:00:00Z".into(),
+            boot_id: Some("boot-1".into()),
+            server_instance_id: Some("inst-1".into()),
+            build_id: None,
+            capabilities: None,
+            runtime_owners: Some(vec![RuntimeOwnerReplay {
+                provider: "codex".into(),
+                session_id: "01a0828d".into(),
+                epoch: 41,
+                generation: 4,
+                owner_kind: "terminal".into(),
+                terminal_id: Some("t-91".into()),
+            }]),
+        });
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(
+            json.contains(r#""runtimeOwners":"#),
+            "wire field must be camelCase: {json}"
+        );
+        let back: ServerMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, msg);
+        let legacy = ServerMessage::Ready(Ready {
+            timestamp: "2026-09-09T00:00:00Z".into(),
+            boot_id: Some("boot-1".into()),
+            server_instance_id: Some("inst-1".into()),
+            build_id: None,
+            capabilities: None,
+            runtime_owners: None,
+        });
+        let legacy_json = serde_json::to_string(&legacy).expect("serialize");
+        assert!(
+            !legacy_json.contains("runtimeOwners"),
+            "omit-when-empty keeps legacy ready frames byte-identical: {legacy_json}"
+        );
+    }
 }

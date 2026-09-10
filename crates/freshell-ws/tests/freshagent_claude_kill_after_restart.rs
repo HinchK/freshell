@@ -403,6 +403,8 @@ fn new_generation(
 
 fn create_msg_resume(request_id: &str, durable: &str) -> FreshAgentCreate {
     FreshAgentCreate {
+        observed_epoch: None,
+        observed_generation: None,
         request_id: request_id.to_string(),
         session_type: SessionType::Freshclaude,
         provider: Some(AgentProvider::Claude),
@@ -425,6 +427,8 @@ fn create_msg_resume(request_id: &str, durable: &str) -> FreshAgentCreate {
 
 fn attach_msg(seat: &str, durable: &str) -> FreshAgentAttach {
     FreshAgentAttach {
+        observed_epoch: None,
+        observed_generation: None,
         provider: AgentProvider::Claude,
         session_id: seat.to_string(),
         session_type: SessionType::Freshclaude,
@@ -439,6 +443,8 @@ fn attach_msg(seat: &str, durable: &str) -> FreshAgentAttach {
 
 fn kill_msg(session_id: &str) -> FreshAgentKill {
     FreshAgentKill {
+        observed_epoch: None,
+        observed_generation: None,
         provider: AgentProvider::Claude,
         session_id: session_id.to_string(),
         session_type: SessionType::Freshclaude,

@@ -132,6 +132,9 @@ pub enum DedupeDecision {
 /// the retry proceeds as a fresh create).
 fn waiter_error(request_id: &str) -> ServerMessage {
     ServerMessage::Error(ErrorMsg {
+        owner_kind: None,
+        owner_generation: None,
+        owner_epoch: None,
         code: ErrorCode::PtySpawnFailed,
         message: "terminal.create did not complete; retry".to_string(),
         timestamp: crate::now_iso(),

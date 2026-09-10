@@ -561,6 +561,7 @@ pub async fn build_handshake_with_capabilities(
     let boot_id = state.boot_id.as_ref().clone();
     let mut messages = vec![
         ServerMessage::Ready(Ready {
+            runtime_owners: None,
             timestamp: now_iso(),
             boot_id: Some(boot_id.clone()),
             server_instance_id: Some(state.server_instance_id.as_ref().clone()),
@@ -903,6 +904,9 @@ async fn send_error(
     message: &str,
 ) -> Result<(), axum::Error> {
     let msg = ServerMessage::Error(ErrorMsg {
+        owner_kind: None,
+        owner_generation: None,
+        owner_epoch: None,
         code,
         message: message.to_string(),
         timestamp: now_iso(),

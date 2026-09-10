@@ -1100,6 +1100,9 @@ impl FreshClaudeState {
     fn fail_create(&self, request_id: &str, code: &str, message: &str) {
         self.broadcast(&ServerMessage::FreshAgentCreateFailed(
             FreshAgentCreateFailed {
+                owner_kind: None,
+                owner_generation: None,
+                owner_epoch: None,
                 code: code.to_string(),
                 message: message.to_string(),
                 request_id: request_id.to_string(),
@@ -1114,6 +1117,9 @@ impl FreshClaudeState {
     fn fail_create_session_reserved(&self, request_id: &str) {
         self.broadcast(&ServerMessage::FreshAgentCreateFailed(
             FreshAgentCreateFailed {
+                owner_kind: None,
+                owner_generation: None,
+                owner_epoch: None,
                 code: "SESSION_RESERVED".to_string(),
                 message: "Another resume for this session is in flight".to_string(),
                 request_id: request_id.to_string(),
@@ -4101,6 +4107,9 @@ impl FreshClaudeState {
 
     fn send_error(&self, request_id: &Option<String>, code: &str, message: &str) {
         self.broadcast(&ServerMessage::Error(ErrorMsg {
+            owner_kind: None,
+            owner_generation: None,
+            owner_epoch: None,
             code: ErrorCode::InternalError,
             message: format!("{code}: {message}"),
             timestamp: now_iso(),
@@ -5723,6 +5732,8 @@ pub(crate) mod tests {
 
     fn attach_msg(session_id: &str) -> FreshAgentAttach {
         FreshAgentAttach {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: session_id.to_string(),
             session_type: SessionType::Freshclaude,
@@ -7172,6 +7183,8 @@ rl.on('line', (line) => {
 
     fn dedup_create_msg(request_id: &str) -> FreshAgentCreate {
         FreshAgentCreate {
+            observed_epoch: None,
+            observed_generation: None,
             request_id: request_id.to_string(),
             session_type: SessionType::Freshclaude,
             provider: Some(freshell_protocol::AgentProvider::Claude),
@@ -7367,6 +7380,8 @@ rl.on('line', (line) => {
         let killed_session_id = created["sessionId"].as_str().unwrap().to_string();
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: killed_session_id.clone(),
             session_type: SessionType::Freshclaude,
@@ -7399,6 +7414,8 @@ rl.on('line', (line) => {
         let st = FreshClaudeState::new(Arc::new(tx));
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: "unknown-session".to_string(),
             session_type: SessionType::Freshclaude,
@@ -7450,6 +7467,8 @@ rl.on('line', (line) => {
         // Kill addressed by the DURABLE id must retire the durable-keyed row
         // (resolve_session_key walks cli_index to the live map key).
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: durable.to_string(),
             session_type: SessionType::Freshclaude,
@@ -7479,6 +7498,8 @@ rl.on('line', (line) => {
             .expect("session tracked under the placeholder")
             .cli_session_id = Some(durable.to_string());
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: placeholder2.clone(),
             session_type: SessionType::Freshclaude,
@@ -7508,6 +7529,8 @@ rl.on('line', (line) => {
         st.set_identity_sink(fake.clone());
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: "evicted-durable".to_string(),
             session_type: SessionType::Freshclaude,
@@ -7556,6 +7579,8 @@ rl.on('line', (line) => {
         let ph = placeholder.clone();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Claude,
                 session_id: ph,
                 session_type: SessionType::Freshclaude,
@@ -7604,6 +7629,8 @@ rl.on('line', (line) => {
         fake.set_fail_writes(true);
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: "sess-kill-fail".to_string(),
             session_type: SessionType::Freshclaude,
@@ -7655,6 +7682,8 @@ rl.on('line', (line) => {
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: "sess-kill-pers".to_string(),
             session_type: SessionType::Freshclaude,
@@ -7732,6 +7761,8 @@ rl.on('line', (line) => {
         let ph = placeholder.clone();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Claude,
                 session_id: ph,
                 session_type: SessionType::Freshclaude,
@@ -7814,6 +7845,8 @@ rl.on('line', (line) => {
         while rx.try_recv().is_ok() {} // drain pre-kill frames
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: placeholder.clone(),
             session_type: SessionType::Freshclaude,
@@ -7894,6 +7927,8 @@ rl.on('line', (line) => {
         }
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: placeholder.clone(),
             session_type: SessionType::Freshclaude,
@@ -7949,6 +7984,8 @@ rl.on('line', (line) => {
         let ph = placeholder.clone();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Claude,
                 session_id: ph,
                 session_type: SessionType::Freshclaude,
@@ -8039,6 +8076,8 @@ rl.on('line', (line) => {
 
         fake.fail_retires_after(0); // every close call fails Clean
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: placeholder.clone(),
             session_type: SessionType::Freshclaude,
@@ -8141,6 +8180,8 @@ rl.on('line', (line) => {
 
         // THE WIRE SHAPE THE CLIENT ACTUALLY SENDS: the bare placeholder.
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: placeholder.clone(),
             session_type: SessionType::Freshclaude,
@@ -8203,6 +8244,8 @@ rl.on('line', (line) => {
         // The user closes the pane NOW (the bare placeholder — the real wire
         // shape) while that write is still in flight.
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: placeholder.clone(),
             session_type: SessionType::Freshclaude,
@@ -8279,6 +8322,8 @@ rl.on('line', (line) => {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: placeholder,
             session_type: SessionType::Freshclaude,
@@ -8357,6 +8402,8 @@ rl.on('line', (line) => {
 
     fn kill_msg(session_id: &str) -> FreshAgentKill {
         FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: session_id.to_string(),
             session_type: SessionType::Freshclaude,
@@ -10951,6 +10998,8 @@ rl.on('line', (line) => {
         );
         // Kill evicts the index entry.
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: created.clone(),
             session_type: SessionType::Freshclaude,

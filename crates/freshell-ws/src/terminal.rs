@@ -797,6 +797,9 @@ async fn handle_client_text(
         match value.get("type").and_then(|t| t.as_str()) {
             Some("terminal.create") | Some("codingcli.create") => {
                 let reply = ServerMessage::Error(ErrorMsg {
+                    owner_kind: None,
+                    owner_generation: None,
+                    owner_epoch: None,
                     code: ErrorCode::InvalidMessage,
                     message: LEGACY_RESUME_IDENTITY_REFUSAL.to_string(),
                     timestamp: crate::now_iso(),
@@ -822,6 +825,9 @@ async fn handle_client_text(
             // frame: presence already proven by the guard condition.
             Some("freshAgent.create") => {
                 let reply = ServerMessage::FreshAgentCreateFailed(FreshAgentCreateFailed {
+                    owner_kind: None,
+                    owner_generation: None,
+                    owner_epoch: None,
                     code: "FRESH_AGENT_CREATE_FAILED".to_string(),
                     message: LEGACY_RESUME_IDENTITY_REFUSAL.to_string(),
                     request_id: value
@@ -901,6 +907,9 @@ async fn handle_client_text(
                 send(
                     ws_tx,
                     &ServerMessage::Error(ErrorMsg {
+                        owner_kind: None,
+                        owner_generation: None,
+                        owner_epoch: None,
                         code: ErrorCode::InvalidMessage,
                         message: message.to_string(),
                         timestamp: crate::now_iso(),
@@ -1720,6 +1729,9 @@ async fn handle_client_text(
             send(
                 ws_tx,
                 &ServerMessage::Error(ErrorMsg {
+                    owner_kind: None,
+                    owner_generation: None,
+                    owner_epoch: None,
                     code: ErrorCode::ReconcileNotNegotiated,
                     message: "pane.reconcile was not negotiated on this connection; fall back to the inventory census.".to_string(),
                     timestamp: crate::now_iso(),
@@ -2241,6 +2253,9 @@ async fn send_session_reserved(
     retry_after_ms: u64,
 ) -> bool {
     let msg = ServerMessage::Error(ErrorMsg {
+        owner_kind: None,
+        owner_generation: None,
+        owner_epoch: None,
         code: ErrorCode::SessionReserved,
         message: "Another terminal.create for this sessionRef is in flight".to_string(),
         timestamp: crate::now_iso(),
@@ -5225,6 +5240,9 @@ pub(crate) async fn send_create_error_with_live_terminal(
     live_terminal_id: Option<String>,
 ) -> bool {
     let msg = ServerMessage::Error(ErrorMsg {
+        owner_kind: None,
+        owner_generation: None,
+        owner_epoch: None,
         code,
         message,
         timestamp: crate::now_iso(),
@@ -5483,6 +5501,9 @@ fn handle_attach(
     // never colliding with createRequestIds — see ws-client's
     // clearTrackedCreate-on-error behavior).
     Some(ServerMessage::Error(ErrorMsg {
+        owner_kind: None,
+        owner_generation: None,
+        owner_epoch: None,
         code: ErrorCode::InvalidTerminalId,
         message: "Terminal not running".to_string(),
         timestamp: crate::now_iso(),
@@ -5556,6 +5577,9 @@ fn input_session_identity_mismatch_error(
     actual: Option<SessionLocator>,
 ) -> ServerMessage {
     ServerMessage::Error(ErrorMsg {
+        owner_kind: None,
+        owner_generation: None,
+        owner_epoch: None,
         code: ErrorCode::SessionIdentityMismatch,
         message: "Terminal session does not match the expected session.".to_string(),
         timestamp: crate::now_iso(),
@@ -5591,6 +5615,9 @@ pub(crate) fn terminal_dims_in_range(cols: i64, rows: i64) -> bool {
 /// a `requestId` field.
 fn invalid_dims_error(cols: i64, rows: i64) -> ServerMessage {
     ServerMessage::Error(ErrorMsg {
+        owner_kind: None,
+        owner_generation: None,
+        owner_epoch: None,
         code: ErrorCode::InvalidMessage,
         message: format!(
             "terminal geometry out of range: cols must be in [2, 1000] and rows in [2, 500] (got cols={cols}, rows={rows})"
@@ -6136,6 +6163,9 @@ fn handle_auto_resume_cancel(cancel: TerminalAutoResumeCancel, state: &WsState) 
 async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) -> bool {
     let unknown_terminal_error = |terminal_id: String| {
         ServerMessage::Error(ErrorMsg {
+            owner_kind: None,
+            owner_generation: None,
+            owner_epoch: None,
             code: ErrorCode::InvalidTerminalId,
             message: "Unknown terminalId".to_string(),
             timestamp: crate::now_iso(),
@@ -6244,6 +6274,9 @@ async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) ->
             return send(ws_tx, &msg).await;
         }
         let msg = ServerMessage::Error(ErrorMsg {
+            owner_kind: None,
+            owner_generation: None,
+            owner_epoch: None,
             code: ErrorCode::InternalError,
             message: CLOSE_FAILURE_COPY.to_string(),
             timestamp: crate::now_iso(),
@@ -6280,6 +6313,9 @@ async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) ->
     if kill_and_broadcast(state, &kill.terminal_id) {
         if persisted_despite_error {
             let msg = ServerMessage::Error(ErrorMsg {
+                owner_kind: None,
+                owner_generation: None,
+                owner_epoch: None,
                 code: ErrorCode::InternalError,
                 message: PERSISTED_CLOSE_COPY.to_string(),
                 timestamp: crate::now_iso(),

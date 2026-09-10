@@ -1502,6 +1502,9 @@ impl FreshCodexState {
     fn fail_create(&self, request_id: &str, code: &str, message: &str) {
         self.broadcast(&ServerMessage::FreshAgentCreateFailed(
             FreshAgentCreateFailed {
+                owner_kind: None,
+                owner_generation: None,
+                owner_epoch: None,
                 code: code.to_string(),
                 message: message.to_string(),
                 request_id: request_id.to_string(),
@@ -1807,6 +1810,9 @@ impl FreshCodexState {
 
     fn send_error(&self, request_id: &Option<String>, code: &str, message: &str) {
         self.broadcast(&ServerMessage::Error(ErrorMsg {
+            owner_kind: None,
+            owner_generation: None,
+            owner_epoch: None,
             code: ErrorCode::InternalError,
             message: format!("{code}: {message}"),
             timestamp: now_iso(),
@@ -7704,6 +7710,8 @@ pub(crate) mod tests {
         .await;
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: "thread-1".to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -7736,6 +7744,8 @@ pub(crate) mod tests {
         let (st, mut rx) = state_with_bus();
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: "does-not-exist".to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -7773,6 +7783,8 @@ pub(crate) mod tests {
         .await;
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: "thread-kill".to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -7795,6 +7807,8 @@ pub(crate) mod tests {
         let (st, _rx, fake) = state_with_sink();
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: "evicted-thread".to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -7856,6 +7870,8 @@ pub(crate) mod tests {
         let st2 = st.clone();
         let kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Codex,
                 session_id: "thread-stall".to_string(),
                 session_type: freshell_protocol::SessionType::Freshcodex,
@@ -7919,6 +7935,8 @@ pub(crate) mod tests {
         fake.set_fail_writes(true);
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: "thread-kill-fail".to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -7983,6 +8001,8 @@ pub(crate) mod tests {
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: "thread-kill-pers".to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -8044,6 +8064,8 @@ pub(crate) mod tests {
 
         // The close the user MEANT (before this attach): row Closed + fence.
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: thread.to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -8075,6 +8097,8 @@ pub(crate) mod tests {
         // THE INTERLEAVING (Finding 1): the user's close lands between the
         // completed commit and the registration.
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: thread.to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -8148,6 +8172,8 @@ pub(crate) mod tests {
         );
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: thread.to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -8164,6 +8190,8 @@ pub(crate) mod tests {
         let create = tokio::spawn(async move {
             st2.handle_create(
                 FreshAgentCreate {
+                    observed_epoch: None,
+                    observed_generation: None,
                     request_id: "req-post-commit-kill".to_string(),
                     session_type: freshell_protocol::SessionType::Freshcodex,
                     provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -8189,6 +8217,8 @@ pub(crate) mod tests {
             .expect("the claim's commit landed (the lane is parked pre-registration)");
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: thread.to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -8250,6 +8280,8 @@ pub(crate) mod tests {
             },
         );
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: thread.to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -8311,6 +8343,8 @@ pub(crate) mod tests {
         // The close, naming the durable thread id (the codex wire shape —
         // the map never held a session here, the evicted arm covers it).
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: thread_id.to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -8330,6 +8364,8 @@ pub(crate) mod tests {
         configure_fake_codex_cmd("{}");
         st.handle_create(
             FreshAgentCreate {
+                observed_epoch: None,
+                observed_generation: None,
                 request_id: "req-claim-resume".to_string(),
                 session_type: freshell_protocol::SessionType::Freshcodex,
                 provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -12951,6 +12987,8 @@ pub(crate) mod tests {
             let (st, mut rx) = state_with_bus();
             st.handle_create(
                 FreshAgentCreate {
+                    observed_epoch: None,
+                    observed_generation: None,
                     request_id: format!("req-{case}"),
                     session_type: freshell_protocol::SessionType::Freshcodex,
                     provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -13005,6 +13043,8 @@ pub(crate) mod tests {
 
     fn attach_msg(session_id: &str) -> FreshAgentAttach {
         FreshAgentAttach {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: session_id.to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -13088,6 +13128,8 @@ pub(crate) mod tests {
 
         // The close: row Closed + fence (by name — the map never held it).
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: thread.to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -13178,6 +13220,8 @@ pub(crate) mod tests {
 
         // The close the user will MEAN: row Closed + fence, before the attach.
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: thread.to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -13205,6 +13249,8 @@ pub(crate) mod tests {
         // THE INTERLEAVING: the user closes the pane now — the kill lands
         // before the commit decides.
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: thread.to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -13445,6 +13491,8 @@ pub(crate) mod tests {
             .await;
 
             st.handle_attach(FreshAgentAttach {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Codex,
                 session_id: "thread-1".to_string(),
                 session_type: freshell_protocol::SessionType::Freshcodex,
@@ -13621,6 +13669,8 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                observed_epoch: None,
+                observed_generation: None,
                 request_id: "req-retryable-1".to_string(),
                 session_type: freshell_protocol::SessionType::Freshcodex,
                 provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -13671,6 +13721,8 @@ pub(crate) mod tests {
     /// `request_id`.
     fn create_msg(request_id: &str) -> FreshAgentCreate {
         FreshAgentCreate {
+            observed_epoch: None,
+            observed_generation: None,
             request_id: request_id.to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
             provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -13896,6 +13948,8 @@ pub(crate) mod tests {
         let killed_session_id = created["sessionId"].as_str().unwrap().to_string();
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: killed_session_id.clone(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -13979,6 +14033,8 @@ pub(crate) mod tests {
 
             if let Some(session_id) = session_id {
                 st.handle_kill(FreshAgentKill {
+                    observed_epoch: None,
+                    observed_generation: None,
                     provider: freshell_protocol::AgentProvider::Codex,
                     session_id,
                     session_type: freshell_protocol::SessionType::Freshcodex,
@@ -14009,6 +14065,8 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                observed_epoch: None,
+                observed_generation: None,
                 request_id: "req-resume-1".to_string(),
                 session_type: freshell_protocol::SessionType::Freshcodex,
                 provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -14076,6 +14134,8 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                observed_epoch: None,
+                observed_generation: None,
                 request_id: "req-sref-resume-1".to_string(),
                 session_type: freshell_protocol::SessionType::Freshcodex,
                 provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -14154,6 +14214,8 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                observed_epoch: None,
+                observed_generation: None,
                 request_id: "req-resume-2".to_string(),
                 session_type: freshell_protocol::SessionType::Freshcodex,
                 provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -14220,6 +14282,8 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                observed_epoch: None,
+                observed_generation: None,
                 request_id: "req-term25-create".to_string(),
                 session_type: freshell_protocol::SessionType::Freshcodex,
                 provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -14842,6 +14906,8 @@ pub(crate) mod tests {
     ) -> String {
         st.handle_create(
             FreshAgentCreate {
+                observed_epoch: None,
+                observed_generation: None,
                 request_id: "req-1".to_string(),
                 session_type: freshell_protocol::SessionType::Freshcodex,
                 provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -14939,6 +15005,8 @@ pub(crate) mod tests {
         state
             .handle_create(
                 FreshAgentCreate {
+                    observed_epoch: None,
+                    observed_generation: None,
                     request_id: "req-bind-1".to_string(),
                     session_type: freshell_protocol::SessionType::Freshcodex,
                     provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -15005,6 +15073,8 @@ pub(crate) mod tests {
         state
             .handle_create(
                 FreshAgentCreate {
+                    observed_epoch: None,
+                    observed_generation: None,
                     request_id: "req-bind-prov".to_string(),
                     session_type: freshell_protocol::SessionType::Freshcodex,
                     provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -15082,6 +15152,8 @@ pub(crate) mod tests {
         state
             .handle_create(
                 FreshAgentCreate {
+                    observed_epoch: None,
+                    observed_generation: None,
                     request_id: "req-ledger-fail".to_string(),
                     session_type: freshell_protocol::SessionType::Freshcodex,
                     provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -15444,6 +15516,8 @@ pub(crate) mod tests {
 
         configure_fake_codex_cmd("{}");
         st.handle_attach(FreshAgentAttach {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: thread_id.clone(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -15519,6 +15593,8 @@ pub(crate) mod tests {
         let attach_task = tokio::spawn(async move {
             st_attach
                 .handle_attach(FreshAgentAttach {
+                    observed_epoch: None,
+                    observed_generation: None,
                     provider: freshell_protocol::AgentProvider::Codex,
                     session_id: attach_thread_id,
                     session_type: freshell_protocol::SessionType::Freshcodex,
@@ -15576,6 +15652,8 @@ pub(crate) mod tests {
 
         configure_fake_codex_cmd("{}");
         st.handle_attach(FreshAgentAttach {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: thread_id.clone(),
             session_type: freshell_protocol::SessionType::Freshcodex,
