@@ -3226,10 +3226,16 @@ impl FreshCodexState {
         // `BlockedHandoff` / `StaleClaim` / an in-flight `Starting`/`Stopping`
         // are typed refusals: the caller does NOT kill (an in-flight handoff
         // owns the transition, or ownership moved under a newer generation —
-        // round-2 review). `NotLive{Vacant}`: the kill proceeds (idempotent
-        // lane cleanup; nothing to stop in the coordinator) and skips the
-        // commit. No retained stamp (never claimed through the
-        // coordinator): the kill is lane-local cleanup, no transition.
+        // round-2 review). The in-flight `NotLive{Starting/Stopping}` case
+        // converges the same way — the in-flight operation either commits
+        // (a later kill with a fresh fence succeeds) or fails (the key
+        // reopens) — and this handler arms no close gate, so a refusal
+        // leaves the still-live session fully operational
+        // (retry-after-settle is honest). `NotLive{Vacant}`: the kill
+        // proceeds (idempotent lane cleanup; nothing to stop in the
+        // coordinator) and skips the commit. No retained stamp (never
+        // claimed through the coordinator): the kill is lane-local
+        // cleanup, no transition.
         let stop_fence =
             crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation);
         let mut stop_generation: Option<u64> = None;

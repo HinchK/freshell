@@ -1468,9 +1468,17 @@ impl FreshClaudeState {
         // resolved for the wire id (a durable) or through the live
         // session's recorded cli id (a placeholder-addressed kill).
         // `BlockedHandoff` / `StaleClaim` / an in-flight `Starting`/`Stopping`
-        // are typed refusals: the caller does NOT kill. `NotLive{Vacant}`:
-        // the kill proceeds (idempotent lane cleanup) and skips the
-        // commit. No retained stamp: lane-local cleanup, no transition.
+        // are typed refusals: the caller does NOT kill. `BlockedHandoff`:
+        // the handoff is already stopping this runtime. `StaleClaim`:
+        // ownership moved under a newer generation. The in-flight
+        // `NotLive{Starting/Stopping}` case converges the same way — the
+        // in-flight operation either commits (a later kill with a fresh
+        // fence succeeds) or fails (the key reopens) — and every refusal
+        // exit rolls the pre-kill mint gate back so the still-live session
+        // keeps serving (adoptions proceed; retry-after-settle is honest).
+        // `NotLive{Vacant}`: the kill proceeds (idempotent lane cleanup)
+        // and skips the commit. No retained stamp: lane-local cleanup, no
+        // transition.
         let stop_fence =
             crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation);
         let mut stop_generation: Option<u64> = None;
@@ -1553,6 +1561,25 @@ impl FreshClaudeState {
                         "fresh_agent_kill_refused: the ownership coordinator refused the \
                          stop (kata b8ke) — nothing is killed"
                     );
+                    // Task 3 review I-1: the refusal killed NOTHING, so it
+                    // must roll the pre-kill mint gate back exactly like
+                    // the Clean-failure abort arm above — a held gate makes
+                    // `adopt_session_init` abandon forever, suppressing the
+                    // still-live session's alias/binding corrector writes,
+                    // and the refusal's own "retry after it settles"
+                    // message promises a retryable, fully operational
+                    // session.
+                    {
+                        let _index = self.cli_index.lock().await;
+                        let _sessions = self.sessions.lock().await;
+                        let mut gates = self.close_pending.lock().expect("close-pending lock");
+                        if let Some(n) = gates.get_mut(&map_key) {
+                            *n -= 1;
+                            if *n == 0 {
+                                gates.remove(&map_key);
+                            }
+                        }
+                    }
                     self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
                         provider: PROVIDER.to_string(),
                         session_id,
@@ -8583,6 +8610,127 @@ rl.on('line', (line) => {
                 .cloned(),
             Some(placeholder.clone()),
             "the post-abort adoption mints normally"
+        );
+    }
+
+    /// kata b8ke Task 3 review I-1: a typed kill REFUSAL (the coordinator
+    /// blocked the stop — here: a handoff owns the session's transition)
+    /// kills NOTHING, so it must also roll back the pre-kill mint gate it
+    /// armed — otherwise the still-live session's adoptions abandon
+    /// forever (the held gate makes `adopt_session_init` discard every
+    /// mint). The refused kill must leave the session fully operational
+    /// for a subsequent adoption.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_kill_releases_the_close_gate_and_adoptions_proceed() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(dedup_create_msg("req-kill-refused"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "req-kill-refused").await;
+        let placeholder = created["sessionId"].as_str().unwrap().to_string();
+
+        // Seed the lane's believed runtime identity exactly as a committed
+        // lane claim does (claim → commit Live{FreshAgent} → retained stamp
+        // under the placeholder — the kill's stop-claim source).
+        let mut seed_ticket = match crate::ownership_lane::begin_lane_claim(
+            &st.ownership,
+            PROVIDER,
+            &placeholder,
+            "test-refused-kill-seed",
+            None,
+            "test",
+            crate::session_lease::now_epoch_ms(),
+        ) {
+            crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+            _ => panic!("fixture: the seed claim must be granted on a vacant key"),
+        };
+        assert!(
+            crate::ownership_lane::commit_lane_claim(
+                &st.ownership,
+                &st.ownership_stamps,
+                PROVIDER,
+                &placeholder,
+                &mut seed_ticket,
+                &placeholder,
+                None,
+            )
+            .is_ok(),
+            "fixture: the seed commit lands Live{{FreshAgent}}"
+        );
+        // The refusal precondition: a handoff owns the placeholder's
+        // transition, so the kill's fenced stop is typed-blocked.
+        let freshell_ownership::BeginOutcome::Granted { .. } = registry.begin_handoff(
+            PROVIDER,
+            &placeholder,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "ho-refused-1",
+            None,
+            "test",
+            crate::session_lease::now_epoch_ms() + 1,
+        ) else {
+            panic!("fixture: the handoff begins from the committed Live state")
+        };
+        while rx.try_recv().is_ok() {}
+
+        st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: placeholder.clone(),
+            session_type: SessionType::Freshclaude,
+            cwd: None,
+        })
+        .await;
+
+        // The refusal killed nothing: the session stays mapped and the
+        // answer reports failure.
+        assert!(
+            st.sessions.lock().await.contains_key(&placeholder),
+            "a refused kill must leave the session mapped"
+        );
+        let mut killed_frame = None;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.killed" {
+                killed_frame = Some(frame);
+            }
+        }
+        let killed_frame = killed_frame.expect("the kill answers freshAgent.killed");
+        assert_eq!(
+            killed_frame["success"], false,
+            "the refused kill reports success:false: {killed_frame}"
+        );
+        // THE regression: the mint gate is released, so an adoption lands
+        // exactly like on a never-killed session.
+        let gated = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+        st.adopt_session_init(
+            gated,
+            &placeholder,
+            "freshclaude",
+            None,
+            None,
+            Some(fake.clone()),
+            None,
+        )
+        .await;
+        assert_eq!(
+            st.cli_index.lock().await.get(gated).cloned(),
+            Some(placeholder.clone()),
+            "the post-refusal adoption mints normally (the gate was released)"
+        );
+        assert!(
+            fake.alias_record_writes
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, p, d)| p == &placeholder && d == gated),
+            "the post-refusal adoption writes its alias record"
         );
     }
     /// Focused-ep5-r1 Finding 1 (retire-on-kill round 2), the REAL wire shape:

@@ -664,6 +664,9 @@ pub(crate) struct FakeIdentitySink {
     /// Retire-on-kill round 6 (focused-ep5-r5 Finding 1) test hook — see
     /// [`Self::arm_retire_stall`].
     retire_stall: std::sync::Mutex<Option<RetireStallGate>>,
+    /// kata b8ke Task 3 review M-1 test hook — see
+    /// [`Self::arm_binding_stall`].
+    binding_stall: std::sync::Mutex<Option<BindingStallGate>>,
     /// Focused-ep5-r5 Finding 2: the fake mirror of the ledger's durable
     /// alias tombstones — (provider, placeholder) -> [(durable, at_ms)],
     /// written by `record_alias_tombstone`, consulted by
@@ -810,6 +813,36 @@ struct RetireStallGate {
 /// parked); `release` lets the stalled answer resolve.
 #[cfg(test)]
 pub(crate) struct RetireStallHandles {
+    pub entered: std::sync::mpsc::Receiver<()>,
+    pub release: tokio::sync::oneshot::Sender<()>,
+}
+
+/// kata b8ke Task 3 review M-1 test hook: the armed binding stall's state.
+/// The write's mutations (the `bindings` log, the row-state flip) land
+/// EAGERLY at call time — exactly like the real ledger's
+/// `record_binding`, which records the row durably inside the call — and
+/// only the returned FUTURE parks behind the test's release, so a lane
+/// that awaits its binding write between a coordinator claim and a
+/// commit (the opencode fork's child registration) sits deterministically
+/// in that window while the test moves the coordinator underneath it.
+#[cfg(test)]
+struct BindingStallGate {
+    /// The (provider, session_id) key this gate intercepts.
+    key: (String, String),
+    /// Signaled when the stalled `record_binding` was INVOKED (its
+    /// mutations already applied — the row is on record and only the
+    /// answer stalls).
+    entered_tx: std::sync::mpsc::Sender<()>,
+    /// The test's release: the returned future resolves only after this.
+    release_rx: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+/// kata b8ke Task 3 review M-1 test hook: the handles
+/// [`FakeIdentitySink::arm_binding_stall`] hands the test. `entered`
+/// fires when the stalled write's mutations LANDED (row recorded, answer
+/// parked); `release` lets the stalled answer resolve.
+#[cfg(test)]
+pub(crate) struct BindingStallHandles {
     pub entered: std::sync::mpsc::Receiver<()>,
     pub release: tokio::sync::oneshot::Sender<()>,
 }
@@ -1022,6 +1055,32 @@ impl FakeIdentitySink {
             release: release_tx,
         }
     }
+    /// kata b8ke Task 3 review M-1 test hook: arm the BINDING stall for
+    /// one identity key. The next `record_binding` for exactly that key
+    /// applies its mutations INLINE (the row lands, exactly like the real
+    /// ledger's `record_binding`) and then parks the returned future
+    /// behind the test's release — so a lane that awaits its binding
+    /// write between a coordinator claim and a commit (the opencode
+    /// fork's child registration) sits deterministically in that window
+    /// while the test moves the coordinator. One-shot: later binding
+    /// writes proceed inline.
+    pub(crate) fn arm_binding_stall(
+        self: &std::sync::Arc<Self>,
+        provider: &str,
+        session_id: &str,
+    ) -> BindingStallHandles {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.binding_stall.lock().unwrap() = Some(BindingStallGate {
+            key: (provider.into(), session_id.into()),
+            entered_tx,
+            release_rx: std::sync::Mutex::new(Some(release_rx)),
+        });
+        BindingStallHandles {
+            entered: entered_rx,
+            release: release_tx,
+        }
+    }
     /// The shared claim-commit decide+apply (the direct path AND the claim
     /// gate's + stall's tasks): EXACTLY `PaneLedger::commit_claim`'s
     /// conditional-transition contract against the fake's state. Refusal
@@ -1228,6 +1287,27 @@ impl PaneIdentitySink for FakeIdentitySink {
                     let _ = applied_tx.send(());
                 });
                 return Box::pin(std::future::ready(Ok(())));
+            }
+            let stall_arm = {
+                let gate = self.binding_stall.lock().unwrap();
+                gate.as_ref().and_then(|g| {
+                    if g.key == (upsert.provider.clone(), upsert.session_id.clone()) {
+                        let release_rx = g.release_rx.lock().unwrap().take();
+                        release_rx.map(|rx| (g.entered_tx.clone(), rx))
+                    } else {
+                        None
+                    }
+                })
+            };
+            if let Some((entered_tx, release_rx)) = stall_arm {
+                // One-shot: disarm so later writes for the key apply inline.
+                *self.binding_stall.lock().unwrap() = None;
+                self.apply_binding(upsert);
+                let _ = entered_tx.send(());
+                return Box::pin(async move {
+                    let _ = release_rx.await;
+                    Ok(())
+                });
             }
             self.apply_binding(upsert);
         }

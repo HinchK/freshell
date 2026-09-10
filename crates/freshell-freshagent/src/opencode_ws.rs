@@ -1559,9 +1559,17 @@ impl FreshOpencodeState {
         // the wire id (a durable `ses_*`) or through the live session's
         // `real_session_id` (a placeholder-addressed kill).
         // `BlockedHandoff` / `StaleClaim` / an in-flight `Starting`/`Stopping`
-        // are typed refusals: the caller does NOT kill. `NotLive{Vacant}`:
-        // the kill proceeds (idempotent lane cleanup) and skips the
-        // commit. No retained stamp: lane-local cleanup, no transition.
+        // are typed refusals: the caller does NOT kill. `BlockedHandoff`:
+        // the handoff is already stopping this runtime. `StaleClaim`:
+        // ownership moved under a newer generation. The in-flight
+        // `NotLive{Starting/Stopping}` case converges the same way — the
+        // in-flight operation either commits (a later kill with a fresh
+        // fence succeeds) or fails (the key reopens) — and every refusal
+        // exit rolls the pre-kill enumeration gate back so the still-live
+        // session keeps serving (sends proceed; retry-after-settle is
+        // honest). `NotLive{Vacant}`: the kill proceeds (idempotent lane
+        // cleanup) and skips the commit. No retained stamp: lane-local
+        // cleanup, no transition.
         let stop_fence =
             crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation);
         let mut stop_generation: Option<u64> = None;
@@ -1578,7 +1586,7 @@ impl FreshOpencodeState {
             let canonical = if msg.session_id.starts_with("ses_") {
                 Some(msg.session_id.clone())
             } else {
-                match session_arc {
+                match session_arc.as_ref() {
                     Some(arc) => arc.lock().await.real_session_id.clone(),
                     None => None,
                 }
@@ -1636,6 +1644,18 @@ impl FreshOpencodeState {
                         "fresh_agent_kill_refused: the ownership coordinator refused the \
                          stop (kata b8ke) — nothing is killed"
                     );
+                    // Task 3 review I-1: the refusal killed NOTHING, so it
+                    // must roll the pre-kill enumeration gate back exactly
+                    // like the Clean-failure abort arm above — a held gate
+                    // bricks every subsequent `freshAgent.send` with
+                    // SESSION_NOT_FOUND (the send gate refuses while
+                    // `close_pending > 0`), and the refusal's own
+                    // "retry after it settles" message promises a
+                    // retryable, fully operational session.
+                    if let Some(session_arc) = &session_arc {
+                        let mut s = session_arc.lock().await;
+                        s.close_pending = s.close_pending.saturating_sub(1);
+                    }
                     self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
                         provider: PROVIDER.to_string(),
                         session_id: msg.session_id,
@@ -2432,16 +2452,25 @@ impl FreshOpencodeState {
                 "freshagent.opencode.fork_commit_stale: the coordinator moved on while the \
                  fork child registered; the uncommitted child is torn down"
             );
-            {
+            // Task 3 review M-1: KEEP the removed value — the re-get below
+            // could never find the just-removed entry, so the bridge abort
+            // and the killed flag never executed (the child's serve-SSE
+            // bridge task leaked, broadcasting for a torn-down session).
+            // The teardown is the sibling stale-commit shape
+            // (`resume_commit_stale` below).
+            let removed = {
                 let mut guard = self.sessions.lock().await;
-                guard.remove(&child.id);
-            }
-            if let Some(session_arc) = self.sessions.lock().await.get(&child.id).cloned() {
-                let mut s = session_arc.lock().await;
+                guard.remove(&child.id)
+            };
+            if let Some(removed) = removed {
+                let mut s = removed.lock().await;
+                s.killed.store(true, Ordering::SeqCst);
+                if let Some(task) = s.turn_task.take() {
+                    task.abort_and_settle().await;
+                }
                 if let Some(bridge) = s.serve_bridge.take() {
                     bridge.abort();
                 }
-                s.killed.store(true, Ordering::SeqCst);
             }
             reply_sink(event_frame(
                 &msg.session_id,
@@ -4972,6 +5001,108 @@ mod tests {
         assert_eq!(
             killed_frame["success"], false,
             "a kill whose durable close failed must report success:false: {killed_frame}"
+        );
+    }
+
+    /// kata b8ke Task 3 review I-1: a typed kill REFUSAL (the coordinator
+    /// blocked the stop — here: a handoff owns the durable key's transition)
+    /// kills NOTHING, so it must also roll back the pre-kill enumeration
+    /// gate it armed — otherwise the still-live session is bricked for
+    /// sends (the send gate refuses SESSION_NOT_FOUND while
+    /// `close_pending > 0`, the exact contract the Clean-failure abort arm
+    /// above established). The refused kill must leave the session fully
+    /// operational for a subsequent send.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_kill_releases_the_enumeration_gate_and_the_session_stays_sendable() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let mut st = FreshOpencodeState::new(fresh_agent);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-kill-refused"), None).await;
+        let placeholder = "freshopencode-req-kill-refused";
+        st.handle_send(send_msg(placeholder, "materialize")).await;
+        let session_arc = {
+            let sessions = st.sessions.lock().await;
+            sessions.get(placeholder).expect("session tracked").clone()
+        };
+        assert_eq!(
+            session_arc.lock().await.real_session_id.as_deref(),
+            Some("ses_1"),
+            "fixture: the send materialized the durable id (and committed Live{{FreshAgent}})"
+        );
+        // The refusal precondition: a handoff owns the durable key's
+        // transition, so the kill's fenced stop is typed-blocked.
+        let freshell_ownership::BeginOutcome::Granted { .. } = registry.begin_handoff(
+            "opencode",
+            "ses_1",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "ho-refused-1",
+            None,
+            "test",
+            crate::session_lease::now_epoch_ms() + 1,
+        ) else {
+            panic!("fixture: the handoff begins from the committed Live state")
+        };
+        while rx.try_recv().is_ok() {}
+
+        st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
+            provider: freshell_protocol::AgentProvider::Opencode,
+            session_id: placeholder.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+
+        // The refusal killed nothing: both map keys stand, the killed flag
+        // was never set, and the answer reports failure.
+        {
+            let sessions = st.sessions.lock().await;
+            assert!(
+                sessions.contains_key(placeholder) && sessions.contains_key("ses_1"),
+                "a refused kill must leave the session map untouched"
+            );
+        }
+        assert!(
+            !session_arc.lock().await.killed.load(Ordering::SeqCst),
+            "a refused kill must never mark the session killed"
+        );
+        let mut killed_frame = None;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.killed" {
+                killed_frame = Some(frame);
+            }
+        }
+        let killed_frame = killed_frame.expect("the kill answers freshAgent.killed");
+        assert_eq!(
+            killed_frame["success"], false,
+            "the refused kill reports success:false: {killed_frame}"
+        );
+        // THE regression: the gate is released, so a subsequent send is
+        // NOT bricked — it is accepted (never SESSION_NOT_FOUND).
+        st.handle_send(send_msg(placeholder, "operational")).await;
+        let mut saw_accepted = false;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert!(
+                frame["type"] != "error",
+                "the post-refusal send must not be refused: {frame}"
+            );
+            if frame["type"] == "freshAgent.send.accepted" {
+                saw_accepted = true;
+            }
+        }
+        assert!(
+            saw_accepted,
+            "the session the kill refused to stop must stay sendable"
         );
     }
 
@@ -10368,6 +10499,93 @@ mod tests {
             child.cwd.as_deref(),
             Some("/parent/cwd"),
             "child.directory ?? state.cwd (adapter.ts fork)"
+        );
+    }
+
+    /// kata b8ke Task 3 review M-1: a fork commit that goes STALE (the
+    /// coordinator moved on while the child registered — here: the
+    /// watchdog's stale-start recovery flips the child's `Starting` to
+    /// `Stopping` mid-fork) must tear the uncommitted child down
+    /// COMPLETELY: map keys gone, killed flag set, serve-SSE bridge
+    /// aborted. The pre-fix teardown re-got the just-removed map entry,
+    /// so the bridge task leaked (broadcasting for a session that no
+    /// longer exists) and the killed flag never landed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fork_commit_that_goes_stale_tears_the_child_down_completely() {
+        let http = Arc::new(ForkFakeHttp::child_ok());
+        let mut st = fork_state(http).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+        insert_fork_parent(&st, "ses_parent", Some("/parent/cwd"), None, None).await;
+
+        // Park the fork BETWEEN its child-key claim and its lane commit: the
+        // child's binding-row write stalls behind the test's release.
+        let stall = fake.arm_binding_stall("opencode", "ses_child");
+        let (sink, captured) = capturing_sink();
+
+        // The mid-fork mover: once the fork parks on the child's binding
+        // write, capture the registered child (proving its serve-SSE bridge
+        // is live at the park), then move the coordinator on (the
+        // watchdog's stale-start recovery) and release the park.
+        let sessions = st.sessions.clone();
+        let registry_mover = registry.clone();
+        let mover = tokio::spawn(async move {
+            stall
+                .entered
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .expect("the fork parks between its claim and its commit");
+            let child_arc = sessions
+                .lock()
+                .await
+                .get("ses_child")
+                .cloned()
+                .expect("the child registered before the park");
+            let bridge_was_live = child_arc.lock().await.serve_bridge.is_some();
+            let recovered = registry_mover.recover_stale_starts(u64::MAX, 0);
+            stall.release.send(()).expect("release the stalled write");
+            (child_arc, bridge_was_live, recovered.len())
+        });
+
+        st.handle_fork(fork_msg("ses_parent", "fork-req-stale", None), None, sink)
+            .await;
+
+        let (child_arc, bridge_was_live, recovered_len) =
+            mover.await.expect("mover task completed");
+        assert_eq!(recovered_len, 1, "fixture: the child's start was recovered");
+        assert!(
+            bridge_was_live,
+            "fixture: the child's serve-SSE bridge was live at the park"
+        );
+
+        // The child is GONE from the map...
+        assert!(
+            !st.sessions.lock().await.contains_key("ses_child"),
+            "the stale commit must remove the uncommitted child"
+        );
+        // ...AND fully torn down: killed flag set + serve bridge aborted
+        // (the pre-fix dead re-get left the bridge task leaked and the flag
+        // unset).
+        {
+            let s = child_arc.lock().await;
+            assert!(
+                s.killed.load(Ordering::SeqCst),
+                "the torn-down child is marked killed"
+            );
+            assert!(
+                s.serve_bridge.is_none(),
+                "the torn-down child's serve bridge was aborted"
+            );
+        }
+        // The fork answers the typed INTERNAL_ERROR, never a success.
+        let frames = captured.lock().expect("captured mutex").clone();
+        assert_eq!(frames.len(), 1, "exactly one reply on the requesting sink");
+        let v = serde_json::to_value(&frames[0]).unwrap();
+        assert_eq!(v["event"]["code"], "INTERNAL_ERROR");
+        assert_eq!(
+            v["event"]["message"],
+            "session ownership changed during fork; the child was torn down"
         );
     }
 
