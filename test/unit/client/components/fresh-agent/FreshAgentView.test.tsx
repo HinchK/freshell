@@ -7185,6 +7185,474 @@ describe('snapshot scheduler integration (zrrj)', () => {
       })
     })
   })
+
+  // ── kata b8ke review I1: direct-reaction lifecycle sends fenced/suppressed ──
+
+  it('the pane-refresh attach carries the observed (epoch, generation) fence', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(freshopencodeSnapshot('done', 10))
+    act(() => store.dispatch(applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'codex',
+      sessionId: 'thread-refresh-fence',
+      epoch: 6,
+      generation: 9,
+      ownerKind: 'fresh-agent',
+      operationId: 'handoff-rf-1',
+      transition: 'handoff-committed',
+    })))
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-refresh-fence',
+        sessionId: 'thread-refresh-fence',
+        status: 'idle',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => {
+      expect(sentFreshAgentMessages('freshAgent.attach').length).toBeGreaterThanOrEqual(1)
+    })
+    wsMock.send.mockClear()
+
+    store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' }))
+
+    await waitFor(() => {
+      const attaches = sentFreshAgentMessages('freshAgent.attach')
+      expect(attaches.some((m) => (
+        m.sessionId === 'thread-refresh-fence'
+        && m.observedEpoch === 6
+        && m.observedGeneration === 9
+      ))).toBe(true)
+    })
+  })
+
+  it('a diverged session suppresses the pane-refresh attach (and its snapshot refresh)', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(freshopencodeSnapshot('done', 10))
+    act(() => store.dispatch(applyRuntimeOwner(terminalOwnerFrame({
+      provider: 'codex',
+      sessionId: 'thread-refresh-diverted',
+    }))))
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-refresh-diverted',
+        sessionId: 'thread-refresh-diverted',
+        status: 'idle',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await act(async () => { await new Promise((r) => setTimeout(r, 50)) })
+    wsMock.send.mockClear()
+    apiMock.getFreshAgentThreadSnapshot.mockClear()
+
+    store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' }))
+
+    await act(async () => { await new Promise((r) => setTimeout(r, 150)) })
+    // The refresh reaction is suppressed for a divergent pane: no attach,
+    // no snapshot churn — the pane renders the divergence state instead.
+    expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(0)
+    expect(apiMock.getFreshAgentThreadSnapshot).not.toHaveBeenCalled()
+  })
+
+  it('the pane-refresh create re-send carries the observed (epoch, generation) fence', async () => {
+    const store = createStore()
+    act(() => store.dispatch(applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'codex',
+      sessionId: 'sid-refresh-create-fence',
+      epoch: 8,
+      generation: 2,
+      ownerKind: 'fresh-agent',
+      operationId: 'handoff-rc-1',
+      transition: 'handoff-committed',
+    })))
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-refresh-create-fence',
+        sessionRef: { provider: 'codex', sessionId: 'sid-refresh-create-fence' },
+        status: 'creating',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => {
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1)
+    })
+    wsMock.send.mockClear()
+
+    store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' }))
+
+    await waitFor(() => {
+      const creates = sentFreshAgentMessages('freshAgent.create')
+      expect(creates).toHaveLength(1)
+      expect(creates[0]).toMatchObject({
+        requestId: 'req-refresh-create-fence',
+        observedEpoch: 8,
+        observedGeneration: 2,
+      })
+    })
+  })
+
+  it('a diverged session suppresses the pane-refresh create re-send', async () => {
+    const store = createStore()
+    act(() => store.dispatch(applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'codex',
+      sessionId: 'sid-refresh-create-diverted',
+      epoch: 3,
+      generation: 2,
+      ownerKind: 'terminal',
+      terminalId: 't-cli-refresh',
+      operationId: 'handoff-rc-2',
+      transition: 'handoff-committed',
+    })))
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-refresh-create-diverted',
+        sessionRef: { provider: 'codex', sessionId: 'sid-refresh-create-diverted' },
+        status: 'creating',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    // Mount create is suppressed by the create effect's own divergence check.
+    await act(async () => { await new Promise((r) => setTimeout(r, 50)) })
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+
+    store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' }))
+    await act(async () => { await new Promise((r) => setTimeout(r, 150)) })
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+  })
+
+  it('the FRESH_AGENT_LOST_SESSION retry attach carries the observed (epoch, generation) fence', async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      onMessage = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'empty',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [],
+    })
+    act(() => store.dispatch(applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'opencode',
+      sessionId: 'ses_retry_fence',
+      epoch: 3,
+      generation: 7,
+      ownerKind: 'fresh-agent',
+      operationId: 'handoff-lr-1',
+      transition: 'handoff-committed',
+    })))
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-retry-fence',
+        sessionId: 'ses_retry_fence',
+        status: 'idle',
+        initialCwd: '/w',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+    })
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'hello fenced retry' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    const sendFrame = sentFreshAgentMessages('freshAgent.send').at(-1)
+    expect(sendFrame).toBeTruthy()
+    await waitFor(() => {
+      expect(getFreshAgentPaneContent(store)).toMatchObject({ status: 'running' })
+    })
+    wsMock.send.mockClear()
+
+    act(() => {
+      onMessage?.({
+        type: 'error',
+        code: 'FRESH_AGENT_LOST_SESSION',
+        requestId: sendFrame?.requestId,
+        message: 'not tracked',
+        timestamp: Date.now(),
+      })
+    })
+
+    await waitFor(() => {
+      const attaches = sentFreshAgentMessages('freshAgent.attach')
+      expect(attaches.some((m) => (
+        m.sessionId === 'ses_retry_fence'
+        && m.cwd === '/w'
+        && m.observedEpoch === 3
+        && m.observedGeneration === 7
+      ))).toBe(true)
+      expect(sentFreshAgentMessages('freshAgent.send').filter((m) => m.text === 'hello fenced retry')).toHaveLength(1)
+    })
+  })
+
+  it('a diverged session suppresses the FRESH_AGENT_LOST_SESSION retry (no attach, no resend) and takes the cleanup path', async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      onMessage = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'empty',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [],
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-retry-diverted',
+        sessionId: 'ses_retry_diverted',
+        status: 'idle',
+        initialCwd: '/w',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+    })
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'hello diverted retry' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    const sendFrame = sentFreshAgentMessages('freshAgent.send').at(-1)
+    expect(sendFrame).toBeTruthy()
+    await waitFor(() => {
+      expect(getFreshAgentPaneContent(store)).toMatchObject({ status: 'running' })
+    })
+    // Mid-flight divergence: the session is handed to a terminal runtime
+    // before the lost-session error arrives — the retry reaction must be
+    // suppressed, not sent stale.
+    act(() => store.dispatch(applyRuntimeOwner(terminalOwnerFrame({
+      sessionId: 'ses_retry_diverted',
+    }))))
+    wsMock.send.mockClear()
+
+    act(() => {
+      onMessage?.({
+        type: 'error',
+        code: 'FRESH_AGENT_LOST_SESSION',
+        requestId: sendFrame?.requestId,
+        message: 'not tracked',
+        timestamp: Date.now(),
+      })
+    })
+
+    await waitFor(() => {
+      expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(0)
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+      // Cleanup fall-through: the stale echo is cleared and the optimistic
+      // busy is released — no leaks while the retry never fires.
+      expect(screen.queryByText('hello diverted retry')).not.toBeInTheDocument()
+    })
+    expect(getFreshAgentPaneContent(store).status).not.toBe('running')
+  })
+
+  it('the post-fork cleanup kill carries the observed (epoch, generation) fence', async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      onMessage = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'empty',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [],
+    })
+    act(() => store.dispatch(applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'codex',
+      sessionId: 'thread-fork-fence',
+      epoch: 5,
+      generation: 2,
+      ownerKind: 'fresh-agent',
+      operationId: 'handoff-fk-1',
+      transition: 'handoff-committed',
+    })))
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-fork-fence',
+        sessionId: 'thread-fork-fence',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(onMessage).toBeTypeOf('function')
+    })
+    wsMock.send.mockClear()
+
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.forked',
+        requestId: 'req-fork-fence',
+        parentSessionId: 'thread-fork-fence',
+        sessionId: 'thread-fork-child',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        runtimeProvider: 'codex',
+      })
+    })
+
+    await waitFor(() => {
+      const kills = sentFreshAgentMessages('freshAgent.kill')
+      expect(kills.some((m) => (
+        m.sessionId === 'thread-fork-fence'
+        && m.observedEpoch === 5
+        && m.observedGeneration === 2
+      ))).toBe(true)
+    })
+  })
+
+  it('the post-fork cleanup kill is fenced, not suppressed, when the parent session has diverged', async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      onMessage = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'empty',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [],
+    })
+    act(() => store.dispatch(applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'codex',
+      sessionId: 'thread-fork-diverted',
+      epoch: 4,
+      generation: 1,
+      ownerKind: 'terminal',
+      terminalId: 't-cli-fork',
+      operationId: 'handoff-fk-2',
+      transition: 'handoff-committed',
+    })))
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-fork-diverted',
+        sessionId: 'thread-fork-diverted',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(onMessage).toBeTypeOf('function')
+    })
+    wsMock.send.mockClear()
+
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.forked',
+        requestId: 'req-fork-diverted',
+        parentSessionId: 'thread-fork-diverted',
+        sessionId: 'thread-fork-diverted-child',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        runtimeProvider: 'codex',
+      })
+    })
+
+    // Kills are fenced, never suppressed (the startNewConversation/
+    // restartStuckSidecar pattern): the server typed-refuses a stale
+    // cross-kind kill from the fence pair instead of the client guessing.
+    await waitFor(() => {
+      const kills = sentFreshAgentMessages('freshAgent.kill')
+      expect(kills.some((m) => (
+        m.sessionId === 'thread-fork-diverted'
+        && m.observedEpoch === 4
+        && m.observedGeneration === 1
+      ))).toBe(true)
+    })
+  })
 })
 
 describe('FreshAgentView /model slash command', () => {

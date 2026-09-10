@@ -1062,18 +1062,24 @@ export function FreshAgentView({
 
   // kata b8ke (round-3 F6): the ONE fenced attach sender — every
   // freshAgent.attach producer (mount rebind, reconnect re-attach,
-  // SESSION_RESERVED redrive) goes through this. Attach is a lifecycle start
-  // (it can cold-resume an untracked session): suppressed while the
-  // canonical session diverges (owned by the other kind — the pane renders
-  // the divergence state instead), otherwise carrying the observed
-  // (epoch, generation) fence so a delayed attach naming superseded
-  // ownership is typed-refused server-side.
-  const sendFencedFreshAgentAttach = useCallback((content: FreshAgentPaneContent) => {
-    if (!content.sessionId) return
-    if (isLifecycleStartSuperseded(appStore.getState(), 'fresh-agent', content, undefined)) return
+  // SESSION_RESERVED redrive, pane-refresh reaction, lost-session retry)
+  // goes through this. Attach is a lifecycle start (it can cold-resume an
+  // untracked session): suppressed while the canonical session diverges
+  // (owned by the other kind — the pane renders the divergence state
+  // instead), otherwise carrying the observed (epoch, generation) fence so
+  // a delayed attach naming superseded ownership is typed-refused
+  // server-side. Returns whether the attach was sent — false means
+  // suppressed, so reaction handlers that follow the attach with more
+  // sends (the lost-session retry's resend) can skip them.
+  const sendFencedFreshAgentAttach = useCallback((content: FreshAgentPaneContent): boolean => {
+    if (!content.sessionId) return false
+    // One state read (review N1): the suppression check and the fence read
+    // observe the same store snapshot — nothing dispatches in between.
     const state = appStore.getState()
+    if (isLifecycleStartSuperseded(state, 'fresh-agent', content, undefined)) return false
     const cwd = getFreshOpenCodeRouteCwd(content, { sessionCwd: freshOpenCodeRouteCwdRef.current })
     sendFreshAgentMessage(buildFreshAgentAttachMessage(content, cwd, selectPaneOwnerFence(state, content)))
+    return true
   }, [appStore, sendFreshAgentMessage])
 
   useEffect(() => () => {
@@ -1456,23 +1462,35 @@ export function FreshAgentView({
     setLoadError(null)
 
     if (current.sessionId) {
-      const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
-      sendFreshAgentMessage(buildFreshAgentAttachMessage(current, cwd))
-      requestSnapshotRefresh('manual')
+      // kata b8ke (review I1): the refresh reaction's attach is a lifecycle
+      // start — routed through the ONE fenced sender, so a diverged pane
+      // suppresses it (and the snapshot churn that follows) instead of
+      // sending a stale attach the server would only typed-refuse.
+      if (sendFencedFreshAgentAttach(current)) {
+        requestSnapshotRefresh('manual')
+      }
     } else if (current.status === 'creating' || current.status === 'starting') {
-      createSentRef.current = true
-      registerFreshAgentCreate(dispatch, current.createRequestId, {
-        sessionType: current.sessionType,
-        provider: current.provider,
-        resumeSessionId: current.resumeSessionId,
-        sessionRef: current.sessionRef,
-        cwd: current.initialCwd,
-      })
-      sendFreshAgentMessage(buildCreateMessage(current))
+      // kata b8ke (review I1): the refresh reaction's create re-send gets
+      // the same fence discipline as the create effect — capture the
+      // observed fence, suppress on divergence. Suppressed re-sends leave
+      // createSentRef armed so the standard create effect retains
+      // responsibility for any later (converged) retry.
+      const observedFence = selectPaneOwnerFence(appStore.getState(), current)
+      if (!isLifecycleStartSuperseded(appStore.getState(), 'fresh-agent', current, observedFence)) {
+        createSentRef.current = true
+        registerFreshAgentCreate(dispatch, current.createRequestId, {
+          sessionType: current.sessionType,
+          provider: current.provider,
+          resumeSessionId: current.resumeSessionId,
+          sessionRef: current.sessionRef,
+          cwd: current.initialCwd,
+        })
+        sendFreshAgentMessage(buildCreateMessage(current, observedFence))
+      }
     }
 
     dispatch(consumePaneRefreshRequest({ tabId, paneId, requestId: refreshRequest.requestId }))
-  }, [buildCreateMessage, commitSnapshot, dispatch, paneId, refreshRequest, requestSnapshotRefresh, sendFreshAgentMessage, tabId])
+  }, [appStore, buildCreateMessage, commitSnapshot, dispatch, paneId, refreshRequest, requestSnapshotRefresh, sendFencedFreshAgentAttach, sendFreshAgentMessage, tabId])
 
   const triggerRecovery = useCallback(() => {
     if (restoreTimeoutRef.current !== null) {
@@ -2000,24 +2018,25 @@ export function FreshAgentView({
           // The ses_ guard keeps genuinely-invalid placeholder/non-durable
           // lost-session errors on the normal cleanup path below.
           if (pendingMeta?.text && cwd && sessionId && sessionId.startsWith('ses_')) {
-            // Re-attach with the route cwd (the incident's no-cwd locator),
-            // then resend the retained text exactly once. The original
-            // request is consumed here; the retry itself is never retried.
-            lostSessionRetryRef.current.add(failedRequestId)
-            pendingSendMetadataRef.current.delete(failedRequestId)
-            sendFreshAgentMessage({
-              type: 'freshAgent.attach',
-              sessionId,
-              sessionType: 'freshopencode',
-              provider: 'opencode',
-              cwd,
-            })
-            const retryRequestId = nanoid()
-            lostSessionRetryRef.current.add(retryRequestId)
-            resendPendingMessage(retryRequestId, pendingMeta.text, cwd)
-            // Do NOT fall through: the echo stays visible while the retry is
-            // in flight.
-            return
+            // kata b8ke (review I1): the retry's re-attach is a lifecycle
+            // start — routed through the ONE fenced attach sender. While the
+            // canonical session has diverged the retry is suppressed (no
+            // attach, no resend at a stale session) and the failure falls
+            // through to the normal cleanup path below instead.
+            if (sendFencedFreshAgentAttach(current)) {
+              // Re-attach with the route cwd (the incident's no-cwd
+              // locator), then resend the retained text exactly once. The
+              // original request is consumed here; the retry itself is
+              // never retried.
+              lostSessionRetryRef.current.add(failedRequestId)
+              pendingSendMetadataRef.current.delete(failedRequestId)
+              const retryRequestId = nanoid()
+              lostSessionRetryRef.current.add(retryRequestId)
+              resendPendingMessage(retryRequestId, pendingMeta.text, cwd)
+              // Do NOT fall through: the echo stays visible while the retry is
+              // in flight.
+              return
+            }
           }
         }
         // Cleanup fall-through: every owned send failure that did not take
@@ -2099,12 +2118,19 @@ export function FreshAgentView({
       ) {
         if (message.sessionId !== paneContent.sessionId) {
           const cwd = getFreshOpenCodeRouteCwd(paneContent, { sessionCwd: agentSession?.cwd })
+          // kata b8ke (review I1): the post-fork cleanup kill carries the
+          // observed (epoch, generation) fence exactly like
+          // startNewConversation/restartStuckSidecar — kills are fenced,
+          // never suppressed; the server typed-refuses a stale cross-kind
+          // kill from the pair instead of the client guessing.
+          const fence = selectPaneOwnerFence(appStore.getState(), paneContent)
           sendFreshAgentMessage({
             type: 'freshAgent.kill',
             sessionId: paneContent.sessionId,
             sessionType: paneContent.sessionType,
             provider: paneContent.provider,
             ...(cwd ? { cwd } : {}),
+            ...(fence ? { observedEpoch: fence.epoch, observedGeneration: fence.generation } : {}),
           })
         }
         commitSnapshot(null)
@@ -2128,7 +2154,7 @@ export function FreshAgentView({
       }
     })
     return unsubscribe
-  }, [agentSession?.cwd, clearReserveRedrive, commitSnapshot, descriptor?.label, dispatch, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, redriveAfterSessionReserved, releasePendingRebind, requestSnapshotRefresh, resendPendingMessage, sendFreshAgentMessage, setLocalEcho, tabId, ws])
+  }, [agentSession?.cwd, appStore, clearReserveRedrive, commitSnapshot, descriptor?.label, dispatch, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, redriveAfterSessionReserved, releasePendingRebind, requestSnapshotRefresh, resendPendingMessage, sendFencedFreshAgentAttach, sendFreshAgentMessage, setLocalEcho, tabId, ws])
 
   useEffect(() => {
     if (!snapshotThreadId) return
