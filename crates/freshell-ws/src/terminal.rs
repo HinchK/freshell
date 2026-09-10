@@ -2981,6 +2981,20 @@ pub(crate) async fn handle_create(
     // the outcome itself is discoverable through the registry.
     let _keyed_create_guard = keyed_create_guard;
 
+    // kata b8ke Task 7: the terminal-create pause seam — the deterministic
+    // race tests park the create HERE, between the keyed-create precheck
+    // above and the coordinator claim below, so a fresh-agent attach that
+    // wins the key while the create is parked is answered with the typed
+    // cross-kind refusal when it unparks (the parked create holds NO
+    // coordinator lease). The hook is an AWAITED barrier (a notify-only
+    // closure would not pause anything); the Arc is cloned out BEFORE the
+    // await (never hold the registry's pause lock across an await). `None`
+    // in production — a no-op pass-through.
+    let create_pause = state.registry.terminal_create_pause_hook();
+    if let Some(hook) = create_pause {
+        hook(&create.request_id).await;
+    }
+
     // kata b8ke Task 4: the terminal lane's coordinator claim — the
     // cross-kind authority, UNGATED (round-2 review: EVERY connection's
     // create-with-sessionRef claims here, BEFORE the registry lease and

@@ -569,6 +569,15 @@ fn retained_runtime_identity(
     }
 }
 
+/// kata b8ke Task 7: the terminal-create pause hook — a closure returning a
+/// future the WS lane's `handle_create` AWAITS (parked between the
+/// keyed-create precheck and the coordinator claim). Test-only (never set in
+/// production); the `TerminalLivenessProbe` injection idiom, async flavor —
+/// this std-sync-free crate only STORES the future, the WS lane awaits it.
+pub type TerminalCreatePauseHook = std::sync::Arc<
+    dyn Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
+>;
+
 #[derive(Clone)]
 pub struct TerminalRegistry {
     inner: Arc<Mutex<RegistryInner>>,
@@ -651,6 +660,18 @@ pub struct TerminalRegistry {
     /// release paths take-if-matches (a newer owner's entry is never taken by
     /// an older terminal's exit).
     session_ref_ownership: Arc<Mutex<HashMap<String, RetainedSessionRefOwnership>>>,
+    /// kata b8ke Task 7: the deterministic-race pause seam for
+    /// `terminal.create` — a closure returning a future the WS lane's
+    /// `handle_create` AWAITS between the keyed-create precheck and the
+    /// coordinator claim, so tests can park a create mid-flight and prove the
+    /// cross-kind fencing under a concurrent fresh-agent attach (a
+    /// notify-only closure would not pause anything). `None` (the default,
+    /// never set in production) keeps every create a no-op pass-through.
+    /// Hosted HERE (not on the WS state struct) because the registry is the
+    /// terminal lane's shared, constructor-built state — interior-shared so
+    /// every cloned handle (the WS state's, the REST spawn state's) observes
+    /// a test-set hook (the `activity_observer` injection idiom).
+    terminal_create_pause: Arc<std::sync::RwLock<Option<TerminalCreatePauseHook>>>,
 }
 
 /// The retained coordinator claim for one sessionRef-owning terminal (kata
@@ -813,6 +834,7 @@ impl TerminalRegistry {
             session_ref_bindings: Arc::new(Mutex::new(HashMap::new())),
             ownership: None,
             session_ref_ownership: Arc::new(Mutex::new(HashMap::new())),
+            terminal_create_pause: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -855,6 +877,38 @@ impl TerminalRegistry {
             .activity_observer
             .write()
             .expect("activity observer lock") = Some(observer);
+    }
+
+    /// kata b8ke Task 7: install the terminal-create pause hook (the
+    /// deterministic-race tests inject here — see
+    /// [`TerminalCreatePauseHook`]). Interior-shared: every cloned registry
+    /// handle (the WS state's, the REST spawn state's) observes it. Never
+    /// set in production.
+    pub fn set_terminal_create_pause_for_tests(&self, hook: TerminalCreatePauseHook) {
+        *self
+            .terminal_create_pause
+            .write()
+            .expect("terminal create pause lock") = Some(hook);
+    }
+
+    /// kata b8ke Task 7: clear the terminal-create pause hook (the race
+    /// tests' between-scenarios cleanup).
+    pub fn clear_terminal_create_pause_for_tests(&self) {
+        *self
+            .terminal_create_pause
+            .write()
+            .expect("terminal create pause lock") = None;
+    }
+
+    /// kata b8ke Task 7: the clone-out read of the terminal-create pause
+    /// hook for `handle_create` — the caller clones the `Arc` out FIRST and
+    /// awaits the hook's future AFTER the lock is released (never hold a
+    /// lock across an await). `None` in production.
+    pub fn terminal_create_pause_hook(&self) -> Option<TerminalCreatePauseHook> {
+        self.terminal_create_pause
+            .read()
+            .expect("terminal create pause lock")
+            .clone()
     }
 
     /// Fire the activity tap, if installed. Cheap no-op otherwise.

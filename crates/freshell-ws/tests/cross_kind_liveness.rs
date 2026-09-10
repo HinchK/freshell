@@ -20,8 +20,12 @@
 //! Harness: the lease-suite fake claude sidecar (request-log knob) + the common
 //! sleeper CLI spec so terminal claude creates genuinely spawn a Running PTY.
 //! Run via `scripts/sandbox-test.sh` per the destructive-suite convention of the
-//! sibling lease suite (shared file-level ruling; these tests kill nothing).
+//! sibling lease suite (shared file-level ruling; the kata-b8ke Task 7 races
+//! kill only sidecar children this harness itself spawned — R4's
+//! unconfirmable-prior arm SIGKILLs its own fake sidecar, the lease-suite
+//! class).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -479,11 +483,28 @@ async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry, WsState
 /// spawn_merged_server pattern).
 struct MergedHarness {
     base_url: String,
+    /// The WS door's URL — the races that need a SECOND connection (R2's
+    /// fresh attach while the first connection's create is parked) connect
+    /// here (kata b8ke Task 7).
+    ws_url: String,
     ws: TestWs,
     ws_state: WsState,
+    /// The handoff runner the REST route serves — the direct-drive door for
+    /// the races that need the abort-capable `HandoffHandle` (R7) or the
+    /// runner's installed hooks (kata b8ke Task 7).
+    handoff_runner: Arc<freshell_freshagent::SessionHandoffRunner>,
 }
 
 async fn spawn_merged_server() -> MergedHarness {
+    spawn_merged_server_with_hooks(Arc::new(freshell_freshagent::HandoffTestHooks::default())).await
+}
+
+/// kata b8ke Task 7: [`spawn_merged_server`] plus the runner's test hooks —
+/// the pause/injection seams (R4-R7) must be armed BEFORE the runner is
+/// minted (the states are cloned into it).
+async fn spawn_merged_server_with_hooks(
+    hooks: Arc<freshell_freshagent::HandoffTestHooks>,
+) -> MergedHarness {
     let cli_commands = Arc::new(vec![sleeper_cli_spec("claude"), sleeper_cli_spec("codex")]);
     let (state, registry, fresh_agent_state) =
         build_ws_state(cli_commands.iter().cloned().collect()).await;
@@ -500,26 +521,30 @@ async fn spawn_merged_server() -> MergedHarness {
     // kata b8ke Task 6: the handoff runner — the SAME fresh states, registry,
     // coordinator, broadcast bus, and CLI specs (main.rs's mint shape; the
     // REST spawn state additionally wired with the registry + specs the
-    // terminal-target pipeline needs).
+    // terminal-target pipeline needs). Task 7: minted with the test hooks.
     let ownership = state.ownership.clone().expect("coordinator wired");
-    let handoff_runner = Arc::new(freshell_freshagent::SessionHandoffRunner::new(
-        Arc::new(AUTH_TOKEN.to_string()),
-        state.broadcast_tx.clone(),
-        ownership,
-        registry.clone(),
-        state.fresh_codex.clone(),
-        state.fresh_claude.clone(),
-        state.fresh_opencode.clone(),
-        fresh_agent_state
-            .with_ownership(state.ownership.clone().expect("coordinator wired"))
-            .with_terminal_registry(registry.clone())
-            .with_cli_commands(Arc::clone(&cli_commands)),
-        Arc::clone(&cli_commands),
-    ));
+    let handoff_runner = Arc::new(
+        freshell_freshagent::SessionHandoffRunner::new(
+            Arc::new(AUTH_TOKEN.to_string()),
+            state.broadcast_tx.clone(),
+            ownership,
+            registry.clone(),
+            state.fresh_codex.clone(),
+            state.fresh_claude.clone(),
+            state.fresh_opencode.clone(),
+            fresh_agent_state
+                .clone()
+                .with_ownership(state.ownership.clone().expect("coordinator wired"))
+                .with_terminal_registry(registry.clone())
+                .with_cli_commands(Arc::clone(&cli_commands)),
+            Arc::clone(&cli_commands),
+        )
+        .with_test_hooks(Arc::clone(&hooks)),
+    );
     let app = freshell_ws::router(state.clone())
         .merge(freshell_freshagent::snapshot::router(snapshot_state))
         .merge(freshell_freshagent::session_handoff::handoff_router(
-            handoff_runner,
+            Arc::clone(&handoff_runner),
         ));
 
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -534,8 +559,10 @@ async fn spawn_merged_server() -> MergedHarness {
     let ws = connect(&ws_url).await;
     MergedHarness {
         base_url: format!("http://{addr}"),
+        ws_url,
         ws,
         ws_state: state,
+        handoff_runner,
     }
 }
 
@@ -2217,4 +2244,1173 @@ async fn fresh_agent_to_terminal_handoff_is_atomic_and_broadcast() {
         "the refusal names the terminal owner: {refused}"
     );
     let _ = sidecar;
+}
+
+// ── kata b8ke Task 7: the deterministic pause-hook race suite ───────────────
+//
+// The kata's required race matrix, made DETERMINISTIC through the pause seams
+// (never sleeps): R1/R3 park a snapshot GET mid-flight at the Task 5
+// codex-lane seam (before its live-map/coordinator resolution — the released
+// GET re-resolves both); R2 parks a terminal.create after its keyed-create
+// precheck (the Task 7 seam, hosted on the terminal registry — see
+// `TerminalCreatePauseHook`); R4-R7 park the handoff runner itself through
+// Task 6's `HandoffTestHooks`.
+//
+// BARRIER DISCIPLINE (round-3 F10, adapted losslessly): the arrival signal
+// is an `AtomicBool` polled on a bounded cadence and the release is a
+// `oneshot` — a sent permit is STORED even if the parked future has not
+// polled yet, so no wakeup can be lost to a registration race (the
+// `snapshot_pause_hook_parks_the_get...` precedent in codex.rs). The runner's
+// own `pause_after_enter` is released with `notify_one()` (permit-storing),
+// never `notify_waiters()`.
+
+/// Establish a live freshcodex owner for `sid` (the fake app-server serves
+/// the durable `thread/resume`) and return once the coordinator records it
+/// Live — Task 6's `establish_fresh_claude_owner`, codex flavor.
+async fn establish_freshcodex_session(h: &mut MergedHarness, sid: &str) {
+    send_json(
+        &mut h.ws,
+        &json!({
+            "type": "freshAgent.create",
+            "requestId": format!("establish-{}", uuid::Uuid::new_v4()),
+            "sessionType": "freshcodex", "provider": "codex", "cwd": "/tmp",
+            "sessionRef": { "provider": "codex", "sessionId": sid },
+        }),
+    )
+    .await;
+    let _ = await_frame(&mut h.ws, Duration::from_secs(20), |v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("freshAgent.created")
+    })
+    .await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match h
+            .ws_state
+            .fresh_codex
+            .ownership_snapshot("codex", sid)
+            .state
+        {
+            freshell_ownership::OwnershipState::Live { owner, .. } => {
+                assert_eq!(
+                    owner.kind,
+                    freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    "the freshcodex owner must be Live{{FreshAgent}}"
+                );
+                return;
+            }
+            state => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "freshcodex owner never committed Live, got {state:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+}
+
+/// The durable `thread/resume` count for `sid` in the fake app-server's op
+/// ledger — the "a sidecar actually served this session" surface.
+fn ledger_resumes_for(fake: &DualRoleCodexFake, sid: &str) -> usize {
+    fake.thread_op_rows()
+        .iter()
+        .filter(|r| r["method"] == json!("thread/resume") && r["threadId"].as_str() == Some(sid))
+        .count()
+}
+
+/// Bounded-poll until the flag flips — the parked seam's arrival proof
+/// (lossless: no wakeup registration to lose, unlike a bare Notify wait).
+async fn await_flag(flag: &AtomicBool, desc: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !flag.load(Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the parked seam was never entered: {desc}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Install the snapshot-GET pause hook (the codex lane's Task 5 seam): the
+/// next GET parks at the seam — BEFORE its live-map/coordinator resolution
+/// (Task 5's delivered placement: the released GET re-resolves BOTH the
+/// live map and the coordinator, so a handoff that completed while parked
+/// answers the typed 409 instead of serving a stale pre-pause resolution —
+/// this subsumes the kata's "after the initial lookup" wording) — until the
+/// returned release is sent. Returns the arrival flag.
+fn install_snapshot_pause(
+    h: &MergedHarness,
+) -> (Arc<AtomicBool>, tokio::sync::oneshot::Sender<()>) {
+    let entered = Arc::new(AtomicBool::new(false));
+    let entered_for_hook = Arc::clone(&entered);
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let release_rx = std::sync::Mutex::new(Some(release_rx));
+    h.ws_state
+        .fresh_codex
+        .set_snapshot_pause_for_tests(Arc::new(move |_thread_id: &str| {
+            let entered = Arc::clone(&entered_for_hook);
+            let release_rx = release_rx.lock().expect("release rx lock").take();
+            Box::pin(async move {
+                entered.store(true, Ordering::SeqCst);
+                // The REAL barrier: park until the test releases (a oneshot
+                // permit survives an unpolled receiver — lossless).
+                if let Some(release_rx) = release_rx {
+                    let _ = release_rx.await;
+                }
+            })
+        }));
+    (entered, release_tx)
+}
+
+/// Install the terminal-create pause hook (the Task 7 seam on the terminal
+/// registry): the next `terminal.create` parks between its keyed-create
+/// precheck and the coordinator claim until the returned release is sent.
+fn install_terminal_create_pause(
+    h: &MergedHarness,
+) -> (Arc<AtomicBool>, tokio::sync::oneshot::Sender<()>) {
+    let entered = Arc::new(AtomicBool::new(false));
+    let entered_for_hook = Arc::clone(&entered);
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let release_rx = std::sync::Mutex::new(Some(release_rx));
+    h.ws_state
+        .registry
+        .set_terminal_create_pause_for_tests(Arc::new(move |_request_id: &str| {
+            let entered = Arc::clone(&entered_for_hook);
+            let release_rx = release_rx.lock().expect("release rx lock").take();
+            Box::pin(async move {
+                entered.store(true, Ordering::SeqCst);
+                if let Some(release_rx) = release_rx {
+                    let _ = release_rx.await;
+                }
+            })
+        }));
+    (entered, release_tx)
+}
+
+/// The handoff REST body every race posts (the fresh→terminal direction on
+/// the codex lane — the snapshot GET door is codex-only, so the races that
+/// assert the read-only contract ride this lane).
+fn handoff_post_body(sid: &str, device: &str) -> Value {
+    json!({
+        "provider": "codex", "sessionId": sid, "targetKind": "terminal",
+        "mode": "codex", "deviceId": device,
+    })
+}
+
+/// The `session.runtimeOwner` frame with this transition for this session
+/// (each transition is broadcast exactly once per handoff).
+async fn await_owner_transition(h: &mut MergedHarness, sid: &str, transition: &str) -> Value {
+    await_frame(&mut h.ws, Duration::from_secs(20), |v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("session.runtimeOwner")
+            && v.get("transition").and_then(|t| t.as_str()) == Some(transition)
+            && v.get("sessionId").and_then(|s| s.as_str()) == Some(sid)
+    })
+    .await
+}
+
+/// Bounded-poll the coordinator until the predicate holds (the async
+/// detached-cleanup settles).
+async fn await_ownership(
+    h: &MergedHarness,
+    sid: &str,
+    want: impl Fn(&freshell_ownership::OwnershipState) -> bool,
+    desc: &str,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let snap = h
+            .ws_state
+            .ownership
+            .as_ref()
+            .expect("coordinator wired")
+            .observe("codex", sid);
+        if want(&snap.state) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "condition never held within budget ({desc}): {:?}",
+            snap.state
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+// ── the capturing tracing layer (the diag01 / Task-6-tests idiom) ───────────
+
+mod race_tracing_capture {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id};
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+    use tracing_subscriber::registry::LookupSpan;
+    use tracing_subscriber::Layer;
+
+    #[derive(Debug, Clone, Default)]
+    pub struct CapturedEvent {
+        pub target: String,
+        pub event: String,
+        pub fields: BTreeMap<String, String>,
+    }
+
+    #[derive(Default)]
+    struct FieldVisitor {
+        event: String,
+        fields: BTreeMap<String, String>,
+    }
+
+    impl Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.fields
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "event" {
+                self.event = value.to_string();
+            }
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_bool(&mut self, field: &Field, value: bool) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    struct CaptureLayer {
+        events: Arc<Mutex<Vec<CapturedEvent>>>,
+    }
+
+    impl<S> Layer<S> for CaptureLayer
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+    {
+        fn on_new_span(&self, _attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {}
+
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            let mut visitor = FieldVisitor::default();
+            event.record(&mut visitor);
+            self.events
+                .lock()
+                .expect("capture lock")
+                .push(CapturedEvent {
+                    target: event.metadata().target().to_string(),
+                    event: visitor.event,
+                    fields: visitor.fields,
+                });
+        }
+    }
+
+    /// Thread-local capturing subscriber (current-thread test runtimes:
+    /// the runner task, the settle task, and the lane awaits all poll on
+    /// this thread and observe the default).
+    pub fn capture() -> (
+        Arc<Mutex<Vec<CapturedEvent>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let layer = CaptureLayer {
+            events: Arc::clone(&events),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let guard = tracing::subscriber::set_default(subscriber);
+        (events, guard)
+    }
+}
+
+/// The first captured `freshell_ownership` event with this name (R7's
+/// observability assertions — the COMPLETE transition-event field set).
+fn find_captured<'e>(
+    events: &'e [race_tracing_capture::CapturedEvent],
+    event: &str,
+) -> Option<&'e race_tracing_capture::CapturedEvent> {
+    events
+        .iter()
+        .find(|e| e.target == "freshell_ownership" && e.event == event)
+}
+
+// ── the seven deterministic races ───────────────────────────────────────────
+
+/// R1: park a snapshot GET mid-flight (the kata's "paused after initial
+/// lookup" — the delivered seam parks BEFORE the resolution, so the released
+/// GET re-resolves live map AND coordinator; the strongest form), begin the
+/// fresh→terminal handoff, then release the snapshot. The released GET must
+/// stay read-only — typed 409 (the terminal owner's fields), zero sidecar
+/// spawns, never a 200-with-resurrection — and the terminal becomes the sole
+/// owner. CODEX lane (round-1 review: only freshcodex could ever have
+/// cold-started from a snapshot GET — the hook lives on FreshCodexState;
+/// round-2 review: the GET cold-start is REMOVED entirely, so this race pins
+/// the read-only contract under a concurrent handoff — the strongest form of
+/// the original assertion).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn race_snapshot_paused_after_lookup_cannot_resurrect_during_handoff() {
+    let _guard = ENV_LOCK.lock().await;
+    let codex_fake = DualRoleCodexFake::install();
+    let mut h = spawn_merged_server().await;
+    let sid = format!("r1-{}", uuid::Uuid::new_v4());
+    establish_freshcodex_session(&mut h, &sid).await;
+    let watermark = codex_fake.thread_op_rows().len();
+
+    // Park the snapshot GET mid-flight (multi_thread flavor so the parked
+    // GET's worker does not stall the test driver).
+    let (entered, release) = install_snapshot_pause(&h);
+    let base_url = h.base_url.clone();
+    let sid_for_get = sid.clone();
+    let get_task = tokio::spawn(async move {
+        http_get_json(
+            &base_url,
+            &format!("/api/fresh-agent/threads/freshcodex/codex/{sid_for_get}"),
+        )
+        .await
+    });
+    await_flag(&entered, "the snapshot GET must park inside the pause hook").await;
+
+    // Begin the fresh→terminal handoff — it must proceed while the GET is
+    // parked (the GET holds no lease; it is read-only).
+    let resp = http_post_json(
+        &h.base_url,
+        "/api/sessions/handoff",
+        &handoff_post_body(&sid, "race-r1"),
+    )
+    .await;
+    assert_eq!(resp.0, 200, "{}", resp.1);
+    assert_eq!(resp.1["ok"], json!(true), "{}", resp.1);
+
+    // Release the parked snapshot.
+    let _ = release.send(());
+    let (status, body) = get_task.await.expect("get task");
+    // The stale GET is typed-refused (never a sidecar spawn, never
+    // 200-with-resurrection).
+    assert_eq!(
+        status, 409,
+        "released stale snapshot must be typed 409: {body}"
+    );
+    assert_eq!(body["code"], json!("RESTORE_UNAVAILABLE"), "{body}");
+    assert_eq!(body["ownerKind"], json!("terminal"), "{body}");
+    assert!(
+        body["ownerGeneration"].as_u64().is_some(),
+        "the typed refusal names the owner generation: {body}"
+    );
+    // No replacement sidecar was spawned or resumed by the stale GET (the
+    // handoff's terminal-target planning spawns no thread ops — the ledger
+    // only ever holds the establish's row, taken before the watermark).
+    assert_eq!(
+        codex_fake.thread_op_rows().len(),
+        watermark,
+        "no thread op may land after the watermark: {:?}",
+        codex_fake.thread_op_rows()
+    );
+    assert_eq!(ledger_resumes_for(&codex_fake, &sid), 1);
+
+    // The terminal is the sole owner (the union of live writers at rest:
+    // one PTY, zero live sidecar sessions).
+    let terminal_id = resp.1["owner"]["terminalId"].as_str().unwrap().to_string();
+    await_ownership(
+        &h,
+        &sid,
+        |state| {
+            matches!(
+                state,
+                freshell_ownership::OwnershipState::Live { owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal
+            )
+        },
+        "the handoff must commit Live{Terminal}",
+    )
+    .await;
+    assert_eq!(
+        live_pty_count_for_session(&h.ws_state.registry, "codex", &sid),
+        1,
+        "the exact terminal session is the sole live writer"
+    );
+    assert!(
+        !h.ws_state.fresh_codex.has_live_session(&sid).await,
+        "the old sidecar session is gone — the terminal is the one writer"
+    );
+    h.ws_state.registry.kill(&terminal_id);
+}
+
+/// R2: pause terminal creation after its keyed-create precheck, attempt the
+/// fresh-agent attach, then release both. One winner; the loser gets the
+/// typed owner/handoff result. The terminal-create pause is the same
+/// real-barrier shape (round-1 review: notify-only does not park the
+/// create) — parked BEFORE the coordinator claim, so the parked create
+/// holds no lease and the fresh attach wins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn race_terminal_create_paused_after_precheck_vs_fresh_attach_one_winner() {
+    let _guard = ENV_LOCK.lock().await;
+    let codex_fake = DualRoleCodexFake::install();
+    let mut h = spawn_merged_server().await;
+    let mut ws_fresh = connect(&h.ws_url).await; // second connection
+    let sid = format!("r2-{}", uuid::Uuid::new_v4());
+
+    let (entered, release) = install_terminal_create_pause(&h);
+    send_json(
+        &mut h.ws,
+        &json!({
+            "type": "terminal.create", "requestId": "r2-t1", "mode": "codex",
+            "shell": "system", "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "codex", "sessionId": sid },
+        }),
+    )
+    .await;
+    await_flag(&entered, "terminal.create must park inside the pause hook").await;
+
+    // While parked, the fresh attach claims — it must WIN (the parked
+    // terminal holds no coordinator lease yet; its claim happens only after
+    // the pause).
+    send_json(
+        &mut ws_fresh,
+        &json!({
+            "type": "freshAgent.create", "requestId": "r2-f1",
+            "sessionType": "freshcodex", "provider": "codex", "cwd": "/tmp",
+            "sessionRef": { "provider": "codex", "sessionId": sid },
+        }),
+    )
+    .await;
+    let _ = await_frame(&mut ws_fresh, Duration::from_secs(20), |v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("freshAgent.created")
+            && v.get("requestId").and_then(|r| r.as_str()) == Some("r2-f1")
+    })
+    .await;
+
+    // Unpark the terminal: its claim now hits Live{FreshAgent} — the typed
+    // loser answer (the frozen D7 code + the additive owner fields).
+    let _ = release.send(());
+    let err = await_frame(&mut h.ws, Duration::from_secs(20), |v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("error")
+            && v.get("requestId").and_then(|r| r.as_str()) == Some("r2-t1")
+    })
+    .await;
+    assert_eq!(
+        err.get("code").and_then(|c| c.as_str()),
+        Some("RESTORE_UNAVAILABLE")
+    );
+    assert_eq!(
+        err.get("ownerKind").and_then(|k| k.as_str()),
+        Some("fresh-agent")
+    );
+    assert!(
+        err.get("ownerGeneration")
+            .and_then(|g| g.as_u64())
+            .unwrap_or(0)
+            >= 1,
+        "the typed loser answer names the owner generation: {err}"
+    );
+
+    // Exactly one runtime: ONE durable resume in the app-server ledger (the
+    // winner's) and ZERO PTY rows for sid — the union of writers is one.
+    assert_eq!(ledger_resumes_for(&codex_fake, &sid), 1);
+    assert_eq!(
+        live_pty_count_for_session(&h.ws_state.registry, "codex", &sid),
+        0,
+        "the loser terminal never spawned a PTY"
+    );
+    // The winner is the coordinator's owner.
+    match h
+        .ws_state
+        .ownership
+        .as_ref()
+        .expect("coordinator wired")
+        .observe("codex", &sid)
+        .state
+    {
+        freshell_ownership::OwnershipState::Live { owner, .. } => {
+            assert_eq!(
+                owner.kind,
+                freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                "the fresh attach is the one owner"
+            );
+        }
+        other => panic!("the fresh winner must own the key, got {other:?}"),
+    }
+}
+
+/// R3: a snapshot queued before "React cleanup" (the server-side analog: a
+/// snapshot GET that entered before the handoff began and is released only
+/// AFTER the handoff fully COMMITTED) cannot reclaim — it answers the typed
+/// 409 with the current terminal owner and spawns nothing (round-2 review:
+/// no GET cold-start exists at all; this pins the read-only contract past
+/// the commit boundary).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn race_queued_snapshot_before_cleanup_is_fenced_by_generation() {
+    let _guard = ENV_LOCK.lock().await;
+    let codex_fake = DualRoleCodexFake::install();
+    let mut h = spawn_merged_server().await;
+    let sid = format!("r3-{}", uuid::Uuid::new_v4());
+    establish_freshcodex_session(&mut h, &sid).await;
+    let watermark = codex_fake.thread_op_rows().len();
+
+    // Park the snapshot GET (queued before the handoff begins).
+    let (entered, release) = install_snapshot_pause(&h);
+    let base_url = h.base_url.clone();
+    let sid_for_get = sid.clone();
+    let get_task = tokio::spawn(async move {
+        http_get_json(
+            &base_url,
+            &format!("/api/fresh-agent/threads/freshcodex/codex/{sid_for_get}"),
+        )
+        .await
+    });
+    await_flag(&entered, "the queued snapshot must park inside the hook").await;
+
+    // The handoff runs to its COMMITTED broadcast first (the "React
+    // cleanup" boundary — the release happens strictly after).
+    let resp = http_post_json(
+        &h.base_url,
+        "/api/sessions/handoff",
+        &handoff_post_body(&sid, "race-r3"),
+    )
+    .await;
+    assert_eq!(resp.0, 200, "{}", resp.1);
+    let committed = await_owner_transition(&mut h, &sid, "handoff-committed").await;
+    let terminal_id = committed["terminalId"].as_str().unwrap().to_string();
+
+    // Release the queued snapshot: the generation fence answers the typed
+    // 409 with the terminal owner — never a reclamation.
+    let _ = release.send(());
+    let (status, body) = get_task.await.expect("get task");
+    assert_eq!(
+        status, 409,
+        "the queued snapshot released after the commit must be typed 409: {body}"
+    );
+    assert_eq!(body["code"], json!("RESTORE_UNAVAILABLE"), "{body}");
+    assert_eq!(body["ownerKind"], json!("terminal"), "{body}");
+    assert_eq!(
+        codex_fake.thread_op_rows().len(),
+        watermark,
+        "the queued GET spawned nothing: {:?}",
+        codex_fake.thread_op_rows()
+    );
+    assert_eq!(ledger_resumes_for(&codex_fake, &sid), 1);
+    // The terminal remains the sole owner.
+    match h
+        .ws_state
+        .ownership
+        .as_ref()
+        .expect("coordinator wired")
+        .observe("codex", &sid)
+        .state
+    {
+        freshell_ownership::OwnershipState::Live { owner, .. } => {
+            assert_eq!(owner.kind, freshell_ownership::RuntimeOwnerKind::Terminal);
+            assert_eq!(owner.terminal_id.as_deref(), Some(terminal_id.as_str()));
+        }
+        other => panic!("the committed terminal must own the key, got {other:?}"),
+    }
+    h.ws_state.registry.kill(&terminal_id);
+}
+
+/// R4: old-runtime reap timeout — no target writer starts early; the session
+/// stays recoverable; a retry after the runtime actually dies succeeds.
+/// BOTH arms (round-2 review): the still-alive fake sidecar re-probes live →
+/// Live{prior} restored; the out-of-band-killed prior re-probes
+/// unconfirmable → Vacant with the typed REAP_TIMEOUT. The unconfirmable
+/// arm's condition is constructed through the injected seams — the forced
+/// timeout PLUS an out-of-band process kill while the runner is parked
+/// INSIDE Handoff (the fenced release cannot run, so the coordinator still
+/// names the prior) — NOT via freshAgent.kill during Handoff, which
+/// correctly answers BlockedHandoff (round-3 F9).
+#[tokio::test]
+async fn race_reap_timeout_no_early_target_start_and_recoverable() {
+    let _guard = ENV_LOCK.lock().await;
+    let codex_fake = DualRoleCodexFake::install();
+    let hooks = Arc::new(freshell_freshagent::HandoffTestHooks {
+        pause_after_enter: Some(tokio::sync::Notify::new()),
+        ..freshell_freshagent::HandoffTestHooks::default()
+    });
+    let mut h = spawn_merged_server_with_hooks(Arc::clone(&hooks)).await;
+
+    // ── Arm A: the prior re-probes LIVE → restored ──────────────────────
+    let sid_a = format!("r4a-{}", uuid::Uuid::new_v4());
+    establish_freshcodex_session(&mut h, &sid_a).await;
+    let spawn_watermark = codex_fake.sidecar_spawn_rows().len();
+
+    let (post_a, post_a_task) = {
+        let base_url = h.base_url.clone();
+        let body = handoff_post_body(&sid_a, "race-r4a");
+        let task =
+            tokio::spawn(
+                async move { http_post_json(&base_url, "/api/sessions/handoff", &body).await },
+            );
+        (sid_a.clone(), task)
+    };
+    let _ = await_owner_transition(&mut h, &post_a, "handoff-started").await;
+    hooks.force_reap_timeout.store(true, Ordering::SeqCst);
+    hooks
+        .pause_after_enter
+        .as_ref()
+        .expect("pause hook installed")
+        .notify_one();
+    let (status, body) = post_a_task.await.expect("handoff post task");
+    assert_eq!(status, 409, "{}", body);
+    assert_eq!(body["error"]["code"], json!("REAP_TIMEOUT"), "{body}");
+    assert_eq!(body["error"]["retryable"], json!(true), "{body}");
+    // No early target start: no PTY, no sidecar spawn, no TargetStarted.
+    assert_eq!(
+        live_pty_count_for_session(&h.ws_state.registry, "codex", &sid_a),
+        0,
+        "no early target start on a reap timeout"
+    );
+    assert_eq!(codex_fake.sidecar_spawn_rows().len(), spawn_watermark);
+    assert!(
+        !hooks
+            .events
+            .lock()
+            .expect("handoff hooks lock")
+            .contains(&"TargetStarted"),
+        "the runner's event log must not contain TargetStarted"
+    );
+    // The re-probe confirmed the prior live — restored.
+    match h
+        .ws_state
+        .ownership
+        .as_ref()
+        .expect("coordinator wired")
+        .observe("codex", &sid_a)
+        .state
+    {
+        freshell_ownership::OwnershipState::Live { owner, .. } => {
+            assert_eq!(
+                owner.kind,
+                freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                "the live prior is restored"
+            );
+        }
+        other => panic!("the live prior must be restored, got {other:?}"),
+    }
+    // The failure broadcast carries the RESTORED prior (the truth, never
+    // the requested target kind).
+    let failed = await_owner_transition(&mut h, &post_a, "handoff-failed").await;
+    assert_eq!(failed["ownerKind"], json!("fresh-agent"), "{failed}");
+    assert_eq!(failed["reason"], json!("REAP_TIMEOUT"), "{failed}");
+
+    // A retry after clearing the hook succeeds (the restored prior is
+    // stoppable): the real kill reaps it, the terminal target starts, the
+    // handoff commits. The pause is still armed — release the retry through
+    // it too (notify_one stores a permit the retry's notified() consumes).
+    hooks.force_reap_timeout.store(false, Ordering::SeqCst);
+    hooks
+        .pause_after_enter
+        .as_ref()
+        .expect("pause hook installed")
+        .notify_one();
+    let (status, body) = http_post_json(
+        &h.base_url,
+        "/api/sessions/handoff",
+        &handoff_post_body(&sid_a, "race-r4a-retry"),
+    )
+    .await;
+    assert_eq!(status, 200, "the retry must succeed: {body}");
+    let terminal_id = body["owner"]["terminalId"].as_str().unwrap().to_string();
+    h.ws_state.registry.kill(&terminal_id);
+
+    // ── Arm B: the prior is unconfirmable → Vacant ───────────────────────
+    let sid_b = format!("r4b-{}", uuid::Uuid::new_v4());
+    establish_freshcodex_session(&mut h, &sid_b).await;
+    hooks.force_reap_timeout.store(true, Ordering::SeqCst);
+
+    let (post_b, post_b_task) = {
+        let base_url = h.base_url.clone();
+        let body = handoff_post_body(&sid_b, "race-r4b");
+        let task =
+            tokio::spawn(
+                async move { http_post_json(&base_url, "/api/sessions/handoff", &body).await },
+            );
+        (sid_b.clone(), task)
+    };
+    let _ = await_owner_transition(&mut h, &post_b, "handoff-started").await;
+    // The out-of-band kill of the prior sidecar (the PROCESS itself, never
+    // the lane API) while the runner is parked inside Handoff: the fenced
+    // release cannot run, so the coordinator still names the prior — the
+    // exact unconfirmable-prior shape (round-3 F9). SIGKILL, not SIGTERM:
+    // the fixture's SIGTERM handler parks in `wss.close(cb)` waiting for
+    // the LANE'S ws client to disconnect — which never happens — so a
+    // SIGTERM'd sidecar lingers alive and the exit watcher never fires;
+    // SIGKILL is the crash-faithful, immediate death (the same signal the
+    // lane's own kill path sends via tokio's `start_kill()`).
+    let sidecar_pid = codex_fake
+        .sidecar_spawn_rows()
+        .last()
+        .and_then(|row| row["pid"].as_u64())
+        .expect("the prior sidecar's dispatcher pid");
+    let _ = std::process::Command::new("kill")
+        .arg("-9")
+        .arg(sidecar_pid.to_string())
+        .status()
+        .expect("out-of-band sidecar kill");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while h.ws_state.fresh_codex.has_live_session(&post_b).await {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the dead sidecar was never evicted from the lane's live map"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    hooks
+        .pause_after_enter
+        .as_ref()
+        .expect("pause hook installed")
+        .notify_one();
+    let (status, body) = post_b_task.await.expect("handoff post task");
+    assert_eq!(status, 409, "{}", body);
+    assert_eq!(body["error"]["code"], json!("REAP_TIMEOUT"), "{body}");
+    assert_eq!(body["error"]["retryable"], json!(true), "{body}");
+    // The unconfirmable prior ends the key Vacant — never a dead runtime
+    // recorded as Live.
+    assert_eq!(
+        h.ws_state
+            .ownership
+            .as_ref()
+            .expect("coordinator wired")
+            .observe("codex", &post_b)
+            .state,
+        freshell_ownership::OwnershipState::Vacant,
+        "an unconfirmable prior ends the key Vacant"
+    );
+    // No target started here either.
+    assert_eq!(
+        live_pty_count_for_session(&h.ws_state.registry, "codex", &post_b),
+        0
+    );
+    // The failure broadcast carries the truth: vacant + the typed reason.
+    let failed = await_owner_transition(&mut h, &post_b, "handoff-failed").await;
+    assert_eq!(failed["ownerKind"], json!("vacant"), "{failed}");
+    assert_eq!(failed["reason"], json!("REAP_TIMEOUT"), "{failed}");
+}
+
+/// R5: target terminal spawn failure — no blank session, session id
+/// preserved, ownership restored or Vacant with the typed error. Uses the
+/// runner's `fail_target_spawn_once` (the prior is REALLY reaped; the target
+/// never starts).
+#[tokio::test]
+async fn race_target_spawn_failure_no_blank_session_id_preserved() {
+    let _guard = ENV_LOCK.lock().await;
+    let codex_fake = DualRoleCodexFake::install();
+    let hooks = Arc::new(freshell_freshagent::HandoffTestHooks::default());
+    hooks.fail_target_spawn_once.store(true, Ordering::SeqCst);
+    let mut h = spawn_merged_server_with_hooks(Arc::clone(&hooks)).await;
+    let sid = format!("r5-{}", uuid::Uuid::new_v4());
+    establish_freshcodex_session(&mut h, &sid).await;
+    let op_watermark = codex_fake.thread_op_rows().len();
+    let spawn_watermark = codex_fake.sidecar_spawn_rows().len();
+
+    let (status, body) = http_post_json(
+        &h.base_url,
+        "/api/sessions/handoff",
+        &handoff_post_body(&sid, "race-r5"),
+    )
+    .await;
+    assert_eq!(status, 409, "{}", body);
+    assert_eq!(
+        body["error"]["code"],
+        json!("TARGET_SPAWN_FAILED"),
+        "{body}"
+    );
+    assert_eq!(body["error"]["retryable"], json!(true), "{body}");
+
+    // No blank session: the canonical key ends Vacant (the prior was
+    // reaped, the target never started), the id is preserved (no remint —
+    // zero post-watermark thread ops under ANY id), zero PTY rows, and no
+    // second sidecar was ever spawned (the spawn watermark is untouched).
+    assert_eq!(
+        h.ws_state
+            .ownership
+            .as_ref()
+            .expect("coordinator wired")
+            .observe("codex", &sid)
+            .state,
+        freshell_ownership::OwnershipState::Vacant,
+        "a failed target spawn leaves the key Vacant"
+    );
+    assert_eq!(
+        codex_fake.thread_op_rows().len(),
+        op_watermark,
+        "no thread op may land after the watermark (no remint, no second writer): {:?}",
+        codex_fake.thread_op_rows()
+    );
+    assert_eq!(
+        codex_fake.sidecar_spawn_rows().len(),
+        spawn_watermark,
+        "no second sidecar may spawn for a failed handoff"
+    );
+    assert_eq!(
+        live_pty_count_for_session(&h.ws_state.registry, "codex", &sid),
+        0,
+        "no terminal may own {sid} after the failed handoff"
+    );
+    // The failure broadcast carries the truth: ownerKind vacant, the prior
+    // fresh-agent previousKind, the typed reason.
+    let failed = await_owner_transition(&mut h, &sid, "handoff-failed").await;
+    assert_eq!(failed["ownerKind"], json!("vacant"), "{failed}");
+    assert_eq!(failed["previousKind"], json!("fresh-agent"), "{failed}");
+    assert_eq!(failed["reason"], json!("TARGET_SPAWN_FAILED"), "{failed}");
+
+    // Session-ID preservation, positively: the canonical id still answers —
+    // a retry handoff for the SAME sid commits a terminal owner under it.
+    let (status, body) = http_post_json(
+        &h.base_url,
+        "/api/sessions/handoff",
+        &handoff_post_body(&sid, "race-r5-retry"),
+    )
+    .await;
+    assert_eq!(status, 200, "the retry must succeed: {body}");
+    match h
+        .ws_state
+        .ownership
+        .as_ref()
+        .expect("coordinator wired")
+        .observe("codex", &sid)
+        .state
+    {
+        freshell_ownership::OwnershipState::Live { owner, .. } => {
+            assert_eq!(
+                owner.terminal_id.as_deref(),
+                Some(body["owner"]["terminalId"].as_str().unwrap()),
+                "the retried handoff committed under the SAME canonical id"
+            );
+        }
+        other => panic!("the retried handoff must commit, got {other:?}"),
+    }
+    h.ws_state
+        .registry
+        .kill(body["owner"]["terminalId"].as_str().unwrap());
+}
+
+/// R6: browser disconnect mid-handoff — the server-side operation reaches a
+/// consistent state. The HTTP request is dropped mid-handoff (the raw
+/// TcpStream aborts — the connection reset a browser disconnect produces)
+/// while the runner is parked after enter; the DETACHED operation still
+/// completes: the coordinator reaches Live{Terminal}, the follow-up
+/// snapshot GET is the typed 409, and a competing fresh create is
+/// typed-refused.
+#[tokio::test]
+async fn race_browser_disconnect_mid_handoff_reaches_consistent_state() {
+    let _guard = ENV_LOCK.lock().await;
+    let codex_fake = DualRoleCodexFake::install();
+    let hooks = Arc::new(freshell_freshagent::HandoffTestHooks {
+        pause_after_enter: Some(tokio::sync::Notify::new()),
+        ..freshell_freshagent::HandoffTestHooks::default()
+    });
+    let mut h = spawn_merged_server_with_hooks(Arc::clone(&hooks)).await;
+    let sid = format!("r6-{}", uuid::Uuid::new_v4());
+    establish_freshcodex_session(&mut h, &sid).await;
+
+    // Fire the handoff POST from a background task, then drop the
+    // connection while the runner is parked mid-handoff.
+    let base_url = h.base_url.clone();
+    let body = handoff_post_body(&sid, "race-r6");
+    let post_task =
+        tokio::spawn(
+            async move { http_post_json(&base_url, "/api/sessions/handoff", &body).await },
+        );
+    let _ = await_owner_transition(&mut h, &sid, "handoff-started").await;
+    post_task.abort(); // the TcpStream drops — the browser disconnect
+    let _ = post_task.await;
+
+    // Unpause: the detached handoff continues (the dropped reply receiver
+    // cannot cancel it) and reaches the consistent state.
+    hooks
+        .pause_after_enter
+        .as_ref()
+        .expect("pause hook installed")
+        .notify_one();
+    let committed = await_owner_transition(&mut h, &sid, "handoff-committed").await;
+    let terminal_id = committed["terminalId"].as_str().unwrap().to_string();
+    match h
+        .ws_state
+        .ownership
+        .as_ref()
+        .expect("coordinator wired")
+        .observe("codex", &sid)
+        .state
+    {
+        freshell_ownership::OwnershipState::Live { owner, .. } => {
+            assert_eq!(
+                owner.terminal_id.as_deref(),
+                Some(terminal_id.as_str()),
+                "the detached handoff committed the terminal owner"
+            );
+        }
+        other => panic!("the detached handoff must reach Live{{Terminal}}, got {other:?}"),
+    }
+
+    // The follow-up snapshot GET is the typed 409 (the read-only contract
+    // under the new owner) and spawned nothing.
+    let watermark = codex_fake.thread_op_rows().len();
+    let (status, body) = http_get_json(
+        &h.base_url,
+        &format!("/api/fresh-agent/threads/freshcodex/codex/{sid}"),
+    )
+    .await;
+    assert_eq!(status, 409, "the post-handoff GET is the typed 409: {body}");
+    assert_eq!(body["code"], json!("RESTORE_UNAVAILABLE"), "{body}");
+    assert_eq!(body["ownerKind"], json!("terminal"), "{body}");
+    assert_eq!(
+        codex_fake.thread_op_rows().len(),
+        watermark,
+        "the GET spawned nothing: {:?}",
+        codex_fake.thread_op_rows()
+    );
+
+    // A competing fresh create is typed-refused (SESSION_RESERVED,
+    // retryable — the terminal may be closing).
+    send_json(
+        &mut h.ws,
+        &json!({
+            "type": "freshAgent.create", "requestId": "r6-f2",
+            "sessionType": "freshcodex", "provider": "codex", "cwd": "/tmp",
+            "sessionRef": { "provider": "codex", "sessionId": sid },
+        }),
+    )
+    .await;
+    let refused = await_frame(&mut h.ws, Duration::from_secs(20), |v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("freshAgent.create.failed")
+            && v.get("requestId").and_then(|r| r.as_str()) == Some("r6-f2")
+    })
+    .await;
+    assert_eq!(
+        refused.get("code").and_then(|c| c.as_str()),
+        Some("SESSION_RESERVED")
+    );
+    assert_eq!(refused.get("retryable"), Some(&json!(true)), "{refused}");
+    h.ws_state.registry.kill(&terminal_id);
+}
+
+/// R7: coordinator cancellation/panic plus sidecar crash — abort the
+/// handoff task at the pause point; assert zero untracked runtime and zero
+/// or one authoritative owner; then crash the sidecar (freshAgent.kill)
+/// and assert the key returns to Vacant and a new claim succeeds. The
+/// observability contract (round-1 review): this race also asserts the
+/// COMPLETE transition-event field set for `ownership.stop.begin` /
+/// `ownership.stop.commit` / `ownership.released` (the capturing-layer
+/// idiom).
+#[tokio::test]
+async fn race_coordinator_cancellation_and_sidecar_crash_leave_consistent_state() {
+    let _guard = ENV_LOCK.lock().await;
+    let codex_fake = DualRoleCodexFake::install();
+    let (events, _capture_guard) = race_tracing_capture::capture();
+    let hooks = Arc::new(freshell_freshagent::HandoffTestHooks {
+        pause_after_enter: Some(tokio::sync::Notify::new()),
+        ..freshell_freshagent::HandoffTestHooks::default()
+    });
+    let mut h = spawn_merged_server_with_hooks(Arc::clone(&hooks)).await;
+    let sid = format!("r7-{}", uuid::Uuid::new_v4());
+    establish_freshcodex_session(&mut h, &sid).await;
+    let capture_start = events.lock().expect("capture lock").len();
+    let spawn_watermark = codex_fake.sidecar_spawn_rows().len();
+
+    // Spawn the handoff through the runner's own handle (the abort-capable
+    // door) and ABORT it at the pause point (round-1 review: the
+    // cancellation-capable HandoffHandle exposes the JoinHandle — dropping
+    // the oneshot receiver intentionally does NOT cancel).
+    let handle = h
+        .handoff_runner
+        .spawn_handoff(freshell_freshagent::HandoffRequest {
+            provider: "codex".to_string(),
+            session_id: sid.clone(),
+            target_kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+            session_type: None,
+            mode: Some("codex".to_string()),
+            cwd: Some(std::env::temp_dir().to_string_lossy().to_string()),
+            tab_id: None,
+            pane_id: None,
+            observed_epoch: None,
+            observed_generation: None,
+            device_id: Some("race-r7".to_string()),
+        });
+    let _ = await_owner_transition(&mut h, &sid, "handoff-started").await;
+    handle.abort();
+    let _ = handle.task.await;
+
+    // Zero or one authoritative owner — deterministically the restored
+    // prior (the pause sits BEFORE the prior stop, so the untouched prior
+    // is restored Live; never a stranded Handoff).
+    match h
+        .ws_state
+        .ownership
+        .as_ref()
+        .expect("coordinator wired")
+        .observe("codex", &sid)
+        .state
+    {
+        freshell_ownership::OwnershipState::Live { owner, .. } => {
+            assert_eq!(
+                owner.kind,
+                freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                "the restored owner is the prior fresh runtime"
+            );
+        }
+        other => panic!("abort must leave zero or one owner (Live prior or Vacant), got {other:?}"),
+    }
+    // Zero UNTRACKED runtime: the target spawn never began.
+    assert_eq!(
+        codex_fake.sidecar_spawn_rows().len(),
+        spawn_watermark,
+        "the aborted handoff spawned nothing"
+    );
+    assert_eq!(
+        live_pty_count_for_session(&h.ws_state.registry, "codex", &sid),
+        0,
+        "no untracked PTY exists"
+    );
+
+    // Crash the sidecar (freshAgent.kill): the key returns to Vacant — and
+    // the kill's coordinator transitions carry the COMPLETE field set.
+    send_json(
+        &mut h.ws,
+        &json!({
+            "type": "freshAgent.kill", "sessionId": sid,
+            "sessionType": "freshcodex", "provider": "codex",
+        }),
+    )
+    .await;
+    let _ = await_frame(&mut h.ws, Duration::from_secs(20), |v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("freshAgent.killed")
+            && v.get("sessionId").and_then(|s| s.as_str()) == Some(sid.as_str())
+    })
+    .await;
+    await_ownership(
+        &h,
+        &sid,
+        |state| matches!(state, freshell_ownership::OwnershipState::Vacant),
+        "the killed sidecar must release the key",
+    )
+    .await;
+    let scope: Vec<_> = {
+        let captured = events.lock().expect("capture lock");
+        captured[capture_start..].to_vec()
+    };
+    let stop_begin =
+        find_captured(&scope, "ownership.stop.begin").expect("ownership.stop.begin event");
+    for field in [
+        "operation_id",
+        "provider",
+        "session_id",
+        "initiator",
+        "from_kind",
+        "runtime_id",
+        "pid",
+        "epoch",
+        "generation",
+        "outcome",
+    ] {
+        assert!(
+            stop_begin.fields.contains_key(field),
+            "ownership.stop.begin must carry {field}: {stop_begin:?}"
+        );
+    }
+    assert_eq!(
+        stop_begin.fields.get("outcome").map(String::as_str),
+        Some("granted")
+    );
+    let stop_commit =
+        find_captured(&scope, "ownership.stop.commit").expect("ownership.stop.commit event");
+    for field in [
+        "operation_id",
+        "provider",
+        "session_id",
+        "initiator",
+        "from_kind",
+        "runtime_id",
+        "pid",
+        "epoch",
+        "generation",
+        "outcome",
+        "duration_ms",
+    ] {
+        assert!(
+            stop_commit.fields.contains_key(field),
+            "ownership.stop.commit must carry {field}: {stop_commit:?}"
+        );
+    }
+    assert_eq!(
+        stop_commit.fields.get("outcome").map(String::as_str),
+        Some("committed")
+    );
+
+    // A new claim succeeds: a terminal.create for the same sessionRef is
+    // Granted and commits.
+    send_json(
+        &mut h.ws,
+        &json!({
+            "type": "terminal.create", "requestId": "r7-t1", "mode": "codex",
+            "shell": "system", "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "codex", "sessionId": sid },
+        }),
+    )
+    .await;
+    let created = await_frame(&mut h.ws, Duration::from_secs(20), |v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("terminal.created")
+            && v.get("requestId").and_then(|r| r.as_str()) == Some("r7-t1")
+    })
+    .await;
+    let terminal_id = created["terminalId"].as_str().unwrap().to_string();
+    await_ownership(
+        &h,
+        &sid,
+        |state| {
+            matches!(
+                state,
+                freshell_ownership::OwnershipState::Live { owner, .. }
+                    if owner.terminal_id.as_deref() == Some(terminal_id.as_str())
+            )
+        },
+        "the new terminal claim must commit",
+    )
+    .await;
+
+    // Kill the terminal: the COMPLETE ownership.released field set.
+    let capture_before_release = events.lock().expect("capture lock").len();
+    h.ws_state.registry.kill(&terminal_id);
+    await_ownership(
+        &h,
+        &sid,
+        |state| matches!(state, freshell_ownership::OwnershipState::Vacant),
+        "the killed terminal must release the key",
+    )
+    .await;
+    let release_scope: Vec<_> = {
+        let captured = events.lock().expect("capture lock");
+        captured[capture_before_release..].to_vec()
+    };
+    let released =
+        find_captured(&release_scope, "ownership.released").expect("ownership.released event");
+    for field in [
+        "provider",
+        "session_id",
+        "operation_id",
+        "initiator",
+        "from_kind",
+        "runtime_id",
+        "pid",
+        "epoch",
+        "generation",
+        "duration_ms",
+        "outcome",
+    ] {
+        assert!(
+            released.fields.contains_key(field),
+            "ownership.released must carry {field}: {released:?}"
+        );
+    }
+    assert_eq!(
+        released.fields.get("outcome").map(String::as_str),
+        Some("released")
+    );
 }
