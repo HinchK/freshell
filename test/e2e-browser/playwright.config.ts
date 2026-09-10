@@ -235,6 +235,8 @@ export const RUST_ONLY_SPECS = [
   // Silent input loss (kata dtfn): imports RustServer directly for restart();
   // input typed in the reconnect-before-reattach window must arrive byte-exact.
   /silent-input-loss-rust\.spec\.ts$/,
+  // ESC single-ingress regression: owns a RustServer directly (see spec header).
+  /terminal-escape-key-rust\.spec\.ts$/,
   // Freshclaude zero-turn restart (kata 09v1): imports RustServer directly
   // for restartAbrupt(); a VISIBLE zero-turn pane must resume, never die.
   /freshclaude-zero-turn-restart-rust\.spec\.ts$/,
@@ -528,6 +530,9 @@ export default defineConfig({
         // restart(); input typed in the reconnect-before-reattach window must
         // arrive byte-exact in the recreated terminal.
         /silent-input-loss-rust\.spec\.ts$/,
+        // ESC single-ingress regression (see the RUST_ONLY_SPECS entry):
+        // owns a RustServer directly.
+        /terminal-escape-key-rust\.spec\.ts$/,
         // Freshclaude zero-turn restart (kata 09v1): imports RustServer directly
         // for restartAbrupt(); a VISIBLE zero-turn pane must resume, never die.
         /freshclaude-zero-turn-restart-rust\.spec\.ts$/,
