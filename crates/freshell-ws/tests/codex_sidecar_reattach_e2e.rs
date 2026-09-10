@@ -926,10 +926,21 @@ fn prepared_codex_launch_reuses_reserved_setup_and_discards_after_adopt_failure(
             "FAKE_CODEX_APP_SERVER_BEHAVIOR",
             "FAKE_CODEX_APP_SERVER_ARG_LOG",
             "FRESHELL_CODEX_MANAGED_LAUNCH",
+            "FRESHELL_PANE_ID",
+            "FRESHELL_TAB_ID",
             "FRESHELL_URL",
             "PORT",
         ]);
         let _injected_failure = AdoptionFailureMode::enable();
+        // Hermetic child env: this suite is routinely run from inside a
+        // Freshell pane, whose shell exports the pane-context variables
+        // (FRESHELL_TAB_ID/FRESHELL_PANE_ID). The spawned TUI/sidecar
+        // children INHERIT them, and the allowlist assertion below pins the
+        // headless prepared launch to the four non-layout context keys —
+        // an ambient pane context would masquerade as a tab/pane stamping
+        // regression. Scrub them for this test's duration (restored on drop).
+        std::env::remove_var("FRESHELL_TAB_ID");
+        std::env::remove_var("FRESHELL_PANE_ID");
         std::env::set_var("CODEX_CMD", codex_dispatcher());
         std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "1");
         std::env::set_var("PORT", "23125");
