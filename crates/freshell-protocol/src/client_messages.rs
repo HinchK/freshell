@@ -489,9 +489,17 @@ pub struct TerminalKill {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
     /// The closing pane's createRequestId — the durable close envelope's key
-    /// when the registry probe cannot answer (reaper race / stale pane).
+    /// when the registry probe can no longer answer (reaper race / stale pane).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub create_request_id: Option<String>,
+    /// kata b8ke delayed-request fence (Task 4): the (epoch, generation) pair
+    /// the client observed when it decided to kill — feeds the fenced stop
+    /// claim. Neither-sent is legacy-unfenced (the server falls back to the
+    /// retained stamp).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<u64>,
 }
 
 // --- *.activity.list --------------------------------------------------------

@@ -370,7 +370,13 @@ async fn main() -> ExitCode {
     // makes the multi-client / reconnection / hot-across-reload flows work.
     // Cloned (cheap Arc) into the files REST surface too, whose `candidate-dirs`
     // sources the running terminals' cwds for the DirectoryPicker.
-    let registry = freshell_terminal::TerminalRegistry::new();
+    // kata b8ke Task 4: the SAME ONE ownership coordinator the fresh-agent
+    // states hold (~:325) reaches the terminal lane's RELEASE side here —
+    // the registry's kill/exit/confirmed-kill paths release coordinator
+    // ownership fenced (release-only integration; the WS/REST/auto-resume
+    // lanes claim).
+    let registry = freshell_terminal::TerminalRegistry::new()
+        .with_ownership(std::sync::Arc::clone(&ownership));
     // HOST-PRESSURE PANE (Task 9, docs/plans/2026-08-25-host-pressure-pane.md):
     // the Rust host-stats collector — freshell-platform readers over
     // freshell-ws's trait bridge. Constructed here (not at the ~1311
@@ -1114,6 +1120,11 @@ async fn main() -> ExitCode {
         // Per-boot fresh-agent respawn-answer counter (campaign §4.3, V2/A7):
         // in-memory by design — a restart intentionally resets it.
         fresh_agent_respawn_counts: Default::default(),
+        // kata b8ke Task 4: the terminal lane's coordinator handle — the
+        // SAME ONE registry the fresh states and the terminal registry hold
+        // (the create/kill claims and the ready-frame owner replay consult
+        // it).
+        ownership: Some(std::sync::Arc::clone(&ownership)),
         auth_token: Arc::clone(&auth_token),
         // Shared (not moved) so `GET /api/health` reports the SAME `instanceId`.
         server_instance_id: Arc::clone(&server_instance_id),
@@ -3241,6 +3252,7 @@ mod sessions_sweep_tests {
             reconcile_deferral_budget_ms:
                 freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
             fresh_agent_respawn_counts: Default::default(),
+            ownership: None,
         };
 
         let mut gen_rx = index.subscribe_changes();

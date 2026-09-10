@@ -1300,6 +1300,16 @@
               "minLength": 1,
               "type": "string"
             },
+            "observedEpoch": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
             "requestId": {
               "minLength": 1,
               "type": "string"
@@ -8032,6 +8042,16 @@
         "createRequestId": {
           "minLength": 1,
           "type": "string"
+        },
+        "observedEpoch": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "observedGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
         },
         "requestId": {
           "minLength": 1,

@@ -258,6 +258,10 @@ async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry, WsState
     fresh_codex.set_ownership(Arc::clone(&ownership));
     fresh_claude.set_ownership(Arc::clone(&ownership));
     fresh_opencode.set_ownership(Arc::clone(&ownership));
+    // kata b8ke Task 4: the SAME coordinator reaches the terminal lane — the
+    // registry (release-only integration) and the WsState (the create/kill
+    // claims + the ready-frame owner replay).
+    let registry = registry.with_ownership(Arc::clone(&ownership));
 
     let state = WsState {
         layout: Default::default(),
@@ -302,6 +306,7 @@ async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry, WsState
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
+        ownership: Some(Arc::clone(&ownership)),
     };
 
     let router = freshell_ws::router(state.clone());
@@ -379,6 +384,110 @@ async fn await_frame(
     })
     .await
     .expect("expected frame did not arrive within budget")
+}
+
+/// Soft-timeout twin of [`await_frame`] (which returns `Value` and PANICS on
+/// timeout): returns `None` when the budget elapses (or the stream ends)
+/// without a matching frame — the race test's polling loops need a
+/// non-panicking bounded wait (kata b8ke Task 4, round-1 review).
+async fn try_await_frame(
+    ws: &mut TestWs,
+    budget: Duration,
+    predicate: impl Fn(&Value) -> bool,
+) -> Option<Value> {
+    tokio::time::timeout(budget, async {
+        loop {
+            let msg = ws.next().await?.expect("no ws error");
+            let WsMessage::Text(text) = msg else { continue };
+            let value: Value = serde_json::from_str(&text).unwrap();
+            if predicate(&value) {
+                return Some(value);
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// [`connect`] variant that RETURNS the ready frame (connect consumes and
+/// discards it — a test that must inspect `ready` uses this; kata b8ke Task 4,
+/// round-1 review).
+async fn connect_and_capture_ready(url: &str) -> (TestWs, Value) {
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("ws connect");
+    let hello = json!({
+        "type": "hello",
+        "token": AUTH_TOKEN,
+        "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
+        "capabilities": { "paneReconcileV1": true, "paneReconcileFreshAgentV1": true },
+    });
+    ws.send(WsMessage::Text(hello.to_string()))
+        .await
+        .expect("send hello");
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("handshake message within timeout")
+            .expect("stream not ended")
+            .expect("no ws error");
+        let WsMessage::Text(text) = msg else { continue };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        if value["type"] == "ready" {
+            return (ws, value); // the captured ready frame
+        }
+    }
+}
+
+/// [`connect`] variant that NEVER negotiates capabilities (kata b8ke Task 4,
+/// round-2 review): the hello carries the protocol version but NO
+/// `capabilities` object — the hand-rolled-script shape. The server still
+/// authenticates it (token + exact protocol-version match); this connection
+/// simply never enters the `paneReconcileV1` gate.
+async fn connect_raw(url: &str) -> TestWs {
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("ws connect");
+    let hello = json!({
+        "type": "hello",
+        "token": AUTH_TOKEN,
+        "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
+    });
+    ws.send(WsMessage::Text(hello.to_string()))
+        .await
+        .expect("send hello");
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("handshake message within timeout")
+            .expect("stream not ended")
+            .expect("no ws error");
+        let WsMessage::Text(text) = msg else { continue };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        if value["type"] == "ready" {
+            return ws;
+        }
+    }
+}
+
+/// The live-PTY count for a session (copied from
+/// `session_ref_singleflight.rs`'s `live_pty_count_for_session`): the
+/// identity-probe join the race test's UNION sampler consumes.
+fn live_pty_count_for_session(
+    registry: &freshell_terminal::TerminalRegistry,
+    mode: &str,
+    session_id: &str,
+) -> usize {
+    registry
+        .identity_probe_rows()
+        .into_iter()
+        .filter(|row| {
+            row.mode == mode
+                && row.status == freshell_protocol::TerminalRunStatus::Running
+                && row.resume_session_id.as_deref() == Some(session_id)
+        })
+        .count()
 }
 
 // ── the red tests ────────────────────────────────────────────────────────────────────
@@ -736,4 +845,361 @@ async fn fresh_agent_create_and_kill_drive_the_shared_coordinator() {
         "kill must release ownership only after the confirmed reap"
     );
     let _ = sidecar;
+}
+
+/// kata b8ke Task 4: the two-writers START race. Both creates are sent
+/// back-to-back with NO sequencing (the genuine-race pattern from
+/// session_ref_singleflight.rs); whichever wins, exactly one runtime may
+/// exist for the session and the loser must have a TYPED answer.
+#[tokio::test]
+async fn concurrent_terminal_and_fresh_agent_start_same_session_ref_yield_one_writer() {
+    let _guard = ENV_LOCK.lock().await;
+    let sidecar = FakeSidecarEnv::install(); // SYNC at base — no .await
+    let (url, registry, _ws_state) = spawn_server().await;
+    let sid = format!("race-{}", uuid::Uuid::new_v4());
+    let mut ws_term = connect(&url).await;
+    let mut ws_fresh = connect(&url).await;
+
+    // Fire both with zero awaits between the sends.
+    let term_req = "race-term-1";
+    let fresh_req = "race-fresh-1";
+    let term_frame = json!({
+        "type": "terminal.create", "requestId": term_req, "mode": "claude",
+        "shell": "system", "cwd": std::env::temp_dir().to_string_lossy(),
+        "sessionRef": { "provider": "claude", "sessionId": sid },
+    });
+    let fresh_frame = json!({
+        "type": "freshAgent.create", "requestId": fresh_req,
+        "sessionType": "freshclaude", "provider": "claude",
+        "sessionRef": { "provider": "claude", "sessionId": sid },
+    });
+    let send_term = send_json(&mut ws_term, &term_frame);
+    let send_fresh = send_json(&mut ws_fresh, &fresh_frame);
+    let ((), ()) = tokio::join!(send_term, send_fresh);
+
+    // The UNION sampler (round-1 review): fresh sidecar creates PLUS terminal
+    // PTYs for the session — the one-writer invariant is over the UNION, not
+    // two separate <=1 assertions (one sidecar + one PTY would pass those).
+    let live_writers = || {
+        let creates = sidecar
+            .create_rows()
+            .iter()
+            .filter(|r| r["msg"]["resumeSessionId"].as_str() == Some(sid.as_str()))
+            .count();
+        let ptys = live_pty_count_for_session(&registry, "claude", &sid);
+        creates + ptys
+    };
+
+    // Wait until BOTH requests have a terminal answer (created OR typed error),
+    // sampling the union across the interleaving.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut term_answered = false;
+    let mut fresh_answered = false;
+    while std::time::Instant::now() < deadline && !(term_answered && fresh_answered) {
+        if !term_answered {
+            if let Some(frame) = try_await_frame(&mut ws_term, Duration::from_millis(250), |v| {
+                let t = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                t == "terminal.created" || t == "error"
+            })
+            .await
+            {
+                if frame.get("requestId").and_then(|r| r.as_str()) == Some(term_req) {
+                    term_answered = true;
+                }
+            }
+        }
+        if !fresh_answered {
+            if let Some(frame) = try_await_frame(&mut ws_fresh, Duration::from_millis(250), |v| {
+                let t = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                t == "freshAgent.created" || t == "freshAgent.create.failed"
+            })
+            .await
+            {
+                if frame.get("requestId").and_then(|r| r.as_str()) == Some(fresh_req) {
+                    fresh_answered = true;
+                }
+            }
+        }
+        assert!(
+            live_writers() <= 1,
+            "the UNION of live writers (sidecars + PTYs) may never exceed 1 mid-race"
+        );
+    }
+    assert!(
+        term_answered && fresh_answered,
+        "both requests must receive a typed answer"
+    );
+
+    // Final settle: the union is still at most one (the loser was typed, and
+    // any loser-side runtime was torn down — not left running).
+    assert!(
+        live_writers() <= 1,
+        "exactly one runtime may survive the race"
+    );
+}
+
+/// kata b8ke Task 4: the fresh-agent→terminal refusal carries the typed
+/// owner fields (additive; frozen text untouched).
+#[tokio::test]
+async fn terminal_create_refusal_names_the_fresh_agent_owner_kind_and_generation() {
+    let _guard = ENV_LOCK.lock().await;
+    let _sidecar = FakeSidecarEnv::install(); // SYNC at base — no .await
+    let (url, _registry, _ws_state) = spawn_server().await;
+    let mut ws = connect(&url).await;
+    let sid = format!("typed-owner-{}", uuid::Uuid::new_v4());
+    // Establish a live freshclaude owner first.
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "freshAgent.create", "requestId": "own-1",
+            "sessionType": "freshclaude", "provider": "claude",
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+    let _ = await_frame(&mut ws, Duration::from_secs(20), |v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("freshAgent.created")
+    })
+    .await;
+    // Competing terminal create is refused with the additive typed fields.
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create", "requestId": "ref-1", "mode": "claude",
+            "shell": "system", "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+    let err = await_frame(&mut ws, Duration::from_secs(20), |v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("error")
+            && v.get("requestId").and_then(|r| r.as_str()) == Some("ref-1")
+    })
+    .await;
+    assert_eq!(
+        err.get("code").and_then(|c| c.as_str()),
+        Some("RESTORE_UNAVAILABLE")
+    );
+    // Frozen text untouched.
+    assert!(err
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .contains("is still running on the server."));
+    // NEW additive typed fields:
+    assert_eq!(
+        err.get("ownerKind").and_then(|k| k.as_str()),
+        Some("fresh-agent")
+    );
+    assert!(
+        err.get("ownerGeneration")
+            .and_then(|g| g.as_u64())
+            .unwrap_or(0)
+            >= 1
+    );
+}
+
+/// kata b8ke Task 4 (round-2 review): the terminal coordinator claim is
+/// UNGATED — a connection that NEVER negotiates paneReconcileV1 still goes
+/// through the coordinator. With a live fresh-agent owner, its
+/// terminal.create is refused with the same frozen D7 text and the typed
+/// owner fields; and on a VACANT key its create CLAIMS through the
+/// coordinator (a second create from a negotiated connection is
+/// typed-refused) — the vacant-state race is closed for non-negotiated
+/// senders too, not just via the check-then-act D7 probe.
+#[tokio::test]
+async fn non_negotiated_terminal_create_is_coordinator_fenced() {
+    let _guard = ENV_LOCK.lock().await;
+    let _sidecar = FakeSidecarEnv::install(); // SYNC at base — no .await
+    let (url, _registry, _ws_state) = spawn_server().await;
+    let sid = format!("raw-{}", uuid::Uuid::new_v4());
+    // A negotiated connection establishes the fresh owner.
+    let mut ws_owner = connect(&url).await;
+    send_json(
+        &mut ws_owner,
+        &json!({
+            "type": "freshAgent.create", "requestId": "raw-own-1",
+            "sessionType": "freshclaude", "provider": "claude",
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+    let _ = await_frame(&mut ws_owner, Duration::from_secs(20), |v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("freshAgent.created")
+    })
+    .await;
+    // The NON-NEGOTIATED connection's create is coordinator-fenced.
+    let mut ws_raw = connect_raw(&url).await;
+    send_json(
+        &mut ws_raw,
+        &json!({
+            "type": "terminal.create", "requestId": "raw-ref-1", "mode": "claude",
+            "shell": "system", "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+    let err = await_frame(&mut ws_raw, Duration::from_secs(20), |v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("error")
+            && v.get("requestId").and_then(|r| r.as_str()) == Some("raw-ref-1")
+    })
+    .await;
+    assert_eq!(
+        err.get("code").and_then(|c| c.as_str()),
+        Some("RESTORE_UNAVAILABLE")
+    );
+    assert!(
+        err.get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("")
+            .contains("is still running on the server."),
+        "frozen D7 text preserved"
+    );
+    assert_eq!(
+        err.get("ownerKind").and_then(|k| k.as_str()),
+        Some("fresh-agent")
+    );
+    // The vacant-state half: a non-negotiated create on a FRESH key claims
+    // through the coordinator and COMMITS the terminal owner. (A negotiated
+    // second create would ATTACH through the registry lease's
+    // BoundElsewhere arm — same-mode multi-device attachment is pinned
+    // behavior — so the claim's visibility is observed the two ways a
+    // non-negotiated sender sees it: the frozen D7 refusal carrying the
+    // coordinator-recorded owner fields, and the ready-frame owner replay.)
+    let sid_b = format!("raw-b-{}", uuid::Uuid::new_v4());
+    let mut ws_raw_b = connect_raw(&url).await;
+    send_json(
+        &mut ws_raw_b,
+        &json!({
+            "type": "terminal.create", "requestId": "raw-b-1", "mode": "claude",
+            "shell": "system", "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid_b },
+        }),
+    )
+    .await;
+    let _ = await_frame(&mut ws_raw_b, Duration::from_secs(20), |v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("terminal.created")
+    })
+    .await;
+    // The raw connection's committed claim is authoritative: a fresh
+    // connection's ready frame replays the terminal owner for sid_b.
+    let (ws_replay, ready_b) = connect_and_capture_ready(&url).await;
+    let owners_b = ready_b
+        .get("runtimeOwners")
+        .and_then(|v| v.as_array())
+        .expect("runtimeOwners present");
+    assert!(
+        owners_b.iter().any(|o| {
+            o.get("sessionId").and_then(|s| s.as_str()) == Some(sid_b.as_str())
+                && o.get("ownerKind").and_then(|k| k.as_str()) == Some("terminal")
+        }),
+        "the raw connection's claim must be recorded: {ready_b}"
+    );
+    drop(ws_replay);
+    // A second NON-NEGOTIATED create for the same key is refused by the D7
+    // guard, and the refusal's typed owner fields name the TERMINAL owner
+    // the raw connection committed (from the coordinator's record).
+    let mut ws_raw_c = connect_raw(&url).await;
+    send_json(
+        &mut ws_raw_c,
+        &json!({
+            "type": "terminal.create", "requestId": "raw-b-2", "mode": "claude",
+            "shell": "system", "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid_b },
+        }),
+    )
+    .await;
+    let refused = await_frame(&mut ws_raw_c, Duration::from_secs(20), |v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("error")
+            && v.get("requestId").and_then(|r| r.as_str()) == Some("raw-b-2")
+    })
+    .await;
+    assert_eq!(
+        refused.get("code").and_then(|c| c.as_str()),
+        Some("RESTORE_UNAVAILABLE")
+    );
+    assert_eq!(
+        refused.get("ownerKind").and_then(|k| k.as_str()),
+        Some("terminal")
+    );
+    assert!(
+        refused.get("liveTerminalId").is_some(),
+        "the terminal owner is nameable for revival: {refused}"
+    );
+}
+
+/// kata b8ke Task 4 (reconnect owner discovery, T1 rec A3): a NEW
+/// connection's `ready` frame replays current runtime-owner state, so a
+/// device that missed the handoff broadcast (offline during handoff,
+/// lag-4008 disconnect, page reload) learns the authoritative owner from the
+/// handshake alone. NOTE (round-1 review): `connect` CONSUMES and discards
+/// the ready frame — the replay assertions use `connect_and_capture_ready`
+/// (the capture variant added above), never a second wait for a frame that
+/// was already read.
+#[tokio::test]
+async fn ready_frame_replays_current_runtime_owners() {
+    let _guard = ENV_LOCK.lock().await;
+    let _sidecar = FakeSidecarEnv::install(); // SYNC at base — no .await
+    let (url, _registry, _ws_state) = spawn_server().await;
+    let mut ws = connect(&url).await;
+    let sid = format!("replay-{}", uuid::Uuid::new_v4());
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "freshAgent.create", "requestId": "replay-1",
+            "sessionType": "freshclaude", "provider": "claude",
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+    let _ = await_frame(&mut ws, Duration::from_secs(20), |v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("freshAgent.created")
+    })
+    .await;
+    // A SECOND connection (the "reloaded/reconnected device"): the ready
+    // frame itself carries the owner — no broadcast needed.
+    let (ws_b, ready) = connect_and_capture_ready(&url).await;
+    let owners = ready
+        .get("runtimeOwners")
+        .and_then(|v| v.as_array())
+        .expect("runtimeOwners present when the registry is injected");
+    assert!(
+        owners.iter().any(|o| {
+            o.get("provider").and_then(|p| p.as_str()) == Some("claude")
+                && o.get("sessionId").and_then(|s| s.as_str()) == Some(sid.as_str())
+                && o.get("ownerKind").and_then(|k| k.as_str()) == Some("fresh-agent")
+                && o.get("epoch").and_then(|e| e.as_u64()).unwrap_or(0) >= 1
+                && o.get("generation").and_then(|g| g.as_u64()).unwrap_or(0) >= 1
+        }),
+        "each replay record carries the boot epoch (round-2 review)"
+    );
+    // Kill releases the key: a THIRD connection's ready replays it as
+    // "vacant" — the divergence-clearing half of the replay.
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "freshAgent.kill", "sessionId": sid,
+            "sessionType": "freshclaude", "provider": "claude",
+        }),
+    )
+    .await;
+    let _ = await_frame(&mut ws, Duration::from_secs(20), |v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("freshAgent.killed")
+            && v.get("sessionId").and_then(|s| s.as_str()) == Some(sid.as_str())
+    })
+    .await;
+    let (ws_c, ready_c) = connect_and_capture_ready(&url).await;
+    let owners_c = ready_c
+        .get("runtimeOwners")
+        .and_then(|v| v.as_array())
+        .expect("runtimeOwners present");
+    assert!(
+        owners_c.iter().any(|o| {
+            o.get("sessionId").and_then(|s| s.as_str()) == Some(sid.as_str())
+                && o.get("ownerKind").and_then(|k| k.as_str()) == Some("vacant")
+        }),
+        "released keys must replay as vacant so replay clears stale divergence"
+    );
+    drop(ws_b);
+    drop(ws_c);
 }

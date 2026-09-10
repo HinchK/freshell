@@ -1452,6 +1452,7 @@ dependencies = [
 name = "freshell-terminal"
 version = "0.1.0"
 dependencies = [
+ "freshell-ownership",
  "freshell-platform",
  "freshell-protocol",
  "indexmap 2.14.0",

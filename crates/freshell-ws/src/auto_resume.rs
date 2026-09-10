@@ -133,6 +133,12 @@ pub struct CrashEvent {
     pub create_request_id: Option<String>,
     /// `now - created_at` of the generation that just died.
     pub lifetime_ms: i64,
+    /// kata b8ke Task 4: the dead generation's last-known coordinator
+    /// `(epoch, generation)` (its committed ownership stamp) — the observed
+    /// fence the respawn's coordinator claim carries, so a delayed recovery
+    /// can never recreate ownership a newer generation superseded. `None`
+    /// when the terminal never committed ownership.
+    pub observed_fence: Option<(u64, u64)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -524,7 +530,17 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                         driver.retire_identity(&ev.terminal_id);
                         continue;
                     }
-                    if !driver.claim_session(&provider, &session_id, &key).await {
+                    if !driver
+                        .claim_session(
+                            &provider,
+                            &session_id,
+                            &key,
+                            ev.observed_fence.map(|(epoch, generation)| {
+                                freshell_ownership::ObservedFence { epoch, generation }
+                            }),
+                        )
+                        .await
+                    {
                         driver.emit_settled(&ev.terminal_id, "session_lease_held", None);
                         driver.log_settled(&ev.terminal_id, "session_lease_held");
                         // Cancel-set hygiene (see the guard tail above).
@@ -626,12 +642,15 @@ pub(crate) trait AutoResumeDriver: Send + 'static {
     ) -> Option<&'static str>;
     /// Acquire the session-ref lease for this holder; false = not acquirable → abort.
     /// The PRODUCTION impl runs the create ingress's full bounded claim
-    /// discipline internally — the hub only sees the outcome.
+    /// discipline internally — the hub only sees the outcome. `observed` is
+    /// the crash event's fence pair: the COORDINATOR claim (kata b8ke Task 4)
+    /// consumes it as the delayed-request fence.
     fn claim_session(
         &self,
         provider: &str,
         session_id: &str,
         create_request_id: &str,
+        observed: Option<freshell_ownership::ObservedFence>,
     ) -> impl std::future::Future<Output = bool> + Send;
     /// Bind the acquired lease to the freshly spawned terminal
     /// (complete_session_ref_claim). false = the binding raced away; the
@@ -691,6 +710,19 @@ pub(crate) struct RespawnSpec {
 /// identity / ledger / respawn seam / broadcast bus.
 pub(crate) struct WsAutoResumeDriver {
     pub(crate) state: crate::WsState,
+    /// kata b8ke Task 4: the in-flight coordinator claim ticket for the
+    /// respawn currently being driven (claim_session → complete/fail_claim).
+    /// The hub processes crash events sequentially, so one slot suffices;
+    /// Arc-shared with the claim future so a registry-lease refusal inside
+    /// it can drop (typed-fail) the parked ticket.
+    pending_ownership: std::sync::Arc<std::sync::Mutex<Option<PendingOwnershipClaim>>>,
+}
+
+/// The coordinator claim a respawn holds between `claim_session` and
+/// `complete_claim`/`fail_claim` (kata b8ke Task 4).
+struct PendingOwnershipClaim {
+    locator: freshell_protocol::SessionLocator,
+    ticket: freshell_ownership::OperationTicket,
 }
 
 fn session_locator(provider: &str, session_id: &str) -> freshell_protocol::SessionLocator {
@@ -779,54 +811,117 @@ impl AutoResumeDriver for WsAutoResumeDriver {
         provider: &str,
         session_id: &str,
         create_request_id: &str,
+        observed: Option<freshell_ownership::ObservedFence>,
     ) -> impl std::future::Future<Output = bool> + Send {
         let state = self.state.clone();
         let locator = session_locator(provider, session_id);
         let create_request_id = create_request_id.to_string();
-        async move {
-            use freshell_terminal::registry::SessionRefClaim;
-            let holder_conn = state.registry.new_connection_id();
-            for round in 0..2u8 {
-                match state.registry.claim_session_ref(
-                    &locator,
-                    &create_request_id,
-                    holder_conn,
-                    crate::terminal::now_ms().max(0) as u64,
-                ) {
-                    SessionRefClaim::Acquired => return true,
-                    SessionRefClaim::BoundElsewhere { .. } | SessionRefClaim::Held { .. } => {
-                        return false;
-                    }
-                    SessionRefClaim::ExpiredNeedsKill { pid } => {
-                        if round == 0
-                            && crate::terminal::kill_session_ref_holder_and_confirm(
-                                &state.registry,
-                                pid,
-                            )
-                            .await
-                        {
-                            state.registry.force_release_after_confirmed_kill(&locator);
-                            continue; // the slot is now free — re-claim
-                        }
-                        // Unconfirmed kill (or a second expiry): hold the
-                        // lease closed and abort, mirroring the ingress.
-                        tracing::error!(target: "invariant",
-                            provider = %locator.provider,
-                            session_id = %locator.session_id,
-                            pid,
-                            "session_ref_lease_expired_kill_unconfirmed: holding lease closed");
-                        return false;
-                    }
+        // kata b8ke Task 4: the COORDINATOR claim runs FIRST — before the
+        // registry lease — with the crash event's fence pair (the dead
+        // generation's committed (epoch, generation); a recovery observing a
+        // superseded generation is typed-refused stale). Granted wraps the
+        // RAII ticket and parks it in the driver's pending slot (the hub is
+        // sequential; `complete_claim` commits it, `fail_claim` — or a
+        // registry-lease refusal below — drops it for the typed fail). A
+        // refusal aborts the resume (the key belongs to a newer owner or an
+        // in-flight transition).
+        let pending_slot = std::sync::Arc::clone(&self.pending_ownership);
+        let coordinator_refused = {
+            let mut pending = pending_slot.lock().expect("pending ownership lock");
+            // Defensive hygiene: drop any stale ticket from an aborted prior
+            // iteration (its RAII drop performs the typed fail).
+            *pending = None;
+            match freshell_freshagent::ownership_lane::begin_terminal_lane_claim(
+                &state.ownership,
+                provider,
+                session_id,
+                &format!("auto-resume-{create_request_id}"),
+                observed,
+                "auto-resume",
+                crate::terminal::now_ms().max(0) as u64,
+            ) {
+                freshell_freshagent::ownership_lane::TerminalLaneClaim::Granted(ticket) => {
+                    *pending = Some(PendingOwnershipClaim {
+                        locator: locator.clone(),
+                        ticket,
+                    });
+                    false
+                }
+                freshell_freshagent::ownership_lane::TerminalLaneClaim::Unwired
+                | freshell_freshagent::ownership_lane::TerminalLaneClaim::Adopt => false,
+                freshell_freshagent::ownership_lane::TerminalLaneClaim::Refused(outcome) => {
+                    tracing::warn!(target: "freshell_ws::auto_resume",
+                        provider, session_id, create_request_id = %create_request_id,
+                        outcome = ?outcome,
+                        "auto_resume_ownership_refused: the coordinator refused the respawn claim"
+                    );
+                    true
                 }
             }
-            false
+        };
+        async move {
+            if coordinator_refused {
+                return false;
+            }
+            use freshell_terminal::registry::SessionRefClaim;
+            // The registry-lease loop's verdict; EVERY false exit drops the
+            // parked coordinator ticket (RAII typed fail) at the single tail.
+            let acquired = {
+                let holder_conn = state.registry.new_connection_id();
+                let mut acquired = false;
+                'rounds: for round in 0..2u8 {
+                    match state.registry.claim_session_ref(
+                        &locator,
+                        &create_request_id,
+                        holder_conn,
+                        crate::terminal::now_ms().max(0) as u64,
+                    ) {
+                        SessionRefClaim::Acquired => {
+                            acquired = true;
+                            break 'rounds;
+                        }
+                        SessionRefClaim::BoundElsewhere { .. } | SessionRefClaim::Held { .. } => {
+                            break 'rounds;
+                        }
+                        SessionRefClaim::ExpiredNeedsKill { pid } => {
+                            if round == 0
+                                && crate::terminal::kill_session_ref_holder_and_confirm(
+                                    &state.registry,
+                                    pid,
+                                )
+                                .await
+                            {
+                                state.registry.force_release_after_confirmed_kill(&locator);
+                                continue; // the slot is now free — re-claim
+                            }
+                            // Unconfirmed kill (or a second expiry): hold the
+                            // lease closed and abort, mirroring the ingress.
+                            tracing::error!(target: "invariant",
+                                provider = %locator.provider,
+                                session_id = %locator.session_id,
+                                pid,
+                                "session_ref_lease_expired_kill_unconfirmed: holding lease closed");
+                            break 'rounds;
+                        }
+                    }
+                }
+                acquired
+            };
+            if !acquired {
+                drop(pending_slot.lock().expect("pending ownership lock").take());
+            }
+            acquired
         }
     }
 
     /// Mirror of the ingress complete==false path (`terminal.rs`): a lease
     /// revoked while spawning means killing OUR OWN just-spawned child via
     /// the registry handle, confirming death, then force-releasing — only
-    /// then does `false` go back to the hub.
+    /// then does `false` go back to the hub. kata b8ke Task 4: on the
+    /// registry completion's success the COORDINATOR claim commits
+    /// `Live{Terminal}` for the replacement (retained in the registry for
+    /// the exit/kill release); on failure the parked ticket drops (typed
+    /// fail) and the kill's own release path covers any committed runtime.
     fn complete_claim(
         &self,
         provider: &str,
@@ -835,6 +930,7 @@ impl AutoResumeDriver for WsAutoResumeDriver {
         new_terminal_id: &str,
     ) -> impl std::future::Future<Output = bool> + Send {
         let state = self.state.clone();
+        let pending_slot = std::sync::Arc::clone(&self.pending_ownership);
         let locator = session_locator(provider, session_id);
         let create_request_id = create_request_id.to_string();
         let new_terminal_id = new_terminal_id.to_string();
@@ -844,6 +940,40 @@ impl AutoResumeDriver for WsAutoResumeDriver {
                 &create_request_id,
                 &new_terminal_id,
             ) {
+                // The coordinator winner commit (the ONE settle point for
+                // the respawn's claim). A stale/foreign commit means the key
+                // was recovered mid-respawn — kill our own child (the
+                // registry kill's release covers any partial state) and
+                // answer false exactly like the revoked-lease shape.
+                let parked = pending_slot.lock().expect("pending ownership lock").take();
+                if let Some(claim) = parked {
+                    let outcome = state.registry.commit_session_ref_ownership(
+                        &claim.locator,
+                        claim.ticket.operation_id(),
+                        claim.ticket.generation(),
+                        &new_terminal_id,
+                    );
+                    if !matches!(outcome, freshell_ownership::CommitOutcome::Committed) {
+                        tracing::error!(target: "invariant",
+                            terminal_id = %new_terminal_id,
+                            provider = %locator.provider,
+                            session_id = %locator.session_id,
+                            outcome = ?outcome,
+                            "auto_resume_ownership_commit_stale: the coordinator moved on \
+                             while the respawn settled; killing the unowned child"
+                        );
+                        let pid = state.registry.pid_of(&new_terminal_id);
+                        state.registry.kill(&new_terminal_id);
+                        let confirmed = match pid {
+                            Some(pid) => crate::terminal::confirm_pid_dead_within_500ms(pid).await,
+                            None => true,
+                        };
+                        if confirmed {
+                            state.registry.force_release_after_confirmed_kill(&locator);
+                        }
+                        return false;
+                    }
+                }
                 return true;
             }
             let pid = state.registry.pid_of(&new_terminal_id);
@@ -869,8 +999,15 @@ impl AutoResumeDriver for WsAutoResumeDriver {
 
     /// The headless driver holds no RAII `SessionRefLeaseGuard` (the WS
     /// ingress's failure-path release) — this explicit call IS its
-    /// failure-path release.
+    /// failure-path release. kata b8ke Task 4: the parked coordinator
+    /// ticket drops here too (RAII typed fail — no orphan `Starting`).
     fn fail_claim(&self, provider: &str, session_id: &str, create_request_id: &str) {
+        drop(
+            self.pending_ownership
+                .lock()
+                .expect("pending ownership lock")
+                .take(),
+        );
         self.state
             .registry
             .fail_session_ref_claim(&session_locator(provider, session_id), create_request_id);
@@ -1009,7 +1146,14 @@ pub fn spawn_auto_resume_hub(
     state: crate::WsState,
     rx: tokio::sync::mpsc::UnboundedReceiver<CrashEvent>,
 ) -> tokio::task::JoinHandle<()> {
-    spawn_hub_with_driver(WsAutoResumeDriver { state }, rx, HubConfig::from_env())
+    spawn_hub_with_driver(
+        WsAutoResumeDriver {
+            state,
+            pending_ownership: Default::default(),
+        },
+        rx,
+        HubConfig::from_env(),
+    )
 }
 
 /// [`spawn_auto_resume_hub`] with explicit backoff AND identity-grace
@@ -1022,7 +1166,10 @@ pub fn spawn_auto_resume_hub_with_schedules(
     identity_grace_delays: Vec<u64>,
 ) -> tokio::task::JoinHandle<()> {
     spawn_hub_with_driver(
-        WsAutoResumeDriver { state },
+        WsAutoResumeDriver {
+            state,
+            pending_ownership: Default::default(),
+        },
         rx,
         HubConfig::with_schedules(delays, identity_grace_delays),
     )
@@ -1297,6 +1444,7 @@ mod tests {
             mode: mode.to_string(),
             create_request_id: create_request_id.map(str::to_string),
             lifetime_ms,
+            observed_fence: None,
         }
     }
 
@@ -1469,6 +1617,7 @@ mod tests {
             _provider: &str,
             _session_id: &str,
             create_request_id: &str,
+            _observed: Option<freshell_ownership::ObservedFence>,
         ) -> impl std::future::Future<Output = bool> + Send {
             let ok = {
                 let mut s = self.lock();

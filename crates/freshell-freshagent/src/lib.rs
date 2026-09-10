@@ -538,6 +538,137 @@ pub mod ownership_lane {
         let claim = stamp.release_claim();
         release_fresh_agent_ownership(registry, provider, session_id, &claim, initiator);
     }
+
+    // ── terminal lane (kata b8ke Task 4) ────────────────────────────────────
+    //
+    // The terminal lane's claim/commit twins, shared by the WS create path
+    // (`freshell-ws/src/terminal.rs`), the REST spawn rung
+    // (`terminal_tabs.rs`), and the auto-resume crash recovery
+    // (`freshell-ws/src/auto_resume.rs`). The RELEASE side of the terminal
+    // lane lives in `freshell-terminal`'s registry (kill/exit paths) — see
+    // `TerminalRegistry::with_ownership`; these helpers only claim and
+    // commit.
+
+    /// The terminal lane's claim answer for [`begin_terminal_lane_claim`]:
+    /// the same shape as [`LaneClaim`] but for `RuntimeOwnerKind::Terminal`
+    /// — `Granted` wraps the RAII ticket (drop without `disarm()` performs
+    /// the typed fail), `Adopt` means a same-kind live terminal runtime
+    /// exists (the registry-lease/D7 attach-or-refuse paths handle it),
+    /// `Unwired` is the legacy no-coordinator behavior, and `Refused` is the
+    /// typed cross-kind/stale outcome the caller maps onto its existing
+    /// refusal frames.
+    pub enum TerminalLaneClaim {
+        Granted(OperationTicket),
+        Adopt,
+        Unwired,
+        Refused(BeginOutcome),
+    }
+
+    /// Begin the TERMINAL lane's claim on the shared coordinator (kata b8ke
+    /// Task 4). The claim happens FIRST — before the registry lease and
+    /// before the `paneReconcileV1` gate (round-2 review: EVERY connection,
+    /// negotiated or not) — at every terminal create/respawn entry point.
+    /// `operation_id` is the caller-minted identity (WS: the create
+    /// requestId; REST: the createRequestId; auto-resume: the respawn key).
+    pub fn begin_terminal_lane_claim(
+        registry: &Option<Arc<RuntimeOwnershipRegistry>>,
+        provider: &str,
+        session_id: &str,
+        operation_id: &str,
+        observed: Option<ObservedFence>,
+        initiator: &str,
+        now_ms: u64,
+    ) -> TerminalLaneClaim {
+        let Some(registry) = registry.as_ref() else {
+            return TerminalLaneClaim::Unwired;
+        };
+        match registry.begin_start(
+            provider,
+            session_id,
+            RuntimeOwnerKind::Terminal,
+            operation_id,
+            observed,
+            initiator,
+            now_ms,
+        ) {
+            BeginOutcome::Granted { generation } => {
+                TerminalLaneClaim::Granted(OperationTicket::new(
+                    Arc::clone(registry),
+                    provider,
+                    session_id,
+                    operation_id,
+                    RuntimeOwnerKind::Terminal,
+                    generation,
+                    initiator,
+                ))
+            }
+            BeginOutcome::AdoptLive { .. } => TerminalLaneClaim::Adopt,
+            outcome => TerminalLaneClaim::Refused(outcome),
+        }
+    }
+
+    /// The terminal lane's wire owner fields for a typed refusal frame: the
+    /// additive `ownerKind`/`ownerGeneration`(/`ownerEpoch`) triple an
+    /// `error` frame or a REST 409 envelope carries when the coordinator
+    /// knows (or can name) the owner. `None` keeps the frame byte-identical
+    /// to the legacy shape (unwired coordinator).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct TerminalOwnerFields {
+        pub owner_kind: &'static str,
+        pub owner_generation: u64,
+        pub owner_epoch: u64,
+    }
+
+    /// Derive the additive owner fields from a `BeginOutcome` refusal (the
+    /// owner the coordinator named) — `None` when the outcome carries no
+    /// owner identity.
+    pub fn terminal_owner_fields_from_outcome(
+        registry: &Option<Arc<RuntimeOwnershipRegistry>>,
+        outcome: &BeginOutcome,
+    ) -> Option<TerminalOwnerFields> {
+        let registry = registry.as_ref()?;
+        match outcome {
+            BeginOutcome::OwnedByOtherKind { generation, .. } => Some(TerminalOwnerFields {
+                owner_kind: "fresh-agent",
+                owner_generation: *generation,
+                owner_epoch: registry.boot_epoch(),
+            }),
+            // Blocked carries the in-flight state; a Live blocked state (the
+            // same-kind backstop the coordinator still holds) names the
+            // terminal owner. Starting/Handoff/Stopping transitions have no
+            // committed owner identity to name, and StaleGeneration names
+            // only the fence mismatch — both stay field-less.
+            BeginOutcome::Blocked {
+                state: freshell_ownership::OwnershipState::Live { generation, .. },
+                ..
+            } => Some(TerminalOwnerFields {
+                owner_kind: "terminal",
+                owner_generation: *generation,
+                owner_epoch: registry.boot_epoch(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Derive the additive owner fields from a live coordinator observation
+    /// (`observe`) — `None` when the key is vacant/unwired.
+    pub fn terminal_owner_fields_from_snapshot(
+        snapshot: &freshell_ownership::OwnershipSnapshot,
+    ) -> Option<TerminalOwnerFields> {
+        match &snapshot.state {
+            freshell_ownership::OwnershipState::Live {
+                owner, generation, ..
+            } => Some(TerminalOwnerFields {
+                owner_kind: match owner.kind {
+                    RuntimeOwnerKind::Terminal => "terminal",
+                    RuntimeOwnerKind::FreshAgent => "fresh-agent",
+                },
+                owner_generation: *generation,
+                owner_epoch: snapshot.epoch,
+            }),
+            _ => None,
+        }
+    }
 }
 
 use std::collections::{HashMap, HashSet};

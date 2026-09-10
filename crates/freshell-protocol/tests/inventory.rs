@@ -227,4 +227,17 @@ fn terminal_kill_accepts_and_carries_the_optional_correlation_fields() {
     };
     assert_eq!(k.request_id.as_deref(), Some("r1"));
     assert_eq!(k.create_request_id.as_deref(), Some("cr1"));
+    // kata b8ke Task 4: the kill's observed (epoch, generation) fence pair
+    // rides through (additive optional; the legacy shape above stays None).
+    assert_eq!(k.observed_epoch, None);
+    assert_eq!(k.observed_generation, None);
+    let fenced: freshell_protocol::ClientMessage = serde_json::from_str(
+        r#"{"type":"terminal.kill","terminalId":"t-1","observedEpoch":41,"observedGeneration":7}"#,
+    )
+    .expect("fenced parse");
+    let freshell_protocol::ClientMessage::TerminalKill(k) = fenced else {
+        panic!("expected terminal.kill")
+    };
+    assert_eq!(k.observed_epoch, Some(41));
+    assert_eq!(k.observed_generation, Some(7));
 }

@@ -676,7 +676,14 @@ fn validate_rest_resume(
 /// on the server." — client regexes and muscle memory depend on it); all
 /// novelty rides the additive field, and `live_terminal_id: None` keeps the
 /// body byte-identical to the pre-feature shape (frozen-client parity).
-fn fail_json_restore_unavailable(live_sid: &str, live_terminal_id: Option<&str>) -> Response {
+/// kata b8ke Task 4: the coordinator's typed owner fields
+/// (`ownerKind`/`ownerGeneration`) ride the same additive rule when the
+/// coordinator knows the owner.
+fn fail_json_restore_unavailable(
+    live_sid: &str,
+    live_terminal_id: Option<&str>,
+    owner: Option<&crate::ownership_lane::TerminalOwnerFields>,
+) -> Response {
     let mut body = json!({
         "status": "error",
         "code": "RESTORE_UNAVAILABLE",
@@ -684,6 +691,10 @@ fn fail_json_restore_unavailable(live_sid: &str, live_terminal_id: Option<&str>)
     });
     if let Some(tid) = live_terminal_id {
         body["liveTerminalId"] = json!(tid);
+    }
+    if let Some(owner) = owner {
+        body["ownerKind"] = json!(owner.owner_kind);
+        body["ownerGeneration"] = json!(owner.owner_generation);
     }
     (StatusCode::CONFLICT, Json(body)).into_response()
 }
@@ -698,6 +709,14 @@ pub(crate) struct TerminalSpawnResult {
     pub(crate) mode: String,
     pub(crate) shell: Option<String>,
     pub(crate) cwd: Option<String>,
+    /// kata b8ke Task 4 (round-1 review, single commit authority): `Some`
+    /// ONLY when the spawn ran UNDER a handoff ticket — the settle task
+    /// skipped its own coordinator commit and the HANDOFF RUNNER (Task 6)
+    /// performs the one `commit_live` with this identity. `None` on every
+    /// ordinary spawn (the settle task committed itself). Task 6's runner is
+    /// the consumer; until it lands the field is write-only plumbing.
+    #[allow(dead_code)] // consumed by Task 6's handoff runner
+    pub(crate) owner_identity: Option<freshell_ownership::OwnerIdentity>,
 }
 
 /// DEV-0006 gate, REST side (S5.e: default ON): a codex `POST /api/tabs` /
@@ -856,6 +875,37 @@ impl Drop for RestSessionRefLease {
     }
 }
 
+/// The REST rung's coordinator claim guard (kata b8ke Task 4): wraps the
+/// `OperationTicket` granted by the unconditional claim in
+/// [`spawn_terminal_pane_with_handoff`]. Drop without [`Self::commit`]
+/// performs the coordinator's typed `fail` (RAII, via the ticket), so an
+/// aborted handler future or a failed spawn can never wedge the session in
+/// `Starting`. The winner path commits through [`Self::commit`] (which also
+/// retains the release claim in the registry).
+struct RestOwnershipClaim {
+    ticket: freshell_ownership::OperationTicket,
+    locator: SessionLocator,
+}
+
+impl RestOwnershipClaim {
+    fn commit(
+        self,
+        registry: &freshell_terminal::TerminalRegistry,
+        terminal_id: &str,
+    ) -> Result<(), freshell_ownership::CommitOutcome> {
+        let outcome = registry.commit_session_ref_ownership(
+            &self.locator,
+            self.ticket.operation_id(),
+            self.ticket.generation(),
+            terminal_id,
+        );
+        match outcome {
+            freshell_ownership::CommitOutcome::Committed => Ok(()),
+            stale => Err(stale),
+        }
+    }
+}
+
 /// Poll `kill(pid, 0)` for ESRCH for up to 500ms (the PTY's dedicated waiter
 /// thread reaps promptly -- `pty.rs` reader/waiter; same 20x25ms cadence as
 /// the WS path's `confirm_pid_dead_within_500ms`). `true` = death CONFIRMED.
@@ -869,14 +919,39 @@ async fn confirm_pid_dead_within_500ms(pid: u32) -> bool {
     !freshell_terminal::registry::pid_alive(pid)
 }
 
+/// The handoff runner's spawn token (kata b8ke Task 4, consumed by Task 6):
+/// when `Some`, the D8 rung's coordinator claim recognizes the in-flight
+/// Handoff (same operation_id, to_kind Terminal) as a Granted continuation
+/// instead of a conflict. Round-1 review (single commit authority): the
+/// settle task runs UNDER-TICKET — it skips its own coordinator commit and
+/// surfaces the terminal's `OwnerIdentity` to the handoff runner, which
+/// performs the ONE `commit_live`.
+pub(crate) struct HandoffToken {
+    pub operation_id: String,
+    /// The commit generation the runner performs its one `commit_live`
+    /// under (Task 6's consumption; the spawn rung itself only needs the
+    /// operation id).
+    #[allow(dead_code)] // consumed by Task 6's handoff runner
+    pub generation: u64,
+}
+
+/// [`spawn_terminal_pane`], parameterized on an in-flight handoff's spawn
+/// token (kata b8ke Task 4): the public entry point delegates with `None`.
+pub(crate) async fn spawn_terminal_pane(
+    state: &FreshAgentState,
+    body: &Value,
+    tab_id: &str,
+    pane_id: &str,
+) -> Result<TerminalSpawnResult, Response> {
+    spawn_terminal_pane_with_handoff(state, body, tab_id, pane_id, None).await
+}
+
 /// The terminal-mode spawn pipeline (`router.ts:724-793` for create,
-/// `router.ts:1326-1369` for split -- the original reuses the SAME
-/// `resolveSpawnProviderSettings`/`registry.create` sequence for both routes, and this
-/// port mirrors that reuse): resolve the requested mode against the registered
-/// coding-CLI specs, derive the resume identity ([`derive_resume_identity`]), spawn
-/// through the shared registry with the SAME argv/env-building pipeline the WS
-/// `terminal.create` handler uses for `mode != "shell"`
-/// (`crates/freshell-ws/src/terminal.rs:700-1050`: `cli_provider_target` ->
+/// `router.ts:1326-1369` for split — the original reuses the SAME sequence
+/// for both routes, and this port mirrors that reuse): resolve the requested
+/// mode against the registered coding-CLI specs, derive the resume identity
+/// ([`derive_resume_identity`]), spawn through the shared registry with the
+/// SAME argv/env-building pipeline the WS `terminal.create` handler uses (
 /// `resolve_mcp_cwd` -> `generate_mcp_injection` -> `CliLaunchInputs` ->
 /// `resolve_coding_cli_command` -> `build_{cli_,windows_cli_,}spawn_spec`), arm the
 /// amplifier/opencode locator for a fresh pane, register the `terminal_panes` +
@@ -888,11 +963,12 @@ async fn confirm_pid_dead_within_500ms(pid: u32) -> bool {
 /// cleanup-then-error contract (`router.ts:817-831`, `:1387-1393`) without needing an
 /// explicit cleanup step, PLUS the MCP-config cleanup the original also performs on a
 /// failed create (`router.ts:819`, `cw:429-448`).
-pub(crate) async fn spawn_terminal_pane(
+async fn spawn_terminal_pane_with_handoff(
     state: &FreshAgentState,
     body: &Value,
     tab_id: &str,
     pane_id: &str,
+    handoff: Option<&HandoffToken>,
 ) -> Result<TerminalSpawnResult, Response> {
     let mode = body
         .get("mode")
@@ -1300,6 +1376,87 @@ pub(crate) async fn spawn_terminal_pane(
                 })
         });
     let mut session_ref_lease: Option<RestSessionRefLease> = None;
+    // kata b8ke Task 4: the REST rung's coordinator claim — UNCONDITIONAL
+    // (REST callers are programmatic; no capability gate), BEFORE the D7
+    // check-then-spawn guard and BEFORE the registry lease, with the body's
+    // observed (epoch, generation) pair as the delayed-request fence (the
+    // Task 4 REST rung of the lifecycle-message fence audit). A handoff token
+    // (Task 6's runner) claims under the in-flight Handoff's operation
+    // identity instead of minting a fresh one (the coordinator's
+    // same-operation continuation arm grants it). The `Adopt` arm claims
+    // nothing: the D7 guard / registry lease below answer a same-kind live
+    // terminal (refusal with `liveTerminalId`, or the attach-shaped
+    // BoundElsewhere refusal).
+    let mut ownership_claim: Option<RestOwnershipClaim> = None;
+    let under_handoff_ticket = handoff.is_some();
+    if let Some(locator) = guard_locator.clone() {
+        let operation_id = handoff
+            .map(|t| t.operation_id.clone())
+            .unwrap_or_else(|| format!("rest-create-{create_request_id}"));
+        match crate::ownership_lane::begin_terminal_lane_claim(
+            &state.ownership,
+            &locator.provider,
+            &locator.session_id,
+            &operation_id,
+            crate::ownership_lane::wire_fence(
+                body.get("observedEpoch").and_then(Value::as_u64),
+                body.get("observedGeneration").and_then(Value::as_u64),
+            ),
+            "rest",
+            now_ms().max(0) as u64,
+        ) {
+            crate::ownership_lane::TerminalLaneClaim::Granted(ticket) => {
+                ownership_claim = Some(RestOwnershipClaim { ticket, locator });
+            }
+            crate::ownership_lane::TerminalLaneClaim::Unwired
+            | crate::ownership_lane::TerminalLaneClaim::Adopt => {}
+            crate::ownership_lane::TerminalLaneClaim::Refused(outcome) => {
+                tracing::warn!(
+                    target: "freshell_freshagent::terminal_tabs",
+                    provider = %locator.provider,
+                    session_id = %locator.session_id,
+                    pane_id = %pane_id,
+                    outcome = ?outcome,
+                    "spawn_refused: the ownership coordinator refused the claim \
+                     (kata b8ke cross-kind authority, REST rung)"
+                );
+                let owner_fields = crate::ownership_lane::terminal_owner_fields_from_outcome(
+                    &state.ownership,
+                    &outcome,
+                );
+                return Err(match &outcome {
+                    freshell_ownership::BeginOutcome::OwnedByOtherKind { .. } => {
+                        fail_json_restore_unavailable(
+                            &locator.session_id,
+                            None,
+                            owner_fields.as_ref(),
+                        )
+                    }
+                    freshell_ownership::BeginOutcome::Blocked { retry_after_ms, .. } => {
+                        let mut body = json!({
+                            "status": "error",
+                            "code": "SESSION_RESERVED",
+                            "message": "Another lifecycle operation for this sessionRef is in flight".to_string(),
+                            "retryAfterMs": retry_after_ms,
+                        });
+                        if let Some(owner) = owner_fields {
+                            body["ownerKind"] = json!(owner.owner_kind);
+                            body["ownerGeneration"] = json!(owner.owner_generation);
+                        }
+                        (StatusCode::CONFLICT, Json(body)).into_response()
+                    }
+                    freshell_ownership::BeginOutcome::StaleGeneration { .. } => {
+                        fail_json(
+                            StatusCode::CONFLICT,
+                            "Session ownership moved on (stale observed generation); refresh and retry."
+                                .to_string(),
+                        )
+                    }
+                    _ => unreachable!("the refused arms are exhaustive above"),
+                });
+            }
+        }
+    }
     if let Some(live_sid) = guard_locator.as_ref().map(|r| r.session_id.as_str()) {
         // Reconnect-revive Task 7: every refusal that CAN name a live terminal
         // carries its id (`liveTerminalId`) so the caller can reattach instead
@@ -1314,9 +1471,17 @@ pub(crate) async fn spawn_terminal_pane(
                 pane_id = %pane_id,
                 "spawn_refused: a Running terminal already owns this session (D7 live-guard, REST rung)"
             );
+            // kata b8ke Task 4: the coordinator's owner fields ride the same
+            // envelope when it knows the owner.
+            let owner_fields = state.ownership.as_ref().and_then(|ownership| {
+                crate::ownership_lane::terminal_owner_fields_from_snapshot(
+                    &ownership.observe(&mode, live_sid),
+                )
+            });
             return Err(fail_json_restore_unavailable(
                 live_sid,
                 Some(&owner_terminal_id),
+                owner_fields.as_ref(),
             ));
         }
 
@@ -1358,7 +1523,16 @@ pub(crate) async fn spawn_terminal_pane(
                     pane_id = %pane_id,
                     "spawn_refused: sessionRef already bound to a live terminal (D8, REST rung)"
                 );
-                return Err(fail_json_restore_unavailable(live_sid, Some(&terminal_id)));
+                let owner_fields = state.ownership.as_ref().and_then(|ownership| {
+                    crate::ownership_lane::terminal_owner_fields_from_snapshot(
+                        &ownership.observe(&mode, live_sid),
+                    )
+                });
+                return Err(fail_json_restore_unavailable(
+                    live_sid,
+                    Some(&terminal_id),
+                    owner_fields.as_ref(),
+                ));
             }
             SessionRefClaim::Held { .. } | SessionRefClaim::ExpiredNeedsKill { .. } => {
                 tracing::warn!(
@@ -1368,7 +1542,16 @@ pub(crate) async fn spawn_terminal_pane(
                     pane_id = %pane_id,
                     "spawn_refused: sessionRef lease unavailable (D8, REST rung)"
                 );
-                return Err(fail_json_restore_unavailable(live_sid, None));
+                let owner_fields = state.ownership.as_ref().and_then(|ownership| {
+                    crate::ownership_lane::terminal_owner_fields_from_snapshot(
+                        &ownership.observe(&mode, live_sid),
+                    )
+                });
+                return Err(fail_json_restore_unavailable(
+                    live_sid,
+                    None,
+                    owner_fields.as_ref(),
+                ));
             }
         }
     }
@@ -1401,6 +1584,8 @@ pub(crate) async fn spawn_terminal_pane(
         pane_identity: state.pane_identity.clone(),
         create_request_id,
         session_ref_lease,
+        ownership_claim,
+        under_handoff_ticket,
         registry,
         host_os,
         is_wsl,
@@ -1454,6 +1639,11 @@ struct GatedSettleInputs {
     pane_identity: Option<std::sync::Arc<dyn freshell_terminal::registry::PaneIdentityBinder>>,
     create_request_id: String,
     session_ref_lease: Option<RestSessionRefLease>,
+    /// kata b8ke Task 4: the coordinator claim (RAII — drop = typed fail);
+    /// committed at the winner-bind site, or surfaced to the handoff runner
+    /// when `under_handoff_ticket` is set (single commit authority).
+    ownership_claim: Option<RestOwnershipClaim>,
+    under_handoff_ticket: bool,
     registry: freshell_terminal::TerminalRegistry,
     /// Hoisted spawn-environment inputs (Task 11): computed ONCE in
     /// [`spawn_terminal_pane`] so the amplifier windows-arm guard there and
@@ -1495,6 +1685,8 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         pane_identity,
         create_request_id,
         mut session_ref_lease,
+        mut ownership_claim,
+        under_handoff_ticket,
         registry,
         host_os,
         is_wsl,
@@ -2178,6 +2370,64 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         }
     }
 
+    // kata b8ke Task 4: the REST rung's coordinator winner commit — right
+    // after the registry winner-bind. UNDER-TICKET (a handoff runner's
+    // spawn): skip the commit (single commit authority — the runner performs
+    // the one `commit_live`) and surface the terminal's OwnerIdentity in the
+    // result instead. A stale/foreign commit tears our own child down
+    // exactly like the revoked-lease arm above.
+    let mut surfaced_owner_identity: Option<freshell_ownership::OwnerIdentity> = None;
+    if let Some(claim) = ownership_claim.take() {
+        if under_handoff_ticket {
+            let mut ticket = claim.ticket;
+            ticket.disarm();
+            surfaced_owner_identity = Some(freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                terminal_id: Some(terminal_id.clone()),
+                live_session_key: None,
+                pid: registry.pid_of(&terminal_id),
+                ownership_id: None,
+            });
+        } else {
+            let claim_locator = claim.locator.clone();
+            match claim.commit(&registry, &terminal_id) {
+                Ok(()) => {
+                    tracing::info!(
+                        target: "freshell_freshagent::terminal_tabs",
+                        terminal_id = %terminal_id,
+                        "session_ref.ownership_committed (REST rung)"
+                    );
+                }
+                Err(outcome) => {
+                    tracing::error!(target: "invariant",
+                        terminal_id = %terminal_id,
+                        outcome = ?outcome,
+                        "session_ref_ownership_commit_stale: the coordinator moved on while \
+                         the REST create spawned; killing the unowned child"
+                    );
+                    let locator = claim_locator;
+                    let pid = registry.pid_of(&terminal_id);
+                    registry.kill(&terminal_id);
+                    let confirmed = match pid {
+                        Some(pid) => confirm_pid_dead_within_500ms(pid).await,
+                        None => true,
+                    };
+                    if confirmed {
+                        registry.force_release_after_confirmed_kill(&locator);
+                    }
+                    return Err(fail_json_code(
+                        StatusCode::CONFLICT,
+                        "RESTORE_UNAVAILABLE",
+                        format!(
+                            "Session {} is still running on the server.",
+                            locator.session_id
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
     let mut pane_content = json!({
         "kind": "terminal",
         "terminalId": terminal_id,
@@ -2267,6 +2517,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         mode,
         shell: shell_str,
         cwd,
+        owner_identity: surfaced_owner_identity,
     })
 }
 
@@ -2306,6 +2557,7 @@ async fn create_terminal_tab(
         mode,
         shell: shell_str,
         cwd,
+        owner_identity: _,
     } = spawned;
 
     state.tabs.lock().expect("tabs mutex").insert(

@@ -663,6 +663,16 @@ export const TerminalKillSchema = z.object({
    * servers (accept-and-strip inbound).
    */
   createRequestId: z.string().min(1).optional(),
+  /**
+   * kata b8ke delayed-request fence (Task 4): the (epoch, generation) pair
+   * the client observed when it decided to kill — feeds the fenced stop
+   * claim (a delayed kill naming superseded ownership is typed-refused
+   * instead of killing the wrong runtime). A pair sent together is the
+   * fence; neither-sent is legacy-unfenced (the server falls back to the
+   * retained stamp). Additive optional; WS_PROTOCOL_VERSION stays put.
+   */
+  observedEpoch: z.number().int().nonnegative().optional(),
+  observedGeneration: z.number().int().nonnegative().optional(),
 })
 
 export const CodexActivityListSchema = z.object({

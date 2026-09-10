@@ -366,6 +366,14 @@ pub struct WsState {
     /// storms. In-memory only: a server restart intentionally resets it.
     pub fresh_agent_respawn_counts:
         std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(String, String), u32>>>,
+    /// kata b8ke Task 4: the ONE server-wide runtime-ownership coordinator
+    /// (the same instance `freshell-server::main` injects into every
+    /// fresh-agent state and the terminal registry). `None` (every hand-built
+    /// test `WsState`) keeps the terminal lane's coordinator bookkeeping off —
+    /// legacy behavior byte-for-byte. The terminal create/kill paths and the
+    /// ready-frame owner replay consult this; Task 6's WS probes and Task 7's
+    /// pause hook live beside it.
+    pub ownership: Option<Arc<freshell_ownership::RuntimeOwnershipRegistry>>,
     /// The opencode terminal-pane session locator (restore-across-restart fix,
     /// `docs/plans/2026-07-18-opencode-terminal-restore-spec.md`): correlates a
     /// fresh opencode PTY's first Enter/submit (or a row written at spawn) with
@@ -559,9 +567,30 @@ pub async fn build_handshake_with_capabilities(
     terminal_interest_v1: bool,
 ) -> Vec<ServerMessage> {
     let boot_id = state.boot_id.as_ref().clone();
+    // kata b8ke Task 4 (reconnect-owner discovery, T1 rec A3): replay current
+    // runtime-owner state on EVERY handshake — a device that missed a
+    // handoff broadcast (offline during handoff, lag-4008 disconnect, page
+    // reload) learns the authoritative owner from ready alone. Omitted when
+    // the coordinator is not injected, keeping hand-built test states (no
+    // registry) byte-identical.
+    let runtime_owners: Option<Vec<freshell_protocol::RuntimeOwnerReplay>> =
+        state.ownership.as_ref().map(|ownership| {
+            ownership
+                .snapshot_records()
+                .into_iter()
+                .map(|rec| freshell_protocol::RuntimeOwnerReplay {
+                    provider: rec.provider,
+                    session_id: rec.session_id,
+                    epoch: rec.epoch,
+                    generation: rec.generation,
+                    owner_kind: rec.owner_kind,
+                    terminal_id: rec.terminal_id,
+                })
+                .collect()
+        });
     let mut messages = vec![
         ServerMessage::Ready(Ready {
-            runtime_owners: None,
+            runtime_owners,
             timestamp: now_iso(),
             boot_id: Some(boot_id.clone()),
             server_instance_id: Some(state.server_instance_id.as_ref().clone()),
@@ -975,6 +1004,7 @@ pub(crate) fn test_ws_state() -> WsState {
         session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
+        ownership: None,
     }
 }
 

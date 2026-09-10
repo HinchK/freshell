@@ -554,6 +554,21 @@ fn session_ref_key(locator: &SessionLocator) -> String {
     format!("{}\u{0}{}", locator.provider, locator.session_id)
 }
 
+/// The runtime identity a retained claim commits/releases under (kata b8ke
+/// Task 4): terminal kind, the terminal id, the recorded pid, keyed to the
+/// committing operation (the release fence key).
+fn retained_runtime_identity(
+    claim: &RetainedSessionRefOwnership,
+) -> freshell_ownership::OwnerIdentity {
+    freshell_ownership::OwnerIdentity {
+        kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+        terminal_id: Some(claim.terminal_id.clone()),
+        live_session_key: None,
+        pid: claim.pid,
+        ownership_id: Some(claim.operation_id.clone()),
+    }
+}
+
 #[derive(Clone)]
 pub struct TerminalRegistry {
     inner: Arc<Mutex<RegistryInner>>,
@@ -621,6 +636,34 @@ pub struct TerminalRegistry {
     /// KNOWN dead (registered but not Running) is pruned instead of
     /// answering `BoundElsewhere`, so a dead winner never strands losers.
     session_ref_bindings: Arc<Mutex<HashMap<String, String>>>,
+    /// kata b8ke Task 4: the ONE server-wide runtime-ownership coordinator,
+    /// release-only integration (the registry itself never claims — the WS/
+    /// REST/auto-resume lanes claim; this crate only RELEASES on confirmed
+    /// death: `kill_internal`'s end-of-fn release after the PTY kill, the
+    /// natural-exit release in `finish_pty_exit`, and the force-release twin
+    /// beside [`Self::force_release_after_confirmed_kill`]). `None` (every
+    /// pre-existing construction) keeps all of it a no-op.
+    ownership: Option<Arc<freshell_ownership::RuntimeOwnershipRegistry>>,
+    /// kata b8ke Task 4: the retained coordinator commit per sessionRef key —
+    /// the fenced `ReleaseClaim` source for the exit/kill release paths. A
+    /// terminal that committed `Live{Terminal}` through
+    /// [`Self::commit_session_ref_ownership`] records its claim here; the
+    /// release paths take-if-matches (a newer owner's entry is never taken by
+    /// an older terminal's exit).
+    session_ref_ownership: Arc<Mutex<HashMap<String, RetainedSessionRefOwnership>>>,
+}
+
+/// The retained coordinator claim for one sessionRef-owning terminal (kata
+/// b8ke Task 4): everything the fenced release needs — the locator, the
+/// committing operation, its generation, and the runtime identity the commit
+/// stamped (terminal id + pid).
+#[derive(Debug, Clone)]
+pub struct RetainedSessionRefOwnership {
+    pub locator: SessionLocator,
+    pub terminal_id: String,
+    pub operation_id: String,
+    pub generation: u64,
+    pub pid: Option<u32>,
 }
 
 impl Default for TerminalRegistry {
@@ -768,7 +811,21 @@ impl TerminalRegistry {
             resume_create_inflight: Arc::new(Mutex::new(std::collections::HashSet::new())),
             session_ref_leases: Arc::new(Mutex::new(HashMap::new())),
             session_ref_bindings: Arc::new(Mutex::new(HashMap::new())),
+            ownership: None,
+            session_ref_ownership: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// kata b8ke Task 4: wire the ONE server-wide runtime-ownership
+    /// coordinator (release-only integration — see [`Self::ownership`]'s field
+    /// doc). Builder form, matching the neighboring injection seams
+    /// (`freshell-server::main` calls it right after `TerminalRegistry::new`).
+    pub fn with_ownership(
+        mut self,
+        ownership: Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+    ) -> Self {
+        self.ownership = Some(ownership);
+        self
     }
 
     /// Mint a unique id for one WS connection (used to key its subscriptions so
@@ -1654,6 +1711,17 @@ impl TerminalRegistry {
             }
         }
         tracing::info!(terminal_id = %terminal_id, by = by, "terminal.killed");
+        // kata b8ke Task 4 (round-1 review: NEVER release before the kill +
+        // confirmed reap): the fenced coordinator release runs at the END of
+        // the kill — AFTER the `pty.kill()` block above, whose return point
+        // IS the confirmed reap for this port (an immediate SIGKILL-and-
+        // reap, see `PtyTerminal::kill`'s doc comment). A release any
+        // earlier would mark the key Vacant while the old writer was still
+        // alive. Fenced: a newer owner or an in-flight Handoff no-ops it;
+        // during an explicit kill's Stopping window (the WS `terminal.kill`
+        // sequence begin_stopped first) the `Live`-only release no-ops and
+        // the stop's own `commit_stop` finishes the transition.
+        self.release_session_ref_ownership(terminal_id, by);
         // TERM-15/TERM-16 tap: a kill clears activity too — no stale blue.
         self.notify_activity(ActivityEvent::Exit {
             terminal_id: terminal_id.to_string(),
@@ -1772,6 +1840,13 @@ impl TerminalRegistry {
             }
         }
         tracing::info!(terminal_id = %terminal_id, exit_code = exit_code, "terminal.exited");
+        // kata b8ke Task 4: the natural-exit confirmation — the reader
+        // thread that runs this hook IS the confirmed reap — releases the
+        // terminal's coordinator ownership fenced (a newer owner or an
+        // in-flight handoff no-ops it; the auto-resume crash-recovery claim
+        // that follows carries the retained fence this terminal committed
+        // under).
+        self.release_session_ref_ownership(terminal_id, "registry/natural-exit");
         // TERM-15/TERM-16 tap: natural exit clears activity (the hub removes
         // the record — no stale blue after exit, TERM-18 semantics).
         self.notify_activity(ActivityEvent::Exit {
@@ -2402,11 +2477,181 @@ impl TerminalRegistry {
 
     /// The caller killed the holder's child via the registry PTY handle and
     /// CONFIRMED death (ESRCH): release the lease so the next claim wins.
+    /// kata b8ke Task 4: also force-release the COORDINATOR with the retained
+    /// claim (fenced — no-op on any mismatch, never fires during a Handoff),
+    /// so a confirmed-kill recovery path reopens BOTH layers.
     pub fn force_release_after_confirmed_kill(&self, locator: &SessionLocator) {
         self.session_ref_leases
             .lock()
             .expect("session-ref lease lock")
             .remove(&session_ref_key(locator));
+        let Some(ownership) = self.ownership.as_ref() else {
+            return;
+        };
+        // Take-if-matches: only an entry whose runtime is CONFIRMED DEAD (no
+        // registry row — every confirmed kill removes it) is taken; a newer
+        // LIVE owner's retained entry (same locator key, replaced at its
+        // commit) is never taken by an older path's force-release.
+        let key = session_ref_key(locator);
+        let dead_runtime = {
+            let claims = self
+                .session_ref_ownership
+                .lock()
+                .expect("session-ref ownership lock");
+            claims
+                .get(&key)
+                .is_some_and(|claim| !self.is_running(&claim.terminal_id))
+        };
+        if dead_runtime {
+            if let Some(claim) = self.take_retained_ownership_claim(&key) {
+                ownership.force_release_for_confirmed_kill(
+                    &locator.provider,
+                    &locator.session_id,
+                    &freshell_ownership::ReleaseClaim {
+                        operation_id: claim.operation_id.clone(),
+                        generation: claim.generation,
+                        runtime: Some(retained_runtime_identity(&claim)),
+                    },
+                    "registry/confirmed-kill",
+                );
+            }
+        }
+    }
+
+    /// kata b8ke Task 4: commit coordinator ownership for a sessionRef-bound
+    /// terminal — `Live{Terminal}` with the runtime identity (terminal id +
+    /// current PTY pid) — and RETAIN the claim so the exit/kill release paths
+    /// can release it fenced. Called by the create lanes (WS / REST /
+    /// auto-resume) at their winner-settle points. Returns the coordinator's
+    /// outcome: `Committed`, or `StaleGeneration`/`ForeignOperation` — the
+    /// caller must tear down its just-spawned child exactly like its
+    /// revoked-lease discipline (the key was never ours to keep).
+    pub fn commit_session_ref_ownership(
+        &self,
+        locator: &SessionLocator,
+        operation_id: &str,
+        generation: u64,
+        terminal_id: &str,
+    ) -> freshell_ownership::CommitOutcome {
+        let Some(ownership) = self.ownership.as_ref() else {
+            return freshell_ownership::CommitOutcome::Committed;
+        };
+        let pid = self.pid_of(terminal_id);
+        let owner = freshell_ownership::OwnerIdentity {
+            kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+            terminal_id: Some(terminal_id.to_string()),
+            live_session_key: None,
+            pid,
+            ownership_id: Some(operation_id.to_string()),
+        };
+        let outcome = ownership.commit_live(
+            &locator.provider,
+            &locator.session_id,
+            operation_id,
+            generation,
+            owner,
+        );
+        if matches!(outcome, freshell_ownership::CommitOutcome::Committed) {
+            self.session_ref_ownership
+                .lock()
+                .expect("session-ref ownership lock")
+                .insert(
+                    session_ref_key(locator),
+                    RetainedSessionRefOwnership {
+                        locator: locator.clone(),
+                        terminal_id: terminal_id.to_string(),
+                        operation_id: operation_id.to_string(),
+                        generation,
+                        pid,
+                    },
+                );
+        }
+        outcome
+    }
+
+    /// The last-known coordinator `(epoch, generation)` a terminal committed
+    /// under (kata b8ke Task 4) — the auto-resume crash event's observed
+    /// fence pair. `None` when the terminal never committed ownership (a
+    /// pre-coordinator terminal, or one whose locator resolved later).
+    pub fn retained_ownership_fence(&self, terminal_id: &str) -> Option<(u64, u64)> {
+        let ownership = self.ownership.as_ref()?;
+        let claims = self
+            .session_ref_ownership
+            .lock()
+            .expect("session-ref ownership lock");
+        claims
+            .values()
+            .find(|claim| claim.terminal_id == terminal_id)
+            .map(|claim| (ownership.boot_epoch(), claim.generation))
+    }
+
+    /// The retained coordinator claim for a terminal (kata b8ke Task 4) —
+    /// the explicit-kill path's `StopClaim` source (expected runtime
+    /// identity + observed fence).
+    pub fn retained_ownership_claim(
+        &self,
+        terminal_id: &str,
+    ) -> Option<RetainedSessionRefOwnership> {
+        let claims = self
+            .session_ref_ownership
+            .lock()
+            .expect("session-ref ownership lock");
+        claims
+            .values()
+            .find(|claim| claim.terminal_id == terminal_id)
+            .cloned()
+    }
+
+    /// Take the retained claim keyed by the locator key (the force-release
+    /// twin's lookup). Removing the entry hands the release decision to the
+    /// caller; a mismatched Live record still no-ops the fenced release.
+    fn take_retained_ownership_claim(&self, key: &str) -> Option<RetainedSessionRefOwnership> {
+        self.session_ref_ownership
+            .lock()
+            .expect("session-ref ownership lock")
+            .remove(key)
+    }
+
+    /// Take the retained claim belonging to THIS terminal (the exit/kill
+    /// release paths' lookup). Only an entry whose terminal id matches is
+    /// taken — a newer owner's retained entry (same locator key, replaced at
+    /// its commit) is never taken by an older terminal's death.
+    fn take_retained_ownership_claim_for_terminal(
+        &self,
+        terminal_id: &str,
+    ) -> Option<RetainedSessionRefOwnership> {
+        let mut claims = self
+            .session_ref_ownership
+            .lock()
+            .expect("session-ref ownership lock");
+        let key = claims
+            .iter()
+            .find(|(_, claim)| claim.terminal_id == terminal_id)
+            .map(|(key, _)| key.clone())?;
+        claims.remove(&key)
+    }
+
+    /// The fenced coordinator release for a terminal's confirmed death (kata
+    /// b8ke Task 4): no-ops when unwired, when the terminal never committed,
+    /// or when the retained claim no longer matches the Live record (a newer
+    /// owner took the key — its entry is never taken).
+    fn release_session_ref_ownership(&self, terminal_id: &str, initiator: &str) {
+        let Some(ownership) = self.ownership.as_ref() else {
+            return;
+        };
+        let Some(claim) = self.take_retained_ownership_claim_for_terminal(terminal_id) else {
+            return;
+        };
+        ownership.release(
+            &claim.locator.provider,
+            &claim.locator.session_id,
+            &freshell_ownership::ReleaseClaim {
+                operation_id: claim.operation_id.clone(),
+                generation: claim.generation,
+                runtime: Some(retained_runtime_identity(&claim)),
+            },
+            initiator,
+        );
     }
 
     /// The terminalId a completed claim bound this sessionRef to

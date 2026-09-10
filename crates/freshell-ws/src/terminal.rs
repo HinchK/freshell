@@ -2209,6 +2209,40 @@ impl Drop for SessionRefLeaseGuard {
     }
 }
 
+/// The terminal lane's coordinator claim guard (kata b8ke Task 4). Wraps the
+/// `OperationTicket` granted by the UNGATED claim at the top of
+/// [`handle_create`] (round-2 review: EVERY connection, negotiated or not —
+/// the registry lease above stays `paneReconcileV1`-gated, this claim does
+/// not). Drop without [`Self::commit`] performs the coordinator's typed
+/// `fail` (RAII, via the ticket), so a cancelled/panicked create can never
+/// wedge a session in `Starting`. The winner path commits through
+/// [`Self::commit`], which also retains the release claim in the registry
+/// (the exit/kill fenced-release source).
+struct TerminalOwnershipClaim {
+    ticket: freshell_ownership::OperationTicket,
+    registry: freshell_terminal::TerminalRegistry,
+    locator: SessionLocator,
+}
+
+impl TerminalOwnershipClaim {
+    /// Commit `Live{Terminal}` for the spawned runtime and retain the claim.
+    /// `Err` (stale generation / foreign operation) means the key was
+    /// recovered out from under us mid-create — the caller must tear its
+    /// just-spawned child down exactly like the revoked-lease discipline.
+    fn commit(self, terminal_id: &str) -> Result<(), freshell_ownership::CommitOutcome> {
+        let outcome = self.registry.commit_session_ref_ownership(
+            &self.locator,
+            self.ticket.operation_id(),
+            self.ticket.generation(),
+            terminal_id,
+        );
+        match outcome {
+            freshell_ownership::CommitOutcome::Committed => Ok(()),
+            stale => Err(stale),
+        }
+    }
+}
+
 /// Poll `kill(pid, 0)` for ESRCH for up to 500ms (the PTY's dedicated waiter
 /// thread reaps promptly — `pty.rs` reader/waiter). `true` = death CONFIRMED.
 pub(crate) async fn confirm_pid_dead_within_500ms(pid: u32) -> bool {
@@ -2246,16 +2280,20 @@ pub(crate) async fn kill_session_ref_holder_and_confirm(
 }
 
 /// The D8 loser reply: `error{SESSION_RESERVED, requestId, retryAfterMs}` —
-/// the only error frame that carries `retryAfterMs`.
+/// the only error frame that carries `retryAfterMs`. kata b8ke Task 4: the
+/// coordinator-named owner rides the additive `ownerKind`/`ownerGeneration`
+/// fields when the coordinator knows one (absent when it is unwired —
+/// legacy byte-for-byte).
 async fn send_session_reserved(
     out: &mut crate::create_gate::CreateOutput<'_>,
     request_id: &str,
     retry_after_ms: u64,
+    owner: Option<&freshell_freshagent::ownership_lane::TerminalOwnerFields>,
 ) -> bool {
     let msg = ServerMessage::Error(ErrorMsg {
-        owner_kind: None,
-        owner_generation: None,
-        owner_epoch: None,
+        owner_kind: owner.map(|o| o.owner_kind.to_string()),
+        owner_generation: owner.map(|o| o.owner_generation),
+        owner_epoch: owner.map(|o| o.owner_epoch),
         code: ErrorCode::SessionReserved,
         message: "Another terminal.create for this sessionRef is in flight".to_string(),
         timestamp: crate::now_iso(),
@@ -2337,6 +2375,12 @@ pub(crate) fn build_pty_exit_hook(
         cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
         // Lane D1: read identity/probe BEFORE finish/retire mutate state.
         let probe = deps.registry.probe(&terminal_id);
+        // kata b8ke Task 4: the dying generation's committed ownership fence,
+        // captured BEFORE `finish_pty_exit` below consumes the retained
+        // claim (its fenced release). The CrashEvent carries it as the
+        // respawn claim's observed fence — a recovery observing a superseded
+        // generation is typed-refused stale.
+        let observed_fence = deps.registry.retained_ownership_fence(&terminal_id);
         let create_request_id = deps.registry.probe_create_request_id(&terminal_id);
         let finished = deps.registry.finish_pty_exit(&terminal_id, exit_code);
         // DEV-0006 S4: tear down this pane's managed codex sidecar + remote proxy
@@ -2418,12 +2462,14 @@ pub(crate) fn build_pty_exit_hook(
                 .as_ref()
                 .map(|p| now_ms() - p.created_at)
                 .unwrap_or(i64::MAX);
+            // kata b8ke Task 4: the fence captured above rides the event.
             let _ = deps.auto_resume_tx.send(crate::auto_resume::CrashEvent {
                 terminal_id: terminal_id.clone(),
                 exit_code,
                 mode: mode.clone(),
                 create_request_id,
                 lifetime_ms,
+                observed_fence,
             });
         }
     })
@@ -2913,6 +2959,115 @@ pub(crate) async fn handle_create(
     // the outcome itself is discoverable through the registry.
     let _keyed_create_guard = keyed_create_guard;
 
+    // kata b8ke Task 4: the terminal lane's coordinator claim — the
+    // cross-kind authority, UNGATED (round-2 review: EVERY connection's
+    // create-with-sessionRef claims here, BEFORE the registry lease and
+    // BEFORE the `paneReconcileV1` gate below, so the vacant-state race is
+    // closed for non-negotiated senders too — not just via the check-then-act
+    // D7 probe). The claim sits before the registry lease on the negotiated
+    // path; the registry's per-sessionRef lease stays INSIDE the gate
+    // (legacy connections never enter the lease branch — unchanged). The
+    // `Adopt` arm claims nothing: a same-kind live terminal runtime is
+    // handled by the lease's `BoundElsewhere` attach (negotiated) or the D7
+    // refusal (non-negotiated). Refusals are the frozen D7 frame with the
+    // ADDITIVE owner fields (round-1 review: `send_create_error_with_owner`).
+    let mut terminal_ownership: Option<TerminalOwnershipClaim> = None;
+    if let Some(locator) = create_session_locator(&create) {
+        if state.ownership.is_some() {
+            let operation_id = format!("term-create-{}", create.request_id);
+            let initiator = format!("ws-conn-{conn_id}");
+            let claim = freshell_freshagent::ownership_lane::begin_terminal_lane_claim(
+                &state.ownership,
+                &locator.provider,
+                &locator.session_id,
+                &operation_id,
+                freshell_freshagent::ownership_lane::wire_fence(
+                    create.observed_epoch,
+                    create.observed_generation,
+                ),
+                &initiator,
+                now_ms().max(0) as u64,
+            );
+            match claim {
+                freshell_freshagent::ownership_lane::TerminalLaneClaim::Granted(ticket) => {
+                    terminal_ownership = Some(TerminalOwnershipClaim {
+                        ticket,
+                        registry: state.registry.clone(),
+                        locator,
+                    });
+                }
+                freshell_freshagent::ownership_lane::TerminalLaneClaim::Unwired
+                | freshell_freshagent::ownership_lane::TerminalLaneClaim::Adopt => {}
+                freshell_freshagent::ownership_lane::TerminalLaneClaim::Refused(outcome) => {
+                    tracing::warn!(
+                        target: "freshell_ws::terminal",
+                        provider = %locator.provider,
+                        session_id = %locator.session_id,
+                        request_id = %create.request_id,
+                        outcome = ?outcome,
+                        "terminal_create_refused: the ownership coordinator refused the claim \
+                         (kata b8ke cross-kind authority)"
+                    );
+                    match &outcome {
+                        freshell_ownership::BeginOutcome::OwnedByOtherKind { owner, .. } => {
+                            // The D7 refusal shape, byte-frozen text, additive
+                            // typed owner fields; `live_terminal_id` names a
+                            // TERMINAL owner only (a fresh-agent owner has no
+                            // terminal id — the revival arm stays inert).
+                            let live_terminal_id = (owner.kind
+                                == freshell_ownership::RuntimeOwnerKind::Terminal)
+                                .then(|| owner.terminal_id.clone())
+                                .flatten();
+                            return send_create_error_with_owner(
+                                out,
+                                ErrorCode::RestoreUnavailable,
+                                format!(
+                                    "Session {} is still running on the server.",
+                                    locator.session_id
+                                ),
+                                &create.request_id,
+                                live_terminal_id,
+                                freshell_freshagent::ownership_lane::terminal_owner_fields_from_outcome(
+                                    &state.ownership, &outcome
+                                )
+                                .as_ref(),
+                            )
+                            .await;
+                        }
+                        freshell_ownership::BeginOutcome::Blocked { retry_after_ms, .. } => {
+                            // SESSION_RESERVED-style, retryable, owner fields
+                            // when the blocked state names a live owner.
+                            return send_session_reserved(
+                                out,
+                                &create.request_id,
+                                *retry_after_ms,
+                                freshell_freshagent::ownership_lane::terminal_owner_fields_from_outcome(
+                                    &state.ownership, &outcome
+                                )
+                                .as_ref(),
+                            )
+                            .await;
+                        }
+                        freshell_ownership::BeginOutcome::StaleGeneration { .. } => {
+                            // Typed stale refusal, retryable: false — no
+                            // retry hint (the caller must refresh its fence).
+                            return send_create_error(
+                                out,
+                                ErrorCode::SessionReserved,
+                                "Session ownership moved on (stale observed generation); \
+                                 refresh and retry."
+                                    .to_string(),
+                                &create.request_id,
+                            )
+                            .await;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
     // Council rule 7 (D8 two-writers closure): per-sessionRef single-flight,
     // negotiated connections ONLY. The claim runs BEFORE the rate limiter —
     // a loser's SESSION_RESERVED (like the §5.4 adopt above, the
@@ -2994,8 +3149,20 @@ pub(crate) async fn handle_create(
                         return out.send(&created).await;
                     }
                     SessionRefClaim::Held { retry_after_ms } => {
-                        return send_session_reserved(out, &create.request_id, retry_after_ms)
-                            .await;
+                        // kata b8ke Task 4: the loser reply names the
+                        // coordinator's owner when one is recorded.
+                        let owner = state.ownership.as_ref().and_then(|ownership| {
+                            freshell_freshagent::ownership_lane::terminal_owner_fields_from_snapshot(
+                                &ownership.observe(&locator.provider, &locator.session_id),
+                            )
+                        });
+                        return send_session_reserved(
+                            out,
+                            &create.request_id,
+                            retry_after_ms,
+                            owner.as_ref(),
+                        )
+                        .await;
                     }
                     SessionRefClaim::ExpiredNeedsKill { pid } => {
                         if round == 0
@@ -3011,10 +3178,16 @@ pub(crate) async fn handle_create(
                             session_id = %locator.session_id,
                             pid,
                             "session_ref_lease_expired_kill_unconfirmed: holding lease closed");
+                        let owner = state.ownership.as_ref().and_then(|ownership| {
+                            freshell_freshagent::ownership_lane::terminal_owner_fields_from_snapshot(
+                                &ownership.observe(&locator.provider, &locator.session_id),
+                            )
+                        });
                         return send_session_reserved(
                             out,
                             &create.request_id,
                             freshell_terminal::registry::SESSION_RESERVED_RETRY_AFTER_MS,
+                            owner.as_ref(),
                         )
                         .await;
                     }
@@ -3179,7 +3352,8 @@ pub(crate) async fn handle_create(
     // are freshly minted or single-source and keep their existing guards.
     let d7_locator = create_session_locator(&create)
         .filter(|loc| resume_session_id.as_deref() == Some(loc.session_id.as_str()));
-    if let Some(live_sid) = d7_locator.as_ref().map(|loc| loc.session_id.as_str()) {
+    if let Some(d7_loc) = d7_locator.as_ref() {
+        let live_sid = d7_loc.session_id.as_str();
         // #540 (ks38): the identity-owner + Running-row join is now the shared
         // `TerminalRegistry::live_session_owner` helper (the same join the REST
         // resume paths consult), replacing the former inline two-arm check.
@@ -3226,12 +3400,20 @@ pub(crate) async fn handle_create(
             // `live_terminal_id` — Some on the terminal-owner arm, None on the
             // cross-kind fresh-agent arm (no terminal id exists there, so the
             // client-side revival arm stays inert by design).
-            return send_create_error_with_live_terminal(
+            // kata b8ke Task 4: the coordinator's owner fields ride along
+            // when it knows the owner (`observe` — absent when unwired).
+            let owner_fields = state.ownership.as_ref().and_then(|ownership| {
+                freshell_freshagent::ownership_lane::terminal_owner_fields_from_snapshot(
+                    &ownership.observe(&d7_loc.provider, live_sid),
+                )
+            });
+            return send_create_error_with_owner(
                 out,
                 ErrorCode::RestoreUnavailable,
                 format!("Session {live_sid} is still running on the server."),
                 &create.request_id,
                 owner,
+                owner_fields.as_ref(),
             )
             .await;
         }
@@ -3266,7 +3448,12 @@ pub(crate) async fn handle_create(
             // STALE ref must be RELEASED, never completed (completing it
             // would bind stale-ref->terminal in the registry binding map).
             // Dropping the armed guard runs fail_session_ref_claim.
+            // kata b8ke Task 4: the coordinator claim follows the same
+            // discipline — dropping the ticket fails the `Starting` claim
+            // (the create proceeds under the freshly-minted id, which claims
+            // nothing — the lifecycle-audit rule for mints).
             session_ref_lease = None;
+            drop(terminal_ownership.take());
             resume_fallback_notice = carry.notice;
         }
     }
@@ -4217,6 +4404,55 @@ pub(crate) async fn handle_create(
                 &create.request_id,
             )
             .await;
+        }
+    }
+
+    // kata b8ke Task 4: the coordinator winner commit — the ONE settle point
+    // every create path (negotiated lease-holder or not) shares, just before
+    // the `terminal.created` emission. `Live{Terminal}` + the retained
+    // release claim (the exit/kill paths' fenced-release source). A stale /
+    // foreign commit means the key was recovered out from under us
+    // mid-create (watchdog): tear our own child down exactly like the
+    // revoked-lease discipline above — never leave an unowned writer.
+    if let Some(ownership_claim) = terminal_ownership.take() {
+        let locator = ownership_claim.locator.clone();
+        match ownership_claim.commit(&terminal_id) {
+            Ok(()) => {
+                tracing::info!(
+                    terminal_id = %terminal_id,
+                    provider = %locator.provider,
+                    session_id = %locator.session_id,
+                    "session_ref.ownership_committed (terminal lane)"
+                );
+            }
+            Err(outcome) => {
+                tracing::error!(target: "invariant",
+                    terminal_id = %terminal_id,
+                    provider = %locator.provider,
+                    session_id = %locator.session_id,
+                    outcome = ?outcome,
+                    "session_ref_ownership_commit_stale: the coordinator moved on while the \
+                     create spawned; killing the unowned child"
+                );
+                let pid = state.registry.pid_of(&terminal_id);
+                state.registry.kill(&terminal_id);
+                let confirmed = match pid {
+                    Some(pid) => confirm_pid_dead_within_500ms(pid).await,
+                    // No pid handle to probe: the registry kill removed the row;
+                    // nothing is left to signal, so treat as confirmed.
+                    None => true,
+                };
+                if confirmed {
+                    state.registry.force_release_after_confirmed_kill(&locator);
+                }
+                return send_create_error(
+                    out,
+                    ErrorCode::InternalError,
+                    "Terminal create lost session ownership during spawn; the spawned process was killed".to_string(),
+                    &create.request_id,
+                )
+                .await;
+            }
         }
     }
 
@@ -5239,10 +5475,27 @@ pub(crate) async fn send_create_error_with_live_terminal(
     request_id: &str,
     live_terminal_id: Option<String>,
 ) -> bool {
+    send_create_error_with_owner(out, code, message, request_id, live_terminal_id, None).await
+}
+
+/// kata b8ke Task 4: `send_create_error_with_live_terminal` + the additive
+/// typed owner fields (`ownerKind`/`ownerGeneration`/`ownerEpoch`) the
+/// coordinator refusals carry. The frozen message text and the
+/// `live_terminal_id` discipline are unchanged — all novelty rides the
+/// additive fields, and `owner: None` keeps the frame byte-identical to the
+/// pre-feature shape (frozen-client parity).
+pub(crate) async fn send_create_error_with_owner(
+    out: &mut crate::create_gate::CreateOutput<'_>,
+    code: ErrorCode,
+    message: String,
+    request_id: &str,
+    live_terminal_id: Option<String>,
+    owner: Option<&freshell_freshagent::ownership_lane::TerminalOwnerFields>,
+) -> bool {
     let msg = ServerMessage::Error(ErrorMsg {
-        owner_kind: None,
-        owner_generation: None,
-        owner_epoch: None,
+        owner_kind: owner.map(|o| o.owner_kind.to_string()),
+        owner_generation: owner.map(|o| o.owner_generation),
+        owner_epoch: owner.map(|o| o.owner_epoch),
         code,
         message,
         timestamp: crate::now_iso(),
@@ -6219,6 +6472,118 @@ async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) ->
     // (`INTERNAL_ERROR` / `INVALID_TERMINAL_ID`) remain for requestId-less
     // kills (older clients). (DETACH stays non-retiring, unchanged.)
     let sref = state.identity.session_ref_for(&kill.terminal_id);
+
+    // kata b8ke Task 4 (round-3 carried finding F3 — the binding requirement):
+    // the terminal EXPLICIT KILL runs the FULL fenced stop sequence, NOT a
+    // release-only path — begin_stop(fenced StopClaim: the observed (epoch,
+    // generation) the wire carried, else the retained stamp, plus the expected
+    // runtime kind/identity) → Stopping (competing starts/handoffs blocked) →
+    // kill → confirmed reap (this port's registry kill is an immediate
+    // SIGKILL-and-reap, so its return point IS the confirmation) →
+    // commit_stop. The stop attempt runs BEFORE the durable ledger close
+    // below so a typed refusal strands NO state (Task 3's I-1 lesson: a
+    // pre-kill gate the handler ran must roll back — here nothing has run
+    // yet). Terminals without a retained coordinator claim (shell panes,
+    // pre-coordinator-era rows) keep the plain kill path.
+    let mut stop_commit: Option<(String, String, String, u64)> = None;
+    if let (Some(ownership), Some(retained)) = (
+        state.ownership.as_ref(),
+        state.registry.retained_ownership_claim(&kill.terminal_id),
+    ) {
+        let stop_op_id = format!("term-kill-{}", uuid::Uuid::new_v4());
+        let observed = freshell_freshagent::ownership_lane::wire_fence(
+            kill.observed_epoch,
+            kill.observed_generation,
+        )
+        .unwrap_or(freshell_ownership::ObservedFence {
+            epoch: ownership.boot_epoch(),
+            generation: retained.generation,
+        });
+        let claim = freshell_ownership::StopClaim {
+            expected_kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+            expected_runtime: Some(freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                terminal_id: Some(retained.terminal_id.clone()),
+                live_session_key: None,
+                pid: retained.pid,
+                ownership_id: Some(retained.operation_id.clone()),
+            }),
+            observed,
+        };
+        let outcome = ownership.begin_stop(
+            &retained.locator.provider,
+            &retained.locator.session_id,
+            &stop_op_id,
+            &claim,
+            &format!("ws-kill-{}", kill.terminal_id),
+            now_ms().max(0) as u64,
+        );
+        let refused_reason: Option<String> = match &outcome {
+            freshell_ownership::StopOutcome::Granted { generation } => {
+                stop_commit = Some((
+                    retained.locator.provider.clone(),
+                    retained.locator.session_id.clone(),
+                    stop_op_id.clone(),
+                    *generation,
+                ));
+                None
+            }
+            // Not Live and VACANT: the kill proceeds (idempotent lane
+            // cleanup — a leftover child the coordinator never knew) and
+            // skips the commit.
+            freshell_ownership::StopOutcome::NotLive {
+                state: freshell_ownership::OwnershipState::Vacant,
+            } => None,
+            freshell_ownership::StopOutcome::NotLive { state } => Some(format!(
+                "a lifecycle operation is in flight for this session ({state:?}); retry after it settles"
+            )),
+            freshell_ownership::StopOutcome::BlockedHandoff { .. } => Some(
+                "a handoff owns this session's transition; retry after it settles".to_string(),
+            ),
+            freshell_ownership::StopOutcome::StaleClaim { .. } => {
+                Some("ownership moved to a newer runtime; refresh and retry".to_string())
+            }
+        };
+        if let Some(reason) = refused_reason {
+            tracing::warn!(
+                target: "freshell_ws::terminal",
+                terminal_id = %kill.terminal_id,
+                provider = %retained.locator.provider,
+                session_id = %retained.locator.session_id,
+                outcome = ?outcome,
+                "terminal_kill_refused: the ownership coordinator refused the stop \
+                 (kata b8ke) — nothing is killed, no durable close is recorded"
+            );
+            if let Some(request_id) = &kill.request_id {
+                let msg = ServerMessage::TerminalKilled(freshell_protocol::TerminalKilled {
+                    request_id: request_id.clone(),
+                    terminal_id: kill.terminal_id,
+                    success: false,
+                    error: Some(reason),
+                });
+                return send(ws_tx, &msg).await;
+            }
+            let msg = ServerMessage::Error(ErrorMsg {
+                owner_kind: None,
+                owner_generation: None,
+                owner_epoch: None,
+                code: ErrorCode::SessionReserved,
+                message: reason,
+                timestamp: crate::now_iso(),
+                actual_session_ref: None,
+                expected_session_ref: None,
+                request_id: None,
+                retry_after_ms: None,
+                terminal_id: Some(kill.terminal_id),
+                terminal_exit_code: None,
+                live_terminal_id: None,
+            });
+            return send(ws_tx, &msg).await;
+        }
+    }
+    // The stop's second half (commit_stop after the confirmed reap) runs at
+    // every successful `kill_and_broadcast` below.
+
     let create_request_id = state
         .registry
         .probe_create_request_id(&kill.terminal_id)
@@ -6301,7 +6666,8 @@ async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) ->
         "the terminal close is recorded durably, but the ledger reported an error; \
          the terminal was closed to keep state consistent";
     if let Some(request_id) = &kill.request_id {
-        kill_and_broadcast(state, &kill.terminal_id);
+        let existed = kill_and_broadcast(state, &kill.terminal_id);
+        commit_terminal_stop(state, existed, &mut stop_commit);
         let msg = ServerMessage::TerminalKilled(freshell_protocol::TerminalKilled {
             request_id: request_id.clone(),
             terminal_id: kill.terminal_id,
@@ -6311,6 +6677,7 @@ async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) ->
         return send(ws_tx, &msg).await;
     }
     if kill_and_broadcast(state, &kill.terminal_id) {
+        commit_terminal_stop(state, true, &mut stop_commit);
         if persisted_despite_error {
             let msg = ServerMessage::Error(ErrorMsg {
                 owner_kind: None,
@@ -6341,6 +6708,42 @@ fn close_outcome_is_clean_failure(
     outcome: &Result<(), crate::pane_ledger::CloseEnvelopeError>,
 ) -> bool {
     matches!(outcome, Err(err) if !err.is_persisted())
+}
+
+/// kata b8ke Task 4: the explicit kill's stop-sequence SECOND HALF —
+/// `commit_stop` after the confirmed reap (this port's registry kill is an
+/// immediate SIGKILL-and-reap, so `kill_and_broadcast` returning IS the
+/// confirmation). `existed == false` (unknown id / already reaped) skips the
+/// commit: the key may have moved on under a newer owner, and a foreign
+/// commit is a typed no-op anyway.
+fn commit_terminal_stop(
+    state: &WsState,
+    existed: bool,
+    stop_commit: &mut Option<(String, String, String, u64)>,
+) {
+    let Some((provider, session_id, operation_id, generation)) = stop_commit.take() else {
+        return;
+    };
+    let Some(ownership) = state.ownership.as_ref() else {
+        return;
+    };
+    if !existed {
+        tracing::warn!(target: "freshell_ws::terminal",
+            provider = %provider, session_id = %session_id,
+            operation_id = %operation_id, generation,
+            "terminal_kill_stop_commit_skipped: the registry row was already gone"
+        );
+        return;
+    }
+    let outcome = ownership.commit_stop(&provider, &session_id, &operation_id, generation);
+    if !matches!(outcome, freshell_ownership::CommitOutcome::Committed) {
+        tracing::warn!(target: "freshell_ws::terminal",
+            provider = %provider, session_id = %session_id,
+            operation_id = %operation_id, generation,
+            outcome = ?outcome,
+            "terminal_kill_stop_commit_foreign: the stop state moved on before the reap"
+        );
+    }
 }
 
 /// The kill core, split from the socket reply for testability: `true` = the
@@ -7335,6 +7738,7 @@ mod terminals_changed_tests {
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
             reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
             fresh_agent_respawn_counts: Default::default(),
+            ownership: None,
         };
         (state, rx)
     }
@@ -7574,6 +7978,7 @@ mod terminal_meta_created_tests {
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
             reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
             fresh_agent_respawn_counts: Default::default(),
+            ownership: None,
         };
         (state, rx)
     }
@@ -8176,6 +8581,7 @@ mod pane_reconcile_gate_tests {
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
             reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
             fresh_agent_respawn_counts: Default::default(),
+            ownership: None,
         }
     }
 
@@ -8596,6 +9002,7 @@ mod host_stats_dispatch_tests {
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
             reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
             fresh_agent_respawn_counts: Default::default(),
+            ownership: None,
         }
     }
 
