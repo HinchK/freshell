@@ -906,6 +906,28 @@ impl RestOwnershipClaim {
     }
 }
 
+/// The stale-teardown discipline shared by the REST settle's refusal arms
+/// (kata b8ke Task 4 review M1 fix): kill the create's own just-spawned
+/// child via the registry handle (group-kill discipline), confirm the reap,
+/// and force-release the locator. Never leave an unowned writer behind.
+async fn teardown_unowned_spawn(
+    registry: &freshell_terminal::TerminalRegistry,
+    locator: &SessionLocator,
+    terminal_id: &str,
+) {
+    let pid = registry.pid_of(terminal_id);
+    registry.kill(terminal_id);
+    let confirmed = match pid {
+        Some(pid) => confirm_pid_dead_within_500ms(pid).await,
+        // No pid handle to probe: the registry kill removed the row;
+        // nothing is left to signal, so treat as confirmed.
+        None => true,
+    };
+    if confirmed {
+        registry.force_release_after_confirmed_kill(locator);
+    }
+}
+
 /// Poll `kill(pid, 0)` for ESRCH for up to 500ms (the PTY's dedicated waiter
 /// thread reaps promptly -- `pty.rs` reader/waiter; same 20x25ms cadence as
 /// the WS path's `confirm_pid_dead_within_500ms`). `true` = death CONFIRMED.
@@ -1585,6 +1607,7 @@ async fn spawn_terminal_pane_with_handoff(
         create_request_id,
         session_ref_lease,
         ownership_claim,
+        claim_locator: guard_locator.clone(),
         under_handoff_ticket,
         registry,
         host_os,
@@ -1643,6 +1666,12 @@ struct GatedSettleInputs {
     /// committed at the winner-bind site, or surfaced to the handoff runner
     /// when `under_handoff_ticket` is set (single commit authority).
     ownership_claim: Option<RestOwnershipClaim>,
+    /// kata b8ke Task 4 review M1 (fix): the locator the DOOR would claim
+    /// under (its `guard_locator`) — the settle's late-claim source when
+    /// `ownership_claim` is None (the Adopt arm claims nothing; the live
+    /// same-kind owner it saw died after the claim, so the create spawned
+    /// anyway and the settle must claim for the surviving terminal).
+    claim_locator: Option<SessionLocator>,
     under_handoff_ticket: bool,
     registry: freshell_terminal::TerminalRegistry,
     /// Hoisted spawn-environment inputs (Task 11): computed ONCE in
@@ -1686,6 +1715,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         create_request_id,
         mut session_ref_lease,
         mut ownership_claim,
+        claim_locator,
         under_handoff_ticket,
         registry,
         host_os,
@@ -2370,6 +2400,69 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         }
     }
 
+    // kata b8ke Task 4 review M1 (fix): TOTAL coverage — a create that
+    // reaches this settle with NO claim (the Adopt arm claims nothing; the
+    // live same-kind owner it saw died after the claim but before the D7/
+    // lease gates, so this create spawned anyway) claims HERE for the
+    // surviving terminal — the same fence discipline as the WS settle: a
+    // LATER owner that legitimately claimed while the key was Vacant
+    // answers Adopt/OwnedByOtherKind/Blocked instead of Granted, and the
+    // just-spawned terminal is torn down per the stale-teardown path (never
+    // double-committed, never clobbering the later owner). Skipped under a
+    // handoff ticket (single commit authority — the runner performs the one
+    // commit_live).
+    if ownership_claim.is_none() && !under_handoff_ticket {
+        if let Some(locator) = claim_locator.clone() {
+            let operation_id = format!("rest-create-late-{create_request_id}");
+            let refusal = match crate::ownership_lane::begin_terminal_lane_claim(
+                &state.ownership,
+                &locator.provider,
+                &locator.session_id,
+                &operation_id,
+                // No observed fence: the create holds no prior observation
+                // to fence against (the Adopt arm claimed nothing).
+                None,
+                "rest",
+                now_ms().max(0) as u64,
+            ) {
+                crate::ownership_lane::TerminalLaneClaim::Granted(ticket) => {
+                    ownership_claim = Some(RestOwnershipClaim {
+                        ticket,
+                        locator: locator.clone(),
+                    });
+                    None
+                }
+                crate::ownership_lane::TerminalLaneClaim::Unwired => None,
+                crate::ownership_lane::TerminalLaneClaim::Adopt => {
+                    Some("a live terminal owner holds the key the create settled under".to_string())
+                }
+                crate::ownership_lane::TerminalLaneClaim::Refused(outcome) => Some(format!(
+                    "the coordinator refused the late claim: {outcome:?}"
+                )),
+            };
+            if let Some(reason) = refusal {
+                tracing::error!(target: "invariant",
+                    terminal_id = %terminal_id,
+                    provider = %locator.provider,
+                    session_id = %locator.session_id,
+                    reason = %reason,
+                    "session_ref_ownership_late_claim_refused: the create spawned with no \
+                     coordinator claim and the key moved on; killing the unclaimed child \
+                     (REST rung)"
+                );
+                teardown_unowned_spawn(&registry, &locator, &terminal_id).await;
+                return Err(fail_json_code(
+                    StatusCode::CONFLICT,
+                    "RESTORE_UNAVAILABLE",
+                    format!(
+                        "Session {} is still running on the server.",
+                        locator.session_id
+                    ),
+                ));
+            }
+        }
+    }
+
     // kata b8ke Task 4: the REST rung's coordinator winner commit — right
     // after the registry winner-bind. UNDER-TICKET (a handoff runner's
     // spawn): skip the commit (single commit authority — the runner performs
@@ -2406,15 +2499,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                          the REST create spawned; killing the unowned child"
                     );
                     let locator = claim_locator;
-                    let pid = registry.pid_of(&terminal_id);
-                    registry.kill(&terminal_id);
-                    let confirmed = match pid {
-                        Some(pid) => confirm_pid_dead_within_500ms(pid).await,
-                        None => true,
-                    };
-                    if confirmed {
-                        registry.force_release_after_confirmed_kill(&locator);
-                    }
+                    teardown_unowned_spawn(&registry, &locator, &terminal_id).await;
                     return Err(fail_json_code(
                         StatusCode::CONFLICT,
                         "RESTORE_UNAVAILABLE",
@@ -7319,5 +7404,138 @@ if (args.includes('app-server')) {{
         let (status, body) = get(app(state), "/api/panes/nope/capture", true).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["message"], json!("pane not found"));
+    }
+
+    // ── kata b8ke Task 4 review M1 (fix): REST rung settle coverage ────────
+
+    /// M1 shape 1, REST rung: the same-kind Adopt→death→acquire interleaving.
+    /// The REST claim's Adopt arm claims nothing; when the live same-kind
+    /// owner dies after the claim but before the D7/lease gates, the create
+    /// spawns anyway and the settle previously skipped the coordinator
+    /// commit (`ownership_claim` None) — a live writer with a Vacant key.
+    /// The settle must late-claim + commit for the surviving terminal.
+    /// Determinism: the phantom owner's "death" (its fenced release) is
+    /// injected through the registry activity tap's Created event, which
+    /// fires inside the spawn's blocking task — after the door's claim,
+    /// strictly before the settle's commit site.
+    #[tokio::test]
+    async fn rest_adopt_death_acquire_settle_commits_the_surviving_terminal() {
+        let _ = isolate_amplifier_home();
+        let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let registry =
+            freshell_terminal::TerminalRegistry::new().with_ownership(Arc::clone(&ownership));
+        let sid = format!("rest-adopt-gap-{}", Uuid::new_v4());
+
+        // The pre-existing same-kind writer the Adopt arm will see.
+        let phantom_op = "op-rest-adopt-gap-phantom";
+        let freshell_ownership::BeginOutcome::Granted { generation } = ownership.begin_start(
+            "claude",
+            &sid,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            phantom_op,
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("expected Granted")
+        };
+        let phantom = freshell_ownership::OwnerIdentity {
+            kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+            terminal_id: Some("t-rest-adopt-gap-phantom".into()),
+            live_session_key: None,
+            pid: None,
+            ownership_id: None,
+        };
+        assert_eq!(
+            ownership.commit_live("claude", &sid, phantom_op, generation, phantom.clone()),
+            freshell_ownership::CommitOutcome::Committed
+        );
+        let mut stored_phantom = phantom.clone();
+        stored_phantom.ownership_id = Some(phantom_op.to_string());
+
+        // The mid-spawn death: when the create's real spawn inserts the new
+        // terminal row (Created), release the phantom exactly as its exit
+        // watcher would — the key is Vacant by the settle.
+        {
+            let ownership = Arc::clone(&ownership);
+            let sid = sid.clone();
+            registry.set_activity_observer(Arc::new(move |event| {
+                if let freshell_terminal::registry::ActivityEvent::Created {
+                    mode,
+                    resume_session_id,
+                    ..
+                } = &event
+                {
+                    if mode == "claude" && resume_session_id.as_deref() == Some(sid.as_str()) {
+                        ownership.release(
+                            "claude",
+                            &sid,
+                            &freshell_ownership::ReleaseClaim {
+                                operation_id: phantom_op.to_string(),
+                                generation,
+                                runtime: Some(stored_phantom.clone()),
+                            },
+                            "test/rest-adopt-gap",
+                        );
+                    }
+                }
+            }));
+        }
+
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let state = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx))
+            .with_terminal_registry(registry.clone())
+            .with_cli_commands(Arc::new(vec![recording_cli_spec(
+                "claude",
+                &unique_argv_file("adopt-gap"),
+            )]))
+            .with_ownership(Arc::clone(&ownership));
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": tmp.to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": sid },
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the gap create must succeed: {body}"
+        );
+        let survivor = body["data"]["terminalId"]
+            .as_str()
+            .expect("terminalId")
+            .to_string();
+
+        match ownership.observe("claude", &sid).state {
+            freshell_ownership::OwnershipState::Live { owner, .. } => {
+                assert_eq!(
+                    owner.terminal_id.as_deref(),
+                    Some(survivor.as_str()),
+                    "the REST settle must commit the SURVIVING terminal, not the dead phantom"
+                );
+            }
+            other => panic!(
+                "the REST settle must record the surviving terminal's ownership, got {other:?}"
+            ),
+        }
+        // Cross-kind protection is restored with it.
+        assert!(matches!(
+            ownership.begin_start(
+                "claude",
+                &sid,
+                freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                "op-after-rest-adopt-gap",
+                None,
+                "test",
+                2_000,
+            ),
+            freshell_ownership::BeginOutcome::OwnedByOtherKind { .. }
+        ));
     }
 }

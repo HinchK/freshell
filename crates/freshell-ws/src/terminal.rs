@@ -2243,6 +2243,25 @@ impl TerminalOwnershipClaim {
     }
 }
 
+/// The stale-teardown discipline shared by the create settle point's
+/// refusal arms (kata b8ke Task 4 review M1 fix): kill the create's own
+/// just-spawned (or attached-but-unclaimed) child via the REGISTRY handle
+/// (group-kill discipline), confirm the reap, and force-release the
+/// locator. Never leave an unowned writer behind.
+async fn teardown_unowned_spawn(state: &WsState, locator: &SessionLocator, terminal_id: &str) {
+    let pid = state.registry.pid_of(terminal_id);
+    state.registry.kill(terminal_id);
+    let confirmed = match pid {
+        Some(pid) => confirm_pid_dead_within_500ms(pid).await,
+        // No pid handle to probe: the registry kill removed the row;
+        // nothing is left to signal, so treat as confirmed.
+        None => true,
+    };
+    if confirmed {
+        state.registry.force_release_after_confirmed_kill(locator);
+    }
+}
+
 /// Poll `kill(pid, 0)` for ESRCH for up to 500ms (the PTY's dedicated waiter
 /// thread reaps promptly — `pty.rs` reader/waiter). `true` = death CONFIRMED.
 pub(crate) async fn confirm_pid_dead_within_500ms(pid: u32) -> bool {
@@ -3139,6 +3158,53 @@ pub(crate) async fn handle_create(
                         // resend on a NON-negotiated connection re-enters
                         // handle_create and spawns a duplicate PTY for the
                         // session.
+                        //
+                        // kata b8ke Task 4 review M1 (fix): TOTAL coverage
+                        // for the ATTACHED terminal. A Granted claim that
+                        // attaches through BoundElsewhere names a binding
+                        // holder that never committed through the coordinator
+                        // (a committed holder would have answered AdoptLive
+                        // at the claim above) — previously the attach
+                        // returned with the claim typed-failed while the
+                        // attached terminal kept living with NO coordinator
+                        // record. Commit the ticket FOR the attached terminal
+                        // so the live writer gains coverage; a stale/foreign
+                        // commit means a later owner legitimately claimed —
+                        // the attached terminal is then an unowned writer and
+                        // is handled per the stale-teardown path (never
+                        // double-committed, never clobbering the later owner).
+                        if let Some(ownership_claim) = terminal_ownership.take() {
+                            let locator = ownership_claim.locator.clone();
+                            match ownership_claim.commit(&terminal_id) {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        terminal_id = %terminal_id,
+                                        provider = %locator.provider,
+                                        session_id = %locator.session_id,
+                                        "session_ref.ownership_committed (terminal lane, attach)"
+                                    );
+                                }
+                                Err(outcome) => {
+                                    tracing::error!(target: "invariant",
+                                        terminal_id = %terminal_id,
+                                        provider = %locator.provider,
+                                        session_id = %locator.session_id,
+                                        outcome = ?outcome,
+                                        "session_ref_ownership_attach_commit_stale: the coordinator \
+                                         moved on while the create attached; killing the unowned \
+                                         attached terminal"
+                                    );
+                                    teardown_unowned_spawn(state, &locator, &terminal_id).await;
+                                    return send_create_error(
+                                        out,
+                                        ErrorCode::InternalError,
+                                        "Terminal create lost session ownership during attach; the attached process was killed".to_string(),
+                                        &dedupe_request_id,
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
                         state.create_dedupe.settle(
                             &dedupe_request_id,
                             &terminal_id,
@@ -4414,6 +4480,68 @@ pub(crate) async fn handle_create(
     // foreign commit means the key was recovered out from under us
     // mid-create (watchdog): tear our own child down exactly like the
     // revoked-lease discipline above — never leave an unowned writer.
+    //
+    // Task 4 review M1 (fix): TOTAL coverage — a create that reaches this
+    // settle with NO claim (the Adopt arm claims nothing; the live
+    // same-kind owner it saw died after the claim but before the lease/D7
+    // gate, so this create spawned anyway) claims HERE, at the settle
+    // point, for the surviving terminal. Fence coherence: the late claim
+    // is an ordinary begin_start fenced by the ticket it mints — a LATER
+    // owner that legitimately claimed while the key was Vacant answers
+    // Adopt/OwnedByOtherKind/Blocked instead of Granted, and the
+    // just-spawned terminal is then handled per the stale-teardown path
+    // below (never double-committed, never clobbering the later owner).
+    if terminal_ownership.is_none() {
+        if let Some(locator) = create_session_locator(&create) {
+            let operation_id = format!("term-create-late-{}", create.request_id);
+            let initiator = format!("ws-conn-{conn_id}");
+            let refusal = match freshell_freshagent::ownership_lane::begin_terminal_lane_claim(
+                &state.ownership,
+                &locator.provider,
+                &locator.session_id,
+                &operation_id,
+                // No observed fence: the create holds no prior observation
+                // to fence against (the Adopt arm claimed nothing).
+                None,
+                &initiator,
+                now_ms().max(0) as u64,
+            ) {
+                freshell_freshagent::ownership_lane::TerminalLaneClaim::Granted(ticket) => {
+                    terminal_ownership = Some(TerminalOwnershipClaim {
+                        ticket,
+                        registry: state.registry.clone(),
+                        locator: locator.clone(),
+                    });
+                    None
+                }
+                freshell_freshagent::ownership_lane::TerminalLaneClaim::Unwired => None,
+                freshell_freshagent::ownership_lane::TerminalLaneClaim::Adopt => {
+                    Some("a live terminal owner holds the key the create settled under".to_string())
+                }
+                freshell_freshagent::ownership_lane::TerminalLaneClaim::Refused(outcome) => Some(
+                    format!("the coordinator refused the late claim: {outcome:?}"),
+                ),
+            };
+            if let Some(reason) = refusal {
+                tracing::error!(target: "invariant",
+                    terminal_id = %terminal_id,
+                    provider = %locator.provider,
+                    session_id = %locator.session_id,
+                    reason = %reason,
+                    "session_ref_ownership_late_claim_refused: the create spawned with no \
+                     coordinator claim and the key moved on; killing the unclaimed child"
+                );
+                teardown_unowned_spawn(state, &locator, &terminal_id).await;
+                return send_create_error(
+                    out,
+                    ErrorCode::InternalError,
+                    "Terminal create lost session ownership during spawn; the spawned process was killed".to_string(),
+                    &create.request_id,
+                )
+                .await;
+            }
+        }
+    }
     if let Some(ownership_claim) = terminal_ownership.take() {
         let locator = ownership_claim.locator.clone();
         match ownership_claim.commit(&terminal_id) {
@@ -4434,17 +4562,7 @@ pub(crate) async fn handle_create(
                     "session_ref_ownership_commit_stale: the coordinator moved on while the \
                      create spawned; killing the unowned child"
                 );
-                let pid = state.registry.pid_of(&terminal_id);
-                state.registry.kill(&terminal_id);
-                let confirmed = match pid {
-                    Some(pid) => confirm_pid_dead_within_500ms(pid).await,
-                    // No pid handle to probe: the registry kill removed the row;
-                    // nothing is left to signal, so treat as confirmed.
-                    None => true,
-                };
-                if confirmed {
-                    state.registry.force_release_after_confirmed_kill(&locator);
-                }
+                teardown_unowned_spawn(state, &locator, &terminal_id).await;
                 return send_create_error(
                     out,
                     ErrorCode::InternalError,

@@ -890,6 +890,29 @@ async fn concurrent_terminal_and_fresh_agent_start_same_session_ref_yield_one_wr
         creates + ptys
     };
 
+    // N1 (Task 4 review, applied): event-sourced union assertion — every PTY
+    // SPAWN for the raced session is counted through the registry's activity
+    // tap, so a sub-cadence two-writer transient (spawn + teardown landing
+    // between sampler iterations) can no longer evade the check: the spawn
+    // itself is the violation, sampled or not.
+    let pty_spawns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    {
+        let pty_spawns = Arc::clone(&pty_spawns);
+        let sid_for_tap = sid.clone();
+        registry.set_activity_observer(Arc::new(move |event| {
+            if let freshell_terminal::registry::ActivityEvent::Created {
+                mode,
+                resume_session_id,
+                ..
+            } = &event
+            {
+                if mode == "claude" && resume_session_id.as_deref() == Some(sid_for_tap.as_str()) {
+                    pty_spawns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }));
+    }
+
     // Wait until BOTH requests have a terminal answer (created OR typed error),
     // sampling the union across the interleaving.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -935,6 +958,19 @@ async fn concurrent_terminal_and_fresh_agent_start_same_session_ref_yield_one_wr
     assert!(
         live_writers() <= 1,
         "exactly one runtime may survive the race"
+    );
+    // N1 (Task 4 review, applied): the event-sourced union — PTY spawns PLUS
+    // sidecar creates — may never exceed 1 either. This is cadence-
+    // independent: even a transient second writer that spawned and was torn
+    // down between two sampler iterations leaves its Created event behind.
+    let sidecar_creates = sidecar
+        .create_rows()
+        .iter()
+        .filter(|r| r["msg"]["resumeSessionId"].as_str() == Some(sid.as_str()))
+        .count();
+    assert!(
+        pty_spawns.load(std::sync::atomic::Ordering::SeqCst) + sidecar_creates <= 1,
+        "the union of SPAWNED writers (PTY spawns + sidecar creates) may never exceed 1"
     );
 }
 
@@ -1202,4 +1238,401 @@ async fn ready_frame_replays_current_runtime_owners() {
     );
     drop(ws_b);
     drop(ws_c);
+}
+
+// ── kata b8ke Task 4 review M1 (fix): total coordinator coverage ───────────
+//
+// The Adopt arm claims nothing (a live same-kind terminal owner exists — the
+// registry lease's BoundElsewhere or the D7 refusal handles it). Three narrow
+// windows can then leave a live terminal writer with NO coordinator record:
+// 1. The Adopt-seen owner DIES after the claim but before the lease/D7 gate —
+//    the lease acquires and the create spawns anyway, holding no claim, so the
+//    settle previously skipped the coordinator commit (the key stayed Vacant
+//    while the new terminal lived).
+// 2. A LATER owner legitimately claims the freed key while that create is
+//    spawning — the settle must never clobber it.
+// 3. A Granted claim attaches through BoundElsewhere to a binding holder that
+//    never committed (the shape-1 leftover): the attach previously returned
+//    with the claim typed-failed while the attached terminal lived.
+//
+// Determinism: the "owner death" in these tests is injected through the
+// registry's activity tap — the Created event fires inside the spawn's blocking
+// task, i.e. AFTER the door's claim but strictly BEFORE the settle — where the
+// phantom owner's fenced release runs. claim < Created < settle is the
+// handler's own control flow, so no timing races.
+
+/// M1 shape 1: the same-kind Adopt→death→acquire interleaving. The create's
+/// claim sees a Live TERMINAL owner (Adopt — the arm that claims nothing);
+/// that owner dies after the claim but before the settle, and the registry
+/// lease then acquires, so the create spawns anyway. The settle must COMMIT
+/// ownership for the surviving terminal — previously it skipped the commit
+/// whenever the create held no claim, leaving the key Vacant while the
+/// terminal lived (a fresh-agent create for the same key would be Granted:
+/// the two-writer door).
+#[tokio::test]
+async fn same_kind_adopt_death_acquire_settle_commits_the_surviving_terminal() {
+    let (url, registry, ws_state) = spawn_server().await;
+    let ownership = ws_state.ownership.clone().expect("coordinator wired");
+    let sid = format!("adopt-gap-{}", uuid::Uuid::new_v4());
+
+    // The pre-existing same-kind writer the Adopt arm will see: a Live
+    // TERMINAL owner for (claude, sid).
+    let phantom_op = "op-adopt-gap-phantom";
+    let freshell_ownership::BeginOutcome::Granted { generation } = ownership.begin_start(
+        "claude",
+        &sid,
+        freshell_ownership::RuntimeOwnerKind::Terminal,
+        phantom_op,
+        None,
+        "test",
+        1_000,
+    ) else {
+        panic!("expected Granted")
+    };
+    let phantom = freshell_ownership::OwnerIdentity {
+        kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+        terminal_id: Some("t-adopt-gap-phantom".into()),
+        live_session_key: None,
+        pid: None,
+        ownership_id: None,
+    };
+    assert_eq!(
+        ownership.commit_live("claude", &sid, phantom_op, generation, phantom.clone()),
+        freshell_ownership::CommitOutcome::Committed
+    );
+    // commit_live stamps ownership_id from the committing operation.
+    let mut stored_phantom = phantom.clone();
+    stored_phantom.ownership_id = Some(phantom_op.to_string());
+
+    // The mid-handler death: when the create's real spawn inserts the new
+    // terminal row (Created), release the phantom exactly as its exit
+    // watcher would (fenced claim) — the key is Vacant by the settle.
+    {
+        let ownership = ownership.clone();
+        let sid = sid.clone();
+        registry.set_activity_observer(Arc::new(move |event| {
+            if let freshell_terminal::registry::ActivityEvent::Created {
+                mode,
+                resume_session_id,
+                ..
+            } = &event
+            {
+                if mode == "claude" && resume_session_id.as_deref() == Some(sid.as_str()) {
+                    ownership.release(
+                        "claude",
+                        &sid,
+                        &freshell_ownership::ReleaseClaim {
+                            operation_id: phantom_op.to_string(),
+                            generation,
+                            runtime: Some(stored_phantom.clone()),
+                        },
+                        "test/adopt-gap",
+                    );
+                }
+            }
+        }));
+    }
+
+    let mut ws = connect(&url).await;
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create", "requestId": "adopt-gap-1", "mode": "claude",
+            "shell": "system", "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+    let created = await_frame(&mut ws, Duration::from_secs(20), |v| {
+        (v["type"] == "terminal.created" || v["type"] == "error") && v["requestId"] == "adopt-gap-1"
+    })
+    .await;
+    assert_eq!(
+        created["type"], "terminal.created",
+        "the gap create itself must succeed: {created}"
+    );
+    let survivor = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+
+    match ownership.observe("claude", &sid).state {
+        freshell_ownership::OwnershipState::Live { owner, .. } => {
+            assert_eq!(
+                owner.terminal_id.as_deref(),
+                Some(survivor.as_str()),
+                "the settle must commit the SURVIVING terminal, not the dead phantom"
+            );
+        }
+        other => panic!("the settle must record the surviving terminal's ownership, got {other:?}"),
+    }
+    // Cross-kind protection is restored with it: a fresh-agent start on the
+    // key is typed-refused (pre-fix this was Granted — the two-writer door).
+    assert!(
+        matches!(
+            ownership.begin_start(
+                "claude",
+                &sid,
+                freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                "op-after-adopt-gap",
+                None,
+                "test",
+                2_000,
+            ),
+            freshell_ownership::BeginOutcome::OwnedByOtherKind { .. }
+        ),
+        "a recorded terminal owner must fence a competing fresh-agent start"
+    );
+}
+
+/// M1 shape 2 (fence coherence): a LATER owner that legitimately claimed
+/// while the key was Vacant (the phantom's release landed mid-spawn, then a
+/// fresh-agent start claimed the freed key) must NEVER be clobbered by the
+/// settle's late claim. The late claim must answer OwnedByOtherKind instead
+/// of Granted, and the just-spawned terminal — now an unowned writer — must
+/// be handled per the stale-teardown path: killed, confirmed, error reply,
+/// the later owner left untouched.
+#[tokio::test]
+async fn settle_late_claim_never_clobbers_a_later_owner_and_tears_the_spawn_down() {
+    let (url, registry, ws_state) = spawn_server().await;
+    let ownership = ws_state.ownership.clone().expect("coordinator wired");
+    let sid = format!("later-owner-{}", uuid::Uuid::new_v4());
+
+    let phantom_op = "op-later-owner-phantom";
+    let freshell_ownership::BeginOutcome::Granted { generation } = ownership.begin_start(
+        "claude",
+        &sid,
+        freshell_ownership::RuntimeOwnerKind::Terminal,
+        phantom_op,
+        None,
+        "test",
+        1_000,
+    ) else {
+        panic!("expected Granted")
+    };
+    let phantom = freshell_ownership::OwnerIdentity {
+        kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+        terminal_id: Some("t-later-owner-phantom".into()),
+        live_session_key: None,
+        pid: None,
+        ownership_id: None,
+    };
+    assert_eq!(
+        ownership.commit_live("claude", &sid, phantom_op, generation, phantom.clone()),
+        freshell_ownership::CommitOutcome::Committed
+    );
+    let mut stored_phantom = phantom.clone();
+    stored_phantom.ownership_id = Some(phantom_op.to_string());
+
+    // On Created (mid-spawn): the phantom dies AND a fresh-agent owner
+    // legitimately claims the freed key — the later owner the settle's late
+    // claim must not clobber.
+    {
+        let ownership = ownership.clone();
+        let sid = sid.clone();
+        registry.set_activity_observer(Arc::new(move |event| {
+            if let freshell_terminal::registry::ActivityEvent::Created {
+                mode,
+                resume_session_id,
+                ..
+            } = &event
+            {
+                if mode == "claude" && resume_session_id.as_deref() == Some(sid.as_str()) {
+                    ownership.release(
+                        "claude",
+                        &sid,
+                        &freshell_ownership::ReleaseClaim {
+                            operation_id: phantom_op.to_string(),
+                            generation,
+                            runtime: Some(stored_phantom.clone()),
+                        },
+                        "test/later-owner",
+                    );
+                    if let freshell_ownership::BeginOutcome::Granted { generation } = ownership
+                        .begin_start(
+                            "claude",
+                            &sid,
+                            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                            "op-later-fresh",
+                            None,
+                            "test",
+                            2_000,
+                        )
+                    {
+                        let later = freshell_ownership::OwnerIdentity {
+                            kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                            terminal_id: None,
+                            live_session_key: Some("freshclaude:sid".into()),
+                            pid: Some(4242),
+                            ownership_id: None,
+                        };
+                        let _ = ownership.commit_live(
+                            "claude",
+                            &sid,
+                            "op-later-fresh",
+                            generation,
+                            later,
+                        );
+                    }
+                }
+            }
+        }));
+    }
+
+    let mut ws = connect(&url).await;
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create", "requestId": "later-owner-1", "mode": "claude",
+            "shell": "system", "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+    let frame = await_frame(&mut ws, Duration::from_secs(20), |v| {
+        (v["type"] == "terminal.created" || v["type"] == "error")
+            && v["requestId"] == "later-owner-1"
+    })
+    .await;
+    assert_eq!(
+        frame["type"], "error",
+        "the unowned spawn must be torn down and refused, not created: {frame}"
+    );
+    assert!(
+        frame["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("killed"),
+        "the refusal must name the teardown: {frame}"
+    );
+    // The spawned terminal is dead — no live PTY for the session.
+    assert_eq!(
+        live_pty_count_for_session(&registry, "claude", &sid),
+        0,
+        "the unowned spawn must be killed and confirmed"
+    );
+    // The later owner survives untouched.
+    match ownership.observe("claude", &sid).state {
+        freshell_ownership::OwnershipState::Live { owner, .. } => {
+            assert_eq!(
+                owner.kind,
+                freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                "the later owner must survive the losing settle"
+            );
+        }
+        other => panic!("the later owner must survive the losing settle, got {other:?}"),
+    }
+}
+
+/// M1 shape 3: the BoundElsewhere-attach-to-uncommitted-terminal shape. A
+/// Granted claim that attaches through the registry lease's BoundElsewhere
+/// names a binding holder that never committed through the coordinator (a
+/// committed holder would have answered AdoptLive at the claim above).
+/// Previously the attach returned with the claim typed-failed while the
+/// attached terminal kept living with NO coordinator record. The settle must
+/// commit the claim FOR the attached terminal.
+#[tokio::test]
+async fn bound_elsewhere_attach_commits_ownership_for_the_unclaimed_holder() {
+    let (url, registry, ws_state) = spawn_server().await;
+    let ownership = ws_state.ownership.clone().expect("coordinator wired");
+    let sid = format!("attach-gap-{}", uuid::Uuid::new_v4());
+
+    // 1. A normal create establishes the holder: committed Live + bound.
+    let mut ws_a = connect(&url).await;
+    send_json(
+        &mut ws_a,
+        &json!({
+            "type": "terminal.create", "requestId": "attach-src-1", "mode": "claude",
+            "shell": "system", "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+    let created = await_frame(&mut ws_a, Duration::from_secs(20), |v| {
+        v["type"] == "terminal.created" && v["requestId"] == "attach-src-1"
+    })
+    .await;
+    let holder = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    assert!(
+        matches!(
+            ownership.observe("claude", &sid).state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ),
+        "the source create must commit its holder"
+    );
+
+    // 2. The uncommitted-live state: the holder's coordinator record is
+    //    released (its exact fenced exit-watcher claim, from the retained
+    //    claim) while the terminal LIVES and keeps the registry binding —
+    //    the state the shape-1 gap leaves behind, reproduced deterministically.
+    let retained = registry
+        .retained_ownership_claim(&holder)
+        .expect("the committed holder retains its claim");
+    ownership.release(
+        "claude",
+        &sid,
+        &freshell_ownership::ReleaseClaim {
+            operation_id: retained.operation_id.clone(),
+            generation: retained.generation,
+            runtime: Some(freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                terminal_id: Some(retained.terminal_id.clone()),
+                live_session_key: None,
+                pid: retained.pid,
+                ownership_id: Some(retained.operation_id.clone()),
+            }),
+        },
+        "test/attach-gap",
+    );
+    assert!(
+        matches!(
+            ownership.observe("claude", &sid).state,
+            freshell_ownership::OwnershipState::Vacant
+        ),
+        "the test state is the gap: a live bound terminal with a Vacant key"
+    );
+
+    // 3. A second (negotiated) create for the same key: Granted (the key is
+    //    Vacant) → the lease answers BoundElsewhere → attach. The settle
+    //    must commit the claim FOR the attached holder.
+    let mut ws_b = connect(&url).await;
+    send_json(
+        &mut ws_b,
+        &json!({
+            "type": "terminal.create", "requestId": "attach-gap-2", "mode": "claude",
+            "shell": "system", "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+    let attached = await_frame(&mut ws_b, Duration::from_secs(20), |v| {
+        (v["type"] == "terminal.created" || v["type"] == "error")
+            && v["requestId"] == "attach-gap-2"
+    })
+    .await;
+    assert_eq!(
+        attached["type"], "terminal.created",
+        "the attach create must succeed: {attached}"
+    );
+    assert_eq!(
+        attached["terminalId"].as_str(),
+        Some(holder.as_str()),
+        "the attach must name the existing holder"
+    );
+
+    match ownership.observe("claude", &sid).state {
+        freshell_ownership::OwnershipState::Live { owner, .. } => {
+            assert_eq!(
+                owner.terminal_id.as_deref(),
+                Some(holder.as_str()),
+                "the attach settle must record the ATTACHED terminal's ownership"
+            );
+        }
+        other => {
+            panic!("the attach settle must commit coverage for the live holder, got {other:?}")
+        }
+    }
 }
