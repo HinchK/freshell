@@ -17,6 +17,7 @@ import {
   getTerminalViewport,
   searchTerminalView,
   setSessionMetadata,
+  requestSessionHandoff,
 } from '@/lib/api'
 import {
   FreshAgentThreadTurnBodyQuerySchema,
@@ -1094,5 +1095,170 @@ describe('api error mapping', () => {
       status: 404,
       message: 'Not found',
     })
+  })
+})
+
+describe('requestSessionHandoff()', () => {
+  beforeEach(() => {
+    mockFetch.mockReset()
+    localStorage.setItem('freshell.auth-token', 'test-token')
+  })
+
+  afterEach(() => {
+    localStorage.clear()
+  })
+
+  it('posts the handoff body and parses a committed terminal owner', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson({
+      ok: true,
+      operationId: 'handoff-1',
+      generation: 2,
+      owner: { kind: 'terminal', terminalId: 't-77', mode: 'codex' },
+    }))
+
+    const result = await requestSessionHandoff({
+      provider: 'codex',
+      sessionId: '019ec8c9-2b12-7001-a11d-e2e089860320',
+      targetKind: 'terminal',
+      mode: 'codex',
+      cwd: '/repo',
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      observedEpoch: 1,
+      observedGeneration: 1,
+      deviceId: 'device-a',
+    })
+
+    expect(result).toEqual({
+      ok: true,
+      operationId: 'handoff-1',
+      generation: 2,
+      owner: { kind: 'terminal', terminalId: 't-77', mode: 'codex' },
+    })
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/api/sessions/handoff',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          provider: 'codex',
+          sessionId: '019ec8c9-2b12-7001-a11d-e2e089860320',
+          targetKind: 'terminal',
+          mode: 'codex',
+          cwd: '/repo',
+          tabId: 'tab-1',
+          paneId: 'pane-1',
+          observedEpoch: 1,
+          observedGeneration: 1,
+          deviceId: 'device-a',
+        }),
+      }),
+    )
+  })
+
+  it('parses a committed fresh-agent owner', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson({
+      ok: true,
+      operationId: 'handoff-2',
+      generation: 3,
+      owner: { kind: 'fresh-agent', sessionId: 'sid-k', sessionType: 'kilroy', provider: 'claude' },
+    }))
+
+    const result = await requestSessionHandoff({
+      provider: 'claude',
+      sessionId: 'sid-k',
+      targetKind: 'fresh-agent',
+      sessionType: 'kilroy',
+    })
+
+    expect(result).toEqual({
+      ok: true,
+      operationId: 'handoff-2',
+      generation: 3,
+      owner: { kind: 'fresh-agent', sessionId: 'sid-k', sessionType: 'kilroy', provider: 'claude' },
+    })
+  })
+
+  it('surfaces the typed failure body of a 409 conflict as the failure arm instead of throwing', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(409, {
+      ok: false,
+      error: {
+        code: 'REAP_TIMEOUT',
+        message: 'the prior runtime did not confirm its exit in time',
+        retryable: true,
+        ownerGeneration: 4,
+      },
+    }))
+
+    const result = await requestSessionHandoff({
+      provider: 'codex',
+      sessionId: 'sid-x',
+      targetKind: 'terminal',
+      mode: 'codex',
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        code: 'REAP_TIMEOUT',
+        message: 'the prior runtime did not confirm its exit in time',
+        retryable: true,
+        ownerGeneration: 4,
+      },
+    })
+  })
+
+  it('parses the stale-generation failure with its owner generation', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(409, {
+      ok: false,
+      error: {
+        code: 'STALE_GENERATION',
+        message: 'observed ownership fence is stale; refresh and retry',
+        retryable: false,
+        ownerKind: 'terminal',
+        ownerGeneration: 9,
+      },
+    }))
+
+    const result = await requestSessionHandoff({
+      provider: 'claude',
+      sessionId: 'sid-s',
+      targetKind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      observedEpoch: 1,
+      observedGeneration: 5,
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        code: 'STALE_GENERATION',
+        message: 'observed ownership fence is stale; refresh and retry',
+        retryable: false,
+        ownerKind: 'terminal',
+        ownerGeneration: 9,
+      },
+    })
+  })
+
+  it('rejects when a non-2xx body is not the typed failure shape', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(500, { error: 'boom' }))
+
+    await expect(requestSessionHandoff({
+      provider: 'codex',
+      sessionId: 'sid-x',
+      targetKind: 'terminal',
+      mode: 'codex',
+    })).rejects.toMatchObject({ status: 500 })
+  })
+
+  it('rejects a 2xx body that matches neither arm of the result union', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson({ hello: 'world' }))
+
+    await expect(requestSessionHandoff({
+      provider: 'codex',
+      sessionId: 'sid-x',
+      targetKind: 'terminal',
+      mode: 'codex',
+    })).rejects.toThrow()
   })
 })

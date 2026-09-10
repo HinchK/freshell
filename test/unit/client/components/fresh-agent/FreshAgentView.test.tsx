@@ -10,7 +10,7 @@ import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import { FreshAgentView, IDLE_INCOMPLETE_MAX_RETRIES } from '@/components/fresh-agent/FreshAgentView'
 import { FreshAgentSettingsButton } from '@/components/fresh-agent/FreshAgentSettingsButton'
-import { initLayout, requestPaneRefresh, setActivePane, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
+import { initLayout, requestPaneRefresh, setActivePane, setPaneHandoffError, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
 import { useAppSelector } from '@/store/hooks'
 import { updateTab } from '@/store/tabsSlice'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
@@ -64,6 +64,14 @@ const apiMock = vi.hoisted(() => ({
   getFreshAgentModelCapabilities: vi.fn(),
   post: vi.fn(),
   setSessionMetadata: vi.fn().mockResolvedValue(undefined),
+  // kata b8ke: the atomic reopen handoff (default success — tests override
+  // for the typed-failure matrix).
+  requestSessionHandoff: vi.fn().mockResolvedValue({
+    ok: true,
+    operationId: 'handoff-default',
+    generation: 1,
+    owner: { kind: 'terminal', terminalId: 't-default', mode: 'codex' },
+  }),
 }))
 
 const saveServerSettingsPatchSpy = vi.hoisted(() => vi.fn((patch: unknown) => ({
@@ -83,6 +91,7 @@ vi.mock('@/lib/api', async () => {
     getFreshAgentThreadSnapshot: apiMock.getFreshAgentThreadSnapshot,
     getFreshAgentModelCapabilities: apiMock.getFreshAgentModelCapabilities,
     setSessionMetadata: apiMock.setSessionMetadata,
+    requestSessionHandoff: apiMock.requestSessionHandoff,
   }
 })
 
@@ -9273,5 +9282,249 @@ describe('FreshAgentView provider-advertised session commands', () => {
     await within(menu).findByRole('group', { name: 'Agent session' })
     expect(within(menu).queryByRole('menuitem', { name: /\/fork/ })).toBeNull()
     expect(within(menu).getByRole('menuitem', { name: /\/review/ })).toBeInTheDocument()
+  })
+})
+
+// ── kata b8ke Task 9: opened-as-CLI-elsewhere divergence card + the typed
+// handoff-failure banner with Retry ──
+describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
+  const DIV_SESSION_ID = 'ses_divergence_1'
+
+  beforeEach(() => {
+    apiMock.requestSessionHandoff.mockClear()
+    apiMock.requestSessionHandoff.mockResolvedValue({
+      ok: true,
+      operationId: 'handoff-default',
+      generation: 1,
+      owner: { kind: 'terminal', terminalId: 't-default', mode: 'codex' },
+    })
+  })
+
+  function divergencePaneContent(overrides: Record<string, unknown> = {}) {
+    return {
+      kind: 'fresh-agent',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      createRequestId: 'req-divergence',
+      sessionId: DIV_SESSION_ID,
+      sessionRef: { provider: 'codex', sessionId: DIV_SESSION_ID },
+      status: 'idle',
+      ...overrides,
+    } as const
+  }
+
+  function terminalOwnerFrame(overrides: Record<string, unknown> = {}) {
+    return {
+      type: 'session.runtimeOwner',
+      provider: 'codex',
+      sessionId: DIV_SESSION_ID,
+      epoch: 1,
+      generation: 2,
+      ownerKind: 'terminal',
+      terminalId: 't-5',
+      operationId: 'handoff-div',
+      transition: 'handoff-committed',
+      ...overrides,
+    }
+  }
+
+  it('divergent pane renders the opened-as-CLI-elsewhere card with a direct attach action', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: divergencePaneContent() }))
+    // Prop-rendered (the wedged-sidecar harness shape): the attach action
+    // swaps the pane to a TERMINAL pane in the store — a store-backed
+    // wrapper would throw on the kind change mid-assertion.
+    render(
+      <Provider store={store}>
+        <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={divergencePaneContent()} />
+      </Provider>,
+    )
+
+    // Install the spy BEFORE the divergence fold re-renders: the click
+    // closure captures `dispatch` at render time (react-redux).
+    const dispatchSpy = vi.spyOn(store, 'dispatch')
+
+    act(() => store.dispatch(applyRuntimeOwner(terminalOwnerFrame())))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent(/open as a terminal on another device/i)
+    const attach = within(alert).getByRole('button', { name: /attach the terminal here/i })
+
+    // The attach action swaps THIS pane to a terminal pane bound to the
+    // owner's terminal id, keeping the same sessionRef.
+    fireEvent.click(attach)
+    const swap = dispatchSpy.mock.calls
+      .map(([action]) => action as { type?: string; payload?: { tabId?: string; paneId?: string; content?: { kind?: string } } })
+      .find((action) => action?.type === 'panes/updatePaneContent' && action.payload?.content?.kind === 'terminal')
+    expect(swap?.payload).toMatchObject({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'terminal',
+        mode: 'codex',
+        terminalId: 't-5',
+        status: 'running',
+        sessionRef: { provider: 'codex', sessionId: DIV_SESSION_ID },
+      },
+    })
+  })
+
+  it('handoff-started is not a live target: the card renders waiting copy with NO attach action', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: divergencePaneContent() }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    act(() => store.dispatch(applyRuntimeOwner(terminalOwnerFrame({
+      transition: 'handoff-started',
+      terminalId: undefined,
+      generation: 3,
+    }))))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent(/being reopened/i)
+    // Round-3 F15: no Attach action until the committed owner event.
+    expect(within(alert).queryByRole('button')).toBeNull()
+  })
+
+  it('handoff-failure banner renders the typed code with a Retry that re-invokes the same handoff identity', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: divergencePaneContent() }))
+    store.dispatch(setPaneHandoffError({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      error: {
+        code: 'TARGET_SPAWN_FAILED',
+        message: 'the target runtime failed to start',
+        retryable: true,
+        generation: 4,
+      },
+    }))
+    // The retry's handoff FAILS again (retryable) — the pane must STAY a
+    // fresh-agent pane wearing the banner; only the invocation is asserted.
+    apiMock.requestSessionHandoff.mockResolvedValue({
+      ok: false,
+      error: { code: 'TARGET_SPAWN_FAILED', message: 'still failing', retryable: true, ownerGeneration: 5 },
+    })
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    const banner = await screen.findByRole('alert')
+    expect(banner).toHaveTextContent(/target runtime failed to start/i)
+    const retry = within(banner).getByRole('button', { name: /retry reopening/i })
+
+    fireEvent.click(retry)
+    // Retry is scheduled after a short backoff — never an immediate
+    // tight loop.
+    expect(apiMock.requestSessionHandoff).not.toHaveBeenCalled()
+    await waitFor(() => {
+      expect(apiMock.requestSessionHandoff).toHaveBeenCalledTimes(1)
+    }, { timeout: 5_000 })
+
+    expect(apiMock.requestSessionHandoff).toHaveBeenCalledWith(expect.objectContaining({
+      provider: 'codex',
+      sessionId: DIV_SESSION_ID,
+      targetKind: 'terminal',
+      mode: 'codex',
+    }))
+  })
+
+  it('STALE_GENERATION retry refreshes the observed (epoch, generation) pair from the runtime-owner record', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: divergencePaneContent() }))
+    store.dispatch(setPaneHandoffError({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      error: {
+        code: 'STALE_GENERATION',
+        message: 'observed ownership fence is stale; refresh and retry',
+        retryable: true,
+        generation: 3,
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    const banner = await screen.findByRole('alert')
+    const retry = within(banner).getByRole('button', { name: /retry reopening/i })
+
+    // The retry's handoff fails again — the pane stays; only the body is
+    // asserted (the REFRESHED fence pair).
+    apiMock.requestSessionHandoff.mockResolvedValue({
+      ok: false,
+      error: { code: 'STALE_GENERATION', message: 'still stale', retryable: true, ownerGeneration: 9 },
+    })
+
+    // The owner record has since moved to (epoch 2, generation 9) — the
+    // retry must carry the REFRESHED pair, never the stale one (round-2).
+    act(() => store.dispatch(applyRuntimeOwner(terminalOwnerFrame({
+      epoch: 2,
+      generation: 9,
+      ownerKind: 'vacant',
+      terminalId: undefined,
+      transition: 'released',
+    }))))
+
+    fireEvent.click(retry)
+    await waitFor(() => {
+      expect(apiMock.requestSessionHandoff).toHaveBeenCalledTimes(1)
+    }, { timeout: 5_000 })
+
+    expect(apiMock.requestSessionHandoff).toHaveBeenCalledWith(expect.objectContaining({
+      provider: 'codex',
+      sessionId: DIV_SESSION_ID,
+      observedEpoch: 2,
+      observedGeneration: 9,
+    }))
+  })
+
+  it('HANDOFF_IN_PROGRESS retry waits out the backoff before re-invoking (never an immediate tight loop)', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: divergencePaneContent() }))
+    store.dispatch(setPaneHandoffError({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      error: {
+        code: 'HANDOFF_IN_PROGRESS',
+        message: 'a lifecycle operation is in flight; retry after it settles',
+        retryable: true,
+        generation: 2,
+      },
+    }))
+    // The retry's handoff fails again — the pane stays; only the timing of
+    // the single re-invocation is asserted.
+    apiMock.requestSessionHandoff.mockResolvedValue({
+      ok: false,
+      error: { code: 'HANDOFF_IN_PROGRESS', message: 'still in flight', retryable: true, ownerGeneration: 2 },
+    })
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    const banner = await screen.findByRole('alert')
+    const retry = within(banner).getByRole('button', { name: /retry reopening/i })
+    fireEvent.click(retry)
+
+    // Synchronous and mid-backoff: nothing sent yet. The backoff (750ms)
+    // cannot have elapsed at 350ms wall-clock.
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 350)) })
+    expect(apiMock.requestSessionHandoff).not.toHaveBeenCalled()
+
+    // After the backoff the single re-invocation leaves.
+    await waitFor(() => {
+      expect(apiMock.requestSessionHandoff).toHaveBeenCalledTimes(1)
+    }, { timeout: 5_000 })
+    expect(apiMock.requestSessionHandoff).toHaveBeenCalledTimes(1)
   })
 })

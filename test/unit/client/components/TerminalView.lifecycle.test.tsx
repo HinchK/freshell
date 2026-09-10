@@ -1,11 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { act, render, cleanup, waitFor } from '@testing-library/react'
+import { act, render, cleanup, waitFor, screen, fireEvent, within } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import tabsReducer, { setActiveTab } from '@/store/tabsSlice'
 import panesReducer, { removeLayout, requestPaneRefresh, setPaneCloseError } from '@/store/panesSlice'
 import settingsReducer, { defaultSettings, updateSettingsLocal } from '@/store/settingsSlice'
 import connectionReducer, { setStatus as setConnectionStatus } from '@/store/connectionSlice'
+import freshAgentReducer, { applyRuntimeOwner } from '@/store/freshAgentSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
 import tabRecencyReducer from '@/store/tabRecencySlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
@@ -3409,6 +3410,330 @@ describe('TerminalView lifecycle updates', () => {
       expect(
         terminalWriteStrings(term).filter((entry) => entry.includes('Reconnected to the still-running session.')),
       ).toHaveLength(1)
+    })
+  })
+
+  // ── kata b8ke Task 9: typed launch-failure cards + the fresh-owner
+  // divergence recovery card ──
+  describe('typed launch failures + fresh-owner divergence (kata b8ke)', () => {
+    const TYPED_SESSION_ID = 'sid-b8ke-x'
+
+    function runtimeOwnerFrame(overrides: Record<string, unknown> = {}) {
+      return {
+        type: 'session.runtimeOwner',
+        provider: 'codex',
+        sessionId: TYPED_SESSION_ID,
+        epoch: 1,
+        generation: 1,
+        ownerKind: 'terminal',
+        terminalId: 't-prev',
+        operationId: 'handoff-b8ke',
+        transition: 'handoff-committed',
+        ...overrides,
+      }
+    }
+
+    function setupTypedPane(options: {
+      content?: Partial<TerminalPaneContent>
+      tabMetadata?: Record<string, { sessionType?: string }>
+      seed?: (store: ReturnType<typeof configureStore>) => void
+    } = {}) {
+      const tabId = 'tab-b8ke'
+      const paneId = 'pane-b8ke'
+
+      const paneContent: TerminalPaneContent = {
+        kind: 'terminal',
+        createRequestId: 'req-b8ke',
+        status: 'creating',
+        mode: 'codex',
+        sessionRef: { provider: 'codex', sessionId: TYPED_SESSION_ID },
+        ...options.content,
+      }
+
+      const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+      const store = configureStore({
+        reducer: {
+          tabs: tabsReducer,
+          panes: panesReducer,
+          settings: settingsReducer,
+          connection: connectionReducer,
+          freshAgent: freshAgentReducer,
+        },
+        preloadedState: {
+          tabs: {
+            tabs: [{
+              id: tabId,
+              mode: 'codex',
+              status: 'creating',
+              title: 'Codex',
+              titleSetByUser: false,
+              createRequestId: 'req-b8ke',
+              ...(options.tabMetadata ? { sessionMetadataByKey: options.tabMetadata } : {}),
+            }],
+            activeTabId: tabId,
+          },
+          panes: {
+            layouts: { [tabId]: root },
+            activePane: { [tabId]: paneId },
+            paneTitles: {},
+          },
+          settings: createSettingsState(),
+          connection: { status: 'connected', error: null },
+        },
+      })
+
+      options.seed?.(store)
+
+      render(
+        <Provider store={store}>
+          <TerminalViewFromStore tabId={tabId} paneId={paneId} />
+        </Provider>
+      )
+
+      return { store, tabId, paneId }
+    }
+
+    const createCalls = () => sentMessages().filter((msg) => msg?.type === 'terminal.create')
+
+    it('typed fresh-owner refusal renders a recoverable card with retry and open-as-fresh-agent actions', async () => {
+      const { store } = setupTypedPane()
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+        expect(createCalls()).toHaveLength(1)
+      })
+
+      // The session is owned by a FRESH-AGENT runtime (no liveTerminalId —
+      // the D7 revival path does not apply).
+      act(() => {
+        messageHandler!({
+          type: 'error',
+          code: 'RESTORE_UNAVAILABLE',
+          message: `Session ${TYPED_SESSION_ID} is still running on the server.`,
+          requestId: 'req-b8ke',
+          ownerKind: 'fresh-agent',
+          ownerGeneration: 4,
+          ownerEpoch: 1,
+          timestamp: new Date().toISOString(),
+        })
+      })
+
+      const card = await screen.findByTestId('terminal-launch-failure-card')
+      expect(card).toHaveAttribute('role', 'alert')
+      expect(card).toHaveTextContent(/open as a fresh agent/i)
+      expect(within(card).getByRole('button', { name: 'Retry launch' })).toBeInTheDocument()
+      expect(within(card).getByRole('button', { name: 'Open as Fresh Agent' })).toBeInTheDocument()
+      // No liveTerminalId on the refusal → no attach action.
+      expect(within(card).queryByRole('button', { name: 'Attach to running session' })).toBeNull()
+
+      // The frozen wire-text notice still lands in the terminal surface
+      // (byte-frozen contract preserved alongside the typed card).
+      const term = terminalInstances[0]
+      expectTerminalWriteContaining(term, '[Launch failed]')
+
+      // Retry launch re-sends terminal.create with the SAME sessionRef and
+      // createRequestId (never re-minted), carrying the observed fence.
+      fireEvent.click(within(card).getByRole('button', { name: 'Retry launch' }))
+      await waitFor(() => {
+        expect(createCalls()).toHaveLength(2)
+      })
+      expect(createCalls()[1]).toMatchObject({
+        requestId: 'req-b8ke',
+        sessionRef: { provider: 'codex', sessionId: TYPED_SESSION_ID },
+      })
+      // The retry cleared the typed card.
+      await waitFor(() => {
+        expect(screen.queryByTestId('terminal-launch-failure-card')).toBeNull()
+      })
+      const leaf = store.getState().panes.layouts['tab-b8ke']
+      if (leaf?.type === 'leaf' && leaf.content.kind === 'terminal') {
+        expect(leaf.content.launchFailure).toBeUndefined()
+      }
+    })
+
+    it('typed handoff-in-progress refusal renders a retryable card with no attach action', async () => {
+      setupTypedPane()
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+        expect(createCalls()).toHaveLength(1)
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'error',
+          code: 'SESSION_RESERVED',
+          message: 'Another terminal.create for this sessionRef is in flight',
+          requestId: 'req-b8ke',
+          retryAfterMs: 30_000,
+          ownerKind: 'terminal',
+          ownerGeneration: 2,
+          ownerEpoch: 1,
+          timestamp: new Date().toISOString(),
+        })
+      })
+
+      const card = await screen.findByTestId('terminal-launch-failure-card')
+      expect(card).toHaveAttribute('role', 'alert')
+      expect(within(card).getByRole('button', { name: 'Retry launch' })).toBeInTheDocument()
+      expect(within(card).queryByRole('button', { name: 'Open as Fresh Agent' })).toBeNull()
+      expect(within(card).queryByRole('button', { name: 'Attach to running session' })).toBeNull()
+    })
+
+    it('a stale-fence create refusal re-drives with the REFRESHED observed pair from the runtime-owner record', async () => {
+      const { store } = setupTypedPane({
+        seed: (seededStore) => {
+          act(() => {
+            seededStore.dispatch(applyRuntimeOwner(runtimeOwnerFrame({ generation: 5 })))
+          })
+        },
+      })
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+        expect(createCalls()).toHaveLength(1)
+      })
+      // The first create carried the observed fence (epoch 1, generation 5).
+      expect(createCalls()[0]).toMatchObject({
+        requestId: 'req-b8ke',
+        observedEpoch: 1,
+        observedGeneration: 5,
+      })
+
+      // Ownership moves on (generation 9) BEFORE the refusal lands.
+      act(() => {
+        store.dispatch(applyRuntimeOwner(runtimeOwnerFrame({ generation: 9 })))
+      })
+
+      // The server's stale-fence refusal (the wire shape: SESSION_RESERVED
+      // code, stale-generation message, no owner fields, no retry hint).
+      act(() => {
+        messageHandler!({
+          type: 'error',
+          code: 'SESSION_RESERVED',
+          message: 'Session ownership moved on (stale observed generation); refresh and retry.',
+          requestId: 'req-b8ke',
+          timestamp: new Date().toISOString(),
+        })
+      })
+
+      // The bounded re-drive re-sends the create carrying the REFRESHED
+      // pair from the record — the stale (1, 5) pair is never re-sent.
+      await waitFor(() => {
+        expect(createCalls()).toHaveLength(2)
+      })
+      expect(createCalls()[1]).toMatchObject({
+        requestId: 'req-b8ke',
+        sessionRef: { provider: 'codex', sessionId: TYPED_SESSION_ID },
+        observedEpoch: 1,
+        observedGeneration: 9,
+      })
+    })
+
+    it('a terminal pane whose session is fresh-agent-owned renders the recovery card with a direct open action', async () => {
+      const { store } = setupTypedPane({
+        content: {
+          status: 'running',
+          terminalId: 't-dead',
+        },
+      })
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+      })
+      // The mount attach to the (now reaped) terminal id happened.
+      const attachesToDead = () => sentMessages().filter(
+        (msg) => msg?.type === 'terminal.attach' && msg?.terminalId === 't-dead',
+      )
+      await waitFor(() => expect(attachesToDead().length).toBeGreaterThan(0))
+      const attachesAtDivergence = attachesToDead().length
+
+      // Install the spy BEFORE the divergence fold re-renders: the click
+      // closure captures `dispatch` at render time (react-redux).
+      const dispatchSpy = vi.spyOn(store, 'dispatch')
+
+      act(() => {
+        store.dispatch(applyRuntimeOwner(runtimeOwnerFrame({
+          ownerKind: 'fresh-agent',
+          terminalId: undefined,
+          generation: 3,
+          operationId: 'handoff-to-fresh',
+        })))
+      })
+
+      const card = await screen.findByTestId('terminal-owner-divergence-card')
+      expect(card).toHaveAttribute('role', 'alert')
+      expect(card).toHaveTextContent(/open as a fresh agent pane on another device/i)
+      const openButton = within(card).getByRole('button', { name: 'Open as Fresh Agent here' })
+
+      // While divergent, no re-attach attempt is made to the dead id.
+      await act(async () => { await Promise.resolve() })
+      expect(attachesToDead()).toHaveLength(attachesAtDivergence)
+      expect(restoreMocks.consumeRecoveredLiveTerminalTarget).not.toHaveBeenCalled()
+
+      fireEvent.click(openButton)
+      const swap = dispatchSpy.mock.calls
+        .map(([action]) => action as { type?: string; payload?: { tabId?: string; paneId?: string; content?: { kind?: string } } })
+        .find((action) => action?.type === 'panes/updatePaneContent' && action.payload?.content?.kind === 'fresh-agent')
+      expect(swap?.payload).toMatchObject({
+        tabId: 'tab-b8ke',
+        paneId: 'pane-b8ke',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          sessionRef: { provider: 'codex', sessionId: TYPED_SESSION_ID },
+        },
+      })
+    })
+
+    it('the open action swaps a kilroy-flavored Claude pane to a KILROY pane, never freshclaude', async () => {
+      const { store } = setupTypedPane({
+        content: {
+          mode: 'claude',
+          status: 'running',
+          terminalId: 't-dead-kilroy',
+          sessionRef: { provider: 'claude', sessionId: '550e8400-e29b-41d4-a716-446655440099' },
+        },
+        tabMetadata: {
+          'claude:550e8400-e29b-41d4-a716-446655440099': { sessionType: 'kilroy' },
+        },
+      })
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+      })
+
+      // Install the spy BEFORE the divergence fold re-renders: the click
+      // closure captures `dispatch` at render time (react-redux).
+      const dispatchSpy = vi.spyOn(store, 'dispatch')
+
+      act(() => {
+        store.dispatch(applyRuntimeOwner({
+          type: 'session.runtimeOwner',
+          provider: 'claude',
+          sessionId: '550e8400-e29b-41d4-a716-446655440099',
+          epoch: 1,
+          generation: 3,
+          ownerKind: 'fresh-agent',
+          operationId: 'handoff-to-kilroy',
+          transition: 'handoff-committed',
+        }))
+      })
+
+      const card = await screen.findByTestId('terminal-owner-divergence-card')
+      const openButton = within(card).getByRole('button', { name: 'Open as Fresh Agent here' })
+
+      fireEvent.click(openButton)
+      const swap = dispatchSpy.mock.calls
+        .map(([action]) => action as { type?: string; payload?: { content?: { kind?: string; sessionType?: string } } })
+        .find((action) => action?.type === 'panes/updatePaneContent' && action.payload?.content?.kind === 'fresh-agent')
+      expect(swap?.payload?.content).toMatchObject({
+        kind: 'fresh-agent',
+        sessionType: 'kilroy',
+        provider: 'claude',
+      })
     })
   })
 

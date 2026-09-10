@@ -257,8 +257,17 @@ describe('getPairedSessionTypeTarget', () => {
     })
   })
 
-  it('does not expose hidden or unsupported session types', () => {
-    expect(getPairedSessionTypeTarget('kilroy')).toBeNull()
+  it('does not expose unsupported session types (kilroy pairs with the Claude CLI — kata b8ke round-2 R2-10)', () => {
+    // kilroy is a hidden flavor, not a public type — but it rides the claude
+    // lane, so a kilroy pane DOES offer the Claude CLI reopen (the runtime
+    // provider, never a public fresh-agent target, is what pairs).
+    expect(getPairedSessionTypeTarget('kilroy')).toMatchObject({
+      sourceSessionType: 'kilroy',
+      targetSessionType: 'claude',
+      runtimeProvider: 'claude',
+      targetKind: 'terminal',
+      metadataSessionType: 'kilroy',
+    })
     expect(getPairedSessionTypeTarget('shell')).toBeNull()
     expect(getPairedSessionTypeTarget(undefined)).toBeNull()
   })

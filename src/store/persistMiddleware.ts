@@ -258,6 +258,11 @@ function stripTransientSessionFields(content: any): any {
     // Delta-r7-r3 (F2): the close-gate failure surface is volatile too —
     // the unconfirmed close stands (the pane reloads), the banner does not.
     closeError: _closeError,
+    // kata b8ke: the typed failure surfaces are volatile — the launch
+    // failure card and the handoff-error banner re-derive from the live
+    // server state after a reload, never from a persisted snapshot.
+    launchFailure: _launchFailure,
+    handoffError: _handoffError,
     ...rest
   } = content
 

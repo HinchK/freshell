@@ -68,6 +68,8 @@ import {
   rollbackUnsupportedNotice,
 } from '@/lib/fresh-agent-rollback'
 import { registerFreshAgentPaneActions } from '@/lib/pane-action-registry'
+import { buildTerminalAttachContent } from '@/lib/session-type-utils'
+import { SessionHandoffErrorBanner } from '@/components/SessionHandoffErrorBanner'
 import {
   freshAgentContextSessionId,
   guardContextUsageTokenSummary,
@@ -1081,6 +1083,33 @@ export function FreshAgentView({
     sendFreshAgentMessage(buildFreshAgentAttachMessage(content, cwd, selectPaneOwnerFence(state, content)))
     return true
   }, [appStore, sendFreshAgentMessage])
+
+  // kata b8ke: the opened-as-CLI-elsewhere attach action — THIS pane adopts
+  // the committed terminal owner (keeping its sessionRef + createRequestId,
+  // entering `running` so TerminalView's mount effect attaches instead of
+  // creating a second process). Only the card's committed path offers it.
+  const attachTerminalOwnerHere = useCallback(() => {
+    const divergence = ownerDivergenceRef.current
+    const content = paneContentRef.current
+    if (!divergence || divergence.ownerKind !== 'terminal' || divergence.terminalId === undefined) return
+    if (content.kind !== 'fresh-agent') return
+    const sessionRef = content.sessionRef ?? (
+      content.sessionId !== undefined ? { provider: content.provider, sessionId: content.sessionId } : undefined
+    )
+    if (!sessionRef) return
+    dispatch(updatePaneContent({
+      tabId,
+      paneId,
+      content: buildTerminalAttachContent({
+        createRequestId: content.createRequestId,
+        mode: content.provider,
+        provider: sessionRef.provider,
+        sessionId: sessionRef.sessionId,
+        terminalId: divergence.terminalId,
+        cwd: content.initialCwd,
+      }),
+    }))
+  }, [dispatch, paneId, tabId])
 
   useEffect(() => () => {
     if (rateLimitRetryTimerRef.current !== null) {
@@ -2951,6 +2980,37 @@ export function FreshAgentView({
                   </div>
                 </div>
               ) : null}
+              {ownerDivergence?.ownerKind === 'terminal' ? (
+                <div
+                  className="fresh-agent-divergence-card flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
+                  role="alert"
+                  aria-label="Session open as a terminal on another device"
+                >
+                  <span>
+                    {ownerDivergence.transition === 'handoff-committed' && ownerDivergence.terminalId !== undefined
+                      ? 'This conversation is open as a terminal on another device.'
+                      : 'This conversation is being reopened as a terminal elsewhere…'}
+                  </span>
+                  {ownerDivergence.transition === 'handoff-committed' && ownerDivergence.terminalId !== undefined ? (
+                    <button
+                      type="button"
+                      className="fresh-agent-divergence-action shrink-0 rounded border border-border/70 px-2 py-1 text-xs"
+                      aria-label="Attach the terminal here"
+                      onClick={attachTerminalOwnerHere}
+                    >
+                      Attach here
+                    </button>
+                  ) : null}
+                </div>
+              ) : null}
+              {paneContent.handoffError ? (
+                <SessionHandoffErrorBanner
+                  error={paneContent.handoffError}
+                  appStore={appStore}
+                  tabId={tabId}
+                  paneId={paneId}
+                />
+              ) : null}
               {sessionEnded ? (
                 <div className="fresh-agent-session-ended-card flex items-center justify-between gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm">
                   <span>This session has ended{sessionErrorMessage ? '' : ' (the agent process exited)'}.</span>
@@ -3168,6 +3228,8 @@ export function FreshAgentView({
     stripModelTooltip,
     handleModelCatalogUnavailable,
     notice,
+    ownerDivergence,
+    attachTerminalOwnerHere,
     paneContent,
     pendingCreateFailure,
     queuedMessages,
@@ -3183,6 +3245,7 @@ export function FreshAgentView({
     snapshot,
     slashCommands,
     dispatch,
+    appStore,
     paneId,
     sendFreshAgentMessage,
     tabId,

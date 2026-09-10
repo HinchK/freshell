@@ -82,6 +82,68 @@ export function normalizeFreshAgentModelEffortLevels(value: unknown): string[] |
  * siblings; re-exported here where pane content consumers import from. */
 export type { CrashTrace }
 
+/**
+ * kata b8ke: a typed, recoverable terminal LAUNCH failure. Set by
+ * TerminalView's create-error fold for refusal frames carrying the typed
+ * owner fields (the additive `ownerKind`/`ownerGeneration` on
+ * SESSION_RESERVED / RESTORE_UNAVAILABLE); rendered by the typed failure
+ * card with attach/retry/open-as-fresh-agent actions. VOLATILE — stripped
+ * by persistMiddleware, never persisted.
+ */
+export type LaunchFailure = {
+  code: 'SESSION_RESERVED' | 'RESTORE_UNAVAILABLE' | 'HANDOFF_IN_PROGRESS' | 'REAP_TIMEOUT'
+    | 'TARGET_SPAWN_FAILED' | 'STALE_GENERATION' | 'LAUNCH_FAILED'
+  message: string
+  retryable: boolean
+  ownerKind?: 'terminal' | 'fresh-agent'
+  ownerGeneration?: number
+  /** The still-running owner terminal a RESTORE_UNAVAILABLE refusal named (the attach action's target). */
+  terminalId?: string
+}
+
+/**
+ * kata b8ke: the typed failure of an atomic reopen handoff (the
+ * ContextMenu handoff path). The pane is KEPT; the banner renders the
+ * message and a Retry that re-invokes the same handoff identity.
+ * VOLATILE — stripped by persistMiddleware, never persisted.
+ */
+export type HandoffError = {
+  code: string
+  message: string
+  retryable: boolean
+  generation: number
+}
+
+/** Sanitize an unknown value into a LaunchFailure (normalizePaneContent's whitelist gate). */
+export function normalizeLaunchFailure(value: unknown): LaunchFailure | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const record = value as Record<string, unknown>
+  if (typeof record.code !== 'string' || typeof record.message !== 'string') return undefined
+  return {
+    code: record.code as LaunchFailure['code'],
+    message: record.message,
+    retryable: record.retryable === true,
+    ...(record.ownerKind === 'terminal' || record.ownerKind === 'fresh-agent'
+      ? { ownerKind: record.ownerKind }
+      : {}),
+    ...(typeof record.ownerGeneration === 'number' ? { ownerGeneration: record.ownerGeneration } : {}),
+    ...(typeof record.terminalId === 'string' && record.terminalId ? { terminalId: record.terminalId } : {}),
+  }
+}
+
+/** Sanitize an unknown value into a HandoffError (normalizePaneContent's whitelist gate). */
+export function normalizeHandoffError(value: unknown): HandoffError | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const record = value as Record<string, unknown>
+  if (typeof record.code !== 'string' || typeof record.message !== 'string') return undefined
+  return {
+    code: record.code,
+    message: record.message,
+    retryable: record.retryable === true,
+    generation: typeof record.generation === 'number' ? record.generation : 0,
+  }
+}
+
 export type TerminalPaneContent = {
   kind: 'terminal'
   /** Backend terminal ID (undefined until created) */
@@ -124,6 +186,10 @@ export type TerminalPaneContent = {
   /** znhn item 1: persisted deliberately — do NOT add to
    * stripTransientSessionFields. Absent on old layouts = no trace. */
   crashTrace?: CrashTrace
+  /** kata b8ke: typed recoverable launch failure (VOLATILE — never persisted). */
+  launchFailure?: LaunchFailure
+  /** kata b8ke: the reopen handoff's typed failure — the pane was KEPT (VOLATILE — never persisted). */
+  handoffError?: HandoffError
 }
 
 /**
@@ -251,6 +317,8 @@ export type FreshAgentPaneContent = {
   pendingReconcile?: 'respawn' | 'fresh'
   /** VOLATILE fold counter — re-fires FreshAgentView's create effect on same-createRequestId folds. */
   reconcileEpoch?: number
+  /** kata b8ke: the reopen handoff's typed failure — the pane was KEPT (VOLATILE — never persisted). */
+  handoffError?: HandoffError
 }
 
 /**

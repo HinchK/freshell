@@ -1,7 +1,7 @@
 import type { Tab, CodingCliProviderName } from '@/store/types'
 import type { PaneContent } from '@/store/paneTypes'
 import { getPairedSessionTypeTarget } from '@/lib/session-type-utils'
-import { isDurableProviderSessionId, type PublicSessionType } from '@shared/session-flavor'
+import { isDurableProviderSessionId } from '@shared/session-flavor'
 
 export type ReopenPaneActivity = {
   isBusy: boolean
@@ -11,20 +11,42 @@ export type ReopenPaneActivity = {
 export type ReopenPaneSessionTarget = {
   tabId: string
   paneId: string
-  sourceSessionType: PublicSessionType
-  targetSessionType: PublicSessionType
+  /** The pane's current session type — a public type OR the hidden kilroy flavor. */
+  sourceSessionType: string
+  targetSessionType: string
   provider: CodingCliProviderName
   sessionId: string
   cwd?: string
   label: string
   disabled: boolean
   disabledReason?: string
+  /** The handoff's target runtime kind ('terminal' = the paired CLI). */
+  targetKind: 'terminal' | 'fresh-agent'
+  /** The paired CLI lane the target rides (claude/codex/opencode). */
+  runtimeProvider: CodingCliProviderName
+  /**
+   * The session flavor the metadata legs record for this reopen
+   * (setSessionMetadata + the tab's sessionMetadataByKey merge). Equals the
+   * target EXCEPT when a hidden flavor rides the target CLI: a kilroy pane
+   * reopened as the Claude CLI records KILROY — the runtime-kind change
+   * must not orphan the flavor (round-2 R2-10). The public types keep
+   * recording the target exactly as before.
+   */
+  metadataSessionType: string
 }
 
 function paneSourceSessionType(content: PaneContent): string | undefined {
   if (content.kind === 'terminal') return content.mode !== 'shell' ? content.mode : undefined
   if (content.kind === 'fresh-agent') return content.sessionType
   return undefined
+}
+
+/** The session flavor recorded on the pane's tab for a durable session. */
+function recordedSessionFlavor(
+  tab: Tab | undefined,
+  ref: { provider: string; sessionId: string },
+): string | undefined {
+  return tab?.sessionMetadataByKey?.[`${ref.provider}:${ref.sessionId}`]?.sessionType
 }
 
 function paneCwd(content: PaneContent, tab?: Tab): string | undefined {
@@ -90,10 +112,15 @@ export function resolveReopenPaneSessionTarget(input: {
   const { tabId, paneId, content, tab, activity } = input
   if (!content) return null
   const sourceSessionType = paneSourceSessionType(content)
-  const paired = getPairedSessionTypeTarget(sourceSessionType)
-  if (!paired) return null
+  // Resolve the durable ref FIRST — the recorded session flavor (kilroy)
+  // participates in the paired-target derivation for CLI panes.
   const durableRef = durablePaneSessionRef(content, tab)
-  if (!durableRef || durableRef.provider !== paired.runtimeProvider) return null
+  const paired = durableRef
+    ? getPairedSessionTypeTarget(sourceSessionType, {
+      flavor: recordedSessionFlavor(tab, durableRef),
+    })
+    : null
+  if (!paired || !durableRef || durableRef.provider !== paired.runtimeProvider) return null
   const reason = disabledReason(content, activity)
   return {
     tabId,
@@ -106,5 +133,8 @@ export function resolveReopenPaneSessionTarget(input: {
     label: paired.label,
     disabled: Boolean(reason),
     ...(reason ? { disabledReason: reason } : {}),
+    targetKind: paired.targetKind,
+    runtimeProvider: paired.runtimeProvider,
+    metadataSessionType: paired.metadataSessionType,
   }
 }

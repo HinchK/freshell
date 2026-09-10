@@ -4,7 +4,7 @@ import userEvent from '@testing-library/user-event'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 
-import tabsReducer from '@/store/tabsSlice'
+import tabsReducer, { updateTab } from '@/store/tabsSlice'
 import panesReducer, { initLayout, updatePaneContent } from '@/store/panesSlice'
 import sessionsReducer, { commitSessionWindowVisibleRefresh } from '@/store/sessionsSlice'
 import connectionReducer from '@/store/connectionSlice'
@@ -102,6 +102,14 @@ const apiMocks = vi.hoisted(() => ({
   put: vi.fn().mockResolvedValue({}),
   delete: vi.fn().mockResolvedValue({}),
   setSessionMetadata: vi.fn().mockResolvedValue(undefined),
+  // kata b8ke: the atomic reopen handoff. Default success shape (terminal
+  // owner) — individual tests override for failures / fresh-agent owners.
+  requestSessionHandoff: vi.fn().mockResolvedValue({
+    ok: true,
+    operationId: 'handoff-default',
+    generation: 1,
+    owner: { kind: 'terminal', terminalId: 't-default', mode: 'claude' },
+  }),
 }))
 
 vi.mock('@/lib/ws-client', () => ({
@@ -117,6 +125,7 @@ vi.mock('@/lib/api', () => ({
     delete: apiMocks.delete,
   },
   setSessionMetadata: apiMocks.setSessionMetadata,
+  requestSessionHandoff: apiMocks.requestSessionHandoff,
 }))
 
 vi.mock('@/lib/clipboard', () => ({
@@ -711,6 +720,16 @@ describe('ContextMenuProvider', () => {
     cleanup()
     vi.clearAllMocks()
     apiMocks.setSessionMetadata.mockResolvedValue(undefined)
+    // clearAllMocks does NOT drop queued mockResolvedValueOnce entries —
+    // under sequence.shuffle a leaked one-time handoff result would bleed
+    // into an unrelated test's first call. Reset and re-prime the default.
+    apiMocks.requestSessionHandoff.mockReset()
+    apiMocks.requestSessionHandoff.mockResolvedValue({
+      ok: true,
+      operationId: 'handoff-default',
+      generation: 1,
+      owner: { kind: 'terminal', terminalId: 't-default', mode: 'claude' },
+    })
   })
 
   it('does not emit selector instability warnings when feature flags are absent', () => {
@@ -1021,6 +1040,15 @@ describe('ContextMenuProvider', () => {
       },
     }))
 
+    // The committed fresh-agent owner the server's handoff reports — queued
+    // BEFORE the click that triggers the request.
+    apiMocks.requestSessionHandoff.mockResolvedValueOnce({
+      ok: true,
+      operationId: 'handoff-cli-to-fresh',
+      generation: 2,
+      owner: { kind: 'fresh-agent', sessionId: VALID_SESSION_ID, sessionType: 'freshclaude', provider: 'claude' },
+    })
+
     render(
       <Provider store={store}>
         <ContextMenuProvider
@@ -1051,14 +1079,23 @@ describe('ContextMenuProvider', () => {
         { sessionTypeSource: 'explicit' },
       )
     })
+
+    // kata b8ke: the kill-and-replace sequence is now ONE atomic server-side
+    // handoff — the replacement conversation starts under the server's
+    // coordinator lease, never via client-orchestrated kill legs.
     await waitFor(() => {
-      expect(wsMocks.send).toHaveBeenCalledWith(
-        expect.objectContaining({ type: 'terminal.kill', terminalId: 'term-1' }),
-      )
+      expect(apiMocks.requestSessionHandoff).toHaveBeenCalledWith(expect.objectContaining({
+        provider: 'claude',
+        sessionId: VALID_SESSION_ID,
+        targetKind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+      }))
     })
-    // The replacement conversation starts only once the old one's durable
-    // close is acknowledged (focused-episode-6 round 2 close-and-replace).
-    ackPendingKills()
+    const sentTypes = wsMocks.send.mock.calls.map(([msg]) => (msg as { type?: string })?.type)
+    expect(sentTypes).not.toContain('terminal.kill')
+    expect(sentTypes).not.toContain('freshAgent.kill')
 
     await waitFor(() => {
       expect(store.getState().panes.layouts['tab-1']).toMatchObject({
@@ -1138,16 +1175,17 @@ describe('ContextMenuProvider', () => {
       )
     })
     await waitFor(() => {
-      expect(wsMocks.send).toHaveBeenCalledWith({
-        type: 'freshAgent.kill',
-        sessionId: 'runtime-sdk-session-id',
-        sessionType: 'freshclaude',
+      expect(apiMocks.requestSessionHandoff).toHaveBeenCalledWith(expect.objectContaining({
         provider: 'claude',
-      })
+        sessionId: VALID_SESSION_ID,
+        targetKind: 'terminal',
+        mode: 'claude',
+      }))
     })
-    // As above: the replacement starts only once the old fresh-agent
-    // session's durable close is acknowledged.
-    ackPendingKills()
+    // The kill happens INSIDE the server-side handoff — no client kill leg.
+    const sentTypes = wsMocks.send.mock.calls.map(([msg]) => (msg as { type?: string })?.type)
+    expect(sentTypes).not.toContain('freshAgent.kill')
+    expect(sentTypes).not.toContain('terminal.kill')
 
     await waitFor(() => {
       expect(store.getState().panes.layouts['tab-1']).toMatchObject({
@@ -1190,6 +1228,13 @@ describe('ContextMenuProvider', () => {
       },
     }))
 
+    apiMocks.requestSessionHandoff.mockResolvedValueOnce({
+      ok: true,
+      operationId: 'handoff-freshcodex-cli',
+      generation: 1,
+      owner: { kind: 'terminal', terminalId: 't-codex-cli', mode: 'codex' },
+    })
+
     render(
       <Provider store={store}>
         <ContextMenuProvider
@@ -1222,6 +1267,18 @@ describe('ContextMenuProvider', () => {
         { sessionTypeSource: 'explicit' },
       )
     })
+    await waitFor(() => {
+      expect(apiMocks.requestSessionHandoff).toHaveBeenCalledWith(expect.objectContaining({
+        provider: 'codex',
+        sessionId: CODEX_THREAD_ID,
+        targetKind: 'terminal',
+        mode: 'codex',
+      }))
+    })
+    // The pane converts locally ONLY on the handoff's typed success.
+    const sentTypes = wsMocks.send.mock.calls.map(([msg]) => (msg as { type?: string })?.type)
+    expect(sentTypes).not.toContain('freshAgent.kill')
+    expect(sentTypes).not.toContain('terminal.kill')
 
     expect(store.getState().panes.layouts['tab-1']).toMatchObject({
       type: 'leaf',
@@ -1268,6 +1325,13 @@ describe('ContextMenuProvider', () => {
       cwd: '/repo/session-state',
     }))
 
+    apiMocks.requestSessionHandoff.mockResolvedValueOnce({
+      ok: true,
+      operationId: 'handoff-freshopencode-cli',
+      generation: 1,
+      owner: { kind: 'terminal', terminalId: 't-opencode-cli', mode: 'opencode' },
+    })
+
     render(
       <Provider store={store}>
         <ContextMenuProvider
@@ -1301,15 +1365,19 @@ describe('ContextMenuProvider', () => {
       )
     })
     await waitFor(() => {
-      expect(wsMocks.send).toHaveBeenCalledWith({
-        type: 'freshAgent.kill',
-        sessionId: OPENCODE_SESSION_ID,
-        sessionType: 'freshopencode',
+      expect(apiMocks.requestSessionHandoff).toHaveBeenCalledWith(expect.objectContaining({
         provider: 'opencode',
+        sessionId: OPENCODE_SESSION_ID,
+        targetKind: 'terminal',
+        mode: 'opencode',
+        // The session-state cwd rides the handoff body — the target CLI
+        // starts where the fresh-agent session ran.
         cwd: '/repo/session-state',
-      })
+      }))
     })
-    ackPendingKills()
+    const sentTypes = wsMocks.send.mock.calls.map(([msg]) => (msg as { type?: string })?.type)
+    expect(sentTypes).not.toContain('freshAgent.kill')
+    expect(sentTypes).not.toContain('terminal.kill')
 
     await waitFor(() => {
       expect(store.getState().panes.layouts['tab-1']).toMatchObject({
@@ -1325,6 +1393,460 @@ describe('ContextMenuProvider', () => {
         },
       })
     })
+  })
+
+  // ── kata b8ke Task 9: the atomic server-side reopen handoff ──
+
+  it('sessionRef-only freshcodex pane reopens as CLI via one awaited handoff using sessionRef.sessionId', async () => {
+    const user = userEvent.setup()
+    const store = createTestStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        provider: 'codex',
+        sessionType: 'freshcodex',
+        // sessionRef-ONLY: no content.sessionId — the handoff must key on
+        // the durable ref (User Request: "a sessionRef-only restored pane
+        // must perform the correct lifecycle handoff using
+        // sessionRef.sessionId").
+        createRequestId: 'req-ref-only',
+        status: 'idle',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: CODEX_THREAD_ID,
+        },
+      },
+    }))
+
+    apiMocks.requestSessionHandoff.mockResolvedValueOnce({
+      ok: true,
+      operationId: 'handoff-x',
+      generation: 2,
+      owner: { kind: 'terminal', terminalId: 't-77', mode: 'codex' },
+    })
+
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.FreshAgent}
+            data-tab-id="tab-1"
+            data-pane-id="pane-1"
+            data-provider="codex"
+            data-session-type="freshcodex"
+          >
+            <div data-context="fresh-agent-transcript">FreshCodex sessionRef-only body</div>
+          </div>
+        </ContextMenuProvider>
+      </Provider>,
+    )
+
+    await user.pointer({ target: screen.getByText('FreshCodex sessionRef-only body'), keys: '[MouseRight]' })
+    await user.click(await screen.findByRole('menuitem', { name: 'Reopen as Codex CLI' }))
+
+    // ONE atomic server-side handoff, keyed on sessionRef.sessionId.
+    await waitFor(() => {
+      expect(apiMocks.requestSessionHandoff).toHaveBeenCalledTimes(1)
+    })
+    expect(apiMocks.requestSessionHandoff).toHaveBeenCalledWith(expect.objectContaining({
+      provider: 'codex',
+      sessionId: CODEX_THREAD_ID,
+      targetKind: 'terminal',
+      mode: 'codex',
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+    }))
+
+    // The server performs the kill INSIDE the handoff — the client never
+    // orchestrates kill legs for the reopen anymore.
+    const sentTypes = wsMocks.send.mock.calls.map(([msg]) => (msg as { type?: string })?.type)
+    expect(sentTypes).not.toContain('freshAgent.kill')
+    expect(sentTypes).not.toContain('terminal.kill')
+
+    // The pane swapped to a terminal pane ATTACHED to the handoff's target
+    // terminal (the attach path, not a fresh create).
+    await waitFor(() => {
+      expect(store.getState().panes.layouts['tab-1']).toMatchObject({
+        type: 'leaf',
+        content: {
+          kind: 'terminal',
+          mode: 'codex',
+          terminalId: 't-77',
+          status: 'running',
+          createRequestId: 'req-ref-only',
+          sessionRef: {
+            provider: 'codex',
+            sessionId: CODEX_THREAD_ID,
+          },
+        },
+      })
+    })
+  })
+
+  it('freshopencode sessionRef-only pane reopens as CLI via the handoff (opencode twin)', async () => {
+    const user = userEvent.setup()
+    const store = createTestStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        provider: 'opencode',
+        sessionType: 'freshopencode',
+        createRequestId: 'req-oc-ref-only',
+        status: 'idle',
+        sessionRef: {
+          provider: 'opencode',
+          sessionId: OPENCODE_SESSION_ID,
+        },
+      },
+    }))
+
+    apiMocks.requestSessionHandoff.mockResolvedValueOnce({
+      ok: true,
+      operationId: 'handoff-oc',
+      generation: 2,
+      owner: { kind: 'terminal', terminalId: 't-88', mode: 'opencode' },
+    })
+
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.FreshAgent}
+            data-tab-id="tab-1"
+            data-pane-id="pane-1"
+            data-provider="opencode"
+            data-session-type="freshopencode"
+          >
+            <div data-context="fresh-agent-transcript">FreshOpenCode sessionRef-only body</div>
+          </div>
+        </ContextMenuProvider>
+      </Provider>,
+    )
+
+    await user.pointer({ target: screen.getByText('FreshOpenCode sessionRef-only body'), keys: '[MouseRight]' })
+    await user.click(await screen.findByRole('menuitem', { name: 'Reopen as OpenCode CLI' }))
+
+    await waitFor(() => {
+      expect(apiMocks.requestSessionHandoff).toHaveBeenCalledTimes(1)
+    })
+    expect(apiMocks.requestSessionHandoff).toHaveBeenCalledWith(expect.objectContaining({
+      provider: 'opencode',
+      sessionId: OPENCODE_SESSION_ID,
+      targetKind: 'terminal',
+      mode: 'opencode',
+    }))
+
+    await waitFor(() => {
+      expect(store.getState().panes.layouts['tab-1']).toMatchObject({
+        type: 'leaf',
+        content: {
+          kind: 'terminal',
+          mode: 'opencode',
+          terminalId: 't-88',
+          status: 'running',
+          sessionRef: {
+            provider: 'opencode',
+            sessionId: OPENCODE_SESSION_ID,
+          },
+        },
+      })
+    })
+  })
+
+  it('kilroy pane reopens as the Claude CLI while the metadata records kilroy (flavor-preserving)', async () => {
+    const user = userEvent.setup()
+    const store = createTestStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        provider: 'claude',
+        sessionType: 'kilroy',
+        createRequestId: 'req-kilroy-fwd',
+        status: 'idle',
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
+      },
+    }))
+
+    apiMocks.requestSessionHandoff.mockResolvedValueOnce({
+      ok: true,
+      operationId: 'handoff-kilroy-fwd',
+      generation: 1,
+      owner: { kind: 'terminal', terminalId: 't-kilroy-cli', mode: 'claude' },
+    })
+
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.FreshAgent}
+            data-tab-id="tab-1"
+            data-pane-id="pane-1"
+            data-provider="claude"
+            data-session-type="kilroy"
+          >
+            <div data-context="fresh-agent-transcript">Kilroy transcript body</div>
+          </div>
+        </ContextMenuProvider>
+      </Provider>,
+    )
+
+    await user.pointer({ target: screen.getByText('Kilroy transcript body'), keys: '[MouseRight]' })
+    // The flavor-aware pairing offers the Claude CLI even though kilroy is
+    // a hidden (non-public) session type.
+    await user.click(await screen.findByRole('menuitem', { name: 'Reopen as Claude CLI' }))
+
+    await waitFor(() => {
+      expect(apiMocks.requestSessionHandoff).toHaveBeenCalledTimes(1)
+    })
+    expect(apiMocks.requestSessionHandoff).toHaveBeenCalledWith(expect.objectContaining({
+      provider: 'claude',
+      sessionId: VALID_SESSION_ID,
+      targetKind: 'terminal',
+      mode: 'claude',
+    }))
+
+    // The metadata leg records KILROY — the runtime-kind change must not
+    // orphan the flavor (round-2 review R2-10), never 'claude'.
+    await waitFor(() => {
+      expect(apiMocks.setSessionMetadata).toHaveBeenCalledWith(
+        'claude',
+        VALID_SESSION_ID,
+        'kilroy',
+        { sessionTypeSource: 'explicit' },
+      )
+    })
+
+    await waitFor(() => {
+      expect(store.getState().panes.layouts['tab-1']).toMatchObject({
+        type: 'leaf',
+        content: {
+          kind: 'terminal',
+          mode: 'claude',
+          terminalId: 't-kilroy-cli',
+          sessionRef: {
+            provider: 'claude',
+            sessionId: VALID_SESSION_ID,
+          },
+        },
+      })
+    })
+    expect(store.getState().tabs.tabs[0].sessionMetadataByKey).toEqual({
+      [`claude:${VALID_SESSION_ID}`]: {
+        sessionType: 'kilroy',
+      },
+    })
+  })
+
+  it('a kilroy-flavored Claude CLI pane maps back to kilroy on reopen (never freshclaude)', async () => {
+    const user = userEvent.setup()
+    const store = createTestStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'terminal',
+        mode: 'claude',
+        status: 'running',
+        terminalId: 'term-kilroy',
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
+      },
+    }))
+    // The tab's recorded session flavor: kilroy (the pane runs the claude
+    // CLI, but the session identity is kilroy).
+    store.dispatch(updateTab({
+      id: 'tab-1',
+      updates: {
+        sessionMetadataByKey: {
+          [`claude:${VALID_SESSION_ID}`]: { sessionType: 'kilroy' },
+        },
+      },
+    }))
+
+    apiMocks.requestSessionHandoff.mockResolvedValueOnce({
+      ok: true,
+      operationId: 'handoff-kilroy-rev',
+      generation: 2,
+      owner: { kind: 'fresh-agent', sessionId: VALID_SESSION_ID, sessionType: 'kilroy', provider: 'claude' },
+    })
+
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.Terminal}
+            data-tab-id="tab-1"
+            data-pane-id="pane-1"
+          >
+            Kilroy CLI body
+          </div>
+        </ContextMenuProvider>
+      </Provider>,
+    )
+
+    await user.pointer({ target: screen.getByText('Kilroy CLI body'), keys: '[MouseRight]' })
+    // The flavor-first derivation maps the CLI pane BACK to kilroy — the
+    // provider-alone public map (claude→freshclaude) would lose the identity.
+    await user.click(await screen.findByRole('menuitem', { name: 'Reopen as kilroy' }))
+
+    await waitFor(() => {
+      expect(apiMocks.requestSessionHandoff).toHaveBeenCalledTimes(1)
+    })
+    expect(apiMocks.requestSessionHandoff).toHaveBeenCalledWith(expect.objectContaining({
+      provider: 'claude',
+      sessionId: VALID_SESSION_ID,
+      targetKind: 'fresh-agent',
+      sessionType: 'kilroy',
+    }))
+    expect((apiMocks.requestSessionHandoff.mock.calls[0][0] as { sessionType?: string }).sessionType)
+      .not.toBe('freshclaude')
+
+    await waitFor(() => {
+      expect(store.getState().panes.layouts['tab-1']).toMatchObject({
+        type: 'leaf',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'kilroy',
+          provider: 'claude',
+          sessionRef: {
+            provider: 'claude',
+            sessionId: VALID_SESSION_ID,
+          },
+        },
+      })
+    })
+  })
+
+  it('handoff failure keeps the pane and surfaces the typed error (every typed code)', async () => {
+    // Round-3 F13/F14: behavior coverage for EVERY typed failure code. The
+    // failures are constructed consistent with the retry semantics — every
+    // code here is retryable:true, so the pane's handoffError carries
+    // retryable and a Retry action is reachable.
+    const typedFailures: Array<{ code: string; message: string; ownerGeneration: number }> = [
+      { code: 'REAP_TIMEOUT', message: 'the prior runtime did not confirm its exit in time', ownerGeneration: 4 },
+      { code: 'TARGET_SPAWN_FAILED', message: 'the target runtime failed to start', ownerGeneration: 4 },
+      { code: 'STALE_GENERATION', message: 'observed ownership fence is stale; refresh and retry', ownerGeneration: 9 },
+      { code: 'HANDOFF_IN_PROGRESS', message: 'a lifecycle operation is in flight; retry after it settles', ownerGeneration: 2 },
+    ]
+
+    for (const failure of typedFailures) {
+      const user = userEvent.setup()
+      apiMocks.requestSessionHandoff.mockClear()
+      const store = createTestStore()
+      store.dispatch(initLayout({        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          provider: 'codex',
+          sessionType: 'freshcodex',
+          createRequestId: `req-fail-${failure.code}`,
+          sessionId: 'runtime-sdk-id',
+          status: 'idle',
+          sessionRef: {
+            provider: 'codex',
+            sessionId: CODEX_THREAD_ID,
+          },
+        },
+      }))
+
+      apiMocks.requestSessionHandoff.mockResolvedValueOnce({
+        ok: false,
+        error: {
+          code: failure.code,
+          message: failure.message,
+          retryable: true,
+          ownerGeneration: failure.ownerGeneration,
+        },
+      })
+
+      render(
+        <Provider store={store}>
+          <ContextMenuProvider
+            view="terminal"
+            onViewChange={() => {}}
+            onToggleSidebar={() => {}}
+            sidebarCollapsed={false}
+          >
+            <div
+              data-context={ContextIds.FreshAgent}
+              data-tab-id="tab-1"
+              data-pane-id="pane-1"
+              data-provider="codex"
+              data-session-type="freshcodex"
+            >
+              <div data-context="fresh-agent-transcript">Failure body {failure.code}</div>
+            </div>
+          </ContextMenuProvider>
+        </Provider>,
+      )
+
+      await user.pointer({ target: screen.getByText(`Failure body ${failure.code}`), keys: '[MouseRight]' })
+      await user.click(await screen.findByRole('menuitem', { name: 'Reopen as Codex CLI' }))
+
+      await waitFor(() => {
+        expect(apiMocks.requestSessionHandoff).toHaveBeenCalledTimes(1)
+      })
+
+      // The pane is KEPT: no content swap, no re-minted identity, no fresh
+      // session row (the session id is preserved, never re-minted).
+      const layout = store.getState().panes.layouts['tab-1']
+      expect(layout).toMatchObject({
+        type: 'leaf',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          sessionId: 'runtime-sdk-id',
+          createRequestId: `req-fail-${failure.code}`,
+          sessionRef: {
+            provider: 'codex',
+            sessionId: CODEX_THREAD_ID,
+          },
+        },
+      })
+
+      // The pane gained the typed handoff error — the banner + Retry
+      // surface (rendered by the views) reads exactly this.
+      expect((layout as { content: { handoffError?: { code: string; retryable: boolean; generation: number } } }).content.handoffError)
+        .toEqual({
+          code: failure.code,
+          message: failure.message,
+          retryable: true,
+          generation: failure.ownerGeneration,
+        })
+
+      cleanup()
+    }
   })
 
   it('does not kill or replace a pane when reopen metadata persistence fails', async () => {

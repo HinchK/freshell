@@ -24,6 +24,7 @@ import {
   repairCodexIdentityMismatch,
   resetPaneForReconcileCreate,
   setPaneCrashTrace,
+  setPaneLaunchFailure,
   clearPaneCrashTrace,
   splitPane,
   updatePaneContent,
@@ -33,6 +34,7 @@ import { buildReconcileRequestForPanes, foldVerdicts } from '@/lib/pane-reconcil
 import type { PaneReconcileRequest } from '@shared/ws-protocol'
 import {
   derivePaneOwnerDivergence,
+  selectPaneOwnerFence,
   selectSessionRuntimeOwner,
 } from '@/store/selectors/runtimeOwner'
 import { updateSessionActivity } from '@/store/sessionActivitySlice'
@@ -53,6 +55,10 @@ import {
   selectResumeCycles,
 } from '@/store/terminalLifecycleSlice'
 import { TerminalExitBanner } from '@/components/TerminalExitBanner'
+import { TerminalLaunchFailureCard } from '@/components/TerminalLaunchFailureCard'
+import { SessionHandoffErrorBanner } from '@/components/SessionHandoffErrorBanner'
+import { buildResumeContent, freshSessionTypeForPaneFlavor } from '@/lib/session-type-utils'
+import type { LaunchFailure } from '@/store/paneTypes'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { focusNextTerminalSearchMatch, focusPreviousTerminalSearchMatch, loadTerminalSearch } from '@/store/terminalDirectoryThunks'
 import { isFatalConnectionErrorCode } from '@/store/connectionSlice'
@@ -3349,6 +3355,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         mode,
         recoveryIntent,
       })
+      // kata b8ke (round-2 review): the delayed-request fence — the observed
+      // (epoch, generation) pair read from the runtime-owner record AT SEND
+      // TIME, so a re-drive after a stale-generation refusal always carries
+      // the refreshed pair, never the stale one. Read once, sent together.
+      const ownerFence = selectPaneOwnerFence(appStore.getState(), contentRef.current ?? {})
       ws.send({
         type: 'terminal.create',
         requestId,
@@ -3358,6 +3369,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         ...(!recoveryIntent && createSessionState.sessionRef ? { sessionRef: createSessionState.sessionRef } : {}),
         ...(!recoveryIntent && createSessionState.codexDurability ? { codexDurability: createSessionState.codexDurability } : {}),
         ...(!recoveryIntent && createSessionState.liveTerminal ? { liveTerminal: createSessionState.liveTerminal } : {}),
+        ...(ownerFence ? { observedEpoch: ownerFence.epoch, observedGeneration: ownerFence.generation } : {}),
         tabId,
         paneId: paneIdRef.current,
         ...(restore ? { restore: true } : {}),
@@ -4538,6 +4550,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             serverInstanceId: serverInstanceIdRef.current,
             streamId: undefined,
             status: 'running',
+            // kata b8ke: the create anchored — any typed launch failure is
+            // resolved (the card must not outlive its recovery).
+            launchFailure: undefined,
             ...(createdCwd && !contentRef.current?.initialCwd ? { initialCwd: createdCwd } : {}),
             // Resume-validation: the notice names a stale resume id the server
             // dropped — clear the persisted refs so codex/opencode gate-fired
@@ -4978,6 +4993,24 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         }
 
         if (msg.type === 'error' && msg.code === 'SESSION_RESERVED' && reqId && msg.requestId === reqId) {
+          // kata b8ke: a TYPED refusal (the coordinator named the owner via
+          // the additive fields) also folds the recoverable launch-failure
+          // card — the user sees the in-flight state with a manual Retry
+          // while the automatic bounded re-drive keeps running underneath.
+          // The untyped legacy shape keeps its notice-only behavior.
+          if (msg.ownerKind !== undefined) {
+            dispatch(setPaneLaunchFailure({
+              tabId,
+              paneId: paneIdRef.current,
+              failure: {
+                code: 'SESSION_RESERVED',
+                message: msg.message || 'Another session start for this conversation is in flight.',
+                retryable: true,
+                ...(msg.ownerKind !== undefined ? { ownerKind: msg.ownerKind } : {}),
+                ...(typeof msg.ownerGeneration === 'number' ? { ownerGeneration: msg.ownerGeneration } : {}),
+              },
+            }))
+          }
           // Another create holds this sessionRef's lease. Re-drive the SAME
           // terminal.create after the server's hint (floored), bounded by a
           // wall-clock window; on exhaustion, auto-resolve via a single-pane
@@ -5029,9 +5062,26 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           clearRateLimitRetry()
           setIsAttaching(false)
           dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
+          // kata b8ke: a TYPED refusal (the additive owner fields on
+          // RESTORE_UNAVAILABLE and friends) folds the recoverable
+          // launch-failure state IN ADDITION to the frozen xterm notice —
+          // the card carries the attach/retry/open-as-fresh-agent actions.
+          // Rides the same updateContent (the ref-based merge would
+          // otherwise clobber it).
+          const typedLaunchFailure: LaunchFailure | undefined = msg.ownerKind !== undefined || typeof msg.ownerGeneration === 'number'
+            ? {
+              code: msg.code === 'RESTORE_UNAVAILABLE' ? 'RESTORE_UNAVAILABLE' : 'LAUNCH_FAILED',
+              message: msg.message || msg.code || 'The launch was refused.',
+              retryable: true,
+              ...(msg.ownerKind !== undefined ? { ownerKind: msg.ownerKind } : {}),
+              ...(typeof msg.ownerGeneration === 'number' ? { ownerGeneration: msg.ownerGeneration } : {}),
+              ...(typeof msg.liveTerminalId === 'string' ? { terminalId: msg.liveTerminalId } : {}),
+            }
+            : undefined
           updateContent({
             status: 'error',
             streamId: undefined,
+            ...(typedLaunchFailure ? { launchFailure: typedLaunchFailure } : {}),
             ...(launchAttempt?.recoveryIntent
               ? { restoreError: buildRestoreError('dead_live_handle') }
               : {}),
@@ -5634,6 +5684,58 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     isAgentPane && (activeNotice || terminalContent.crashTrace || settledDead)
   )
 
+  // ── kata b8ke: typed recovery surfaces ──
+  // The reverse-direction divergence card (round-1 review: terminal panes
+  // converge too): the canonical session's runtime owner is a FRESH-AGENT
+  // runtime — this pane's terminal was reaped by the handoff. Handoff-started
+  // is NOT a live target (round-3 F15): the open action renders only on the
+  // committed owner event.
+  const freshOwnerDivergenceCommitted = freshAgentOwnerDivergence?.ownerKind === 'fresh-agent'
+    && freshAgentOwnerDivergence.transition === 'handoff-committed'
+
+  const openAsFreshAgentHere = () => {
+    const sessionRef = terminalContent.sessionRef
+    if (!sessionRef) return
+    const sessionType = freshSessionTypeForPaneFlavor(tab, terminalContent)
+    if (!sessionType) return
+    const providerSettings = appStore.getState().settings.settings.freshAgent?.providers?.[sessionType]
+    dispatch(updatePaneContent({
+      tabId,
+      paneId,
+      content: buildResumeContent({
+        sessionType,
+        sessionId: sessionRef.sessionId,
+        cwd: terminalContent.initialCwd,
+        ...(providerSettings ? { freshAgentProviderSettings: providerSettings } : {}),
+      }),
+    }))
+  }
+
+  // The typed launch-failure card: rendered only while NOT divergent — the
+  // live owner record (the divergence card) is the authoritative surface
+  // when both would show.
+  const typedLaunchFailure = freshAgentOwnerDivergence === null
+    ? terminalContent.launchFailure
+    : undefined
+
+  const retryLaunch = () => {
+    // The Relaunch discipline: a reconcile-driven respawn create re-fires
+    // the lifecycle effect (the reconcileEpoch bump is its ONLY re-fire
+    // signal — createRequestId is preserved, never re-minted).
+    dispatch(resetPaneForReconcileCreate({
+      tabId,
+      paneId,
+      intent: 'respawn',
+      sessionRef: terminalContent.sessionRef,
+    }))
+  }
+
+  const attachToNamedTerminal = () => {
+    const terminalId = terminalContent.launchFailure?.terminalId
+    if (!terminalId) return
+    dispatch(applyReattachToLiveTerminal({ tabId, paneId, terminalId }))
+  }
+
   return (
     <div
       ref={wrapperRef}
@@ -5659,6 +5761,50 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           className="pointer-events-none absolute inset-x-0 top-0 z-10 bg-amber-100/90 px-3 py-1 text-xs text-amber-900 dark:bg-amber-900/80 dark:text-amber-100"
         >
           {freshByRaceNotice}
+        </div>
+      ) : null}
+      {freshAgentOwnerDivergence?.ownerKind === 'fresh-agent' ? (
+        <div
+          role="alert"
+          data-testid="terminal-owner-divergence-card"
+          aria-label="Session open as a Fresh Agent pane on another device"
+          className="pointer-events-auto absolute inset-x-0 top-0 z-20 m-2 flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
+        >
+          <span>
+            {freshOwnerDivergenceCommitted
+              ? 'This conversation is open as a Fresh Agent pane on another device.'
+              : 'This conversation is being reopened as a Fresh Agent pane elsewhere…'}
+          </span>
+          {freshOwnerDivergenceCommitted && terminalContent.sessionRef ? (
+            <button
+              type="button"
+              className="shrink-0 rounded border border-border/70 px-2 py-1 text-xs"
+              aria-label="Open as Fresh Agent here"
+              onClick={openAsFreshAgentHere}
+            >
+              Open as Fresh Agent here
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+      {typedLaunchFailure ? (
+        <TerminalLaunchFailureCard
+          failure={typedLaunchFailure}
+          onRetry={retryLaunch}
+          onAttach={typedLaunchFailure.terminalId !== undefined ? attachToNamedTerminal : undefined}
+          onOpenFresh={typedLaunchFailure.ownerKind === 'fresh-agent' && terminalContent.sessionRef
+            ? openAsFreshAgentHere
+            : undefined}
+        />
+      ) : null}
+      {terminalContent.handoffError ? (
+        <div className="pointer-events-auto absolute inset-x-0 bottom-14 z-20 mx-2">
+          <SessionHandoffErrorBanner
+            error={terminalContent.handoffError}
+            appStore={appStore}
+            tabId={tabId}
+            paneId={paneId}
+          />
         </div>
       ) : null}
       {isMobile && (

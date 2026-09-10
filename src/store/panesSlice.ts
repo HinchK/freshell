@@ -5,9 +5,13 @@ import {
   normalizeFreshAgentModelEffortLevels,
   normalizeFreshAgentModelSelection,
   normalizeFreshAgentPendingLocalEcho,
+  normalizeHandoffError,
+  normalizeLaunchFailure,
   type DeadSessionEntry,
   type CrashTrace,
   type FreshAgentPaneContent,
+  type HandoffError,
+  type LaunchFailure,
   type LivePaneContentInput,
   type PanesState,
   type PaneContent,
@@ -77,6 +81,8 @@ function normalizePaneContent(
     const codexDurability = sanitizeCodexDurabilityRef(input.codexDurability)
     const restoreError = sanitizeRestoreError((input as { restoreError?: unknown }).restoreError)
     const crashTrace = sanitizeCrashTrace((input as { crashTrace?: unknown }).crashTrace)
+    const launchFailure = normalizeLaunchFailure((input as { launchFailure?: unknown }).launchFailure)
+    const handoffError = normalizeHandoffError((input as { handoffError?: unknown }).handoffError)
     return {
       kind: 'terminal',
       terminalId: typeof input.terminalId === 'string' ? input.terminalId : undefined,
@@ -109,6 +115,10 @@ function normalizePaneContent(
       // "survives reload" property silently dies here even though the
       // persistMiddleware strip and persistedState load both keep it).
       ...(crashTrace ? { crashTrace } : {}),
+      // kata b8ke typed failure surfaces (VOLATILE): survive identity-preserving
+      // merges; a wholesale content swap omits them and clears them.
+      ...(launchFailure ? { launchFailure } : {}),
+      ...(handoffError ? { handoffError } : {}),
     }
   }
   if (input.kind === 'browser') {
@@ -134,6 +144,7 @@ function normalizePaneContent(
     const style = normalizeFreshAgentStyleOverride((input as { style?: unknown }).style)
     const pendingLocalEcho = normalizeFreshAgentPendingLocalEcho(rawFreshAgent.pendingLocalEcho)
     const modelEffortLevels = normalizeFreshAgentModelEffortLevels(rawFreshAgent.modelEffortLevels)
+    const freshHandoffError = normalizeHandoffError(rawFreshAgent.handoffError)
     const rawModelLabel = rawFreshAgent.modelLabel
     const modelLabel =
       rawModelLabel && typeof rawModelLabel === 'object'
@@ -208,6 +219,7 @@ function normalizePaneContent(
             ? { pendingReconcile: input.pendingReconcile }
             : {}),
           ...(typeof input.reconcileEpoch === 'number' ? { reconcileEpoch: input.reconcileEpoch } : {}),
+          ...(freshHandoffError ? { handoffError: freshHandoffError } : {}),
         }
       }
     }
@@ -288,6 +300,7 @@ function normalizePaneContent(
         ? { pendingReconcile: input.pendingReconcile }
         : {}),
       ...(typeof input.reconcileEpoch === 'number' ? { reconcileEpoch: input.reconcileEpoch } : {}),
+      ...(freshHandoffError ? { handoffError: freshHandoffError } : {}),
     }
   }
   if (input.kind === 'extension') {
@@ -747,6 +760,9 @@ function foldLiveTerminalAttach(content: TerminalPaneContent, terminalId: string
   content.streamId = undefined
   content.status = 'running'
   content.restoreError = undefined
+  // kata b8ke: anchoring onto a live terminal resolves any typed launch
+  // failure — the recoverable card must not outlive its recovery.
+  content.launchFailure = undefined
   content.reconcileEpoch = (content.reconcileEpoch ?? 0) + 1
 }
 
@@ -2361,6 +2377,62 @@ export const panesSlice = createSlice({
     },
 
     /**
+     * kata b8ke: fold the typed failure of an atomic reopen handoff onto
+     * the pane it was invoked for. The pane is KEPT (identity fields are
+     * never touched) — the banner + Retry surface renders from this field.
+     */
+    setPaneHandoffError: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string; error: HandoffError }>
+    ) => {
+      const { tabId, paneId, error } = action.payload
+      const content = findReconcilePaneContent(state, tabId, paneId)
+      if (!content) return
+      content.handoffError = normalizeHandoffError(error) ?? {
+        code: 'HANDOFF_REQUEST_FAILED',
+        message: error.message,
+        retryable: error.retryable,
+        generation: error.generation,
+      }
+    },
+
+    /** kata b8ke: clear the handoff-failure banner (a superseded stale state). */
+    clearPaneHandoffError: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string }>
+    ) => {
+      const content = findReconcilePaneContent(state, action.payload.tabId, action.payload.paneId)
+      if (!content) return
+      content.handoffError = undefined
+    },
+
+    /**
+     * kata b8ke: fold the typed terminal LAUNCH failure (a create refusal
+     * carrying the additive owner fields) onto the pane. The frozen
+     * xterm-notice write still happens in TerminalView — this field feeds
+     * the typed recoverable card.
+     */
+    setPaneLaunchFailure: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string; failure: LaunchFailure }>
+    ) => {
+      const { tabId, paneId, failure } = action.payload
+      const content = findReconcileTerminalContent(state, tabId, paneId)
+      if (!content) return
+      content.launchFailure = normalizeLaunchFailure(failure)
+    },
+
+    /** kata b8ke: clear the typed launch-failure card (retry/anchor clears it). */
+    clearPaneLaunchFailure: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string }>
+    ) => {
+      const content = findReconcileTerminalContent(state, action.payload.tabId, action.payload.paneId)
+      if (!content) return
+      content.launchFailure = undefined
+    },
+
+    /**
      * Fold a pane.reconcile respawn/fresh verdict: clear live handles so
      * TerminalView re-creates, PRESERVING createRequestId (D4 — the
      * load-bearing difference from clearTerminalContentForRecreate).
@@ -2388,6 +2460,10 @@ export const panesSlice = createSlice({
       content.streamId = undefined
       content.status = 'creating'
       content.restoreError = undefined
+      // kata b8ke: a reconcile-driven create re-attempts the launch — the
+      // typed failure surfaces are stale until a new refusal lands.
+      content.launchFailure = undefined
+      content.handoffError = undefined
 
       if (intent === 'respawn') {
         if (sessionRef && sessionRef.provider === content.mode) {
@@ -2717,6 +2793,10 @@ export const {
   clearTerminalLiveHandles,
   applyReconcileAttach,
   applyReattachToLiveTerminal,
+  setPaneHandoffError,
+  clearPaneHandoffError,
+  setPaneLaunchFailure,
+  clearPaneLaunchFailure,
   resetPaneForReconcileCreate,
   applyFreshAgentReconcileAttach,
   resetFreshAgentPaneForReconcileCreate,
