@@ -1347,6 +1347,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "freshell-ownership"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tracing",
+]
+
+[[package]]
 name = "freshell-platform"
 version = "0.1.0"
 dependencies = [

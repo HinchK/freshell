@@ -1,0 +1,23 @@
+# freshell-ownership — the ONE server-wide runtime-ownership coordinator (kata b8ke).
+#
+# Leaf crate (no workspace deps, tokio-free): a sync state machine keyed by
+# canonical (provider, sessionId) with monotonic per-key generations. The
+# terminal lane and every fresh-agent provider claim/commit/release through
+# the single instance minted in freshell-server::main. Async orchestration
+# (kills, reap awaits, spawns) lives in the callers; this crate only owns
+# the atomic transitions.
+[package]
+name = "freshell-ownership"
+version = "0.1.0"
+description = "Server-authoritative runtime-ownership coordinator for canonical (provider, sessionId): one writer, generation fencing, atomic handoff state."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+# Diagnostic transition events (stable target "freshell_ownership") — flows
+# to the global `tracing` subscriber freshell-server installs
+# (crates/freshell-server/src/logging.rs); this crate stays tokio-free (std
+# `sync::Mutex` only) and never installs its own subscriber.
+tracing = "0.1"
