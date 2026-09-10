@@ -26,8 +26,13 @@
 //!
 //! ## Scope
 //!
-//! All three providers are served: **freshcodex/codex** and **freshopencode/opencode** ask
-//! their live runtime slices, while **freshclaude/claude** and **kilroy/claude** are a
+//! All three providers are served: **freshcodex/codex** asks its live runtime
+//! slice — SIDE-EFFECT-FREE (kata b8ke Task 5): a thread this process tracks
+//! serves from the live runtime, an untracked one answers the EMPTY snapshot
+//! (with the additive owner-state fields), and a session another runtime owns
+//! or a transition holds answers the typed 409 envelope — never a spawn or a
+//! resume; **freshopencode/opencode** asks its live runtime slice, while
+//! **freshclaude/claude** and **kilroy/claude** are a
 //! disk+env adapter ([`crate::claude_snapshot::get_claude_snapshot`]) that reads the CLI's
 //! own transcript store directly (`<claude_home>/projects/*/<threadId>.jsonl`) — no sidecar
 //! required, so snapshots survive a server restart. When the session is LIVE, the route
@@ -124,6 +129,20 @@ async fn get_snapshot(
             Err(CodexSnapshotError::Protocol(message)) => {
                 fail(StatusCode::INTERNAL_SERVER_ERROR, message)
             }
+            // kata b8ke Task 5: the typed ownership refusals — a session
+            // another runtime owns or a transition holds answers the 409
+            // envelope (the `fail_json_restore_unavailable` shape).
+            Err(
+                typed @ (CodexSnapshotError::ReservedByOwner { .. }
+                | CodexSnapshotError::HandoffInProgress { .. }),
+            ) => snapshot_error_response(&thread_id, &typed),
+            // Defensive depth: `get_snapshot` already folds this into its
+            // `Ok` (the empty snapshot), so this arm is unreachable today —
+            // but the route's contract for it stays the same 200 empty
+            // snapshot if it ever propagates.
+            Err(CodexSnapshotError::UntrackedReadonly) => {
+                Json(state.codex.empty_readonly_snapshot(&thread_id)).into_response()
+            }
         },
         ("freshopencode", "opencode") => {
             match state
@@ -212,6 +231,40 @@ fn fail(status: StatusCode, message: String) -> Response {
 
 fn fail_with_code(status: StatusCode, message: String, code: &str) -> Response {
     (status, Json(json!({ "error": message, "code": code }))).into_response()
+}
+
+/// kata b8ke Task 5: the typed 409 envelope for a snapshot GET against a
+/// session another runtime owns or a transition holds — the
+/// `fail_json_restore_unavailable` shape (`terminal_tabs.rs`): the frozen
+/// "still running on the server." message text (client regexes and muscle
+/// memory depend on it) with the additive `ownerKind`/`ownerGeneration`
+/// fields riding the same rule (omitted when the transition names no
+/// committed owner — the `terminal_owner_fields_from_outcome` discipline).
+fn snapshot_error_response(thread_id: &str, err: &CodexSnapshotError) -> Response {
+    let mut body = json!({
+        "status": "error",
+        "code": "RESTORE_UNAVAILABLE",
+        "message": format!("Session {thread_id} is still running on the server."),
+    });
+    match err {
+        CodexSnapshotError::ReservedByOwner {
+            owner_kind,
+            generation,
+        } => {
+            body["ownerKind"] = json!(match owner_kind {
+                freshell_ownership::RuntimeOwnerKind::Terminal => "terminal",
+                freshell_ownership::RuntimeOwnerKind::FreshAgent => "fresh-agent",
+            });
+            body["ownerGeneration"] = json!(generation);
+        }
+        CodexSnapshotError::HandoffInProgress { generation } => {
+            // A transition names no committed owner identity — only its
+            // generation is truthfully known.
+            body["ownerGeneration"] = json!(generation);
+        }
+        _ => unreachable!("snapshot_error_response maps only the typed ownership refusals"),
+    }
+    (StatusCode::CONFLICT, Json(body)).into_response()
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -758,52 +811,40 @@ mod tests {
         );
     }
 
+    /// kata b8ke Task 5 (round-2 review — intended behavior change): an
+    /// unknown codex thread answers 200 with the SIDE-EFFECT-FREE empty
+    /// snapshot (owner state vacant) — never the removed cold-start, which
+    /// with no reachable `CODEX_CMD` used to surface as a generic 500. The
+    /// bogus-binary setup is retained deliberately: if the GET ever regresses
+    /// to spawning, this test fails again (coverage purpose preserved,
+    /// expectation inverted).
     #[tokio::test]
-    async fn unknown_codex_thread_is_404_with_lost_session_code() {
-        // `get_snapshot` now attempts ensure-runtime-on-demand for a thread outside the live
-        // map (see `codex::snapshot_runtime_for`), which spawns a `CODEX_CMD` subprocess --
-        // force a definitely-nonexistent binary (shared `ENV_LOCK` so this can't race
-        // against `codex.rs`'s own `CODEX_CMD`-mutating tests in the same process) so this
-        // test deterministically exercises the "app-server unreachable" -> non-404 path is
-        // NOT what's under test here; this test wants a genuine "no such thread" 404, which
-        // requires the spawn to succeed. Since only `codex.rs`'s fake-app-server fixture can
-        // provide that, and sharing it across modules is out of scope for this test, assert
-        // the REALISTIC outcome instead: with no real codex binary reachable, the request
-        // fails, but never with a 200 (masking a nonexistent thread as found).
+    async fn unknown_codex_thread_serves_the_side_effect_free_empty_snapshot() {
         let _guard = crate::codex::tests::ENV_LOCK.lock().await;
         std::env::set_var(
             "CODEX_CMD",
             "/definitely/not/a/real/codex/binary-xyz-does-not-exist",
         );
         std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
-        let resp = get_snapshot(
-            State(snapshot_state()),
-            Path((
-                "freshcodex".to_string(),
-                "codex".to_string(),
-                "does-not-exist".to_string(),
-            )),
-            Query(HashMap::new()),
-            headers_with_token("tok"),
-        )
-        .await;
-        // With no real codex binary reachable, ensure-runtime-on-demand's spawn fails before
-        // it can even ask the (nonexistent) app-server whether the thread exists -- a
-        // genuine infra error, not "this thread doesn't exist" (see
-        // `codex::tests::get_snapshot_ensure_runtime_resumes_a_thread_not_in_the_live_map`
-        // for the real "successfully resumes an unknown-but-real thread" proof, and
-        // `codex::tests::get_snapshot_with_no_codex_binary_available_is_an_app_server_error`
-        // for this exact scenario at the store level). Critically, it must never be 200.
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(
-            value["code"].is_null(),
-            "generic 500 has no code, matching sendFreshAgentError's fallback"
-        );
+        let (status, body) = get_json("freshcodex", "codex", "does-not-exist").await;
         std::env::remove_var("CODEX_CMD");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an untracked thread serves the empty snapshot, not an error: {body}"
+        );
+        assert_eq!(body["sessionType"], json!("freshcodex"));
+        assert_eq!(body["threadId"], json!("does-not-exist"));
+        assert_eq!(body["turns"], json!([]));
+        assert_eq!(
+            body["extensions"]["codex"]["ownerKind"],
+            json!("vacant"),
+            "the additive owner-state fields name the vacant key: {body}"
+        );
+        assert!(
+            body.get("code").is_none(),
+            "a 200 snapshot body carries no error code: {body}"
+        );
     }
 
     #[tokio::test]

@@ -135,13 +135,15 @@ pub struct FreshCodexState {
     settings: Arc<TokioMutex<Value>>,
     /// The required auth token (constant-time compared on `PATCH /api/settings`).
     auth_token: Arc<String>,
-    /// Per-thread-id single-flight guard for [`Self::ensure_session_resumable`]: a
-    /// `freshAgent.attach` (reload-rehydrate) and a `GET .../threads/...` snapshot read
-    /// (`Self::snapshot_runtime_for`) can race for the SAME historical thread id (e.g. a
-    /// browser reload that both re-attaches its pane's WS session AND refetches its
-    /// snapshot). Without this, both would spawn their own `codex app-server` sidecar and
+    /// Per-thread-id single-flight guard for [`Self::ensure_session_resumable`]: two
+    /// lifecycle lanes (a `freshAgent.attach` reload-rehydrate and a
+    /// `freshAgent.create` resume) can race for the SAME historical thread id (e.g. a
+    /// browser reload that both re-attaches its pane's WS session AND re-creates its
+    /// pane). Without this, both would spawn their own `codex app-server` sidecar and
     /// `thread/resume` the same thread concurrently -- two owned sidecars for one logical
-    /// session, one of which becomes an orphaned, un-tracked leak. Keyed by thread id;
+    /// session, one of which becomes an orphaned, un-tracked leak. (kata b8ke Task 5:
+    /// the snapshot GET no longer races here at all -- it is side-effect-free and never
+    /// resumes.) Keyed by thread id;
     /// entries are never removed (a small, bounded amount of long-lived bookkeeping, no
     /// worse than `sessions` itself never shrinking for thread ids this process has ever
     /// touched).
@@ -219,8 +221,24 @@ pub struct FreshCodexState {
     /// proceeds and destroys redo ("send waits, rollback wins, then destroys") —
     /// no circular wait, no deadlock.
     rollback_in_flight: crate::InFlightRegistry,
+    /// kata b8ke Task 5: the deterministic-race pause seam for the snapshot
+    /// GET (Task 7's race tests inject here). An AWAITED barrier —
+    /// `None` in production (never set outside tests). Interior-shared
+    /// (`Arc<StdMutex<..>>`, the `codex_quiet_window_ms` pattern) so every
+    /// cloned state handle — the WS door's and the snapshot REST router's —
+    /// observes a test-set hook. BARRIER DISCIPLINE (round-3 review): the
+    /// test registers its `notified()` future BEFORE any `notify_waiters()`
+    /// — never notify before the waiter registered (lost-notification hang).
+    snapshot_pause: Arc<StdMutex<Option<SnapshotPauseHook>>>,
     controls: controls::ControlRegistry,
 }
+
+/// kata b8ke Task 5 (round-1 review shape, round-3 F10 placement): the
+/// snapshot-GET pause hook — a closure returning a future the host AWAITS
+/// (a notify-only closure would not pause anything). Injected `Arc<dyn ...>`
+/// in the `TerminalLivenessProbe` injection idiom, never env vars.
+pub type SnapshotPauseHook =
+    std::sync::Arc<dyn Fn(&str) -> futures_util::future::BoxFuture<'static, ()> + Send + Sync>;
 
 /// The cached result of a completed codex `freshAgent.create`, keyed by `requestId` in
 /// [`FreshCodexState::create_dedup`]. Only `session_id` is needed: every other field of
@@ -475,6 +493,7 @@ impl FreshCodexState {
             fork_in_flight: crate::InFlightRegistry::new(),
             codex_quiet_window_ms: Arc::new(AtomicU64::new(codex_quiet_window_ms_from_env())),
             rollback_in_flight: crate::InFlightRegistry::new(),
+            snapshot_pause: Arc::new(StdMutex::new(None)),
             controls: Default::default(),
         }
     }
@@ -489,6 +508,21 @@ impl FreshCodexState {
     #[cfg(test)]
     pub(crate) fn set_codex_quiet_window_ms_for_tests(&self, ms: u64) {
         self.codex_quiet_window_ms.store(ms, Ordering::SeqCst);
+    }
+
+    /// kata b8ke Task 5: install the snapshot-GET pause hook (Task 7's
+    /// deterministic race tests). Interior-shared — any cloned state handle
+    /// (the WS door's, the snapshot REST router's) observes the hook, so the
+    /// seam can be armed after the harness is spawned. Never set in
+    /// production; the hook is an AWAITED barrier (`SnapshotPauseHook`).
+    pub fn set_snapshot_pause_for_tests(&self, hook: SnapshotPauseHook) {
+        *self.snapshot_pause.lock().expect("snapshot pause lock") = Some(hook);
+    }
+
+    /// kata b8ke Task 5: clear the snapshot-GET pause hook (the race tests'
+    /// cleanup between scenarios).
+    pub fn clear_snapshot_pause_for_tests(&self) {
+        *self.snapshot_pause.lock().expect("snapshot pause lock") = None;
     }
 
     /// Wire the cross-kind terminal-liveness probe (Task 13b; called by `main.rs`
@@ -3418,8 +3452,10 @@ impl FreshCodexState {
     /// perfectly healthy historical session from a page reload or a fresh-agent pane that
     /// outlived a server restart -- unconditionally hit `INVALID_SESSION_ID`, which the
     /// client folds into `markSessionLost` and abandons the durable session entirely
-    /// (`fresh-agent-ws.ts:326-328`). Mirroring [`Self::snapshot_runtime_for`]'s
-    /// ensure-runtime-on-demand behavior here is what makes restore actually restore.
+    /// (`fresh-agent-ws.ts:326-328`). Resuming the not-tracked id on demand HERE (the
+    /// explicit lifecycle lane -- kata b8ke Task 5 removed the snapshot GET's
+    /// cold-start, so attach/create are the only on-demand resumes left) is what makes
+    /// restore actually restore.
     ///
     /// WIRE-SHAPE PARITY (fresh-agent differential capture,
     /// `test/unit/port/oracle/freshagent-wireshape-differential.test.ts`): the tracked +
@@ -4642,12 +4678,33 @@ impl FreshCodexState {
     /// `active_turn` tracker (mirrors legacy's `activeTurnByThread`/`findActiveTurnId`) rather
     /// than re-deriving it from the raw payload, since it is already the source of truth this
     /// process trusts for `handle_interrupt`.
+    ///
+    /// DOCUMENTED DIVERGENCE (kata b8ke Task 5, round-2 review): the reference's
+    /// `ensureRuntime` cold-starts a sidecar for a never-seen thread
+    /// (`adapter.ts:762-799,1083-1086`); this GET is FULLY side-effect-free —
+    /// a tracked thread serves from its live runtime, and an untracked one
+    /// answers the EMPTY snapshot (or the typed ownership refusals) with no
+    /// spawn, no `thread/resume`, and no coordinator claim. Cold resume flows
+    /// only through the explicit lifecycle commands (`freshAgent.create`/
+    /// `attach` with `sessionRef`, generation-fenced). See
+    /// [`Self::snapshot_runtime_for`].
     pub async fn get_snapshot(
         &self,
         thread_id: &str,
-        cwd: Option<&str>,
+        // Retained for API stability (the REST route's `?cwd=` passthrough)
+        // but INERT since kata b8ke Task 5: the GET never spawns, so it has
+        // no spawn cwd to seed.
+        _cwd: Option<&str>,
     ) -> Result<Value, CodexSnapshotError> {
-        let (client, active_turn_present) = self.snapshot_runtime_for(thread_id, cwd).await?;
+        let (client, active_turn_present) = match self.snapshot_runtime_for(thread_id).await {
+            Ok(resolved) => resolved,
+            // kata b8ke Task 5: an untracked session serves the EMPTY
+            // snapshot read-only — never a cold-start spawn.
+            Err(CodexSnapshotError::UntrackedReadonly) => {
+                return Ok(self.empty_readonly_snapshot(thread_id));
+            }
+            Err(other) => return Err(other),
+        };
         // `isCodexIncludeTurnsUnavailable` fallback (`adapter.ts:1088-1095,1157-1159`): a
         // thread with no committed turns yet (freshly created, or resumed before its first
         // user message) can make the REAL codex app-server reject `includeTurns:true`. THIS
@@ -4752,43 +4809,94 @@ impl FreshCodexState {
         Ok(snapshot)
     }
 
-    /// Resolve the live client + active-turn bit for `thread_id`, via
-    /// [`Self::ensure_session_resumable`] (called unconditionally, mirroring the
-    /// reference's `ensureRuntime`, `adapter.ts:762-799,1083-1086`, regardless of whether
-    /// the thread was ever created by THIS process). This is what lets a HISTORICAL
-    /// session (opened from the sidebar, never created/attached in this server's
-    /// lifetime) serve a snapshot at all, instead of an unconditional 404.
+    /// Resolve the live client + active-turn bit for `thread_id` — FULLY
+    /// READ-ONLY (kata b8ke Task 5, round-2 review: the vacant-session
+    /// cold-start is REMOVED). Tracked in this process → serve from the live
+    /// runtime (unchanged behavior). Untracked → the coordinator decides,
+    /// and the GET never mutates anything: no spawn, no `thread/resume`, no
+    /// [`Self::ensure_session_resumable`] call, no claim — a Vacant key
+    /// answers [`CodexSnapshotError::UntrackedReadonly`] (the EMPTY
+    /// snapshot with owner state), a Live owner answers the typed
+    /// [`CodexSnapshotError::ReservedByOwner`] refusal (never a spawn on
+    /// top of an owner), and a transition (Starting/Handoff/Stopping)
+    /// answers the typed [`CodexSnapshotError::HandoffInProgress`]. All
+    /// cold resume flows through the EXPLICIT lifecycle commands
+    /// (`freshAgent.create`/`freshAgent.attach` with `sessionRef`,
+    /// generation-fenced) — the client's GET-mount path relies on the
+    /// explicit lifecycle rebind and nowhere on a GET cold-start.
     async fn snapshot_runtime_for(
         &self,
         thread_id: &str,
-        cwd: Option<&str>,
     ) -> Result<(Arc<CodexAppServerClient>, bool), CodexSnapshotError> {
-        // kata b8ke Task 3: the snapshot GET's temporary compatibility
-        // cold-start — through the shared coordinator (unfenced: no lifecycle
-        // message observed anything), so it can never spawn when another
-        // kind owns or is transitioning the session. Task 5 removes this
-        // cold-start entirely.
-        match self
-            .ensure_session_resumable(thread_id, cwd, None, None)
-            .await
-        {
-            Ok(resumed) => {
-                let active_turn_present = resumed
-                    .active_turn
-                    .lock()
-                    .expect("active_turn mutex")
-                    .is_some();
-                Ok((resumed.client, active_turn_present))
-            }
-            Err(ResumeSessionError::NotFound) => Err(CodexSnapshotError::NotFound),
-            Err(ResumeSessionError::Transient(message)) => {
-                Err(CodexSnapshotError::Protocol(message))
-            }
-            // Task 13 (D8): a reserved sessionRef is transient at the REST layer.
-            Err(ResumeSessionError::Reserved) => Err(CodexSnapshotError::Protocol(
-                "SESSION_RESERVED: another resume for this session is in flight".to_string(),
-            )),
+        // kata b8ke Task 5 (round-3 finding F10): the deterministic-race
+        // seam runs BEFORE the live-client lookup — a parked GET re-resolves
+        // BOTH the live map and the coordinator AFTER its release, so a
+        // handoff that completed while parked answers the typed 409 instead
+        // of serving from a stale pre-pause resolution. The hook is cloned
+        // out of the interior-shared cell in its own statement (an `if let`
+        // scrutinee temporary would hold the cell's lock across the await —
+        // not Send); `None` in production.
+        let pause_hook = self
+            .snapshot_pause
+            .lock()
+            .expect("snapshot pause lock")
+            .clone();
+        if let Some(hook) = pause_hook {
+            hook(thread_id).await;
         }
+        // Tracked: serve from the live runtime (unchanged behavior).
+        if let Some(resumed) = self.live_resumed_session(thread_id).await {
+            let active_turn_present = resumed
+                .active_turn
+                .lock()
+                .expect("active_turn mutex")
+                .is_some();
+            return Ok((resumed.client, active_turn_present));
+        }
+        // Untracked: SIDE-EFFECT-FREE contract (kata b8ke; round-2 review —
+        // the vacant-session cold-start is REMOVED). `ownership_snapshot`'s
+        // Vacant default (unwired coordinator) makes the untracked arm the
+        // empty-snapshot path with no special case.
+        let ownership = self.ownership_snapshot(PROVIDER, thread_id);
+        match ownership.state {
+            freshell_ownership::OwnershipState::Vacant => {
+                Err(CodexSnapshotError::UntrackedReadonly)
+            }
+            freshell_ownership::OwnershipState::Live {
+                owner, generation, ..
+            } => {
+                // A live owner we cannot serve locally (fresh or terminal):
+                // read-only typed refusal — never spawn on top of an owner.
+                Err(CodexSnapshotError::ReservedByOwner {
+                    owner_kind: owner.kind,
+                    generation,
+                })
+            }
+            freshell_ownership::OwnershipState::Handoff { generation, .. }
+            | freshell_ownership::OwnershipState::Starting { generation, .. }
+            | freshell_ownership::OwnershipState::Stopping { generation, .. } => {
+                Err(CodexSnapshotError::HandoffInProgress { generation })
+            }
+        }
+    }
+
+    /// kata b8ke Task 5: the side-effect-free EMPTY snapshot for an untracked
+    /// session — the same JSON shape a never-started historical session
+    /// serves (empty rows + `status`/`sessionType` facts,
+    /// [`build_codex_snapshot_json`] over an empty raw payload) plus the
+    /// additive owner-state fields under `extensions.codex` (the strict
+    /// client schema's permissive per-provider bag — `ownerKind: "vacant"`
+    /// with the coordinator's epoch/generation). No runtime was consulted;
+    /// no runtime was created.
+    pub(crate) fn empty_readonly_snapshot(&self, thread_id: &str) -> Value {
+        let ownership = self.ownership_snapshot(PROVIDER, thread_id);
+        let mut snapshot =
+            build_codex_snapshot_json(thread_id, &json!({}), false, None, None, false)
+                .expect("the empty raw payload always normalizes");
+        snapshot["extensions"]["codex"]["ownerKind"] = json!("vacant");
+        snapshot["extensions"]["codex"]["ownerEpoch"] = json!(ownership.epoch);
+        snapshot["extensions"]["codex"]["ownerGeneration"] = json!(ownership.generation);
+        snapshot
     }
 
     // -- dead-thread negative cache (CODEX-FIRST triage Finding 2) --
@@ -5047,8 +5155,8 @@ impl FreshCodexState {
             .as_ref()
             .and_then(|s| s.load_settings("codex", thread_id));
         // A record miss with NO prior recording (pre-ship / historical / sidebar-opened
-        // -- the populations this resume path exists to serve, see `snapshot_runtime_for`)
-        // is ROUTINE: resume silently with defaults exactly as before. NO alarm, NO
+        // -- the populations the lifecycle resume paths exist to serve) is ROUTINE:
+        // resume silently with defaults exactly as before. NO alarm, NO
         // defaults write (V7).
         if recovered.is_none()
             && sink
@@ -5491,16 +5599,34 @@ pub enum CodexSnapshotError {
     NotFound,
     /// The live app-server client's `thread/read` call failed.
     AppServer(CodexAppServerError),
-    /// A non-item-type protocol failure while building the snapshot (currently: sidecar spawn
-    /// failure from [`FreshCodexState::snapshot_runtime_for`]). NOTE: an unrecognized raw thread
-    /// item `type` (e.g. the real codex CLI's `subAgentActivity`, unknown to both the frozen
-    /// legacy protocol and current `origin/main`) no longer produces this variant -- see the
+    /// A non-item-type protocol failure while building the snapshot (NOTE: an
+    /// unrecognized raw thread item `type` (e.g. the real codex CLI's
+    /// `subAgentActivity`, unknown to both the frozen legacy protocol and
+    /// current `origin/main`) no longer produces this variant -- see the
     /// DELIBERATE DEVIATION doc on [`map_codex_item`]. The reference's `readCodexThreadItemType`/
     /// `assertNever` throw `Unsupported Codex thread item type: ${value}`
     /// (`normalize.ts:141-147,123-125`), which `router.ts`'s catch-all turns into a bare 500 for
     /// the whole thread (`router.ts:165-166`); this port instead skips the single unrecognized
     /// item and keeps rendering everything else.
     Protocol(String),
+    /// kata b8ke Task 5 (round-2 review): the GET is side-effect-free, so an
+    /// UNTRACKED session with a Vacant coordinator key is served read-only —
+    /// the caller answers the EMPTY snapshot (with owner state); no spawn, no
+    /// `thread/resume`, no `ensure_session_resumable` call, no claim. Cold
+    /// resume belongs ONLY to the explicit lifecycle commands
+    /// (`freshAgent.create`/`freshAgent.attach` with `sessionRef`,
+    /// generation-fenced).
+    UntrackedReadonly,
+    /// kata b8ke Task 5: a live runtime owner this GET cannot serve locally
+    /// (a terminal PTY, or a fresh-agent runtime outside this process's live
+    /// map). Typed refusal — never a spawn on top of an owner.
+    ReservedByOwner {
+        owner_kind: freshell_ownership::RuntimeOwnerKind,
+        generation: u64,
+    },
+    /// kata b8ke Task 5: the session is mid-transition (Starting/Handoff/
+    /// Stopping). Typed refusal — a read-only GET never races a transition.
+    HandoffInProgress { generation: u64 },
 }
 
 impl std::fmt::Display for CodexSnapshotError {
@@ -5509,6 +5635,20 @@ impl std::fmt::Display for CodexSnapshotError {
             CodexSnapshotError::NotFound => write!(f, "codex thread not found"),
             CodexSnapshotError::AppServer(err) => write!(f, "{err}"),
             CodexSnapshotError::Protocol(message) => write!(f, "{message}"),
+            CodexSnapshotError::UntrackedReadonly => {
+                write!(f, "codex thread untracked (read-only empty snapshot)")
+            }
+            CodexSnapshotError::ReservedByOwner { owner_kind, .. } => write!(
+                f,
+                "codex thread owned by another runtime ({})",
+                match owner_kind {
+                    freshell_ownership::RuntimeOwnerKind::Terminal => "terminal",
+                    freshell_ownership::RuntimeOwnerKind::FreshAgent => "fresh-agent",
+                }
+            ),
+            CodexSnapshotError::HandoffInProgress { .. } => {
+                write!(f, "codex thread handoff in progress")
+            }
         }
     }
 }
@@ -13822,8 +13962,9 @@ pub(crate) mod tests {
 
     /// THE FIX (defect 2): a thread id outside the live in-memory map -- e.g. a page
     /// reload re-attaching a fresh-agent pane's WS session after a server restart --
-    /// must NOT be declared lost. It must be resumed on demand (same mechanism as
-    /// `snapshot_runtime_for`), registered, and rehydrated with a real idle snapshot.
+    /// must NOT be declared lost. It must be resumed on demand by the attach lane
+    /// (the snapshot GET no longer resumes anything — kata b8ke Task 5), registered,
+    /// and rehydrated with a real idle snapshot.
     #[tokio::test]
     async fn handle_attach_unknown_session_resumes_via_fake_app_server_and_registers_idle_snapshot()
     {
@@ -14340,7 +14481,7 @@ pub(crate) mod tests {
     }
 
     /// V7/A10: record misses are ROUTINE (pre-ship sessions, sidebar-opened historical
-    /// threads -- R3 exists FOR them, see `snapshot_runtime_for`'s doc). They must
+    /// threads -- R3 exists FOR them). They must
     /// resume silently with defaults exactly as today, and must NOT launder a defaults
     /// row into the ledger. Permanent regression guard for V7's no-spam rule.
     #[tokio::test(flavor = "multi_thread")]
@@ -17260,16 +17401,15 @@ pub(crate) mod tests {
 
     // -- GET /api/fresh-agent/threads/freshcodex/codex/:threadId (Batch D PR-5) --
 
-    /// A thread the process has never seen now goes through ensure-runtime-on-demand
-    /// (`snapshot_runtime_for`) rather than an immediate 404 -- see
-    /// `get_snapshot_ensure_runtime_resumes_a_thread_not_in_the_live_map` for the SUCCESS
-    /// path via a real (fake) app-server subprocess. This test covers what happens when no
-    /// codex binary is reachable at all (`CODEX_CMD` unset, bare test env): the spawn itself
-    /// fails, which is a genuine infra error, not "this specific thread doesn't exist" --
-    /// mirrors the reference (`ensureRuntime` propagates an unwrapped spawn error, which
-    /// `sendFreshAgentError`'s generic fallback turns into a plain 500).
+    /// kata b8ke Task 5 (round-2 review — intended behavior change): the GET
+    /// is side-effect-free, so an unreachable `CODEX_CMD` is never consulted —
+    /// an untracked thread serves the EMPTY snapshot instead of the removed
+    /// cold-start's spawn-and-fail error. If the cold-start ever regresses,
+    /// this test fails (the bogus binary's spawn error surfaces again), so
+    /// the pinned spawn-attempt coverage is preserved with an inverted
+    /// expectation.
     #[tokio::test]
-    async fn get_snapshot_with_no_codex_binary_available_is_an_app_server_error() {
+    async fn get_snapshot_with_no_codex_binary_available_serves_the_empty_snapshot() {
         // Force a definitely-nonexistent binary rather than relying on ambient `CODEX_CMD`:
         // the guard restores the caller's environment after this test, but the assertion
         // itself must remain deterministic even when that caller intentionally set an override.
@@ -17281,43 +17421,166 @@ pub(crate) mod tests {
         std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
         let (st, _rx) = state_with_bus();
 
-        let err = st
+        let snapshot = st
             .get_snapshot("does-not-exist", None)
             .await
-            .expect_err("no codex binary reachable");
-        assert!(
-            matches!(
-                err,
-                CodexSnapshotError::AppServer(_) | CodexSnapshotError::Protocol(_)
-            ),
-            "expected a spawn/RPC-shaped error, got {err:?}"
+            .expect("no spawn is attempted — the untracked arm serves the empty snapshot");
+        assert_eq!(snapshot["threadId"], json!("does-not-exist"));
+        assert_eq!(snapshot["sessionType"], json!("freshcodex"));
+        assert_eq!(snapshot["turns"], json!([]));
+        assert_eq!(
+            snapshot["extensions"]["codex"]["ownerKind"],
+            json!("vacant"),
+            "the additive owner-state fields name the vacant key"
         );
         std::env::remove_var("CODEX_CMD");
     }
 
-    /// The actual Fix Task #2 deliverable: a thread id this process has NEVER created or
-    /// attached to (a stand-in for a historical session opened from the sidebar) still
-    /// serves a valid snapshot, because `get_snapshot` spawns a real app-server subprocess
-    /// and `thread/resume`s the requested id on demand.
+    /// kata b8ke Task 5 (round-2 review — intended behavior change): the
+    /// legacy spawn-on-GET contract is INVERTED. A thread id this process has
+    /// NEVER created or attached to (a stand-in for a historical session
+    /// opened from the sidebar) serves the EMPTY snapshot — NO spawn, NO
+    /// `thread/resume`, no registration — and cold resume belongs to the
+    /// EXPLICIT lifecycle commands (`freshAgent.create`/`attach` with
+    /// `sessionRef`, generation-fenced). The fake fixture's durable op ledger
+    /// proves the never-spawned part; a second read serving the same empty
+    /// snapshot proves nothing was registered.
     #[tokio::test]
-    async fn get_snapshot_ensure_runtime_resumes_a_thread_not_in_the_live_map() {
+    async fn get_snapshot_serves_the_empty_snapshot_for_a_thread_not_in_the_live_map() {
         let _guard = ENV_LOCK.lock().await;
-        configure_fake_codex_cmd("{}");
+        let ledger = std::env::temp_dir().join(format!(
+            "freshell-codex-get-readonly-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        configure_fake_codex_cmd(
+            &serde_json::json!({
+                "appendThreadOperationLogPath": ledger.display().to_string(),
+            })
+            .to_string(),
+        );
         let (st, _rx) = state_with_bus();
 
         let snapshot = st
             .get_snapshot("historical-thread-1", None)
             .await
-            .expect("ensure-runtime-on-demand resumes a not-yet-live thread");
+            .expect("an untracked session serves the empty snapshot (never a spawn)");
         assert_eq!(snapshot["threadId"], json!("historical-thread-1"));
         assert_eq!(snapshot["sessionType"], json!("freshcodex"));
+        assert_eq!(snapshot["turns"], json!([]));
+        assert_eq!(
+            snapshot["extensions"]["codex"]["ownerKind"],
+            json!("vacant")
+        );
 
-        // And it's now registered for reuse -- a second read doesn't need to resume again.
+        // Zero thread ops: the GET never spawned or resumed anything (a
+        // resumed historical thread would append a `thread/resume` row).
+        let ledger_text = std::fs::read_to_string(&ledger).unwrap_or_default();
+        assert!(
+            !ledger_text.contains("thread/resume") && !ledger_text.contains("thread/start"),
+            "the side-effect-free GET must leave the fixture's op ledger untouched: {ledger_text}"
+        );
+        let _ = std::fs::remove_file(&ledger);
+
+        // And nothing was registered: a second read serves the same EMPTY
+        // snapshot (the old contract's "second read reuses the now-live
+        // session" — inverted).
         let snapshot2 = st
             .get_snapshot("historical-thread-1", None)
             .await
-            .expect("second read reuses the now-live session");
+            .expect("the second read also serves the empty snapshot");
         assert_eq!(snapshot2["threadId"], json!("historical-thread-1"));
+        assert_eq!(snapshot2["turns"], json!([]));
+    }
+
+    /// kata b8ke Task 5: the snapshot-GET pause seam (Task 7's deterministic
+    /// race tests inject here) is an AWAITED barrier placed BEFORE the
+    /// live-client lookup (round-3 finding F10). While parked the GET is
+    /// genuinely blocked, and the lookup re-resolves AFTER release: remove
+    /// the tracked session while parked (the handoff-teardown shape) and the
+    /// released GET serves the EMPTY snapshot — never a stale serve from a
+    /// pre-pause resolution.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_pause_hook_parks_the_get_and_the_lookup_re_resolves_after_release() {
+        let (st, _rx) = state_with_bus();
+        let (transport, _peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thread-pause-1",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-snapshot-pause",
+        )
+        .await;
+
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let release_rx = StdMutex::new(Some(release_rx));
+        {
+            let entered = Arc::clone(&entered);
+            st.set_snapshot_pause_for_tests(Arc::new(move |thread_id: &str| {
+                let entered = Arc::clone(&entered);
+                let release_rx = release_rx.lock().expect("release rx lock").take();
+                let thread_id = thread_id.to_string();
+                Box::pin(async move {
+                    assert_eq!(thread_id, "thread-pause-1");
+                    entered.store(true, Ordering::SeqCst);
+                    // A REAL barrier: park until the test releases (the
+                    // round-3 barrier discipline — the waiter is registered
+                    // before it can ever be notified).
+                    if let Some(release_rx) = release_rx {
+                        let _ = release_rx.await;
+                    }
+                })
+            }));
+        }
+
+        let getter = {
+            let st = st.clone();
+            tokio::spawn(async move { st.get_snapshot("thread-pause-1", None).await })
+        };
+
+        // Wait until the GET is parked inside the hook (bounded poll).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !entered.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "the parked GET never reached the pause hook"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // While parked, the GET has NOT completed (it is genuinely blocked
+        // on the barrier — a notify-only hook would have let it run).
+        assert!(
+            !getter.is_finished(),
+            "the parked snapshot GET must not complete before the hook releases"
+        );
+
+        // The handoff-teardown shape: the tracked session goes away while
+        // the GET is parked. A hook placed AFTER the live-client lookup
+        // would already hold the client and serve from it after release;
+        // the F10 placement re-resolves and takes the untracked arm.
+        st.sessions.lock().await.remove("thread-pause-1");
+
+        release_tx.send(()).expect("release the parked GET");
+        let snapshot = getter
+            .await
+            .expect("the GET task survives the pause")
+            .expect("the released GET completes with the empty snapshot");
+        assert_eq!(snapshot["threadId"], json!("thread-pause-1"));
+        assert_eq!(
+            snapshot["turns"],
+            json!([]),
+            "the lookup re-resolved after release — the untracked arm served the empty snapshot"
+        );
+        assert_eq!(
+            snapshot["extensions"]["codex"]["ownerKind"],
+            json!("vacant")
+        );
+
+        // The seam clears (the race tests' between-scenarios cleanup).
+        st.clear_snapshot_pause_for_tests();
     }
 
     #[tokio::test]

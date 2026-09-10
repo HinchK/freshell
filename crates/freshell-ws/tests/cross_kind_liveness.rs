@@ -124,6 +124,132 @@ fn uuid_like_suffix() -> String {
     format!("{nanos}-{:?}", std::thread::current().id())
 }
 
+// ── dual-role codex fake (kata b8ke Task 5; the codex_sidecar_reattach_e2e.rs
+//    pattern, self-contained here) ──────────────────────────────────────────
+//
+// `CODEX_CMD` points at a node dispatcher: argv containing `app-server`
+// (the freshcodex sidecar spawn) routes to the committed fake app-server
+// fixture; anything else (a terminal TUI launch) just stays alive. Two
+// spawn-count surfaces, both per-instance:
+// - the dispatcher logs EVERY invocation's argv (`sidecar_spawn_rows` —
+//   only app-server spawns reach it in this harness);
+// - the fixture appends every `thread/*` operation with its thread id to
+//   the durable op ledger (`thread_op_rows` — `thread/start`,
+//   `thread/resume`, ...).
+
+struct DualRoleCodexFake {
+    dir: std::path::PathBuf,
+}
+
+impl DualRoleCodexFake {
+    fn install() -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "freshell-cross-kind-codex-fake-{}",
+            uuid_like_suffix()
+        ));
+        std::fs::create_dir_all(&dir).expect("create codex fake temp dir");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs")
+            .canonicalize()
+            .expect("fake-app-server fixture exists");
+        let dispatcher = dir.join("dispatcher.mjs");
+        let script = format!(
+            "#!/usr/bin/env node\n\
+             import fs from 'node:fs'\n\
+             const args = process.argv.slice(2)\n\
+             if (process.env.FAKE_CODEX_DISPATCHER_LOG) {{\n\
+               fs.appendFileSync(process.env.FAKE_CODEX_DISPATCHER_LOG, \
+             JSON.stringify({{ pid: process.pid, argv: args }}) + '\\n')\n\
+             }}\n\
+             if (args.includes('app-server')) {{\n\
+               await import('file://{}')\n\
+             }} else {{\n\
+               setInterval(() => undefined, 1000)\n\
+             }}\n",
+            fixture.display()
+        );
+        std::fs::write(&dispatcher, script).expect("write codex dispatcher");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&dispatcher).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&dispatcher, perms).expect("chmod codex dispatcher");
+        }
+        std::env::set_var("CODEX_CMD", format!("node {}", dispatcher.display()));
+        // The fixture's durable thread-op ledger: every `thread/*` method
+        // appends {method, threadId, params, ...} — the no-spawn watermark.
+        let behavior = serde_json::json!({
+            "appendThreadOperationLogPath": dir.join("thread-ops.jsonl"),
+        });
+        std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR", behavior.to_string());
+        std::env::set_var(
+            "FAKE_CODEX_DISPATCHER_LOG",
+            dir.join("dispatcher-log.jsonl"),
+        );
+        Self { dir }
+    }
+
+    fn rows_from(&self, file: &str) -> Vec<Value> {
+        let Ok(raw) = std::fs::read_to_string(self.dir.join(file)) else {
+            return Vec::new();
+        };
+        raw.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<Value>(l).expect("log row parses"))
+            .collect()
+    }
+
+    /// Every app-server role the dispatcher routed to the fixture — the
+    /// sidecar spawn count.
+    fn sidecar_spawn_rows(&self) -> Vec<Value> {
+        self.rows_from("dispatcher-log.jsonl")
+            .into_iter()
+            .filter(|row| {
+                row["argv"]
+                    .as_array()
+                    .is_some_and(|argv| argv.iter().any(|a| a == "app-server"))
+            })
+            .collect()
+    }
+
+    /// The fixture's durable `thread/*` op ledger (method + threadId) — the
+    /// `thread/resume`-never-happens surface the side-effect-free GET
+    /// contract asserts against.
+    fn thread_op_rows(&self) -> Vec<Value> {
+        self.rows_from("thread-ops.jsonl")
+    }
+}
+
+impl Drop for DualRoleCodexFake {
+    fn drop(&mut self) {
+        // Reap every process the dispatcher spawned (the managed-launch
+        // sidecars a mode-codex terminal create plans, and the explicit
+        // freshAgent.create's sidecar — none of them outlive the fake): the
+        // fixture has no SIGTERM handler, so a plain kill terminates it.
+        // Read BEFORE the dir removal below consumes the log.
+        for row in self.rows_from("dispatcher-log.jsonl") {
+            if let Some(pid) = row["pid"].as_u64() {
+                #[cfg(unix)]
+                {
+                    let _ = std::process::Command::new("kill")
+                        .arg(pid.to_string())
+                        .status();
+                }
+                let _ = pid; // non-unix: nothing to do (this suite is unix-shaped anyway)
+            }
+        }
+        for var in [
+            "CODEX_CMD",
+            "FAKE_CODEX_APP_SERVER_BEHAVIOR",
+            "FAKE_CODEX_DISPATCHER_LOG",
+        ] {
+            std::env::remove_var(var);
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// Sleeper CLI spec (duplicated from `tests/common/mod.rs` -- this file needs its own
 /// server builder because the shared one disables `freshAgent.enabled`).
 fn sleeper_cli_spec(name: &str) -> freshell_platform::CliCommandSpec {
@@ -201,11 +327,22 @@ fn test_settings_value() -> serde_json::Value {
     })
 }
 
-/// Server with BOTH kinds live: a sleeper `claude` terminal CLI spec AND the
-/// fresh-agent runtimes (freshAgent enabled). Returns the ws URL, the registry,
-/// and the `WsState` clone (kata b8ke Task 3: the shared ownership
-/// coordinator is minted HERE, exactly like `main.rs` injects it).
-async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry, WsState) {
+/// Shared construction for both harness shapes in this file: the `WsState`
+/// with BOTH kinds live (a sleeper terminal CLI spec per requested mode AND
+/// the fresh-agent runtimes, freshAgent enabled), the terminal-liveness
+/// probe joined over the identity registry, and the kata b8ke Task 3/4
+/// ownership coordinator minted HERE and injected into every fresh state,
+/// the registry, and the WsState (exactly like `main.rs`). Returns the
+/// state, the registry, and the opencode slice's inner `FreshAgentState`
+/// (the snapshot REST door needs it — `main.rs`'s `SnapshotState::new`
+/// shape).
+async fn build_ws_state(
+    cli_commands: Vec<freshell_platform::CliCommandSpec>,
+) -> (
+    WsState,
+    freshell_terminal::TerminalRegistry,
+    freshell_freshagent::FreshAgentState,
+) {
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let settings =
@@ -248,7 +385,8 @@ async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry, WsState
         Arc::clone(&auth_token),
         Arc::clone(&broadcast_tx),
     );
-    let mut fresh_opencode = freshell_freshagent::FreshOpencodeState::new(fresh_agent_state);
+    let mut fresh_opencode =
+        freshell_freshagent::FreshOpencodeState::new(fresh_agent_state.clone());
     fresh_opencode.set_terminal_liveness(Arc::clone(&terminal_liveness));
 
     // kata b8ke Task 3: mint the ONE ownership coordinator and inject it into
@@ -288,7 +426,7 @@ async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry, WsState
         host_stats: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
-        cli_commands: Arc::new(vec![sleeper_cli_spec("claude")]),
+        cli_commands: Arc::new(cli_commands),
         shutdown: Arc::new(tokio::sync::Notify::new()),
         ping_interval_ms: 30_000,
         hello_timeout_ms: 5_000,
@@ -309,6 +447,17 @@ async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry, WsState
         ownership: Some(Arc::clone(&ownership)),
     };
 
+    (state, registry, fresh_agent_state)
+}
+
+/// Server with BOTH kinds live: a sleeper `claude` terminal CLI spec AND the
+/// fresh-agent runtimes (freshAgent enabled). Returns the ws URL, the registry,
+/// and the `WsState` clone (kata b8ke Task 3: the shared ownership
+/// coordinator is minted HERE, exactly like `main.rs` injects it).
+async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry, WsState) {
+    let (state, registry, _fresh_agent_state) =
+        build_ws_state(vec![sleeper_cli_spec("claude")]).await;
+
     let router = freshell_ws::router(state.clone());
     // Ephemeral loopback port only -- NEVER the self-hosted 3001/3002 ports.
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -320,6 +469,94 @@ async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry, WsState
     });
 
     (format!("ws://{addr}/ws"), registry, state)
+}
+
+/// kata b8ke Task 5: the merged harness — the WS door AND the snapshot REST
+/// door (`GET /api/fresh-agent/threads/...`) on ONE axum app over the SAME
+/// state slices (main.rs's router-merge shape), with BOTH a `claude` and a
+/// `codex` sleeper terminal spec so a `mode:"codex"` terminal create
+/// genuinely spawns a Running PTY (the `rest_claude_identity.rs`
+/// spawn_merged_server pattern).
+struct MergedHarness {
+    base_url: String,
+    ws: TestWs,
+    ws_state: WsState,
+}
+
+async fn spawn_merged_server() -> MergedHarness {
+    let (state, _registry, fresh_agent_state) =
+        build_ws_state(vec![sleeper_cli_spec("claude"), sleeper_cli_spec("codex")]).await;
+
+    // The snapshot REST door shares the WS door's state slices (main.rs's
+    // `SnapshotState::new` wiring: same auth token, same codex/claude
+    // clones, the opencode slice's inner FreshAgentState).
+    let snapshot_state = freshell_freshagent::SnapshotState::new(
+        Arc::new(AUTH_TOKEN.to_string()),
+        state.fresh_codex.clone(),
+        fresh_agent_state,
+        state.fresh_claude.clone(),
+    );
+    let app = freshell_ws::router(state.clone())
+        .merge(freshell_freshagent::snapshot::router(snapshot_state));
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral loopback port");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let ws_url = format!("ws://{addr}/ws");
+    let ws = connect(&ws_url).await;
+    MergedHarness {
+        base_url: format!("http://{addr}"),
+        ws,
+        ws_state: state,
+    }
+}
+
+/// A parsed minimal HTTP GET response: `(status, JSON body)` — the
+/// `rest_claude_identity.rs::raw_post_tabs` raw-TcpStream pattern, GET
+/// flavor, for the snapshot REST door the merged harness serves.
+async fn http_get_json(base_url: &str, path: &str) -> (u16, serde_json::Value) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let host = base_url
+        .strip_prefix("http://")
+        .expect("base_url is http://{addr}");
+    let request = format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         x-auth-token: {token}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        token = AUTH_TOKEN,
+    );
+    let mut stream = tokio::net::TcpStream::connect(host)
+        .await
+        .expect("connect to merged server");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write HTTP GET");
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(15), stream.read_to_end(&mut raw))
+        .await
+        .expect("HTTP response within deadline")
+        .expect("read HTTP response");
+    let text = String::from_utf8(raw).expect("utf8 HTTP response");
+    let (head, response_body) = text
+        .split_once("\r\n\r\n")
+        .expect("HTTP header/body separator");
+    let status: u16 = head
+        .split_whitespace()
+        .nth(1)
+        .expect("status code in status line")
+        .parse()
+        .expect("numeric status code");
+    let json = serde_json::from_str(response_body.trim()).unwrap_or(serde_json::Value::Null);
+    (status, json)
 }
 
 type TestWs =
@@ -1635,4 +1872,159 @@ async fn bound_elsewhere_attach_commits_ownership_for_the_unclaimed_holder() {
             panic!("the attach settle must commit coverage for the live holder, got {other:?}")
         }
     }
+}
+
+// ── kata b8ke Task 5: the side-effect-free snapshot GET ────────────────────
+
+/// kata b8ke Task 5: a snapshot GET while a TERMINAL owns the session must be
+/// side-effect-free — zero sidecar spawns, typed 409 with the owner fields.
+#[tokio::test]
+async fn snapshot_get_never_spawns_while_a_terminal_owns_the_session() {
+    let _guard = ENV_LOCK.lock().await;
+    let codex_fake = DualRoleCodexFake::install();
+    let mut h = spawn_merged_server().await;
+    let sid = format!("snap-term-{}", uuid::Uuid::new_v4());
+    // Terminal owner first (mode codex — the sleeper spec spawns a real
+    // Running PTY that claims Live{Terminal} through the coordinator).
+    send_json(
+        &mut h.ws,
+        &json!({
+            "type": "terminal.create", "requestId": "snap-t1", "mode": "codex",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "codex", "sessionId": sid },
+        }),
+    )
+    .await;
+    let _ = await_frame(&mut h.ws, Duration::from_secs(20), |v| {
+        v["type"] == "terminal.created" && v["requestId"] == "snap-t1"
+    })
+    .await;
+    assert!(
+        matches!(
+            h.ws_state
+                .fresh_codex
+                .ownership_snapshot("codex", &sid)
+                .state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ),
+        "the terminal create must commit Live{{Terminal}} first"
+    );
+
+    let watermark = codex_fake.thread_op_rows().len();
+    let spawn_watermark = codex_fake.sidecar_spawn_rows().len();
+    let (status, body) = http_get_json(
+        &h.base_url,
+        &format!("/api/fresh-agent/threads/freshcodex/codex/{sid}"),
+    )
+    .await;
+    assert_eq!(
+        status, 409,
+        "owned sessions answer the typed 409, got {status}: {body}"
+    );
+    assert_eq!(body["code"], "RESTORE_UNAVAILABLE", "typed code: {body}");
+    assert_eq!(
+        body["ownerKind"], "terminal",
+        "the owner kind is named: {body}"
+    );
+    assert!(
+        body["ownerGeneration"].as_u64().is_some(),
+        "the owner generation is named: {body}"
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains(&sid) && m.contains("still running on the server.")),
+        "the frozen refusal text names the session: {body}"
+    );
+    let rows = codex_fake.thread_op_rows();
+    assert_eq!(
+        rows.len(),
+        watermark,
+        "snapshot GET must not spawn or resume a sidecar: {rows:?}"
+    );
+    assert_eq!(
+        codex_fake.sidecar_spawn_rows().len(),
+        spawn_watermark,
+        "the GET window spawned no app-server (the terminal create's managed-launch \
+         sidecar predates the watermark): {:?}",
+        codex_fake.sidecar_spawn_rows()
+    );
+}
+
+/// kata b8ke Task 5 (round-2 review — the intended behavior change): a
+/// snapshot GET for a VACANT untracked session NEVER spawns — 200 with the
+/// EMPTY snapshot and owner state, zero app-server invocations, and the
+/// coordinator stays Vacant. Cold resume happens ONLY through the explicit
+/// lifecycle commands (the fenced `freshAgent.create` below proves the
+/// coverage moved, not vanished).
+#[tokio::test]
+async fn snapshot_get_for_a_vacant_untracked_session_never_spawns() {
+    let _guard = ENV_LOCK.lock().await;
+    let codex_fake = DualRoleCodexFake::install();
+    let mut h = spawn_merged_server().await;
+    let sid = format!("snap-cold-{}", uuid::Uuid::new_v4());
+    let watermark = codex_fake.thread_op_rows().len();
+    let spawn_watermark = codex_fake.sidecar_spawn_rows().len();
+    let (status, body) = http_get_json(
+        &h.base_url,
+        &format!("/api/fresh-agent/threads/freshcodex/codex/{sid}"),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "vacant untracked sessions answer 200 with the empty snapshot, got {status}: {body}"
+    );
+    assert_eq!(
+        body["sessionType"], "freshcodex",
+        "the snapshot facts are stamped: {body}"
+    );
+    assert_eq!(body["threadId"], sid, "the requested id is echoed: {body}");
+    assert_eq!(body["turns"], Value::Array(vec![]), "empty rows: {body}");
+    assert_eq!(
+        body["extensions"]["codex"]["ownerKind"], "vacant",
+        "the additive owner-state fields name the vacant key: {body}"
+    );
+    let rows = codex_fake.thread_op_rows();
+    assert_eq!(
+        rows.len(),
+        watermark,
+        "the GET must not spawn, resume, or otherwise touch a sidecar — no thread/resume row: {rows:?}"
+    );
+    assert_eq!(
+        codex_fake.sidecar_spawn_rows().len(),
+        spawn_watermark,
+        "the GET window spawned no app-server: {:?}",
+        codex_fake.sidecar_spawn_rows()
+    );
+    // The coordinator is untouched: still Vacant, no claim recorded.
+    let snap = h.ws_state.fresh_codex.ownership_snapshot("codex", &sid);
+    assert_eq!(
+        snap.state,
+        freshell_ownership::OwnershipState::Vacant,
+        "a read-only GET must not create ownership, got {:?}",
+        snap.state
+    );
+    // The explicit lifecycle rebind is the ONLY cold resume: a fenced
+    // freshAgent.create resumes the session (the fake ledger grows exactly
+    // one thread/resume for the id), proving the coverage moved, not vanished.
+    send_json(
+        &mut h.ws,
+        &json!({
+            "type": "freshAgent.create", "requestId": "snap-cold-2",
+            "sessionType": "freshcodex", "provider": "codex", "cwd": "/tmp",
+            "sessionRef": { "provider": "codex", "sessionId": sid },
+        }),
+    )
+    .await;
+    let _ = await_frame(&mut h.ws, Duration::from_secs(20), |v| {
+        v["type"] == "freshAgent.created" && v["requestId"] == "snap-cold-2"
+    })
+    .await;
+    let rows = codex_fake.thread_op_rows();
+    assert!(
+        rows.iter().any(|r| r["method"] == "thread/resume"
+            && r["threadId"].as_str() == Some(sid.as_str())),
+        "the explicit freshAgent.create — not the GET — performed the resume: {rows:?}"
+    );
 }
