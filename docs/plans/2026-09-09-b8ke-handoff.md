@@ -48,6 +48,9 @@ Fix kata b8ke: make Fresh Agent to terminal-CLI session handoff atomic and cross
 - **MCP scope (validated by T3):** "REST, browser, and MCP creation paths cannot bypass the coordinator" is satisfied at the Rust REST surface — every MCP lifecycle verb in `server/mcp/freshell-tool.ts` is an HTTP call to `FRESHELL_URL` (`server/mcp/http-client.ts:16` defaults to `http://localhost:3001`, the Rust server's own port, and the Rust server injects that env into every terminal it spawns, `terminal.rs:5265-5295`), so MCP verbs inherit coordinator coverage transitively from Tasks 4/10. Do not claim MCP parity for a dev-mode `FRESHELL_URL` pointed at the Node server.
 - **NodeNext/ESM:** server/shared TS relative imports need `.js` extensions. Path aliases `@/` → `src/`, `@test/` → `test/`.
 - **OpenCode invariant:** never kill or restart the shared `opencode serve` daemon during handoff; never record a kill handle on an opencode lease (`opencode_ws.rs:131-136`); handoff must not change the session id. Codex is the opposite (per-session owned sidecar, kill handles, crash-respawn legitimately mints a new thread id) — generations key on the canonical durable `(provider, sessionId)`, never on runtime identity.
+- **Scope ruling — WS non-negotiated senders (round-1 review, validated by T3):** the coordinator claim rides the `paneReconcileV1` gate, and a connection that never negotiates cannot claim through the coordinator. The ungated path's SAFETY NET is the existing D7 active-writer refusal (`terminal.rs:3165-3223`, deliberately OUTSIDE the gate): a hand-rolled token-holding script that skips negotiation still receives today's probe-based `RESTORE_UNAVAILABLE` refusal — the pre-kata status quo, within the good-faith threat model. Do not un-gate the claim to close a residual D7 already fences.
+- **OUT-OF-SCOPE — Node server (round-1 review):** the system under fix is the Rust server (the kata source map and all incidents are Rust + client). The Node server (`server/`, `npm start`/`dev`/`serve`) is dev-only frozen legacy with retirement work in progress; its coordinator-less REST/MCP surfaces are recorded as a FOLLOW-UP SUGGESTION (wire-or-retire alongside the Node-server retirement), not in-scope work for this run. Do not claim MCP parity for a dev-mode `FRESHELL_URL` pointed at the Node server.
+- **Session-ID preservation scope (round-1 review):** the never-mint-a-new-session-id rule binds THIS run's NEW paths — the handoff runner and the respawn recovery must never mint a new session/thread id, never start a blank session, and never accept a respawned-new-thread runtime as handoff success (the commit path validates the target runtime serves the canonical `(provider, sessionId)` before `commit_live`). The pre-existing codex crash-respawn self-healing (which mints a new thread id for a crashed sidecar OUTSIDE any handoff, `codex.rs:3617-3625`) is unchanged pre-existing behavior on a different path and stays out of scope — this plan neither weakens nor extends it.
 - **Testing discipline:** red/green/refactor; tests exercise behavior, never assert prose/config text. Focused runs: `cargo test -p <crate> <filter>` and `npm run test:vitest -- run <paths> --config config/vitest/vitest.config.ts` (client unit) or `--config config/vitest/vitest.server.config.ts` (Node server tests). The `freshagent_session_lease.rs` suite is destructive and must run via `npm run test:sandbox -- "cargo test -p freshell-ws --test freshagent_session_lease"`. Broad gates only in Task 12. Fake-sidecar env knobs are process-global: every new test using them takes its file's existing `ENV_LOCK`.
 - **Worktree test prerequisite (validated by T4):** the b8ke worktree starts WITHOUT `node_modules`, and every cargo suite that spawns claude-mode terminals fails there with `PTY_SPAWN_FAILED` regardless of code state — the MCP inject step resolves `<repo_root>/node_modules/tsx/dist/loader.mjs` (`crates/freshell-platform/src/mcp_inject.rs:131-160`; the two pre-existing claude-owner `cross_kind_liveness` tests are red in a bare worktree and green from main, root-caused by T4). Before the first server-side task that runs such suites (Task 3 Step 0), provision `node_modules` in the worktree (`npm install`); re-confirm whenever a fresh worktree is cut.
 - **Cloud backend policy:** cloud is the configured backend; never silently fall back to local. All cloud commands in this run export `GCLOUD_ROBOT_HOME=/home/dan/.codex/skills/gcloud-robot` and `FRESHELL_GCP_ACCOUNT=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com` (run-state decision, 2026-09-09). New e2e specs run on fakes only (`CODEX_CMD`/`OPENCODE_CMD` dual-role shims) and must NOT be added to `CLOUD_SKIP_SPECS`.
@@ -71,14 +74,18 @@ The workspace root uses `members = ["crates/*"]`, so the crate joins the workspa
 - Produces (used by Tasks 3-10):
   - `RuntimeOwnerKind { Terminal, FreshAgent }` (serde kebab-case: `"terminal"`/`"fresh-agent"`)
   - `SessionKey { provider: String, session_id: String }` + `SessionKey::new(&str, &str)`
-  - `OwnerIdentity { kind: RuntimeOwnerKind, terminal_id: Option<String>, live_session_key: Option<String>, pid: Option<u32>, ownership_id: Option<String> }`
-  - `OwnershipState { Vacant, Starting{kind, operation_id, generation, since_ms}, Live{owner, generation}, Handoff{prior: Option<(OwnerIdentity, u64)>, to_kind, operation_id, generation, since_ms}, Stopping{owner: Option<OwnerIdentity>, operation_id, generation, since_ms} }`
+  - `OwnerIdentity { kind: RuntimeOwnerKind, terminal_id: Option<String>, live_session_key: Option<String>, pid: Option<u32>, ownership_id: Option<String> }` (the runtime-identity fence for release paths; `commit_live` stamps `ownership_id` from the committing operation when the caller leaves it `None`)
+  - `OwnershipState { Vacant, Starting{kind, operation_id, generation, initiator, since_ms}, Live{owner, generation}, Handoff{prior: Option<(OwnerIdentity, u64)>, to_kind, operation_id, generation, initiator, since_ms}, Stopping{owner: Option<OwnerIdentity>, operation_id, generation, initiator, since_ms} }` (`initiator` — the initiating client/device or lane identity — is recorded at begin and emitted by every subsequent transition event on that operation; round-1 review observability fix)
   - `BeginOutcome { Granted{generation}, AdoptLive{owner, generation}, OwnedByOtherKind{owner, generation}, Blocked{state, retry_after_ms}, StaleGeneration{current_generation} }`
   - `CommitOutcome { Committed, StaleGeneration{current_generation}, ForeignOperation }`
-  - `FailOutcome { Released, RestoredPriorOwner, Vacant, ForeignOperation }`
-  - `StopOutcome { Granted{generation}, NotLive{state} }`
+  - `FailVacantReason { NoPrior, PriorNotLive }`
+  - `FailOutcome { Released, RestoredPriorOwner, Vacant{reason: FailVacantReason}, ForeignOperation }` — a failed handoff restores the prior owner ONLY when the caller confirms the prior runtime is still live (`fail(..., prior_confirmed_live: true)`); a reaped/confirmed-dead prior ends `Vacant { reason: PriorNotLive }` — never record a dead runtime as `Live` (round-1 review)
+  - `StopOutcome { Granted{generation}, NotLive{state}, BlockedHandoff{state, retry_after_ms} }` — a stop attempted during another operation's `Handoff` returns the TYPED `BlockedHandoff` result and the caller must NOT kill (an in-flight handoff owns the transition; round-1 review)
+  - `ReleaseClaim { operation_id: String, generation: u64, runtime: Option<OwnerIdentity> }` — the fencing claim every watcher/TTL release must carry; `release`/`force_release_for_confirmed_kill` are no-ops on ANY mismatch (newer owner, different generation, in-flight handoff), so a delayed exit watcher or TTL recovery can never erase a newer owner or an in-flight handoff (round-1 review)
+  - `OperationTicket` — the RAII claim guard for create/resume tickets: constructed on `Granted`, `Drop` (unless `disarm()`ed) performs the typed `fail` releasing the claim, so a panicked or detached-and-dropped spawn path cannot wedge a session in `Starting`
+  - `RecoveredStart { provider, session_id, operation_id, generation, kind, initiator }` + `RuntimeOwnershipRegistry::recover_stale_starts(&self, now_ms: u64, max_age_ms: u64) -> Vec<RecoveredStart>` — the bounded Starting-state timeout watchdog sweep: over-aged `Starting` records transition to `Vacant` (generation preserved, logged as `ownership.start.recovered`); the host (Task 3's `main.rs` mint) drives it on a 5s tokio interval with a 30s max age — the backstop for leaked tickets the RAII guard cannot reach (e.g. a detached task killed without unwind)
   - `OwnershipSnapshot { generation: u64, state: OwnershipState }`
-  - `RuntimeOwnershipRegistry::{new, begin_start, begin_handoff, commit_live, fail, begin_stop, commit_stop, release, force_release_for_confirmed_kill, observe, snapshot_records}` — signatures in Step 3
+  - `RuntimeOwnershipRegistry::{new, begin_start, begin_handoff, commit_live, fail, begin_stop, commit_stop, release, force_release_for_confirmed_kill, observe, snapshot_records, recover_stale_starts}` — signatures in Step 3 (the `begin_*` and release methods take an `initiator: &str`; `fail` takes `prior_confirmed_live: bool`)
   - `RuntimeOwnerReplayRecord { provider: String, session_id: String, generation: u64, owner_kind: String, terminal_id: Option<String> }` (`owner_kind` is the wire string `"terminal" | "fresh-agent" | "vacant"`)
   - `RuntimeOwnershipRegistry::snapshot_records(&self) -> Vec<RuntimeOwnerReplayRecord>` — the reconnect-owner replay source (kata b8ke, T1 recommendation A1): one record per key in the map; `Live`/`Starting` map to their kind, `Handoff` to the in-flight target kind, `Stopping` to the stopping owner's kind, and `Vacant` entries replay as `"vacant"` so a reconnecting device can CLEAR stale divergence, not just learn owners. The record set is bounded by the distinct sessions claimed since server boot (restarts clear it) — self-hosted scale, no pruning window needed (recorded decision).
   - `pub const OWNERSHIP_RETRY_AFTER_MS: u64 = 1_000`
@@ -101,7 +108,7 @@ mod tests {
     fn registry_with_live_terminal() -> (RuntimeOwnershipRegistry, OwnerIdentity, u64) {
         let r = RuntimeOwnershipRegistry::new();
         let BeginOutcome::Granted { generation } =
-            r.begin_start(PROVIDER, "sid", RuntimeOwnerKind::Terminal, "op-1", None, 1_000)
+            r.begin_start(PROVIDER, "sid", RuntimeOwnerKind::Terminal, "op-1", None, "test", 1_000)
         else { panic!("expected Granted") };
         let owner = OwnerIdentity {
             kind: RuntimeOwnerKind::Terminal,
@@ -115,6 +122,17 @@ mod tests {
             CommitOutcome::Committed
         );
         (r, owner, generation)
+    }
+
+    /// The fencing claim an exit watcher carries: the operation that committed
+    /// the runtime, the generation it committed under, and the runtime identity.
+    /// (commit_live stamps `ownership_id` from the operation — round-1 review.)
+    fn watcher_claim(owner: &OwnerIdentity, operation_id: &str, generation: u64) -> crate::ReleaseClaim {
+        crate::ReleaseClaim {
+            operation_id: operation_id.to_string(),
+            generation,
+            runtime: Some(owner.clone()),
+        }
     }
 
     #[test]
@@ -135,7 +153,7 @@ mod tests {
                     RuntimeOwnerKind::FreshAgent
                 };
                 let op = format!("op-{i}");
-                match r.begin_start(PROVIDER, "sid", kind, &op, None, i as u64) {
+                match r.begin_start(PROVIDER, "sid", kind, &op, None, "stress", i as u64) {
                     BeginOutcome::Granted { generation } => {
                         if live_holders.fetch_add(1, Ordering::SeqCst) != 0 {
                             violations.fetch_add(1, Ordering::SeqCst);
@@ -143,8 +161,13 @@ mod tests {
                         for _ in 0..50 {
                             std::hint::spin_loop();
                         }
-                        let _ = r.fail(PROVIDER, "sid", &op, generation);
+                        // Decrement BEFORE the fail (round-1 review): between fail()
+                        // and a late decrement another valid grant could observe a
+                        // stale nonzero count — a false double-owner violation. While
+                        // the key is still Starting no other grant can happen, so
+                        // decrement-then-fail has no window at all.
                         live_holders.fetch_sub(1, Ordering::SeqCst);
+                        let _ = r.fail(PROVIDER, "sid", &op, generation, false);
                     }
                     _ => {}
                 }
@@ -172,7 +195,7 @@ mod tests {
                     RuntimeOwnerKind::FreshAgent
                 };
                 if let BeginOutcome::Granted { .. } =
-                    r.begin_handoff(PROVIDER, "sid", to, &format!("ho-{i}"), None, 1)
+                    r.begin_handoff(PROVIDER, "sid", to, &format!("ho-{i}"), None, "stress", 1)
                 {
                     grants.lock().unwrap().push(to);
                 }
@@ -188,52 +211,134 @@ mod tests {
     #[test]
     fn same_kind_duplicate_attach_converges_on_one_live_runtime() {
         let (r, owner, generation) = registry_with_live_terminal();
-        let second = r.begin_start(PROVIDER, "sid", RuntimeOwnerKind::Terminal, "op-2", None, 2_000);
+        let second = r.begin_start(PROVIDER, "sid", RuntimeOwnerKind::Terminal, "op-2", None, "test", 2_000);
         assert_eq!(second, BeginOutcome::AdoptLive { owner, generation });
         assert!(matches!(r.observe(PROVIDER, "sid").state, OwnershipState::Live { .. }));
     }
 
     #[test]
     fn stop_crash_and_unfail_release_or_leave_recoverable_typed_state() {
-        // Explicit stop: Live -> Stopping -> commit_stop -> Vacant.
+        // Explicit stop: Live -> Stopping (kill happens while Stopping) ->
+        // commit_stop -> Vacant ONLY after the confirmed reap. Never Vacant
+        // before the reap (round-1 review).
         let (r, _owner, _) = registry_with_live_terminal();
-        let gen = match r.begin_stop(PROVIDER, "sid", "kill-1", 1) {
+        let gen = match r.begin_stop(PROVIDER, "sid", "kill-1", "test", 1) {
             StopOutcome::Granted { generation } => generation,
             other => panic!("expected Granted, got {other:?}"),
         };
+        // While Stopping, competing starts are Blocked — the key is not Vacant.
+        assert!(matches!(
+            r.begin_start(PROVIDER, "sid", RuntimeOwnerKind::FreshAgent, "op-x", None, "test", 2),
+            BeginOutcome::Blocked { .. }
+        ));
+        assert!(matches!(r.observe(PROVIDER, "sid").state, OwnershipState::Stopping { .. }));
         assert_eq!(r.commit_stop(PROVIDER, "sid", "kill-1", gen), CommitOutcome::Committed);
         assert_eq!(r.observe(PROVIDER, "sid").state, OwnershipState::Vacant);
 
-        // Crash (exit-watcher release): Live -> Vacant, generation preserved (monotonic).
-        let (r, _, _) = registry_with_live_terminal();
-        r.release(PROVIDER, "sid", RuntimeOwnerKind::Terminal);
+        // A stop attempted during another operation's Handoff is TYPED Blocked
+        // and the caller must NOT kill (round-1 review).
+        let (r, _owner, _) = registry_with_live_terminal();
+        let BeginOutcome::Granted { .. } =
+            r.begin_handoff(PROVIDER, "sid", RuntimeOwnerKind::FreshAgent, "ho-1", None, "test", 2)
+        else { panic!() };
+        assert!(matches!(
+            r.begin_stop(PROVIDER, "sid", "kill-2", "test", 3),
+            StopOutcome::BlockedHandoff { .. }
+        ));
+        assert!(matches!(r.observe(PROVIDER, "sid").state, OwnershipState::Handoff { .. }));
+
+        // Crash (exit-watcher release): Live -> Vacant, generation preserved
+        // (monotonic). The release carries the fencing claim — the committing
+        // operation, the generation, and the runtime identity (round-1 review).
+        let (r, owner, generation) = registry_with_live_terminal();
+        r.release(PROVIDER, "sid", &watcher_claim(&owner, "op-1", generation), "exit-watcher");
         assert_eq!(r.observe(PROVIDER, "sid").state, OwnershipState::Vacant);
         assert!(r.observe(PROVIDER, "sid").generation >= 1);
 
-        // Holder panics/never completes: state stays Starting (typed Blocked for the
-        // next claimant — recoverable, never a second grant) until force-release.
+        // A DELAYED watcher cannot erase a newer owner: after a re-start under a
+        // new generation, the old claim is a typed no-op (round-1 review).
+        let BeginOutcome::Granted { generation: g2 } =
+            r.begin_start(PROVIDER, "sid", RuntimeOwnerKind::FreshAgent, "op-new", None, "test", 4)
+        else { panic!() };
+        let fresh_owner = OwnerIdentity {
+            kind: RuntimeOwnerKind::FreshAgent,
+            terminal_id: None,
+            live_session_key: Some("freshcodex:sid".into()),
+            pid: Some(99),
+            ownership_id: None,
+        };
+        assert_eq!(
+            r.commit_live(PROVIDER, "sid", "op-new", g2, fresh_owner.clone()),
+            CommitOutcome::Committed
+        );
+        r.release(PROVIDER, "sid", &watcher_claim(&owner, "op-1", generation), "exit-watcher");
+        assert!(matches!(r.observe(PROVIDER, "sid").state, OwnershipState::Live { .. }),
+            "a stale watcher release must never erase the newer owner");
+
+        // Holder panics/never completes: state stays Starting (typed Blocked for
+        // the next claimant — recoverable, never a second grant) until the
+        // fenced force-release (matched on operation id + generation).
         let r = RuntimeOwnershipRegistry::new();
-        let _ = r.begin_start(PROVIDER, "sid", RuntimeOwnerKind::FreshAgent, "op-zombie", None, 1);
+        let g_zombie = match r.begin_start(PROVIDER, "sid", RuntimeOwnerKind::FreshAgent, "op-zombie", None, "test", 1) {
+            BeginOutcome::Granted { generation } => generation,
+            other => panic!("expected Granted, got {other:?}"),
+        };
         assert!(matches!(
-            r.begin_start(PROVIDER, "sid", RuntimeOwnerKind::Terminal, "op-2", None, 2),
+            r.begin_start(PROVIDER, "sid", RuntimeOwnerKind::Terminal, "op-2", None, "test", 2),
             BeginOutcome::Blocked { .. }
         ));
-        r.force_release_for_confirmed_kill(PROVIDER, "sid");
+        // A force-release fenced to a DIFFERENT operation is a no-op.
+        r.force_release_for_confirmed_kill(
+            PROVIDER, "sid",
+            &crate::ReleaseClaim { operation_id: "op-other".into(), generation: g_zombie, runtime: None },
+            "ttl-recovery",
+        );
+        assert!(matches!(r.observe(PROVIDER, "sid").state, OwnershipState::Starting { .. }));
+        // The matched force-release recovers the zombie ticket.
+        r.force_release_for_confirmed_kill(
+            PROVIDER, "sid",
+            &crate::ReleaseClaim { operation_id: "op-zombie".into(), generation: g_zombie, runtime: None },
+            "ttl-recovery",
+        );
         assert!(matches!(
-            r.begin_start(PROVIDER, "sid", RuntimeOwnerKind::Terminal, "op-3", None, 3),
+            r.begin_start(PROVIDER, "sid", RuntimeOwnerKind::Terminal, "op-3", None, "test", 3),
             BeginOutcome::Granted { .. }
         ));
     }
 
     #[test]
-    fn stale_generation_cannot_commit_after_a_later_generation_begins() {
-        let r = RuntimeOwnershipRegistry::new();
-        let BeginOutcome::Granted { generation: g1 } =
-            r.begin_start(PROVIDER, "sid", RuntimeOwnerKind::Terminal, "op-slow", None, 1)
+    fn operation_ticket_drop_releases_a_panicked_claim_and_the_watchdog_recovers_leaked_starts() {
+        // RAII (round-1 review): dropping an un-disarmed ticket performs the
+        // typed fail, so a panicked spawn cannot wedge the session.
+        let r = Arc::new(RuntimeOwnershipRegistry::new());
+        {
+            let ticket = OperationTicket::new(
+                Arc::clone(&r), PROVIDER, "sid", "op-panic", 1, "test",
+            );
+            assert!(matches!(r.observe(PROVIDER, "sid").state, OwnershipState::Starting { .. }));
+            drop(ticket); // no disarm — the simulated panic
+        }
+        assert_eq!(r.observe(PROVIDER, "sid").state, OwnershipState::Vacant);
+        // Watchdog backstop: a LEAKED ticket (guard never ran — e.g. a detached
+        // task killed without unwind) is recovered by the bounded sweep.
+        let BeginOutcome::Granted { generation } =
+            r.begin_start(PROVIDER, "sid", RuntimeOwnerKind::Terminal, "op-leak", None, "test", 0)
         else { panic!() };
-        // A handoff bumps the generation while op-slow is in flight.
+        let _ = generation; // the "ticket" was lost without Drop
+        let recovered = r.recover_stale_starts(0, 0); // everything is over-aged at now=0
+        assert!(recovered.iter().any(|rec|
+            rec.provider == PROVIDER && rec.session_id == "sid" && rec.operation_id == "op-leak"));
+        assert_eq!(r.observe(PROVIDER, "sid").state, OwnershipState::Vacant);
+    }
+
+    #[test]
+    fn stale_generation_cannot_commit_after_a_later_generation_begins() {
+        // Round-1 review: begin_handoff from Starting is Blocked BY DESIGN, so
+        // this test starts from LIVE — a committed owner, then a handoff that
+        // bumps the generation, then the delayed pre-handoff commit.
+        let (r, _owner, _) = registry_with_live_terminal(); // Live, generation 1
         let BeginOutcome::Granted { .. } =
-            r.begin_handoff(PROVIDER, "sid", RuntimeOwnerKind::FreshAgent, "ho-1", None, 2)
+            r.begin_handoff(PROVIDER, "sid", RuntimeOwnerKind::FreshAgent, "ho-1", None, "test", 2)
         else { panic!() };
         let owner = OwnerIdentity {
             kind: RuntimeOwnerKind::Terminal,
@@ -242,40 +347,60 @@ mod tests {
             pid: None,
             ownership_id: None,
         };
-        // The stale starter's commit is refused — it must tear down its own child.
+        // A commit carrying the PRE-handoff generation is refused — the stale
+        // caller must tear down its own child.
         assert_eq!(
-            r.commit_live(PROVIDER, "sid", "op-slow", g1, owner),
-            CommitOutcome::StaleGeneration { current_generation: g1 + 1 }
+            r.commit_live(PROVIDER, "sid", "op-slow", 1, owner),
+            CommitOutcome::StaleGeneration { current_generation: 2 }
         );
         assert!(matches!(r.observe(PROVIDER, "sid").state, OwnershipState::Handoff { .. }));
     }
 
     #[test]
-    fn handoff_fail_restores_prior_owner_or_vacant() {
-        // Prior live owner, handoff fails before the prior was stopped.
+    fn handoff_fail_restores_prior_owner_only_when_confirmed_live() {
+        // Prior live owner, handoff fails BEFORE the prior was stopped — the
+        // prior is confirmed still live, so it is restored (round-1 review).
         let (r, owner, _) = registry_with_live_terminal();
         let BeginOutcome::Granted { generation: g } =
-            r.begin_handoff(PROVIDER, "sid", RuntimeOwnerKind::FreshAgent, "ho-1", None, 2)
+            r.begin_handoff(PROVIDER, "sid", RuntimeOwnerKind::FreshAgent, "ho-1", None, "test", 2)
         else { panic!() };
-        assert_eq!(r.fail(PROVIDER, "sid", "ho-1", g), FailOutcome::RestoredPriorOwner);
+        assert_eq!(
+            r.fail(PROVIDER, "sid", "ho-1", g, /* prior_confirmed_live: */ true),
+            FailOutcome::RestoredPriorOwner
+        );
         assert!(matches!(
             r.observe(PROVIDER, "sid").state,
             OwnershipState::Live { ref o, .. } if *o == owner
         ));
-        // No prior: handoff fail -> Vacant.
+        // No prior: handoff fail -> Vacant{NoPrior}.
         let r = RuntimeOwnershipRegistry::new();
         let BeginOutcome::Granted { generation: g } =
-            r.begin_handoff(PROVIDER, "sid", RuntimeOwnerKind::Terminal, "ho-2", None, 1)
+            r.begin_handoff(PROVIDER, "sid", RuntimeOwnerKind::Terminal, "ho-2", None, "test", 1)
         else { panic!() };
-        assert_eq!(r.fail(PROVIDER, "sid", "ho-2", g), FailOutcome::Vacant);
+        assert_eq!(
+            r.fail(PROVIDER, "sid", "ho-2", g, false),
+            FailOutcome::Vacant { reason: FailVacantReason::NoPrior }
+        );
+        assert_eq!(r.observe(PROVIDER, "sid").state, OwnershipState::Vacant);
+        // Prior was REAPED (the runner confirmed the kill) and the target then
+        // failed: restoring would record a dead runtime as Live — the key ends
+        // Vacant with the typed PriorNotLive reason instead (round-1 review).
+        let (r, _owner, _) = registry_with_live_terminal();
+        let BeginOutcome::Granted { generation: g } =
+            r.begin_handoff(PROVIDER, "sid", RuntimeOwnerKind::Terminal, "ho-3", None, "test", 2)
+        else { panic!() };
+        assert_eq!(
+            r.fail(PROVIDER, "sid", "ho-3", g, /* prior_confirmed_live: */ false),
+            FailOutcome::Vacant { reason: FailVacantReason::PriorNotLive }
+        );
         assert_eq!(r.observe(PROVIDER, "sid").state, OwnershipState::Vacant);
     }
 
     #[test]
     fn distinct_session_refs_start_concurrently() {
         let r = RuntimeOwnershipRegistry::new();
-        let a = r.begin_start(PROVIDER, "sid-a", RuntimeOwnerKind::Terminal, "op-a", None, 1);
-        let b = r.begin_start(PROVIDER, "sid-b", RuntimeOwnerKind::FreshAgent, "op-b", None, 1);
+        let a = r.begin_start(PROVIDER, "sid-a", RuntimeOwnerKind::Terminal, "op-a", None, "test", 1);
+        let b = r.begin_start(PROVIDER, "sid-b", RuntimeOwnerKind::FreshAgent, "op-b", None, "test", 1);
         assert!(matches!(a, BeginOutcome::Granted { .. }));
         assert!(matches!(b, BeginOutcome::Granted { .. }));
     }
@@ -284,15 +409,15 @@ mod tests {
     fn handoff_continuation_grants_target_start_under_same_operation() {
         let r = RuntimeOwnershipRegistry::new();
         let BeginOutcome::Granted { generation: g } =
-            r.begin_handoff(PROVIDER, "sid", RuntimeOwnerKind::Terminal, "ho-1", None, 1)
+            r.begin_handoff(PROVIDER, "sid", RuntimeOwnerKind::Terminal, "ho-1", None, "test", 1)
         else { panic!() };
         // Target start under the handoff's operation_id + to_kind: granted, state stays Handoff.
-        let cont = r.begin_start(PROVIDER, "sid", RuntimeOwnerKind::Terminal, "ho-1", None, 2);
+        let cont = r.begin_start(PROVIDER, "sid", RuntimeOwnerKind::Terminal, "ho-1", None, "test", 2);
         assert_eq!(cont, BeginOutcome::Granted { generation: g });
         assert!(matches!(r.observe(PROVIDER, "sid").state, OwnershipState::Handoff { .. }));
         // A DIFFERENT operation (or wrong kind) is blocked.
         assert!(matches!(
-            r.begin_start(PROVIDER, "sid", RuntimeOwnerKind::FreshAgent, "op-x", None, 3),
+            r.begin_start(PROVIDER, "sid", RuntimeOwnerKind::FreshAgent, "op-x", None, "test", 3),
             BeginOutcome::Blocked { .. }
         ));
     }
@@ -304,13 +429,13 @@ mod tests {
         // must be Granted (it is the same holder, not a second writer).
         let r = RuntimeOwnershipRegistry::new();
         let BeginOutcome::Granted { generation } =
-            r.begin_start(PROVIDER, "sid", RuntimeOwnerKind::FreshAgent, "snap-1", None, 1)
+            r.begin_start(PROVIDER, "sid", RuntimeOwnerKind::FreshAgent, "snap-1", None, "test", 1)
         else { panic!() };
-        let re = r.begin_start(PROVIDER, "sid", RuntimeOwnerKind::FreshAgent, "snap-1", None, 2);
+        let re = r.begin_start(PROVIDER, "sid", RuntimeOwnerKind::FreshAgent, "snap-1", None, "test", 2);
         assert_eq!(re, BeginOutcome::Granted { generation });
         // A different op still blocked while snap-1 holds Starting.
         assert!(matches!(
-            r.begin_start(PROVIDER, "sid", RuntimeOwnerKind::FreshAgent, "snap-2", None, 3),
+            r.begin_start(PROVIDER, "sid", RuntimeOwnerKind::FreshAgent, "snap-2", None, "test", 3),
             BeginOutcome::Blocked { .. }
         ));
     }
@@ -321,12 +446,12 @@ mod tests {
         // runtimeOwners payload comes from here — live owners replay with
         // their kind, released keys replay as "vacant" so replay CLEARS stale
         // divergence on reconnecting devices.
-        let (r, _owner, generation) = registry_with_live_terminal();
+        let (r, owner, generation) = registry_with_live_terminal();
         let records = r.snapshot_records();
         assert!(records.iter().any(|rec|
             rec.provider == PROVIDER && rec.session_id == "sid"
                 && rec.generation == generation && rec.owner_kind == "terminal"));
-        r.release(PROVIDER, "sid", RuntimeOwnerKind::Terminal);
+        r.release(PROVIDER, "sid", &watcher_claim(&owner, "op-1", generation), "exit-watcher");
         let records = r.snapshot_records();
         assert!(records.iter().any(|rec|
             rec.provider == PROVIDER && rec.session_id == "sid"
@@ -389,11 +514,28 @@ tracing = "0.1"
 //!   claim happens FIRST in every lifecycle path.
 //! - `generation` is per-key monotonic and never resets (Vacant keeps it),
 //!   so "stale" is identity-of-generation, not wall clock.
-//! - Every transition logs a diagnostic `tracing` event with join fields
-//!   as EVENT fields (target-directive filters kill span fields; see
+//! - Stop path (round-1 review): `begin_stop` enters `Stopping` (blocking
+//!   competing starts); the KILL happens while `Stopping`; `commit_stop`
+//!   moves to `Vacant` only after the caller confirms the reap. A stop
+//!   attempted during another operation's `Handoff` returns the typed
+//!   `BlockedHandoff` — the caller must NOT kill.
+//! - Release fencing (round-1 review): watcher/TTL releases carry
+//!   `(operation_id, generation, runtime identity)` and are no-ops on any
+//!   mismatch — a delayed watcher can never erase a newer owner or an
+//!   in-flight handoff. Exit-watcher events arriving while the state is
+//!   `Handoff` are folded by the handoff runner (its awaited kill/reap is
+//!   the single fold point); `release` is a no-op there by construction.
+//! - Ticket discipline (round-1 review): create/resume claims ride an
+//!   `OperationTicket` RAII guard (drop = typed fail); the
+//!   `recover_stale_starts` watchdog is the backstop for leaked tickets.
+//! - Every transition logs a diagnostic `tracing` event with the FULL
+//!   join-critical field set (operation_id, provider/session_id,
+//!   generation, old/new kind, runtime id/pid, transition, initiator,
+//!   outcome, duration_ms, failure reason) as EVENT fields
+//!   (target-directive filters kill span fields; see
 //!   crates/freshell-server/src/logging.rs:30-44).
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
@@ -435,16 +577,29 @@ pub struct OwnerIdentity {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OwnershipState {
     Vacant,
-    Starting { kind: RuntimeOwnerKind, operation_id: String, generation: u64, since_ms: u64 },
+    Starting {
+        kind: RuntimeOwnerKind,
+        operation_id: String,
+        generation: u64,
+        initiator: String,
+        since_ms: u64,
+    },
     Live { owner: OwnerIdentity, generation: u64 },
     Handoff {
         prior: Option<(OwnerIdentity, u64)>,
         to_kind: RuntimeOwnerKind,
         operation_id: String,
         generation: u64,
+        initiator: String,
         since_ms: u64,
     },
-    Stopping { owner: Option<OwnerIdentity>, operation_id: String, generation: u64, since_ms: u64 },
+    Stopping {
+        owner: Option<OwnerIdentity>,
+        operation_id: String,
+        generation: u64,
+        initiator: String,
+        since_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -468,27 +623,64 @@ pub enum CommitOutcome {
     ForeignOperation,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailVacantReason {
+    /// The failed operation had no prior owner to restore.
+    NoPrior,
+    /// The prior runtime was reaped/confirmed dead — never record a dead
+    /// runtime as Live (round-1 review).
+    PriorNotLive,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FailOutcome {
     /// A Starting operation was released (key now Vacant).
     Released,
-    /// A failed handoff restored the prior live owner.
+    /// A failed handoff restored the prior CONFIRMED-LIVE owner.
     RestoredPriorOwner,
-    /// A failed handoff had no prior owner (key now Vacant).
-    Vacant,
+    /// The key ends Vacant with the typed reason (no prior, or prior dead).
+    Vacant { reason: FailVacantReason },
     ForeignOperation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopOutcome {
     Granted { generation: u64 },
+    /// The key is not Live (Vacant/Starting/Stopping) — the caller may still
+    /// perform its own kill but must skip `commit_stop`.
     NotLive { state: OwnershipState },
+    /// An in-flight handoff owns the transition (round-1 review): the caller
+    /// must NOT kill — typed, retryable after the handoff settles.
+    BlockedHandoff { state: OwnershipState, retry_after_ms: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnershipSnapshot {
     pub generation: u64,
     pub state: OwnershipState,
+}
+
+/// The fencing claim every watcher/TTL release must carry (round-1 review):
+/// the operation that committed the runtime, the generation it committed
+/// under, and the runtime identity. `runtime` is `None` only for the zombie
+/// Starting-ticket recovery (nothing spawned yet — the operation id and
+/// generation fence it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseClaim {
+    pub operation_id: String,
+    pub generation: u64,
+    pub runtime: Option<OwnerIdentity>,
+}
+
+/// A watchdog-recovered over-aged `Starting` ticket (round-1 review).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveredStart {
+    pub provider: String,
+    pub session_id: String,
+    pub operation_id: String,
+    pub generation: u64,
+    pub kind: RuntimeOwnerKind,
+    pub initiator: String,
 }
 
 /// One replayed owner record for the `ready.runtimeOwners` handshake field
@@ -508,6 +700,107 @@ fn kind_wire(kind: &RuntimeOwnerKind) -> String {
     match kind {
         RuntimeOwnerKind::Terminal => "terminal".into(),
         RuntimeOwnerKind::FreshAgent => "fresh-agent".into(),
+    }
+}
+
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Runtime-identity match for the release fence: kind + terminal id (or
+/// live session key) + pid must all agree with the watched runtime, and the
+/// committing operation must agree (`owner.ownership_id`).
+fn runtime_matches(owner: &OwnerIdentity, claim: &ReleaseClaim) -> bool {
+    let Some(runtime) = claim.runtime.as_ref() else { return false };
+    owner.kind == runtime.kind
+        && owner.terminal_id == runtime.terminal_id
+        && owner.live_session_key == runtime.live_session_key
+        && owner.pid == runtime.pid
+        && owner.ownership_id.as_deref() == Some(claim.operation_id.as_str())
+}
+
+impl OwnershipState {
+    /// The recorded initiator of the in-flight operation (round-1 review
+    /// observability: commit/fail/stop events emit it from the record).
+    fn initiator(&self) -> Option<String> {
+        match self {
+            OwnershipState::Starting { initiator, .. }
+            | OwnershipState::Handoff { initiator, .. }
+            | OwnershipState::Stopping { initiator, .. } => Some(initiator.clone()),
+            _ => None,
+        }
+    }
+
+    /// The kind this state is (or is transitioning to), for old/new-kind
+    /// event fields.
+    fn kind(&self) -> Option<RuntimeOwnerKind> {
+        match self {
+            OwnershipState::Vacant => None,
+            OwnershipState::Starting { kind, .. } => Some(*kind),
+            OwnershipState::Live { owner, .. } => Some(owner.kind),
+            OwnershipState::Handoff { to_kind, .. } => Some(*to_kind),
+            OwnershipState::Stopping { owner, .. } => owner.as_ref().map(|o| o.kind),
+        }
+    }
+}
+
+/// RAII claim guard for create/resume tickets (round-1 review). Constructed
+/// on `Granted`; `Drop` without `disarm()` performs the typed `fail`
+/// releasing the claim, so a panicked spawn cannot wedge a session in
+/// `Starting`. After a successful `commit_live` the record is `Live` and a
+/// forgotten `disarm()` is a safe typed no-op (ForeignOperation).
+pub struct OperationTicket {
+    registry: Arc<RuntimeOwnershipRegistry>,
+    provider: String,
+    session_id: String,
+    operation_id: String,
+    generation: u64,
+    initiator: String,
+    disarmed: bool,
+}
+
+impl OperationTicket {
+    pub fn new(
+        registry: Arc<RuntimeOwnershipRegistry>,
+        provider: &str,
+        session_id: &str,
+        operation_id: &str,
+        generation: u64,
+        initiator: &str,
+    ) -> Self {
+        Self {
+            registry,
+            provider: provider.to_string(),
+            session_id: session_id.to_string(),
+            operation_id: operation_id.to_string(),
+            generation,
+            initiator: initiator.to_string(),
+            disarmed: false,
+        }
+    }
+
+    pub fn generation(&self) -> u64 { self.generation }
+    pub fn operation_id(&self) -> &str { &self.operation_id }
+    pub fn disarm(&mut self) { self.disarmed = true; }
+}
+
+impl Drop for OperationTicket {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            let _ = self.registry.fail(
+                &self.provider, &self.session_id, &self.operation_id,
+                self.generation, /* prior_confirmed_live: */ false,
+            );
+            tracing::warn!(target: "freshell_ownership",
+                event = "ownership.ticket.dropped_unarmed",
+                operation_id = %self.operation_id,
+                provider = %self.provider, session_id = %self.session_id,
+                initiator = %self.initiator, generation = self.generation,
+                outcome = "released", failure_reason = "TICKET_DROPPED");
+        }
     }
 }
 
@@ -537,10 +830,11 @@ impl RuntimeOwnershipRegistry {
     /// Atomically begin a start/attach/resume of `kind` for
     /// `(provider, session_id)`. `observed_generation` is the generation a
     /// DELAYED request saw when it decided to act; `None` means the caller
-    /// has no stale risk to fence. Entering `Starting` increments the
-    /// generation. Re-claiming a `Starting`/`Handoff` held by the SAME
-    /// operation and kind is Granted (the snapshot compat cold-start and
-    /// the handoff target continuation both rely on this).
+    /// has no stale risk to fence. `initiator` identifies the initiating
+    /// client/device/lane for the transition events. Entering `Starting`
+    /// increments the generation. Re-claiming a `Starting`/`Handoff` held by
+    /// the SAME operation and kind is Granted (the snapshot compat cold-start
+    /// and the handoff target continuation both rely on this).
     pub fn begin_start(
         &self,
         provider: &str,
@@ -548,6 +842,7 @@ impl RuntimeOwnershipRegistry {
         kind: RuntimeOwnerKind,
         operation_id: &str,
         observed_generation: Option<u64>,
+        initiator: &str,
         now_ms: u64,
     ) -> BeginOutcome {
         let mut inner = self.inner.lock().expect("ownership lock poisoned");
@@ -557,8 +852,9 @@ impl RuntimeOwnershipRegistry {
             if observed < record.generation {
                 tracing::warn!(target: "freshell_ownership",
                     event = "ownership.begin_start.stale_generation",
-                    operation_id, provider, session_id,
-                    observed_generation = observed, generation = record.generation);
+                    operation_id, provider, session_id, initiator,
+                    observed_generation = observed, generation = record.generation,
+                    outcome = "refused", failure_reason = "STALE_GENERATION");
                 return BeginOutcome::StaleGeneration { current_generation: record.generation };
             }
         }
@@ -569,11 +865,13 @@ impl RuntimeOwnershipRegistry {
                     kind,
                     operation_id: operation_id.to_string(),
                     generation: record.generation,
+                    initiator: initiator.to_string(),
                     since_ms: now_ms,
                 };
                 tracing::info!(target: "freshell_ownership",
                     event = "ownership.start.begin", operation_id, provider, session_id,
-                    kind = ?kind, generation = record.generation);
+                    initiator, kind = ?kind, to_kind = ?kind,
+                    generation = record.generation, outcome = "granted");
                 BeginOutcome::Granted { generation: record.generation }
             }
             OwnershipState::Starting { kind: held_kind, operation_id: held_op, generation, .. }
@@ -599,7 +897,8 @@ impl RuntimeOwnershipRegistry {
     /// Atomically enter `Handoff` (incrementing the generation), capturing
     /// the prior live owner for restore-on-failure. Granted from `Vacant`
     /// (no prior to stop) and from `Live` of any kind; `Starting` /
-    /// `Handoff` / `Stopping` block.
+    /// `Handoff` / `Stopping` block (a handoff from `Starting` is Blocked
+    /// BY DESIGN — round-1 review test alignment).
     pub fn begin_handoff(
         &self,
         provider: &str,
@@ -607,6 +906,7 @@ impl RuntimeOwnershipRegistry {
         to_kind: RuntimeOwnerKind,
         operation_id: &str,
         observed_generation: Option<u64>,
+        initiator: &str,
         now_ms: u64,
     ) -> BeginOutcome {
         let mut inner = self.inner.lock().expect("ownership lock poisoned");
@@ -625,11 +925,13 @@ impl RuntimeOwnershipRegistry {
                     to_kind,
                     operation_id: operation_id.to_string(),
                     generation: record.generation,
+                    initiator: initiator.to_string(),
                     since_ms: now_ms,
                 };
                 tracing::info!(target: "freshell_ownership",
                     event = "ownership.handoff.begin", operation_id, provider, session_id,
-                    to_kind = ?to_kind, generation = record.generation);
+                    initiator, to_kind = ?to_kind,
+                    generation = record.generation, outcome = "granted");
                 BeginOutcome::Granted { generation: record.generation }
             }
             OwnershipState::Live { owner, generation } => {
@@ -640,13 +942,14 @@ impl RuntimeOwnershipRegistry {
                     to_kind,
                     operation_id: operation_id.to_string(),
                     generation: record.generation,
+                    initiator: initiator.to_string(),
                     since_ms: now_ms,
                 };
                 tracing::info!(target: "freshell_ownership",
                     event = "ownership.handoff.begin", operation_id, provider, session_id,
-                    from_kind = ?owner.kind, to_kind = ?to_kind,
+                    initiator, from_kind = ?owner.kind, to_kind = ?to_kind,
                     runtime_id = ?owner.terminal_id, pid = ?owner.pid,
-                    generation = record.generation);
+                    generation = record.generation, outcome = "granted");
                 BeginOutcome::Granted { generation: record.generation }
             }
             OwnershipState::Starting { .. } | OwnershipState::Handoff { .. }
@@ -657,15 +960,19 @@ impl RuntimeOwnershipRegistry {
 
     /// Commit a live runtime. Legal from this operation's `Starting`, or
     /// from this operation's `Handoff` (the target writer commit —
-    /// generation retained). A stale generation commits nothing: the
-    /// caller must tear down its own child.
+    /// generation retained; the handoff runner is the SINGLE commit
+    /// authority, round-1 review: target paths invoked under-ticket skip
+    /// their own commit). A stale generation commits nothing: the
+    /// caller must tear down its own child. Stamps `ownership_id` from the
+    /// committing operation (the release fence key) when the caller left it
+    /// `None`.
     pub fn commit_live(
         &self,
         provider: &str,
         session_id: &str,
         operation_id: &str,
         generation: u64,
-        owner: OwnerIdentity,
+        mut owner: OwnerIdentity,
     ) -> CommitOutcome {
         let mut inner = self.inner.lock().expect("ownership lock poisoned");
         let key = SessionKey::new(provider, session_id);
@@ -678,30 +985,39 @@ impl RuntimeOwnershipRegistry {
                 "ownership.commit_live.stale_generation: caller must tear down its child");
             return CommitOutcome::StaleGeneration { current_generation: record.generation };
         }
+        let initiator = record.state.initiator().unwrap_or_default();
+        let old_kind = record.state.kind();
         match record.state.clone() {
             OwnershipState::Starting { operation_id: op, .. } if op == operation_id => {}
             OwnershipState::Handoff { operation_id: op, to_kind, .. }
                 if op == operation_id && to_kind == owner.kind => {}
             _ => return CommitOutcome::ForeignOperation,
         }
+        if owner.ownership_id.is_none() {
+            owner.ownership_id = Some(operation_id.to_string());
+        }
         record.state = OwnershipState::Live { owner: owner.clone(), generation };
         tracing::info!(target: "freshell_ownership",
             event = "ownership.live.commit", operation_id, provider, session_id,
-            kind = ?owner.kind, runtime_id = ?owner.terminal_id,
+            initiator, from_kind = ?old_kind, to_kind = ?owner.kind,
+            runtime_id = ?owner.terminal_id,
             live_session_key = ?owner.live_session_key, pid = ?owner.pid,
-            generation);
+            generation, outcome = "committed");
         CommitOutcome::Committed
     }
 
-    /// Fail an in-flight operation: `Starting` → Vacant; `Handoff` →
-    /// restore the prior owner (if any) or Vacant. Foreign operations are
-    /// a typed no-op.
+    /// Fail an in-flight operation: `Starting` → Vacant; `Handoff` → restore
+    /// the prior owner ONLY when the caller confirms it is still live
+    /// (`prior_confirmed_live: true`) — a reaped/confirmed-dead prior ends
+    /// `Vacant { reason: PriorNotLive }` (never record a dead runtime as
+    /// Live, round-1 review). Foreign operations are a typed no-op.
     pub fn fail(
         &self,
         provider: &str,
         session_id: &str,
         operation_id: &str,
         generation: u64,
+        prior_confirmed_live: bool,
     ) -> FailOutcome {
         let mut inner = self.inner.lock().expect("ownership lock poisoned");
         let key = SessionKey::new(provider, session_id);
@@ -709,20 +1025,41 @@ impl RuntimeOwnershipRegistry {
         if generation != record.generation {
             return FailOutcome::ForeignOperation;
         }
+        let initiator = record.state.initiator().unwrap_or_default();
         match record.state.clone() {
             OwnershipState::Starting { operation_id: op, .. } if op == operation_id => {
                 record.state = OwnershipState::Vacant;
+                tracing::warn!(target: "freshell_ownership",
+                    event = "ownership.start.failed", operation_id, provider, session_id,
+                    initiator, generation, outcome = "released",
+                    failure_reason = "START_FAILED");
                 FailOutcome::Released
             }
-            OwnershipState::Handoff { operation_id: op, prior, .. } if op == operation_id => {
+            OwnershipState::Handoff { operation_id: op, prior, since_ms, .. } if op == operation_id => {
+                let duration_ms = now_epoch_ms().saturating_sub(since_ms);
                 match prior {
-                    Some((owner, gen)) => {
-                        record.state = OwnershipState::Live { owner, generation: gen };
+                    Some((owner, gen)) if prior_confirmed_live => {
+                        record.state = OwnershipState::Live { owner: owner.clone(), generation: gen };
+                        tracing::warn!(target: "freshell_ownership",
+                            event = "ownership.handoff.failed", operation_id, provider, session_id,
+                            initiator, generation, to_kind = ?record.state.kind(),
+                            runtime_id = ?owner.terminal_id, pid = ?owner.pid,
+                            outcome = "restored_prior_owner", duration_ms,
+                            failure_reason = "HANDOFF_FAILED");
                         FailOutcome::RestoredPriorOwner
                     }
-                    None => {
+                    _ => {
+                        let reason = if prior.is_some() {
+                            FailVacantReason::PriorNotLive
+                        } else {
+                            FailVacantReason::NoPrior
+                        };
                         record.state = OwnershipState::Vacant;
-                        FailOutcome::Vacant
+                        tracing::warn!(target: "freshell_ownership",
+                            event = "ownership.handoff.failed", operation_id, provider, session_id,
+                            initiator, generation, outcome = "vacant", duration_ms,
+                            failure_reason = ?reason);
+                        FailOutcome::Vacant { reason }
                     }
                 }
             }
@@ -731,38 +1068,54 @@ impl RuntimeOwnershipRegistry {
     }
 
     /// Begin an explicit stop (kill): `Live` → `Stopping` (generation+1),
-    /// blocking competing starts while the kill is confirmed. `NotLive`
-    /// means the caller should still perform its own kill, but skip
-    /// `commit_stop` (an in-flight handoff owns the transition).
+    /// blocking competing starts while the kill is confirmed. The KILL
+    /// happens while `Stopping`; `commit_stop` moves to `Vacant` only after
+    /// the caller confirms the reap (round-1 review). `NotLive` means the
+    /// caller should still perform its own kill, but skip `commit_stop`.
+    /// `BlockedHandoff` means an in-flight handoff owns the transition: the
+    /// caller must NOT kill.
     pub fn begin_stop(
         &self,
         provider: &str,
         session_id: &str,
         operation_id: &str,
+        initiator: &str,
         now_ms: u64,
     ) -> StopOutcome {
         let mut inner = self.inner.lock().expect("ownership lock poisoned");
         let key = SessionKey::new(provider, session_id);
         let Some(record) = inner.get_mut(&key) else {
             return StopOutcome::NotLive { state: OwnershipState::Vacant };
-        };
+        }
         match record.state.clone() {
             OwnershipState::Live { owner, .. } => {
                 record.generation += 1;
                 record.state = OwnershipState::Stopping {
-                    owner: Some(owner),
+                    owner: Some(owner.clone()),
                     operation_id: operation_id.to_string(),
                     generation: record.generation,
+                    initiator: initiator.to_string(),
                     since_ms: now_ms,
                 };
+                tracing::info!(target: "freshell_ownership",
+                    event = "ownership.stop.begin", operation_id, provider, session_id,
+                    initiator, from_kind = ?owner.kind, to_kind = ?owner.kind,
+                    runtime_id = ?owner.terminal_id, pid = ?owner.pid,
+                    generation = record.generation, outcome = "granted");
                 StopOutcome::Granted { generation: record.generation }
             }
+            OwnershipState::Handoff { .. } => StopOutcome::BlockedHandoff {
+                state: record.state.clone(),
+                retry_after_ms: OWNERSHIP_RETRY_AFTER_MS,
+            },
             OwnershipState::Vacant => StopOutcome::NotLive { state: OwnershipState::Vacant },
             state => StopOutcome::NotLive { state },
         }
     }
 
-    /// Confirm a stop: `Stopping{op}` → `Vacant` (generation preserved).
+    /// Confirm a stop AFTER the reap: `Stopping{op}` → `Vacant` (generation
+    /// preserved). Callers must only invoke this once the runtime's death is
+    /// confirmed (round-1 review: never Vacant before the reap).
     pub fn commit_stop(
         &self,
         provider: &str,
@@ -777,40 +1130,133 @@ impl RuntimeOwnershipRegistry {
             return CommitOutcome::StaleGeneration { current_generation: record.generation };
         }
         match record.state.clone() {
-            OwnershipState::Stopping { operation_id: op, .. } if op == operation_id => {
+            OwnershipState::Stopping { operation_id: op, owner, since_ms, initiator, .. }
+                if op == operation_id =>
+            {
+                let duration_ms = now_epoch_ms().saturating_sub(since_ms);
                 record.state = OwnershipState::Vacant;
                 tracing::info!(target: "freshell_ownership",
-                    event = "ownership.stop.commit", operation_id, provider, session_id, generation);
+                    event = "ownership.stop.commit", operation_id, provider, session_id,
+                    initiator, from_kind = ?owner.as_ref().map(|o| o.kind),
+                    runtime_id = ?owner.as_ref().and_then(|o| o.terminal_id.clone()),
+                    pid = ?owner.as_ref().and_then(|o| o.pid),
+                    generation, outcome = "committed", duration_ms);
                 CommitOutcome::Committed
             }
             _ => CommitOutcome::ForeignOperation,
         }
     }
 
-    /// Exit-watcher hook: `Live{kind}` → `Vacant`, idempotent, any other
-    /// state is a no-op (a handoff or stop owns the transition).
-    pub fn release(&self, provider: &str, session_id: &str, kind: RuntimeOwnerKind) {
+    /// Exit-watcher hook (round-1 review: FENCED). `Live` → `Vacant` only
+    /// when the record still matches the watched runtime EXACTLY — same
+    /// operation id (`owner.ownership_id`), same generation, same runtime
+    /// identity (kind + terminal_id/live_session_key + pid). A newer owner,
+    /// a different generation, or an in-flight handoff makes this a typed
+    /// no-op (the handoff runner folds exit events itself — its awaited
+    /// kill/reap is the single fold point).
+    pub fn release(&self, provider: &str, session_id: &str, claim: &ReleaseClaim, initiator: &str) {
         let mut inner = self.inner.lock().expect("ownership lock poisoned");
         let key = SessionKey::new(provider, session_id);
         if let Some(record) = inner.get_mut(&key) {
             if let OwnershipState::Live { owner, generation } = record.state.clone() {
-                if owner.kind == kind {
+                if runtime_matches(&owner, claim) && generation == claim.generation {
                     record.state = OwnershipState::Vacant;
                     tracing::info!(target: "freshell_ownership",
                         event = "ownership.released", provider, session_id,
-                        kind = ?kind, generation);
+                        operation_id = %claim.operation_id, initiator,
+                        from_kind = ?owner.kind, to_kind = ?owner.kind,
+                        runtime_id = ?owner.terminal_id, pid = ?owner.pid,
+                        generation, outcome = "released");
+                } else {
+                    tracing::warn!(target: "freshell_ownership",
+                        event = "ownership.release.fenced_noop", provider, session_id,
+                        operation_id = %claim.operation_id, initiator,
+                        claim_generation = claim.generation, generation,
+                        outcome = "no_op", failure_reason = "RELEASE_FENCE_MISMATCH");
                 }
             }
         }
     }
 
     /// Only after the holder's entire process tree death was confirmed
-    /// (the lane TTL paths' kill-before-release contract).
-    pub fn force_release_for_confirmed_kill(&self, provider: &str, session_id: &str) {
+    /// (the lane TTL paths' kill-before-release contract). Round-1 review:
+    /// FENCED — fires only when the current record still matches the
+    /// confirmed-dead runtime (Live owner, or Stopping owner, matched on
+    /// operation id + generation + runtime identity) or the claimed
+    /// zombie `Starting` ticket (operation id + generation). NEVER fires
+    /// during a `Handoff` (invariant log) and never erases a newer owner.
+    pub fn force_release_for_confirmed_kill(
+        &self,
+        provider: &str,
+        session_id: &str,
+        claim: &ReleaseClaim,
+        initiator: &str,
+    ) {
         let mut inner = self.inner.lock().expect("ownership lock poisoned");
-        if let Some(record) = inner.get_mut(&SessionKey::new(provider, session_id)) {
+        let key = SessionKey::new(provider, session_id);
+        let Some(record) = inner.get_mut(&key) else { return };
+        let matched = match record.state.clone() {
+            OwnershipState::Handoff { .. } => {
+                tracing::error!(target: "invariant", provider, session_id,
+                    operation_id = %claim.operation_id, initiator,
+                    "ownership.force_release.refused_during_handoff: the handoff runner owns the transition");
+                false
+            }
+            OwnershipState::Live { owner, generation } =>
+                runtime_matches(&owner, claim) && generation == claim.generation,
+            OwnershipState::Stopping { owner, operation_id, generation, .. } =>
+                operation_id == claim.operation_id
+                    && generation == claim.generation
+                    && owner.map(|o| runtime_matches(&o, claim)).unwrap_or(claim.runtime.is_none()),
+            OwnershipState::Starting { operation_id, generation, .. } =>
+                operation_id == claim.operation_id
+                    && generation == claim.generation
+                    && claim.runtime.is_none(),
+            OwnershipState::Vacant => false,
+        };
+        if matched {
             record.state = OwnershipState::Vacant;
+            tracing::warn!(target: "freshell_ownership",
+                event = "ownership.force_released", provider, session_id,
+                operation_id = %claim.operation_id, initiator, generation = claim.generation,
+                outcome = "released", failure_reason = "CONFIRMED_KILL");
         }
+    }
+
+    /// The bounded Starting-state timeout watchdog (round-1 review):
+    /// over-aged `Starting` tickets transition to `Vacant` (generation
+    /// preserved) with a typed `ownership.start.recovered` event, so a
+    /// panicked or leaked spawn cannot wedge a session. The host drives
+    /// this on an interval (Task 3's main.rs: 5s sweep, 30s max age).
+    pub fn recover_stale_starts(&self, now_ms: u64, max_age_ms: u64) -> Vec<RecoveredStart> {
+        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut recovered = Vec::new();
+        for (key, record) in inner.iter_mut() {
+            if let OwnershipState::Starting { kind, operation_id, generation, initiator, since_ms } =
+                record.state.clone()
+            {
+                if now_ms.saturating_sub(since_ms) >= max_age_ms {
+                    record.state = OwnershipState::Vacant;
+                    tracing::warn!(target: "freshell_ownership",
+                        event = "ownership.start.recovered",
+                        operation_id = %operation_id,
+                        provider = %key.provider, session_id = %key.session_id,
+                        initiator = %initiator, kind = ?kind,
+                        generation, outcome = "recovered_vacant",
+                        duration_ms = now_ms.saturating_sub(since_ms),
+                        failure_reason = "STARTING_TIMEOUT");
+                    recovered.push(RecoveredStart {
+                        provider: key.provider.clone(),
+                        session_id: key.session_id.clone(),
+                        operation_id,
+                        generation,
+                        kind,
+                        initiator,
+                    });
+                }
+            }
+        }
+        recovered
     }
 
     /// Side-effect-free read for snapshot GETs and reconcile verdicts.
@@ -930,13 +1376,21 @@ fn session_runtime_owner_frame_round_trips_with_the_frozen_tag() {
 
 #[test]
 fn error_message_accepts_additive_owner_fields_without_changing_the_frozen_text() {
-    let msg = ServerMessage::Error(Error {
-        // Fill ONLY the fields the existing Error struct defines, plus the two
-        // new additive ones; keep the frozen message text byte-for-byte.
+    // The REAL repo type is `ErrorMsg` (server_messages.rs:627) with its
+    // existing required + optional fields — `timestamp` is REQUIRED (no
+    // skip_serializing_if); fill the full real field set plus the two new
+    // additive ones (round-1 review: the earlier `Error` sketch did not
+    // compile against the repo type).
+    let msg = ServerMessage::Error(ErrorMsg {
         code: ErrorCode::RestoreUnavailable,
         message: "Session 01a0828d is still running on the server.".into(),
+        timestamp: "2026-09-09T00:00:00Z".into(),
+        actual_session_ref: None,
+        expected_session_ref: None,
         request_id: Some("req-1".into()),
         retry_after_ms: None,
+        terminal_exit_code: None,
+        terminal_id: None,
         live_terminal_id: None,
         owner_kind: Some("fresh-agent".into()),
         owner_generation: Some(7),
@@ -1008,9 +1462,9 @@ fn terminal_create_and_fresh_agent_create_accept_observed_generation() {
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `cargo test -p freshell-protocol session_runtime_owner_frame_round_trips error_message_accepts_additive_owner_fields ready_frame_round_trips terminal_create_and_fresh_agent_create_accept_observed_generation`
+Run: `cargo test -p freshell-protocol`
 
-Expected: FAIL — compile errors: `SessionRuntimeOwner`, `owner_kind`, `owner_generation`, `observed_generation`, `RuntimeOwnerReplay`, `runtime_owners` do not exist yet. That missing-surface failure is the intended red.
+Expected: FAIL — compile errors: `SessionRuntimeOwner`, `owner_kind`, `owner_generation`, `observed_generation`, `RuntimeOwnerReplay`, `runtime_owners` do not exist yet (a whole-crate run; cargo accepts only ONE positional test filter per invocation, so the four new tests are reached via the crate target, not four positional args — round-1 review command fix). That missing-surface failure is the intended red.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -1059,7 +1513,7 @@ pub struct SessionRuntimeOwner {
 }
 ```
 
-plus `#[serde(rename = "session.runtimeOwner")] SessionRuntimeOwner(SessionRuntimeOwner),` in the `ServerMessage` enum, and the two additive optional fields on `ErrorMessage` (`owner_kind`, `owner_generation`, both `#[serde(skip_serializing_if = "Option::is_none")]`, camelCase per the struct's existing `rename_all`). In `client_messages.rs`, add `#[serde(default, skip_serializing_if = "Option::is_none")] pub observed_generation: Option<u64>` to `TerminalCreate` and `FreshAgentCreate` (both already camelCase-renamed at struct level).
+plus `#[serde(rename = "session.runtimeOwner")] SessionRuntimeOwner(SessionRuntimeOwner),` in the `ServerMessage` enum, and the two additive optional fields on the Rust `ErrorMsg` struct (`owner_kind`, `owner_generation`, both `#[serde(skip_serializing_if = "Option::is_none")]`, camelCase per the struct's existing `rename_all`; the TS-side type is `ErrorMessage`). In `client_messages.rs`, add `#[serde(default, skip_serializing_if = "Option::is_none")] pub observed_generation: Option<u64>` to `TerminalCreate` and `FreshAgentCreate` (both already camelCase-renamed at struct level).
 
 `ReadyMessage` (both sides) — the reconnect-owner replay (kata b8ke, T1 rec A2; chosen over a follow-up broadcast batch or a query endpoint because the one frame every reconnect is guaranteed to process closes all three miss windows — offline-during-handoff, lag-4008, page reload — with zero extra round-trips): in `shared/ws-protocol.ts`, extend `ReadyMessage` (~:1047-1059) with
 
@@ -1145,9 +1599,9 @@ git commit -m "feat(protocol): session.runtimeOwner broadcast + typed owner fiel
 - Test: `crates/freshell-ws/tests/cross_kind_liveness.rs` (one new test on the existing harness)
 
 **Interfaces:**
-- Consumes: Task 1 registry API; Task 2 `FreshAgentCreate.observed_generation`.
+- Consumes: Task 1 registry API (including `OperationTicket`, `ReleaseClaim`, `StopOutcome::BlockedHandoff`); Task 2 `FreshAgentCreate.observed_generation`.
 - Produces:
-  - `freshell_freshagent::ownership_lane::{claim_fresh_agent_ownership, commit_fresh_agent_ownership, fail_fresh_agent_ownership, stop_fresh_agent_ownership}` (signatures in Step 3).
+  - `freshell_freshagent::ownership_lane::{claim_fresh_agent_ownership, commit_fresh_agent_ownership, fail_fresh_agent_ownership, begin_fresh_agent_stop, commit_fresh_agent_stop}` (signatures in Step 3). The stop path is split (round-1 review): `begin_fresh_agent_stop` enters `Stopping` and returns the typed `StopOutcome`; the CALLER performs the kill while `Stopping` and calls `commit_fresh_agent_stop` only after the awaited, confirmed reap. `BlockedHandoff` means the caller does NOT kill (typed refusal to its caller); `NotLive` during another transition means the caller may still kill its own runtime but skips the commit.
   - `FreshAgentState::with_ownership(Arc<RuntimeOwnershipRegistry>) -> Self`; `FreshCodexState::set_ownership(...)`, `FreshClaudeState::set_ownership(...)`, `FreshOpencodeState::set_ownership(...)` (Option-injected: `None` = every pre-existing test unchanged).
   - `ownership_snapshot(&self, provider, session_id) -> freshell_ownership::OwnershipSnapshot` convenience on each fresh state (Vacant/0 default when un-injected) — Tasks 5-7 assert through it, and Task 3's reconcile guard reads it.
   - The reconcile respawn-counter guard: `reconcile_freshagent::build_snapshot` consults the coordinator (via each fresh state's `ownership_snapshot`) when building presence facts — when the key is `Live{Terminal}` or any transition state (`Starting`/`Handoff`/`Stopping`), the respawn ANSWER does not burn the per-pane respawn counter (the `freshAgent.create` it arms would be typed-refused by the coordinator anyway), so reconnecting divergent panes can never march toward a false `dead_session{respawn_exhausted}`. The VERDICT shape is unchanged (frozen-client compatible); the client-side divergence gate lives in Task 8.
@@ -1172,11 +1626,11 @@ New file `crates/freshell-freshagent/src/ownership_wiring_tests.rs` (registered 
 //! freshell-ws/tests/cross_kind_liveness.rs.
 use std::sync::Arc;
 
-use freshell_ownership::{BeginOutcome, CommitOutcome, OwnershipState, RuntimeOwnerKind};
+use freshell_ownership::{BeginOutcome, CommitOutcome, OwnershipState, RuntimeOwnerKind, StopOutcome};
 
 use crate::ownership_lane::{
     claim_fresh_agent_ownership, commit_fresh_agent_ownership, fail_fresh_agent_ownership,
-    stop_fresh_agent_ownership,
+    begin_fresh_agent_stop, commit_fresh_agent_stop,
 };
 
 fn owner_fresh(key: &str) -> freshell_ownership::OwnerIdentity {
@@ -1193,7 +1647,7 @@ fn owner_fresh(key: &str) -> freshell_ownership::OwnerIdentity {
 fn fresh_agent_claim_then_commit_is_live_then_kill_releases() {
     let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
     let BeginOutcome::Granted { generation } =
-        claim_fresh_agent_ownership(&registry, "codex", "sid-1", "op-1", None, 1)
+        claim_fresh_agent_ownership(&registry, "codex", "sid-1", "op-1", None, "test", 1)
     else { panic!("expected Granted") };
     assert_eq!(
         commit_fresh_agent_ownership(&registry, "codex", "sid-1", "op-1", generation, owner_fresh("freshcodex:sid-1")),
@@ -1203,16 +1657,56 @@ fn fresh_agent_claim_then_commit_is_live_then_kill_releases() {
         registry.observe("codex", "sid-1").state,
         OwnershipState::Live { .. }
     ));
-    // Kill path: Live{fresh-agent} -> Stopping -> Vacant.
-    stop_fresh_agent_ownership(&registry, "codex", "sid-1", "kill-1", 2);
+    // Kill path (round-1 review): Live{fresh-agent} -> Stopping FIRST (the kill
+    // happens while Stopping — competing starts are Blocked), then
+    // commit_stop -> Vacant ONLY after the confirmed reap.
+    match begin_fresh_agent_stop(&registry, "codex", "sid-1", "kill-1", "test", 2) {
+        StopOutcome::Granted { generation } => {
+            assert!(matches!(
+                claim_fresh_agent_ownership(&registry, "codex", "sid-1", "op-x", None, "test", 3),
+                BeginOutcome::Blocked { .. }
+            ), "no competing start may be granted while Stopping");
+            // ...the caller kills the sidecar and awaits its confirmed exit...
+            assert_eq!(
+                commit_fresh_agent_stop(&registry, "codex", "sid-1", "kill-1", generation),
+                CommitOutcome::Committed
+            );
+        }
+        other => panic!("expected Granted, got {other:?}"),
+    }
     assert_eq!(registry.observe("codex", "sid-1").state, OwnershipState::Vacant);
+}
+
+#[test]
+fn fresh_agent_stop_during_a_handoff_is_typed_blocked_and_does_not_kill() {
+    // Round-1 review: a stop attempted during another operation's Handoff
+    // returns the typed BlockedHandoff — the caller must NOT kill.
+    let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+    let BeginOutcome::Granted { generation } =
+        claim_fresh_agent_ownership(&registry, "codex", "sid-4", "op-4", None, "test", 1)
+    else { panic!() };
+    assert_eq!(
+        commit_fresh_agent_ownership(&registry, "codex", "sid-4", "op-4", generation, owner_fresh("freshcodex:sid-4")),
+        CommitOutcome::Committed
+    );
+    let BeginOutcome::Granted { .. } =
+        registry.begin_handoff("codex", "sid-4", RuntimeOwnerKind::Terminal, "ho-4", None, "test", 2)
+    else { panic!() };
+    assert!(matches!(
+        begin_fresh_agent_stop(&registry, "codex", "sid-4", "kill-4", "test", 3),
+        StopOutcome::BlockedHandoff { .. }
+    ));
+    assert!(matches!(
+        registry.observe("codex", "sid-4").state,
+        OwnershipState::Handoff { .. }
+    ), "the blocked stop must not have killed or transitioned the handoff");
 }
 
 #[test]
 fn fresh_agent_claim_fails_typed_when_terminal_owns() {
     let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
     let BeginOutcome::Granted { generation } =
-        registry.begin_start("codex", "sid-2", RuntimeOwnerKind::Terminal, "term-op", None, 1)
+        registry.begin_start("codex", "sid-2", RuntimeOwnerKind::Terminal, "term-op", None, "test", 1)
     else { panic!() };
     let t = freshell_ownership::OwnerIdentity {
         kind: RuntimeOwnerKind::Terminal,
@@ -1223,7 +1717,7 @@ fn fresh_agent_claim_fails_typed_when_terminal_owns() {
     };
     registry.commit_live("codex", "sid-2", "term-op", generation, t);
     // The fresh-agent lane's claim must see the typed cross-kind conflict.
-    let claim = claim_fresh_agent_ownership(&registry, "codex", "sid-2", "op-2", None, 2);
+    let claim = claim_fresh_agent_ownership(&registry, "codex", "sid-2", "op-2", None, "test", 2);
     assert!(matches!(claim, BeginOutcome::OwnedByOtherKind { .. }));
 }
 
@@ -1231,18 +1725,18 @@ fn fresh_agent_claim_fails_typed_when_terminal_owns() {
 fn fresh_agent_fail_reopens_the_key() {
     let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
     let BeginOutcome::Granted { generation } =
-        claim_fresh_agent_ownership(&registry, "opencode", "ses-3", "op-3", None, 1)
+        claim_fresh_agent_ownership(&registry, "opencode", "ses-3", "op-3", None, "test", 1)
     else { panic!() };
     assert_eq!(
         fail_fresh_agent_ownership(&registry, "opencode", "ses-3", "op-3", generation),
         freshell_ownership::FailOutcome::Released
     );
-    let retry = claim_fresh_agent_ownership(&registry, "opencode", "ses-3", "op-4", None, 2);
+    let retry = claim_fresh_agent_ownership(&registry, "opencode", "ses-3", "op-4", None, "test", 2);
     assert!(matches!(retry, BeginOutcome::Granted { .. }));
 }
 ```
 
-And in `crates/freshell-ws/tests/cross_kind_liveness.rs` (following the file's existing `ENV_LOCK` + `FakeSidecarEnv` discipline; extend `spawn_server` to also return a `WsState` clone the way `tests/common/mod.rs::spawn_server_with_specs_hub_and_state` does — the file hand-builds `WsState`, so add the clone to its return tuple, and mint ONE `RuntimeOwnershipRegistry` in the harness injected exactly like `main.rs` — `set_ownership` on the three fresh states, plus `WsState.ownership` from Task 4 on — so the coordinator is live for these tests):
+And in `crates/freshell-ws/tests/cross_kind_liveness.rs` (following the file's existing `ENV_LOCK` + `FakeSidecarEnv` discipline; extend `spawn_server` to a 3-tuple `(String, TerminalRegistry, WsState)` returning the `WsState` clone the way `tests/common/mod.rs::spawn_server_with_specs_hub_and_state` does — the file hand-builds `WsState`, so add the clone to its return tuple, and mint ONE `RuntimeOwnershipRegistry` in the harness injected exactly like `main.rs` — `set_ownership` on the three fresh states, plus `WsState.ownership` from Task 4 on — so the coordinator is live for these tests. NOTE the file's REAL helper APIs, verified at base (round-1 review): `FakeSidecarEnv::install()` is SYNC (`fn install() -> Self`) and `create_rows()` is SYNC; `connect(url)` consumes and discards the `ready` frame — capture it with a `connect_and_capture_ready(url) -> (TestWs, Value)` variant when a test needs it (Task 4); `await_frame(ws, budget, predicate) -> Value` PANICS on timeout (returns `Value`, never `Option`/`Result`) — polling loops need a file-local `try_await_frame(...) -> Option<Value>` soft-timeout twin (Task 4)):
 
 ```rust
 /// kata b8ke Task 3: a real freshclaude create/kill drives the shared
@@ -1250,9 +1744,9 @@ And in `crates/freshell-ws/tests/cross_kind_liveness.rs` (following the file's e
 #[tokio::test]
 async fn fresh_agent_create_and_kill_drive_the_shared_coordinator() {
     let _env = ENV_LOCK.lock().await;
-    let sidecar = FakeSidecarEnv::install().await;
-    let (server, url) = spawn_server().await;
-    let ws = connect(url).await;
+    let sidecar = FakeSidecarEnv::install(); // SYNC at base — no .await
+    let (url, _registry, ws_state) = spawn_server().await;
+    let ws = connect(&url).await;
     let sid = format!("coord-{}", uuid::Uuid::new_v4());
     send_json(&ws, json!({
         "type": "freshAgent.create", "requestId": "req-coord-1",
@@ -1262,7 +1756,7 @@ async fn fresh_agent_create_and_kill_drive_the_shared_coordinator() {
     let _created = await_frame(&ws, Duration::from_secs(20), |v| {
         v.get("type").and_then(|t| t.as_str()) == Some("freshAgent.created")
     }).await.expect("created");
-    let snap = server.ws_state.fresh_claude.ownership_snapshot("claude", &sid);
+    let snap = ws_state.fresh_claude.ownership_snapshot("claude", &sid);
     assert!(matches!(snap.state, freshell_ownership::OwnershipState::Live { .. }),
         "expected Live fresh-agent owner, got {:?}", snap.state);
     send_json(&ws, json!({
@@ -1273,9 +1767,9 @@ async fn fresh_agent_create_and_kill_drive_the_shared_coordinator() {
         v.get("type").and_then(|t| t.as_str()) == Some("freshAgent.killed")
             && v.get("sessionId").and_then(|s| s.as_str()) == Some(sid.as_str())
     }).await.expect("killed");
-    let snap = server.ws_state.fresh_claude.ownership_snapshot("claude", &sid);
+    let snap = ws_state.fresh_claude.ownership_snapshot("claude", &sid);
     assert_eq!(snap.state, freshell_ownership::OwnershipState::Vacant,
-        "kill must release ownership");
+        "kill must release ownership only after the confirmed reap");
     let _ = sidecar;
 }
 ```
@@ -1306,7 +1800,8 @@ fn respawn_counter_does_not_burn_when_the_coordinator_owns_elsewhere() {
     // A lifecycle transition in flight: no burn.
     assert!(respawn_burn_skipped(&OwnershipState::Handoff {
         prior: None, to_kind: RuntimeOwnerKind::Terminal,
-        operation_id: "ho-1".into(), generation: 3, since_ms: 0,
+        operation_id: "ho-1".into(), generation: 3,
+        initiator: "test".into(), since_ms: 0,
     }));
     // Vacant: normal respawn accounting.
     assert!(!respawn_burn_skipped(&OwnershipState::Vacant));
@@ -1336,21 +1831,25 @@ pub mod ownership_lane {
     use std::sync::Arc;
 
     use freshell_ownership::{
-        BeginOutcome, CommitOutcome, FailOutcome, OwnerIdentity, RuntimeOwnershipRegistry,
-        RuntimeOwnerKind, StopOutcome,
+        BeginOutcome, CommitOutcome, FailOutcome, OwnerIdentity, ReleaseClaim,
+        RuntimeOwnershipRegistry, RuntimeOwnerKind, StopOutcome,
     };
 
+    /// Claim; on Granted the caller wraps the result in an `OperationTicket`
+    /// (Task 1's RAII guard — drop = typed fail) so a panicked spawn cannot
+    /// wedge the session.
     pub fn claim_fresh_agent_ownership(
         registry: &Arc<RuntimeOwnershipRegistry>,
         provider: &str,
         session_id: &str,
         operation_id: &str,
         observed_generation: Option<u64>,
+        initiator: &str,
         now_ms: u64,
     ) -> BeginOutcome {
         registry.begin_start(
             provider, session_id, RuntimeOwnerKind::FreshAgent,
-            operation_id, observed_generation, now_ms,
+            operation_id, observed_generation, initiator, now_ms,
         )
     }
 
@@ -1372,25 +1871,51 @@ pub mod ownership_lane {
         operation_id: &str,
         generation: u64,
     ) -> FailOutcome {
-        registry.fail(provider, session_id, operation_id, generation)
+        registry.fail(provider, session_id, operation_id, generation, /* prior_confirmed_live */ false)
     }
 
-    /// Kill path: Live{fresh-agent} -> Stopping -> Vacant after confirmed
-    /// exit. NotLive (e.g. an in-flight handoff owns the transition) still
-    /// proceeds with the provider's own kill; the handoff drives the final
-    /// state.
-    pub fn stop_fresh_agent_ownership(
+    /// Kill path, FIRST HALF (round-1 review): `Live{fresh-agent}` →
+    /// `Stopping` (blocks competing starts). The CALLER then performs the
+    /// kill while `Stopping` and finishes with `commit_fresh_agent_stop`
+    /// ONLY after the awaited, confirmed reap — never Vacant before the
+    /// reap. `BlockedHandoff`: the caller must NOT kill (an in-flight
+    /// handoff owns the transition). `NotLive` during another transition:
+    /// the caller may still kill its own runtime but skips the commit.
+    pub fn begin_fresh_agent_stop(
         registry: &Arc<RuntimeOwnershipRegistry>,
         provider: &str,
         session_id: &str,
         operation_id: &str,
+        initiator: &str,
         now_ms: u64,
+    ) -> StopOutcome {
+        registry.begin_stop(provider, session_id, operation_id, initiator, now_ms)
+    }
+
+    /// Kill path, SECOND HALF: `Stopping{op}` → `Vacant` after the caller
+    /// has confirmed the reap (the awaited sidecar/serve exit).
+    pub fn commit_fresh_agent_stop(
+        registry: &Arc<RuntimeOwnershipRegistry>,
+        provider: &str,
+        session_id: &str,
+        operation_id: &str,
+        generation: u64,
+    ) -> CommitOutcome {
+        registry.commit_stop(provider, session_id, operation_id, generation)
+    }
+
+    /// Exit-watcher release (round-1 review: FENCED). The watcher captures
+    /// the `ReleaseClaim` (operation id, generation, runtime identity) when
+    /// it registers; a delayed event can never erase a newer owner or an
+    /// in-flight handoff — the registry no-ops on mismatch.
+    pub fn release_fresh_agent_ownership(
+        registry: &Arc<RuntimeOwnershipRegistry>,
+        provider: &str,
+        session_id: &str,
+        claim: &ReleaseClaim,
+        initiator: &str,
     ) {
-        if let StopOutcome::Granted { generation } =
-            registry.begin_stop(provider, session_id, operation_id, now_ms)
-        {
-            let _ = registry.commit_stop(provider, session_id, operation_id, generation);
-        }
+        registry.release(provider, session_id, claim, initiator);
     }
 }
 ```
@@ -1415,16 +1940,16 @@ Add to `FreshAgentState` (and mirror the field+setter on `FreshCodexState`, `Fre
 
 plus `ownership_snapshot(&self, provider: &str, session_id: &str) -> freshell_ownership::OwnershipSnapshot` on each state (delegating to the injected registry; `Vacant`/0 default when `None`).
 
-3. Wire the claim points. At each anchor below, insert the coordinator claim IMMEDIATELY BEFORE the existing `FreshAgentSessionLeases` claim (coordinator first — it closes the cross-kind window), and thread `(operation_id, generation)` through to the commit/fail points:
+3. Wire the claim points. At each anchor below, insert the coordinator claim IMMEDIATELY BEFORE the existing `FreshAgentSessionLeases` claim (coordinator first — it closes the cross-kind window), wrap every Granted claim in an `OperationTicket` (Task 1's RAII guard; `disarm()` on the matching commit), and thread `(operation_id, generation)` through to the commit/fail points:
 
-- `codex.rs` `ensure_session_resumable` (~:4266, right after the terminal-liveness precheck :4259-4265): extend the signature with two parameters — `observed_generation: Option<u64>` and `handoff: Option<(&str /*operation_id*/, u64 /*generation*/)>`; every existing caller passes `(None, None)`. Claim with `operation_id = &resume_request_id`. On `OwnedByOtherKind`/`Blocked` → return `ResumeSessionError::Reserved` (existing typed variant — same wire behavior). On `Granted { generation }` → proceed to the existing fresh lease claim. On the handoff continuation (`handoff` is `Some`), skip the claim — the runner already holds it.
-- `codex.rs` commit: at the `register_live_session` call sites inside `ensure_session_resumable` (~:4478-4500) and the create-resume lane (`handle_create`/`handle_create_resume`, ~:931-1025) → `commit_fresh_agent_ownership(..., OwnerIdentity { kind: FreshAgent, live_session_key: <sessions-map key>, pid: <sidecar child pid>, ownership_id })`. On `StaleGeneration`/`ForeignOperation` → tear down the just-registered session exactly like the existing `commit_session_claim`-refusal path (kill sidecar, no binding) plus `tracing::error!(target: "invariant", ...)`.
-- `codex.rs` fail: wherever the fresh lease `fail()` fires in those flows → `fail_fresh_agent_ownership`.
-- `codex.rs` `handle_kill` (~:2837): `stop_fresh_agent_ownership(..., &format!("kill-{}", session_id), now_ms())` BEFORE the existing kill body (its NotLive branch is safe mid-handoff).
-- `codex.rs` `ensure_session_alive` (~:3160-3264) and `handle_attach` (~:2971): same claim/commit pattern (crash recovery claims too — the crash-respawn's NEW thread id is a NEW canonical key; the old key is released by the exit watcher).
-- `claude.rs`: the three lease-claim regions (:729-770, :2783, :3674), `handle_kill` (:1160), `handle_attach` (:3628) — identical shape (provider `"claude"`).
-- `opencode_ws.rs`: `resume_durable_session` claim (~:2868-2895, after the refusal precheck :2862-2866), commit where the durable row registers; `handle_kill` (~:1234) via `stop_fresh_agent_ownership` (never touching the shared serve); `handle_attach` re-key commit (~:2804-2808); the `lib.rs` send-keys placeholder→durable materialization commits `Live{FreshAgent}` for the minted `ses_*` id (provider `"opencode"`). OpenCode passes `pid: None` and NEVER a kill handle.
-- Every exit watcher that today calls `leases.clear_binding(...)` on natural exit also calls `registry.release(provider, sid, RuntimeOwnerKind::FreshAgent)` (codex exit watcher in `register_live_session` ~:4601-4665; claude and opencode equivalents).
+- `codex.rs` `ensure_session_resumable` (~:4266, right after the terminal-liveness precheck :4259-4265): extend the signature with two parameters — `observed_generation: Option<u64>` and `handoff: Option<(&str /*operation_id*/, u64 /*generation*/)>`; every existing caller passes `(None, None)`. Claim with `operation_id = &resume_request_id` and the initiating connection id as `initiator`. On `OwnedByOtherKind`/`Blocked` → return `ResumeSessionError::Reserved` (existing typed variant — same wire behavior). On `Granted { generation }` → proceed to the existing fresh lease claim. On the handoff continuation (`handoff` is `Some`), skip the claim AND the commit (round-1 review: single commit authority — under-ticket mode; see the commit bullet) — the runner holds the ticket and performs the one `commit_live`.
+- `codex.rs` commit: at the `register_live_session` call sites inside `ensure_session_resumable` (~:4478-4500) and the create-resume lane (`handle_create`/`handle_create_resume`, ~:931-1025) → `commit_fresh_agent_ownership(..., OwnerIdentity { kind: FreshAgent, live_session_key: <sessions-map key>, pid: <sidecar child pid>, ownership_id })`, then `ticket.disarm()`. UNDER-TICKET MODE (round-1 review): when invoked with a `handoff` continuation, SKIP this commit entirely — return the constructed `OwnerIdentity` to the caller (the handoff runner performs the single `commit_live`; no double commits). On `StaleGeneration`/`ForeignOperation` on the non-handoff path → tear down the just-registered session exactly like the existing `commit_session_claim`-refusal path (kill sidecar, no binding) plus `tracing::error!(target: "invariant", ...)` — a stale post-spawn commit must reap its uncommitted child.
+- `codex.rs` fail: wherever the fresh lease `fail()` fires in those flows → `fail_fresh_agent_ownership` (drop of the un-disarmed `OperationTicket` performs the same typed fail for panic paths).
+- `codex.rs` `handle_kill` (~:2837): `begin_fresh_agent_stop(..., initiator = connection id, ...)` FIRST; on `Granted` the existing kill body runs while `Stopping`, and the awaited, confirmed sidecar exit is followed by `commit_fresh_agent_stop` — NEVER commit before the reap (round-1 review). On `BlockedHandoff` → emit the typed refusal to the caller and DO NOT kill (an in-flight handoff owns the transition). On `NotLive` → the caller may still perform its own kill but skips the commit.
+- `codex.rs` `ensure_session_alive` (~:3160-3264) and `handle_attach` (~:2971): same claim/commit pattern with tickets (crash recovery claims too — the crash-respawn's NEW thread id is a NEW canonical key; the old key is released by the exit watcher with its `ReleaseClaim`).
+- `claude.rs`: the three lease-claim regions (:729-770, :2783, :3674), `handle_kill` (:1160) via `begin_fresh_agent_stop`/kill/await/`commit_fresh_agent_stop` exactly as the codex bullet, `handle_attach` (:3628) — identical shape (provider `"claude"`).
+- `opencode_ws.rs`: `resume_durable_session` claim (~:2868-2895, after the refusal precheck :2862-2866), commit where the durable row registers; `handle_kill` (~:1234) via the same begin/kill/await/commit sequence (never touching the shared serve); `handle_attach` re-key commit (~:2804-2808); the `lib.rs` send-keys placeholder→durable materialization commits `Live{FreshAgent}` for the minted `ses_*` id (provider `"opencode"`). OpenCode passes `pid: None` and NEVER a kill handle.
+- Every exit watcher that today calls `leases.clear_binding(...)` on natural exit also calls `release_fresh_agent_ownership` with the `ReleaseClaim` captured when the runtime registered (operation id, generation, runtime identity — round-1 review: a delayed watcher can never erase a newer owner or an in-flight handoff; during `Handoff` the release no-ops by construction and the handoff runner folds the exit event itself) (codex exit watcher in `register_live_session` ~:4601-4665; claude and opencode equivalents).
 
 4. `crates/freshell-server/src/main.rs` — mint the ONE instance and inject (follow the `fresh_agent_leases` block :318-321 verbatim):
 
@@ -1435,6 +1960,24 @@ plus `ownership_snapshot(&self, provider: &str, session_id: &str) -> freshell_ow
     fresh_codex_state.set_ownership(Arc::clone(&ownership));
     fresh_claude_state.set_ownership(Arc::clone(&ownership));
     fresh_opencode_state.set_ownership(Arc::clone(&ownership));
+    // Round-1 review: the bounded Starting-state timeout watchdog (5s sweep,
+    // 30s max age) — the RAII tickets handle panics; this backstop recovers
+    // leaked tickets (e.g. a detached task killed without unwind) so a
+    // stranded Starting claim can never wedge a session.
+    {
+        let ownership = Arc::clone(&ownership);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                ownership.recover_stale_starts(now, 30_000);
+            }
+        });
+    }
 ```
 
 and thread it into the `FreshAgentState` builder chain (`.with_ownership(Arc::clone(&ownership))`) where the REST state is constructed (~:343). The `WsState` field is added in Task 4.
@@ -1515,6 +2058,62 @@ git commit -m "feat(ownership): wire fresh-agent lane claims/commits through the
 
 In `crates/freshell-ws/tests/cross_kind_liveness.rs`:
 
+First add two file-local harness twins (round-1 review: the real `await_frame` returns `Value` and PANICS on timeout — polling loops need a soft-timeout `Option` twin; the real `connect` consumes and discards the `ready` frame — the ready-replay test needs a capture variant):
+
+```rust
+/// Soft-timeout twin of `await_frame` (which returns `Value` and panics on
+/// timeout): returns None when the budget elapses (or the stream ends)
+/// without a matching frame.
+async fn try_await_frame(
+    ws: &mut TestWs,
+    budget: Duration,
+    predicate: impl Fn(&Value) -> bool,
+) -> Option<Value> {
+    tokio::time::timeout(budget, async {
+        loop {
+            let msg = ws.next().await?.expect("no ws error");
+            let WsMessage::Text(text) = msg else { continue };
+            let value: Value = serde_json::from_str(&text).unwrap();
+            if predicate(&value) {
+                return Some(value);
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// `connect` variant that RETURNS the ready frame (connect consumes and
+/// discards it — a test that must inspect `ready` uses this).
+async fn connect_and_capture_ready(url: &str) -> (TestWs, Value) {
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("ws connect");
+    let hello = json!({
+        "type": "hello",
+        "token": AUTH_TOKEN,
+        "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
+        "capabilities": { "paneReconcileV1": true, "paneReconcileFreshAgentV1": true },
+    });
+    ws.send(WsMessage::Text(hello.to_string()))
+        .await
+        .expect("send hello");
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("handshake message within timeout")
+            .expect("stream not ended")
+            .expect("no ws error");
+        let WsMessage::Text(text) = msg else { continue };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        if value["type"] == "ready" {
+            return (ws, value); // the captured ready frame
+        }
+    }
+}
+```
+
 ```rust
 /// kata b8ke Task 4: the two-writers START race. Both creates are sent
 /// back-to-back with NO sequencing (the genuine-race pattern from
@@ -1523,13 +2122,13 @@ In `crates/freshell-ws/tests/cross_kind_liveness.rs`:
 #[tokio::test]
 async fn concurrent_terminal_and_fresh_agent_start_same_session_ref_yield_one_writer() {
     let _env = ENV_LOCK.lock().await;
-    let sidecar = FakeSidecarEnv::install().await;
-    let (server, url) = spawn_server().await;
+    let sidecar = FakeSidecarEnv::install(); // SYNC at base — no .await
+    let (url, registry, ws_state) = spawn_server().await;
     let sid = format!("race-{}", uuid::Uuid::new_v4());
-    let ws_term = connect(url.clone()).await;
-    let ws_fresh = connect(url).await;
+    let ws_term = connect(&url).await;
+    let ws_fresh = connect(&url).await;
 
-    let watermark = sidecar.create_rows().await.len();
+    let watermark = sidecar.create_rows().len(); // SYNC at base — no .await
 
     // Fire both with zero awaits between the sends.
     let term_req = "race-term-1";
@@ -1545,13 +2144,27 @@ async fn concurrent_terminal_and_fresh_agent_start_same_session_ref_yield_one_wr
     }));
     let ((), ()) = tokio::join!(send_term, send_fresh);
 
-    // Wait until BOTH requests have a terminal answer (created OR typed error).
+    // The UNION sampler (round-1 review): fresh sidecar creates PLUS terminal
+    // PTYs for the session — the one-writer invariant is over the UNION, not
+    // two separate <=1 assertions (one sidecar + one PTY would pass those).
+    let live_writers = || {
+        let creates = sidecar
+            .create_rows()
+            .iter()
+            .filter(|r| r["msg"]["resumeSessionId"].as_str() == Some(sid.as_str()))
+            .count();
+        let ptys = registry.session_ref_pty_count("claude", &sid);
+        creates + ptys
+    };
+
+    // Wait until BOTH requests have a terminal answer (created OR typed error),
+    // sampling the union across the interleaving.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let mut term_answered = false;
     let mut fresh_answered = false;
     while std::time::Instant::now() < deadline && !(term_answered && fresh_answered) {
         if !term_answered {
-            if let Some(frame) = await_frame(&ws_term, Duration::from_millis(250), |v| {
+            if let Some(frame) = try_await_frame(&ws_term, Duration::from_millis(250), |v| {
                 let t = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 t == "terminal.created" || t == "error"
             }).await {
@@ -1561,7 +2174,7 @@ async fn concurrent_terminal_and_fresh_agent_start_same_session_ref_yield_one_wr
             }
         }
         if !fresh_answered {
-            if let Some(frame) = await_frame(&ws_fresh, Duration::from_millis(250), |v| {
+            if let Some(frame) = try_await_frame(&ws_fresh, Duration::from_millis(250), |v| {
                 let t = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 t == "freshAgent.created" || t == "freshAgent.create.failed"
             }).await {
@@ -1570,24 +2183,19 @@ async fn concurrent_terminal_and_fresh_agent_start_same_session_ref_yield_one_wr
                 }
             }
         }
+        assert!(live_writers() <= 1,
+            "the UNION of live writers (sidecars + PTYs) may never exceed 1 mid-race");
     }
     assert!(term_answered && fresh_answered, "both requests must receive a typed answer");
-    assert!(term_answered || fresh_answered);
 
-    // Exactly one sidecar create for the durable id — never two.
-    let rows = sidecar.create_rows().await;
-    let creates = rows[watermark.min(rows.len())..]
-        .iter()
-        .filter(|r| r.msg.as_ref().and_then(|m| m.resumeSessionId.as_ref()) == Some(&sid))
-        .count();
-    assert!(creates <= 1, "at most one fresh sidecar may exist, saw {creates}");
-    // Exactly one PTY row bound to the sessionRef (or none, if fresh won).
-    let pty = server.ws_state.registry.session_ref_pty_count("claude", &sid);
-    assert!(pty <= 1, "at most one terminal may own the session, saw {pty}");
+    // Final settle: the union is still at most one (the loser was typed, and
+    // any loser-side runtime was torn down — not left running).
+    assert!(live_writers() <= 1, "exactly one runtime may survive the race");
+    let _ = ws_state;
 }
 ```
 
-(Adapt helper names to the file's real ones: `sidecar.create_rows()` is `create_rows(&sidecar_log)` here; add a tiny `session_ref_pty_count` probe on `TerminalRegistry` — or reuse the `identity_probe_rows()` join that `session_ref_singleflight.rs`'s `live_pty_count_for_session` uses, copying that helper in. If `spawn_server` does not return the `WsState` clone, extend it now — Task 3's test already required it.)
+(Adapt helper names to the file's real ones: the fake sidecar's request-log rows are read via the file-local `FakeSidecarEnv::create_rows()` (SYNC — the `.await` in the earlier draft was wrong) and the row shape is `{ pid, msg }` with `msg.resumeSessionId` on create rows; add a tiny `session_ref_pty_count` probe on `TerminalRegistry` — or reuse the `identity_probe_rows()` join that `session_ref_singleflight.rs`'s `live_pty_count_for_session` uses, copying that helper in. The 3-tuple `spawn_server` extension is Task 3's.)
 
 ```rust
 /// kata b8ke Task 4: the fresh-agent→terminal refusal carries the typed
@@ -1595,9 +2203,9 @@ async fn concurrent_terminal_and_fresh_agent_start_same_session_ref_yield_one_wr
 #[tokio::test]
 async fn terminal_create_refusal_names_the_fresh_agent_owner_kind_and_generation() {
     let _env = ENV_LOCK.lock().await;
-    let _sidecar = FakeSidecarEnv::install().await;
-    let (server, url) = spawn_server().await;
-    let ws = connect(url).await;
+    let _sidecar = FakeSidecarEnv::install(); // SYNC at base — no .await
+    let (url, _registry, _ws_state) = spawn_server().await;
+    let ws = connect(&url).await;
     let sid = format!("typed-owner-{}", uuid::Uuid::new_v4());
     // Establish a live freshclaude owner first.
     send_json(&ws, json!({
@@ -1624,7 +2232,6 @@ async fn terminal_create_refusal_names_the_fresh_agent_owner_kind_and_generation
     // NEW additive typed fields:
     assert_eq!(err.get("ownerKind").and_then(|k| k.as_str()), Some("fresh-agent"));
     assert!(err.get("ownerGeneration").and_then(|g| g.as_u64()).unwrap_or(0) >= 1);
-    let _ = server;
 }
 ```
 
@@ -1633,13 +2240,16 @@ async fn terminal_create_refusal_names_the_fresh_agent_owner_kind_and_generation
 /// connection's `ready` frame replays current runtime-owner state, so a
 /// device that missed the handoff broadcast (offline during handoff,
 /// lag-4008 disconnect, page reload) learns the authoritative owner from the
-/// handshake alone.
+/// handshake alone. NOTE (round-1 review): `connect` CONSUMES and discards
+/// the ready frame — the replay assertions use `connect_and_capture_ready`
+/// (the capture variant added above), never a second wait for a frame that
+/// was already read.
 #[tokio::test]
 async fn ready_frame_replays_current_runtime_owners() {
     let _env = ENV_LOCK.lock().await;
-    let sidecar = FakeSidecarEnv::install().await;
-    let (server, url) = spawn_server().await;
-    let ws = connect(url.clone()).await;
+    let sidecar = FakeSidecarEnv::install(); // SYNC at base — no .await
+    let (url, _registry, _ws_state) = spawn_server().await;
+    let ws = connect(&url).await;
     let sid = format!("replay-{}", uuid::Uuid::new_v4());
     send_json(&ws, json!({
         "type": "freshAgent.create", "requestId": "replay-1",
@@ -1651,10 +2261,7 @@ async fn ready_frame_replays_current_runtime_owners() {
     }).await.expect("created");
     // A SECOND connection (the "reloaded/reconnected device"): the ready
     // frame itself carries the owner — no broadcast needed.
-    let ws_b = connect(url).await;
-    let ready = await_frame(&ws_b, Duration::from_secs(20), |v| {
-        v.get("type").and_then(|t| t.as_str()) == Some("ready")
-    }).await.expect("ready");
+    let (ws_b, ready) = connect_and_capture_ready(&url).await;
     let owners = ready.get("runtimeOwners").and_then(|v| v.as_array())
         .expect("runtimeOwners present when the registry is injected");
     assert!(owners.iter().any(|o|
@@ -1672,30 +2279,30 @@ async fn ready_frame_replays_current_runtime_owners() {
         v.get("type").and_then(|t| t.as_str()) == Some("freshAgent.killed")
             && v.get("sessionId").and_then(|s| s.as_str()) == Some(sid.as_str())
     }).await.expect("killed");
-    let ws_c = connect(url).await;
-    let ready_c = await_frame(&ws_c, Duration::from_secs(20), |v| {
-        v.get("type").and_then(|t| t.as_str()) == Some("ready")
-    }).await.expect("ready");
+    let (ws_c, ready_c) = connect_and_capture_ready(&url).await;
     let owners_c = ready_c.get("runtimeOwners").and_then(|v| v.as_array())
         .expect("runtimeOwners present");
     assert!(owners_c.iter().any(|o|
         o.get("sessionId").and_then(|s| s.as_str()) == Some(sid.as_str())
             && o.get("ownerKind").and_then(|k| k.as_str()) == Some("vacant")),
         "released keys must replay as vacant so replay clears stale divergence");
-    let _ = server;
     let _ = sidecar;
+    drop(ws_b);
+    drop(ws_c);
 }
 ```
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `cargo test -p freshell-ws --test cross_kind_liveness concurrent_terminal_and_fresh_agent terminal_create_refusal_names ready_frame_replays`
+Run: `cargo test -p freshell-ws --test cross_kind_liveness`
 
-Expected: FAIL — the typed-owner test fails on the missing `ownerKind`/`ownerGeneration` fields; the race test observes either two sidecar creates or a missing typed answer (the pre-coordinator race is the red); the ready-replay test fails on the absent `runtimeOwners` field (reconnect owner discovery is the missing behavior).
+(a whole-target run — cargo accepts only ONE positional test filter per invocation, so the three new tests are reached via the test-target, not three positional args; round-1 review command fix. Task 3's additions are red at this stage too — expected, they share the target.)
+
+Expected: FAIL — the typed-owner test fails on the missing `ownerKind`/`ownerGeneration` fields; the race test observes a union of live writers > 1 (sidecar + PTY) or a missing typed answer (the pre-coordinator race is the red); the ready-replay test fails on the absent `runtimeOwners` field (reconnect owner discovery is the missing behavior).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-1. `crates/freshell-terminal/Cargo.toml`: add `freshell-ownership = { path = "../freshell-ownership" }`. In `registry.rs`, add `ownership: Option<std::sync::Arc<freshell_ownership::RuntimeOwnershipRegistry>>` (default `None` in `new`) + `with_ownership(...)`. In `kill()` (~:1587, after the binding-prune at :1617-1620) and `finish_pty_exit`, resolve the terminal's `SessionLocator` (already recorded on the terminal row at create/association time — the same locator the D8 claim used) and call `ownership.release(&locator.provider, &locator.session_id, RuntimeOwnerKind::Terminal)`. Beside the registry's own `force_release_after_confirmed_kill` (~:2405-2410), also call the coordinator's `force_release_for_confirmed_kill`.
+1. `crates/freshell-terminal/Cargo.toml`: add `freshell-ownership = { path = "../freshell-ownership" }`. In `registry.rs`, add `ownership: Option<std::sync::Arc<freshell_ownership::RuntimeOwnershipRegistry>>` (default `None` in `new`) + `with_ownership(...)`. Release placement (round-1 review: NEVER release before the kill + confirmed reap — `kill_internal`'s binding-prune at :1617-1620 happens BEFORE `pty.kill()` at :1651-1654, so releasing there would mark the key Vacant while the old writer is still alive): in `kill_internal`, call the fenced `ownership.release(...)` at the END of the function — AFTER the `pty.kill()` block (this port's kill is an immediate SIGKILL-and-reap, so the return point is the confirmed reap) — and in `finish_pty_exit` (the natural-exit confirmation). Both resolve the terminal's `SessionLocator` + the `ReleaseClaim` captured at commit time (the same locator/identity the D8 claim recorded). Beside the registry's own `force_release_after_confirmed_kill` (~:2405-2410), also call the coordinator's fenced `force_release_for_confirmed_kill` with the captured claim — it no-ops on mismatch and never fires during a Handoff.
 
 2. `crates/freshell-ws`: the `freshell-ownership` dep is already present (Task 3 added it for the reconcile guard); add `pub ownership: Option<Arc<freshell_ownership::RuntimeOwnershipRegistry>>` to `WsState` (default `None`; `main.rs` sets it — the `Option` keeps every hand-built test `WsState` compiling unchanged).
 
@@ -1711,9 +2318,14 @@ Expected: FAIL — the typed-owner test fails on the missing `ownerKind`/`ownerG
             freshell_ownership::RuntimeOwnerKind::Terminal,
             &operation_id,
             create.observed_generation,
+            &initiator, // the connection id / "rest" — the transition event's initiator
             now_ms(),
         ) {
-            BeginOutcome::Granted { generation } => Some((operation_id, generation)),
+            BeginOutcome::Granted { generation } => {
+                // Round-1 review: wrap the claim in the RAII OperationTicket —
+                // drop (panic/cancel) performs the typed fail.
+                Some((operation_id, generation))
+            }
             BeginOutcome::AdoptLive { .. } => None, // same-kind live: BoundElsewhere path handles attach
             BeginOutcome::OwnedByOtherKind { owner, generation } => {
                 // Same refusal shape as the D7 guard, now with the typed owner fields.
@@ -1731,7 +2343,7 @@ Expected: FAIL — the typed-owner test fails on the missing `ownerKind`/`ownerG
 
 (Implement `send_create_error_with_owner` as a thin extension of the existing `send_create_error_with_live_terminal` (:3214-3221) that adds `ownerKind`/`ownerGeneration` to the frame — keep the frozen message and the `live_terminal_id: Some`-for-terminal-owners behavior exactly.)
 
-Thread `(operation_id, generation)` into the existing `SessionRefLeaseGuard` (:2174-2198) — it gains `ownership: Option<Arc<RuntimeOwnershipRegistry>>`, `operation_id`, `generation` fields — so its existing complete/fail arms also call `commit_live` (with `OwnerIdentity { kind: Terminal, terminal_id, pid }` — the pid via `set_session_ref_lease_pid`'s twin) and `fail` at the same points the registry lease completes/fails. The D7 guard's fresh-agent arm (:3183-3189) stays as the fast path; the coordinator claim closes its race. The D7 refusal and `send_session_reserved` loser path (:2238-2256) add `ownerKind`/`ownerGeneration` from `ownership.observe(...)` when available (absent when `state.ownership` is `None` — legacy byte-for-byte).
+Thread `(operation_id, generation)` into the existing `SessionRefLeaseGuard` (:2174-2198) — it gains `ownership: Option<Arc<RuntimeOwnershipRegistry>>`, `operation_id`, `generation` fields — so its existing complete/fail arms also call `commit_live` (with `OwnerIdentity { kind: Terminal, terminal_id, pid }` — the pid via `set_session_ref_lease_pid`'s twin) and `fail` at the same points the registry lease completes/fails. UNDER-TICKET MODE (round-1 review: single commit authority): when the create was invoked under a handoff `HandoffToken` (Task 6's runner), the guard's complete arm SKIPS `commit_live` and instead returns the constructed `OwnerIdentity` to its caller — the handoff runner performs the one commit; its fail arm still fires the typed `fail` (the runner's guard tolerates ForeignOperation). The D7 guard's fresh-agent arm (:3183-3189) stays as the fast path; the coordinator claim closes its race. The D7 refusal and `send_session_reserved` loser path (:2238-2256) add `ownerKind`/`ownerGeneration` from `ownership.observe(...)` when available (absent when `state.ownership` is `None` — legacy byte-for-byte).
 
 4. `auto_resume.rs` `claim_session` (:527-547): same claim/commit/fail around the existing registry claim; the crash-recovery respawn carries the observed generation from the crash event (the terminal row's last-known coordinator generation).
 
@@ -1741,7 +2353,10 @@ Thread `(operation_id, generation)` into the existing `SessionRefLeaseGuard` (:2
 /// The handoff runner's spawn token: when Some, the D8 rung's coordinator
 /// claim recognizes the in-flight Handoff (same operation_id, to_kind
 /// Terminal) as a Granted continuation instead of a conflict, and the D7
-/// rung is satisfied by the already-confirmed reap.
+/// rung is satisfied by the already-confirmed reap. Round-1 review
+/// (single commit authority): the settle task runs UNDER-TICKET — it skips
+/// its own coordinator commit and returns the terminal's OwnerIdentity to
+/// the handoff runner, which performs the ONE commit_live.
 pub(crate) struct HandoffToken {
     pub operation_id: String,
     pub generation: u64,
@@ -1756,7 +2371,9 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
 ) -> Result<TerminalSpawnResult, Response> {
     // identical body to spawn_terminal_pane, with the coordinator claim at the
     // D8 rung passing handoff.map(|t| (t.operation_id.as_str(), t.generation))
-    // as the operation identity instead of minting a fresh one.
+    // as the operation identity instead of minting a fresh one — and the settle
+    // task deferring its commit to the runner when under-ticket (it surfaces
+    // the OwnerIdentity instead of committing).
 }
 
 pub(crate) async fn spawn_terminal_pane(...) -> ... { // existing signature unchanged
@@ -1836,29 +2453,30 @@ git commit -m "feat(ownership): wire terminal lane through the coordinator; clos
 
 First extend the `cross_kind_liveness.rs` harness: merge `freshell_freshagent::router(fresh_agent_state)` onto the same axum app (the `rest_claude_identity.rs::spawn_merged_server` pattern, ~:166+) and add a small `http_get_json_status(&server, path) -> u16` helper (raw `TcpStream` HTTP GET with the auth header, copied from that file's `raw_post_tabs`).
 
+CODEX ONLY (round-1 review, validated against the repo): only `freshcodex/codex` invokes `snapshot_runtime_for` and can cold-start a sidecar from a snapshot GET — FreshClaude snapshots are disk reads + a live overlay with NO sidecar spawn, so a freshclaude-based spawn test can never exercise the claimed behavior. Both tests therefore use the CODEX fake harness, the committed fake app-server fixture at `test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs` reached through a dual-role `CODEX_CMD` dispatcher (the `codex_sidecar_reattach_e2e.rs` pattern: argv containing `app-server` routes to the fixture, everything else to a terminal fake — env knobs `FAKE_CODEX_APP_SERVER_BEHAVIOR` / `FAKE_CODEX_APP_SERVER_ARG_LOG`; the sidecar's durable op ledger rows carry `method` (`thread/start`/`thread/resume`) + thread id), and a `sleeper_cli_spec("codex")` terminal spec so a mode-`codex` terminal create genuinely spawns a Running PTY:
+
 ```rust
 /// kata b8ke Task 5: a snapshot GET while a TERMINAL owns the session must
 /// be side-effect-free — zero sidecar spawns, typed 409.
 #[tokio::test]
 async fn snapshot_get_never_spawns_while_a_terminal_owns_the_session() {
     let _env = ENV_LOCK.lock().await;
-    let sidecar = FakeSidecarEnv::install().await;
-    let (server, url) = spawn_server().await;
-    let ws = connect(url).await;
+    let codex_fake = install_dual_role_codex_fake().await; // app-server fixture + arg-log knob
+    let mut h = spawn_merged_server().await; // Harness { base_url, ws, registry, ws_state } — the rest_claude_identity.rs shape
     let sid = format!("snap-term-{}", uuid::Uuid::new_v4());
-    // Terminal owner first.
-    send_json(&ws, json!({
-        "type": "terminal.create", "requestId": "snap-t1", "mode": "claude",
-        "sessionRef": { "provider": "claude", "sessionId": sid },
+    // Terminal owner first (mode codex — the sleeper spec).
+    send_json(&mut h.ws, json!({
+        "type": "terminal.create", "requestId": "snap-t1", "mode": "codex",
+        "sessionRef": { "provider": "codex", "sessionId": sid },
     })).await;
-    let _ = await_frame(&ws, Duration::from_secs(20), |v| {
+    let _ = await_frame(&mut h.ws, Duration::from_secs(20), |v| {
         v.get("type").and_then(|t| t.as_str()) == Some("terminal.created")
     }).await.expect("terminal created");
 
-    let watermark = sidecar.create_rows().await.len();
-    let status = http_get_json_status(&server, &format!("/api/fresh-agent/threads/freshclaude/claude/{sid}")).await;
+    let watermark = codex_fake.arg_log_rows().len();
+    let status = http_get_json_status(&h.base_url, &format!("/api/fresh-agent/threads/freshcodex/codex/{sid}")).await;
     assert_eq!(status, 409, "owned sessions answer typed 409, got {status}");
-    let rows = sidecar.create_rows().await;
+    let rows = codex_fake.arg_log_rows();
     assert_eq!(rows.len(), watermark, "snapshot GET must not spawn a sidecar");
 }
 
@@ -1869,27 +2487,31 @@ async fn snapshot_get_never_spawns_while_a_terminal_owns_the_session() {
 #[tokio::test]
 async fn snapshot_get_cold_start_goes_through_the_coordinator_only_when_vacant() {
     let _env = ENV_LOCK.lock().await;
-    let sidecar = FakeSidecarEnv::install().await;
-    let (server, url) = spawn_server().await;
+    let codex_fake = install_dual_role_codex_fake().await;
+    let h = spawn_merged_server().await;
     let sid = format!("snap-cold-{}", uuid::Uuid::new_v4());
-    let status = http_get_json_status(&server, &format!("/api/fresh-agent/threads/freshclaude/claude/{sid}")).await;
+    let status = http_get_json_status(&h.base_url, &format!("/api/fresh-agent/threads/freshcodex/codex/{sid}")).await;
     assert_eq!(status, 200, "vacant historical sessions still cold-start (compat path)");
-    let rows = sidecar.create_rows().await;
-    assert!(rows.iter().any(|r| r.msg.as_ref().and_then(|m| m.resumeSessionId.as_ref()) == Some(&sid)),
-        "compat cold-start resumed exactly the requested session");
+    let rows = codex_fake.arg_log_rows();
+    assert!(rows.iter().any(|r| r["method"] == json!("thread/resume")
+        && r["thread_id"].as_str() == Some(sid.as_str())),
+        "compat cold-start resumed exactly the requested session (fixture ledger row)");
     // The coordinator now records the live fresh-agent owner.
-    let snap = server.ws_state.fresh_claude.ownership_snapshot("claude", &sid);
+    let snap = h.ws_state.fresh_codex.ownership_snapshot("codex", &sid);
     assert!(matches!(snap.state, freshell_ownership::OwnershipState::Live { .. }),
         "compat cold-start must commit ownership, got {:?}", snap.state);
-    let _ = url;
 }
 ```
 
+(Match the fixture ledger's real row shape at execution time — `codex_sidecar_reattach_e2e.rs:773-790` reads entries keyed on `method` + thread id; keep `ENV_LOCK` discipline since `CODEX_CMD` and the `FAKE_CODEX_*` knobs are process-global. The earlier freshclaude draft asserted the CLAUDE sidecar's `resumeSessionId` log row — wrong lane; the codex fixture's op ledger is the spawn-count surface. `http_get_json_status` takes the merged harness's `base_url`, the `rest_claude_identity.rs` raw-request pattern.)
+
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `cargo test -p freshell-ws --test cross_kind_liveness snapshot_get_never_spawns snapshot_get_cold_start`
+Run: `cargo test -p freshell-ws --test cross_kind_liveness`
 
-Expected: FAIL — the terminal-owned GET currently returns 200 (the spawn path resurrects a sidecar: `rows.len() > watermark`); the cold-start test's `Live` assertion fails (no claim today). Both reds are the missing behavior.
+(a whole-target run — cargo accepts only ONE positional test filter per invocation; round-1 review command fix.)
+
+Expected: FAIL — the terminal-owned GET currently returns 200 (the spawn path resurrects a sidecar: the codex fixture ledger grows past the watermark); the cold-start test's `Live` assertion fails (no claim today). Both reds are the missing behavior.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -1926,7 +2548,7 @@ async fn snapshot_runtime_for(
             match freshell_ownership::BeginOutcome::from_registry_claim(
                 registry.begin_start(PROVIDER, thread_id,
                     freshell_ownership::RuntimeOwnerKind::FreshAgent, &op,
-                    observed_generation, now_epoch_ms()),
+                    observed_generation, "snapshot-get", now_epoch_ms()),
             ) {
                 Granted { generation } => {
                     // The ensure path's own coordinator claim re-claims under the
@@ -1937,7 +2559,7 @@ async fn snapshot_runtime_for(
                     match result {
                         Ok(resumed) => Ok((resumed.client, false)),
                         Err(e) => {
-                            let _ = registry.fail(PROVIDER, thread_id, &op, generation);
+                            let _ = registry.fail(PROVIDER, thread_id, &op, generation, false);
                             Err(CodexSnapshotError::from(e))
                         }
                     }
@@ -2027,14 +2649,21 @@ async fn handoff_to_terminal_reaps_sidecar_before_target_start_and_commits_owner
     // Setup: freshclaude session live (fake sidecar); runner with fresh states +
     // registry + coordinator; a subscribed broadcast receiver.
     // Act: runner.spawn_handoff(HandoffRequest { provider: "claude", session_id: sid,
-    //     target_kind: Terminal, mode: Some("claude"), device_id: Some("dev-a"), .. }) -> rx.
-    // Assert: rx.await -> ok:true, owner.terminal_id set, mode "claude";
+    //     target_kind: Terminal, mode: Some("claude"), device_id: Some("dev-a"), .. }) -> handle.
+    // Assert: handle.completion.await -> ok:true, owner.terminal_id set, mode "claude";
     //         coordinator observe() == Live{Terminal, terminal_id};
     //         broadcast frames: session.runtimeOwner handoff-started then
     //         handoff-committed (terminalId == owner.terminalId);
     //         the sidecar create log has exactly ONE row for sid and its pid is gone
     //         (sidecar log rows carry pid; the kill is awaited before spawn — also
     //         assert the runner's hook event log ordering: Reaped < TargetStarted).
+    // Round-1 review (observability): via the in-process capturing layer
+    //         (diag01_lifecycle_events.rs pattern), assert the COMPLETE field set
+    //         on the representative transitions — ownership.handoff.begin,
+    //         ownership.live.commit, ownership.handoff.done{outcome: committed}
+    //         each carry operation_id, provider, session_id, generation,
+    //         initiator, from_kind/to_kind, runtime_id/pid where applicable,
+    //         duration_ms, and outcome (see the Observability contract).
 }
 
 // 2. Target spawn failure: no blank session, session id preserved, Vacant + typed.
@@ -2062,16 +2691,20 @@ async fn handoff_reap_timeout_returns_typed_and_does_not_start_target_early() {
 //    strand the operation; the detached task still reaches Live{target}.
 #[tokio::test]
 async fn handoff_continues_to_consistency_when_client_disconnects() {
-    // hooks.pause_after_enter = Some(Notify); rx dropped immediately after spawn.
+    // hooks.pause_after_enter = Some(Notify); the HandoffHandle's completion
+    // receiver is dropped immediately after spawn (round-1 review: the
+    // endpoint keeps only the oneshot — dropping it never cancels).
     // Unpark; await the runner's completion via the hook/broadcast; assert
     // coordinator Live{Terminal} and the handoff-committed broadcast fired.
 }
 
 // 5. Guard fail: aborting the handoff task restores prior owner or Vacant —
-//    zero or one owner, never a stranded Handoff.
+//    zero or one owner, never a stranded Handoff. Round-1 review: the
+//    cancellation-capable handle makes this test implementable —
+//    spawn_handoff exposes the JoinHandle (HandoffHandle::abort()).
 #[tokio::test]
 async fn handoff_task_abort_leaves_zero_or_one_owner() {
-    // hooks.pause_after_enter; keep the JoinHandle; abort() it.
+    // hooks.pause_after_enter; keep the HandoffHandle; handle.abort().
     // Assert: observe() is Live{prior} or Vacant (never Handoff/Starting);
     //         a fresh begin_start Granted afterward.
 }
@@ -2098,9 +2731,9 @@ And in `cross_kind_liveness.rs` (merged-router harness from Task 5; add `http_po
 #[tokio::test]
 async fn fresh_agent_to_terminal_handoff_is_atomic_and_broadcast() {
     let _env = ENV_LOCK.lock().await;
-    let sidecar = FakeSidecarEnv::install().await;
-    let (server, url) = spawn_server().await;
-    let ws = connect(url).await;
+    let sidecar = FakeSidecarEnv::install(); // SYNC at base — no .await
+    let (url, _registry, ws_state) = spawn_server().await;
+    let ws = connect(&url).await;
     let sid = format!("ho-e2e-{}", uuid::Uuid::new_v4());
     // Fresh owner.
     send_json(&ws, json!({
@@ -2112,7 +2745,7 @@ async fn fresh_agent_to_terminal_handoff_is_atomic_and_broadcast() {
         v.get("type").and_then(|t| t.as_str()) == Some("freshAgent.created")
     }).await.expect("created");
     // Handoff to terminal via REST.
-    let resp = http_post_json(&server, "/api/sessions/handoff", json!({
+    let resp = http_post_json(&url_http, "/api/sessions/handoff", json!({
         "provider": "claude", "sessionId": sid, "targetKind": "terminal",
         "mode": "claude", "deviceId": "test-device-a",
     })).await;
@@ -2121,7 +2754,7 @@ async fn fresh_agent_to_terminal_handoff_is_atomic_and_broadcast() {
     assert_eq!(body["ok"], serde_json::json!(true));
     let terminal_id = body["owner"]["terminalId"].as_str().expect("terminalId").to_string();
     // The coordinator is Live{Terminal} for (claude, sid).
-    let snap = server.ws_state.ownership.as_ref().unwrap().observe("claude", &sid);
+    let snap = ws_state.ownership.as_ref().unwrap().observe("claude", &sid);
     assert!(matches!(snap.state, freshell_ownership::OwnershipState::Live { ref owner, .. }
         if owner.terminal_id.as_deref() == Some(terminal_id.as_str())));
     // Both broadcast transitions arrived on the WS.
@@ -2134,11 +2767,24 @@ async fn fresh_agent_to_terminal_handoff_is_atomic_and_broadcast() {
             && v.get("transition").and_then(|t| t.as_str()) == Some("handoff-committed")
     }).await.expect("handoff-committed broadcast");
     assert_eq!(committed.get("terminalId").and_then(|t| t.as_str()), Some(terminal_id.as_str()));
-    // A subsequent snapshot GET is typed 409 (terminal owns) — Task 5's contract.
-    let status = http_get_json_status(&server, &format!("/api/fresh-agent/threads/freshclaude/claude/{sid}")).await;
-    assert_eq!(status, 409);
+    // A subsequent freshAgent.create for the session is typed-refused with
+    // the terminal owner (Task 3's lane claim; the claude snapshot GET is a
+    // disk read and is not the refusal surface).
+    send_json(&ws, json!({
+        "type": "freshAgent.create", "requestId": "ho-f2",
+        "sessionType": "freshclaude", "provider": "claude",
+        "sessionRef": { "provider": "claude", "sessionId": sid },
+    })).await;
+    let refused = await_frame(&ws, Duration::from_secs(20), |v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("freshAgent.create.failed")
+            && v.get("requestId").and_then(|r| r.as_str()) == Some("ho-f2")
+    }).await.expect("typed refusal");
+    assert_eq!(refused.get("ownerKind").and_then(|k| k.as_str()), Some("terminal"));
+    let _ = sidecar;
 }
 ```
+
+(`url_http` is the merged harness's HTTP base — the `rest_claude_identity.rs` `Harness.base_url` shape this file's merged-router extension from Task 5 provides; the follow-up refusal assertion reflects the F8 correction: the claude snapshot GET is a disk read with no spawn/refusal semantics, so terminal ownership is proven through the typed fresh-agent refusal instead.)
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
@@ -2227,17 +2873,21 @@ impl SessionHandoffRunner {
         self.test_hooks = Some(hooks); self
     }
 
-    /// Spawn the detached handoff; the HTTP reply rides a oneshot. Dropping
-    /// the receiver (client gone) never cancels the operation.
-    pub fn spawn_handoff(self: &Arc<Self>, req: HandoffRequest) -> oneshot::Receiver<Value> {
+    /// Spawn the detached handoff. Round-1 review: returns a
+    /// CANCELLATION-CAPABLE handle — the `JoinHandle` is exposed (abort()),
+    /// and the HTTP reply rides the oneshot. Dropping the receiver (client
+    /// gone) never cancels the operation; abort() DOES (the RAII guard
+    /// fails the coordinator entry — deterministic cancellation/panic tests
+    /// are implementable through `handle.task.abort()`).
+    pub fn spawn_handoff(self: &Arc<Self>, req: HandoffRequest) -> HandoffHandle {
         let (tx, rx) = oneshot::channel();
         let runner = Arc::clone(self);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let result = runner.run(req).await;
             // Err (dropped receiver) is fine: the operation is detached.
             let _ = tx.send(result);
         });
-        rx
+        HandoffHandle { completion: rx, task }
     }
 
     async fn run(&self, req: HandoffRequest) -> Value {
@@ -2247,7 +2897,7 @@ impl SessionHandoffRunner {
         // 1. Atomically enter Handoff (+generation).
         let entered = self.ownership.begin_handoff(
             &req.provider, &req.session_id, req.target_kind, &operation_id,
-            req.observed_generation, now_ms(),
+            req.observed_generation, &initiator, now_ms(),
         );
         let generation = match entered {
             BeginOutcome::Granted { generation } => generation,
@@ -2267,6 +2917,7 @@ impl SessionHandoffRunner {
             session_id: req.session_id.clone(),
             operation_id: operation_id.clone(),
             generation,
+            prior_still_live: true, // flipped false once the reap confirms the prior died
             disarmed: false,
         };
         // 2. Broadcast the transition (all devices stop old-kind polling).
@@ -2277,64 +2928,128 @@ impl SessionHandoffRunner {
             }
         }
         // 3+4. Stop the prior runtime and await confirmed reap (bounded).
+        // Round-1 review: exit-watcher events arriving DURING Handoff are
+        // folded HERE — release() is fenced to a no-op in Handoff state (Task
+        // 1), so this awaited kill/reap is the single fold point.
         let prior = self.ownership.observe(&req.provider, &req.session_id)
             .state.prior_owner(); // Some((OwnerIdentity, u64)) captured at enter
         if let Some((owner, _)) = prior.as_ref() {
             match self.stop_runtime(&req, owner, &initiator).await {
-                StopResult::Reaped | StopResult::AlreadyGone => {}
+                StopResult::Reaped | StopResult::AlreadyGone => {
+                    guard.prior_still_live = false; // the runner folded the exit event
+                }
                 StopResult::ReapTimeout => {
-                    // Restore the prior record; the exit watcher releases it
-                    // naturally once the dying runtime actually exits.
+                    // The prior is NOT confirmed dead — restore it (still
+                    // live); its fenced exit watcher releases it once it
+                    // actually dies. Round-1 review fail semantics: restore
+                    // ONLY a confirmed-live prior.
                     let _ = guard.disarm_and_fail();
+                    self.broadcast_owner(&req, "handoff-failed", req.target_kind,
+                        None, &operation_id, generation);
                     tracing::warn!(target: "freshell_ownership",
                         event = "ownership.handoff.done", operation_id,
                         provider = %req.provider, session_id = %req.session_id,
-                        generation, outcome = "reap_timeout",
+                        initiator = %initiator, generation,
+                        from_kind = ?owner.kind, to_kind = ?req.target_kind,
+                        outcome = "reap_timeout",
                         duration_ms = began.elapsed().as_millis() as u64,
-                        initiator = %initiator, failure = "REAP_TIMEOUT");
+                        failure = "REAP_TIMEOUT");
                     return typed_failure("REAP_TIMEOUT",
                         "prior runtime did not confirm exit in time", true, generation);
                 }
             }
         }
-        // 5. Start/attach the target under the retained lease.
+        // 5. Start/attach the target UNDER the handoff's ticket (round-1
+        // review: single commit authority). The target paths (Tasks 3/4
+        // under-ticket mode) skip their own coordinator commit and return
+        // the OwnerIdentity; THIS runner performs the one commit_live.
         if let Some(hooks) = self.test_hooks.as_ref() {
             if hooks.fail_target_spawn_once.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                // Prior was reaped: the key must end Vacant, NOT restore the
+                // dead prior (round-1 review).
                 let _ = guard.disarm_and_fail();
+                self.broadcast_owner(&req, "handoff-failed", req.target_kind,
+                    None, &operation_id, generation);
                 return typed_failure("TARGET_SPAWN_FAILED",
                     "target runtime failed to start (session id preserved)", true, generation);
             }
         }
         match self.start_target(&req, &operation_id, generation).await {
             Ok(owner) => {
-                // 6. Commit Live(targetKind) + broadcast owner identity.
-                if self.ownership.commit_live(&req.provider, &req.session_id,
-                    &operation_id, generation, owner.clone()) == CommitOutcome::Committed
+                // 6. THE single commit Live(targetKind) + broadcast owner identity.
+                match self.ownership.commit_live(&req.provider, &req.session_id,
+                    &operation_id, generation, owner.clone())
                 {
-                    guard.disarm();
-                    self.broadcast_owner(&req, "handoff-committed", owner.kind,
-                        owner.terminal_id.clone(), &operation_id, generation);
-                    tracing::info!(target: "freshell_ownership",
-                        event = "ownership.handoff.done", operation_id,
-                        provider = %req.provider, session_id = %req.session_id,
-                        generation, outcome = "committed",
-                        duration_ms = began.elapsed().as_millis() as u64,
-                        initiator = %initiator);
-                    return json!({ "ok": true, "operationId": operation_id,
-                        "generation": generation, "owner": owner_json(&owner, &req) });
+                    CommitOutcome::Committed => {
+                        guard.disarm();
+                        self.broadcast_owner(&req, "handoff-committed", owner.kind,
+                            owner.terminal_id.clone(), &operation_id, generation);
+                        tracing::info!(target: "freshell_ownership",
+                            event = "ownership.handoff.done", operation_id,
+                            provider = %req.provider, session_id = %req.session_id,
+                            initiator = %initiator, generation,
+                            from_kind = ?prior.map(|(o, _)| o.kind), to_kind = ?owner.kind,
+                            runtime_id = ?owner.terminal_id, pid = ?owner.pid,
+                            outcome = "committed",
+                            duration_ms = began.elapsed().as_millis() as u64);
+                        return json!({ "ok": true, "operationId": operation_id,
+                            "generation": generation, "owner": owner_json(&owner, &req) });
+                    }
+                    // Round-1 review: a stale/foreign commit (the ownership
+                    // moved mid-handoff) must REAP the uncommitted target
+                    // runtime — it has no owner record — then fail typed.
+                    stale @ (CommitOutcome::StaleGeneration { .. } | CommitOutcome::ForeignOperation) => {
+                        self.reap_uncommitted_target(&req, &owner).await;
+                        let _ = guard.disarm_and_fail();
+                        self.broadcast_owner(&req, "handoff-failed", req.target_kind,
+                            None, &operation_id, generation);
+                        let current = self.ownership.observe(&req.provider, &req.session_id).generation;
+                        tracing::error!(target: "freshell_ownership",
+                            event = "ownership.handoff.done", operation_id,
+                            provider = %req.provider, session_id = %req.session_id,
+                            initiator = %initiator, generation,
+                            outcome = "stale_commit_reaped_target",
+                            duration_ms = began.elapsed().as_millis() as u64,
+                            failure = "STALE_GENERATION", stale = ?stale);
+                        return typed_failure("STALE_GENERATION",
+                            "ownership moved during handoff; the uncommitted target was reaped",
+                            false, current);
+                    }
                 }
-                typed_failure("STALE_GENERATION", "ownership moved during handoff", false, generation)
             }
             Err((code, detail)) => {
-                // 7. Typed recoverable state — the prior was reaped, so Vacant.
+                // 7. Typed recoverable state — the prior was reaped, so the
+                // key ends Vacant (never restore a dead runtime as Live).
                 let _ = guard.disarm_and_fail();
+                self.broadcast_owner(&req, "handoff-failed", req.target_kind,
+                    None, &operation_id, generation);
                 tracing::warn!(target: "freshell_ownership",
                     event = "ownership.handoff.done", operation_id,
                     provider = %req.provider, session_id = %req.session_id,
-                    generation, outcome = "target_spawn_failed",
+                    initiator = %initiator, generation,
+                    from_kind = ?prior.map(|(o, _)| o.kind), to_kind = ?req.target_kind,
+                    outcome = "target_spawn_failed",
                     duration_ms = began.elapsed().as_millis() as u64,
-                    initiator = %initiator, failure = %code);
+                    failure = %code);
                 typed_failure("TARGET_SPAWN_FAILED", &detail, true, generation)
+            }
+        }
+    }
+
+    /// Round-1 review: reap a target runtime whose commit was refused
+    /// (stale/foreign) — no owner record points at it, so leaving it
+    /// running would be an untracked second writer. Terminal targets:
+    /// registry kill (the immediate SIGKILL-and-reap). Fresh targets: the
+    /// same `kill_for_handoff` path used for priors.
+    async fn reap_uncommitted_target(&self, req: &HandoffRequest, owner: &OwnerIdentity) {
+        match owner.kind {
+            RuntimeOwnerKind::Terminal => {
+                if let Some(terminal_id) = owner.terminal_id.as_deref() {
+                    let _ = self.registry.kill(terminal_id);
+                }
+            }
+            RuntimeOwnerKind::FreshAgent => {
+                let _ = self.stop_runtime(req, owner, "handoff-runner-stale-commit").await;
             }
         }
     }
@@ -2379,6 +3094,13 @@ impl SessionHandoffRunner {
     async fn start_target(&self, req: &HandoffRequest, operation_id: &str, generation: u64)
         -> Result<OwnerIdentity, (String, String)>
     {
+        // Round-1 review: BOTH arms run UNDER-TICKET — they must not commit
+        // ownership themselves (Tasks 3/4 under-ticket mode); they return the
+        // OwnerIdentity and the runner performs the single commit_live.
+        // Session-ID preservation: a returned fresh-agent runtime that does
+        // not serve the canonical (provider, req.session_id) is a
+        // TARGET_SPAWN_FAILED (never accept a respawned-new-thread runtime as
+        // handoff success, never mint a new session id).
         match req.target_kind {
             RuntimeOwnerKind::Terminal => {
                 let body = json!({
@@ -2443,12 +3165,20 @@ impl SessionHandoffRunner {
 /// RAII: fail the coordinator entry if the handoff task is cancelled or
 /// panics before commit (armed + not disarmed => fail on Drop) — the
 /// FreshSessionLeaseGuard drop-discipline precedent (lib.rs:2886-2901).
+/// Round-1 review: the guard TRACKS whether the prior runtime is still
+/// live — the runner sets `prior_still_live = false` once its awaited
+/// kill/reap confirms the prior's death (the runner folds exit-watcher
+/// events; they are no-ops in Handoff state by Task 1's fence). `fail`
+/// restores the prior ONLY when `prior_still_live` is true; otherwise the
+/// key ends Vacant (typed PriorNotLive) — never a dead runtime recorded
+/// as Live.
 struct HandoffGuard {
     ownership: Arc<freshell_ownership::RuntimeOwnershipRegistry>,
     provider: String,
     session_id: String,
     operation_id: String,
     generation: u64,
+    prior_still_live: bool,
     disarmed: bool,
 }
 
@@ -2456,7 +3186,8 @@ impl HandoffGuard {
     fn disarm(&mut self) { self.disarmed = true; }
     fn disarm_and_fail(&mut self) -> freshell_ownership::FailOutcome {
         self.disarmed = true;
-        self.ownership.fail(&self.provider, &self.session_id, &self.operation_id, self.generation)
+        self.ownership.fail(&self.provider, &self.session_id, &self.operation_id,
+            self.generation, self.prior_still_live)
     }
 }
 
@@ -2466,6 +3197,19 @@ impl Drop for HandoffGuard {
             let _ = self.disarm_and_fail();
         }
     }
+}
+
+/// Round-1 review: the cancellation-capable spawn handle. `completion` is
+/// the HTTP reply channel (dropping it never cancels the operation);
+/// `task` is the detached JoinHandle — `abort()` cancels deterministically
+/// (the HandoffGuard Drop then fails the coordinator entry).
+pub struct HandoffHandle {
+    pub completion: oneshot::Receiver<Value>,
+    pub task: tokio::task::JoinHandle<()>,
+}
+
+impl HandoffHandle {
+    pub fn abort(&self) { self.task.abort(); }
 }
 
 fn typed_failure(code: &str, message: &str, retryable: bool, generation: u64) -> Value {
@@ -2555,10 +3299,14 @@ async fn handoff_handler(
         observed_generation: body.get("observedGeneration").and_then(|v| v.as_u64()),
         device_id: body.get("deviceId").and_then(|v| v.as_str()).map(String::from),
     };
-    // The reply rides a oneshot with a bounded HTTP timeout; the operation
-    // itself is detached and outlives the request (test 4 pins this).
-    let mut rx = runner.spawn_handoff(req);
-    match tokio::time::timeout(std::time::Duration::from_secs(30), &mut rx).await {
+    // The reply rides the handle's oneshot with a bounded HTTP timeout; the
+    // operation itself is detached and outlives the request (test 4 pins
+    // this). The endpoint KEEPS only the completion receiver — the exposed
+    // JoinHandle stays available to the runner's host (tests abort through
+    // it; round-1 review).
+    let handle = runner.spawn_handoff(req);
+    let mut completion = handle.completion;
+    match tokio::time::timeout(std::time::Duration::from_secs(30), &mut completion).await {
         Ok(Ok(value)) => {
             let ok = value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
             (if ok { StatusCode::OK } else { StatusCode::CONFLICT }, Json(value))
@@ -2614,115 +3362,140 @@ git commit -m "feat(handoff): atomic server-side session handoff endpoint + type
 ### Task 7: Deterministic pause-hook race suite (snapshot paused, terminal create paused, queued snapshot)
 
 **Files:**
-- Modify: `crates/freshell-freshagent/src/codex.rs` (snapshot pause hook: `FreshCodexState::snapshot_pause: Option<Arc<dyn Fn(&str) + Send + Sync>>` + `set_snapshot_pause_for_tests`; called in `snapshot_runtime_for` after the initial lookup, before the compat decision)
-- Modify: `crates/freshell-freshagent/src/claude.rs` (same hook for the freshclaude snapshot path if its GET shares the ensure pattern; the claude snapshot is a disk read + live overlay, so the hook belongs on the codex lane only — verify and place accordingly)
-- Modify: `crates/freshell-ws/src/terminal.rs` (terminal-create pause hook: `WsState::terminal_create_pause: Option<Arc<dyn Fn(&str) + Send + Sync>>` + `set_terminal_create_pause_for_tests`; called in `handle_create` after the D7 precheck, before the D8 coordinator claim — the notify-sends, the test receives and blocks)
+- Modify: `crates/freshell-freshagent/src/codex.rs` (snapshot pause hook: `FreshCodexState::snapshot_pause: Option<SnapshotPauseHook>` + `set_snapshot_pause_for_tests`; called in `snapshot_runtime_for` after the initial lookup, before the compat decision. CODEX ONLY — round-1 review verdict: the freshclaude snapshot is a disk read + live overlay with NO sidecar spawn, so `claude.rs` is NOT modified; only the codex lane can cold-start and needs pausing)
+- Modify: `crates/freshell-ws/src/terminal.rs` (terminal-create pause hook: `WsState::terminal_create_pause: Option<TerminalCreatePauseHook>` + `set_terminal_create_pause_for_tests`; called in `handle_create` after the D7 precheck, before the D8 coordinator claim)
 - Modify: `crates/freshell-ws/tests/cross_kind_liveness.rs` (the seven deterministic race tests)
 - Test: the new race tests in `cross_kind_liveness.rs`
 
 **Interfaces:**
-- Consumes: Tasks 3-6 (wired lanes, side-effect-free GET, handoff runner + `HandoffTestHooks.pause_after_enter`).
-- Produces: the two test-only pause seams above (injected `Arc<dyn Fn>` closures — the `TerminalLivenessProbe` idiom; never env vars) and the seven deterministic races the kata requires.
+- Consumes: Tasks 3-6 (wired lanes, side-effect-free GET, handoff runner + `HandoffTestHooks.pause_after_enter` + the cancellation-capable `HandoffHandle`).
+- Produces: the two test-only pause seams above and the seven deterministic races the kata requires. Both hook types are ASYNC-BARRIER hooks (round-1 review: a notify-only closure does not pause anything) — `pub type SnapshotPauseHook = Arc<dyn Fn(&str) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>` and the same shape for `TerminalCreatePauseHook`: the hook returns a future the host AWAITS, so a parked GET/create genuinely blocks on its release channel (`tokio::sync::Notify::notified()` — a real barrier), never a bare `notify_waiters()`. Injected `Arc<dyn ...>` closures — the `TerminalLivenessProbe` injection idiom, never env vars; `futures-util` 0.3 is already a `freshell-freshagent` dependency.
 
 - [ ] **Step 1: Write the failing behavioral tests**
 
-The seven races in `cross_kind_liveness.rs` (each takes `ENV_LOCK`; hooks are set on the in-process state before connecting; the fake claude sidecar provides spawn-countable runtimes; the handoff endpoint drives handoffs — Task 6's merged harness):
+The seven races in `cross_kind_liveness.rs` (each takes `ENV_LOCK`; hooks are set on the in-process state before connecting; the dual-role CODEX fake — app-server fixture + terminal fake — provides spawn-countable runtimes via the op ledger; the handoff endpoint drives handoffs — Task 6's merged harness. Round-1 review: the snapshot-pause races are CODEX-lane only; R4-R7 may use either lane's fake):
 
 ```rust
 /// R1: pause a snapshot GET after its initial lookup, begin the
 /// fresh→terminal handoff, then release the snapshot. The released GET
 /// must NOT spawn/register a replacement sidecar (stale generation), and
-/// the terminal becomes the sole owner.
-#[tokio::test]
+/// the terminal becomes the sole owner. CODEX lane (round-1 review: only
+/// freshcodex cold-starts from a snapshot GET — the hook lives on
+/// FreshCodexState, NOT fresh_claude — and the pause is a REAL barrier
+/// awaiting the release Notify, never a bare notify_waiters).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn race_snapshot_paused_after_lookup_cannot_resurrect_during_handoff() {
     let _env = ENV_LOCK.lock().await;
-    let sidecar = FakeSidecarEnv::install().await;
-    let (server, url) = spawn_server().await;
-    let ws = connect(url).await;
+    let codex_fake = install_dual_role_codex_fake().await;
+    let mut h = spawn_merged_server().await;
     let sid = format!("r1-{}", uuid::Uuid::new_v4());
-    // Fresh owner live for sid (create + await created — helper factored from
-    // the Task 6 test).
-    let _fresh = establish_freshclaude_session(&ws, &sid).await;
-    let watermark = sidecar.create_rows().await.len();
-    // Park the snapshot GET after its lookup (tokio mpsc oneshot pair).
-    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    // Fresh OWNER live for sid (freshcodex create + await created — helper
+    // factored from the Task 6 test, codex flavor).
+    let _fresh = establish_freshcodex_session(&mut h, &sid).await;
+    let watermark = codex_fake.arg_log_rows().len();
+    // Park the snapshot GET after its lookup: `entered` signals arrival;
+    // `release` is the barrier the hook AWAITS (multi_thread flavor so the
+    // parked GET's worker does not stall the test driver).
     let entered = Arc::new(tokio::sync::Notify::new());
-    server.ws_state.fresh_claude.set_snapshot_pause_for_tests(Arc::new({
+    let release = Arc::new(tokio::sync::Notify::new());
+    h.ws_state.fresh_codex.set_snapshot_pause_for_tests(Arc::new({
         let entered = Arc::clone(&entered);
-        move |_thread_id| { entered.notify_waiters(); }
+        let release = Arc::clone(&release);
+        move |_thread_id| {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            async move {
+                entered.notify_waiters();
+                release.notified().await; // the REAL barrier
+            }
+            .boxed()
+        }
     }));
     // Fire the GET in the background, wait until it is parked inside the hook.
-    let get_server = server.clone_for_http();
+    let base_url = h.base_url.clone();
+    let sid_for_get = sid.clone();
     let get_task = tokio::spawn(async move {
-        http_get_json_status(&get_server, &format!("/api/fresh-agent/threads/freshclaude/claude/{sid}")).await
+        http_get_json_status(&base_url, &format!("/api/fresh-agent/threads/freshcodex/codex/{sid_for_get}")).await
     });
     entered.notified().await;
     // Begin the fresh→terminal handoff (it must proceed: the GET holds NO lease).
-    let resp = http_post_json(&server, "/api/sessions/handoff", json!({
-        "provider": "claude", "sessionId": sid, "targetKind": "terminal",
-        "mode": "claude", "deviceId": "race-r1",
+    let resp = http_post_json(&h.base_url, "/api/sessions/handoff", json!({
+        "provider": "codex", "sessionId": sid, "targetKind": "terminal",
+        "mode": "codex", "deviceId": "race-r1",
     })).await;
     assert_eq!(resp.status, 200, "{}", resp.body);
     // Release the parked snapshot.
-    let _ = release_tx.send(());
+    release.notify_waiters();
     let status = get_task.await.expect("get task");
     // The stale GET is typed-refused (never a sidecar spawn, never 200-with-resurrection).
     assert_eq!(status, 409, "released stale snapshot must be typed 409");
-    let rows = sidecar.create_rows().await;
+    let rows = codex_fake.arg_log_rows();
     let creates = rows[watermark.min(rows.len())..].iter()
-        .filter(|r| r.msg.as_ref().and_then(|m| m.resumeSessionId.as_ref()) == Some(&sid)).count();
+        .filter(|r| r["method"] == json!("thread/resume")
+            && r["thread_id"].as_str() == Some(sid.as_str())).count();
     assert_eq!(creates, 0, "no replacement sidecar may be spawned by the stale GET");
     // The terminal is the sole owner.
-    let snap = server.ws_state.ownership.as_ref().unwrap().observe("claude", &sid);
+    let snap = h.ws_state.ownership.as_ref().unwrap().observe("codex", &sid);
     assert!(matches!(snap.state, freshell_ownership::OwnershipState::Live { ref owner, .. }
         if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal));
-    let _ = release_rx;
 }
 
 /// R2: pause terminal creation after its precheck, attempt fresh-agent
 /// attach/resume, then release both. One winner; the loser gets a typed
-/// owner/handoff result.
-#[tokio::test]
+/// owner/handoff result. The terminal-create pause is the SAME real-barrier
+/// hook shape (round-1 review: notify-only does not park the create).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn race_terminal_create_paused_after_precheck_vs_fresh_attach_one_winner() {
     let _env = ENV_LOCK.lock().await;
-    let sidecar = FakeSidecarEnv::install().await;
-    let (server, url) = spawn_server().await;
-    let ws_a = connect(url.clone()).await;
-    let ws_b = connect(url).await;
+    let codex_fake = install_dual_role_codex_fake().await;
+    let mut h = spawn_merged_server().await;
+    let mut ws_fresh = connect(&h.ws_url()).await; // second connection (the merged Harness exposes both base_url and a ws_url accessor — a small extension of the rest_claude_identity.rs shape)
     let sid = format!("r2-{}", uuid::Uuid::new_v4());
-    // Park terminal.create after the precheck.
+    // Park terminal.create after the precheck — awaiting the release barrier.
     let entered = Arc::new(tokio::sync::Notify::new());
-    server.ws_state.set_terminal_create_pause_for_tests(Arc::new({
+    let release = Arc::new(tokio::sync::Notify::new());
+    h.ws_state.set_terminal_create_pause_for_tests(Arc::new({
         let entered = Arc::clone(&entered);
-        move |_request_id| { entered.notify_waiters(); }
+        let release = Arc::clone(&release);
+        move |_request_id| {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            async move {
+                entered.notify_waiters();
+                release.notified().await; // the REAL barrier
+            }
+            .boxed()
+        }
     }));
-    send_json(&ws_a, json!({
-        "type": "terminal.create", "requestId": "r2-t1", "mode": "claude",
-        "sessionRef": { "provider": "claude", "sessionId": sid },
+    send_json(&mut h.ws, json!({
+        "type": "terminal.create", "requestId": "r2-t1", "mode": "codex",
+        "sessionRef": { "provider": "codex", "sessionId": sid },
     })).await;
     entered.notified().await;
     // While parked, the fresh attach claims — it must WIN (the parked terminal
     // hold no coordinator lease yet; the claim happens after the pause).
-    send_json(&ws_b, json!({
+    send_json(&mut ws_fresh, json!({
         "type": "freshAgent.create", "requestId": "r2-f1",
-        "sessionType": "freshclaude", "provider": "claude",
-        "sessionRef": { "provider": "claude", "sessionId": sid },
+        "sessionType": "freshcodex", "provider": "codex",
+        "sessionRef": { "provider": "codex", "sessionId": sid },
     })).await;
-    let _ = await_frame(&ws_b, Duration::from_secs(20), |v| {
+    let _ = await_frame(&mut ws_fresh, Duration::from_secs(20), |v| {
         v.get("type").and_then(|t| t.as_str()) == Some("freshAgent.created")
     }).await.expect("fresh wins while terminal parked");
     // Unpark the terminal: its claim now hits Live{FreshAgent} — typed refusal.
-    server.ws_state.set_terminal_create_pause_for_tests(Arc::new(|_| {}));
-    let err = await_frame(&ws_a, Duration::from_secs(20), |v| {
+    release.notify_waiters();
+    let err = await_frame(&mut h.ws, Duration::from_secs(20), |v| {
         v.get("type").and_then(|t| t.as_str()) == Some("error")
             && v.get("requestId").and_then(|r| r.as_str()) == Some("r2-t1")
     }).await.expect("typed loser answer");
     assert_eq!(err.get("code").and_then(|c| c.as_str()), Some("RESTORE_UNAVAILABLE"));
     assert_eq!(err.get("ownerKind").and_then(|k| k.as_str()), Some("fresh-agent"));
-    // Exactly one runtime: one sidecar create, zero PTY rows for sid.
-    let rows = sidecar.create_rows().await;
-    assert!(rows.iter().any(|r| r.msg.as_ref().and_then(|m| m.resumeSessionId.as_ref()) == Some(&sid)));
-    assert_eq!(server.ws_state.registry.session_ref_pty_count("claude", &sid), 0);
+    // Exactly one runtime: one durable resume in the app-server ledger,
+    // zero PTY rows for sid.
+    let rows = codex_fake.arg_log_rows();
+    assert!(rows.iter().any(|r| r["method"] == json!("thread/resume")
+        && r["thread_id"].as_str() == Some(sid.as_str())));
+    assert_eq!(h.ws_state.registry.session_ref_pty_count("codex", &sid), 0);
 }
 
 /// R3: a snapshot queued before "React cleanup" (server-side analog: a
@@ -2776,13 +3549,15 @@ async fn race_browser_disconnect_mid_handoff_reaches_consistent_state() {
 #[tokio::test]
 async fn race_coordinator_cancellation_and_sidecar_crash_leave_consistent_state() {
     // pause_after_enter; spawn the handoff via the runner handle exposed on the
-    // test server state; abort the JoinHandle; assert observe() is Live{prior}
-    // or Vacant (never Handoff); freshAgent.kill the sidecar; assert Vacant;
-    // a new terminal.create Granted.
+    // test server state; ABORT via handle.abort() (round-1 review: the
+    // cancellation-capable HandoffHandle exposes the JoinHandle — dropping
+    // the oneshot receiver intentionally does NOT cancel); assert observe()
+    // is Live{prior} or Vacant (never Handoff); freshAgent.kill the sidecar;
+    // assert Vacant; a new terminal.create Granted.
 }
 ```
 
-(Write the four `// …` bodies fully at execution time — they follow R1/R2's exact mechanics with the stated release points and assertions. R4-R7 reuse Task 6's `HandoffTestHooks`; expose a test setter on the merged harness's runner.)
+(Write the four `// …` bodies fully at execution time — they follow R1/R2's exact mechanics with the stated release points and assertions. R4-R7 reuse Task 6's `HandoffTestHooks`; expose a test setter on the merged harness's runner. Round-1 review observability: at least one race (R4 or R7) also asserts the COMPLETE transition-event field set for `ownership.stop.begin`/`ownership.stop.commit`/`ownership.released` via the file's capturing-layer pattern — the `diag01_lifecycle_events.rs:20-75` idiom — per the Observability contract.)
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
@@ -2792,24 +3567,26 @@ Expected: FAIL — compile errors for the missing pause hooks first; with hooks 
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-1. Snapshot pause hook — `crates/freshell-freshagent/src/codex.rs`:
+1. Snapshot pause hook — `crates/freshell-freshagent/src/codex.rs` (CODEX lane only — round-1 review verdict: freshclaude snapshots are disk reads, no sidecar, nothing to pause):
 
 ```rust
-    /// Test-only seam (kata b8ke): called in `snapshot_runtime_for` AFTER the
-    /// initial lookup and BEFORE the compat cold-start decision, so tests can
-    /// park a GET mid-flight and prove generation fencing. Never set in
-    /// production. The TerminalLivenessProbe injection idiom.
+    /// Test-only seam (kata b8ke): awaited in `snapshot_runtime_for` AFTER
+    /// the initial lookup and BEFORE the compat cold-start decision, so tests
+    /// can park a GET mid-flight and prove generation fencing. ASYNC-BARRIER
+    /// shape (round-1 review): the hook RETURNS a future the caller awaits —
+    /// a notify-only closure would not pause anything. Never set in
+    /// production. The TerminalLivenessProbe injection idiom, async flavor.
     pub fn set_snapshot_pause_for_tests(
         &mut self,
-        hook: Arc<dyn Fn(&str) + Send + Sync>,
+        hook: Arc<dyn Fn(&str) -> futures_util::future::BoxFuture<'static, ()> + Send + Sync>,
     ) {
         self.snapshot_pause = Some(hook);
     }
 ```
 
-and in `snapshot_runtime_for`, immediately after the live-client lookup: `if let Some(hook) = self.snapshot_pause.as_ref() { hook(thread_id); }`.
+and in `snapshot_runtime_for`, immediately after the live-client lookup: `if let Some(hook) = self.snapshot_pause.clone() { hook(thread_id).await; }` (clone the `Option<Arc<...>>` out of `&self` before awaiting — the registry-lock discipline forbids holding any lock across the await; `FreshCodexState`'s interior locks are not held at this point).
 
-2. Terminal-create pause hook — `crates/freshell-ws/src/terminal.rs`: `WsState` gains `pub(crate) terminal_create_pause: Option<Arc<dyn Fn(&str) + Send + Sync>>` (+ `pub fn set_terminal_create_pause_for_tests(...)`), called in `handle_create` after the D7 guard, before the D8 coordinator claim.
+2. Terminal-create pause hook — `crates/freshell-ws/src/terminal.rs`: `WsState` gains `pub(crate) terminal_create_pause: Option<Arc<dyn Fn(&str) -> futures_util::future::BoxFuture<'static, ()> + Send + Sync>>` (+ `pub fn set_terminal_create_pause_for_tests(...)`), AWAITED in `handle_create` after the D7 guard, before the D8 coordinator claim — the same real-barrier discipline (round-1 review: the parked create must genuinely block between precheck and claim or the race is not deterministic).
 
 3. Nothing else — the races are tests over existing Task 3-6 behavior made deterministic by the two hooks.
 
@@ -2821,7 +3598,7 @@ Expected: PASS (the full file: the four original refusals, Tasks 3-6 additions, 
 
 - [ ] **Step 5: Refactor while green**
 
-Factor the repeated "establish freshclaude session + watermark + count creates for sid" helpers into small file-local fns (`establish_freshclaude_session`, `sidecar_creates_for`) mirroring the file's existing helper style.
+Factor the repeated "establish freshcodex session + watermark + count durable resumes for sid" helpers into small file-local fns (`establish_freshcodex_session`, `ledger_resumes_for`) mirroring the file's existing helper style.
 
 - [ ] **Step 6: Run impacted-test verification**
 
@@ -2849,6 +3626,7 @@ git commit -m "test(handoff): deterministic pause-hook race suite for cross-kind
 - Modify: `src/lib/pane-reconcile.ts` (`foldVerdicts`/`foldFreshAgentVerdict` divergence gate on the `respawn`/`fresh` arms)
 - Modify: `src/lib/fresh-agent-ws.ts` (nothing structural — the fold lives in the slice; keep `handleFreshAgentMessage` untouched if the dispatch happens in App)
 - Modify: `src/components/fresh-agent/FreshAgentView.tsx` (poll effect :2508-2515 + snapshot effect :2055-2334 gate on divergence; create effect :1557-1635 sends `observedGeneration` and re-checks before send)
+- Modify: `src/components/TerminalView.tsx` (round-1 review: BOTH directions — a terminal pane observing a FRESH-AGENT owner consumes the same `selectPaneOwnerDivergence` selector; on divergence it stops treating its (dead) terminal as live and renders the Task 9 terminal-side recovery card with a direct "Open as Fresh Agent" attach action; the auto-reattach/`applyReattachToLiveTerminal` guards skip re-attach attempts to the reaped terminal while divergent)
 - Modify: `src/lib/fresh-agent-snapshot-scheduler.ts` (no signature change — fencing is result-application guards per the run-closure contract)
 - Test: `test/unit/client/store/freshAgentSlice.runtime-owner.test.ts` (new), `test/unit/client/store/selectors-runtime-owner.test.ts` (new), `test/unit/client/lib/fresh-agent-ws.test.ts` (new cases), `test/unit/client/lib/pane-reconcile.fresh-agent.test.ts` (new cases — the reconcile divergence gate), `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx` (new cases beside the pinned no-AbortSignal test at :6933-6947)
 
@@ -2856,7 +3634,7 @@ git commit -m "test(handoff): deterministic pause-hook race suite for cross-kind
 - Consumes: Task 2 `SessionRuntimeOwnerMessage`.
 - Produces:
   - `RuntimeOwnerRecord = { provider: string; sessionId: string; generation: number; ownerKind: 'terminal' | 'fresh-agent' | 'vacant'; terminalId?: string; updatedAt: number }` keyed `${provider}:${sessionId}`.
-  - `selectPaneOwnerDivergence(state, { paneKind, provider?, sessionRef?, sessionId? }): { ownerKind: 'terminal' | 'fresh-agent'; terminalId?: string; generation: number } | null` — null when the canonical session has no owner record, the record is `vacant`, or the owner kind MATCHES the pane kind (same-mode attachment stays untouched).
+  - `selectPaneOwnerDivergence(state, { paneKind, provider?, sessionRef?, sessionId? }): { ownerKind: 'terminal' | 'fresh-agent'; terminalId?: string; generation: number } | null` — null when the canonical session has no owner record, the record is `vacant`, or the owner kind MATCHES the pane kind (same-mode attachment stays untouched). `paneKind` accepts BOTH `'fresh-agent'` and `'terminal'` (round-1 review: convergence is bidirectional — a fresh-agent pane observing a terminal owner AND a terminal pane observing a fresh-agent owner both diverge).
   - FreshAgentView's create message carries `observedGeneration` (from the record at effect time) — `buildCreateMessage` (:1205-1227) gains the field.
   - The ready fold (kata b8ke reconnect-owner discovery, T1 rec A4): every `ready.runtimeOwners` entry dispatches `applyRuntimeOwner` BEFORE the pane-reconcile request is built and sent — a device that missed the handoff broadcast (offline during handoff, lag-4008, page reload) converges on its very first post-reconnect reconcile. The reducer is generation-monotonic, so replay interleaved with live broadcasts is safe.
   - The reconcile divergence gate (T1 rec A5): `foldFreshAgentVerdict`'s `respawn`/`fresh` arms skip `resetFreshAgentPaneForReconcileCreate` when `selectPaneOwnerDivergence` is non-null for that pane (key on `sessionRef.sessionId`) — the pane keeps its identity and renders the Task 9 divergence card instead of re-arming a stale-kind create; the fold still reports handled (firing the caller's `onVerdictFolded` → `ws.cancelCreate`, App.tsx:1207) so the pre-verdict create hold is retracted, not flushed at the `RECONCILE_VERDICT_WAIT_MS` bound.
@@ -2949,6 +3727,17 @@ describe('selectPaneOwnerDivergence', () => {
       paneKind: 'fresh-agent', provider: 'codex',
       sessionRef: { provider: 'codex', sessionId: 'sid-OTHER' },
     })).toBeNull()
+  })
+
+  it('diverges a TERMINAL pane whose session is fresh-agent-owned (both directions)', () => {
+    // Round-1 review: the reverse direction — a terminal pane observing a
+    // fresh-agent owner — is the same selector with paneKind 'terminal'.
+    const state = stateWithRuntimeOwner({ provider: 'codex', sessionId: 'sid-1',
+      ownerKind: 'fresh-agent', generation: 6 })
+    expect(selectPaneOwnerDivergence(state, {
+      paneKind: 'terminal', provider: 'codex',
+      sessionRef: { provider: 'codex', sessionId: 'sid-1' },
+    })).toEqual({ ownerKind: 'fresh-agent', generation: 6 })
   })
 })
 ```
@@ -3161,6 +3950,8 @@ And in the ready handler (kata b8ke reconnect-owner discovery, T1 rec A4) — fo
 - Create/rebind effect (:1557-1635): capture `const observedGeneration = selectSessionRuntimeOwner(appStore.getState(), provider, sessionId)?.generation` at effect start; pass it into `buildCreateMessage` (:1205-1227 adds `...(observedGeneration !== undefined ? { observedGeneration } : {})`); immediately before `send`, re-read the store and skip the send when a divergence with a generation `>=` the captured one now exists (the server-side fence is the backstop — Task 2/4 wiring).
 - The snapshot GET call (`getFreshAgentThreadSnapshot` at :2283) adds `observedGeneration` to the query bag when present (Task 5's `?observedGeneration=` param).
 
+`src/components/TerminalView.tsx` (round-1 review: the reverse direction — terminal panes converge too): subscribe to the same selector — `const ownerDivergence = useAppSelector((s) => selectPaneOwnerDivergence(s, { paneKind: 'terminal', provider: paneContent.sessionRef?.provider, sessionRef: paneContent.sessionRef }))`; when `ownerDivergence?.ownerKind === 'fresh-agent'` (the pane's session was handed to a fresh-agent runtime — its terminal was reaped by the handoff): skip any auto-reattach/`applyReattachToLiveTerminal` attempt on the dead `terminalId`, and render the Task 9 terminal-side recovery card (below the terminal surface) with the direct "Open as Fresh Agent here" action — the same divergence contract FreshAgentView implements for the terminal-owner direction. The behavior tests for this direction live with Task 9's TerminalView card tests.
+
 - [ ] **Step 4: Run the focused test**
 
 Run: `npm run test:vitest -- run test/unit/client/store/freshAgentSlice.runtime-owner.test.ts test/unit/client/store/selectors-runtime-owner.test.ts test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/lib/fresh-agent-ws.test.ts test/unit/client/lib/pane-reconcile.fresh-agent.test.ts --config config/vitest/vitest.config.ts`
@@ -3234,13 +4025,23 @@ In `test/unit/client/components/ContextMenuProvider.test.tsx` — extend the ses
     // liveTerminal { terminalId:'t-88' } and the same ses_ id in sessionRef.
   })
 
-  it('handoff failure keeps the pane and surfaces the typed error', async () => {
-    // requestSessionHandoff resolves { ok:false, error:{ code:'REAP_TIMEOUT',
-    //   message:'prior runtime did not confirm exit in time', retryable:true,
-    //   ownerGeneration:3 } }.
-    // Assert: updatePaneContent was NOT dispatched (pane unchanged);
-    //   the pane gained handoffError { code:'REAP_TIMEOUT', retryable:true };
-    //   a Retry action re-invokes requestSessionHandoff with the same identity.
+  it('handoff failure keeps the pane and surfaces the typed error (every typed code)', async () => {
+    // Round-1 review: behavior coverage for EVERY typed failure code, not one.
+    // For EACH code in ['REAP_TIMEOUT', 'TARGET_SPAWN_FAILED', 'STALE_GENERATION',
+    // 'HANDOFF_IN_PROGRESS']:
+    //   requestSessionHandoff resolves { ok:false, error:{ code,
+    //     message, retryable, ownerGeneration:N } }.
+    // Assert per code: updatePaneContent was NOT dispatched (pane unchanged);
+    //   the pane gained handoffError { code, retryable } — the banner renders
+    //   (role="alert") with the code's message; a Retry action re-invokes
+    //   requestSessionHandoff with the SAME provider/sessionId identity; the
+    //   sessionId in every retry body is UNCHANGED (no blank session).
+    // TARGET_SPAWN_FAILED additionally: no fresh session row exists (the
+    //   session id is preserved, never re-minted).
+    // STALE_GENERATION additionally: the retry refreshes observedGeneration
+    //   from the store's runtimeOwners record before sending.
+    // HANDOFF_IN_PROGRESS additionally: the retry is scheduled after a short
+    //   backoff (retryable: true), never an immediate tight loop.
   })
 ```
 
@@ -3261,6 +4062,28 @@ In `test/unit/client/components/TerminalView.lifecycle.test.tsx` (the create-err
   it('typed handoff-in-progress refusal renders a retryable card', async () => {
     // error frame { code:'SESSION_RESERVED', retryable:true, ownerKind:'terminal',
     //   ownerGeneration:2 } -> card with "Retry launch"; no attach button (no liveTerminalId).
+  })
+
+  it('typed stale-generation refusal renders a recoverable card with retry', async () => {
+    // Round-1 review: the stale-generation typed state needs behavior coverage.
+    // error frame { code:'STALE_GENERATION', retryable:false, ownerGeneration:9 }
+    //   -> role="alert" card ("This session moved; retry to pick up the current
+    //   owner") with a "Retry launch" button and NO attach button; clicking
+    //   Retry re-sends terminal.create carrying a REFRESHED observedGeneration
+    //   from the runtimeOwners record (the stale one is never re-sent).
+  })
+
+  it('terminal pane whose session is fresh-agent-owned renders the recovery card with a direct open action', async () => {
+    // Round-1 review (both directions): a TERMINAL pane (mode codex, sessionRef
+    // { provider:'codex', sessionId:'sid-x' }, liveTerminal on a reaped id)
+    // observing a fresh-agent owner — dispatch applyRuntimeOwner({ provider:
+    // 'codex', sessionId:'sid-x', generation:3, ownerKind:'fresh-agent' }).
+    // Assert: role="alert" card "This conversation is open as a Fresh Agent
+    //   pane on another device." with an "Open as Fresh Agent here" button;
+    //   NO re-attach attempt is made to the dead terminalId (the
+    //   applyReattachToLiveTerminal / auto-reattach mocks record zero calls);
+    //   clicking the button dispatches updatePaneContent with fresh-agent
+    //   resume content (kind fresh-agent, same sessionRef — buildResumeContent).
   })
 ```
 
@@ -3468,9 +4291,36 @@ function failureTitle(failure: LaunchFailure): string {
     )}
 ```
 
-Plus the `handoffError` banner (from the ContextMenu failure path) with a Retry button that re-invokes the same handoff.
+Plus the `handoffError` banner (from the ContextMenu failure path) with a Retry button that re-invokes the same handoff — and behavior tests for each typed code (REAP_TIMEOUT / TARGET_SPAWN_FAILED / STALE_GENERATION / HANDOFF_IN_PROGRESS: the banner renders with the code, retry re-invokes with the same identity; STALE_GENERATION refreshes `observedGeneration` first; see the ContextMenu matrix above).
 
-6. `docs/index.html` — add a static mock of a fresh-agent pane showing the "This conversation is open as a terminal on another device." card with the Attach here button (matching the file's existing mock-card style).
+6. `src/components/TerminalView.tsx` — the REVERSE-direction recovery card (round-1 review: terminal panes converge too). When `ownerDivergence?.ownerKind === 'fresh-agent'` (Task 8's selector subscription), render beside the terminal surface:
+
+```tsx
+    {ownerDivergence?.ownerKind === 'fresh-agent' && (
+      <div role="alert" aria-label="Session open as a Fresh Agent pane on another device" className="...">
+        <p>This conversation is open as a Fresh Agent pane on another device.</p>
+        <button
+          type="button"
+          aria-label="Open as Fresh Agent here"
+          onClick={() => dispatch(updatePaneContent({
+            tabId, paneId,
+            content: buildResumeContent({
+              sessionType: freshSessionTypeForProvider(paneContent.sessionRef?.provider),
+              sessionId: paneContent.sessionRef?.sessionId,
+              cwd: paneContent.initialCwd,
+              freshAgentProviderSettings: providerSettings,
+            }),
+          }))}
+        >
+          Open as Fresh Agent here
+        </button>
+      </div>
+    )}
+```
+
+(the same a11y pattern as the FreshAgentView card; `buildResumeContent` + the provider→sessionType mapping reuse Task 9's existing helpers — the swapped content keeps the pane's `sessionRef` untouched, never minting a new session id. While divergent, TerminalView's auto-reattach paths skip the dead `terminalId` — Task 8's wiring.)
+
+7. `docs/index.html` — add a static mock of a fresh-agent pane showing the "This conversation is open as a terminal on another device." card with the Attach here button (matching the file's existing mock-card style).
 
 - [ ] **Step 4: Run the focused test**
 
@@ -3502,20 +4352,23 @@ git commit -m "feat(client): atomic reopen handoff + typed launch-failure recove
 ### Task 10: respawn-pane via LayoutStore + typed ownership responses + attach_pane + REST/MCP parity
 
 **Files:**
-- Modify: `crates/freshell-freshagent/src/pane_ops.rs` (`respawn_pane` :721-774 LayoutStore fallback + typed bodies; `attach_pane` :792-811 implemented via the `session_identity` seam)
-- Modify: `crates/freshell-freshagent/src/layout_store.rs` (a `find_pane_tab(&self, pane_id) -> Option<String>` lookup over per-client snapshots — primary-first, most-recent-first; mirrors `resolve_pane_target`'s existing resolution order)
-- Test: `crates/freshell-freshagent/src/pane_ops_tests.rs` (three new tower-oneshot cases)
+- Modify: `crates/freshell-freshagent/src/pane_ops.rs` (`respawn_pane` :721-774 LayoutStore fallback + typed bodies + the re-sync handshake before the typed 404; `attach_pane` :792-811 implemented via the `session_identity` seam)
+- Modify: `crates/freshell-freshagent/src/layout_store.rs` (a `find_pane_tab(&self, pane_id) -> Option<String>` lookup over per-client snapshots — primary-first, most-recent-first; mirrors `resolve_pane_target`'s existing resolution order. Round-1 review: DURABLE — `LayoutStore::with_persistence(path)` persists the multi-client snapshot to disk (atomic temp+rename, the `~/.freshell/config.json` write discipline) on every `update_from_ui`/prune mutation and loads it on boot, so a server restart does not lose the registry)
+- Modify: `crates/freshell-server/src/main.rs` (construct the LayoutStore with the persistence path under `~/.freshell/` — the config-dir resolution the server already uses)
+- Modify: `src/store/layoutMirrorMiddleware.ts` + `src/App.tsx` (round-1 review: the re-sync handshake's client half — a `ui.command { command: "layout.resync" }` handler resets the mirror's `lastPayload` dedupe gate and re-sends the current layout immediately; minimal, no new subsystem)
+- Test: `crates/freshell-freshagent/src/pane_ops_tests.rs` (the typed cases + the persistence round-trip + the re-sync handshake)
 - Test: `crates/freshell-ws/tests/rest_claude_identity.rs` (one merged-harness parity test: REST + WS + browser-shaped paths consult the one coordinator)
 - Test: `test/e2e-browser/specs/mcp-bridge-rust.spec.ts` (respawn-pane + ownership-conflict cases through the MCP stdio binary)
 - Test: `test/unit/server/mcp/freshell-tool.test.ts` — NO changes expected (the Node MCP tool proxies REST verbatim; if its mocked contract asserts exact request bodies, they are unchanged) — run it to confirm.
+- Test: `test/unit/client/layout-mirror-middleware.test.ts` (the client half of the re-sync handshake — the force-resync behavior case; the suite exists at base).
 
 **Interfaces:**
 - Consumes: Task 4's coordinator-wired `spawn_terminal_pane` D8 rung (typed 409s) + injected `session_identity: Arc<dyn SessionIdentityLookup>` (already on `FreshAgentState`, wired in `main.rs:441-463`); Task 3's `ownership_snapshot`.
 - Produces:
-  - `POST /api/panes/:id/respawn` resolves the pane via `pane_tabs` FIRST, then `LayoutStore::find_pane_tab` (browser-created/error panes work in place); both miss → typed `404 { code: "PANE_NOT_FOUND", message }`; ownership conflicts surface the typed 409 envelope with `ownerKind`/`ownerGeneration`.
+  - `POST /api/panes/:id/respawn` resolves the pane via `pane_tabs` FIRST, then `LayoutStore::find_pane_tab` (browser-created/error panes work in place; the store is durable across server restarts). On a BOTH-miss, the RE-SYNC HANDSHAKE fires before any typed 404 (round-1 review): the server broadcasts `ui.command { command: "layout.resync" }`, waits a bounded window (1.5s — above the mirror's 1s first-sync debounce, per T6's quantified windows) polling `find_pane_tab`, and proceeds if the pane appears; only a still-missing pane answers the typed `404 { code: "PANE_NOT_FOUND", message }`. Ownership conflicts surface the typed 409 envelope with `ownerKind`/`ownerGeneration`.
   - `POST /api/panes/:id/attach` body `{ sessionRef: { provider, sessionId } }`: coordinator observes; terminal-owned → resolves the `terminalId` via `SessionIdentityLookup::terminal_for_session`, broadcasts `ui.command{pane.attach}` with terminal content carrying `liveTerminal`, `200 { ok: true, terminalId }`; other owner/transition → typed 409 owner info. The deferral comment (:776-811) is replaced — the `SessionIdentityLookup` seam (registry.rs:675-678) IS the TerminalIdentityRegistry read surface, wired across the crate boundary exactly for this purpose.
 
-**Respawn data-path rulings (validated by T6, `.worktrees/.the-usual-logs/b8ke-handoff/reports/load-bearing-validator-T6.md`):** LayoutStore snapshots verbatim-retain every well-formed leaf including error panes — terminal panes carry `mode`/`sessionRef`/`initialCwd`/`status` (incl. `create-failed`)/`restoreError` as raw JSON, fresh-agent panes carry `sessionType`/`provider`/`sessionRef`/`status`, and a restore-FAILED pane stays resolvable with its error content folded in (pinned by `layout_store_tests.rs:1038-1106`; base-exact suite 45/45 green). Two quantified residuals are compensated by the typed `PANE_NOT_FOUND` 404 BY DESIGN — no additional machinery: (1) the layout-mirror debounce window (≤200ms steady-state / ≤1s first-sync after page load; a create-then-immediately-respawn race may miss the store — note a FAILED pane re-syncs ~200ms after its error status lands, since the failure fold itself triggers the mirror); (2) no re-sync after a silent WS reconnect or a server restart with a quiescent browser (the mirror is change-gated on `lastPayload`; a page reload always re-sends). Reconstruction keys on `sessionRef`/`initialCwd` — NEVER `resumeSessionId` (persistence strips it on reload, `stripTransientSessionFields`, persistMiddleware.ts:245-270). Under this task's caller-supplies-fields design that ruling is inert; if a later task reads reconstruction fields from the LayoutStore pane content instead, it must read `initialCwd` (not `cwd`) and `sessionRef`.
+**Respawn data-path rulings (validated by T6, `.worktrees/.the-usual-logs/b8ke-handoff/reports/load-bearing-validator-T6.md`):** LayoutStore snapshots verbatim-retain every well-formed leaf including error panes — terminal panes carry `mode`/`sessionRef`/`initialCwd`/`status` (incl. `create-failed`)/`restoreError` as raw JSON, fresh-agent panes carry `sessionType`/`provider`/`sessionRef`/`status`, and a restore-FAILED pane stays resolvable with its error content folded in (pinned by `layout_store_tests.rs:1038-1106`; base-exact suite 45/45 green). T6's two quantified residuals are BOTH compensated by this task's design (round-1 review — the registry is authoritative, not best-effort): (1) the layout-mirror debounce window (≤200ms steady-state / ≤1s first-sync) is closed by the re-sync handshake (the pane's owner client re-syncs on `layout.resync` before the typed 404 fires — a FAILED pane re-syncs ~200ms after its error status lands anyway, since the failure fold itself triggers the mirror, but the handshake covers the create-then-immediately-respawn race); (2) the server-restart/quiescent-browser hole is closed by DURABILITY (persist on update, load on boot) — a restarted server restores the registry from disk, and the `lastPayload` change-gate no longer matters for respawn resolution. The remaining typed `PANE_NOT_FOUND` 404 is reserved for panes no connected or recently-connected browser has EVER synced — the honest answer, BY DESIGN. Reconstruction keys on `sessionRef`/`initialCwd` — NEVER `resumeSessionId` (persistence strips it on reload, `stripTransientSessionFields`, persistMiddleware.ts:245-270). Under this task's caller-supplies-fields design that ruling is inert; if a later task reads reconstruction fields from the LayoutStore pane content instead, it must read `initialCwd` (not `cwd`) and `sessionRef`.
 
 - [ ] **Step 1: Write the failing behavioral tests**
 
@@ -3537,9 +4390,36 @@ async fn respawn_resolves_a_browser_created_pane_through_the_layout_store() {
 
 #[tokio::test]
 async fn respawn_for_a_pane_that_never_populated_pane_tabs_is_typed_not_found() {
-    // No pane_tabs entry, no LayoutStore entry.
+    // No pane_tabs entry, no LayoutStore entry, and a re-sync handshake that
+    // finds nothing (no connected client answers the layout.resync broadcast —
+    // wire the harness's broadcast receiver and assert the ui.command frame
+    // WAS emitted, then let the bounded window elapse).
     // POST respawn -> 404 with body { "code": "PANE_NOT_FOUND", ... } (typed JSON,
     // not the legacy bare "pane not found" string envelope).
+}
+
+#[tokio::test]
+async fn respawn_miss_triggers_the_layout_resync_handshake_and_recovers_the_pane() {
+    // Round-1 review (authoritative registry): a pane that exists in a
+    // CONNECTED browser but missed the mirror debounce (create-then-
+    // immediately-respawn) is recovered by the handshake, not 404'd.
+    // Build the state with a broadcast receiver the test holds; sync NO
+    // layout yet; POST respawn for pane_id -> the handler broadcasts
+    // ui.command { command: "layout.resync" }; the test (acting as the owner
+    // client) responds with state.layout.update_from_ui(&layout_with_pane,
+    // "client-a"); assert 200 { terminalId } once the bounded poll sees the
+    // pane — recovery IN PLACE, no 404.
+}
+
+#[tokio::test]
+async fn layout_store_survives_a_server_restart_via_disk_persistence() {
+    // Round-1 review (authoritative registry): construct the LayoutStore
+    // with a temp persistence path; update_from_ui with a browser layout
+    // containing pane p1; DROP the store (the "restart"); construct a NEW
+    // store on the SAME path — it loads the snapshot on boot.
+    // Assert: find_pane_tab("p1") resolves on the reloaded store, and the
+    // persisted file is valid JSON matching the snapshot shape (atomic
+    // temp+rename — never a partial write observable).
 }
 
 #[tokio::test]
@@ -3638,7 +4518,9 @@ Expected: FAIL — respawn returns the bare "pane not found" for LayoutStore pan
 
 (`client_has_pane` walks the client's layout tree — reuse the pane-walk helpers `resolve_pane_target` already uses.)
 
-2. `pane_ops.rs::respawn_pane` (:738-746) — replace the bare miss:
+DURABILITY (round-1 review — `LayoutStore::with_persistence(path)`): the store gains an optional `persist_path: Option<PathBuf>`; on a `Some` path, every mutation that changes the snapshot set (`update_from_ui`, the stale-entry prune) serializes the multi-client snapshot (the `LayoutInner`'s clients: key, snapshot, stale flag) to disk with the atomic temp+rename discipline (the `~/.freshell/config.json` writer's pattern — write `path.tmp`, fsync, rename), and `LayoutStore::new`/`with_persistence` LOADS it on construction when the file exists (best-effort: a corrupt/absent file logs a warning and boots empty — never a crash). `main.rs` constructs it with `<config_dir>/layout-store.json` beside the existing config resolution. Keep it minimal: no schema versioning beyond a `"version": 1` field, no rotation.
+
+2. `pane_ops.rs::respawn_pane` (:738-746) — replace the bare miss with the re-sync handshake (round-1 review):
 
 ```rust
     let tab_id = state
@@ -3647,18 +4529,23 @@ Expected: FAIL — respawn returns the bare "pane not found" for LayoutStore pan
         .expect("pane_tabs mutex")
         .get(&pane_id)
         .cloned()
-        .or_else(|| state.layout.find_pane_tab(&pane_id))
-        .or_else(|| {
-            // Record pane_id for the typed 404 below before giving up.
-            None
-        });
+        .or_else(|| state.layout.find_pane_tab(&pane_id));
+    // Round-1 review: an authoritative registry misses only when no connected
+    // browser has synced the pane — ask the owner client to re-sync before
+    // giving up (bounded 1.5s poll, above the mirror's 1s first-sync debounce).
+    let tab_id = match tab_id {
+        Some(tab_id) => Some(tab_id),
+        None => try_layout_resync_then_find(&state, &pane_id).await,
+    };
     let Some(tab_id) = tab_id else {
         return fail_json_typed(StatusCode::NOT_FOUND, "PANE_NOT_FOUND",
-            &format!("pane {pane_id} not found in the pane registry or any synced layout"));
+            &format!("pane {pane_id} not found in the pane registry, any synced layout, or the re-sync handshake"));
     };
 ```
 
-(`fail_json_typed` = the JSON envelope `{ "code": ..., "message": ... }` — follow `fail_json_restore_unavailable`'s envelope shape from `terminal_tabs.rs:671-690`. The spawn itself already consults the coordinator via Task 4's D8 rung, producing the typed 409s.)
+(`try_layout_resync_then_find`: broadcast `ui.command { command: "layout.resync" }` on the state's broadcast bus, then poll `state.layout.find_pane_tab(&pane_id)` every 100ms for up to 1.5s; return `Some` the moment it resolves, `None` on window expiry. `fail_json_typed` = the JSON envelope `{ "code": ..., "message": ... }` — follow `fail_json_restore_unavailable`'s envelope shape from `terminal_tabs.rs:671-690`. The spawn itself already consults the coordinator via Task 4's D8 rung, producing the typed 409s.)
+
+5. Client half of the handshake (round-1 review) — `src/App.tsx`'s `ui.command` dispatch chain gains the `"layout.resync"` command: it dispatches a small action the `layoutMirrorMiddleware` exposes (`forceLayoutResync()`), which resets its `lastPayload` dedupe gate and re-sends the current layout immediately (the middleware's existing send path — no new transport). One behavior test extends `test/unit/client/layout-mirror-middleware.test.ts`: dispatching the resync command results in a `ui.layout.sync` send even when the layout is unchanged (the dedupe bypass). Keep minimal — no other client machinery.
 
 3. `pane_ops.rs::attach_pane` (:792-811) — implement:
 
@@ -3730,15 +4617,17 @@ Unify `fail_json_typed`/`fail_json_typed_with_owner` with the existing `fail_jso
 
 Impacted: pane_ops route consumers, MCP tool unit tests (frozen Node tree — confirm unchanged), and the REST e2e family.
 
-Run: `cargo test -p freshell-freshagent && npm run test:vitest -- run test/unit/server/mcp --config config/vitest/vitest.config.ts && bash scripts/e2e-cloud.sh run --local --project=rust-chromium test/e2e-browser/specs/mcp-bridge-rust.spec.ts`
+Run: `cargo test -p freshell-freshagent && npm run test:vitest -- run test/unit/server/mcp --config config/vitest/vitest.server.config.ts && GCLOUD_ROBOT_HOME=/home/dan/.codex/skills/gcloud-robot FRESHELL_GCP_ACCOUNT=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com bash scripts/e2e-cloud.sh run --cloud --project=rust-chromium test/e2e-browser/specs/mcp-bridge-rust.spec.ts`
+
+(Round-1 review command fixes: the MCP unit tests live under `test/unit/server/**`, which the DEFAULT `vitest.config.ts` EXCLUDES — a zero-test pass — so they run under `config/vitest/vitest.server.config.ts` (verify the runner's nonzero test count in the output; a filter that matches no tests is not coverage). The e2e runs on the CONFIGURED cloud backend — `--cloud`, never a `--local` override, per the no-local-substitution policy; the env pins are the Global Constraints' cloud identity.)
 
 Expected: PASS.
 
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add crates/freshell-freshagent/src/pane_ops.rs crates/freshell-freshagent/src/layout_store.rs crates/freshell-freshagent/src/pane_ops_tests.rs crates/freshell-ws/tests/rest_claude_identity.rs test/e2e-browser/specs/mcp-bridge-rust.spec.ts
-git commit -m "feat(panes): LayoutStore-backed respawn + attach + REST/MCP ownership parity"
+git add crates/freshell-freshagent/src/pane_ops.rs crates/freshell-freshagent/src/layout_store.rs crates/freshell-freshagent/src/pane_ops_tests.rs crates/freshell-server/src/main.rs src/store/layoutMirrorMiddleware.ts src/App.tsx test/unit/client crates/freshell-ws/tests/rest_claude_identity.rs test/e2e-browser/specs/mcp-bridge-rust.spec.ts
+git commit -m "feat(panes): durable LayoutStore respawn + re-sync handshake + attach + REST/MCP ownership parity"
 ```
 
 ### Task 11: Two-device Playwright e2e — Codex + OpenCode + offline/reconnect
@@ -3918,7 +4807,9 @@ Registration — `test/e2e-browser/playwright.config.ts`: add `'handoff-two-devi
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `bash scripts/e2e-cloud.sh run --local --project=rust-chromium test/e2e-browser/specs/handoff-two-device-rust.spec.ts`
+Run: `GCLOUD_ROBOT_HOME=/home/dan/.codex/skills/gcloud-robot FRESHELL_GCP_ACCOUNT=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com bash scripts/e2e-cloud.sh run --cloud --project=rust-chromium test/e2e-browser/specs/handoff-two-device-rust.spec.ts`
+
+(Round-1 review: the CONFIGURED backend is cloud — every e2e verification uses `--cloud`, never a `--local` override, per the no-local-substitution policy.)
 
 Expected: FAIL — before Task 9's client work lands this spec cannot pass (the context-menu path still client-orchestrates; no convergence card exists). Within this task's execution order (after Tasks 8-10), the failure mode at red time is the missing dual-role opencode fixture / missing registration (spec runs zero tests — check the runner's test count, not just the exit code) or the first behavioral assertion (no card on the phone, double sidecar).
 
@@ -3928,9 +4819,9 @@ No production code — this task is fixtures + spec + registration. If a behavio
 
 - [ ] **Step 4: Run the focused test**
 
-Run: `bash scripts/e2e-cloud.sh run --local --project=rust-chromium test/e2e-browser/specs/handoff-two-device-rust.spec.ts`
+Run: `GCLOUD_ROBOT_HOME=/home/dan/.codex/skills/gcloud-robot FRESHELL_GCP_ACCOUNT=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com bash scripts/e2e-cloud.sh run --cloud --project=rust-chromium test/e2e-browser/specs/handoff-two-device-rust.spec.ts`
 
-Expected: PASS — 3 tests, with a visible nonzero test count in the runner output (registration proof).
+Expected: PASS — 3 tests, with a visible nonzero test count in the runner output (registration proof — a filter that matches no tests is not coverage).
 
 - [ ] **Step 5: Refactor while green**
 
@@ -3940,7 +4831,7 @@ Deduplicate the per-spec helper copies only if a second consumer appears; per th
 
 Impacted: the rust-chromium project's spec set shape (registration) and the donors' helpers (unchanged).
 
-Run: `bash scripts/e2e-cloud.sh run --local --project=rust-chromium test/e2e-browser/specs/handoff-two-device-rust.spec.ts test/e2e-browser/specs/reconcile-completion-rust.spec.ts test/e2e-browser/specs/mcp-bridge-rust.spec.ts`
+Run: `GCLOUD_ROBOT_HOME=/home/dan/.codex/skills/gcloud-robot FRESHELL_GCP_ACCOUNT=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com bash scripts/e2e-cloud.sh run --cloud --project=rust-chromium test/e2e-browser/specs/handoff-two-device-rust.spec.ts test/e2e-browser/specs/reconcile-completion-rust.spec.ts test/e2e-browser/specs/mcp-bridge-rust.spec.ts`
 
 Expected: PASS (the new spec plus its closest neighbors).
 
@@ -4008,29 +4899,32 @@ The worktree is clean and every gate green; the branch `the-usual/b8ke-handoff` 
 
 ## Observability contract (reference for Tasks 3-6)
 
-Every coordinator transition logs one `tracing` event on `target: "freshell_ownership"` with the join fields as EVENT fields (the `ws.terminal.create.settled` companion pattern):
+Every coordinator transition — begin (start/handoff/stop), commit (live/stop), fail, release, force-release, watchdog recovery, and every handoff phase — logs one `tracing` event on `target: "freshell_ownership"` with the FULL structured field set as EVENT fields (round-1 review: no handoff-only narrowing — the initiating client/device, outcome, duration, and typed failure reason are present at EVERY transition, not just the runner's). Fields not yet known at a transition (e.g. `runtime_id` before spawn) are omitted-when-absent, never narrowed by event type:
 
-| Field | Source |
-|---|---|
-| `operation_id` | every begin/commit/fail/stop/release/handoff event |
-| `provider`, `session_id` | every event |
-| `generation` | every event (the record's generation after the transition) |
-| `kind` / `from_kind` / `to_kind` | begin/commit events |
-| `runtime_id` (`terminal_id`), `live_session_key`, `pid` | commit events |
-| `transition` (`event` dotted name) | every event (`ownership.start.begin`, `ownership.live.commit`, `ownership.handoff.begin`, `ownership.handoff.done`, `ownership.stop.commit`, `ownership.released`, `ownership.begin_start.stale_generation`) |
-| `initiator` / `outcome` / `duration_ms` / `failure` | handoff runner events |
-| invariant violations | `tracing::error!(target: "invariant", ...)` — the existing lease-violation idiom (`registry.rs:2278-2284`, `session_lease.rs:294-296`) |
+| Field | Every transition? | Source |
+|---|---|---|
+| `operation_id` | yes — every begin/commit/fail/stop/release/force-release/handoff/watchdog event (the release events carry the fencing claim's operation) | Task 1 registry |
+| `provider`, `session_id` | yes | every event |
+| `generation` | yes (the record's generation after the transition) | every event |
+| `from_kind` / `to_kind` (old and new runtime kind) | yes where a kind is known — begin/commit/fail/stop/release carry the transition's kinds | Task 1 registry (`OwnershipState::kind()`) |
+| `runtime_id` (`terminal_id`), `live_session_key`, `pid` | yes where a runtime identity applies (commit, release, handoff phases) | `OwnerIdentity` |
+| `transition` (the `event` dotted name) | yes — `ownership.start.begin`, `ownership.start.failed`, `ownership.start.recovered`, `ownership.start.ticket.dropped_unarmed`, `ownership.live.commit`, `ownership.handoff.begin`, `ownership.handoff.failed`, `ownership.handoff.done`, `ownership.stop.begin`, `ownership.stop.commit`, `ownership.released`, `ownership.release.fenced_noop`, `ownership.force_released`, `ownership.begin_start.stale_generation` | every event |
+| `initiator` (initiating client/device/lane) | yes — recorded in the state at `begin_*` and emitted by every subsequent transition on that operation; release/force-release/watchdog events carry the acting watcher identity (`exit-watcher`, `ttl-recovery`, `handoff-runner`) | Task 1 registry |
+| `outcome` | yes — `granted`/`refused`/`committed`/`released`/`recovered_vacant`/`restored_prior_owner`/`vacant`/`no_op` per event | Task 1 registry + Task 6 runner |
+| `duration_ms` | yes at terminal transitions (commit/fail/stop/release computed from the record's `since_ms`; the handoff runner's `ownership.handoff.done` from its own `began`) | Task 1 internal `now_epoch_ms()` |
+| `failure_reason` (typed failure reason) | yes on every non-happy outcome — `STALE_GENERATION`, `START_FAILED`, `STARTING_TIMEOUT`, `TICKET_DROPPED`, `HANDOFF_FAILED`, `PriorNotLive`/`NoPrior`, `RELEASE_FENCE_MISMATCH`, `CONFIRMED_KILL`, plus the runner's `REAP_TIMEOUT`/`TARGET_SPAWN_FAILED` | Task 1 + Task 6 |
+| invariant violations | `tracing::error!(target: "invariant", ...)` — the existing lease-violation idiom (`registry.rs:2278-2284`, `session_lease.rs:294-296`) — e.g. a force-release refused during Handoff, a stale commit_live | Task 1 |
 
-Assertions live in the Task 6/7 tests via the in-process capturing layer (`diag01_lifecycle_events.rs:20-75` pattern — asserts exactly what the production JsonLayer writes, including dual-carrier event fields). No audit-grade history, no viewer refcounts.
+Concrete assertions (round-1 review: the field set is test-enforced, not aspirational): Task 6's in-src tests assert the COMPLETE field set at representative transitions via the in-process capturing layer (the `diag01_lifecycle_events.rs:20-75` pattern replicated in `freshell-freshagent`'s test setup — asserts exactly what the production JsonLayer writes, including dual-carrier event fields): the happy-path test asserts `ownership.handoff.begin` + `ownership.live.commit` + `ownership.handoff.done{outcome: committed}` each carry `operation_id`, `provider`, `session_id`, `generation`, `initiator`, `from_kind`/`to_kind`, `runtime_id`/`pid` where applicable, `duration_ms`, and `outcome`; the failure tests (reap-timeout, target-spawn-failed, abort) assert `ownership.handoff.failed`/`ownership.handoff.done` carry the same set plus `failure_reason`; Task 7's race suite (freshell-ws, where the diag01 capturing pattern already lives) extends the same complete-field assertions to `ownership.stop.begin`, `ownership.stop.commit`, `ownership.released`, and `ownership.release.fenced_noop` (`operation_id`, `initiator`, `generation`, kinds, `runtime_id`/`pid`, `outcome`, `duration_ms` on commit/release, `failure_reason` on the fenced no-op). No audit-grade history, no viewer refcounts.
 
 ## Coverage map (kata test matrix → tasks)
 
 1. Coordinator unit tests (concurrent terminal-vs-fresh start, opposite handoffs, same-kind attach convergence, stop/crash/cancellation/panic, stale generation commit, max-one-writer stress, distinct sessionRefs) → **Task 1**.
 2. Deterministic Rust integration races (snapshot paused, terminal create paused, queued snapshot, reap timeout, target spawn failure, browser disconnect, cancellation/panic + sidecar crash) extending `cross_kind_liveness.rs` → **Tasks 6-7** (plus the outcome-normalized race in **Task 4**).
-3. Client unit/integration tests (sessionRef-only handoff codex+opencode; owner transition stops old-kind scheduling; stale scheduled callback cannot lifecycle-start; typed terminal-owned/fresh-owned/handoff-in-progress/reap-timeout/spawn-failure recoverable states with attach/retry; remote-device handoff updates matching panes only; same-mode multi-device; snapshot GET never spawns) updating the FreshAgentView no-AbortSignal coverage at :6933-6947 → **Tasks 5, 8, 9** (the wire-level "never spawns" proof is Task 5's `snapshot_get_never_spawns_while_a_terminal_owns_the_session`).
+3. Client unit/integration tests (sessionRef-only handoff codex+opencode; owner transition stops old-kind scheduling; stale scheduled callback cannot lifecycle-start; typed terminal-owned/fresh-owned/handoff-in-progress/reap-timeout/spawn-failure/stale-generation recoverable states with attach/retry actions for EACH typed state — round-1 review: the full typed matrix, both convergence directions, fresh-agent panes observing a terminal owner AND terminal panes observing a fresh-agent owner) updating the FreshAgentView no-AbortSignal coverage at :6933-6947 → **Tasks 5, 8, 9** (the wire-level "never spawns" proof is Task 5's `snapshot_get_never_spawns_while_a_terminal_owns_the_session`).
 4. Two-BrowserContext Playwright e2e (codex, opencode, offline/reconnect) → **Task 11**.
-5. REST/MCP recovery parity (browser-created pane via LayoutStore, forced launch failure, respawn in place; pane never in pane_tabs; REST/MCP/browser share the coordinator; typed ownership conflict; no recovery changes session id or launches an empty conversation) → **Tasks 4, 10** (+ Task 6's session-id-preserved typed failures).
-6. Observability assertions on the structured log fields → **Tasks 3, 6, 7** + the reference table above.
+5. REST/MCP recovery parity (browser-created pane via the DURABLE LayoutStore + re-sync handshake, forced launch failure, respawn in place; pane never in pane_tabs; REST/MCP/browser share the coordinator; typed ownership conflict; no recovery changes session id or launches an empty conversation) → **Tasks 4, 10** (+ Task 6's session-id-preserved typed failures).
+6. Observability assertions on the structured log fields (the COMPLETE field set at every coordinator transition — begin/commit/fail/stop/release/force-release/handoff phases) → **Tasks 1, 3, 6, 7** + the reference table above.
 7. Affected e2e specs pass on the configured cloud backend, not in CLOUD_SKIP_SPECS → **Task 12 Step 5**.
 8. Reconnect owner discovery (missed-broadcast recovery: offline during handoff, lag-4008 disconnect, page reload; a terminal-owned session must not re-arm a stale-kind freshAgent.create after reconnect) → **Tasks 1-4** (registry `snapshot_records` + `ready.runtimeOwners` wire type + handshake emission + ready-replay integration test), **Task 3** (owner-aware respawn-counter guard), **Task 8** (ready fold + reconcile divergence gate + tests), **Task 11** (offline/reconnect e2e). Validated by T1 (recommendations A1-A7, `.worktrees/.the-usual-logs/b8ke-handoff/reports/load-bearing-validator-T1.md`).
 
@@ -4040,5 +4934,6 @@ Assertions live in the Task 6/7 tests via the in-process capturing layer (`diag0
 - No stubs, mocks, or test seams are left without a later production task replacing them: the pause hooks (Task 7) are permanent test-only seams in the `TerminalLivenessProbe` injection idiom, not behavior stubs; the fake CLIs are the repo's established e2e provider doubles.
 - Known deliberate divergences, each asserted rather than hidden: snapshot GET cold-start remains (accepted tradeoff, coordinator-gated, Task 5); the WS terminal claim rides the existing `paneReconcileV1` gate (legacy connections keep today's probe-based protection — Task 4).
 - Every command is a focused repo-owned path except Task 12's coordinated gates; destructive suites route through `scripts/sandbox-test.sh`; cloud commands carry the run-state identity pins.
-- Load-bearing validation amendments applied 2026-09-09 (validator reports at `.worktrees/.the-usual-logs/b8ke-handoff/reports/`, cited at each decision site): reconnect owner discovery integrated per T1 recs A1-A6 (`snapshot_records` → `ready.runtimeOwners` → handshake emission → App ready fold → reconcile divergence gate + server-side respawn-counter guard); protocol facts corrected per T3/T4 (version 10 not 8, frozen inventory 64→65 + inventory.rs 104→105, freeze tests run under the port config, handoff-only broadcast scope keeps the T2 wire-type-set differential green); the opencode serve fake corrected to `fixtures/fake-opencode.cjs` per T2 (probe-proven: serve boot + health + ses_* stability + cross-lane resume + daemon survival), with the codex fake-fidelity caveats recorded (no writer-lock, no rollout-existence check — ordering assertable only on the coordinator); offline e2e pairs `setOffline` with `harness.forceDisconnect()` per T5 (setOffline alone blackholes without closing the WS); respawn data-path rulings recorded per T6 (typed PANE_NOT_FOUND compensates the debounce window and server-restart no-re-sync; reconstruction keys on sessionRef/initialCwd, never resumeSessionId); worktree `node_modules` prerequisite added per T4 (Task 3 Step 0); capability-gate and MCP scope rulings recorded per T3 (production-scope reading; MCP coverage at the Rust REST surface).
+- Load-bearing validation amendments applied 2026-09-09 (validator reports at `.worktrees/.the-usual-logs/b8ke-handoff/reports/`, cited at each decision site): reconnect owner discovery integrated per T1 recs A1-A6 (`snapshot_records` → `ready.runtimeOwners` → handshake emission → App ready fold → reconcile divergence gate + server-side respawn-counter guard); protocol facts corrected per T3/T4 (version 10 not 8, frozen inventory 64→65 + inventory.rs 104→105, freeze tests run under the port config, handoff-only broadcast scope keeps the T2 wire-type-set differential green); the opencode serve fake corrected to `fixtures/fake-opencode.cjs` per T2 (probe-proven: serve boot + health + ses_* stability + cross-lane resume + daemon survival), with the codex fake-fidelity caveats recorded (no writer-lock, no rollout-existence check — ordering assertable only on the coordinator); offline e2e pairs `setOffline` with `harness.forceDisconnect()` per T5 (setOffline alone blackholes without closing the WS); respawn data-path rulings recorded per T6 (reconstruction keys on sessionRef/initialCwd, never resumeSessionId); worktree `node_modules` prerequisite added per T4 (Task 3 Step 0); capability-gate and MCP scope rulings recorded per T3 (production-scope reading; MCP coverage at the Rust REST surface).
+- Round-1 review remediation applied 2026-09-10 (16 Major findings, coordinator-adjudicated): the coordinator's stop path holds `Stopping` through the kill with `commit_stop` only after the confirmed reap (never Vacant before reap; typed `BlockedHandoff` refuses a stop during another operation's handoff — terminal counterpart releases after `pty.kill()` + reap); `release`/`force_release_for_confirmed_kill` carry `(operation_id, generation, runtime identity)` fencing claims and no-op on mismatch; create/resume claims ride RAII `OperationTicket`s with a bounded `recover_stale_starts` watchdog; the handoff runner is the SINGLE commit authority (target paths run under-ticket and skip their own commit); `fail` restores a prior owner ONLY when confirmed still live (else `Vacant{PriorNotLive}`), folds exit-watcher events during Handoff itself, broadcasts `handoff-failed` on every failure branch, and reaps an uncommitted target on a stale commit; `spawn_handoff` returns a cancellation-capable `HandoffHandle`. Test sketches corrected to the repo's real types and harnesses (`ErrorMsg` with its required `timestamp`; single cargo test filter per invocation; the cross-kind race asserts the UNION of live writers ≤ 1 sampled across the interleaving; `await_frame`'s panicking `Value` return and `connect`'s consumed ready frame handled via `try_await_frame`/`connect_and_capture_ready`; the snapshot-pause races moved to the codex lane with real async barriers on `FreshCodexState`). Client convergence is bidirectional (terminal panes observe fresh-agent owners too, with the recovery card + direct open action), the typed-state test matrix covers every failure code with attach/retry actions, the pane registry is durable (disk persistence + the `layout.resync` re-sync handshake before any typed 404), every verification command is cloud-legal (`--cloud`, correct `vitest.server.config.ts` for `test/unit/server/**`, nonzero-test-count checks), and the observability contract carries the full field set at every transition with concrete capturing-layer assertions. Scope rulings recorded: the ungated WS path retains the D7 refusal (T3); the Node server is OUT-OF-SCOPE dev-only legacy (follow-up suggestion); the session-ID-preservation rule binds this run's new paths (handoff/respawn recovery), leaving the pre-existing codex crash-respawn self-healing unchanged.
 
