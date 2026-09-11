@@ -439,6 +439,101 @@ pub mod ownership_lane {
         );
     }
 
+    /// b8ke delta round-2 F2: the production start-cancellation settle
+    /// guard. Created by [`register_start_cancellation_for_ticket`]; its
+    /// Drop fires the start's settle signal — the operation's completion
+    /// or unwind (EVERY exit path of the start handler's scope, panic
+    /// included). The watchdog's bounded settle await treats the fired
+    /// signal as the operation's confirmed death.
+    pub struct StartCancellationGuard {
+        settle_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl Drop for StartCancellationGuard {
+        fn drop(&mut self) {
+            if let Some(tx) = self.settle_tx.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    /// The shared sidecar-pid slot behind the fresh lanes' REAL start
+    /// cancellation ([`pid_slot_cancellation`]): the start fills it the
+    /// moment its child spawns; the cancellation closure SIGTERMs the
+    /// recorded pid.
+    pub type SidecarPidSlot = Arc<std::sync::Mutex<Option<u32>>>;
+
+    /// b8ke delta round-2 F2: register a REAL lifecycle start's
+    /// cancellation + settle with the coordinator's watchdog machinery.
+    /// `cancel` kills whatever the operation has spawned so far (the
+    /// sidecar pid slot / the registry row); the returned guard's Drop
+    /// fires the settle when the start handler's scope ends. No-op guard
+    /// when the coordinator is unwired or the caller holds no ticket.
+    pub fn register_start_cancellation_for_ticket(
+        registry: &Option<Arc<RuntimeOwnershipRegistry>>,
+        provider: &str,
+        session_id: &str,
+        ticket: &Option<OperationTicket>,
+        cancel: Arc<dyn Fn() + Send + Sync>,
+    ) -> StartCancellationGuard {
+        let (Some(registry), Some(ticket)) = (registry.as_ref(), ticket.as_ref()) else {
+            return StartCancellationGuard { settle_tx: None };
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        registry.register_start_cancellation(
+            provider,
+            session_id,
+            ticket.operation_id(),
+            ticket.generation(),
+            cancel,
+            Box::new(async move {
+                let _ = rx.await;
+            }),
+        );
+        StartCancellationGuard {
+            settle_tx: Some(tx),
+        }
+    }
+
+    /// A fresh (empty) sidecar pid slot — see [`SidecarPidSlot`].
+    pub fn sidecar_pid_cancel_slot() -> SidecarPidSlot {
+        Arc::new(std::sync::Mutex::new(None))
+    }
+
+    /// The fresh lanes' REAL start cancellation: SIGTERM the spawned
+    /// sidecar's pid — the start's own awaits then fail through their
+    /// existing teardown gates and the operation unwinds (its settle
+    /// fires). A no-op before the child spawns (nothing to cancel).
+    pub fn pid_slot_cancellation(slot: &SidecarPidSlot) -> Arc<dyn Fn() + Send + Sync> {
+        let slot = Arc::clone(slot);
+        Arc::new(move || {
+            if let Some(pid) = *slot.lock().expect("sidecar pid cancel slot lock") {
+                tracing::warn!(target: "freshell_ownership", pid,
+                    event = "ownership.start.cancel_signal",
+                    "the watchdog's start cancellation SIGTERMs the spawned sidecar pid");
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGTERM);
+                }
+            }
+        })
+    }
+
+    /// The post-spawn variant of [`pid_slot_cancellation`]: the claim was
+    /// taken AFTER the child existed, so the cancellation carries the pid
+    /// directly (no slot needed).
+    pub fn sidecar_pid_cancellation(pid: Option<u32>) -> Arc<dyn Fn() + Send + Sync> {
+        Arc::new(move || {
+            if let Some(pid) = pid {
+                tracing::warn!(target: "freshell_ownership", pid,
+                    event = "ownership.start.cancel_signal",
+                    "the watchdog's start cancellation SIGTERMs the spawned sidecar pid");
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGTERM);
+                }
+            }
+        })
+    }
+
     /// Commit a lane claim and retain the stamp: builds the fresh-agent
     /// owner identity (the lane's sessions-map key + the sidecar pid),
     /// commits, and inserts the stamp into `stamps` (the kill/exit

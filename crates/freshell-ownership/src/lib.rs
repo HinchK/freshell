@@ -361,6 +361,16 @@ pub enum FenceReason {
     /// confirmation is IMPOSSIBLE on this platform, so nothing clears the
     /// fence within this boot epoch (the documented tradeoff).
     PlatformLimited,
+    /// b8ke delta round-2 F2: the stale-Starting watchdog could not confirm
+    /// the start operation's death (a blocked/hung start, an unregistered
+    /// settle, or an unconfirmable partial reap). The fence's recovery
+    /// paths: the operation's OWN unwind (its ticket's typed `fail` —
+    /// [`RuntimeOwnershipRegistry::fail`] releases exactly this reason),
+    /// a confirmed-death probe ([`Self::release_fenced`]), or the lane
+    /// teardown paths. Never force-clearable (the r4 acknowledged
+    /// force-clear matches only `PlatformLimited`): a possibly-live start
+    /// is never an operator-acknowledged risk.
+    StaleStart,
 }
 
 impl FenceReason {
@@ -371,6 +381,7 @@ impl FenceReason {
         match self {
             FenceReason::WatcherFailed => "watcher-failed",
             FenceReason::PlatformLimited => "platform-limited",
+            FenceReason::StaleStart => "stale-start",
         }
     }
 }
@@ -1129,6 +1140,35 @@ impl RuntimeOwnershipRegistry {
                         FailOutcome::Vacant { reason }
                     }
                 }
+            }
+            // b8ke delta round-2 F2: the stale-Starting watchdog's
+            // UNCONFIRMED fence, released by the stale-start operation's
+            // OWN unwind. The ticket's Drop performs exactly this `fail`
+            // — the unwind IS the operation's confirmed death (nothing it
+            // created can still commit: every commit in `Fenced` is the
+            // typed foreign refusal), so the fence reopens to Vacant
+            // instead of wedging the session until a server restart.
+            // Scoped to [`FenceReason::StaleStart`] ONLY: the handoff/stop
+            // fences keep the strict release discipline (a confirmed-death
+            // probe + release_fenced, never a stray fail). Fenced exactly
+            // on (operation_id, generation).
+            OwnershipState::Fenced {
+                operation_id: op,
+                reason: FenceReason::StaleStart,
+                ..
+            } if op == operation_id => {
+                let duration_ms = now_epoch_ms()
+                    .saturating_sub(record.state.since_ms().unwrap_or(now_epoch_ms()));
+                record.state = OwnershipState::Vacant;
+                tracing::warn!(target: "freshell_ownership",
+                    event = "ownership.start.watchdog_fence_released_by_unwind",
+                    operation_id, provider, session_id, initiator,
+                    epoch = self.epoch, generation, duration_ms,
+                    outcome = "released_vacant",
+                    "the stale-start operation unwound (its ticket's typed fail) — the \
+                     watchdog's unconfirmed fence releases on the operation's own \
+                     confirmed death");
+                FailOutcome::Released
             }
             _ => FailOutcome::ForeignOperation,
         }
@@ -2619,6 +2659,85 @@ mod tests {
                 None,
                 "test",
                 2
+            ),
+            BeginOutcome::Granted { .. }
+        ));
+    }
+
+    /// b8ke delta round-2 F2: the watchdog's UNCONFIRMED fence releases
+    /// when the stale-start operation UNWINDS — the ticket's typed fail
+    /// on a `Fenced{op, generation}` record IS the operation's own
+    /// confirmed death (the pre-fix `fail()` answered ForeignOperation
+    /// and the fence held forever: a normally-recoverable session wedged
+    /// until a server restart). Fenced exactly on the operation id +
+    /// generation — a foreign fail can never release another operation's
+    /// fence.
+    #[test]
+    fn a_watchdog_fence_releases_when_the_stale_start_operation_unwinds() {
+        let r = RuntimeOwnershipRegistry::new();
+        let BeginOutcome::Granted { generation } = r.begin_start(
+            PROVIDER,
+            "sid",
+            RuntimeOwnerKind::FreshAgent,
+            "op-watchdog",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!()
+        };
+        // The watchdog sweep: Starting → Stopping (nothing registered —
+        // the blocked-before-partial-registration shape).
+        let recovered = r.recover_stale_starts(0, 0);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].operation_id, "op-watchdog");
+        // The watchdog's UNCONFIRMED arm: Stopping → Fenced typed StaleStart.
+        assert!(matches!(
+            r.fence_unconfirmed_stop(
+                PROVIDER,
+                "sid",
+                "op-watchdog",
+                generation,
+                FenceReason::StaleStart
+            ),
+            FenceOutcome::Fenced
+        ));
+        // A foreign fail (a different operation / generation) must NEVER
+        // release this fence.
+        assert!(matches!(
+            r.fail(PROVIDER, "sid", "op-foreign", generation, false),
+            FailOutcome::ForeignOperation
+        ));
+        assert!(matches!(
+            r.observe(PROVIDER, "sid").state,
+            OwnershipState::Fenced { .. }
+        ));
+        assert!(matches!(
+            r.fail(PROVIDER, "sid", "op-watchdog", generation + 1, false),
+            FailOutcome::ForeignOperation
+        ));
+        assert!(matches!(
+            r.observe(PROVIDER, "sid").state,
+            OwnershipState::Fenced { .. }
+        ));
+        // THE OPERATION UNWINDS (the ticket's Drop performs exactly this
+        // fail): the unwind IS the operation's confirmed death — the
+        // watchdog fence releases to Vacant.
+        assert!(matches!(
+            r.fail(PROVIDER, "sid", "op-watchdog", generation, false),
+            FailOutcome::Released
+        ));
+        assert_eq!(r.observe(PROVIDER, "sid").state, OwnershipState::Vacant);
+        // The recovered key reopens for a new writer.
+        assert!(matches!(
+            r.begin_start(
+                PROVIDER,
+                "sid",
+                RuntimeOwnerKind::Terminal,
+                "op-after",
+                None,
+                "test",
+                1
             ),
             BeginOutcome::Granted { .. }
         ));

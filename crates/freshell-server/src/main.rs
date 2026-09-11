@@ -116,6 +116,125 @@ fn snapshot_close_evidence_references(
     }
 }
 
+async fn recover_stale_start(
+    ownership: &Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+    registry: &freshell_terminal::TerminalRegistry,
+    fresh_codex: freshell_freshagent::FreshCodexState,
+    fresh_claude: freshell_freshagent::FreshClaudeState,
+    fresh_opencode: freshell_freshagent::FreshOpencodeState,
+    rec: freshell_ownership::RecoveredStart,
+    settle_budget: std::time::Duration,
+) {
+    // 1. The operation's OWN cancellation first (the registered
+    //    handle — the production start paths register through
+    //    `ownership_lane::register_start_cancellation_for_ticket`).
+    if let Some(cancel) = rec.cancellation.as_ref() {
+        cancel();
+    }
+    // 2. The settle BOUNDED — a timeout means the operation is STILL
+    //    RUNNING: unconfirmed, never Vacant.
+    let operation_dead = match rec.settle {
+        Some(settle) => tokio::time::timeout(settle_budget, Box::into_pin(settle))
+            .await
+            .is_ok(),
+        // Nothing registered: nothing can confirm the operation's
+        // death — fail closed.
+        None => false,
+    };
+    // 3. The partial-runtime reap — CONSUMED. Only a confirmed death
+    //    (or the provable absence of any registered runtime) counts.
+    let runtime_dead = match rec.partial_runtime.as_ref() {
+        // No partial was ever registered: nothing of the start exists
+        // to kill (the operation's own settle decides below).
+        None => true,
+        Some(partial) => match partial.kind {
+            freshell_ownership::RuntimeOwnerKind::Terminal => {
+                match partial.terminal_id.as_deref() {
+                    // A terminal partial always carries its terminal id
+                    // once registered; None is unreachable — fail
+                    // closed.
+                    None => false,
+                    Some(tid) => {
+                        // Best-effort kill (a no-op for an already-dead
+                        // row), then the bounded dead-poll — the
+                        // registry's own row-state truth, not the
+                        // kill's return alone.
+                        let _ = registry.kill(tid);
+                        let deadline =
+                            tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+                        loop {
+                            if registry.terminal_is_dead(tid) {
+                                break true;
+                            }
+                            if tokio::time::Instant::now() >= deadline {
+                                break false;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                        }
+                    }
+                }
+            }
+            freshell_ownership::RuntimeOwnerKind::FreshAgent => match rec.provider.as_str() {
+                "codex" => fresh_codex.kill_raw_for_watchdog(&rec.session_id).await,
+                "claude" => fresh_claude.kill_raw_for_watchdog(&rec.session_id).await,
+                "opencode" => {
+                    fresh_opencode
+                        .fresh_agent()
+                        .opencode_kill_raw_for_watchdog(&rec.session_id)
+                        .await
+                }
+                // An unknown provider's runtime cannot be confirmed —
+                // fail closed.
+                _ => false,
+            },
+        },
+    };
+    // 4. The decision: ONLY confirmed death reopens the key;
+    //    everything unconfirmable fences TYPED (StaleStart — the
+    //    recovery paths are the operation's own unwind release, a
+    //    confirmed-death probe, or the lane teardowns).
+    if operation_dead && runtime_dead {
+        let _ = ownership.commit_stop(
+            &rec.provider,
+            &rec.session_id,
+            &rec.operation_id,
+            rec.generation,
+        );
+        tracing::warn!(target: "freshell_ownership",
+            event = "ownership.start.recovered",
+            operation_id = %rec.operation_id,
+            provider = %rec.provider, session_id = %rec.session_id,
+            initiator = %rec.initiator, from_kind = ?rec.kind,
+            epoch = ownership.boot_epoch(), generation = rec.generation,
+            outcome = "recovered_vacant_confirmed",
+            failure_reason = "STARTING_TIMEOUT",
+            "the stale start's operation settled and its partial runtime is \
+             confirmed dead — the key reopens");
+    } else {
+        let fenced = ownership.fence_unconfirmed_stop(
+            &rec.provider,
+            &rec.session_id,
+            &rec.operation_id,
+            rec.generation,
+            freshell_ownership::FenceReason::StaleStart,
+        );
+        tracing::error!(target: "freshell_ownership",
+            event = "ownership.start.recovery_fenced",
+            operation_id = %rec.operation_id,
+            provider = %rec.provider, session_id = %rec.session_id,
+            initiator = %rec.initiator, from_kind = ?rec.kind,
+            epoch = ownership.boot_epoch(), generation = rec.generation,
+            operation_settled = operation_dead,
+            runtime_confirmed_dead = runtime_dead,
+            outcome = ?fenced,
+            failure_reason = "STARTING_TIMEOUT",
+            "the stale start could NOT be confirmed dead (operation settle \
+             or partial reap unconfirmed) — the key fences typed StaleStart, \
+             NEVER plain Vacant; the operation's own unwind or a confirmed \
+             death probe releases it");
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     // Legacy parity: `import 'dotenv/config'` (`server/index.ts:2-3`) loads
@@ -573,15 +692,21 @@ async fn main() -> ExitCode {
     // recovers leaked tickets (e.g. a detached task killed without unwind)
     // so a stranded Starting claim can never wedge a session.
     // Round-2 review: the sweep CANCELS FIRST — it never flips a live spawn
-    // to Vacant underneath it. Per recovered record the host: aborts the
-    // operation (its registered cancellation handle — the fresh-agent lanes
-    // spawn inline in request-handler tasks, so they register no abort
-    // handle; the raw teardown below IS the cancellation), awaits its settle
-    // (bounded 5s; none registered for the same reason), kills the
-    // registered partial runtime if any via the lane's raw teardown, and
-    // only then commit_stop → Vacant with the typed
-    // ownership.start.recovered failure log (failure_reason =
-    // STARTING_TIMEOUT).
+    // to Vacant underneath it.
+    // b8ke delta round-2 F2: the per-record recovery FAILS CLOSED — the
+    // pre-fix host unconditionally commit_stop'd to plain Vacant (the
+    // registered cancellation was never invoked, settle timeouts were
+    // ignored, and the raw reap results were discarded), so a blocked or
+    // hung start could release the key while its operation/runtime still
+    // proceeded — a competing lifecycle request then took ownership and the
+    // one-writer guarantee broke. The recovery now: invoke the operation's
+    // registered cancellation; await its settle BOUNDED (a timeout is
+    // UNCONFIRMED); consume the partial-runtime reap results (an
+    // unconfirmable reap is UNCONFIRMED); and only CONFIRMED death reopens
+    // the key — everything unconfirmable fences with the TYPED
+    // `StaleStart` reason, whose recovery paths are the operation's own
+    // unwind (the ticket's typed fail releases exactly this fence), a
+    // confirmed-death probe (`release_fenced`), or the lane teardowns.
     {
         let ownership = Arc::clone(&ownership);
         let registry = registry.clone();
@@ -597,63 +722,16 @@ async fn main() -> ExitCode {
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
                 for rec in ownership.recover_stale_starts(now, 30_000) {
-                    if let Some(settle) = rec.settle {
-                        let _ = tokio::time::timeout(
-                            std::time::Duration::from_secs(5),
-                            Box::into_pin(settle),
-                        )
-                        .await;
-                    }
-                    if let Some(partial) = rec.partial_runtime.as_ref() {
-                        // Raw teardown of the uncommitted partial runtime
-                        // (the lane helpers key off the session id; a
-                        // terminal partial is killed by terminal id).
-                        match partial.kind {
-                            freshell_ownership::RuntimeOwnerKind::Terminal => {
-                                if let Some(tid) = partial.terminal_id.as_deref() {
-                                    let _ = registry.kill(tid);
-                                }
-                            }
-                            freshell_ownership::RuntimeOwnerKind::FreshAgent => {
-                                match rec.provider.as_str() {
-                                    "codex" => {
-                                        let _ = fresh_codex
-                                            .kill_raw_for_watchdog(&rec.session_id)
-                                            .await;
-                                    }
-                                    "claude" => {
-                                        let _ = fresh_claude
-                                            .kill_raw_for_watchdog(&rec.session_id)
-                                            .await;
-                                    }
-                                    "opencode" => {
-                                        // OpenCode: the shared serve is
-                                        // never a kill target — there is
-                                        // no partial runtime to reap.
-                                        let _ = fresh_opencode
-                                            .fresh_agent()
-                                            .opencode_kill_raw_for_watchdog(&rec.session_id)
-                                            .await;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                    let _ = ownership.commit_stop(
-                        &rec.provider,
-                        &rec.session_id,
-                        &rec.operation_id,
-                        rec.generation,
-                    );
-                    tracing::warn!(target: "freshell_ownership",
-                        event = "ownership.start.recovered",
-                        operation_id = %rec.operation_id,
-                        provider = %rec.provider, session_id = %rec.session_id,
-                        initiator = %rec.initiator, from_kind = ?rec.kind,
-                        epoch = ownership.boot_epoch(), generation = rec.generation,
-                        outcome = "recovered_vacant",
-                        failure_reason = "STARTING_TIMEOUT");
+                    recover_stale_start(
+                        &ownership,
+                        &registry,
+                        fresh_codex.clone(),
+                        fresh_claude.clone(),
+                        fresh_opencode.clone(),
+                        rec,
+                        std::time::Duration::from_secs(5),
+                    )
+                    .await;
                 }
             }
         });
@@ -3922,5 +4000,293 @@ mod tests {
         load_dotenv_from(&dir);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// b8ke delta round-2 F2: the stale-Starting watchdog's PRODUCTION-path
+/// tests — the per-record recovery (`recover_stale_start`, the same
+/// function the production loop drives) against a REAL coordinator and
+/// REAL lane states, replacing the old coordinator-unit demonstration of
+/// a hypothetical host. The matrix: an UNREGISTERED stale start (the
+/// blocked/hung shape) fences typed StaleStart — NEVER plain Vacant (the
+/// pre-fix watchdog commit_stop'd unconditionally, releasing the key
+/// while the operation could still proceed); a REGISTERED start's
+/// cancellation is invoked and its completed settle + confirmed partial
+/// reap vacate; an unconfirmed partial reap fences; the operation's own
+/// unwind releases the fence.
+#[cfg(test)]
+mod stale_start_watchdog_tests {
+    use super::*;
+    use freshell_ownership::{BeginOutcome, FenceReason, OwnershipState, RuntimeOwnershipRegistry};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    type WatchdogStates = (
+        Arc<RuntimeOwnershipRegistry>,
+        freshell_terminal::TerminalRegistry,
+        freshell_freshagent::FreshCodexState,
+        freshell_freshagent::FreshClaudeState,
+        freshell_freshagent::FreshOpencodeState,
+    );
+
+    fn watchdog_states() -> WatchdogStates {
+        let ownership = Arc::new(RuntimeOwnershipRegistry::new());
+        let registry = freshell_terminal::TerminalRegistry::new();
+        let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
+        let auth_token = Arc::new("stale-start-watchdog-test-token".to_string());
+        let fresh_codex = freshell_freshagent::FreshCodexState::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+            serde_json::json!({ "freshAgent": { "enabled": true } }),
+        );
+        let fresh_claude = freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx));
+        let fresh_agent =
+            freshell_freshagent::FreshAgentState::new(Arc::clone(&auth_token), broadcast_tx);
+        let fresh_opencode = freshell_freshagent::FreshOpencodeState::new(fresh_agent);
+        (
+            ownership,
+            registry,
+            fresh_codex,
+            fresh_claude,
+            fresh_opencode,
+        )
+    }
+
+    async fn begin_stale_start(ownership: &Arc<RuntimeOwnershipRegistry>, op: &str) -> u64 {
+        let BeginOutcome::Granted { generation } = ownership.begin_start(
+            "claude",
+            "sid-stale",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            op,
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("expected Granted")
+        };
+        generation
+    }
+
+    /// Recover THE one stale start through the PRODUCTION function.
+    async fn recover_one(states: &WatchdogStates, settle_budget: std::time::Duration) {
+        let recs = states.0.recover_stale_starts(0, 0);
+        assert_eq!(recs.len(), 1, "exactly one stale start recovered");
+        let rec = recs.into_iter().next().unwrap();
+        recover_stale_start(
+            &states.0,
+            &states.1,
+            states.2.clone(),
+            states.3.clone(),
+            states.4.clone(),
+            rec,
+            settle_budget,
+        )
+        .await;
+        // The recovery consumed the record: no second recovery fires.
+        assert!(states.0.recover_stale_starts(0, 0).is_empty());
+    }
+
+    /// THE F2 red/green: an UNREGISTERED stale start (nothing can confirm
+    /// the operation's death) fences typed StaleStart — pre-fix the
+    /// watchdog commit_stop'd unconditionally to plain Vacant, releasing
+    /// the key while the blocked operation/runtime could still proceed.
+    #[tokio::test]
+    async fn an_unregistered_stale_start_fences_never_vacant() {
+        let states = watchdog_states();
+        begin_stale_start(&states.0, "op-unregistered").await;
+        // Nothing registered: no cancellation, no settle, no partial.
+        let _ = recover_one(&states, std::time::Duration::from_millis(50)).await;
+        assert!(
+            matches!(
+                states.0.observe("claude", "sid-stale").state,
+                OwnershipState::Fenced {
+                    reason: FenceReason::StaleStart,
+                    ..
+                }
+            ),
+            "the unregistered stale start must fence typed, got {:?}",
+            states.0.observe("claude", "sid-stale").state
+        );
+        // A competing lifecycle request is BLOCKED through the fence —
+        // the one-writer guarantee holds.
+        assert!(matches!(
+            states.0.begin_start(
+                "claude",
+                "sid-stale",
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "op-competing",
+                None,
+                "test",
+                1,
+            ),
+            BeginOutcome::Blocked { .. }
+        ));
+    }
+
+    /// The production-path cancellation test (replacing the old
+    /// hypothetical-host unit demonstration): a start registered through
+    /// the PRODUCTION helper (`register_start_cancellation_for_ticket`)
+    /// has its cancellation INVOKED by the watchdog, and the fired settle
+    /// (the guard's Drop — the operation's completed unwind) + the
+    /// confirmed partial reap vacate the key.
+    #[tokio::test]
+    async fn a_registered_stale_start_cancellation_is_invoked_and_the_settled_key_vacates() {
+        let states = watchdog_states();
+        let generation = begin_stale_start(&states.0, "op-registered").await;
+        // The PRODUCTION registration: a REAL ticket + the shared helper
+        // the claude/codex/terminal lanes use.
+        // The PRODUCTION shape: the start HOLDS its ticket (own_ticket)
+        // while it runs — the RAII drop is the operation's typed unwind.
+        let own_ticket = Some(freshell_ownership::OperationTicket::new(
+            Arc::clone(&states.0),
+            "claude",
+            "sid-stale",
+            "op-registered",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            generation,
+            "test",
+        ));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel = {
+            let cancelled = Arc::clone(&cancelled);
+            Arc::new(move || cancelled.store(true, Ordering::SeqCst)) as Arc<dyn Fn() + Send + Sync>
+        };
+        let guard = freshell_freshagent::ownership_lane::register_start_cancellation_for_ticket(
+            &Some(Arc::clone(&states.0)),
+            "claude",
+            "sid-stale",
+            &own_ticket,
+            cancel,
+        );
+        // The partial runtime: a TERMINAL identity for a terminal id with
+        // no registry row — the watchdog's kill is a no-op and the
+        // dead-poll confirms (a provably-dead runtime).
+        states.0.register_partial_runtime(
+            "claude",
+            "sid-stale",
+            "op-registered",
+            generation,
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                terminal_id: Some("t-never-existed".into()),
+                live_session_key: None,
+                pid: None,
+                ownership_id: None,
+            },
+        );
+        // The operation COMPLETES: the guard's Drop fires the settle.
+        drop(guard);
+
+        let recs = states.0.recover_stale_starts(0, 0);
+        assert_eq!(recs.len(), 1);
+        recover_stale_start(
+            &states.0,
+            &states.1,
+            states.2.clone(),
+            states.3.clone(),
+            states.4.clone(),
+            recs.into_iter().next().unwrap(),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "the watchdog must invoke the registered start cancellation"
+        );
+        assert_eq!(
+            states.0.observe("claude", "sid-stale").state,
+            OwnershipState::Vacant,
+            "the settled operation + confirmed-dead partial vacate the key"
+        );
+    }
+
+    /// A registered start whose settle NEVER fires (the operation is still
+    /// running) fences — the settle timeout is UNCONFIRMED, never Vacant.
+    #[tokio::test]
+    async fn a_settle_timeout_fences_the_still_running_start() {
+        let states = watchdog_states();
+        let generation = begin_stale_start(&states.0, "op-settle-timeout").await;
+        // The start HOLDS its ticket (the operation is still running).
+        let own_ticket = Some(freshell_ownership::OperationTicket::new(
+            Arc::clone(&states.0),
+            "claude",
+            "sid-stale",
+            "op-settle-timeout",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            generation,
+            "test",
+        ));
+        // The guard is HELD (never dropped): the operation never settles.
+        let _guard = freshell_freshagent::ownership_lane::register_start_cancellation_for_ticket(
+            &Some(Arc::clone(&states.0)),
+            "claude",
+            "sid-stale",
+            &own_ticket,
+            Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>,
+        );
+        let _ = recover_one(&states, std::time::Duration::from_millis(50)).await;
+        assert!(
+            matches!(
+                states.0.observe("claude", "sid-stale").state,
+                OwnershipState::Fenced {
+                    reason: FenceReason::StaleStart,
+                    ..
+                }
+            ),
+            "the settle timeout is UNCONFIRMED — the still-running start's key fences, \
+             never Vacant"
+        );
+        // THE RECOVERY (the ownership-layer test pins it too): the
+        // operation's own unwind (its ticket's typed fail) releases the
+        // watchdog fence.
+        assert!(matches!(
+            states.0.fail(
+                "claude",
+                "sid-stale",
+                "op-settle-timeout",
+                generation,
+                false
+            ),
+            freshell_ownership::FailOutcome::Released
+        ));
+        assert_eq!(
+            states.0.observe("claude", "sid-stale").state,
+            OwnershipState::Vacant
+        );
+    }
+
+    /// An UNCONFIRMABLE partial reap (a fresh-agent partial whose lane raw
+    /// kill answers false) fences — the reap result is CONSUMED, never
+    /// discarded into a Vacant.
+    #[tokio::test]
+    async fn an_unconfirmable_partial_reap_fences_the_key() {
+        let states = watchdog_states();
+        let generation = begin_stale_start(&states.0, "op-reap-false").await;
+        // A FRESH partial under a session the (empty) claude lane cannot
+        // confirm — kill_raw_for_watchdog answers false.
+        states.0.register_partial_runtime(
+            "claude",
+            "sid-stale",
+            "op-reap-false",
+            generation,
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                terminal_id: None,
+                live_session_key: Some("sid-stale".into()),
+                pid: Some(999_999),
+                ownership_id: None,
+            },
+        );
+        let _ = recover_one(&states, std::time::Duration::from_millis(50)).await;
+        assert!(
+            matches!(
+                states.0.observe("claude", "sid-stale").state,
+                OwnershipState::Fenced {
+                    reason: FenceReason::StaleStart,
+                    ..
+                }
+            ),
+            "the false raw reap must fence, never release to Vacant"
+        );
     }
 }

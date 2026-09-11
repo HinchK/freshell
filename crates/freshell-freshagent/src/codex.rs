@@ -1408,6 +1408,18 @@ impl FreshCodexState {
             }
         };
         let sidecar_pid = child.id();
+        // b8ke delta round-2 F2: the start's watchdog machinery — the
+        // direct-pid cancellation (the child exists: the watchdog's cancel
+        // SIGTERMs it; the start's own gates tear down and unwind) + the
+        // settle guard held to this handler's end (the watchdog's bounded
+        // settle treats its firing as the operation's confirmed death).
+        let _start_cancellation = crate::ownership_lane::register_start_cancellation_for_ticket(
+            &self.ownership,
+            PROVIDER,
+            &thread_id,
+            &own_ticket,
+            crate::ownership_lane::sidecar_pid_cancellation(sidecar_pid),
+        );
         crate::ownership_lane::register_partial_fresh_runtime(
             &self.ownership,
             PROVIDER,
@@ -1637,6 +1649,18 @@ impl FreshCodexState {
         // kata b8ke Task 3: register the spawn's partial runtime for the
         // watchdog (the resume lane's claim happened in `handle_create`).
         let sidecar_pid = child.id();
+        // b8ke delta round-2 F2: the start's watchdog machinery — the
+        // direct-pid cancellation (the child exists: the watchdog's cancel
+        // SIGTERMs it; the start's own gates tear down and unwind) + the
+        // settle guard held to this handler's end (the watchdog's bounded
+        // settle treats its firing as the operation's confirmed death).
+        let _start_cancellation = crate::ownership_lane::register_start_cancellation_for_ticket(
+            &self.ownership,
+            PROVIDER,
+            &thread_id,
+            &own_ticket,
+            crate::ownership_lane::sidecar_pid_cancellation(sidecar_pid),
+        );
         crate::ownership_lane::register_partial_fresh_runtime(
             &self.ownership,
             PROVIDER,
@@ -3243,6 +3267,18 @@ impl FreshCodexState {
         // kata b8ke Task 3: the child sidecar exists — register its partial
         // runtime for the watchdog (before the commit below).
         let child_pid = child_proc.id();
+        // b8ke delta round-2 F2: the start's watchdog machinery — the
+        // direct-pid cancellation (the child exists: the watchdog's cancel
+        // SIGTERMs it; the start's own gates tear down and unwind) + the
+        // settle guard held to this handler's end (the watchdog's bounded
+        // settle treats its firing as the operation's confirmed death).
+        let _start_cancellation = crate::ownership_lane::register_start_cancellation_for_ticket(
+            &self.ownership,
+            PROVIDER,
+            &child_id,
+            &own_ticket,
+            crate::ownership_lane::sidecar_pid_cancellation(child_pid),
+        );
         crate::ownership_lane::register_partial_fresh_runtime(
             &self.ownership,
             PROVIDER,
@@ -4076,6 +4112,18 @@ impl FreshCodexState {
         }
         // kata b8ke Task 3: the spawn's partial runtime for the watchdog.
         let sidecar_pid = child.id();
+        // b8ke delta round-2 F2: the start's watchdog machinery — the
+        // direct-pid cancellation (the child exists: the watchdog's cancel
+        // SIGTERMs it; the start's own gates tear down and unwind) + the
+        // settle guard held to this handler's end (the watchdog's bounded
+        // settle treats its firing as the operation's confirmed death).
+        let _start_cancellation = crate::ownership_lane::register_start_cancellation_for_ticket(
+            &self.ownership,
+            PROVIDER,
+            session_id,
+            &own_ticket,
+            crate::ownership_lane::sidecar_pid_cancellation(sidecar_pid),
+        );
         crate::ownership_lane::register_partial_fresh_runtime(
             &self.ownership,
             PROVIDER,
@@ -4450,6 +4498,18 @@ impl FreshCodexState {
             }
         };
         let sidecar_pid = child.id();
+        // b8ke delta round-2 F2: the start's watchdog machinery — the
+        // direct-pid cancellation (the child exists: the watchdog's cancel
+        // SIGTERMs it; the start's own gates tear down and unwind) + the
+        // settle guard held to this handler's end (the watchdog's bounded
+        // settle treats its firing as the operation's confirmed death).
+        let _start_cancellation = crate::ownership_lane::register_start_cancellation_for_ticket(
+            &self.ownership,
+            PROVIDER,
+            &new_thread_id,
+            &own_ticket,
+            crate::ownership_lane::sidecar_pid_cancellation(sidecar_pid),
+        );
         crate::ownership_lane::register_partial_fresh_runtime(
             &self.ownership,
             PROVIDER,
@@ -5395,6 +5455,18 @@ impl FreshCodexState {
         // watchdog's reap target) the moment the child exists — before the
         // commit.
         let sidecar_pid = child.id();
+        // b8ke delta round-2 F2: the start's watchdog machinery — the
+        // direct-pid cancellation (the child exists: the watchdog's cancel
+        // SIGTERMs it; the start's own gates tear down and unwind) + the
+        // settle guard held to this handler's end (the watchdog's bounded
+        // settle treats its firing as the operation's confirmed death).
+        let _start_cancellation = crate::ownership_lane::register_start_cancellation_for_ticket(
+            &self.ownership,
+            PROVIDER,
+            thread_id,
+            &own_ticket,
+            crate::ownership_lane::sidecar_pid_cancellation(sidecar_pid),
+        );
         crate::ownership_lane::register_partial_fresh_runtime(
             &self.ownership,
             PROVIDER,

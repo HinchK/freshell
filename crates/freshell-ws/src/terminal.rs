@@ -3008,6 +3008,18 @@ pub(crate) async fn handle_create(
     // refusal (non-negotiated). Refusals are the frozen D7 frame with the
     // ADDITIVE owner fields (round-1 review: `send_create_error_with_owner`).
     let mut terminal_ownership: Option<TerminalOwnershipClaim> = None;
+    // b8ke delta round-2 F2: the terminal start's watchdog machinery —
+    // the terminal-id slot (the registered cancellation kills the
+    // registry row the moment it exists; the create's own settle gates
+    // then refuse and unwind) and the settle guard (held to this create
+    // handler's end; its Drop fires the settle the watchdog's bounded
+    // await treats as the operation's confirmed death). Registered only
+    // when the claim Grants below.
+    let terminal_start_tid_slot: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let mut _terminal_start_cancellation: Option<
+        freshell_freshagent::ownership_lane::StartCancellationGuard,
+    > = None;
     if let Some(locator) = create_session_locator(&create) {
         if state.ownership.is_some() {
             let operation_id = format!("term-create-{}", create.request_id);
@@ -3051,6 +3063,39 @@ pub(crate) async fn handle_create(
             );
             match claim {
                 freshell_freshagent::ownership_lane::TerminalLaneClaim::Granted(ticket) => {
+                    // b8ke delta round-2 F2: register the start's
+                    // cancellation + settle (the tid slot arms at the
+                    // preallocated id below) — BEFORE the claim construction
+                    // moves the ticket.
+                    let registry = state.registry.clone();
+                    let tid_slot = Arc::clone(&terminal_start_tid_slot);
+                    let cancel: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                        if let Some(tid) = tid_slot
+                            .lock()
+                            .expect("terminal start tid slot lock")
+                            .clone()
+                        {
+                            tracing::warn!(target: "freshell_ws::terminal",
+                                terminal_id = %tid,
+                                event = "ownership.start.cancel_signal",
+                                "the watchdog's start cancellation kills the spawned \
+                                 terminal's registry row");
+                            registry.kill(&tid);
+                        }
+                    });
+                    let mut registration_ticket = Some(ticket);
+                    _terminal_start_cancellation = Some(
+                        freshell_freshagent::ownership_lane::register_start_cancellation_for_ticket(
+                            &state.ownership,
+                            &locator.provider,
+                            &locator.session_id,
+                            &registration_ticket,
+                            cancel,
+                        ),
+                    );
+                    let ticket = registration_ticket
+                        .take()
+                        .expect("the ticket is present on the Granted arm");
                     terminal_ownership = Some(TerminalOwnershipClaim {
                         ticket,
                         registry: state.registry.clone(),
@@ -3362,6 +3407,11 @@ pub(crate) async fn handle_create(
         .and_then(PreparedCodexLaunch::terminal_id)
         .map(str::to_string)
         .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+    // b8ke delta round-2 F2: arm the registered start cancellation — from
+    // here the watchdog's cancel kills this row.
+    *terminal_start_tid_slot
+        .lock()
+        .expect("terminal start tid slot lock") = Some(terminal_id.clone());
     let stream_id = Uuid::new_v4().to_string();
 
     // Resolve the effective cwd BEFORE any branch/mcp computation (`tr:1565` via
@@ -4206,6 +4256,27 @@ pub(crate) async fn handle_create(
                 pid,
             );
         }
+    }
+
+    // b8ke delta round-2 F2: the spawned terminal's partial runtime (the
+    // watchdog's reap target — the pid + terminal id the stale-Starting
+    // recovery kills and confirms). Registered only when THIS create
+    // holds the coordinator claim.
+    if let (Some(ownership), Some(claim)) = (state.ownership.as_ref(), terminal_ownership.as_ref())
+    {
+        ownership.register_partial_runtime(
+            &claim.locator.provider,
+            &claim.locator.session_id,
+            claim.ticket.operation_id(),
+            claim.ticket.generation(),
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                terminal_id: Some(terminal_id.clone()),
+                live_session_key: None,
+                pid: state.registry.pid_of(&terminal_id),
+                ownership_id: None,
+            },
+        );
     }
 
     // DEV-0006 S4: adopt the managed codex launch for this terminal
