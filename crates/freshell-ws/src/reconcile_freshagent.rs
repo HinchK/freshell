@@ -58,6 +58,10 @@ fn respawn_burn_skipped(state: &freshell_ownership::OwnershipState) -> bool {
         OwnershipState::Starting { .. }
             | OwnershipState::Handoff { .. }
             | OwnershipState::Stopping { .. }
+            // b8ke focused round-2 review: a fenced key (an unconfirmed
+            // prior death) blocks every create the respawn verdict would
+            // arm — never burn the counter toward a false respawn_exhausted.
+            | OwnershipState::Fenced { .. }
     )
 }
 

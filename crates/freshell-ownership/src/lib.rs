@@ -192,7 +192,8 @@ impl OwnershipState {
         match self {
             OwnershipState::Starting { initiator, .. }
             | OwnershipState::Handoff { initiator, .. }
-            | OwnershipState::Stopping { initiator, .. } => Some(initiator.clone()),
+            | OwnershipState::Stopping { initiator, .. }
+            | OwnershipState::Fenced { initiator, .. } => Some(initiator.clone()),
             _ => None,
         }
     }
@@ -206,6 +207,7 @@ impl OwnershipState {
             OwnershipState::Live { owner, .. } => Some(owner.kind),
             OwnershipState::Handoff { to_kind, .. } => Some(*to_kind),
             OwnershipState::Stopping { owner, .. } => owner.as_ref().map(|o| o.kind),
+            OwnershipState::Fenced { prior, .. } => prior.as_ref().map(|(owner, _)| owner.kind),
         }
     }
 
@@ -218,7 +220,8 @@ impl OwnershipState {
             OwnershipState::Live { since_ms, .. }
             | OwnershipState::Starting { since_ms, .. }
             | OwnershipState::Handoff { since_ms, .. }
-            | OwnershipState::Stopping { since_ms, .. } => Some(*since_ms),
+            | OwnershipState::Stopping { since_ms, .. }
+            | OwnershipState::Fenced { since_ms, .. } => Some(*since_ms),
         }
     }
 
@@ -318,6 +321,46 @@ pub enum OwnershipState {
         initiator: String,
         since_ms: u64,
     },
+    /// b8ke focused round-2 review (R2-1/R2-3): the TYPED fenced state —
+    /// the prior runtime's death is UNCONFIRMED and no in-flight operation
+    /// remains that could ever settle it, so the key blocks EVERY new
+    /// writer until [`RuntimeOwnershipRegistry::release_fenced`] clears it
+    /// (ONLY a caller that confirmed the prior's death by a bounded
+    /// identity/pid probe or a watcher event may invoke it). The fail-open
+    /// to plain `Vacant` the round-1 fix shipped for a lost watcher is
+    /// REMOVED: it licensed a second writer over a possibly-live prior.
+    /// `PlatformLimited` fences have no probe that can ever confirm (the
+    /// descendant-tree walk is Linux-only), so they persist for the boot
+    /// epoch — the documented tradeoff (the operator can still kill the
+    /// leftover processes by other means; the server restart mints a new
+    /// epoch). `begin_stop` answers the typed `NotLive{Fenced}` for this
+    /// state: the caller must NOT kill (the fence owns the transition).
+    Fenced {
+        prior: Option<(OwnerIdentity, u64)>,
+        reason: FenceReason,
+        operation_id: String,
+        generation: u64,
+        initiator: String,
+        since_ms: u64,
+    },
+}
+
+/// Why a key sits in [`OwnershipState::Fenced`] (b8ke focused round-2
+/// review). Typed on the state so every Blocked refusal carries the
+/// machine-readable reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FenceReason {
+    /// The detached reap-confirmation watcher itself failed (its
+    /// confirmation future was lost — a JoinError) while the prior's death
+    /// stayed unconfirmed. A replacement watcher clears the fence only once
+    /// its bounded recorded-identity probe confirms death.
+    WatcherFailed,
+    /// Non-Linux teardown: the direct child's awaited exit is the portable
+    /// floor, but the descendant-tree verification requires `/proc` —
+    /// confirmation is IMPOSSIBLE on this platform, so nothing clears the
+    /// fence within this boot epoch (the documented tradeoff).
+    PlatformLimited,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -374,13 +417,6 @@ pub enum FailVacantReason {
     /// The prior runtime was reaped/confirmed dead — never record a dead
     /// runtime as Live (round-1 review).
     PriorNotLive,
-    /// b8ke focused review FR6: the detached reap watcher itself failed
-    /// (its confirmation future was lost — a JoinError) after the
-    /// teardown's bounded escalation window had already run. The key
-    /// fail-OPENS to Vacant with this typed reason: never a permanent
-    /// `Handoff` wedge (every retry would be typed-refused forever with
-    /// nothing left to settle the fence).
-    WatcherFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -393,6 +429,19 @@ pub enum FailOutcome {
     Vacant {
         reason: FailVacantReason,
     },
+    ForeignOperation,
+}
+
+/// Outcome of the typed fence transitions (b8ke focused round-2 review):
+/// [`RuntimeOwnershipRegistry::fence_unconfirmed_handoff`] and
+/// [`RuntimeOwnershipRegistry::fence_unconfirmed_stop`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FenceOutcome {
+    /// The record moved into [`OwnershipState::Fenced`] with the typed
+    /// reason — every begin is now Blocked.
+    Fenced,
+    /// The record moved on (a foreign operation id or generation, or the
+    /// state is no longer the expected in-flight one) — the typed no-op.
     ForeignOperation,
 }
 
@@ -1014,52 +1063,163 @@ impl RuntimeOwnershipRegistry {
         }
     }
 
-    /// b8ke focused review FR6: fail an in-flight `Handoff` whose DETACHED
-    /// reap watcher was lost (its confirmation future failed — a JoinError)
-    /// to `Vacant` with the typed [`FailVacantReason::WatcherFailed`]
-    /// reason. The watcher's escalation already ran (the lane teardown's
-    /// bounded confirmation window SIGKILLed the captured tree before its
-    /// continuation was lost), so the key cannot stay fenced in `Handoff`
-    /// forever — every retry would be the typed in-flight refusal with
-    /// nothing left to settle the fence. Fail-open to Vacant is the typed
-    /// recoverable terminal state: the identity fence and the next claim's
-    /// own reap discipline cover safety. Fenced exactly like
-    /// [`Self::fail`]: a foreign operation/generation is the typed no-op.
-    pub fn fail_watcher_lost(
+    /// b8ke focused round-2 review R2-1: fail an in-flight `Handoff` whose
+    /// DETACHED reap watcher was lost (its confirmation future failed — a
+    /// JoinError) to the TYPED [`OwnershipState::Fenced`] state carrying
+    /// [`FenceReason::WatcherFailed`] — NEVER plain `Vacant` (the round-1
+    /// fail-open licensed a second writer over a possibly-live prior).
+    /// The key stays fenced — every competing begin is Blocked with the
+    /// typed in-flight answer — until the caller's replacement watcher
+    /// confirms the prior's death (a bounded recorded-identity probe) and
+    /// invokes [`Self::release_fenced`]. The captured prior identity
+    /// (with the generation it held Live) rides the state so the probe has
+    /// its kill target. Fenced exactly like [`Self::fail`]: a foreign
+    /// operation/generation is the typed no-op.
+    pub fn fence_unconfirmed_handoff(
         &self,
         provider: &str,
         session_id: &str,
         operation_id: &str,
         generation: u64,
-    ) -> FailOutcome {
+        reason: FenceReason,
+    ) -> FenceOutcome {
         let mut inner = self.inner.lock().expect("ownership lock poisoned");
         let key = SessionKey::new(provider, session_id);
         let Some(record) = inner.get_mut(&key) else {
-            return FailOutcome::ForeignOperation;
+            return FenceOutcome::ForeignOperation;
         };
         if generation != record.generation {
-            return FailOutcome::ForeignOperation;
+            return FenceOutcome::ForeignOperation;
         }
         let initiator = record.state.initiator().unwrap_or_default();
         match record.state.clone() {
             OwnershipState::Handoff {
                 operation_id: op,
-                to_kind,
+                prior,
+                ..
+            } if op == operation_id => {
+                let duration_ms = now_epoch_ms()
+                    .saturating_sub(record.state.since_ms().unwrap_or(now_epoch_ms()));
+                record.state = OwnershipState::Fenced {
+                    prior,
+                    reason,
+                    operation_id: op,
+                    generation,
+                    initiator: initiator.clone(),
+                    since_ms: now_epoch_ms(),
+                };
+                tracing::error!(target: "freshell_ownership",
+                    event = "ownership.handoff.fenced_unconfirmed", operation_id, provider, session_id,
+                    initiator, epoch = self.epoch, generation, duration_ms,
+                    fence_reason = ?reason, outcome = "fenced",
+                    failure_reason = "UNCONFIRMED_PRIOR_DEATH",
+                    "the reap confirmation failed without confirming the prior's death — \
+                     the key is fenced (blocked for every new writer) until confirmed death \
+                     releases it; never a fail-open to Vacant");
+                FenceOutcome::Fenced
+            }
+            _ => FenceOutcome::ForeignOperation,
+        }
+    }
+
+    /// b8ke focused round-2 review R2-2: an explicit stop whose teardown
+    /// could not confirm the prior runtime tree's death (a bounded
+    /// platform-limited confirmation) moves `Stopping{op}` to the TYPED
+    /// [`OwnershipState::Fenced`] state — never `commit_stop`'s `Vacant`.
+    /// The key stays fenced until confirmed death releases it (on
+    /// non-Linux nothing can — the documented tradeoff).
+    pub fn fence_unconfirmed_stop(
+        &self,
+        provider: &str,
+        session_id: &str,
+        operation_id: &str,
+        generation: u64,
+        reason: FenceReason,
+    ) -> FenceOutcome {
+        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let key = SessionKey::new(provider, session_id);
+        let Some(record) = inner.get_mut(&key) else {
+            return FenceOutcome::ForeignOperation;
+        };
+        if generation != record.generation {
+            return FenceOutcome::ForeignOperation;
+        }
+        let initiator = record.state.initiator().unwrap_or_default();
+        match record.state.clone() {
+            OwnershipState::Stopping {
+                operation_id: op,
+                owner,
+                prior_generation,
+                ..
+            } if op == operation_id => {
+                let prior =
+                    owner.map(|o| (o, prior_generation.unwrap_or(generation.saturating_sub(1))));
+                let duration_ms = now_epoch_ms()
+                    .saturating_sub(record.state.since_ms().unwrap_or(now_epoch_ms()));
+                record.state = OwnershipState::Fenced {
+                    prior,
+                    reason,
+                    operation_id: op,
+                    generation,
+                    initiator: initiator.clone(),
+                    since_ms: now_epoch_ms(),
+                };
+                tracing::error!(target: "freshell_ownership",
+                    event = "ownership.stop.fenced_unconfirmed", operation_id, provider, session_id,
+                    initiator, epoch = self.epoch, generation, duration_ms,
+                    fence_reason = ?reason, outcome = "fenced",
+                    failure_reason = "UNCONFIRMED_PRIOR_DEATH",
+                    "the stop's teardown could not confirm the prior's death — the key is \
+                     fenced (blocked for every new writer) until confirmed death releases it");
+                FenceOutcome::Fenced
+            }
+            _ => FenceOutcome::ForeignOperation,
+        }
+    }
+
+    /// b8ke focused round-2 review: `Fenced{op}` → `Vacant` (generation
+    /// preserved). The caller MUST have CONFIRMED the fenced prior's death
+    /// (a bounded identity/pid probe or a watcher event) before invoking —
+    /// this is the ONLY transition that reopens a fenced key, and it is
+    /// never taken on faith. Fenced on (operation_id, generation) exactly
+    /// like [`Self::commit_stop`].
+    pub fn release_fenced(
+        &self,
+        provider: &str,
+        session_id: &str,
+        operation_id: &str,
+        generation: u64,
+    ) -> CommitOutcome {
+        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let key = SessionKey::new(provider, session_id);
+        let Some(record) = inner.get_mut(&key) else {
+            return CommitOutcome::ForeignOperation;
+        };
+        if generation != record.generation {
+            return CommitOutcome::StaleGeneration {
+                current_generation: record.generation,
+            };
+        }
+        match record.state.clone() {
+            OwnershipState::Fenced {
+                operation_id: op,
+                prior,
+                reason,
                 since_ms,
                 ..
             } if op == operation_id => {
                 let duration_ms = now_epoch_ms().saturating_sub(since_ms);
                 record.state = OwnershipState::Vacant;
-                tracing::warn!(target: "freshell_ownership",
-                    event = "ownership.handoff.watcher_failed", operation_id, provider, session_id,
-                    initiator, to_kind = ?to_kind,
-                    epoch = self.epoch, generation, outcome = "vacant", duration_ms,
-                    failure_reason = "WATCHER_FAILED");
-                FailOutcome::Vacant {
-                    reason: FailVacantReason::WatcherFailed,
-                }
+                tracing::info!(target: "freshell_ownership",
+                    event = "ownership.fenced.released", operation_id, provider, session_id,
+                    from_kind = ?prior.as_ref().map(|(o, _)| o.kind),
+                    runtime_id = ?prior.as_ref().and_then(|(o, _)| o.terminal_id.clone()),
+                    pid = ?prior.as_ref().and_then(|(o, _)| o.pid),
+                    epoch = self.epoch, generation, duration_ms,
+                    fence_reason = ?reason, outcome = "released_on_confirmed_death");
+                CommitOutcome::Committed
             }
-            _ => FailOutcome::ForeignOperation,
+            _ => CommitOutcome::ForeignOperation,
         }
     }
 
@@ -1355,6 +1515,11 @@ impl RuntimeOwnershipRegistry {
                     && generation == claim.generation
                     && claim.runtime.is_none()
             }
+            // b8ke focused round-2 review: a fenced key reopens ONLY via
+            // `release_fenced` after ITS OWN probe confirms the prior's
+            // death — the fenced record's operation id is the fencing
+            // (handoff/stop) operation, which no lane TTL claim carries.
+            OwnershipState::Fenced { .. } => false,
             OwnershipState::Vacant => false,
         };
         if matched {
@@ -1535,6 +1700,15 @@ impl RuntimeOwnershipRegistry {
                     OwnershipState::Handoff { to_kind, .. } => (kind_wire(to_kind), None),
                     OwnershipState::Stopping { owner, .. } => match owner {
                         Some(owner) => (kind_wire(&owner.kind), owner.terminal_id.clone()),
+                        None => ("vacant", None),
+                    },
+                    // b8ke focused round-2 review: a fenced key replays the
+                    // FENCED PRIOR's kind (the owner the handoff-failed
+                    // frames already named on every device) — never
+                    // "vacant", which would invite a create the registry
+                    // itself would refuse.
+                    OwnershipState::Fenced { prior, .. } => match prior {
+                        Some((owner, _)) => (kind_wire(&owner.kind), owner.terminal_id.clone()),
                         None => ("vacant", None),
                     },
                 };
@@ -2458,14 +2632,16 @@ mod tests {
         ));
     }
 
-    /// b8ke focused review FR6: a lost detached reap watcher fail-opens the
-    /// in-flight Handoff to `Vacant { reason: WatcherFailed }` — the typed
-    /// recoverable terminal state (never a permanent `Handoff` wedge where
-    /// every retry is typed-refused forever). The restore arm is NEVER
-    /// taken (the watcher's failure says nothing about the prior's
-    /// liveness), and a foreign operation/generation is the typed no-op.
+    /// b8ke focused round-2 review R2-1: a lost detached reap watcher must
+    /// leave the TYPED FENCED state — NEVER the round-1 fail-open to
+    /// `Vacant`. While fenced, every begin (start/handoff) is Blocked and a
+    /// stop is the typed `NotLive` (the caller must not kill); ONLY
+    /// [`RuntimeOwnershipRegistry::release_fenced`] — the confirmed-death
+    /// caller — reopens the key (after which a create is Granted again). A
+    /// foreign operation/generation is the typed no-op, and a wrong
+    /// generation on the release is the typed stale refusal.
     #[test]
-    fn fail_watcher_lost_opens_the_handoff_to_a_typed_vacant_state() {
+    fn watcher_lost_fences_the_handoff_until_confirmed_death_releases() {
         let (r, _owner, _) = registry_with_live_terminal();
         let BeginOutcome::Granted { generation: g } = r.begin_handoff(
             PROVIDER,
@@ -2482,16 +2658,99 @@ mod tests {
             r.observe(PROVIDER, "sid").state,
             OwnershipState::Handoff { .. }
         ));
-        // The watcher was lost: the key fail-OPENS to the typed Vacant
-        // state (never restored — the watcher's failure is not a liveness
-        // answer; never wedged in Handoff).
+        // The watcher was lost: the key is FENCED with the typed reason —
+        // never Vacant, never restored.
         assert_eq!(
-            r.fail_watcher_lost(PROVIDER, "sid", "ho-wf", g),
-            FailOutcome::Vacant {
-                reason: FailVacantReason::WatcherFailed
+            r.fence_unconfirmed_handoff(PROVIDER, "sid", "ho-wf", g, FenceReason::WatcherFailed),
+            FenceOutcome::Fenced
+        );
+        assert!(matches!(
+            r.observe(PROVIDER, "sid").state,
+            OwnershipState::Fenced {
+                reason: FenceReason::WatcherFailed,
+                ..
+            }
+        ));
+        // While fenced: a create is BLOCKED (the round-1 fail-open granted
+        // it — the defect this test pins), a handoff is BLOCKED, and a stop
+        // is the typed NotLive (no kill).
+        assert!(matches!(
+            r.begin_start(
+                PROVIDER,
+                "sid",
+                RuntimeOwnerKind::Terminal,
+                "fence-probe-create",
+                None,
+                "test",
+                3,
+            ),
+            BeginOutcome::Blocked { .. }
+        ));
+        assert!(matches!(
+            r.begin_handoff(
+                PROVIDER,
+                "sid",
+                RuntimeOwnerKind::Terminal,
+                "fence-probe-handoff",
+                None,
+                "test",
+                4,
+            ),
+            BeginOutcome::Blocked { .. }
+        ));
+        assert!(matches!(
+            r.begin_stop(
+                PROVIDER,
+                "sid",
+                "fence-probe-stop",
+                &StopClaim {
+                    expected_kind: RuntimeOwnerKind::Terminal,
+                    expected_runtime: None,
+                    observed: ObservedFence {
+                        epoch: r.boot_epoch(),
+                        generation: g
+                    },
+                },
+                "test",
+                5,
+            ),
+            StopOutcome::NotLive { .. }
+        ));
+        // The fenced key does NOT release through the generic fail (an
+        // unarmed ticket drop is the typed no-op) — only release_fenced.
+        assert_eq!(
+            r.fail(PROVIDER, "sid", "ho-wf", g, false),
+            FailOutcome::ForeignOperation
+        );
+        assert!(matches!(
+            r.observe(PROVIDER, "sid").state,
+            OwnershipState::Fenced { .. }
+        ));
+        // A stale generation on the release is the typed refusal.
+        assert_eq!(
+            r.release_fenced(PROVIDER, "sid", "ho-wf", g + 1),
+            CommitOutcome::StaleGeneration {
+                current_generation: g
             }
         );
+        // Confirmed death releases: the key reopens and a create succeeds.
+        assert_eq!(
+            r.release_fenced(PROVIDER, "sid", "ho-wf", g),
+            CommitOutcome::Committed
+        );
         assert_eq!(r.observe(PROVIDER, "sid").state, OwnershipState::Vacant);
+        assert!(matches!(
+            r.begin_start(
+                PROVIDER,
+                "sid",
+                RuntimeOwnerKind::FreshAgent,
+                "post-fence-create",
+                None,
+                "test",
+                6,
+            ),
+            BeginOutcome::Granted { .. }
+        ));
 
         // Foreign operation id: the typed no-op (the record moved on).
         let (r, _owner, _) = registry_with_live_terminal();
@@ -2507,13 +2766,87 @@ mod tests {
             panic!()
         };
         assert_eq!(
-            r.fail_watcher_lost(PROVIDER, "sid", "ho-foreign", g),
-            FailOutcome::ForeignOperation
+            r.fence_unconfirmed_handoff(
+                PROVIDER,
+                "sid",
+                "ho-foreign",
+                g,
+                FenceReason::WatcherFailed
+            ),
+            FenceOutcome::ForeignOperation
         );
         assert!(matches!(
             r.observe(PROVIDER, "sid").state,
             OwnershipState::Handoff { .. }
         ));
+    }
+
+    /// b8ke focused round-2 review R2-2/R2-3: an explicit stop whose
+    /// teardown cannot confirm the prior's death fences `Stopping` with
+    /// the typed reason (never `commit_stop`'s Vacant), and — for the
+    /// platform-limited reason — the fence is terminal for the epoch
+    /// (nothing can confirm on that platform; the documented tradeoff).
+    #[test]
+    fn unconfirmed_stop_fences_the_key_typed() {
+        let (r, owner, generation) = registry_with_live_terminal();
+        let StopOutcome::Granted { generation: g } = r.begin_stop(
+            PROVIDER,
+            "sid",
+            "kill-pl",
+            &StopClaim {
+                expected_kind: RuntimeOwnerKind::Terminal,
+                expected_runtime: Some(owner.clone()),
+                observed: ObservedFence {
+                    epoch: r.boot_epoch(),
+                    generation,
+                },
+            },
+            "test",
+            7,
+        ) else {
+            panic!()
+        };
+        assert_eq!(
+            r.fence_unconfirmed_stop(PROVIDER, "sid", "kill-pl", g, FenceReason::PlatformLimited),
+            FenceOutcome::Fenced
+        );
+        // The fenced record carries the PRIOR owner (the unconfirmed
+        // runtime, stamped with its committing operation id) — a snapshot
+        // consumer still sees the fence, and a create is Blocked until a
+        // confirmed death releases it.
+        let stamped_prior = stamped(owner, "op-1");
+        assert!(matches!(
+            r.observe(PROVIDER, "sid").state,
+            OwnershipState::Fenced {
+                ref prior,
+                reason: FenceReason::PlatformLimited,
+                ..
+            } if prior.as_ref().map(|(o, _)| o) == Some(&stamped_prior)
+        ));
+        assert!(matches!(
+            r.begin_start(
+                PROVIDER,
+                "sid",
+                RuntimeOwnerKind::Terminal,
+                "pl-probe-create",
+                None,
+                "test",
+                8,
+            ),
+            BeginOutcome::Blocked { .. }
+        ));
+        // The stop commit no longer applies (the record moved past
+        // Stopping): the fence owns the transition now.
+        assert_eq!(
+            r.commit_stop(PROVIDER, "sid", "kill-pl", g),
+            CommitOutcome::ForeignOperation
+        );
+        // Confirmed death still releases the fence (the one legal reopen).
+        assert_eq!(
+            r.release_fenced(PROVIDER, "sid", "kill-pl", g),
+            CommitOutcome::Committed
+        );
+        assert_eq!(r.observe(PROVIDER, "sid").state, OwnershipState::Vacant);
     }
 
     #[test]

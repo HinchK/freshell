@@ -120,11 +120,22 @@ pub(crate) enum StopResult {
     /// escalating and resolves `true` only once death is finally
     /// confirmed; the runner fences the key (the F3 machinery), broadcasts
     /// the failure frame, and its watcher releases on this future. A lost
-    /// continuation is covered by the watcher's typed fail-open release
-    /// (FR6).
+    /// continuation is covered by the watcher's typed fenced state +
+    /// replacement probe (round-2 review R2-1).
     NotConfirmed {
         confirmation: std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'static>>,
     },
+    /// b8ke focused round-2 review R2-3: a non-Linux teardown confirmed the
+    /// direct child's awaited exit (the portable floor) but CANNOT verify
+    /// the descendant tree (`/proc` is Linux-only) — the typed
+    /// platform-limited stop answer. It must NEVER satisfy the handoff's
+    /// confirmed-reap requirement: the runner fences the key with the typed
+    /// [`freshell_ownership::FenceReason::PlatformLimited`] reason (a new
+    /// writer cannot start; the session remains recoverable — the operator
+    /// can still kill leftover processes by other means), the documented
+    /// tradeoff being that nothing on that platform can confirm the
+    /// descendant death, so the fence persists for the boot epoch.
+    PlatformLimited,
 }
 
 impl std::fmt::Debug for StopResult {
@@ -133,8 +144,22 @@ impl std::fmt::Debug for StopResult {
             StopResult::Reaped => f.write_str("Reaped"),
             StopResult::AlreadyGone => f.write_str("AlreadyGone"),
             StopResult::NotConfirmed { .. } => f.write_str("NotConfirmed { .. }"),
+            StopResult::PlatformLimited => f.write_str("PlatformLimited"),
         }
     }
+}
+
+/// The detached reap watcher's answer (b8ke focused round-2 review):
+/// `Confirmed` — the prior runtime's death was positively confirmed (the
+/// lane teardown's own watcher, the registry dead-poll, or the replacement
+/// probe); `PlatformLimited` — the teardown completed but its platform
+/// cannot confirm the descendant tree (R2-3: fences, never releases);
+/// `Lost` — the confirmation future itself failed (R2-1: fences with the
+/// typed WatcherFailed reason and spawns the replacement probe).
+pub(crate) enum ReapAnswer {
+    Confirmed,
+    PlatformLimited,
+    Lost,
 }
 
 /// Why a prior runtime's stop could not be confirmed reaped.
@@ -159,6 +184,13 @@ enum StopOutcomePriv {
     /// `stop_runtime`, strictly before the watcher existed — the caller
     /// never re-broadcasts it.
     ReapTimeout { fenced: bool },
+    /// b8ke focused round-2 review R2-3: the lane answered
+    /// [`StopResult::PlatformLimited`] — the child's awaited exit is the
+    /// portable floor but the descendant tree is unverifiable on that
+    /// platform. The caller fences the key with the typed PlatformLimited
+    /// reason and answers the typed retryable failure; a new writer can
+    /// never start against the unconfirmable prior.
+    PlatformLimitedFenced,
 }
 
 /// The server-wide atomic handoff runner. Minted in `freshell-server::main`
@@ -437,6 +469,60 @@ impl SessionHandoffRunner {
                         "REAP_TIMEOUT",
                         "the prior runtime's reap is still being confirmed; the session stays \
                          fenced until the prior is confirmed dead — retry after it settles",
+                        true,
+                        generation,
+                    );
+                }
+                StopOutcomePriv::PlatformLimitedFenced => {
+                    // b8ke focused round-2 review R2-3: the lane's teardown
+                    // confirmed the direct child's awaited exit but cannot
+                    // verify the descendant tree on this platform — NEVER a
+                    // confirmed reap. The failure frame (reason
+                    // PLATFORM_LIMITED) was already broadcast inside
+                    // `stop_runtime`; here the key moves to the TYPED
+                    // `Fenced{PlatformLimited}` state: every new writer is
+                    // Blocked (never a second writer over a possibly-live
+                    // descendant), the session stays recoverable (the
+                    // durable history is untouched; the operator can kill
+                    // leftover processes by other means), and — the
+                    // documented tradeoff — nothing on this platform can
+                    // ever confirm the descendant death, so the fence
+                    // persists for the boot epoch.
+                    guard.disarm(); // the fenced state replaces the Handoff
+                    let fenced = self.ownership.fence_unconfirmed_handoff(
+                        &req.provider,
+                        &req.session_id,
+                        &operation_id,
+                        generation,
+                        freshell_ownership::FenceReason::PlatformLimited,
+                    );
+                    debug_assert!(matches!(fenced, freshell_ownership::FenceOutcome::Fenced));
+                    self.log_transition(
+                        TransitionLog {
+                            operation_id: &operation_id,
+                            provider: &req.provider,
+                            session_id: &req.session_id,
+                            initiator: &initiator,
+                            epoch: self.ownership.boot_epoch(),
+                            generation,
+                            live_session_key: owner.live_session_key.as_deref(),
+                            from_kind: prior_kind,
+                            to_kind: Some(req.target_kind),
+                            runtime_id: owner.terminal_id.as_deref(),
+                            pid: owner.pid,
+                            outcome: "reap_platform_limited_fenced",
+                            duration_ms: began.elapsed().as_millis() as u64,
+                            failure_reason: Some("PLATFORM_LIMITED"),
+                            stale: None,
+                        },
+                        "ownership.handoff.done",
+                        TransitionLevel::Error,
+                    );
+                    return typed_failure(
+                        "PLATFORM_LIMITED",
+                        "the prior runtime's teardown cannot confirm the descendant tree on \
+                         this platform; the session stays fenced (no new writer can start) \
+                         and remains recoverable",
                         true,
                         generation,
                     );
@@ -1201,10 +1287,11 @@ impl SessionHandoffRunner {
                             generation,
                             initiator,
                             owner,
+                            "REAP_TIMEOUT",
                             async move {
                                 await_terminal_dead(&registry, &tid).await;
                                 // The registry row is dead — confirmed.
-                                true
+                                ReapAnswer::Confirmed
                             },
                         );
                         StopOutcomePriv::ReapTimeout { fenced: true }
@@ -1259,6 +1346,20 @@ impl SessionHandoffRunner {
                         // The lane teardown awaited its own watcher — the confirmed
                         // reap. AlreadyGone is the same truth (nothing to stop).
                         StopResult::Reaped | StopResult::AlreadyGone => StopOutcomePriv::Reaped,
+                        // b8ke focused round-2 review R2-3: a platform-limited
+                        // teardown (non-Linux: the direct child's awaited exit
+                        // is the portable floor, the descendant tree is
+                        // unverifiable) must NOT satisfy confirmed-reap — the
+                        // failure frame (reason PLATFORM_LIMITED) precedes the
+                        // fence, and the caller answers the typed failure. No
+                        // watcher: nothing on that platform can ever confirm
+                        // the descendant death.
+                        StopResult::PlatformLimited => {
+                            self.broadcast_fenced_stop_refusal(
+                                req, owner, operation_id, generation, "PLATFORM_LIMITED",
+                            );
+                            StopOutcomePriv::PlatformLimitedFenced
+                        }
                         StopResult::NotConfirmed { confirmation } => {
                             self.broadcast_fenced_reap_timeout(req, owner, operation_id, generation);
                             self.spawn_reap_confirmation_watcher(
@@ -1267,7 +1368,14 @@ impl SessionHandoffRunner {
                                 generation,
                                 &initiator,
                                 owner,
-                                confirmation,
+                                "REAP_TIMEOUT",
+                                async move {
+                                    if confirmation.await {
+                                        ReapAnswer::Confirmed
+                                    } else {
+                                        ReapAnswer::Lost
+                                    }
+                                },
                             );
                             StopOutcomePriv::ReapTimeout { fenced: true }
                         }
@@ -1282,12 +1390,14 @@ impl SessionHandoffRunner {
                             generation,
                             &initiator,
                             owner,
+                            "REAP_TIMEOUT",
                             async move {
                                 // b8ke focused FR6's test seam: the armed hook
                                 // aborts the spawned teardown task — a REAL
                                 // JoinError (cancelled) surfaces through the
-                                // await, exercising the watcher's typed
-                                // fail-open release. Never armed in production.
+                                // await, exercising the watcher's typed fenced
+                                // state + replacement probe (round-2 R2-1).
+                                // Never armed in production.
                                 if let Some(hooks) = hooks.as_ref() {
                                     if hooks.abort_reap_confirmation_once.swap(
                                         false,
@@ -1296,13 +1406,31 @@ impl SessionHandoffRunner {
                                         confirmation.abort();
                                     }
                                 }
-                                // The lane teardown's own watcher IS the
-                                // confirmed reap; its completion resolves
-                                // `true`. A JoinError (the teardown task
-                                // panicked or was cancelled) resolves `false`:
-                                // death is UNCONFIRMED, and the watcher's
-                                // typed fail-open release (FR6) covers it.
-                                confirmation.await.is_ok()
+                                // b8ke focused round-2 review: the spawned
+                                // teardown's COMPLETED answer is confirmed
+                                // death ONLY for Reaped/AlreadyGone — a
+                                // completed-but-PlatformLimited answer fences
+                                // (R2-3), and a NotConfirmed answer's own
+                                // escalation continuation IS the confirmation.
+                                // A JoinError (the teardown task panicked or
+                                // was cancelled) is `Lost`: death is
+                                // UNCONFIRMED, the watcher fences with the
+                                // typed WatcherFailed reason and the
+                                // replacement probe settles it (R2-1).
+                                match confirmation.await {
+                                    Ok(StopResult::Reaped) | Ok(StopResult::AlreadyGone) => {
+                                        ReapAnswer::Confirmed
+                                    }
+                                    Ok(StopResult::PlatformLimited) => ReapAnswer::PlatformLimited,
+                                    Ok(StopResult::NotConfirmed { confirmation }) => {
+                                        if confirmation.await {
+                                            ReapAnswer::Confirmed
+                                        } else {
+                                            ReapAnswer::Lost
+                                        }
+                                    }
+                                    Err(_) => ReapAnswer::Lost,
+                                }
                             },
                         );
                         StopOutcomePriv::ReapTimeout { fenced: true }
@@ -1338,30 +1466,62 @@ impl SessionHandoffRunner {
         );
     }
 
+    /// b8ke focused round-2 review R2-3: the platform-limited stop's fenced
+    /// failure frame — the same FR5 truth (the PRIOR still owns the fenced
+    /// key) with the typed PLATFORM_LIMITED reason.
+    fn broadcast_fenced_stop_refusal(
+        &self,
+        req: &HandoffRequest,
+        owner: &OwnerIdentity,
+        operation_id: &str,
+        generation: u64,
+        reason: &str,
+    ) {
+        let prior_kind = Some(owner.kind);
+        self.broadcast_owner(
+            req,
+            "handoff-failed",
+            prior_kind,
+            owner.terminal_id.clone(),
+            operation_id,
+            generation,
+            prior_kind,
+            Some(reason),
+        );
+    }
+
     /// b8ke delta review F3: the detached reap-confirmation watcher for a
     /// REAL reap timeout (kill issued, death delayed past the runner's
     /// budget). The key stays fenced in `Handoff` — every competing
     /// begin (start/handoff/stop) is Blocked with the typed in-flight
     /// answer, so no new writer can start while the old runtime's death is
-    /// unconfirmed — until `confirmation` resolves `true` (the lane
-    /// teardown's own watcher for fresh priors; the registry dead-probe
-    /// for terminal priors), then the key releases to Vacant, the
-    /// corrective `released` broadcast supersedes the fenced
-    /// `handoff-failed` frame, and the uniform done-line logs the
-    /// settlement. A retry during the fence is typed-refused; after the
-    /// release it succeeds.
+    /// unconfirmed — until `confirmation` resolves
+    /// [`ReapAnswer::Confirmed`] (the lane teardown's own watcher for
+    /// fresh priors; the registry dead-probe for terminal priors), then
+    /// the key releases to Vacant, the corrective `released` broadcast
+    /// supersedes the fenced `handoff-failed` frame, and the uniform
+    /// done-line logs the settlement. A retry during the fence is
+    /// typed-refused; after the release it succeeds.
     ///
-    /// An UNCONFIRMED resolution (`false` — the confirmation future itself
-    /// failed: the spawned teardown JoinError'd, or a NotConfirmed
-    /// continuation was lost) is the typed recoverable WATCHER_FAILED state
-    /// (b8ke focused review FR6): the key cannot stay fenced in `Handoff`
-    /// forever (every retry would be HANDOFF_IN_PROGRESS with nothing left
-    /// to settle it). The watcher fail-OPENS to Vacant with the typed
-    /// `WatcherFailed` reason: the escalation already ran (the teardown's
-    /// bounded window SIGKILLed the tree before its future was lost), the
-    /// identity fence plus the next claim's reap discipline cover safety,
-    /// and the corrective `released` frame (reason WATCHER_FAILED)
-    /// supersedes the fenced failure frame on every device.
+    /// b8ke focused round-2 review R2-1: a `Lost` resolution (the
+    /// confirmation future itself failed — the spawned teardown
+    /// JoinError'd, or a NotConfirmed continuation was lost) NEVER
+    /// fail-opens the key: the watcher moves it to the TYPED
+    /// `Fenced{WatcherFailed}` state and spawns the REPLACEMENT watcher
+    /// whose bounded recorded-identity probe re-issues the death
+    /// confirmation (the terminal registry dead-poll; each fresh lane's
+    /// condemn-record kill-and-confirm) — only that probe's `Confirmed`
+    /// answer releases the fence. There is no path from here to plain
+    /// Vacant.
+    ///
+    /// b8ke focused round-2 review R2-3: a `PlatformLimited` resolution
+    /// (the teardown completed but its platform cannot verify the
+    /// descendant tree) fences with the typed `PlatformLimited` reason
+    /// and spawns nothing — no probe on that platform can ever confirm,
+    /// so the fence persists for the boot epoch (the documented
+    /// tradeoff; the session stays recoverable and the operator can kill
+    /// leftover processes by other means).
+    #[allow(clippy::too_many_arguments)] // the watcher field set (the spawn-call shape it has always had)
     fn spawn_reap_confirmation_watcher(
         self: &Arc<Self>,
         req: &HandoffRequest,
@@ -1369,7 +1529,8 @@ impl SessionHandoffRunner {
         generation: u64,
         initiator: &str,
         prior: &OwnerIdentity,
-        confirmation: impl std::future::Future<Output = bool> + Send + 'static,
+        release_reason: &'static str,
+        confirmation: impl std::future::Future<Output = ReapAnswer> + Send + 'static,
     ) {
         let runner = Arc::clone(self);
         let provider = req.provider.clone();
@@ -1381,86 +1542,154 @@ impl SessionHandoffRunner {
         let broadcast_req = self.cleanup_request(&provider, &session_id, req.target_kind);
         let settled = std::time::Instant::now();
         tokio::spawn(async move {
-            if !confirmation.await {
-                // FR6: the typed recoverable watcher-failed state — the
-                // confirmation future was lost, so fail-open to Vacant with
-                // the typed reason (never a permanent Handoff wedge).
-                tracing::error!(target: "freshell_ownership",
-                    event = "ownership.handoff.reap_watcher_failed",
-                    operation_id = %operation_id, provider = %provider, session_id = %session_id,
-                    epoch = runner.ownership.boot_epoch(), generation,
-                    outcome = "released_vacant_watcher_failed",
-                    failure_reason = "WATCHER_FAILED",
-                    "the detached reap confirmation failed before resolving; the key \
-                     fail-opens to Vacant — the escalation already ran and the next \
-                     claim's reap discipline covers safety");
-                let outcome = runner.ownership.fail_watcher_lost(
-                    &provider,
-                    &session_id,
-                    &operation_id,
-                    generation,
-                );
-                if !matches!(outcome, freshell_ownership::FailOutcome::Vacant { .. }) {
-                    // The record moved on (a foreign op/generation, or
-                    // already failed) — the typed no-op; say nothing on the
-                    // bus (a stale-generation frame would be dropped by the
-                    // clients' monotonic fold anyway).
-                    tracing::warn!(target: "freshell_ownership",
-                        event = "ownership.handoff.reap_watcher_failed_foreign",
-                        operation_id = %operation_id, provider = %provider, session_id = %session_id,
-                        epoch = runner.ownership.boot_epoch(), generation,
-                        outcome = "foreign_noop", failure_reason = "WATCHER_FAILED",
-                        "the watcher-failed release landed after the coordinator record moved on");
+            match confirmation.await {
+                ReapAnswer::Lost => {
+                    // R2-1: the confirmation future was lost — FENCE with
+                    // the typed WatcherFailed reason (never a fail-open to
+                    // Vacant), then re-spawn the replacement watcher whose
+                    // bounded recorded-identity probe settles the fence
+                    // ONLY on confirmed death.
+                    let outcome = runner.ownership.fence_unconfirmed_handoff(
+                        &provider,
+                        &session_id,
+                        &operation_id,
+                        generation,
+                        freshell_ownership::FenceReason::WatcherFailed,
+                    );
+                    if !matches!(outcome, freshell_ownership::FenceOutcome::Fenced) {
+                        // The record moved on (a foreign op/generation, or
+                        // already settled) — the typed no-op; nothing on the
+                        // bus (a stale-generation frame would be dropped by
+                        // the clients' monotonic fold anyway).
+                        tracing::warn!(target: "freshell_ownership",
+                            event = "ownership.handoff.reap_watcher_failed_foreign",
+                            operation_id = %operation_id, provider = %provider, session_id = %session_id,
+                            epoch = runner.ownership.boot_epoch(), generation,
+                            outcome = "foreign_noop", failure_reason = "WATCHER_FAILED",
+                            "the watcher-failed fence landed after the coordinator record moved on");
+                        return;
+                    }
+                    // The fence's corrective frame: the truth is unchanged
+                    // from the REAP_TIMEOUT `handoff-failed` frame already
+                    // on the bus (the prior still owns the fenced key), so
+                    // no new frame here — only the done-line.
+                    runner.log_transition(
+                        TransitionLog {
+                            operation_id: &operation_id,
+                            provider: &provider,
+                            session_id: &session_id,
+                            initiator: &initiator,
+                            epoch: runner.ownership.boot_epoch(),
+                            generation,
+                            live_session_key: prior.live_session_key.as_deref(),
+                            from_kind: prior_kind,
+                            to_kind: None,
+                            runtime_id: prior.terminal_id.as_deref(),
+                            pid: prior.pid,
+                            outcome: "reap_watcher_failed_fenced",
+                            duration_ms: settled.elapsed().as_millis() as u64,
+                            failure_reason: Some("WATCHER_FAILED"),
+                            stale: None,
+                        },
+                        "ownership.handoff.done",
+                        TransitionLevel::Error,
+                    );
+                    // The replacement probe — same watcher shape, settling
+                    // ONLY on a positive death confirmation (it loops the
+                    // bounded lane/registry probe until then; it can never
+                    // resolve Lost or PlatformLimited).
+                    let replacement =
+                        runner.prior_death_reconfirmation(&provider, &session_id, &prior);
+                    runner.spawn_reap_confirmation_watcher(
+                        &broadcast_req,
+                        &operation_id,
+                        generation,
+                        &initiator,
+                        &prior,
+                        "WATCHER_FAILED",
+                        replacement,
+                    );
+                    // The replacement watcher owns the release from here —
+                    // this watcher's job ended with the fence (falling
+                    // through would run the Confirmed-release code below and
+                    // immediately reopen the key it just fenced).
                     return;
                 }
-                // The corrective frame: the key is vacant now (the fenced
-                // handoff-failed frame said the prior still owned it — the
-                // same-generation fold applies this one).
-                runner.broadcast_owner(
-                    &broadcast_req,
-                    "released",
-                    None,
-                    None,
-                    &operation_id,
-                    generation,
-                    prior_kind,
-                    Some("WATCHER_FAILED"),
-                );
-                runner.log_transition(
-                    TransitionLog {
-                        operation_id: &operation_id,
-                        provider: &provider,
-                        session_id: &session_id,
-                        initiator: &initiator,
-                        epoch: runner.ownership.boot_epoch(),
+                ReapAnswer::PlatformLimited => {
+                    // R2-3: the teardown completed but the platform cannot
+                    // verify the descendant tree — fence with the typed
+                    // PlatformLimited reason and settle for the epoch.
+                    let outcome = runner.ownership.fence_unconfirmed_handoff(
+                        &provider,
+                        &session_id,
+                        &operation_id,
                         generation,
-                        live_session_key: prior.live_session_key.as_deref(),
-                        from_kind: prior_kind,
-                        to_kind: None,
-                        runtime_id: prior.terminal_id.as_deref(),
-                        pid: prior.pid,
-                        outcome: "reap_watcher_failed_vacant",
-                        duration_ms: settled.elapsed().as_millis() as u64,
-                        failure_reason: Some("WATCHER_FAILED"),
-                        stale: None,
-                    },
-                    "ownership.handoff.done",
-                    TransitionLevel::Error,
-                );
-                return;
+                        freshell_ownership::FenceReason::PlatformLimited,
+                    );
+                    if !matches!(outcome, freshell_ownership::FenceOutcome::Fenced) {
+                        tracing::warn!(target: "freshell_ownership",
+                            event = "ownership.handoff.reap_platform_limited_foreign",
+                            operation_id = %operation_id, provider = %provider, session_id = %session_id,
+                            epoch = runner.ownership.boot_epoch(), generation,
+                            outcome = "foreign_noop", failure_reason = "PLATFORM_LIMITED",
+                            "the platform-limited fence landed after the coordinator record moved on");
+                        return;
+                    }
+                    runner.log_transition(
+                        TransitionLog {
+                            operation_id: &operation_id,
+                            provider: &provider,
+                            session_id: &session_id,
+                            initiator: &initiator,
+                            epoch: runner.ownership.boot_epoch(),
+                            generation,
+                            live_session_key: prior.live_session_key.as_deref(),
+                            from_kind: prior_kind,
+                            to_kind: None,
+                            runtime_id: prior.terminal_id.as_deref(),
+                            pid: prior.pid,
+                            outcome: "reap_platform_limited_fenced",
+                            duration_ms: settled.elapsed().as_millis() as u64,
+                            failure_reason: Some("PLATFORM_LIMITED"),
+                            stale: None,
+                        },
+                        "ownership.handoff.done",
+                        TransitionLevel::Error,
+                    );
+                }
+                ReapAnswer::Confirmed => {}
             }
             // The confirmation IS the observed death (the lane teardown
-            // awaited its own watcher; the registry row is dead): release
-            // the fenced key — never restore a dead runtime as Live.
-            let outcome =
-                runner
-                    .ownership
-                    .fail(&provider, &session_id, &operation_id, generation, false);
-            if !matches!(outcome, freshell_ownership::FailOutcome::Vacant { .. }) {
+            // awaited its own watcher; the registry row is dead; the
+            // replacement probe kill-and-confirmed): release the fenced
+            // key — never restore a dead runtime as Live. The subject is
+            // either the original `Handoff` (`fail`) or — for the
+            // replacement watcher — the `Fenced` record itself
+            // (`release_fenced`); a foreign op/gen on either path is the
+            // typed no-op.
+            let released = match runner.ownership.fail(
+                &provider,
+                &session_id,
+                &operation_id,
+                generation,
+                false,
+            ) {
+                freshell_ownership::FailOutcome::Vacant { .. } => true,
+                _ => matches!(
+                    runner.ownership.release_fenced(
+                        &provider,
+                        &session_id,
+                        &operation_id,
+                        generation,
+                    ),
+                    freshell_ownership::CommitOutcome::Committed
+                ),
+            };
+            if !released {
                 // The record moved on (a foreign op/generation, or already
-                // failed) — the typed no-op; log it and say nothing on the
-                // bus (a stale-generation frame would be dropped by the
-                // clients' monotonic fold anyway).
+                // settled) — log it and say nothing on the bus (a
+                // stale-generation frame would be dropped by the clients'
+                // monotonic fold anyway).
                 tracing::warn!(target: "freshell_ownership",
                     event = "ownership.handoff.reap_settled_foreign",
                     operation_id = %operation_id, provider = %provider, session_id = %session_id,
@@ -1480,7 +1709,7 @@ impl SessionHandoffRunner {
                 &operation_id,
                 generation,
                 prior_kind,
-                Some("REAP_TIMEOUT"),
+                Some(release_reason),
             );
             runner.log_transition(
                 TransitionLog {
@@ -1497,13 +1726,78 @@ impl SessionHandoffRunner {
                     pid: prior.pid,
                     outcome: "reap_timeout_settled_vacant",
                     duration_ms: settled.elapsed().as_millis() as u64,
-                    failure_reason: Some("REAP_TIMEOUT"),
+                    failure_reason: Some(release_reason),
                     stale: None,
                 },
                 "ownership.handoff.done",
                 TransitionLevel::Warn,
             );
         });
+    }
+
+    /// b8ke focused round-2 review R2-1: the replacement death confirmation
+    /// for a `Fenced{WatcherFailed}` key — a BOUNDED probe of the recorded
+    /// prior identity that re-issues the kill where the lost teardown left
+    /// it and resolves [`ReapAnswer::Confirmed`] ONLY once death is
+    /// positively confirmed. Terminal priors: the registry dead-poll of the
+    /// recorded terminal id. Fresh priors: the lane's own recorded-identity
+    /// kill-and-confirm (claude/codex: the condemned (pid, tag) tree sweep;
+    /// opencode: the condemned daemon-side turn abort), with a full lane
+    /// teardown re-run for a session the cancelled kill never reached.
+    /// Never resolves anything but `Confirmed` — it loops (bounded steps,
+    /// fail-closed) until death is proven.
+    fn prior_death_reconfirmation(
+        self: &Arc<Self>,
+        provider: &str,
+        session_id: &str,
+        prior: &OwnerIdentity,
+    ) -> impl std::future::Future<Output = ReapAnswer> + Send + 'static {
+        let registry = self.registry.clone();
+        let fresh_claude = self.fresh_claude.clone();
+        let fresh_codex = self.fresh_codex.clone();
+        let fresh_opencode = self.fresh_opencode.clone();
+        let provider = provider.to_string();
+        let session_id = session_id.to_string();
+        let prior = prior.clone();
+        async move {
+            let mut logged_wait = false;
+            loop {
+                match prior.kind {
+                    RuntimeOwnerKind::Terminal => {
+                        if let Some(tid) = prior.terminal_id.as_deref() {
+                            await_terminal_dead(&registry, tid).await;
+                            return ReapAnswer::Confirmed;
+                        }
+                        // A Live terminal owner always carries its
+                        // terminal id; None is unreachable — stay
+                        // fail-closed (the fence holds).
+                    }
+                    RuntimeOwnerKind::FreshAgent => {
+                        let confirmed = match provider.as_str() {
+                            "claude" => fresh_claude.confirm_fenced_prior_dead(&session_id).await,
+                            "codex" => fresh_codex.confirm_fenced_prior_dead(&session_id).await,
+                            "opencode" => {
+                                fresh_opencode.confirm_fenced_prior_dead(&session_id).await
+                            }
+                            _ => false,
+                        };
+                        if confirmed {
+                            return ReapAnswer::Confirmed;
+                        }
+                    }
+                }
+                if !logged_wait {
+                    logged_wait = true;
+                    tracing::warn!(target: "freshell_ownership",
+                        event = "ownership.handoff.replacement_probe_waiting",
+                        provider = %provider, session_id = %session_id,
+                        runtime_id = ?prior.terminal_id, pid = ?prior.pid,
+                        "the replacement death probe has not yet confirmed the fenced prior's \
+                         death — the key stays fenced (fail-closed) while the probe retries");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
     }
 
     /// Start/attach the target UNDER-TICKET — the target paths skip their own

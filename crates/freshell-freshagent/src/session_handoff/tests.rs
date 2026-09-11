@@ -21,7 +21,8 @@ use freshell_ownership::{
     BeginOutcome, OwnershipState, RuntimeOwnerKind, RuntimeOwnershipRegistry,
 };
 use freshell_protocol::{
-    AgentProvider, FreshAgentAttach, FreshAgentCreate, FreshAgentKill, SessionType,
+    AgentProvider, FreshAgentAttach, FreshAgentCompact, FreshAgentCreate, FreshAgentKill,
+    SessionType,
 };
 
 use super::{HandoffHandle, HandoffRequest, HandoffTestHooks, SessionHandoffRunner};
@@ -171,6 +172,32 @@ const server = http.createServer((req, res) => {
     res.end('{}')
     return
   }
+  // The config: a splittable model so a compact's model-pair resolution
+  // succeeds against the fake serve (b8ke focused round-2 R2-5).
+  if (url.pathname === '/config') {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ model: 'fakeprov/fakemodel' }))
+    return
+  }
+  // A summarize (compact): log the receipt, then HOLD the answer until the
+  // release file appears — the mid-compaction window (the POST dispatched,
+  // the daemon-side summarization running, the response parked) a handoff
+  // must still quiesce through the abort (b8ke focused round-2 R2-5).
+  const summarize = url.pathname.match(/^\/session\/([^/]+)\/summarize$/)
+  if (summarize && req.method === 'POST') {
+    const id = decodeURIComponent(summarize[1])
+    log({ event: 'summarize-received', id })
+    const release = process.env.FAKE_OPENCODE_SERVE_SUMMARIZE_RELEASE || ''
+    const timer = setInterval(() => {
+      if (!release || fs.existsSync(release)) {
+        clearInterval(timer)
+        log({ event: 'summarize-answered', id })
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end('true')
+      }
+    }, 25)
+    return
+  }
   // The abort: log the receipt, then HOLD the answer until the release
   // file appears (the test releases it) — proving the caller awaits the
   // daemon-side abort before reporting the reap.
@@ -274,6 +301,7 @@ impl Drop for FakeOpencodeServeEnv {
             "OPENCODE_CMD",
             "FAKE_OPENCODE_SERVE_AUDIT_LOG",
             "FAKE_OPENCODE_SERVE_ABORT_RELEASE",
+            "FAKE_OPENCODE_SERVE_SUMMARIZE_RELEASE",
         ] {
             std::env::remove_var(var);
         }
@@ -380,6 +408,29 @@ fn build_rig_full(
     reap_timeout_ms: u64,
     claude_confirm_rounds: Option<u8>,
 ) -> Rig {
+    build_rig_with_options(
+        hooks,
+        kill_pause,
+        resume_pause,
+        reap_timeout_ms,
+        claude_confirm_rounds,
+        false,
+    )
+}
+
+/// [`build_rig_full`] plus the b8ke focused round-2 R2-3 seam — the claude
+/// lane's platform-limited stop override (the typed PlatformLimited answer
+/// the real lane only produces under `cfg(not(linux))`, driven on Linux
+/// for the fenced-platform-limited red/green).
+#[allow(clippy::too_many_arguments)]
+fn build_rig_with_options(
+    hooks: Option<Arc<HandoffTestHooks>>,
+    kill_pause: Option<Arc<tokio::sync::Notify>>,
+    resume_pause: Option<Arc<tokio::sync::Notify>>,
+    reap_timeout_ms: u64,
+    claude_confirm_rounds: Option<u8>,
+    claude_platform_limited: bool,
+) -> Rig {
     let auth_token = Arc::new("handoff-test-token".to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let rx = broadcast_tx.subscribe();
@@ -391,6 +442,11 @@ fn build_rig_full(
     fresh_claude.set_ownership(Arc::clone(&ownership));
     fresh_claude.set_handoff_test_pauses(kill_pause, resume_pause);
     fresh_claude.set_handoff_confirm_rounds_for_test(claude_confirm_rounds);
+    fresh_claude.set_handoff_platform_limited_for_test(if claude_platform_limited {
+        Some(true)
+    } else {
+        None
+    });
     let mut fresh_codex = crate::FreshCodexState::new(
         Arc::clone(&auth_token),
         Arc::clone(&broadcast_tx),
@@ -1377,16 +1433,18 @@ async fn handoff_reap_timeout_fences_the_key_until_the_detached_reap_confirms_de
     rig.registry.kill(&retry_terminal);
 }
 
-/// 3g. b8ke focused review FR6: a JoinError in the detached reap watcher
-/// (the spawned teardown task itself fails — here: cancelled by the test
-/// hook, a REAL JoinError) must leave the TYPED recoverable state — the
-/// key fail-opens to Vacant with the typed WatcherFailed reason and the
-/// corrective `released` frame (reason WATCHER_FAILED) supersedes the
-/// fenced `handoff-failed` frame — never a permanent Handoff wedge where
-/// every retry stays HANDOFF_IN_PROGRESS. A retry after the release
+/// 3g. b8ke focused round-2 review R2-1: a JoinError in the detached reap
+/// watcher (the spawned teardown task itself fails — here: cancelled by the
+/// test hook, a REAL JoinError) must leave the TYPED FENCED state — NEVER
+/// the round-1 fail-open to plain `Vacant` (which licensed a second writer
+/// over a possibly-live prior). A create during the fence is BLOCKED; the
+/// replacement watcher's bounded recorded-identity probe kill-and-confirms
+/// the condemned sidecar tree, and ONLY that confirmed death releases the
+/// fence — the corrective `released` frame (reason WATCHER_FAILED)
+/// superseding the fenced `handoff-failed` frame — after which a retry
 /// succeeds.
 #[tokio::test]
-async fn a_watcher_join_error_releases_the_fenced_key_to_a_typed_vacant_state() {
+async fn a_watcher_join_error_fences_the_key_until_the_replacement_probe_confirms_death() {
     let _guard = ENV_LOCK.lock().await;
     // The claude-lane env surface this file's tests mutate
     // (FRESHELL_CLAUDE_SIDECAR/NODE, FAKE_SIDECAR_REQUEST_LOG,
@@ -1394,7 +1452,7 @@ async fn a_watcher_join_error_releases_the_fenced_key_to_a_typed_vacant_state() 
     // snapshot.rs's tests through THEIR lock — hold it too: our own
     // ENV_LOCK only serializes this file against itself.
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
-    let _env = FakeSidecarEnv::install();
+    let env = FakeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let kill_pause = Arc::new(tokio::sync::Notify::new());
     let hooks = Arc::new(HandoffTestHooks::default());
@@ -1406,6 +1464,35 @@ async fn a_watcher_join_error_releases_the_fenced_key_to_a_typed_vacant_state() 
         None,
     );
     establish_fresh_claude_owner(&rig, &sid).await;
+    let prior_pid = env.sidecar_pid_for(&sid).expect("the prior sidecar's pid");
+    // The sidecar's ownership tag (our process is its ancestor, so
+    // /proc/<pid>/environ is readable) — the replacement probe's
+    // kill-and-confirm target.
+    let ownership_id = {
+        let environ = std::fs::read(format!("/proc/{prior_pid}/environ"))
+            .expect("read the sidecar's environ");
+        environ
+            .split(|&b| b == 0)
+            .find_map(|var| {
+                let var = std::str::from_utf8(var).ok()?;
+                var.strip_prefix("FRESHELL_CLAUDE_SIDECAR_ID=")
+            })
+            .expect("the sidecar's ownership id")
+            .to_string()
+    };
+    // A TERM-immune tagged "CLI grandchild" under the sidecar's tag: the
+    // replacement probe's kill-and-confirm needs its SIGKILL escalation
+    // rounds (≥500ms), so the Fenced window is deterministically
+    // observable — and the probe provably kill-and-confirms the WHOLE
+    // condemned tree, not just the sidecar.
+    let mut grandchild = tokio::process::Command::new("bash")
+        .arg("-c")
+        .arg("trap '' TERM; while :; do sleep 1; done")
+        .env("FRESHELL_CLAUDE_SIDECAR_ID", &ownership_id)
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn the lingering tagged grandchild");
+    let grandchild_pid = grandchild.id().expect("grandchild pid");
 
     // Arm the injected JoinError: the NEXT watcher's confirmation wrapper
     // aborts the spawned teardown task (a real cancelled-JoinError).
@@ -1427,30 +1514,62 @@ async fn a_watcher_join_error_releases_the_fenced_key_to_a_typed_vacant_state() 
     let result = handle.completion.await.expect("runner completed");
     assert_eq!(result["error"]["code"], json!("REAP_TIMEOUT"));
 
-    // The watcher's JoinError fail-opens the fenced key to the TYPED
-    // Vacant state (never a permanent Handoff wedge).
-    await_cond("the watcher-failed release must open the key", || {
+    // THE R2-1 regression: the watcher's JoinError leaves the key in the
+    // TYPED Fenced{WatcherFailed} state — never the round-1 fail-open to
+    // Vacant.
+    await_cond("the watcher failure must fence the key typed", || {
+        matches!(
+            rig.ownership.observe("claude", &sid).state,
+            OwnershipState::Fenced {
+                reason: freshell_ownership::FenceReason::WatcherFailed,
+                ..
+            }
+        )
+    })
+    .await;
+    // While fenced, a create is BLOCKED — the round-1 fail-open granted it
+    // (two writers on one session; the defect this test pins).
+    assert!(
+        matches!(
+            rig.ownership.begin_start(
+                "claude",
+                &sid,
+                RuntimeOwnerKind::FreshAgent,
+                "fence-probe-create-r21",
+                None,
+                "test",
+                0,
+            ),
+            BeginOutcome::Blocked { .. }
+        ),
+        "a create during the watcher-failed fence must be Blocked, never Granted"
+    );
+
+    // The replacement watcher's bounded recorded-identity probe finishes
+    // the condemned kill: the sidecar dies immediately and the tagged
+    // grandchild needs the SIGKILL escalation — the fence releases only
+    // after the WHOLE tree is confirmed dead.
+    await_pid_dead(prior_pid).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while crate::session_lease::proc_starttime(grandchild_pid as i32).is_some() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the replacement probe never killed the lingering descendant"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    await_cond("the confirmed death must release the fenced key", || {
         rig.ownership.observe("claude", &sid).state == OwnershipState::Vacant
     })
     .await;
-
-    // The corrective frames, in arrival order: the fenced `handoff-failed`
-    // (reason REAP_TIMEOUT) strictly before the `released` (reason
-    // WATCHER_FAILED) — the same-generation fold converges every device on
-    // the vacant key.
     let frames = await_owner_frames(&mut rig.rx, &["handoff-failed", "released"]).await;
     let failed = runtime_owner_frame(&frames, "handoff-failed");
     assert_eq!(failed["reason"], json!("REAP_TIMEOUT"));
     let released = runtime_owner_frame(&frames, "released");
     assert_eq!(
-        released["ownerKind"],
-        json!("vacant"),
-        "the watcher-failed release names the vacant key: {released}"
-    );
-    assert_eq!(
         released["reason"],
         json!("WATCHER_FAILED"),
-        "the typed watcher-failed reason rides the release: {released}"
+        "the replacement probe's release names the watcher failure: {released}"
     );
     let failed_pos = frames
         .iter()
@@ -1459,15 +1578,15 @@ async fn a_watcher_join_error_releases_the_fenced_key_to_a_typed_vacant_state() 
     let released_pos = frames
         .iter()
         .position(|f| f["transition"] == "released")
-        .expect("the released frame position");
+        .expect("the release frame position");
     assert!(
         failed_pos < released_pos,
         "the failure frame (index {failed_pos}) must precede the release (index {released_pos})"
     );
 
-    // The recoverable state: a retry SUCCEEDS (the key reopened; pre-fix
-    // every retry stayed HANDOFF_IN_PROGRESS forever).
-    kill_pause.notify_one(); // release the parked (aborted) kill's pause slot
+    // The recoverable state: a retry SUCCEEDS (the fence released on
+    // confirmed death).
+    let _ = grandchild.wait().await;
     let retry = rig
         .runner
         .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
@@ -1475,10 +1594,80 @@ async fn a_watcher_join_error_releases_the_fenced_key_to_a_typed_vacant_state() 
     assert_eq!(
         retried["ok"],
         json!(true),
-        "the post-watcher-failure retry must succeed: {retried}"
+        "the post-settlement retry must succeed: {retried}"
     );
     let retry_terminal = retried["owner"]["terminalId"].as_str().unwrap().to_string();
     rig.registry.kill(&retry_terminal);
+}
+
+/// 3i. b8ke focused round-2 review R2-3: a platform-limited prior stop (the
+/// direct child's awaited exit is the portable confirmation floor; the
+/// descendant-tree verification requires Linux `/proc`) must NOT satisfy
+/// confirmed-reap. The handoff answers the typed PLATFORM_LIMITED failure,
+/// the key is FENCED with the typed reason — a create is Blocked (never a
+/// second writer over a possibly-live descendant), and the session remains
+/// recoverable (the durable history untouched). The documented tradeoff:
+/// nothing on that platform can confirm the descendant death, so the fence
+/// persists for the boot epoch — driven on Linux through the lane's test
+/// seam (the real arm is `cfg(not(linux))`-only).
+#[tokio::test]
+async fn handoff_with_a_platform_limited_prior_stop_fences_the_key_typed() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let rig = build_rig_with_options(None, None, None, 8_000, None, true);
+    establish_fresh_claude_owner(&rig, &sid).await;
+
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let result = handle.completion.await.expect("runner completed");
+
+    // The typed failure — NEVER a bare success (pre-R2-3 the
+    // PlatformLimited teardown answered Reaped and the handoff committed
+    // a terminal writer over an unverifiable descendant tree).
+    assert_eq!(
+        result["ok"],
+        json!(false),
+        "the platform-limited handoff must fail: {result}"
+    );
+    assert_eq!(result["error"]["code"], json!("PLATFORM_LIMITED"));
+    assert_eq!(result["error"]["retryable"], json!(true));
+    // The key is FENCED with the typed PlatformLimited reason.
+    assert!(
+        matches!(
+            rig.ownership.observe("claude", &sid).state,
+            OwnershipState::Fenced {
+                reason: freshell_ownership::FenceReason::PlatformLimited,
+                ..
+            }
+        ),
+        "the platform-limited stop must fence the key typed, got {:?}",
+        rig.ownership.observe("claude", &sid).state
+    );
+    // A create during the fence is Blocked — no new writer can start.
+    assert!(
+        matches!(
+            rig.ownership.begin_start(
+                "claude",
+                &sid,
+                RuntimeOwnerKind::FreshAgent,
+                "pl-fence-probe-create",
+                None,
+                "test",
+                0,
+            ),
+            BeginOutcome::Blocked { .. }
+        ),
+        "a create during the platform-limited fence must be Blocked"
+    );
+    // A handoff retry is the typed in-flight refusal while fenced.
+    let retry = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let retried = retry.completion.await.expect("retry completed");
+    assert_eq!(retried["error"]["code"], json!("HANDOFF_IN_PROGRESS"));
 }
 
 /// 3h. b8ke focused review FR3 (the runner's fenced not-confirmed path): a
@@ -2898,6 +3087,116 @@ async fn opencode_handoff_stop_aborts_a_daemon_turn_left_running_by_a_finished_l
     );
 
     // Cleanup: kill the terminal owner's row.
+    rig.registry.kill(&terminal_id);
+}
+
+/// 6e. b8ke focused round-2 review R2-5: a handoff landing MID-COMPACTION
+/// must quiesce the daemon-side summarize through the abort before
+/// Reaped — the compact drive arms the SAME accepted-daemon-operation
+/// witness the send drive arms, at the summarize POST's dispatch boundary.
+/// Pre-fix: the compact never armed the flag, so the stop path skipped the
+/// daemon abort, reported Reaped, and started the terminal while the
+/// daemon-side summarization still mutated the session. The fake serve
+/// holds the summarize answer open (the POST dispatched, the response
+/// parked) while the abort answers normally.
+#[tokio::test]
+async fn opencode_handoff_during_compaction_aborts_the_daemon_side_summarize() {
+    let _guard = ENV_LOCK.lock().await;
+    // The claude-lane env surface this file's tests mutate
+    // (FRESHELL_CLAUDE_SIDECAR/NODE, FAKE_SIDECAR_REQUEST_LOG,
+    // CLAUDE_CONFIG_DIR) is process-global and shared with claude.rs's and
+    // snapshot.rs's tests through THEIR lock — hold it too: our own
+    // ENV_LOCK only serializes this file against itself.
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let env = FakeOpencodeServeEnv::install();
+    // The summarize-hold release file: absent until the test writes it, so
+    // the fake serve holds its summarize answer open — the mid-compaction
+    // window (dispatched, daemon-side work running, response parked).
+    let summarize_release = env.dir.join("summarize-release-r25");
+    std::env::set_var("FAKE_OPENCODE_SERVE_SUMMARIZE_RELEASE", &summarize_release);
+    let sid = format!("ses_handoff_compact_{}", uuid::Uuid::new_v4().simple());
+    let rig = build_rig(None);
+
+    // Fresh owner: a durable opencode session, registered through the
+    // shared serve (the test-6 pattern).
+    rig.fresh_opencode
+        .handle_attach(FreshAgentAttach {
+            provider: AgentProvider::Opencode,
+            session_id: sid.clone(),
+            session_type: SessionType::Freshopencode,
+            cwd: Some("/tmp".to_string()),
+            observed_epoch: None,
+            observed_generation: None,
+            resume_session_id: None,
+            session_ref: None,
+        })
+        .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        match rig.ownership.observe("opencode", &sid).state {
+            OwnershipState::Live { owner, .. } => {
+                assert_eq!(owner.kind, RuntimeOwnerKind::FreshAgent);
+                break;
+            }
+            state => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the opencode attach never committed Live, got {state:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+
+    // A compact whose summarize POST the fake serve accepts but whose
+    // answer is HELD open — the daemon-side summarization is running.
+    rig.fresh_opencode
+        .handle_compact(FreshAgentCompact {
+            provider: AgentProvider::Opencode,
+            session_id: sid.clone(),
+            session_type: SessionType::Freshopencode,
+            cwd: Some("/tmp".to_string()),
+            instructions: None,
+        })
+        .await;
+    env.await_audit_row(Duration::from_secs(20), |r| {
+        r["event"] == "summarize-received" && r["id"] == json!(sid)
+    })
+    .await;
+
+    // Handoff opencode -> terminal MID-COMPACTION: the stop must abort the
+    // daemon-side summarize before the reap is reported.
+    let to_terminal = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("opencode", &sid, "opencode"));
+    let completion = to_terminal.completion;
+
+    // THE R2-5 assertion: the manager abort IS issued for the compacted
+    // session (pre-fix: the compact never armed the acceptance, so the
+    // stop path skipped the abort entirely).
+    env.await_audit_row(Duration::from_secs(20), |r| {
+        r["event"] == "abort-received" && r["id"] == json!(sid)
+    })
+    .await;
+
+    // The abort answers (no abort hold set): the stop reports Reaped and
+    // the handoff runs to its committed terminal owner.
+    let result = completion.await.expect("handoff completed");
+    assert_eq!(result["ok"], json!(true), "handoff to terminal: {result}");
+    let terminal_id = result["owner"]["terminalId"].as_str().unwrap().to_string();
+
+    // The shared serve was never killed — exactly one serve pid across the
+    // whole handoff (OpenCode invariant).
+    assert_eq!(
+        env.serve_pids().len(),
+        1,
+        "the shared serve was never killed or restarted: pids {:?}",
+        env.serve_pids()
+    );
+
+    // Release the summarize hold for a clean shutdown of the parked
+    // response, then clean up the terminal owner's row.
+    std::fs::write(&summarize_release, "").expect("release the summarize hold");
     rig.registry.kill(&terminal_id);
 }
 

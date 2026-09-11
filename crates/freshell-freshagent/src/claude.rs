@@ -116,6 +116,20 @@ pub struct FreshClaudeState {
     /// confirmation round budget override — `None` in production (the
     /// [`TREE_DEATH_CONFIRM_ROUNDS`] default).
     handoff_confirm_rounds: Option<u8>,
+    /// Test seam (b8ke focused round-2 R2-3): make the NEXT
+    /// `kill_for_handoff` answer the typed [`StopResult::PlatformLimited`]
+    /// unconditionally — the platform-limited red/green on Linux, where the
+    /// real arm is `cfg(not(linux))`-only. `None` in production.
+    handoff_platform_limited: Option<bool>,
+    /// b8ke focused round-2 review R2-1: the CONDEMNED-PRIOR record — the
+    /// canonical session id → the (sidecar child pid, `/proc` ownership
+    /// tag) pair every `kill_for_handoff` records BEFORE its first
+    /// cancellable await. A cancelled/panicked teardown leaves the record
+    /// behind (the sessions-map entry is already gone), and the handoff
+    /// watcher's replacement probe kill-and-confirms the recorded tree
+    /// through exactly this pair — the bounded recorded-identity probe the
+    /// fenced key releases on. Cleared by whichever path confirms death.
+    condemned_priors: Arc<std::sync::Mutex<HashMap<String, (u32, String)>>>,
     /// Test seam (Task 6 round-3 review I-1): park `resume_for_attach`
     /// right after the target session is REGISTERED — the fresh-arm
     /// target-spawn-window abort test's deterministic hold. `None` in
@@ -637,7 +651,9 @@ impl FreshClaudeState {
             close_pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
             handoff_kill_pause: None,
             handoff_confirm_rounds: None,
+            handoff_platform_limited: None,
             handoff_resume_pause: None,
+            condemned_priors: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -662,23 +678,133 @@ impl FreshClaudeState {
         self.handoff_confirm_rounds = rounds;
     }
 
+    /// Test seam (b8ke focused round-2 R2-3): make the next
+    /// `kill_for_handoff` answer the typed platform-limited stop result —
+    /// the Linux red/green for a confirmation gap the real code only
+    /// produces on non-Linux builds. `None` in production.
+    pub fn set_handoff_platform_limited_for_test(&mut self, armed: Option<bool>) {
+        self.handoff_platform_limited = armed;
+    }
+
+    /// b8ke focused round-2 review R2-1: record the condemned prior's
+    /// identity — `(sidecar child pid, /proc ownership tag)` — for the
+    /// canonical `session_id`, BEFORE `kill_for_handoff`'s first
+    /// cancellable await. Sync (lock awaits only), never removes anything
+    /// from the sessions map.
+    async fn record_condemned_prior(&self, session_id: &str) {
+        let Some(map_key) = self.resolve_session_key(session_id).await else {
+            return;
+        };
+        let identity = {
+            let sessions = self.sessions.lock().await;
+            sessions.get(&map_key).and_then(|session| {
+                session
+                    .child
+                    .id()
+                    .map(|pid| (pid, session.ownership_id.clone()))
+            })
+        };
+        if let Some((pid, tag)) = identity {
+            self.condemned_priors
+                .lock()
+                .expect("condemned priors lock")
+                .insert(session_id.to_string(), (pid, tag));
+        }
+    }
+
+    /// b8ke focused round-2 review R2-1: the bounded recorded-identity
+    /// death probe for a fenced claude/kilroy prior. A condemned-prior
+    /// record means a `kill_for_handoff` was cancelled or panicked between
+    /// arming its record and confirming the tree's death — this probe
+    /// FINISHES the job (SIGTERM→SIGKILL the recorded child + tagged tree,
+    /// confirm dead-by-starttime) and clears the record on success. A
+    /// still-mapped session (the cancelled kill never reached the map
+    /// removal) instead gets the lane's own full teardown re-run — its
+    /// `Reaped` answer IS the confirmed reap. Never confirms on less:
+    /// `false` keeps the fence held (fail-closed).
+    pub(crate) async fn confirm_fenced_prior_dead(&self, session_id: &str) -> bool {
+        // Bind before the `if let`: the guard must never live across the
+        // kill-and-confirm await.
+        let condemned = self
+            .condemned_priors
+            .lock()
+            .expect("condemned priors lock")
+            .get(session_id)
+            .cloned();
+        if let Some((pid, tag)) = condemned {
+            let confirmed = crate::session_lease::kill_and_confirm_tree_dead(
+                pid,
+                CLAUDE_SIDECAR_OWNERSHIP_ENV,
+                &tag,
+            )
+            .await;
+            if confirmed {
+                self.condemned_priors
+                    .lock()
+                    .expect("condemned priors lock")
+                    .remove(session_id);
+            }
+            return confirmed;
+        }
+        // No condemned record: either the cancelled teardown completed its
+        // confirmation (the record was cleared) or it never got past the
+        // session lookup. A still-live map entry is the latter — the full
+        // lane teardown re-run is the confirmation. An absent entry with no
+        // record has nothing this lane can positively probe (fail-closed:
+        // the caller's fence holds).
+        if self.has_live_session(session_id).await {
+            match self
+                .kill_for_handoff(session_id, "handoff-watcher-replacement")
+                .await
+            {
+                crate::session_handoff::StopResult::Reaped => return true,
+                crate::session_handoff::StopResult::NotConfirmed { confirmation } => {
+                    return confirmation.await;
+                }
+                crate::session_handoff::StopResult::AlreadyGone
+                | crate::session_handoff::StopResult::PlatformLimited => return false,
+            }
+        }
+        false
+    }
+
     /// Run [`teardown_removed_session`] with the production confirmation
-    /// budget and surface its typed outcome (b8ke focused review FR3):
-    /// these callers (the kill-family sweeps and the uncommitted-orphan
-    /// unwinds) hold no coordinator fence of their own, so the structured
-    /// error line is their observable record of an unconfirmed tree —
-    /// never a silent success.
-    async fn teardown_removed_session_logged(&self, session: ClaudeSession) {
-        match teardown_removed_session(session, TREE_DEATH_CONFIRM_ROUNDS).await {
-            TeardownConfirmation::NotConfirmed { tree, .. } => {
+    /// budget and PROPAGATE its typed outcome (b8ke focused round-2 review
+    /// R2-2): an unconfirmed tree is never a silent success — the
+    /// structured error line lands AND the detached escalation keeps
+    /// killing the tree, with the handle handed to the caller. The
+    /// kill-family sweeps and uncommitted-orphan unwinds hold no
+    /// coordinator fence of their own, so for them the typed log plus the
+    /// running escalation IS the discipline; the explicit kill (which
+    /// holds `Stopping`) additionally defers its commit on the escalation.
+    async fn teardown_removed_session_logged(&self, session: ClaudeSession) -> LoggedTeardown {
+        let session_label = session.sidecar_session_id.clone();
+        match teardown_removed_session(
+            session,
+            self.handoff_confirm_rounds
+                .unwrap_or(TREE_DEATH_CONFIRM_ROUNDS),
+        )
+        .await
+        {
+            TeardownConfirmation::Confirmed => LoggedTeardown::Confirmed,
+            TeardownConfirmation::PlatformLimited => LoggedTeardown::PlatformLimited,
+            TeardownConfirmation::NotConfirmed { tree, ownership_id } => {
                 tracing::error!(target: "freshell_freshagent::claude",
+                    session_id = %session_label,
                     lingering = tree.len(),
                     "freshagent.claude.teardown_unconfirmed: the bounded confirmation \
                      window expired with tagged descendants still alive — the teardown \
-                     did NOT confirm the runtime tree's death"
+                     did NOT confirm the runtime tree's death; the escalation continues \
+                     detached and the caller's coordinator fence (if any) stays held"
                 );
+                LoggedTeardown::NotConfirmed {
+                    escalation: spawn_claude_tree_death_escalation(
+                        tree,
+                        ownership_id,
+                        session_label,
+                    ),
+                }
             }
-            TeardownConfirmation::Confirmed | TeardownConfirmation::PlatformLimited => {}
         }
     }
 
@@ -767,12 +893,26 @@ impl FreshClaudeState {
             "freshagent.claude.handoff_stop: stopping the prior freshclaude/kilroy runtime for handoff"
         );
         crate::ownership_lane::take_retained_stamp(&self.ownership_stamps, session_id);
+        // b8ke focused round-2 review R2-1: record the condemned identity
+        // BEFORE the first await a cancellation can land in (the test pause
+        // included) — a cancelled/panicked teardown leaves this record as
+        // the replacement watcher's bounded kill-and-confirm probe target.
+        self.record_condemned_prior(session_id).await;
         // Test seam (Task 6 round-3 review I-1): park with the kill ISSUED
         // (the retained stamp taken) but nothing else disturbed — the
         // prior-reap-window abort test's deterministic hold. None in
         // production and every other test.
         if let Some(pause) = self.handoff_kill_pause.as_ref() {
             let _ = pause.notified().await;
+        }
+        // Test seam (b8ke focused round-2 R2-3): the platform-limited shape
+        // the real code only produces under `cfg(not(linux))`.
+        if self.handoff_platform_limited == Some(true) {
+            self.condemned_priors
+                .lock()
+                .expect("condemned priors lock")
+                .remove(session_id);
+            return crate::session_handoff::StopResult::PlatformLimited;
         }
         let Some(map_key) = self.resolve_session_key(session_id).await else {
             return crate::session_handoff::StopResult::AlreadyGone;
@@ -794,10 +934,15 @@ impl FreshClaudeState {
         // (SIGKILL rounds) until the tree is dead — the runner fences the
         // key (the F3 machinery), broadcasts the failure frame first
         // (FR5), and its watcher releases on the continuation. A
-        // `PlatformLimited` answer (non-Linux) is the typed limitation —
-        // the child's AWAITED exit is the portable confirmation floor, and
-        // the descendant-tree gap is named in the structured log, never a
-        // silent success.
+        // `PlatformLimited` answer (non-Linux) is the typed limitation
+        // (b8ke focused round-2 R2-3): the child's AWAITED exit is the
+        // portable confirmation floor, but the descendant-tree gap must
+        // NOT satisfy confirmed-reap — the runner fences the key with the
+        // typed PlatformLimited reason (a new writer cannot start; the
+        // session remains recoverable — the operator can still kill
+        // leftover processes by other means; nothing on that platform can
+        // ever confirm the descendant death, so the fence persists for the
+        // boot epoch — the documented tradeoff).
         let confirmation = teardown_removed_session(
             session,
             self.handoff_confirm_rounds
@@ -807,8 +952,20 @@ impl FreshClaudeState {
         self.evict_cli_index_aliases(&map_key).await;
         self.leases.clear_binding(PROVIDER, session_id);
         match confirmation {
-            TeardownConfirmation::Confirmed => crate::session_handoff::StopResult::Reaped,
-            TeardownConfirmation::PlatformLimited => crate::session_handoff::StopResult::Reaped,
+            TeardownConfirmation::Confirmed => {
+                self.condemned_priors
+                    .lock()
+                    .expect("condemned priors lock")
+                    .remove(session_id);
+                crate::session_handoff::StopResult::Reaped
+            }
+            TeardownConfirmation::PlatformLimited => {
+                self.condemned_priors
+                    .lock()
+                    .expect("condemned priors lock")
+                    .remove(session_id);
+                crate::session_handoff::StopResult::PlatformLimited
+            }
             TeardownConfirmation::NotConfirmed {
                 mut tree,
                 ownership_id,
@@ -820,6 +977,7 @@ impl FreshClaudeState {
                      continues detached; Reaped is withheld until death is confirmed"
                 );
                 let escalation_session_id = session_id.to_string();
+                let condemned_priors = Arc::clone(&self.condemned_priors);
                 crate::session_handoff::StopResult::NotConfirmed {
                     confirmation: Box::pin(async move {
                         while !confirm_captured_claude_tree_dead(
@@ -835,6 +993,12 @@ impl FreshClaudeState {
                                  detached tree-death escalation re-armed its bounded window"
                             );
                         }
+                        // Death confirmed — the condemned-prior record this
+                        // escalation just settled clears with it.
+                        condemned_priors
+                            .lock()
+                            .expect("condemned priors lock")
+                            .remove(&escalation_session_id);
                         true
                     }),
                 }
@@ -1532,7 +1696,11 @@ impl FreshClaudeState {
                      claim's commit and its registration; the registered orphan is torn down"
                 );
                 if let Some(session) = self.sessions.lock().await.remove(&created) {
-                    self.teardown_removed_session_logged(session).await;
+                    // R2-2: the typed outcome is propagated; this unwind path holds no
+                    // coordinator fence, so the helper's typed log + its detached
+                    // escalation are the whole discipline here.
+                    let _teardown: LoggedTeardown =
+                        self.teardown_removed_session_logged(session).await;
                 }
                 // Demote (never drop) the torn-down registration: a later
                 // kill naming this placeholder still resolves the durable.
@@ -1598,7 +1766,11 @@ impl FreshClaudeState {
                      the create registered; the uncommitted session is torn down"
                 );
                 if let Some(session) = self.sessions.lock().await.remove(&created) {
-                    self.teardown_removed_session_logged(session).await;
+                    // R2-2: the typed outcome is propagated; this unwind path holds no
+                    // coordinator fence, so the helper's typed log + its detached
+                    // escalation are the whole discipline here.
+                    let _teardown: LoggedTeardown =
+                        self.teardown_removed_session_logged(session).await;
                 }
                 self.evict_cli_index_aliases(&created).await;
                 self.fail_create(
@@ -2044,9 +2216,14 @@ impl FreshClaudeState {
             let _ = self.retire_closed_rows(&strays).await;
             retire_ids.extend(strays);
         }
-        if let Some(session) = removed {
-            self.teardown_removed_session_logged(session).await;
-        }
+        // b8ke focused round-2 review R2-2: the teardown's typed outcome
+        // decides the stop commit AND the broadcast truth — an unconfirmed
+        // tree is never a silent success.
+        let teardown = if let Some(session) = removed {
+            self.teardown_removed_session_logged(session).await
+        } else {
+            LoggedTeardown::Confirmed
+        };
 
         // Explicit kill evicts this session's requestId dedup cache entries (mirrors
         // `clearFreshAgentCreateCachesForSession`) -- a later duplicate `create` for the
@@ -2074,27 +2251,103 @@ impl FreshClaudeState {
         // sweep) is a genuine reopen and is spared.
         self.sweep_late_claim_orphans(&retire_ids).await;
 
-        // kata b8ke Task 3: the teardown (the reap — consumer abort, child
-        // kill, ownership sweep) is done — commit the stop (Stopping →
-        // Vacant). NEVER before the reap (round-1 review).
+        // kata b8ke Task 3 + b8ke focused round-2 review R2-2: the stop
+        // commit follows the CONFIRMED reap — `Stopping` → `Vacant` only
+        // once the teardown confirmed the tree's death. An UNCONFIRMED
+        // tree keeps the key fenced in `Stopping` (blocked for every new
+        // writer) while the detached escalation finishes the kill, and only
+        // its confirmed death commits the stop; a PLATFORM-LIMITED
+        // confirmation (non-Linux) fences the key typed — never a Vacant
+        // over an unverifiable descendant tree. NEVER before the reap
+        // (round-1 review), never unconfirmed (round-2 review).
+        let mut kill_failure: Option<(&'static str, String)> = None;
         if let (Some(registry), Some(generation), Some(op_id), Some(key)) = (
             self.ownership.as_ref(),
             stop_generation,
             stop_op_id.as_deref(),
             stop_key.as_deref(),
         ) {
-            let _ = crate::ownership_lane::commit_fresh_agent_stop(
-                registry, PROVIDER, key, op_id, generation,
-            );
+            match teardown {
+                LoggedTeardown::Confirmed => {
+                    let _ = crate::ownership_lane::commit_fresh_agent_stop(
+                        registry, PROVIDER, key, op_id, generation,
+                    );
+                }
+                LoggedTeardown::NotConfirmed { escalation } => {
+                    // The bounded window expired with tagged descendants
+                    // still alive: the key stays fenced in `Stopping` (no
+                    // new writer can start) while the escalation kills the
+                    // tree — its confirmed death performs the deferred
+                    // commit. The kill visibly FAILS (typed, retryable).
+                    kill_failure = Some((
+                        "TEARDOWN_NOT_CONFIRMED",
+                        "the session was killed but its runtime tree's death could not be \
+                         confirmed yet; the key stays fenced until the escalation confirms \
+                         it — retry after it settles"
+                            .to_string(),
+                    ));
+                    let registry = Arc::clone(registry);
+                    let key = key.to_string();
+                    let op_id = op_id.to_string();
+                    tokio::spawn(async move {
+                        if escalation.await.unwrap_or(false) {
+                            let _ = crate::ownership_lane::commit_fresh_agent_stop(
+                                &registry, PROVIDER, &key, &op_id, generation,
+                            );
+                            tracing::warn!(target: "freshell_ownership",
+                                event = "ownership.stop.deferred_commit",
+                                provider = PROVIDER, session_id = %key,
+                                operation_id = %op_id, generation,
+                                outcome = "committed_after_confirmed_death",
+                                failure_reason = "TEARDOWN_NOT_CONFIRMED",
+                                "the unconfirmed-kill escalation confirmed the tree's death — \
+                                 the deferred stop commit released the fenced key");
+                        } else {
+                            tracing::error!(target: "freshell_ownership",
+                                event = "ownership.stop.deferred_commit",
+                                provider = PROVIDER, session_id = %key,
+                                operation_id = %op_id, generation,
+                                outcome = "escalation_lost",
+                                failure_reason = "TEARDOWN_ESCALATION_LOST",
+                                "the unconfirmed-kill escalation itself was lost — the key \
+                                 stays fenced in Stopping (fail-closed; no new writer)");
+                        }
+                    });
+                }
+                LoggedTeardown::PlatformLimited => {
+                    // R2-3 discipline on the explicit-kill path: a
+                    // platform-limited confirmation is NOT a confirmed
+                    // reap — the key fences typed instead of committing
+                    // `Stopping` → `Vacant`. Nothing on a non-Linux
+                    // platform can confirm the descendant death, so the
+                    // fence persists for the boot epoch (the documented
+                    // tradeoff; the session stays recoverable and the
+                    // operator can kill leftover processes by other means).
+                    let _ = registry.fence_unconfirmed_stop(
+                        PROVIDER,
+                        key,
+                        op_id,
+                        generation,
+                        freshell_ownership::FenceReason::PlatformLimited,
+                    );
+                    kill_failure = Some((
+                        "TEARDOWN_PLATFORM_LIMITED",
+                        "the session was killed but this platform cannot verify the runtime \
+                         tree's death; the key stays fenced (no new writer can start) and \
+                         the session remains recoverable"
+                            .to_string(),
+                    ));
+                }
+            }
         }
 
         self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
             provider: PROVIDER.to_string(),
             session_id,
             session_type: session_type.to_string(),
-            success: !main_close_reported_failure && !invariant_broken,
-            code: None,
-            message: None,
+            success: !main_close_reported_failure && !invariant_broken && kill_failure.is_none(),
+            code: kill_failure.as_ref().map(|(code, _)| code.to_string()),
+            message: kill_failure.as_ref().map(|(_, message)| message.clone()),
         }));
     }
 
@@ -2186,7 +2439,10 @@ impl FreshClaudeState {
                 if let Err(e) = sink.retire_closed(PROVIDER, id).await {
                     tracing::warn!(error = %e, session = %id, "freshagent.claude.kill_sweep_reretire_failed");
                 }
-                self.teardown_removed_session_logged(session).await;
+                // R2-2: the typed outcome is propagated; this unwind path holds no
+                // coordinator fence, so the helper's typed log + its detached
+                // escalation are the whole discipline here.
+                let _teardown: LoggedTeardown = self.teardown_removed_session_logged(session).await;
                 // Keep the alias bookkeeping consistent with the removal
                 // (demote, never drop — a later kill naming this placeholder
                 // still resolves the durable row).
@@ -4974,7 +5230,10 @@ impl FreshClaudeState {
                  claim's commit and its registration; the registered orphan is torn down"
             );
             if let Some(session) = self.sessions.lock().await.remove(&msg.session_id) {
-                self.teardown_removed_session_logged(session).await;
+                // R2-2: the typed outcome is propagated; this unwind path holds no
+                // coordinator fence, so the helper's typed log + its detached
+                // escalation are the whole discipline here.
+                let _teardown: LoggedTeardown = self.teardown_removed_session_logged(session).await;
             }
             self.evict_cli_index_aliases(&msg.session_id).await; // demote, never drop
             if let Some(mut g) = lease_guard.take() {
@@ -5020,7 +5279,10 @@ impl FreshClaudeState {
                  resume registered; the uncommitted session is torn down"
             );
             if let Some(session) = self.sessions.lock().await.remove(&msg.session_id) {
-                self.teardown_removed_session_logged(session).await;
+                // R2-2: the typed outcome is propagated; this unwind path holds no
+                // coordinator fence, so the helper's typed log + its detached
+                // escalation are the whole discipline here.
+                let _teardown: LoggedTeardown = self.teardown_removed_session_logged(session).await;
             }
             self.evict_cli_index_aliases(&msg.session_id).await;
             return Err(ResumeClaudeError::Transient(
@@ -6705,6 +6967,48 @@ enum TeardownConfirmation {
     /// dead-code on the Linux build by construction.)
     #[allow(dead_code)]
     PlatformLimited,
+}
+
+/// b8ke focused round-2 review R2-2: the typed outcome of the shared
+/// logged teardown ([`FreshClaudeState::teardown_removed_session_logged`]).
+/// `NotConfirmed` carries the DETACHED escalation handle (the SIGKILL
+/// rounds keep killing the captured tree until it is dead) so a caller
+/// holding a coordinator fence — the explicit kill's `Stopping` — can
+/// defer its commit until the escalation confirms death.
+enum LoggedTeardown {
+    Confirmed,
+    PlatformLimited,
+    NotConfirmed {
+        escalation: tokio::task::JoinHandle<bool>,
+    },
+}
+
+/// The detached unconfirmed-tree escalation (b8ke focused round-2 review
+/// R2-2): SIGTERM→SIGKILL rounds until the captured tree is confirmed
+/// dead-by-starttime. Resolves `true` only on confirmed death — the
+/// deferred stop commit releases on exactly that.
+fn spawn_claude_tree_death_escalation(
+    tree: Vec<(i32, u64)>,
+    ownership_id: String,
+    session_label: String,
+) -> tokio::task::JoinHandle<bool> {
+    tokio::spawn(async move {
+        let mut tree = tree;
+        while !confirm_captured_claude_tree_dead(
+            &mut tree,
+            &ownership_id,
+            TREE_DEATH_CONFIRM_ROUNDS,
+        )
+        .await
+        {
+            tracing::warn!(target: "freshell_freshagent::claude",
+                session_id = %session_label, lingering = tree.len(),
+                "freshagent.claude.teardown_escalation_continues: the detached tree-death \
+                 escalation re-armed its bounded window"
+            );
+        }
+        true
+    })
 }
 
 /// The bounded SIGTERM→SIGKILL confirmation round budget (24 × 25ms with
@@ -9527,6 +9831,186 @@ rl.on('line', (line) => {
             "the post-refusal adoption writes its alias record"
         );
     }
+
+    /// b8ke focused round-2 review R2-2: an explicit kill whose teardown
+    /// CANNOT confirm the runtime tree's death (a TERM-immune tagged
+    /// descendant outlives the bounded confirmation window) must NOT
+    /// commit `Stopping` → `Vacant` and must NOT broadcast success — the
+    /// key stays fenced in `Stopping` (a create is Blocked) until the
+    /// detached escalation's SIGKILL rounds confirm the tree's death, and
+    /// only that deferred commit releases the key. Pre-fix: the helper
+    /// discarded the `NotConfirmed` outcome after logging it and the kill
+    /// committed the stop + broadcast success regardless — a descendant
+    /// writer could outlive the released ownership. Linux-only (the /proc
+    /// ownership-tag scan is the Linux discipline).
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unconfirmed_kill_fences_the_key_until_the_escalation_confirms_death() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+        // The one-round confirmation window: a TERM-immune tagged descendant
+        // deterministically outlives it (the FR3 seam, now shared by the
+        // kill-family helper).
+        st.set_handoff_confirm_rounds_for_test(Some(1));
+
+        st.handle_create(dedup_create_msg("req-kill-unconfirmed"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "req-kill-unconfirmed").await;
+        let placeholder = created["sessionId"].as_str().unwrap().to_string();
+
+        // Seed the lane's believed runtime identity exactly as a committed
+        // lane claim does (the kill's stop-claim source).
+        let mut seed_ticket = match crate::ownership_lane::begin_lane_claim(
+            &st.ownership,
+            PROVIDER,
+            &placeholder,
+            "test-unconfirmed-kill-seed",
+            None,
+            "test",
+            crate::session_lease::now_epoch_ms(),
+        ) {
+            crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+            _ => panic!("fixture: the seed claim must be granted on a vacant key"),
+        };
+        assert!(
+            crate::ownership_lane::commit_lane_claim(
+                &st.ownership,
+                &st.ownership_stamps,
+                PROVIDER,
+                &placeholder,
+                &mut seed_ticket,
+                &placeholder,
+                None,
+            )
+            .is_ok(),
+            "fixture: the seed commit lands Live{{FreshAgent}}"
+        );
+
+        // Park a TERM-immune tagged "CLI grandchild" under the sidecar's
+        // ownership tag (the FR3 fixture): it deterministically outlives the
+        // one-round confirmation window.
+        let prior_pid = st
+            .sessions
+            .lock()
+            .await
+            .get(&placeholder)
+            .and_then(|session| session.child.id())
+            .expect("the live session's sidecar pid");
+        let ownership_id = {
+            let environ = std::fs::read(format!("/proc/{prior_pid}/environ"))
+                .expect("read the sidecar's environ");
+            environ
+                .split(|&b| b == 0)
+                .find_map(|var| {
+                    let var = std::str::from_utf8(var).ok()?;
+                    var.strip_prefix("FRESHELL_CLAUDE_SIDECAR_ID=")
+                })
+                .expect("the sidecar's ownership id")
+                .to_string()
+        };
+        let mut grandchild = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg("trap '' TERM; while :; do sleep 1; done")
+            .env("FRESHELL_CLAUDE_SIDECAR_ID", &ownership_id)
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the lingering tagged grandchild");
+        let grandchild_pid = grandchild.id().expect("grandchild pid");
+
+        while rx.try_recv().is_ok() {}
+        st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: placeholder.clone(),
+            session_type: SessionType::Freshclaude,
+            cwd: None,
+        })
+        .await;
+
+        // THE R2-2 regression: the kill visibly FAILS with the typed code
+        // while the tree is unconfirmed — never a silent success.
+        let mut killed_frame = None;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while killed_frame.is_none() {
+            let raw = tokio::time::timeout(std::time::Duration::from_millis(250), rx.recv())
+                .await
+                .expect("a broadcast arrives within budget")
+                .expect("the bus stays open");
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.killed" {
+                killed_frame = Some(frame);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the killed frame never arrived"
+            );
+        }
+        let killed_frame = killed_frame.unwrap();
+        assert_eq!(
+            killed_frame["success"], false,
+            "the unconfirmed kill reports success:false: {killed_frame}"
+        );
+        assert_eq!(
+            killed_frame["code"], "TEARDOWN_NOT_CONFIRMED",
+            "the typed not-confirmed code rides the failure: {killed_frame}"
+        );
+        // The key stays FENCED in Stopping — the stop commit is deferred on
+        // the escalation (pre-fix: the kill committed Stopping → Vacant and
+        // a create was Granted over the still-lingering descendant).
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, &placeholder).state,
+                freshell_ownership::OwnershipState::Stopping { .. }
+            ),
+            "the unconfirmed kill must keep the key fenced in Stopping, got {:?}",
+            registry.observe(PROVIDER, &placeholder).state
+        );
+        assert!(
+            matches!(
+                registry.begin_start(
+                    PROVIDER,
+                    &placeholder,
+                    freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    "r22-fence-probe-create",
+                    None,
+                    "test",
+                    0,
+                ),
+                freshell_ownership::BeginOutcome::Blocked { .. }
+            ),
+            "a create during the unconfirmed-kill fence must be Blocked"
+        );
+
+        // The detached escalation's SIGKILL rounds confirm the grandchild's
+        // death — and ONLY then does the deferred commit release the key.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while crate::session_lease::proc_starttime(grandchild_pid as i32).is_some() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the escalation never killed the lingering descendant"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while registry.observe(PROVIDER, &placeholder).state
+            != freshell_ownership::OwnershipState::Vacant
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the deferred stop commit never released the fenced key, got {:?}",
+                registry.observe(PROVIDER, &placeholder).state
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let _ = grandchild.wait().await;
+    }
+
     /// Focused-ep5-r1 Finding 1 (retire-on-kill round 2), the REAL wire shape:
     /// the client closes a pane by its ORIGINAL BARE PLACEHOLDER sessionId,
     /// while the ledger row is keyed on the durable cli UUID. The round-1

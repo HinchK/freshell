@@ -1625,7 +1625,8 @@ impl FreshAgentState {
             }),
             freshell_ownership::OwnershipState::Handoff { generation, .. }
             | freshell_ownership::OwnershipState::Starting { generation, .. }
-            | freshell_ownership::OwnershipState::Stopping { generation, .. } => {
+            | freshell_ownership::OwnershipState::Stopping { generation, .. }
+            | freshell_ownership::OwnershipState::Fenced { generation, .. } => {
                 Err(OpencodeSnapshotError::HandoffInProgress { generation })
             }
             freshell_ownership::OwnershipState::Vacant => Ok(self.opencode_empty_disk_snapshot(

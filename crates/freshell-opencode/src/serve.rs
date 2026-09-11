@@ -832,22 +832,26 @@ impl OpencodeServeManager {
         body: Option<Value>,
         not_found_value: Option<Value>,
     ) -> Result<Value, ServeError> {
-        self.json_request_maybe_witnessed(method, path, body, not_found_value, None)
+        self.json_request_maybe_witnessed(method, path, body, not_found_value, &[])
             .await
     }
 
-    /// [`json_request`] with an optional dispatch witness: when present, the
-    /// flag flips exactly once the URL exists and the HTTP send is issued —
-    /// after this call's own `require_base` — the TRUE dispatch point (ep4-r6
-    /// F3: arming the witness between two require_base calls misclassifies an
+    /// [`json_request`] with optional dispatch witnesses: every flag flips
+    /// exactly once the URL exists and the HTTP send is issued — after this
+    /// call's own `require_base` — the TRUE dispatch point (ep4-r6 F3:
+    /// arming a witness between two require_base calls misclassifies an
     /// abort that lands inside the second one's wait as "dispatched").
+    /// b8ke focused round-2 review R2-4/R2-5: the witnesses are a SLICE
+    /// because a single dispatch must be able to arm more than one flag at
+    /// the same instant — the prompt's accepted-turn witness AND the
+    /// compact's undo-guard witness + accepted-daemon-operation witness.
     async fn json_request_maybe_witnessed(
         &self,
         method: HttpMethod,
         path: &str,
         body: Option<Value>,
         not_found_value: Option<Value>,
-        dispatch_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        dispatch_witnesses: &[std::sync::Arc<std::sync::atomic::AtomicBool>],
     ) -> Result<Value, ServeError> {
         let base = self.require_base().await?;
         self.json_request_over_base(
@@ -857,7 +861,7 @@ impl OpencodeServeManager {
             not_found_value,
             base,
             DiscardOnTimeout::Yes,
-            dispatch_witness,
+            dispatch_witnesses,
         )
         .await
     }
@@ -879,7 +883,7 @@ impl OpencodeServeManager {
         not_found_value: Option<Value>,
         base: String,
         discard_on_timeout: discard_on_timeout::DiscardOnTimeout,
-        dispatch_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        dispatch_witnesses: &[std::sync::Arc<std::sync::atomic::AtomicBool>],
     ) -> Result<Value, ServeError> {
         let url = format!("{base}{path}");
         let timeout = self.config().request_timeout;
@@ -894,7 +898,7 @@ impl OpencodeServeManager {
 
         let method_str = format!("{method:?}").to_uppercase();
         let resp = match {
-            if let Some(witness) = &dispatch_witness {
+            for witness in dispatch_witnesses {
                 witness.store(true, std::sync::atomic::Ordering::SeqCst);
             }
             tokio::time::timeout(timeout, self.inner.deps.http.request(req))
@@ -1001,7 +1005,7 @@ impl OpencodeServeManager {
             None,
             base.to_string(),
             DiscardOnTimeout::No,
-            None,
+            &[],
         )
         .await
     }
@@ -1040,24 +1044,35 @@ impl OpencodeServeManager {
             Some(Value::Array(Vec::new())),
             base.to_string(),
             DiscardOnTimeout::No,
-            None,
+            &[],
         )
         .await
     }
 
     /// `promptAsync(id, {parts, model?, variant?, agent?}, route)` — the send-turn call
     /// (`serve-manager.ts:355-365`). Returns once the serve accepts the prompt.
+    ///
+    /// `dispatch_witness` (b8ke focused round-2 review R2-4): flips at the
+    /// TRUE dispatch boundary — right where the HTTP send is issued, after
+    /// this call's own `require_base` — NOT when the response is processed.
+    /// The POST-received→response-processed window (and any ambiguous
+    /// response failure) must already count as accepted: the daemon may be
+    /// executing the turn while the local await is still parked on the
+    /// response, so a handoff landing in that window still sees the
+    /// acceptance armed and issues the daemon-side abort.
     pub async fn prompt_async(
         &self,
         id: &str,
         body: Value,
         route: &Route,
+        dispatch_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<(), ServeError> {
         let path = with_route(
             &format!("/session/{}/prompt_async", encode_path_segment(id)),
             route,
         );
-        self.json_request(HttpMethod::Post, &path, Some(body), None)
+        let witnesses = dispatch_witness.map(|w| vec![w]).unwrap_or_default();
+        self.json_request_maybe_witnessed(HttpMethod::Post, &path, Some(body), None, &witnesses)
             .await?;
         Ok(())
     }
@@ -1115,7 +1130,7 @@ impl OpencodeServeManager {
             None,
             base.to_string(),
             DiscardOnTimeout::No,
-            None,
+            &[],
         )
         .await?;
         Ok(())
@@ -1143,6 +1158,14 @@ impl OpencodeServeManager {
     /// cold-start leg are still provably no-side-effects) and BEFORE the HTTP
     /// call is issued. An aborted drive past this point is ambiguous-possibly-
     /// mutated and must never be compensated by ledger restore.
+    ///
+    /// `accepted_witness` (b8ke focused round-2 review R2-5): the SAME
+    /// dispatch-boundary arming for the session's accepted-daemon-operation
+    /// flag — a summarize POST the daemon received (even before its response
+    /// is processed) is daemon-side work a handoff must quiesce, exactly like
+    /// an accepted prompt. Both flags flip at the SAME instant, inside the
+    /// request leg at the true send point.
+    #[allow(clippy::too_many_arguments)] // the compact field set (both witnesses ride the one dispatch)
     pub async fn compact(
         &self,
         id: &str,
@@ -1150,22 +1173,32 @@ impl OpencodeServeManager {
         model_id: &str,
         route: &Route,
         dispatched_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        accepted_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<(), ServeError> {
         let path = with_route(
             &format!("/session/{}/summarize", encode_path_segment(id)),
             route,
         );
-        // The witness flips INSIDE the request leg at the true send point —
+        // Both witnesses flip INSIDE the request leg at the true send point —
         // after its own `require_base` (the serve is running; aborts in the
         // cold-start leg are still provably no-side-effects) and right where
         // the HTTP call is issued (an abort inside the request leg's shared
         // lock waits doesn't falsely look dispatched — ep4-r6 F3).
+        let mut witnesses = Vec::with_capacity(
+            dispatched_witness.is_some() as usize + accepted_witness.is_some() as usize,
+        );
+        if let Some(w) = dispatched_witness {
+            witnesses.push(w);
+        }
+        if let Some(w) = accepted_witness {
+            witnesses.push(w);
+        }
         self.json_request_maybe_witnessed(
             HttpMethod::Post,
             &path,
             Some(json!({ "providerID": provider_id, "modelID": model_id })),
             None,
-            dispatched_witness,
+            &witnesses,
         )
         .await?;
         Ok(())
@@ -1418,11 +1451,15 @@ impl OpencodeServeManager {
     /// missed. `model`/`effort` are the already-normalized wire values (normalization is
     /// the adapter's job; see [`crate::model`]).
     ///
-    /// `accepted_witness` (b8ke focused FR1): flipped exactly once the prompt POST has
-    /// been ACCEPTED by the daemon — from that moment the turn executes INSIDE the
-    /// shared serve, so a caller tracking daemon-side liveness must arm its
-    /// "an accepted daemon-side turn may still be running" flag here (the local
-    /// future can later fail `IdleTimeout` while the daemon-side turn still runs).
+    /// `accepted_witness` (b8ke focused FR1 + round-2 R2-4): flipped at the
+    /// DISPATCH boundary — the moment the prompt POST is issued onto the
+    /// transport, inside [`Self::prompt_async`] — NOT after it returns.
+    /// Delivery and daemon acceptance happen before the response is
+    /// processed; the POST-received→response-processed window (and any
+    /// ambiguous response failure) must count as accepted, because from
+    /// that moment the turn may execute INSIDE the shared serve while the
+    /// local future can later fail (IdleTimeout) or be cancelled with the
+    /// flag still falsely dark.
     #[allow(clippy::too_many_arguments)] // the turn field set (the compact precedent carries its witness the same way)
     pub async fn run_turn(
         &self,
@@ -1436,10 +1473,8 @@ impl OpencodeServeManager {
     ) -> Result<(), ServeError> {
         let rx = self.subscribe(session_id);
         let body = build_prompt_body(text, model, effort);
-        self.prompt_async(session_id, body, &route).await?;
-        if let Some(witness) = accepted_witness {
-            witness.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
+        self.prompt_async(session_id, body, &route, accepted_witness)
+            .await?;
         self.await_idle(session_id, rx, timeout, route).await
     }
 
@@ -1552,6 +1587,7 @@ fn encode_path_segment(segment: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn healthy_response_predicate_matches_reference() {
@@ -1767,6 +1803,108 @@ mod tests {
         mgr
     }
 
+    // ── b8ke focused round-2 review R2-4: the dispatch-boundary witness ─────────
+
+    /// A `ServeHttp` fake whose `prompt_async` handler parks the response
+    /// until the test releases it — the exact POST-received→response-
+    /// processed window the accepted-turn witness must already cover.
+    struct ParkedPromptHttp {
+        dispatched: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl ParkedPromptHttp {
+        fn new() -> Self {
+            Self {
+                dispatched: Arc::new(tokio::sync::Notify::new()),
+                release: Arc::new(tokio::sync::Notify::new()),
+            }
+        }
+    }
+
+    impl ServeHttp for ParkedPromptHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<ServeHttpResponse, ServeHttpError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                if req.url.contains("/global/health") {
+                    return Ok(ServeHttpResponse::new(200, b"{}".to_vec()));
+                }
+                if req.url.contains("/prompt_async") {
+                    // The POST is on the wire — the daemon may already be
+                    // running the turn — but its response is parked.
+                    self.dispatched.notify_one();
+                    self.release.notified().await;
+                    return Ok(ServeHttpResponse::new(200, b"{}".to_vec()));
+                }
+                Ok(ServeHttpResponse::new(200, b"{}".to_vec()))
+            })
+        }
+    }
+
+    /// b8ke focused round-2 review R2-4: the accepted-turn witness must be
+    /// armed at the DISPATCH boundary — the moment the prompt POST is
+    /// issued onto the transport — NOT after `prompt_async` returns. In
+    /// the POST-received→response-processed window the daemon may already
+    /// be executing the turn while the local await is still parked on the
+    /// response; a handoff landing there must see the acceptance armed
+    /// and issue the daemon-side abort (pre-fix: the flag stayed dark
+    /// until the response was processed, so the stop path skipped the
+    /// abort and reported Reaped over a still-running daemon-side turn).
+    #[tokio::test]
+    async fn run_turn_arms_the_accepted_witness_at_the_dispatch_boundary() {
+        let http = Arc::new(ParkedPromptHttp::new());
+        let deps = ServeDeps {
+            spawner: Arc::new(FakeSpawner),
+            http: http.clone(),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let mgr = OpencodeServeManager::new(deps, ServeConfig::default());
+        mgr.ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+
+        let witness = Arc::new(AtomicBool::new(false));
+        let armed = Arc::clone(&witness);
+        let turn = tokio::spawn(async move {
+            mgr.run_turn(
+                "ses_r24",
+                "hold this daemon-side turn open",
+                None,
+                None,
+                Duration::from_millis(50),
+                None,
+                Some(armed),
+            )
+            .await
+        });
+
+        // The POST reached the fake daemon; its response is parked. THE
+        // assertion: the witness is ALREADY armed inside this window.
+        http.dispatched.notified().await;
+        assert!(
+            witness.load(Ordering::SeqCst),
+            "the accepted witness must be armed at the dispatch boundary — the POST is \
+             on the wire and the daemon may already be running the turn while the \
+             response is still parked"
+        );
+
+        // Release: the response completes; the local await then settles
+        // (IdleTimeout here — the fake never emits an idle edge, matching
+        // a turn still running daemon-side; the flag stays armed for the
+        // stop path, exactly like the production IdleTimeout shape).
+        http.release.notify_one();
+        let settled = turn.await.expect("run_turn settled");
+        assert!(matches!(settled, Err(ServeError::IdleTimeout { .. })));
+        assert!(
+            witness.load(Ordering::SeqCst),
+            "an ambiguous local failure keeps the acceptance armed (fail closed)"
+        );
+    }
+
     #[tokio::test]
     async fn compact_posts_the_exact_validated_summarize_body() {
         let http = Arc::new(RecordingHttp::new());
@@ -1777,6 +1915,7 @@ mod tests {
             "prov-a",
             "mdl-x",
             &Some("/work dir".to_string()),
+            None,
             None,
         )
         .await
@@ -1815,7 +1954,10 @@ mod tests {
         });
         let mgr = started_recording_manager(http).await;
 
-        match mgr.compact("ses_9", "prov-a", "mdl-x", &None, None).await {
+        match mgr
+            .compact("ses_9", "prov-a", "mdl-x", &None, None, None)
+            .await
+        {
             Err(ServeError::Http { method, status, .. }) => {
                 assert_eq!(method, "POST");
                 assert_eq!(status, 400);

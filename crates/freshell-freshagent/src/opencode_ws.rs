@@ -150,6 +150,25 @@ pub struct FreshOpencodeState {
     /// its only wait point is the per-session mutex, so a send issued mid-rollback
     /// blocks behind it, then proceeds and destroys redo (no circular wait).
     rollback_in_flight: crate::InFlightRegistry,
+    /// b8ke focused round-2 review R2-1: the CONDEMNED-SESSION record —
+    /// the canonical real `ses_*` id → the daemon-side quiescence identity
+    /// (the accepted-turn flag + the session's route) every
+    /// `opencode_kill_for_handoff` records BEFORE its first cancellable
+    /// await. A cancelled/panicked teardown leaves the record behind (the
+    /// sessions-map entry is already gone), and the handoff watcher's
+    /// replacement probe re-issues the daemon-side abort through exactly
+    /// this record. Cleared by whichever path settles the acceptance.
+    condemned_sessions: Arc<std::sync::Mutex<HashMap<String, CondemnedOpencodeSession>>>,
+}
+
+/// The condemned opencode session's quiescence identity (b8ke focused
+/// round-2 review R2-1): the per-session accepted-daemon-turn flag (the
+/// SAME flag the send/compact drives arm) and the route the daemon-side
+/// abort must be issued at.
+#[derive(Clone)]
+struct CondemnedOpencodeSession {
+    daemon_turn_accepted: Arc<AtomicBool>,
+    route: Option<String>,
 }
 
 /// The cached result of a completed opencode `freshAgent.create`, keyed by `requestId` in
@@ -431,6 +450,7 @@ impl FreshOpencodeState {
             terminal_liveness: Arc::new(|_, _| false),
             fork_in_flight: crate::InFlightRegistry::new(),
             rollback_in_flight: crate::InFlightRegistry::new(),
+            condemned_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -1346,9 +1366,12 @@ impl FreshOpencodeState {
         let turn_task = tokio::spawn(async move {
             // `run_turn` (freshell-opencode/serve.rs) prompts + awaits idle against the
             // REAL opencode serve session (adapter.ts materializeOrSend:363-368). The
-            // accepted witness (b8ke focused FR1) arms the session's
-            // daemon-turn-accepted flag exactly when the daemon accepts the prompt:
-            // from that moment the turn executes INSIDE the shared daemon, and only a
+            // accepted witness (b8ke focused FR1 + round-2 R2-4) arms the session's
+            // daemon-turn-accepted flag at the prompt POST's DISPATCH boundary —
+            // the moment the send is issued onto the transport, before the
+            // response is processed: from that moment the turn may execute
+            // INSIDE the shared daemon (delivery precedes the response, and an
+            // ambiguous response failure counts as accepted), and only a
             // settled outcome below (or a confirmed abort) may disarm it.
             let result = manager
                 .run_turn(
@@ -1495,6 +1518,25 @@ impl FreshOpencodeState {
             );
         }
         let Some(session_arc) = session_arc else {
+            // b8ke focused round-2 review R2-1: a cancelled earlier teardown
+            // may have left the condemned daemon-side turn unquiesced (the
+            // session is gone from the map but the accepted-turn abort never
+            // landed) — settle it through the condemned-session record
+            // before `AlreadyGone` is true. (Bind before the `if let`: the
+            // guard must never live across the await below.)
+            let condemned = self
+                .condemned_sessions
+                .lock()
+                .expect("condemned sessions lock")
+                .remove(session_id);
+            if let Some(condemned) = condemned {
+                self.abort_accepted_daemon_turn(
+                    session_id,
+                    &condemned.route,
+                    &condemned.daemon_turn_accepted,
+                )
+                .await;
+            }
             return crate::session_handoff::StopResult::AlreadyGone;
         };
         let (turn_task, bridge, real, route, daemon_turn_accepted) = {
@@ -1508,6 +1550,23 @@ impl FreshOpencodeState {
                 s.daemon_turn_accepted.clone(),
             )
         };
+        // b8ke focused round-2 review R2-1: the condemned-session record —
+        // BEFORE the first await that a cancellation can land in (the map
+        // removal happens next, after which nothing else can reach this
+        // session's accepted daemon turn). The replacement watcher's
+        // probe re-issues the daemon-side abort through exactly this
+        // record; the confirmed end below clears it.
+        let condemn_key = real.clone().unwrap_or_else(|| session_id.to_string());
+        self.condemned_sessions
+            .lock()
+            .expect("condemned sessions lock")
+            .insert(
+                condemn_key.clone(),
+                CondemnedOpencodeSession {
+                    daemon_turn_accepted: daemon_turn_accepted.clone(),
+                    route: route.clone(),
+                },
+            );
         // The map removal: its own short synchronous section (every key
         // aliasing this Arc goes; the killed flag has gated sends).
         {
@@ -1543,7 +1602,55 @@ impl FreshOpencodeState {
         if let Some(real) = real.as_deref() {
             self.leases.clear_binding(PROVIDER, real);
         }
+        // Quiescence confirmed — the condemned-session record clears with
+        // it (b8ke focused round-2 R2-1).
+        self.condemned_sessions
+            .lock()
+            .expect("condemned sessions lock")
+            .remove(&condemn_key);
         crate::session_handoff::StopResult::Reaped
+    }
+
+    /// b8ke focused round-2 review R2-1: the bounded quiescence probe for a
+    /// fenced freshopencode prior. A condemned-session record means an
+    /// `opencode_kill_for_handoff` was cancelled or panicked between arming
+    /// its record and settling the accepted daemon-side turn — this probe
+    /// re-issues the abort through the record (never spawning or killing
+    /// the shared daemon — OpenCode invariant) and confirms on its
+    /// settlement. A still-mapped session (the cancelled kill never reached
+    /// the map removal) instead gets the lane's own full teardown re-run —
+    /// its `Reaped` answer IS the confirmed quiescence. Never confirms on
+    /// less: `false` keeps the fence held (fail-closed).
+    pub(crate) async fn confirm_fenced_prior_dead(&self, session_id: &str) -> bool {
+        if self.has_live_session(session_id).await {
+            return matches!(
+                self.opencode_kill_for_handoff(session_id, "handoff-watcher-replacement")
+                    .await,
+                crate::session_handoff::StopResult::Reaped
+            );
+        }
+        // Bind before the `if let`: the guard must never live across the
+        // abort await.
+        let condemned = self
+            .condemned_sessions
+            .lock()
+            .expect("condemned sessions lock")
+            .get(session_id)
+            .cloned();
+        if let Some(condemned) = condemned {
+            self.abort_accepted_daemon_turn(
+                session_id,
+                &condemned.route,
+                &condemned.daemon_turn_accepted,
+            )
+            .await;
+            self.condemned_sessions
+                .lock()
+                .expect("condemned sessions lock")
+                .remove(session_id);
+            return true;
+        }
+        false
     }
 
     /// Abort an ACCEPTED daemon-side turn to confirmed settlement (b8ke
@@ -2276,6 +2383,13 @@ impl FreshOpencodeState {
         let turn_aborted = session.turn_aborted.clone();
         let turn_errored = session.turn_errored.clone();
         let last_turn_complete_at = session.last_turn_complete_at.clone();
+        // b8ke focused round-2 review R2-5: the compact is a first-class
+        // accepted daemon-side operation — it arms the SAME
+        // `daemon_turn_accepted` witness the send drive arms, at the SAME
+        // dispatch boundary (inside the summarize POST's request leg), so a
+        // handoff landing mid-compaction quiesces the daemon-side
+        // summarization through the abort before reporting Reaped.
+        let daemon_turn_accepted = session.daemon_turn_accepted.clone();
 
         // adapter.ts:362 `emitStatus(state, 'running')` — BEFORE the upstream request.
         self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "running")));
@@ -2387,6 +2501,7 @@ impl FreshOpencodeState {
             settled_tx: Some(compact_settled_tx),
         };
         let collected_witness = summarize_dispatched.clone();
+        let compact_accepted_witness = daemon_turn_accepted.clone();
         let compact_task = tokio::spawn(async move {
             let result = match manager
                 .compact(
@@ -2395,6 +2510,7 @@ impl FreshOpencodeState {
                     &model_pair.model_id,
                     &route,
                     Some(collected_witness),
+                    Some(compact_accepted_witness),
                 )
                 .await
             {
@@ -2452,6 +2568,21 @@ impl FreshOpencodeState {
             // unconditionally + the gated chime); a serve error additionally surfaces
             // loudly (the SAME nested envelope `emit_fresh_agent_error` builds) and
             // never produces a false turn-complete.
+            //
+            // b8ke focused round-2 review R2-5: the accepted-daemon-operation
+            // witness settles with the SAME discipline the send drive uses —
+            // the idle edge was observed (or the daemon itself is gone:
+            // nothing runs daemon-side) ⇒ the acceptance is settled; any
+            // other error is ambiguous ⇒ the flag STAYS armed (fail closed:
+            // a later handoff would rather issue one redundant abort than
+            // miss live daemon-side work). An ABORT of this task never
+            // reaches here at all — the flag stays armed for the stop path.
+            match &result {
+                Ok(()) | Err(ServeError::SidecarLost { .. }) => {
+                    daemon_turn_accepted.store(false, Ordering::SeqCst);
+                }
+                Err(_) => {}
+            }
             let succeeded = result.is_ok();
             settle_turn_outcome(
                 &fresh_agent,

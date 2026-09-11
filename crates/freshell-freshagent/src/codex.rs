@@ -192,6 +192,15 @@ pub struct FreshCodexState {
     /// canonical thread id → the stamp its `commit_live` left — the kill
     /// `StopClaim` / exit-watcher `ReleaseClaim` source (round-2 review).
     pub(crate) ownership_stamps: crate::ownership_lane::OwnershipStamps,
+    /// b8ke focused round-2 review R2-1: the CONDEMNED-PRIOR record —
+    /// canonical thread id → the (sidecar child pid, `/proc` ownership
+    /// tag) pair every `kill_for_handoff` records BEFORE its first
+    /// cancellable await. A cancelled/panicked teardown leaves the record
+    /// behind (the sessions-map entry is already gone), and the handoff
+    /// watcher's replacement probe kill-and-confirms the recorded tree
+    /// through exactly this pair. Cleared by whichever path confirms
+    /// death.
+    condemned_priors: Arc<StdMutex<HashMap<String, (u32, String)>>>,
     /// Task 13b: cross-kind liveness -- true when a live terminal PTY owns
     /// `(provider, session_id)`. Wired by `main.rs`; defaults to always-false.
     terminal_liveness: crate::TerminalLivenessProbe,
@@ -328,6 +337,16 @@ struct CodexSession {
     /// `ensureRuntime` lazy-restart invariant, adapter.ts:935-946). Cleared back to `false`
     /// once a respawn succeeds.
     exited: Arc<AtomicBool>,
+    /// b8ke focused round-2 review R2-1: the sidecar child's pid + `/proc`
+    /// ownership tag — the recorded identity `kill_for_handoff` condemns
+    /// BEFORE its first cancellable await, so the handoff watcher's
+    /// replacement probe can kill-and-confirm the tree after a cancelled
+    /// teardown (the sessions-map entry is already gone by then).
+    /// `None` for test fixtures without a real child.
+    sidecar_pid: Option<u32>,
+    /// The `/proc` ownership tag of the sidecar tree (the watcher's kill
+    /// sweep tag) — see [`Self::sidecar_pid`].
+    sidecar_ownership_id: String,
     /// The wedged-sidecar quiet deadman's per-session state. Independently lockable
     /// (mirrors the `active_turn` field pattern) because the sessions map rides a tokio
     /// Mutex that must never be held across an await and the notification reducer is
@@ -489,6 +508,7 @@ impl FreshCodexState {
             leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
             ownership: None,
             ownership_stamps: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            condemned_priors: Arc::new(StdMutex::new(HashMap::new())),
             terminal_liveness: Arc::new(|_, _| false),
             fork_in_flight: crate::InFlightRegistry::new(),
             codex_quiet_window_ms: Arc::new(AtomicU64::new(codex_quiet_window_ms_from_env())),
@@ -612,6 +632,28 @@ impl FreshCodexState {
             "freshagent.codex.handoff_stop: stopping the prior freshcodex runtime for handoff"
         );
         crate::ownership_lane::take_retained_stamp(&self.ownership_stamps, session_id);
+        // b8ke focused round-2 review R2-1: record the condemned identity
+        // BEFORE the first await a cancellation can land in — a cancelled
+        // or panicked teardown leaves this record as the replacement
+        // watcher's bounded kill-and-confirm probe target.
+        {
+            let identity = self
+                .sessions
+                .lock()
+                .await
+                .get(session_id)
+                .and_then(|session| {
+                    session
+                        .sidecar_pid
+                        .map(|pid| (pid, session.sidecar_ownership_id.clone()))
+                });
+            if let Some((pid, tag)) = identity {
+                self.condemned_priors
+                    .lock()
+                    .expect("condemned priors lock")
+                    .insert(session_id.to_string(), (pid, tag));
+            }
+        }
         self.clear_controls(session_id).await;
         self.leases.clear_binding(PROVIDER, session_id);
         let removed = self.sessions.lock().await.remove(session_id);
@@ -626,7 +668,56 @@ impl FreshCodexState {
         // The exit-watcher performs start_kill + reap on this requested-kill
         // path; awaiting it is the CONFIRMED reap.
         let _ = session.watcher.await;
+        // Death confirmed — the condemned-prior record clears with it.
+        self.condemned_priors
+            .lock()
+            .expect("condemned priors lock")
+            .remove(session_id);
         crate::session_handoff::StopResult::Reaped
+    }
+
+    /// b8ke focused round-2 review R2-1: the bounded recorded-identity
+    /// death probe for a fenced freshcodex prior. A condemned-prior record
+    /// means a `kill_for_handoff` was cancelled or panicked between arming
+    /// its record and the watcher's confirmed reap — this probe FINISHES
+    /// the job (SIGTERM→SIGKILL the recorded child + tagged tree, confirm
+    /// dead-by-starttime) and clears the record on success. A still-mapped
+    /// session (the cancelled kill never reached the map removal) instead
+    /// gets the lane's own full teardown re-run — its `Reaped` answer IS
+    /// the confirmed reap. Never confirms on less: `false` keeps the
+    /// fence held (fail-closed).
+    pub(crate) async fn confirm_fenced_prior_dead(&self, session_id: &str) -> bool {
+        // Bind before the `if let`: the guard must never live across the
+        // kill-and-confirm await.
+        let condemned = self
+            .condemned_priors
+            .lock()
+            .expect("condemned priors lock")
+            .get(session_id)
+            .cloned();
+        if let Some((pid, tag)) = condemned {
+            let confirmed = crate::session_lease::kill_and_confirm_tree_dead(
+                pid,
+                CODEX_SIDECAR_OWNERSHIP_ENV,
+                &tag,
+            )
+            .await;
+            if confirmed {
+                self.condemned_priors
+                    .lock()
+                    .expect("condemned priors lock")
+                    .remove(session_id);
+            }
+            return confirmed;
+        }
+        if self.has_live_session(session_id).await {
+            return matches!(
+                self.kill_for_handoff(session_id, "handoff-watcher-replacement")
+                    .await,
+                crate::session_handoff::StopResult::Reaped
+            );
+        }
+        false
     }
 
     /// kata b8ke Task 6: the handoff runner's TARGET-resume entry point —
@@ -1688,6 +1779,9 @@ impl FreshCodexState {
         // and flips `exited` so the next send/attach lazily respawns (PR-4).
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
+        // b8ke focused round-2 R2-1: the condemned-prior tag (the pid was
+        // captured above for the coordinator commit).
+        let sidecar_ownership_id = ownership_id.clone();
         let watcher = spawn_exit_watcher(
             child,
             ownership_id,
@@ -1718,6 +1812,8 @@ impl FreshCodexState {
                 kill_tx: Some(kill_tx),
                 watcher,
                 exited,
+                sidecar_pid,
+                sidecar_ownership_id,
                 quiet_deadman,
                 // D8 (focused-ep1-r3 — the parking invariant): park the creating
                 // connection's provenance ON the session so downstream readers
@@ -4102,6 +4198,9 @@ impl FreshCodexState {
             compact_turn_id.clone(),
         );
         let (kill_tx, kill_rx) = oneshot::channel();
+        // b8ke focused round-2 R2-1: the condemned-prior identity (pid + tag).
+        let sidecar_pid = child.id();
+        let sidecar_ownership_id = ownership_id.clone();
         let watcher = spawn_exit_watcher(
             child,
             ownership_id,
@@ -4144,6 +4243,8 @@ impl FreshCodexState {
                     kill_tx: Some(kill_tx),
                     watcher,
                     exited,
+                    sidecar_pid,
+                    sidecar_ownership_id,
                     quiet_deadman,
                     // D8 (focused-ep1-r3): CARRY the crashed session's parked
                     // provenance onto the rebuilt record (the same logical
@@ -4360,6 +4461,9 @@ impl FreshCodexState {
             compact_turn_id.clone(),
         );
         let (kill_tx, kill_rx) = oneshot::channel();
+        // b8ke focused round-2 R2-1: the condemned-prior identity (pid + tag).
+        let sidecar_pid = child.id();
+        let sidecar_ownership_id = ownership_id.clone();
         let watcher = spawn_exit_watcher(
             child,
             ownership_id,
@@ -4393,6 +4497,8 @@ impl FreshCodexState {
                     kill_tx: Some(kill_tx),
                     watcher,
                     exited,
+                    sidecar_pid,
+                    sidecar_ownership_id,
                     quiet_deadman,
                     // D8 (focused-ep1-r3): the parked provenance rides the
                     // OLD→NEW re-key (carried from the crashed session).
@@ -5011,7 +5117,8 @@ impl FreshCodexState {
             }
             freshell_ownership::OwnershipState::Handoff { generation, .. }
             | freshell_ownership::OwnershipState::Starting { generation, .. }
-            | freshell_ownership::OwnershipState::Stopping { generation, .. } => {
+            | freshell_ownership::OwnershipState::Stopping { generation, .. }
+            | freshell_ownership::OwnershipState::Fenced { generation, .. } => {
                 Err(CodexSnapshotError::HandoffInProgress { generation })
             }
         }
@@ -5621,6 +5728,9 @@ impl FreshCodexState {
             compact_turn_id.clone(),
         );
         let (kill_tx, kill_rx) = oneshot::channel();
+        // b8ke focused round-2 R2-1: the condemned-prior identity (pid + tag).
+        let sidecar_pid = child.id();
+        let sidecar_ownership_id = ownership_id.clone();
         let watcher = spawn_exit_watcher(
             child,
             ownership_id,
@@ -5650,6 +5760,8 @@ impl FreshCodexState {
                 kill_tx: Some(kill_tx),
                 watcher,
                 exited,
+                sidecar_pid,
+                sidecar_ownership_id,
                 quiet_deadman,
                 provenance,
             },
@@ -5690,6 +5802,9 @@ impl FreshCodexState {
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
         let quiet_deadman = QuietDeadman::new_shared();
+        // b8ke focused round-2 R2-1: the condemned-prior identity (pid + tag).
+        let sidecar_pid = child.id();
+        let sidecar_ownership_id = format!("codex-sidecar-test-snapshot-router-{thread_id}");
         let watcher = spawn_exit_watcher(
             child,
             format!("codex-sidecar-test-snapshot-router-{thread_id}"),
@@ -5720,6 +5835,8 @@ impl FreshCodexState {
                 kill_tx: Some(kill_tx),
                 watcher,
                 exited,
+                sidecar_pid,
+                sidecar_ownership_id,
                 quiet_deadman,
                 provenance: None,
             },
@@ -7791,6 +7908,8 @@ pub(crate) mod tests {
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
         let quiet_deadman = QuietDeadman::new_shared();
+        let sidecar_pid = child.id();
+        let sidecar_ownership_id = ownership_id.to_string();
         let watcher = spawn_exit_watcher(
             child,
             ownership_id.to_string(),
@@ -7821,6 +7940,8 @@ pub(crate) mod tests {
                 kill_tx: Some(kill_tx),
                 watcher,
                 exited,
+                sidecar_pid,
+                sidecar_ownership_id,
                 quiet_deadman,
                 provenance: None,
             },
@@ -7865,6 +7986,8 @@ pub(crate) mod tests {
         );
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
+        let sidecar_pid = child.id();
+        let sidecar_ownership_id = ownership_id.to_string();
         let watcher = spawn_exit_watcher(
             child,
             ownership_id.to_string(),
@@ -7895,6 +8018,8 @@ pub(crate) mod tests {
                 kill_tx: Some(kill_tx),
                 watcher,
                 exited,
+                sidecar_pid,
+                sidecar_ownership_id,
                 quiet_deadman,
                 provenance: None,
             },
@@ -8917,6 +9042,8 @@ pub(crate) mod tests {
             "thread-stall".to_string(),
             CodexSession {
                 client,
+                sidecar_pid: None,
+                sidecar_ownership_id: String::new(),
                 model: "gpt-5.3-codex-spark".to_string(),
                 effort: None,
                 cwd: None,
