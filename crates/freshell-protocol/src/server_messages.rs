@@ -1030,6 +1030,14 @@ pub struct SessionRuntimeOwner {
     /// Machine-readable failure reason (handoff-failed frames).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// b8ke focused round-4 review R4-5: `Some(true)` on a FENCED
+    /// failure frame — the prior is still the FENCED owner (no live
+    /// writer exists), so an online same-kind pane keeps the typed
+    /// recovery state instead of resuming polling as a healthy owner.
+    /// Omitted on every non-fenced frame (additive; pre-R4-5 servers never
+    /// set it — their clients degrade to the pre-existing fold).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fenced: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1707,6 +1715,7 @@ mod tests {
             operation_id: "handoff-abc".into(),
             transition: "handoff-committed".into(),
             reason: None,
+            fenced: None,
         });
         let json = serde_json::to_string(&msg).expect("serialize");
         assert!(
@@ -1719,6 +1728,60 @@ mod tests {
         );
         let back: ServerMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, msg);
+    }
+
+    /// b8ke focused round-4 review R4-5: the fenced failure frame carries
+    /// the additive `fenced: true` marker (camelCase, omitted when absent)
+    /// — the client's same-kind panes keep the typed recovery state
+    /// instead of resuming polling as a healthy owner.
+    #[test]
+    fn session_runtime_owner_fenced_failure_frame_carries_the_marker() {
+        let msg = ServerMessage::SessionRuntimeOwner(SessionRuntimeOwner {
+            provider: "codex".into(),
+            session_id: "sid-fenced-failure".into(),
+            epoch: 41,
+            generation: 7,
+            owner_kind: "terminal".into(),
+            previous_kind: Some("terminal".into()),
+            terminal_id: Some("t-91".into()),
+            operation_id: "handoff-abc".into(),
+            transition: "handoff-failed".into(),
+            reason: Some("REAP_TIMEOUT".into()),
+            fenced: Some(true),
+        });
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(
+            json.contains(r#""fenced":true"#),
+            "the fenced failure frame must carry the marker: {json}"
+        );
+        assert!(
+            json.contains(r#""reason":"REAP_TIMEOUT""#),
+            "the typed failure reason rides along: {json}"
+        );
+        let back: ServerMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn session_runtime_owner_non_fenced_frames_omit_the_marker() {
+        let msg = ServerMessage::SessionRuntimeOwner(SessionRuntimeOwner {
+            provider: "codex".into(),
+            session_id: "sid-plain".into(),
+            epoch: 41,
+            generation: 7,
+            owner_kind: "terminal".into(),
+            previous_kind: None,
+            terminal_id: None,
+            operation_id: "handoff-abc".into(),
+            transition: "handoff-started".into(),
+            reason: None,
+            fenced: None,
+        });
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(
+            !json.contains(r#""fenced""#),
+            "a non-fenced frame omits the marker (additive wire): {json}"
+        );
     }
 
     #[test]

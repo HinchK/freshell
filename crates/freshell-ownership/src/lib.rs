@@ -586,8 +586,9 @@ pub struct RuntimeOwnerReplayRecord {
     pub reason: Option<String>,
 }
 
-/// The replayed record's truth for fenced keys (b8ke focused round-3
-/// review R3-5).
+/// The replayed record's truth for fenced and in-progress keys (b8ke
+/// focused round-3 review R3-5; round-4 R4-6 widened the in-progress
+/// states).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ReplayOwnerState {
@@ -598,6 +599,19 @@ pub enum ReplayOwnerState {
     /// live owner); the key blocks every new writer pending typed
     /// recovery. See `RuntimeOwnerReplayRecord::reason`.
     Fenced,
+    /// b8ke focused round-4 review R4-6: a runtime of `owner_kind` is
+    /// SPAWNING but not yet committed live — an in-progress lifecycle
+    /// transition, never committed ownership (no attach/polling resume).
+    Starting,
+    /// b8ke focused round-4 review R4-6: a handoff owns the transition —
+    /// `owner_kind` names the TARGET kind (the handoff-started
+    /// broadcast's owner), pending the prior's confirmed reap and the
+    /// target's commit.
+    Handoff,
+    /// b8ke focused round-4 review R4-6: the prior owner (`owner_kind`)
+    /// is being STOPPED — the key's live era is ending; the record is an
+    /// in-progress transition, never committed ownership.
+    Stopping,
 }
 
 /// Per-key registry record. Hand-implemented `Default` (a `Vacant` record at
@@ -1824,6 +1838,11 @@ impl RuntimeOwnershipRegistry {
     /// already named on every device). The client folds a fenced record as
     /// the typed recovery state (handoff-failed + reason), NEVER as a
     /// committed live owner.
+    ///
+    /// b8ke focused round-4 review R4-6: the in-progress lifecycle states
+    /// (`Starting`/`Handoff`/`Stopping`) replay as their OWN states —
+    /// a reconnecting device folds them as transition-in-progress, never
+    /// as committed live ownership.
     pub fn snapshot_records(&self) -> Vec<RuntimeOwnerReplayRecord> {
         let inner = self.inner.lock().expect("ownership lock poisoned");
         inner
@@ -1837,20 +1856,25 @@ impl RuntimeOwnershipRegistry {
                         ReplayOwnerState::Live,
                         None,
                     ),
+                    // b8ke focused round-4 review R4-6: in-progress
+                    // lifecycle states replay AS WHAT THEY ARE — never
+                    // `Live`. A reconnecting device folds these as
+                    // transition-in-progress (no attach action, no
+                    // polling resume), never as committed ownership.
                     OwnershipState::Starting { kind, .. } => {
-                        (kind_wire(kind), None, ReplayOwnerState::Live, None)
+                        (kind_wire(kind), None, ReplayOwnerState::Starting, None)
                     }
                     OwnershipState::Handoff { to_kind, .. } => {
-                        (kind_wire(to_kind), None, ReplayOwnerState::Live, None)
+                        (kind_wire(to_kind), None, ReplayOwnerState::Handoff, None)
                     }
                     OwnershipState::Stopping { owner, .. } => match owner {
                         Some(owner) => (
                             kind_wire(&owner.kind),
                             owner.terminal_id.clone(),
-                            ReplayOwnerState::Live,
+                            ReplayOwnerState::Stopping,
                             None,
                         ),
-                        None => ("vacant", None, ReplayOwnerState::Live, None),
+                        None => ("vacant", None, ReplayOwnerState::Stopping, None),
                     },
                     // b8ke focused round-2 review: a fenced key replays the
                     // FENCED PRIOR's kind (the owner the handoff-failed
@@ -3422,6 +3446,110 @@ mod tests {
         assert_eq!(fenced.reason.as_deref(), Some("platform-limited"));
         assert_eq!(fenced.owner_kind, "terminal", "the fenced PRIOR's kind");
         assert_eq!(fenced.generation, g);
+    }
+
+    /// b8ke focused round-4 review R4-6: in-progress lifecycle states
+    /// replay AS WHAT THEY ARE — a reconnecting device must never fold a
+    /// `Starting`/`Handoff`/`Stopping` record as committed live ownership
+    /// (the pre-fix replay serialized all three as `Live`, licensing a
+    /// false "handoff-committed" fold and resumed polling/actions mid
+    /// transition).
+    #[test]
+    fn snapshot_records_replay_in_progress_lifecycle_states_truthfully() {
+        // Starting: a fresh-agent runtime is spawning (no prior).
+        let r = RuntimeOwnershipRegistry::new();
+        let BeginOutcome::Granted { .. } = r.begin_start(
+            PROVIDER,
+            "sid-starting",
+            RuntimeOwnerKind::FreshAgent,
+            "op-starting",
+            None,
+            "test",
+            1,
+        ) else {
+            panic!("expected Granted")
+        };
+        // Handoff: a live terminal owner is being taken over to fresh-agent.
+        let (r2, _owner, _gen) = registry_with_live_terminal();
+        let BeginOutcome::Granted { .. } = r2.begin_handoff(
+            PROVIDER,
+            "sid",
+            RuntimeOwnerKind::FreshAgent,
+            "op-handoff",
+            None,
+            "test",
+            2,
+        ) else {
+            panic!("expected Granted")
+        };
+        // Stopping: the live owner of a third key is being stopped.
+        let r3 = RuntimeOwnershipRegistry::new();
+        let BeginOutcome::Granted { generation: g3 } = r3.begin_start(
+            PROVIDER,
+            "sid-stopping",
+            RuntimeOwnerKind::Terminal,
+            "op-stop-start",
+            None,
+            "test",
+            3,
+        ) else {
+            panic!("expected Granted")
+        };
+        let owner3 = OwnerIdentity {
+            kind: RuntimeOwnerKind::Terminal,
+            terminal_id: Some("t-3".into()),
+            live_session_key: None,
+            pid: Some(4242),
+            ownership_id: None,
+        };
+        assert_eq!(
+            r3.commit_live(
+                PROVIDER,
+                "sid-stopping",
+                "op-stop-start",
+                g3,
+                owner3.clone()
+            ),
+            CommitOutcome::Committed
+        );
+        let StopOutcome::Granted { .. } = r3.begin_stop(
+            PROVIDER,
+            "sid-stopping",
+            "op-stopping",
+            &stop_claim(&owner3, r3.boot_epoch(), g3),
+            "test",
+            4,
+        ) else {
+            panic!("expected Granted")
+        };
+
+        let starting = r
+            .snapshot_records()
+            .into_iter()
+            .find(|rec| rec.session_id == "sid-starting")
+            .expect("the Starting key replays");
+        assert_eq!(starting.state, ReplayOwnerState::Starting);
+        assert_eq!(starting.owner_kind, "fresh-agent");
+        assert!(starting.reason.is_none());
+
+        let handoff = r2
+            .snapshot_records()
+            .into_iter()
+            .find(|rec| rec.session_id == "sid")
+            .expect("the Handoff key replays");
+        assert_eq!(handoff.state, ReplayOwnerState::Handoff);
+        // The Handoff record's kind names the TARGET (the handoff-started
+        // broadcast's owner kind — cross-device consistency).
+        assert_eq!(handoff.owner_kind, "fresh-agent");
+
+        let stopping = r3
+            .snapshot_records()
+            .into_iter()
+            .find(|rec| rec.session_id == "sid-stopping")
+            .expect("the Stopping key replays");
+        assert_eq!(stopping.state, ReplayOwnerState::Stopping);
+        // The Stopping record's kind names the PRIOR being stopped.
+        assert_eq!(stopping.owner_kind, "terminal");
     }
 
     /// Task 4 review F1 (fix): a GRANTED stop abandoned before the kill (the

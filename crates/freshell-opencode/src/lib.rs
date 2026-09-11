@@ -50,8 +50,8 @@ pub use model::{
     FRESHOPENCODE_DEFAULT_EFFORT,
 };
 pub use serve::{
-    is_healthy_response, CreatedSession, Endpoint, EventSource, EventStreamHandle, ForkedSession,
-    OpencodeServeManager, PortAllocator, ProcessSpawner, Route, ServeConfig, ServeDeps, ServeError,
-    ServeHttp, ServeHttpError, ServeHttpRequest, ServeHttpResponse, ServeProcess, SessionSignal,
-    SpawnRequest, OPENCODE_SIDECAR_OWNERSHIP_ENV,
+    build_prompt_body, is_healthy_response, CreatedSession, Endpoint, EventSource,
+    EventStreamHandle, ForkedSession, OpencodeServeManager, PortAllocator, ProcessSpawner, Route,
+    ServeConfig, ServeDeps, ServeError, ServeHttp, ServeHttpError, ServeHttpRequest,
+    ServeHttpResponse, ServeProcess, SessionSignal, SpawnRequest, OPENCODE_SIDECAR_OWNERSHIP_ENV,
 };

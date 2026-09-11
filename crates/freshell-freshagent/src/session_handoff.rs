@@ -103,6 +103,16 @@ pub struct HandoffRequest {
     pub observed_epoch: Option<u64>,
     pub observed_generation: Option<u64>,
     pub device_id: Option<String>,
+    /// b8ke focused round-4 review R4-4: the EXPLICIT operator
+    /// acknowledgment that licenses the PlatformLimited force-clear. An
+    /// ordinary retry NEVER clears the fence (the prior's descendant tree
+    /// is unverified on this platform — starting a new writer over it is
+    /// the operator's acknowledged risk, never an implicit one). When set
+    /// against a `Fenced{PlatformLimited}` key the request force-clears
+    /// the fence (recording the limitation prominently) and answers the
+    /// TYPED CLEAR — it does NOT start a handoff; the caller retries the
+    /// handoff explicitly afterwards as a fresh no-prior sequence.
+    pub acknowledge_platform_limited_risk: bool,
 }
 
 /// The lanes' `kill_for_handoff` answer. The reap TIMEOUT itself is the
@@ -345,76 +355,116 @@ impl SessionHandoffRunner {
                     current_generation,
                 )
             }
-            // b8ke focused round-3 review R3-4: the TYPED operator
-            // recovery for a PlatformLimited fence. An explicit handoff
-            // retry carrying a FRESH observed fence (the recovery UI's
-            // Retry refreshes the pair from the runtime-owner record) is
-            // the operator action that force-clears the fence — the
-            // non-Linux semantics make it honest: the direct child's
-            // awaited exit WAS confirmed; only the descendant verification
-            // is platform-limited, and the force-clear records that
-            // limitation. The DEFAULT path stays fenced (a fence-less
-            // retry, any create/attach, a WatcherFailed fence whose
-            // bounded probe can still confirm).
+            // b8ke focused round-4 review R4-4: a PlatformLimited fence is
+            // cleared ONLY by the EXPLICIT acknowledged operator
+            // force-clear — NEVER by an ordinary retry. Pre-fix, any
+            // observed-fence retry force-cleared AND re-entered handoff
+            // in one step, licensing a new writer while the prior's
+            // descendant tree was unverified (only the direct child's
+            // exit was confirmed). The force-clear is its own typed
+            // action: it clears the key Vacant with the platform
+            // limitation logged prominently, broadcasts the cleared state
+            // (every device converges), and answers the typed clear —
+            // NO handoff starts here. The caller retries the handoff
+            // explicitly afterwards; that retry is a NEW operation whose
+            // prior-owner is Vacant (no prior runtime to reap — the
+            // normal sequence starts the target fresh from the durable
+            // session, the unverified descendants being the operator's
+            // acknowledged risk).
             BeginOutcome::Blocked {
                 state:
                     freshell_ownership::OwnershipState::Fenced {
                         reason: freshell_ownership::FenceReason::PlatformLimited,
+                        prior,
                         ..
                     },
                 ..
-            } if observed.is_some() => {
-                let forced = self.ownership.force_release_platform_limited(
+            } => {
+                if !req.acknowledge_platform_limited_risk {
+                    let generation = self
+                        .ownership
+                        .observe(&req.provider, &req.session_id)
+                        .generation;
+                    tracing::warn!(target: "freshell_ownership",
+                        event = "ownership.handoff.platform_limited_fence_refused",
+                        operation_id = %operation_id, provider = %req.provider, session_id = %req.session_id,
+                        epoch = self.ownership.boot_epoch(), generation,
+                        outcome = "refused", failure_reason = "PLATFORM_LIMITED_FENCED",
+                        "an ordinary retry does not clear a PlatformLimited fence: this \
+                         platform cannot verify the prior runtime's descendant processes — \
+                         the acknowledged force-clear is the only recovery");
+                    return typed_failure(
+                        "PLATFORM_LIMITED_FENCED",
+                        "the session is fenced pending recovery: this platform cannot \
+                         verify the prior runtime's descendant processes. Retry with the \
+                         acknowledged force-clear (acknowledgePlatformLimitedRisk: true) to \
+                         release the fence, accepting that unverified descendants may remain.",
+                        true,
+                        generation,
+                    );
+                }
+                // The acknowledged force-clear requires the CURRENT
+                // observed fence pair — the operator clears the fence they
+                // are looking at, never a stale one.
+                let Some(observed) = observed else {
+                    let generation = self
+                        .ownership
+                        .observe(&req.provider, &req.session_id)
+                        .generation;
+                    return typed_failure(
+                        "PLATFORM_LIMITED_FENCED",
+                        "the acknowledged force-clear requires the current observed \
+                         (epoch, generation) fence pair; refresh and retry",
+                        true,
+                        generation,
+                    );
+                };
+                match self.ownership.force_release_platform_limited(
                     &req.provider,
                     &req.session_id,
-                    observed.expect("the guarded arm carries the fence"),
+                    observed,
                     &initiator,
-                );
-                match forced {
+                ) {
                     freshell_ownership::ForceReleaseOutcome::Released => {
-                        tracing::info!(target: "freshell_ownership",
-                            event = "ownership.handoff.force_cleared_platform_limited",
+                        // The prominent limitation record: the registry's
+                        // own line (ownership.fenced.force_released_platform_limited)
+                        // plus the operator-action acknowledgment here.
+                        tracing::warn!(target: "freshell_ownership",
+                            event = "ownership.handoff.platform_limited_force_cleared",
                             operation_id = %operation_id, provider = %req.provider, session_id = %req.session_id,
-                            epoch = self.ownership.boot_epoch(),
-                            "an explicit retry force-cleared a PlatformLimited fence; \
-                             the handoff re-enters");
-                        // Re-enter: the force-clear preserved the record's
-                        // generation, so the retry's observed fence still
-                        // satisfies the stale check and the handoff grants
-                        // from the now-Vacant key.
-                        match self.ownership.begin_handoff(
-                            &req.provider,
-                            &req.session_id,
-                            req.target_kind,
+                            epoch = self.ownership.boot_epoch(), generation = observed.generation,
+                            from_kind = ?prior.as_ref().map(|(o, _)| o.kind),
+                            acknowledged = "platform-limited-descendant-tree-risk",
+                            "PLATFORM-LIMITED RISK ACKNOWLEDGED: the operator force-cleared \
+                             the fence — the prior runtime's DESCENDANT tree is UNVERIFIED on \
+                             this platform (only the direct child's exit was confirmed). \
+                             Surviving descendants are the operator's acknowledged risk; the \
+                             key is Vacant and a subsequent explicit handoff starts the \
+                             target fresh from the durable session");
+                        // Broadcast the cleared state so every device
+                        // holding the sessionRef converges on the Vacant
+                        // key (their fenced recovery cards clear).
+                        self.broadcast_owner(
+                            &req,
+                            "released",
+                            None,
+                            None,
                             &operation_id,
-                            observed,
-                            &initiator,
-                            now_ms(),
-                        ) {
-                            BeginOutcome::Granted { generation } => generation,
-                            BeginOutcome::StaleGeneration {
-                                current_generation, ..
-                            } => {
-                                return typed_failure(
-                                    "STALE_GENERATION",
-                                    "observed ownership fence is stale; refresh and retry",
-                                    false,
-                                    current_generation,
-                                )
-                            }
-                            _ => {
-                                let generation = self
-                                    .ownership
-                                    .observe(&req.provider, &req.session_id)
-                                    .generation;
-                                return typed_failure(
-                                    "HANDOFF_IN_PROGRESS",
-                                    "a lifecycle operation is in flight; retry after it settles",
-                                    true,
-                                    generation,
-                                );
-                            }
-                        }
+                            observed.generation,
+                            prior.as_ref().map(|(owner, _)| owner.kind),
+                            Some("PLATFORM_LIMITED_FORCE_CLEARED"),
+                            None,
+                        );
+                        // The typed clear — the force-clear's own answer.
+                        // NOT a handoff success: no owner is committed
+                        // and the caller must retry the handoff
+                        // explicitly (the fresh no-prior sequence).
+                        return json!({
+                            "ok": true,
+                            "cleared": "platform-limited-fence",
+                            "operationId": operation_id,
+                            "generation": observed.generation,
+                        });
                     }
                     freshell_ownership::ForceReleaseOutcome::NotPlatformLimited { state } => {
                         let generation = self
@@ -425,7 +475,7 @@ impl SessionHandoffRunner {
                             event = "ownership.handoff.force_clear_refused",
                             operation_id = %operation_id, provider = %req.provider, session_id = %req.session_id,
                             state = ?state,
-                            "the fenced retry's force-clear was refused — the key stays fenced");
+                            "the acknowledged force-clear was refused — the key's state moved on");
                         return typed_failure(
                             "SESSION_FENCED",
                             "the session is fenced pending recovery; retry with a fresh \
@@ -505,6 +555,7 @@ impl SessionHandoffRunner {
             &operation_id,
             generation,
             prior_kind,
+            None,
             None,
         );
         if let Some(hooks) = self.test_hooks.as_ref() {
@@ -810,6 +861,7 @@ impl SessionHandoffRunner {
                             generation,
                             prior_kind,
                             None,
+                            None,
                         );
                         self.log_transition(
                             TransitionLog {
@@ -1059,6 +1111,7 @@ impl SessionHandoffRunner {
             generation,
             previous_kind,
             Some(reason),
+            None,
         );
     }
 
@@ -1124,6 +1177,7 @@ impl SessionHandoffRunner {
             observed_epoch: None,
             observed_generation: None,
             device_id: Some("handoff-guard-cleanup".into()),
+            acknowledge_platform_limited_risk: false,
         }
     }
 
@@ -1634,7 +1688,9 @@ impl SessionHandoffRunner {
     /// watcher is spawned. The frame's truth: the PRIOR is still the
     /// fenced owner (its kind/runtime identity) — never the target kind,
     /// never a lie about vacancy. The watcher's `released` frame supersedes
-    /// it once death is confirmed.
+    /// it once death is confirmed. b8ke focused round-4 R4-5: the frame
+    /// carries the `fenced` marker so an online same-kind pane keeps the
+    /// typed recovery state (no polling resumption as a healthy owner).
     fn broadcast_fenced_reap_timeout(
         &self,
         req: &HandoffRequest,
@@ -1652,12 +1708,15 @@ impl SessionHandoffRunner {
             generation,
             prior_kind,
             Some("REAP_TIMEOUT"),
+            Some(true),
         );
     }
 
     /// b8ke focused round-2 review R2-3: the platform-limited stop's fenced
     /// failure frame — the same FR5 truth (the PRIOR still owns the fenced
-    /// key) with the typed PLATFORM_LIMITED reason.
+    /// key) with the typed PLATFORM_LIMITED reason. b8ke focused round-4
+    /// R4-5: the frame carries the `fenced` marker (the same-kind recovery
+    /// state persists on every device).
     fn broadcast_fenced_stop_refusal(
         &self,
         req: &HandoffRequest,
@@ -1676,6 +1735,7 @@ impl SessionHandoffRunner {
             generation,
             prior_kind,
             Some(reason),
+            Some(true),
         );
     }
 
@@ -1907,6 +1967,7 @@ impl SessionHandoffRunner {
                 generation,
                 prior_kind,
                 Some(release_reason),
+                None,
             );
             runner.log_transition(
                 TransitionLog {
@@ -2161,7 +2222,11 @@ impl SessionHandoffRunner {
 
     /// Every frame carries the boot epoch, `previousKind` (the transition's
     /// from-kind when one exists), and — on failure frames — the typed
-    /// `reason`. `owner_kind: None` broadcasts "vacant".
+    /// `reason`. `owner_kind: None` broadcasts "vacant". R4-5: `fenced` is
+    /// `Some(true)` ONLY on the fenced failure frames (the prior is the
+    /// FENCED owner — no live writer exists), so an online same-kind pane
+    /// keeps the typed recovery state instead of resuming as a healthy
+    /// owner; every other frame omits it.
     #[allow(clippy::too_many_arguments)] // the uniform broadcast field set (round-2 review)
     fn broadcast_owner(
         &self,
@@ -2173,6 +2238,7 @@ impl SessionHandoffRunner {
         generation: u64,
         previous_kind: Option<RuntimeOwnerKind>,
         reason: Option<&str>,
+        fenced: Option<bool>,
     ) {
         let frame = serde_json::to_string(&freshell_protocol::ServerMessage::SessionRuntimeOwner(
             freshell_protocol::SessionRuntimeOwner {
@@ -2193,6 +2259,7 @@ impl SessionHandoffRunner {
                 operation_id: operation_id.to_string(),
                 transition: transition.to_string(),
                 reason: reason.map(str::to_string),
+                fenced,
             },
         ))
         .unwrap_or_default();
@@ -2680,6 +2747,13 @@ async fn handoff_handler(
             .get("deviceId")
             .and_then(Value::as_str)
             .map(String::from),
+        // b8ke focused round-4 R4-4: the EXPLICIT operator
+        // acknowledgment licensing the PlatformLimited force-clear
+        // (an ordinary retry never clears the fence).
+        acknowledge_platform_limited_risk: body
+            .get("acknowledgePlatformLimitedRisk")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     };
     // The reply rides the handle's oneshot with a bounded HTTP timeout; the
     // operation itself is detached and outlives the request.

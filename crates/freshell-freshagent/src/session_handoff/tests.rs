@@ -514,6 +514,7 @@ fn handoff_req_terminal(provider: &str, sid: &str, mode: &str) -> HandoffRequest
         observed_epoch: None,
         observed_generation: None,
         device_id: Some("test-device-a".to_string()),
+        acknowledge_platform_limited_risk: false,
     }
 }
 
@@ -530,6 +531,7 @@ fn handoff_req_fresh(provider: &str, sid: &str, session_type: &str) -> HandoffRe
         observed_epoch: None,
         observed_generation: None,
         device_id: Some("test-device-a".to_string()),
+        acknowledge_platform_limited_risk: false,
     }
 }
 
@@ -1625,8 +1627,10 @@ async fn handoff_with_a_platform_limited_prior_stop_fences_the_key_typed() {
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
     let _env = FakeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
-    let rig = build_rig_with_options(None, None, None, 8_000, None, true);
+    let mut rig = build_rig_with_options(None, None, None, 8_000, None, true);
     establish_fresh_claude_owner(&rig, &sid).await;
+    // Consume the establish-time frames so the failure window is isolated.
+    let _ = drain_runtime_owner_frames(&mut rig.rx);
 
     let handle = rig
         .runner
@@ -1643,6 +1647,19 @@ async fn handoff_with_a_platform_limited_prior_stop_fences_the_key_typed() {
     );
     assert_eq!(result["error"]["code"], json!("PLATFORM_LIMITED"));
     assert_eq!(result["error"]["retryable"], json!(true));
+    // b8ke focused round-4 R4-5: the fenced failure frame carries the
+    // `fenced` marker — an online same-kind pane keeps the typed recovery
+    // state (no polling resumption as a healthy owner). Pre-fix, the
+    // frame read as an ordinary handoff-failed owner and the client
+    // resumed normal polling.
+    let frames = await_owner_frames(&mut rig.rx, &["handoff-failed"]).await;
+    let failed = runtime_owner_frame(&frames, "handoff-failed");
+    assert_eq!(
+        failed["fenced"],
+        json!(true),
+        "the fenced failure frame must carry the fenced marker: {failed}"
+    );
+    assert_eq!(failed["reason"], json!("PLATFORM_LIMITED"));
     // The key is FENCED with the typed PlatformLimited reason.
     assert!(
         matches!(
@@ -1671,30 +1688,44 @@ async fn handoff_with_a_platform_limited_prior_stop_fences_the_key_typed() {
         ),
         "a create during the platform-limited fence must be Blocked"
     );
-    // A handoff retry is the typed in-flight refusal while fenced.
+    // A handoff retry is the typed refusal while fenced. b8ke focused
+    // round-4 R4-4: an ordinary retry (with OR without the observed
+    // fence pair) answers the typed PLATFORM_LIMITED_FENCED refusal —
+    // never a force-clear (the acknowledged force-clear is the only
+    // recovery; see 3k).
     let retry = rig
         .runner
         .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
     let retried = retry.completion.await.expect("retry completed");
-    assert_eq!(retried["error"]["code"], json!("HANDOFF_IN_PROGRESS"));
+    assert_eq!(retried["error"]["code"], json!("PLATFORM_LIMITED_FENCED"));
 }
 
-/// 3k. b8ke focused round-3 review R3-4: the PlatformLimited fence gains
-/// a typed bounded recovery — an EXPLICIT handoff retry carrying a FRESH
-/// observed fence (the recovery UI's Retry refreshes the pair from the
-/// runtime-owner record) force-clears the fence, recording the limitation
-/// honestly (the direct child DID die — the portable floor; only the
-/// descendant verification is platform-limited), and the retry proceeds.
-/// The DEFAULT path stays fenced: a create is Blocked, and a retry WITHOUT
-/// the observed fence is the typed in-flight refusal.
+/// 3k. b8ke focused round-3 review R3-4, redesigned by the round-4 R4-4
+/// review: a PlatformLimited fence recovers ONLY through the EXPLICIT
+/// acknowledged operator force-clear — an ORDINARY retry (even with a
+/// fresh observed fence) never clears it (pre-R4-4, the observed-fence
+/// retry force-cleared AND re-entered handoff in one step, licensing a
+/// new writer while the prior's descendant tree was unverified). The
+/// three-phase contract:
+///   (a) an ordinary retry is the typed PLATFORM_LIMITED_FENCED refusal
+///       and the key STAYS fenced;
+///   (b) the acknowledged force-clear (acknowledgePlatformLimitedRisk)
+///       clears the key Vacant, answers the TYPED CLEAR (never a handoff
+///       success — no owner is committed), and broadcasts the cleared
+///       state;
+///   (c) a subsequent EXPLICIT handoff proceeds as a fresh no-prior
+///       sequence (the prior is Vacant — nothing to reap; the unverified
+///       descendants are the operator's acknowledged risk).
 #[tokio::test]
-async fn a_fenced_retry_force_clears_a_platform_limited_fence_and_proceeds() {
+async fn a_platform_limited_fence_recovers_only_through_the_acknowledged_force_clear() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
     let _env = FakeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
-    let rig = build_rig_with_options(None, None, None, 8_000, None, true);
+    let mut rig = build_rig_with_options(None, None, None, 8_000, None, true);
     establish_fresh_claude_owner(&rig, &sid).await;
+    // Consume the establish-time frames so the recovery window is isolated.
+    let _ = drain_runtime_owner_frames(&mut rig.rx);
 
     // Fence the key PlatformLimited (the 3i shape).
     let handle = rig
@@ -1711,45 +1742,90 @@ async fn a_fenced_retry_force_clears_a_platform_limited_fence_and_proceeds() {
         }
     ));
 
-    // The DEFAULT path stays fenced: a create is Blocked, and a fence-less
-    // retry is the typed in-flight refusal.
+    // (a) THE R4-4 regression: an ORDINARY retry — even carrying the
+    // FRESH observed fence pair — must NOT force-clear. Pre-fix, this
+    // retry cleared the fence and started the terminal writer in one
+    // step over an unverified descendant tree.
+    let mut ordinary = handoff_req_terminal("claude", &sid, "claude");
+    ordinary.observed_epoch = Some(snap.epoch);
+    ordinary.observed_generation = Some(snap.generation);
+    let ordinary_retry = rig.runner.spawn_handoff(ordinary);
+    let ordinary_result = ordinary_retry.completion.await.expect("retry completed");
+    assert_eq!(
+        ordinary_result["error"]["code"],
+        json!("PLATFORM_LIMITED_FENCED"),
+        "an ordinary retry must not force-clear: {ordinary_result}"
+    );
+    assert_eq!(ordinary_result["error"]["retryable"], json!(true));
     assert!(
         matches!(
-            rig.ownership.begin_start(
-                "claude",
-                &sid,
-                RuntimeOwnerKind::FreshAgent,
-                "pl-force-probe-create",
-                None,
-                "test",
-                0,
-            ),
-            BeginOutcome::Blocked { .. }
+            rig.ownership.observe("claude", &sid).state,
+            OwnershipState::Fenced { .. }
         ),
-        "a create during the platform-limited fence must stay Blocked"
+        "the ordinary retry left the fence held"
     );
+    // A fence-less ordinary retry answers the same typed refusal.
     let fenceless = rig
         .runner
         .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
     let fenceless_retry = fenceless.completion.await.expect("retry completed");
     assert_eq!(
         fenceless_retry["error"]["code"],
-        json!("HANDOFF_IN_PROGRESS"),
-        "a retry without the observed fence must not force-clear: {fenceless_retry}"
+        json!("PLATFORM_LIMITED_FENCED"),
+        "a fence-less ordinary retry must not force-clear: {fenceless_retry}"
     );
 
-    // THE R3-4 recovery: the explicit retry CARRYING the observed fence
-    // (the pair the fenced record's observers hold) force-clears the fence
-    // and proceeds — the handoff runs to its committed terminal owner.
-    let mut req = handoff_req_terminal("claude", &sid, "claude");
-    req.observed_epoch = Some(snap.epoch);
-    req.observed_generation = Some(snap.generation);
-    let retry = rig.runner.spawn_handoff(req);
+    // (b) THE acknowledged force-clear: clears the key Vacant, answers
+    // the TYPED CLEAR — never a handoff success (no owner committed, no
+    // handoff-started frame) — and broadcasts the cleared state so every
+    // device converges.
+    let _ = drain_runtime_owner_frames(&mut rig.rx);
+    let mut clear_req = handoff_req_terminal("claude", &sid, "claude");
+    clear_req.acknowledge_platform_limited_risk = true;
+    clear_req.observed_epoch = Some(snap.epoch);
+    clear_req.observed_generation = Some(snap.generation);
+    let clear = rig.runner.spawn_handoff(clear_req);
+    let cleared = clear.completion.await.expect("force-clear completed");
+    assert_eq!(
+        cleared["ok"],
+        json!(true),
+        "the acknowledged force-clear answers the typed clear: {cleared}"
+    );
+    assert_eq!(cleared["cleared"], json!("platform-limited-fence"));
+    assert!(
+        cleared.get("owner").is_none(),
+        "the typed clear is NOT a handoff success — no owner is committed"
+    );
+    match rig.ownership.observe("claude", &sid).state {
+        OwnershipState::Vacant => {}
+        other => panic!("the force-clear must leave the key Vacant, got {other:?}"),
+    }
+    // No handoff-started frame rode the clear (no handoff ran), and the
+    // cleared state was broadcast for cross-device convergence.
+    let frames = await_owner_frames(&mut rig.rx, &["released"]).await;
+    let released = runtime_owner_frame(&frames, "released");
+    assert_eq!(released["ownerKind"], json!("vacant"));
+    assert_eq!(
+        released["reason"],
+        json!("PLATFORM_LIMITED_FORCE_CLEARED"),
+        "the clear broadcast names the typed force-clear: {released}"
+    );
+    assert!(
+        !frames.iter().any(|f| f["transition"] == "handoff-started"),
+        "the force-clear path must not re-enter handoff: {frames:?}"
+    );
+
+    // (c) A subsequent EXPLICIT handoff proceeds as a fresh no-prior
+    // sequence — the key is Vacant, so the runner starts the terminal
+    // target fresh from the durable session and commits it.
+    let retry = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
     let retried = retry.completion.await.expect("retry completed");
     assert_eq!(
         retried["ok"],
         json!(true),
-        "the force-cleared retry must proceed: {retried}"
+        "the post-clear explicit handoff must proceed: {retried}"
     );
     let terminal_id = retried["owner"]["terminalId"].as_str().unwrap().to_string();
     match rig.ownership.observe("claude", &sid).state {
@@ -1762,10 +1838,10 @@ async fn a_fenced_retry_force_clears_a_platform_limited_fence_and_proceeds() {
     rig.registry.kill(&terminal_id);
 
     // The limitation was recorded honestly: the force-clear's log names
-    // the platform limitation and the fenced reason.
-    // (The tracing capture is thread-local; the runner runs on its own
-    // task, so the assertion runs against the registry's own test below —
-    // here the behavioral outcome is the proof.)
+    // the platform limitation and the operator's acknowledgment (the
+    // registry's own force_released line + the runner's acknowledgment
+    // line; the behavioral outcome above is the proof — no log capture is
+    // needed here).
 }
 
 /// 3j. b8ke focused round-3 review R3-3: the DELAYED platform-limited
@@ -3667,6 +3743,357 @@ async fn opencode_handoff_stop_aborts_an_in_flight_rest_driven_turn_before_reapi
         env.serve_pids()
     );
     rig.registry.kill(&terminal_id);
+}
+
+/// 6g. b8ke focused round-4 review R4-2: the REST drive's dispatch is
+/// ATOMIC against lifecycle handoff. The drive holds the session's
+/// dispatch/condemn GATE across [ownership re-check + accepted-witness
+/// arming + prompt POST]; the stop's quiesce takes the SAME gate around
+/// [witness take + condemn]. The interleaving under review — a handoff
+/// that starts AFTER the drive's ownership check but BEFORE its prompt
+/// dispatch — must be total: pre-fix (check once, then a separate
+/// unconstrained dispatch) the stop condemned the UNARMED witness,
+/// reported the reap, and committed the terminal owner while the parked
+/// drive then armed the removed witness and POSTed a daemon-side writer
+/// AFTER the coordinator had moved on. Post-fix the stop BLOCKS on the
+/// gate until the POST issued, sees the ARMED witness, and its abort
+/// confirms the daemon-side turn's death BEFORE the reap.
+#[tokio::test]
+async fn opencode_handoff_stop_waits_for_a_mid_dispatch_rest_drive_under_the_gate() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let env = FakeOpencodeServeEnv::install();
+    // No abort hold: the fake serve answers aborts immediately.
+    let rig = build_rig(None);
+
+    // A REST-created freshopencode pane (the POST /api/tabs shape).
+    rig.fresh_agent.panes.lock().expect("panes mutex").insert(
+        "pane-r42".to_string(),
+        crate::PaneEntry {
+            placeholder_id: "freshopencode-r42".to_string(),
+            cwd: Some("/tmp".to_string()),
+            model: None,
+            effort: None,
+            durable_id: None,
+        },
+    );
+    let headers = |()| {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-auth-token", "handoff-test-token".parse().unwrap());
+        h
+    };
+    // Drive #1 materializes ses_1 with a short budget: the prompt
+    // dispatches, the local await gives up (IdleTimeout), and the witness
+    // stays ARMED and REGISTERED (the R4-3 retained shape).
+    let first = tokio::spawn(crate::send_keys(
+        axum::extract::State(rig.fresh_agent.clone()),
+        axum::extract::Path("pane-r42".to_string()),
+        headers(()),
+        axum::Json(json!({ "text": "first REST turn", "timeout": 1 })),
+    ));
+    let rest_response = first.await.expect("drive #1 completed");
+    assert_eq!(
+        rest_response.status(),
+        axum::http::StatusCode::OK,
+        "drive #1 answers approx: {rest_response:?}"
+    );
+
+    // Park drive #2 mid-dispatch — AFTER the gate-held re-check, BEFORE
+    // the prompt POST (the R4-2 test seam; never armed in production).
+    let pause = Arc::new(tokio::sync::Notify::new());
+    rig.fresh_agent
+        .set_rest_turn_test_pause_for_test(Some(Arc::clone(&pause)));
+    let second = tokio::spawn(crate::send_keys(
+        axum::extract::State(rig.fresh_agent.clone()),
+        axum::extract::Path("pane-r42".to_string()),
+        headers(()),
+        axum::Json(json!({ "text": "second REST turn", "timeout": 5 })),
+    ));
+    // The drive reached the park: its retained-witness settle (R4-3)
+    // aborted drive #1's daemon-side turn first — that abort row is the
+    // drive's progress marker up to the park point.
+    env.await_audit_row(Duration::from_secs(20), |r| {
+        r["event"] == "abort-received" && r["id"] == json!("ses_1")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Handoff opencode -> terminal while the drive is parked BEFORE its
+    // prompt POST: the stop's quiesce blocks on the dispatch gate.
+    let to_terminal = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("opencode", "ses_1", "opencode"));
+    let mut completion = to_terminal.completion;
+
+    // THE R4-2 regression: the handoff must NOT complete while the drive
+    // is parked mid-section — pre-fix the quiesce condemned the UNARMED
+    // witness and the handoff committed the terminal owner BEFORE the
+    // drive's POST (a daemon-side writer started after the reap).
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), &mut completion)
+            .await
+            .is_err(),
+        "the handoff completed while the REST drive was parked before its \
+         prompt dispatch — the stop must block on the dispatch gate"
+    );
+
+    // Release the drive: the prompt POST issues UNDER the gate, the gate
+    // opens, and the stop takes+condemns the now-ARMED witness and its
+    // abort confirms the daemon-side turn BEFORE the reap.
+    pause.notify_waiters();
+    env.await_audit_row(Duration::from_secs(20), |r| {
+        r["method"] == "POST"
+            && r["path"]
+                .as_str()
+                .is_some_and(|p| p == "/session/ses_1/prompt_async")
+    })
+    .await;
+    let result = completion.await.expect("handoff completed");
+    assert_eq!(result["ok"], json!(true), "handoff to terminal: {result}");
+    let terminal_id = result["owner"]["terminalId"].as_str().unwrap().to_string();
+    match rig.ownership.observe("opencode", "ses_1").state {
+        OwnershipState::Live { owner, .. } => {
+            assert_eq!(owner.kind, RuntimeOwnerKind::Terminal);
+            assert_eq!(owner.terminal_id.as_deref(), Some(terminal_id.as_str()));
+        }
+        other => panic!("expected Live terminal owner, got {other:?}"),
+    }
+    // Ordering proof: the drive's prompt POST row precedes a SECOND
+    // abort row for ses_1 — the quiesce's confirmed abort of the armed
+    // witness. (Pre-fix the quiesce aborted nothing: no armed witness
+    // existed and the drive's POST armed an orphan AFTER the handoff.)
+    let rows = env.audit_rows();
+    let prompt_idx = rows
+        .iter()
+        .position(|r| {
+            r["method"] == "POST"
+                && r["path"]
+                    .as_str()
+                    .is_some_and(|p| p == "/session/ses_1/prompt_async")
+        })
+        .expect("the drive's prompt row");
+    let abort_after_prompt = rows[prompt_idx..]
+        .iter()
+        .any(|r| r["event"] == "abort-received" && r["id"] == json!("ses_1"));
+    assert!(
+        abort_after_prompt,
+        "the stop's abort of the ARMED witness must follow the prompt POST"
+    );
+
+    // The drive answered (approx — the fake serve never idles).
+    let second_response = second.await.expect("drive #2 completed");
+    assert_eq!(
+        second_response.status(),
+        axum::http::StatusCode::OK,
+        "drive #2 answers: {second_response:?}"
+    );
+    assert_eq!(
+        env.serve_pids().len(),
+        1,
+        "the shared serve was never killed or restarted: pids {:?}",
+        env.serve_pids()
+    );
+    rig.fresh_agent.set_rest_turn_test_pause_for_test(None);
+    rig.registry.kill(&terminal_id);
+}
+
+/// 6h. b8ke focused round-4 review R4-3: a second REST drive SETTLES the
+/// retained witness before replacing it. An earlier drive's IdleTimeout
+/// deliberately leaves its witness ARMED and REGISTERED (the daemon-side
+/// turn may still be mutating the session); pre-fix the replacement
+/// overwrote the registry entry unconditionally, silently forgetting that
+/// unresolved writer. Post-fix the retained witness is condemned and its
+/// accepted daemon-side turn is aborted to confirmed settlement BEFORE
+/// the new witness registers — the audit shows the abort landing between
+/// the two prompt POSTs.
+#[tokio::test]
+async fn a_second_rest_drive_settles_the_retained_witness_before_replacing_it() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let env = FakeOpencodeServeEnv::install();
+    let rig = build_rig(None);
+
+    rig.fresh_agent.panes.lock().expect("panes mutex").insert(
+        "pane-r43".to_string(),
+        crate::PaneEntry {
+            placeholder_id: "freshopencode-r43".to_string(),
+            cwd: Some("/tmp".to_string()),
+            model: None,
+            effort: None,
+            durable_id: None,
+        },
+    );
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("x-auth-token", "handoff-test-token".parse().unwrap());
+    // Drive #1: IdleTimeout leaves the retained witness armed.
+    let first = tokio::spawn(crate::send_keys(
+        axum::extract::State(rig.fresh_agent.clone()),
+        axum::extract::Path("pane-r43".to_string()),
+        headers.clone(),
+        axum::Json(json!({ "text": "first REST turn", "timeout": 1 })),
+    ));
+    assert_eq!(
+        first.await.expect("drive #1 completed").status(),
+        axum::http::StatusCode::OK
+    );
+    // The retained witness is registered and armed.
+    {
+        let turns = rig
+            .fresh_agent
+            .rest_opencode_turns
+            .lock()
+            .expect("rest opencode turns lock");
+        let retained = turns.get("ses_1").expect("the retained witness");
+        assert!(
+            retained
+                .daemon_turn_accepted
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "drive #1's IdleTimeout left its witness ARMED"
+        );
+    }
+
+    // Drive #2: the settle-then-replace. Pre-fix this drive overwrote the
+    // registry entry silently — no abort was ever issued for the retained
+    // turn.
+    let second = tokio::spawn(crate::send_keys(
+        axum::extract::State(rig.fresh_agent.clone()),
+        axum::extract::Path("pane-r43".to_string()),
+        headers.clone(),
+        axum::Json(json!({ "text": "second REST turn", "timeout": 5 })),
+    ));
+    assert_eq!(
+        second.await.expect("drive #2 completed").status(),
+        axum::http::StatusCode::OK,
+        "the settled replacement drive proceeds"
+    );
+
+    // THE R4-3 regression: the retained witness's daemon-side turn was
+    // ABORTED — and the abort landed BETWEEN the two prompt POSTs (the
+    // settle runs before the new witness registers and dispatches).
+    let rows = env.audit_rows();
+    let prompt_positions: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| {
+            (r["method"] == "POST"
+                && r["path"]
+                    .as_str()
+                    .is_some_and(|p| p == "/session/ses_1/prompt_async"))
+            .then_some(i)
+        })
+        .collect();
+    assert_eq!(
+        prompt_positions.len(),
+        2,
+        "both drives dispatched their prompts: rows {:?}",
+        rows
+    );
+    let abort_between = rows[prompt_positions[0]..prompt_positions[1]]
+        .iter()
+        .any(|r| r["event"] == "abort-received" && r["id"] == json!("ses_1"));
+    assert!(
+        abort_between,
+        "the retained witness's daemon-side turn must be aborted to \
+         confirmed settlement BEFORE the replacement drive dispatches"
+    );
+    assert_eq!(
+        env.serve_pids().len(),
+        1,
+        "the shared serve was never killed: pids {:?}",
+        env.serve_pids()
+    );
+}
+
+/// 6i. b8ke focused round-4 review R4-3: an UNCONFIRMABLE retained
+/// witness refuses the replacement TYPED — never a silent overwrite that
+/// orphans the earlier daemon-side writer. The fake serve holds its abort
+/// answer open (the release file stays absent), so the new drive's
+/// bounded settle cannot confirm; the drive answers the typed 409 and the
+/// retained witness STAYS registered (still visible to every lifecycle
+/// stop). Releasing the hold lets the NEXT drive settle and proceed.
+#[tokio::test]
+async fn an_unconfirmable_retained_witness_refuses_the_replacement_typed() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let env = FakeOpencodeServeEnv::install();
+    // The abort-hold release file: absent until the test writes it, so
+    // the fake serve holds every abort answer open.
+    let release = env.dir.join("abort-release-r43b");
+    std::env::set_var("FAKE_OPENCODE_SERVE_ABORT_RELEASE", &release);
+    let rig = build_rig(None);
+
+    rig.fresh_agent.panes.lock().expect("panes mutex").insert(
+        "pane-r43b".to_string(),
+        crate::PaneEntry {
+            placeholder_id: "freshopencode-r43b".to_string(),
+            cwd: Some("/tmp".to_string()),
+            model: None,
+            effort: None,
+            durable_id: None,
+        },
+    );
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("x-auth-token", "handoff-test-token".parse().unwrap());
+    // Drive #1: IdleTimeout leaves the retained witness armed.
+    let first = tokio::spawn(crate::send_keys(
+        axum::extract::State(rig.fresh_agent.clone()),
+        axum::extract::Path("pane-r43b".to_string()),
+        headers.clone(),
+        axum::Json(json!({ "text": "first REST turn", "timeout": 1 })),
+    ));
+    assert_eq!(
+        first.await.expect("drive #1 completed").status(),
+        axum::http::StatusCode::OK
+    );
+
+    // Drive #2 while the abort is unanswerable: the bounded settle fails →
+    // the typed refusal. Pre-fix this drive silently replaced the
+    // retained witness and answered 200.
+    let second = tokio::spawn(crate::send_keys(
+        axum::extract::State(rig.fresh_agent.clone()),
+        axum::extract::Path("pane-r43b".to_string()),
+        headers.clone(),
+        axum::Json(json!({ "text": "second REST turn", "timeout": 1 })),
+    ));
+    let second_response = second.await.expect("drive #2 completed");
+    assert_eq!(
+        second_response.status(),
+        axum::http::StatusCode::CONFLICT,
+        "the unconfirmable retained witness must refuse the replacement \
+         typed: {second_response:?}"
+    );
+
+    // The retained witness STAYS registered — no orphan writer (every
+    // lifecycle stop still sees it).
+    assert!(
+        rig.fresh_agent
+            .rest_opencode_turns
+            .lock()
+            .expect("rest opencode turns lock")
+            .contains_key("ses_1"),
+        "the unconfirmed retained witness must stay registered"
+    );
+
+    // Release the hold: the NEXT drive settles (the abort answers) and
+    // proceeds.
+    std::fs::write(&release, "").expect("release the abort hold");
+    let third = tokio::spawn(crate::send_keys(
+        axum::extract::State(rig.fresh_agent.clone()),
+        axum::extract::Path("pane-r43b".to_string()),
+        headers.clone(),
+        axum::Json(json!({ "text": "third REST turn", "timeout": 5 })),
+    ));
+    assert_eq!(
+        third.await.expect("drive #3 completed").status(),
+        axum::http::StatusCode::OK,
+        "the post-release drive settles the retained witness and proceeds"
+    );
+    assert_eq!(
+        env.serve_pids().len(),
+        1,
+        "the shared serve was never killed: pids {:?}",
+        env.serve_pids()
+    );
 }
 
 /// 6b. kilroy (round-2 review): handoff TO a kilroy fresh-agent target — the

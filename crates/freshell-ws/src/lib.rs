@@ -584,12 +584,18 @@ pub async fn build_handshake_with_capabilities(
                     epoch: rec.epoch,
                     generation: rec.generation,
                     owner_kind: rec.owner_kind,
-                    // b8ke focused round-3 review R3-5: the replayed state's
-                    // truth — a fenced record folds as the typed recovery
-                    // state on the client, never as a committed owner.
+                    // b8ke focused round-3 review R3-5 + round-4 R4-6:
+                    // the replayed state's truth — a fenced record folds as
+                    // the typed recovery state on the client, never as a
+                    // committed owner; the in-progress lifecycle states
+                    // (starting/handoff/stopping) fold as transition-in-
+                    // progress, never as committed live ownership.
                     state: match rec.state {
                         freshell_ownership::ReplayOwnerState::Live => "live",
                         freshell_ownership::ReplayOwnerState::Fenced => "fenced",
+                        freshell_ownership::ReplayOwnerState::Starting => "starting",
+                        freshell_ownership::ReplayOwnerState::Handoff => "handoff",
+                        freshell_ownership::ReplayOwnerState::Stopping => "stopping",
                     }
                     .to_string(),
                     reason: rec.reason,

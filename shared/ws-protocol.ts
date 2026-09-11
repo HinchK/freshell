@@ -1098,11 +1098,16 @@ export type ReadyMessage = {
     epoch: number
     generation: number
     ownerKind: 'terminal' | 'fresh-agent' | 'vacant'
-    /** b8ke: 'live' | 'fenced' — a fenced record's ownerKind names the
-     *  FENCED PRIOR (not a live owner); the client folds the typed
-     *  recovery state (handoff-failed + reason), never a committed
-     *  owner. Omitted by pre-R3-5 servers (fold as live). */
-    state?: 'live' | 'fenced'
+    /** b8ke: the record's truthful state. 'live' — the named owner is the
+     *  committed live owner (a vacant key's ownerKind carries its own
+     *  truth). 'fenced' — a fenced record's ownerKind names the FENCED
+     *  PRIOR (not a live owner); the client folds the typed recovery
+     *  state (handoff-failed + reason), never a committed owner. R4-6:
+     *  'starting' | 'handoff' | 'stopping' — in-progress lifecycle
+     *  transitions (the client folds them as handoff-in-progress, never
+     *  as committed ownership). Omitted by pre-R3-5 servers (fold as
+     *  live). */
+    state?: 'live' | 'fenced' | 'starting' | 'handoff' | 'stopping'
     /** The typed fence reason (fenced records only):
      *  'watcher-failed' | 'platform-limited'. */
     reason?: string
@@ -1621,8 +1626,10 @@ export type SessionRuntimeOwnerMessage = {
   /** Machine-readable failure reason (handoff-failed frames). */
   reason?: string
   /** b8ke R3-5: true on the ready-replay fold of a FENCED record (the
-   *  named owner is the fenced prior, not a live owner) — additive and
-   *  never set by broadcast frames. */
+   *  named owner is the fenced prior, not a live owner). b8ke R4-5: the
+   *  fenced reap/stop FAILURE broadcasts also set it — an online
+   *  old-kind pane keeps the typed recovery state (no polling
+   *  resumption) after the fenced failure frame. */
   fenced?: boolean
 }
 

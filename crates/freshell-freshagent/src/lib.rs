@@ -727,8 +727,8 @@ use freshell_opencode::transport::{
     LoopbackPortAllocator, ReqwestEventSource, ReqwestServeHttp, TokioProcessSpawner,
 };
 use freshell_opencode::{
-    normalize_opencode_effort, normalize_opencode_model, OpencodeServeManager, ServeConfig,
-    ServeDeps, ServeError,
+    build_prompt_body as build_opencode_prompt_body, normalize_opencode_effort,
+    normalize_opencode_model, OpencodeServeManager, ServeConfig, ServeDeps, ServeError,
 };
 use freshell_protocol::{
     FreshAgentEvent, FreshAgentSessionMaterialized, ServerMessage, SessionLocator, SessionsChanged,
@@ -948,6 +948,13 @@ pub struct FreshAgentState {
     /// Configured via [`Self::set_resume_probe_timeout_ms_for_test`].
     #[cfg(test)]
     resume_probe_timeout_ms: Arc<Mutex<Option<u64>>>,
+    /// b8ke focused round-4 R4-2 test seam: when set, the REST opencode
+    /// drive PARKS at the exact interleaving point under review — after
+    /// the gate-held ownership/condemned re-check, BEFORE the prompt POST
+    /// — until the Notify fires. Never armed in production. Installed via
+    /// [`Self::set_rest_turn_test_pause_for_test`].
+    #[cfg(test)]
+    rest_turn_test_pause: Arc<Mutex<Option<Arc<tokio::sync::Notify>>>>,
     /// The ONE server-wide runtime-ownership coordinator (kata b8ke Task 3),
     /// wired from freshell-server::main next to `fresh_agent_leases`.
     /// `None` (every pre-existing test) = the lane skips coordinator
@@ -965,6 +972,20 @@ pub struct FreshAgentState {
     /// represented in the WebSocket session map). See
     /// [`RestOpencodeTurn`].
     pub(crate) rest_opencode_turns: Arc<Mutex<HashMap<String, Arc<RestOpencodeTurn>>>>,
+    /// b8ke focused round-4 review R4-2: the per-canonical-id
+    /// DISPATCH/CONDEMN mutual-exclusion gates for REST opencode turns.
+    /// The drive holds its session's gate across the [condemned/ownership
+    /// re-check + accepted-witness arming + prompt POST] critical section,
+    /// and every lifecycle quiesce path holds the SAME gate across its
+    /// [witness take + condemn] section — the interleaving is total:
+    /// either the POST is issued before the condemnation (the quiesce
+    /// sees the armed witness and its abort confirms the daemon-side
+    /// turn's death BEFORE the reap is reported), or the condemnation
+    /// lands first (the drive's re-check refuses the dispatch typed). The
+    /// gate is keyed by session (not carried in the witness Arc) so a
+    /// witness REPLACEMENT can never leave the condemner gating a stale
+    /// object. See [`FreshAgentState::rest_turn_gate`].
+    rest_turn_gates: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 /// What [`terminal_tabs::spawn_terminal_pane`] hands the injected
@@ -1086,9 +1107,12 @@ impl FreshAgentState {
             )),
             #[cfg(test)]
             resume_probe_timeout_ms: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            rest_turn_test_pause: Arc::new(Mutex::new(None)),
             ownership: None,
             ownership_stamps: Arc::new(Mutex::new(HashMap::new())),
             rest_opencode_turns: Arc::new(Mutex::new(HashMap::new())),
+            rest_turn_gates: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1519,6 +1543,81 @@ impl FreshAgentState {
         }
     }
 
+    /// b8ke focused round-4 review R4-2: the per-canonical-id
+    /// dispatch/condemn gate. Get-or-create (id-keyed, stable across
+    /// witness replacements — see [`Self::rest_turn_gates`]). The REST
+    /// drive holds this gate across its [re-check + arming + prompt POST]
+    /// critical section; the lifecycle quiesce paths hold it across
+    /// [witness take + condemn]. Neither side ever acquires another
+    /// session's gate while holding one, so no lock ordering exists.
+    pub(crate) fn rest_turn_gate(&self, durable_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self.rest_turn_gates.lock().expect("rest turn gates lock");
+        gates
+            .entry(durable_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// b8ke focused round-4 review R4-3: settle the RETAINED REST turn
+    /// witness for a canonical id BEFORE a new drive replaces it. An
+    /// earlier drive that answered `IdleTimeout` (or any ambiguous
+    /// error) deliberately leaves its witness ARMED and REGISTERED — its
+    /// daemon-side turn may still be mutating the session — so a second
+    /// request replacing the registry entry unconditionally would SILENTLY
+    /// FORGET that unresolved writer (handoffs could only ever see the
+    /// replacement). Settle-then-replace: the retained witness is
+    /// CONDEMNED and, when its accepted flag is armed, its daemon-side
+    /// turn is aborted to confirmed settlement through the PEEKED manager
+    /// (never spawning and never killing the shared daemon — OpenCode
+    /// invariant), bounded by the new drive's own turn budget.
+    ///
+    /// Returns `true` when the retained witness was ABSENT, never
+    /// dispatched, or its daemon-side turn is CONFIRMED settled — the
+    /// caller may register its own witness. Returns `false` when the
+    /// bounded settle could not confirm: the retained witness STAYS
+    /// registered and condemned (no orphan writer — the registry keeps it
+    /// visible to every lifecycle stop; the next attempt or a handoff
+    /// kill retries the settle) and the caller must refuse the new drive
+    /// typed.
+    pub(crate) async fn settle_retained_rest_opencode_turn(
+        &self,
+        durable_id: &str,
+        budget: std::time::Duration,
+    ) -> bool {
+        let retained = {
+            let turns = self
+                .rest_opencode_turns
+                .lock()
+                .expect("rest opencode turns lock");
+            turns.get(durable_id).cloned()
+        };
+        let Some(retained) = retained else {
+            return true;
+        };
+        retained.condemned.store(true, Ordering::SeqCst);
+        if !retained.daemon_turn_accepted.load(Ordering::SeqCst) {
+            // Never dispatched — nothing of ours runs daemon-side.
+            return true;
+        }
+        let real = durable_id.to_string();
+        let route = retained.route.clone();
+        let accepted = Arc::clone(&retained.daemon_turn_accepted);
+        let settle =
+            crate::opencode_ws::settle_accepted_daemon_turn(self, &real, &route, &accepted);
+        match tokio::time::timeout(budget, settle).await {
+            Ok(()) => true,
+            Err(_elapsed) => {
+                tracing::warn!(target: "freshell_freshagent::opencode",
+                    session_id = %durable_id,
+                    "freshagent.opencode.rest_turn_replacement_settle_unconfirmed: a prior \
+                     REST-driven daemon turn could not be quiesced within the drive's budget — \
+                     the retained witness stays registered; the new drive is refused"
+                );
+                false
+            }
+        }
+    }
+
     /// Get-or-create the single serve client. `ServeConfig::default()` reads `OPENCODE_CMD`
     /// (unset in the cold-start path → the real `opencode` binary). Cheap `Arc` clone.
     ///
@@ -1583,6 +1682,19 @@ impl FreshAgentState {
             .resume_probe_timeout_ms
             .lock()
             .expect("resume_probe_timeout_ms mutex") = Some(ms);
+    }
+
+    /// b8ke focused round-4 R4-2 test seam installer: see
+    /// [`Self::rest_turn_test_pause`].
+    #[cfg(test)]
+    pub(crate) fn set_rest_turn_test_pause_for_test(
+        &self,
+        pause: Option<Arc<tokio::sync::Notify>>,
+    ) {
+        *self
+            .rest_turn_test_pause
+            .lock()
+            .expect("rest_turn_test_pause mutex") = pause;
     }
 
     /// The REST resume probe's bounded `get_session` budget, in milliseconds:
@@ -3462,19 +3574,38 @@ async fn send_keys(
     let effort = normalize_opencode_effort(pane.model.as_deref(), pane.effort.as_deref());
     let submitted_turn_id = Uuid::new_v4().to_string();
 
-    // b8ke focused round-3 review R3-1: the REST pane drive PARTICIPATES
-    // in the coordinator exactly like the WS lane's turn. (1) The witness
-    // is registered BEFORE the ownership check and the dispatch, so a
-    // concurrent lifecycle stop sees the in-flight drive either way; (2)
-    // the ownership/claim check — the canonical key must be
-    // Live{FreshAgent} (this pane's materialization committed it; a
-    // concurrent handoff/stop, a fence, or a foreign owner refuses the
-    // dispatch typed); (3) a stop that CONDEMNED this drive before its
-    // dispatch (the handoff owned the transition) refuses it too; (4) the
-    // accepted-turn witness arms at the prompt POST's DISPATCH boundary
-    // (run_turn's accepted_witness — the same seam the WS lane's turns
-    // use), so a handoff finding it armed aborts the daemon-side turn
-    // before reporting the reap.
+    // b8ke focused round-3 review R3-1 + round-4 R4-2/R4-3: the REST pane
+    // drive PARTICIPATES in the coordinator exactly like the WS lane's
+    // turn. R4-2 makes the participation ATOMIC against lifecycle: the
+    // drive holds the session's dispatch/condemn GATE across the whole
+    // [retained-witness settle + registration + ownership/condemned
+    // re-check + accepted-witness arming + prompt POST] critical section,
+    // and every lifecycle quiesce path holds the SAME gate across its
+    // [witness take + condemn] section — the interleaving is total: a
+    // handoff that condemns the witness either sees the ARMED witness
+    // (the POST already went out; its abort confirms the daemon-side
+    // turn's death BEFORE the reap is reported) or condemned before the
+    // drive's re-check (the drive refuses the dispatch with the typed
+    // conflict — the handoff owns the transition). R4-3: a RETAINED
+    // witness (an earlier drive's IdleTimeout — its daemon-side turn may
+    // still be mutating the session) is condemned and aborted to
+    // confirmed settlement BEFORE the new witness replaces it; an
+    // unconfirmable settle refuses the new drive typed (the retained
+    // witness stays registered — never a silently forgotten writer).
+    let gate = state.rest_turn_gate(&durable_id);
+    let gate_guard = gate.lock().await;
+    if !state
+        .settle_retained_rest_opencode_turn(&durable_id, turn_timeout)
+        .await
+    {
+        drop(gate_guard);
+        return fail_json(
+            StatusCode::CONFLICT,
+            "SESSION_RESERVED: a prior REST-driven turn on this session could not be \
+             quiesced; retry after it settles"
+                .to_string(),
+        );
+    }
     let turn_witness = state.register_rest_opencode_turn(&durable_id, route.clone());
     if !state.rest_turn_ownership_granted(&durable_id)
         || turn_witness.condemned.load(Ordering::SeqCst)
@@ -3486,24 +3617,54 @@ async fn send_keys(
              this session's transition — the REST turn is not dispatched"
         );
         state.remove_rest_opencode_turn(&durable_id, &turn_witness);
+        drop(gate_guard);
         return fail_json(
             StatusCode::CONFLICT,
             "SESSION_RESERVED: another lifecycle operation owns this session".to_string(),
         );
     }
 
-    match manager
-        .run_turn(
-            &durable_id,
-            &text,
-            model.as_deref(),
-            effort.as_deref(),
-            turn_timeout,
-            route,
-            Some(turn_witness.daemon_turn_accepted.clone()),
-        )
-        .await
+    // Subscribe BEFORE prompting so the idle edge cannot be missed
+    // (run_turn's own ordering), then issue the prompt POST UNDER the
+    // gate: the accepted-turn witness arms at the POST's DISPATCH
+    // boundary (the same seam the WS lane's turns use), so a handoff
+    // finding it armed aborts the daemon-side turn before reporting the
+    // reap.
+    #[cfg(test)]
     {
+        // R4-2's test seam: park at the exact interleaving point under
+        // review (after the gate-held re-check, before the POST). The
+        // guard is scoped to the block so no std lock lives across the
+        // await (Send).
+        let pause = state
+            .rest_turn_test_pause
+            .lock()
+            .expect("rest_turn_test_pause mutex")
+            .clone();
+        if let Some(pause) = pause {
+            pause.notified().await;
+        }
+    }
+    let rx = manager.subscribe(&durable_id);
+    let body = build_opencode_prompt_body(&text, model.as_deref(), effort.as_deref());
+    let accepted = Arc::clone(&turn_witness.daemon_turn_accepted);
+    let prompt = manager
+        .prompt_async(&durable_id, body, &route, Some(accepted))
+        .await;
+    // The gate section ends with the POST: from here the witness is
+    // either armed-and-registered (the quiesce paths see it) or the
+    // prompt failed before dispatch.
+    drop(gate_guard);
+
+    let drive_result = match prompt {
+        Ok(()) => {
+            manager
+                .await_idle(&durable_id, rx, turn_timeout, route)
+                .await
+        }
+        Err(err) => Err(err),
+    };
+    match drive_result {
         Ok(()) => {
             // The idle edge was observed (or the daemon itself is gone —
             // nothing runs daemon-side): the accepted turn is settled.

@@ -3487,6 +3487,7 @@ async fn race_coordinator_cancellation_and_sidecar_crash_leave_consistent_state(
             observed_epoch: None,
             observed_generation: None,
             device_id: Some("race-r7".to_string()),
+            acknowledge_platform_limited_risk: false,
         });
     let _ = await_owner_transition(&mut h, &sid, "handoff-started").await;
     handle.abort();

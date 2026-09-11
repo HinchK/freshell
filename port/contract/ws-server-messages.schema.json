@@ -2697,7 +2697,10 @@
               "state": {
                 "enum": [
                   "live",
-                  "fenced"
+                  "fenced",
+                  "starting",
+                  "handoff",
+                  "stopping"
                 ],
                 "type": "string"
               },

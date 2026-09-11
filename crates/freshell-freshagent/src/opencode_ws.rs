@@ -437,6 +437,74 @@ impl OpencodeSession {
     }
 }
 
+/// Settle an ACCEPTED daemon-side turn to confirmed quiescence (b8ke
+/// focused review FR1, refactored for the round-4 R4-2/R4-3 REST-lane
+/// needs): the bounded abort loop against the PEEKED manager at its
+/// READ-ONLY base (the manager cell is never created here and
+/// `require_base` is never consulted — a stop path must never spawn a
+/// daemon), retrying transport failures until the daemon answers. Only a
+/// landed abort (a 2xx answer), an observably absent daemon (no
+/// manager/no running entry), a 404 (no such session daemon-side), or a
+/// provably-never-delivered abort against a dead listener settles the
+/// acceptance. The shared daemon is never killed or discarded. Shared by
+/// the WS lane's stop paths and the REST drive's retained-witness settle.
+pub(crate) async fn settle_accepted_daemon_turn(
+    fresh_agent: &crate::FreshAgentState,
+    real: &str,
+    route: &Option<String>,
+    accepted: &Arc<AtomicBool>,
+) {
+    // Three consecutive provable non-deliveries: the daemon's private
+    // loopback port has no listener — the process is gone, so nothing
+    // runs daemon-side.
+    const UNDELIVERED_SETTLE_THRESHOLD: u32 = 3;
+    let mut consecutive_undelivered: u32 = 0;
+    loop {
+        let Some(manager) = fresh_agent.peek_running_manager().await else {
+            // The manager cell is absent: the shared serve is not
+            // running — nothing executes daemon-side.
+            accepted.store(false, Ordering::SeqCst);
+            return;
+        };
+        let Some(base) = manager.base_url().await else {
+            // The manager exists but nothing is running (a prior
+            // discard/shutdown): nothing executes daemon-side.
+            accepted.store(false, Ordering::SeqCst);
+            return;
+        };
+        match manager.abort_at(real, route, &base).await {
+            Ok(()) => {
+                // The daemon answered the abort — the daemon-side turn
+                // is settled.
+                accepted.store(false, Ordering::SeqCst);
+                return;
+            }
+            Err(ServeError::Http { status: 404, .. }) => {
+                // The daemon does not know the session — no turn of
+                // ours exists daemon-side.
+                accepted.store(false, Ordering::SeqCst);
+                return;
+            }
+            Err(ServeError::Undelivered(_)) => {
+                consecutive_undelivered += 1;
+                if consecutive_undelivered >= UNDELIVERED_SETTLE_THRESHOLD {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %real,
+                        "freshagent.opencode.handoff_stop_abort_undelivered: the shared \
+                         serve's loopback listener is gone — no daemon-side turn remains"
+                    );
+                    accepted.store(false, Ordering::SeqCst);
+                    return;
+                }
+            }
+            Err(_) => {
+                consecutive_undelivered = 0;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 impl FreshOpencodeState {
     /// Build the state around an existing [`FreshAgentState`] (REUSED, not duplicated),
     /// so this slice and the REST tabs slice share exactly one `opencode serve` sidecar.
@@ -1672,26 +1740,35 @@ impl FreshOpencodeState {
         }
         // R3-1: a lingering REST-driven turn (a cancelled stop took no
         // witness — or the drive armed after it) is the remaining
-        // daemon-side writer this lane can settle.
-        let rest_turn = self
-            .fresh_agent
-            .rest_opencode_turns
-            .lock()
-            .expect("rest opencode turns lock")
-            .remove(session_id);
-        if let Some(rest_turn) = rest_turn {
+        // daemon-side writer this lane can settle. R4-2: the [take +
+        // condemn + accepted read] runs under the session's
+        // dispatch/condemn gate, exactly like quiesce_rest_opencode_turn.
+        let rest_turn = {
+            let gate = self.fresh_agent.rest_turn_gate(session_id);
+            let _gate = gate.lock().await;
+            let rest_turn = self
+                .fresh_agent
+                .rest_opencode_turns
+                .lock()
+                .expect("rest opencode turns lock")
+                .remove(session_id);
+            let Some(rest_turn) = rest_turn else {
+                return false;
+            };
             rest_turn.condemned.store(true, Ordering::SeqCst);
-            if rest_turn.daemon_turn_accepted.load(Ordering::SeqCst) {
-                self.abort_accepted_daemon_turn(
-                    session_id,
-                    &rest_turn.route,
-                    &rest_turn.daemon_turn_accepted,
-                )
-                .await;
-            }
-            return true;
+            let accepted = rest_turn.daemon_turn_accepted.load(Ordering::SeqCst);
+            (rest_turn, accepted)
+        };
+        let (rest_turn, accepted) = rest_turn;
+        if accepted {
+            self.abort_accepted_daemon_turn(
+                session_id,
+                &rest_turn.route,
+                &rest_turn.daemon_turn_accepted,
+            )
+            .await;
         }
-        false
+        true
     }
 
     /// b8ke focused round-3 review R3-1: quiesce the REST-driven turn
@@ -1704,19 +1781,36 @@ impl FreshOpencodeState {
     /// path must never spawn a daemon; the shared serve itself is NEVER
     /// killed or discarded — OpenCode invariant). A witness that was never
     /// armed (no accepted turn) settles immediately.
+    ///
+    /// b8ke focused round-4 review R4-2: the [take + condemn + accepted
+    /// read] runs UNDER the session's dispatch/condemn GATE (the same one
+    /// the REST drive holds across its [re-check + arming + prompt POST]
+    /// critical section) — the interleaving is total: either this stop
+    /// sees the drive's ARMED witness (the POST already issued; the abort
+    /// below confirms the daemon-side turn's death BEFORE the reap is
+    /// reported) or the condemnation lands first and the drive's own
+    /// re-check refuses the dispatch typed. The abort itself runs AFTER
+    /// the gate section: the drive has nothing left that could re-arm.
     pub(crate) async fn quiesce_rest_opencode_turn(&self, canonical: &str) {
         // Bind before the await: the guard must never live across it.
-        let witness = self
-            .fresh_agent
-            .rest_opencode_turns
-            .lock()
-            .expect("rest opencode turns lock")
-            .remove(canonical);
-        let Some(witness) = witness else {
-            return;
+        let witness = {
+            let gate = self.fresh_agent.rest_turn_gate(canonical);
+            let _gate = gate.lock().await;
+            let witness = self
+                .fresh_agent
+                .rest_opencode_turns
+                .lock()
+                .expect("rest opencode turns lock")
+                .remove(canonical);
+            let Some(witness) = witness else {
+                return;
+            };
+            witness.condemned.store(true, Ordering::SeqCst);
+            let accepted = witness.daemon_turn_accepted.load(Ordering::SeqCst);
+            (witness, accepted)
         };
-        witness.condemned.store(true, Ordering::SeqCst);
-        if witness.daemon_turn_accepted.load(Ordering::SeqCst) {
+        let (witness, accepted) = witness;
+        if accepted {
             self.abort_accepted_daemon_turn(
                 canonical,
                 &witness.route,
@@ -1743,55 +1837,7 @@ impl FreshOpencodeState {
         route: &Option<String>,
         accepted: &Arc<AtomicBool>,
     ) {
-        // Three consecutive provable non-deliveries: the daemon's private
-        // loopback port has no listener — the process is gone, so nothing
-        // runs daemon-side.
-        const UNDELIVERED_SETTLE_THRESHOLD: u32 = 3;
-        let mut consecutive_undelivered: u32 = 0;
-        loop {
-            let Some(manager) = self.fresh_agent.peek_running_manager().await else {
-                // The manager cell is absent: the shared serve is not
-                // running — nothing executes daemon-side.
-                accepted.store(false, Ordering::SeqCst);
-                return;
-            };
-            let Some(base) = manager.base_url().await else {
-                // The manager exists but nothing is running (a prior
-                // discard/shutdown): nothing executes daemon-side.
-                accepted.store(false, Ordering::SeqCst);
-                return;
-            };
-            match manager.abort_at(real, route, &base).await {
-                Ok(()) => {
-                    // The daemon answered the abort — the daemon-side turn
-                    // is settled.
-                    accepted.store(false, Ordering::SeqCst);
-                    return;
-                }
-                Err(ServeError::Http { status: 404, .. }) => {
-                    // The daemon does not know the session — no turn of
-                    // ours exists daemon-side.
-                    accepted.store(false, Ordering::SeqCst);
-                    return;
-                }
-                Err(ServeError::Undelivered(_)) => {
-                    consecutive_undelivered += 1;
-                    if consecutive_undelivered >= UNDELIVERED_SETTLE_THRESHOLD {
-                        tracing::warn!(target: "freshell_freshagent::opencode",
-                            session_id = %real,
-                            "freshagent.opencode.handoff_stop_abort_undelivered: the shared \
-                             serve's loopback listener is gone — no daemon-side turn remains"
-                        );
-                        accepted.store(false, Ordering::SeqCst);
-                        return;
-                    }
-                }
-                Err(_) => {
-                    consecutive_undelivered = 0;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+        settle_accepted_daemon_turn(&self.fresh_agent, real, route, accepted).await
     }
 
     /// The handoff runner's TARGET-resume entry point —

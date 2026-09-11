@@ -1510,7 +1510,10 @@ fn dispatch_event_on(inner: &Arc<Inner>, event: ParsedServeEvent) {
 /// Build the `prompt_async` body: `{ parts:[{type:'text',text}], model?, variant? }`
 /// (`adapter.ts:363-367`). `model` is split into `{providerID, modelID}`; a
 /// non-splittable model is omitted so the serve session default applies.
-fn build_prompt_body(text: &str, model: Option<&str>, effort: Option<&str>) -> Value {
+/// `pub` for the fresh-agent REST lane's gate-held drive (b8ke focused
+/// round-4 R4-2: it composes subscribe + prompt_async + await_idle itself
+/// so the prompt POST issues INSIDE its dispatch/condemn critical section).
+pub fn build_prompt_body(text: &str, model: Option<&str>, effort: Option<&str>) -> Value {
     let mut body = Map::new();
     body.insert(
         "parts".into(),
