@@ -28,6 +28,7 @@ idle-gate-semantics-rust.spec.ts:150
 amplifier-lane-resilience-rust.spec.ts:120
 create-protection-restore-storm-rust.spec.ts:120
 reconcile-client-adoption-rust.spec.ts:120
+handoff-two-device-rust.spec.ts:240
 freshclaude-identity-persistence-rust.spec.ts:120
 freshagent-settings-resume-rust.spec.ts:120
 session-directory-matrix.spec.ts:200

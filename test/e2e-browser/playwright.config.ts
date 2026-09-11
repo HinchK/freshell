@@ -362,6 +362,11 @@ export const RUST_ONLY_SPECS = [
   // for restartAbrupt(); proves terminal.create wire sends are spaced
   // >=400ms on reload. See docs/plans/2026-09-08-stagger-restore-launches.md
   /restore-create-stagger-rust\.spec\.ts$/,
+  // kata b8ke (Task 11): two-BrowserContext atomic-handoff proof (codex +
+  // opencode reopen-as-CLI + offline/reconnect) on per-test owned
+  // RustServers with dual-role fake CLIs; hard e2eServerKind==='rust'
+  // assertion per test. See the spec's doc comment.
+  /handoff-two-device-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -629,6 +634,11 @@ export default defineConfig({
         // owns its RustServer on an ephemeral port; proves terminal.create
         // wire sends are spaced >=400ms on reload.
         /restore-create-stagger-rust\.spec\.ts$/,
+        // kata b8ke (Task 11, see RUST_ONLY_SPECS entry): two-device
+        // handoff specs (codex/opencode reopen-as-CLI + offline/reconnect)
+        // against per-test owned RustServers with dual-role fake CLIs.
+        // Cloud-legal by design (never added to CLOUD_SKIP_SPECS).
+        /handoff-two-device-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
