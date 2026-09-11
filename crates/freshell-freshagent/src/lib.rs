@@ -4103,7 +4103,10 @@ mod tests {
         // Both present: the fence.
         assert_eq!(
             ownership_lane::wire_fence(Some(3), Some(7)),
-            Ok(Some(ObservedFence { epoch: 3, generation: 7 }))
+            Ok(Some(ObservedFence {
+                epoch: 3,
+                generation: 7
+            }))
         );
         // Both absent: the legacy unfenced path.
         assert_eq!(ownership_lane::wire_fence(None, None), Ok(None));

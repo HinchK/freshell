@@ -1657,24 +1657,22 @@ impl FreshClaudeState {
         // epoch/generation) is the typed invalid-fence refusal — BEFORE the
         // durable close, the mint gate, or any live-state destruction. The
         // kill never proceeds as a silently downgraded legacy request.
-        let stop_fence = match crate::ownership_lane::wire_fence(
-            msg.observed_epoch,
-            msg.observed_generation,
-        ) {
-            Ok(fence) => fence,
-            Err(err) => {
-                tracing::warn!(target: "freshell_freshagent::claude",
+        let stop_fence =
+            match crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation) {
+                Ok(fence) => fence,
+                Err(err) => {
+                    tracing::warn!(target: "freshell_freshagent::claude",
                     session_id = %session_id, code = err.code(),
                     "fresh_agent_kill_refused: the observed fence is half-sent (invalid)");
-                self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
-                    provider: PROVIDER.to_string(),
-                    session_id: msg.session_id.clone(),
-                    session_type: session_type.to_string(),
-                    success: false,
-                }));
-                return;
-            }
-        };
+                    self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                        provider: PROVIDER.to_string(),
+                        session_id: msg.session_id.clone(),
+                        session_type: session_type.to_string(),
+                        success: false,
+                    }));
+                    return;
+                }
+            };
 
         // Retire-on-kill (delta-review round 5 + focused-ep5-r1 round 2,
         // restore-open-sessions-only): an explicit kill is an intentional
@@ -4360,24 +4358,22 @@ impl FreshClaudeState {
         // epoch/generation) is the typed invalid-fence refusal — before any
         // state interaction. The attach never proceeds as a silently
         // downgraded legacy request.
-        let attach_fence = match crate::ownership_lane::wire_fence(
-            msg.observed_epoch,
-            msg.observed_generation,
-        ) {
-            Ok(fence) => fence,
-            Err(err) => {
-                tracing::warn!(target: "freshell_freshagent::claude",
+        let attach_fence =
+            match crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation) {
+                Ok(fence) => fence,
+                Err(err) => {
+                    tracing::warn!(target: "freshell_freshagent::claude",
                     session_id = %msg.session_id, code = err.code(),
                     "fresh_agent_attach_refused: the observed fence is half-sent (invalid)");
-                self.emit_fresh_agent_error(
-                    &msg.session_id,
-                    session_type_str(msg.session_type),
-                    err.code(),
-                    err.message(),
-                );
-                return;
-            }
-        };
+                    self.emit_fresh_agent_error(
+                        &msg.session_id,
+                        session_type_str(msg.session_type),
+                        err.code(),
+                        err.message(),
+                    );
+                    return;
+                }
+            };
         if self.sessions.lock().await.contains_key(&msg.session_id) {
             return; // tracked-and-alive: no frame (wire-shape parity with codex)
         }

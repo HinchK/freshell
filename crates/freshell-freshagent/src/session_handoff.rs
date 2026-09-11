@@ -225,7 +225,10 @@ impl SessionHandoffRunner {
             req.mode.as_deref(),
             &self.cli_commands,
         ) {
-            let generation = self.ownership.observe(&req.provider, &req.session_id).generation;
+            let generation = self
+                .ownership
+                .observe(&req.provider, &req.session_id)
+                .generation;
             tracing::warn!(target: "freshell_ownership",
                 event = "ownership.handoff.refused_pre_stop",
                 provider = %req.provider, session_id = %req.session_id,

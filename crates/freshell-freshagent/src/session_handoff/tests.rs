@@ -1987,13 +1987,13 @@ async fn handoff_abort_cleanup_spares_a_same_id_different_provider_terminal() {
     let codex_terminal = format!("f6-codex-collision-{}", uuid::Uuid::new_v4().simple());
     rig.registry
         .register_headless(freshell_terminal::registry::HeadlessTerminal {
-        terminal_id: codex_terminal.clone(),
-        stream_id: codex_terminal.clone(),
-        mode: "codex".to_string(),
-        resume_session_id: Some(sid.clone()),
-        create_request_id: None,
-        created_at: None,
-    });
+            terminal_id: codex_terminal.clone(),
+            stream_id: codex_terminal.clone(),
+            mode: "codex".to_string(),
+            resume_session_id: Some(sid.clone()),
+            create_request_id: None,
+            created_at: None,
+        });
     assert!(
         rig.registry
             .probe(&codex_terminal)
@@ -2038,11 +2038,14 @@ async fn handoff_abort_cleanup_spares_a_same_id_different_provider_terminal() {
         rig.registry.terminal_is_dead(&target_terminal)
     })
     .await;
-    await_cond("the sweep must clear every claude row for the session", || {
-        !rig.registry.directory().into_iter().any(|entry| {
-            entry.mode == "claude" && entry.resume_session_id.as_deref() == Some(sid.as_str())
-        })
-    })
+    await_cond(
+        "the sweep must clear every claude row for the session",
+        || {
+            !rig.registry.directory().into_iter().any(|entry| {
+                entry.mode == "claude" && entry.resume_session_id.as_deref() == Some(sid.as_str())
+            })
+        },
+    )
     .await;
     // The sweep is the cleanup task's last step — a short settle before the
     // survival read keeps the assertion race-free.
@@ -2384,10 +2387,12 @@ async fn opencode_handoff_stop_aborts_the_active_turn_through_the_manager_before
             settings: None,
         })
         .await;
-    env.await_audit_row(
-        Duration::from_secs(20),
-        |r| r["method"] == "POST" && r["path"].as_str().is_some_and(|p| p.ends_with("/prompt_async")),
-    )
+    env.await_audit_row(Duration::from_secs(20), |r| {
+        r["method"] == "POST"
+            && r["path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with("/prompt_async"))
+    })
     .await;
 
     // Handoff opencode -> terminal: the stop must abort the daemon-side
@@ -2399,10 +2404,9 @@ async fn opencode_handoff_stop_aborts_the_active_turn_through_the_manager_before
 
     // The manager abort was ISSUED through the daemon (the interrupt
     // mechanism) for the REAL session id.
-    env.await_audit_row(
-        Duration::from_secs(20),
-        |r| r["event"] == "abort-received" && r["id"] == json!(sid),
-    )
+    env.await_audit_row(Duration::from_secs(20), |r| {
+        r["event"] == "abort-received" && r["id"] == json!(sid)
+    })
     .await;
 
     // Ordering: the handoff must NOT complete (Reaped unreported) while
@@ -2431,10 +2435,9 @@ async fn opencode_handoff_stop_aborts_the_active_turn_through_the_manager_before
 
     // The shared serve was never killed — exactly one serve pid across
     // the whole handoff, and the abort was answered by that same process.
-    env.await_audit_row(
-        Duration::from_secs(10),
-        |r| r["event"] == "abort-answered" && r["id"] == json!(sid),
-    )
+    env.await_audit_row(Duration::from_secs(10), |r| {
+        r["event"] == "abort-answered" && r["id"] == json!(sid)
+    })
     .await;
     assert_eq!(
         env.serve_pids().len(),

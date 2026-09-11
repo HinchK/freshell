@@ -837,19 +837,17 @@ impl FreshOpencodeState {
         // b8ke delta review F7: a half-sent observed pair (exactly one of
         // epoch/generation) is the typed invalid-fence refusal — never a
         // silently downgraded legacy request.
-        let create_fence = match crate::ownership_lane::wire_fence(
-            msg.observed_epoch,
-            msg.observed_generation,
-        ) {
-            Ok(fence) => fence,
-            Err(err) => {
-                tracing::warn!(target: "freshell_freshagent::opencode",
+        let create_fence =
+            match crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation) {
+                Ok(fence) => fence,
+                Err(err) => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
                     session_id = %durable_id, request_id = %request_id, code = err.code(),
                     "fresh_agent_create_refused: the observed fence is half-sent (invalid)");
-                self.fail_create(&request_id, err.code(), err.message());
-                return;
-            }
-        };
+                    self.fail_create(&request_id, err.code(), err.message());
+                    return;
+                }
+            };
         let session_arc = match existing {
             Some(session_arc) => session_arc,
             None => match self
@@ -1468,9 +1466,7 @@ impl FreshOpencodeState {
         // The settlement awaits (phase 5 of `handle_kill`): the turn task's
         // abort + settle, then the daemon-side turn abort, then the
         // serve-SSE bridge teardown.
-        let turn_was_in_flight = turn_task
-            .as_ref()
-            .is_some_and(|t| !t.is_finished());
+        let turn_was_in_flight = turn_task.as_ref().is_some_and(|t| !t.is_finished());
         if let Some(task) = turn_task {
             task.abort_and_settle().await;
         }
@@ -1576,24 +1572,22 @@ impl FreshOpencodeState {
         // durable close envelope, the enumeration gate, or any live-state
         // mutation. The kill never proceeds as a silently downgraded legacy
         // request.
-        let stop_fence = match crate::ownership_lane::wire_fence(
-            msg.observed_epoch,
-            msg.observed_generation,
-        ) {
-            Ok(fence) => fence,
-            Err(err) => {
-                tracing::warn!(target: "freshell_freshagent::opencode",
+        let stop_fence =
+            match crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation) {
+                Ok(fence) => fence,
+                Err(err) => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
                     session_id = %msg.session_id, code = err.code(),
                     "fresh_agent_kill_refused: the observed fence is half-sent (invalid)");
-                self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
-                    provider: PROVIDER.to_string(),
-                    session_id: msg.session_id.clone(),
-                    session_type: SESSION_TYPE.to_string(),
-                    success: false,
-                }));
-                return;
-            }
-        };
+                    self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                        provider: PROVIDER.to_string(),
+                        session_id: msg.session_id.clone(),
+                        session_type: SESSION_TYPE.to_string(),
+                        success: false,
+                    }));
+                    return;
+                }
+            };
         // Retire-on-kill close-durability rule (delta-r6): the durable close
         // — every row retire plus every pending-marker delete — is recorded
         // BEFORE any live-state mutation (map removal, the killed flag) and
@@ -3320,19 +3314,17 @@ impl FreshOpencodeState {
         // epoch/generation) is the typed invalid-fence refusal — before any
         // state interaction. The attach never proceeds as a silently
         // downgraded legacy request.
-        let attach_fence = match crate::ownership_lane::wire_fence(
-            msg.observed_epoch,
-            msg.observed_generation,
-        ) {
-            Ok(fence) => fence,
-            Err(err) => {
-                tracing::warn!(target: "freshell_freshagent::opencode",
+        let attach_fence =
+            match crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation) {
+                Ok(fence) => fence,
+                Err(err) => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
                     session_id = %msg.session_id, code = err.code(),
                     "fresh_agent_attach_refused: the observed fence is half-sent (invalid)");
-                self.emit_fresh_agent_error(&msg.session_id, err.code(), err.message());
-                return;
-            }
-        };
+                    self.emit_fresh_agent_error(&msg.session_id, err.code(), err.message());
+                    return;
+                }
+            };
         let session_arc = {
             let guard = self.sessions.lock().await;
             guard.get(&msg.session_id).cloned()
