@@ -918,8 +918,8 @@ export const defaultLocalSettings: LocalSettings = {
     collapsed: false,
   },
   freshAgent: {
-    showThinking: false,
-    showTools: false,
+    showThinking: true,
+    showTools: true,
     showTimecodes: false,
   },
   notifications: {

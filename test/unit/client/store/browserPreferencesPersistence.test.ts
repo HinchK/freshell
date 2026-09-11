@@ -189,65 +189,45 @@ describe('browserPreferencesPersistence', () => {
     expect(blob.settings?.panes?.tabBarRows).toBeUndefined()
   })
 
-  it('persists freshAgent.showThinking/showTools/showTimecodes to browser preferences', () => {
+  it('persists a freshAgent opt-out to browser preferences', () => {
     const store = createStore()
 
     store.dispatch(updateSettingsLocal({
-      freshAgent: { showThinking: true },
+      freshAgent: { showThinking: false },
     }))
 
     vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
 
     const bp = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
-    expect(bp.settings.freshAgent).toEqual({ showThinking: true })
+    expect(bp.settings.freshAgent).toEqual({ showThinking: false })
     expect(bp.settings.freshAgent.showTools).toBeUndefined()
     expect(bp.settings.freshAgent.showTimecodes).toBeUndefined()
     expect(bp.settings.agentChat).toBeUndefined()
   })
 
-  it('persists all three freshAgent toggles when all are enabled', () => {
+  it('persists all three freshAgent toggles when each deviates from its default', () => {
     const store = createStore()
 
     store.dispatch(updateSettingsLocal({
-      freshAgent: { showThinking: true, showTools: true, showTimecodes: true },
+      freshAgent: { showThinking: false, showTools: false, showTimecodes: true },
     }))
 
     vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
 
     const bp = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
     expect(bp.settings.freshAgent).toEqual({
-      showThinking: true,
-      showTools: true,
+      showThinking: false,
+      showTools: false,
       showTimecodes: true,
     })
     expect(bp.settings.agentChat).toBeUndefined()
   })
 
-  it('round-trips freshAgent settings through localStorage', () => {
+  it('does not persist freshAgent values that equal the defaults', () => {
     const store = createStore()
 
     store.dispatch(updateSettingsLocal({
-      freshAgent: { showThinking: true, showTools: true },
-    }))
-
-    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
-
-    const saved = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
-    expect(saved.settings.freshAgent).toEqual({ showThinking: true, showTools: true })
-    expect(saved.settings.agentChat).toBeUndefined()
-
-    const rehydrated = resolveLocalSettings(saved.settings)
-    expect(rehydrated.freshAgent.showThinking).toBe(true)
-    expect(rehydrated.freshAgent.showTools).toBe(true)
-    expect(rehydrated.freshAgent.showTimecodes).toBe(false)
-    expect('agentChat' in rehydrated).toBe(false)
-  })
-
-  it('does not persist freshAgent when set to defaults', () => {
-    const store = createStore()
-
-    store.dispatch(updateSettingsLocal({
-      freshAgent: { showThinking: false, showTools: false, showTimecodes: false },
+      freshAgent: { showThinking: true, showTools: true, showTimecodes: false },
     }))
 
     vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
@@ -255,6 +235,26 @@ describe('browserPreferencesPersistence', () => {
     const bp = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
     expect(bp.settings?.freshAgent).toBeUndefined()
     expect(bp.settings?.agentChat).toBeUndefined()
+  })
+
+  it('round-trips freshAgent opt-outs through localStorage', () => {
+    const store = createStore()
+
+    store.dispatch(updateSettingsLocal({
+      freshAgent: { showThinking: false, showTools: false },
+    }))
+
+    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
+
+    const saved = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
+    expect(saved.settings.freshAgent).toEqual({ showThinking: false, showTools: false })
+    expect(saved.settings.agentChat).toBeUndefined()
+
+    const rehydrated = resolveLocalSettings(saved.settings)
+    expect(rehydrated.freshAgent.showThinking).toBe(false)
+    expect(rehydrated.freshAgent.showTools).toBe(false)
+    expect(rehydrated.freshAgent.showTimecodes).toBe(false)
+    expect('agentChat' in rehydrated).toBe(false)
   })
 
   it('ignores removed freshAgent.fontScale values', () => {
@@ -275,7 +275,7 @@ describe('browserPreferencesPersistence', () => {
     const store = createStore()
 
     store.dispatch(updateSettingsLocal({
-      freshAgent: { showTools: true },
+      freshAgent: { showTools: false },
     }))
 
     vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
@@ -285,7 +285,7 @@ describe('browserPreferencesPersistence', () => {
       ...bp.settings,
       freshAgent: { ...bp.settings.freshAgent, fontScale: 1.75 },
     } as never)
-    expect(rehydrated.freshAgent.showTools).toBe(true)
+    expect(rehydrated.freshAgent.showTools).toBe(false)
     expect('fontScale' in rehydrated.freshAgent).toBe(false)
     expect('agentChat' in rehydrated).toBe(false)
   })

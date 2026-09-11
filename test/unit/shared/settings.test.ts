@@ -673,8 +673,8 @@ describe('shared settings contract', () => {
   describe('deprecated fresh-agent font scale is dropped', () => {
     it('resolves the default fresh-agent settings without a fontScale key', () => {
       expect(resolveLocalSettings(undefined).freshAgent).toEqual({
-        showThinking: false,
-        showTools: false,
+        showThinking: true,
+        showTools: true,
         showTimecodes: false,
       })
     })
@@ -682,8 +682,8 @@ describe('shared settings contract', () => {
     it('drops a canonical freshAgent.fontScale regardless of value', () => {
       for (const value of [1.75, 5, 'big']) {
         expect(resolveLocalSettings({ freshAgent: { fontScale: value } } as never).freshAgent).toEqual({
-          showThinking: false,
-          showTools: false,
+          showThinking: true,
+          showTools: true,
           showTimecodes: false,
         })
       }

@@ -583,11 +583,11 @@ export function FreshAgentView({
   )
   const globalShowThinking = useAppSelector(
     (state) => state.settings.settings.freshAgent?.showThinking
-      ?? false,
+      ?? true,
   )
   const globalShowTools = useAppSelector(
     (state) => state.settings.settings.freshAgent?.showTools
-      ?? false,
+      ?? true,
   )
   const globalShowTimecodes = useAppSelector(
     (state) => state.settings.settings.freshAgent?.showTimecodes

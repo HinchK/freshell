@@ -772,6 +772,53 @@ describe('FreshAgentView', () => {
     expect(timecodeEl.textContent).toMatch(/^\d{1,2}:\d{2}\s?(AM|PM)$/i)
   })
 
+  it('shows thinking rows and expanded activity details by default', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      status: 'idle',
+      summary: 'Display summary',
+      capabilities: { send: true, interrupt: true, fork: false },
+      turns: [{
+        id: 'turn-defaults', turnId: 'turn-defaults', role: 'assistant',
+        timestamp: '2026-06-15T12:34:56.000Z',
+        model: 'claude-opus-4-6',
+        summary: 'used tools',
+        items: [
+          { id: 'think-defaults', kind: 'thinking', text: 'default-visible thinking' },
+          {
+            id: 'tool-defaults', kind: 'tool_use', toolUseId: 'call-defaults',
+            name: 'Bash', input: { command: 'npm run display-check' },
+          },
+        ],
+      }],
+    })
+
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-defaults',
+            sessionId: CLAUDE_THREAD_ID,
+            status: 'connected',
+          }}
+        />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      // showTools defaults on: the activity strip mounts EXPANDED, so the
+      // tool call detail renders with no click.
+      expect(screen.getByText('npm run display-check')).toBeInTheDocument()
+    })
+    // showThinking defaults on: the Thinking disclosure renders.
+    expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()
+  })
+
   it('does not pin the provider snapshot summary above the transcript', async () => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({

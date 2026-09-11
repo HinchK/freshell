@@ -2014,10 +2014,11 @@ describe('FreshAgentTranscript', () => {
         summary: 'Considering options', summaryKind: 'echo' as const,
         items: [{ id: 'think-1', kind: 'thinking' as const, text: 'Considering options' }],
       }
-      // Frame 1 (showThinking=false, the production default): the thinking-only
-      // streaming tail is fully filtered — it MUST NOT paint its echo caption:
-      // the summary derives from a hidden item, and the paint gate matches the
-      // stash gate (LB-1 closes both directions).
+      // Frame 1 (explicit showThinking={false} — the opt-out path; production
+      // defaults are on): the thinking-only streaming tail is fully filtered —
+      // it MUST NOT paint its echo caption: the summary derives from a hidden
+      // item, and the paint gate matches the stash gate (LB-1 closes both
+      // directions).
       const { rerender } = render(
         <FreshAgentTranscript isStreaming showThinking={false} turns={[turnA, thinkingTurn]} />,
       )
@@ -2094,10 +2095,11 @@ describe('FreshAgentTranscript', () => {
     })
 
     it('merges a mixed thinking-plus-tool turn whose hidden thinking is part of the summary (live claude shape)', () => {
-      // Production default showThinking=false: the thinking item is filtered
-      // out, and the summary ('Considering Read', space-joined by the live
-      // summarizer) never renders — the article renders its activity block.
-      // The server-tagged echo provenance replaces echo classification.
+      // Explicit showThinking={false} (the opt-out path; production defaults
+      // are on): the thinking item is filtered out, and the summary
+      // ('Considering Read', space-joined by the live summarizer) never
+      // renders — the article renders its activity block. The server-tagged
+      // echo provenance replaces echo classification.
       render(
         <FreshAgentTranscript
           isStreaming
@@ -2174,10 +2176,11 @@ describe('FreshAgentTranscript', () => {
 
     describe('foldable echo captions', () => {
       it('stashes a superseded echo caption only when its turn was fully visible (claude lane)', () => {
-        // Claude lane (LB-1): [thinking "secret", tool_use] under the production
-        // default showThinking=false. The echo summary derives from the HIDDEN
-        // thinking item; the turn is partially filtered, so its caption is
-        // NEITHER painted at the tail NOR stashed into the expansion.
+        // Claude lane (LB-1): [thinking "secret", tool_use] with explicit
+        // showThinking={false} (the opt-out path; production defaults are on).
+        // The echo summary derives from the HIDDEN thinking item; the turn is
+        // partially filtered, so its caption is NEITHER painted at the tail
+        // NOR stashed into the expansion.
         const secretTurn = {
           id: 'turn-secret', turnId: 'turn-secret', role: 'assistant' as const,
           summary: 'secret plans', summaryKind: 'echo' as const,
@@ -2218,8 +2221,9 @@ describe('FreshAgentTranscript', () => {
 
       it('stashes a superseded echo caption only when its turn was fully visible (codex lane)', () => {
         // Codex lane (LB-1): [reasoning{summary: [], text: "secret"}, command]
-        // under showThinking=false — the reasoning item is hidden, the command
-        // item renders; the echo summary derives from the hidden reasoning.
+        // with explicit showThinking={false} (the opt-out path; production
+        // defaults are on) — the reasoning item is hidden, the command item
+        // renders; the echo summary derives from the hidden reasoning.
         const secretTurn = {
           id: 'turn-secret', turnId: 'turn-secret', role: 'assistant' as const,
           summary: 'secret plans', summaryKind: 'echo' as const,
