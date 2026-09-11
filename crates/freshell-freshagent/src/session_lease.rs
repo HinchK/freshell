@@ -144,9 +144,10 @@ async fn wait_pid_gone(pid: u32) -> bool {
 /// The process's `starttime` (field 22 of `/proc/<pid>/stat`, world-readable — no
 /// ptrace needed), or `None` when the pid is gone, a zombie, or dead (`Z`/`X` state).
 /// `(pid, starttime)` uniquely identifies a process incarnation: a recycled pid gets a
-/// new starttime, so comparing both is the pid-reuse guard.
+/// new starttime, so comparing both is the pid-reuse guard. `pub(crate)` for the claude
+/// lane's confirmed-reap capture (b8ke delta review F2).
 #[cfg(target_os = "linux")]
-fn proc_starttime(pid: i32) -> Option<u64> {
+pub(crate) fn proc_starttime(pid: i32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // comm (field 2) may contain spaces/parens: split at the LAST ')' — the remainder
     // starts at field 3 (state), so starttime (field 22) is index 19 there.

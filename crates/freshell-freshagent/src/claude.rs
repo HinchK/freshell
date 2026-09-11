@@ -6523,9 +6523,28 @@ fn terminate_pid(_pid: i32) {}
 /// Linux `/proc`-based, best-effort; only processes carrying OUR unique tag are signaled.
 #[cfg(target_os = "linux")]
 fn reap_owned_claude_sidecars(ownership_id: &str) {
+    for pid in owned_claude_sidecar_pids(ownership_id) {
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
+}
+#[cfg(not(target_os = "linux"))]
+fn reap_owned_claude_sidecars(_ownership_id: &str) {
+    // Non-Linux: the direct child is reaped via kill_on_drop; the /proc environ scan is
+    // Linux-only (matches the reference's platform guard).
+}
+
+/// Every live pid whose `/proc/<pid>/environ` carries this sidecar's ownership
+/// tag (the Node sidecar AND its SDK-spawned CLI grandchildren). Readable only
+/// for processes this process may ptrace (YAMA) — see
+/// [`capture_owned_claude_tree`] for why callers capture BEFORE killing.
+#[cfg(target_os = "linux")]
+fn owned_claude_sidecar_pids(ownership_id: &str) -> Vec<i32> {
     let needle = format!("{CLAUDE_SIDECAR_OWNERSHIP_ENV}={ownership_id}");
+    let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
-        return;
+        return out;
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -6540,16 +6559,80 @@ fn reap_owned_claude_sidecars(ownership_id: &str) {
             .split(|&b| b == 0)
             .any(|var| var == needle.as_bytes());
         if carries_tag {
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
+            out.push(pid);
+        }
+    }
+    out
+}
+
+/// b8ke delta review F2 (confirmed reap): the ownership-tagged tree as
+/// `(pid, starttime)` pairs, captured BEFORE the teardown's kills. YAMA
+/// (`ptrace_scope=1`, the Ubuntu default) makes a reparented
+/// grandchild's `/proc/<pid>/environ` unreadable the moment the sidecar
+/// dies, so the environ scan is taken while the chain is intact and death
+/// is later confirmed via the world-readable `/proc/<pid>/stat` with a
+/// starttime match (the pid-reuse guard) — the
+/// [`crate::session_lease::kill_and_confirm_tree_dead`] discipline. The
+/// sidecar child itself is included even when untagged (the fake-session
+/// test fixtures spawn it without the env).
+#[cfg(target_os = "linux")]
+fn capture_owned_claude_tree(ownership_id: &str, child_pid: Option<u32>) -> Vec<(i32, u64)> {
+    let mut tree: Vec<(i32, u64)> = owned_claude_sidecar_pids(ownership_id)
+        .into_iter()
+        .filter_map(|p| crate::session_lease::proc_starttime(p).map(|st| (p, st)))
+        .collect();
+    if let Some(pid) = child_pid {
+        if !tree.iter().any(|(p, _)| *p == pid as i32) {
+            if let Some(st) = crate::session_lease::proc_starttime(pid as i32) {
+                tree.push((pid as i32, st));
             }
         }
     }
+    tree
 }
 #[cfg(not(target_os = "linux"))]
-fn reap_owned_claude_sidecars(_ownership_id: &str) {
-    // Non-Linux: the direct child is reaped via kill_on_drop; the /proc environ scan is
-    // Linux-only (matches the reference's platform guard).
+fn capture_owned_claude_tree(_ownership_id: &str, _child_pid: Option<u32>) -> Vec<(i32, u64)> {
+    Vec::new()
+}
+
+/// b8ke delta review F2: poll the captured tree until every member is
+/// confirmed dead-by-starttime (a zombie counts — it holds no pipes and
+/// writes nothing), escalating SIGTERM → SIGKILL after 20 rounds and
+/// folding in any still-readable tagged newcomers. Returns only when the
+/// captured tree is gone (bounded rounds; the callers' reap timeouts
+/// bound the whole teardown).
+#[cfg(target_os = "linux")]
+async fn confirm_captured_claude_tree_dead(tree: &mut Vec<(i32, u64)>, ownership_id: &str) {
+    for round in 0..24u8 {
+        tree.retain(|(p, st)| crate::session_lease::proc_starttime(*p) == Some(*st));
+        for p in owned_claude_sidecar_pids(ownership_id) {
+            if !tree.iter().any(|(q, _)| *q == p) {
+                if let Some(st) = crate::session_lease::proc_starttime(p) {
+                    tree.push((p, st));
+                }
+            }
+        }
+        if tree.is_empty() {
+            return;
+        }
+        let sig = if round < 20 {
+            libc::SIGTERM
+        } else {
+            libc::SIGKILL
+        };
+        for (p, _) in &*tree {
+            unsafe {
+                libc::kill(*p, sig);
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    tree.retain(|(p, st)| crate::session_lease::proc_starttime(*p) == Some(*st));
+}
+#[cfg(not(target_os = "linux"))]
+async fn confirm_captured_claude_tree_dead(_tree: &mut Vec<(i32, u64)>, _ownership_id: &str) {
+    // Non-Linux: no /proc — the direct child's awaited exit (the caller's
+    // `child.wait()`) is the platform's confirmation.
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────────────────
@@ -6561,7 +6644,16 @@ fn reap_owned_claude_sidecars(_ownership_id: &str) {
 /// rule (the durable close precedes every teardown/settlement await) means
 /// callers only run this AFTER the close is durable — a crash anywhere in
 /// here never loses it.
+///
+/// b8ke delta review F2 (confirmed reap): the teardown AWAITS the child's
+/// actual exit and confirms every ownership-tagged descendant gone before
+/// returning — `kill_for_handoff` may only answer `StopResult::Reaped`
+/// after this (the confirmed-reap ordering the handoff contract requires).
+/// The tagged tree is captured FIRST (YAMA: once the sidecar dies, the
+/// reparented grandchildren's environ becomes unreadable), mirroring
+/// [`crate::session_lease::kill_and_confirm_tree_dead`].
 async fn teardown_removed_session(session: ClaudeSession) {
+    let mut tree = capture_owned_claude_tree(&session.ownership_id, session.child.id());
     session.consumer.abort();
     let _ = session.consumer.await;
     let mut stdin = session.stdin;
@@ -6573,6 +6665,12 @@ async fn teardown_removed_session(session: ClaudeSession) {
     let mut child = session.child;
     let _ = child.start_kill();
     reap_owned_claude_sidecars(&session.ownership_id);
+    // The child's ACTUAL exit (SIGKILL was issued; an unreaped zombie has
+    // already exited — it holds no pipes and writes nothing).
+    let _ = child.wait().await;
+    // The captured ownership-tagged tree's confirmed death (bounded poll,
+    // SIGKILL escalation — a TERM-immune grandchild cannot outlive this).
+    confirm_captured_claude_tree_dead(&mut tree, &session.ownership_id).await;
 }
 
 /// ISO-8601 / RFC-3339 millis-Z timestamp (`new Date().toISOString()`) for error frames.
@@ -6657,6 +6755,49 @@ pub(crate) mod tests {
                 last_status: Arc::new(std::sync::Mutex::new("idle".to_string())),
             },
         );
+    }
+
+    /// b8ke delta review F2 (confirmed reap): the handoff teardown must not
+    /// report `StopResult::Reaped` until the sidecar child has ACTUALLY
+    /// exited and every ownership-tagged descendant is confirmed gone. A
+    /// "CLI grandchild" that ignores SIGTERM lingers through the old
+    /// teardown (it only ever SIGTERMs the tagged tree) — pre-fix,
+    /// `kill_for_handoff` answers Reaped while that process still lives.
+    #[tokio::test]
+    async fn kill_for_handoff_confirms_the_tagged_tree_dead_before_reporting_reaped() {
+        let st = state();
+        let sid = uuid::Uuid::new_v4().to_string();
+        insert_fake_claude_session(&st, &sid).await;
+        // The lingering ownership-tagged "CLI grandchild": SIGTERM-immune
+        // (only the confirmed-death escalation's SIGKILL can end it).
+        // `kill_on_drop` backstops the assertion's own failure path.
+        let mut grandchild = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg("trap '' TERM; while :; do sleep 1; done")
+            .env(CLAUDE_SIDECAR_OWNERSHIP_ENV, format!("test-{sid}"))
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the lingering tagged grandchild");
+        let grandchild_pid = grandchild.id().expect("grandchild pid");
+
+        let result = st.kill_for_handoff(&sid, "test-f2").await;
+
+        assert_eq!(
+            result,
+            crate::session_handoff::StopResult::Reaped,
+            "the teardown completed"
+        );
+        // THE confirmed-reap contract: by the time Reaped is reported, the
+        // tagged tree is confirmed dead (the TERM-immune grandchild needed
+        // the escalation — a teardown that merely SIGNALS would leave it
+        // alive here). Death is the production predicate: gone or zombie
+        // (`proc_starttime` reads None for state Z — a zombie has exited,
+        // holds no pipes, writes nothing; the test process reaps it below).
+        assert!(
+            crate::session_lease::proc_starttime(grandchild_pid as i32).is_none(),
+            "Reaped must not be reported while a tagged descendant still lives"
+        );
+        let _ = grandchild.wait().await;
     }
 
     /// Task 3: insert a fake session AND stage its pending set by folding raw `sdk.*`
