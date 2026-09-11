@@ -9390,6 +9390,36 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
     expect(within(alert).queryByRole('button')).toBeNull()
   })
 
+  // b8ke focused round-5 R5-3: a SAME-KIND in-progress lifecycle transition
+  // (the ready-replay fold of starting/handoff/stopping naming THIS pane's
+  // kind) is transition-blocked: the pane shows the transition card (never
+  // a silent same-kind "all clear") and offers no actions.
+  it('a same-kind in-progress owner record renders the transition card with no actions', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: divergencePaneContent() }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    // SAME-KIND: the pane is fresh-agent (freshcodex) and the record's
+    // ownerKind is fresh-agent with an in-progress transition — pre-fix
+    // this folded as no divergence at all (polling resumed mid-lifecycle).
+    act(() => store.dispatch(applyRuntimeOwner(terminalOwnerFrame({
+      ownerKind: 'fresh-agent',
+      transition: 'handoff-started',
+      terminalId: undefined,
+      generation: 4,
+    }))))
+
+    const card = await screen.findByTestId('fresh-agent-owner-transition-card')
+    expect(card).toHaveTextContent(/being reopened/i)
+    expect(within(card).queryByRole('button')).toBeNull()
+    // Not the cross-kind divergence card, not the fenced recovery card.
+    expect(screen.queryByTestId('session-handoff-error-banner')).toBeNull()
+  })
+
   it('handoff-failure banner renders the typed code with a Retry that re-invokes the same handoff identity', async () => {
     const store = createStore()
     store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: divergencePaneContent() }))

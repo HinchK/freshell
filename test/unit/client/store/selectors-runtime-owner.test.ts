@@ -297,6 +297,64 @@ describe('selectPaneOwnerDivergence', () => {
       fencedReason: 'REAP_TIMEOUT',
     })
   })
+
+  // b8ke focused round-5 R5-3: an IN-PROGRESS lifecycle transition
+  // (handoff-started — the live broadcast, or the ready-replay fold of
+  // starting/handoff/stopping) is TRANSITION-BLOCKED for EVERY pane kind.
+  // Pre-fix, derivePaneOwnerDivergence returned null whenever the record's
+  // ownerKind matched the pane, so a same-kind pane reconnecting
+  // mid-lifecycle saw no transition state and resumed normal
+  // polling/scheduling.
+  it('diverges an in-progress transition for a SAME-KIND pane (transition-blocked)', () => {
+    const state = stateWithRuntimeOwner({
+      provider: 'codex',
+      sessionId: 'sid-starting',
+      ownerKind: 'fresh-agent',
+      transition: 'handoff-started',
+      epoch: 2,
+      generation: 4,
+    })
+    const sameKind = selectPaneOwnerDivergence(state, {
+      paneKind: 'fresh-agent',
+      provider: 'codex',
+      sessionRef: { provider: 'codex', sessionId: 'sid-starting' },
+    })
+    expect(sameKind).toMatchObject({
+      ownerKind: 'fresh-agent',
+      transition: 'handoff-started',
+      generation: 4,
+      inProgress: true,
+    })
+    // The opposite-kind pane sees the same transition-blocked state.
+    expect(selectPaneOwnerDivergence(state, {
+      paneKind: 'terminal',
+      provider: 'codex',
+      sessionRef: { provider: 'codex', sessionId: 'sid-starting' },
+    })).toMatchObject({
+      ownerKind: 'fresh-agent',
+      transition: 'handoff-started',
+      inProgress: true,
+    })
+  })
+
+  // R5-3 (the committed control): a same-kind COMMITTED owner still folds
+  // as healthy — the block is exactly the in-progress transition state,
+  // never same-mode multi-device attachment.
+  it('a committed same-kind owner stays non-divergent (multi-device attachment untouched)', () => {
+    const state = stateWithRuntimeOwner({
+      provider: 'codex',
+      sessionId: 'sid-committed',
+      ownerKind: 'fresh-agent',
+      transition: 'handoff-committed',
+      epoch: 2,
+      generation: 5,
+    })
+    expect(selectPaneOwnerDivergence(state, {
+      paneKind: 'fresh-agent',
+      provider: 'codex',
+      sessionRef: { provider: 'codex', sessionId: 'sid-committed' },
+    })).toBeNull()
+  })
 })
 
 describe('selectSessionRuntimeOwner and fence helpers', () => {

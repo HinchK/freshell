@@ -5797,6 +5797,20 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             </button>
           ) : null}
         </div>
+      ) : freshAgentOwnerDivergence?.inProgress ? (
+        // b8ke focused round-5 R5-3: a SAME-KIND in-progress lifecycle
+        // transition (the ready-replay fold of starting/handoff/stopping,
+        // or a live handoff-started broadcast naming this pane's kind) is
+        // transition-blocked: the pane shows the transition state and
+        // suspends its normal attach/polling until it settles.
+        <div
+          role="alert"
+          data-testid="terminal-owner-transition-card"
+          aria-label="Session transition in progress"
+          className="pointer-events-auto absolute inset-x-0 top-0 z-20 m-2 flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
+        >
+          <span>This conversation is being reopened elsewhere…</span>
+        </div>
       ) : null}
       {typedLaunchFailure ? (
         <TerminalLaunchFailureCard

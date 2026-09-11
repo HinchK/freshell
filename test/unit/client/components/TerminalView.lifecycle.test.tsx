@@ -3688,6 +3688,55 @@ describe('TerminalView lifecycle updates', () => {
       })
     })
 
+    // b8ke focused round-5 R5-3: a SAME-KIND in-progress lifecycle
+    // transition (the ready-replay fold of starting/handoff/stopping
+    // naming THIS pane's kind — here a terminal-kind record mid-handoff)
+    // is transition-blocked: the pane shows the transition card (never a
+    // silent same-kind "all clear") and suspends reattach/polling until
+    // the transition settles.
+    it('a same-kind in-progress owner record renders the transition card and blocks reattach', async () => {
+      const { store } = setupTypedPane({
+        content: {
+          status: 'running',
+          terminalId: 't-live-own',
+        },
+      })
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+      })
+      const attachCalls = () => sentMessages().filter(
+        (msg) => msg?.type === 'terminal.attach' && msg?.terminalId === 't-live-own',
+      )
+      await waitFor(() => expect(attachCalls().length).toBeGreaterThan(0))
+      const attachesAtTransition = attachCalls().length
+
+      // SAME-KIND: the pane is a terminal and the record's ownerKind is
+      // terminal with an in-progress transition — pre-fix this folded as
+      // no divergence at all (the pane resumed normal attach/polling
+      // mid-lifecycle).
+      act(() => {
+        store.dispatch(applyRuntimeOwner(runtimeOwnerFrame({
+          ownerKind: 'terminal',
+          terminalId: 't-live-own',
+          transition: 'handoff-started',
+          generation: 6,
+          operationId: 'handoff-r53',
+        })))
+      })
+
+      const card = await screen.findByTestId('terminal-owner-transition-card')
+      expect(card).toHaveAttribute('role', 'alert')
+      expect(card).toHaveTextContent(/being reopened/i)
+      expect(within(card).queryByRole('button')).toBeNull()
+      // Transition-blocked: no further attach attempts while the
+      // in-progress record holds.
+      await act(async () => { await Promise.resolve() })
+      expect(attachCalls()).toHaveLength(attachesAtTransition)
+      // Not the cross-kind divergence card.
+      expect(screen.queryByTestId('terminal-owner-divergence-card')).toBeNull()
+    })
+
     it('the open action swaps a kilroy-flavored Claude pane to a KILROY pane, never freshclaude', async () => {
       const { store } = setupTypedPane({
         content: {

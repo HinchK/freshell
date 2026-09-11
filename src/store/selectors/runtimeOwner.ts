@@ -46,6 +46,16 @@ export type PaneOwnerDivergence = {
    * a false committed owner or an old-kind continuation.
    */
   fencedReason?: string
+  /**
+   * b8ke R5-3: present while a lifecycle transition is IN PROGRESS (the
+   * record's transition is handoff-started — a live handoff broadcast, or
+   * the ready-replay fold of starting/handoff/stopping). The pane is
+   * TRANSITION-BLOCKED for EVERY pane kind: no attach actions, no
+   * polling/scheduling resumption until the transition's committed,
+   * failed, or released frame supersedes it — even when the ownerKind
+   * matches the pane.
+   */
+  inProgress?: boolean
 }
 
 export type PaneOwnerKind = 'fresh-agent' | 'terminal'
@@ -126,6 +136,13 @@ export function selectPaneOwnerFence(
  * early-return — a FENCED record whose prior is vacant (an unconfirmed
  * cleanup failure while starting from vacancy) drives the typed recovery
  * state too, instead of being suppressed as a plain vacant key.
+ *
+ * b8ke focused round-5 R5-3: an IN-PROGRESS lifecycle transition
+ * (handoff-started) is TRANSITION-BLOCKED for EVERY pane kind — the
+ * check precedes the same-kind early-return, so a pane whose kind
+ * matches the record still blocks its attach/polling until the
+ * transition settles, instead of resuming as if the in-progress state
+ * were committed live ownership.
  */
 export function derivePaneOwnerDivergence(
   record: RuntimeOwnerRecord | undefined,
@@ -139,6 +156,15 @@ export function derivePaneOwnerDivergence(
       ...(record.terminalId !== undefined ? { terminalId: record.terminalId } : {}),
       generation: record.generation,
       ...(record.reason !== undefined ? { fencedReason: record.reason } : {}),
+    }
+  }
+  if (record.transition === 'handoff-started') {
+    return {
+      ownerKind: record.ownerKind,
+      transition: record.transition,
+      ...(record.terminalId !== undefined ? { terminalId: record.terminalId } : {}),
+      generation: record.generation,
+      inProgress: true,
     }
   }
   if (record.ownerKind === 'vacant') return null
