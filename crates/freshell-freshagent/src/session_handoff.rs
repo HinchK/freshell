@@ -972,9 +972,16 @@ impl SessionHandoffRunner {
                 self.kill_and_confirm_terminal(&terminal_id).await;
             }
             // Backstop: any registry row still holding the canonical
-            // sessionRef is an uncommitted spawn for this handoff — reap it.
+            // sessionRef UNDER THIS HANDOFF'S PROVIDER is an uncommitted
+            // spawn for this handoff — reap it. b8ke delta review F6: the
+            // row must ALSO match the provider (the registry-row join every
+            // sessionRef lookup uses: `mode == provider`) — an opaque-id
+            // collision across providers must never abort an unrelated
+            // terminal.
             for entry in self.registry.directory() {
-                if entry.resume_session_id.as_deref() == Some(session_id.as_str()) {
+                if entry.mode == provider
+                    && entry.resume_session_id.as_deref() == Some(session_id.as_str())
+                {
                     self.kill_and_confirm_terminal(&entry.terminal_id).await;
                 }
             }

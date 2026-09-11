@@ -1917,6 +1917,127 @@ async fn handoff_abort_during_target_spawn_reaps_the_uncommitted_terminal() {
     await_pid_dead(prior_pid).await;
 }
 
+/// 5f. Cancellation kill filter (b8ke delta review F6): the abort
+/// cleanup's sessionRef backstop sweep must match the handoff's PROVIDER
+/// (the registry join: `mode == provider`) in addition to the session id —
+/// an opaque-id collision across providers must never abort an unrelated
+/// terminal. A same-id CODEX terminal survives the aborted CLAUDE
+/// handoff's cleanup; the same-id claude terminal (the uncommitted target)
+/// is still reaped.
+#[tokio::test]
+async fn handoff_abort_cleanup_spares_a_same_id_different_provider_terminal() {
+    let _guard = ENV_LOCK.lock().await;
+    // The claude-lane env surface this file's tests mutate
+    // (FRESHELL_CLAUDE_SIDECAR/NODE, FAKE_SIDECAR_REQUEST_LOG,
+    // CLAUDE_CONFIG_DIR) is process-global and shared with claude.rs's and
+    // snapshot.rs's tests through THEIR lock — hold it too: our own
+    // ENV_LOCK only serializes this file against itself.
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let pause = Arc::new(tokio::sync::Notify::new());
+    let hooks = Arc::new(HandoffTestHooks {
+        pause_in_target_spawn: Some(Arc::clone(&pause)),
+        ..HandoffTestHooks::default()
+    });
+    let rig = build_rig(Some(Arc::clone(&hooks)));
+    establish_fresh_claude_owner(&rig, &sid).await;
+
+    // The collision victim: a RUNNING terminal of a DIFFERENT provider
+    // (codex) whose registry row carries the SAME resume session id — the
+    // opaque-id collision. It is not part of this handoff in any way.
+    let codex_terminal = format!("f6-codex-collision-{}", uuid::Uuid::new_v4().simple());
+    rig.registry
+        .register_headless(freshell_terminal::registry::HeadlessTerminal {
+        terminal_id: codex_terminal.clone(),
+        stream_id: codex_terminal.clone(),
+        mode: "codex".to_string(),
+        resume_session_id: Some(sid.clone()),
+        create_request_id: None,
+        created_at: None,
+    });
+    assert!(
+        rig.registry
+            .probe(&codex_terminal)
+            .is_some_and(|row| row.status == freshell_protocol::TerminalRunStatus::Running),
+        "the different-provider terminal must be Running before the handoff"
+    );
+
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    // Park proof (the 5d pattern): the settle PUBLISHED the spawned
+    // terminal, then parked at the seam.
+    let target_terminal = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(watch) = hooks.spawn_watch_slot.lock().unwrap().clone() {
+                if let Some(terminal_id) = watch.published_terminal() {
+                    break terminal_id;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the settle never published the spawned terminal"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+
+    // ABORT inside the target-spawn await.
+    handle.abort();
+    let _ = handle.task.await;
+    assert_eq!(
+        rig.ownership.observe("claude", &sid).state,
+        OwnershipState::Vacant,
+        "the aborted handoff must leave the key Vacant"
+    );
+    pause.notify_one();
+
+    // The uncommitted CLAUDE target is reaped — no claude row may hold the
+    // canonical sessionRef once the cleanup's sweep has settled.
+    await_cond("the uncommitted claude target must be reaped", || {
+        rig.registry.terminal_is_dead(&target_terminal)
+    })
+    .await;
+    await_cond("the sweep must clear every claude row for the session", || {
+        !rig.registry.directory().into_iter().any(|entry| {
+            entry.mode == "claude" && entry.resume_session_id.as_deref() == Some(sid.as_str())
+        })
+    })
+    .await;
+    // The sweep is the cleanup task's last step — a short settle before the
+    // survival read keeps the assertion race-free.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // THE F6 ASSERTION: the different-provider terminal with the SAME
+    // session id is untouched — still registered, still Running.
+    assert!(
+        rig.registry
+            .probe(&codex_terminal)
+            .is_some_and(|row| row.status == freshell_protocol::TerminalRunStatus::Running),
+        "the same-id different-provider (codex) terminal must survive the claude handoff's abort cleanup"
+    );
+
+    // The key reopens (not wedged).
+    assert!(matches!(
+        rig.ownership.begin_start(
+            "claude",
+            &sid,
+            RuntimeOwnerKind::Terminal,
+            "post-abort-probe",
+            None,
+            "test",
+            0,
+        ),
+        BeginOutcome::Granted { .. }
+    ));
+    let _ = rig
+        .ownership
+        .fail("claude", &sid, "post-abort-probe", 1, false);
+    let _ = env;
+}
+
 /// 5e. Target-spawn window, fresh arm (round-3 review I-1): an abort landing
 /// inside the fresh-target resume await — parked right AFTER the target
 /// session registered — must reap the registered-but-uncommitted session
