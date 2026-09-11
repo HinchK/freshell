@@ -4183,14 +4183,29 @@ mod tests {
 
         // Closed: pick a high port nothing is listening on and expect Some(false).
         // (Bind-then-drop to get a genuinely free ephemeral port number, then
-        // probe it after the listener is gone — connection refused.)
-        let temp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let free_port = temp_listener.local_addr().unwrap().port();
-        drop(temp_listener);
-        assert_eq!(
-            probe.probe("127.0.0.1".to_string(), free_port).await,
-            Some(false)
-        );
+        // probe it after the listener is gone — connection refused.) A
+        // foreign process on a shared host can bind the just-released port
+        // inside the probe's await window (observed on a busy many-agent
+        // host): that is environmental, not a probe defect — retry on a
+        // fresh port, failing only when every attempt finds a listener.
+        for attempt in 1..=5u32 {
+            let temp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let free_port = temp_listener.local_addr().unwrap().port();
+            drop(temp_listener);
+            match probe.probe("127.0.0.1".to_string(), free_port).await {
+                Some(false) => break,
+                Some(true) if attempt < 5 => {
+                    eprintln!(
+                        "closed-port probe attempt {attempt} found a foreign listener on \
+                         {free_port}; retrying on a fresh port"
+                    );
+                }
+                Some(true) => {
+                    panic!("closed-port probe found a listener on every fresh port (5 attempts)");
+                }
+                None => panic!("closed-port probe timed out on loopback (unexpected)"),
+            }
+        }
     }
 
     // ---- NET-10: native-Linux LAN detection wiring into resolve_live_network_facts ----
