@@ -213,6 +213,41 @@ impl SessionHandoffRunner {
     /// typed, retryable JSON body and leaves the coordinator in a coherent
     /// state (restored prior, or Vacant — never a stranded Handoff).
     async fn run(self: &Arc<Self>, req: HandoffRequest) -> Value {
+        // b8ke delta review F5: the provider↔target validation — BEFORE the
+        // coordinator enter, so a mismatched target never stops the prior
+        // runtime or bumps the generation. The HTTP handler already refuses
+        // mismatches with the typed 400 pre-spawn; this re-check covers
+        // direct `spawn_handoff` callers with the same rule.
+        if let Err(reason) = validate_handoff_target(
+            &req.provider,
+            req.target_kind,
+            req.session_type.as_deref(),
+            req.mode.as_deref(),
+            &self.cli_commands,
+        ) {
+            let generation = self.ownership.observe(&req.provider, &req.session_id).generation;
+            tracing::warn!(target: "freshell_ownership",
+                event = "ownership.handoff.refused_pre_stop",
+                provider = %req.provider, session_id = %req.session_id,
+                epoch = self.ownership.boot_epoch(), generation,
+                outcome = "validation_failed", failure_reason = "BAD_REQUEST",
+                "a mismatched handoff target was refused before any coordinator state change: {reason}");
+            return typed_failure("BAD_REQUEST", &reason, false, generation);
+        }
+        // b8ke delta review F5: resolve an ABSENT sessionType to the
+        // provider's canonical type when unambiguous (codex → freshcodex,
+        // opencode → freshopencode), so the dispatch, the response, and
+        // the owner frames all name the lane the request actually targets
+        // — never a silent freshcodex default under a foreign provider's
+        // key. (An ambiguous absent type — claude — was refused above.)
+        let mut req = req;
+        if req.target_kind == RuntimeOwnerKind::FreshAgent && req.session_type.is_none() {
+            if let Some(canonical) =
+                canonical_session_types(&req.provider).filter(|list| list.len() == 1)
+            {
+                req.session_type = Some(canonical[0].to_string());
+            }
+        }
         let operation_id = format!("handoff-{}", uuid::Uuid::new_v4());
         let initiator = req.device_id.clone().unwrap_or_else(|| "rest".into());
         let began = std::time::Instant::now();
@@ -1934,26 +1969,20 @@ async fn handoff_handler(
         .get("sessionType")
         .and_then(Value::as_str)
         .map(String::from);
-    if target_kind == RuntimeOwnerKind::FreshAgent {
-        match session_type.as_deref() {
-            Some("freshcodex" | "freshopencode" | "freshclaude" | "kilroy") | None => {}
-            Some(other) => {
-                return typed_bad_request(&format!(
-                    "sessionType must be freshcodex | freshopencode | freshclaude | kilroy, got {other:?}"
-                ));
-            }
-        }
-    }
     let mode = body.get("mode").and_then(Value::as_str).map(String::from);
-    if target_kind == RuntimeOwnerKind::Terminal {
-        // A handoff's terminal target must be a REGISTERED session-bearing
-        // CLI mode (never "shell" — a plain shell owns no canonical session).
-        let mode_ref = mode.as_deref().unwrap_or(provider.as_str());
-        if !runner.cli_commands.iter().any(|spec| spec.name == mode_ref) {
-            return typed_bad_request(&format!(
-                "unknown CLI mode {mode_ref:?} (a handoff terminal target must be a registered coding-CLI mode)"
-            ));
-        }
+    // b8ke delta review F5: the provider↔target validation, refused
+    // PRE-SPAWN — a sessionType that is not one of the provider's canonical
+    // fresh-agent types (or an ambiguous absent one), or a terminal mode
+    // that does not match the provider, is a typed 400: the prior runtime is
+    // never stopped, the coordinator never touched.
+    if let Err(reason) = validate_handoff_target(
+        &provider,
+        target_kind,
+        session_type.as_deref(),
+        mode.as_deref(),
+        &runner.cli_commands,
+    ) {
+        return typed_bad_request(&reason);
     }
     let req = HandoffRequest {
         provider,
@@ -2009,6 +2038,78 @@ fn typed_bad_request(message: &str) -> (StatusCode, Json<Value>) {
             "error": { "code": "BAD_REQUEST", "message": message, "retryable": false }
         })),
     )
+}
+
+/// The provider's canonical fresh-agent session types — the lane derivation
+/// (`model_capabilities`'s `SessionType::runtime_provider` mapping, the same
+/// one every lane and model-capability surface uses): freshcodex rides the
+/// codex lane, freshopencode the opencode lane, and BOTH claude flavors
+/// (freshclaude, kilroy) ride the claude lane.
+pub(crate) fn canonical_session_types(provider: &str) -> Option<&'static [&'static str]> {
+    match provider {
+        "codex" => Some(&["freshcodex"]),
+        "opencode" => Some(&["freshopencode"]),
+        "claude" => Some(&["freshclaude", "kilroy"]),
+        _ => None,
+    }
+}
+
+/// b8ke delta review F5: validate the request's target against its provider
+/// BEFORE any coordinator state change (the HTTP handler refuses pre-spawn
+/// with the typed 400; [`SessionHandoffRunner::run`] re-checks at entry for
+/// direct `spawn_handoff` callers). (a) a fresh-agent target's `sessionType`
+/// must be one of the provider's canonical types — an ABSENT sessionType
+/// resolves only when unambiguous (claude is two flavors: rejected — the
+/// safer choice, consistent with the lane derivation that never maps a
+/// claude session by provider alone); (b) a terminal target's `mode` must
+/// be the provider's own CLI mode (the registry-row join every sessionRef
+/// lookup uses: `mode == provider`) and a registered session-bearing mode.
+/// A mismatch never stops the prior runtime, never bumps the generation,
+/// and never spawns a blank wrong-provider CLI.
+pub(crate) fn validate_handoff_target(
+    provider: &str,
+    target_kind: RuntimeOwnerKind,
+    session_type: Option<&str>,
+    mode: Option<&str>,
+    cli_commands: &[freshell_platform::CliCommandSpec],
+) -> Result<(), String> {
+    match target_kind {
+        RuntimeOwnerKind::FreshAgent => {
+            let Some(canonical) = canonical_session_types(provider) else {
+                return Err(format!(
+                    "provider {provider:?} has no fresh-agent lane (expected codex | claude | opencode)"
+                ));
+            };
+            match session_type {
+                Some(st) if canonical.contains(&st) => Ok(()),
+                Some(st) => Err(format!(
+                    "sessionType {st:?} is not a {provider:?} fresh-agent session type \
+                     (expected one of {canonical:?})"
+                )),
+                None if canonical.len() == 1 => Ok(()), // unambiguous: the provider's single flavor
+                None => Err(format!(
+                    "provider {provider:?} has multiple fresh-agent session types {canonical:?}; \
+                     sessionType is required"
+                )),
+            }
+        }
+        RuntimeOwnerKind::Terminal => {
+            let mode_ref = mode.unwrap_or(provider);
+            if mode_ref != provider {
+                return Err(format!(
+                    "terminal mode {mode_ref:?} does not match provider {provider:?} (a handoff \
+                     terminal target must run the provider's own CLI mode)"
+                ));
+            }
+            if !cli_commands.iter().any(|spec| spec.name == mode_ref) {
+                return Err(format!(
+                    "unknown CLI mode {mode_ref:?} (a handoff terminal target must be a \
+                     registered coding-CLI mode)"
+                ));
+            }
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]

@@ -151,6 +151,13 @@ const server = http.createServer((req, res) => {
   const m = url.pathname.match(/^\/session\/([^/]+)$/)
   if (m && req.method === 'GET') {
     const id = decodeURIComponent(m[1])
+    // An id containing "missing" models a session the serve does not know
+    // (a 404) so wrong-lane dispatch attempts fail fast and hermetically.
+    if (id.includes('missing')) {
+      res.writeHead(404, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ error: 'not found' }))
+      return
+    }
     res.writeHead(200, { 'content-type': 'application/json' })
     res.end(JSON.stringify({ id, directory: '/tmp', title: 'fake opencode session' }))
     return
@@ -2505,4 +2512,236 @@ async fn handoff_route_refuses_each_half_fenced_observation_typed() {
         OwnershipState::Vacant,
         "a half-fenced body must never touch the coordinator"
     );
+}
+
+/// b8ke delta review F5: the provider↔target validation — a handoff whose
+/// sessionType is not one of the provider's canonical fresh-agent session
+/// types, whose absent sessionType is ambiguous (claude is two flavors), or
+/// whose terminal mode does not match the provider is a TYPED 400 refused
+/// PRE-STOP: the prior runtime is never stopped, the coordinator record
+/// never changes. The wrong-mode case is proven against a LIVE prior (the
+/// record must stay byte-identical: same owner kind, same generation).
+#[tokio::test]
+async fn handoff_route_refuses_provider_mismatched_targets_typed() {
+    let _guard = ENV_LOCK.lock().await;
+    // The claude-lane env surface this file's tests mutate
+    // (FRESHELL_CLAUDE_SIDECAR/NODE, FAKE_SIDECAR_REQUEST_LOG,
+    // CLAUDE_CONFIG_DIR) is process-global and shared with claude.rs's and
+    // snapshot.rs's tests through THEIR lock — hold it too: our own
+    // ENV_LOCK only serializes this file against itself.
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    // The codex sidecar stub: wrong-lane dispatches that reach the codex
+    // lane in the pre-fix shape fail fast instead of spawning the real
+    // `codex` binary (held with codex.rs's own env lock — CODEX_CMD is its
+    // process-global surface).
+    let _codex_env = crate::codex::tests::ENV_LOCK.lock().await;
+    let prev_codex_cmd = std::env::var("CODEX_CMD").ok();
+    std::env::set_var("CODEX_CMD", "/bin/false");
+    // The fake serve: wrong-lane dispatches that reach the opencode lane
+    // resume a session the fake 404s (the "missing" id rule).
+    let _serve_env = FakeOpencodeServeEnv::install();
+    let env = FakeSidecarEnv::install();
+
+    let rig = build_rig(None);
+    // A LIVE prior for the wrong-mode case: the refusal must leave this
+    // record byte-identical (same owner kind, same generation).
+    let live_sid = uuid::Uuid::new_v4().to_string();
+    establish_fresh_claude_owner(&rig, &live_sid).await;
+    let before = rig.ownership.observe("claude", &live_sid);
+    let before_generation = before.generation;
+
+    let missing = format!("missing-{}", uuid::Uuid::new_v4());
+    for (name, body) in [
+        (
+            "wrong-provider sessionType (opencode key, codex flavor)",
+            json!({
+                "provider": "opencode", "sessionId": missing, "targetKind": "fresh-agent",
+                "sessionType": "freshcodex", "cwd": "/tmp",
+            }),
+        ),
+        (
+            "wrong-provider sessionType (codex key, opencode flavor)",
+            json!({
+                "provider": "codex", "sessionId": missing, "targetKind": "fresh-agent",
+                "sessionType": "freshopencode", "cwd": "/tmp",
+            }),
+        ),
+        (
+            "wrong-provider sessionType (claude key, opencode flavor)",
+            json!({
+                "provider": "claude", "sessionId": missing, "targetKind": "fresh-agent",
+                "sessionType": "freshopencode", "cwd": "/tmp",
+            }),
+        ),
+        (
+            "absent sessionType under an ambiguous provider (claude)",
+            json!({
+                "provider": "claude", "sessionId": missing, "targetKind": "fresh-agent",
+                "cwd": "/tmp",
+            }),
+        ),
+        (
+            "provider with no fresh-agent lane",
+            json!({
+                "provider": "gemini", "sessionId": missing, "targetKind": "fresh-agent",
+                "sessionType": "freshclaude", "cwd": "/tmp",
+            }),
+        ),
+        (
+            "terminal mode of a different provider",
+            json!({
+                "provider": "claude", "sessionId": live_sid, "targetKind": "terminal",
+                "mode": "opencode",
+            }),
+        ),
+        (
+            "blank terminal mode",
+            json!({
+                "provider": "claude", "sessionId": live_sid, "targetKind": "terminal",
+                "mode": "",
+            }),
+        ),
+        (
+            "unregistered terminal mode",
+            json!({
+                "provider": "claude", "sessionId": live_sid, "targetKind": "terminal",
+                "mode": "shell",
+            }),
+        ),
+    ] {
+        let router = super::handoff_router(Arc::clone(&rig.runner));
+        let (status, response) = post_handoff_route(router, body, true).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "the {name} mismatch must be a typed 400: {response}"
+        );
+        assert_eq!(
+            response["error"]["code"],
+            json!("BAD_REQUEST"),
+            "the {name} mismatch carries the typed code: {response}"
+        );
+        assert_eq!(
+            response["error"]["retryable"],
+            json!(false),
+            "a validation refusal is not retryable as-is: {response}"
+        );
+    }
+
+    // The LIVE prior is untouched: same owner kind, same generation — the
+    // refusals never stopped it, never bumped the record.
+    let after = rig.ownership.observe("claude", &live_sid);
+    assert_eq!(
+        after.generation, before_generation,
+        "a refused handoff must never bump the coordinator record"
+    );
+    match after.state {
+        OwnershipState::Live { owner, .. } => {
+            assert_eq!(
+                owner.kind,
+                RuntimeOwnerKind::FreshAgent,
+                "the live prior must still own its key after the refusals"
+            );
+        }
+        other => panic!("the live prior must remain Live, got {other:?}"),
+    }
+
+    // Restore the codex command surface.
+    match prev_codex_cmd {
+        Some(value) => std::env::set_var("CODEX_CMD", value),
+        None => std::env::remove_var("CODEX_CMD"),
+    }
+    let _ = env;
+}
+
+/// b8ke delta review F5: an ABSENT sessionType resolves to the provider's
+/// canonical fresh-agent type when unambiguous — an opencode handoff
+/// without a sessionType resumes as freshopencode through the shared
+/// serve (never the silent freshcodex default under an opencode key).
+#[tokio::test]
+async fn handoff_route_resolves_absent_session_type_when_unambiguous() {
+    let _guard = ENV_LOCK.lock().await;
+    // The claude-lane env surface this file's tests mutate
+    // (FRESHELL_CLAUDE_SIDECAR/NODE, FAKE_SIDECAR_REQUEST_LOG,
+    // CLAUDE_CONFIG_DIR) is process-global and shared with claude.rs's and
+    // snapshot.rs's tests through THEIR lock — hold it too: our own
+    // ENV_LOCK only serializes this file against itself.
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    // The pre-fix shape dispatches an absent sessionType to the CODEX lane
+    // — stub the sidecar so that dispatch fails fast and hermetically.
+    let _codex_env = crate::codex::tests::ENV_LOCK.lock().await;
+    let prev_codex_cmd = std::env::var("CODEX_CMD").ok();
+    std::env::set_var("CODEX_CMD", "/bin/false");
+    let env = FakeOpencodeServeEnv::install();
+
+    let sid = format!("ses_handoff_absent_{}", uuid::Uuid::new_v4().simple());
+    let rig = build_rig(None);
+
+    // Fresh owner: a durable opencode session through the shared serve.
+    rig.fresh_opencode
+        .handle_attach(FreshAgentAttach {
+            provider: AgentProvider::Opencode,
+            session_id: sid.clone(),
+            session_type: SessionType::Freshopencode,
+            cwd: Some("/tmp".to_string()),
+            observed_epoch: None,
+            observed_generation: None,
+            resume_session_id: None,
+            session_ref: None,
+        })
+        .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        match rig.ownership.observe("opencode", &sid).state {
+            OwnershipState::Live { owner, .. } => {
+                assert_eq!(owner.kind, RuntimeOwnerKind::FreshAgent);
+                break;
+            }
+            state => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the opencode attach never committed Live, got {state:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+
+    // The handoff carries NO sessionType: the unambiguous opencode
+    // resolution must resume as freshopencode.
+    let router = super::handoff_router(Arc::clone(&rig.runner));
+    let (status, body) = post_handoff_route(
+        router,
+        json!({
+            "provider": "opencode", "sessionId": sid, "targetKind": "fresh-agent",
+            "cwd": "/tmp",
+        }),
+        true,
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], json!(true), "the absent-type handoff: {body}");
+    assert_eq!(
+        body["owner"]["sessionType"],
+        json!("freshopencode"),
+        "the resolved sessionType names the lane the request targets: {body}"
+    );
+    assert_eq!(body["owner"]["sessionId"], json!(sid), "{body}");
+    match rig.ownership.observe("opencode", &sid).state {
+        OwnershipState::Live { owner, .. } => {
+            assert_eq!(owner.kind, RuntimeOwnerKind::FreshAgent);
+        }
+        other => panic!("expected Live fresh owner, got {other:?}"),
+    }
+
+    // Cleanup: the lane bookkeeping (never the serve).
+    let _ = rig
+        .fresh_opencode
+        .opencode_kill_for_handoff(&sid, "test-cleanup")
+        .await;
+    match prev_codex_cmd {
+        Some(value) => std::env::set_var("CODEX_CMD", value),
+        None => std::env::remove_var("CODEX_CMD"),
+    }
+    let _ = env;
 }
