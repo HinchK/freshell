@@ -59,6 +59,13 @@ pub fn now_epoch_ms() -> u64 {
 /// 3. Sweep the captured tree (SIGTERM rounds, SIGKILL escalation) until every member
 ///    is confirmed dead-by-starttime, folding in any still-readable tagged newcomers.
 ///
+/// b8ke focused round-5 review R5-4: every signal in this family is
+/// IDENTITY-SAFE — issued through a pidfd pinned to the recorded
+/// incarnation (see [`signal_recorded_incarnation`]). An unreadable or
+/// missing start time is NEVER proof of liveness: no signal is issued
+/// (fail-closed — the caller's unconfirmed path), and a pid recycled
+/// between the verify and the send can never receive it.
+///
 /// Returns `true` only when the whole captured tree is confirmed gone; callers may
 /// `force_release` ONLY then. Non-Linux: no `/proc` — returns `false` (hold closed).
 #[cfg(target_os = "linux")]
@@ -78,22 +85,10 @@ pub async fn kill_and_confirm_tree_dead(pid: u32, ownership_env: &str, ownership
         }
     }
 
-    // 2. Graceful SIGTERM to the recorded child, poll, SIGKILL fallback.
-    unsafe {
-        libc::kill(pid as i32, libc::SIGTERM);
-    }
-    if !wait_recorded_incarnation_gone(pid, child_start).await {
-        // R4-8: the escalation signal revalidates the recorded incarnation
-        // immediately before firing — only the ORIGINAL process is ever
-        // SIGKILLed, never a recycled-pid replacement.
-        if pid_is_recorded_incarnation(pid, child_start) {
-            unsafe {
-                libc::kill(pid as i32, libc::SIGKILL);
-            }
-        }
-        if !wait_recorded_incarnation_gone(pid, child_start).await {
-            return false;
-        }
+    // 2. Graceful SIGTERM to the recorded child, poll, SIGKILL fallback —
+    // both signals through the pinned incarnation (R5-4).
+    if kill_recorded_child_unconfirmed(pid, child_start).await {
+        return false;
     }
 
     // 3. Sweep the captured tree until confirmed empty (bounded; SIGKILL
@@ -106,7 +101,10 @@ pub async fn kill_and_confirm_tree_dead(pid: u32, ownership_env: &str, ownership
 /// The sweep behind [`kill_and_confirm_tree_dead`]'s step 3: poll the
 /// captured `(pid, starttime)` tree until every member is confirmed
 /// dead-by-starttime (SIGTERM rounds, SIGKILL escalation after 20 rounds),
-/// folding in currently-readable tagged newcomers each round.
+/// folding in currently-readable tagged newcomers each round. R5-4: every
+/// member signal is issued through the pidfd-pinned recorded incarnation —
+/// a member whose identity cannot be pinned/verified is simply not
+/// signaled that round (fail-closed; the next round's retain revalidates).
 #[cfg(target_os = "linux")]
 async fn sweep_captured_tree_until_dead(
     mut tree: Vec<(i32, u64)>,
@@ -130,10 +128,8 @@ async fn sweep_captured_tree_until_dead(
         } else {
             libc::SIGKILL
         };
-        for (p, _) in &tree {
-            unsafe {
-                libc::kill(*p, sig);
-            }
+        for (p, st) in &tree {
+            signal_recorded_incarnation(*p as u32, Some(*st), sig);
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
@@ -214,8 +210,11 @@ pub fn record_condemned_runtime_identity(
 ///    replacement process (the original incarnation is gone for the pid to
 ///    have been reused) — it is NEVER signaled; the sweep proceeds without
 ///    it.
-/// 2. The graceful-then-forced direct-child kill (only when the child is
-///    still the recorded incarnation).
+/// 2. The graceful-then-forced direct-child kill — every signal issued
+///    through a pidfd PINNED to the recorded incarnation (b8ke focused
+///    round-5 R5-4: an unreadable start time or an unavailable pidfd is
+///    NEVER proof of liveness — no signal is issued at all, and the kill
+///    fails closed to the caller's unconfirmed path).
 /// 3. The sweep runs over the RECORDED tree (reparented descendants whose
 ///    tags became unreadable are still confirmed dead-by-starttime) plus
 ///    any currently-readable tagged newcomers.
@@ -224,41 +223,16 @@ pub async fn kill_and_confirm_recorded_tree_dead(
     recorded: &CondemnedRuntimeIdentity,
     ownership_env: &str,
 ) -> bool {
-    let child_live = match recorded.start_time {
-        Some(expected) => match proc_starttime(recorded.pid as i32) {
-            Some(actual) if actual != expected => {
-                tracing::warn!(target: "freshell_freshagent::session_lease",
-                    pid = recorded.pid, ownership_id = %recorded.ownership_id,
-                    "session_lease.condemned_pid_reused: the recorded child's pid now belongs \
-                     to an unrelated process — not signaled; the original incarnation is gone"
-                );
-                false
-            }
-            // Alive at the recorded incarnation (or unreadable right now).
-            _ => true,
-        },
-        // No recorded start time: the legacy discipline (signal the pid).
-        None => true,
-    };
-    if child_live {
-        unsafe {
-            libc::kill(recorded.pid as i32, libc::SIGTERM);
-        }
-        if !wait_recorded_incarnation_gone(recorded.pid, recorded.start_time).await {
-            // R4-8: revalidate the recorded incarnation IMMEDIATELY before
-            // the escalation signal — a pid that exited during the grace
-            // wait and was recycled belongs to an unrelated process now
-            // and must NEVER receive the SIGKILL (the original incarnation
-            // is provably gone; the confirmation proceeds without it).
-            if pid_is_recorded_incarnation(recorded.pid, recorded.start_time) {
-                unsafe {
-                    libc::kill(recorded.pid as i32, libc::SIGKILL);
-                }
-            }
-            if !wait_recorded_incarnation_gone(recorded.pid, recorded.start_time).await {
-                return false;
-            }
-        }
+    // The recorded start time is the identity license: the direct child's
+    // signals ride the pidfd-pinned incarnation only (R5-4). No recorded
+    // start time (the identity says the child was already gone at capture
+    // — `proc_starttime` reads None for a dead or zombie process): NOTHING
+    // is signaled on the bare pid (an unconfirmable identity never signals
+    // its occupant) and the recorded tree alone is confirmed.
+    if recorded.start_time.is_some()
+        && kill_recorded_child_unconfirmed(recorded.pid, recorded.start_time).await
+    {
+        return false;
     }
     sweep_captured_tree_until_dead(recorded.tree.clone(), ownership_env, &recorded.ownership_id)
         .await
@@ -280,6 +254,205 @@ pub async fn kill_and_confirm_tree_dead(
     _ownership_id: &str,
 ) -> bool {
     false
+}
+
+/// b8ke focused round-5 review R5-4: identity-safe signaling through a
+/// pidfd PINNED to the recorded process incarnation. `pidfd_open` captures
+/// the process currently holding the pid; the recorded start time is
+/// reverified against that occupant and the signal is sent THROUGH the
+/// pidfd — a pid recycled between the verify and the send can never
+/// receive it (the pidfd addresses the original incarnation, and an exited
+/// original answers ESRCH, not some replacement). Without a recorded
+/// start time, or where the pidfd syscalls are unavailable (a kernel
+/// without pidfd, or an unsupported architecture), the identity is
+/// UNCONFIRMABLE: no signal is ever issued (fail-closed — the caller's
+/// unconfirmed path, never a signal to a possibly-unrelated occupant).
+#[cfg(target_os = "linux")]
+mod pinned_signal {
+    /// The unified-pool syscall numbers (stable ABI since Linux 5.3). The
+    /// libc crate exports these only for some targets, so the numbers are
+    /// declared for the architectures the pidfd path supports; every other
+    /// Linux arch fails closed at runtime (the syscalls return `-ENOSYS`,
+    /// [`super::signal_recorded_incarnation`] answers `Unconfirmable`).
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "powerpc64",
+        target_arch = "s390x",
+        target_arch = "loongarch64"
+    ))]
+    const SYS_PIDFD_OPEN: libc::c_long = 434;
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "powerpc64",
+        target_arch = "s390x",
+        target_arch = "loongarch64"
+    ))]
+    const SYS_PIDFD_SEND_SIGNAL: libc::c_long = 424;
+
+    /// `pidfd_open(pid, 0)` — pin the process currently holding `pid`.
+    /// `Err(1)` (`ESRCH`): NO process holds the pid — the recorded
+    /// incarnation has provably exited (a process always holds its own
+    /// pid while alive); `Err(other)`: the pidfd facility is unavailable
+    /// (kernel/arch/permission) — the caller fails closed.
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "powerpc64",
+        target_arch = "s390x",
+        target_arch = "loongarch64"
+    ))]
+    pub(super) fn open(pid: libc::pid_t) -> Result<i32, i32> {
+        let fd = unsafe { libc::syscall(SYS_PIDFD_OPEN, pid, 0u32) };
+        if fd >= 0 {
+            Ok(fd as i32)
+        } else {
+            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(-1))
+        }
+    }
+
+    /// `pidfd_send_signal(pidfd, sig, NULL, 0)` — signal the PINNED
+    /// incarnation exactly.
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "powerpc64",
+        target_arch = "s390x",
+        target_arch = "loongarch64"
+    ))]
+    pub(super) fn send_signal(pidfd: i32, sig: libc::c_int) -> bool {
+        unsafe {
+            libc::syscall(
+                SYS_PIDFD_SEND_SIGNAL,
+                pidfd,
+                sig,
+                std::ptr::null::<libc::c_void>(),
+                0u32,
+            ) == 0
+        }
+    }
+}
+
+/// The outcome of an identity-safe signal attempt (R5-4).
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IncarnationSignal {
+    /// The signal was delivered through the pidfd to the recorded
+    /// incarnation.
+    Sent,
+    /// The recorded incarnation is provably gone (a different process now
+    /// holds the readable pid, or the pinned incarnation exited since the
+    /// verify) — nothing was signaled and nothing of ours remains.
+    Gone,
+    /// The identity could not be pinned/verified (unreadable start time,
+    /// unavailable pidfd) — NOTHING was signaled (fail-closed).
+    Unconfirmable,
+}
+
+/// Issue ONE signal to the RECORDED process incarnation, identity-safe
+/// (b8ke focused round-5 R5-4): pin the pid's current occupant with a
+/// pidfd, verify the occupant still carries the recorded start time, and
+/// send through the pidfd. Never signals an unconfirmable identity.
+#[cfg(target_os = "linux")]
+pub(crate) fn signal_recorded_incarnation(
+    pid: u32,
+    recorded_start: Option<u64>,
+    sig: libc::c_int,
+) -> IncarnationSignal {
+    let Some(expected) = recorded_start else {
+        // No recorded start time: the identity is unconfirmable — no
+        // signal (fail-closed; the caller must NOT treat the pid's
+        // occupant as the condemned child).
+        return IncarnationSignal::Unconfirmable;
+    };
+    let pidfd = match pinned_signal::open(pid as libc::pid_t) {
+        Ok(pidfd) => pidfd,
+        // ESRCH: NO process holds the pid — the recorded incarnation has
+        // provably exited (the strongest death proof available). Nothing
+        // to signal; the caller proceeds to its tree confirmation.
+        Err(libc::ESRCH) => return IncarnationSignal::Gone,
+        // pidfd unavailable (kernel/arch without it, permission): without
+        // the pin there is no identity-safe send — no signal.
+        Err(_) => return IncarnationSignal::Unconfirmable,
+    };
+    let sent = match proc_starttime(pid as i32) {
+        // STILL the recorded incarnation at this instant — and the pidfd
+        // pins that same occupant, so the send below cannot reach a
+        // recycled replacement even if the pid turns over between this
+        // verify and the send.
+        Some(actual) if actual == expected => {
+            let sent = pinned_signal::send_signal(pidfd, sig);
+            // `false` here is ESRCH: the pinned incarnation exited since
+            // the verify — provably gone, never a replacement.
+            sent
+        }
+        // A DIFFERENT readable process holds the pid: the original
+        // incarnation is provably gone (the pid was reused) — never
+        // signaled. The same holds for an UNREADABLE pid: `proc_starttime`
+        // reads None exactly for a gone, zombie, or exited process (the
+        // wait discipline's proof of death) — nothing to signal, nothing
+        // of ours remains.
+        Some(_) | None => false,
+    };
+    unsafe { libc::close(pidfd) };
+    if sent {
+        IncarnationSignal::Sent
+    } else {
+        IncarnationSignal::Gone
+    }
+}
+
+/// The direct child's graceful-then-forced kill with EVERY signal issued
+/// through the pidfd-pinned recorded incarnation (b8ke focused round-5
+/// R5-4). Returns `true` when the child's death could NOT be confirmed —
+/// the caller must fail closed (its unconfirmed path), never claim the
+/// reap. `recorded_start: None` (dead at capture per the identity
+/// contract) skips signaling entirely; the recorded tree alone is
+/// confirmed by the caller's sweep.
+#[cfg(target_os = "linux")]
+async fn kill_recorded_child_unconfirmed(pid: u32, recorded_start: Option<u64>) -> bool {
+    let Some(expected) = recorded_start else {
+        return false;
+    };
+    match signal_recorded_incarnation(pid, recorded_start, libc::SIGTERM) {
+        IncarnationSignal::Sent => {}
+        // The recorded incarnation is provably gone — nothing to kill.
+        IncarnationSignal::Gone => return false,
+        // Unconfirmable identity: NO signal was issued — fail closed.
+        IncarnationSignal::Unconfirmable => {
+            tracing::warn!(target: "freshell_freshagent::session_lease",
+                pid, expected_start_time = expected,
+                "session_lease.condemned_child_unconfirmable: the recorded child's identity \
+                 could not be pinned/verified — no signal issued (fail-closed)"
+            );
+            return true;
+        }
+    }
+    if wait_recorded_incarnation_gone(pid, recorded_start).await {
+        return false;
+    }
+    // R4-8/R5-4: the escalation signal re-pins and re-verifies the
+    // recorded incarnation immediately before firing — only the ORIGINAL
+    // process is ever SIGKILLed, through the pidfd.
+    match signal_recorded_incarnation(pid, recorded_start, libc::SIGKILL) {
+        IncarnationSignal::Sent => {}
+        // Exited (or turned over) since the grace wait — provably gone.
+        IncarnationSignal::Gone => return false,
+        IncarnationSignal::Unconfirmable => {
+            tracing::warn!(target: "freshell_freshagent::session_lease",
+                pid, expected_start_time = expected,
+                "session_lease.condemned_child_escalation_unconfirmable: the escalation \
+                 signal could not be pinned to the recorded incarnation — not issued"
+            );
+            return true;
+        }
+    }
+    !wait_recorded_incarnation_gone(pid, recorded_start).await
 }
 
 /// b8ke focused round-4 review R4-8: is `pid` still the RECORDED process
@@ -770,7 +943,6 @@ mod tests {
         );
         let _ = child.kill().await;
     }
-
     /// b8ke focused round-4 review R4-8 (the kill-path contract): a
     /// recorded identity whose pid belongs to an UNRELATED incarnation is
     /// never signaled at ANY point of the kill-and-confirm — the original
@@ -803,5 +975,80 @@ mod tests {
             "the recycled pid's unrelated process must survive the whole kill-and-confirm"
         );
         let _ = unrelated.kill().await;
+    }
+
+    /// b8ke focused round-5 review R5-4: an UNCONFIRMABLE identity never
+    /// signals. A recorded identity with NO start time cannot prove the
+    /// pid's current occupant is the condemned child — pre-fix the guard
+    /// treated it as "live" and SIGTERMed (then SIGKILLed) whatever held
+    /// the pid, so a recycled occupant died. Post-fix the direct-child
+    /// signals are licensed ONLY through a pidfd pinned to the RECORDED
+    /// incarnation (verified before every send); with no identity there
+    /// is no signal, and the recorded tree alone is confirmed.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_unconfirmable_identity_never_signals_the_pids_occupant() {
+        // A live process holding the recorded pid — under the forged
+        // identity it is an unrelated occupant (the identity claims the
+        // condemned child was already gone at capture time).
+        let mut occupant = tokio::process::Command::new("sleep")
+            .arg("300")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the unrelated occupant");
+        let pid = occupant.id().expect("occupant pid");
+        let unconfirmable = CondemnedRuntimeIdentity {
+            pid,
+            start_time: None,
+            tree: Vec::new(),
+            ownership_id: "r54-unconfirmable".to_string(),
+        };
+
+        let confirmed =
+            kill_and_confirm_recorded_tree_dead(&unconfirmable, "R54_TEST_OWNERSHIP").await;
+
+        assert!(
+            confirmed,
+            "the recorded identity says the child was dead at capture — the empty recorded \
+             tree is confirmed without any signal"
+        );
+        assert!(
+            proc_starttime(pid as i32).is_some(),
+            "the UNCONFIRMABLE identity must never signal the pid's occupant"
+        );
+        let _ = occupant.kill().await;
+    }
+
+    /// b8ke focused round-5 review R5-4 (the pinned-signal positive
+    /// control): a CONFIRMABLE identity — the pid still carrying the
+    /// recorded start time — is signaled through the pidfd and the
+    /// kill-and-confirm settles its death.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_recorded_incarnation_is_killed_through_the_pinned_pidfd() {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("300")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the recorded child");
+        let pid = child.id().expect("child pid");
+        let recorded = CondemnedRuntimeIdentity {
+            pid,
+            start_time: proc_starttime(pid as i32),
+            tree: Vec::new(),
+            ownership_id: "r54-pinned".to_string(),
+        };
+
+        let confirmed = kill_and_confirm_recorded_tree_dead(&recorded, "R54_TEST_OWNERSHIP").await;
+
+        assert!(
+            confirmed,
+            "the pinned-incarnation kill must confirm the recorded child's death"
+        );
+        assert!(
+            proc_starttime(pid as i32).is_none(),
+            "the recorded child itself was signaled (through the pidfd) and is dead"
+        );
+        let _ = child.kill().await;
     }
 }
