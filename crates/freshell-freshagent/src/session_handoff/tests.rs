@@ -162,6 +162,33 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({ id, directory: '/tmp', title: 'fake opencode session' }))
     return
   }
+  // A prompt: accept it and NEVER emit a session.idle event — the turn
+  // executes daemon-side with the client parked awaiting idle (the
+  // active-turn shape the handoff stop must abort through the manager).
+  const prompt = url.pathname.match(/^\/session\/([^/]+)\/prompt_async$/)
+  if (prompt && req.method === 'POST') {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end('{}')
+    return
+  }
+  // The abort: log the receipt, then HOLD the answer until the release
+  // file appears (the test releases it) — proving the caller awaits the
+  // daemon-side abort before reporting the reap.
+  const abort = url.pathname.match(/^\/session\/([^/]+)\/abort$/)
+  if (abort && req.method === 'POST') {
+    const id = decodeURIComponent(abort[1])
+    log({ event: 'abort-received', id })
+    const release = process.env.FAKE_OPENCODE_SERVE_ABORT_RELEASE || ''
+    const timer = setInterval(() => {
+      if (!release || fs.existsSync(release)) {
+        clearInterval(timer)
+        log({ event: 'abort-answered', id })
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end('{}')
+      }
+    }, 25)
+    return
+  }
   res.writeHead(404, { 'content-type': 'application/json' })
   res.end(JSON.stringify({ error: 'not found' }))
 })
@@ -243,7 +270,11 @@ impl Drop for FakeOpencodeServeEnv {
             }
             let _ = pid;
         }
-        for var in ["OPENCODE_CMD", "FAKE_OPENCODE_SERVE_AUDIT_LOG"] {
+        for var in [
+            "OPENCODE_CMD",
+            "FAKE_OPENCODE_SERVE_AUDIT_LOG",
+            "FAKE_OPENCODE_SERVE_ABORT_RELEASE",
+        ] {
             std::env::remove_var(var);
         }
         let _ = std::fs::remove_dir_all(&self.dir);
@@ -2279,6 +2310,142 @@ async fn opencode_handoff_keeps_shared_serve_alive_and_session_id_stable() {
         .fresh_opencode
         .opencode_kill_for_handoff(&sid, "test-cleanup")
         .await;
+}
+
+/// 6c. b8ke delta review F1: a handoff that stops an opencode session with
+/// an ACTIVE turn must abort the turn THROUGH THE MANAGER (the interrupt
+/// path's mechanism) before reporting Reaped — the local JoinHandle abort
+/// only stops awaiting the turn; once `prompt_async` returned, the turn
+/// executes INSIDE the shared daemon. The fake serve accepts the prompt and
+/// never goes idle (the active-turn shape), and HOLDS its abort answer
+/// until the test releases it: the handoff must not complete while the
+/// daemon-side abort is unanswered, and the shared serve itself is never
+/// killed (OpenCode invariant).
+#[tokio::test]
+async fn opencode_handoff_stop_aborts_the_active_turn_through_the_manager_before_reaping() {
+    let _guard = ENV_LOCK.lock().await;
+    // The claude-lane env surface this file's tests mutate
+    // (FRESHELL_CLAUDE_SIDECAR/NODE, FAKE_SIDECAR_REQUEST_LOG,
+    // CLAUDE_CONFIG_DIR) is process-global and shared with claude.rs's and
+    // snapshot.rs's tests through THEIR lock — hold it too: our own
+    // ENV_LOCK only serializes this file against itself.
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let env = FakeOpencodeServeEnv::install();
+    // The abort-hold release file: absent until the test writes it, so the
+    // fake serve holds its abort answer open.
+    let release = env.dir.join("abort-release");
+    std::env::set_var("FAKE_OPENCODE_SERVE_ABORT_RELEASE", &release);
+    let sid = format!("ses_handoff_active_{}", uuid::Uuid::new_v4().simple());
+    let rig = build_rig(None);
+
+    // Fresh owner: a durable opencode session, registered through the
+    // shared serve (the attach-resume lane — the test-6 pattern).
+    rig.fresh_opencode
+        .handle_attach(FreshAgentAttach {
+            provider: AgentProvider::Opencode,
+            session_id: sid.clone(),
+            session_type: SessionType::Freshopencode,
+            cwd: Some("/tmp".to_string()),
+            observed_epoch: None,
+            observed_generation: None,
+            resume_session_id: None,
+            session_ref: None,
+        })
+        .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        match rig.ownership.observe("opencode", &sid).state {
+            OwnershipState::Live { owner, .. } => {
+                assert_eq!(owner.kind, RuntimeOwnerKind::FreshAgent);
+                break;
+            }
+            state => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the opencode attach never committed Live, got {state:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+
+    // An ACTIVE turn: a send whose prompt the fake serve accepts but whose
+    // idle never arrives — the turn executes daemon-side, with the local
+    // turn task parked awaiting it.
+    rig.fresh_opencode
+        .handle_send(freshell_protocol::FreshAgentSend {
+            provider: AgentProvider::Opencode,
+            session_id: sid.clone(),
+            session_type: SessionType::Freshopencode,
+            text: "hold this turn open".to_string(),
+            cwd: Some("/tmp".to_string()),
+            images: None,
+            request_id: Some(format!("handoff-active-send-{}", uuid::Uuid::new_v4())),
+            settings: None,
+        })
+        .await;
+    env.await_audit_row(
+        Duration::from_secs(20),
+        |r| r["method"] == "POST" && r["path"].as_str().is_some_and(|p| p.ends_with("/prompt_async")),
+    )
+    .await;
+
+    // Handoff opencode -> terminal: the stop must abort the daemon-side
+    // turn before the reap is reported.
+    let to_terminal = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("opencode", &sid, "opencode"));
+    let mut completion = to_terminal.completion;
+
+    // The manager abort was ISSUED through the daemon (the interrupt
+    // mechanism) for the REAL session id.
+    env.await_audit_row(
+        Duration::from_secs(20),
+        |r| r["event"] == "abort-received" && r["id"] == json!(sid),
+    )
+    .await;
+
+    // Ordering: the handoff must NOT complete (Reaped unreported) while
+    // the daemon-side abort is unanswered.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), &mut completion)
+            .await
+            .is_err(),
+        "the handoff completed before the daemon-side turn abort settled — \
+         Reaped must follow the manager abort"
+    );
+
+    // Release: the daemon answers the abort; the stop reports Reaped and
+    // the handoff runs to its committed terminal owner.
+    std::fs::write(&release, "").expect("release the abort hold");
+    let result = completion.await.expect("handoff completed");
+    assert_eq!(result["ok"], json!(true), "handoff to terminal: {result}");
+    let terminal_id = result["owner"]["terminalId"].as_str().unwrap().to_string();
+    match rig.ownership.observe("opencode", &sid).state {
+        OwnershipState::Live { owner, .. } => {
+            assert_eq!(owner.kind, RuntimeOwnerKind::Terminal);
+            assert_eq!(owner.terminal_id.as_deref(), Some(terminal_id.as_str()));
+        }
+        other => panic!("expected Live terminal owner, got {other:?}"),
+    }
+
+    // The shared serve was never killed — exactly one serve pid across
+    // the whole handoff, and the abort was answered by that same process.
+    env.await_audit_row(
+        Duration::from_secs(10),
+        |r| r["event"] == "abort-answered" && r["id"] == json!(sid),
+    )
+    .await;
+    assert_eq!(
+        env.serve_pids().len(),
+        1,
+        "the shared serve was never killed or restarted: pids {:?}",
+        env.serve_pids()
+    );
+
+    // Cleanup: kill the terminal owner's row (the lane bookkeeping for an
+    // opencode session no longer exists post-handoff).
+    rig.registry.kill(&terminal_id);
 }
 
 /// 6b. kilroy (round-2 review): handoff TO a kilroy fresh-agent target — the

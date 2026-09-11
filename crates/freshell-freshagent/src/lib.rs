@@ -1420,6 +1420,20 @@ impl FreshAgentState {
         manager
     }
 
+    /// b8ke delta review F1: the shared serve manager ONLY when it already
+    /// exists and is started — the cell is peeked without creating it and
+    /// its started-ness read without starting it (the F4 discipline). For
+    /// the handoff stop path's daemon-side turn abort: a stop path must
+    /// never SPAWN a daemon (and a daemon that is not running cannot be
+    /// executing a turn, so there is nothing to abort through).
+    pub(crate) async fn peek_running_manager(&self) -> Option<OpencodeServeManager> {
+        let manager = self.opencode.lock().await.clone();
+        match manager {
+            Some(manager) if manager.base_url().await.is_some() => Some(manager),
+            _ => None,
+        }
+    }
+
     /// Test-only: seed the manager cell with a fake-backed [`OpencodeServeManager`] so
     /// [`opencode_ws`]'s unit tests can drive `ensure_manager()` deterministically, with
     /// NO real `opencode` process spawned.

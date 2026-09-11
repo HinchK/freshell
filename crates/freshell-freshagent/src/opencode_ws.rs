@@ -1449,13 +1449,14 @@ impl FreshOpencodeState {
         let Some(session_arc) = session_arc else {
             return crate::session_handoff::StopResult::AlreadyGone;
         };
-        let (turn_task, bridge, real) = {
+        let (turn_task, bridge, real, route) = {
             let mut s = session_arc.lock().await;
             s.killed.store(true, Ordering::SeqCst);
             (
                 s.turn_task.take(),
                 s.serve_bridge.take(),
                 s.real_session_id.clone(),
+                s.cwd.clone(),
             )
         };
         // The map removal: its own short synchronous section (every key
@@ -1465,9 +1466,46 @@ impl FreshOpencodeState {
             guard.retain(|_, candidate| !Arc::ptr_eq(candidate, &session_arc));
         }
         // The settlement awaits (phase 5 of `handle_kill`): the turn task's
-        // abort + settle, then the serve-SSE bridge teardown.
+        // abort + settle, then the daemon-side turn abort, then the
+        // serve-SSE bridge teardown.
+        let turn_was_in_flight = turn_task
+            .as_ref()
+            .is_some_and(|t| !t.is_finished());
         if let Some(task) = turn_task {
             task.abort_and_settle().await;
+        }
+        // b8ke delta review F1: the local abort above only stops AWAITING
+        // the turn — once `prompt_async` returned, the turn executes INSIDE
+        // the shared daemon. Abort it through the manager (the same
+        // mechanism the interrupt path uses) BEFORE the SSE bridge teardown,
+        // and only then let the caller report Reaped. The shared daemon
+        // itself is NEVER killed (OpenCode invariant), and the manager is
+        // only ever PEEKED — a stop path must never spawn a daemon (the F4
+        // discipline). Best-effort: an abort that fails to land is logged,
+        // never fatal to the stop.
+        if turn_was_in_flight {
+            if let Some(real) = real.as_deref() {
+                match self.fresh_agent.peek_running_manager().await {
+                    Some(manager) => {
+                        if let Err(err) = manager.abort(real, &route).await {
+                            tracing::warn!(target: "freshell_freshagent::opencode",
+                                session_id = %session_id, real_session_id = %real,
+                                error = %err,
+                                "freshagent.opencode.handoff_stop_abort_failed: the daemon-side \
+                                 turn abort did not land (best-effort; the shared serve is never \
+                                 killed)"
+                            );
+                        }
+                    }
+                    None => {
+                        tracing::info!(target: "freshell_freshagent::opencode",
+                            session_id = %session_id, real_session_id = %real,
+                            "freshagent.opencode.handoff_stop_abort_skipped: the shared serve is \
+                             not running — no daemon-side turn to abort"
+                        );
+                    }
+                }
+            }
         }
         if let Some(bridge) = bridge {
             bridge.abort();
