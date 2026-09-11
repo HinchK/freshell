@@ -3,6 +3,7 @@ import { initLayout, splitPane, setActivePane, updatePaneContent, resizePanes, s
 import { captureUiScreenshot } from '@/lib/ui-screenshot'
 import type { AppDispatch, RootState } from '@/store/store'
 import { applyPaneRename, applyTabRename } from '@/store/titleSync'
+import { forceLayoutResync } from '@/store/layoutMirrorMiddleware'
 
 type DispatchFn = (action: any) => any
 
@@ -137,5 +138,10 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
       return dispatch(resizePanes({ tabId: msg.payload.tabId, splitId: msg.payload.splitId, sizes: msg.payload.sizes }))
     case 'pane.swap':
       return dispatch(swapPanes({ tabId: msg.payload.tabId, paneId: msg.payload.paneId, otherId: msg.payload.otherId }))
+    case 'layout.resync':
+      // kata b8ke Task 10: the server's re-sync handshake (respawn/attach
+      // missed this pane in every synced layout) — the layout mirror
+      // re-sends the current layout immediately, dedupe gate bypassed.
+      return dispatch(forceLayoutResync())
   }
 }

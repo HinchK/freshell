@@ -678,25 +678,21 @@ fn validate_rest_resume(
 /// body byte-identical to the pre-feature shape (frozen-client parity).
 /// kata b8ke Task 4: the coordinator's typed owner fields
 /// (`ownerKind`/`ownerGeneration`) ride the same additive rule when the
-/// coordinator knows the owner.
+/// coordinator knows the owner. kata b8ke Task 10 (refactor): delegates to
+/// the ONE shared `fail_json_conflict_with_owner` envelope so every
+/// ownership-conflict door (this rung, the attach/respawn conflicts, the
+/// MCP-proxied body) shares one JSON shape.
 fn fail_json_restore_unavailable(
     live_sid: &str,
     live_terminal_id: Option<&str>,
     owner: Option<&crate::ownership_lane::TerminalOwnerFields>,
 ) -> Response {
-    let mut body = json!({
-        "status": "error",
-        "code": "RESTORE_UNAVAILABLE",
-        "message": format!("Session {live_sid} is still running on the server."),
-    });
-    if let Some(tid) = live_terminal_id {
-        body["liveTerminalId"] = json!(tid);
-    }
-    if let Some(owner) = owner {
-        body["ownerKind"] = json!(owner.owner_kind);
-        body["ownerGeneration"] = json!(owner.owner_generation);
-    }
-    (StatusCode::CONFLICT, Json(body)).into_response()
+    crate::fail_json_conflict_with_owner(
+        "RESTORE_UNAVAILABLE",
+        format!("Session {live_sid} is still running on the server."),
+        live_terminal_id,
+        owner,
+    )
 }
 
 /// The successful result of [`spawn_terminal_pane`]: the `paneContent` JSON + the
@@ -1603,6 +1599,42 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                 Some(&owner_terminal_id),
                 owner_fields.as_ref(),
             ));
+        }
+
+        // kata b8ke Task 10 (REST-door D7 parity, the WS door's Task 13b
+        // cross-kind live-guard): a live FRESH-AGENT sidecar owning
+        // `(provider, S)` is just as much "the one writer on S's JSONL" as
+        // a live PTY -- the fresh create lane deliberately never commits
+        // coordinator ownership (the canonical durable id only materializes
+        // at `sdk.session.init`; the D7 probe backstop covers the residual),
+        // so the coordinator GRANTED this claim on a key it cannot see.
+        // Consult the SAME sidecar-liveness probe the WS door's D7 join
+        // uses (wired in main.rs over the same has_live_session joins) and
+        // refuse with the same typed envelope -- never a second writer. No
+        // terminal id exists to name, so `liveTerminalId` stays absent (the
+        // WS door's cross-kind arm does the same); the coordinator's owner
+        // fields ride along when it happens to know the owner.
+        if let Some(probe) = &state.sidecar_liveness {
+            if probe(&mode, live_sid).await {
+                tracing::warn!(
+                    target: "freshell_freshagent::terminal_tabs",
+                    mode = %mode,
+                    session_id = %live_sid,
+                    pane_id = %pane_id,
+                    "spawn_refused: a live fresh-agent sidecar already owns this session \
+                     (D7 cross-kind live-guard, REST rung)"
+                );
+                let owner_fields = state.ownership.as_ref().and_then(|ownership| {
+                    crate::ownership_lane::terminal_owner_fields_from_snapshot(
+                        &ownership.observe(&mode, live_sid),
+                    )
+                });
+                return Err(fail_json_restore_unavailable(
+                    live_sid,
+                    None,
+                    owner_fields.as_ref(),
+                ));
+            }
         }
 
         // D8 session-ref lease, REST rung (Design Decision 6) -- D7 above is
@@ -6297,12 +6329,16 @@ if (args.includes('app-server')) {{
     /// MANDATORY liveness precondition, arm 2 (sidecar — mirrors Task 6 case
     /// 6): the registry holds NO row for the candidate, but a fresh-agent
     /// sidecar owns it live. The registry-live test above stays GREEN if this
-    /// arm is dropped, so it cannot pin it. The create must proceed UNCHANGED
-    /// (resume id reaches CliLaunchInputs intact — today's behavior for a
-    /// sidecar-live resume; no D7-REST reject since the registry has no row),
-    /// `on_stale_resume` never invoked, no notice injected.
+    /// arm is dropped, so it cannot pin it. The gate must SKIP the live
+    /// candidate (`on_stale_resume` never invoked, no notice, no fresh-mint
+    /// spawn) — and since kata b8ke Task 10 the create then answers the
+    /// cross-kind D7 REST refusal (the same typed RESTORE_UNAVAILABLE the WS
+    /// door's Task 13b arm emits), never a second writer onto the sidecar's
+    /// session. The gate-skip itself is pinned by the refusal: a gate fire
+    /// would have REPLACED the resume id (guard locator gone, no D7 arm) and
+    /// answered 200 with a fresh-minted id.
     #[tokio::test]
-    async fn rest_gate_skips_sidecar_live_candidate_create_proceeds_unchanged() {
+    async fn rest_gate_skips_sidecar_live_candidate_then_d7_refuses() {
         // DEV-0006 S5.e: the managed-launch default is ON; this suite exercises the
         // plain-CLI codex path (recording CLI spec, no app-server), so pin OFF.
         let _codex_environment = crate::codex::tests::ENV_LOCK.lock().await;
@@ -6326,7 +6362,7 @@ if (args.includes('app-server')) {{
             .with_on_stale_resume(on_stale)
             .with_sidecar_liveness(sidecar);
         let registry = state.terminal_registry.clone().unwrap();
-        let mut rx = state.broadcast_tx.subscribe();
+        let rows_before = registry.identity_probe_rows().len();
 
         let (status, body) = post(
             app(state),
@@ -6339,36 +6375,29 @@ if (args.includes('app-server')) {{
             true,
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
-
-        // The resume id reaching CliLaunchInputs is STILL the live one — the
-        // registry row records it, and no gate-fired fresh spawn happened.
-        let entry = registry
-            .directory()
-            .into_iter()
-            .find(|e| e.terminal_id == terminal_id)
-            .expect("directory entry");
-        assert_eq!(entry.resume_session_id.as_deref(), Some(SIDECAR_LIVE));
+        // kata b8ke Task 10 (REST-door D7 parity): the sidecar is the one
+        // writer — the typed refusal, never a second spawn.
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], json!("RESTORE_UNAVAILABLE"), "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|m| m.contains(SIDECAR_LIVE)),
+            "message names the live session: {body}"
+        );
+        // The gate never fired (the liveness precondition held): no stale
+        // callback, no fresh-mint spawn.
         assert_eq!(
             stale_count.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "on_stale_resume must never fire for a sidecar-live session"
         );
-        let frame = rx.recv().await.expect("ui.command frame broadcast");
-        let msg: Value = serde_json::from_str(&frame).unwrap();
-        let pane_content = &msg["payload"]["paneContent"];
-        assert!(
-            pane_content.get("reconcileNotice").is_none(),
-            "no notice for a skipped (live) candidate: {pane_content}"
-        );
         assert_eq!(
-            pane_content["sessionRef"],
-            json!({ "provider": "codex", "sessionId": SIDECAR_LIVE }),
-            "wire ref stamped unchanged: {pane_content}"
+            registry.identity_probe_rows().len(),
+            rows_before,
+            "no new terminal (no gate-fired fresh spawn, no second writer)"
         );
 
-        registry.kill(&terminal_id);
         let _ = std::fs::remove_file(&argv_file);
     }
 

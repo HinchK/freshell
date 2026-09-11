@@ -2317,6 +2317,35 @@ pub(crate) fn fail_json_code(status: StatusCode, code: &str, message: String) ->
         .into_response()
 }
 
+/// [`fail_json_code`] + the typed ownership-conflict additions (kata b8ke
+/// Task 10): the additive `ownerKind`/`ownerGeneration` pair when the
+/// coordinator knows the owner, plus the reconnect-revive `liveTerminalId`
+/// a caller reattaches to instead of dead-ending. ONE shape for every
+/// ownership-conflict door (WS error frame, REST 409, MCP-proxied body) —
+/// `terminal_tabs::fail_json_restore_unavailable` and `pane_ops`'s
+/// attach/respawn conflicts all build on this helper so they can never
+/// drift apart.
+pub(crate) fn fail_json_conflict_with_owner(
+    code: &str,
+    message: String,
+    live_terminal_id: Option<&str>,
+    owner: Option<&crate::ownership_lane::TerminalOwnerFields>,
+) -> Response {
+    let mut body = json!({
+        "status": "error",
+        "code": code,
+        "message": message,
+    });
+    if let Some(tid) = live_terminal_id {
+        body["liveTerminalId"] = json!(tid);
+    }
+    if let Some(owner) = owner {
+        body["ownerKind"] = json!(owner.owner_kind);
+        body["ownerGeneration"] = json!(owner.owner_generation);
+    }
+    (StatusCode::CONFLICT, Json(body)).into_response()
+}
+
 /// [`fail_json_code`] + machine-readable retry guidance for 429-family
 /// rejections. The window rides BOTH the HTTP `Retry-After` header (whole
 /// seconds, floor 1 — HTTP convention) and a `retryAfterMs` body field

@@ -348,7 +348,18 @@ async fn main() -> ExitCode {
     // SAME instance via `fresh_agent_state.layout`. Constructed BEFORE
     // `fresh_agent_state` and wired at `new()`-time so the
     // `fresh_opencode_state` clone (taken immediately below) shares it too.
-    let layout_store = freshell_freshagent::layout_store::LayoutStore::default();
+    // kata b8ke Task 10 (round-1 review, DURABILITY): persisted under the
+    // same config-dir resolution the settings store uses — a server
+    // restart reloads the pane registry instead of losing it, so
+    // respawn/attach resolution for browser-created panes survives restarts.
+    // A `None` home (headless/ephemeral run) has nowhere to persist and
+    // stays in-memory only — the pre-existing behavior.
+    let layout_store = match home.as_deref() {
+        Some(home_dir) => freshell_freshagent::layout_store::LayoutStore::with_persistence(
+            home_dir.join(".freshell").join("layout-store.json"),
+        ),
+        None => freshell_freshagent::layout_store::LayoutStore::default(),
+    };
     let fresh_agent_state =
         FreshAgentState::new(Arc::clone(&auth_token), Arc::clone(&broadcast_tx))
             .with_shared_sessions_revision(Arc::clone(&sessions_revision))

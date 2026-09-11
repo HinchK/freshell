@@ -100,6 +100,11 @@ struct LayoutInner {
     /// entry; if only stale entries remain, the most recent stale one
     /// (Node-parity post-disconnect reads).
     clients: Vec<ClientEntry>,
+    /// kata b8ke Task 10 (round-1 review, DURABILITY): `Some` → every
+    /// mutation that changes the snapshot set rewrites the multi-client
+    /// snapshot to this path (atomic temp+rename) and construction loads
+    /// it, so a server restart does not lose the pane registry.
+    persist_path: Option<std::path::PathBuf>,
 }
 
 impl LayoutInner {
@@ -218,6 +223,58 @@ impl LayoutStore {
         self.inner.lock().expect("layout store mutex")
     }
 
+    /// kata b8ke Task 10 (round-1 review, DURABILITY): construct the store
+    /// with a persistence path. Every mutation that changes the snapshot
+    /// rewrites the multi-client snapshot to `path` with the atomic
+    /// temp+rename discipline (the `~/.freshell/config.json` writer's
+    /// pattern: write `path.tmp`, fsync, rename), and construction LOADS a
+    /// previously persisted file (best-effort: a corrupt/absent file logs
+    /// a warning and boots empty — never a crash). Loaded entries are
+    /// marked STALE: a restarted server has no live connections, and the
+    /// client mirror is change-gated — retention is exactly what the
+    /// stale-entry design exists for.
+    pub fn with_persistence(path: std::path::PathBuf) -> Self {
+        let store = Self::default();
+        {
+            let mut inner = store.lock();
+            inner.persist_path = Some(path.clone());
+            match std::fs::read(&path) {
+                Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                    Ok(body) => load_persisted_clients(&mut inner, &body),
+                    Err(error) => tracing::warn!(
+                        target: "freshell_freshagent::layout_store",
+                        %error,
+                        path = %path.display(),
+                        "layout_store_persist_file_corrupt: booting empty"
+                    ),
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    target: "freshell_freshagent::layout_store",
+                    %error,
+                    path = %path.display(),
+                    "layout_store_persist_file_unreadable: booting empty"
+                ),
+            }
+        }
+        store
+    }
+
+    /// kata b8ke: paneId → owning tabId across per-client snapshots —
+    /// primary-first, most-recent-first (the `resolve_pane_target`
+    /// resolution order). REST-minted panes resolve via `pane_tabs` first;
+    /// this covers browser-created/error panes that live only in layout
+    /// syncs.
+    pub fn find_pane_tab(&self, pane_id: &str) -> Option<String> {
+        let inner = self.lock();
+        for snapshot in inner.snapshots() {
+            if let Some(tab_id) = find_pane_tab(snapshot, pane_id) {
+                return Some(tab_id);
+            }
+        }
+        None
+    }
+
     /// Clones of every client snapshot — primary first, then most-recent-first
     /// — for read-only walkers (target resolver).
     pub(crate) fn snapshots_clone(&self) -> Vec<UiSnapshot> {
@@ -306,6 +363,7 @@ impl LayoutStore {
                 stale: false,
             },
         );
+        persist_locked(&inner);
     }
 
     pub fn has_snapshot(&self) -> bool {
@@ -465,6 +523,7 @@ impl LayoutStore {
         snapshot.active_tab_id = Some(tab_id.clone());
         snapshot.active_pane.insert(tab_id.clone(), pane_id.clone());
         seed_pane_title(snapshot, &tab_id, &pane_id, &content);
+        persist_locked(&inner);
         (tab_id, pane_id)
     }
 
@@ -491,6 +550,7 @@ impl LayoutStore {
             found = true;
         }
         if found {
+            persist_locked(&inner);
             RenameOutcome::tab(tab_id)
         } else {
             RenameOutcome::failed("tab not found")
@@ -509,6 +569,7 @@ impl LayoutStore {
             }
         }
         if found {
+            persist_locked(&inner);
             RenameOutcome::tab(tab_id)
         } else {
             RenameOutcome::failed("tab not found")
@@ -543,6 +604,7 @@ impl LayoutStore {
             .position(|t| Some(&t.id) == snapshot.active_tab_id.as_ref());
         let tab_id = snapshot.tabs[pick(current, snapshot.tabs.len())].id.clone();
         snapshot.active_tab_id = Some(tab_id.clone());
+        persist_locked(&inner);
         Some(tab_id)
     }
 
@@ -569,6 +631,7 @@ impl LayoutStore {
             found = true;
         }
         if found {
+            persist_locked(&inner);
             RenameOutcome::tab(tab_id)
         } else {
             RenameOutcome::failed("tab not found")
@@ -597,6 +660,9 @@ impl LayoutStore {
                 }
             }
             first.get_or_insert(tab_id);
+        }
+        if first.is_some() {
+            persist_locked(&inner);
         }
         match first {
             Some(tab_id) => RenameOutcome::tab_pane(&tab_id, pane_id),
@@ -733,7 +799,10 @@ impl LayoutStore {
             }
         }
         match first {
-            Some(tab_id) => Ok((tab_id, new_pane_id)),
+            Some(tab_id) => {
+                persist_locked(&inner);
+                Ok((tab_id, new_pane_id))
+            }
             None => Err("pane not found"),
         }
     }
@@ -763,6 +832,7 @@ impl LayoutStore {
             found = true;
         }
         if found {
+            persist_locked(&inner);
             RenameOutcome::tab_pane(tab_id, pane_id)
         } else {
             RenameOutcome::failed("tab not found")
@@ -790,6 +860,9 @@ impl LayoutStore {
                     break;
                 }
             }
+        }
+        if first.as_ref().is_some_and(|result| result.is_ok()) {
+            persist_locked(&inner);
         }
         first.unwrap_or(Err("pane not found"))
     }
@@ -824,6 +897,9 @@ impl LayoutStore {
                 .insert(target.clone(), pane_id.to_string());
             snapshot.active_tab_id = Some(target.clone());
             first.get_or_insert(target);
+        }
+        if first.is_some() {
+            persist_locked(&inner);
         }
         match first {
             Some(target) => Ok((target, pane_id.to_string())),
@@ -888,6 +964,9 @@ impl LayoutStore {
                 other_id,
             );
             first.get_or_insert(target);
+        }
+        if first.is_some() {
+            persist_locked(&inner);
         }
         first.ok_or("panes not found")
     }
@@ -954,6 +1033,9 @@ impl LayoutStore {
                 any |= root.set_split_sizes(split_id, sizes);
             }
         }
+        if any {
+            persist_locked(&inner);
+        }
         any
     }
 
@@ -997,6 +1079,9 @@ impl LayoutStore {
                 .expect("count above cap implies a stale entry exists");
             inner.clients.remove(oldest);
         }
+        // The stale-flag flip and the prune both change the snapshot set —
+        // persist unconditionally (a no-change mark is a cheap no-op write).
+        persist_locked(&inner);
     }
 
     /// Total retained entries (live + stale) — test/diagnostic probe.
@@ -1027,6 +1112,147 @@ impl LayoutStore {
 }
 
 // ── snapshot helpers ─────────────────────────────────────────────────────────
+
+/// The persisted-file schema version (kata b8ke Task 10): `{"version": 1,
+/// "clients": [{key, snapshot, stale}]}`. No rotation, no migration beyond
+/// this field — a future shape change bumps it and loads empty.
+const PERSIST_SCHEMA_VERSION: i64 = 1;
+
+/// Rewrite the multi-client snapshot to the store's persistence path (atomic
+/// temp+rename: write `path.tmp`, fsync, rename — the config-persistence
+/// idiom). Best-effort: a failure warn-logs and NEVER blocks the mutation
+/// that called it (the in-memory store stays authoritative for this boot).
+/// Called with the inner lock held (single-process single-writer).
+fn persist_locked(inner: &LayoutInner) {
+    let Some(path) = &inner.persist_path else {
+        return;
+    };
+    let body = json!({
+        "version": PERSIST_SCHEMA_VERSION,
+        "clients": inner
+            .clients
+            .iter()
+            .map(|entry| json!({
+                "key": entry.key,
+                "snapshot": snapshot_value(&entry.snapshot),
+                "stale": entry.stale,
+            }))
+            .collect::<Vec<_>>(),
+    });
+    let write = (|| -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("tmp");
+        let mut file = std::fs::File::create(&tmp)?;
+        use std::io::Write;
+        file.write_all(body.to_string().as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if let Err(error) = write {
+        tracing::warn!(
+            target: "freshell_freshagent::layout_store",
+            %error,
+            path = %path.display(),
+            "layout_store_persist_failed: keeping the in-memory snapshot"
+        );
+    }
+}
+
+/// The load half of [`persist_locked`]: parse the persisted clients array
+/// back into `inner`. Every loaded entry is marked STALE (post-restart, no
+/// connection is live; the change-gated client mirror re-supersedes them on
+/// its next sync via the existing subset-eviction rule).
+fn load_persisted_clients(inner: &mut LayoutInner, body: &Value) {
+    if body.get("version").and_then(Value::as_i64) != Some(PERSIST_SCHEMA_VERSION) {
+        tracing::warn!(
+            target: "freshell_freshagent::layout_store",
+            version = ?body.get("version"),
+            "layout_store_persist_unsupported_version: booting empty"
+        );
+        return;
+    }
+    let Some(clients) = body.get("clients").and_then(Value::as_array) else {
+        tracing::warn!(
+            target: "freshell_freshagent::layout_store",
+            "layout_store_persist_malformed: no clients array, booting empty"
+        );
+        return;
+    };
+    for entry in clients {
+        let Some(key) = entry.get("key").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(snapshot_value_json) = entry.get("snapshot") else {
+            continue;
+        };
+        let Some(snapshot) = snapshot_from_value(snapshot_value_json) else {
+            continue;
+        };
+        inner.clients.push(ClientEntry {
+            key: key.to_string(),
+            snapshot,
+            // A restarted server has no live connections — retained, never
+            // primary while a live client exists (the stale-entry contract).
+            stale: true,
+        });
+    }
+    tracing::info!(
+        target: "freshell_freshagent::layout_store",
+        entries = inner.clients.len(),
+        "layout_store_persist_loaded: registry restored from disk"
+    );
+}
+
+/// Rebuild one [`UiSnapshot`] from its persisted JSON (the `snapshot_value`
+/// round-trip): tabs/activeTabId/layouts (via `PaneNode::parse`)/
+/// activePane/paneTitles/paneTitleSetByUser/timestamp.
+fn snapshot_from_value(value: &Value) -> Option<UiSnapshot> {
+    let obj = value.as_object()?;
+    let mut snapshot = UiSnapshot {
+        tabs: Vec::new(),
+        active_tab_id: obj
+            .get("activeTabId")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        layouts: HashMap::new(),
+        active_pane: HashMap::new(),
+        pane_titles: nested_string_map(obj.get("paneTitles")),
+        pane_title_set_by_user: nested_bool_map(obj.get("paneTitleSetByUser")),
+        timestamp: obj.get("timestamp").and_then(Value::as_i64),
+    };
+    for tab in obj.get("tabs")?.as_array()? {
+        snapshot.tabs.push(TabRow {
+            id: tab.get("id")?.as_str()?.to_string(),
+            title: tab.get("title").and_then(Value::as_str).map(str::to_string),
+            fallback_session_ref: tab.get("fallbackSessionRef").cloned(),
+        });
+    }
+    if let Some(layouts) = obj.get("layouts").and_then(Value::as_object) {
+        for (tab_id, node) in layouts {
+            // The persistence layer is a verbatim round-trip of what the
+            // store itself wrote (`PaneNode::to_value`), so the migration
+            // pass is not needed — but running it keeps a hand-edited or
+            // legacy-shaped file on the same code path as a live sync.
+            let migrated = migrate_legacy_fresh_agent_node(node);
+            if let Some(parsed) = PaneNode::parse(&migrated) {
+                snapshot.layouts.insert(tab_id.clone(), parsed);
+            }
+        }
+    }
+    if let Some(active_pane) = obj.get("activePane").and_then(Value::as_object) {
+        for (tab_id, pane_id) in active_pane {
+            if let Some(pane_id) = pane_id.as_str() {
+                snapshot
+                    .active_pane
+                    .insert(tab_id.clone(), pane_id.to_string());
+            }
+        }
+    }
+    Some(snapshot)
+}
 
 fn tab_row_value(tab: &TabRow) -> Value {
     let mut map = Map::new();
