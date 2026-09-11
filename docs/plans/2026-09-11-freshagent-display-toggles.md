@@ -486,7 +486,7 @@ git commit -m "feat(settings): add fresh-agent display toggles to Coding Agents"
 ### Task 3: E2E — adapt default-rendering describes and add default-visibility + toggle coverage
 
 **Files:**
-- Modify: `test/e2e-browser/specs/fresh-agent.spec.ts` (:1645-1667, :1669-1682, :1748-1785, :1787-1818; one new test)
+- Modify: `test/e2e-browser/specs/fresh-agent.spec.ts` (:1645-1667, :1669-1682, :1748-1785, :1787-1818, :975-980; one new test)
 - Modify: `test/e2e-browser/specs/settings.spec.ts` (`openSettingsSection` helper :13-19 — tabpanel-name derivation; one new test)
 
 **Interfaces:**
@@ -499,7 +499,7 @@ Tasks 1–2 changed the default rendering these describes assume. Observe the re
 
 Run: `export GCLOUD_ROBOT_HOME="$HOME/.codex/skills/gcloud-robot"; scripts/e2e-cloud.sh run --local --project=chromium test/e2e-browser/specs/fresh-agent.spec.ts --grep "activity line collapse|foldable echo captions"`
 
-Expected: FAIL — the three store-default tests (:1645, :1669, :1748) expect collapsed summaries / need an expand click, but strips now mount expanded; :1787's expand clicks now collapse the strips.
+Expected: FAIL — the three store-default tests (:1645, :1669, :1748) expect collapsed summaries / need an expand click, but strips now mount expanded; :1787 may instead PASS VACUOUSLY (its expand clicks collapse the strips, hiding any caption from its count-0 assertion — the same defect its adaptation repairs; observed reality during execution). Additionally run the style-persists test and observe the fifth default-assuming failure it inherits from Task 1: `scripts/e2e-cloud.sh run --local --project=chromium test/e2e-browser/specs/fresh-agent.spec.ts --grep "style setting persists per Fresh Agent pane type"` — expected FAIL at the :977 press (the strip mounts expanded, so the press collapses it and the Thinking disclosure vanishes; adaptation item 5 below repairs it).
 
 - [ ] **Step 2: Write the new tests**
 
@@ -524,7 +524,10 @@ Expected: FAIL — the three store-default tests (:1645, :1669, :1748) expect co
     // showTools defaults on: the strip mounts EXPANDED without any click.
     await expect(strip.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'true')
     await expect(strip.getByRole('button', { name: 'Read tool call' })).toHaveCount(1)
-    await expect(pane.getByText('src/a.ts')).toBeVisible()
+    // Tool blocks mount expanded under the new default, so the input renders
+    // BOTH as the preview span and as the raw <pre data-tool-input> body —
+    // assert the pre (strict-mode-safe; pins the tool-block-expanded default).
+    await expect(pane.locator('pre[data-tool-input]').filter({ hasText: 'src/a.ts' })).toBeVisible()
     // showThinking defaults on: the Thinking disclosure renders.
     const thinking = strip.getByRole('button', { name: 'Thinking' })
     await expect(thinking).toBeVisible()
@@ -647,8 +650,10 @@ No production code in this task. Adapt the four default-assuming tests in `fresh
     await expect(strips.first()).toContainText('5 tools used')
     await toggle.click()
     await expect(pane.getByRole('button', { name: 'Read tool call' })).toHaveCount(5)
-    await expect(pane.getByText('src/a.ts')).toBeVisible()
-    await expect(pane.getByText('src/e.ts')).toBeVisible()
+    // Tool blocks mount expanded (span preview + <pre data-tool-input> both
+    // carry the path) — assert the pre, strict-mode-safe.
+    await expect(pane.locator('pre[data-tool-input]').filter({ hasText: 'src/a.ts' })).toBeVisible()
+    await expect(pane.locator('pre[data-tool-input]').filter({ hasText: 'src/e.ts' })).toBeVisible()
     // A merged line's fork affordance resolves to the line's LAST contributing turn.
     const lineArticle = pane.locator('article[data-turn-index="1"]')
     await lineArticle.hover()
@@ -688,7 +693,7 @@ Replace the whole post-`pushSnapshot` block (:1773-1784) with:
     const caption = pane.getByTestId('fresh-agent-activity-caption')
     await expect(caption).toHaveCount(1)
     await expect(caption).toContainText('Considering options')
-    await expect(pane.getByText('src/b.ts')).toBeVisible()
+    await expect(pane.locator('pre[data-tool-input]').filter({ hasText: 'src/b.ts' })).toBeVisible()
     // (Anchor order — caption row precedes the superseded turn's first item row —
     // is pinned by the unit test's compareDocumentPosition assertion.)
 ```
@@ -703,6 +708,18 @@ Replace the whole post-`pushSnapshot` block (:1773-1784) with:
     await expect(thinking).toBeVisible()
     await thinking.click()
     await expect(stripTwo.getByText('Pausing to plan the next step').first()).toBeVisible()
+```
+
+5. `style setting persists per Fresh Agent pane type and applies serif rendering` (:814-1010, keyboard press at :977) — a FIFTH default-assuming site the original inventory missed, broken the same way by Task 1's flip: the test seeds per-pane `showThinking: true` (:957) but leaves `showTools` at the store default (now true), so the strip mounts expanded and the keyboard press at :977 — written to EXPAND a collapsed strip — now COLLAPSES it, removing the Thinking disclosure that :979 presses. Adaptation (keeps the keyboard-activation discipline; the glom-chip overlay rationale at :969-976 still holds for the Thinking press):
+
+```ts
+    // New default: the strip (and its tool blocks) mount EXPANDED — pin it
+    // instead of blind-pressing the toggle (a press would now collapse).
+    await expect(freshcodexRoot.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'true')
+    // (delete the press at :977 — the strip is already expanded)
+    await expect(freshcodexRoot.getByText('private style reasoning should stay hidden')).toHaveCount(0)
+    await freshcodexRoot.getByRole('button', { name: 'Thinking' }).press('Enter')
+    await expect(freshcodexRoot.getByText('private style reasoning should stay hidden')).toBeVisible()
 ```
 
 - [ ] **Step 4: Run the focused test**
