@@ -1025,40 +1025,115 @@ impl SessionHandoffRunner {
     }
 
     /// Round-3 review I-1: the abort/panic cleanup's coordinator half, run
-    /// on the Drop's detached task when the prior kill was ISSUED but its
-    /// confirmed reap was lost to the abort. Re-probe the prior's liveness
-    /// BEFORE any restore (the reap-timeout discipline): confirmed live →
-    /// restore (and repair the lane claims — the fresh stamp the lane kill
-    /// took, the terminal's retained claim — to the restored generation,
-    /// so the exit watchers can still release later); unconfirmable → typed
-    /// Vacant (never a dying prior recorded as Live). Then the target half.
-    async fn abort_cleanup(self: &Arc<Self>, payload: AbortPayload) {
+    /// on the Drop's detached task. b8ke focused round-3 review R3-6: the
+    /// UNCOMMITTED-TARGET reap runs FIRST — the record stays in this
+    /// operation's `Handoff` (every competing begin Blocked with the typed
+    /// in-flight answer) until the fresh target's `NotConfirmed`
+    /// continuation settles (or a bounded kill confirms) — the record never
+    /// goes plain-Vacant while an uncommitted target may live. THEN the
+    /// prior half: re-probe the prior's liveness (KillInFlight — the
+    /// reap-timeout discipline: a dying prior is never restored as Live;
+    /// a confirmed-live one is restored WITH its lane claims repaired to
+    /// the restored generation) or use the guard's known value
+    /// (NotIssued/Reaped), and fail accordingly. An UNCONFIRMED or
+    /// PLATFORM-LIMITED target reap never fails to plain Vacant — the key
+    /// fences typed (recoverable) instead.
+    async fn abort_cleanup(self: &Arc<Self>, payload: AbortPayload, decision: AbortFailDecision) {
         let AbortPayload {
             provider,
             session_id,
             operation_id,
             generation,
             prior,
-            target_kind,
-            target_spawn_begun,
-            target,
-            spawn_watch,
-        } = payload;
+            ..
+        } = &payload;
+        let target_outcome = self.abort_reap_uncommitted_target(&payload).await;
         let confirmed_live = match prior.as_ref() {
             Some((owner, _)) => {
-                let live = self.probe_prior_live(&provider, &session_id, owner).await;
-                let outcome =
-                    self.ownership
-                        .fail(&provider, &session_id, &operation_id, generation, live);
-                if live && matches!(outcome, FailOutcome::RestoredPriorOwner) {
-                    self.repair_restored_prior_claims(&provider, &session_id, owner, generation);
+                let live = match decision {
+                    AbortFailDecision::Probe => {
+                        self.probe_prior_live(provider, session_id, owner).await
+                    }
+                    AbortFailDecision::Known(live) => live,
+                };
+                match target_outcome {
+                    UncommittedTargetOutcome::Reaped | UncommittedTargetOutcome::NothingToDo => {
+                        let outcome = self.ownership.fail(
+                            provider,
+                            session_id,
+                            operation_id,
+                            *generation,
+                            live,
+                        );
+                        if live && matches!(outcome, FailOutcome::RestoredPriorOwner) {
+                            self.repair_restored_prior_claims(provider, session_id, owner, *generation);
+                        }
+                    }
+                    UncommittedTargetOutcome::PlatformLimited => {
+                        // R3-6 + the round-2 R2-3 discipline: the target's
+                        // descendant tree is unverifiable on this platform —
+                        // fence typed (a new writer can never start against
+                        // the unconfirmable target), never plain Vacant.
+                        let fenced = self.ownership.fence_unconfirmed_handoff(
+                            provider,
+                            session_id,
+                            operation_id,
+                            *generation,
+                            freshell_ownership::FenceReason::PlatformLimited,
+                        );
+                        tracing::error!(target: "freshell_ownership",
+                            event = "ownership.handoff.abort_fenced_platform_limited",
+                            operation_id = %operation_id, provider = %provider, session_id = %session_id,
+                            epoch = self.ownership.boot_epoch(), generation,
+                            outcome = ?fenced,
+                            "the aborted handoff's uncommitted target could not be \
+                             confirmed dead on this platform — the key fences typed");
+                    }
+                    UncommittedTargetOutcome::Unconfirmed => {
+                        // R3-6 fail-closed: the escalation continuation was
+                        // lost or resolved unconfirmed — a live unowned
+                        // writer may remain, so the key fences typed rather
+                        // than reopening.
+                        let fenced = self.ownership.fence_unconfirmed_handoff(
+                            provider,
+                            session_id,
+                            operation_id,
+                            *generation,
+                            freshell_ownership::FenceReason::WatcherFailed,
+                        );
+                        tracing::error!(target: "freshell_ownership",
+                            event = "ownership.handoff.abort_fenced_unconfirmed_target",
+                            operation_id = %operation_id, provider = %provider, session_id = %session_id,
+                            epoch = self.ownership.boot_epoch(), generation,
+                            outcome = ?fenced,
+                            "the aborted handoff's uncommitted target reap never confirmed \
+                             death — the key fences typed (never plain Vacant)");
+                    }
                 }
                 live
             }
             None => {
-                let _ =
-                    self.ownership
-                        .fail(&provider, &session_id, &operation_id, generation, false);
+                match target_outcome {
+                    UncommittedTargetOutcome::Reaped | UncommittedTargetOutcome::NothingToDo => {
+                        let _ = self.ownership.fail(
+                            provider,
+                            session_id,
+                            operation_id,
+                            *generation,
+                            false,
+                        );
+                    }
+                    UncommittedTargetOutcome::PlatformLimited
+                    | UncommittedTargetOutcome::Unconfirmed => {
+                        let _ = self.ownership.fence_unconfirmed_handoff(
+                            provider,
+                            session_id,
+                            operation_id,
+                            *generation,
+                            freshell_ownership::FenceReason::WatcherFailed,
+                        );
+                    }
+                }
                 false
             }
         };
@@ -1067,20 +1142,9 @@ impl SessionHandoffRunner {
             operation_id = %operation_id, provider = %provider, session_id = %session_id,
             epoch = self.ownership.boot_epoch(), generation,
             outcome = if confirmed_live { "restored_prior_owner" } else { "vacant" },
+            target_reap = ?target_outcome,
             failure_reason = "RUNNER_ABORTED",
             "handoff runner aborted inside the prior-reap window; liveness re-probed before restore");
-        self.abort_reap_uncommitted_target(AbortPayload {
-            provider,
-            session_id,
-            operation_id,
-            generation,
-            prior,
-            target_kind,
-            target_spawn_begun,
-            target,
-            spawn_watch,
-        })
-        .await;
     }
 
     /// Round-3 review I-1: the abort/panic cleanup's target half — reap the
@@ -1095,7 +1159,18 @@ impl SessionHandoffRunner {
     ///     its in-function cleanup — the lane kill is idempotent and only
     ///     reached once `start_target` was entered, so the reaped prior can
     ///     never be its victim).
-    async fn abort_reap_uncommitted_target(self: &Arc<Self>, payload: AbortPayload) {
+    ///
+    /// b8ke focused round-3 review R3-6: the fresh-lane kill's answer is
+    /// FULLY consumed — a `NotConfirmed` continuation is AWAITED (the
+    /// caller's coordinator record stays fenced in `Handoff` while it
+    /// runs), a `PlatformLimited` answer is never a confirmed reap, and
+    /// only `Reaped`/`AlreadyGone` release the lane lease. The returned
+    /// outcome tells the cleanup's coordinator half whether the record may
+    /// fail (Reaped/NothingToDo) or must fence typed instead.
+    async fn abort_reap_uncommitted_target(
+        self: &Arc<Self>,
+        payload: &AbortPayload,
+    ) -> UncommittedTargetOutcome {
         let AbortPayload {
             provider,
             session_id,
@@ -1108,8 +1183,8 @@ impl SessionHandoffRunner {
             ..
         } = payload;
         if let Some(target) = target.as_ref() {
-            let req = self.cleanup_request(&provider, &session_id, target.kind);
-            self.reap_uncommitted_target(&req, target, &operation_id, generation)
+            let req = self.cleanup_request(provider, session_id, target.kind);
+            self.reap_uncommitted_target(&req, target, operation_id, *generation)
                 .await;
         }
         if let Some(watch) = spawn_watch.as_ref() {
@@ -1125,46 +1200,47 @@ impl SessionHandoffRunner {
             // collision across providers must never abort an unrelated
             // terminal.
             for entry in self.registry.directory() {
-                if entry.mode == provider
+                if entry.mode == provider.as_str()
                     && entry.resume_session_id.as_deref() == Some(session_id.as_str())
                 {
                     self.kill_and_confirm_terminal(&entry.terminal_id).await;
                 }
             }
         }
-        if target_spawn_begun && target_kind == RuntimeOwnerKind::FreshAgent {
+        if *target_spawn_begun && *target_kind == RuntimeOwnerKind::FreshAgent {
             let initiator = "handoff-guard-cleanup";
-            // b8ke focused FR3: a `NotConfirmed` answer here drops the
-            // lane's escalation continuation — the abort cleanup's kill is
-            // best-effort (the teardown's bounded window already issued its
-            // SIGKILL rounds before the continuation existed), so the lease
-            // stays held for TTL recovery instead.
-            let reaped = match provider.as_str() {
+            let result = match provider.as_str() {
                 "codex" => {
-                    matches!(
-                        self.fresh_codex
-                            .kill_for_handoff(&session_id, initiator)
-                            .await,
-                        StopResult::Reaped
-                    )
+                    self.fresh_codex
+                        .kill_for_handoff(session_id, initiator)
+                        .await
                 }
                 "claude" => {
-                    matches!(
-                        self.fresh_claude
-                            .kill_for_handoff(&session_id, initiator)
-                            .await,
-                        StopResult::Reaped
-                    )
+                    self.fresh_claude
+                        .kill_for_handoff(session_id, initiator)
+                        .await
                 }
                 "opencode" => {
-                    matches!(
-                        self.fresh_opencode
-                            .opencode_kill_for_handoff(&session_id, initiator)
-                            .await,
-                        StopResult::Reaped
-                    )
+                    self.fresh_opencode
+                        .opencode_kill_for_handoff(session_id, initiator)
+                        .await
                 }
-                _ => false,
+                _ => return UncommittedTargetOutcome::Unconfirmed,
+            };
+            let reaped = match result {
+                StopResult::Reaped | StopResult::AlreadyGone => true,
+                // R3-6: a platform-limited teardown (the direct child's
+                // awaited exit is the portable floor, the descendant tree is
+                // unverifiable) must never count as the confirmed reap of
+                // the uncommitted target — the caller fences typed.
+                StopResult::PlatformLimited => {
+                    return UncommittedTargetOutcome::PlatformLimited;
+                }
+                // R3-6: the lane's escalation continuation IS the
+                // confirmation — await it (the coordinator record stays
+                // fenced in Handoff while it runs). A lost/unconfirmed
+                // continuation never reopens the key.
+                StopResult::NotConfirmed { confirmation } => confirmation.await,
             };
             if reaped {
                 // The aborted resume's lease guard dropped ARMED with its
@@ -1172,8 +1248,13 @@ impl SessionHandoffRunner {
                 // for TTL recovery — but the teardown we just awaited IS
                 // the confirmed tree death, so the precise release applies
                 // and the typed RETRYABLE failure stays honestly retryable.
-                self.release_fresh_lane_lease(&provider, &session_id);
+                self.release_fresh_lane_lease(provider, session_id);
+                UncommittedTargetOutcome::Reaped
+            } else {
+                UncommittedTargetOutcome::Unconfirmed
             }
+        } else {
+            UncommittedTargetOutcome::NothingToDo
         }
     }
 
@@ -1656,6 +1737,14 @@ impl SessionHandoffRunner {
                         "ownership.handoff.done",
                         TransitionLevel::Error,
                     );
+                    // b8ke focused round-3 R3-3: the fence is TERMINAL on
+                    // this platform — RETURN, exactly like the Lost arm.
+                    // Falling through would run the Confirmed-release code
+                    // below, reopening the key (and broadcasting
+                    // `released`) over a descendant tree nobody ever
+                    // confirmed dead — the fail-open the delayed-crossing
+                    // test pins.
+                    return;
                 }
                 ReapAnswer::Confirmed => {}
             }
@@ -2156,6 +2245,38 @@ struct AbortPayload {
     spawn_watch: Option<crate::terminal_tabs::HandoffSpawnWatch>,
 }
 
+/// b8ke focused round-3 review R3-6: what the abort cleanup's
+/// uncommitted-target reap established — the coordinator half's ending
+/// keys off it (fail to the probed prior/Vacant, or fence typed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UncommittedTargetOutcome {
+    /// No target cleanup was owed (nothing spawned/begun), or the reap
+    /// confirmed the target's death — the record may fail.
+    NothingToDo,
+    /// The target's death was confirmed (lane teardown awaited, terminal
+    /// dead-poll, or AlreadyGone idempotence) — the record may fail.
+    Reaped,
+    /// The lane's teardown confirmed the direct child's awaited exit but
+    /// cannot verify the descendant tree (non-Linux) — never a confirmed
+    /// reap; the record fences typed instead of failing.
+    PlatformLimited,
+    /// The escalation continuation was lost or resolved unconfirmed — a
+    /// live unowned writer may remain; the record fences typed instead of
+    /// failing.
+    Unconfirmed,
+}
+
+/// How the abort cleanup decides the prior's liveness for its `fail`:
+/// `Probe` re-probes (the KillInFlight window — the kill was issued but
+/// its confirmation was lost to the abort); `Known` carries the guard's
+/// already-settled value (NotIssued: the untouched prior; Reaped: never
+/// restore a dead runtime).
+#[derive(Debug, Clone, Copy)]
+enum AbortFailDecision {
+    Probe,
+    Known(bool),
+}
+
 /// RAII: fail the coordinator entry if the handoff task is cancelled or
 /// panics before commit (armed + not disarmed => fail on Drop) — the
 /// `FreshSessionLeaseGuard` drop-discipline precedent. Round-1 review: the
@@ -2217,14 +2338,6 @@ impl HandoffGuard {
         )
     }
 
-    /// Move the full abort payload out (the prior-reap window's deferred
-    /// cleanup consumes everything).
-    fn take_abort_payload(&mut self) -> AbortPayload {
-        let target = self.target_runtime.take();
-        let spawn_watch = self.target_spawn_watch.take();
-        self.abort_payload_with(target, spawn_watch)
-    }
-
     /// The target-half payload: the given target identity + spawn watch in
     /// place of the guard's own (already-taken) ones.
     fn abort_payload_with(
@@ -2252,22 +2365,38 @@ impl Drop for HandoffGuard {
             return;
         }
         let reactor = tokio::runtime::Handle::try_current();
-        if matches!(self.prior_stop, PriorStopPhase::KillInFlight) && reactor.is_ok() {
-            // Round-3 review I-1 (prior-reap window): the kill was issued
-            // but its confirmed reap was lost to the abort. DEFER the
-            // restore decision to the detached cleanup — it re-probes the
-            // prior's liveness first (a dying prior is never restored as
-            // Live) and repairs the lane claims on a confirmed-live
-            // restore. The record stays Handoff only for the probe's
-            // microsecond-to-millisecond duration — retryable, never
-            // wedged.
-            let runner = Arc::clone(&self.runner);
-            let payload = self.take_abort_payload();
-            self.disarmed = true;
-            tokio::spawn(async move {
-                runner.abort_cleanup(payload).await;
-            });
-            return;
+        // b8ke focused round-3 review R3-6: whenever an uncommitted-target
+        // cleanup is owed, the global fail is DEFERRED into the detached
+        // cleanup — the record stays in this operation's `Handoff` (every
+        // competing begin Blocked with the typed in-flight answer) until
+        // the target's reap settles (the NotConfirmed continuation, or a
+        // bounded kill). Only when NOTHING is owed (or no reactor exists —
+        // runtime shutdown, nothing can run) does the sync fail below run.
+        let target = self.target_runtime.take();
+        let spawn_watch = self.target_spawn_watch.take();
+        let owes_target_cleanup = target.is_some()
+            || spawn_watch.is_some()
+            || (self.target_spawn_begun && self.target_kind == RuntimeOwnerKind::FreshAgent);
+        if let Ok(handle) = &reactor {
+            if matches!(self.prior_stop, PriorStopPhase::KillInFlight) || owes_target_cleanup {
+                // Round-3 review I-1 (prior-reap window): the kill was
+                // issued but its confirmed reap was lost to the abort —
+                // the detached cleanup re-probes the prior's liveness
+                // first (a dying prior is never restored as Live) and
+                // repairs the lane claims on a confirmed-live restore.
+                let decision = match self.prior_stop {
+                    PriorStopPhase::KillInFlight => AbortFailDecision::Probe,
+                    PriorStopPhase::NotIssued => AbortFailDecision::Known(self.prior_still_live),
+                    PriorStopPhase::Reaped => AbortFailDecision::Known(false),
+                };
+                let runner = Arc::clone(&self.runner);
+                let payload = self.abort_payload_with(target, spawn_watch);
+                self.disarmed = true;
+                handle.spawn(async move {
+                    runner.abort_cleanup(payload, decision).await;
+                });
+                return;
+            }
         }
         // Sync fail: NotIssued restores the untouched prior (true); Reaped
         // never restores (false); KillInFlight with NO reactor (runtime
@@ -2292,26 +2421,6 @@ impl Drop for HandoffGuard {
                     owner,
                     self.generation,
                 );
-            }
-        }
-        // Cancellation/panic mid-flight: a spawned-but-uncommitted target
-        // runtime has no owner record — reap it on a detached task (Drop is
-        // sync; the lanes' teardowns are async). The fresh-lane sweep and
-        // the settle-watch reap ride the same cleanup. Racing an explicit
-        // reap is harmless: the lanes' teardowns and the registry kill are
-        // idempotent.
-        let target = self.target_runtime.take();
-        let spawn_watch = self.target_spawn_watch.take();
-        if target.is_some()
-            || spawn_watch.is_some()
-            || (self.target_spawn_begun && self.target_kind == RuntimeOwnerKind::FreshAgent)
-        {
-            if let Ok(handle) = reactor {
-                let runner = Arc::clone(&self.runner);
-                let payload = self.abort_payload_with(target, spawn_watch);
-                handle.spawn(async move {
-                    runner.abort_reap_uncommitted_target(payload).await;
-                });
             }
         }
     }

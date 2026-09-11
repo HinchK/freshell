@@ -129,7 +129,8 @@ pub struct FreshClaudeState {
     /// watcher's replacement probe kill-and-confirms the recorded tree
     /// through exactly this pair — the bounded recorded-identity probe the
     /// fenced key releases on. Cleared by whichever path confirms death.
-    condemned_priors: Arc<std::sync::Mutex<HashMap<String, (u32, String)>>>,
+    condemned_priors:
+        Arc<std::sync::Mutex<HashMap<String, crate::session_lease::CondemnedRuntimeIdentity>>>,
     /// Test seam (Task 6 round-3 review I-1): park `resume_for_attach`
     /// right after the target session is REGISTERED — the fresh-arm
     /// target-spawn-window abort test's deterministic hold. `None` in
@@ -686,11 +687,16 @@ impl FreshClaudeState {
         self.handoff_platform_limited = armed;
     }
 
-    /// b8ke focused round-2 review R2-1: record the condemned prior's
-    /// identity — `(sidecar child pid, /proc ownership tag)` — for the
+    /// b8ke focused round-2 review R2-1 (widened round-3 R3-7): record the
+    /// condemned prior's identity — the direct child's pid + start time AND
+    /// the already-discovered tagged descendant tree, captured NOW (while
+    /// the ancestry chain is intact and the tags readable) — for the
     /// canonical `session_id`, BEFORE `kill_for_handoff`'s first
     /// cancellable await. Sync (lock awaits only), never removes anything
-    /// from the sessions map.
+    /// from the sessions map. The replacement probe verifies the start
+    /// time before signaling (no unrelated-process kills on pid reuse) and
+    /// sweeps the recorded tree when reparenting makes the tags unreadable
+    /// (no empty-tree false confirmation).
     async fn record_condemned_prior(&self, session_id: &str) {
         let Some(map_key) = self.resolve_session_key(session_id).await else {
             return;
@@ -705,10 +711,15 @@ impl FreshClaudeState {
             })
         };
         if let Some((pid, tag)) = identity {
+            let recorded = crate::session_lease::record_condemned_runtime_identity(
+                pid,
+                CLAUDE_SIDECAR_OWNERSHIP_ENV,
+                &tag,
+            );
             self.condemned_priors
                 .lock()
                 .expect("condemned priors lock")
-                .insert(session_id.to_string(), (pid, tag));
+                .insert(session_id.to_string(), recorded);
         }
     }
 
@@ -716,12 +727,15 @@ impl FreshClaudeState {
     /// death probe for a fenced claude/kilroy prior. A condemned-prior
     /// record means a `kill_for_handoff` was cancelled or panicked between
     /// arming its record and confirming the tree's death — this probe
-    /// FINISHES the job (SIGTERM→SIGKILL the recorded child + tagged tree,
-    /// confirm dead-by-starttime) and clears the record on success. A
-    /// still-mapped session (the cancelled kill never reached the map
-    /// removal) instead gets the lane's own full teardown re-run — its
-    /// `Reaped` answer IS the confirmed reap. Never confirms on less:
-    /// `false` keeps the fence held (fail-closed).
+    /// FINISHES the job (SIGTERM→SIGKILL the recorded child + recorded
+    /// tree, confirm dead-by-starttime — R3-7: the pid's start time is
+    /// verified before any signal, and the tree captured at kill time
+    /// still sweeps descendants whose tags became unreadable after the
+    /// child died) and clears the record on success. A still-mapped
+    /// session (the cancelled kill never reached the map removal) instead
+    /// gets the lane's own full teardown re-run — its `Reaped` answer IS
+    /// the confirmed reap. Never confirms on less: `false` keeps the fence
+    /// held (fail-closed).
     pub(crate) async fn confirm_fenced_prior_dead(&self, session_id: &str) -> bool {
         // Bind before the `if let`: the guard must never live across the
         // kill-and-confirm await.
@@ -731,11 +745,10 @@ impl FreshClaudeState {
             .expect("condemned priors lock")
             .get(session_id)
             .cloned();
-        if let Some((pid, tag)) = condemned {
-            let confirmed = crate::session_lease::kill_and_confirm_tree_dead(
-                pid,
+        if let Some(condemned) = condemned {
+            let confirmed = crate::session_lease::kill_and_confirm_recorded_tree_dead(
+                &condemned,
                 CLAUDE_SIDECAR_OWNERSHIP_ENV,
-                &tag,
             )
             .await;
             if confirmed {
@@ -17047,5 +17060,172 @@ rl.on('line', (line) => {
             "the ledger holds NO row at all afterward — not even an empty record"
         );
         drop(env);
+    }
+
+    // ── b8ke focused round-3 R3-7: the condemned-prior recorded identity ──
+
+    /// R3-7(b): the fenced-prior death probe must not FALSE-CONFIRM over a
+    /// reparented descendant. The condemned record is armed while the
+    /// sidecar lives (the ancestry chain intact, the ownership tags
+    /// readable); by probe time the sidecar has exited and the tagged
+    /// grandchild reparented to init — its environ is no longer readable
+    /// (YAMA) — so a fresh tag scan alone finds NOTHING and answers
+    /// `true` while the descendant still runs. The recorded identity (the
+    /// original pid + start time and the tree discovered at kill time) is
+    /// what still confirms and kills the reparented descendant.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_fenced_prior_probe_kills_a_reparented_descendant_from_the_recorded_identity() {
+        let st = state();
+        let sid = format!("r37-reparent-{}", uuid::Uuid::new_v4());
+        // The condemned "sidecar" child holding a tagged "CLI grandchild".
+        let mut child = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg("sleep 300 & wait")
+            .env("R37_TEST_OWNERSHIP", &sid)
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the condemned child");
+        let child_pid = child.id().expect("child pid");
+        // Give bash a beat to spawn the grandchild, then discover the
+        // grandchild's pid from the tagged /proc scan (the record's own
+        // discovery mechanism, same as the production capture).
+        let grandchild_pid = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let tree = std::fs::read_dir("/proc").expect("read /proc");
+                let mut found: Option<i32> = None;
+                for entry in tree.flatten() {
+                    let name = entry.file_name();
+                    let Some(name) = name.to_str() else { continue };
+                    let Ok(p) = name.parse::<i32>() else { continue };
+                    if p == child_pid as i32 {
+                        continue;
+                    }
+                    let Ok(bytes) =
+                        std::fs::read(std::path::Path::new("/proc").join(name).join("environ"))
+                    else {
+                        continue;
+                    };
+                    let needle = format!("R37_TEST_OWNERSHIP={sid}");
+                    if bytes.split(|b| *b == 0).any(|kv| kv == needle.as_bytes()) {
+                        found = Some(p);
+                        break;
+                    }
+                }
+                if let Some(p) = found {
+                    break p as u32;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the tagged grandchild never appeared in the scan"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+
+        // The condemned record the interrupted kill armed (the fixture
+        // seeds exactly what `record_condemned_prior` arms — captured
+        // while the child and its tagged tree are still readable).
+        let recorded = crate::session_lease::record_condemned_runtime_identity(
+            child_pid,
+            "R37_TEST_OWNERSHIP",
+            &sid,
+        );
+        st.condemned_priors
+            .lock()
+            .expect("condemned priors lock")
+            .insert(sid.clone(), recorded);
+
+        // The child exits out-of-band (the interrupted teardown's partial
+        // kill): the grandchild reparents to init and its tag becomes
+        // unreadable — the fresh-scan-blindness window.
+        let _ = tokio::process::Command::new("kill")
+            .arg(child_pid.to_string())
+            .status()
+            .await
+            .expect("kill the condemned child");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while crate::session_lease::proc_starttime(child_pid as i32).is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the condemned child never died"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // The reparenting is what makes the fresh scan blind — give it a
+        // beat to land (the grandchild's environ is unreadable once bash
+        // is gone from its ancestry chain).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // THE R3-7(b) regression: the probe must KILL the reparented
+        // descendant (from the recorded tree) and confirm — never answer
+        // `true` over a still-running descendant.
+        let confirmed = st.confirm_fenced_prior_dead(&sid).await;
+        assert!(confirmed, "the recorded identity must confirm the tree dead");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while crate::session_lease::proc_starttime(grandchild_pid as i32).is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reparented tagged descendant was never killed — a false confirmation"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // The record cleared with the confirmed kill.
+        assert!(
+            !st.condemned_priors
+                .lock()
+                .expect("condemned priors lock")
+                .contains_key(&sid),
+            "the confirmed kill clears the condemned record"
+        );
+    }
+
+    /// R3-7(a): the fenced-prior death probe must verify the recorded pid's
+    /// START TIME before signaling — a recycled pid belongs to an unrelated
+    /// process (the original incarnation is gone). Pre-fix, the probe
+    /// signals whatever currently holds the pid.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_fenced_prior_probe_never_signals_a_reused_pid() {
+        let st = state();
+        let sid = format!("r37-reuse-{}", uuid::Uuid::new_v4());
+        // A live "unrelated replacement" process holding the recorded pid.
+        let mut unrelated = tokio::process::Command::new("sleep")
+            .arg("300")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the unrelated replacement");
+        let pid = unrelated.id().expect("unrelated pid");
+
+        // The condemned record: the pid with the ORIGINAL incarnation's
+        // start time (forged to differ — the pid-reuse shape: the original
+        // died, an unrelated process recycled the pid).
+        let recorded = crate::session_lease::CondemnedRuntimeIdentity {
+            pid,
+            start_time: Some(u64::MAX / 2),
+            tree: Vec::new(),
+            ownership_id: sid.clone(),
+        };
+        st.condemned_priors
+            .lock()
+            .expect("condemned priors lock")
+            .insert(sid.clone(), recorded);
+
+        let confirmed = st.confirm_fenced_prior_dead(&sid).await;
+
+        // THE R3-7(a) regression: the unrelated process was NEVER
+        // signaled — it is still alive — while the probe honestly
+        // confirms the original incarnation dead (its recorded tree is
+        // empty and its pid was recycled).
+        assert!(
+            crate::session_lease::proc_starttime(pid as i32).is_some(),
+            "the reused pid's unrelated process must never be signaled"
+        );
+        assert!(
+            confirmed,
+            "the original incarnation is gone (pid reused) — confirmed dead"
+        );
+        let _ = unrelated.kill().await;
     }
 }

@@ -87,9 +87,23 @@ pub async fn kill_and_confirm_tree_dead(pid: u32, ownership_env: &str, ownership
         }
     }
 
-    // 3. Sweep the captured tree until confirmed empty (bounded; SIGKILL escalation
-    //    after 20 SIGTERM rounds). Re-scan folds in still-readable tagged newcomers
-    //    (covers the YAMA=0 case and children spawned after the initial capture).
+    // 3. Sweep the captured tree until confirmed empty (bounded; SIGKILL
+    // escalation after 20 SIGTERM rounds). Re-scan folds in still-readable
+    // tagged newcomers (covers the YAMA=0 case and children spawned after
+    // the initial capture).
+    sweep_captured_tree_until_dead(tree, ownership_env, ownership_id).await
+}
+
+/// The sweep behind [`kill_and_confirm_tree_dead`]'s step 3: poll the
+/// captured `(pid, starttime)` tree until every member is confirmed
+/// dead-by-starttime (SIGTERM rounds, SIGKILL escalation after 20 rounds),
+/// folding in currently-readable tagged newcomers each round.
+#[cfg(target_os = "linux")]
+async fn sweep_captured_tree_until_dead(
+    mut tree: Vec<(i32, u64)>,
+    ownership_env: &str,
+    ownership_id: &str,
+) -> bool {
     for round in 0..24u8 {
         tree.retain(|(p, st)| proc_starttime(*p) == Some(*st));
         for p in scan_tagged_pids(ownership_env, ownership_id) {
@@ -116,6 +130,131 @@ pub async fn kill_and_confirm_tree_dead(pid: u32, ownership_env: &str, ownership
     }
     tree.retain(|(p, st)| proc_starttime(*p) == Some(*st));
     tree.is_empty()
+}
+
+/// b8ke focused round-3 review R3-7: the recorded identity of a condemned
+/// runtime — the direct child's pid + its `/proc` start time and the tagged
+/// descendant tree discovered at KILL TIME (while the ancestry chain was
+/// still intact and the ownership tags readable). The replacement probe (a
+/// cancelled/panicked teardown's finisher) verifies the pid's start time
+/// BEFORE signaling (a recycled pid belongs to an unrelated process —
+/// never signaled) and sweeps the RECORDED tree, so reparented descendants
+/// whose tags became unreadable after the child died are still confirmed
+/// dead-by-starttime — never an empty-tree false confirmation.
+#[derive(Debug, Clone)]
+pub struct CondemnedRuntimeIdentity {
+    /// The direct sidecar child's pid at kill time.
+    pub pid: u32,
+    /// The child's `/proc` start time at kill time (`None` when unreadable
+    /// or on non-Linux): the pid-reuse guard.
+    pub start_time: Option<u64>,
+    /// The tagged `(pid, starttime)` pairs discovered at kill time — the
+    /// child plus its descendants, captured while readable.
+    pub tree: Vec<(i32, u64)>,
+    /// The ownership tag the tree was discovered under.
+    pub ownership_id: String,
+}
+
+/// Capture a condemned runtime's identity NOW (kill time): the tagged tree
+/// scan plus the direct child's start time. Cheap, sync, no signals.
+#[cfg(target_os = "linux")]
+pub fn record_condemned_runtime_identity(
+    pid: u32,
+    ownership_env: &str,
+    ownership_id: &str,
+) -> CondemnedRuntimeIdentity {
+    let mut tree: Vec<(i32, u64)> = scan_tagged_pids(ownership_env, ownership_id)
+        .into_iter()
+        .filter_map(|p| proc_starttime(p).map(|st| (p, st)))
+        .collect();
+    if !tree.iter().any(|(p, _)| *p == pid as i32) {
+        if let Some(st) = proc_starttime(pid as i32) {
+            tree.push((pid as i32, st));
+        }
+    }
+    CondemnedRuntimeIdentity {
+        pid,
+        start_time: proc_starttime(pid as i32),
+        tree,
+        ownership_id: ownership_id.to_string(),
+    }
+}
+
+/// Non-Linux: no `/proc` — nothing can be captured (the direct child's
+/// death remains the caller's portable floor; the fence stays held).
+#[cfg(not(target_os = "linux"))]
+pub fn record_condemned_runtime_identity(
+    pid: u32,
+    _ownership_env: &str,
+    ownership_id: &str,
+) -> CondemnedRuntimeIdentity {
+    CondemnedRuntimeIdentity {
+        pid,
+        start_time: None,
+        tree: Vec::new(),
+        ownership_id: ownership_id.to_string(),
+    }
+}
+
+/// The recorded-identity kill-and-confirm (b8ke focused round-3 R3-7):
+/// like [`kill_and_confirm_tree_dead`] but driven by the identity captured
+/// at kill time —
+///
+/// 1. The pid-reuse guard BEFORE any signal: a pid whose CURRENT start
+///    time differs from the recorded one belongs to an unrelated
+///    replacement process (the original incarnation is gone for the pid to
+///    have been reused) — it is NEVER signaled; the sweep proceeds without
+///    it.
+/// 2. The graceful-then-forced direct-child kill (only when the child is
+///    still the recorded incarnation).
+/// 3. The sweep runs over the RECORDED tree (reparented descendants whose
+///    tags became unreadable are still confirmed dead-by-starttime) plus
+///    any currently-readable tagged newcomers.
+#[cfg(target_os = "linux")]
+pub async fn kill_and_confirm_recorded_tree_dead(
+    recorded: &CondemnedRuntimeIdentity,
+    ownership_env: &str,
+) -> bool {
+    let child_live = match recorded.start_time {
+        Some(expected) => match proc_starttime(recorded.pid as i32) {
+            Some(actual) if actual != expected => {
+                tracing::warn!(target: "freshell_freshagent::session_lease",
+                    pid = recorded.pid, ownership_id = %recorded.ownership_id,
+                    "session_lease.condemned_pid_reused: the recorded child's pid now belongs \
+                     to an unrelated process — not signaled; the original incarnation is gone"
+                );
+                false
+            }
+            // Alive at the recorded incarnation (or unreadable right now).
+            _ => true,
+        },
+        // No recorded start time: the legacy discipline (signal the pid).
+        None => true,
+    };
+    if child_live {
+        unsafe {
+            libc::kill(recorded.pid as i32, libc::SIGTERM);
+        }
+        if !wait_pid_gone(recorded.pid).await {
+            unsafe {
+                libc::kill(recorded.pid as i32, libc::SIGKILL);
+            }
+            if !wait_pid_gone(recorded.pid).await {
+                return false;
+            }
+        }
+    }
+    sweep_captured_tree_until_dead(recorded.tree.clone(), ownership_env, &recorded.ownership_id)
+        .await
+}
+
+/// Non-Linux: no `/proc` — hold closed (the fence stays held).
+#[cfg(not(target_os = "linux"))]
+pub async fn kill_and_confirm_recorded_tree_dead(
+    _recorded: &CondemnedRuntimeIdentity,
+    _ownership_env: &str,
+) -> bool {
+    false
 }
 
 #[cfg(not(target_os = "linux"))]

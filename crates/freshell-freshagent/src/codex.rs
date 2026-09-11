@@ -200,7 +200,8 @@ pub struct FreshCodexState {
     /// watcher's replacement probe kill-and-confirms the recorded tree
     /// through exactly this pair. Cleared by whichever path confirms
     /// death.
-    condemned_priors: Arc<StdMutex<HashMap<String, (u32, String)>>>,
+    condemned_priors:
+        Arc<StdMutex<HashMap<String, crate::session_lease::CondemnedRuntimeIdentity>>>,
     /// Task 13b: cross-kind liveness -- true when a live terminal PTY owns
     /// `(provider, session_id)`. Wired by `main.rs`; defaults to always-false.
     terminal_liveness: crate::TerminalLivenessProbe,
@@ -632,10 +633,15 @@ impl FreshCodexState {
             "freshagent.codex.handoff_stop: stopping the prior freshcodex runtime for handoff"
         );
         crate::ownership_lane::take_retained_stamp(&self.ownership_stamps, session_id);
-        // b8ke focused round-2 review R2-1: record the condemned identity
-        // BEFORE the first await a cancellation can land in — a cancelled
+        // b8ke focused round-2 review R2-1 (widened round-3 R3-7): record
+        // the condemned identity — the child's pid + start time AND the
+        // already-discovered tagged tree, captured NOW (while readable) —
+        // BEFORE the first await a cancellation can land in. A cancelled
         // or panicked teardown leaves this record as the replacement
-        // watcher's bounded kill-and-confirm probe target.
+        // watcher's bounded kill-and-confirm probe target; the recorded
+        // tree still sweeps descendants whose tags became unreadable after
+        // the child died, and the start-time check never signals a reused
+        // pid.
         {
             let identity = self
                 .sessions
@@ -648,10 +654,15 @@ impl FreshCodexState {
                         .map(|pid| (pid, session.sidecar_ownership_id.clone()))
                 });
             if let Some((pid, tag)) = identity {
+                let recorded = crate::session_lease::record_condemned_runtime_identity(
+                    pid,
+                    CODEX_SIDECAR_OWNERSHIP_ENV,
+                    &tag,
+                );
                 self.condemned_priors
                     .lock()
                     .expect("condemned priors lock")
-                    .insert(session_id.to_string(), (pid, tag));
+                    .insert(session_id.to_string(), recorded);
             }
         }
         self.clear_controls(session_id).await;
@@ -676,16 +687,18 @@ impl FreshCodexState {
         crate::session_handoff::StopResult::Reaped
     }
 
-    /// b8ke focused round-2 review R2-1: the bounded recorded-identity
-    /// death probe for a fenced freshcodex prior. A condemned-prior record
-    /// means a `kill_for_handoff` was cancelled or panicked between arming
-    /// its record and the watcher's confirmed reap — this probe FINISHES
-    /// the job (SIGTERM→SIGKILL the recorded child + tagged tree, confirm
-    /// dead-by-starttime) and clears the record on success. A still-mapped
-    /// session (the cancelled kill never reached the map removal) instead
-    /// gets the lane's own full teardown re-run — its `Reaped` answer IS
-    /// the confirmed reap. Never confirms on less: `false` keeps the
-    /// fence held (fail-closed).
+    /// b8ke focused round-2 review R2-1 (widened round-3 R3-7): the bounded
+    /// recorded-identity death probe for a fenced freshcodex prior. A
+    /// condemned-prior record means a `kill_for_handoff` was cancelled or
+    /// panicked between arming its record and the watcher's confirmed
+    /// reap — this probe FINISHES the job (SIGTERM→SIGKILL the recorded
+    /// child + RECORDED tree, confirm dead-by-starttime — the start time
+    /// is verified before any signal, and the tree captured at kill time
+    /// still sweeps reparented descendants) and clears the record on
+    /// success. A still-mapped session (the cancelled kill never reached
+    /// the map removal) instead gets the lane's own full teardown re-run
+    /// — its `Reaped` answer IS the confirmed reap. Never confirms on
+    /// less: `false` keeps the fence held (fail-closed).
     pub(crate) async fn confirm_fenced_prior_dead(&self, session_id: &str) -> bool {
         // Bind before the `if let`: the guard must never live across the
         // kill-and-confirm await.
@@ -695,11 +708,10 @@ impl FreshCodexState {
             .expect("condemned priors lock")
             .get(session_id)
             .cloned();
-        if let Some((pid, tag)) = condemned {
-            let confirmed = crate::session_lease::kill_and_confirm_tree_dead(
-                pid,
+        if let Some(condemned) = condemned {
+            let confirmed = crate::session_lease::kill_and_confirm_recorded_tree_dead(
+                &condemned,
                 CODEX_SIDECAR_OWNERSHIP_ENV,
-                &tag,
             )
             .await;
             if confirmed {

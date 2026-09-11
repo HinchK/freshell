@@ -1670,6 +1670,91 @@ async fn handoff_with_a_platform_limited_prior_stop_fences_the_key_typed() {
     assert_eq!(retried["error"]["code"], json!("HANDOFF_IN_PROGRESS"));
 }
 
+/// 3j. b8ke focused round-3 review R3-3: the DELAYED platform-limited
+/// shape — a teardown that crosses the handoff's reap budget (the runner
+/// answers REAP_TIMEOUT and detaches the kill) and only LATER resolves
+/// PlatformLimited — must leave the key `Fenced{PlatformLimited}`. The
+/// delayed watcher's PlatformLimited arm fences and RETURNS: falling
+/// through into the confirmed-death release would reopen the key (and
+/// broadcast `released`) over a descendant tree nobody ever confirmed —
+/// the literal-missing-return fail-open this test pins.
+#[tokio::test]
+async fn a_delayed_platform_limited_reap_fences_the_key_and_never_releases() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let kill_pause = Arc::new(tokio::sync::Notify::new());
+    // The platform-limited seam + a SHORT reap budget: the parked lane kill
+    // crosses the runner's budget (the timeout branch spawns it detached),
+    // then the released park answers PlatformLimited.
+    let mut rig = build_rig_with_options(
+        None,
+        Some(Arc::clone(&kill_pause)),
+        None,
+        150,
+        None,
+        true,
+    );
+    establish_fresh_claude_owner(&rig, &sid).await;
+
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    // The lane kill parks past the runner's budget (the stamp is taken —
+    // the deterministic observable that the kill entered its pause).
+    await_cond("the lane kill must issue (take the stamp)", || {
+        crate::ownership_lane::peek_retained_stamp(&rig.fresh_claude.ownership_stamps, &sid)
+            .is_none()
+    })
+    .await;
+    let result = handle.completion.await.expect("runner completed");
+    assert_eq!(result["error"]["code"], json!("REAP_TIMEOUT"));
+
+    // The parked kill now crosses: it answers PlatformLimited late.
+    kill_pause.notify_one();
+
+    // THE R3-3 regression: the delayed PlatformLimited answer FENCES the
+    // key typed — never falls through into the confirmed-death release
+    // (which would reopen it and broadcast `released`).
+    await_cond("the delayed platform-limited answer must fence the key", || {
+        matches!(
+            rig.ownership.observe("claude", &sid).state,
+            OwnershipState::Fenced {
+                reason: freshell_ownership::FenceReason::PlatformLimited,
+                ..
+            }
+        )
+    })
+    .await;
+    // The fence is terminal on this platform: NO corrective `released`
+    // frame may follow the fenced `handoff-failed` frame.
+    let frames = await_owner_frames(&mut rig.rx, &["handoff-failed"]).await;
+    assert!(
+        !frames
+            .iter()
+            .any(|f| f["transition"] == "released"),
+        "the delayed platform-limited fence must never broadcast released: {frames:?}"
+    );
+    let _ = runtime_owner_frame(&frames, "handoff-failed");
+    // A new writer stays Blocked over the unconfirmed descendant tree.
+    assert!(
+        matches!(
+            rig.ownership.begin_start(
+                "claude",
+                &sid,
+                RuntimeOwnerKind::FreshAgent,
+                "delayed-pl-fence-probe-create",
+                None,
+                "test",
+                0,
+            ),
+            BeginOutcome::Blocked { .. }
+        ),
+        "a create during the delayed platform-limited fence must be Blocked"
+    );
+}
+
 /// 3h. b8ke focused review FR3 (the runner's fenced not-confirmed path): a
 /// claude prior whose teardown CANNOT confirm the runtime tree's death in
 /// its bounded window (a TERM-immune tagged descendant outlives the
@@ -2416,11 +2501,15 @@ async fn handoff_abort_during_target_spawn_reaps_the_uncommitted_terminal() {
     handle.abort();
     let _ = handle.task.await;
 
-    // The key ends Vacant (the prior was reaped; the sync fail ran in Drop).
-    assert_eq!(
-        rig.ownership.observe("claude", &sid).state,
-        OwnershipState::Vacant,
-        "the aborted handoff must leave the key Vacant"
+    // b8ke focused round-3 R3-6: the key does NOT go plain-Vacant yet — the
+    // deferred cleanup holds the record in Handoff (Blocked) until the
+    // uncommitted terminal's settle + reap complete.
+    assert!(
+        matches!(
+            rig.ownership.observe("claude", &sid).state,
+            OwnershipState::Handoff { .. }
+        ),
+        "the abort must hold the fence while the uncommitted target settle runs"
     );
 
     // Release the settle: it completes UNDER-TICKET (no commit — the
@@ -2440,6 +2529,12 @@ async fn handoff_abort_during_target_spawn_reaps_the_uncommitted_terminal() {
             .any(|entry| entry.resume_session_id.as_deref() == Some(sid.as_str())),
         "no terminal may own {sid} after the aborted handoff"
     );
+
+    // The settled cleanup vacated the key (the prior was reaped).
+    await_cond("the settled cleanup must leave the key Vacant", || {
+        rig.ownership.observe("claude", &sid).state == OwnershipState::Vacant
+    })
+    .await;
 
     // The key reopens (not wedged).
     assert!(matches!(
@@ -2530,11 +2625,6 @@ async fn handoff_abort_cleanup_spares_a_same_id_different_provider_terminal() {
     // ABORT inside the target-spawn await.
     handle.abort();
     let _ = handle.task.await;
-    assert_eq!(
-        rig.ownership.observe("claude", &sid).state,
-        OwnershipState::Vacant,
-        "the aborted handoff must leave the key Vacant"
-    );
     pause.notify_one();
 
     // The uncommitted CLAUDE target is reaped — no claude row may hold the
@@ -2551,6 +2641,12 @@ async fn handoff_abort_cleanup_spares_a_same_id_different_provider_terminal() {
             })
         },
     )
+    .await;
+    // b8ke focused round-3 R3-6: the deferred cleanup settled — the key
+    // vacated only after the uncommitted target's reap completed.
+    await_cond("the settled cleanup must leave the key Vacant", || {
+        rig.ownership.observe("claude", &sid).state == OwnershipState::Vacant
+    })
     .await;
     // The sweep is the cleanup task's last step — a short settle before the
     // survival read keeps the assertion race-free.
@@ -2640,12 +2736,6 @@ async fn handoff_abort_during_fresh_target_resume_reaps_the_registered_session_a
     handle.abort();
     let _ = handle.task.await;
 
-    // The key ends Vacant (the prior was reaped; the sync fail ran in Drop).
-    assert_eq!(
-        rig.ownership.observe("claude", &sid).state,
-        OwnershipState::Vacant,
-        "the aborted handoff must leave the key Vacant"
-    );
     // The registered-but-uncommitted target session was reaped by the
     // cleanup's lane sweep — no live unowned writer.
     await_live_session(
@@ -2664,6 +2754,13 @@ async fn handoff_abort_during_fresh_target_resume_reaps_the_registered_session_a
         .find(|pid| *pid != prior_pid as u64)
         .expect("the target sidecar's create row") as u32;
     await_pid_dead(target_pid).await;
+    // b8ke focused round-3 R3-6: the deferred cleanup settled (the target
+    // reap completed), and only THEN did the key vacate — the prior was
+    // reaped, so the ending is Vacant.
+    await_cond("the settled cleanup must leave the key Vacant", || {
+        rig.ownership.observe("claude", &sid).state == OwnershipState::Vacant
+    })
+    .await;
 
     // Retryability (the `resuming` flag did not leak): a retry of the same
     // handoff succeeds — it registers (parking at the same seam), the test
@@ -2692,6 +2789,161 @@ async fn handoff_abort_during_fresh_target_resume_reaps_the_registered_session_a
         .fresh_claude
         .kill_for_handoff(&sid, "test-cleanup")
         .await;
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+    let _ = std::fs::remove_dir_all(&store_dir);
+}
+
+/// 5g. b8ke focused round-3 review R3-6: an abort inside the fresh-target
+/// window must HOLD the coordinator fence until the uncommitted target's
+/// `NotConfirmed` continuation settles — the global record does not go
+/// plain-Vacant while an uncommitted target may live. A competing start
+/// DURING the continuation is Blocked; after the settle/confirm the key
+/// goes Vacant and the start proceeds. (Pre-fix, the sync Drop fail
+/// vacated the record BEFORE the detached cleanup even issued its lane
+/// kill — the competing start was Granted over the uncommitted target.)
+#[tokio::test]
+async fn handoff_abort_holds_the_fence_until_the_uncommitted_target_continuation_settles() {
+    let _guard = ENV_LOCK.lock().await;
+    // The claude-lane env surface this file's tests mutate
+    // (FRESHELL_CLAUDE_SIDECAR/NODE, FAKE_SIDECAR_REQUEST_LOG,
+    // CLAUDE_CONFIG_DIR) is process-global and shared with claude.rs's and
+    // snapshot.rs's tests through THEIR lock — hold it too: our own
+    // ENV_LOCK only serializes this file against itself.
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let env = FakeSidecarEnv::install();
+    // The claude-lane resume gates on transcript presence (the 6b pattern).
+    let store_dir = std::env::temp_dir().join(format!(
+        "freshell-handoff-r36-store-{}",
+        uuid_like_suffix()
+    ));
+    let project_dir = store_dir.join("projects").join("slug");
+    std::fs::create_dir_all(&project_dir).expect("create transcript project dir");
+    let sid = uuid::Uuid::new_v4().to_string();
+    std::fs::write(
+        project_dir.join(format!("{sid}.jsonl")),
+        "{\"cwd\": \"/tmp\"}\n",
+    )
+    .expect("write fake transcript");
+    std::env::set_var("CLAUDE_CONFIG_DIR", &store_dir);
+
+    let resume_pause = Arc::new(tokio::sync::Notify::new());
+    // The one-round confirmation window: the cleanup's lane kill cannot
+    // confirm the target tree while a TERM-immune tagged descendant lives
+    // — the NotConfirmed continuation shape.
+    let rig = build_rig_full(None, None, Some(Arc::clone(&resume_pause)), 8_000, Some(1));
+    establish_fresh_claude_owner(&rig, &sid).await;
+    let prior_pid = env.sidecar_pid_for(&sid).expect("the prior sidecar's pid");
+
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_fresh("claude", &sid, "freshclaude"));
+    // Park proof: the prior was reaped and the TARGET resume registered its
+    // session (the park is right after registration).
+    await_pid_dead(prior_pid).await;
+    await_live_session(
+        &rig.fresh_claude,
+        &sid,
+        true,
+        "the target resume must register its session",
+    )
+    .await;
+    // The TARGET sidecar's ownership tag, and a TERM-immune tagged
+    // grandchild parked under it: the cleanup's kill cannot confirm the
+    // tree in its one-round window, so it answers NotConfirmed and the
+    // escalation continuation runs (SIGKILL rounds ≥500ms later).
+    let target_pid = env
+        .create_rows()
+        .into_iter()
+        .filter(|r| r["msg"]["resumeSessionId"] == sid)
+        .filter_map(|r| r["pid"].as_u64())
+        .find(|pid| *pid != prior_pid as u64)
+        .expect("the target sidecar's create row") as u32;
+    let ownership_id = {
+        let environ = std::fs::read(format!("/proc/{target_pid}/environ"))
+            .expect("read the target sidecar's environ");
+        environ
+            .split(|&b| b == 0)
+            .find_map(|var| {
+                let var = std::str::from_utf8(var).ok()?;
+                var.strip_prefix("FRESHELL_CLAUDE_SIDECAR_ID=")
+            })
+            .expect("the target sidecar's ownership id")
+            .to_string()
+    };
+    let mut grandchild = tokio::process::Command::new("bash")
+        .arg("-c")
+        .arg("trap '' TERM; while :; do sleep 1; done")
+        .env("FRESHELL_CLAUDE_SIDECAR_ID", &ownership_id)
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn the lingering tagged grandchild");
+    let grandchild_pid = grandchild.id().expect("grandchild pid");
+
+    // ABORT inside the fresh-target resume await.
+    handle.abort();
+    let _ = handle.task.await;
+
+    // THE R3-6 regression: the record did NOT go plain-Vacant — the
+    // cleanup's target reap (its NotConfirmed continuation) is still in
+    // flight, and a competing start is BLOCKED throughout it.
+    let assert_blocked = |label: &str| {
+        assert!(
+            matches!(
+                rig.ownership.begin_start(
+                    "claude",
+                    &sid,
+                    RuntimeOwnerKind::Terminal,
+                    "r36-competing-start",
+                    None,
+                    "test",
+                    0,
+                ),
+                BeginOutcome::Blocked { .. }
+            ),
+            "a competing start {label} must be Blocked (the fence holds while the \
+             uncommitted target's continuation runs)"
+        );
+    };
+    assert_blocked("immediately after the abort");
+    // The cleanup's lane kill ran and entered its continuation: the
+    // target's direct child dies while the TERM-immune grandchild needs
+    // the escalation — the continuation is observably in flight.
+    await_pid_dead(target_pid).await;
+    assert_blocked("during the uncommitted target's continuation");
+
+    // The escalation settles: the grandchild dies, the continuation
+    // resolves, and the key goes Vacant — the competing start proceeds.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while crate::session_lease::proc_starttime(grandchild_pid as i32).is_some() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the cleanup's escalation never killed the lingering descendant"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    await_cond("the settled continuation must vacate the key", || {
+        rig.ownership.observe("claude", &sid).state == OwnershipState::Vacant
+    })
+    .await;
+    assert!(
+        matches!(
+            rig.ownership.begin_start(
+                "claude",
+                &sid,
+                RuntimeOwnerKind::Terminal,
+                "r36-competing-start-after",
+                None,
+                "test",
+                0,
+            ),
+            BeginOutcome::Granted { .. }
+        ),
+        "after the settle/confirm the competing start proceeds"
+    );
+    let _ = rig
+        .ownership
+        .fail("claude", &sid, "r36-competing-start-after", 1, false);
+    let _ = grandchild.wait().await;
     std::env::remove_var("CLAUDE_CONFIG_DIR");
     let _ = std::fs::remove_dir_all(&store_dir);
 }

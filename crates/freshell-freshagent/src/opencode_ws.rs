@@ -2086,7 +2086,7 @@ impl FreshOpencodeState {
         // still be caught loud (the invariant probe below) and the kill
         // would answer failure — never masquerade a broken gate as success.
         if let Some(session_arc) = &session_arc {
-            let (turn_task, bridge, real, strays) = {
+            let (turn_task, bridge, real, strays, daemon_turn_accepted, route) = {
                 let mut s = session_arc.lock().await;
                 let strays: Vec<String> = s
                     .real_session_id
@@ -2100,6 +2100,13 @@ impl FreshOpencodeState {
                     s.serve_bridge.take(),
                     s.real_session_id.clone(),
                     strays,
+                    // b8ke focused round-3 R3-2: the accepted-daemon-turn
+                    // witness rides the same extraction — the kill must
+                    // quiesce the daemon-side turn (the per-session
+                    // /abort), exactly like interrupt/handoff, before
+                    // declaring the reap confirmed.
+                    s.daemon_turn_accepted.clone(),
+                    s.cwd.clone(),
                 )
             };
             // DEFENSIVE invariant probe (F6, must never fire): an identity
@@ -2141,6 +2148,20 @@ impl FreshOpencodeState {
                 // ep4-r6 F2: join + await the compact's pre-drive-redo settle
                 // before the kill answers — the compensation must have landed.
                 task.abort_and_settle().await;
+            }
+            // b8ke focused round-3 R3-2: abort whenever the session has any
+            // ACCEPTED daemon-side turn — NOT only while the local task
+            // lives (a finished local `run_turn` can mean IdleTimeout: the
+            // turn still executes INSIDE the shared daemon, and Reaped may
+            // only be reported — the stop committed — once that turn is
+            // confirmed aborted/settled). Same discipline as
+            // `handle_interrupt`/`opencode_kill_for_handoff`; the shared
+            // serve itself is NEVER killed (OpenCode invariant).
+            if daemon_turn_accepted.load(Ordering::SeqCst) {
+                if let Some(real) = real.as_deref() {
+                    self.abort_accepted_daemon_turn(real, &route, &daemon_turn_accepted)
+                        .await;
+                }
             }
             // PR-3: stop the persistent serve-SSE bridge too (`unsubscribeServe?.()`,
             // adapter.ts:568) so it doesn't keep broadcasting for a dead session.
@@ -4377,6 +4398,70 @@ mod tests {
         }
     }
 
+    /// b8ke focused round-3 R3-2: a fake that RECORDS the per-session
+    /// `prompt_async` and `abort` POSTs (with the session id each was
+    /// issued for) — the kill/handoff quiescence tests assert the
+    /// daemon-side abort actually landed for the REAL session id.
+    #[derive(Default)]
+    struct AbortRecordingHttp {
+        next_session: AtomicUsize,
+        prompts: StdMutex<Vec<String>>,
+        aborts: StdMutex<Vec<String>>,
+    }
+    impl AbortRecordingHttp {
+        fn session_of(url: &str, marker: &str) -> Option<String> {
+            url.split(marker).nth(1)?.split(['/', '?']).next().map(str::to_string)
+        }
+        fn await_prompt(&self, budget: Duration) -> String {
+            let deadline = std::time::Instant::now() + budget;
+            loop {
+                if let Some(id) = self.prompts.lock().unwrap().first().cloned() {
+                    return id;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the prompt POST was never dispatched"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+    impl ServeHttp for AbortRecordingHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >
+        > {
+            let is_create = matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
+                && (req.url.ends_with("/session") || req.url.contains("/session?"));
+            let body = if is_create {
+                let n = self.next_session.fetch_add(1, Ordering::SeqCst) + 1;
+                serde_json::to_vec(&json!({ "id": format!("ses_{n}"), "directory": null })).unwrap()
+            } else {
+                b"{}".to_vec()
+            };
+            if !is_create {
+                if let Some(id) = Self::session_of(&req.url, "/session/") {
+                    if req.url.contains("/prompt_async")
+                        && matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
+                    {
+                        self.prompts.lock().unwrap().push(id);
+                    } else if req.url.contains("/abort")
+                        && matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
+                    {
+                        self.aborts.lock().unwrap().push(id);
+                    }
+                }
+            }
+            Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) })
+        }
+    }
+
     /// A `ServeProcess` fake that records whether it was ever killed, so tests can
     /// assert the SHARED sidecar survives a per-session `freshAgent.kill`.
     struct TrackedProcess {
@@ -5609,6 +5694,98 @@ mod tests {
         assert!(
             saw_accepted,
             "the session the kill refused to stop must stay sendable"
+        );
+    }
+
+    /// b8ke focused round-3 review R3-2: an explicit `freshAgent.kill` on an
+    /// opencode session whose daemon-side turn is still ACCEPTED — the
+    /// local turn task FINISHED (the IdleTimeout shape) while the turn
+    /// executes INSIDE the shared daemon — must abort the daemon-side turn
+    /// (the per-session `/abort`, exactly like interrupt/handoff do)
+    /// BEFORE declaring the reap confirmed (Stopping → Vacant). Pre-fix,
+    /// the kill aborted only the local turn task + SSE bridge and
+    /// committed the stop with the daemon turn still running.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kill_during_an_accepted_daemon_turn_aborts_it_before_the_stop_commits() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let http = Arc::new(AbortRecordingHttp::default());
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: http.clone(),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let mut st = FreshOpencodeState::new(fresh_agent);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+
+        st.handle_create(create_msg("req-kill-daemon-abort"), None).await;
+        let placeholder = "freshopencode-req-kill-daemon-abort";
+        st.handle_send(send_msg(placeholder, "hold this turn")).await;
+        let session_arc = {
+            let sessions = st.sessions.lock().await;
+            sessions.get(placeholder).expect("session tracked").clone()
+        };
+        assert_eq!(
+            session_arc.lock().await.real_session_id.as_deref(),
+            Some("ses_1"),
+            "fixture: the send materialized the durable id (and committed Live{{FreshAgent}})"
+        );
+        // The prompt POST is dispatched onto the transport (the acceptance
+        // witness armed at the dispatch boundary); then the LOCAL task is
+        // settled — the IdleTimeout shape (a finished local task with the
+        // daemon-side turn still running).
+        let real_id = http.await_prompt(Duration::from_secs(10));
+        assert_eq!(real_id, "ses_1");
+        st.settle_local_turn_task_for_test(placeholder).await;
+        while rx.try_recv().is_ok() {}
+
+        st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
+            provider: freshell_protocol::AgentProvider::Opencode,
+            session_id: placeholder.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+
+        // THE R3-2 regression: the kill issued the per-session daemon-side
+        // abort for the REAL session id before declaring the reap
+        // confirmed.
+        let aborts = http.aborts.lock().unwrap().clone();
+        assert_eq!(
+            aborts,
+            vec!["ses_1".to_string()],
+            "the kill must abort the accepted daemon-side turn (per-session /abort)"
+        );
+        // The stop committed AFTER the abort: Stopping → Vacant.
+        assert_eq!(
+            registry.observe("opencode", "ses_1").state,
+            freshell_ownership::OwnershipState::Vacant,
+            "the kill's coordinator stop must commit (Stopping → Vacant)"
+        );
+        // The answer reports success (the quiesced kill).
+        let mut killed_frame = None;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.killed" {
+                killed_frame = Some(frame);
+            }
+        }
+        let killed_frame = killed_frame.expect("the kill answers freshAgent.killed");
+        assert_eq!(
+            killed_frame["success"], true,
+            "the quiesced kill answers success: {killed_frame}"
         );
     }
 
