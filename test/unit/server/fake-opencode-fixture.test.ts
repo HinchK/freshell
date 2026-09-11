@@ -9,6 +9,7 @@
 // and asserts the copied turns SURVIVE and the new turn APPENDS.
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
+import { once } from 'node:events'
 import * as fs from 'node:fs'
 import * as net from 'node:net'
 import * as os from 'node:os'
@@ -81,11 +82,26 @@ beforeAll(async () => {
   await waitForServer(port)
 }, 30_000)
 
-afterAll(() => {
-  server?.kill('SIGTERM')
+afterAll(async () => {
+  // The fixture's SIGTERM handler still WRITES into the scratch tree (the
+  // shutdown audit line) before exiting, and `server.close` can take up to
+  // its 1s hard-exit backstop — removing the tree before the child has
+  // actually exited races those final writes (observed as ENOTEMPTY on a
+  // loaded cloud runner). Register the exit wait BEFORE kill so the exit
+  // event can never be missed; SIGKILL is the never-expected backstop.
+  if (server && server.exitCode === null) {
+    const exited = once(server, 'exit')
+    server.kill('SIGTERM')
+    const killBackstop = setTimeout(() => server?.kill('SIGKILL'), 5_000)
+    try {
+      await exited
+    } finally {
+      clearTimeout(killBackstop)
+    }
+  }
   server = undefined
   fs.rmSync(scratch, { recursive: true, force: true })
-})
+}, 15_000)
 
 describe('fake-opencode fixture fork sequence parity (ep3-r1 F3)', () => {
   it('a prompt to a forked session APPENDS past the copied history', async () => {
