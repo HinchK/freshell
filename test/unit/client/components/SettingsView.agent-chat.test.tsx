@@ -39,10 +39,32 @@ describe('SettingsView coding agents settings', () => {
     ]) {
       expect(screen.getByRole('switch', { name })).toBeInTheDocument()
     }
-    expect(screen.queryByText('Show thinking')).not.toBeInTheDocument()
-    expect(screen.queryByText('Show tools')).not.toBeInTheDocument()
+    // Display toggles revived (defaults on); the timecodes toggle and the
+    // font-size control are NOT revived (out of scope).
+    expect(screen.getByRole('switch', { name: 'Show thinking' })).toBeInTheDocument()
+    expect(screen.getByRole('switch', { name: 'Show tools' })).toBeInTheDocument()
     expect(screen.queryByText('Show timecodes & model')).not.toBeInTheDocument()
     expect(screen.queryByLabelText('Fresh agent font size')).not.toBeInTheDocument()
+  })
+
+  it('toggles fresh-agent display settings locally without calling the server', () => {
+    const store = createSettingsViewStore()
+    renderSettingsView(store)
+    switchSettingsTab('Coding Agents')
+
+    const thinkingToggle = screen.getByRole('switch', { name: 'Show thinking' })
+    expect(thinkingToggle).toHaveAttribute('aria-checked', 'true')
+    const toolsToggle = screen.getByRole('switch', { name: 'Show tools' })
+    expect(toolsToggle).toHaveAttribute('aria-checked', 'true')
+
+    fireEvent.click(thinkingToggle)
+    expect(store.getState().settings.settings.freshAgent.showThinking).toBe(false)
+    expect(store.getState().settings.settings.freshAgent.showTools).toBe(true)
+    expect(api.patch).not.toHaveBeenCalled()
+
+    fireEvent.click(toolsToggle)
+    expect(store.getState().settings.settings.freshAgent.showTools).toBe(false)
+    expect(api.patch).not.toHaveBeenCalled()
   })
 
   it('hides unavailable CLI agents and their Fresh variants', () => {

@@ -11,7 +11,7 @@ import { useAppSelector } from '@/store/hooks'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 import type { ServerSettingsPatch } from '@/store/types'
 import type { SettingsSectionProps } from './settings-types'
-import { SettingsSection, Toggle } from './settings-controls'
+import { SettingsSection, SettingsRow, Toggle } from './settings-controls'
 
 type IconComponent = ComponentType<SVGProps<SVGSVGElement>>
 
@@ -47,6 +47,7 @@ const EMPTY_AVAILABLE_CLIS: Record<string, boolean> = {}
 
 export default function CodingAgentsSettings({
   settings,
+  applyLocalSetting,
   applyServerSetting,
 }: SettingsSectionProps) {
   const enabledProviders = settings.codingCli?.enabledProviders ?? []
@@ -112,42 +113,67 @@ export default function CodingAgentsSettings({
   }
 
   return (
-    <SettingsSection id="coding-agents" title="Coding Agents">
-      {visibleRows.length === 0 ? (
-        <p className="text-sm text-muted-foreground">No coding agents detected.</p>
-      ) : (
-        <div className="space-y-2">
-          {visibleRows.map((row) => {
-            const Icon = row.icon
-            const checked = row.kind === 'cli'
-              ? enabledProviders.includes(row.id) && !disabledItems.includes(row.id)
-              : freshEnabled && !disabledItems.includes(row.id)
+    <>
+      <SettingsSection id="coding-agents" title="Coding Agents">
+        {visibleRows.length === 0 ? (
+          <p className="text-sm text-muted-foreground">No coding agents detected.</p>
+        ) : (
+          <div className="space-y-2">
+            {visibleRows.map((row) => {
+              const Icon = row.icon
+              const checked = row.kind === 'cli'
+                ? enabledProviders.includes(row.id) && !disabledItems.includes(row.id)
+                : freshEnabled && !disabledItems.includes(row.id)
 
-            return (
-              <div
-                key={`${row.kind}-${row.id}`}
-                className="flex min-h-12 items-center justify-between gap-4 rounded-md border border-border/30 px-3 py-2"
-              >
-                <div className="flex min-w-0 items-center gap-3">
-                  <Icon aria-hidden="true" className="h-5 w-5 shrink-0 text-foreground" />
-                  <span className="truncate text-sm font-medium">{row.label}</span>
+              return (
+                <div
+                  key={`${row.kind}-${row.id}`}
+                  className="flex min-h-12 items-center justify-between gap-4 rounded-md border border-border/30 px-3 py-2"
+                >
+                  <div className="flex min-w-0 items-center gap-3">
+                    <Icon aria-hidden="true" className="h-5 w-5 shrink-0 text-foreground" />
+                    <span className="truncate text-sm font-medium">{row.label}</span>
+                  </div>
+                  <Toggle
+                    checked={checked}
+                    aria-label={row.label}
+                    onChange={(next) => {
+                      if (row.kind === 'cli') {
+                        setCliEnabled(row.id, next)
+                        return
+                      }
+                      setFreshEnabled(row.id, next)
+                    }}
+                  />
                 </div>
-                <Toggle
-                  checked={checked}
-                  aria-label={row.label}
-                  onChange={(next) => {
-                    if (row.kind === 'cli') {
-                      setCliEnabled(row.id, next)
-                      return
-                    }
-                    setFreshEnabled(row.id, next)
-                  }}
-                />
-              </div>
-            )
-          })}
-        </div>
-      )}
-    </SettingsSection>
+              )
+            })}
+          </div>
+        )}
+      </SettingsSection>
+      <SettingsSection
+        title="Fresh agent display"
+        description="What fresh-agent panes show by default"
+      >
+        <SettingsRow label="Show thinking">
+          <Toggle
+            checked={settings.freshAgent?.showThinking ?? true}
+            onChange={(checked) => {
+              applyLocalSetting({ freshAgent: { showThinking: checked } })
+            }}
+            aria-label="Show thinking"
+          />
+        </SettingsRow>
+        <SettingsRow label="Show tools">
+          <Toggle
+            checked={settings.freshAgent?.showTools ?? true}
+            onChange={(checked) => {
+              applyLocalSetting({ freshAgent: { showTools: checked } })
+            }}
+            aria-label="Show tools"
+          />
+        </SettingsRow>
+      </SettingsSection>
+    </>
   )
 }

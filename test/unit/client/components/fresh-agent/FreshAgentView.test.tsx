@@ -819,6 +819,59 @@ describe('FreshAgentView', () => {
     expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()
   })
 
+  it('hides thinking rows and collapses activity details when the global settings turn off', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      status: 'idle',
+      summary: 'Display summary',
+      capabilities: { send: true, interrupt: true, fork: false },
+      turns: [{
+        id: 'turn-live', turnId: 'turn-live', role: 'assistant',
+        summary: 'used tools',
+        items: [
+          { id: 'think-live', kind: 'thinking', text: 'live toggle thinking' },
+          { id: 'tool-live', kind: 'tool_use', toolUseId: 'call-live', name: 'Bash',
+            input: { command: 'npm run live-check' } },
+        ],
+      }],
+    })
+
+    const { unmount } = render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude',
+            createRequestId: 'req-live', sessionId: CLAUDE_THREAD_ID, status: 'connected',
+          }}
+        />
+      </Provider>,
+    )
+
+    // Task 1 defaults: expanded + thinking visible.
+    await waitFor(() => {
+      expect(screen.getByText('npm run live-check')).toBeInTheDocument()
+    })
+    expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()
+
+    // Flip both display settings off on the live store (the reducer path the
+    // Settings toggle drives) — the pane must re-render, not need a remount.
+    act(() => {
+      store.dispatch(updateSettingsLocal({
+        freshAgent: { showThinking: false, showTools: false },
+      }))
+    })
+
+    expect(screen.queryByRole('button', { name: 'Thinking' })).not.toBeInTheDocument()
+    // Collapsed strip: the summary line replaces the expanded detail rows.
+    await waitFor(() => {
+      expect(screen.getByText('1 tool used')).toBeInTheDocument()
+    })
+    expect(screen.queryByText('npm run live-check')).not.toBeInTheDocument()
+    unmount()
+  })
+
   it('does not pin the provider snapshot summary above the transcript', async () => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
