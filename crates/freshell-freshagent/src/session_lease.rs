@@ -64,12 +64,16 @@ pub fn now_epoch_ms() -> u64 {
 #[cfg(target_os = "linux")]
 pub async fn kill_and_confirm_tree_dead(pid: u32, ownership_env: &str, ownership_id: &str) -> bool {
     // 1. Capture the tagged tree BEFORE any kill (see YAMA note above).
+    // The direct child's recorded start time — captured BEFORE any signal
+    // so the grace wait and the escalation both revalidate the incarnation
+    // (b8ke focused round-4 R4-8: a pid recycled mid-wait is never signaled).
+    let child_start = proc_starttime(pid as i32);
     let mut tree: Vec<(i32, u64)> = scan_tagged_pids(ownership_env, ownership_id)
         .into_iter()
         .filter_map(|p| proc_starttime(p).map(|st| (p, st)))
         .collect();
     if !tree.iter().any(|(p, _)| *p == pid as i32) {
-        if let Some(st) = proc_starttime(pid as i32) {
+        if let Some(st) = child_start {
             tree.push((pid as i32, st));
         }
     }
@@ -78,11 +82,16 @@ pub async fn kill_and_confirm_tree_dead(pid: u32, ownership_env: &str, ownership
     unsafe {
         libc::kill(pid as i32, libc::SIGTERM);
     }
-    if !wait_pid_gone(pid).await {
-        unsafe {
-            libc::kill(pid as i32, libc::SIGKILL);
+    if !wait_recorded_incarnation_gone(pid, child_start).await {
+        // R4-8: the escalation signal revalidates the recorded incarnation
+        // immediately before firing — only the ORIGINAL process is ever
+        // SIGKILLed, never a recycled-pid replacement.
+        if pid_is_recorded_incarnation(pid, child_start) {
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
         }
-        if !wait_pid_gone(pid).await {
+        if !wait_recorded_incarnation_gone(pid, child_start).await {
             return false;
         }
     }
@@ -235,11 +244,18 @@ pub async fn kill_and_confirm_recorded_tree_dead(
         unsafe {
             libc::kill(recorded.pid as i32, libc::SIGTERM);
         }
-        if !wait_pid_gone(recorded.pid).await {
-            unsafe {
-                libc::kill(recorded.pid as i32, libc::SIGKILL);
+        if !wait_recorded_incarnation_gone(recorded.pid, recorded.start_time).await {
+            // R4-8: revalidate the recorded incarnation IMMEDIATELY before
+            // the escalation signal — a pid that exited during the grace
+            // wait and was recycled belongs to an unrelated process now
+            // and must NEVER receive the SIGKILL (the original incarnation
+            // is provably gone; the confirmation proceeds without it).
+            if pid_is_recorded_incarnation(recorded.pid, recorded.start_time) {
+                unsafe {
+                    libc::kill(recorded.pid as i32, libc::SIGKILL);
+                }
             }
-            if !wait_pid_gone(recorded.pid).await {
+            if !wait_recorded_incarnation_gone(recorded.pid, recorded.start_time).await {
                 return false;
             }
         }
@@ -266,18 +282,37 @@ pub async fn kill_and_confirm_tree_dead(
     false
 }
 
-/// ESRCH-or-zombie poll: is `pid` dead (gone or unreaped-zombie) within 20 × 25ms?
-/// A zombie is dead-but-unreaped (tokio reaps it eventually) — it holds no pipes and
-/// writes nothing, so it counts as gone here.
+/// b8ke focused round-4 review R4-8: is `pid` still the RECORDED process
+/// incarnation? With a recorded start time, the pid belongs to the
+/// original process iff `/proc` still shows EXACTLY that start time — a
+/// recycled pid (the original died; an unrelated process took the id)
+/// reads a DIFFERENT start time and is never "ours". Without a recorded
+/// start time (the legacy discipline), pid existence alone is the best
+/// available identity.
 #[cfg(target_os = "linux")]
-async fn wait_pid_gone(pid: u32) -> bool {
+pub(crate) fn pid_is_recorded_incarnation(pid: u32, recorded_start: Option<u64>) -> bool {
+    match recorded_start {
+        Some(expected) => matches!(proc_starttime(pid as i32), Some(actual) if actual == expected),
+        None => proc_starttime(pid as i32).is_some(),
+    }
+}
+
+/// b8ke focused round-4 review R4-8: the RECORDED-INCARNATION grace wait —
+/// the kill path's quiescence poll. The pid counts as gone when it is no
+/// longer the recorded incarnation: dead/zombie (`starttime` reads None)
+/// OR RECYCLED (a different start time — the original incarnation is
+/// provably dead and the replacement must never be signaled, so the wait
+/// reports gone instead of letting the escalation fire at the unrelated
+/// process). Bounded: 20 × 25ms, then a final check.
+#[cfg(target_os = "linux")]
+async fn wait_recorded_incarnation_gone(pid: u32, recorded_start: Option<u64>) -> bool {
     for _ in 0..20u8 {
-        if proc_starttime(pid as i32).is_none() {
+        if !pid_is_recorded_incarnation(pid, recorded_start) {
             return true;
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    proc_starttime(pid as i32).is_none()
+    !pid_is_recorded_incarnation(pid, recorded_start)
 }
 
 /// The process's `starttime` (field 22 of `/proc/<pid>/stat`, world-readable — no
@@ -665,5 +700,108 @@ mod tests {
                 retry_after_ms: FRESH_AGENT_SESSION_RESERVED_RETRY_AFTER_MS
             }
         );
+    }
+
+    /// b8ke focused round-4 review R4-8: the grace wait (and the
+    /// escalation decision after it) must revalidate the RECORDED start
+    /// time — a pid that now belongs to a DIFFERENT incarnation was
+    /// recycled while the original died, so the original is provably gone
+    /// and the replacement must NEVER be signaled. Pre-fix, the grace
+    /// wait polled PID EXISTENCE alone: a recycled pid made the wait
+    /// answer "still alive" and the escalation SIGKILLed the unrelated
+    /// replacement process.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_grace_wait_treats_a_recycled_pid_as_gone_and_never_escalates() {
+        // A live "unrelated replacement" process holding the recorded pid.
+        let mut unrelated = tokio::process::Command::new("sleep")
+            .arg("300")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the unrelated replacement");
+        let pid = unrelated.id().expect("unrelated pid");
+        // The recorded identity: the pid with the ORIGINAL (dead)
+        // incarnation's start time — forged to differ from the
+        // replacement's, the exact pid-reuse shape.
+        let recorded_start = proc_starttime(pid as i32).expect("the replacement's start time") + 1;
+
+        let began = std::time::Instant::now();
+        let gone = wait_recorded_incarnation_gone(pid, Some(recorded_start)).await;
+        assert!(
+            gone,
+            "a recycled pid's original incarnation is gone — the wait must report it gone"
+        );
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(1),
+            "the incarnation mismatch must be detected on the first poll, not the bounded window"
+        );
+        assert!(
+            proc_starttime(pid as i32).is_some(),
+            "the reused pid's unrelated process must never be signaled"
+        );
+        let _ = unrelated.kill().await;
+    }
+
+    /// b8ke focused round-4 review R4-8 (the matching-incarnation control):
+    /// a pid that still carries the RECORDED start time is the original
+    /// process — the wait must report it STILL PRESENT after the bounded
+    /// window so the escalation signal stays licensed for exactly that
+    /// incarnation.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_grace_wait_reports_a_live_recorded_incarnation_still_present() {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("300")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the recorded child");
+        let pid = child.id().expect("child pid");
+        let recorded_start = proc_starttime(pid as i32).expect("the child's start time");
+
+        let still_present = !wait_recorded_incarnation_gone(pid, Some(recorded_start)).await;
+
+        assert!(
+            still_present,
+            "the recorded incarnation is alive — the wait must report it still present"
+        );
+        assert!(
+            proc_starttime(pid as i32).is_some(),
+            "the wait itself never signals — the live recorded incarnation survives it"
+        );
+        let _ = child.kill().await;
+    }
+
+    /// b8ke focused round-4 review R4-8 (the kill-path contract): a
+    /// recorded identity whose pid belongs to an UNRELATED incarnation is
+    /// never signaled at ANY point of the kill-and-confirm — the original
+    /// is provably dead (only its recycled pid remains) and the
+    /// confirmation proceeds through the recorded tree alone.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_recorded_kill_path_never_signals_a_recycled_pid() {
+        let mut unrelated = tokio::process::Command::new("sleep")
+            .arg("300")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the unrelated replacement");
+        let pid = unrelated.id().expect("unrelated pid");
+        let recorded = CondemnedRuntimeIdentity {
+            pid,
+            start_time: Some(proc_starttime(pid as i32).expect("start time") + 1),
+            tree: Vec::new(),
+            ownership_id: "r48-kill-path".to_string(),
+        };
+
+        let confirmed = kill_and_confirm_recorded_tree_dead(&recorded, "R48_TEST_OWNERSHIP").await;
+
+        assert!(
+            confirmed,
+            "the original incarnation is provably gone (its pid was recycled) — confirmed"
+        );
+        assert!(
+            proc_starttime(pid as i32).is_some(),
+            "the recycled pid's unrelated process must survive the whole kill-and-confirm"
+        );
+        let _ = unrelated.kill().await;
     }
 }
