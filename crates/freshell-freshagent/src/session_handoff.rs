@@ -54,6 +54,11 @@ pub struct HandoffTestHooks {
     /// exactly as alive as the test made it). Atomic so a test can clear it
     /// for the retry assertion.
     pub force_reap_timeout: std::sync::atomic::AtomicBool,
+    /// b8ke focused review FR6: abort the detached reap-confirmation task
+    /// at the NEXT watcher spawn — the injected REAL JoinError (cancelled)
+    /// the watcher's fail-open typed release is tested against. Atomic so
+    /// a test can arm it once.
+    pub abort_reap_confirmation_once: std::sync::atomic::AtomicBool,
     /// Make the NEXT `start_target` fail before spawning anything.
     pub fail_target_spawn_once: std::sync::atomic::AtomicBool,
     /// Ordered step labels ("Reaped", "TargetStarted") — test assertions.
@@ -68,6 +73,7 @@ impl Default for HandoffTestHooks {
             pause_in_target_spawn: None,
             spawn_watch_slot: std::sync::Mutex::new(None),
             force_reap_timeout: std::sync::atomic::AtomicBool::new(false),
+            abort_reap_confirmation_once: std::sync::atomic::AtomicBool::new(false),
             fail_target_spawn_once: std::sync::atomic::AtomicBool::new(false),
             events: std::sync::Mutex::new(Vec::new()),
         }
@@ -103,12 +109,32 @@ pub struct HandoffRequest {
 /// runner's concern (it bounds the whole kill future with
 /// [`SessionHandoffRunner::reap_timeout_ms`]) — the lanes answer only what
 /// they directly observed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StopResult {
     /// The runtime is confirmed gone (awaited watcher/teardown).
     Reaped,
     /// There was no live runtime under this id (idempotent stop).
     AlreadyGone,
+    /// b8ke focused review FR3: the lane's bounded confirmation window
+    /// expired with the runtime tree still alive — NEVER a reap, never a
+    /// silent success. Carries the detached continuation that keeps
+    /// escalating and resolves `true` only once death is finally
+    /// confirmed; the runner fences the key (the F3 machinery), broadcasts
+    /// the failure frame, and its watcher releases on this future. A lost
+    /// continuation is covered by the watcher's typed fail-open release
+    /// (FR6).
+    NotConfirmed {
+        confirmation: std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'static>>,
+    },
+}
+
+impl std::fmt::Debug for StopResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StopResult::Reaped => f.write_str("Reaped"),
+            StopResult::AlreadyGone => f.write_str("AlreadyGone"),
+            StopResult::NotConfirmed { .. } => f.write_str("NotConfirmed { .. }"),
+        }
+    }
 }
 
 /// Why a prior runtime's stop could not be confirmed reaped.
@@ -121,12 +147,17 @@ enum StopOutcomePriv {
     /// b8ke delta review F3: `fenced` distinguishes the two shapes.
     /// `false` — the FORCE test hook short-circuited BEFORE any kill was
     /// issued (the prior is untouched): the round-2 re-probe semantics
-    /// decide restore-vs-Vacant. `true` — a REAL timeout: the kill WAS
+    /// decide restore-vs-Vacant. `true` — a REAL timeout (or a lane's typed
+    /// [`StopResult::NotConfirmed`], b8ke focused FR3): the kill WAS
     /// issued and its confirmation continues DETACHED (the teardown future
-    /// was spawned, never dropped); the key stays fenced in Handoff until
+    /// was spawned, never dropped; a NotConfirmed lane carries its own
+    /// escalation continuation); the key stays fenced in Handoff until
     /// the watcher confirms death — a probe that reads the lane's
     /// sessions map cannot see a map-evicted-but-alive runtime, so the
-    /// probe must NOT decide anything here.
+    /// probe must NOT decide anything here. b8ke focused FR5: this arm
+    /// implies the `handoff-failed` frame was ALREADY broadcast by
+    /// `stop_runtime`, strictly before the watcher existed — the caller
+    /// never re-broadcasts it.
     ReapTimeout { fenced: bool },
 }
 
@@ -375,21 +406,12 @@ impl SessionHandoffRunner {
                     // lane's map cannot see a map-evicted-but-alive
                     // runtime). It stays fenced in Handoff until the
                     // watcher confirms death, then releases to Vacant.
+                    // b8ke focused review FR5: the `handoff-failed` frame was
+                    // ALREADY broadcast inside `stop_runtime`, strictly
+                    // before the watcher was spawned — never again here (a
+                    // second send could only ever trail the watcher's
+                    // corrective `released`).
                     guard.disarm(); // the watcher performs the release
-                                    // Failure-broadcast truth: the PRIOR is still the
-                                    // fenced owner (its kind/runtime identity) — never the
-                                    // target kind, never a lie about vacancy. The watcher's
-                                    // `released` frame supersedes it once death is confirmed.
-                    self.broadcast_owner(
-                        &req,
-                        "handoff-failed",
-                        prior_kind,
-                        owner.terminal_id.clone(),
-                        &operation_id,
-                        generation,
-                        prior_kind,
-                        Some("REAP_TIMEOUT"),
-                    );
                     self.log_transition(
                         TransitionLog {
                             operation_id: &operation_id,
@@ -1026,24 +1048,35 @@ impl SessionHandoffRunner {
         }
         if target_spawn_begun && target_kind == RuntimeOwnerKind::FreshAgent {
             let initiator = "handoff-guard-cleanup";
+            // b8ke focused FR3: a `NotConfirmed` answer here drops the
+            // lane's escalation continuation — the abort cleanup's kill is
+            // best-effort (the teardown's bounded window already issued its
+            // SIGKILL rounds before the continuation existed), so the lease
+            // stays held for TTL recovery instead.
             let reaped = match provider.as_str() {
                 "codex" => {
-                    self.fresh_codex
-                        .kill_for_handoff(&session_id, initiator)
-                        .await
-                        == StopResult::Reaped
+                    matches!(
+                        self.fresh_codex
+                            .kill_for_handoff(&session_id, initiator)
+                            .await,
+                        StopResult::Reaped
+                    )
                 }
                 "claude" => {
-                    self.fresh_claude
-                        .kill_for_handoff(&session_id, initiator)
-                        .await
-                        == StopResult::Reaped
+                    matches!(
+                        self.fresh_claude
+                            .kill_for_handoff(&session_id, initiator)
+                            .await,
+                        StopResult::Reaped
+                    )
                 }
                 "opencode" => {
-                    self.fresh_opencode
-                        .opencode_kill_for_handoff(&session_id, initiator)
-                        .await
-                        == StopResult::Reaped
+                    matches!(
+                        self.fresh_opencode
+                            .opencode_kill_for_handoff(&session_id, initiator)
+                            .await,
+                        StopResult::Reaped
+                    )
                 }
                 _ => false,
             };
@@ -1103,6 +1136,18 @@ impl SessionHandoffRunner {
     /// timeout branch hands the still-running teardown to a DETACHED
     /// watcher and reports the fenced timeout. The watcher owns the
     /// coordinator release from there ([`Self::spawn_reap_confirmation_watcher`]).
+    ///
+    /// b8ke focused review FR5: every fenced branch broadcasts the
+    /// `handoff-failed` frame BEFORE spawning the detached watcher — the
+    /// broadcast is a synchronous channel send on THIS task, so no
+    /// `released` frame can ever precede the failure frame on the bus (a
+    /// same-generation client fold would otherwise latch the stale
+    /// prior-owner frame over the corrective release).
+    ///
+    /// b8ke focused review FR3: a lane answering
+    /// [`StopResult::NotConfirmed`] (its bounded tree-death confirmation
+    /// window expired with the runtime still alive) takes the SAME fenced
+    /// path — the carried continuation is the watcher's confirmation.
     async fn stop_runtime(
         self: &Arc<Self>,
         req: &HandoffRequest,
@@ -1144,7 +1189,10 @@ impl SessionHandoffRunner {
                     _ = tokio::time::sleep(budget) => {
                         // The SIGKILL was issued; the row's death is merely
                         // unobserved. Keep polling DETACHED (the watcher
-                        // releases the fenced key once the row is dead).
+                        // releases the fenced key once the row is dead) — the
+                        // failure frame FIRST (FR5), strictly before the
+                        // watcher exists.
+                        self.broadcast_fenced_reap_timeout(req, owner, operation_id, generation);
                         let registry = self.registry.clone();
                         let tid = terminal_id.to_string();
                         self.spawn_reap_confirmation_watcher(
@@ -1201,14 +1249,33 @@ impl SessionHandoffRunner {
                 // confirmed reap; AlreadyGone is the same truth); over
                 // budget → the still-running teardown is SPAWNED (never
                 // dropped) and the key is fenced until its watcher settles.
+                // A lane answering `NotConfirmed` (its bounded window could
+                // not confirm the tree's death — b8ke focused FR3) takes the
+                // same fenced path with the lane's own continuation as the
+                // confirmation; the failure frame is broadcast BEFORE the
+                // watcher exists in every arm (b8ke focused FR5).
                 tokio::select! {
                     result = &mut kill => match result {
                         // The lane teardown awaited its own watcher — the confirmed
                         // reap. AlreadyGone is the same truth (nothing to stop).
                         StopResult::Reaped | StopResult::AlreadyGone => StopOutcomePriv::Reaped,
+                        StopResult::NotConfirmed { confirmation } => {
+                            self.broadcast_fenced_reap_timeout(req, owner, operation_id, generation);
+                            self.spawn_reap_confirmation_watcher(
+                                req,
+                                operation_id,
+                                generation,
+                                &initiator,
+                                owner,
+                                confirmation,
+                            );
+                            StopOutcomePriv::ReapTimeout { fenced: true }
+                        }
                     },
                     _ = tokio::time::sleep(budget) => {
+                        self.broadcast_fenced_reap_timeout(req, owner, operation_id, generation);
                         let confirmation = tokio::spawn(kill);
+                        let hooks = self.test_hooks.clone();
                         self.spawn_reap_confirmation_watcher(
                             req,
                             operation_id,
@@ -1216,14 +1283,25 @@ impl SessionHandoffRunner {
                             &initiator,
                             owner,
                             async move {
+                                // b8ke focused FR6's test seam: the armed hook
+                                // aborts the spawned teardown task — a REAL
+                                // JoinError (cancelled) surfaces through the
+                                // await, exercising the watcher's typed
+                                // fail-open release. Never armed in production.
+                                if let Some(hooks) = hooks.as_ref() {
+                                    if hooks.abort_reap_confirmation_once.swap(
+                                        false,
+                                        std::sync::atomic::Ordering::SeqCst,
+                                    ) {
+                                        confirmation.abort();
+                                    }
+                                }
                                 // The lane teardown's own watcher IS the
                                 // confirmed reap; its completion resolves
                                 // `true`. A JoinError (the teardown task
-                                // panicked — a should-never-happen bug)
-                                // resolves `false`: death is UNCONFIRMED,
-                                // and the watcher fails CLOSED (the key
-                                // stays fenced — never a second writer on
-                                // an unconfirmed death).
+                                // panicked or was cancelled) resolves `false`:
+                                // death is UNCONFIRMED, and the watcher's
+                                // typed fail-open release (FR6) covers it.
                                 confirmation.await.is_ok()
                             },
                         );
@@ -1232,6 +1310,32 @@ impl SessionHandoffRunner {
                 }
             }
         }
+    }
+
+    /// b8ke focused review FR5: the fenced reap-timeout failure frame,
+    /// broadcast from the runner's OWN task strictly BEFORE any detached
+    /// watcher is spawned. The frame's truth: the PRIOR is still the
+    /// fenced owner (its kind/runtime identity) — never the target kind,
+    /// never a lie about vacancy. The watcher's `released` frame supersedes
+    /// it once death is confirmed.
+    fn broadcast_fenced_reap_timeout(
+        &self,
+        req: &HandoffRequest,
+        owner: &OwnerIdentity,
+        operation_id: &str,
+        generation: u64,
+    ) {
+        let prior_kind = Some(owner.kind);
+        self.broadcast_owner(
+            req,
+            "handoff-failed",
+            prior_kind,
+            owner.terminal_id.clone(),
+            operation_id,
+            generation,
+            prior_kind,
+            Some("REAP_TIMEOUT"),
+        );
     }
 
     /// b8ke delta review F3: the detached reap-confirmation watcher for a
@@ -1245,10 +1349,19 @@ impl SessionHandoffRunner {
     /// corrective `released` broadcast supersedes the fenced
     /// `handoff-failed` frame, and the uniform done-line logs the
     /// settlement. A retry during the fence is typed-refused; after the
-    /// release it succeeds. An UNCONFIRMED resolution (`false` — the
-    /// teardown task itself failed) fails CLOSED: the key stays fenced
-    /// and the error line makes the wedge diagnosable — never a second
-    /// writer on an unconfirmed death.
+    /// release it succeeds.
+    ///
+    /// An UNCONFIRMED resolution (`false` — the confirmation future itself
+    /// failed: the spawned teardown JoinError'd, or a NotConfirmed
+    /// continuation was lost) is the typed recoverable WATCHER_FAILED state
+    /// (b8ke focused review FR6): the key cannot stay fenced in `Handoff`
+    /// forever (every retry would be HANDOFF_IN_PROGRESS with nothing left
+    /// to settle it). The watcher fail-OPENS to Vacant with the typed
+    /// `WatcherFailed` reason: the escalation already ran (the teardown's
+    /// bounded window SIGKILLed the tree before its future was lost), the
+    /// identity fence plus the next claim's reap discipline cover safety,
+    /// and the corrective `released` frame (reason WATCHER_FAILED)
+    /// supersedes the fenced failure frame on every device.
     fn spawn_reap_confirmation_watcher(
         self: &Arc<Self>,
         req: &HandoffRequest,
@@ -1269,17 +1382,71 @@ impl SessionHandoffRunner {
         let settled = std::time::Instant::now();
         tokio::spawn(async move {
             if !confirmation.await {
-                // Fail CLOSED: the teardown task failed before confirming
-                // death — the key stays fenced (the typed in-flight answer
-                // keeps refusing retries) and the error line carries the
-                // full field set for diagnosis.
+                // FR6: the typed recoverable watcher-failed state — the
+                // confirmation future was lost, so fail-open to Vacant with
+                // the typed reason (never a permanent Handoff wedge).
                 tracing::error!(target: "freshell_ownership",
-                    event = "ownership.handoff.reap_unconfirmed",
+                    event = "ownership.handoff.reap_watcher_failed",
                     operation_id = %operation_id, provider = %provider, session_id = %session_id,
                     epoch = runner.ownership.boot_epoch(), generation,
-                    outcome = "fenced_failed_closed", failure_reason = "REAP_UNCONFIRMED",
-                    "the detached prior teardown failed before confirming death; the key stays \
-                     fenced — investigate the lane teardown");
+                    outcome = "released_vacant_watcher_failed",
+                    failure_reason = "WATCHER_FAILED",
+                    "the detached reap confirmation failed before resolving; the key \
+                     fail-opens to Vacant — the escalation already ran and the next \
+                     claim's reap discipline covers safety");
+                let outcome = runner.ownership.fail_watcher_lost(
+                    &provider,
+                    &session_id,
+                    &operation_id,
+                    generation,
+                );
+                if !matches!(outcome, freshell_ownership::FailOutcome::Vacant { .. }) {
+                    // The record moved on (a foreign op/generation, or
+                    // already failed) — the typed no-op; say nothing on the
+                    // bus (a stale-generation frame would be dropped by the
+                    // clients' monotonic fold anyway).
+                    tracing::warn!(target: "freshell_ownership",
+                        event = "ownership.handoff.reap_watcher_failed_foreign",
+                        operation_id = %operation_id, provider = %provider, session_id = %session_id,
+                        epoch = runner.ownership.boot_epoch(), generation,
+                        outcome = "foreign_noop", failure_reason = "WATCHER_FAILED",
+                        "the watcher-failed release landed after the coordinator record moved on");
+                    return;
+                }
+                // The corrective frame: the key is vacant now (the fenced
+                // handoff-failed frame said the prior still owned it — the
+                // same-generation fold applies this one).
+                runner.broadcast_owner(
+                    &broadcast_req,
+                    "released",
+                    None,
+                    None,
+                    &operation_id,
+                    generation,
+                    prior_kind,
+                    Some("WATCHER_FAILED"),
+                );
+                runner.log_transition(
+                    TransitionLog {
+                        operation_id: &operation_id,
+                        provider: &provider,
+                        session_id: &session_id,
+                        initiator: &initiator,
+                        epoch: runner.ownership.boot_epoch(),
+                        generation,
+                        live_session_key: prior.live_session_key.as_deref(),
+                        from_kind: prior_kind,
+                        to_kind: None,
+                        runtime_id: prior.terminal_id.as_deref(),
+                        pid: prior.pid,
+                        outcome: "reap_watcher_failed_vacant",
+                        duration_ms: settled.elapsed().as_millis() as u64,
+                        failure_reason: Some("WATCHER_FAILED"),
+                        stale: None,
+                    },
+                    "ownership.handoff.done",
+                    TransitionLevel::Error,
+                );
                 return;
             }
             // The confirmation IS the observed death (the lane teardown

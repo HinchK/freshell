@@ -374,6 +374,13 @@ pub enum FailVacantReason {
     /// The prior runtime was reaped/confirmed dead — never record a dead
     /// runtime as Live (round-1 review).
     PriorNotLive,
+    /// b8ke focused review FR6: the detached reap watcher itself failed
+    /// (its confirmation future was lost — a JoinError) after the
+    /// teardown's bounded escalation window had already run. The key
+    /// fail-OPENS to Vacant with this typed reason: never a permanent
+    /// `Handoff` wedge (every retry would be typed-refused forever with
+    /// nothing left to settle the fence).
+    WatcherFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1001,6 +1008,55 @@ impl RuntimeOwnershipRegistry {
                             failure_reason = ?reason);
                         FailOutcome::Vacant { reason }
                     }
+                }
+            }
+            _ => FailOutcome::ForeignOperation,
+        }
+    }
+
+    /// b8ke focused review FR6: fail an in-flight `Handoff` whose DETACHED
+    /// reap watcher was lost (its confirmation future failed — a JoinError)
+    /// to `Vacant` with the typed [`FailVacantReason::WatcherFailed`]
+    /// reason. The watcher's escalation already ran (the lane teardown's
+    /// bounded confirmation window SIGKILLed the captured tree before its
+    /// continuation was lost), so the key cannot stay fenced in `Handoff`
+    /// forever — every retry would be the typed in-flight refusal with
+    /// nothing left to settle the fence. Fail-open to Vacant is the typed
+    /// recoverable terminal state: the identity fence and the next claim's
+    /// own reap discipline cover safety. Fenced exactly like
+    /// [`Self::fail`]: a foreign operation/generation is the typed no-op.
+    pub fn fail_watcher_lost(
+        &self,
+        provider: &str,
+        session_id: &str,
+        operation_id: &str,
+        generation: u64,
+    ) -> FailOutcome {
+        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let key = SessionKey::new(provider, session_id);
+        let Some(record) = inner.get_mut(&key) else {
+            return FailOutcome::ForeignOperation;
+        };
+        if generation != record.generation {
+            return FailOutcome::ForeignOperation;
+        }
+        let initiator = record.state.initiator().unwrap_or_default();
+        match record.state.clone() {
+            OwnershipState::Handoff {
+                operation_id: op,
+                to_kind,
+                since_ms,
+                ..
+            } if op == operation_id => {
+                let duration_ms = now_epoch_ms().saturating_sub(since_ms);
+                record.state = OwnershipState::Vacant;
+                tracing::warn!(target: "freshell_ownership",
+                    event = "ownership.handoff.watcher_failed", operation_id, provider, session_id,
+                    initiator, to_kind = ?to_kind,
+                    epoch = self.epoch, generation, outcome = "vacant", duration_ms,
+                    failure_reason = "WATCHER_FAILED");
+                FailOutcome::Vacant {
+                    reason: FailVacantReason::WatcherFailed,
                 }
             }
             _ => FailOutcome::ForeignOperation,
@@ -2395,6 +2451,64 @@ mod tests {
             CommitOutcome::StaleGeneration {
                 current_generation: 2
             }
+        );
+        assert!(matches!(
+            r.observe(PROVIDER, "sid").state,
+            OwnershipState::Handoff { .. }
+        ));
+    }
+
+    /// b8ke focused review FR6: a lost detached reap watcher fail-opens the
+    /// in-flight Handoff to `Vacant { reason: WatcherFailed }` — the typed
+    /// recoverable terminal state (never a permanent `Handoff` wedge where
+    /// every retry is typed-refused forever). The restore arm is NEVER
+    /// taken (the watcher's failure says nothing about the prior's
+    /// liveness), and a foreign operation/generation is the typed no-op.
+    #[test]
+    fn fail_watcher_lost_opens_the_handoff_to_a_typed_vacant_state() {
+        let (r, _owner, _) = registry_with_live_terminal();
+        let BeginOutcome::Granted { generation: g } = r.begin_handoff(
+            PROVIDER,
+            "sid",
+            RuntimeOwnerKind::FreshAgent,
+            "ho-wf",
+            None,
+            "test",
+            2,
+        ) else {
+            panic!()
+        };
+        assert!(matches!(
+            r.observe(PROVIDER, "sid").state,
+            OwnershipState::Handoff { .. }
+        ));
+        // The watcher was lost: the key fail-OPENS to the typed Vacant
+        // state (never restored — the watcher's failure is not a liveness
+        // answer; never wedged in Handoff).
+        assert_eq!(
+            r.fail_watcher_lost(PROVIDER, "sid", "ho-wf", g),
+            FailOutcome::Vacant {
+                reason: FailVacantReason::WatcherFailed
+            }
+        );
+        assert_eq!(r.observe(PROVIDER, "sid").state, OwnershipState::Vacant);
+
+        // Foreign operation id: the typed no-op (the record moved on).
+        let (r, _owner, _) = registry_with_live_terminal();
+        let BeginOutcome::Granted { generation: g } = r.begin_handoff(
+            PROVIDER,
+            "sid",
+            RuntimeOwnerKind::FreshAgent,
+            "ho-wf-2",
+            None,
+            "test",
+            2,
+        ) else {
+            panic!()
+        };
+        assert_eq!(
+            r.fail_watcher_lost(PROVIDER, "sid", "ho-foreign", g),
+            FailOutcome::ForeignOperation
         );
         assert!(matches!(
             r.observe(PROVIDER, "sid").state,

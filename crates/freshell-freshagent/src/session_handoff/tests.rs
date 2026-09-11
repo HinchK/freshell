@@ -365,6 +365,21 @@ fn build_rig_with_claude_pauses_and_reap_timeout_ms(
     resume_pause: Option<Arc<tokio::sync::Notify>>,
     reap_timeout_ms: u64,
 ) -> Rig {
+    build_rig_full(hooks, kill_pause, resume_pause, reap_timeout_ms, None)
+}
+
+/// The full rig: the claude pauses + reap budget, PLUS the b8ke focused-FR3
+/// seam — the claude lane's tree-death confirmation round override (a
+/// one-round window makes a TERM-immune tagged descendant deterministically
+/// outlive the lane's bounded confirmation, driving the runner's fenced
+/// not-confirmed path).
+fn build_rig_full(
+    hooks: Option<Arc<HandoffTestHooks>>,
+    kill_pause: Option<Arc<tokio::sync::Notify>>,
+    resume_pause: Option<Arc<tokio::sync::Notify>>,
+    reap_timeout_ms: u64,
+    claude_confirm_rounds: Option<u8>,
+) -> Rig {
     let auth_token = Arc::new("handoff-test-token".to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let rx = broadcast_tx.subscribe();
@@ -375,6 +390,7 @@ fn build_rig_with_claude_pauses_and_reap_timeout_ms(
     let mut fresh_claude = crate::FreshClaudeState::new(Arc::clone(&broadcast_tx));
     fresh_claude.set_ownership(Arc::clone(&ownership));
     fresh_claude.set_handoff_test_pauses(kill_pause, resume_pause);
+    fresh_claude.set_handoff_confirm_rounds_for_test(claude_confirm_rounds);
     let mut fresh_codex = crate::FreshCodexState::new(
         Arc::clone(&auth_token),
         Arc::clone(&broadcast_tx),
@@ -498,6 +514,40 @@ fn drain_runtime_owner_frames(rx: &mut tokio::sync::broadcast::Receiver<String>)
         }
     }
     frames
+}
+
+/// Bounded-poll until every named `session.runtimeOwner` transition has
+/// arrived, then return ALL queued frames of this window in ARRIVAL ORDER
+/// (the order the channel delivered them — the b8ke focused FR5 ordering
+/// assertion's substrate: a `released` delivered before the `handoff-failed`
+/// would let the stale failure frame overwrite the corrective release on
+/// every same-generation client fold).
+async fn await_owner_frames(
+    rx: &mut tokio::sync::broadcast::Receiver<String>,
+    transitions: &[&str],
+) -> Vec<Value> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut frames = Vec::new();
+    loop {
+        while let Ok(raw) = rx.try_recv() {
+            if let Ok(value) = serde_json::from_str::<Value>(&raw) {
+                if value["type"] == "session.runtimeOwner" {
+                    frames.push(value);
+                }
+            }
+        }
+        if transitions
+            .iter()
+            .all(|t| frames.iter().any(|f| f["transition"] == *t))
+        {
+            return frames;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the {transitions:?} broadcasts never arrived within budget"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 /// The single `session.runtimeOwner` frame with this transition (panics on
@@ -1276,23 +1326,289 @@ async fn handoff_reap_timeout_fences_the_key_until_the_detached_reap_confirms_de
 
     // The corrective frames: the fenced `handoff-failed` names the PRIOR
     // (still the fenced owner, reason REAP_TIMEOUT), then the settlement's
-    // `released` names the now-vacant key.
-    let failed = await_owner_frame(&mut rig.rx, "handoff-failed").await;
+    // `released` names the now-vacant key. b8ke focused review FR5: the
+    // failure frame must land STRICTLY BEFORE any released frame — the
+    // frames are collected in arrival order (bounded-wait for both) and
+    // their positions asserted (a released-first ordering would leave
+    // same-generation client folds latched on the stale prior-owner
+    // frame).
+    let frames = await_owner_frames(&mut rig.rx, &["handoff-failed", "released"]).await;
+    let failed = runtime_owner_frame(&frames, "handoff-failed");
     assert_eq!(
         failed["ownerKind"],
         json!("fresh-agent"),
         "the truth: {failed}"
     );
     assert_eq!(failed["reason"], json!("REAP_TIMEOUT"));
-    let released = await_owner_frame(&mut rig.rx, "released").await;
+    let released = runtime_owner_frame(&frames, "released");
     assert_eq!(
         released["ownerKind"],
         json!("vacant"),
         "the truth: {released}"
     );
+    let failed_pos = frames
+        .iter()
+        .position(|f| f["transition"] == "handoff-failed")
+        .expect("the failed frame position");
+    let released_pos = frames
+        .iter()
+        .position(|f| f["transition"] == "released")
+        .expect("the released frame position");
+    assert!(
+        failed_pos < released_pos,
+        "b8ke focused FR5: the handoff-failed frame (index {failed_pos}) must strictly \
+         precede the released frame (index {released_pos}) — a released-first ordering \
+         would let the stale failure frame overwrite the corrective release on every \
+         same-generation client fold"
+    );
 
     // After confirmed death a retry succeeds (granted from Vacant — no
     // prior to stop; the target spawns and commits).
+    let retry = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let retried = retry.completion.await.expect("retry completed");
+    assert_eq!(
+        retried["ok"],
+        json!(true),
+        "the post-settlement retry must succeed: {retried}"
+    );
+    let retry_terminal = retried["owner"]["terminalId"].as_str().unwrap().to_string();
+    rig.registry.kill(&retry_terminal);
+}
+
+/// 3g. b8ke focused review FR6: a JoinError in the detached reap watcher
+/// (the spawned teardown task itself fails — here: cancelled by the test
+/// hook, a REAL JoinError) must leave the TYPED recoverable state — the
+/// key fail-opens to Vacant with the typed WatcherFailed reason and the
+/// corrective `released` frame (reason WATCHER_FAILED) supersedes the
+/// fenced `handoff-failed` frame — never a permanent Handoff wedge where
+/// every retry stays HANDOFF_IN_PROGRESS. A retry after the release
+/// succeeds.
+#[tokio::test]
+async fn a_watcher_join_error_releases_the_fenced_key_to_a_typed_vacant_state() {
+    let _guard = ENV_LOCK.lock().await;
+    // The claude-lane env surface this file's tests mutate
+    // (FRESHELL_CLAUDE_SIDECAR/NODE, FAKE_SIDECAR_REQUEST_LOG,
+    // CLAUDE_CONFIG_DIR) is process-global and shared with claude.rs's and
+    // snapshot.rs's tests through THEIR lock — hold it too: our own
+    // ENV_LOCK only serializes this file against itself.
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let kill_pause = Arc::new(tokio::sync::Notify::new());
+    let hooks = Arc::new(HandoffTestHooks::default());
+    let mut rig = build_rig_full(
+        Some(Arc::clone(&hooks)),
+        Some(Arc::clone(&kill_pause)),
+        None,
+        150,
+        None,
+    );
+    establish_fresh_claude_owner(&rig, &sid).await;
+
+    // Arm the injected JoinError: the NEXT watcher's confirmation wrapper
+    // aborts the spawned teardown task (a real cancelled-JoinError).
+    hooks
+        .abort_reap_confirmation_once
+        .store(true, Ordering::SeqCst);
+
+    // Drive test 3f's real-timeout shape: the lane kill parks past the
+    // runner's budget, the timeout branch fences the key and spawns the
+    // watcher — whose confirmation task the hook then aborts.
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    await_cond("the lane kill must issue (take the stamp)", || {
+        crate::ownership_lane::peek_retained_stamp(&rig.fresh_claude.ownership_stamps, &sid)
+            .is_none()
+    })
+    .await;
+    let result = handle.completion.await.expect("runner completed");
+    assert_eq!(result["error"]["code"], json!("REAP_TIMEOUT"));
+
+    // The watcher's JoinError fail-opens the fenced key to the TYPED
+    // Vacant state (never a permanent Handoff wedge).
+    await_cond("the watcher-failed release must open the key", || {
+        rig.ownership.observe("claude", &sid).state == OwnershipState::Vacant
+    })
+    .await;
+
+    // The corrective frames, in arrival order: the fenced `handoff-failed`
+    // (reason REAP_TIMEOUT) strictly before the `released` (reason
+    // WATCHER_FAILED) — the same-generation fold converges every device on
+    // the vacant key.
+    let frames = await_owner_frames(&mut rig.rx, &["handoff-failed", "released"]).await;
+    let failed = runtime_owner_frame(&frames, "handoff-failed");
+    assert_eq!(failed["reason"], json!("REAP_TIMEOUT"));
+    let released = runtime_owner_frame(&frames, "released");
+    assert_eq!(
+        released["ownerKind"],
+        json!("vacant"),
+        "the watcher-failed release names the vacant key: {released}"
+    );
+    assert_eq!(
+        released["reason"],
+        json!("WATCHER_FAILED"),
+        "the typed watcher-failed reason rides the release: {released}"
+    );
+    let failed_pos = frames
+        .iter()
+        .position(|f| f["transition"] == "handoff-failed")
+        .expect("the failed frame position");
+    let released_pos = frames
+        .iter()
+        .position(|f| f["transition"] == "released")
+        .expect("the released frame position");
+    assert!(
+        failed_pos < released_pos,
+        "the failure frame (index {failed_pos}) must precede the release (index {released_pos})"
+    );
+
+    // The recoverable state: a retry SUCCEEDS (the key reopened; pre-fix
+    // every retry stayed HANDOFF_IN_PROGRESS forever).
+    kill_pause.notify_one(); // release the parked (aborted) kill's pause slot
+    let retry = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let retried = retry.completion.await.expect("retry completed");
+    assert_eq!(
+        retried["ok"],
+        json!(true),
+        "the post-watcher-failure retry must succeed: {retried}"
+    );
+    let retry_terminal = retried["owner"]["terminalId"].as_str().unwrap().to_string();
+    rig.registry.kill(&retry_terminal);
+}
+
+/// 3h. b8ke focused review FR3 (the runner's fenced not-confirmed path): a
+/// claude prior whose teardown CANNOT confirm the runtime tree's death in
+/// its bounded window (a TERM-immune tagged descendant outlives the
+/// one-round test window) makes the handoff answer the typed retryable
+/// REAP_TIMEOUT and fence the key in Handoff — never a bare success with
+/// the lingering descendant still alive — until the lane's carried
+/// escalation confirms death, the watcher releases the key to Vacant, and
+/// the corrective `released` frame lands. Linux-only: the /proc ownership
+/// tag scan is the Linux discipline.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn handoff_with_an_unconfirmable_claude_tree_fences_the_key_until_the_escalation_lands() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    // The one-round confirmation window: a TERM-immune descendant
+    // deterministically outlives it (the SIGKILL escalation is rounds away).
+    let mut rig = build_rig_full(None, None, None, 8_000, Some(1));
+    establish_fresh_claude_owner(&rig, &sid).await;
+    let prior_pid = env.sidecar_pid_for(&sid).expect("the prior sidecar's pid");
+
+    // Discover the sidecar's ownership tag from its environment (the
+    // spawn injects FRESHELL_CLAUDE_SIDECAR_ID; our process is its
+    // ancestor, so /proc/<pid>/environ is readable) and park a
+    // TERM-immune tagged "CLI grandchild" under it.
+    let ownership_id = {
+        let environ = std::fs::read(format!("/proc/{prior_pid}/environ"))
+            .expect("read the sidecar's environ");
+        environ
+            .split(|&b| b == 0)
+            .find_map(|var| {
+                let var = std::str::from_utf8(var).ok()?;
+                var.strip_prefix("FRESHELL_CLAUDE_SIDECAR_ID=")
+            })
+            .expect("the sidecar's ownership id")
+            .to_string()
+    };
+    let mut grandchild = tokio::process::Command::new("bash")
+        .arg("-c")
+        .arg("trap '' TERM; while :; do sleep 1; done")
+        .env("FRESHELL_CLAUDE_SIDECAR_ID", &ownership_id)
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn the lingering tagged grandchild");
+    let grandchild_pid = grandchild.id().expect("grandchild pid");
+
+    // Handoff claude -> terminal: the prior stop cannot confirm the tree's
+    // death in its (one-round) window.
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let result = handle.completion.await.expect("runner completed");
+
+    // The typed fenced failure — NEVER a bare success while the descendant
+    // lives.
+    assert_eq!(
+        result["ok"],
+        json!(false),
+        "the unconfirmable-tree handoff must fail: {result}"
+    );
+    assert_eq!(result["error"]["code"], json!("REAP_TIMEOUT"));
+    assert_eq!(result["error"]["retryable"], json!(true));
+    // The key is FENCED in Handoff at the failure (the lane's carried
+    // escalation needs its SIGKILL rounds — ≥500ms — before the watcher
+    // can release): a competing create is Blocked, never granted, while the
+    // lingering descendant still lives.
+    assert!(
+        matches!(
+            rig.ownership.observe("claude", &sid).state,
+            OwnershipState::Handoff { .. }
+        ),
+        "the unconfirmable tree must fence the key in Handoff, got {:?}",
+        rig.ownership.observe("claude", &sid).state
+    );
+    assert!(
+        matches!(
+            rig.ownership.begin_start(
+                "claude",
+                &sid,
+                RuntimeOwnerKind::FreshAgent,
+                "fence-probe-create-fr3",
+                None,
+                "test",
+                0,
+            ),
+            BeginOutcome::Blocked { .. }
+        ),
+        "a create during the fenced not-confirmed window must be Blocked"
+    );
+
+    // The escalation lands: the descendant dies (a zombie counts — nothing
+    // holds its pipes; `proc_starttime` reads None for state Z), the
+    // watcher releases the key to Vacant, and the corrective frames arrive
+    // in order.
+    await_cond("the escalation must kill the lingering descendant", || {
+        crate::session_lease::proc_starttime(grandchild_pid as i32).is_none()
+    })
+    .await;
+    await_cond("the confirmed death must release the fenced key", || {
+        rig.ownership.observe("claude", &sid).state == OwnershipState::Vacant
+    })
+    .await;
+    let frames = await_owner_frames(&mut rig.rx, &["handoff-failed", "released"]).await;
+    let failed = runtime_owner_frame(&frames, "handoff-failed");
+    assert_eq!(failed["reason"], json!("REAP_TIMEOUT"));
+    let released = runtime_owner_frame(&frames, "released");
+    assert_eq!(
+        released["ownerKind"],
+        json!("vacant"),
+        "the truth: {released}"
+    );
+    let failed_pos = frames
+        .iter()
+        .position(|f| f["transition"] == "handoff-failed")
+        .expect("the failed frame position");
+    let released_pos = frames
+        .iter()
+        .position(|f| f["transition"] == "released")
+        .expect("the released frame position");
+    assert!(
+        failed_pos < released_pos,
+        "the failure frame (index {failed_pos}) must precede the release (index {released_pos})"
+    );
+    await_pid_dead(prior_pid).await;
+    let _ = grandchild.wait().await;
+
+    // The recoverable state: a retry from Vacant succeeds.
     let retry = rig
         .runner
         .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
@@ -2448,6 +2764,140 @@ async fn opencode_handoff_stop_aborts_the_active_turn_through_the_manager_before
 
     // Cleanup: kill the terminal owner's row (the lane bookkeeping for an
     // opencode session no longer exists post-handoff).
+    rig.registry.kill(&terminal_id);
+}
+
+/// 6d. b8ke focused review FR1: the IdleTimeout shape — the local turn
+/// task FINISHED (the local `run_turn` await gave up) while the
+/// daemon-side turn still runs (the prompt was accepted; no idle ever
+/// arrived). The stop path must STILL abort the daemon-side turn through
+/// the manager and AWAIT its answer before reporting Reaped — pre-fix, the
+/// stop skipped the abort entirely whenever the local task was finished
+/// and let the handoff start a terminal writer over a still-running
+/// daemon-side turn.
+#[tokio::test]
+async fn opencode_handoff_stop_aborts_a_daemon_turn_left_running_by_a_finished_local_task() {
+    let _guard = ENV_LOCK.lock().await;
+    // The claude-lane env surface this file's tests mutate
+    // (FRESHELL_CLAUDE_SIDECAR/NODE, FAKE_SIDECAR_REQUEST_LOG,
+    // CLAUDE_CONFIG_DIR) is process-global and shared with claude.rs's and
+    // snapshot.rs's tests through THEIR lock — hold it too: our own
+    // ENV_LOCK only serializes this file against itself.
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let env = FakeOpencodeServeEnv::install();
+    // The abort-hold release file: absent until the test writes it, so the
+    // fake serve holds its abort answer open.
+    let release = env.dir.join("abort-release-fr1");
+    std::env::set_var("FAKE_OPENCODE_SERVE_ABORT_RELEASE", &release);
+    let sid = format!("ses_handoff_idletimeout_{}", uuid::Uuid::new_v4().simple());
+    let rig = build_rig(None);
+
+    // Fresh owner: a durable opencode session, registered through the
+    // shared serve (the test-6 pattern).
+    rig.fresh_opencode
+        .handle_attach(FreshAgentAttach {
+            provider: AgentProvider::Opencode,
+            session_id: sid.clone(),
+            session_type: SessionType::Freshopencode,
+            cwd: Some("/tmp".to_string()),
+            observed_epoch: None,
+            observed_generation: None,
+            resume_session_id: None,
+            session_ref: None,
+        })
+        .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        match rig.ownership.observe("opencode", &sid).state {
+            OwnershipState::Live { owner, .. } => {
+                assert_eq!(owner.kind, RuntimeOwnerKind::FreshAgent);
+                break;
+            }
+            state => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the opencode attach never committed Live, got {state:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+
+    // An ACTIVE daemon-side turn: a send whose prompt the fake serve
+    // accepts but whose idle never arrives.
+    rig.fresh_opencode
+        .handle_send(freshell_protocol::FreshAgentSend {
+            provider: AgentProvider::Opencode,
+            session_id: sid.clone(),
+            session_type: SessionType::Freshopencode,
+            text: "hold this daemon-side turn open".to_string(),
+            cwd: Some("/tmp".to_string()),
+            images: None,
+            request_id: Some(format!("handoff-idletimeout-send-{}", uuid::Uuid::new_v4())),
+            settings: None,
+        })
+        .await;
+    env.await_audit_row(Duration::from_secs(20), |r| {
+        r["method"] == "POST"
+            && r["path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with("/prompt_async"))
+    })
+    .await;
+
+    // THE IdleTimeout shape: the LOCAL turn task finishes (the local
+    // await is settled) while the daemon-side turn keeps running — the
+    // test seam performs exactly the local settle a real IdleTimeout
+    // leaves behind (task finished, acceptance still armed).
+    rig.fresh_opencode
+        .settle_local_turn_task_for_test(&sid)
+        .await;
+
+    // Handoff opencode -> terminal: the stop must STILL abort the
+    // daemon-side turn before the reap is reported.
+    let to_terminal = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("opencode", &sid, "opencode"));
+    let mut completion = to_terminal.completion;
+
+    // The manager abort was ISSUED through the daemon for the REAL session
+    // id — despite the local task being finished (pre-fix: never issued).
+    env.await_audit_row(Duration::from_secs(20), |r| {
+        r["event"] == "abort-received" && r["id"] == json!(sid)
+    })
+    .await;
+
+    // Ordering: the handoff must NOT complete (Reaped unreported) while
+    // the daemon-side abort is unanswered.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), &mut completion)
+            .await
+            .is_err(),
+        "the handoff completed before the daemon-side turn abort settled — \
+         Reaped must follow the manager abort even when the local task finished"
+    );
+
+    // Release: the daemon answers the abort; the stop reports Reaped and
+    // the handoff runs to its committed terminal owner.
+    std::fs::write(&release, "").expect("release the abort hold");
+    let result = completion.await.expect("handoff completed");
+    assert_eq!(result["ok"], json!(true), "handoff to terminal: {result}");
+    let terminal_id = result["owner"]["terminalId"].as_str().unwrap().to_string();
+
+    // The shared serve was never killed — exactly one serve pid across
+    // the whole handoff.
+    env.await_audit_row(Duration::from_secs(10), |r| {
+        r["event"] == "abort-answered" && r["id"] == json!(sid)
+    })
+    .await;
+    assert_eq!(
+        env.serve_pids().len(),
+        1,
+        "the shared serve was never killed or restarted: pids {:?}",
+        env.serve_pids()
+    );
+
+    // Cleanup: kill the terminal owner's row.
     rig.registry.kill(&terminal_id);
 }
 
