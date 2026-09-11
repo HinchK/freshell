@@ -353,10 +353,16 @@ async fn main() -> ExitCode {
     // restart reloads the pane registry instead of losing it, so
     // respawn/attach resolution for browser-created panes survives restarts.
     // A `None` home (headless/ephemeral run) has nowhere to persist and
-    // stays in-memory only — the pre-existing behavior.
+    // stays in-memory only — the pre-existing behavior. Round-2 review M2:
+    // constructed with the OFFLOAD writer, so every persist is serialized
+    // under the layout lock and durably written from `spawn_blocking` (the
+    // repo's A13 discipline) instead of fsyncing on the async runtime
+    // while holding the mutex; the queue is drained at graceful shutdown
+    // below.
     let layout_store = match home.as_deref() {
-        Some(home_dir) => freshell_freshagent::layout_store::LayoutStore::with_persistence(
+        Some(home_dir) => freshell_freshagent::layout_store::LayoutStore::with_persistence_offload(
             home_dir.join(".freshell").join("layout-store.json"),
+            tokio::runtime::Handle::current(),
         ),
         None => freshell_freshagent::layout_store::LayoutStore::default(),
     };
@@ -2114,6 +2120,12 @@ async fn main() -> ExitCode {
     freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
         .shutdown()
         .await;
+    // kata b8ke Task 10 (round-2 review M2): drain the layout store's
+    // ordered persist writer before exit, so a graceful SIGTERM/SIGINT
+    // restart loses no queued layout write. (A hard kill can still lose
+    // the in-flight tail — the registry is re-syncable from connected
+    // clients, which re-send their layout on reconnect.)
+    layout_store.flush_persistence().await;
     // DIAG-01 lifecycle context: the terminal "we are done" marker. Every
     // owner above has run (WS drain, registry kill_all, all three fresh-agent
     // sidecar reapers, the codex launch manager); the logging writer flushes

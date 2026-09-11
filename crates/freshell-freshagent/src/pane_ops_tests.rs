@@ -987,6 +987,17 @@ fn task10_claude_spec() -> freshell_platform::CliCommandSpec {
 /// client-minted id shape: the pane exists ONLY in the synced layout,
 /// never in this crate's REST-side `pane_tabs`).
 fn task10_ui_layout_sync(pane_id: &str, tab_id: &str) -> freshell_protocol::UiLayoutSync {
+    task10_ui_layout_sync_with_status(pane_id, tab_id, "running")
+}
+
+/// The status-parameterized variant (round-2 review M3): the leaf walk is
+/// status-blind, and error-status leaves (create-failed / restoreError
+/// panes) are first-class resolution cases the brief names.
+fn task10_ui_layout_sync_with_status(
+    pane_id: &str,
+    tab_id: &str,
+    status: &str,
+) -> freshell_protocol::UiLayoutSync {
     freshell_protocol::UiLayoutSync {
         tabs: vec![freshell_protocol::UiLayoutTab {
             id: tab_id.to_string(),
@@ -1000,7 +1011,7 @@ fn task10_ui_layout_sync(pane_id: &str, tab_id: &str) -> freshell_protocol::UiLa
                 "content": {
                     "kind": "terminal",
                     "mode": "claude",
-                    "status": "running",
+                    "status": status,
                     "createRequestId": "r-task10",
                 },
             },
@@ -1119,6 +1130,64 @@ async fn respawn_resolves_a_browser_created_pane_through_the_layout_store() {
             .get("pane-browser-1")
             .map(String::as_str),
         Some("tab-browser-1")
+    );
+    state.terminal_registry.clone().unwrap().kill(&terminal_id);
+}
+
+/// kata b8ke Task 10 (round-2 review M3): an ERROR-STATUS leaf — the
+/// brief's create-failed / restoreError case (a pane whose spawn or
+/// restore failed, so it never carries a live terminalId) — resolves
+/// through the layout store exactly like a running one and respawns IN
+/// PLACE. The leaf walk is status-blind by construction; this test pins
+/// that contract directly.
+#[tokio::test]
+async fn respawn_resolves_a_create_failed_pane_through_the_layout_store() {
+    let state = state_with_registry().with_cli_commands(Arc::new(vec![task10_claude_spec()]));
+    let router = app(state.clone());
+    let mut rx = state.broadcast_tx.subscribe();
+
+    // A create-failed pane: error status + a restoreError marker, no
+    // terminalId — the exact shape a failed spawn leaves in the mirror.
+    let mut sync = task10_ui_layout_sync_with_status("pane-err-1", "tab-err-1", "create-failed");
+    sync.layouts["tab-err-1"]["content"]["restoreError"] = json!({
+        "code": "RESTORE_UNAVAILABLE",
+        "reason": "spawn_failed"
+    });
+    state.layout.update_from_ui(&sync, "client-a");
+
+    let tmp = std::env::temp_dir();
+    let (status_code, body) = post(
+        router,
+        "/api/panes/pane-err-1/respawn",
+        json!({
+            "mode": "claude",
+            "cwd": tmp.to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": "sid-r10-err" },
+        }),
+        true,
+    )
+    .await;
+    assert_eq!(status_code, StatusCode::OK, "{body}");
+    let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
+    assert!(!terminal_id.is_empty());
+
+    // Recovery IN PLACE: the broadcast carries the SAME client-minted ids.
+    let frame = rx.recv().await.expect("pane.attach broadcast");
+    let msg: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(msg["command"], json!("pane.attach"));
+    assert_eq!(msg["payload"]["tabId"], json!("tab-err-1"));
+    assert_eq!(msg["payload"]["paneId"], json!("pane-err-1"));
+    assert_eq!(msg["payload"]["content"]["terminalId"], json!(terminal_id));
+
+    assert_eq!(
+        state
+            .pane_tabs
+            .lock()
+            .unwrap()
+            .get("pane-err-1")
+            .map(String::as_str),
+        Some("tab-err-1"),
+        "recovery IN PLACE for an error-status leaf"
     );
     state.terminal_registry.clone().unwrap().kill(&terminal_id);
 }

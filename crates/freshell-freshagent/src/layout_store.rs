@@ -28,6 +28,10 @@ mod content;
 pub use content::{derive_pane_title, is_valid_percent, normalize_pair_to_hundred};
 use content::{migrate_legacy_fresh_agent_content, migrate_legacy_fresh_agent_node};
 
+#[path = "layout_store_persist.rs"]
+mod persist;
+use persist::{load_persisted_clients, persist_locked};
+
 /// One ORDERED tab row (`UiSnapshot.tabs`, `layout-store.ts:7`).
 #[derive(Clone, Debug, Default)]
 pub struct TabRow {
@@ -105,6 +109,16 @@ struct LayoutInner {
     /// snapshot to this path (atomic temp+rename) and construction loads
     /// it, so a server restart does not lose the pane registry.
     persist_path: Option<std::path::PathBuf>,
+    /// kata b8ke Task 10 (round-2 review, M2): `Some` → every persist is
+    /// SERIALIZED under the layout lock and HANDED to the ordered writer
+    /// task (enqueued before the lock is released, so queue order ==
+    /// mutation order); the writer performs each durable write inside
+    /// `spawn_blocking` (the repo's A13 discipline), so the ~15ms fsync
+    /// never pins an async worker and never runs under this mutex.
+    /// `None` (tests, `None`-home runs) → the write runs inline on the
+    /// mutating thread under the lock (the pre-M2 behavior; synchronous
+    /// contexts only).
+    persist_tx: Option<tokio::sync::mpsc::UnboundedSender<persist::PersistMsg>>,
 }
 
 impl LayoutInner {
@@ -227,12 +241,19 @@ impl LayoutStore {
     /// with a persistence path. Every mutation that changes the snapshot
     /// rewrites the multi-client snapshot to `path` with the atomic
     /// temp+rename discipline (the `~/.freshell/config.json` writer's
-    /// pattern: write `path.tmp`, fsync, rename), and construction LOADS a
-    /// previously persisted file (best-effort: a corrupt/absent file logs
-    /// a warning and boots empty — never a crash). Loaded entries are
-    /// marked STALE: a restarted server has no live connections, and the
-    /// client mirror is change-gated — retention is exactly what the
-    /// stale-entry design exists for.
+    /// pattern: write `path.tmp`, fsync, rename, parent-dir fsync), and
+    /// construction LOADS a previously persisted file (best-effort: a
+    /// corrupt/absent file logs a warning and boots empty — never a
+    /// crash). Loaded entries are marked STALE: a restarted server has no
+    /// live connections, and the client mirror is change-gated —
+    /// retention is exactly what the stale-entry design exists for.
+    ///
+    /// Writes run INLINE on the mutating thread (fine for the synchronous
+    /// test contexts that use this constructor); production — where
+    /// mutators run on the async runtime — uses
+    /// [`LayoutStore::with_persistence_offload`] instead, which hands
+    /// every write to an ordered `spawn_blocking` writer (round-2 review
+    /// M2).
     pub fn with_persistence(path: std::path::PathBuf) -> Self {
         let store = Self::default();
         {
@@ -1113,145 +1134,38 @@ impl LayoutStore {
 
 // ── snapshot helpers ─────────────────────────────────────────────────────────
 
-/// The persisted-file schema version (kata b8ke Task 10): `{"version": 1,
-/// "clients": [{key, snapshot, stale}]}`. No rotation, no migration beyond
-/// this field — a future shape change bumps it and loads empty.
-const PERSIST_SCHEMA_VERSION: i64 = 1;
+// The durable-persistence half (persist_locked/load + the M2 ordered
+// writer) lives in [`persist`] (`layout_store_persist.rs`).
 
-/// Rewrite the multi-client snapshot to the store's persistence path (atomic
-/// temp+rename: write `path.tmp`, fsync, rename — the config-persistence
-/// idiom). Best-effort: a failure warn-logs and NEVER blocks the mutation
-/// that called it (the in-memory store stays authoritative for this boot).
-/// Called with the inner lock held (single-process single-writer).
-fn persist_locked(inner: &LayoutInner) {
-    let Some(path) = &inner.persist_path else {
-        return;
-    };
-    let body = json!({
-        "version": PERSIST_SCHEMA_VERSION,
-        "clients": inner
-            .clients
-            .iter()
-            .map(|entry| json!({
-                "key": entry.key,
-                "snapshot": snapshot_value(&entry.snapshot),
-                "stale": entry.stale,
-            }))
-            .collect::<Vec<_>>(),
-    });
-    let write = (|| -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp = path.with_extension("tmp");
-        let mut file = std::fs::File::create(&tmp)?;
-        use std::io::Write;
-        file.write_all(body.to_string().as_bytes())?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
-    })();
-    if let Err(error) = write {
-        tracing::warn!(
-            target: "freshell_freshagent::layout_store",
-            %error,
-            path = %path.display(),
-            "layout_store_persist_failed: keeping the in-memory snapshot"
-        );
+impl LayoutStore {
+    /// kata b8ke Task 10 (round-2 review, M2): the PRODUCTION construction
+    /// — [`LayoutStore::with_persistence`] plus the ordered offload writer
+    /// on `runtime`. Every snapshot-set mutation serializes its snapshot
+    /// under the layout lock, hands it to the writer, and returns without
+    /// blocking; the writer performs each durable write (atomic
+    /// temp+rename+parent-fsync) inside `spawn_blocking` — the repo's A13
+    /// discipline (`terminal.rs` / pane-ledger writes) — strictly in
+    /// mutation order. [`Self::flush_persistence`] drains the queue
+    /// (graceful shutdown; tests).
+    pub fn with_persistence_offload(
+        path: std::path::PathBuf,
+        runtime: tokio::runtime::Handle,
+    ) -> Self {
+        let store = Self::with_persistence(path);
+        let tx = persist::spawn_offload_writer(&runtime);
+        store.lock().persist_tx = Some(tx);
+        store
     }
-}
 
-/// The load half of [`persist_locked`]: parse the persisted clients array
-/// back into `inner`. Every loaded entry is marked STALE (post-restart, no
-/// connection is live; the change-gated client mirror re-supersedes them on
-/// its next sync via the existing subset-eviction rule).
-fn load_persisted_clients(inner: &mut LayoutInner, body: &Value) {
-    if body.get("version").and_then(Value::as_i64) != Some(PERSIST_SCHEMA_VERSION) {
-        tracing::warn!(
-            target: "freshell_freshagent::layout_store",
-            version = ?body.get("version"),
-            "layout_store_persist_unsupported_version: booting empty"
-        );
-        return;
-    }
-    let Some(clients) = body.get("clients").and_then(Value::as_array) else {
-        tracing::warn!(
-            target: "freshell_freshagent::layout_store",
-            "layout_store_persist_malformed: no clients array, booting empty"
-        );
-        return;
-    };
-    for entry in clients {
-        let Some(key) = entry.get("key").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(snapshot_value_json) = entry.get("snapshot") else {
-            continue;
-        };
-        let Some(snapshot) = snapshot_from_value(snapshot_value_json) else {
-            continue;
-        };
-        inner.clients.push(ClientEntry {
-            key: key.to_string(),
-            snapshot,
-            // A restarted server has no live connections — retained, never
-            // primary while a live client exists (the stale-entry contract).
-            stale: true,
-        });
-    }
-    tracing::info!(
-        target: "freshell_freshagent::layout_store",
-        entries = inner.clients.len(),
-        "layout_store_persist_loaded: registry restored from disk"
-    );
-}
-
-/// Rebuild one [`UiSnapshot`] from its persisted JSON (the `snapshot_value`
-/// round-trip): tabs/activeTabId/layouts (via `PaneNode::parse`)/
-/// activePane/paneTitles/paneTitleSetByUser/timestamp.
-fn snapshot_from_value(value: &Value) -> Option<UiSnapshot> {
-    let obj = value.as_object()?;
-    let mut snapshot = UiSnapshot {
-        tabs: Vec::new(),
-        active_tab_id: obj
-            .get("activeTabId")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        layouts: HashMap::new(),
-        active_pane: HashMap::new(),
-        pane_titles: nested_string_map(obj.get("paneTitles")),
-        pane_title_set_by_user: nested_bool_map(obj.get("paneTitleSetByUser")),
-        timestamp: obj.get("timestamp").and_then(Value::as_i64),
-    };
-    for tab in obj.get("tabs")?.as_array()? {
-        snapshot.tabs.push(TabRow {
-            id: tab.get("id")?.as_str()?.to_string(),
-            title: tab.get("title").and_then(Value::as_str).map(str::to_string),
-            fallback_session_ref: tab.get("fallbackSessionRef").cloned(),
-        });
-    }
-    if let Some(layouts) = obj.get("layouts").and_then(Value::as_object) {
-        for (tab_id, node) in layouts {
-            // The persistence layer is a verbatim round-trip of what the
-            // store itself wrote (`PaneNode::to_value`), so the migration
-            // pass is not needed — but running it keeps a hand-edited or
-            // legacy-shaped file on the same code path as a live sync.
-            let migrated = migrate_legacy_fresh_agent_node(node);
-            if let Some(parsed) = PaneNode::parse(&migrated) {
-                snapshot.layouts.insert(tab_id.clone(), parsed);
-            }
+    /// Wait until every persist queued before this call has landed on disk
+    /// (graceful shutdown; tests). No-op without the offload writer — the
+    /// inline path is synchronous by construction.
+    pub async fn flush_persistence(&self) {
+        let tx = self.lock().persist_tx.clone();
+        if let Some(tx) = tx {
+            persist::send_flush_and_wait(&tx).await;
         }
     }
-    if let Some(active_pane) = obj.get("activePane").and_then(Value::as_object) {
-        for (tab_id, pane_id) in active_pane {
-            if let Some(pane_id) = pane_id.as_str() {
-                snapshot
-                    .active_pane
-                    .insert(tab_id.clone(), pane_id.to_string());
-            }
-        }
-    }
-    Some(snapshot)
 }
 
 fn tab_row_value(tab: &TabRow) -> Value {
