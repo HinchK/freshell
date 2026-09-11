@@ -1509,15 +1509,26 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
         let operation_id = handoff
             .map(|t| t.operation_id.clone())
             .unwrap_or_else(|| format!("rest-create-{create_request_id}"));
+        // b8ke delta review F7: a half-fenced body (exactly one of the
+        // observed epoch/generation pair) is a TYPED invalid-fence refusal —
+        // never a silent legacy downgrade.
+        let observed = crate::ownership_lane::wire_fence(
+            body.get("observedEpoch").and_then(Value::as_u64),
+            body.get("observedGeneration").and_then(Value::as_u64),
+        )
+        .map_err(|err| {
+            tracing::warn!(target: "freshell_freshagent::terminal_tabs",
+                provider = %locator.provider, session_id = %locator.session_id, pane_id = %pane_id,
+                code = err.code(),
+                "spawn_refused: the observed fence is half-sent (invalid)");
+            fail_json(StatusCode::BAD_REQUEST, err.message().to_string())
+        })?;
         match crate::ownership_lane::begin_terminal_lane_claim(
             &state.ownership,
             &locator.provider,
             &locator.session_id,
             &operation_id,
-            crate::ownership_lane::wire_fence(
-                body.get("observedEpoch").and_then(Value::as_u64),
-                body.get("observedGeneration").and_then(Value::as_u64),
-            ),
+            observed,
             "rest",
             now_ms().max(0) as u64,
         ) {

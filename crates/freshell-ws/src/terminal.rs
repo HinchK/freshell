@@ -3012,15 +3012,40 @@ pub(crate) async fn handle_create(
         if state.ownership.is_some() {
             let operation_id = format!("term-create-{}", create.request_id);
             let initiator = format!("ws-conn-{conn_id}");
+            // b8ke delta review F7: a half-sent observed pair (exactly one
+            // of epoch/generation) is a typed invalid-fence refusal — never
+            // a silent legacy downgrade. The WS `Error` frame's code enum
+            // is frozen-client parity, so the refusal rides the existing
+            // INVALID_CREATE_REQUEST code with a half-fence message (the
+            // fresh-agent free-string surfaces carry INVALID_FENCE).
+            let observed = match freshell_freshagent::ownership_lane::wire_fence(
+                create.observed_epoch,
+                create.observed_generation,
+            ) {
+                Ok(fence) => fence,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "freshell_ws::terminal",
+                        provider = %locator.provider,
+                        session_id = %locator.session_id,
+                        request_id = %create.request_id,
+                        "terminal_create_refused: the observed fence is half-sent (invalid)"
+                    );
+                    return send_create_error(
+                        out,
+                        ErrorCode::InvalidCreateRequest,
+                        err.message().to_string(),
+                        &create.request_id,
+                    )
+                    .await;
+                }
+            };
             let claim = freshell_freshagent::ownership_lane::begin_terminal_lane_claim(
                 &state.ownership,
                 &locator.provider,
                 &locator.session_id,
                 &operation_id,
-                freshell_freshagent::ownership_lane::wire_fence(
-                    create.observed_epoch,
-                    create.observed_generation,
-                ),
+                observed,
                 &initiator,
                 now_ms().max(0) as u64,
             );
@@ -6639,14 +6664,57 @@ async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) ->
         state.registry.retained_ownership_claim(&kill.terminal_id),
     ) {
         let stop_op_id = format!("term-kill-{}", uuid::Uuid::new_v4());
-        let observed = freshell_freshagent::ownership_lane::wire_fence(
+        // b8ke delta review F7: a half-sent observed pair (exactly one of
+        // epoch/generation) is a typed invalid-fence refusal — the kill
+        // does NOT fall back to the retained-claim fence (that would be
+        // the silent downgrade) and nothing is killed. Nothing has run
+        // yet, so the refusal strands no state.
+        let observed = match freshell_freshagent::ownership_lane::wire_fence(
             kill.observed_epoch,
             kill.observed_generation,
-        )
-        .unwrap_or(freshell_ownership::ObservedFence {
-            epoch: ownership.boot_epoch(),
-            generation: retained.generation,
-        });
+        ) {
+            Ok(Some(fence)) => fence,
+            Ok(None) => freshell_ownership::ObservedFence {
+                epoch: ownership.boot_epoch(),
+                generation: retained.generation,
+            },
+            Err(err) => {
+                tracing::warn!(
+                    target: "freshell_ws::terminal",
+                    terminal_id = %kill.terminal_id,
+                    provider = %retained.locator.provider,
+                    session_id = %retained.locator.session_id,
+                    "terminal_kill_refused: the observed fence is half-sent (invalid) — \
+                     nothing is killed, no durable close is recorded"
+                );
+                let reason = err.message().to_string();
+                if let Some(request_id) = &kill.request_id {
+                    let msg = ServerMessage::TerminalKilled(freshell_protocol::TerminalKilled {
+                        request_id: request_id.clone(),
+                        terminal_id: kill.terminal_id,
+                        success: false,
+                        error: Some(reason),
+                    });
+                    return send(ws_tx, &msg).await;
+                }
+                let msg = ServerMessage::Error(ErrorMsg {
+                    owner_kind: None,
+                    owner_generation: None,
+                    owner_epoch: None,
+                    code: ErrorCode::InvalidCreateRequest,
+                    message: reason,
+                    timestamp: crate::now_iso(),
+                    actual_session_ref: None,
+                    expected_session_ref: None,
+                    request_id: None,
+                    retry_after_ms: None,
+                    terminal_exit_code: None,
+                    terminal_id: None,
+                    live_terminal_id: None,
+                });
+                return send(ws_tx, &msg).await;
+            }
+        };
         let claim = freshell_ownership::StopClaim {
             expected_kind: freshell_ownership::RuntimeOwnerKind::Terminal,
             expected_runtime: Some(freshell_ownership::OwnerIdentity {

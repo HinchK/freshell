@@ -1105,12 +1105,25 @@ impl FreshClaudeState {
             // the provider lease — so the cross-kind authority decides
             // atomically. The wire pair on `freshAgent.create` is the
             // delayed-request fence (`None` = legacy unfenced sender, still
-            // cross-kind-checked).
+            // cross-kind-checked). b8ke delta review F7: a half-sent pair is
+            // the typed invalid-fence refusal, never a legacy downgrade.
             let claim_op_id = format!("create-resume-{request_id}");
+            let claim_fence =
+                crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation);
+            let claim_fence = match claim_fence {
+                Ok(fence) => fence,
+                Err(err) => {
+                    tracing::warn!(target: "freshell_freshagent::claude",
+                        session_id = %sid, request_id = %request_id, code = err.code(),
+                        "fresh_agent_create_refused: the observed fence is half-sent (invalid)");
+                    self.fail_create(&request_id, err.code(), err.message());
+                    return;
+                }
+            };
             match self.begin_lane_claim_at(
                 sid,
                 &claim_op_id,
-                crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation),
+                claim_fence,
                 &Self::initiator_for(provenance.as_ref(), "freshclaude/create-resume"),
             ) {
                 crate::ownership_lane::LaneClaim::Granted(ticket) => own_ticket = Some(ticket),
@@ -1640,6 +1653,29 @@ impl FreshClaudeState {
         let session_id = msg.session_id.clone();
         let session_type = session_type_str(msg.session_type);
 
+        // b8ke delta review F7: a half-sent observed pair (exactly one of
+        // epoch/generation) is the typed invalid-fence refusal — BEFORE the
+        // durable close, the mint gate, or any live-state destruction. The
+        // kill never proceeds as a silently downgraded legacy request.
+        let stop_fence = match crate::ownership_lane::wire_fence(
+            msg.observed_epoch,
+            msg.observed_generation,
+        ) {
+            Ok(fence) => fence,
+            Err(err) => {
+                tracing::warn!(target: "freshell_freshagent::claude",
+                    session_id = %session_id, code = err.code(),
+                    "fresh_agent_kill_refused: the observed fence is half-sent (invalid)");
+                self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                    provider: PROVIDER.to_string(),
+                    session_id: msg.session_id.clone(),
+                    session_type: session_type.to_string(),
+                    success: false,
+                }));
+                return;
+            }
+        };
+
         // Retire-on-kill (delta-review round 5 + focused-ep5-r1 round 2,
         // restore-open-sessions-only): an explicit kill is an intentional
         // session END — every durable id this kill covers retires its
@@ -1770,9 +1806,8 @@ impl FreshClaudeState {
         // keeps serving (adoptions proceed; retry-after-settle is honest).
         // `NotLive{Vacant}`: the kill proceeds (idempotent lane cleanup)
         // and skips the commit. No retained stamp: lane-local cleanup, no
-        // transition.
-        let stop_fence =
-            crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation);
+        // transition. (The fence itself was resolved at entry — a half-sent
+        // pair never reaches this point.)
         let mut stop_generation: Option<u64> = None;
         let mut stop_op_id: Option<String> = None;
         let mut stop_key: Option<String> = None;
@@ -4321,6 +4356,28 @@ impl FreshClaudeState {
     /// | untracked, transcript ABSENT in EVERY candidate root | `lost_session_frame` -- positive denial: the store is the authority (honest even under the 30-day GC, ledger A4) |
     /// | untracked, spawn/pipe/created failure (incl. no store root resolvable) | top-level `error` `CLAUDE_ATTACH_RESUME_FAILED` -- NEVER the lost frame |
     pub async fn handle_attach(&self, msg: FreshAgentAttach) {
+        // b8ke delta review F7: a half-sent observed pair (exactly one of
+        // epoch/generation) is the typed invalid-fence refusal — before any
+        // state interaction. The attach never proceeds as a silently
+        // downgraded legacy request.
+        let attach_fence = match crate::ownership_lane::wire_fence(
+            msg.observed_epoch,
+            msg.observed_generation,
+        ) {
+            Ok(fence) => fence,
+            Err(err) => {
+                tracing::warn!(target: "freshell_freshagent::claude",
+                    session_id = %msg.session_id, code = err.code(),
+                    "fresh_agent_attach_refused: the observed fence is half-sent (invalid)");
+                self.emit_fresh_agent_error(
+                    &msg.session_id,
+                    session_type_str(msg.session_type),
+                    err.code(),
+                    err.message(),
+                );
+                return;
+            }
+        };
         if self.sessions.lock().await.contains_key(&msg.session_id) {
             return; // tracked-and-alive: no frame (wire-shape parity with codex)
         }
@@ -4376,7 +4433,7 @@ impl FreshClaudeState {
         let mut own_ticket = match self.begin_lane_claim_at(
             &durable,
             &format!("attach-{}", uuid::Uuid::new_v4()),
-            crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation),
+            attach_fence,
             "freshclaude/attach",
         ) {
             crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
@@ -6648,6 +6705,40 @@ pub(crate) mod tests {
         assert_eq!(frame["sessionType"], "freshclaude");
         assert_eq!(frame["event"]["type"], "freshAgent.error");
         assert_eq!(frame["event"]["code"], "INVALID_SESSION_ID");
+    }
+
+    /// b8ke delta review F7: a half-fenced `freshAgent.attach` (exactly one
+    /// of the observed epoch/generation pair) is the TYPED invalid-fence
+    /// refusal — never the silent legacy downgrade (which could let an
+    /// old-generation half-fenced request reacquire a Vacant key). Both
+    /// half-fence combinations refuse; nothing is spawned or resumed.
+    #[tokio::test]
+    async fn handle_attach_refuses_each_half_fenced_observation_typed() {
+        for (epoch, generation) in [(Some(3u64), None), (None, Some(7u64))] {
+            let (st, mut rx) = state_with_bus();
+            let mut msg = attach_msg("half-fenced");
+            msg.observed_epoch = epoch;
+            msg.observed_generation = generation;
+
+            st.handle_attach(msg).await;
+
+            let raw = rx.try_recv().expect("the typed refusal frame");
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(frame["type"], "freshAgent.event", "{frame}");
+            assert_eq!(frame["event"]["type"], "freshAgent.error", "{frame}");
+            assert_eq!(frame["event"]["code"], "INVALID_FENCE", "{frame}");
+            assert!(
+                frame["event"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("together")),
+                "the refusal names the pair rule: {frame}"
+            );
+            // Nothing was spawned or resumed: the sessions map stays empty.
+            assert!(
+                st.sessions.lock().await.is_empty(),
+                "a half-fenced attach must never resume or spawn"
+            );
+        }
     }
 
     /// Kilroy panes send `provider: "claude"` with `sessionType: "kilroy"` -- the envelope

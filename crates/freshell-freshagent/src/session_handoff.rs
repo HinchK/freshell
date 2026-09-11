@@ -1648,6 +1648,20 @@ async fn handoff_handler(
             return typed_bad_request("targetKind must be \"terminal\" or \"fresh-agent\"");
         }
     };
+    // b8ke delta review F7: a half-sent observed pair (exactly one of
+    // epoch/generation) is the typed invalid-fence refusal — never a silent
+    // downgrade to the unfenced legacy path. No handoff is spawned.
+    let observed_epoch = body.get("observedEpoch").and_then(Value::as_u64);
+    let observed_generation = body.get("observedGeneration").and_then(Value::as_u64);
+    if let Err(err) = crate::ownership_lane::wire_fence(observed_epoch, observed_generation) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": { "code": err.code(), "message": err.message(), "retryable": false }
+            })),
+        );
+    }
     let session_type = body
         .get("sessionType")
         .and_then(Value::as_str)
@@ -1682,8 +1696,8 @@ async fn handoff_handler(
         cwd: body.get("cwd").and_then(Value::as_str).map(String::from),
         tab_id: body.get("tabId").and_then(Value::as_str).map(String::from),
         pane_id: body.get("paneId").and_then(Value::as_str).map(String::from),
-        observed_epoch: body.get("observedEpoch").and_then(Value::as_u64),
-        observed_generation: body.get("observedGeneration").and_then(Value::as_u64),
+        observed_epoch,
+        observed_generation,
         device_id: body
             .get("deviceId")
             .and_then(Value::as_str)

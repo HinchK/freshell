@@ -133,6 +133,29 @@ pub mod ownership_lane {
         ReleaseClaim, RuntimeOwnerKind, RuntimeOwnershipRegistry, StopClaim, StopOutcome,
     };
 
+    /// The typed half-fence refusal (b8ke delta review F7): a lifecycle
+    /// request carried exactly ONE of the observed epoch/generation pair.
+    /// The pair is one fence — half of it is not "no fence", it is an
+    /// invalid one, and the caller must answer the typed error without
+    /// touching the coordinator (never the silent legacy downgrade, which
+    /// let an old-generation half-fenced request recreate a runtime after
+    /// the key went Vacant).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct WireFenceError;
+
+    impl WireFenceError {
+        /// The stable typed error code carried by every refusal surface
+        /// (WS error frames, REST 400 bodies).
+        pub fn code(&self) -> &'static str {
+            "INVALID_FENCE"
+        }
+
+        /// The refusal message (the wire pair must arrive complete).
+        pub fn message(&self) -> &'static str {
+            "observedEpoch and observedGeneration must be sent together — a half-fence is invalid"
+        }
+    }
+
     /// The stamp a lane retains beside its live-session entry after
     /// `commit_live` (round-2 review): the later `StopClaim` (explicit kill)
     /// and `ReleaseClaim` (exit watcher) source — the believed runtime
@@ -208,12 +231,20 @@ pub mod ownership_lane {
 
     /// The `(epoch, generation)` wire pair a lifecycle message carried, as
     /// the fence the coordinator consumes. Neither field sent (legacy
-    /// unfenced sender) → `None` — still cross-kind-checked, just not
-    /// stale-fenced.
-    pub fn wire_fence(epoch: Option<u64>, generation: Option<u64>) -> Option<ObservedFence> {
+    /// unfenced sender) → `Ok(None)` — still cross-kind-checked, just not
+    /// stale-fenced. Exactly ONE of the pair sent → the typed
+    /// [`WireFenceError`] refusal (b8ke delta review F7): a half-fence is
+    /// never silently downgraded to the unfenced legacy path — an
+    /// old-generation half-fenced request must not be able to reacquire a
+    /// Vacant key as if it had observed nothing.
+    pub fn wire_fence(
+        epoch: Option<u64>,
+        generation: Option<u64>,
+    ) -> Result<Option<ObservedFence>, WireFenceError> {
         match (epoch, generation) {
-            (Some(epoch), Some(generation)) => Some(ObservedFence { epoch, generation }),
-            _ => None,
+            (Some(epoch), Some(generation)) => Ok(Some(ObservedFence { epoch, generation })),
+            (None, None) => Ok(None),
+            (Some(_), None) | (None, Some(_)) => Err(WireFenceError),
         }
     }
 
@@ -3947,6 +3978,31 @@ mod tests {
         assert_eq!(value_as_secs(&json!(-1)), None);
         assert_eq!(value_as_secs(&json!("nan")), None);
         assert_eq!(value_as_secs(&json!(null)), None);
+    }
+
+    /// b8ke delta review F7: a request carrying exactly ONE of the observed
+    /// epoch/generation pair is a typed invalid fence — never a silent
+    /// downgrade to the unfenced legacy path. Only BOTH-present (a fence)
+    /// and BOTH-absent (legacy) are accepted shapes.
+    #[test]
+    fn wire_fence_rejects_each_half_fenced_combination_typed() {
+        use freshell_ownership::ObservedFence;
+
+        // Both present: the fence.
+        assert_eq!(
+            ownership_lane::wire_fence(Some(3), Some(7)),
+            Ok(Some(ObservedFence { epoch: 3, generation: 7 }))
+        );
+        // Both absent: the legacy unfenced path.
+        assert_eq!(ownership_lane::wire_fence(None, None), Ok(None));
+        // Each half-fenced combination: the typed refusal.
+        let epoch_only = ownership_lane::wire_fence(Some(3), None);
+        let generation_only = ownership_lane::wire_fence(None, Some(7));
+        for err in [epoch_only, generation_only] {
+            let err = err.expect_err("a half-fenced pair must be refused");
+            assert_eq!(err.code(), "INVALID_FENCE");
+            assert!(!err.message().is_empty());
+        }
     }
 
     #[test]

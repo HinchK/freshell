@@ -2180,3 +2180,53 @@ async fn handoff_route_validates_target_kind_typed() {
         "an invalid body must never touch the coordinator"
     );
 }
+
+/// b8ke delta review F7: a handoff body carrying exactly ONE of the
+/// observed epoch/generation pair is a TYPED invalid-fence refusal — never
+/// a silent downgrade to the unfenced legacy path (which could let an
+/// old-generation half-fenced request reacquire a Vacant key). Both
+/// half-fence combinations refuse; the coordinator is untouched.
+#[tokio::test]
+async fn handoff_route_refuses_each_half_fenced_observation_typed() {
+    let rig = build_rig(None);
+    let sid = uuid::Uuid::new_v4().to_string();
+    for (name, body) in [
+        (
+            "epoch-only",
+            json!({
+                "provider": "claude", "sessionId": sid, "targetKind": "terminal",
+                "mode": "claude", "observedEpoch": 1,
+            }),
+        ),
+        (
+            "generation-only",
+            json!({
+                "provider": "claude", "sessionId": sid, "targetKind": "terminal",
+                "mode": "claude", "observedGeneration": 4,
+            }),
+        ),
+    ] {
+        let router = super::handoff_router(Arc::clone(&rig.runner));
+        let (status, response) = post_handoff_route(router, body, true).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "the {name} half-fence must be a typed 400: {response}"
+        );
+        assert_eq!(
+            response["error"]["code"],
+            json!("INVALID_FENCE"),
+            "the {name} half-fence carries the typed code: {response}"
+        );
+        assert_eq!(
+            response["error"]["retryable"],
+            json!(false),
+            "an invalid fence is not retryable as-is: {response}"
+        );
+    }
+    assert_eq!(
+        rig.ownership.observe("claude", &sid).state,
+        OwnershipState::Vacant,
+        "a half-fenced body must never touch the coordinator"
+    );
+}
