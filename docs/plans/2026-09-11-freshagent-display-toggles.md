@@ -487,7 +487,7 @@ git commit -m "feat(settings): add fresh-agent display toggles to Coding Agents"
 
 **Files:**
 - Modify: `test/e2e-browser/specs/fresh-agent.spec.ts` (:1645-1667, :1669-1682, :1748-1785, :1787-1818; one new test)
-- Modify: `test/e2e-browser/specs/settings.spec.ts` (one new test)
+- Modify: `test/e2e-browser/specs/settings.spec.ts` (`openSettingsSection` helper :13-19 — tabpanel-name derivation; one new test)
 
 **Interfaces:**
 - Consumes: Tasks 1–2 (defaults resolve through the e2e harness's fresh store — verified: Playwright contexts start with empty localStorage, no storageState/init scripts, and the test server writes no legacy seed; the settings toggles exist under Coding Agents). The seeding helpers `seedCollapsePane` (:1596-1643) and `seedFoldablePane` (:1686-1746) create panes with NO display overrides, so effective values now come from the flipped defaults: strips mount EXPANDED (`initialExpanded={showTools}`, `FreshAgentTranscript.tsx:865`) and thinking/reasoning rows render.
@@ -551,35 +551,82 @@ Expected: FAIL — the three store-default tests (:1645, :1669, :1748) expect co
     await expect(paneAfter.getByRole('button', { name: 'Thinking' })).toHaveCount(0)
     // showTools is still on: tool detail stays expanded.
     await expect(paneAfter.getByRole('button', { name: 'Read tool call' })).toHaveCount(1)
+
+    // Now flip Show tools off as well: the pane's strip must mount collapsed
+    // on return (the Show-tools pane effect, end to end).
+    await page.getByRole('button', { name: /settings/i }).click()
+    await page.getByRole('tab', { name: /^Coding Agents$/i }).click()
+    const toolsRow = page.getByText('Show tools')
+    const showToolsSwitch = toolsRow.locator('..').getByRole('switch')
+    await expect(showToolsSwitch).toHaveAttribute('aria-checked', 'true')
+    await showToolsSwitch.click()
+    await expect(showToolsSwitch).toHaveAttribute('aria-checked', 'false')
+    await page.getByTitle('Coding Agents (Ctrl+B T)').click()
+    const paneToolsOff = page.locator('[data-context="fresh-agent"]').last()
+    await expect(paneToolsOff).toBeVisible({ timeout: 10_000 })
+    // Collapsed strip: the settled summary replaces the expanded tool detail.
+    await expect(paneToolsOff.getByText('1 tool used')).toBeVisible()
+    await expect(paneToolsOff.getByRole('button', { name: 'Read tool call' })).toHaveCount(0)
   })
 ```
 
-(b) New toggle test in `settings.spec.ts` (mirrors the cursor-blink pattern at :79-128 plus a localStorage assertion):
+(b) New toggle test in `settings.spec.ts`. First fix the file-local helper's tabpanel wait: the tabpanel is labeled from the section ID (`SettingsView.tsx:138`, `aria-label={\`${activeSection} settings\`}` — `coding-agents settings`), so a display-name regex with a space can never match a multi-word section; derive the panel name from the section id. The existing 'Advanced' callers keep matching:
 
 ```ts
-  test('fresh agent display toggles persist locally', async ({ freshellPage, page, harness, serverInfo }) => {
+  async function openSettingsSection(page: any, section: string) {
+    await openSettings(page)
+    await page.getByRole('tab', { name: new RegExp(`^${section}$`, 'i') }).click()
+    const panelName = section.toLowerCase().replace(/ /g, '-')
+    await expect(page.getByRole('tabpanel', { name: new RegExp(`${panelName} settings`, 'i') })).toBeVisible({
+      timeout: 5_000,
+    })
+  }
+```
+
+Then add the test, operating BOTH toggles (each requested toggle gets store, reload, and blob coverage):
+
+```ts
+  test('fresh agent display toggles persist locally and clear on re-enable', async ({ freshellPage, page, harness, serverInfo }) => {
     await openSettingsSection(page, 'Coding Agents')
 
-    const thinkingRow = page.getByText('Show thinking')
-    await expect(thinkingRow).toBeVisible()
-    const thinkingToggle = thinkingRow.locator('..').getByRole('switch')
+    const switchFor = (label: string) => page.getByText(label).locator('..').getByRole('switch')
+    const thinkingToggle = switchFor('Show thinking')
+    const toolsToggle = switchFor('Show tools')
     await expect(thinkingToggle).toHaveAttribute('aria-checked', 'true')
+    await expect(toolsToggle).toHaveAttribute('aria-checked', 'true')
 
+    // Opt out of BOTH display settings.
     await thinkingToggle.click()
+    await toolsToggle.click()
     await page.waitForTimeout(600) // browser-preferences persist debounce is 500ms
     expect((await harness.getSettings()).freshAgent.showThinking).toBe(false)
+    expect((await harness.getSettings()).freshAgent.showTools).toBe(false)
 
-    // Opt-outs persist across reload; the blob holds ONLY the non-default value.
+    // Both opt-outs persist across reload; the blob holds ONLY non-default values.
     await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
     await harness.waitForHarness()
     await harness.waitForConnection()
-    expect((await harness.getSettings()).freshAgent.showThinking).toBe(false)
+    const afterReload = (await harness.getSettings()).freshAgent
+    expect(afterReload.showThinking).toBe(false)
+    expect(afterReload.showTools).toBe(false)
     const blob = await page.evaluate(() => localStorage.getItem('freshell.browser-preferences.v1'))
     const parsed = JSON.parse(blob ?? '{}')
     expect(parsed.settings?.freshAgent?.showThinking).toBe(false)
-    expect(parsed.settings?.freshAgent?.showTools).toBeUndefined()
+    expect(parsed.settings?.freshAgent?.showTools).toBe(false)
+
+    // Re-enabling both drops the keys from the blob (diff-vs-defaults).
+    await openSettingsSection(page, 'Coding Agents')
+    await thinkingToggle.click()
+    await toolsToggle.click()
+    await expect(thinkingToggle).toHaveAttribute('aria-checked', 'true')
+    await expect(toolsToggle).toHaveAttribute('aria-checked', 'true')
+    await page.waitForTimeout(600)
+    const blobOn = await page.evaluate(() => localStorage.getItem('freshell.browser-preferences.v1'))
+    expect(JSON.parse(blobOn ?? '{}').settings?.freshAgent).toBeUndefined()
   })
 ```
+
+(Locators are lazy in Playwright, so reusing `thinkingToggle`/`toolsToggle` after the `goto` re-resolves against the reloaded page.)
 
 - [ ] **Step 3: Adapt the broken tests**
 
@@ -688,7 +735,7 @@ git commit -m "test(e2e): pin fresh-agent display defaults and settings toggles"
 ## Verification summary (user-visible outcome)
 
 - Fresh profile, fresh-agent pane with thinking + tool items → Thinking disclosure and expanded tool detail visible with zero clicks (Task 1 unit, Task 3 e2e).
-- Settings → Coding Agents → "Fresh agent display" → two switches, on by default; toggling off hides thinking rows / collapses strips — pinned at the pane level by the Task 2 unit companion test and end to end by the Task 3 settings-loop e2e; opt-outs persist per browser across reloads (Task 2 unit, Task 3 e2e).
+- Settings → Coding Agents → "Fresh agent display" → two switches, on by default; toggling either off changes the pane (thinking rows disappear / strips collapse) and persists per browser across reloads, and re-enabling clears the persisted diff — each toggle gets its own e2e operation (Task 2 unit companion pin; Task 3 e2e: fresh-agent.spec operates both toggles against a live pane, settings.spec persists both across reload).
 - Existing browsers flip on with no migration (Task 1 persistence semantics); per-pane overrides still win (existing precedence test stays green).
 
 ## Notes for reviewers
