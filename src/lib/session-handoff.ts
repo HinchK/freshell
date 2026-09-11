@@ -128,9 +128,10 @@ function resolveReopenContext(
  */
 export async function runPaneSessionHandoff(
   appStore: AppStore,
-  options: { tabId: string; paneId: string; expected?: ReopenPaneSessionTarget },
+  options: { tabId: string; paneId: string; expected?: ReopenPaneSessionTarget; acknowledgePlatformLimitedRisk?: boolean },
 ): Promise<boolean> {
   const { tabId, paneId, expected } = options
+  const acknowledgePlatformLimitedRisk = options.acknowledgePlatformLimitedRisk === true
 
   const current = resolveReopenContext(appStore.getState(), tabId, paneId)
   if (!current || current.target.disabled) return false
@@ -196,6 +197,7 @@ export async function runPaneSessionHandoff(
         ? { observedEpoch: ownerRecord.epoch, observedGeneration: ownerRecord.generation }
         : {}),
       deviceId: appStore.getState().tabRegistry?.deviceId,
+      ...(acknowledgePlatformLimitedRisk ? { acknowledgePlatformLimitedRisk: true } : {}),
     })
   } catch (err) {
     log.warn({
@@ -218,6 +220,24 @@ export async function runPaneSessionHandoff(
       },
     }))
     return false
+  }
+
+  // b8ke focused round-4 R4-4: the acknowledged PlatformLimited
+  // force-clear's TYPED answer — the fence cleared, NO handoff ran, no
+  // owner is committed. The server never auto-re-enters handoff from the
+  // force-release path; the caller retries explicitly: this operator
+  // action's single gesture covers clear-then-reopen, re-issuing the
+  // handoff ONCE as the fresh no-prior sequence (the prior is Vacant).
+  if (handoff.ok === true && 'cleared' in handoff) {
+    log.info({
+      event: 'session_handoff_platform_limited_force_cleared',
+      provider: latest.target.provider,
+      sessionId: latest.target.sessionId,
+      tabId,
+      paneId,
+      generation: handoff.generation,
+    })
+    return runPaneSessionHandoff(appStore, { tabId, paneId, expected })
   }
 
   if (!handoff.ok) {

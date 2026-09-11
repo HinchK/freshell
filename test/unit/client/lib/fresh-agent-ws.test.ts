@@ -9,6 +9,7 @@ import {
   handleFreshAgentMessage,
   registerFreshAgentCreate,
 } from '@/lib/fresh-agent-ws'
+import { ReadyMessageSchema } from '@/lib/ready-message-schema'
 import { cancelCreate, _resetCancelledCreates } from '@/lib/create-cancellation'
 import type { SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
@@ -1024,6 +1025,118 @@ describe('runtime-owner folds (kata b8ke)', () => {
     foldSessionRuntimeOwnerFrame(store.dispatch, ownerFrame({ sessionId: 'sid-gone' }))
     foldReadyRuntimeOwners(store.dispatch, undefined)
     expect(store.getState().freshAgent.runtimeOwners).toEqual({})
+  })
+
+  // b8ke focused round-4 R4-1: the tests must exercise the PARSER
+  // BOUNDARY — the App path is
+  // `ReadyMessageSchema.safeParse(frame)` then
+  // `foldReadyRuntimeOwners(dispatch, parsed.data.runtimeOwners)`. Zod
+  // strips undeclared object properties, so a parser that does not
+  // declare the replay's `state`/`reason` silently folds every fenced
+  // replay as handoff-committed (the pre-fix defect these tests pin).
+  describe('ready replay folds THROUGH the parser (kata b8ke R4-1/R4-6)', () => {
+    function parseReadyRuntimeOwners(raw: unknown) {
+      const parsed = ReadyMessageSchema.safeParse(raw)
+      expect(parsed.success).toBe(true)
+      return parsed.success ? parsed.data.runtimeOwners : undefined
+    }
+
+    function readyFrame(runtimeOwners: unknown[]): unknown {
+      return {
+        type: 'ready',
+        timestamp: new Date().toISOString(),
+        serverInstanceId: 'srv-1',
+        bootId: 'boot-1',
+        runtimeOwners,
+      }
+    }
+
+    it('a fenced replay record keeps state/reason through the parser — typed recovery, never committed', () => {
+      const store = createFreshAgentStore()
+      const owners = parseReadyRuntimeOwners(readyFrame([
+        {
+          provider: 'claude',
+          sessionId: 'sid-fenced',
+          epoch: 3,
+          generation: 5,
+          ownerKind: 'terminal',
+          state: 'fenced',
+          reason: 'platform-limited',
+        },
+      ]))
+      foldReadyRuntimeOwners(store.dispatch, owners)
+      expect(store.getState().freshAgent.runtimeOwners['claude:sid-fenced']).toMatchObject({
+        ownerKind: 'terminal',
+        transition: 'handoff-failed',
+        reason: 'platform-limited',
+        fenced: true,
+        epoch: 3,
+        generation: 5,
+      })
+    })
+
+    it('in-progress lifecycle replays (starting/handoff/stopping) fold as the transition state, never committed-live', () => {
+      const store = createFreshAgentStore()
+      const owners = parseReadyRuntimeOwners(readyFrame([
+        {
+          provider: 'codex', sessionId: 'sid-starting', epoch: 2, generation: 4,
+          ownerKind: 'fresh-agent', state: 'starting',
+        },
+        {
+          provider: 'codex', sessionId: 'sid-handoff', epoch: 2, generation: 7,
+          ownerKind: 'terminal', state: 'handoff',
+        },
+        {
+          provider: 'codex', sessionId: 'sid-stopping', epoch: 2, generation: 9,
+          ownerKind: 'terminal', state: 'stopping',
+        },
+      ]))
+      foldReadyRuntimeOwners(store.dispatch, owners)
+      const owners_ = store.getState().freshAgent.runtimeOwners
+      // R4-6: reconnecting during Starting/Handoff/Stopping shows the
+      // transition (handoff-started — the Task 8 in-progress semantics),
+      // never a committed live owner.
+      expect(owners_['codex:sid-starting']).toMatchObject({
+        ownerKind: 'fresh-agent',
+        transition: 'handoff-started',
+      })
+      expect(owners_['codex:sid-handoff']).toMatchObject({
+        ownerKind: 'terminal',
+        transition: 'handoff-started',
+      })
+      expect(owners_['codex:sid-stopping']).toMatchObject({
+        ownerKind: 'terminal',
+        transition: 'handoff-started',
+      })
+      for (const key of ['codex:sid-starting', 'codex:sid-handoff', 'codex:sid-stopping']) {
+        expect(owners_[key].fenced).toBeUndefined()
+      }
+    })
+
+    it('live and vacant replays keep their existing folds through the parser', () => {
+      const store = createFreshAgentStore()
+      const owners = parseReadyRuntimeOwners(readyFrame([
+        {
+          provider: 'codex', sessionId: 'sid-live', epoch: 3, generation: 2,
+          ownerKind: 'fresh-agent', state: 'live', terminalId: 't-1',
+        },
+        {
+          provider: 'codex', sessionId: 'sid-vacant', epoch: 3, generation: 8,
+          ownerKind: 'vacant',
+        },
+      ]))
+      foldReadyRuntimeOwners(store.dispatch, owners)
+      const owners_ = store.getState().freshAgent.runtimeOwners
+      expect(owners_['codex:sid-live']).toMatchObject({
+        ownerKind: 'fresh-agent',
+        transition: 'handoff-committed',
+        terminalId: 't-1',
+      })
+      expect(owners_['codex:sid-vacant']).toMatchObject({
+        ownerKind: 'vacant',
+        transition: 'released',
+      })
+    })
   })
 
   it('freshAgent.create.failed owner fields are preserved in the fold (typed conflict → recovery UI)', () => {

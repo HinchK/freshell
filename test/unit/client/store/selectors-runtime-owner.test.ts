@@ -211,6 +211,92 @@ describe('selectPaneOwnerDivergence', () => {
       fencedReason: 'platform-limited',
     })
   })
+
+  // b8ke focused round-4 R4-7: a FENCED record whose prior is VACANT (the
+  // server's fenced-with-no-prior replay shape — e.g. an unconfirmed
+  // cleanup failure while starting from vacancy) drives the typed recovery
+  // state, never the plain-vacant "all clear". Pre-fix, the vacant
+  // early-return suppressed it and the pane showed no recovery UI.
+  it('diverges a FENCED-VACANT record (fenced before the vacant early-return)', () => {
+    const state = stateWithRuntimeOwner({
+      provider: 'codex',
+      sessionId: 'sid-fenced-vacant',
+      ownerKind: 'vacant',
+      transition: 'handoff-failed',
+      reason: 'watcher-failed',
+      fenced: true,
+      generation: 11,
+    })
+    const divergence = selectPaneOwnerDivergence(state, {
+      paneKind: 'terminal',
+      provider: 'codex',
+      sessionRef: { provider: 'codex', sessionId: 'sid-fenced-vacant' },
+    })
+    expect(divergence).toMatchObject({
+      ownerKind: 'vacant',
+      transition: 'handoff-failed',
+      generation: 11,
+      fencedReason: 'watcher-failed',
+    })
+    // The fenced state must not be lost for a plain vacant record.
+    const plainVacant = stateWithRuntimeOwner({
+      provider: 'codex',
+      sessionId: 'sid-plain-vacant',
+      ownerKind: 'vacant',
+      transition: 'released',
+    })
+    expect(selectPaneOwnerDivergence(plainVacant, {
+      paneKind: 'terminal',
+      provider: 'codex',
+      sessionRef: { provider: 'codex', sessionId: 'sid-plain-vacant' },
+    })).toBeNull()
+  })
+
+  // b8ke focused round-4 R4-5 (client half): a fenced reap/stop FAILURE
+  // broadcast carries the `fenced` marker — an online old-kind pane folds
+  // the frame through the store and KEEPS the typed recovery state (the
+  // same-kind fenced owner diverges), instead of resuming normal
+  // polling/actions as a healthy owner.
+  it('a fenced failure BROADCAST keeps the same-kind pane blocked (no polling resumption)', () => {
+    // The online old-kind pane first sees the handoff start...
+    const state = { freshAgent: freshAgentReducer(undefined, applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'claude',
+      sessionId: 'sid-bcast',
+      epoch: 5,
+      generation: 9,
+      ownerKind: 'terminal',
+      operationId: 'handoff-9',
+      transition: 'handoff-started',
+      previousKind: 'terminal',
+    })) }
+    // ...then the fenced failure frame (prior kind, handoff-failed, WITH
+    // the fenced marker — the server's R4-5 broadcast shape).
+    const after = { freshAgent: freshAgentReducer(state.freshAgent, applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'claude',
+      sessionId: 'sid-bcast',
+      epoch: 5,
+      generation: 9,
+      ownerKind: 'terminal',
+      operationId: 'handoff-9',
+      transition: 'handoff-failed',
+      reason: 'REAP_TIMEOUT',
+      fenced: true,
+    })) } as unknown as RootState
+    // A SAME-KIND (terminal) pane stays divergent with the typed reason —
+    // pre-fix (marker absent) the fold stored no `fenced` and a same-kind
+    // owner read as healthy, resuming the pane's polling.
+    expect(selectPaneOwnerDivergence(after, {
+      paneKind: 'terminal',
+      provider: 'claude',
+      sessionRef: { provider: 'claude', sessionId: 'sid-bcast' },
+    })).toMatchObject({
+      ownerKind: 'terminal',
+      transition: 'handoff-failed',
+      fencedReason: 'REAP_TIMEOUT',
+    })
+  })
 })
 
 describe('selectSessionRuntimeOwner and fence helpers', () => {

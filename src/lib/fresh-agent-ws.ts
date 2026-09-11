@@ -293,6 +293,11 @@ export function foldSessionRuntimeOwnerFrame(
  * the typed recovery state (handoff-failed + the typed reason, plus the
  * fenced marker the divergence/recovery UI derives from) — never a false
  * "handoff-committed" owner.
+ *
+ * b8ke focused round-4 R4-6: an IN-PROGRESS lifecycle replay
+ * (state 'starting' | 'handoff' | 'stopping') folds as the transition
+ * state ('handoff-started' — the existing Task 8 semantics: no attach
+ * action, no polling resume), never as committed live ownership.
  */
 export function foldReadyRuntimeOwners(
   dispatch: AppDispatch,
@@ -301,6 +306,9 @@ export function foldReadyRuntimeOwners(
   dispatch(resetRuntimeOwners())
   for (const owner of owners ?? []) {
     const fenced = owner.state === 'fenced'
+    const inProgress = owner.state === 'starting'
+      || owner.state === 'handoff'
+      || owner.state === 'stopping'
     dispatch(applyRuntimeOwner({
       type: 'session.runtimeOwner',
       provider: owner.provider,
@@ -312,7 +320,9 @@ export function foldReadyRuntimeOwners(
       operationId: 'ready-replay',
       transition: fenced
         ? 'handoff-failed'
-        : owner.ownerKind === 'vacant' ? 'released' : 'handoff-committed',
+        : inProgress
+          ? 'handoff-started'
+          : owner.ownerKind === 'vacant' ? 'released' : 'handoff-committed',
       ...(fenced ? {
         reason: owner.reason ?? 'fenced',
         fenced: true,

@@ -89,7 +89,7 @@ import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
 import { createLogger } from '@/lib/client-logger'
 import { hasDismissedAutoSetupWizard, markAutoSetupWizardDismissed } from '@/lib/setup-wizard-dismissal'
 import type { LocalSettingsPatch, ServerSettings } from '@shared/settings'
-import { z } from 'zod'
+import { ReadyMessageSchema as readyMessageSchema } from '@/lib/ready-message-schema'
 import { withChunkErrorRecovery } from '@/lib/import-retry'
 
 const log = createLogger('App')
@@ -164,36 +164,7 @@ function hasLoadedPlatformCapabilities(value: BootstrapPlatformInfo | null | und
   return 'availableClis' in value || 'featureFlags' in value
 }
 
-const ReadyMessageSchema = z.object({
-  type: z.literal('ready'),
-  timestamp: z.string(),
-  serverInstanceId: z.string().min(1),
-  bootId: z.string().min(1).optional(),
-  // The server's baked build identity (additive/optional — old servers omit
-  // it). Compared in checkServerBuildId below. Plain `z.string()` (NOT
-  // min(1)): a present-but-EMPTY buildId must reach the helper and no-op
-  // there, never fail the WHOLE ready frame and silently disable restart
-  // detection. Only a non-string TYPE can fail the frame, which no real
-  // server emits (the helper additionally treats "unknown" as a no-op).
-  buildId: z.string().optional(),
-  // Server capability ack (present iff our hello opted in). Deliberately a
-  // loose record: an unexpected capabilities shape must never fail the WHOLE
-  // ready frame and silently disable restart detection.
-  capabilities: z.record(z.string(), z.unknown()).optional(),
-  // kata b8ke: the handshake's runtime-owner replay (additive/optional —
-  // old servers omit it). Same ready-frame doctrine: `.catch(undefined)`
-  // degrades a malformed replay to "no owners folded" (the reconcile gate
-  // stays open; the server-side generation fence is the backstop) instead
-  // of failing the WHOLE ready frame.
-  runtimeOwners: z.array(z.object({
-    provider: z.string().min(1),
-    sessionId: z.string().min(1),
-    epoch: z.number().int().nonnegative(),
-    generation: z.number().int().nonnegative(),
-    ownerKind: z.enum(['terminal', 'fresh-agent', 'vacant']),
-    terminalId: z.string().optional(),
-  })).optional().catch(undefined),
-})
+const ReadyMessageSchema = readyMessageSchema
 
 export default function App() {
   useThemeEffect()

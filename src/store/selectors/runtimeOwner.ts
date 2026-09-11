@@ -29,7 +29,12 @@ import type { RuntimeOwnerRecord } from '@/store/freshAgentTypes'
 export type { RuntimeOwnerRecord }
 
 export type PaneOwnerDivergence = {
-  ownerKind: 'terminal' | 'fresh-agent'
+  /** The owner record's kind — the divergent owner's kind, the FENCED
+   *  PRIOR's kind, or 'vacant' for a fenced record with no prior (b8ke
+   *  R4-7: a fenced-vacant record drives the typed recovery state; the
+   *  kind never matches a pane so the blocked card renders for both
+   *  kinds). */
+  ownerKind: 'terminal' | 'fresh-agent' | 'vacant'
   /** The owner record's transition at fold time — handoff-started is not a live target. */
   transition: RuntimeOwnerRecord['transition']
   terminalId?: string
@@ -116,12 +121,17 @@ export function selectPaneOwnerFence(
  * writer exists (the ownerKind names the fenced prior), so every pane
  * holding the sessionRef renders the typed recovery state via
  * `fencedReason`, never a same-kind "all clear".
+ *
+ * b8ke focused round-4 R4-7: the fenced check comes BEFORE the vacant
+ * early-return — a FENCED record whose prior is vacant (an unconfirmed
+ * cleanup failure while starting from vacancy) drives the typed recovery
+ * state too, instead of being suppressed as a plain vacant key.
  */
 export function derivePaneOwnerDivergence(
   record: RuntimeOwnerRecord | undefined,
   paneKind: PaneOwnerKind,
 ): PaneOwnerDivergence | null {
-  if (!record || record.ownerKind === 'vacant') return null
+  if (!record) return null
   if (record.fenced) {
     return {
       ownerKind: record.ownerKind,
@@ -131,6 +141,7 @@ export function derivePaneOwnerDivergence(
       ...(record.reason !== undefined ? { fencedReason: record.reason } : {}),
     }
   }
+  if (record.ownerKind === 'vacant') return null
   if (record.ownerKind === paneKind) return null
   return {
     ownerKind: record.ownerKind,

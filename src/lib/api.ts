@@ -708,6 +708,10 @@ export const SessionHandoffErrorCodeSchema = z.enum([
   'SESSION_NOT_FOUND',
   'BAD_REQUEST',
   'UNAUTHORIZED',
+  /** b8ke R4-4: an ordinary retry against a PlatformLimited fence — the
+   *  acknowledged force-clear is the only recovery. */
+  'PLATFORM_LIMITED_FENCED',
+  'SESSION_FENCED',
 ])
 export type SessionHandoffErrorCode = z.infer<typeof SessionHandoffErrorCodeSchema>
 
@@ -743,6 +747,16 @@ export const SessionHandoffResultSchema = z.union([
     generation: z.number().int().nonnegative(),
     owner: SessionHandoffOwnerSchema,
   }),
+  // b8ke focused round-4 R4-4: the acknowledged PlatformLimited
+  // force-clear's TYPED answer — the fence was cleared (key Vacant) but
+  // NO handoff ran and no owner is committed; the caller retries the
+  // handoff explicitly as a fresh no-prior sequence.
+  z.object({
+    ok: z.literal(true),
+    cleared: z.literal('platform-limited-fence'),
+    operationId: z.string(),
+    generation: z.number().int().nonnegative(),
+  }),
   SessionHandoffFailureSchema,
 ])
 export type SessionHandoffResult = z.infer<typeof SessionHandoffResultSchema>
@@ -762,6 +776,12 @@ export type SessionHandoffRequestBody = {
   observedEpoch?: number
   observedGeneration?: number
   deviceId?: string
+  /** b8ke focused round-4 R4-4: the EXPLICIT operator acknowledgment
+   *  licensing the PlatformLimited force-clear (an ordinary retry never
+   *  clears the fence). With this flag, a Fenced{PlatformLimited} key
+   *  force-clears and the request answers the TYPED CLEAR — no handoff
+   *  starts; the caller retries the handoff explicitly afterwards. */
+  acknowledgePlatformLimitedRisk?: boolean
 }
 
 export async function requestSessionHandoff(
