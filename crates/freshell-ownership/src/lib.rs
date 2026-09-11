@@ -2612,11 +2612,17 @@ mod tests {
     }
 
     /// Task 4 review F1 (fix): a GRANTED stop abandoned before the kill (the
-    /// runtime confirmed still alive) must roll back to `Live` — at the
-    /// owner's PRE-STOP generation, the same coherence discipline as the
-    /// failed-handoff restore (M3/M3-R) — so a fenced retry carrying the
-    /// retained/snapshot baseline is Granted again (no StaleClaim liveness
-    /// corner), and the aborted stop is consumed (a late commit is foreign).
+    /// runtime confirmed still alive) must roll back to `Live` at the
+    /// owner's PRE-STOP generation — deliberately a DIFFERENT value than
+    /// the failed-handoff restore (whole-branch review M-1): that restore
+    /// forward-bumps to the record's current generation (the handoff
+    /// broadcasts carried it to every client), while the stop path
+    /// broadcasts nothing at the bumped generation, so the pre-stop one is
+    /// what observers hold — the one remaining deliberate record≠Live
+    /// straddle (`snapshot_generation`'s Live arm exists for it). A fenced
+    /// retry carrying the retained/snapshot baseline is Granted again (no
+    /// StaleClaim liveness corner), and the aborted stop is consumed (a
+    /// late commit is foreign).
     #[test]
     fn abort_stop_restores_the_live_owner_at_its_pre_stop_generation() {
         let (r, owner, live_gen) = registry_with_live_terminal();
@@ -2668,21 +2674,54 @@ mod tests {
             }
             other => panic!("abort must restore Live, got {other:?}"),
         }
+        // RR-1 (re-review): the straddle is deliberate and typed — after
+        // the abort restore, observe()/snapshot_records() must report the
+        // Live STATE's (pre-stop) generation while the record keeps the
+        // current (bumped) one. This is the only remaining record≠Live
+        // divergence and the sole reason `snapshot_generation`'s Live arm
+        // exists; a regression returning the record's generation
+        // unconditionally would re-expose the snapshot-fenced StaleClaim
+        // wedge in this corner (stop abandoned, runtime alive).
+        let snap = r.observe(PROVIDER, "sid");
+        assert_eq!(
+            snap.generation, live_gen,
+            "observe() must report the Live state's pre-stop generation, not the record's bumped one"
+        );
+        let replay = r
+            .snapshot_records()
+            .into_iter()
+            .find(|rec| rec.provider == PROVIDER && rec.session_id == "sid")
+            .expect("the aborted key must replay");
+        assert_eq!(
+            replay.generation, live_gen,
+            "snapshot_records() must fence at the pre-stop generation"
+        );
+        // The record's own generation is still the bumped stop generation
+        // (the per-key monotonic counter never rolls back) — the straddle
+        // is real, and only a fence reporting the RECORD's value sees it.
+        assert_eq!(
+            r.commit_stop(PROVIDER, "sid", "kill-1", stop_gen + 1),
+            CommitOutcome::StaleGeneration {
+                current_generation: stop_gen
+            },
+            "the record keeps the bumped stop generation while the Live state holds the pre-stop one"
+        );
         // The aborted stop is consumed: a late commit for it is foreign.
         assert_eq!(
             r.commit_stop(PROVIDER, "sid", "kill-1", stop_gen),
             CommitOutcome::ForeignOperation
         );
         // Fence coherence: a retry carrying the PRE-stop observed pair (the
-        // retained stamp's baseline) is Granted — never a StaleClaim loop —
-        // and that retry still commits normally.
+        // retained stamp's baseline — equivalently, the snapshot-derived
+        // `observe()` generation asserted above) is Granted — never a
+        // StaleClaim loop — and that retry still commits normally.
         let StopOutcome::Granted {
             generation: retry_gen,
         } = r.begin_stop(
             PROVIDER,
             "sid",
             "kill-2",
-            &stop_claim(&owner, r.boot_epoch(), live_gen),
+            &stop_claim(&owner, r.boot_epoch(), snap.generation),
             "test",
             4_000,
         )
