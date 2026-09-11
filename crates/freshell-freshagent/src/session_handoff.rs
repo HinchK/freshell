@@ -59,6 +59,12 @@ pub struct HandoffTestHooks {
     /// the watcher's fail-open typed release is tested against. Atomic so
     /// a test can arm it once.
     pub abort_reap_confirmation_once: std::sync::atomic::AtomicBool,
+    /// b8ke focused round-5 review R5-1: make the NEXT abort-cleanup target
+    /// reap DROP its `NotConfirmed` continuation (the lost-escalation
+    /// shape) and answer `Unconfirmed` — the deterministic red/green for
+    /// the no-prior abort path's replacement confirmation watcher. Atomic
+    /// so a test can arm it once; never armed in production.
+    pub drop_abort_target_confirmation_once: std::sync::atomic::AtomicBool,
     /// Make the NEXT `start_target` fail before spawning anything.
     pub fail_target_spawn_once: std::sync::atomic::AtomicBool,
     /// Ordered step labels ("Reaped", "TargetStarted") — test assertions.
@@ -74,6 +80,7 @@ impl Default for HandoffTestHooks {
             spawn_watch_slot: std::sync::Mutex::new(None),
             force_reap_timeout: std::sync::atomic::AtomicBool::new(false),
             abort_reap_confirmation_once: std::sync::atomic::AtomicBool::new(false),
+            drop_abort_target_confirmation_once: std::sync::atomic::AtomicBool::new(false),
             fail_target_spawn_once: std::sync::atomic::AtomicBool::new(false),
             events: std::sync::Mutex::new(Vec::new()),
         }
@@ -1256,6 +1263,12 @@ impl SessionHandoffRunner {
                         // lost or resolved unconfirmed — a live unowned
                         // writer may remain, so the key fences typed rather
                         // than reopening.
+                        // b8ke focused round-5 review R5-1: the fence is
+                        // NEVER watcher-less — the replacement confirmation
+                        // watcher (the r2/e3887a378 pattern) probes the
+                        // uncommitted target's recorded identity and only
+                        // a confirmed death releases the fence; without it
+                        // the key blocked until a server restart.
                         let fenced = self.ownership.fence_unconfirmed_handoff(
                             provider,
                             session_id,
@@ -1269,7 +1282,9 @@ impl SessionHandoffRunner {
                             epoch = self.ownership.boot_epoch(), generation,
                             outcome = ?fenced,
                             "the aborted handoff's uncommitted target reap never confirmed \
-                             death — the key fences typed (never plain Vacant)");
+                             death — the key fences typed (never plain Vacant); the \
+                             replacement confirmation watcher owns the release");
+                        self.spawn_abort_target_reconfirmation(&payload);
                     }
                 }
                 live
@@ -1285,20 +1300,80 @@ impl SessionHandoffRunner {
                             false,
                         );
                     }
-                    UncommittedTargetOutcome::PlatformLimited
-                    | UncommittedTargetOutcome::Unconfirmed => {
-                        let _ = self.ownership.fence_unconfirmed_handoff(
+                    // b8ke focused round-5 review R5-1: a handoff may
+                    // legitimately start from VACANT — the abort's target
+                    // reap outcomes must fence with the SAME typed
+                    // separation as the prior arm, never the folded
+                    // watcher-less WatcherFailed fence the pre-fix path
+                    // produced for BOTH outcomes (a PlatformLimited
+                    // teardown was unrecoverable: force_release_platform_
+                    // limited only clears PlatformLimited fences, and no
+                    // watcher existed to confirm the target's death —
+                    // the session blocked until a server restart).
+                    UncommittedTargetOutcome::PlatformLimited => {
+                        // Typed PlatformLimited (recoverable through the
+                        // acknowledged force-clear): the target's teardown
+                        // confirmed the direct child's exit but cannot
+                        // verify the descendant tree on this platform.
+                        let fenced = self.ownership.fence_unconfirmed_handoff(
+                            provider,
+                            session_id,
+                            operation_id,
+                            *generation,
+                            freshell_ownership::FenceReason::PlatformLimited,
+                        );
+                        tracing::error!(target: "freshell_ownership",
+                            event = "ownership.handoff.abort_fenced_platform_limited",
+                            operation_id = %operation_id, provider = %provider, session_id = %session_id,
+                            epoch = self.ownership.boot_epoch(), generation,
+                            outcome = ?fenced,
+                            "the aborted handoff's uncommitted target could not be \
+                             confirmed dead on this platform — the key fences TYPED \
+                             PlatformLimited (the acknowledged force-clear recovers it)");
+                    }
+                    UncommittedTargetOutcome::Unconfirmed => {
+                        // Typed WatcherFailed WITH the replacement
+                        // confirmation watcher — the r2/e3887a378 pattern:
+                        // the bounded probe re-issues the target's lane
+                        // kill-and-confirm and only a confirmed death
+                        // releases the fence. Never a watcher-less fence.
+                        let fenced = self.ownership.fence_unconfirmed_handoff(
                             provider,
                             session_id,
                             operation_id,
                             *generation,
                             freshell_ownership::FenceReason::WatcherFailed,
                         );
+                        tracing::error!(target: "freshell_ownership",
+                            event = "ownership.handoff.abort_fenced_unconfirmed_target",
+                            operation_id = %operation_id, provider = %provider, session_id = %session_id,
+                            epoch = self.ownership.boot_epoch(), generation,
+                            outcome = ?fenced,
+                            "the aborted handoff's uncommitted target reap never confirmed \
+                             death — the key fences typed (never plain Vacant); the \
+                             replacement confirmation watcher owns the release");
+                        self.spawn_abort_target_reconfirmation(&payload);
                     }
                 }
                 false
             }
         };
+        // b8ke focused round-5 review R5-2: broadcast the post-abort
+        // AUTHORITATIVE owner state — connected devices hold the stale
+        // `handoff-started` record otherwise (no fenced marker/reason, no
+        // restored owner, no vacancy) until a reconnect heals through the
+        // ready replay. Same envelope as the other transitions: the
+        // fenced outcomes carry the r4 `fenced: true` marker + the typed
+        // reason (the fenced prior's kind — "vacant" for a no-prior
+        // fence); the restored prior is named as the authoritative owner;
+        // the vacancy is the `released` frame.
+        self.broadcast_post_abort_authority(
+            provider,
+            session_id,
+            operation_id,
+            payload.target_kind,
+            prior.as_ref().map(|(owner, _)| owner.kind),
+        );
         tracing::warn!(target: "freshell_ownership",
             event = "ownership.handoff.abort_settled",
             operation_id = %operation_id, provider = %provider, session_id = %session_id,
@@ -1307,6 +1382,121 @@ impl SessionHandoffRunner {
             target_reap = ?target_outcome,
             failure_reason = "RUNNER_ABORTED",
             "handoff runner aborted inside the prior-reap window; liveness re-probed before restore");
+    }
+
+    /// b8ke focused round-5 review R5-2: broadcast the post-abort
+    /// AUTHORITATIVE owner state — connected devices hold the stale
+    /// `handoff-started` record otherwise (no fenced marker/reason, no
+    /// restored owner, no vacancy) until a reconnect heals through the
+    /// ready replay. Same envelope as the other transitions: the fenced
+    /// outcomes carry the r4 `fenced: true` marker + the typed reason
+    /// (the fenced prior's kind — "vacant" for a no-prior fence); the
+    /// restored prior is named as the authoritative owner; the vacancy is
+    /// the `released` frame. A foreign in-progress transition owns the
+    /// record in the snapshot's place — its own operation broadcasts its
+    /// frames, never this one.
+    fn broadcast_post_abort_authority(
+        &self,
+        provider: &str,
+        session_id: &str,
+        operation_id: &str,
+        target_kind: RuntimeOwnerKind,
+        previous_kind: Option<RuntimeOwnerKind>,
+    ) {
+        let snapshot = self.ownership.observe(provider, session_id);
+        let cleanup_req = self.cleanup_request(provider, session_id, target_kind);
+        match &snapshot.state {
+            freshell_ownership::OwnershipState::Fenced {
+                prior: fenced_prior,
+                reason,
+                ..
+            } => {
+                let (owner_kind, terminal_id) = match fenced_prior {
+                    Some((owner, _)) => (Some(owner.kind), owner.terminal_id.clone()),
+                    None => (None, None),
+                };
+                self.broadcast_owner(
+                    &cleanup_req,
+                    "handoff-failed",
+                    owner_kind,
+                    terminal_id,
+                    operation_id,
+                    snapshot.generation,
+                    previous_kind,
+                    Some(reason.wire_str()),
+                    Some(true),
+                );
+            }
+            freshell_ownership::OwnershipState::Live { .. } => {
+                // The restored prior is the authoritative owner — the
+                // failure-truth envelope reads and names it (or the
+                // vacancy if the record moved on).
+                self.broadcast_failure_truth(
+                    &cleanup_req,
+                    operation_id,
+                    snapshot.generation,
+                    previous_kind,
+                    "RUNNER_ABORTED",
+                );
+            }
+            freshell_ownership::OwnershipState::Vacant => {
+                self.broadcast_owner(
+                    &cleanup_req,
+                    "released",
+                    None,
+                    None,
+                    operation_id,
+                    snapshot.generation,
+                    previous_kind,
+                    Some("RUNNER_ABORTED"),
+                    None,
+                );
+            }
+            // A foreign in-progress transition owns the record — its own
+            // operation broadcasts its frames; never assert over it.
+            _ => {}
+        }
+    }
+
+    /// b8ke focused round-5 review R5-1: the replacement confirmation
+    /// watcher for an aborted handoff's UNCONFIRMED target — the
+    /// r2/e3887a378 pattern, applied to the abort-cleanup fence. The
+    /// bounded probe re-issues the TARGET's lane kill-and-confirm (the
+    /// recorded condemned identity the lane kill armed) and ONLY a
+    /// confirmed death releases the fence — never a watcher-less
+    /// WatcherFailed fence. The probe identity is the uncommitted target
+    /// itself: the known spawn identity when `start_target` returned, or
+    /// the canonical session key (fresh lanes probe
+    /// `confirm_fenced_prior_dead(sessionId)` by id) for a target whose
+    /// spawn await was dropped mid-flight.
+    fn spawn_abort_target_reconfirmation(self: &Arc<Self>, payload: &AbortPayload) {
+        let AbortPayload {
+            provider,
+            session_id,
+            operation_id,
+            generation,
+            target_kind,
+            target,
+            ..
+        } = payload;
+        let probe_target = target.clone().unwrap_or_else(|| OwnerIdentity {
+            kind: *target_kind,
+            terminal_id: None,
+            live_session_key: Some(session_id.clone()),
+            pid: None,
+            ownership_id: None,
+        });
+        let cleanup_req = self.cleanup_request(provider, session_id, *target_kind);
+        let confirmation = self.prior_death_reconfirmation(provider, session_id, &probe_target);
+        self.spawn_reap_confirmation_watcher(
+            &cleanup_req,
+            operation_id,
+            *generation,
+            "handoff-guard-cleanup",
+            &probe_target,
+            "RUNNER_ABORTED",
+            confirmation,
+        );
     }
 
     /// Round-3 review I-1: the abort/panic cleanup's target half — reap the
@@ -1402,7 +1592,29 @@ impl SessionHandoffRunner {
                 // confirmation — await it (the coordinator record stays
                 // fenced in Handoff while it runs). A lost/unconfirmed
                 // continuation never reopens the key.
-                StopResult::NotConfirmed { confirmation } => confirmation.await,
+                StopResult::NotConfirmed { confirmation } => {
+                    // b8ke focused round-5 review R5-1 test seam: model
+                    // the LOST continuation (the dropped escalation) —
+                    // the cleanup answers Unconfirmed and the fence's
+                    // replacement watcher owns the confirmation. Never
+                    // armed in production.
+                    if let Some(hooks) = self.test_hooks.as_ref() {
+                        if hooks
+                            .drop_abort_target_confirmation_once
+                            .swap(false, std::sync::atomic::Ordering::SeqCst)
+                        {
+                            tracing::warn!(target: "freshell_ownership",
+                                operation_id = %operation_id, provider = %provider,
+                                session_id = %session_id,
+                                event = "ownership.handoff.abort_target_confirmation_dropped_seam",
+                                "test seam: the uncommitted target's NotConfirmed continuation \
+                                 is dropped — the cleanup answers Unconfirmed"
+                            );
+                            return UncommittedTargetOutcome::Unconfirmed;
+                        }
+                    }
+                    confirmation.await
+                }
             };
             if reaped {
                 // The aborted resume's lease guard dropped ARMED with its
@@ -2598,6 +2810,18 @@ impl Drop for HandoffGuard {
                 );
             }
         }
+        // b8ke focused round-5 review R5-2: the SYNC unwind broadcasts the
+        // post-abort authority too — the detached-cleanup path and this
+        // one are the two abort exits, and devices hold the stale
+        // `handoff-started` record after either (the same envelope: the
+        // restored owner, the vacancy, or the fenced marker/reason).
+        self.runner.broadcast_post_abort_authority(
+            &self.provider,
+            &self.session_id,
+            &self.operation_id,
+            self.target_kind,
+            self.prior.as_ref().map(|(owner, _)| owner.kind),
+        );
     }
 }
 

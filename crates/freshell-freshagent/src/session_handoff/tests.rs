@@ -3115,6 +3115,325 @@ async fn handoff_abort_holds_the_fence_until_the_uncommitted_target_continuation
     let _ = std::fs::remove_dir_all(&store_dir);
 }
 
+/// 7a. b8ke focused round-5 review R5-1: a handoff that legitimately
+/// started from VACANT and is aborted while its fresh target is
+/// registering must fence with the TYPED separation, never the folded
+/// watcher-less WatcherFailed the pre-fix no-prior arm produced for BOTH
+/// outcomes — a PlatformLimited target teardown (the non-Linux shape,
+/// driven here through the R2-3 lane seam) fences TYPED PlatformLimited,
+/// which the r4 acknowledged force-clear recovers (pre-fix it was
+/// WatcherFailed: `force_release_platform_limited` matched nothing and
+/// the session blocked until a server restart).
+///
+/// R5-2: the abort-cleanup fence transition BROADCASTS the authoritative
+/// state — the fenced marker, the typed reason, and the no-prior fence's
+/// vacant ownerKind — so connected devices converge without a reconnect
+/// (pre-fix: no frame at all; the stale handoff-started record lingered).
+#[tokio::test]
+async fn an_aborted_from_vacant_platform_limited_target_fences_typed_and_recovers() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    // The claude-lane resume gates on transcript presence (the 6b pattern).
+    let store_dir = std::env::temp_dir().join(format!(
+        "freshell-handoff-r54a-store-{}",
+        uuid_like_suffix()
+    ));
+    let project_dir = store_dir.join("projects").join("slug");
+    std::fs::create_dir_all(&project_dir).expect("create transcript project dir");
+    let sid = uuid::Uuid::new_v4().to_string();
+    std::fs::write(
+        project_dir.join(format!("{sid}.jsonl")),
+        "{\"cwd\": \"/tmp\"}\n",
+    )
+    .expect("write fake transcript");
+    std::env::set_var("CLAUDE_CONFIG_DIR", &store_dir);
+
+    let resume_pause = Arc::new(tokio::sync::Notify::new());
+    // The R2-3 platform-limited lane seam: the target teardown answers
+    // PlatformLimited (the non-Linux shape) on Linux for this red/green.
+    let mut rig = build_rig_with_options(
+        None,
+        None,
+        Some(Arc::clone(&resume_pause)),
+        8_000,
+        None,
+        true,
+    );
+    let _ = drain_runtime_owner_frames(&mut rig.rx);
+
+    // FROM VACANT: no establish — the key has no owner; the handoff
+    // begins from a vacant key (prior = None).
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_fresh("claude", &sid, "freshclaude"));
+    // The target resume registered its session (the park point).
+    await_live_session(
+        &rig.fresh_claude,
+        &sid,
+        true,
+        "the from-vacant target resume must register its session",
+    )
+    .await;
+
+    // ABORT inside the target-resume await: the cleanup's lane kill
+    // answers PlatformLimited and the NO-PRIOR arm fences.
+    handle.abort();
+    let _ = handle.task.await;
+
+    // R5-1: the fence is TYPED PlatformLimited (pre-fix: the folded
+    // WatcherFailed the force-clear can never release).
+    let snap = rig.ownership.observe("claude", &sid);
+    assert!(
+        matches!(
+            snap.state,
+            OwnershipState::Fenced {
+                reason: freshell_ownership::FenceReason::PlatformLimited,
+                prior: None,
+                ..
+            }
+        ),
+        "the aborted from-vacant handoff's PlatformLimited target must fence \
+         TYPED PlatformLimited with no prior, got {:?}",
+        snap.state
+    );
+
+    // R5-2: the fence transition BROADCASTS — fenced marker + typed
+    // reason + the no-prior fence's vacant ownerKind (pre-fix: no frame).
+    let frames = await_owner_frames(&mut rig.rx, &["handoff-failed"]).await;
+    let failed = runtime_owner_frame(&frames, "handoff-failed");
+    assert_eq!(
+        failed["fenced"],
+        json!(true),
+        "the abort-cleanup fence frame carries the fenced marker: {failed}"
+    );
+    assert_eq!(failed["reason"], json!("platform-limited"));
+    assert_eq!(
+        failed["ownerKind"],
+        json!("vacant"),
+        "a no-prior fence names the vacant prior: {failed}"
+    );
+
+    // THE R5-1 recovery: the r4 acknowledged force-clear releases the
+    // typed PlatformLimited fence (pre-fix: force_release_platform_
+    // limited matched nothing — SESSION_FENCED, blocked until restart).
+    let mut clear = handoff_req_fresh("claude", &sid, "freshclaude");
+    clear.acknowledge_platform_limited_risk = true;
+    clear.observed_epoch = Some(snap.epoch);
+    clear.observed_generation = Some(snap.generation);
+    let clear_handle = rig.runner.spawn_handoff(clear);
+    let cleared = clear_handle
+        .completion
+        .await
+        .expect("force-clear completed");
+    assert_eq!(
+        cleared["ok"],
+        json!(true),
+        "the typed PlatformLimited fence is force-clear recoverable: {cleared}"
+    );
+    assert_eq!(cleared["cleared"], json!("platform-limited-fence"));
+    assert!(
+        matches!(
+            rig.ownership.observe("claude", &sid).state,
+            OwnershipState::Vacant
+        ),
+        "the force-cleared key is Vacant"
+    );
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+    let _ = std::fs::remove_dir_all(&store_dir);
+}
+
+/// 7b. b8ke focused round-5 review R5-1: the aborted from-vacant handoff's
+/// UNCONFIRMED target (the lane kill's NotConfirmed continuation LOST —
+/// the drop-confirmation test seam) fences WITH the replacement
+/// confirmation watcher (the r2/e3887a378 pattern): the watcher's bounded
+/// probe re-issues the target's recorded-identity kill-and-confirm, and
+/// ONLY the confirmed death (the lingering TERM-immune grandchild killed)
+/// releases the fence to Vacant + broadcasts `released`. Pre-fix the
+/// no-prior arm produced a WATCHER-LESS WatcherFailed fence — the key
+/// blocked until a server restart.
+#[tokio::test]
+async fn an_aborted_from_vacant_unconfirmed_target_fences_with_a_replacement_watcher() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let env = FakeSidecarEnv::install();
+    // The claude-lane resume gates on transcript presence (the 6b pattern).
+    let store_dir = std::env::temp_dir().join(format!(
+        "freshell-handoff-r54b-store-{}",
+        uuid_like_suffix()
+    ));
+    let project_dir = store_dir.join("projects").join("slug");
+    std::fs::create_dir_all(&project_dir).expect("create transcript project dir");
+    let sid = uuid::Uuid::new_v4().to_string();
+    std::fs::write(
+        project_dir.join(format!("{sid}.jsonl")),
+        "{\"cwd\": \"/tmp\"}\n",
+    )
+    .expect("write fake transcript");
+    std::env::set_var("CLAUDE_CONFIG_DIR", &store_dir);
+
+    let resume_pause = Arc::new(tokio::sync::Notify::new());
+    let hooks = Arc::new(HandoffTestHooks {
+        drop_abort_target_confirmation_once: std::sync::atomic::AtomicBool::new(true),
+        ..HandoffTestHooks::default()
+    });
+    // The one-round confirmation window: the lane kill cannot confirm the
+    // target tree while the TERM-immune tagged descendant lives — the
+    // NotConfirmed shape; the armed seam then DROPS the continuation.
+    let mut rig = build_rig_with_options(
+        Some(Arc::clone(&hooks)),
+        None,
+        Some(Arc::clone(&resume_pause)),
+        8_000,
+        Some(1),
+        false,
+    );
+    let _ = drain_runtime_owner_frames(&mut rig.rx);
+
+    // FROM VACANT (no establish): the freshclaude target resume registers.
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_fresh("claude", &sid, "freshclaude"));
+    await_live_session(
+        &rig.fresh_claude,
+        &sid,
+        true,
+        "the from-vacant target resume must register its session",
+    )
+    .await;
+    // The TARGET sidecar's ownership tag + a TERM-immune tagged grandchild
+    // parked under it (the R3-6 pattern): the lane kill's one-round window
+    // cannot confirm, and the dropped continuation leaves it lingering.
+    let target_pid = env
+        .create_rows()
+        .into_iter()
+        .filter(|r| r["msg"]["resumeSessionId"] == sid)
+        .filter_map(|r| r["pid"].as_u64())
+        .find(|pid| *pid != 0)
+        .expect("the target sidecar's create row") as u32;
+    let ownership_id = {
+        let environ = std::fs::read(format!("/proc/{target_pid}/environ"))
+            .expect("read the target sidecar's environ");
+        environ
+            .split(|&b| b == 0)
+            .find_map(|var| {
+                let var = std::str::from_utf8(var).ok()?;
+                var.strip_prefix("FRESHELL_CLAUDE_SIDECAR_ID=")
+            })
+            .expect("the target sidecar's ownership id")
+            .to_string()
+    };
+    let mut grandchild = tokio::process::Command::new("bash")
+        .arg("-c")
+        .arg("trap '' TERM; while :; do sleep 1; done")
+        .env("FRESHELL_CLAUDE_SIDECAR_ID", &ownership_id)
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn the lingering tagged grandchild");
+    let grandchild_pid = grandchild.id().expect("grandchild pid");
+
+    // ABORT inside the fresh-target resume await; the cleanup's lane kill
+    // answers NotConfirmed and the armed seam DROPS the continuation.
+    handle.abort();
+    let _ = handle.task.await;
+
+    // The fence is typed (never plain Vacant, never Reaped) — and R5-2:
+    // the fence transition is BROADCAST with the marker + reason.
+    await_cond("the unconfirmed target must fence the key", || {
+        matches!(
+            rig.ownership.observe("claude", &sid).state,
+            OwnershipState::Fenced { prior: None, .. }
+        )
+    })
+    .await;
+    let frames = await_owner_frames(&mut rig.rx, &["handoff-failed"]).await;
+    let failed = runtime_owner_frame(&frames, "handoff-failed");
+    assert_eq!(failed["fenced"], json!(true), "the fence frame: {failed}");
+    assert_eq!(failed["reason"], json!("watcher-failed"));
+    assert_eq!(failed["ownerKind"], json!("vacant"));
+
+    // THE R5-1 replacement watcher: its bounded probe re-issues the
+    // recorded-identity kill-and-confirm — the lingering grandchild is
+    // killed, the death is CONFIRMED, and only then the fence releases to
+    // Vacant + the corrective `released` broadcast (RUNNER_ABORTED).
+    // Pre-fix (watcher-less): the grandchild lingers and the key stays
+    // fenced forever.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while crate::session_lease::proc_starttime(grandchild_pid as i32).is_some() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the replacement confirmation watcher never killed the lingering \
+             unconfirmed-target descendant — a watcher-less fence"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    await_cond("the watcher-confirmed death must release the fence", || {
+        rig.ownership.observe("claude", &sid).state == OwnershipState::Vacant
+    })
+    .await;
+    let frames = await_owner_frames(&mut rig.rx, &["released"]).await;
+    let released = runtime_owner_frame(&frames, "released");
+    assert_eq!(
+        released["reason"],
+        json!("RUNNER_ABORTED"),
+        "the watcher's release names the abort: {released}"
+    );
+    let _ = grandchild.wait().await;
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+    let _ = std::fs::remove_dir_all(&store_dir);
+}
+
+/// 7c. b8ke focused round-5 review R5-2: the abort-cleanup RESTORE arm
+/// broadcasts the authoritative owner too — an abort with a live prior
+/// restores it, and the devices holding the stale handoff-started record
+/// receive the corrective handoff-failed frame naming the RESTORED owner
+/// (pre-fix: nothing on the bus until a reconnect).
+#[tokio::test]
+async fn an_abort_cleanup_broadcasts_the_restored_prior_owner() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let hooks = Arc::new(HandoffTestHooks {
+        pause_after_enter: Some(tokio::sync::Notify::new()),
+        ..HandoffTestHooks::default()
+    });
+    let mut rig = build_rig(Some(Arc::clone(&hooks)));
+    establish_fresh_claude_owner(&rig, &sid).await;
+    let _ = drain_runtime_owner_frames(&mut rig.rx);
+
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    // Park proof: the started broadcast, so the abort lands mid-Handoff.
+    let _started = await_owner_frame(&mut rig.rx, "handoff-started").await;
+    handle.abort();
+    let _ = handle.task.await;
+
+    // The restored prior is the authoritative owner.
+    await_cond("the aborted handoff must restore the live prior", || {
+        matches!(
+            rig.ownership.observe("claude", &sid).state,
+            OwnershipState::Live { .. }
+        )
+    })
+    .await;
+    // R5-2: the corrective frame names the RESTORED owner (the fresh-agent
+    // prior) with the typed abort reason — no reconnect needed.
+    let frames = await_owner_frames(&mut rig.rx, &["handoff-failed"]).await;
+    let failed = runtime_owner_frame(&frames, "handoff-failed");
+    assert_eq!(
+        failed["ownerKind"],
+        json!("fresh-agent"),
+        "the abort-cleanup frame names the restored prior: {failed}"
+    );
+    assert_eq!(failed["reason"], json!("RUNNER_ABORTED"));
+    assert!(
+        failed.get("fenced").is_none() || failed["fenced"] == Value::Null,
+        "the restore arm is NOT fenced: {failed}"
+    );
+}
+
 /// 6. opencode: handoff never kills the shared serve and never changes the
 /// id. The serve manager instance is the SAME before/after (exactly one
 /// serve pid across both handoffs — a restart would add one); the `ses_*`
