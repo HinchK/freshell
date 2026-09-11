@@ -132,6 +132,7 @@ function argValue(name) {
 const hostname = argValue('--hostname') || '127.0.0.1'
 const port = Number(argValue('--port'))
 const audit = process.env.FAKE_OPENCODE_SERVE_AUDIT_LOG || ''
+let nextSession = 0
 function log(row) {
   if (!audit) return
   try { fs.appendFileSync(audit, JSON.stringify({ pid: process.pid, t: Date.now(), ...row }) + '\n') } catch {}
@@ -142,6 +143,14 @@ const server = http.createServer((req, res) => {
   if (url.pathname === '/global/health') {
     res.writeHead(200, { 'content-type': 'application/json' })
     res.end(JSON.stringify({ status: 'ok' }))
+    return
+  }
+  // A create (the REST send-keys cold-start materialization): mint a
+  // fresh durable ses_N id (b8ke focused round-3 R3-1).
+  if (url.pathname === '/session' && req.method === 'POST') {
+    nextSession += 1
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ id: `ses_${nextSession}`, directory: '/tmp', title: 'fake opencode session' }))
     return
   }
   if (url.pathname === '/event' || url.pathname === '/global/event') {
@@ -3449,6 +3458,136 @@ async fn opencode_handoff_during_compaction_aborts_the_daemon_side_summarize() {
     // Release the summarize hold for a clean shutdown of the parked
     // response, then clean up the terminal owner's row.
     std::fs::write(&summarize_release, "").expect("release the summarize hold");
+    rig.registry.kill(&terminal_id);
+}
+
+/// 6f. b8ke focused round-3 review R3-1: the REST/MCP opencode send-keys
+/// path participates in the coordinator. An in-flight REST-driven daemon
+/// turn — the pane is NOT represented in the WebSocket session map — is
+/// still visible to a concurrent handoff: the stop finds the REST turn
+/// witness and ABORTS the daemon-side turn (the per-session /abort)
+/// BEFORE reporting the reap, exactly like a WS-lane turn. Pre-fix, the
+/// stop found no session (AlreadyGone), answered Reaped, and the handoff
+/// started the terminal CLI while the REST-driven turn kept mutating the
+/// session. The fake serve holds its abort answer until released: the
+/// handoff must not complete while the daemon-side abort is unanswered.
+#[tokio::test]
+async fn opencode_handoff_stop_aborts_an_in_flight_rest_driven_turn_before_reaping() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let env = FakeOpencodeServeEnv::install();
+    // The abort-hold release file: absent until the test writes it, so the
+    // fake serve holds its abort answer open.
+    let release = env.dir.join("abort-release-r31");
+    std::env::set_var("FAKE_OPENCODE_SERVE_ABORT_RELEASE", &release);
+    let rig = build_rig(None);
+
+    // A REST-created freshopencode pane (the POST /api/tabs shape),
+    // driven through the REST send-keys surface — never the WS lane.
+    rig.fresh_agent
+        .panes
+        .lock()
+        .expect("panes mutex")
+        .insert(
+            "pane-r31".to_string(),
+            crate::PaneEntry {
+                placeholder_id: "freshopencode-r31".to_string(),
+                cwd: Some("/tmp".to_string()),
+                model: None,
+                effort: None,
+                durable_id: None,
+            },
+        );
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("x-auth-token", "handoff-test-token".parse().unwrap());
+    // Drive the REST turn with a short budget: the prompt dispatches (the
+    // acceptance witness arms at the dispatch boundary), the local await
+    // gives up (IdleTimeout — the fake serve never goes idle), and the
+    // daemon-side turn keeps running with the request already answered.
+    let send = tokio::spawn(crate::send_keys(
+        axum::extract::State(rig.fresh_agent.clone()),
+        axum::extract::Path("pane-r31".to_string()),
+        headers,
+        axum::Json(json!({ "text": "hold this REST turn open", "timeout": 1 })),
+    ));
+    // The REST materialization committed Live{FreshAgent} for the minted
+    // durable id (the fake serve's first create is ses_1).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        match rig.ownership.observe("opencode", "ses_1").state {
+            OwnershipState::Live { owner, .. } => {
+                assert_eq!(owner.kind, RuntimeOwnerKind::FreshAgent);
+                break;
+            }
+            state => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the REST materialization never committed Live, got {state:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+    // The REST request answered (approx — its own budget expired while the
+    // daemon-side turn runs on).
+    let rest_response = send.await.expect("REST send-keys completed");
+    assert_eq!(
+        rest_response.status(),
+        axum::http::StatusCode::OK,
+        "the REST send-keys drive answers approx: {rest_response:?}"
+    );
+
+    // Handoff opencode -> terminal: the stop must abort the REST-driven
+    // daemon-side turn before the reap is reported.
+    let to_terminal = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("opencode", "ses_1", "opencode"));
+    let mut completion = to_terminal.completion;
+
+    // THE R3-1 regression: the manager abort was ISSUED for the REAL
+    // session id through the REST turn witness (pre-fix: no session in
+    // the WS map → AlreadyGone → no abort at all).
+    env.await_audit_row(Duration::from_secs(20), |r| {
+        r["event"] == "abort-received" && r["id"] == json!("ses_1")
+    })
+    .await;
+
+    // Ordering: the handoff must NOT complete (the reap unreported) while
+    // the daemon-side abort is unanswered.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), &mut completion)
+            .await
+            .is_err(),
+        "the handoff completed before the daemon-side turn abort settled — \
+         the reap must follow the manager abort"
+    );
+
+    // Release: the daemon answers the abort; the stop reports the reap
+    // and the handoff runs to its committed terminal owner.
+    std::fs::write(&release, "").expect("release the abort hold");
+    let result = completion.await.expect("handoff completed");
+    assert_eq!(result["ok"], json!(true), "handoff to terminal: {result}");
+    let terminal_id = result["owner"]["terminalId"].as_str().unwrap().to_string();
+    match rig.ownership.observe("opencode", "ses_1").state {
+        OwnershipState::Live { owner, .. } => {
+            assert_eq!(owner.kind, RuntimeOwnerKind::Terminal);
+            assert_eq!(owner.terminal_id.as_deref(), Some(terminal_id.as_str()));
+        }
+        other => panic!("expected Live terminal owner, got {other:?}"),
+    }
+
+    // The shared serve was never killed — exactly one serve pid across the
+    // whole handoff (OpenCode invariant).
+    env.await_audit_row(Duration::from_secs(10), |r| {
+        r["event"] == "abort-answered" && r["id"] == json!("ses_1")
+    })
+    .await;
+    assert_eq!(
+        env.serve_pids().len(),
+        1,
+        "the shared serve was never killed or restarted: pids {:?}",
+        env.serve_pids()
+    );
     rig.registry.kill(&terminal_id);
 }
 

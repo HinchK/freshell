@@ -709,7 +709,7 @@ pub mod ownership_lane {
 }
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -958,6 +958,14 @@ pub struct FreshAgentState {
     /// kill/exit `StopClaim`/`ReleaseClaim` source. Shared with the WS
     /// opencode slice (this state is the single object both surfaces wrap).
     pub(crate) ownership_stamps: ownership_lane::OwnershipStamps,
+    /// b8ke focused round-3 review R3-1: the in-flight REST-driven
+    /// opencode turns, keyed by canonical durable `ses_*` id — the REST
+    /// send-keys participation registry the WS opencode lane's handoff
+    /// stop / kill / fence-recovery paths consult (a REST pane is not
+    /// represented in the WebSocket session map). See
+    /// [`RestOpencodeTurn`].
+    pub(crate) rest_opencode_turns:
+        Arc<Mutex<HashMap<String, Arc<RestOpencodeTurn>>>>,
 }
 
 /// What [`terminal_tabs::spawn_terminal_pane`] hands the injected
@@ -988,6 +996,31 @@ struct PaneEntry {
     effort: Option<String>,
     /// The durable `ses_*` id after the first turn materializes it.
     durable_id: Option<String>,
+}
+
+/// b8ke focused round-3 review R3-1: the in-flight REST-driven opencode
+/// turn witness — one per canonical durable `ses_*` id while a REST
+/// `send-keys` drive may be mutating the session through the shared
+/// serve. The REST pane is NOT represented in the WebSocket session map,
+/// so this shared registry (on [`FreshAgentState`], shared with the WS
+/// opencode lane by Arc) is what the lane's lifecycle stops see:
+///
+/// - `daemon_turn_accepted` arms at the prompt POST's DISPATCH boundary
+///   (run_turn's accepted witness, the same seam the WS lane's turns
+///   use): a handoff/kill that finds it armed must abort the daemon-side
+///   turn (`POST /session/:id/abort`) to confirmed settlement before
+///   reporting the reap.
+/// - `condemned` is set by a lifecycle stop that finds the drive BEFORE
+///   its dispatch: the drive checks it right before `run_turn` and
+///   refuses to issue the prompt POST (the handoff owns the transition).
+///
+/// An `IdleTimeout` (or any ambiguous drive error) leaves the witness
+/// armed and registered — the daemon-side turn may still run; only the
+/// observed idle edge (or a confirmed abort / a lost sidecar) settles it.
+pub(crate) struct RestOpencodeTurn {
+    pub(crate) daemon_turn_accepted: Arc<AtomicBool>,
+    pub(crate) condemned: AtomicBool,
+    pub(crate) route: Option<String>,
 }
 
 /// A Slice-1 terminal pane's record: just enough to dispatch `send-keys` /
@@ -1056,6 +1089,7 @@ impl FreshAgentState {
             resume_probe_timeout_ms: Arc::new(Mutex::new(None)),
             ownership: None,
             ownership_stamps: Arc::new(Mutex::new(HashMap::new())),
+            rest_opencode_turns: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1395,6 +1429,96 @@ impl FreshAgentState {
             // A send with no live receivers is fine (returns Err) — the capture socket
             // subscribed before the handshake, so it will observe every broadcast.
             let _ = self.broadcast_tx.send(frame);
+        }
+    }
+
+    /// b8ke focused round-3 review R3-1: register the REST-driven turn
+    /// witness for a canonical durable `ses_*` id, replacing any leftover
+    /// entry an earlier timed-out drive left (the witness tracks the
+    /// session's daemon-side turn, not a specific request). Registered
+    /// BEFORE the ownership check and the dispatch so a concurrent
+    /// lifecycle stop can see the in-flight drive either way.
+    pub(crate) fn register_rest_opencode_turn(
+        &self,
+        durable_id: &str,
+        route: Option<String>,
+    ) -> Arc<RestOpencodeTurn> {
+        let witness = Arc::new(RestOpencodeTurn {
+            daemon_turn_accepted: Arc::new(AtomicBool::new(false)),
+            condemned: AtomicBool::new(false),
+            route,
+        });
+        self.rest_opencode_turns
+            .lock()
+            .expect("rest opencode turns lock")
+            .insert(durable_id.to_string(), Arc::clone(&witness));
+        witness
+    }
+
+    /// b8ke focused round-3 review R3-1: the ownership/claim check a REST
+    /// turn dispatch must pass — the canonical key must be
+    /// `Live{FreshAgent}` (this pane's materialization committed it; a
+    /// concurrent handoff/stop, a fence, or a foreign owner refuses the
+    /// dispatch typed). `false` when unwired (the legacy no-coordinator
+    /// behavior every pre-existing test keeps).
+    pub(crate) fn rest_turn_ownership_granted(&self, durable_id: &str) -> bool {
+        let Some(registry) = self.ownership.as_ref() else {
+            return true;
+        };
+        matches!(
+            registry.observe(PROVIDER, durable_id).state,
+            freshell_ownership::OwnershipState::Live {
+                owner,
+                ..
+            } if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+        )
+    }
+
+    /// b8ke focused round-3 review R3-1: settle the REST turn witness
+    /// after the drive's own await resolved. A genuinely-settled turn
+    /// (the idle edge observed, or the sidecar itself gone — nothing runs
+    /// daemon-side) disarms and unregisters; every other outcome
+    /// (IdleTimeout, ambiguous errors) keeps the witness ARMED and
+    /// REGISTERED — the daemon-side turn may still run, and only a
+    /// lifecycle stop's confirmed abort (or a later drive's replacement)
+    /// may clear it.
+    pub(crate) fn settle_rest_opencode_turn(
+        &self,
+        durable_id: &str,
+        witness: &Arc<RestOpencodeTurn>,
+        settled: bool,
+    ) {
+        if settled {
+            witness
+                .daemon_turn_accepted
+                .store(false, Ordering::SeqCst);
+            let mut turns = self
+                .rest_opencode_turns
+                .lock()
+                .expect("rest opencode turns lock");
+            if let Some(registered) = turns.get(durable_id) {
+                if Arc::ptr_eq(registered, witness) {
+                    turns.remove(durable_id);
+                }
+            }
+        }
+    }
+
+    /// Remove a REST turn witness registration on a refusal path (the
+    /// ownership/condemned check failed before any dispatch).
+    pub(crate) fn remove_rest_opencode_turn(
+        &self,
+        durable_id: &str,
+        witness: &Arc<RestOpencodeTurn>,
+    ) {
+        let mut turns = self
+            .rest_opencode_turns
+            .lock()
+            .expect("rest opencode turns lock");
+        if let Some(registered) = turns.get(durable_id) {
+            if Arc::ptr_eq(registered, witness) {
+                turns.remove(durable_id);
+            }
         }
     }
 
@@ -3341,6 +3465,36 @@ async fn send_keys(
     let effort = normalize_opencode_effort(pane.model.as_deref(), pane.effort.as_deref());
     let submitted_turn_id = Uuid::new_v4().to_string();
 
+    // b8ke focused round-3 review R3-1: the REST pane drive PARTICIPATES
+    // in the coordinator exactly like the WS lane's turn. (1) The witness
+    // is registered BEFORE the ownership check and the dispatch, so a
+    // concurrent lifecycle stop sees the in-flight drive either way; (2)
+    // the ownership/claim check — the canonical key must be
+    // Live{FreshAgent} (this pane's materialization committed it; a
+    // concurrent handoff/stop, a fence, or a foreign owner refuses the
+    // dispatch typed); (3) a stop that CONDEMNED this drive before its
+    // dispatch (the handoff owned the transition) refuses it too; (4) the
+    // accepted-turn witness arms at the prompt POST's DISPATCH boundary
+    // (run_turn's accepted_witness — the same seam the WS lane's turns
+    // use), so a handoff finding it armed aborts the daemon-side turn
+    // before reporting the reap.
+    let turn_witness = state.register_rest_opencode_turn(&durable_id, route.clone());
+    if !state.rest_turn_ownership_granted(&durable_id)
+        || turn_witness.condemned.load(Ordering::SeqCst)
+    {
+        tracing::warn!(target: "freshell_freshagent::opencode",
+            provider = PROVIDER, session_id = %durable_id,
+            condemned = turn_witness.condemned.load(Ordering::SeqCst),
+            "freshagent.opencode.rest_turn_dispatch_refused: the coordinator owns \
+             this session's transition — the REST turn is not dispatched"
+        );
+        state.remove_rest_opencode_turn(&durable_id, &turn_witness);
+        return fail_json(
+            StatusCode::CONFLICT,
+            "SESSION_RESERVED: another lifecycle operation owns this session".to_string(),
+        );
+    }
+
     match manager
         .run_turn(
             &durable_id,
@@ -3349,36 +3503,48 @@ async fn send_keys(
             effort.as_deref(),
             turn_timeout,
             route,
-            // b8ke focused FR1: the acceptance witness is the WS lane's
-            // session-flag concern; this REST pane drive holds the pane's
-            // own lifecycle (the request bounds the turn) and registers no
-            // WS-lane session record, so there is no flag to arm here.
-            None,
+            Some(turn_witness.daemon_turn_accepted.clone()),
         )
         .await
     {
-        Ok(()) => ok_json(
-            json!({
-                "paneId": pane_id,
-                "sessionId": durable_id,
-                "submittedTurnId": submitted_turn_id,
-                "sessionRef": { "provider": PROVIDER, "sessionId": durable_id },
-                "status": "idle",
-            }),
-            "prompt sent",
-        ),
+        Ok(()) => {
+            // The idle edge was observed (or the daemon itself is gone —
+            // nothing runs daemon-side): the accepted turn is settled.
+            state.settle_rest_opencode_turn(&durable_id, &turn_witness, true);
+            ok_json(
+                json!({
+                    "paneId": pane_id,
+                    "sessionId": durable_id,
+                    "submittedTurnId": submitted_turn_id,
+                    "sessionRef": { "provider": PROVIDER, "sessionId": durable_id },
+                    "status": "idle",
+                }),
+                "prompt sent",
+            )
+        }
         // Idle deadline missed → approx (the turn was accepted; it just did not idle in time).
-        Err(ServeError::IdleTimeout { .. }) => approx_json(
-            json!({
-                "paneId": pane_id,
-                "sessionId": durable_id,
-                "submittedTurnId": submitted_turn_id,
-                "sessionRef": { "provider": PROVIDER, "sessionId": durable_id },
-                "status": "approx",
-            }),
-            "prompt sent; turn did not complete within deadline",
-        ),
-        Err(err) => fail_json(serve_error_status(&err), err.to_string()),
+        // The witness STAYS armed and registered — the daemon-side turn
+        // still runs and a lifecycle stop must still abort it.
+        Err(ServeError::IdleTimeout { .. }) => {
+            state.settle_rest_opencode_turn(&durable_id, &turn_witness, false);
+            approx_json(
+                json!({
+                    "paneId": pane_id,
+                    "sessionId": durable_id,
+                    "submittedTurnId": submitted_turn_id,
+                    "sessionRef": { "provider": PROVIDER, "sessionId": durable_id },
+                    "status": "approx",
+                }),
+                "prompt sent; turn did not complete within deadline",
+            )
+        }
+        // Ambiguous errors keep the witness armed (fail closed: the stop
+        // path would rather issue one redundant abort than miss a live
+        // daemon-side writer).
+        Err(err) => {
+            state.settle_rest_opencode_turn(&durable_id, &turn_witness, false);
+            fail_json(serve_error_status(&err), err.to_string())
+        }
     }
 }
 
@@ -4797,6 +4963,130 @@ mod tests {
         // A settings-bearing row keeps "recorded" status under the new keying.
         drop(bindings);
         assert!(fake.was_recorded("opencode", "ses_1"));
+    }
+
+    /// b8ke focused round-3 review R3-1: the REST turn dispatch performs
+    /// the ownership/claim check — the canonical key must be
+    /// `Live{FreshAgent}`. A key whose Live owner is a TERMINAL (a
+    /// completed handoff moved the session to the terminal lane) refuses
+    /// the REST drive typed (409 SESSION_RESERVED), never dispatching a
+    /// prompt POST over a session this pane no longer owns. Pre-fix, the
+    /// REST path dispatched `run_turn` with no ownership check at all.
+    #[tokio::test]
+    async fn rest_send_keys_refuses_a_foreign_owned_session_typed() {
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let st = state().with_ownership(Arc::clone(&registry));
+        let deps = ServeDeps {
+            spawner: Arc::new(NoopSpawner),
+            http: Arc::new(CreateCapableHttp),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        st.set_manager_for_test(manager).await;
+
+        // First send: materializes ses_1 and commits Live{FreshAgent}
+        // (timeout 0 bounds the drive's own idle wait to an immediate
+        // approx).
+        st.panes.lock().expect("panes mutex").insert(
+            "pane-foreign".to_string(),
+            PaneEntry {
+                placeholder_id: "freshopencode-foreign".to_string(),
+                cwd: Some("/w".to_string()),
+                model: None,
+                effort: None,
+                durable_id: None,
+            },
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("x-auth-token", "tok".parse().unwrap());
+        let first = send_keys(
+            State(st.clone()),
+            Path("pane-foreign".to_string()),
+            headers.clone(),
+            Json(json!({ "text": "hello", "timeout": 0 })),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        // Fixture: the materialization committed the fresh owner.
+        match registry.observe(PROVIDER, "ses_1").state {
+            freshell_ownership::OwnershipState::Live { owner, .. } => {
+                assert_eq!(
+                    owner.kind,
+                    freshell_ownership::RuntimeOwnerKind::FreshAgent
+                );
+            }
+            other => panic!("fixture: expected the committed fresh owner, got {other:?}"),
+        }
+
+        // Move the canonical key to a TERMINAL owner (a completed
+        // handoff's end state).
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_handoff(
+            PROVIDER,
+            "ses_1",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "test-terminal-move",
+            None,
+            "test",
+            crate::session_lease::now_epoch_ms(),
+        ) else {
+            panic!("fixture: the handoff begins from the committed Live state")
+        };
+        let terminal_owner = freshell_ownership::OwnerIdentity {
+            kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+            terminal_id: Some("term-1".into()),
+            live_session_key: None,
+            pid: None,
+            ownership_id: None,
+        };
+        assert_eq!(
+            registry.commit_live(
+                PROVIDER,
+                "ses_1",
+                "test-terminal-move",
+                generation,
+                terminal_owner,
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        );
+
+        // THE R3-1 regression: the second REST drive on the SAME pane is
+        // refused typed — the pane's session is owned by a terminal now.
+        let second = send_keys(
+            State(st.clone()),
+            Path("pane-foreign".to_string()),
+            headers,
+            Json(json!({ "text": "another turn", "timeout": 5 })),
+        )
+        .await;
+        assert_eq!(
+            second.status(),
+            StatusCode::CONFLICT,
+            "a foreign-owned session must refuse the REST turn dispatch: {second:?}"
+        );
+        let body = axum::body::to_bytes(
+            second.into_body(),
+            usize::MAX,
+        )
+        .await
+        .expect("read the refusal body");
+        let body: Value = serde_json::from_slice(&body).expect("the refusal body parses");
+        assert_eq!(
+            body["message"], "SESSION_RESERVED: another lifecycle operation owns this session",
+            "the typed refusal: {body}"
+        );
+        // The refused drive leaves no witness registered.
+        assert!(
+            st.rest_opencode_turns
+                .lock()
+                .expect("rest opencode turns lock")
+                .is_empty(),
+            "the refused dispatch must not leave a REST turn witness behind"
+        );
     }
 
     /// Task 3 (corrected semantics — this test previously asserted the WAVE-B

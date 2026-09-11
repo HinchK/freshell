@@ -1537,6 +1537,13 @@ impl FreshOpencodeState {
                 )
                 .await;
             }
+            // b8ke focused round-3 review R3-1: a REST-driven turn on this
+            // canonical id is STILL an in-flight writer the map never saw —
+            // quiesce it (condemn + abort the accepted daemon turn) before
+            // `AlreadyGone` is true. Pre-fix, the stop answered
+            // AlreadyGone/Reaped while the REST-driven daemon turn kept
+            // mutating the session.
+            self.quiesce_rest_opencode_turn(session_id).await;
             return crate::session_handoff::StopResult::AlreadyGone;
         };
         let (turn_task, bridge, real, route, daemon_turn_accepted) = {
@@ -1596,6 +1603,16 @@ impl FreshOpencodeState {
                     .await;
             }
         }
+        // b8ke focused round-3 review R3-1: a REST-driven turn on the SAME
+        // canonical id is an in-flight writer this map never saw — quiesce
+        // it before the reap is reported (the confirmed end below is the
+        // whole canonical session's quiescence).
+        match real.as_deref().unwrap_or(session_id) {
+            canonical if canonical.starts_with("ses_") => {
+                self.quiesce_rest_opencode_turn(canonical).await;
+            }
+            _ => {}
+        }
         if let Some(bridge) = bridge {
             bridge.abort();
         }
@@ -1619,8 +1636,11 @@ impl FreshOpencodeState {
     /// the shared daemon — OpenCode invariant) and confirms on its
     /// settlement. A still-mapped session (the cancelled kill never reached
     /// the map removal) instead gets the lane's own full teardown re-run —
-    /// its `Reaped` answer IS the confirmed quiescence. Never confirms on
-    /// less: `false` keeps the fence held (fail-closed).
+    /// its `Reaped` answer IS the confirmed quiescence. b8ke focused
+    /// round-3 review R3-1: a REST-driven turn witness is the same class
+    /// of un-settled daemon-side writer — quiescing it through the shared
+    /// registry IS the confirmation. Never confirms on less: `false`
+    /// keeps the fence held (fail-closed).
     pub(crate) async fn confirm_fenced_prior_dead(&self, session_id: &str) -> bool {
         if self.has_live_session(session_id).await {
             return matches!(
@@ -1650,7 +1670,60 @@ impl FreshOpencodeState {
                 .remove(session_id);
             return true;
         }
+        // R3-1: a lingering REST-driven turn (a cancelled stop took no
+        // witness — or the drive armed after it) is the remaining
+        // daemon-side writer this lane can settle.
+        let rest_turn = self
+            .fresh_agent
+            .rest_opencode_turns
+            .lock()
+            .expect("rest opencode turns lock")
+            .remove(session_id);
+        if let Some(rest_turn) = rest_turn {
+            rest_turn.condemned.store(true, Ordering::SeqCst);
+            if rest_turn.daemon_turn_accepted.load(Ordering::SeqCst) {
+                self.abort_accepted_daemon_turn(
+                    session_id,
+                    &rest_turn.route,
+                    &rest_turn.daemon_turn_accepted,
+                )
+                .await;
+            }
+            return true;
+        }
         false
+    }
+
+    /// b8ke focused round-3 review R3-1: quiesce the REST-driven turn
+    /// witness for a canonical durable `ses_*` id — the REST send-keys
+    /// participation half of every opencode lifecycle stop. The witness
+    /// entry is TAKEN from the shared registry and CONDEMNED (a drive
+    /// that has not dispatched yet refuses to), and an ACCEPTED daemon
+    /// turn is aborted to confirmed settlement through the PEEKED manager
+    /// at its CAPTURED base (never a `require_base` re-lookup — a stop
+    /// path must never spawn a daemon; the shared serve itself is NEVER
+    /// killed or discarded — OpenCode invariant). A witness that was never
+    /// armed (no accepted turn) settles immediately.
+    pub(crate) async fn quiesce_rest_opencode_turn(&self, canonical: &str) {
+        // Bind before the await: the guard must never live across it.
+        let witness = self
+            .fresh_agent
+            .rest_opencode_turns
+            .lock()
+            .expect("rest opencode turns lock")
+            .remove(canonical);
+        let Some(witness) = witness else {
+            return;
+        };
+        witness.condemned.store(true, Ordering::SeqCst);
+        if witness.daemon_turn_accepted.load(Ordering::SeqCst) {
+            self.abort_accepted_daemon_turn(
+                canonical,
+                &witness.route,
+                &witness.daemon_turn_accepted,
+            )
+            .await;
+        }
     }
 
     /// Abort an ACCEPTED daemon-side turn to confirmed settlement (b8ke
@@ -2162,6 +2235,18 @@ impl FreshOpencodeState {
                     self.abort_accepted_daemon_turn(real, &route, &daemon_turn_accepted)
                         .await;
                 }
+            }
+            // b8ke focused round-3 R3-1: a REST-driven turn on the SAME
+            // canonical id is an in-flight writer the WS session map never
+            // saw — the kill's reap confirmation covers it too (condemn +
+            // abort the accepted daemon turn before the stop commits).
+            let canonical_for_rest: Option<&str> = match real.as_deref() {
+                Some(id) if id.starts_with("ses_") => Some(id),
+                _ if msg.session_id.starts_with("ses_") => Some(msg.session_id.as_str()),
+                _ => None,
+            };
+            if let Some(canonical) = canonical_for_rest {
+                self.quiesce_rest_opencode_turn(canonical).await;
             }
             // PR-3: stop the persistent serve-SSE bridge too (`unsubscribeServe?.()`,
             // adapter.ts:568) so it doesn't keep broadcasting for a dead session.
