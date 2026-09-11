@@ -3434,6 +3434,157 @@ async fn an_abort_cleanup_broadcasts_the_restored_prior_owner() {
     );
 }
 
+/// The fake sidecar's durable id for a create with NO resumeSessionId
+/// (the fresh-create fallback in FAKE_CLAUDE_SIDECAR_SOURCE).
+const FRESH_CREATE_DURABLE_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+fn fresh_create_msg(session_type: SessionType) -> FreshAgentCreate {
+    FreshAgentCreate {
+        request_id: format!("handoff-create-fresh-{}", uuid::Uuid::new_v4()),
+        session_type,
+        cwd: Some("/tmp".to_string()),
+        effort: None,
+        legacy_restore_context: None,
+        model: None,
+        model_selection: None,
+        observed_epoch: None,
+        observed_generation: None,
+        permission_mode: None,
+        plugins: None,
+        provider: Some(AgentProvider::Claude),
+        resume_session_id: None,
+        sandbox: None,
+        // b8ke delta round-2 F1: the ORDINARY create — NO explicit
+        // sessionRef. The durable id materializes at sdk.session.init
+        // (the pre-fix tests all created with an explicit sessionRef,
+        // masking the no-adoption defect).
+        session_ref: None,
+        tab_id: None,
+    }
+}
+
+/// 8a. b8ke delta round-2 F1: a NORMALLY created freshclaude session (no
+/// explicit sessionRef) adopts the canonical key at `sdk.session.init` —
+/// the coordinator holds authoritative Live{FreshAgent} under the durable
+/// id, every device receives the owner broadcast, and a handoff to the CLI
+/// sees the prior owner, STOPS it (the sidecar is reaped), and transfers
+/// atomically. Pre-fix: the coordinator saw Vacant (no prior — the sidecar
+/// was never stopped), the handoff "succeeded" over a live second writer,
+/// and no owner frame ever reached the bus.
+#[tokio::test]
+async fn a_fresh_created_claude_session_adopts_the_canonical_key_and_hands_off_atomically() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let env = FakeSidecarEnv::install();
+    let mut rig = build_rig(None);
+    let _ = drain_runtime_owner_frames(&mut rig.rx);
+
+    // The ORDINARY create: no sessionRef, no resume id.
+    rig.fresh_claude
+        .handle_create(fresh_create_msg(SessionType::Freshclaude), None)
+        .await;
+
+    // THE F1 ADOPTION: the durable id minted at sdk.session.init becomes
+    // the authoritative Live{FreshAgent} owner. Pre-fix: the key stayed
+    // Vacant forever (this await is the red).
+    await_cond(
+        "the fresh-created session must adopt the canonical key",
+        || {
+            matches!(
+                rig.ownership
+                    .observe("claude", FRESH_CREATE_DURABLE_ID)
+                    .state,
+                OwnershipState::Live { owner, .. }
+                    if owner.kind == RuntimeOwnerKind::FreshAgent
+            )
+        },
+    )
+    .await;
+
+    // The authoritative owner record reached the bus (cross-device
+    // convergence; pre-fix no frame ever named this owner).
+    let frames = await_owner_frames(&mut rig.rx, &["handoff-committed"]).await;
+    let committed = frames
+        .iter()
+        .find(|f| {
+            f["transition"] == "handoff-committed"
+                && f["ownerKind"] == "fresh-agent"
+                && f["sessionId"] == json!(FRESH_CREATE_DURABLE_ID)
+        })
+        .expect("the adoption's authoritative owner frame");
+    assert_eq!(committed["provider"], json!("claude"));
+
+    // The sidecar process serving the fresh create (the handoff must reap
+    // it — pre-fix it was never stopped).
+    let sidecar_pid = env
+        .create_rows()
+        .last()
+        .and_then(|r| r["pid"].as_u64())
+        .expect("the fresh create's sidecar pid") as u32;
+
+    // THE F1 HANDOFF: freshclaude → terminal over the durable id. Post-fix
+    // the runner sees the prior owner, stops the sidecar, and transfers
+    // atomically. Pre-fix: prior=None (Vacant) — the handoff committed a
+    // terminal over the LIVE sidecar (two writers).
+    let handle = rig.runner.spawn_handoff(handoff_req_terminal(
+        "claude",
+        FRESH_CREATE_DURABLE_ID,
+        "claude",
+    ));
+    let result = handle.completion.await.expect("handoff completed");
+    assert_eq!(
+        result["ok"],
+        json!(true),
+        "the from-fresh-create handoff must succeed: {result}"
+    );
+    let terminal_id = result["owner"]["terminalId"].as_str().unwrap().to_string();
+    match rig
+        .ownership
+        .observe("claude", FRESH_CREATE_DURABLE_ID)
+        .state
+    {
+        OwnershipState::Live { owner, .. } => {
+            assert_eq!(owner.kind, RuntimeOwnerKind::Terminal);
+            assert_eq!(owner.terminal_id.as_deref(), Some(terminal_id.as_str()));
+        }
+        other => panic!("expected the committed terminal owner, got {other:?}"),
+    }
+    // The sidecar was STOPPED (the prior owner's confirmed reap).
+    await_pid_dead(sidecar_pid).await;
+    rig.registry.kill(&terminal_id);
+}
+
+/// 8b. b8ke delta round-2 F1 (kilroy): the ORDINARY create shares the
+/// claude lane — a fresh-created KILROY session adopts the canonical key
+/// at `sdk.session.init` the same way (the ownership machinery is
+/// flavor-independent).
+#[tokio::test]
+async fn a_fresh_created_kilroy_session_adopts_the_canonical_key() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    let mut rig = build_rig(None);
+    let _ = drain_runtime_owner_frames(&mut rig.rx);
+
+    rig.fresh_claude
+        .handle_create(fresh_create_msg(SessionType::Kilroy), None)
+        .await;
+
+    await_cond(
+        "the fresh-created kilroy session must adopt the canonical key",
+        || {
+            matches!(
+                rig.ownership
+                    .observe("claude", FRESH_CREATE_DURABLE_ID)
+                    .state,
+                OwnershipState::Live { owner, .. }
+                    if owner.kind == RuntimeOwnerKind::FreshAgent
+            )
+        },
+    )
+    .await;
+}
+
 /// 6. opencode: handoff never kills the shared serve and never changes the
 /// id. The serve manager instance is the SAME before/after (exactly one
 /// serve pid across both handoffs — a restart would add one); the `ses_*`

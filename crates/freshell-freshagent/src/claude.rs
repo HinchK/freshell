@@ -59,7 +59,7 @@ use freshell_protocol::{
     FreshAgentCreate, FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent,
     FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled, FreshAgentQuestionRespond,
     FreshAgentSend, FreshAgentSendAccepted, FreshAgentSessionMaterialized, ServerMessage,
-    SessionType,
+    SessionRuntimeOwner, SessionType,
 };
 
 use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySink};
@@ -1337,6 +1337,16 @@ impl FreshClaudeState {
         // Hoisted to this scope so the commit at the registration tail can
         // consume it; every failure return drops it (RAII typed fail).
         let mut own_ticket: Option<freshell_ownership::OperationTicket> = None;
+        // b8ke delta round-2 F2: the start's REAL watchdog machinery — the
+        // sidecar pid slot (the cancellation SIGTERMs the spawned child; the
+        // create's own gates then tear down and unwind) and the settle
+        // guard (fires when THIS create handler's scope ends — the
+        // operation's completion or unwind; the watchdog's bounded settle
+        // treats it as the operation's confirmed death). Registered only
+        // once the claim Grants below; the guard is held to the handler's
+        // end.
+        let start_pid_slot = crate::ownership_lane::sidecar_pid_cancel_slot();
+        let mut _start_cancellation: Option<crate::ownership_lane::StartCancellationGuard> = None;
         if let Some(sid) = resume_sid.as_deref() {
             // Task 13b (cross-kind liveness): a live terminal PTY owning
             // `(claude, sid)` is the one writer on that JSONL -- refuse the
@@ -1386,7 +1396,21 @@ impl FreshClaudeState {
                 claim_fence,
                 &Self::initiator_for(provenance.as_ref(), "freshclaude/create-resume"),
             ) {
-                crate::ownership_lane::LaneClaim::Granted(ticket) => own_ticket = Some(ticket),
+                crate::ownership_lane::LaneClaim::Granted(ticket) => {
+                    own_ticket = Some(ticket);
+                    // b8ke delta round-2 F2: register the start's
+                    // cancellation + settle with the watchdog (the
+                    // machinery exists — the sidecar pid slot).
+                    _start_cancellation = Some(
+                        crate::ownership_lane::register_start_cancellation_for_ticket(
+                            &self.ownership,
+                            PROVIDER,
+                            sid,
+                            &own_ticket,
+                            crate::ownership_lane::pid_slot_cancellation(&start_pid_slot),
+                        ),
+                    );
+                }
                 crate::ownership_lane::LaneClaim::Unwired => {}
                 crate::ownership_lane::LaneClaim::Adopt => {
                     // A same-kind live runtime the map fast-path missed —
@@ -1505,6 +1529,9 @@ impl FreshClaudeState {
         // reap target) + the pid for the commit's owner identity (captured
         // before `child` moves into the session entry).
         let sidecar_pid = child.id();
+        // b8ke delta round-2 F2: arm the registered start cancellation —
+        // from here the watchdog's cancel SIGTERMs this child.
+        *start_pid_slot.lock().expect("sidecar pid cancel slot lock") = sidecar_pid;
         if let Some(sid) = resume_sid.as_deref() {
             crate::ownership_lane::register_partial_fresh_runtime(
                 &self.ownership,
@@ -3803,7 +3830,12 @@ impl FreshClaudeState {
         // same durable lane) is cross-kind-authoritative. The "we ARE the
         // bound live owner" case surfaces as AdoptLive (same-kind live).
         let rollback_lease_id = format!("rollback-{}", uuid::Uuid::new_v4());
-        let mut own_ticket = match self.begin_lane_claim_at(
+        // b8ke delta round-2 F2: the rollback-respawn start's watchdog
+        // machinery (the sidecar pid slot + the settle guard — see the
+        // create-resume claim site).
+        let start_pid_slot = crate::ownership_lane::sidecar_pid_cancel_slot();
+        let mut _start_cancellation: Option<crate::ownership_lane::StartCancellationGuard> = None;
+        let granted_ticket = match self.begin_lane_claim_at(
             &durable_id,
             &rollback_lease_id,
             None,
@@ -3832,6 +3864,21 @@ impl FreshClaudeState {
             }
         };
         let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
+        // b8ke delta round-2 F2: the granted claim registers its REAL
+        // cancellation + settle with the watchdog (the sidecar pid slot
+        // arms at the respawn below).
+        let mut own_ticket = granted_ticket;
+        if own_ticket.is_some() {
+            _start_cancellation = Some(
+                crate::ownership_lane::register_start_cancellation_for_ticket(
+                    &self.ownership,
+                    PROVIDER,
+                    &durable_id,
+                    &own_ticket,
+                    crate::ownership_lane::pid_slot_cancellation(&start_pid_slot),
+                ),
+            );
+        }
         for round in 0..2u8 {
             match self.leases.claim(
                 PROVIDER,
@@ -4515,6 +4562,8 @@ impl FreshClaudeState {
         // reap target) + the pid for the commit's owner identity (captured
         // before `child` moves into the session entry).
         let sidecar_pid = child.id();
+        // b8ke delta round-2 F2: arm the registered start cancellation.
+        *start_pid_slot.lock().expect("sidecar pid cancel slot lock") = sidecar_pid;
         crate::ownership_lane::register_partial_fresh_runtime(
             &self.ownership,
             PROVIDER,
@@ -4786,6 +4835,11 @@ impl FreshClaudeState {
         // lifecycle audit: attach can cold-resume an untracked session,
         // registering a runtime). AdoptLive converges via the same rebind
         // arm the lease's BoundLive uses.
+        // b8ke delta round-2 F2: the attach-start's watchdog machinery
+        // (cancellation + settle) is registered inside
+        // `resume_for_attach` — the function that owns the spawn and the
+        // registration window (and the under-ticket handoff-resume caller
+        // passes no ticket, so the registration no-ops there).
         let mut own_ticket = match self.begin_lane_claim_at(
             &durable,
             &format!("attach-{}", uuid::Uuid::new_v4()),
@@ -4993,6 +5047,21 @@ impl FreshClaudeState {
         // for the caller's drop (RAII typed fail).
         own_ticket: &mut Option<freshell_ownership::OperationTicket>,
     ) -> Result<(), ResumeClaudeError> {
+        // b8ke delta round-2 F2: the attach-start's REAL watchdog machinery
+        // — the sidecar pid slot (the registered cancellation SIGTERMs the
+        // spawned child; the resume's own gates then tear down and unwind)
+        // and the settle guard (fires when THIS resume's scope ends — the
+        // operation's completion or unwind; the watchdog's bounded settle
+        // treats it as the operation's confirmed death). No-op for the
+        // under-ticket handoff-resume caller (no ticket).
+        let start_pid_slot = crate::ownership_lane::sidecar_pid_cancel_slot();
+        let _start_cancellation = crate::ownership_lane::register_start_cancellation_for_ticket(
+            &self.ownership,
+            PROVIDER,
+            durable,
+            own_ticket,
+            crate::ownership_lane::pid_slot_cancellation(&start_pid_slot),
+        );
         if crate::claude_snapshot::claude_home_candidates().is_empty() {
             // No store root resolvable at all: we cannot CHECK, so we must not DENY.
             return Err(ResumeClaudeError::Transient(
@@ -5065,6 +5134,8 @@ impl FreshClaudeState {
         // target) + the pid for the commit's owner identity (captured before
         // `child` moves into the session entry).
         let sidecar_pid = child.id();
+        // b8ke delta round-2 F2: arm the registered start cancellation.
+        *start_pid_slot.lock().expect("sidecar pid cancel slot lock") = sidecar_pid;
         crate::ownership_lane::register_partial_fresh_runtime(
             &self.ownership,
             PROVIDER,
@@ -5367,6 +5438,10 @@ impl FreshClaudeState {
         identity_sink: Option<SharedPaneIdentitySink>,
         provenance: Option<&crate::BindProvenance>,
     ) {
+        // The sidecar's pid (the fresh create's canonical owner runtime),
+        // read under the mint-gate lock scope below, before the ownership
+        // adoption.
+        let sidecar_pid;
         {
             // Focused-episode-6 round 4 (Finding F5): the mint gate. The
             // lock order (cli_index → sessions → close_pending) is THE order
@@ -5395,6 +5470,86 @@ impl FreshClaudeState {
             index.insert(cli_id.to_string(), session_id.to_string());
             if let Some(session) = sessions.get_mut(session_id) {
                 session.cli_session_id = Some(cli_id.to_string());
+            }
+            sidecar_pid = sessions.get(session_id).and_then(|s| s.child.id());
+        }
+        // b8ke delta round-2 F1: the CANONICAL-KEY ADOPTION. A normally
+        // created claude/kilroy session (NO explicit sessionRef) claims
+        // nothing at create time — the durable id only materializes HERE,
+        // at `sdk.session.init` — so the coordinator saw the canonical key
+        // as Vacant and a handoff skipped stopping the live sidecar (the
+        // target then hit the D7 sidecar-liveness refusal, or worse the
+        // two-writer shape), and no device ever learned the authoritative
+        // Live{FreshAgent} owner. Reconcile the provisional creation-time
+        // identity with the durable canonical one: claim-and-commit the
+        // authoritative ownership under the durable id (idempotent — a
+        // resume/attach that already committed at create answers Adopt and
+        // adopts nothing; a foreign owner is refused loudly, never stolen)
+        // and BROADCAST the authoritative owner record so every device
+        // converges.
+        let mut adoption_ticket = match self.begin_lane_claim_at(
+            cli_id,
+            &format!("claude-init-adopt-{}", uuid::Uuid::new_v4()),
+            None,
+            "claude/session-init-adoption",
+        ) {
+            // Granted: the canonical key is vacant (a fresh create's first
+            // init) — THIS adoption claims it.
+            crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+            // Unwired (no coordinator): the legacy behavior.
+            crate::ownership_lane::LaneClaim::Unwired => None,
+            // Adopt: the canonical key is ALREADY Live{FreshAgent} — a
+            // resume/attach committed at create time; the record is already
+            // authoritative.
+            crate::ownership_lane::LaneClaim::Adopt => None,
+            // Refused: the canonical key moved on (a foreign owner or an
+            // in-flight transition). NEVER steal — the session stays
+            // unclaimed and the D7 backstop holds; log loud.
+            crate::ownership_lane::LaneClaim::Refused(outcome) => {
+                tracing::warn!(target: "freshell_freshagent::claude",
+                    cli_id = %cli_id, placeholder = %session_id,
+                    outcome = ?outcome,
+                    "freshagent.claude.init_ownership_adoption_refused: the canonical key \
+                     moved on while the durable id minted — the session stays unclaimed"
+                );
+                None
+            }
+        };
+        if let Some(ticket) = adoption_ticket.as_ref() {
+            let generation = ticket.generation();
+            let operation_id = ticket.operation_id().to_string();
+            match self.commit_lane_claim_at(&mut adoption_ticket, cli_id, session_id, sidecar_pid) {
+                Ok(()) => {
+                    // Broadcast the authoritative owner record: every device
+                    // holding the durable sessionRef converges on the
+                    // committed Live{FreshAgent} owner (the ready replay
+                    // covers reconnects; the broadcast covers the live ones).
+                    self.broadcast(&ServerMessage::SessionRuntimeOwner(SessionRuntimeOwner {
+                        provider: PROVIDER.to_string(),
+                        session_id: cli_id.to_string(),
+                        epoch: self.ownership.as_ref().map(|r| r.boot_epoch()).unwrap_or(0),
+                        generation,
+                        owner_kind: "fresh-agent".into(),
+                        previous_kind: None,
+                        terminal_id: None,
+                        operation_id,
+                        transition: "handoff-committed".into(),
+                        reason: None,
+                        fenced: None,
+                    }));
+                }
+                Err(outcome) => {
+                    // Stale/foreign commit: the coordinator moved on between
+                    // the claim and the commit — the adoption lands nothing
+                    // (the ticket's Drop performs the typed fail); the D7
+                    // backstop holds for this session.
+                    tracing::warn!(target: "freshell_freshagent::claude",
+                        cli_id = %cli_id, placeholder = %session_id,
+                        outcome = ?outcome,
+                        "freshagent.claude.init_ownership_adoption_commit_stale: the \
+                         coordinator moved on while the adoption committed"
+                    );
+                }
             }
         }
         // Round 6 (focused-ep5-r5 Finding 2): persist the alias AT MINT. The
