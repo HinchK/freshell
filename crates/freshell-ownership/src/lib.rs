@@ -78,8 +78,11 @@ pub const OWNERSHIP_RETRY_AFTER_MS: u64 = 1_000;
 static BOOT_SEED_NS: OnceLock<u64> = OnceLock::new();
 
 /// Per-mint counter: distinguishes registry instances inside one process
-/// BY CONSTRUCTION (the splitmix mix below is injective per mint for a
-/// fixed seed, so two mints can never produce the same epoch).
+/// (the splitmix mix below is injective per mint for a fixed seed, so
+/// distinct mints stay unique PRE-mask; the JSON-safety mask at the mint
+/// makes residual collisions a negligible 53-bit coincidence, and
+/// [`RuntimeOwnershipRegistry::with_epoch`] remains the
+/// construction-uniqueness guarantee).
 static NEXT_MINT: AtomicU64 = AtomicU64::new(1);
 
 /// The JSON wire-safety bound every browser client imposes on the epoch:

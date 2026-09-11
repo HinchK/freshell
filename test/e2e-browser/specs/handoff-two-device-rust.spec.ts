@@ -696,6 +696,31 @@ test.describe('Session handoff across two devices (rust only)', () => {
       expect(spawnTs, 'the terminal spawned before the owner commit').toBeLessThanOrEqual(
         Date.parse(committedRows[0].ts),
       )
+
+      // 11. The phone's divergence card carries a DIRECT attach action:
+      // clicking it lands the pane on the terminal-owned runtime (the SAME
+      // terminalId, keeping the exact sessionRef) — a pure same-mode
+      // attach: no new terminal spawn, no fresh-agent writer rows.
+      await phone.page.getByRole('button', { name: 'Attach the terminal here' }).click()
+      const attachedLeaf = await expect
+        .poll(async () => {
+          const leaf = findLeafByPaneId(
+            await phone.harness.getPaneLayout(phoneSession.tabId),
+            phoneSession.paneId,
+          )
+          return leaf?.content?.kind === 'terminal' && leaf?.content?.terminalId ? leaf : null
+        }, { timeout: 30_000 })
+        .not.toBeNull()
+        .then(async () =>
+          findLeafByPaneId(await phone.harness.getPaneLayout(phoneSession.tabId), phoneSession.paneId)!)
+      expect(attachedLeaf.content.mode).toBe('codex')
+      expect(attachedLeaf.content.terminalId).toBe(handoffTerminalId)
+      expect(attachedLeaf.content.sessionRef?.sessionId).toBe(CODEX_THREAD_ID)
+      expect(codexTerminalSpawns(termArgvLogPath), 'the card attach spawned nothing').toHaveLength(spawns.length)
+      expect(
+        codexWriterRows(opLogPath, CODEX_THREAD_ID).length,
+        'the card attach wrote no fresh-agent rows',
+      ).toBe(settledWriterRows)
     } finally {
       await desktopCtx?.close().catch(() => {})
       await phoneCtx?.close().catch(() => {})
