@@ -1541,52 +1541,47 @@ impl FreshAgentState {
             ));
         }
 
-        // b8ke delta review F4: the daemon probe — the cell WITHOUT creating
-        // it, the started-ness WITHOUT starting it.
-        let running_manager = self.opencode.lock().await.clone();
-        let manager = match running_manager {
-            Some(manager) if manager.base_url().await.is_some() => manager,
-            _ => {
+        // b8ke focused review FR2: the daemon capture — ONE observation of
+        // the running entry (the manager handle AND its read-only base
+        // URL). Everything below uses ONLY this captured pair: no
+        // `require_base` re-lookup (which `ensure_started`s a replacement
+        // daemon if the running entry disappeared mid-GET) and no
+        // `discard_running` (a timeout never kills the shared daemon — the
+        // captured-base transport refuses both). Any failure of the
+        // captured instance falls to the ownership-gated disk-state answer.
+        let captured: Option<(OpencodeServeManager, String)> = {
+            let running = self.opencode.lock().await.clone();
+            match running {
+                Some(manager) => manager.base_url().await.map(|base| (manager, base)),
+                None => None,
+            }
+        };
+        let (manager, base) = match captured {
+            Some(captured) => captured,
+            None => {
                 // Daemon absent: NO spawn — the coordinator decides (the
                 // codex Task-5 contract).
-                return match self.ownership_snapshot(PROVIDER, thread_id).state {
-                    freshell_ownership::OwnershipState::Live {
-                        owner, generation, ..
-                    } => {
-                        // An owner this GET cannot serve locally (a terminal,
-                        // or a fresh-agent record whose daemon is gone): the
-                        // read-only typed refusal — never a spawn on top of an
-                        // owner, never an empty snapshot pretending vacancy.
-                        Err(OpencodeSnapshotError::ReservedByOwner {
-                            owner_kind: owner.kind,
-                            generation,
-                        })
-                    }
-                    freshell_ownership::OwnershipState::Handoff { generation, .. }
-                    | freshell_ownership::OwnershipState::Starting { generation, .. }
-                    | freshell_ownership::OwnershipState::Stopping { generation, .. } => {
-                        Err(OpencodeSnapshotError::HandoffInProgress { generation })
-                    }
-                    freshell_ownership::OwnershipState::Vacant => {
-                        Ok(self.opencode_empty_disk_snapshot(thread_id))
-                    }
-                };
+                return self.opencode_disk_state_response(thread_id);
             }
         };
         let route: freshell_opencode::Route = cwd.map(str::to_string);
 
-        let info = match manager.get_session(thread_id, &route).await {
+        let info = match manager.get_session_at(thread_id, &route, &base).await {
             Ok(value) if value.is_object() => value,
             Ok(_) => return Err(OpencodeSnapshotError::NotFound),
             Err(ServeError::Http { status: 404, .. }) => {
                 return Err(OpencodeSnapshotError::NotFound);
             }
-            Err(err) => return Err(OpencodeSnapshotError::Serve(err)),
+            // The captured instance failed (the daemon died or wedged after
+            // the capture): degrade to the disk-state/409 shape — never a
+            // re-lookup, never a spawn, never a kill.
+            Err(_) => return self.opencode_disk_state_response(thread_id),
         };
-        let messages = manager
-            .list_messages(thread_id, &route)
-            .await
-            .map_err(OpencodeSnapshotError::Serve)?;
+        let messages = match manager.list_messages_at(thread_id, &route, &base).await {
+            Ok(value) => value,
+            Err(ServeError::Http { status: 404, .. }) => json!([]),
+            Err(_) => return self.opencode_disk_state_response(thread_id),
+        };
 
         // Kata 1wxv Task 5: the DURABLE rollback record (memory-fast sync read
         // over the ledger's write-through index) sources the marker bucket,
@@ -1603,24 +1598,62 @@ impl FreshAgentState {
         ))
     }
 
+    /// b8ke focused review FR2: the ownership-gated answer for a GET that
+    /// could not consult a live daemon (absent at capture, or the captured
+    /// instance failed). A Live owner answers the typed 409 refusal (never
+    /// a spawn on top of an owner, never an empty snapshot pretending
+    /// vacancy); a lifecycle transition answers the typed 409; everything
+    /// else serves the EMPTY-FROM-DISK snapshot. Cold resume flows only
+    /// through the explicit lifecycle commands (`freshAgent.create`/
+    /// `attach` with `sessionRef`, generation-fenced) — the shared daemon
+    /// starts only there.
+    fn opencode_disk_state_response(
+        &self,
+        thread_id: &str,
+    ) -> Result<Value, OpencodeSnapshotError> {
+        // b8ke focused review FR7: ONE ownership observation both chooses
+        // the branch AND stamps the vacant snapshot's fence pair — a second
+        // observation could label a just-claimed active generation
+        // "vacant" (the impossible snapshot).
+        let ownership = self.ownership_snapshot(PROVIDER, thread_id);
+        match ownership.state {
+            freshell_ownership::OwnershipState::Live {
+                owner, generation, ..
+            } => Err(OpencodeSnapshotError::ReservedByOwner {
+                owner_kind: owner.kind,
+                generation,
+            }),
+            freshell_ownership::OwnershipState::Handoff { generation, .. }
+            | freshell_ownership::OwnershipState::Starting { generation, .. }
+            | freshell_ownership::OwnershipState::Stopping { generation, .. } => {
+                Err(OpencodeSnapshotError::HandoffInProgress { generation })
+            }
+            freshell_ownership::OwnershipState::Vacant => Ok(self.opencode_empty_disk_snapshot(
+                thread_id,
+                ownership.epoch,
+                ownership.generation,
+            )),
+        }
+    }
+
     /// b8ke delta review F4: the side-effect-free EMPTY-FROM-DISK snapshot
     /// for a daemon-absent GET — the empty info/message page over the
     /// durable rollback record (the lane's only serve-independent disk
     /// state), plus the additive owner-state fields under
     /// `extensions.opencode` (the strict client schema's permissive
-    /// per-provider bag) naming the vacant key with the coordinator's
-    /// epoch/generation — the codex `empty_readonly_snapshot` shape. No
-    /// daemon was consulted; no daemon was created.
-    fn opencode_empty_disk_snapshot(&self, thread_id: &str) -> Value {
-        let ownership = self.ownership_snapshot(PROVIDER, thread_id);
+    /// per-provider bag) naming the vacant key with the caller's
+    /// SINGLE-OBSERVED epoch/generation (b8ke focused FR7 — threaded from
+    /// [`Self::opencode_disk_state_response`]'s one observation, never
+    /// re-observed here). No daemon was consulted; no daemon was created.
+    fn opencode_empty_disk_snapshot(&self, thread_id: &str, epoch: u64, generation: u64) -> Value {
         let rollback = self
             .identity_sink()
             .and_then(|s| s.load_rollback(PROVIDER, thread_id));
         let mut snapshot =
             build_opencode_snapshot_json(thread_id, &json!({}), &json!([]), rollback.as_ref());
         snapshot["extensions"]["opencode"]["ownerKind"] = json!("vacant");
-        snapshot["extensions"]["opencode"]["ownerEpoch"] = json!(ownership.epoch);
-        snapshot["extensions"]["opencode"]["ownerGeneration"] = json!(ownership.generation);
+        snapshot["extensions"]["opencode"]["ownerEpoch"] = json!(epoch);
+        snapshot["extensions"]["opencode"]["ownerGeneration"] = json!(generation);
         snapshot
     }
 }
@@ -3315,6 +3348,11 @@ async fn send_keys(
             effort.as_deref(),
             turn_timeout,
             route,
+            // b8ke focused FR1: the acceptance witness is the WS lane's
+            // session-flag concern; this REST pane drive holds the pane's
+            // own lifecycle (the request bounds the turn) and registers no
+            // WS-lane session record, so there is no flag to arm here.
+            None,
         )
         .await
     {
@@ -4446,6 +4484,212 @@ mod tests {
             .await
             .expect_err("unknown session");
         assert!(matches!(err, OpencodeSnapshotError::NotFound));
+    }
+
+    /// b8ke focused review FR2: a snapshot GET whose CAPTURED serve instance
+    /// fails (the daemon died after the capture — the transport refuses)
+    /// degrades to the disk-state answer and NEVER touches the shared
+    /// daemon's lifecycle: no `ensure_started` respawn (the spawner count
+    /// stays at the test's own one) and no `discard_running` kill (the
+    /// running entry stays). Pre-fix, the GET's `require_base` re-lookup
+    /// could respawn a daemon and the failure surfaced as a raw 5xx.
+    #[tokio::test]
+    async fn get_opencode_snapshot_over_a_failed_captured_serve_degrades_to_disk_state() {
+        let st = state();
+        let spawner = Arc::new(CountingSpawner::default());
+        let deps = ServeDeps {
+            spawner: Arc::clone(&spawner) as Arc<dyn freshell_opencode::ProcessSpawner>,
+            http: Arc::new(HealthThenUndeliveredHttp),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        let manager_handle = manager.clone();
+        st.set_manager_for_test(manager).await;
+        assert_eq!(spawner.spawns(), 1, "the test's own setup spawn");
+
+        let snapshot = st
+            .get_opencode_snapshot("ses_gone_daemon", None)
+            .await
+            .expect("a failed captured serve degrades to the disk-state snapshot");
+
+        // The disk-state shape: the empty snapshot with the vacant
+        // owner-state fields — never a raw Serve error.
+        assert_eq!(snapshot["threadId"], json!("ses_gone_daemon"));
+        assert_eq!(snapshot["turns"], json!([]), "empty rows: {snapshot}");
+        assert_eq!(
+            snapshot["extensions"]["opencode"]["ownerKind"],
+            json!("vacant"),
+            "the disk-state answer names the vacant key: {snapshot}"
+        );
+        // The GET never respawned AND never killed: the spawner count is
+        // unchanged and the running entry is still there.
+        assert_eq!(
+            spawner.spawns(),
+            1,
+            "the GET must never spawn a replacement daemon"
+        );
+        assert!(
+            manager_handle.base_url().await.is_some(),
+            "the GET must never discard the shared daemon's running entry"
+        );
+        assert!(
+            !spawner.last_spawn_killed(),
+            "the GET must never kill the shared daemon process"
+        );
+    }
+
+    /// b8ke focused review FR2: a snapshot GET that TIMES OUT against the
+    /// captured serve instance keeps the shared daemon HEALTHY — the
+    /// reference `discardRunning('request_timeout')` behavior is forbidden
+    /// on the GET path. The running entry stays, the process is never
+    /// killed, and the caller gets the disk-state answer.
+    #[tokio::test]
+    async fn get_opencode_snapshot_timeout_never_kills_the_shared_daemon() {
+        let st = state();
+        let spawner = Arc::new(CountingSpawner::default());
+        let deps = ServeDeps {
+            spawner: Arc::clone(&spawner) as Arc<dyn freshell_opencode::ProcessSpawner>,
+            http: Arc::new(HealthOnlyHttp),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(
+            deps,
+            ServeConfig {
+                request_timeout: std::time::Duration::from_millis(100),
+                ..ServeConfig::default()
+            },
+        );
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        let manager_handle = manager.clone();
+        st.set_manager_for_test(manager).await;
+
+        let snapshot = st
+            .get_opencode_snapshot("ses_slow_daemon", None)
+            .await
+            .expect("a timed-out captured serve degrades to the disk-state snapshot");
+
+        assert_eq!(snapshot["threadId"], json!("ses_slow_daemon"));
+        assert_eq!(
+            snapshot["extensions"]["opencode"]["ownerKind"],
+            json!("vacant"),
+            "the disk-state answer: {snapshot}"
+        );
+        // THE OpenCode-health invariant: the timeout did NOT kill the daemon.
+        assert!(
+            manager_handle.base_url().await.is_some(),
+            "a GET timeout must never discard the shared daemon's running entry"
+        );
+        assert!(
+            !spawner.last_spawn_killed(),
+            "a GET timeout must never kill the shared daemon process"
+        );
+        assert_eq!(spawner.spawns(), 1, "no replacement spawn either");
+    }
+
+    /// A `ServeHttp` fake whose health probe answers (so the test's own
+    /// `ensure_started` succeeds) but whose session reads PROVABLY never
+    /// reach a server (connect-phase refusal) — the daemon-died-after-the-
+    /// capture shape (b8ke focused FR2).
+    struct HealthThenUndeliveredHttp;
+    impl ServeHttp for HealthThenUndeliveredHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                if req.url.contains("/global/health") {
+                    return Ok(ServeHttpResponse::new(200, b"{}".to_vec()));
+                }
+                Err(ServeHttpError::Undelivered(
+                    "connect refused (daemon gone)".to_string(),
+                ))
+            })
+        }
+    }
+
+    /// A `ServeHttp` fake that answers health probes and NEVER resolves any
+    /// session request — the wedged-daemon shape that drives the GET's
+    /// request timeout (b8ke focused FR2).
+    struct HealthOnlyHttp;
+    impl ServeHttp for HealthOnlyHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                if req.url.contains("/global/health") {
+                    return Ok(ServeHttpResponse::new(200, b"{}".to_vec()));
+                }
+                std::future::pending().await
+            })
+        }
+    }
+
+    /// A spawner that counts spawns and records whether its (single) child
+    /// was ever killed — the GET-path no-spawn/no-kill assertions
+    /// (b8ke focused FR2).
+    #[derive(Default)]
+    struct CountingSpawner {
+        spawns: std::sync::atomic::AtomicUsize,
+        killed: Arc<std::sync::Mutex<Vec<bool>>>,
+    }
+    impl CountingSpawner {
+        fn spawns(&self) -> usize {
+            self.spawns.load(Ordering::SeqCst)
+        }
+        fn last_spawn_killed(&self) -> bool {
+            self.killed.lock().expect("killed lock").last() == Some(&true)
+        }
+    }
+    impl freshell_opencode::ProcessSpawner for CountingSpawner {
+        fn spawn(
+            &self,
+            _req: freshell_opencode::serve::SpawnRequest,
+        ) -> Result<Box<dyn freshell_opencode::ServeProcess>, String> {
+            self.spawns.fetch_add(1, Ordering::SeqCst);
+            self.killed.lock().expect("killed lock").push(false);
+            struct CountedProcess {
+                killed: Arc<std::sync::Mutex<Vec<bool>>>,
+            }
+            impl freshell_opencode::ServeProcess for CountedProcess {
+                fn exited(&self) -> Option<i32> {
+                    None
+                }
+                fn take_fatal_startup_error(&self) -> Option<String> {
+                    None
+                }
+                fn kill(&self) {
+                    let mut killed = self.killed.lock().expect("killed lock");
+                    if let Some(last) = killed.last_mut() {
+                        *last = true;
+                    }
+                }
+            }
+            Ok(Box::new(CountedProcess {
+                killed: Arc::clone(&self.killed),
+            }))
+        }
     }
 
     // -- P1.13 Task 7: REST send-keys materialization writes a binding row --

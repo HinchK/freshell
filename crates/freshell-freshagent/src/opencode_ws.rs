@@ -316,6 +316,14 @@ struct OpencodeSession {
     /// completion gating suppresses `freshAgent.turn.complete` (`state.turnAborted`,
     /// adapter.ts:521,334-335). Reset to `false` at the top of every `handle_send`.
     turn_aborted: Arc<AtomicBool>,
+    /// b8ke focused review FR1: TRUE from the moment a prompt POST is
+    /// ACCEPTED by the shared daemon until the daemon-side turn is known
+    /// settled — `run_turn`'s accepted witness arms it, and it stays armed
+    /// across an `IdleTimeout` (the LOCAL task finished, but the turn still
+    /// executes INSIDE the daemon). The handoff stop path aborts the
+    /// daemon-side turn whenever this is set, NOT whenever the local task
+    /// is unfinished — a finished local task can mean IdleTimeout.
+    daemon_turn_accepted: Arc<AtomicBool>,
     /// PR-3: flipped `true` by the serve-stream bridge when it observes a `session.error`
     /// SSE event during the in-flight turn (`state.turnErrored`, adapter.ts:278-282,334-335).
     /// Reset to `false` at the top of every `handle_send`.
@@ -399,6 +407,7 @@ impl OpencodeSession {
             effort,
             turn_task: None,
             turn_aborted: Arc::new(AtomicBool::new(false)),
+            daemon_turn_accepted: Arc::new(AtomicBool::new(false)),
             turn_errored: Arc::new(AtomicBool::new(false)),
             last_turn_complete_at: Arc::new(StdMutex::new(None)),
             serve_bridge: None,
@@ -1332,10 +1341,15 @@ impl FreshOpencodeState {
         let turn_aborted = session.turn_aborted.clone();
         let turn_errored = session.turn_errored.clone();
         let last_turn_complete_at = session.last_turn_complete_at.clone();
+        let daemon_turn_accepted = session.daemon_turn_accepted.clone();
 
         let turn_task = tokio::spawn(async move {
             // `run_turn` (freshell-opencode/serve.rs) prompts + awaits idle against the
-            // REAL opencode serve session (adapter.ts materializeOrSend:363-368).
+            // REAL opencode serve session (adapter.ts materializeOrSend:363-368). The
+            // accepted witness (b8ke focused FR1) arms the session's
+            // daemon-turn-accepted flag exactly when the daemon accepts the prompt:
+            // from that moment the turn executes INSIDE the shared daemon, and only a
+            // settled outcome below (or a confirmed abort) may disarm it.
             let result = manager
                 .run_turn(
                     &real_id,
@@ -1344,8 +1358,22 @@ impl FreshOpencodeState {
                     effort.as_deref(),
                     DEFAULT_TURN_TIMEOUT,
                     route,
+                    Some(daemon_turn_accepted.clone()),
                 )
                 .await;
+            match &result {
+                // The idle edge was observed (or the daemon itself is gone —
+                // nothing runs daemon-side): the accepted turn is settled.
+                Ok(()) | Err(ServeError::SidecarLost { .. }) => {
+                    daemon_turn_accepted.store(false, Ordering::SeqCst);
+                }
+                // IdleTimeout: the LOCAL await gave up, but the daemon-side
+                // turn still runs — the flag STAYS armed (the stop path must
+                // still abort it). Other errors are ambiguous — keep it armed
+                // (fail closed: the stop path would rather issue one redundant
+                // abort than miss a live daemon-side writer).
+                Err(_) => {}
+            }
 
             settle_turn_outcome(
                 &fresh_agent,
@@ -1402,6 +1430,28 @@ impl FreshOpencodeState {
         );
     }
 
+    /// Test-only seam for the b8ke focused FR1 red/green: settle the
+    /// session's LOCAL turn task (abort + join, exactly what a completed
+    /// `run_turn` looks like to the stop path — the IdleTimeout shape)
+    /// WITHOUT touching the daemon-turn-accepted flag. Production code must
+    /// never call this; the production IdleTimeout completes the task
+    /// through `run_turn`'s own deadline while leaving the acceptance
+    /// armed.
+    #[doc(hidden)]
+    pub async fn settle_local_turn_task_for_test(&self, session_id: &str) {
+        let session_arc = {
+            let guard = self.sessions.lock().await;
+            guard.get(session_id).cloned()
+        };
+        let Some(session_arc) = session_arc else {
+            return;
+        };
+        let task = session_arc.lock().await.turn_task.take();
+        if let Some(task) = task {
+            task.abort_and_settle().await;
+        }
+    }
+
     // ── kata b8ke Task 6: the handoff runner's opencode entry points ────────
 
     /// The handoff runner's PRIOR-stop entry point. Thin `handle_kill`-shaped
@@ -1447,7 +1497,7 @@ impl FreshOpencodeState {
         let Some(session_arc) = session_arc else {
             return crate::session_handoff::StopResult::AlreadyGone;
         };
-        let (turn_task, bridge, real, route) = {
+        let (turn_task, bridge, real, route, daemon_turn_accepted) = {
             let mut s = session_arc.lock().await;
             s.killed.store(true, Ordering::SeqCst);
             (
@@ -1455,6 +1505,7 @@ impl FreshOpencodeState {
                 s.serve_bridge.take(),
                 s.real_session_id.clone(),
                 s.cwd.clone(),
+                s.daemon_turn_accepted.clone(),
             )
         };
         // The map removal: its own short synchronous section (every key
@@ -1466,41 +1517,24 @@ impl FreshOpencodeState {
         // The settlement awaits (phase 5 of `handle_kill`): the turn task's
         // abort + settle, then the daemon-side turn abort, then the
         // serve-SSE bridge teardown.
-        let turn_was_in_flight = turn_task.as_ref().is_some_and(|t| !t.is_finished());
         if let Some(task) = turn_task {
             task.abort_and_settle().await;
         }
-        // b8ke delta review F1: the local abort above only stops AWAITING
-        // the turn — once `prompt_async` returned, the turn executes INSIDE
-        // the shared daemon. Abort it through the manager (the same
-        // mechanism the interrupt path uses) BEFORE the SSE bridge teardown,
-        // and only then let the caller report Reaped. The shared daemon
-        // itself is NEVER killed (OpenCode invariant), and the manager is
-        // only ever PEEKED — a stop path must never spawn a daemon (the F4
-        // discipline). Best-effort: an abort that fails to land is logged,
-        // never fatal to the stop.
-        if turn_was_in_flight {
+        // b8ke focused review FR1: abort whenever the session has any
+        // ACCEPTED daemon-side turn — NOT only while the local task lives.
+        // A finished local `run_turn` can mean `IdleTimeout`: the local
+        // await gave up while the turn still executes INSIDE the shared
+        // daemon, and Reaped may only be reported once that turn is
+        // confirmed aborted/settled. Abort through the PEEKED manager at
+        // its CAPTURED base (never a `require_base` re-lookup, which could
+        // spawn a replacement daemon after the running entry disappeared),
+        // retrying transport failures — the runner's reap budget bounds the
+        // wait, and the shared daemon itself is NEVER killed or discarded
+        // (OpenCode invariant).
+        if daemon_turn_accepted.load(Ordering::SeqCst) {
             if let Some(real) = real.as_deref() {
-                match self.fresh_agent.peek_running_manager().await {
-                    Some(manager) => {
-                        if let Err(err) = manager.abort(real, &route).await {
-                            tracing::warn!(target: "freshell_freshagent::opencode",
-                                session_id = %session_id, real_session_id = %real,
-                                error = %err,
-                                "freshagent.opencode.handoff_stop_abort_failed: the daemon-side \
-                                 turn abort did not land (best-effort; the shared serve is never \
-                                 killed)"
-                            );
-                        }
-                    }
-                    None => {
-                        tracing::info!(target: "freshell_freshagent::opencode",
-                            session_id = %session_id, real_session_id = %real,
-                            "freshagent.opencode.handoff_stop_abort_skipped: the shared serve is \
-                             not running — no daemon-side turn to abort"
-                        );
-                    }
-                }
+                self.abort_accepted_daemon_turn(real, &route, &daemon_turn_accepted)
+                    .await;
             }
         }
         if let Some(bridge) = bridge {
@@ -1510,6 +1544,74 @@ impl FreshOpencodeState {
             self.leases.clear_binding(PROVIDER, real);
         }
         crate::session_handoff::StopResult::Reaped
+    }
+
+    /// Abort an ACCEPTED daemon-side turn to confirmed settlement (b8ke
+    /// focused review FR1) — the handoff stop path's quiescence step. The
+    /// abort is issued through the PEEKED manager at its READ-ONLY base
+    /// (the manager cell is never created here and `require_base` is never
+    /// consulted — a stop path must never spawn a daemon), and a transport
+    /// failure is NOT a reap: the abort is retried until the daemon
+    /// answers (the runner's reap timeout bounds the caller; the detached
+    /// watcher keeps this alive past it). Only a landed abort (a 2xx
+    /// answer), an observably absent daemon (no manager/no running entry),
+    /// or a provably-never-delivered abort against a dead listener settles
+    /// the acceptance. The shared daemon is never killed or discarded.
+    async fn abort_accepted_daemon_turn(
+        &self,
+        real: &str,
+        route: &Option<String>,
+        accepted: &Arc<AtomicBool>,
+    ) {
+        // Three consecutive provable non-deliveries: the daemon's private
+        // loopback port has no listener — the process is gone, so nothing
+        // runs daemon-side.
+        const UNDELIVERED_SETTLE_THRESHOLD: u32 = 3;
+        let mut consecutive_undelivered: u32 = 0;
+        loop {
+            let Some(manager) = self.fresh_agent.peek_running_manager().await else {
+                // The manager cell is absent: the shared serve is not
+                // running — nothing executes daemon-side.
+                accepted.store(false, Ordering::SeqCst);
+                return;
+            };
+            let Some(base) = manager.base_url().await else {
+                // The manager exists but nothing is running (a prior
+                // discard/shutdown): nothing executes daemon-side.
+                accepted.store(false, Ordering::SeqCst);
+                return;
+            };
+            match manager.abort_at(real, route, &base).await {
+                Ok(()) => {
+                    // The daemon answered the abort — the daemon-side turn
+                    // is settled.
+                    accepted.store(false, Ordering::SeqCst);
+                    return;
+                }
+                Err(ServeError::Http { status: 404, .. }) => {
+                    // The daemon does not know the session — no turn of
+                    // ours exists daemon-side.
+                    accepted.store(false, Ordering::SeqCst);
+                    return;
+                }
+                Err(ServeError::Undelivered(_)) => {
+                    consecutive_undelivered += 1;
+                    if consecutive_undelivered >= UNDELIVERED_SETTLE_THRESHOLD {
+                        tracing::warn!(target: "freshell_freshagent::opencode",
+                            session_id = %real,
+                            "freshagent.opencode.handoff_stop_abort_undelivered: the shared \
+                             serve's loopback listener is gone — no daemon-side turn remains"
+                        );
+                        accepted.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                }
+                Err(_) => {
+                    consecutive_undelivered = 0;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     /// The handoff runner's TARGET-resume entry point —
@@ -1584,6 +1686,8 @@ impl FreshOpencodeState {
                         session_id: msg.session_id.clone(),
                         session_type: SESSION_TYPE.to_string(),
                         success: false,
+                        code: Some(err.code().to_string()),
+                        message: Some(err.message().to_string()),
                     }));
                     return;
                 }
@@ -1734,6 +1838,8 @@ impl FreshOpencodeState {
                             session_id: msg.session_id,
                             session_type: SESSION_TYPE.to_string(),
                             success: false,
+                            code: None,
+                            message: None,
                         }));
                         return;
                     }
@@ -1853,6 +1959,8 @@ impl FreshOpencodeState {
                         session_id: msg.session_id,
                         session_type: SESSION_TYPE.to_string(),
                         success: false,
+                        code: None,
+                        message: None,
                     }));
                     return;
                 }
@@ -1977,6 +2085,8 @@ impl FreshOpencodeState {
             session_id: msg.session_id,
             session_type: SESSION_TYPE.to_string(),
             success: !close_reported_failure && !close_invariant_broken,
+            code: None,
+            message: None,
         }));
     }
 
@@ -1999,7 +2109,7 @@ impl FreshOpencodeState {
             return;
         };
 
-        let (real_id, route, turn_aborted) = {
+        let (real_id, route, turn_aborted, daemon_turn_accepted) = {
             let mut session = session_arc.lock().await;
             session.turn_aborted.store(true, Ordering::SeqCst);
             if let Some(task) = session.turn_task.take() {
@@ -2011,6 +2121,7 @@ impl FreshOpencodeState {
                 session.real_session_id.clone(),
                 session.cwd.clone(),
                 session.turn_aborted.clone(),
+                session.daemon_turn_accepted.clone(),
             )
         };
 
@@ -2027,6 +2138,10 @@ impl FreshOpencodeState {
         let manager = self.fresh_agent.ensure_manager().await;
         match manager.abort(&real_id, &route).await {
             Ok(()) => {
+                // b8ke focused FR1: the daemon answered the abort — the
+                // daemon-side turn is settled; disarm the acceptance so a
+                // later handoff stop does not issue a redundant abort.
+                daemon_turn_accepted.store(false, Ordering::SeqCst);
                 self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
             }
             Err(_) => {
@@ -4815,6 +4930,39 @@ mod tests {
             "the dedup cache must have been evicted by the kill, so this create is a \
              genuinely fresh (unmaterialized) session, not a replay of the killed one"
         );
+    }
+
+    /// b8ke focused review FR9: the half-fenced kill refusal carries the
+    /// typed INVALID_FENCE code in the `freshAgent.killed` answer — clients
+    /// reduce the code instead of the generic KILL_FAILED default.
+    /// Pre-fix the frame carried only `success:false`.
+    #[tokio::test]
+    async fn half_fenced_kill_refusal_carries_the_typed_invalid_fence_code() {
+        for (epoch, generation) in [(Some(3u64), None), (None, Some(7u64))] {
+            let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+            let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+            let st = FreshOpencodeState::new(fresh_agent);
+
+            st.handle_kill(FreshAgentKill {
+                observed_epoch: epoch,
+                observed_generation: generation,
+                provider: AgentProvider::Opencode,
+                session_id: "half-fenced-kill".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+
+            let raw = rx.try_recv().expect("the refusal frame");
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(frame["type"], "freshAgent.killed", "{frame}");
+            assert_eq!(frame["success"], json!(false), "{frame}");
+            assert_eq!(
+                frame["code"],
+                json!("INVALID_FENCE"),
+                "the typed refusal code must ride the kill answer: {frame}"
+            );
+        }
     }
 
     /// Retire-on-kill (delta-review round 5, restore-open-sessions-only): an

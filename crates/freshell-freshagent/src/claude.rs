@@ -1669,6 +1669,8 @@ impl FreshClaudeState {
                         session_id: msg.session_id.clone(),
                         session_type: session_type.to_string(),
                         success: false,
+                        code: Some(err.code().to_string()),
+                        message: Some(err.message().to_string()),
                     }));
                     return;
                 }
@@ -1779,6 +1781,8 @@ impl FreshClaudeState {
                 session_id,
                 session_type: session_type.to_string(),
                 success: false,
+                code: None,
+                message: None,
             }));
             return;
         }
@@ -1910,6 +1914,8 @@ impl FreshClaudeState {
                         session_id,
                         session_type: session_type.to_string(),
                         success: false,
+                        code: None,
+                        message: None,
                     }));
                     return;
                 }
@@ -2004,6 +2010,8 @@ impl FreshClaudeState {
             session_id,
             session_type: session_type.to_string(),
             success: !main_close_reported_failure && !invariant_broken,
+            code: None,
+            message: None,
         }));
     }
 

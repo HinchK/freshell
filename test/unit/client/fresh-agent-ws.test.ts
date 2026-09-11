@@ -66,4 +66,71 @@ describe('fresh-agent websocket public contract', () => {
     expect(session.lastErrorCode).toBe('KILL_FAILED')
     expect(session.lastError).toContain('still be running')
   })
+
+  it('reduces a typed refusal code instead of the generic KILL_FAILED default (b8ke focused FR9)', () => {
+    const store = configureStore({
+      reducer: { freshAgent: freshAgentReducer },
+    })
+
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId: 'thread-1',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      event: {
+        type: 'freshAgent.session.snapshot',
+        sessionId: 'thread-1',
+        latestTurnId: null,
+        status: 'idle',
+        revision: 1,
+      },
+    })
+
+    // The half-sent observed fence pair: the server refuses the kill with
+    // the typed INVALID_FENCE code riding the killed answer — the pane's
+    // session-error surface must show THAT code, not KILL_FAILED.
+    expect(handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.killed',
+      sessionId: 'thread-1',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      success: false,
+      code: 'INVALID_FENCE',
+      message: 'observedEpoch and observedGeneration must be sent together — a half-fence is invalid',
+    })).toBe(true)
+    const session = store.getState().freshAgent.sessions['freshcodex:codex:thread-1']
+    expect(session).toBeDefined()
+    expect(session.lastErrorCode).toBe('INVALID_FENCE')
+    expect(session.lastError).toContain('together')
+
+    // The event-wrapped shape folds identically.
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId: 'thread-1',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      event: {
+        type: 'freshAgent.session.snapshot',
+        sessionId: 'thread-1',
+        latestTurnId: null,
+        status: 'idle',
+        revision: 2,
+      },
+    })
+    expect(handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId: 'thread-1',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      event: {
+        type: 'freshAgent.killed',
+        success: false,
+        code: 'INVALID_FENCE',
+        message: 'observedEpoch and observedGeneration must be sent together — a half-fence is invalid',
+      },
+    })).toBe(true)
+    const folded = store.getState().freshAgent.sessions['freshcodex:codex:thread-1']
+    expect(folded).toBeDefined()
+    expect(folded.lastErrorCode).toBe('INVALID_FENCE')
+  })
 })

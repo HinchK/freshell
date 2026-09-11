@@ -327,6 +327,19 @@ impl std::fmt::Display for ServeHttpError {
 
 impl std::error::Error for ServeHttpError {}
 
+/// Whether a timed-out request over a captured base may discard the running
+/// sidecar (the reference `discardRunning('request_timeout')` behavior). The
+/// read-only GET surface (b8ke focused FR2) passes `No`: a slow request must
+/// never KILL the shared `opencode serve` daemon.
+mod discard_on_timeout {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum DiscardOnTimeout {
+        Yes,
+        No,
+    }
+}
+use discard_on_timeout::DiscardOnTimeout;
+
 /// The HTTP transport seam (`fetchFn`). One request/response round-trip. The
 /// `Err` side is a [`ServeHttpError`]: `Undelivered` ONLY for a provable
 /// connect-phase refusal (never a byte sent), `Ambiguous` for everything else
@@ -837,6 +850,37 @@ impl OpencodeServeManager {
         dispatch_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<Value, ServeError> {
         let base = self.require_base().await?;
+        self.json_request_over_base(
+            method,
+            path,
+            body,
+            not_found_value,
+            base,
+            DiscardOnTimeout::Yes,
+            dispatch_witness,
+        )
+        .await
+    }
+
+    /// One JSON request/response against a CALLER-CAPTURED base URL — the
+    /// side-effect-free transport core (b8ke focused FR2). Unlike the
+    /// `require_base` paths this NEVER spawns (no `ensure_started` lookup —
+    /// the base is the caller's single captured observation) and, per
+    /// `discard_on_timeout`, may be forbidden from discarding the running
+    /// sidecar on a timeout — the read-only GET surface passes `No` so a
+    /// slow request can never KILL the shared daemon (it degrades to its
+    /// disk-state answer instead).
+    #[allow(clippy::too_many_arguments)] // the uniform request field set (mirrors json_request_maybe_witnessed)
+    async fn json_request_over_base(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        body: Option<Value>,
+        not_found_value: Option<Value>,
+        base: String,
+        discard_on_timeout: discard_on_timeout::DiscardOnTimeout,
+        dispatch_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<Value, ServeError> {
         let url = format!("{base}{path}");
         let timeout = self.config().request_timeout;
         let mut req = match (method, &body) {
@@ -858,7 +902,9 @@ impl OpencodeServeManager {
         .await
         {
             Err(_) => {
-                self.discard_running("request_timeout").await;
+                if discard_on_timeout == DiscardOnTimeout::Yes {
+                    self.discard_running("request_timeout").await;
+                }
                 return Err(ServeError::RequestTimeout {
                     method: method_str,
                     url,
@@ -936,6 +982,30 @@ impl OpencodeServeManager {
         self.json_request(HttpMethod::Get, &path, None, None).await
     }
 
+    /// `getSession` against a CALLER-CAPTURED base URL (b8ke focused FR2):
+    /// the side-effect-free snapshot GET's transport. Never spawns (no
+    /// `require_base` re-lookup mid-request) and never discards the running
+    /// sidecar on a timeout — the caller degrades to its disk-state answer
+    /// instead of killing the shared daemon.
+    pub async fn get_session_at(
+        &self,
+        id: &str,
+        route: &Route,
+        base: &str,
+    ) -> Result<Value, ServeError> {
+        let path = with_route(&format!("/session/{}", encode_path_segment(id)), route);
+        self.json_request_over_base(
+            HttpMethod::Get,
+            &path,
+            None,
+            None,
+            base.to_string(),
+            DiscardOnTimeout::No,
+            None,
+        )
+        .await
+    }
+
     /// `listMessages(id, {}, route)` (`serve-manager.ts:367-393`) — the current session
     /// message page (`GET /session/:id/message`). Simplified for the transcript-capture
     /// use: returns the raw JSON body the serve responds with (an array of message/part
@@ -948,6 +1018,31 @@ impl OpencodeServeManager {
         );
         self.json_request(HttpMethod::Get, &path, None, Some(Value::Array(Vec::new())))
             .await
+    }
+
+    /// `listMessages` against a CALLER-CAPTURED base URL (b8ke focused
+    /// FR2) — the same side-effect-free contract as
+    /// [`Self::get_session_at`].
+    pub async fn list_messages_at(
+        &self,
+        id: &str,
+        route: &Route,
+        base: &str,
+    ) -> Result<Value, ServeError> {
+        let path = with_route(
+            &format!("/session/{}/message", encode_path_segment(id)),
+            route,
+        );
+        self.json_request_over_base(
+            HttpMethod::Get,
+            &path,
+            None,
+            Some(Value::Array(Vec::new())),
+            base.to_string(),
+            DiscardOnTimeout::No,
+            None,
+        )
+        .await
     }
 
     /// `promptAsync(id, {parts, model?, variant?, agent?}, route)` — the send-turn call
@@ -999,6 +1094,30 @@ impl OpencodeServeManager {
         );
         self.json_request(HttpMethod::Post, &path, None, None)
             .await?;
+        Ok(())
+    }
+
+    /// `abort` against a CALLER-CAPTURED base URL (b8ke focused FR1): the
+    /// stop path's daemon-side turn abort. The stop path must never spawn a
+    /// daemon (a `require_base` re-lookup could `ensure_started` one after
+    /// the running entry disappeared) and never kills the shared daemon —
+    /// the abort is issued at exactly the captured base, and a transport
+    /// failure is surfaced to the caller's bounded retry loop.
+    pub async fn abort_at(&self, id: &str, route: &Route, base: &str) -> Result<(), ServeError> {
+        let path = with_route(
+            &format!("/session/{}/abort", encode_path_segment(id)),
+            route,
+        );
+        self.json_request_over_base(
+            HttpMethod::Post,
+            &path,
+            None,
+            None,
+            base.to_string(),
+            DiscardOnTimeout::No,
+            None,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1298,6 +1417,13 @@ impl OpencodeServeManager {
     /// (`adapter.ts:355-368`). Subscribes BEFORE prompting so the idle edge cannot be
     /// missed. `model`/`effort` are the already-normalized wire values (normalization is
     /// the adapter's job; see [`crate::model`]).
+    ///
+    /// `accepted_witness` (b8ke focused FR1): flipped exactly once the prompt POST has
+    /// been ACCEPTED by the daemon — from that moment the turn executes INSIDE the
+    /// shared serve, so a caller tracking daemon-side liveness must arm its
+    /// "an accepted daemon-side turn may still be running" flag here (the local
+    /// future can later fail `IdleTimeout` while the daemon-side turn still runs).
+    #[allow(clippy::too_many_arguments)] // the turn field set (the compact precedent carries its witness the same way)
     pub async fn run_turn(
         &self,
         session_id: &str,
@@ -1306,10 +1432,14 @@ impl OpencodeServeManager {
         effort: Option<&str>,
         timeout: Duration,
         route: Route,
+        accepted_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<(), ServeError> {
         let rx = self.subscribe(session_id);
         let body = build_prompt_body(text, model, effort);
         self.prompt_async(session_id, body, &route).await?;
+        if let Some(witness) = accepted_witness {
+            witness.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         self.await_idle(session_id, rx, timeout, route).await
     }
 

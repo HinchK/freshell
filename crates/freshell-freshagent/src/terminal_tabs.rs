@@ -1511,7 +1511,10 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
             .unwrap_or_else(|| format!("rest-create-{create_request_id}"));
         // b8ke delta review F7: a half-fenced body (exactly one of the
         // observed epoch/generation pair) is a TYPED invalid-fence refusal —
-        // never a silent legacy downgrade.
+        // never a silent legacy downgrade. b8ke focused review FR8: the
+        // 400 envelope carries the shared error contract's stable
+        // machine-readable code (INVALID_FENCE) — REST and MCP callers
+        // reduce it instead of parsing prose.
         let observed = crate::ownership_lane::wire_fence(
             body.get("observedEpoch").and_then(Value::as_u64),
             body.get("observedGeneration").and_then(Value::as_u64),
@@ -1521,7 +1524,11 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                 provider = %locator.provider, session_id = %locator.session_id, pane_id = %pane_id,
                 code = err.code(),
                 "spawn_refused: the observed fence is half-sent (invalid)");
-            fail_json(StatusCode::BAD_REQUEST, err.message().to_string())
+            crate::fail_json_code(
+                StatusCode::BAD_REQUEST,
+                err.code(),
+                err.message().to_string(),
+            )
         })?;
         match crate::ownership_lane::begin_terminal_lane_claim(
             &state.ownership,
@@ -6437,6 +6444,47 @@ if (args.includes('app-server')) {{
             body["message"],
             json!("Timed out waiting for a terminal spawn slot")
         );
+    }
+
+    /// b8ke focused review FR8: the REST terminal-create repair's half-fence
+    /// refusal carries the shared error contract's stable machine-readable
+    /// code in the 400 envelope — REST and MCP callers reduce
+    /// `INVALID_FENCE` instead of parsing prose. Pre-fix the envelope was
+    /// the untyped `{status, message}` shape.
+    #[tokio::test]
+    async fn half_fenced_rest_create_answers_the_typed_invalid_fence_code() {
+        let state = state_with_registry();
+        // A sessionRef-carrying body (the fence rung only arms for a
+        // locator); exactly ONE of the observed pair is sent. Mode "shell"
+        // is always a known launch target, and the sessionRef's provider
+        // matches it so the wire ref arms the guard locator.
+        let mut body = json!({
+            "mode": "shell",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "shell", "sessionId": "ses_fr8_half_fenced" },
+            "observedEpoch": 7u64,
+        });
+        let (status, resp) = post(app(state), "/api/tabs", body.clone(), true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+        assert_eq!(resp["status"], json!("error"));
+        assert_eq!(
+            resp["code"],
+            json!("INVALID_FENCE"),
+            "the typed code must ride the 400 envelope: {resp}"
+        );
+        assert!(
+            resp["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("together")),
+            "the message names the pair rule: {resp}"
+        );
+
+        // The other half-fence combination refuses identically.
+        body["observedEpoch"] = Value::Null;
+        body["observedGeneration"] = json!(11u64);
+        let (status, resp) = post(app(state_with_registry()), "/api/tabs", body, true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+        assert_eq!(resp["code"], json!("INVALID_FENCE"), "{resp}");
     }
 
     #[tokio::test]

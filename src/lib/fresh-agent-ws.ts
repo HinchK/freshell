@@ -77,6 +77,12 @@ type FreshAgentKilledMessage = {
   sessionType: FreshAgentSessionType
   provider: FreshAgentRuntimeProvider
   success: boolean
+  /** b8ke focused FR9: the typed refusal code when success is false (e.g.
+   *  INVALID_FENCE for a half-sent observed fence pair) — additive and
+   *  optional (legacy servers never send it). */
+  code?: string
+  /** The typed refusal's human-readable message (rides with code). */
+  message?: string
 }
 
 type FreshAgentClientMessage =
@@ -108,17 +114,23 @@ function foldFreshAgentKilled(
   dispatch: AppDispatch,
   locator: { sessionId: string; sessionType: FreshAgentSessionType; provider: FreshAgentRuntimeProvider },
   success: boolean | undefined,
+  code?: string,
+  message?: string,
 ): void {
   if (success === false) {
     log.warn('freshAgent.killed reported success:false — the close was not durably recorded; the session may still be running on the server', {
       sessionId: locator.sessionId,
       sessionType: locator.sessionType,
       provider: locator.provider,
+      code: code ?? 'KILL_FAILED',
     })
     dispatch(sessionError({
       ...locator,
-      code: 'KILL_FAILED',
-      message: KILL_FAILED_MESSAGE, // one copy for both writers (see kill-ack.ts)
+      // b8ke focused FR9: a typed refusal code from the server (e.g.
+      // INVALID_FENCE) reduces HERE — only the code-less legacy shape keeps
+      // the generic KILL_FAILED default.
+      code: code ?? 'KILL_FAILED',
+      message: message ?? KILL_FAILED_MESSAGE, // one copy for both writers (see kill-ack.ts)
     }))
     return
   }
@@ -242,7 +254,7 @@ export function handleFreshAgentMessage(
         sessionId: killed.sessionId,
         sessionType: killed.sessionType,
         provider: killed.provider,
-      }, killed.success)
+      }, killed.success, killed.code, killed.message)
       return true
     }
     case 'freshAgent.event':
@@ -483,7 +495,13 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
       }
       return true
     case 'freshAgent.killed':
-      foldFreshAgentKilled(dispatch, locator, event.success as boolean | undefined)
+      foldFreshAgentKilled(
+        dispatch,
+        locator,
+        event.success as boolean | undefined,
+        event.code as string | undefined,
+        event.message as string | undefined,
+      )
       return true
     default:
       return false

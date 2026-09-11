@@ -816,6 +816,15 @@ pub struct FreshAgentKilled {
     pub session_id: String,
     pub session_type: String,
     pub success: bool,
+    /// b8ke focused review FR9: the typed refusal code when `success` is
+    /// false (e.g. `INVALID_FENCE` for a half-sent observed fence pair) —
+    /// additive and optional so legacy servers' frames stay valid. Clients
+    /// reduce THIS code instead of the generic `KILL_FAILED` default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// The typed refusal's human-readable message (rides with `code`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

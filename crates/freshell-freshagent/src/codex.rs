@@ -3345,6 +3345,8 @@ impl FreshCodexState {
                         session_id: msg.session_id.clone(),
                         session_type: SESSION_TYPE.to_string(),
                         success: false,
+                        code: Some(err.code().to_string()),
+                        message: Some(err.message().to_string()),
                     }));
                     return;
                 }
@@ -3360,6 +3362,8 @@ impl FreshCodexState {
                 session_id,
                 session_type: SESSION_TYPE.to_string(),
                 success: false,
+                code: None,
+                message: None,
             }));
             return;
         }
@@ -3448,6 +3452,8 @@ impl FreshCodexState {
                         session_id,
                         session_type: SESSION_TYPE.to_string(),
                         success: false,
+                        code: None,
+                        message: None,
                     }));
                     return;
                 }
@@ -3506,6 +3512,8 @@ impl FreshCodexState {
             // with the durable close) but the kill visibly fails
             // (delta-r6-r4, focused-episode-6 round 3 Finding 3).
             success: !close_reported_failure,
+            code: None,
+            message: None,
         }));
     }
 
@@ -8766,6 +8774,36 @@ pub(crate) mod tests {
             !st.sessions.lock().await.contains_key("thread-1"),
             "session removed"
         );
+    }
+
+    /// b8ke focused review FR9: the half-fenced kill refusal carries the
+    /// typed INVALID_FENCE code in the `freshAgent.killed` answer — clients
+    /// reduce the code instead of the generic KILL_FAILED default.
+    /// Pre-fix the frame carried only `success:false`.
+    #[tokio::test]
+    async fn half_fenced_kill_refusal_carries_the_typed_invalid_fence_code() {
+        for (epoch, generation) in [(Some(3u64), None), (None, Some(7u64))] {
+            let (st, mut rx) = state_with_bus();
+            st.handle_kill(FreshAgentKill {
+                observed_epoch: epoch,
+                observed_generation: generation,
+                provider: freshell_protocol::AgentProvider::Codex,
+                session_id: "half-fenced-kill".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                cwd: None,
+            })
+            .await;
+
+            let raw = rx.try_recv().expect("the refusal frame");
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(frame["type"], "freshAgent.killed", "{frame}");
+            assert_eq!(frame["success"], json!(false), "{frame}");
+            assert_eq!(
+                frame["code"],
+                json!("INVALID_FENCE"),
+                "the typed refusal code must ride the kill answer: {frame}"
+            );
+        }
     }
 
     #[tokio::test]
