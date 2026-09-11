@@ -82,17 +82,30 @@ static BOOT_SEED_NS: OnceLock<u64> = OnceLock::new();
 /// fixed seed, so two mints can never produce the same epoch).
 static NEXT_MINT: AtomicU64 = AtomicU64::new(1);
 
+/// The JSON wire-safety bound every browser client imposes on the epoch:
+/// IEEE-754 doubles represent integers EXACTLY only up to 2^53-1, and the
+/// client's ready-frame schema (zod v4 `.int()`) enforces exactly this
+/// range. The default mint masks its output into the range so the epoch
+/// survives the JS JSON.parse round trip verbatim — both directions: the
+/// `ready.runtimeOwners` / `session.runtimeOwner` frames the client folds,
+/// and any `observedEpoch` fence the client sends back (a full-64-bit
+/// value would round to a DIFFERENT integer and poison every fence
+/// comparison). Explicitly injected epochs ([`RuntimeOwnershipRegistry::with_epoch`])
+/// stay unconstrained by contract.
+const EPOCH_JSON_SAFE_MASK: u64 = (1u64 << 53) - 1;
+
 /// Mint a boot epoch unique per registry construction (round-2 review:
 /// never bare wall-clock milliseconds). Within a process the per-mint
 /// counter plus the injective mix guarantees uniqueness; across restarts
 /// the distinct first-mint instants separate the seeds (a collision needs
-/// an exact 64-bit coincidence, ~2^-64). Hosts wanting strict
-/// cross-restart uniqueness by construction inject a persisted monotonic
-/// counter via [`RuntimeOwnershipRegistry::with_epoch`].
+/// an exact 53-bit coincidence after the JSON-safety mask below — the
+/// splitmix avalanche keeps the masked outputs uniform). Hosts wanting
+/// strict cross-restart uniqueness by construction inject a persisted
+/// monotonic counter via [`RuntimeOwnershipRegistry::with_epoch`].
 fn default_boot_epoch() -> u64 {
     let seed = *BOOT_SEED_NS.get_or_init(now_epoch_ns);
     let mint = NEXT_MINT.fetch_add(1, Ordering::Relaxed);
-    mix_boot_epoch(seed, mint)
+    mix_boot_epoch(seed, mint) & EPOCH_JSON_SAFE_MASK
 }
 
 /// splitmix64 finalizer over the rotated seed XOR the mint counter —
@@ -1456,6 +1469,25 @@ mod tests {
     use crate::*;
 
     const PROVIDER: &str = "codex";
+
+    /// kata b8ke (Task 11 e2e red): the DEFAULT boot epoch must stay inside
+    /// the JSON-safe integer range. Every browser client parses the epoch
+    /// as an IEEE-754 double (JSON.parse) — and the ready-frame schema's
+    /// zod v4 `.int()` enforces exactly this bound — so a full-64-bit epoch
+    /// is either silently dropped from `ready.runtimeOwners` (the array's
+    /// `.catch(undefined)` swallows the whole replay) or rounds to a
+    /// DIFFERENT integer in any `observedEpoch` fence the client sends
+    /// back, poisoning every fence comparison. Injected epochs
+    /// (`with_epoch`) stay unconstrained by contract.
+    #[test]
+    fn default_boot_epoch_fits_the_json_safe_integer_range() {
+        for _ in 0..64 {
+            assert!(
+                default_boot_epoch() <= 9_007_199_254_740_991,
+                "the default boot epoch must survive the JS double/zod safe-int round trip"
+            );
+        }
+    }
 
     fn registry_with_live_terminal() -> (RuntimeOwnershipRegistry, OwnerIdentity, u64) {
         let r = RuntimeOwnershipRegistry::new();
