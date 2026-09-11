@@ -757,6 +757,14 @@ pub(crate) const OPENCODE_PLACEHOLDER_PREFIX: &str = "freshopencode-";
 /// generous Kimi budget; the request always supplies one in the oracle path).
 const DEFAULT_TURN_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// Serializes every test that mutates the process-global `OPENCODE_CMD`
+/// (the shared `opencode serve` command) across this crate's test binary —
+/// the session-handoff fake-serve tests and the snapshot cold-GET tests
+/// must never interleave their mutations (the session-handoff file's
+/// `ENV_LOCK` is an import of this lock).
+#[cfg(test)]
+pub(crate) static OPENCODE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// The resume probe's bounded `get_session` budget resolution, extracted pure
 /// (delta-r2 Fix 3 — the state-injection timeout tests prove boundedness; the
 /// lib tests pin THE KNOB's parsing/default without ever mutating process

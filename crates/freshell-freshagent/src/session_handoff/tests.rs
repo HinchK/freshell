@@ -28,8 +28,10 @@ use super::{HandoffHandle, HandoffRequest, HandoffTestHooks, SessionHandoffRunne
 
 /// Serializes the tests in this file: they mutate process-global env vars
 /// (`FRESHELL_CLAUDE_SIDECAR` / `FRESHELL_CLAUDE_NODE` /
-/// `FAKE_SIDECAR_REQUEST_LOG` / `OPENCODE_CMD` / ...).
-static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// `FAKE_SIDECAR_REQUEST_LOG` / `OPENCODE_CMD` / ...). It is the crate-wide
+/// [`crate::OPENCODE_ENV_LOCK`] under its historical name — the snapshot
+/// cold-GET tests mutate `OPENCODE_CMD` too and must exclude these.
+use crate::OPENCODE_ENV_LOCK as ENV_LOCK;
 
 // ── fake claude sidecar (request-log knob only; copied from
 //    cross_kind_liveness.rs per the plan's instruction) ──────────────────────
@@ -312,6 +314,19 @@ fn build_rig_with_claude_pauses(
     kill_pause: Option<Arc<tokio::sync::Notify>>,
     resume_pause: Option<Arc<tokio::sync::Notify>>,
 ) -> Rig {
+    build_rig_with_claude_pauses_and_reap_timeout_ms(hooks, kill_pause, resume_pause, 8_000)
+}
+
+/// [`build_rig_with_claude_pauses`] plus a caller-chosen reap budget — the
+/// F3 real-timeout window needs a SHORT budget so a parked lane kill
+/// deterministically exceeds the runner's reap timeout (the production
+/// shape: kill issued, death delayed past the budget).
+fn build_rig_with_claude_pauses_and_reap_timeout_ms(
+    hooks: Option<Arc<HandoffTestHooks>>,
+    kill_pause: Option<Arc<tokio::sync::Notify>>,
+    resume_pause: Option<Arc<tokio::sync::Notify>>,
+    reap_timeout_ms: u64,
+) -> Rig {
     let auth_token = Arc::new("handoff-test-token".to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let rx = broadcast_tx.subscribe();
@@ -352,7 +367,7 @@ fn build_rig_with_claude_pauses(
         fresh_agent.clone(),
         cli_commands,
     )
-    .with_reap_timeout_ms(8_000);
+    .with_reap_timeout_ms(reap_timeout_ms);
     if let Some(hooks) = hooks.clone() {
         runner = runner.with_test_hooks(hooks);
     }
@@ -1108,6 +1123,146 @@ async fn handoff_reap_timeout_with_unconfirmable_prior_ends_vacant_typed() {
         retried["ok"],
         json!(true),
         "the retry must succeed: {retried}"
+    );
+    let retry_terminal = retried["owner"]["terminalId"].as_str().unwrap().to_string();
+    rig.registry.kill(&retry_terminal);
+}
+
+/// 3f. b8ke delta review F3 — the REAL reap-timeout window (the production
+/// shape the `force_reap_timeout` hook cannot model: the kill ISSUED, the
+/// death DELAYED past the runner's budget). The caller gets the typed
+/// retryable REAP_TIMEOUT immediately, but the key does NOT go Vacant (and
+/// the live prior is NOT restored — the detached teardown is still killing
+/// it): it stays fenced in the Handoff/watcher state — a concurrent create
+/// is Blocked, a retry is typed-refused — until the detached teardown's own
+/// watcher confirms death, then the key releases to Vacant, the corrective
+/// `released` broadcast supersedes the fenced `handoff-failed` frame, and a
+/// retry succeeds. Pre-fix the timeout DROPPED the kill future and the
+/// liveness probe's answer decided restore-vs-Vacant — a probe that reads
+/// the lane's sessions map cannot see a map-evicted-but-alive sidecar, so
+/// the key could reopen while the old process still ran (the second-writer
+/// window).
+#[tokio::test]
+async fn handoff_reap_timeout_fences_the_key_until_the_detached_reap_confirms_death() {
+    let _guard = ENV_LOCK.lock().await;
+    // The claude-lane env surface this file's tests mutate
+    // (FRESHELL_CLAUDE_SIDECAR/NODE, FAKE_SIDECAR_REQUEST_LOG,
+    // CLAUDE_CONFIG_DIR) is process-global and shared with claude.rs's and
+    // snapshot.rs's tests through THEIR lock — hold it too: our own
+    // ENV_LOCK only serializes this file against itself.
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let kill_pause = Arc::new(tokio::sync::Notify::new());
+    let mut rig = build_rig_with_claude_pauses_and_reap_timeout_ms(
+        None,
+        Some(Arc::clone(&kill_pause)),
+        None,
+        150,
+    );
+    establish_fresh_claude_owner(&rig, &sid).await;
+    let prior_pid = env.sidecar_pid_for(&sid).expect("the prior sidecar's pid");
+
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    // Park proof: the lane kill ISSUED (the retained stamp taken) — the
+    // deterministic observable that the kill future is in flight and the
+    // prior's death is DELAYED (the session itself is still registered).
+    await_cond("the lane kill must issue (take the stamp)", || {
+        crate::ownership_lane::peek_retained_stamp(&rig.fresh_claude.ownership_stamps, &sid)
+            .is_none()
+    })
+    .await;
+
+    // The runner's reap budget elapses while the kill is parked: the
+    // caller gets the typed retryable REAP_TIMEOUT...
+    let result = handle.completion.await.expect("runner completed");
+    assert_eq!(
+        result["ok"],
+        json!(false),
+        "the handoff must fail: {result}"
+    );
+    assert_eq!(result["error"]["code"], json!("REAP_TIMEOUT"));
+    assert_eq!(result["error"]["retryable"], json!(true));
+
+    // ...and the key does NOT go Vacant nor restore the prior: it stays
+    // fenced in Handoff (the detached watcher owns the release).
+    assert!(
+        matches!(
+            rig.ownership.observe("claude", &sid).state,
+            OwnershipState::Handoff { .. }
+        ),
+        "a real reap timeout must fence the key in Handoff until death is \
+         confirmed, got {:?}",
+        rig.ownership.observe("claude", &sid).state
+    );
+    // (a) A concurrent create is BLOCKED, not granted — no second writer
+    // can start while the old process's death is unconfirmed.
+    assert!(
+        matches!(
+            rig.ownership.begin_start(
+                "claude",
+                &sid,
+                RuntimeOwnerKind::FreshAgent,
+                "fence-probe-create",
+                None,
+                "test",
+                0,
+            ),
+            BeginOutcome::Blocked { .. }
+        ),
+        "a create during the fenced reap window must be Blocked, not Granted"
+    );
+    // A handoff retry during the fence is typed-refused (in flight).
+    let retry = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let retried = retry.completion.await.expect("retry completed");
+    assert_eq!(
+        retried["error"]["code"],
+        json!("HANDOFF_IN_PROGRESS"),
+        "the fenced retry is typed-refused: {retried}"
+    );
+    assert_eq!(retried["error"]["retryable"], json!(true));
+
+    // (b) The delayed death lands: release the pause, the DETACHED
+    // teardown runs to its confirmed reap, and the watcher releases the
+    // fenced key to Vacant.
+    kill_pause.notify_one();
+    await_cond("the confirmed death must release the fenced key", || {
+        rig.ownership.observe("claude", &sid).state == OwnershipState::Vacant
+    })
+    .await;
+    await_pid_dead(prior_pid).await;
+
+    // The corrective frames: the fenced `handoff-failed` names the PRIOR
+    // (still the fenced owner, reason REAP_TIMEOUT), then the settlement's
+    // `released` names the now-vacant key.
+    let failed = await_owner_frame(&mut rig.rx, "handoff-failed").await;
+    assert_eq!(
+        failed["ownerKind"],
+        json!("fresh-agent"),
+        "the truth: {failed}"
+    );
+    assert_eq!(failed["reason"], json!("REAP_TIMEOUT"));
+    let released = await_owner_frame(&mut rig.rx, "released").await;
+    assert_eq!(
+        released["ownerKind"],
+        json!("vacant"),
+        "the truth: {released}"
+    );
+
+    // After confirmed death a retry succeeds (granted from Vacant — no
+    // prior to stop; the target spawns and commits).
+    let retry = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let retried = retry.completion.await.expect("retry completed");
+    assert_eq!(
+        retried["ok"],
+        json!(true),
+        "the post-settlement retry must succeed: {retried}"
     );
     let retry_terminal = retried["owner"]["terminalId"].as_str().unwrap().to_string();
     rig.registry.kill(&retry_terminal);
