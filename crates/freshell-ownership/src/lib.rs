@@ -159,21 +159,25 @@ fn runtime_matches(owner: &OwnerIdentity, claim: &ReleaseClaim) -> bool {
 }
 
 /// The generation a snapshot/replay consumer fences against (review M3):
-/// for Live keys the Live STATE's own generation. A prior owner restored
-/// by a failed handoff keeps its ORIGINAL generation in the Live state
-/// while the record's generation was already bumped by the handoff, and
-/// every fence comparison — begin_stop's stale-claim check and
+/// for Live keys the Live STATE's own generation. A stop abandoned with
+/// the runtime still alive (`abort_stop`) restores the PRE-STOP Live
+/// generation while the record's generation was already bumped by the
+/// stop, and every fence comparison — begin_stop's stale-claim check and
 /// begin_start/begin_handoff's stale-generation check (M3-R) — uses the
-/// Live state's generation, so reporting the record's value for a
-/// restored key would leave a snapshot-derived fence permanently stale
-/// (a StaleGeneration/StaleClaim loop: fail-closed liveness corner, no
-/// safety violation). Remedy chosen over rolling the record's generation
-/// back on restore: the record's generation is the per-key monotonic
-/// counter (never resets — see the crate doc), and a rollback would let
-/// distinct handoff eras reuse a generation number, weakening the
+/// Live state's generation, so reporting the record's value for such a
+/// key would leave a snapshot-derived fence permanently stale (a
+/// StaleGeneration/StaleClaim loop: fail-closed liveness corner, no
+/// safety violation). The failed-HANDOFF restore does NOT straddle: it
+/// writes the record's current generation (whole-branch review M-1 — the
+/// handoff broadcasts carried it to every client, whose monotonic folds
+/// cannot regress), so `abort_stop`'s restore is the one deliberate
+/// straddle this helper papers over. Chosen over rolling the record's
+/// generation back on any restore: the record's generation is the per-key
+/// monotonic counter (never resets — see the crate doc), and a rollback
+/// would let distinct eras reuse a generation number, weakening the
 /// stale-request fence for every consumer. For every non-Live state the
 /// record's generation always equals the state's own (they are written
-/// together), so this only diverges for restored keys.
+/// together).
 fn snapshot_generation(record: &SessionRecord) -> u64 {
     match &record.state {
         OwnershipState::Live { generation, .. } => *generation,
@@ -219,10 +223,13 @@ impl OwnershipState {
     }
 
     /// The `Handoff` state's captured prior owner plus the generation it held
-    /// when it went Live (kata b8ke Task 6): the handoff runner's stop/restore
-    /// source — the identity to stop, and the generation a restored prior
-    /// resumes at. `None` for every other state (only `Handoff` carries a
-    /// prior; a Vacant-entered handoff captures `None` too).
+    /// when it went Live (kata b8ke Task 6): the handoff runner's stop
+    /// source — the identity to stop. The captured generation is the
+    /// PRIOR's own (historical); a restore resumes at the RECORD's current
+    /// generation instead (whole-branch review M-1), so the runner must
+    /// not use this value as a restore fence. `None` for every other state
+    /// (only `Handoff` carries a prior; a Vacant-entered handoff captures
+    /// `None` too).
     pub fn prior_owner(&self) -> Option<(OwnerIdentity, u64)> {
         match self {
             OwnershipState::Handoff { prior, .. } => prior.clone(),
@@ -900,7 +907,16 @@ impl RuntimeOwnershipRegistry {
 
     /// Fail an in-flight operation: `Starting` → Vacant; `Handoff` → restore
     /// the prior owner ONLY when the caller confirms it is still live
-    /// (`prior_confirmed_live: true`) — a reaped/confirmed-dead prior ends
+    /// (`prior_confirmed_live: true`) — restored at the RECORD's CURRENT
+    /// (handoff-bumped) generation, a FORWARD bump of the Live state that
+    /// never rolls the record's monotonic counter back, so every fence
+    /// family converges on one value: the handoff broadcasts the clients'
+    /// monotonic folds hold (they cannot regress), the wire pairs those
+    /// clients send, and the lane stamps/claims the host repairs
+    /// (whole-branch review M-1 — a restored Live state at the prior's
+    /// ORIGINAL generation wedged every wire-fenced kill from a client
+    /// that folded the handoff frames in a StaleClaim loop until a
+    /// reconnect). A reaped/confirmed-dead prior ends
     /// `Vacant { reason: PriorNotLive }` (never record a dead runtime as
     /// Live, round-1 review). Foreign operations are a typed no-op.
     pub fn fail(
@@ -945,10 +961,21 @@ impl RuntimeOwnershipRegistry {
             } if op == operation_id => {
                 let duration_ms = now_epoch_ms().saturating_sub(since_ms);
                 match prior {
-                    Some((owner, gen)) if prior_confirmed_live => {
+                    Some((owner, _)) if prior_confirmed_live => {
+                        // Whole-branch review M-1: the Live state resumes at
+                        // the RECORD's current generation (== the handoff's,
+                        // fence-checked above) — NOT the prior's original.
+                        // The handoff broadcasts carried this generation to
+                        // every client and their same-epoch monotonic folds
+                        // cannot regress, so any lower Live generation
+                        // would wedge every wire-fenced kill (begin_stop's
+                        // exact match) in a StaleClaim loop until a
+                        // reconnect. The record's own counter is untouched
+                        // (never a rollback).
+                        let restored_generation = record.generation;
                         record.state = OwnershipState::Live {
                             owner: owner.clone(),
-                            generation: gen,
+                            generation: restored_generation,
                             since_ms: now_epoch_ms(),
                         };
                         tracing::warn!(target: "freshell_ownership",
@@ -1036,8 +1063,10 @@ impl RuntimeOwnershipRegistry {
                         current_epoch: self.epoch,
                         // The Live STATE's generation — the exact value a
                         // refreshed stop fence must carry to satisfy
-                        // begin_stop (M3: for a restored prior owner it is
-                        // lower than the record's bumped generation).
+                        // begin_stop (M3: for a stop-abandoned restore it
+                        // can be lower than the record's bumped generation;
+                        // a failed-handoff restore no longer straddles —
+                        // whole-branch M-1).
                         current_generation: generation,
                         state: record.state.clone(),
                     };
@@ -1120,10 +1149,13 @@ impl RuntimeOwnershipRegistry {
     /// ledger close failed cleanly and the kill deliberately left the
     /// terminal running). `Stopping{op}` → `Live`, restoring the captured
     /// owner at its PRE-STOP generation so every fence a pre-stop observer
-    /// carries (retained stamp, snapshot) stays coherent — the same
-    /// discipline as the failed-handoff restore (M3/M3-R: never the bumped
-    /// record generation, never a rollback of the record's monotonic
-    /// counter). Fenced on (operation_id, generation) exactly like
+    /// carries (retained stamp, snapshot) stays coherent — unlike the
+    /// failed-handoff restore, which writes the record's CURRENT generation
+    /// because the handoff broadcasts carried it to every client
+    /// (whole-branch review M-1); the stop path broadcasts nothing at the
+    /// bumped generation, so the pre-stop fences are the ones observers
+    /// hold. Neither restore ever rolls the record's monotonic counter
+    /// back. Fenced on (operation_id, generation) exactly like
     /// `commit_stop`; a watchdog-synthesized `Stopping` (no prior Live era)
     /// is a typed `ForeignOperation` no-op — the host's abort/settle/commit
     /// owns that transition.
@@ -2958,15 +2990,92 @@ mod tests {
     }
 
     #[test]
+    fn handoff_restore_carries_the_record_generation_so_client_fences_converge() {
+        // Whole-branch review M-1: the handoff broadcasts carry the HANDOFF
+        // generation to every client, and the client fold is same-epoch
+        // monotonic — it never regresses. A prior restored by a failed
+        // handoff must therefore hold the RECORD's current (handoff)
+        // generation: otherwise a wire-fenced kill from a client holding
+        // the folded broadcast pair (epoch, N+1) fails begin_stop's
+        // exact-generation match in a typed StaleClaim loop ("refresh and
+        // retry" re-sends the same stale pair) until a reconnect replays
+        // the truth.
+        let (r, owner, live_gen) = registry_with_live_terminal(); // Live, generation 1
+        let BeginOutcome::Granted { generation: ho_gen } = r.begin_handoff(
+            PROVIDER,
+            "sid",
+            RuntimeOwnerKind::FreshAgent,
+            "ho-1",
+            None,
+            "test",
+            2,
+        ) else {
+            panic!()
+        };
+        assert_eq!(ho_gen, live_gen + 1);
+        assert_eq!(
+            r.fail(PROVIDER, "sid", "ho-1", ho_gen, /* prior_confirmed_live: */ true),
+            FailOutcome::RestoredPriorOwner
+        );
+        // Coherence: the record's generation and the restored Live state's
+        // are ONE value (no straddle) — observe() reports it.
+        let snap = r.observe(PROVIDER, "sid");
+        assert!(matches!(snap.state, OwnershipState::Live { .. }));
+        assert_eq!(
+            snap.generation, ho_gen,
+            "the restored Live key holds the record's (handoff) generation"
+        );
+        // The exact M-1 wedge: a kill fenced at the HANDOFF generation —
+        // the pair every client folded from the broadcasts — must be
+        // Granted (pre-fix: a permanent StaleClaim loop, fail-closed).
+        let stop = r.begin_stop(
+            PROVIDER,
+            "sid",
+            "kill-1",
+            &stop_claim(&owner, snap.epoch, ho_gen),
+            "test",
+            3,
+        );
+        assert!(
+            matches!(stop, StopOutcome::Granted { .. }),
+            "a handoff-generation fence must satisfy begin_stop on a restored key (got {stop:?})"
+        );
+        let StopOutcome::Granted { generation } = stop else {
+            unreachable!("asserted Granted above")
+        };
+        assert_eq!(
+            r.commit_stop(PROVIDER, "sid", "kill-1", generation),
+            CommitOutcome::Committed
+        );
+        assert_eq!(r.observe(PROVIDER, "sid").state, OwnershipState::Vacant);
+        // Task 1's invariant: the per-key monotonic counter never resets —
+        // the next transition bumps beyond the stop's generation.
+        let BeginOutcome::Granted { generation: next } = r.begin_handoff(
+            PROVIDER,
+            "sid",
+            RuntimeOwnerKind::Terminal,
+            "ho-2",
+            None,
+            "test",
+            4,
+        ) else {
+            panic!()
+        };
+        assert!(
+            next > generation,
+            "the per-key counter stays monotonic across the restore (next {next}, stop {generation})"
+        );
+    }
+
+    #[test]
     fn snapshot_fence_satisfies_begin_stop_after_a_failed_handoff_restore() {
-        // M3 (review): a failed handoff restores the prior owner at its
-        // ORIGINAL generation while the record's generation keeps the
-        // handoff's bump. begin_stop compares stop fences against the Live
-        // STATE's generation, so a fence derived from observe()/
-        // snapshot_records() must report the Live state's generation —
-        // otherwise a snapshot-fenced stopper loops on StaleClaim forever
-        // (fail-closed liveness corner; no safety violation, no kill
-        // licensed).
+        // M3 (review) + whole-branch M-1: a failed handoff restores the
+        // prior owner at the RECORD's current generation (the handoff's
+        // bump — the handoff broadcasts carried it to every client, whose
+        // monotonic folds hold it and cannot regress). The snapshot must
+        // report that same coherent value — otherwise a snapshot-fenced
+        // stopper loops on StaleClaim forever (fail-closed liveness
+        // corner; no safety violation, no kill licensed).
         let (r, owner, live_gen) = registry_with_live_terminal(); // Live, generation 1
         let BeginOutcome::Granted { generation: ho_gen } = r.begin_handoff(
             PROVIDER,
@@ -2989,13 +3098,13 @@ mod tests {
             FailOutcome::RestoredPriorOwner
         );
         // The snapshot a stopper derives its fence from must be coherent
-        // with begin_stop's comparison target: the Live state's own
-        // generation (the restored prior's original).
+        // with begin_stop's comparison target: the restored key's ONE
+        // generation (the record's current — the handoff's bump).
         let snap = r.observe(PROVIDER, "sid");
         assert!(matches!(snap.state, OwnershipState::Live { .. }));
         assert_eq!(
-            snap.generation, live_gen,
-            "the snapshot generation for a restored-Live key is the Live state's own"
+            snap.generation, ho_gen,
+            "the snapshot generation for a restored-Live key is the record's (handoff) generation"
         );
         let rec = r
             .snapshot_records()
@@ -3003,8 +3112,8 @@ mod tests {
             .find(|rec| rec.provider == PROVIDER && rec.session_id == "sid")
             .expect("the restored key must replay");
         assert_eq!(
-            rec.generation, live_gen,
-            "the replay record's generation for a restored-Live key is the Live state's own"
+            rec.generation, ho_gen,
+            "the replay record's generation for a restored-Live key is the record's (handoff) generation"
         );
         // A stopper fences from the snapshot and stops the restored owner:
         // no permanent StaleClaim loop.
@@ -3037,7 +3146,10 @@ mod tests {
         // handoff leaves bumped above the restored Live state's own — so
         // a snapshot-fenced start/handoff was permanently StaleGeneration
         // on restored keys (refreshing from the snapshot loops). All fence
-        // comparisons must use the same coherent baseline.
+        // comparisons must use the same coherent baseline. Post whole-
+        // branch M-1 the restored key's Live state IS the record's current
+        // generation, so the baselines coincide by construction — the
+        // test still pins the coherence.
         let (r, _owner, live_gen) = registry_with_live_terminal(); // Live, generation 1
         let BeginOutcome::Granted { generation: ho_gen } = r.begin_handoff(
             PROVIDER,
@@ -3056,15 +3168,15 @@ mod tests {
             FailOutcome::RestoredPriorOwner
         );
         // The fence a snapshot consumer derives: snapshot_records reports
-        // the Live state's generation for the restored key.
+        // the restored key's ONE coherent generation.
         let rec = r
             .snapshot_records()
             .into_iter()
             .find(|rec| rec.provider == PROVIDER && rec.session_id == "sid")
             .expect("the restored key must replay");
         assert_eq!(
-            rec.generation, live_gen,
-            "the replay record's generation for a restored-Live key is the Live state's own"
+            rec.generation, ho_gen,
+            "the replay record's generation for a restored-Live key is the record's (handoff) generation"
         );
         // begin_start: the state machine allows AdoptLive for the same
         // kind — the snapshot fence must not be StaleGeneration.

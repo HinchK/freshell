@@ -2698,6 +2698,37 @@ impl TerminalRegistry {
         claims.remove(&key)
     }
 
+    /// The failed-handoff restore's claim repair (kata b8ke whole-branch
+    /// review M-1): a prior TERMINAL owner restored as Live carries the
+    /// RECORD's current (handoff-bumped) generation, so the retained claim
+    /// its exit/kill release paths fence with must be bumped to the SAME
+    /// generation — otherwise the fenced `release`/
+    /// `force_release_for_confirmed_kill` (an exact generation match
+    /// against the Live state) would no-op forever and the restored key
+    /// would never vacate when the terminal dies. Only the generation moves:
+    /// the locator, terminal id, committing operation id, and pid stay the
+    /// prior's own (the identity the restored Live record holds). Returns
+    /// whether a claim for this terminal was found and bumped. A restore
+    /// only ever happens while the terminal's row is still Running (a
+    /// killed row fails the liveness re-probe), so the claim is present in
+    /// every reachable shape — unlike the fresh lanes' stamp (which the
+    /// lane kill TAKES while the runtime can stay alive), the terminal
+    /// claim is only ever consumed by paths that remove the row.
+    pub fn repair_restored_prior_ownership(&self, terminal_id: &str, generation: u64) -> bool {
+        let mut claims = self
+            .session_ref_ownership
+            .lock()
+            .expect("session-ref ownership lock");
+        let Some(claim) = claims
+            .values_mut()
+            .find(|claim| claim.terminal_id == terminal_id)
+        else {
+            return false;
+        };
+        claim.generation = generation;
+        true
+    }
+
     /// The fenced coordinator release for a terminal's confirmed death (kata
     /// b8ke Task 4): no-ops when unwired, when the terminal never committed,
     /// or when the retained claim no longer matches the Live record (a newer

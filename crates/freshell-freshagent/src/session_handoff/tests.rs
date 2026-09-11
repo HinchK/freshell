@@ -1158,6 +1158,181 @@ async fn a_prior_restored_after_reap_timeout_still_releases_when_it_later_exits(
     }
 }
 
+/// 3d. Whole-branch review M-1 (the exact wedge): a client that folded the
+/// handoff frames holds the HANDOFF generation (the fold is same-epoch
+/// monotonic — it never regresses). After a reap-timeout restore, its
+/// wire-fenced kill (`freshAgent.kill` carrying the folded
+/// observedEpoch/observedGeneration pair) must CONVERGE: begin_stop
+/// Granted, the lane kill proceeds, commit_stop leaves the key Vacant.
+/// Pre-fix the restored Live state held the prior's ORIGINAL generation
+/// and the kill looped on typed StaleClaim until a reconnect.
+#[tokio::test]
+async fn a_wire_fenced_kill_at_the_handoff_generation_converges_after_a_restore() {
+    let _guard = ENV_LOCK.lock().await;
+    // The claude-lane env surface this file's tests mutate
+    // (FRESHELL_CLAUDE_SIDECAR/NODE, FAKE_SIDECAR_REQUEST_LOG,
+    // CLAUDE_CONFIG_DIR) is process-global and shared with claude.rs's and
+    // snapshot.rs's tests through THEIR lock — hold it too: our own
+    // ENV_LOCK only serializes this file against itself.
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let hooks = Arc::new(HandoffTestHooks::default());
+    let mut rig = build_rig(Some(Arc::clone(&hooks)));
+    establish_fresh_claude_owner(&rig, &sid).await;
+    let prior_pid = env.sidecar_pid_for(&sid).expect("the prior sidecar's pid");
+
+    // Drive test 3's scenario: timeout, re-probe live, restored.
+    hooks.force_reap_timeout.store(true, Ordering::SeqCst);
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let result = handle.completion.await.expect("runner completed");
+    assert_eq!(result["error"]["code"], json!("REAP_TIMEOUT"));
+    assert!(matches!(
+        rig.ownership.observe("claude", &sid).state,
+        OwnershipState::Live { .. }
+    ));
+
+    // The client's folded fence: the handoff frames carry the boot epoch and
+    // the HANDOFF generation (the failed frame rides the started frame's
+    // generation — test 2's assertion).
+    let frames = drain_runtime_owner_frames(&mut rig.rx);
+    let failed = runtime_owner_frame(&frames, "handoff-failed");
+    let epoch = failed["epoch"]
+        .as_u64()
+        .expect("the frame carries the epoch");
+    let generation = failed["generation"]
+        .as_u64()
+        .expect("the frame carries the generation");
+    // The restored Live key must hold EXACTLY the generation the frames
+    // carried (no straddle: the record's, the Live state's, and the
+    // broadcast's are one value).
+    assert_eq!(
+        rig.ownership.observe("claude", &sid).generation,
+        generation,
+        "the restored Live key holds the handoff generation the frames carried"
+    );
+    // The lane's retained stamp is repaired to the same generation, so the
+    // stamp-fenced kill path converges too.
+    assert_eq!(
+        crate::ownership_lane::peek_retained_stamp(&rig.fresh_claude.ownership_stamps, &sid)
+            .map(|stamp| stamp.generation),
+        Some(generation),
+        "the repaired lane stamp fences at the restored generation"
+    );
+
+    // The wire-fenced kill from that client: begin_stop must Grant (the
+    // exact-generation match), the lane teardown runs, and the key ends
+    // Vacant — not a StaleClaim refusal loop.
+    rig.fresh_claude
+        .handle_kill(FreshAgentKill {
+            observed_epoch: Some(epoch),
+            observed_generation: Some(generation),
+            ..kill_msg(&sid)
+        })
+        .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while rig.ownership.observe("claude", &sid).state != OwnershipState::Vacant {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the wire-fenced kill at the handoff generation must converge after a \
+             restore — the key is {:?}",
+            rig.ownership.observe("claude", &sid).state
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    await_pid_dead(prior_pid).await;
+}
+
+/// 3e. Whole-branch M-1 ripple (terminal priors): a restored TERMINAL prior
+/// holds the handoff generation, so the registry's retained claim (the
+/// terminal exit/kill release paths' fence source) must be repaired to the
+/// SAME generation — otherwise the fenced `release` (an exact generation
+/// match against the Live state) would no-op forever and the restored key
+/// would never vacate when the terminal later dies.
+#[tokio::test]
+async fn a_restored_terminal_prior_still_releases_when_it_later_exits() {
+    let _guard = ENV_LOCK.lock().await;
+    // The claude-lane env surface this file's tests mutate
+    // (FRESHELL_CLAUDE_SIDECAR/NODE, FAKE_SIDECAR_REQUEST_LOG,
+    // CLAUDE_CONFIG_DIR) is process-global and shared with claude.rs's and
+    // snapshot.rs's tests through THEIR lock — hold it too: our own
+    // ENV_LOCK only serializes this file against itself.
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let sid = uuid::Uuid::new_v4().to_string();
+    let hooks = Arc::new(HandoffTestHooks::default());
+    let mut rig = build_rig(Some(Arc::clone(&hooks)));
+
+    // Terminal prior (the 5c pattern): a real Running PTY that
+    // self-commits Live{Terminal} for the canonical key.
+    let spawn_body = json!({
+        "mode": "claude",
+        "cwd": std::env::temp_dir().to_string_lossy(),
+        "sessionRef": { "provider": "claude", "sessionId": sid },
+    });
+    let spawned = crate::terminal_tabs::spawn_terminal_pane(
+        &rig.fresh_agent,
+        &spawn_body,
+        "handoff-restore-terminal-tab",
+        "handoff-restore-terminal-pane",
+    )
+    .await
+    .expect("terminal prior spawn");
+    let prior_terminal = spawned.terminal_id.clone();
+    assert!(matches!(
+        rig.ownership.observe("claude", &sid).state,
+        OwnershipState::Live { .. }
+    ));
+
+    // Reap-timeout restore of the still-live terminal prior.
+    hooks.force_reap_timeout.store(true, Ordering::SeqCst);
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_fresh("claude", &sid, "freshclaude"));
+    let result = handle.completion.await.expect("runner completed");
+    assert_eq!(result["error"]["code"], json!("REAP_TIMEOUT"));
+    assert!(matches!(
+        rig.ownership.observe("claude", &sid).state,
+        OwnershipState::Live { ref owner, .. } if owner.kind == RuntimeOwnerKind::Terminal
+    ));
+
+    // The retained claim must now fence at the RESTORED (handoff)
+    // generation — the same value the failure broadcast carried.
+    let frames = drain_runtime_owner_frames(&mut rig.rx);
+    let failed = runtime_owner_frame(&frames, "handoff-failed");
+    let generation = failed["generation"]
+        .as_u64()
+        .expect("the frame carries the generation");
+    assert_eq!(
+        rig.ownership.observe("claude", &sid).generation,
+        generation,
+        "the restored terminal prior holds the handoff generation"
+    );
+    assert_eq!(
+        rig.registry
+            .retained_ownership_fence(&prior_terminal)
+            .map(|(_, claim_generation)| claim_generation),
+        Some(generation),
+        "the retained claim is repaired to the restored generation"
+    );
+
+    // The terminal later dies (the registry kill IS the confirmed reap):
+    // the fenced release must match and vacate the key — no permanent
+    // wedge after a reap-timeout restore.
+    rig.registry.kill(&prior_terminal);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while rig.ownership.observe("claude", &sid).state != OwnershipState::Vacant {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the restored terminal prior's later exit must release the key — no \
+             permanent wedge after a reap-timeout restore, got {:?}",
+            rig.ownership.observe("claude", &sid).state
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// 4. Detached completion: dropping the reply receiver mid-handoff cannot
 /// strand the operation; the detached task still reaches Live{target} and
 /// the handoff-committed broadcast fires.

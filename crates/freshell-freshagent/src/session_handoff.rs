@@ -252,9 +252,10 @@ impl SessionHandoffRunner {
                 );
             }
         };
-        // The prior owner captured at enter (the stop/restore source) —
-        // WITH its Live generation (the stamp-repair source, round-3
-        // review I-1). Read before the guard so the guard carries it.
+        // The prior owner captured at enter (the stop source) — WITH its
+        // Live generation (historical; a restore fences at the RECORD's
+        // current generation instead — whole-branch M-1). Read before the
+        // guard so the guard carries it.
         let prior = self
             .ownership
             .observe(&req.provider, &req.session_id)
@@ -327,17 +328,19 @@ impl SessionHandoffRunner {
                         .await;
                     guard.prior_still_live = prior_live;
                     let fail_outcome = guard.disarm_and_fail();
-                    // Round-3 review I-1 (stamp repair): a restored fresh
-                    // prior whose retained stamp the lane kill already took
-                    // (a real timeout — the forced-hook shape short-circuits
-                    // before any kill) must get the stamp BACK, or its later
-                    // exit/kill paths can never release the record.
+                    // Round-3 review I-1 (claim repairs) + whole-branch M-1:
+                    // a restored prior — fresh (whose retained stamp the lane
+                    // kill may have taken) or terminal (whose retained claim
+                    // still fences at its commit generation) — must have its
+                    // lane claims brought to the RESTORED generation (the
+                    // handoff's — `fail` restores the record's current), or
+                    // its later exit/kill paths can never release the record.
                     if prior_live && matches!(fail_outcome, FailOutcome::RestoredPriorOwner) {
-                        self.repair_restored_prior_stamp(
+                        self.repair_restored_prior_claims(
                             &req.provider,
                             &req.session_id,
                             owner,
-                            prior.as_ref().map(|(_, gen)| *gen).unwrap_or_default(),
+                            generation,
                         );
                     }
                     // Failure-broadcast truth (round-2 review): the frame
@@ -636,51 +639,75 @@ impl SessionHandoffRunner {
         }
     }
 
-    /// Round-3 review I-1 (stamp repair): re-retain the stamp a lane's
-    /// `kill_for_handoff` took, for a prior the abort/reap-timeout path is
-    /// RESTORING as Live. The repaired stamp matches the restored record
-    /// exactly (same owner identity, its original generation and committing
-    /// operation id), so the lane's later kill/exit-watcher release paths
-    /// keep working — the taken stamp can never permanently block repair.
-    /// Fresh priors only: terminal priors release through the terminal
-    /// registry's own exit/kill paths, which never consult fresh stamps.
-    fn repair_restored_prior_stamp(
+    /// Round-3 review I-1 + whole-branch review M-1 (the claim repairs): a
+    /// prior the abort/reap-timeout path is RESTORING as Live resumes at
+    /// the RECORD's current (handoff) generation, so every lane-side
+    /// fenced claim must be brought to that same generation or the prior's
+    /// later kill/exit paths could never match the restored record. Fresh
+    /// priors: re-retain the lane stamp (the lane kill may have taken it —
+    /// the insert overwrites either way; a real teardown timeout can leave
+    /// the runtime alive with its stamp gone). Terminal priors: bump the
+    /// registry's retained claim. The repaired claims match the restored
+    /// record exactly (same owner identity, the restored generation, the
+    /// prior's committing operation id), so the lanes' later
+    /// kill/exit-watcher release paths keep working — a taken stamp can
+    /// never permanently block repair.
+    fn repair_restored_prior_claims(
         &self,
         provider: &str,
         session_id: &str,
         owner: &OwnerIdentity,
-        prior_generation: u64,
+        restored_generation: u64,
     ) {
-        if owner.kind != RuntimeOwnerKind::FreshAgent {
-            return;
+        match owner.kind {
+            RuntimeOwnerKind::FreshAgent => {
+                let Some(operation_id) = owner.ownership_id.clone() else {
+                    // No committing operation id on the identity: no fenced claim
+                    // can ever match it (commit_live stamps one) — nothing to
+                    // repair against.
+                    return;
+                };
+                let stamp = crate::ownership_lane::OwnershipStamp {
+                    epoch: self.ownership.boot_epoch(),
+                    generation: restored_generation,
+                    operation_id,
+                    owner: owner.clone(),
+                };
+                let stamps = match provider {
+                    "codex" => &self.fresh_codex.ownership_stamps,
+                    "claude" => &self.fresh_claude.ownership_stamps,
+                    _ => &self.fresh_opencode.fresh_agent().ownership_stamps,
+                };
+                stamps
+                    .lock()
+                    .expect("ownership stamps lock")
+                    .insert(session_id.to_string(), stamp);
+                tracing::warn!(target: "freshell_ownership",
+                    event = "ownership.handoff.stamp_repaired",
+                    provider, session_id,
+                    generation = restored_generation,
+                    outcome = "stamp_retained",
+                    "handoff restored a live prior; its lane stamp must fence at the restored generation");
+            }
+            RuntimeOwnerKind::Terminal => {
+                let Some(terminal_id) = owner.terminal_id.as_deref() else {
+                    // A Live terminal owner always carries its terminal id
+                    // (commit_session_ref_ownership stamps it) — nothing to
+                    // repair against without one.
+                    return;
+                };
+                let repaired = self
+                    .registry
+                    .repair_restored_prior_ownership(terminal_id, restored_generation);
+                tracing::warn!(target: "freshell_ownership",
+                    event = "ownership.handoff.terminal_claim_repaired",
+                    provider, session_id, terminal_id,
+                    generation = restored_generation,
+                    outcome = if repaired { "claim_bumped" } else { "no_claim_to_repair" },
+                    "handoff restored a live terminal prior; its retained claim must fence \
+                     at the restored generation");
+            }
         }
-        let Some(operation_id) = owner.ownership_id.clone() else {
-            // No committing operation id on the identity: no fenced claim
-            // can ever match it (commit_live stamps one) — nothing to
-            // repair against.
-            return;
-        };
-        let stamp = crate::ownership_lane::OwnershipStamp {
-            epoch: self.ownership.boot_epoch(),
-            generation: prior_generation,
-            operation_id,
-            owner: owner.clone(),
-        };
-        let stamps = match provider {
-            "codex" => &self.fresh_codex.ownership_stamps,
-            "claude" => &self.fresh_claude.ownership_stamps,
-            _ => &self.fresh_opencode.fresh_agent().ownership_stamps,
-        };
-        stamps
-            .lock()
-            .expect("ownership stamps lock")
-            .insert(session_id.to_string(), stamp);
-        tracing::warn!(target: "freshell_ownership",
-            event = "ownership.handoff.stamp_repaired",
-            provider, session_id,
-            generation = prior_generation,
-            outcome = "stamp_retained",
-            "handoff restored a live prior whose retained stamp the lane kill had taken");
     }
 
     /// Round-2 review (failure-broadcast truth): AFTER `disarm_and_fail`,
@@ -772,9 +799,10 @@ impl SessionHandoffRunner {
     /// on the Drop's detached task when the prior kill was ISSUED but its
     /// confirmed reap was lost to the abort. Re-probe the prior's liveness
     /// BEFORE any restore (the reap-timeout discipline): confirmed live →
-    /// restore (and repair the retained stamp the lane kill took, so the
-    /// exit watcher can still release later); unconfirmable → typed Vacant
-    /// (never a dying prior recorded as Live). Then the target half.
+    /// restore (and repair the lane claims — the fresh stamp the lane kill
+    /// took, the terminal's retained claim — to the restored generation,
+    /// so the exit watchers can still release later); unconfirmable → typed
+    /// Vacant (never a dying prior recorded as Live). Then the target half.
     async fn abort_cleanup(&self, payload: AbortPayload) {
         let AbortPayload {
             provider,
@@ -788,13 +816,13 @@ impl SessionHandoffRunner {
             spawn_watch,
         } = payload;
         let confirmed_live = match prior.as_ref() {
-            Some((owner, prior_gen)) => {
+            Some((owner, _)) => {
                 let live = self.probe_prior_live(&provider, &session_id, owner).await;
                 let outcome =
                     self.ownership
                         .fail(&provider, &session_id, &operation_id, generation, live);
                 if live && matches!(outcome, FailOutcome::RestoredPriorOwner) {
-                    self.repair_restored_prior_stamp(&provider, &session_id, owner, *prior_gen);
+                    self.repair_restored_prior_claims(&provider, &session_id, owner, generation);
                 }
                 live
             }
@@ -1330,13 +1358,16 @@ async fn await_terminal_dead(registry: &freshell_terminal::TerminalRegistry, ter
 enum PriorStopPhase {
     /// The stop was never issued (the abort landed before the kill await):
     /// the prior is untouched — restore it directly (test 5's window; its
-    /// retained stamp is intact, so its exit watcher still releases).
+    /// retained stamp is intact, and the restore repairs it FORWARD to the
+    /// restored generation so the exit watcher still releases —
+    /// whole-branch M-1).
     NotIssued,
     /// The stop was issued but its confirmed reap was lost to the abort:
     /// re-probe prior liveness BEFORE any restore (the reap-timeout
     /// discipline) — a dying prior is never restored as Live; a
-    /// confirmed-live one is restored WITH its retained stamp repaired (the
-    /// lane kill already took it).
+    /// confirmed-live one is restored WITH its lane claims (fresh stamp /
+    /// terminal retained claim) repaired to the restored generation (the
+    /// lane kill already took the stamp).
     KillInFlight,
     /// Confirmed reaped (or there never was a prior): never restore — the
     /// runner folded the exit; the key ends Vacant.
@@ -1374,7 +1405,8 @@ struct AbortPayload {
 /// Round-3 review I-1: the phase refines the abort semantics — a kill
 /// issued but unconfirmed (`KillInFlight`) defers the restore decision to
 /// the Drop's detached cleanup (re-probe, then restore-only-a-confirmed-
-/// live prior, repairing the retained stamp the lane kill took).
+/// live prior, repairing the lane claims — the fresh stamp the lane kill
+/// took, the terminal's retained claim — to the restored generation).
 /// `target_runtime`: a spawned-but-uncommitted target runtime is REAPED on
 /// Drop (the cancellation-safety window between spawn and commit);
 /// `target_spawn_watch`/`target_spawn_begun` cover the window INSIDE the
@@ -1386,8 +1418,9 @@ struct HandoffGuard {
     session_id: String,
     operation_id: String,
     generation: u64,
-    /// The prior owner captured at enter, WITH its Live generation (the
-    /// stamp-repair source).
+    /// The prior owner captured at enter, WITH its Live generation
+    /// (historical — the stop source; the restore's claim repairs fence at
+    /// the record's current generation instead, whole-branch M-1).
     prior: Option<(OwnerIdentity, u64)>,
     prior_still_live: bool,
     prior_stop: PriorStopPhase,
@@ -1457,7 +1490,7 @@ impl Drop for HandoffGuard {
             // but its confirmed reap was lost to the abort. DEFER the
             // restore decision to the detached cleanup — it re-probes the
             // prior's liveness first (a dying prior is never restored as
-            // Live) and repairs the retained stamp on a confirmed-live
+            // Live) and repairs the lane claims on a confirmed-live
             // restore. The record stays Handoff only for the probe's
             // microsecond-to-millisecond duration — retryable, never
             // wedged.
@@ -1477,7 +1510,23 @@ impl Drop for HandoffGuard {
         if matches!(self.prior_stop, PriorStopPhase::KillInFlight) {
             self.prior_still_live = false;
         }
-        let _ = self.disarm_and_fail();
+        let fail_outcome = self.disarm_and_fail();
+        // Whole-branch M-1 (the claim repairs): a SYNC-path restore must
+        // also bring the lane claims (fresh stamp / terminal retained
+        // claim) to the restored generation — the untouched prior's own
+        // stamp still fences at its COMMIT generation, which the restored
+        // record (at the handoff generation) no longer holds, so its
+        // later kill/exit paths would never match without the repair.
+        if matches!(fail_outcome, FailOutcome::RestoredPriorOwner) {
+            if let Some((owner, _)) = self.prior.as_ref() {
+                self.runner.repair_restored_prior_claims(
+                    &self.provider,
+                    &self.session_id,
+                    owner,
+                    self.generation,
+                );
+            }
+        }
         // Cancellation/panic mid-flight: a spawned-but-uncommitted target
         // runtime has no owner record — reap it on a detached task (Drop is
         // sync; the lanes' teardowns are async). The fresh-lane sweep and

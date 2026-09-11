@@ -503,7 +503,12 @@ pub mod ownership_lane {
     /// The fenced stop claim for an explicit kill: the lane's believed
     /// runtime identity plus the `(epoch, generation)` its `commit_live`
     /// stamped — with the wire pair a delayed client carried taking
-    /// precedence when present (round-2 review).
+    /// precedence when present (round-2 review). Both sources converge on
+    /// the Live record's generation after a failed-handoff restore: the
+    /// restored state holds the record's (handoff) generation and the
+    /// lane's retained stamp is repaired to it (whole-branch review M-1),
+    /// so a wire-fenced kill from a client that folded the handoff frames
+    /// satisfies `begin_stop`'s exact-generation match.
     pub fn stop_claim_from_stamp(
         stamp: &OwnershipStamp,
         observed: Option<ObservedFence>,
