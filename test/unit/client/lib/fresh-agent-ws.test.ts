@@ -977,6 +977,48 @@ describe('runtime-owner folds (kata b8ke)', () => {
     expect(Object.keys(owners)).toEqual(['codex:sid-r'])
   })
 
+  // b8ke focused round-3 R3-5: a reconnecting device after
+  // PLATFORM_LIMITED/WATCHER_FAILED must fold the FENCED truth — a fenced
+  // replay record is the typed recovery state (handoff-failed + the typed
+  // reason), never a false committed owner.
+  it('a fenced replay record folds as the typed recovery state, never handoff-committed', () => {
+    const store = createFreshAgentStore()
+    foldReadyRuntimeOwners(store.dispatch, [
+      {
+        provider: 'claude',
+        sessionId: 'sid-fenced',
+        epoch: 3,
+        generation: 5,
+        ownerKind: 'terminal',
+        state: 'fenced',
+        reason: 'platform-limited',
+      },
+      {
+        provider: 'codex',
+        sessionId: 'sid-live',
+        epoch: 3,
+        generation: 2,
+        ownerKind: 'fresh-agent',
+        state: 'live',
+      },
+    ])
+    const owners = store.getState().freshAgent.runtimeOwners
+    expect(owners['claude:sid-fenced']).toMatchObject({
+      ownerKind: 'terminal',
+      transition: 'handoff-failed',
+      reason: 'platform-limited',
+      fenced: true,
+      epoch: 3,
+      generation: 5,
+    })
+    // A live record still folds as committed (the pre-existing behavior).
+    expect(owners['codex:sid-live']).toMatchObject({
+      ownerKind: 'fresh-agent',
+      transition: 'handoff-committed',
+    })
+    expect(owners['codex:sid-live'].fenced).toBeUndefined()
+  })
+
   it('a ready fold with no replay entries still resets (empty owner map)', () => {
     const store = createFreshAgentStore()
     foldSessionRuntimeOwnerFrame(store.dispatch, ownerFrame({ sessionId: 'sid-gone' }))

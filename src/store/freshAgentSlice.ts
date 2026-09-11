@@ -649,6 +649,7 @@ const freshAgentSlice = createSlice({
         ...(f.terminalId !== undefined ? { terminalId: f.terminalId } : {}),
         transition: f.transition,
         ...(f.reason !== undefined ? { reason: f.reason } : {}),
+        ...(f.fenced !== undefined ? { fenced: f.fenced } : {}),
         updatedAt: Date.now(),
       }
     },

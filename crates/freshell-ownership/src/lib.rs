@@ -363,6 +363,18 @@ pub enum FenceReason {
     PlatformLimited,
 }
 
+impl FenceReason {
+    /// The wire string for the reconnect-replay fields (b8ke focused
+    /// round-3 review R3-5) — the same kebab-case spelling the serde
+    /// derive emits.
+    pub fn wire_str(&self) -> &'static str {
+        match self {
+            FenceReason::WatcherFailed => "watcher-failed",
+            FenceReason::PlatformLimited => "platform-limited",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BeginOutcome {
     /// The caller holds the lease; it MUST end with `commit_live` (or `fail`).
@@ -443,6 +455,26 @@ pub enum FenceOutcome {
     /// The record moved on (a foreign operation id or generation, or the
     /// state is no longer the expected in-flight one) — the typed no-op.
     ForeignOperation,
+}
+
+/// Outcome of [`RuntimeOwnershipRegistry::force_release_platform_limited`]
+/// (b8ke focused round-3 review R3-4): the typed operator recovery for a
+/// `Fenced{PlatformLimited}` key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForceReleaseOutcome {
+    /// The fence cleared — the record is `Vacant` at the same generation;
+    /// the caller's explicit retry may proceed.
+    Released,
+    /// The key is not a `Fenced{PlatformLimited}` record (anything else —
+    /// including `WatcherFailed` fences, whose bounded probe can still
+    /// confirm; the state rides along for the typed refusal).
+    NotPlatformLimited { state: OwnershipState },
+    /// The observation is stale (a different boot epoch, or an older
+    /// generation than the fenced record) — refresh and retry.
+    StaleObservation {
+        current_epoch: u64,
+        current_generation: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -541,6 +573,31 @@ pub struct RuntimeOwnerReplayRecord {
     pub owner_kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_id: Option<String>,
+    /// b8ke focused round-3 review R3-5: the replayed state's truth.
+    /// `Fenced` marks a record whose `owner_kind` names the FENCED PRIOR —
+    /// NOT a live owner. A reconnecting device must never fold such a
+    /// record as a committed owner (the pre-fix replay licensed a false
+    /// "handoff-committed" fold after PLATFORM_LIMITED/WATCHER_FAILED — no
+    /// divergence, no recovery UI). `reason` carries the typed fence reason
+    /// when fenced.
+    pub state: ReplayOwnerState,
+    /// The typed fence reason (`state == Fenced` only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// The replayed record's truth for fenced keys (b8ke focused round-3
+/// review R3-5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReplayOwnerState {
+    /// The named owner is the committed live owner (a vacant key's
+    /// `owner_kind: "vacant"` carries its own truth).
+    Live,
+    /// The record is FENCED: `owner_kind` names the fenced prior (not a
+    /// live owner); the key blocks every new writer pending typed
+    /// recovery. See `RuntimeOwnerReplayRecord::reason`.
+    Fenced,
 }
 
 /// Per-key registry record. Hand-implemented `Default` (a `Vacant` record at
@@ -1223,6 +1280,80 @@ impl RuntimeOwnershipRegistry {
         }
     }
 
+    /// b8ke focused round-3 review R3-4: the typed operator recovery for a
+    /// `Fenced{PlatformLimited}` key — the bounded path that keeps the
+    /// session from being permanently disabled on non-Linux hosts. The
+    /// non-Linux teardown semantics: the direct child's awaited exit WAS
+    /// confirmed (the portable floor); only the DESCENDANT-tree
+    /// verification is platform-limited. An EXPLICIT operator action — a
+    /// handoff retry carrying a FRESH observed fence (the recovery UI's
+    /// Retry refreshes the pair from the runtime-owner record) — may
+    /// therefore force-clear the fence, and the log records the limitation
+    /// honestly (the descendant tree is UNVERIFIED, not confirmed dead).
+    /// Every other shape is the typed refusal: a `WatcherFailed` fence (a
+    /// bounded probe can still confirm it), any non-fenced state, and a
+    /// stale/mismatched observation (a different epoch, or an older
+    /// generation than the fenced record) — the default path stays fenced.
+    pub fn force_release_platform_limited(
+        &self,
+        provider: &str,
+        session_id: &str,
+        observed: ObservedFence,
+        initiator: &str,
+    ) -> ForceReleaseOutcome {
+        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let key = SessionKey::new(provider, session_id);
+        let Some(record) = inner.get_mut(&key) else {
+            return ForceReleaseOutcome::NotPlatformLimited {
+                state: OwnershipState::Vacant,
+            };
+        };
+        let current_generation = snapshot_generation(record);
+        if observed.epoch != self.epoch || observed.generation != current_generation {
+            tracing::warn!(target: "freshell_ownership",
+                event = "ownership.fenced.force_release_platform_limited",
+                provider, session_id, initiator,
+                observed_epoch = observed.epoch, observed_generation = observed.generation,
+                epoch = self.epoch, current_generation,
+                outcome = "refused", failure_reason = "STALE_OBSERVATION",
+                "the force-clear's observed fence is stale — refresh and retry");
+            return ForceReleaseOutcome::StaleObservation {
+                current_epoch: self.epoch,
+                current_generation,
+            };
+        }
+        match record.state.clone() {
+            OwnershipState::Fenced {
+                reason: FenceReason::PlatformLimited,
+                operation_id,
+                prior,
+                since_ms,
+                ..
+            } => {
+                let duration_ms = now_epoch_ms().saturating_sub(since_ms);
+                record.state = OwnershipState::Vacant;
+                tracing::warn!(target: "freshell_ownership",
+                    event = "ownership.fenced.force_released_platform_limited",
+                    provider, session_id, initiator,
+                    fenced_operation_id = %operation_id,
+                    from_kind = ?prior.as_ref().map(|(o, _)| o.kind),
+                    runtime_id = ?prior.as_ref().and_then(|(o, _)| o.terminal_id.clone()),
+                    pid = ?prior.as_ref().and_then(|(o, _)| o.pid),
+                    epoch = self.epoch, generation = record.generation, duration_ms,
+                    fence_reason = "platform-limited",
+                    confirmed = "direct-child-exit",
+                    unverified = "descendant-tree",
+                    outcome = "force_released_on_operator_action",
+                    "an explicit operator retry cleared a PlatformLimited fence: the direct \
+                     child's awaited exit was confirmed; the DESCENDANT tree is UNVERIFIED \
+                     (the platform cannot read it) — recorded honestly, never as a confirmed \
+                     reap");
+                ForceReleaseOutcome::Released
+            }
+            state => ForceReleaseOutcome::NotPlatformLimited { state },
+        }
+    }
+
     /// Begin an explicit stop (kill): `Live` → `Stopping` (generation+1),
     /// blocking competing starts while the kill is confirmed. The KILL
     /// happens while `Stopping`; `commit_stop` moves to `Vacant` only after
@@ -1686,31 +1817,64 @@ impl RuntimeOwnershipRegistry {
     /// lag-4008 disconnect, page reload) learns the authoritative owner on
     /// reconnect. Vacant keys replay as "vacant" to CLEAR stale divergence.
     /// Sync; the lock is never held across an await.
+    ///
+    /// b8ke focused round-3 review R3-5: a FENCED record replays its
+    /// truth — `state: "fenced"` + the typed reason, with `owner_kind`
+    /// naming the fenced PRIOR (the owner the handoff-failed frames
+    /// already named on every device). The client folds a fenced record as
+    /// the typed recovery state (handoff-failed + reason), NEVER as a
+    /// committed live owner.
     pub fn snapshot_records(&self) -> Vec<RuntimeOwnerReplayRecord> {
         let inner = self.inner.lock().expect("ownership lock poisoned");
         inner
             .iter()
             .map(|(key, record)| {
-                let (owner_kind, terminal_id) = match &record.state {
-                    OwnershipState::Vacant => ("vacant", None),
-                    OwnershipState::Live { owner, .. } => {
-                        (kind_wire(&owner.kind), owner.terminal_id.clone())
+                let (owner_kind, terminal_id, replay_state, reason) = match &record.state {
+                    OwnershipState::Vacant => ("vacant", None, ReplayOwnerState::Live, None),
+                    OwnershipState::Live { owner, .. } => (
+                        kind_wire(&owner.kind),
+                        owner.terminal_id.clone(),
+                        ReplayOwnerState::Live,
+                        None,
+                    ),
+                    OwnershipState::Starting { kind, .. } => {
+                        (kind_wire(kind), None, ReplayOwnerState::Live, None)
                     }
-                    OwnershipState::Starting { kind, .. } => (kind_wire(kind), None),
-                    OwnershipState::Handoff { to_kind, .. } => (kind_wire(to_kind), None),
+                    OwnershipState::Handoff { to_kind, .. } => {
+                        (kind_wire(to_kind), None, ReplayOwnerState::Live, None)
+                    }
                     OwnershipState::Stopping { owner, .. } => match owner {
-                        Some(owner) => (kind_wire(&owner.kind), owner.terminal_id.clone()),
-                        None => ("vacant", None),
+                        Some(owner) => (
+                            kind_wire(&owner.kind),
+                            owner.terminal_id.clone(),
+                            ReplayOwnerState::Live,
+                            None,
+                        ),
+                        None => ("vacant", None, ReplayOwnerState::Live, None),
                     },
                     // b8ke focused round-2 review: a fenced key replays the
                     // FENCED PRIOR's kind (the owner the handoff-failed
                     // frames already named on every device) — never
                     // "vacant", which would invite a create the registry
-                    // itself would refuse.
-                    OwnershipState::Fenced { prior, .. } => match prior {
-                        Some((owner, _)) => (kind_wire(&owner.kind), owner.terminal_id.clone()),
-                        None => ("vacant", None),
-                    },
+                    // itself would refuse. b8ke focused round-3 R3-5: the
+                    // record's truth rides along — fenced + the typed
+                    // reason, never a plain live owner.
+                    OwnershipState::Fenced {
+                        prior,
+                        reason: fence_reason,
+                        ..
+                    } => {
+                        let wire_reason = Some(fence_reason.wire_str().to_string());
+                        match prior {
+                            Some((owner, _)) => (
+                                kind_wire(&owner.kind),
+                                owner.terminal_id.clone(),
+                                ReplayOwnerState::Fenced,
+                                wire_reason,
+                            ),
+                            None => ("vacant", None, ReplayOwnerState::Fenced, wire_reason),
+                        }
+                    }
                 };
                 RuntimeOwnerReplayRecord {
                     provider: key.provider.clone(),
@@ -1719,6 +1883,8 @@ impl RuntimeOwnershipRegistry {
                     generation: snapshot_generation(record),
                     owner_kind: owner_kind.to_string(),
                     terminal_id,
+                    state: replay_state,
+                    reason,
                 }
             })
             .collect()
@@ -2849,6 +3015,166 @@ mod tests {
         assert_eq!(r.observe(PROVIDER, "sid").state, OwnershipState::Vacant);
     }
 
+    /// b8ke focused round-3 review R3-4: the typed operator force-clear
+    /// for a PlatformLimited fence. An explicit retry carrying a FRESH
+    /// observed fence releases the record to Vacant (the limitation
+    /// recorded honestly); a WatcherFailed fence is NOT force-releasable
+    /// (its bounded probe can still confirm); a stale observation and any
+    /// non-fenced state are the typed refusals — the default path stays
+    /// fenced.
+    #[test]
+    fn force_release_platform_limited_is_the_typed_fenced_recovery() {
+        // A PlatformLimited fence from a stop.
+        let (r, owner, generation) = registry_with_live_terminal();
+        let StopOutcome::Granted { generation: g } = r.begin_stop(
+            PROVIDER,
+            "sid",
+            "kill-pl2",
+            &StopClaim {
+                expected_kind: RuntimeOwnerKind::Terminal,
+                expected_runtime: Some(owner.clone()),
+                observed: ObservedFence {
+                    epoch: r.boot_epoch(),
+                    generation,
+                },
+            },
+            "test",
+            7,
+        ) else {
+            panic!()
+        };
+        assert_eq!(
+            r.fence_unconfirmed_stop(PROVIDER, "sid", "kill-pl2", g, FenceReason::PlatformLimited),
+            FenceOutcome::Fenced
+        );
+        // A stale observation (an older generation) is the typed refusal.
+        assert_eq!(
+            r.force_release_platform_limited(
+                PROVIDER,
+                "sid",
+                ObservedFence {
+                    epoch: r.boot_epoch(),
+                    generation: g - 1,
+                },
+                "operator",
+            ),
+            ForceReleaseOutcome::StaleObservation {
+                current_epoch: r.boot_epoch(),
+                current_generation: g,
+            }
+        );
+        // A foreign epoch is the typed refusal too.
+        assert!(matches!(
+            r.force_release_platform_limited(
+                PROVIDER,
+                "sid",
+                ObservedFence {
+                    epoch: r.boot_epoch() + 1,
+                    generation: g,
+                },
+                "operator",
+            ),
+            ForceReleaseOutcome::StaleObservation { .. }
+        ));
+        // THE R3-4 recovery: the fresh observed fence force-clears — the
+        // record reopens Vacant at the SAME generation (the caller's
+        // retry proceeds).
+        assert_eq!(
+            r.force_release_platform_limited(
+                PROVIDER,
+                "sid",
+                ObservedFence {
+                    epoch: r.boot_epoch(),
+                    generation: g,
+                },
+                "operator",
+            ),
+            ForceReleaseOutcome::Released
+        );
+        assert_eq!(r.observe(PROVIDER, "sid").state, OwnershipState::Vacant);
+        assert_eq!(r.observe(PROVIDER, "sid").generation, g);
+        assert!(matches!(
+            r.begin_start(
+                PROVIDER,
+                "sid",
+                RuntimeOwnerKind::Terminal,
+                "post-force-create",
+                None,
+                "test",
+                8,
+            ),
+            BeginOutcome::Granted { .. }
+        ));
+
+        // A WatcherFailed fence is NOT force-releasable: its bounded
+        // replacement probe can still confirm death.
+        let (r, _owner, _generation) = registry_with_live_terminal();
+        let BeginOutcome::Granted { generation: g } = r.begin_handoff(
+            PROVIDER,
+            "sid",
+            RuntimeOwnerKind::FreshAgent,
+            "ho-wf-pl",
+            None,
+            "test",
+            2,
+        ) else {
+            panic!()
+        };
+        assert_eq!(
+            r.fence_unconfirmed_handoff(PROVIDER, "sid", "ho-wf-pl", g, FenceReason::WatcherFailed),
+            FenceOutcome::Fenced
+        );
+        let refused = r.force_release_platform_limited(
+            PROVIDER,
+            "sid",
+            ObservedFence {
+                epoch: r.boot_epoch(),
+                generation: g,
+            },
+            "operator",
+        );
+        assert!(
+            matches!(
+                &refused,
+                ForceReleaseOutcome::NotPlatformLimited { state }
+                    if matches!(state, OwnershipState::Fenced { .. })
+            ),
+            "a WatcherFailed fence must not force-clear: {refused:?}"
+        );
+        assert!(matches!(
+            r.observe(PROVIDER, "sid").state,
+            OwnershipState::Fenced { .. }
+        ));
+
+        // A non-fenced key is the typed NotPlatformLimited refusal.
+        let (r, _owner, _) = registry_with_live_terminal();
+        assert!(matches!(
+            r.force_release_platform_limited(
+                PROVIDER,
+                "sid",
+                ObservedFence {
+                    epoch: r.boot_epoch(),
+                    generation: 1,
+                },
+                "operator",
+            ),
+            ForceReleaseOutcome::NotPlatformLimited { .. }
+        ));
+        // And an unknown key likewise.
+        assert!(matches!(
+            r.force_release_platform_limited(
+                PROVIDER,
+                "never-existed",
+                ObservedFence {
+                    epoch: r.boot_epoch(),
+                    generation: 0,
+                },
+                "operator",
+            ),
+            ForceReleaseOutcome::NotPlatformLimited { .. }
+        ));
+    }
+
     #[test]
     fn handoff_fail_restores_prior_owner_only_when_confirmed_live() {
         // Prior live owner, handoff fails BEFORE the prior was stopped — the
@@ -3044,7 +3370,9 @@ mod tests {
             && rec.session_id == "sid"
             && rec.epoch == r.boot_epoch()
             && rec.generation == generation
-            && rec.owner_kind == "terminal"));
+            && rec.owner_kind == "terminal"
+            && rec.state == ReplayOwnerState::Live
+            && rec.reason.is_none()));
         r.release(
             PROVIDER,
             "sid",
@@ -3055,7 +3383,45 @@ mod tests {
         assert!(records.iter().any(|rec| rec.provider == PROVIDER
             && rec.session_id == "sid"
             && rec.generation >= generation
-            && rec.owner_kind == "vacant"));
+            && rec.owner_kind == "vacant"
+            && rec.state == ReplayOwnerState::Live));
+
+        // b8ke focused round-3 review R3-5: a FENCED record replays its
+        // truth — `state: "fenced"` with the typed reason and the fenced
+        // PRIOR's kind — never a plain live owner (the pre-fix replay
+        // licensed a false committed-owner fold on reconnecting devices
+        // after PLATFORM_LIMITED/WATCHER_FAILED).
+        let (r, _owner, _) = registry_with_live_terminal();
+        let BeginOutcome::Granted { generation: g } = r.begin_handoff(
+            PROVIDER,
+            "sid",
+            RuntimeOwnerKind::FreshAgent,
+            "ho-fence-replay",
+            None,
+            "test",
+            2,
+        ) else {
+            panic!()
+        };
+        assert_eq!(
+            r.fence_unconfirmed_handoff(
+                PROVIDER,
+                "sid",
+                "ho-fence-replay",
+                g,
+                FenceReason::PlatformLimited,
+            ),
+            FenceOutcome::Fenced
+        );
+        let records = r.snapshot_records();
+        let fenced = records
+            .iter()
+            .find(|rec| rec.session_id == "sid")
+            .expect("the fenced key replays");
+        assert_eq!(fenced.state, ReplayOwnerState::Fenced);
+        assert_eq!(fenced.reason.as_deref(), Some("platform-limited"));
+        assert_eq!(fenced.owner_kind, "terminal", "the fenced PRIOR's kind");
+        assert_eq!(fenced.generation, g);
     }
 
     /// Task 4 review F1 (fix): a GRANTED stop abandoned before the kill (the

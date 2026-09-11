@@ -17079,7 +17079,7 @@ rl.on('line', (line) => {
         let st = state();
         let sid = format!("r37-reparent-{}", uuid::Uuid::new_v4());
         // The condemned "sidecar" child holding a tagged "CLI grandchild".
-        let mut child = tokio::process::Command::new("bash")
+        let child = tokio::process::Command::new("bash")
             .arg("-c")
             .arg("sleep 300 & wait")
             .env("R37_TEST_OWNERSHIP", &sid)
@@ -17162,7 +17162,10 @@ rl.on('line', (line) => {
         // descendant (from the recorded tree) and confirm — never answer
         // `true` over a still-running descendant.
         let confirmed = st.confirm_fenced_prior_dead(&sid).await;
-        assert!(confirmed, "the recorded identity must confirm the tree dead");
+        assert!(
+            confirmed,
+            "the recorded identity must confirm the tree dead"
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while crate::session_lease::proc_starttime(grandchild_pid as i32).is_some() {
             assert!(

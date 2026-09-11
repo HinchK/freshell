@@ -1694,6 +1694,97 @@ async fn ready_frame_replays_current_runtime_owners() {
     drop(ws_c);
 }
 
+/// b8ke focused round-3 review R3-5: a FENCED key reconnects truthfully —
+/// the ready replay carries `state: "fenced"` with the typed reason and the
+/// fenced PRIOR's kind, so a reconnecting device folds the typed recovery
+/// state instead of a false committed owner (the pre-fix replay omitted the
+/// fenced state entirely and the client labeled every non-vacant record
+/// "handoff-committed").
+#[tokio::test]
+async fn ready_frame_replays_a_fenced_key_with_its_typed_reason() {
+    let (url, _registry, ws_state) = spawn_server().await;
+    let ownership = ws_state.ownership.clone().expect("coordinator wired");
+    let sid = format!("fenced-replay-{}", uuid::Uuid::new_v4());
+
+    // A Live terminal prior, then a handoff that fences with the typed
+    // PlatformLimited reason (the shape a non-Linux teardown produces).
+    let freshell_ownership::BeginOutcome::Granted { generation } = ownership.begin_start(
+        "claude",
+        &sid,
+        freshell_ownership::RuntimeOwnerKind::Terminal,
+        "op-fenced-replay-prior",
+        None,
+        "test",
+        1_000,
+    ) else {
+        panic!("expected Granted")
+    };
+    let prior = freshell_ownership::OwnerIdentity {
+        kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+        terminal_id: Some(format!("t-{sid}")),
+        live_session_key: None,
+        pid: None,
+        ownership_id: None,
+    };
+    assert_eq!(
+        ownership.commit_live("claude", &sid, "op-fenced-replay-prior", generation, prior,),
+        freshell_ownership::CommitOutcome::Committed
+    );
+    let freshell_ownership::BeginOutcome::Granted { generation: ho_gen } = ownership.begin_handoff(
+        "claude",
+        &sid,
+        freshell_ownership::RuntimeOwnerKind::FreshAgent,
+        "op-fenced-replay-ho",
+        None,
+        "test",
+        2_000,
+    ) else {
+        panic!("expected Granted")
+    };
+    assert_eq!(
+        ownership.fence_unconfirmed_handoff(
+            "claude",
+            &sid,
+            "op-fenced-replay-ho",
+            ho_gen,
+            freshell_ownership::FenceReason::PlatformLimited,
+        ),
+        freshell_ownership::FenceOutcome::Fenced
+    );
+
+    // The reconnecting device's ready frame carries the fenced truth.
+    let (_ws, ready) = connect_and_capture_ready(&url).await;
+    let owners = ready
+        .get("runtimeOwners")
+        .and_then(|v| v.as_array())
+        .expect("runtimeOwners present");
+    let fenced = owners
+        .iter()
+        .find(|o| o.get("sessionId").and_then(|s| s.as_str()) == Some(sid.as_str()))
+        .expect("the fenced key replays")
+        .clone();
+    assert_eq!(
+        fenced.get("ownerKind").and_then(|k| k.as_str()),
+        Some("terminal"),
+        "the fenced PRIOR's kind: {fenced}"
+    );
+    assert_eq!(
+        fenced.get("state").and_then(|s| s.as_str()),
+        Some("fenced"),
+        "THE R3-5 regression: the replay must carry the fenced state: {fenced}"
+    );
+    assert_eq!(
+        fenced.get("reason").and_then(|r| r.as_str()),
+        Some("platform-limited"),
+        "the typed fence reason: {fenced}"
+    );
+    assert_eq!(
+        fenced.get("generation").and_then(|g| g.as_u64()),
+        Some(ho_gen),
+        "the fence's generation: {fenced}"
+    );
+}
+
 // ── kata b8ke Task 4 review M1 (fix): total coordinator coverage ───────────
 //
 // The Adopt arm claims nothing (a live same-kind terminal owner exists — the

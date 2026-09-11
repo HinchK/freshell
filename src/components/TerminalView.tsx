@@ -5763,7 +5763,18 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           {freshByRaceNotice}
         </div>
       ) : null}
-      {freshAgentOwnerDivergence?.ownerKind === 'fresh-agent' ? (
+      {freshAgentOwnerDivergence?.fencedReason !== undefined ? (
+        <div
+          role="alert"
+          data-testid="terminal-owner-fenced-card"
+          aria-label="Session blocked pending recovery"
+          className="pointer-events-auto absolute inset-x-0 top-0 z-20 m-2 flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
+        >
+          <span>
+            {`This conversation is blocked pending recovery (${freshAgentOwnerDivergence.fencedReason}).`}
+          </span>
+        </div>
+      ) : freshAgentOwnerDivergence?.ownerKind === 'fresh-agent' ? (
         <div
           role="alert"
           data-testid="terminal-owner-divergence-card"

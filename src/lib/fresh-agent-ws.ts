@@ -288,6 +288,11 @@ export function foldSessionRuntimeOwnerFrame(
  * sent, so a device that missed the handoff broadcast (offline during
  * handoff, lag-4008, page reload) converges on its very first
  * post-reconnect reconcile.
+ *
+ * b8ke focused round-3 R3-5: a FENCED replay record folds truthfully —
+ * the typed recovery state (handoff-failed + the typed reason, plus the
+ * fenced marker the divergence/recovery UI derives from) — never a false
+ * "handoff-committed" owner.
  */
 export function foldReadyRuntimeOwners(
   dispatch: AppDispatch,
@@ -295,6 +300,7 @@ export function foldReadyRuntimeOwners(
 ): void {
   dispatch(resetRuntimeOwners())
   for (const owner of owners ?? []) {
+    const fenced = owner.state === 'fenced'
     dispatch(applyRuntimeOwner({
       type: 'session.runtimeOwner',
       provider: owner.provider,
@@ -304,7 +310,13 @@ export function foldReadyRuntimeOwners(
       ownerKind: owner.ownerKind,
       ...(owner.terminalId !== undefined ? { terminalId: owner.terminalId } : {}),
       operationId: 'ready-replay',
-      transition: owner.ownerKind === 'vacant' ? 'released' : 'handoff-committed',
+      transition: fenced
+        ? 'handoff-failed'
+        : owner.ownerKind === 'vacant' ? 'released' : 'handoff-committed',
+      ...(fenced ? {
+        reason: owner.reason ?? 'fenced',
+        fenced: true,
+      } : {}),
     }))
   }
 }

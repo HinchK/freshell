@@ -345,6 +345,109 @@ impl SessionHandoffRunner {
                     current_generation,
                 )
             }
+            // b8ke focused round-3 review R3-4: the TYPED operator
+            // recovery for a PlatformLimited fence. An explicit handoff
+            // retry carrying a FRESH observed fence (the recovery UI's
+            // Retry refreshes the pair from the runtime-owner record) is
+            // the operator action that force-clears the fence — the
+            // non-Linux semantics make it honest: the direct child's
+            // awaited exit WAS confirmed; only the descendant verification
+            // is platform-limited, and the force-clear records that
+            // limitation. The DEFAULT path stays fenced (a fence-less
+            // retry, any create/attach, a WatcherFailed fence whose
+            // bounded probe can still confirm).
+            BeginOutcome::Blocked {
+                state:
+                    freshell_ownership::OwnershipState::Fenced {
+                        reason: freshell_ownership::FenceReason::PlatformLimited,
+                        ..
+                    },
+                ..
+            } if observed.is_some() => {
+                let forced = self.ownership.force_release_platform_limited(
+                    &req.provider,
+                    &req.session_id,
+                    observed.expect("the guarded arm carries the fence"),
+                    &initiator,
+                );
+                match forced {
+                    freshell_ownership::ForceReleaseOutcome::Released => {
+                        tracing::info!(target: "freshell_ownership",
+                            event = "ownership.handoff.force_cleared_platform_limited",
+                            operation_id = %operation_id, provider = %req.provider, session_id = %req.session_id,
+                            epoch = self.ownership.boot_epoch(),
+                            "an explicit retry force-cleared a PlatformLimited fence; \
+                             the handoff re-enters");
+                        // Re-enter: the force-clear preserved the record's
+                        // generation, so the retry's observed fence still
+                        // satisfies the stale check and the handoff grants
+                        // from the now-Vacant key.
+                        match self.ownership.begin_handoff(
+                            &req.provider,
+                            &req.session_id,
+                            req.target_kind,
+                            &operation_id,
+                            observed,
+                            &initiator,
+                            now_ms(),
+                        ) {
+                            BeginOutcome::Granted { generation } => generation,
+                            BeginOutcome::StaleGeneration {
+                                current_generation, ..
+                            } => {
+                                return typed_failure(
+                                    "STALE_GENERATION",
+                                    "observed ownership fence is stale; refresh and retry",
+                                    false,
+                                    current_generation,
+                                )
+                            }
+                            _ => {
+                                let generation = self
+                                    .ownership
+                                    .observe(&req.provider, &req.session_id)
+                                    .generation;
+                                return typed_failure(
+                                    "HANDOFF_IN_PROGRESS",
+                                    "a lifecycle operation is in flight; retry after it settles",
+                                    true,
+                                    generation,
+                                );
+                            }
+                        }
+                    }
+                    freshell_ownership::ForceReleaseOutcome::NotPlatformLimited { state } => {
+                        let generation = self
+                            .ownership
+                            .observe(&req.provider, &req.session_id)
+                            .generation;
+                        tracing::warn!(target: "freshell_ownership",
+                            event = "ownership.handoff.force_clear_refused",
+                            operation_id = %operation_id, provider = %req.provider, session_id = %req.session_id,
+                            state = ?state,
+                            "the fenced retry's force-clear was refused — the key stays fenced");
+                        return typed_failure(
+                            "SESSION_FENCED",
+                            "the session is fenced pending recovery; retry with a fresh \
+                             observation or confirm the prior runtime is dead",
+                            true,
+                            generation,
+                        );
+                    }
+                    freshell_ownership::ForceReleaseOutcome::StaleObservation {
+                        current_epoch,
+                        current_generation,
+                    } => {
+                        let _ = current_epoch;
+                        return typed_failure(
+                            "STALE_GENERATION",
+                            "observed ownership fence is stale; refresh and retry",
+                            false,
+                            current_generation,
+                        );
+                    }
+                }
+            }
             // `begin_handoff` grants from Vacant AND from Live of any kind, so
             // AdoptLive/OwnedByOtherKind are unreachable arms — mapped to the
             // same typed, retryable in-flight answer rather than unwrapped.
@@ -1066,7 +1169,12 @@ impl SessionHandoffRunner {
                             live,
                         );
                         if live && matches!(outcome, FailOutcome::RestoredPriorOwner) {
-                            self.repair_restored_prior_claims(provider, session_id, owner, *generation);
+                            self.repair_restored_prior_claims(
+                                provider,
+                                session_id,
+                                owner,
+                                *generation,
+                            );
                         }
                     }
                     UncommittedTargetOutcome::PlatformLimited => {

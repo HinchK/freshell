@@ -2688,7 +2688,17 @@
               "provider": {
                 "type": "string"
               },
+              "reason": {
+                "type": "string"
+              },
               "sessionId": {
+                "type": "string"
+              },
+              "state": {
+                "enum": [
+                  "live",
+                  "fenced"
+                ],
                 "type": "string"
               },
               "terminalId": {
@@ -2771,6 +2781,9 @@
       "properties": {
         "epoch": {
           "type": "number"
+        },
+        "fenced": {
+          "type": "boolean"
         },
         "generation": {
           "type": "number"

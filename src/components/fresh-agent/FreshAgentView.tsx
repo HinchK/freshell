@@ -2980,7 +2980,17 @@ export function FreshAgentView({
                   </div>
                 </div>
               ) : null}
-              {ownerDivergence?.ownerKind === 'terminal' ? (
+              {ownerDivergence?.fencedReason !== undefined ? (
+                <div
+                  className="fresh-agent-fenced-card flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
+                  role="alert"
+                  aria-label="Session blocked pending recovery"
+                >
+                  <span>
+                    {`This conversation is blocked pending recovery (${ownerDivergence.fencedReason}).`}
+                  </span>
+                </div>
+              ) : ownerDivergence?.ownerKind === 'terminal' ? (
                 <div
                   className="fresh-agent-divergence-card flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
                   role="alert"

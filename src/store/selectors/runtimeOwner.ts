@@ -34,6 +34,13 @@ export type PaneOwnerDivergence = {
   transition: RuntimeOwnerRecord['transition']
   terminalId?: string
   generation: number
+  /**
+   * b8ke R3-5: present when the record is FENCED (no live writer exists —
+   * the ownerKind names the fenced prior). Present for BOTH pane kinds:
+   * every pane holding the sessionRef shows the typed recovery state, not
+   * a false committed owner or an old-kind continuation.
+   */
+  fencedReason?: string
 }
 
 export type PaneOwnerKind = 'fresh-agent' | 'terminal'
@@ -104,12 +111,26 @@ export function selectPaneOwnerFence(
  * Derive a pane's divergence from its owner record — pure, safe to call in
  * render (no store dependency; pair with a `selectSessionRuntimeOwner`
  * subscription so the record reference stays stable).
+ *
+ * b8ke R3-5: a FENCED record diverges for BOTH pane kinds — no live
+ * writer exists (the ownerKind names the fenced prior), so every pane
+ * holding the sessionRef renders the typed recovery state via
+ * `fencedReason`, never a same-kind "all clear".
  */
 export function derivePaneOwnerDivergence(
   record: RuntimeOwnerRecord | undefined,
   paneKind: PaneOwnerKind,
 ): PaneOwnerDivergence | null {
   if (!record || record.ownerKind === 'vacant') return null
+  if (record.fenced) {
+    return {
+      ownerKind: record.ownerKind,
+      transition: record.transition,
+      ...(record.terminalId !== undefined ? { terminalId: record.terminalId } : {}),
+      generation: record.generation,
+      ...(record.reason !== undefined ? { fencedReason: record.reason } : {}),
+    }
+  }
   if (record.ownerKind === paneKind) return null
   return {
     ownerKind: record.ownerKind,

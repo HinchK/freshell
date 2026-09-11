@@ -66,6 +66,10 @@ export type RuntimeOwnerRecord = {
   terminalId?: string
   transition: SessionRuntimeOwnerMessage['transition']
   reason?: string
+  /** b8ke R3-5: the record is FENCED (the ownerKind names the fenced
+   *  prior, not a live owner) — every pane holding the sessionRef shows
+   *  the typed recovery state. */
+  fenced?: boolean
   updatedAt: number
 }
 

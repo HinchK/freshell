@@ -984,6 +984,15 @@ pub struct RuntimeOwnerReplay {
     pub generation: u64,
     /// "terminal" | "fresh-agent" | "vacant"
     pub owner_kind: String,
+    /// "live" | "fenced" (b8ke focused round-3 review R3-5): "fenced" marks
+    /// a record whose `owner_kind` names the FENCED PRIOR — not a live
+    /// owner. The client folds a fenced record as the typed recovery state
+    /// (handoff-failed + reason), never as a committed owner.
+    pub state: String,
+    /// The typed fence reason (fenced records only):
+    /// "watcher-failed" | "platform-limited".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_id: Option<String>,
 }
@@ -1807,25 +1816,45 @@ mod tests {
         // kata b8ke reconnect-owner discovery (T1 rec A2): the ready frame
         // replays current runtime-owner state; omit-when-empty keeps legacy
         // frames byte-identical. Matches `Ready`'s real field set.
+        // b8ke focused round-3 R3-5: every replay record carries its state
+        // truth ("live" | "fenced") — a fenced record adds the typed reason.
         let msg = ServerMessage::Ready(Ready {
             timestamp: "2026-09-09T00:00:00Z".into(),
             boot_id: Some("boot-1".into()),
             server_instance_id: Some("inst-1".into()),
             build_id: None,
             capabilities: None,
-            runtime_owners: Some(vec![RuntimeOwnerReplay {
-                provider: "codex".into(),
-                session_id: "01a0828d".into(),
-                epoch: 41,
-                generation: 4,
-                owner_kind: "terminal".into(),
-                terminal_id: Some("t-91".into()),
-            }]),
+            runtime_owners: Some(vec![
+                RuntimeOwnerReplay {
+                    provider: "codex".into(),
+                    session_id: "01a0828d".into(),
+                    epoch: 41,
+                    generation: 4,
+                    owner_kind: "terminal".into(),
+                    state: "live".into(),
+                    reason: None,
+                    terminal_id: Some("t-91".into()),
+                },
+                RuntimeOwnerReplay {
+                    provider: "claude".into(),
+                    session_id: "fenced-1".into(),
+                    epoch: 41,
+                    generation: 7,
+                    owner_kind: "terminal".into(),
+                    state: "fenced".into(),
+                    reason: Some("platform-limited".into()),
+                    terminal_id: None,
+                },
+            ]),
         });
         let json = serde_json::to_string(&msg).expect("serialize");
         assert!(
             json.contains(r#""runtimeOwners":"#),
             "wire field must be camelCase: {json}"
+        );
+        assert!(
+            json.contains(r#""state":"fenced""#) && json.contains(r#""reason":"platform-limited""#),
+            "a fenced replay record carries its typed truth: {json}"
         );
         let back: ServerMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, msg);

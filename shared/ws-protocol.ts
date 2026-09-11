@@ -1098,6 +1098,14 @@ export type ReadyMessage = {
     epoch: number
     generation: number
     ownerKind: 'terminal' | 'fresh-agent' | 'vacant'
+    /** b8ke: 'live' | 'fenced' — a fenced record's ownerKind names the
+     *  FENCED PRIOR (not a live owner); the client folds the typed
+     *  recovery state (handoff-failed + reason), never a committed
+     *  owner. Omitted by pre-R3-5 servers (fold as live). */
+    state?: 'live' | 'fenced'
+    /** The typed fence reason (fenced records only):
+     *  'watcher-failed' | 'platform-limited'. */
+    reason?: string
     terminalId?: string
   }>
 }
@@ -1612,6 +1620,10 @@ export type SessionRuntimeOwnerMessage = {
   transition: 'handoff-started' | 'handoff-committed' | 'handoff-failed' | 'released'
   /** Machine-readable failure reason (handoff-failed frames). */
   reason?: string
+  /** b8ke R3-5: true on the ready-replay fold of a FENCED record (the
+   *  named owner is the fenced prior, not a live owner) — additive and
+   *  never set by broadcast frames. */
+  fenced?: boolean
 }
 
 // -- Extensions --

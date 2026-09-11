@@ -1679,6 +1679,95 @@ async fn handoff_with_a_platform_limited_prior_stop_fences_the_key_typed() {
     assert_eq!(retried["error"]["code"], json!("HANDOFF_IN_PROGRESS"));
 }
 
+/// 3k. b8ke focused round-3 review R3-4: the PlatformLimited fence gains
+/// a typed bounded recovery — an EXPLICIT handoff retry carrying a FRESH
+/// observed fence (the recovery UI's Retry refreshes the pair from the
+/// runtime-owner record) force-clears the fence, recording the limitation
+/// honestly (the direct child DID die — the portable floor; only the
+/// descendant verification is platform-limited), and the retry proceeds.
+/// The DEFAULT path stays fenced: a create is Blocked, and a retry WITHOUT
+/// the observed fence is the typed in-flight refusal.
+#[tokio::test]
+async fn a_fenced_retry_force_clears_a_platform_limited_fence_and_proceeds() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let rig = build_rig_with_options(None, None, None, 8_000, None, true);
+    establish_fresh_claude_owner(&rig, &sid).await;
+
+    // Fence the key PlatformLimited (the 3i shape).
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let result = handle.completion.await.expect("runner completed");
+    assert_eq!(result["error"]["code"], json!("PLATFORM_LIMITED"));
+    let snap = rig.ownership.observe("claude", &sid);
+    assert!(matches!(
+        snap.state,
+        OwnershipState::Fenced {
+            reason: freshell_ownership::FenceReason::PlatformLimited,
+            ..
+        }
+    ));
+
+    // The DEFAULT path stays fenced: a create is Blocked, and a fence-less
+    // retry is the typed in-flight refusal.
+    assert!(
+        matches!(
+            rig.ownership.begin_start(
+                "claude",
+                &sid,
+                RuntimeOwnerKind::FreshAgent,
+                "pl-force-probe-create",
+                None,
+                "test",
+                0,
+            ),
+            BeginOutcome::Blocked { .. }
+        ),
+        "a create during the platform-limited fence must stay Blocked"
+    );
+    let fenceless = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let fenceless_retry = fenceless.completion.await.expect("retry completed");
+    assert_eq!(
+        fenceless_retry["error"]["code"],
+        json!("HANDOFF_IN_PROGRESS"),
+        "a retry without the observed fence must not force-clear: {fenceless_retry}"
+    );
+
+    // THE R3-4 recovery: the explicit retry CARRYING the observed fence
+    // (the pair the fenced record's observers hold) force-clears the fence
+    // and proceeds — the handoff runs to its committed terminal owner.
+    let mut req = handoff_req_terminal("claude", &sid, "claude");
+    req.observed_epoch = Some(snap.epoch);
+    req.observed_generation = Some(snap.generation);
+    let retry = rig.runner.spawn_handoff(req);
+    let retried = retry.completion.await.expect("retry completed");
+    assert_eq!(
+        retried["ok"],
+        json!(true),
+        "the force-cleared retry must proceed: {retried}"
+    );
+    let terminal_id = retried["owner"]["terminalId"].as_str().unwrap().to_string();
+    match rig.ownership.observe("claude", &sid).state {
+        OwnershipState::Live { owner, .. } => {
+            assert_eq!(owner.kind, RuntimeOwnerKind::Terminal);
+            assert_eq!(owner.terminal_id.as_deref(), Some(terminal_id.as_str()));
+        }
+        other => panic!("expected the committed terminal owner, got {other:?}"),
+    }
+    rig.registry.kill(&terminal_id);
+
+    // The limitation was recorded honestly: the force-clear's log names
+    // the platform limitation and the fenced reason.
+    // (The tracing capture is thread-local; the runner runs on its own
+    // task, so the assertion runs against the registry's own test below —
+    // here the behavioral outcome is the proof.)
+}
+
 /// 3j. b8ke focused round-3 review R3-3: the DELAYED platform-limited
 /// shape — a teardown that crosses the handoff's reap budget (the runner
 /// answers REAP_TIMEOUT and detaches the kill) and only LATER resolves
@@ -1697,14 +1786,8 @@ async fn a_delayed_platform_limited_reap_fences_the_key_and_never_releases() {
     // The platform-limited seam + a SHORT reap budget: the parked lane kill
     // crosses the runner's budget (the timeout branch spawns it detached),
     // then the released park answers PlatformLimited.
-    let mut rig = build_rig_with_options(
-        None,
-        Some(Arc::clone(&kill_pause)),
-        None,
-        150,
-        None,
-        true,
-    );
+    let mut rig =
+        build_rig_with_options(None, Some(Arc::clone(&kill_pause)), None, 150, None, true);
     establish_fresh_claude_owner(&rig, &sid).await;
 
     let handle = rig
@@ -1726,23 +1809,24 @@ async fn a_delayed_platform_limited_reap_fences_the_key_and_never_releases() {
     // THE R3-3 regression: the delayed PlatformLimited answer FENCES the
     // key typed — never falls through into the confirmed-death release
     // (which would reopen it and broadcast `released`).
-    await_cond("the delayed platform-limited answer must fence the key", || {
-        matches!(
-            rig.ownership.observe("claude", &sid).state,
-            OwnershipState::Fenced {
-                reason: freshell_ownership::FenceReason::PlatformLimited,
-                ..
-            }
-        )
-    })
+    await_cond(
+        "the delayed platform-limited answer must fence the key",
+        || {
+            matches!(
+                rig.ownership.observe("claude", &sid).state,
+                OwnershipState::Fenced {
+                    reason: freshell_ownership::FenceReason::PlatformLimited,
+                    ..
+                }
+            )
+        },
+    )
     .await;
     // The fence is terminal on this platform: NO corrective `released`
     // frame may follow the fenced `handoff-failed` frame.
     let frames = await_owner_frames(&mut rig.rx, &["handoff-failed"]).await;
     assert!(
-        !frames
-            .iter()
-            .any(|f| f["transition"] == "released"),
+        !frames.iter().any(|f| f["transition"] == "released"),
         "the delayed platform-limited fence must never broadcast released: {frames:?}"
     );
     let _ = runtime_owner_frame(&frames, "handoff-failed");
@@ -2821,10 +2905,8 @@ async fn handoff_abort_holds_the_fence_until_the_uncommitted_target_continuation
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
     let env = FakeSidecarEnv::install();
     // The claude-lane resume gates on transcript presence (the 6b pattern).
-    let store_dir = std::env::temp_dir().join(format!(
-        "freshell-handoff-r36-store-{}",
-        uuid_like_suffix()
-    ));
+    let store_dir =
+        std::env::temp_dir().join(format!("freshell-handoff-r36-store-{}", uuid_like_suffix()));
     let project_dir = store_dir.join("projects").join("slug");
     std::fs::create_dir_all(&project_dir).expect("create transcript project dir");
     let sid = uuid::Uuid::new_v4().to_string();
@@ -3484,20 +3566,16 @@ async fn opencode_handoff_stop_aborts_an_in_flight_rest_driven_turn_before_reapi
 
     // A REST-created freshopencode pane (the POST /api/tabs shape),
     // driven through the REST send-keys surface — never the WS lane.
-    rig.fresh_agent
-        .panes
-        .lock()
-        .expect("panes mutex")
-        .insert(
-            "pane-r31".to_string(),
-            crate::PaneEntry {
-                placeholder_id: "freshopencode-r31".to_string(),
-                cwd: Some("/tmp".to_string()),
-                model: None,
-                effort: None,
-                durable_id: None,
-            },
-        );
+    rig.fresh_agent.panes.lock().expect("panes mutex").insert(
+        "pane-r31".to_string(),
+        crate::PaneEntry {
+            placeholder_id: "freshopencode-r31".to_string(),
+            cwd: Some("/tmp".to_string()),
+            model: None,
+            effort: None,
+            durable_id: None,
+        },
+    );
     let mut headers = axum::http::HeaderMap::new();
     headers.insert("x-auth-token", "handoff-test-token".parse().unwrap());
     // Drive the REST turn with a short budget: the prompt dispatches (the

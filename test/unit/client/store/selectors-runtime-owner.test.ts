@@ -170,6 +170,47 @@ describe('selectPaneOwnerDivergence', () => {
     expect(divergence?.transition).toBe('handoff-started')
     expect(divergence?.terminalId).toBeUndefined()
   })
+
+  // b8ke focused round-3 R3-5: a FENCED record drives the typed recovery
+  // state for EVERY pane kind holding the sessionRef — including the
+  // SAME-kind pane (no live writer exists; the ownerKind names the fenced
+  // prior). Pre-fix, a same-kind pane saw no divergence at all and kept
+  // acting as the committed owner.
+  it('diverges a fenced record for BOTH pane kinds with the typed reason', () => {
+    // A fresh-agent pane whose fenced prior was ALSO fresh-agent (the
+    // same-kind shape a fresh→fresh handoff leaves fenced).
+    const state = stateWithRuntimeOwner({
+      provider: 'claude',
+      sessionId: 'sid-fenced',
+      ownerKind: 'fresh-agent',
+      transition: 'handoff-failed',
+      reason: 'platform-limited',
+      fenced: true,
+      generation: 8,
+    })
+    const sameKind = selectPaneOwnerDivergence(state, {
+      paneKind: 'fresh-agent',
+      provider: 'claude',
+      sessionRef: { provider: 'claude', sessionId: 'sid-fenced' },
+    })
+    expect(sameKind).toMatchObject({
+      ownerKind: 'fresh-agent',
+      transition: 'handoff-failed',
+      generation: 8,
+      fencedReason: 'platform-limited',
+    })
+    // The opposite-kind pane sees the same recovery state.
+    const terminalPane = selectPaneOwnerDivergence(state, {
+      paneKind: 'terminal',
+      provider: 'claude',
+      sessionRef: { provider: 'claude', sessionId: 'sid-fenced' },
+    })
+    expect(terminalPane).toMatchObject({
+      ownerKind: 'fresh-agent',
+      transition: 'handoff-failed',
+      fencedReason: 'platform-limited',
+    })
+  })
 })
 
 describe('selectSessionRuntimeOwner and fence helpers', () => {

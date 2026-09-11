@@ -4495,7 +4495,11 @@ mod tests {
     }
     impl AbortRecordingHttp {
         fn session_of(url: &str, marker: &str) -> Option<String> {
-            url.split(marker).nth(1)?.split(['/', '?']).next().map(str::to_string)
+            url.split(marker)
+                .nth(1)?
+                .split(['/', '?'])
+                .next()
+                .map(str::to_string)
         }
         fn await_prompt(&self, budget: Duration) -> String {
             let deadline = std::time::Instant::now() + budget;
@@ -4520,7 +4524,7 @@ mod tests {
                 dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
                     + Send
                     + 'a,
-            >
+            >,
         > {
             let is_create = matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
                 && (req.url.ends_with("/session") || req.url.contains("/session?"));
@@ -5813,9 +5817,11 @@ mod tests {
         let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
         st.set_ownership(registry.clone());
 
-        st.handle_create(create_msg("req-kill-daemon-abort"), None).await;
+        st.handle_create(create_msg("req-kill-daemon-abort"), None)
+            .await;
         let placeholder = "freshopencode-req-kill-daemon-abort";
-        st.handle_send(send_msg(placeholder, "hold this turn")).await;
+        st.handle_send(send_msg(placeholder, "hold this turn"))
+            .await;
         let session_arc = {
             let sessions = st.sessions.lock().await;
             sessions.get(placeholder).expect("session tracked").clone()

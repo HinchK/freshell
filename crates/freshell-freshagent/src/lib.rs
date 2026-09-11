@@ -964,8 +964,7 @@ pub struct FreshAgentState {
     /// stop / kill / fence-recovery paths consult (a REST pane is not
     /// represented in the WebSocket session map). See
     /// [`RestOpencodeTurn`].
-    pub(crate) rest_opencode_turns:
-        Arc<Mutex<HashMap<String, Arc<RestOpencodeTurn>>>>,
+    pub(crate) rest_opencode_turns: Arc<Mutex<HashMap<String, Arc<RestOpencodeTurn>>>>,
 }
 
 /// What [`terminal_tabs::spawn_terminal_pane`] hands the injected
@@ -1489,9 +1488,7 @@ impl FreshAgentState {
         settled: bool,
     ) {
         if settled {
-            witness
-                .daemon_turn_accepted
-                .store(false, Ordering::SeqCst);
+            witness.daemon_turn_accepted.store(false, Ordering::SeqCst);
             let mut turns = self
                 .rest_opencode_turns
                 .lock()
@@ -5015,10 +5012,7 @@ mod tests {
         // Fixture: the materialization committed the fresh owner.
         match registry.observe(PROVIDER, "ses_1").state {
             freshell_ownership::OwnershipState::Live { owner, .. } => {
-                assert_eq!(
-                    owner.kind,
-                    freshell_ownership::RuntimeOwnerKind::FreshAgent
-                );
+                assert_eq!(owner.kind, freshell_ownership::RuntimeOwnerKind::FreshAgent);
             }
             other => panic!("fixture: expected the committed fresh owner, got {other:?}"),
         }
@@ -5068,12 +5062,9 @@ mod tests {
             StatusCode::CONFLICT,
             "a foreign-owned session must refuse the REST turn dispatch: {second:?}"
         );
-        let body = axum::body::to_bytes(
-            second.into_body(),
-            usize::MAX,
-        )
-        .await
-        .expect("read the refusal body");
+        let body = axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
+            .expect("read the refusal body");
         let body: Value = serde_json::from_slice(&body).expect("the refusal body parses");
         assert_eq!(
             body["message"], "SESSION_RESERVED: another lifecycle operation owns this session",
