@@ -254,6 +254,117 @@ impl Drop for DualRoleCodexFake {
     }
 }
 
+// ── fake `opencode serve` (b8ke delta review F4; the
+//    freshagent_session_lease.rs/session_handoff.rs shape, self-contained
+//    here) — the audit log's distinct pids are the spawn watermark ────────
+
+const FAKE_OPENCODE_SERVE_SOURCE: &str = r#"#!/usr/bin/env node
+const http = require('node:http')
+const fs = require('node:fs')
+function argValue(name) {
+  const i = process.argv.indexOf(name)
+  return i < 0 ? undefined : process.argv[i + 1]
+}
+const hostname = argValue('--hostname') || '127.0.0.1'
+const port = Number(argValue('--port'))
+const audit = process.env.FAKE_OPENCODE_SERVE_AUDIT_LOG || ''
+function log(row) {
+  if (!audit) return
+  try { fs.appendFileSync(audit, JSON.stringify({ pid: process.pid, t: Date.now(), ...row }) + '\n') } catch {}
+}
+const server = http.createServer((req, res) => {
+  const url = new URL(req.url || '/', `http://${hostname}:${port}`)
+  log({ method: req.method, path: url.pathname })
+  if (url.pathname === '/global/health') {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ status: 'ok' }))
+    return
+  }
+  if (url.pathname === '/event' || url.pathname === '/global/event') {
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' })
+    res.write(':ok\n\n')
+    return // held open
+  }
+  const m = url.pathname.match(/^\/session\/([^/]+)$/)
+  if (m && req.method === 'GET') {
+    const id = decodeURIComponent(m[1])
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ id, directory: '/tmp', title: 'fake opencode session' }))
+    return
+  }
+  res.writeHead(404, { 'content-type': 'application/json' })
+  res.end(JSON.stringify({ error: 'not found' }))
+})
+server.listen(port, hostname, () => { log({ event: 'listen', hostname, port }) })
+"#;
+
+struct FakeOpencodeServeEnv {
+    dir: std::path::PathBuf,
+}
+
+impl FakeOpencodeServeEnv {
+    fn install() -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "freshell-cross-kind-opencode-serve-{}",
+            uuid_like_suffix()
+        ));
+        std::fs::create_dir_all(&dir).expect("create fake serve temp dir");
+        let script = dir.join("fake-opencode-serve");
+        std::fs::write(&script, FAKE_OPENCODE_SERVE_SOURCE).expect("write fake serve");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).expect("chmod fake serve");
+        }
+        std::env::set_var("OPENCODE_CMD", &script);
+        std::env::set_var("FAKE_OPENCODE_SERVE_AUDIT_LOG", dir.join("audit.jsonl"));
+        Self { dir }
+    }
+
+    fn audit_rows(&self) -> Vec<Value> {
+        let Ok(raw) = std::fs::read_to_string(self.dir.join("audit.jsonl")) else {
+            return Vec::new();
+        };
+        raw.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<Value>(l).expect("audit row parses"))
+            .collect()
+    }
+
+    /// Every distinct process id the fake serve ever ran under — a spawn
+    /// (or a second spawn) adds a pid.
+    fn serve_pids(&self) -> Vec<u64> {
+        let mut pids: Vec<u64> = self
+            .audit_rows()
+            .into_iter()
+            .filter_map(|r| r["pid"].as_u64())
+            .collect();
+        pids.sort();
+        pids.dedup();
+        pids
+    }
+}
+
+impl Drop for FakeOpencodeServeEnv {
+    fn drop(&mut self) {
+        for pid in self.serve_pids() {
+            #[cfg(unix)]
+            {
+                let _ = std::process::Command::new("kill")
+                    .arg(pid.to_string())
+                    .status();
+            }
+            let _ = pid;
+        }
+        for var in ["OPENCODE_CMD", "FAKE_OPENCODE_SERVE_AUDIT_LOG"] {
+            std::env::remove_var(var);
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// Sleeper CLI spec (duplicated from `tests/common/mod.rs` -- this file needs its own
 /// server builder because the shared one disables `freshAgent.enabled`).
 fn sleeper_cli_spec(name: &str) -> freshell_platform::CliCommandSpec {
@@ -511,11 +622,15 @@ async fn spawn_merged_server_with_hooks(
 
     // The snapshot REST door shares the WS door's state slices (main.rs's
     // `SnapshotState::new` wiring: same auth token, same codex/claude
-    // clones, the opencode slice's inner FreshAgentState).
+    // clones, the opencode slice's inner FreshAgentState — coordinator-
+    // wired exactly like main.rs builds it, so the ownership-refusal arms
+    // are live on this door too).
     let snapshot_state = freshell_freshagent::SnapshotState::new(
         Arc::new(AUTH_TOKEN.to_string()),
         state.fresh_codex.clone(),
-        fresh_agent_state.clone(),
+        fresh_agent_state
+            .clone()
+            .with_ownership(state.ownership.clone().expect("coordinator wired")),
         state.fresh_claude.clone(),
     );
     // kata b8ke Task 6: the handoff runner — the SAME fresh states, registry,
@@ -2128,6 +2243,54 @@ async fn snapshot_get_for_a_vacant_untracked_session_never_spawns() {
         rows.iter().any(|r| r["method"] == "thread/resume"
             && r["threadId"].as_str() == Some(sid.as_str())),
         "the explicit freshAgent.create — not the GET — performed the resume: {rows:?}"
+    );
+}
+
+/// b8ke delta review F4: the opencode twin — a snapshot GET over the real
+/// merged HTTP door NEVER spawns the shared `opencode serve` daemon. A cold
+/// server (no manager, daemon absent) answers 200 with the
+/// empty-from-disk snapshot and the additive owner-state fields, the fake
+/// serve's audit log stays EMPTY (zero processes ever spawned), and the
+/// coordinator is untouched. The daemon starts only via explicit lifecycle
+/// (`freshAgent.create`/`send` materialization).
+#[tokio::test]
+async fn snapshot_get_for_opencode_never_spawns_the_shared_serve() {
+    let _guard = ENV_LOCK.lock().await;
+    let opencode_fake = FakeOpencodeServeEnv::install();
+    let h = spawn_merged_server().await;
+    let sid = format!("ses_snap-opencode-{}", uuid::Uuid::new_v4());
+    let (status, body) = http_get_json(
+        &h.base_url,
+        &format!("/api/fresh-agent/threads/freshopencode/opencode/{sid}"),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a daemon-absent opencode GET answers 200 with the empty-from-disk \
+         snapshot, got {status}: {body}"
+    );
+    assert_eq!(body["sessionType"], "freshopencode", "the facts: {body}");
+    assert_eq!(body["threadId"], sid, "the requested id is echoed: {body}");
+    assert_eq!(body["turns"], Value::Array(vec![]), "empty rows: {body}");
+    assert_eq!(
+        body["extensions"]["opencode"]["ownerKind"], "vacant",
+        "the additive owner-state fields name the vacant key: {body}"
+    );
+    assert!(
+        opencode_fake.serve_pids().is_empty(),
+        "the GET window spawned no opencode serve: {:?}",
+        opencode_fake.serve_pids()
+    );
+    // The coordinator is untouched: still Vacant, no claim recorded.
+    let snap = h
+        .ws_state
+        .fresh_opencode
+        .ownership_snapshot("opencode", &sid);
+    assert_eq!(
+        snap.state,
+        freshell_ownership::OwnershipState::Vacant,
+        "a read-only GET must not create ownership, got {:?}",
+        snap.state
     );
 }
 

@@ -1428,6 +1428,15 @@ impl FreshAgentState {
         *self.opencode.lock().await = Some(manager);
     }
 
+    /// Test-only probe: is the shared serve manager cell populated? (The
+    /// side-effect-free cold-GET tests assert the cell stays empty across a
+    /// GET — the manager is only ever created by the explicit lifecycle
+    /// paths.)
+    #[cfg(test)]
+    pub(crate) async fn opencode_manager_present_for_test(&self) -> bool {
+        self.opencode.lock().await.is_some()
+    }
+
     /// Task 4 test seam: bound the REST resume probe's `get_session` budget
     /// WITHOUT touching the process-global `FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS`
     /// env var — an existing opencode_ws.rs test already sets/removes that var
@@ -1470,9 +1479,20 @@ impl FreshAgentState {
     /// materialized fresh-agent pane's REST/WS surfaces hand the client) -- there is no
     /// placeholder-session snapshot path here (an un-materialized pane has no opencode
     /// session to read yet; the client only calls this endpoint after a `sessionRef`/
-    /// `sessionId` exists). Fetches the session's own info (`GET /session/:id`) and its
-    /// message page (`GET /session/:id/message`) through the ONE shared `opencode serve`
-    /// sidecar via [`Self::ensure_manager`].
+    /// `sessionId` exists).
+    ///
+    /// SIDE-EFFECT-FREE (b8ke delta review F4): the shared `opencode serve`
+    /// is consulted ONLY when it is already running — the manager cell is
+    /// peeked without creating it, and its started-ness read without
+    /// starting it (`base_url` is the read-only `baseUrlOrUndefined`). A
+    /// daemon-absent GET never spawns: the coordinator decides (the codex
+    /// Task-5 contract) — a Live owner answers the typed 409 refusal, a
+    /// lifecycle transition answers the typed 409, and everything else
+    /// serves the EMPTY-FROM-DISK snapshot (the durable rollback record +
+    /// the additive owner-state fields). Cold resume flows only through
+    /// the explicit lifecycle commands (`freshAgent.create`/`attach` with
+    /// `sessionRef`, generation-fenced) — the shared daemon starts only
+    /// there.
     pub async fn get_opencode_snapshot(
         &self,
         thread_id: &str,
@@ -1494,7 +1514,8 @@ impl FreshAgentState {
         // so short-circuit on it directly, reusing [`build_opencode_snapshot_json`] with an
         // empty info/message page -- WITHOUT ever calling [`Self::ensure_manager`]/serve. A
         // `ses_*` (or any other) id serve genuinely doesn't know about still falls through
-        // below and surfaces as a real `OpencodeSnapshotError::NotFound` (404).
+        // to the serve path below and surfaces as a real
+        // `OpencodeSnapshotError::NotFound` (404).
         if thread_id.starts_with(OPENCODE_PLACEHOLDER_PREFIX) {
             return Ok(build_opencode_snapshot_json(
                 thread_id,
@@ -1506,7 +1527,38 @@ impl FreshAgentState {
             ));
         }
 
-        let manager = self.ensure_manager().await;
+        // b8ke delta review F4: the daemon probe — the cell WITHOUT creating
+        // it, the started-ness WITHOUT starting it.
+        let running_manager = self.opencode.lock().await.clone();
+        let manager = match running_manager {
+            Some(manager) if manager.base_url().await.is_some() => manager,
+            _ => {
+                // Daemon absent: NO spawn — the coordinator decides (the
+                // codex Task-5 contract).
+                return match self.ownership_snapshot(PROVIDER, thread_id).state {
+                    freshell_ownership::OwnershipState::Live {
+                        owner, generation, ..
+                    } => {
+                        // An owner this GET cannot serve locally (a terminal,
+                        // or a fresh-agent record whose daemon is gone): the
+                        // read-only typed refusal — never a spawn on top of an
+                        // owner, never an empty snapshot pretending vacancy.
+                        Err(OpencodeSnapshotError::ReservedByOwner {
+                            owner_kind: owner.kind,
+                            generation,
+                        })
+                    }
+                    freshell_ownership::OwnershipState::Handoff { generation, .. }
+                    | freshell_ownership::OwnershipState::Starting { generation, .. }
+                    | freshell_ownership::OwnershipState::Stopping { generation, .. } => {
+                        Err(OpencodeSnapshotError::HandoffInProgress { generation })
+                    }
+                    freshell_ownership::OwnershipState::Vacant => {
+                        Ok(self.opencode_empty_disk_snapshot(thread_id))
+                    }
+                };
+            }
+        };
         let route: freshell_opencode::Route = cwd.map(str::to_string);
 
         let info = match manager.get_session(thread_id, &route).await {
@@ -1536,6 +1588,27 @@ impl FreshAgentState {
             rollback.as_ref(),
         ))
     }
+
+    /// b8ke delta review F4: the side-effect-free EMPTY-FROM-DISK snapshot
+    /// for a daemon-absent GET — the empty info/message page over the
+    /// durable rollback record (the lane's only serve-independent disk
+    /// state), plus the additive owner-state fields under
+    /// `extensions.opencode` (the strict client schema's permissive
+    /// per-provider bag) naming the vacant key with the coordinator's
+    /// epoch/generation — the codex `empty_readonly_snapshot` shape. No
+    /// daemon was consulted; no daemon was created.
+    fn opencode_empty_disk_snapshot(&self, thread_id: &str) -> Value {
+        let ownership = self.ownership_snapshot(PROVIDER, thread_id);
+        let rollback = self
+            .identity_sink()
+            .and_then(|s| s.load_rollback(PROVIDER, thread_id));
+        let mut snapshot =
+            build_opencode_snapshot_json(thread_id, &json!({}), &json!([]), rollback.as_ref());
+        snapshot["extensions"]["opencode"]["ownerKind"] = json!("vacant");
+        snapshot["extensions"]["opencode"]["ownerEpoch"] = json!(ownership.epoch);
+        snapshot["extensions"]["opencode"]["ownerGeneration"] = json!(ownership.generation);
+        snapshot
+    }
 }
 
 /// Why [`FreshAgentState::get_opencode_snapshot`] could not produce a snapshot.
@@ -1545,6 +1618,16 @@ pub enum OpencodeSnapshotError {
     NotFound,
     /// The serve request itself failed (transport, cold-start, etc.).
     Serve(ServeError),
+    /// b8ke delta review F4: the key is owned by a runtime this read-only GET
+    /// cannot serve (daemon absent) — the typed refusal, never a spawn on top
+    /// of an owner.
+    ReservedByOwner {
+        owner_kind: freshell_ownership::RuntimeOwnerKind,
+        generation: u64,
+    },
+    /// b8ke delta review F4: a lifecycle transition (Starting/Handoff/
+    /// Stopping) holds the key — the typed refusal until it settles.
+    HandoffInProgress { generation: u64 },
 }
 
 impl std::fmt::Display for OpencodeSnapshotError {
@@ -1552,6 +1635,13 @@ impl std::fmt::Display for OpencodeSnapshotError {
         match self {
             OpencodeSnapshotError::NotFound => write!(f, "opencode session not found"),
             OpencodeSnapshotError::Serve(err) => write!(f, "{err}"),
+            OpencodeSnapshotError::ReservedByOwner { .. } => {
+                write!(f, "opencode session reserved by a live runtime owner")
+            }
+            OpencodeSnapshotError::HandoffInProgress { .. } => write!(
+                f,
+                "opencode session held by an in-flight lifecycle operation"
+            ),
         }
     }
 }
