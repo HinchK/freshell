@@ -3480,13 +3480,46 @@ async fn a_handoff_on_a_superseded_rekeyed_id_resolves_the_canonical_owner() {
     let canonical = uuid::Uuid::new_v4().to_string();
     let superseded = uuid::Uuid::new_v4().to_string();
     let rig = build_rig(None);
-    establish_fresh_claude_owner(&rig, &canonical).await;
-    let sidecar_pid = env.sidecar_pid_for(&canonical);
+    // The pre-rekey truth: the live owner sits under the OLD durable id
+    // (the superseded name). The kill handle / sidecar pid resolve through
+    // the OLD name.
+    establish_fresh_claude_owner(&rig, &superseded).await;
+    let sidecar_pid = env.sidecar_pid_for(&superseded);
     assert!(sidecar_pid.is_some(), "the live owner's sidecar pid");
 
-    // The rollback's re-key alias: the superseded id points at the canonical.
-    rig.fresh_claude
-        .record_durable_rekey(&superseded, &canonical);
+    // The rollback's re-key in the FULL production sequence: (1) the fork
+    // adoption publishes the re-key bookkeeping at the LANE level (the
+    // preseed publication: cli_index[new] = map key + the session's
+    // cli_session_id = new — the same write adopt_session_init performs
+    // for the supersedes-carrying preseed), then (2) the registry's own
+    // rekey_live performs the atomic old→new coordinator move (the same
+    // step the rollback's Adopt-path commit performs), leaving
+    // Aliased{to: canonical} at the superseded key — the COORDINATOR as
+    // the single source of truth (e2r3 F3). Pre-fix this id pair was a
+    // lane-local HashMap nobody hydrated.
+    // (1) The fork adoption's publication — the REAL lane-level re-key
+    // bookkeeping (cli_index[new] = map key + the session's
+    // cli_session_id = new), driven through the adoption itself exactly
+    // like the rollback's preseed arm.
+    {
+        let map_key = rig
+            .fresh_claude
+            .test_resolve_session_key(&superseded)
+            .await
+            .expect("the live session's map key");
+        rig.fresh_claude
+            .test_adopt_session_init(&canonical, &map_key, "freshclaude", Some(&superseded))
+            .await;
+    }
+    // (2) The registry's own rekey_live performs the atomic old→new
+    // coordinator move (the same step the rollback's Adopt-path commit
+    // performs), leaving Aliased{to: canonical} at the superseded key —
+    // the COORDINATOR as the single source of truth (e2r3 F3).
+    assert!(matches!(
+        rig.ownership
+            .rekey_live("claude", &superseded, &canonical, "test-rekey"),
+        freshell_ownership::CommitOutcome::Committed
+    ));
 
     // THE e2r2 F1 red/green: the handoff on the SUPERSEDED id resolves the
     // canonical key and stops the prior owner.
@@ -3508,10 +3541,11 @@ async fn a_handoff_on_a_superseded_rekeyed_id_resolves_the_canonical_owner() {
         }
         other => panic!("expected the committed terminal owner, got {other:?}"),
     }
-    // The SUPERSEDED key was never the operation's key.
+    // The SUPERSEDED key holds only the Aliased residue (never an
+    // operation key).
     assert!(matches!(
         rig.ownership.observe("claude", &superseded).state,
-        OwnershipState::Vacant
+        OwnershipState::Aliased { .. }
     ));
     // The prior's sidecar is dead (the resolved handoff stopped it).
     if let Some(pid) = sidecar_pid {

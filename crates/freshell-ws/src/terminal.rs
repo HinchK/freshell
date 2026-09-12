@@ -3093,6 +3093,37 @@ pub(crate) async fn handle_create(
                             cancel,
                         ),
                     );
+                    // b8ke focused episode-2 round-3 F4: the terminal
+                    // START's partial runtime registers at CLAIM time — the
+                    // preallocated terminal id is the kind-appropriate
+                    // identity, and the handler performs asynchronous work
+                    // (a managed codex launch with a 45-second budget) long
+                    // before the PTY row exists; a watchdog sweep in that
+                    // window must find armed evidence, never fence on
+                    // nothing. The post-spawn registration below re-arms
+                    // with the real pid (idempotent, fenced to the same
+                    // operation id + generation).
+                    let ticket_ref_for_partial = registration_ticket
+                        .as_ref()
+                        .expect("the ticket is present on the Granted arm");
+                    if let Some(ownership) = state.ownership.as_ref() {
+                        ownership.register_partial_runtime(
+                            &locator.provider,
+                            &locator.session_id,
+                            ticket_ref_for_partial.operation_id(),
+                            ticket_ref_for_partial.generation(),
+                            freshell_ownership::OwnerIdentity {
+                                kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                                terminal_id: terminal_start_tid_slot
+                                    .lock()
+                                    .expect("terminal start tid slot lock")
+                                    .clone(),
+                                live_session_key: None,
+                                pid: None,
+                                ownership_id: None,
+                            },
+                        );
+                    }
                     let ticket = registration_ticket
                         .take()
                         .expect("the ticket is present on the Granted arm");

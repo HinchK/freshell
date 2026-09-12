@@ -699,7 +699,7 @@ impl FreshCodexState {
     /// the map removal) instead gets the lane's own full teardown re-run
     /// — its `Reaped` answer IS the confirmed reap. Never confirms on
     /// less: `false` keeps the fence held (fail-closed).
-    pub(crate) async fn confirm_fenced_prior_dead(&self, session_id: &str) -> bool {
+    pub async fn confirm_fenced_prior_dead(&self, session_id: &str) -> bool {
         // Bind before the `if let`: the guard must never live across the
         // kill-and-confirm await.
         let condemned = self
@@ -5336,6 +5336,12 @@ impl FreshCodexState {
         let ownership = self.ownership_snapshot(PROVIDER, thread_id);
         match ownership.state {
             freshell_ownership::OwnershipState::Vacant => {
+                Err(CodexSnapshotError::UntrackedReadonly)
+            }
+            // An aliased (re-keyed) key has no writer under THIS id — the
+            // canonical record lives under the resolved key; this snapshot
+            // path answers the same untracked-vacant truth.
+            freshell_ownership::OwnershipState::Aliased { .. } => {
                 Err(CodexSnapshotError::UntrackedReadonly)
             }
             freshell_ownership::OwnershipState::Live {

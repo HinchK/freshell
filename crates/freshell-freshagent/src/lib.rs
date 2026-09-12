@@ -2021,6 +2021,12 @@ impl FreshAgentState {
         // "vacant" (the impossible snapshot).
         let ownership = self.ownership_snapshot(PROVIDER, thread_id);
         match ownership.state {
+            // An aliased (re-keyed) key has no writer under THIS id — the
+            // canonical record lives under the resolved key; the snapshot
+            // falls through to the vacant-read-only arm.
+            freshell_ownership::OwnershipState::Aliased { .. } => Ok(
+                self.opencode_empty_disk_snapshot(thread_id, ownership.epoch, ownership.generation)
+            ),
             freshell_ownership::OwnershipState::Live {
                 owner, generation, ..
             } => Err(OpencodeSnapshotError::ReservedByOwner {

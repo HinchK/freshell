@@ -1709,7 +1709,7 @@ impl FreshOpencodeState {
     /// of un-settled daemon-side writer — quiescing it through the shared
     /// registry IS the confirmation. Never confirms on less: `false`
     /// keeps the fence held (fail-closed).
-    pub(crate) async fn confirm_fenced_prior_dead(&self, session_id: &str) -> bool {
+    pub async fn confirm_fenced_prior_dead(&self, session_id: &str) -> bool {
         if self.has_live_session(session_id).await {
             return matches!(
                 self.opencode_kill_for_handoff(session_id, "handoff-watcher-replacement")
