@@ -61,6 +61,18 @@ states), and **Task 9** (e2e proof, trimmed to the diff/exec tests). All
 dropped tasks remain documented below for the record; their acceptance
 criteria are satisfied by main's landed implementations, not by this branch.
 
+**Correction (delta review round 6, Major 3):** the draft code listings in
+Tasks 2 and 3 below are pre-implementation sketches, and their RED steps are
+not literally executable as written — Task 2's Step 1 test references
+`DiffQuery`/`get_diff` before any stub exists (a compile failure, not the
+claimed assertion-level red), and Task 3's listing at :795-796 moves `resp`
+into `body_json(resp)` before `resp.status()` reads it (another compile
+error). The executed reality followed the plan's intent with working
+assertion-level REDs (the receipts in the run's usual-sdd ledger —
+task-002/003 reports and the RED evidence — are the authoritative record, and
+the shipped code's own `#[cfg(test)]` suites are the durable protection).
+Treat the listings as design documents, not runnable steps.
+
 ## Global Constraints
 
 1. **Worktree/git.** Work only in `/home/dan/code/freshell/.worktrees/freshagent-rust-parity` on branch `the-usual/freshagent-rust-parity` (base `db8e09cb67e08a1028ab50b71b99b160a2e7f35f`). Focused conventional commits per task. Never touch the main checkout, other worktrees, or `origin/main`.
