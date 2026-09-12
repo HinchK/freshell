@@ -404,6 +404,15 @@ pub enum FenceReason {
     /// force-clear matches only `PlatformLimited`): a possibly-live start
     /// is never an operator-acknowledged risk.
     StaleStart,
+    /// b8ke e3r2 F2: an over-aged `Stopping` record whose stop operation
+    /// died without `commit_stop`/`abort_stop` (e.g. a panicked kill
+    /// handler between its claim and its commit) — the stale-Stopping
+    /// watchdog fences it TYPED so the key can never strand in `Stopping`
+    /// blocking every claimant until restart. The recorded prior's death
+    /// is UNCONFIRMED (the operation that was killing it vanished), so
+    /// the same force-clear discipline applies as StaleStart: the
+    /// acknowledged operator action or the confirmed-death probe.
+    StaleStop,
 }
 
 impl FenceReason {
@@ -414,6 +423,7 @@ impl FenceReason {
         match self {
             FenceReason::WatcherFailed => "watcher-failed",
             FenceReason::PlatformLimited => "platform-limited",
+            FenceReason::StaleStop => "stale-stop",
             FenceReason::StaleStart => "stale-start",
         }
     }
@@ -603,6 +613,19 @@ pub struct RecoveredStart {
     pub cancellation: Option<Arc<dyn Fn() + Send + Sync>>,
     pub settle: Option<Box<dyn std::future::Future<Output = ()> + Send>>,
     pub partial_runtime: Option<OwnerIdentity>,
+}
+
+/// b8ke e3r2 F2: one over-aged `Stopping` record the stale-Stopping
+/// watchdog fenced — the stop-claim unwind's typed record.
+#[derive(Debug, Clone)]
+pub struct StaleStopping {
+    pub provider: String,
+    pub session_id: String,
+    pub operation_id: String,
+    pub generation: u64,
+    pub prior: Option<(OwnerIdentity, u64)>,
+    pub initiator: String,
+    pub since_ms: u64,
 }
 
 /// One `Fenced{StaleStart}` record for the watchdog's confirmed-death
@@ -1767,7 +1790,10 @@ impl RuntimeOwnershipRegistry {
         }
         match record.state.clone() {
             OwnershipState::Fenced {
-                reason: reason @ (FenceReason::PlatformLimited | FenceReason::StaleStart),
+                reason:
+                    reason @ (FenceReason::PlatformLimited
+                    | FenceReason::StaleStart
+                    | FenceReason::StaleStop),
                 operation_id,
                 prior,
                 since_ms,
@@ -2162,6 +2188,67 @@ impl RuntimeOwnershipRegistry {
         // alias (pre-fix the helper registered against the ALIASED key)
         // or the operation already moved on.
         false
+    }
+
+    /// b8ke e3r2 F2: the stale-Stopping watchdog — the stop-claim unwind
+    /// analogous to the stale-start machinery. An over-aged `Stopping`
+    /// record (whose stop operation died without commit_stop/abort_stop —
+    /// a panicked handler between claim and commit) fences TYPED
+    /// (`StaleStop`) so the key can never strand blocking every claimant
+    /// until restart. The host sweeps this alongside the stale-start
+    /// recovery; the fence releases through the confirmed-death probe or
+    /// the acknowledged operator force-clear (the prior's death is
+    /// UNCONFIRMED — the killing operation vanished mid-flight).
+    pub fn recover_stale_stoppings(&self, now_ms: u64, max_age_ms: u64) -> Vec<StaleStopping> {
+        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut out = Vec::new();
+        for (key, record) in inner.iter_mut() {
+            let snapshot = record.state.clone();
+            if let OwnershipState::Stopping {
+                owner,
+                prior_generation,
+                operation_id,
+                generation,
+                initiator,
+                since_ms,
+            } = snapshot
+            {
+                if now_ms.saturating_sub(since_ms) < max_age_ms {
+                    continue;
+                }
+                let prior = owner
+                    .as_ref()
+                    .map(|owner| (owner.clone(), prior_generation.unwrap_or(generation)));
+                let stale = StaleStopping {
+                    provider: key.provider.clone(),
+                    session_id: key.session_id.clone(),
+                    operation_id: operation_id.clone(),
+                    generation,
+                    prior: prior.clone(),
+                    initiator: initiator.clone(),
+                    since_ms,
+                };
+                record.state = OwnershipState::Fenced {
+                    prior,
+                    reason: FenceReason::StaleStop,
+                    operation_id: operation_id.clone(),
+                    generation,
+                    initiator: initiator.clone(),
+                    since_ms,
+                };
+                tracing::error!(target: "freshell_ownership",
+                    event = "ownership.stop.stale_stopping_fenced",
+                    operation_id = %operation_id, provider = %key.provider,
+                    session_id = %key.session_id,
+                    epoch = self.epoch, generation,
+                    stale_age_ms = now_ms.saturating_sub(since_ms),
+                    outcome = "fenced", failure_reason = "STALE_STOP",
+                    "an over-aged Stopping record whose stop operation vanished — \
+                     the key fences TYPED (never stranded until restart)");
+                out.push(stale);
+            }
+        }
+        out
     }
 
     /// Register the in-flight `Starting` operation's partial-runtime
@@ -3712,6 +3799,103 @@ mod tests {
              operation is NOT pre-concluded"
         );
         let _ = g2;
+    }
+
+    /// b8ke e3r2 F2: the stale-Stopping watchdog — an over-aged Stopping
+    /// record (a stop operation that died without commit/abort) fences
+    /// TYPED (StaleStop) so the key can never strand blocking every
+    /// claimant until restart; the fence is recoverable through the
+    /// acknowledged force-clear (the same discipline as StaleStart).
+    #[test]
+    fn stale_stopping_records_fence_typed_and_recover_via_the_force_clear() {
+        let r = RuntimeOwnershipRegistry::new();
+        // A Live owner, then a stop claim that never commits (the
+        // panicked-kill shape).
+        let BeginOutcome::Granted { generation } = r.begin_start(
+            PROVIDER,
+            "sid-stale-stop",
+            RuntimeOwnerKind::FreshAgent,
+            "op-live",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!()
+        };
+        let owner = OwnerIdentity {
+            kind: RuntimeOwnerKind::FreshAgent,
+            terminal_id: None,
+            live_session_key: Some("map".into()),
+            pid: Some(4321),
+            ownership_id: None,
+        };
+        assert!(matches!(
+            r.commit_live(PROVIDER, "sid-stale-stop", "op-live", generation, owner),
+            CommitOutcome::Committed
+        ));
+        let stop_claim = StopClaim {
+            expected_kind: RuntimeOwnerKind::FreshAgent,
+            expected_runtime: None,
+            observed: ObservedFence {
+                epoch: r.boot_epoch(),
+                generation,
+            },
+        };
+        match r.begin_stop(
+            PROVIDER,
+            "sid-stale-stop",
+            "op-stranded-stop",
+            &stop_claim,
+            "test",
+            0,
+        ) {
+            StopOutcome::Granted { generation: _ } => {}
+            other => panic!("expected the stop claim granted, got {other:?}"),
+        }
+        // In-flight claims are BLOCKED while Stopping (the strand).
+        assert!(matches!(
+            r.begin_start(
+                PROVIDER,
+                "sid-stale-stop",
+                RuntimeOwnerKind::Terminal,
+                "op-blocked",
+                None,
+                "test",
+                1,
+            ),
+            BeginOutcome::Blocked { .. }
+        ));
+
+        // THE WATCHDOG: over-aged → the typed StaleStop fence.
+        let fenced = r.recover_stale_stoppings(10_000, 5_000);
+        assert_eq!(fenced.len(), 1);
+        assert_eq!(fenced[0].operation_id, "op-stranded-stop");
+        assert!(matches!(
+            r.observe(PROVIDER, "sid-stale-stop").state,
+            OwnershipState::Fenced {
+                reason: FenceReason::StaleStop,
+                ..
+            }
+        ));
+        // Still blocked (typed), but now RECOVERABLE: the acknowledged
+        // force-clear accepts StaleStop.
+        let snap = r.observe(PROVIDER, "sid-stale-stop");
+        assert!(matches!(
+            r.force_release_platform_limited(
+                PROVIDER,
+                "sid-stale-stop",
+                ObservedFence {
+                    epoch: snap.epoch,
+                    generation: snap.generation,
+                },
+                "operator",
+            ),
+            ForceReleaseOutcome::Released
+        ));
+        assert!(matches!(
+            r.observe(PROVIDER, "sid-stale-stop").state,
+            OwnershipState::Vacant
+        ));
     }
 
     /// b8ke focused episode-2 round-2 F1: the atomic re-key — a start's

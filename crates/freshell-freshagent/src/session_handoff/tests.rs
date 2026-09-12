@@ -368,6 +368,32 @@ fn sleeper_cli_spec(name: &str) -> freshell_platform::CliCommandSpec {
 /// b8ke e3r1 F4: the rig's recording flavor-writer log.
 type FlavorWriteLog = Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
 
+/// The recording writer (the rig's default): records (provider, session,
+/// flavor) and succeeds.
+struct RecordingFlavorWriter {
+    log: FlavorWriteLog,
+}
+
+impl crate::session_handoff::FlavorWrite for RecordingFlavorWriter {
+    fn write(
+        &self,
+        provider: &str,
+        session_id: &str,
+        flavor: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
+        self.log.lock().expect("flavor log lock").push((
+            provider.to_string(),
+            session_id.to_string(),
+            flavor.to_string(),
+        ));
+        Box::pin(std::future::ready(Ok(())))
+    }
+}
+
+fn build_recording_flavor_writer(log: FlavorWriteLog) -> FlavorWriter {
+    Arc::new(RecordingFlavorWriter { log })
+}
+
 struct Rig {
     runner: Arc<SessionHandoffRunner>,
     ownership: Arc<RuntimeOwnershipRegistry>,
@@ -446,6 +472,33 @@ fn build_rig_with_options(
     claude_confirm_rounds: Option<u8>,
     claude_platform_limited: bool,
 ) -> Rig {
+    build_rig_inner(
+        hooks,
+        kill_pause,
+        resume_pause,
+        reap_timeout_ms,
+        claude_confirm_rounds,
+        claude_platform_limited,
+        None,
+    )
+}
+
+/// b8ke e3r2 F3: a rig with a CUSTOM flavor writer (the failing/blocking
+/// shapes the awaited-in-window contract needs).
+fn build_rig_with_flavor_writer(writer: FlavorWriter) -> Rig {
+    build_rig_inner(None, None, None, 10_000, None, false, Some(writer))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_rig_inner(
+    hooks: Option<Arc<HandoffTestHooks>>,
+    kill_pause: Option<Arc<tokio::sync::Notify>>,
+    resume_pause: Option<Arc<tokio::sync::Notify>>,
+    reap_timeout_ms: u64,
+    claude_confirm_rounds: Option<u8>,
+    claude_platform_limited: bool,
+    flavor_writer_override: Option<FlavorWriter>,
+) -> Rig {
     let auth_token = Arc::new("handoff-test-token".to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let rx = broadcast_tx.subscribe();
@@ -481,18 +534,12 @@ fn build_rig_with_options(
     let mut fresh_opencode = crate::FreshOpencodeState::new(fresh_agent.clone());
     fresh_opencode.set_ownership(Arc::clone(&ownership));
 
-    // b8ke e3r1 F4: the rig wires a RECORDING flavor writer so the
-    // commit-side durable-flavor contract is testable.
+    // b8ke e3r1 F4 + e3r2 F3: the rig wires a RECORDING flavor writer so
+    // the commit-side durable-flavor contract is testable (the awaited
+    // write lands INSIDE the Handoff window, before the owner commit).
     let flavor_log: FlavorWriteLog = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let writer_log = Arc::clone(&flavor_log);
-    let flavor_writer: FlavorWriter =
-        Arc::new(move |provider: &str, session_id: &str, flavor: &str| {
-            writer_log.lock().expect("flavor log lock").push((
-                provider.to_string(),
-                session_id.to_string(),
-                flavor.to_string(),
-            ));
-        });
+    let flavor_writer: FlavorWriter = flavor_writer_override
+        .unwrap_or_else(|| build_recording_flavor_writer(Arc::clone(&flavor_log)));
     let mut runner = SessionHandoffRunner::new(
         auth_token,
         broadcast_tx,
@@ -1718,6 +1765,155 @@ async fn handoff_with_a_platform_limited_prior_stop_fences_the_key_typed() {
         .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
     let retried = retry.completion.await.expect("retry completed");
     assert_eq!(retried["error"]["code"], json!("PLATFORM_LIMITED_FENCED"));
+}
+
+/// b8ke e3r2 F3: a FAILING flavor writer — the failure surfaces as the
+/// TYPED handoff failure (SESSION_METADATA_WRITE_FAILED), never a
+/// log-only success; the spawned target is reaped and the key ends Vacant
+/// (the prior was reaped; a dead runtime is never restored Live).
+struct FailingFlavorWriter;
+
+impl crate::session_handoff::FlavorWrite for FailingFlavorWriter {
+    fn write(
+        &self,
+        _provider: &str,
+        _session_id: &str,
+        _flavor: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
+        Box::pin(std::future::ready(Err(
+            "metadata store write failed (test)".to_string(),
+        )))
+    }
+}
+
+/// b8ke e3r2 F3: a BLOCKING writer — parks inside the write until released
+/// (the generation-order test's window).
+struct BlockingFlavorWriter {
+    log: FlavorWriteLog,
+    release: Arc<tokio::sync::Notify>,
+    reached: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl crate::session_handoff::FlavorWrite for BlockingFlavorWriter {
+    fn write(
+        &self,
+        provider: &str,
+        session_id: &str,
+        flavor: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
+        self.log.lock().expect("flavor log lock").push((
+            provider.to_string(),
+            session_id.to_string(),
+            flavor.to_string(),
+        ));
+        self.reached
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let release = Arc::clone(&self.release);
+        Box::pin(async move {
+            let _ = release.notified().await;
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_flavor_write_failure_surfaces_as_the_typed_handoff_failure() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let rig = build_rig_with_flavor_writer(Arc::new(FailingFlavorWriter));
+    establish_fresh_claude_owner(&rig, &sid).await;
+
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let result = handle.completion.await.expect("runner completed");
+    // THE TYPED FAILURE (never log-only success; the runtime switch is
+    // unwound — the spawned target reaped, the key not left committed).
+    assert_eq!(result["ok"], json!(false), "the failure surfaces: {result}");
+    assert_eq!(
+        result["error"]["code"],
+        json!("SESSION_METADATA_WRITE_FAILED"),
+        "the typed failure code: {result}"
+    );
+    assert_eq!(result["error"]["retryable"], json!(true));
+    // The key ends Vacant (the prior was reaped; the uncommitted target
+    // was reaped — never a dead runtime recorded Live).
+    assert!(matches!(
+        rig.ownership.observe("claude", &sid).state,
+        OwnershipState::Vacant
+    ));
+}
+
+#[tokio::test]
+async fn the_flavor_write_serializes_consecutive_handoffs_in_generation_order() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let log: FlavorWriteLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let rig = build_rig_with_flavor_writer(Arc::new(BlockingFlavorWriter {
+        log: Arc::clone(&log),
+        release: Arc::clone(&release),
+        reached: Arc::clone(&reached),
+    }));
+    establish_fresh_claude_owner(&rig, &sid).await;
+
+    // Handoff A parks INSIDE its awaited flavor write (the record is
+    // still Handoff — the write precedes the owner commit).
+    let handle_a = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !reached.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "handoff A never reached its flavor write"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // Handoff B CANNOT begin while A's write is in flight — the
+    // coordinator's own generation discipline blocks it (pre-e3r2 the
+    // detached post-commit write let B proceed and its flavor could land
+    // before A's).
+    assert_eq!(
+        log.lock().expect("flavor log lock").len(),
+        1,
+        "A's write is recorded (pre-park) and B's has NOT landed"
+    );
+    let handle_b = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    // B answers while A is still parked: the HANDOFF_IN_PROGRESS refusal.
+    let result_b = tokio::time::timeout(std::time::Duration::from_secs(5), handle_b.completion)
+        .await
+        .expect("B answered while A's write is in flight")
+        .expect("B's completion channel survived");
+    assert_eq!(
+        result_b["error"]["code"],
+        json!("HANDOFF_IN_PROGRESS"),
+        "B cannot begin until A's flavor write completes: {result_b}"
+    );
+
+    // Release A: its write completes, its owner commits — and ONLY THEN
+    // could any later handoff begin (its flavor would land after A's; a
+    // detached out-of-generation overwrite is impossible by construction).
+    release.notify_one();
+    let result_a = handle_a.completion.await.expect("A completed");
+    assert_eq!(result_a["ok"], json!(true), "A commits: {result_a}");
+
+    let flavors = log.lock().expect("flavor log lock").clone();
+    assert_eq!(
+        flavors,
+        vec![("claude".to_string(), sid.clone(), "claude".to_string())],
+        "exactly A's flavor write landed — B's was refused before any write \
+         (the generation order holds: no later handoff's write can precede \
+         an in-flight one)"
+    );
 }
 
 /// b8ke e3r1 F4: the handoff COMMIT writes the durable flavor SERVER-SIDE

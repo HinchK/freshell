@@ -889,6 +889,13 @@ async fn main() -> ExitCode {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
+                // b8ke e3r2 F2: the stale-Stopping watchdog — over-aged
+                // Stopping records (a stop operation that died between
+                // claim and commit) fence TYPED alongside the stale-start
+                // sweep, so a key can never strand in Stopping until
+                // restart. The fence releases through the confirmed-death
+                // probe or the acknowledged operator force-clear.
+                let _ = ownership.recover_stale_stoppings(now, 30_000);
                 for rec in ownership.recover_stale_starts(now, 30_000) {
                     recover_stale_start(
                         &ownership,
@@ -1929,35 +1936,57 @@ async fn main() -> ExitCode {
     // every other lane holds (the REST spawn state is the fully-wired
     // `fresh_agent_state` — the terminal-target pipeline needs its registry
     // and CLI-spec wiring; the opencode slice carries the shared serve).
-    // b8ke e3r1 F4: the handoff COMMIT writes the durable flavor itself
-    // (the host's session-metadata store), inside the server's atomic
-    // transition — the client's separate unversioned POST (cross-device
-    // out-of-order overwrites; log-only failure) is gone. The writer
-    // spawns the store's async set; failures log server-side structured.
-    let flavor_store = Arc::new(session_metadata_store.clone());
-    let flavor_writer: freshell_freshagent::session_handoff::FlavorWriter =
-        Arc::new(move |provider: &str, session_id: &str, flavor: &str| {
-            let store = Arc::clone(&flavor_store);
+    // b8ke e3r1 F4 + e3r2 F3: the handoff commit AWAITS the durable flavor
+    // write INSIDE the Handoff window (before the owner commit) through
+    // the host's writer — persistence completes before success returns,
+    // the coordinator's own generation discipline serializes consecutive
+    // handoffs' writes (a detached out-of-generation overwrite is
+    // impossible), and a failure surfaces as the typed
+    // SESSION_METADATA_WRITE_FAILED handoff failure (never log-only). The
+    // writer routes through the metadata API's core (set + the
+    // changed-gated sessions.changed revision broadcast).
+    struct HandoffFlavorWriter {
+        store: session_metadata::SessionMetadataStore,
+        broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+        sessions_revision: Arc<std::sync::atomic::AtomicI64>,
+    }
+    impl freshell_freshagent::session_handoff::FlavorWrite for HandoffFlavorWriter {
+        fn write(
+            &self,
+            provider: &str,
+            session_id: &str,
+            flavor: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+        {
+            let store = self.store.clone();
+            let broadcast_tx = Arc::clone(&self.broadcast_tx);
+            let sessions_revision = Arc::clone(&self.sessions_revision);
             let (provider, session_id, flavor) = (
                 provider.to_string(),
                 session_id.to_string(),
                 flavor.to_string(),
             );
-            tokio::spawn(async move {
-                if let Err(err) = store
-                    .set(&provider, &session_id, &flavor, Some("explicit"))
-                    .await
-                {
-                    tracing::warn!(target: "freshell_server",
-                        provider = %provider, session_id = %session_id, session_type = %flavor,
-                        error = %err,
-                        event = "session_metadata.handoff_commit_write_failed",
-                        "the handoff committed the owner but the durable flavor write \
-                         failed — the flavor remains derivable from the owner state; \
-                         this is a durability gap, not an ownership error"
-                    );
-                }
-            });
+            Box::pin(async move {
+                session_metadata::apply_session_metadata(
+                    &store,
+                    &broadcast_tx,
+                    &sessions_revision,
+                    &provider,
+                    &session_id,
+                    &flavor,
+                    Some("explicit"),
+                )
+                .await
+                .map(|_| ())
+                .map_err(|err| err.to_string())
+            })
+        }
+    }
+    let flavor_writer: freshell_freshagent::session_handoff::FlavorWriter =
+        Arc::new(HandoffFlavorWriter {
+            store: session_metadata_store.clone(),
+            broadcast_tx: Arc::clone(&broadcast_tx),
+            sessions_revision: Arc::clone(&sessions_revision),
         });
     let handoff_runner = Arc::new(
         freshell_freshagent::SessionHandoffRunner::new(

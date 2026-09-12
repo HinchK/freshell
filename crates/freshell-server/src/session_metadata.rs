@@ -336,37 +336,18 @@ async fn post_session_metadata(
         )
             .into_response(),
         Ok((provider, session_id, session_type, session_type_source)) => {
-            match state
-                .store
-                .set(
-                    &provider,
-                    &session_id,
-                    &session_type,
-                    session_type_source.as_deref(),
-                )
-                .await
+            match apply_session_metadata(
+                &state.store,
+                &state.broadcast_tx,
+                &state.sessions_revision,
+                &provider,
+                &session_id,
+                &session_type,
+                session_type_source.as_deref(),
+            )
+            .await
             {
-                Ok(changed) => {
-                    // W5 fix-forward: broadcast `sessions.changed` directly for a
-                    // metadata write that actually changed the persisted `sessionType`
-                    // (mirroring `sessions::patch_session`'s GAP-1 fix). Guarded on
-                    // `changed` -- the store's own no-op comparison (semantic `Map`
-                    // equality, see `SessionMetadataStore::set`'s doc comment) is the
-                    // same gate the periodic session-directory sweep would otherwise
-                    // never trip for a metadata-only change (`IndexedSession` carries
-                    // no `sessionType` field, so the sweep's `(count, max
-                    // lastActivityAt)` signature can't detect this).
-                    if changed {
-                        let revision = state
-                            .sessions_revision
-                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                            + 1;
-                        let frame =
-                            json!({ "type": "sessions.changed", "revision": revision }).to_string();
-                        let _ = state.broadcast_tx.send(frame);
-                    }
-                    Json(json!({ "ok": true, "changed": changed })).into_response()
-                }
+                Ok(changed) => Json(json!({ "ok": true, "changed": changed })).into_response(),
                 Err(err) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({ "error": err.to_string() })),
@@ -375,6 +356,38 @@ async fn post_session_metadata(
             }
         }
     }
+}
+
+/// b8ke e3r2 F3: the metadata write's CORE — `store.set` plus the
+/// changed-gated `sessions.changed` revision broadcast — shared by the
+/// `POST /api/session-metadata` handler and the handoff commit's
+/// server-atomic flavor writer, so the handoff path routes through the
+/// metadata API's exact semantics (the revision broadcast fires).
+pub async fn apply_session_metadata(
+    store: &SessionMetadataStore,
+    broadcast_tx: &tokio::sync::broadcast::Sender<String>,
+    sessions_revision: &std::sync::atomic::AtomicI64,
+    provider: &str,
+    session_id: &str,
+    session_type: &str,
+    session_type_source: Option<&str>,
+) -> std::io::Result<bool> {
+    let changed = store
+        .set(provider, session_id, session_type, session_type_source)
+        .await?;
+    // W5 fix-forward: broadcast `sessions.changed` directly for a
+    // metadata write that actually changed the persisted `sessionType`
+    // (mirroring `sessions::patch_session`'s GAP-1 fix). Guarded on
+    // `changed` -- the store's own no-op comparison (semantic `Map`
+    // equality, see `SessionMetadataStore::set`'s doc comment) is the
+    // same gate the periodic session-directory sweep would otherwise
+    // never trip for a metadata-only change.
+    if changed {
+        let revision = sessions_revision.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let frame = json!({ "type": "sessions.changed", "revision": revision }).to_string();
+        let _ = broadcast_tx.send(frame);
+    }
+    Ok(changed)
 }
 
 /// `SessionMetadataPostSchema.safeParse` (`sessions-router.ts:220-227`). Returns

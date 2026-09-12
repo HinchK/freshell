@@ -150,6 +150,12 @@ pub struct FreshClaudeState {
     /// answer Abandoned with NOTHING persisted).
     #[cfg(test)]
     adoption_commit_pause: Option<std::sync::Arc<AdoptionTestPause>>,
+    /// b8ke e3r2 F2 test seam: park in the KILL path between the stop
+    /// claim and the retained-stamp take — the deterministic
+    /// watcher-race window (the test removes the stamp while parked;
+    /// the released take must be Option-tolerant, never a panic).
+    #[cfg(test)]
+    kill_stop_take_pause: Option<std::sync::Arc<AdoptionTestPause>>,
     /// P1.13 identity-event sink (the pane-ledger bridge,
     /// [`crate::identity_sink`]). Clone-shared + set-once: the state is cloned
     /// into consumer tasks, so the `OnceLock` sits behind an `Arc`. Wired
@@ -711,6 +717,8 @@ impl FreshClaudeState {
             adoption_pause: None,
             #[cfg(test)]
             adoption_commit_pause: None,
+            #[cfg(test)]
+            kill_stop_take_pause: None,
         }
     }
 
@@ -748,6 +756,15 @@ impl FreshClaudeState {
     #[cfg(test)]
     pub fn set_adoption_test_pause(&mut self, pause: Option<std::sync::Arc<AdoptionTestPause>>) {
         self.adoption_pause = pause;
+    }
+
+    /// b8ke e3r2 F2 test seam installer (the kill's take-race park).
+    #[cfg(test)]
+    pub fn set_kill_stop_take_test_pause(
+        &mut self,
+        pause: Option<std::sync::Arc<AdoptionTestPause>>,
+    ) {
+        self.kill_stop_take_pause = pause;
     }
 
     /// b8ke focused episode-2 post-cap F3 test seam installer (the
@@ -2526,14 +2543,35 @@ impl FreshClaudeState {
                 );
                 let refused = match stop_outcome {
                     freshell_ownership::StopOutcome::Granted { generation } => {
-                        taken_stop_stamp = Some((
-                            stop_session_id.clone(),
-                            crate::ownership_lane::take_retained_stamp(
-                                &self.ownership_stamps,
-                                &stop_session_id,
-                            )
-                            .expect("the stamp was peeked moments ago"),
-                        ));
+                        // b8ke e3r2 F2 test seam: the watcher-race park
+                        // (never armed in production).
+                        #[cfg(test)]
+                        if let Some(pause) = &self.kill_stop_take_pause {
+                            pause
+                                .reached
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            let _ = pause.notify.notified().await;
+                        }
+                        // b8ke e3r2 F2: the take is Option-tolerant — a
+                        // concurrent consumer-exit watcher can remove the
+                        // stamp between the begin_stop and the take (its
+                        // registry release no-ops against our Stopping);
+                        // that is an EXPECTED race, never a panic. We hold
+                        // the stop claim; the commit path needs no stamp,
+                        // so the kill proceeds coherently.
+                        taken_stop_stamp = crate::ownership_lane::take_retained_stamp(
+                            &self.ownership_stamps,
+                            &stop_session_id,
+                        )
+                        .map(|st| (stop_session_id.clone(), st));
+                        if taken_stop_stamp.is_none() {
+                            tracing::warn!(target: "freshell_freshagent::claude",
+                                session_id = %stop_session_id,
+                                "fresh_agent_kill_stamp_raced: the exit watcher removed the \
+                                 stamp between the stop claim and the take — the kill proceeds \
+                                 coherently under the held claim (never a panic)"
+                            );
+                        }
                         stop_generation = Some(generation);
                         stop_op_id = Some(kill_op_id);
                         stop_key = Some(stop_session_id);
@@ -2754,9 +2792,111 @@ impl FreshClaudeState {
                             }
                         }
                     }
+                    freshell_ownership::OwnershipState::Handoff { .. } => {
+                        // b8ke e3r1... e3r2 F1: a HANDOFF owns the key's
+                        // transition (its kill_for_handoff consumed the
+                        // stamp while the record stayed Handoff) — a
+                        // concurrent/delayed kill answers the TYPED
+                        // in-flight refusal, NEVER proceeds with the
+                        // durable close + teardown that would race the
+                        // handoff's replacement commit (pre-e3r2 the
+                        // wildcard arm treated Handoff as "residue" and
+                        // proceeded).
+                        tracing::warn!(target: "freshell_freshagent::claude",
+                            session_id = %session_id,
+                            "fresh_agent_kill_refused_no_stamp: a handoff owns this \
+                             session's transition — the kill is refused typed"
+                        );
+                        {
+                            let _index = self.cli_index.lock().await;
+                            let _sessions = self.sessions.lock().await;
+                            let mut gates = self.close_pending.lock().expect("close-pending lock");
+                            if let Some(n) = gates.get_mut(&map_key) {
+                                *n -= 1;
+                                if *n == 0 {
+                                    gates.remove(&map_key);
+                                }
+                            }
+                        }
+                        self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                            provider: PROVIDER.to_string(),
+                            session_id,
+                            session_type: session_type.to_string(),
+                            success: false,
+                            code: Some("HANDOFF_IN_FLIGHT".to_string()),
+                            message: Some(
+                                "a handoff owns this session's transition; retry after it settles"
+                                    .to_string(),
+                            ),
+                        }));
+                        return;
+                    }
+                    freshell_ownership::OwnershipState::Starting { .. }
+                    | freshell_ownership::OwnershipState::Stopping { .. } => {
+                        tracing::warn!(target: "freshell_freshagent::claude",
+                            session_id = %session_id, state = ?snap.state,
+                            "fresh_agent_kill_refused_no_stamp: a lifecycle operation is \
+                             in flight — the kill is refused typed"
+                        );
+                        {
+                            let _index = self.cli_index.lock().await;
+                            let _sessions = self.sessions.lock().await;
+                            let mut gates = self.close_pending.lock().expect("close-pending lock");
+                            if let Some(n) = gates.get_mut(&map_key) {
+                                *n -= 1;
+                                if *n == 0 {
+                                    gates.remove(&map_key);
+                                }
+                            }
+                        }
+                        self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                            provider: PROVIDER.to_string(),
+                            session_id,
+                            session_type: session_type.to_string(),
+                            success: false,
+                            code: Some("LIFECYCLE_IN_FLIGHT".to_string()),
+                            message: Some(
+                                "a lifecycle operation is in flight; retry after it settles"
+                                    .to_string(),
+                            ),
+                        }));
+                        return;
+                    }
+                    freshell_ownership::OwnershipState::Fenced { .. } => {
+                        tracing::warn!(target: "freshell_freshagent::claude",
+                            session_id = %session_id, state = ?snap.state,
+                            "fresh_agent_kill_refused_no_stamp: the key is FENCED — the \
+                             kill is refused typed (the fence owns the transition)"
+                        );
+                        {
+                            let _index = self.cli_index.lock().await;
+                            let _sessions = self.sessions.lock().await;
+                            let mut gates = self.close_pending.lock().expect("close-pending lock");
+                            if let Some(n) = gates.get_mut(&map_key) {
+                                *n -= 1;
+                                if *n == 0 {
+                                    gates.remove(&map_key);
+                                }
+                            }
+                        }
+                        self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                            provider: PROVIDER.to_string(),
+                            session_id,
+                            session_type: session_type.to_string(),
+                            success: false,
+                            code: Some("SESSION_FENCED".to_string()),
+                            message: Some(
+                                "the session is fenced pending recovery; retry with the \
+                                 acknowledged force-clear or after the fence clears"
+                                    .to_string(),
+                            ),
+                        }));
+                        return;
+                    }
                     _ => {
-                        // Vacant (or residue): lane-local cleanup proceeds —
-                        // the coordinator holds nothing to stop.
+                        // Genuinely Vacant (or this-lane rekey residue):
+                        // lane-local cleanup proceeds — the coordinator
+                        // holds nothing to stop.
                     }
                 }
             }
@@ -2772,27 +2912,51 @@ impl FreshClaudeState {
         // still reports `success:false` (the kill visibly fails).
         let close_answer = self.retire_closed_rows(&retire_ids).await;
         if close_answer == crate::identity_sink::CloseAnswer::Failed {
-            // b8ke delta round-3 F1: a GRANTED stop claim must not strand
-            // the coordinator in `Stopping` when the ledger close failed
-            // clean — unwind it (Stopping → Live at the pre-stop
-            // generation) before the abort. The runtime still runs; the
-            // ledger is untouched; the session resumes fully operational.
+            // b8ke delta round-3 F1 + e3r1 F2 + e3r2 F4: the clean-close
+            // failure unwinds the granted claim BY THE RUNTIME'S ACTUAL
+            // LIVENESS — one source of truth (the live session map's child
+            // incarnation):
+            //   • LIVE  → abort_stop (Stopping → Live at the pre-stop
+            //     generation) + restore the consumed stamp, so the session
+            //     resumes fully operational AND the natural-exit watcher
+            //     can still release ownership later.
+            //   • EXITED (e3r2 F4: it died during the awaited close; the
+            //     exit watcher already observed the stamp absent and
+            //     completed) → commit_stop (Vacant): NEVER resurrect a
+            //     dead runtime as Live with no future watcher.
+            let runtime_still_live = {
+                let sessions = self.sessions.lock().await;
+                sessions.get(&map_key).and_then(|sess| sess.child.id())
+            }
+            .map(|pid| !crate::ownership_lane::partial_pid_confirmed_dead(pid))
+            .unwrap_or(false);
             if let (Some(key), Some(op_id), Some(generation)) =
                 (stop_key.clone(), stop_op_id.clone(), stop_generation)
             {
                 if let Some(registry) = self.ownership.as_ref() {
-                    let _ = registry.abort_stop(PROVIDER, &key, &op_id, generation);
+                    if runtime_still_live {
+                        let _ = registry.abort_stop(PROVIDER, &key, &op_id, generation);
+                    } else {
+                        tracing::warn!(target: "freshell_freshagent::claude",
+                            session_id = %session_id,
+                            "fresh_agent_kill_abort_runtime_exited: the runtime exited \
+                             during the awaited close — NOT restored (never a dead \
+                             runtime recorded Live); the key ends Vacant"
+                        );
+                        let _ = registry.commit_stop(PROVIDER, &key, &op_id, generation);
+                    }
                 }
             }
-            // b8ke e3r1 F2: restore the consumed stamp — the abort must
-            // restore what the grant consumed, or the natural-exit watcher
-            // can never release the live owner.
-            if let Some((stamp_key, stamp)) = taken_stop_stamp {
-                crate::ownership_lane::restore_retained_stamp(
-                    &self.ownership_stamps,
-                    &stamp_key,
-                    stamp,
-                );
+            // The stamp restore follows the SAME liveness verdict (only a
+            // live runtime gets its release stamp back).
+            if runtime_still_live {
+                if let Some((stamp_key, stamp)) = taken_stop_stamp {
+                    crate::ownership_lane::restore_retained_stamp(
+                        &self.ownership_stamps,
+                        &stamp_key,
+                        stamp,
+                    );
+                }
             }
             {
                 let _index = self.cli_index.lock().await;
@@ -10610,6 +10774,264 @@ rl.on('line', (line) => {
             ),
             "the natural exit released the restored stamp — the owner is \
              vacated (pre-e3r1: a crash stayed recorded live forever)"
+        );
+    }
+
+    /// b8ke e3r2 F1: a DELAYED kill arriving MID-HANDOFF is refused typed.
+    /// During a handoff, kill_for_handoff consumes the stamp while the
+    /// coordinator stays Handoff — the concurrent kill enters the no-stamp
+    /// fallback, observes the Handoff state, and answers the TYPED
+    /// HANDOFF_IN_FLIGHT refusal: NOTHING durable closes, the session stays
+    /// live, and the handoff completes undisturbed (pre-e3r2 the wildcard
+    /// arm treated Handoff as "residue" and proceeded — racing the
+    /// replacement commit over a closed ledger row).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delayed_kill_mid_handoff_answers_typed_and_does_not_race_the_handoff() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(sink.clone());
+
+        let mut create = dedup_create_msg("req-e3r2-f1");
+        create.model = Some("opus".into());
+        st.handle_create(create, None).await;
+        let created = await_claude_created(&mut rx, "req-e3r2-f1").await;
+        let placeholder = created["sessionId"].as_str().unwrap().to_string();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !sink.was_recorded("claude", FRESH_CREATE_DURABLE_ID) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the create's adoption never recorded the binding"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // THE MID-HANDOFF WINDOW: kill_for_handoff consumed the stamp
+        // while the coordinator record stays Handoff.
+        crate::ownership_lane::take_retained_stamp(&st.ownership_stamps, FRESH_CREATE_DURABLE_ID);
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_handoff(
+            "claude",
+            FRESH_CREATE_DURABLE_ID,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "handoff-in-flight-e3r2",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("expected the Handoff begin to be granted")
+        };
+
+        // THE CONCURRENT KILL: typed refusal, NOTHING durable.
+        st.handle_kill(kill_msg(&placeholder)).await;
+        let frame = await_specific_frame(&mut rx, "freshAgent.killed", &placeholder).await;
+        assert_eq!(frame["success"], json!(false));
+        assert_eq!(
+            frame["code"],
+            json!("HANDOFF_IN_FLIGHT"),
+            "the mid-handoff kill answers the TYPED in-flight refusal: {frame}"
+        );
+        assert!(
+            sink.retires
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, id)| id != FRESH_CREATE_DURABLE_ID),
+            "NOTHING durable closed — the ledger row stays bound"
+        );
+        assert!(
+            st.has_live_session(FRESH_CREATE_DURABLE_ID).await,
+            "the session stays live for the handoff"
+        );
+
+        // THE HANDOFF COMPLETES UNDISTURBED (the coordinator record was
+        // never vacated or stolen by the kill).
+        let terminal_owner = freshell_ownership::OwnerIdentity {
+            kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+            terminal_id: Some("t-replacement-e3r2".into()),
+            live_session_key: None,
+            pid: None,
+            ownership_id: Some("handoff-in-flight-e3r2".into()),
+        };
+        assert!(matches!(
+            registry.commit_live(
+                "claude",
+                FRESH_CREATE_DURABLE_ID,
+                "handoff-in-flight-e3r2",
+                generation,
+                terminal_owner,
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        ));
+    }
+
+    /// b8ke e3r2 F2: the watcher-race take — a concurrent consumer-exit
+    /// watcher removes the retained stamp BETWEEN the stop claim and the
+    /// take. The take is Option-tolerant (pre-e3r2: `.expect` PANICKED and
+    /// the claim stranded in Stopping); the kill proceeds coherently under
+    /// the held claim and commits the stop.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_watcher_race_on_the_stamp_take_never_panics_and_completes_coherently() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(sink.clone());
+
+        let mut create = dedup_create_msg("req-e3r2-f2");
+        create.model = Some("opus".into());
+        st.handle_create(create, None).await;
+        let created = await_claude_created(&mut rx, "req-e3r2-f2").await;
+        let placeholder = created["sessionId"].as_str().unwrap().to_string();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !sink.was_recorded("claude", FRESH_CREATE_DURABLE_ID) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the create's adoption never recorded the binding"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // The race window: park between the stop claim and the take.
+        let pause = std::sync::Arc::new(AdoptionTestPause {
+            notify: tokio::sync::Notify::new(),
+            reached: std::sync::atomic::AtomicBool::new(false),
+        });
+        st.set_kill_stop_take_test_pause(Some(std::sync::Arc::clone(&pause)));
+        let st2 = st.clone();
+        let ph = placeholder.clone();
+        let kill_task = tokio::spawn(async move {
+            st2.handle_kill(kill_msg(&ph)).await;
+        });
+        let park_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !pause.reached.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < park_deadline,
+                "the kill never reached the take-race park"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        st.set_kill_stop_take_test_pause(None);
+
+        // THE WATCHER'S RACE: the stamp vanishes while the kill is parked
+        // (its registry release no-ops against our Stopping).
+        let raced_stamp = crate::ownership_lane::take_retained_stamp(
+            &st.ownership_stamps,
+            FRESH_CREATE_DURABLE_ID,
+        );
+        assert!(raced_stamp.is_some(), "the stamp existed at the park");
+
+        // Release: NO PANIC (the pre-e3r2 expect panicked here); the kill
+        // completes coherently — the stop commits, the key vacates.
+        pause.notify.notify_one();
+        let kill_result = tokio::time::timeout(std::time::Duration::from_secs(15), kill_task).await;
+        match kill_result {
+            Ok(Ok(())) => {}
+            Ok(Err(join_err)) => {
+                panic!("the kill task PANICKED on the raced take (pre-e3r2 shape): {join_err}")
+            }
+            Err(_) => panic!("the kill never completed after the raced take"),
+        }
+        let frame = await_specific_frame(&mut rx, "freshAgent.killed", &placeholder).await;
+        assert_eq!(
+            frame["success"],
+            json!(true),
+            "the kill completed coherently under the held claim: {frame}"
+        );
+        assert!(matches!(
+            registry.observe("claude", FRESH_CREATE_DURABLE_ID).state,
+            freshell_ownership::OwnershipState::Vacant
+        ));
+    }
+
+    /// b8ke e3r2 F4: the runtime exits during the awaited close — the
+    /// failure path does NOT resurrect it. The unwind's liveness verdict
+    /// sees the dead child and ends the key VACANT (never falsely Live
+    /// with no future watcher); the stamp is not restored.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_runtime_exit_during_the_close_failure_is_never_resurrected() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(sink.clone());
+
+        let mut create = dedup_create_msg("req-e3r2-f4");
+        create.model = Some("opus".into());
+        st.handle_create(create, None).await;
+        let created = await_claude_created(&mut rx, "req-e3r2-f4").await;
+        let placeholder = created["sessionId"].as_str().unwrap().to_string();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !sink.was_recorded("claude", FRESH_CREATE_DURABLE_ID) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the create's adoption never recorded the binding"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // THE RUNTIME EXITS (the sidecar's recorded pid is killed outright
+        // — it is dead by the time the kill's unwind verdict runs).
+        let stamp = crate::ownership_lane::peek_retained_stamp(
+            &st.ownership_stamps,
+            FRESH_CREATE_DURABLE_ID,
+        )
+        .expect("the create's stamp");
+        let runtime_pid = stamp.owner.pid.expect("the sidecar pid");
+        let kill_res = tokio::process::Command::new("kill")
+            .arg("-9")
+            .arg(runtime_pid.to_string())
+            .status()
+            .await
+            .expect("kill -9 the sidecar");
+        assert!(kill_res.success(), "the sidecar was killed");
+        // Wait for the consumer's reap (the EOF path reaps its child; the
+        // verdict's recorded-incarnation probe is /proc-based, so the
+        // zombie must be gone before the kill runs — the same ordering
+        // production guarantees: the consumer always reaps its own child).
+        let reap_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !crate::ownership_lane::partial_pid_confirmed_dead(runtime_pid) {
+            assert!(
+                tokio::time::Instant::now() < reap_deadline,
+                "the killed sidecar was never reaped"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // The clean close failure → the unwind's verdict: DEAD → Vacant.
+        sink.fail_retires_for("claude", FRESH_CREATE_DURABLE_ID);
+        st.handle_kill(kill_msg(&placeholder)).await;
+        let frame = await_specific_frame(&mut rx, "freshAgent.killed", &placeholder).await;
+        assert_eq!(
+            frame["code"],
+            json!("DURABLE_CLOSE_FAILED"),
+            "the recoverable close failure answers typed: {frame}"
+        );
+        // NOT resurrected: the key ends VACANT (pre-e3r2: abort_stop
+        // restored a DEAD runtime as Live with no future watcher).
+        assert!(
+            matches!(
+                registry.observe("claude", FRESH_CREATE_DURABLE_ID).state,
+                freshell_ownership::OwnershipState::Vacant
+            ),
+            "the exited runtime ends VACANT — never resurrected as Live"
+        );
+        // And the stamp is not restored (peek absent — or, if the watcher's
+        // race emptied it first, still absent).
+        assert!(
+            crate::ownership_lane::peek_retained_stamp(
+                &st.ownership_stamps,
+                FRESH_CREATE_DURABLE_ID
+            )
+            .is_none(),
+            "no release stamp is restored for a dead runtime"
         );
     }
 

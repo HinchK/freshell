@@ -3627,15 +3627,24 @@ impl FreshCodexState {
                     freshell_ownership::StopOutcome::Granted { generation } => {
                         // Consume the stamp; the commit follows the
                         // confirmed reap below (captured for the abort
-                        // path's restoration — e3r1 F2).
-                        taken_stop_stamp = Some((
-                            session_id.clone(),
-                            crate::ownership_lane::take_retained_stamp(
-                                &self.ownership_stamps,
-                                &session_id,
-                            )
-                            .expect("the stamp was peeked moments ago"),
-                        ));
+                        // path's restoration — e3r1 F2). e3r2 F2: the take
+                        // is Option-tolerant — a concurrent exit watcher
+                        // can remove the stamp between the claim and the
+                        // take; an EXPECTED race, never a panic (we hold
+                        // the claim; the commit needs no stamp).
+                        taken_stop_stamp = crate::ownership_lane::take_retained_stamp(
+                            &self.ownership_stamps,
+                            &session_id,
+                        )
+                        .map(|st| (session_id.clone(), st));
+                        if taken_stop_stamp.is_none() {
+                            tracing::warn!(target: "freshell_freshagent::codex",
+                                session_id = %session_id,
+                                "fresh_agent_kill_stamp_raced: the exit watcher removed the \
+                                 stamp between the stop claim and the take — the kill proceeds \
+                                 coherently under the held claim (never a panic)"
+                            );
+                        }
                         stop_generation = Some(generation);
                         stop_op_id = Some(kill_op_id);
                         None
@@ -3788,9 +3797,72 @@ impl FreshCodexState {
                             }
                         }
                     }
+                    freshell_ownership::OwnershipState::Handoff { .. } => {
+                        // b8ke e3r2 F1: a HANDOFF owns the transition — the
+                        // concurrent/delayed kill answers the TYPED
+                        // in-flight refusal (never the wildcard proceed
+                        // that raced the handoff's replacement commit).
+                        tracing::warn!(target: "freshell_freshagent::codex",
+                            session_id = %session_id,
+                            "fresh_agent_kill_refused_no_stamp: a handoff owns this \
+                             session's transition — the kill is refused typed"
+                        );
+                        self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                            provider: PROVIDER.to_string(),
+                            session_id,
+                            session_type: SESSION_TYPE.to_string(),
+                            success: false,
+                            code: Some("HANDOFF_IN_FLIGHT".to_string()),
+                            message: Some(
+                                "a handoff owns this session's transition; retry after it settles"
+                                    .to_string(),
+                            ),
+                        }));
+                        return;
+                    }
+                    freshell_ownership::OwnershipState::Starting { .. }
+                    | freshell_ownership::OwnershipState::Stopping { .. } => {
+                        tracing::warn!(target: "freshell_freshagent::codex",
+                            session_id = %session_id, state = ?snap.state,
+                            "fresh_agent_kill_refused_no_stamp: a lifecycle operation is \
+                             in flight — the kill is refused typed"
+                        );
+                        self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                            provider: PROVIDER.to_string(),
+                            session_id,
+                            session_type: SESSION_TYPE.to_string(),
+                            success: false,
+                            code: Some("LIFECYCLE_IN_FLIGHT".to_string()),
+                            message: Some(
+                                "a lifecycle operation is in flight; retry after it settles"
+                                    .to_string(),
+                            ),
+                        }));
+                        return;
+                    }
+                    freshell_ownership::OwnershipState::Fenced { .. } => {
+                        tracing::warn!(target: "freshell_freshagent::codex",
+                            session_id = %session_id, state = ?snap.state,
+                            "fresh_agent_kill_refused_no_stamp: the key is FENCED — the \
+                             kill is refused typed"
+                        );
+                        self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                            provider: PROVIDER.to_string(),
+                            session_id,
+                            session_type: SESSION_TYPE.to_string(),
+                            success: false,
+                            code: Some("SESSION_FENCED".to_string()),
+                            message: Some(
+                                "the session is fenced pending recovery; retry with the \
+                                 acknowledged force-clear or after the fence clears"
+                                    .to_string(),
+                            ),
+                        }));
+                        return;
+                    }
                     _ => {
-                        // Vacant (or residue): lane-local cleanup proceeds —
-                        // the coordinator holds nothing to stop.
+                        // Genuinely Vacant (or residue): lane-local cleanup
+                        // proceeds — the coordinator holds nothing to stop.
                     }
                 }
             }
@@ -3809,14 +3881,38 @@ impl FreshCodexState {
                     let _ = registry.abort_stop(PROVIDER, &session_id, &op_id, generation);
                 }
             }
-            // b8ke e3r1 F2: restore the consumed stamp — the abort must
-            // restore what the grant consumed.
+            // b8ke e3r1 F2 + e3r2 F4: restore the consumed stamp — but
+            // ONLY if the runtime is still LIVE. If it exited during the
+            // awaited close, the exit watcher already observed the stamp
+            // absent and completed; restoring would resurrect a DEAD
+            // runtime as Live with no future watcher — it ends Vacant
+            // instead, never falsely Live.
             if let Some((stamp_key, stamp)) = taken_stop_stamp {
-                crate::ownership_lane::restore_retained_stamp(
-                    &self.ownership_stamps,
-                    &stamp_key,
-                    stamp,
-                );
+                let runtime_still_live = stamp
+                    .owner
+                    .pid
+                    .map(|pid| !crate::ownership_lane::partial_pid_confirmed_dead(pid))
+                    .unwrap_or(false);
+                if runtime_still_live {
+                    crate::ownership_lane::restore_retained_stamp(
+                        &self.ownership_stamps,
+                        &stamp_key,
+                        stamp,
+                    );
+                } else {
+                    tracing::warn!(target: "freshell_freshagent::codex",
+                        session_id = %stamp_key,
+                        "fresh_agent_kill_abort_runtime_exited: the runtime exited during \
+                         the awaited close — NOT restored (never a dead runtime recorded \
+                         Live); the key ends Vacant"
+                    );
+                    if let (Some(op_id), Some(generation)) = (stop_op_id.clone(), stop_generation) {
+                        if let Some(registry) = self.ownership.as_ref() {
+                            let _ = registry.abort_stop(PROVIDER, &session_id, &op_id, generation);
+                            let _ = registry.commit_stop(PROVIDER, &session_id, &op_id, generation);
+                        }
+                    }
+                }
             }
             self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
                 provider: PROVIDER.to_string(),

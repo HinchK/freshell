@@ -213,9 +213,24 @@ enum StopOutcomePriv {
 /// The server-wide atomic handoff runner. Minted in `freshell-server::main`
 /// with the SAME fresh states, registry, coordinator, broadcast bus, and CLI
 /// specs every other lane holds.
-/// b8ke e3r1 F4: the host-wired durable flavor writer — (provider,
-/// session_id, flavor), invoked inside the handoff COMMIT.
-pub type FlavorWriter = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
+/// b8ke e3r1 F4 + e3r2 F3: the host-wired durable flavor writer. The
+/// handoff commit AWAITS `write` INSIDE the Handoff window (before the
+/// owner commit) — persistence completes before success returns, and the
+/// next handoff on the same session cannot begin until this write does
+/// (the coordinator's own generation discipline enforces the order), so
+/// a detached out-of-generation write overwriting a newer owner's flavor
+/// is impossible by construction. Failures surface as the typed
+/// SESSION_METADATA_WRITE_FAILED handoff failure.
+pub trait FlavorWrite: Send + Sync {
+    fn write(
+        &self,
+        provider: &str,
+        session_id: &str,
+        flavor: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
+}
+
+pub type FlavorWriter = Arc<dyn FlavorWrite>;
 
 pub struct SessionHandoffRunner {
     auth_token: Arc<String>,
@@ -944,6 +959,80 @@ impl SessionHandoffRunner {
                 // commit, so no abort can land between them).
                 guard.target_runtime = Some(owner.clone());
                 guard.target_spawn_watch = None;
+                // b8ke e3r2 F3: the durable flavor write is AWAITED here —
+                // INSIDE the Handoff window, before the owner commit. The
+                // record is still `Handoff`, so the NEXT handoff on this
+                // session cannot begin until this write completes (the
+                // coordinator's generation discipline enforces the flavor
+                // order); persistence lands before success returns; and a
+                // failure surfaces as the TYPED handoff failure (the
+                // spawned target is reaped + the entry fails, mirroring
+                // the stale-commit unwind — never log-only success).
+                if let Some(writer) = &self.flavor_writer {
+                    let flavor: Option<String> = match owner.kind {
+                        RuntimeOwnerKind::Terminal => req.mode.clone().filter(|m| !m.is_empty()),
+                        RuntimeOwnerKind::FreshAgent => {
+                            req.session_type.clone().filter(|t| !t.is_empty())
+                        }
+                    };
+                    if let Some(flavor) = flavor {
+                        if let Err(err) =
+                            writer.write(&req.provider, &req.session_id, &flavor).await
+                        {
+                            tracing::error!(target: "invariant",
+                                operation_id = %operation_id, provider = %req.provider,
+                                session_id = %req.session_id, flavor = %flavor,
+                                error = %err,
+                                event = "ownership.handoff.flavor_write_failed",
+                                "the durable flavor write failed inside the commit \
+                                 window — the uncommitted target is reaped and the \
+                                 handoff answers the typed failure"
+                            );
+                            self.reap_uncommitted_target(&req, &owner, &operation_id, generation)
+                                .await;
+                            let _ = guard.disarm_and_fail();
+                            self.broadcast_failure_truth(
+                                &req,
+                                &operation_id,
+                                generation,
+                                prior_kind,
+                                "SESSION_METADATA_WRITE_FAILED",
+                            );
+                            let current = self
+                                .ownership
+                                .observe(&req.provider, &req.session_id)
+                                .generation;
+                            self.log_transition(
+                                TransitionLog {
+                                    operation_id: &operation_id,
+                                    provider: &req.provider,
+                                    session_id: &req.session_id,
+                                    initiator: &initiator,
+                                    epoch: self.ownership.boot_epoch(),
+                                    generation,
+                                    live_session_key: owner.live_session_key.as_deref(),
+                                    from_kind: prior_kind,
+                                    to_kind: Some(owner.kind),
+                                    runtime_id: owner.terminal_id.as_deref(),
+                                    pid: owner.pid,
+                                    outcome: "flavor_write_failed_target_reaped",
+                                    duration_ms: began.elapsed().as_millis() as u64,
+                                    failure_reason: Some("SESSION_METADATA_WRITE_FAILED"),
+                                    stale: None,
+                                },
+                                "ownership.handoff.done",
+                                TransitionLevel::Error,
+                            );
+                            return typed_failure(
+                                "SESSION_METADATA_WRITE_FAILED",
+                                "the handoff switched the runtime but could not persist the \
+                                 session's durable flavor; retry the handoff",
+                                true,
+                                current,
+                            );
+                        }
+                    }
+                }
                 // 6. THE single commit Live(targetKind) + broadcast owner
                 // identity.
                 match self.ownership.commit_live(
@@ -973,26 +1062,9 @@ impl SessionHandoffRunner {
                             None,
                             None,
                         );
-                        // b8ke e3r1 F4: the durable flavor write IS part of
-                        // the server's atomic commit — the target's flavor
-                        // recorded under the session the handoff just
-                        // switched (single-server-ordered; cross-device
-                        // out-of-order delivery is impossible by
-                        // construction). The host's writer logs its own
-                        // failure server-side.
-                        if let Some(writer) = &self.flavor_writer {
-                            let flavor: Option<String> = match owner.kind {
-                                RuntimeOwnerKind::Terminal => {
-                                    req.mode.clone().filter(|m| !m.is_empty())
-                                }
-                                RuntimeOwnerKind::FreshAgent => {
-                                    req.session_type.clone().filter(|t| !t.is_empty())
-                                }
-                            };
-                            if let Some(flavor) = flavor {
-                                writer(&req.provider, &req.session_id, &flavor);
-                            }
-                        }
+                        // (The durable flavor write already landed — e3r2
+                        // F3 moved it INSIDE the Handoff window, before
+                        // the owner commit, awaited.)
                         self.log_transition(
                             TransitionLog {
                                 operation_id: &operation_id,
