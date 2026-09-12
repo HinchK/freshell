@@ -19,21 +19,29 @@
 //!   `checkpoints.rs`).
 //! - Diff 500 detail suffix: Node's `git diff failed: <detail>` uses the
 //!   execFile error text (`Command failed: …\n<stderr>`); this port uses
-//!   git's stderr (trimmed), `git diff failed: timed out after 15s` on
-//!   timeout, and `git exited without output` when git fails silently. The
-//!   500 status, the `{error}` envelope, and the `git diff failed: ` prefix
-//!   are pinned.
+//!   git's stderr (trimmed), and `git exited without output` when git fails
+//!   silently. The 500 status, the `{error}` envelope, and the
+//!   `git diff failed: ` prefix are pinned. The permissive branch is shared
+//!   with the timeout path: error/kill WITH captured stdout resolves
+//!   `200 {diff: <captured prefix>}` (Node's `error && !stdout` reject
+//!   guard), so the `git diff failed: timed out after 15s` 500 fires only
+//!   when a timed-out git produced NO stdout.
 //! - Over-cap diffs (>512 KiB): Node's execFile maxBuffer KILLS git at
 //!   ~512 KiB but still resolves 200 with the captured prefix; this port
 //!   drains stdout to EOF (never killing, never deadlocking on a full pipe)
 //!   and clips the buffer to exactly 512 KiB. The response contract
 //!   (200-with-captured-prefix) is identical; only git's process lifetime
 //!   differs.
-//! - Exec JSON-body rejections (malformed JSON, non-JSON content type):
-//!   express's `json()` leaves `req.body` undefined or routes through its
-//!   HTML error page (status parity: 400); axum's `Json` extractor rejects
-//!   BEFORE the handler with its own plain-text 400/415 body. A wrong
-//!   content type is 400 `command is required` from Node vs 415 from axum.
+//! - Over-limit exec bodies: the Node route's 413 is express's non-JSON
+//!   `PayloadTooLargeError` page (the app-wide `express.json({limit:
+//!   '1mb'})`, server/index.ts:191); axum's route-scoped
+//!   `DefaultBodyLimit` rejection is 413 with axum's own plain-text body.
+//!   Status parity only. Auth still wins: an unauthenticated over-limit
+//!   body is 401 (the router-level gate precedes the body limit).
+//! - Malformed exec JSON bodies: express's `json()` parse failure routes
+//!   through its HTML error page; this port returns 400 with the crate's
+//!   `{error}` envelope. Status parity; the oracle body is an HTML page,
+//!   so no `{error}`-shape parity exists to preserve.
 //! - Exec truncation is measured in UTF-8 BYTES (`.len()`/
 //!   `floor_char_boundary`) where Node uses UTF-16 code units
 //!   (`String.length`/`slice`, which can split a surrogate pair). Identical
@@ -44,13 +52,6 @@
 //!   writers), but a command producing output a reader can't saturate only
 //!   resolves at the shared 30 s timeout. The response contract
 //!   (prefix + marker + exitCode 1) is identical; only timing differs.
-//! - Exec stdin is `Stdio::null()` where Node's `execFile` leaves the
-//!   child's stdin an open pipe that nothing ever writes to or ends: a
-//!   stdin-consuming one-liner (e.g. `cat`) gets instant EOF here (exitCode
-//!   0, empty output) vs hanging until the 30 s timeout kill on Node
-//!   (exitCode 1, empty output). Deliberate — no stdin producer exists, so
-//!   hanging is never useful — but it diverges from the oracle on that edge
-//!   (exitCode + timing).
 //! - Exact-cap kill boundary: this port kills the moment a stream's buffer
 //!   REACHES 200 KiB (`drain_exec_stream`, `>=`), while Node kills only when
 //!   consumed bytes EXCEED maxBuffer (`>`). A run producing exactly 200 KiB
@@ -60,8 +61,9 @@
 //!   repaired.
 
 use axum::{
-    extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    body::Bytes,
+    extract::{DefaultBodyLimit, Query, State},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -80,19 +82,35 @@ const DIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const EXEC_MAX_OUTPUT: usize = 200 * 1024;
 
+/// The exec route's JSON-body limit: the app-wide `express.json({limit:
+/// '1mb'})` the Node route parses under (`server/index.ts:191`; `bytes`
+/// '1mb' = 1024²).
+const EXEC_MAX_JSON_BYTES: usize = 1024 * 1024;
+
 #[derive(Clone)]
 pub struct FreshAgentExtrasApiState {
     pub auth_token: Arc<String>,
-    /// Resolved home (the `os.homedir()` analogue,
-    /// `fresh-agent-extras-router.ts:291`): the exec route's cwd fallback
-    /// when the request carries no usable `cwd`.
-    pub home: Arc<PathBuf>,
+    /// The USER's home (`os.homedir()` analogue, `fresh-agent-extras-router.ts:291`):
+    /// the exec route's cwd fallback when the request carries no usable `cwd`.
+    /// Resolved from `session_directory::provider_home()` semantics — HOME set
+    /// and non-empty, else the passwd-entry home — NOT the FRESHELL_HOME-preferring
+    /// storage root. `None` mirrors Node's `os.homedir()` returning undefined
+    /// (the 400 `cwd does not exist: undefined` funnel).
+    pub user_home: Option<Arc<PathBuf>>,
 }
 
 pub fn router(state: FreshAgentExtrasApiState) -> Router {
     Router::new()
         .route("/api/fresh-agent/diff", get(get_diff))
-        .route("/api/fresh-agent/exec", post(post_exec))
+        .route(
+            "/api/fresh-agent/exec",
+            // Route-scoped limit mirroring the app-wide `express.json({limit:
+            // '1mb'})` (server/index.ts:191) — axum's own 2 MiB `Bytes` default
+            // would accept bodies Node rejects. Auth still runs first (the
+            // router-level gate below): an unauthenticated over-limit body is
+            // 401, never 413.
+            post(post_exec).layer(DefaultBodyLimit::max(EXEC_MAX_JSON_BYTES)),
+        )
         // Node-ordering parity (validated C8, axum 0.8.9 + the main.rs
         // router-level layering precedent): a ROUTER-level auth gate
         // short-circuits BEFORE route extractors, so an unauthenticated
@@ -154,15 +172,28 @@ async fn get_diff(
 
 /// `POST /api/fresh-agent/exec` (`fresh-agent-extras-router.ts:289-302`).
 /// Auth FIRST, then `command` validation BEFORE the cwd lookup — the Node
-/// field order, observable when both are invalid.
+/// field order, observable when both are invalid. The body is read as raw
+/// bytes and parsed here (not via axum's `Json` extractor) so the Node
+/// funnels hold: a missing/wrong content type or an empty body leaves the
+/// request unparsed (Node's `req.body` undefined → `Value::Null` here) and
+/// funnels into the `command is required` 400, and a malformed JSON body is
+/// a 400 (express's HTML-page status parity; the recorded body divergence
+/// is documented in the module header).
 async fn post_exec(
     State(state): State<FreshAgentExtrasApiState>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    body: Bytes,
 ) -> Response {
     if !is_authed(&headers, &state.auth_token) {
         return unauthorized();
     }
+    let body = match parse_exec_body(&headers, &body) {
+        Ok(value) => value,
+        // Malformed JSON under a JSON content type — the oracle's pre-handler
+        // 400 (express's HTML-page status parity; the body divergence is
+        // recorded in the module header).
+        Err(MalformedExecBody) => return bad_request("request body is not valid JSON"),
+    };
     // `fresh-agent-extras-router.ts:290-294`: non-string, missing, and
     // empty-after-trim all funnel into the one 400.
     let command = body
@@ -173,14 +204,20 @@ async fn post_exec(
     let Some(command) = command else {
         return bad_request("command is required");
     };
-    // `:291`: a non-string or empty cwd falls back to the home (the
-    // `os.homedir()` analogue) — it is never a 400 by itself.
-    let cwd = body
+    // `:291`: a non-string or empty cwd falls back to the USER's home
+    // (`os.homedir()`), never a 400 by itself — except Node's undefined-home
+    // edge, where `fsp.access(undefined)` rejects through the same 400.
+    let cwd = match body
         .get("cwd")
         .and_then(Value::as_str)
         .filter(|c| !c.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| state.home.to_string_lossy().to_string());
+    {
+        Some(cwd) => cwd.to_string(),
+        None => match &state.user_home {
+            Some(home) => home.to_string_lossy().to_string(),
+            None => return bad_request("cwd does not exist: undefined"),
+        },
+    };
     if !std::path::Path::new(&cwd).exists() {
         return bad_request(&format!("cwd does not exist: {cwd}"));
     }
@@ -196,6 +233,42 @@ async fn post_exec(
         "truncated": result.truncated,
     }))
     .into_response()
+}
+
+/// Node's express `json()` acceptance rule, mirrored: `application/json`, any
+/// `*/*+json` suffix type, or an explicit charset parameter — media type
+/// compared case-insensitively before any `;` parameters. Anything else (or no
+/// content type at all) leaves the request unparsed.
+fn is_json_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            let media = v
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            media == "application/json" || media.ends_with("+json")
+        })
+        .unwrap_or(false)
+}
+
+/// Marker for a JSON-typed body that failed to parse.
+struct MalformedExecBody;
+
+/// The exec body parse (`express.json({limit: '1mb'})` semantics, minus the
+/// limit itself which the route-scoped `DefaultBodyLimit` enforces): a
+/// missing/wrong content type or an empty body leaves the request unparsed
+/// (express's `req.body` undefined/`{}` → `Value::Null`, the same
+/// missing-command funnel), and a JSON parse failure is the oracle's
+/// pre-handler 400.
+fn parse_exec_body(headers: &HeaderMap, body: &[u8]) -> Result<Value, MalformedExecBody> {
+    if !is_json_content_type(headers) || body.is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_slice(body).map_err(|_| MalformedExecBody)
 }
 
 struct ExecOutcome {
@@ -226,7 +299,12 @@ async fn run_command(command: &str, cwd: &str) -> ExecOutcome {
         .arg(command)
         .current_dir(cwd)
         .kill_on_drop(true)
-        .stdin(std::process::Stdio::null())
+        // Node's `execFile` leaves the child's stdin an open pipe that
+        // nothing ever writes to or ends — a stdin-consuming one-liner
+        // (e.g. `cat`) hangs until the 30 s timeout kill (exitCode 1).
+        // The write end is never taken here, so it stays open exactly as
+        // long as the `Child` handle lives (dropped after `wait`).
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn();
@@ -348,14 +426,17 @@ async fn drain_exec_stream(
 
 /// `runGitDiff` (`fresh-agent-extras-router.ts:48-59`): `git diff --no-color
 /// [-- <path>]`, 512 KiB stdout cap, 15 s timeout. The permissive branch is
-/// the contract: error/kill WITH captured stdout resolves with that stdout;
-/// only error-with-empty-stdout rejects (`git diff failed: <detail>`).
+/// the contract — Node rejects only when `error && !stdout`, so error/kill
+/// WITH captured stdout (a timed-out or maxBuffer-killed git that already
+/// emitted its prefix) resolves `200 {diff: <captured prefix>}`, and only
+/// error-with-empty-stdout rejects (`git diff failed: <detail>`). The
+/// timeout path follows the same rule: buffers live OUTSIDE the timed
+/// future so a kill can still read the captured prefix.
 /// Recorded divergence: Node's detail is its execFile error text
 /// (`Command failed: …\n<stderr>`); the port uses git's stderr (trimmed) with
 /// the same `git diff failed: ` prefix. Node's `${stdout}` payload is
 /// verbatim — no trim on the diff text.
 async fn run_git_diff(cwd: &str, file_path: Option<&str>) -> Result<String, String> {
-    use tokio::io::AsyncReadExt;
     let mut cmd = tokio::process::Command::new("git");
     cmd.arg("diff").arg("--no-color");
     if let Some(p) = file_path {
@@ -365,70 +446,84 @@ async fn run_git_diff(cwd: &str, file_path: Option<&str>) -> Result<String, Stri
         .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        // `git diff` never reads stdin (pathspecs come from argv), so
+        // null-vs-Node's-open-pipe is observationally equivalent here;
+        // null avoids holding a dead write end for the child's lifetime.
         .stdin(std::process::Stdio::null());
     let mut child = cmd.spawn().map_err(|e| format!("git diff failed: {e}"))?;
     let mut stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");
-
     // Drain both streams concurrently (a full pipe never blocks the child);
     // stdout capped at DIFF_MAX_BYTES keeping the prefix (the permissive
-    // branch), stderr small-capped for the error message only.
-    let read_out = async {
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 8192];
-        loop {
-            match stdout.read(&mut chunk).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    let room = DIFF_MAX_BYTES.saturating_sub(buf.len());
-                    buf.extend_from_slice(&chunk[..n.min(room)]);
-                }
-                Err(_) => break,
-            }
-        }
-        buf
-    };
-    let read_err = async {
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 4096];
-        loop {
-            match stderr.read(&mut chunk).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    let room = (64 * 1024_usize).saturating_sub(buf.len());
-                    buf.extend_from_slice(&chunk[..n.min(room)]);
-                }
-                Err(_) => break,
-            }
-        }
-        buf
-    };
+    // branch), stderr small-capped for the error message only. The buffers
+    // are shared with the timeout arm so a killed git's captured bytes
+    // survive the cancelled drain futures.
+    let out_buf = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let err_buf = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let drained = tokio::time::timeout(DIFF_TIMEOUT, async {
-        let (out, err) = tokio::join!(read_out, read_err);
-        let status = child.wait().await;
-        (out, err, status)
+        let (status, (), ()) = tokio::join!(
+            child.wait(),
+            drain_diff_stream(&mut stdout, std::sync::Arc::clone(&out_buf), DIFF_MAX_BYTES),
+            drain_diff_stream(&mut stderr, std::sync::Arc::clone(&err_buf), 64 * 1024),
+        );
+        status
     })
     .await;
 
-    let (out, err, status) = match drained {
-        Ok(v) => v,
+    match drained {
+        Ok(status) => {
+            let out = std::mem::take(&mut *out_buf.lock().await);
+            let err = std::mem::take(&mut *err_buf.lock().await);
+            let ok = matches!(status, Ok(s) if s.success());
+            let stdout_text = String::from_utf8_lossy(&out).into_owned();
+            if !ok && stdout_text.is_empty() {
+                let detail = String::from_utf8_lossy(&err).trim().to_string();
+                let detail = if detail.is_empty() {
+                    "git exited without output".to_string()
+                } else {
+                    detail
+                };
+                return Err(format!("git diff failed: {detail}"));
+            }
+            Ok(stdout_text)
+        }
         Err(_) => {
             let _ = child.kill().await;
-            return Err("git diff failed: timed out after 15s".to_string());
+            // The permissive branch on the timeout path: a git that already
+            // emitted stdout resolves 200 with the captured prefix (Node's
+            // `error && !stdout` reject guard); only a silent hang rejects.
+            let out = std::mem::take(&mut *out_buf.lock().await);
+            let stdout_text = String::from_utf8_lossy(&out).into_owned();
+            if stdout_text.is_empty() {
+                Err("git diff failed: timed out after 15s".to_string())
+            } else {
+                Ok(stdout_text)
+            }
         }
-    };
-    let ok = matches!(status, Ok(s) if s.success());
-    let stdout_text = String::from_utf8_lossy(&out).into_owned();
-    if !ok && stdout_text.is_empty() {
-        let detail = String::from_utf8_lossy(&err).trim().to_string();
-        let detail = if detail.is_empty() {
-            "git exited without output".to_string()
-        } else {
-            detail
-        };
-        return Err(format!("git diff failed: {detail}"));
     }
-    Ok(stdout_text)
+}
+
+/// Drains one git stream into `buf`, keeping at most `cap` bytes (the
+/// captured prefix). Never kills: an over-cap stdout clips and keeps
+/// reading to EOF so the 15 s timeout can still fire the permissive branch
+/// on a hung-but-chatty git.
+async fn drain_diff_stream(
+    pipe: &mut (impl tokio::io::AsyncRead + Unpin),
+    buf: std::sync::Arc<tokio::sync::Mutex<Vec<u8>>>,
+    cap: usize,
+) {
+    use tokio::io::AsyncReadExt as _;
+    let mut chunk = [0u8; 8192];
+    loop {
+        match pipe.read(&mut chunk).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                let mut guard = buf.lock().await;
+                let room = cap.saturating_sub(guard.len());
+                guard.extend_from_slice(&chunk[..n.min(room)]);
+            }
+        }
+    }
 }
 
 fn bad_request(message: &str) -> Response {
@@ -453,7 +548,7 @@ mod tests {
     fn state(home: &std::path::Path) -> FreshAgentExtrasApiState {
         FreshAgentExtrasApiState {
             auth_token: Arc::new("tok".to_string()),
-            home: Arc::new(home.to_path_buf()),
+            user_home: Some(Arc::new(home.to_path_buf())),
         }
     }
 
@@ -664,10 +759,90 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// A repo whose `*.txt` diffs run through an external diff driver
+    /// (`gitattributes` + `[diff "<name>"] command`), letting a test script
+    /// control git's stdout timing deterministically: the driver script's
+    /// stdout IS the diff output git streams out, so a driver that emits and
+    /// then sleeps makes git produce a partial prefix and hang.
+    fn git_repo_with_diff_driver(driver_body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let driver = dir.path().join("driver.sh");
+        std::fs::write(&driver, driver_body).unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "diff.slow.command", &driver.to_string_lossy()]);
+        std::fs::write(repo.join(".gitattributes"), "*.txt diff=slow\n").unwrap();
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+        std::fs::write(repo.join("a.txt"), "two\n").unwrap();
+        (dir, repo)
+    }
+
+    // The permissive branch on the timeout path (delta round 6, Major 1):
+    // Node's `runGitDiff` rejects only when `error && !stdout`, so a git
+    // that already streamed a partial diff and then hangs past the 15 s
+    // timeout resolves `200 {diff: <captured prefix>}` — never a 500. The
+    // driver emits one line then sleeps 60 s; the 15 s timeout kills git
+    // with the prefix already captured.
+    #[tokio::test]
+    async fn diff_timeout_with_partial_stdout_resolves_200_with_prefix() {
+        let (_d, repo) =
+            git_repo_with_diff_driver("#!/bin/sh\necho diff-driver-output\nsleep 60\n");
+        let home = tempfile::tempdir().unwrap();
+        let resp = get_diff(
+            State(state(home.path())),
+            headers_with_token("tok"),
+            diff_query(&repo, Some("a.txt")),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let diff = body_json(resp).await["diff"].as_str().unwrap().to_string();
+        assert!(diff.contains("diff-driver-output"), "{diff}");
+    }
+
+    // The reject side of the same branch: a git that hangs WITHOUT any
+    // stdout keeps the oracle's 500 timeout contract.
+    #[tokio::test]
+    async fn diff_timeout_with_empty_stdout_is_a_500() {
+        let (_d, repo) = git_repo_with_diff_driver("#!/bin/sh\nsleep 60\n");
+        let home = tempfile::tempdir().unwrap();
+        let resp = get_diff(
+            State(state(home.path())),
+            headers_with_token("tok"),
+            diff_query(&repo, Some("a.txt")),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body_json(resp).await["error"],
+            json!("git diff failed: timed out after 15s")
+        );
+    }
+
     /* ------------------------- POST /api/fresh-agent/exec ---------------- */
 
     async fn post_exec_authed(home: &std::path::Path, body: Value) -> Response {
-        post_exec(State(state(home)), headers_with_token("tok"), Json(body)).await
+        let mut headers = headers_with_token("tok");
+        headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        post_exec(State(state(home)), headers, Bytes::from(body.to_string())).await
     }
 
     // Oracle `fresh-agent-extras.test.ts:84-94` happy path, made exact:
@@ -743,16 +918,147 @@ mod tests {
         );
     }
 
-    // The cwd default is the state's home (the `os.homedir()` analogue,
-    // oracle :291) — not the server process's cwd.
+    // The cwd default is the USER's home (the `os.homedir()` analogue,
+    // oracle :291 — resolved via `session_directory::provider_home()`
+    // semantics in main.rs's wiring) — not the server process's cwd and not
+    // the FRESHELL_HOME storage root.
     #[tokio::test]
-    async fn exec_defaults_to_the_state_home_cwd() {
+    async fn exec_defaults_to_the_user_home_cwd() {
         let home = tempfile::tempdir().unwrap();
         let resp = post_exec_authed(home.path(), json!({ "command": "pwd" })).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_json(resp).await;
         let expected = std::fs::canonicalize(home.path()).unwrap();
         assert_eq!(v["output"], json!(expected.to_string_lossy()));
+    }
+
+    // Node's undefined-home edge: `os.homedir()` can return undefined, and
+    // the oracle then fails `fsp.access(undefined)` into the same 400
+    // funnel (`fresh-agent-extras-router.ts:291-298`) — verbatim
+    // `cwd does not exist: undefined`.
+    #[tokio::test]
+    async fn exec_without_resolvable_home_is_the_undefined_cwd_400() {
+        let no_home_state = FreshAgentExtrasApiState {
+            auth_token: Arc::new("tok".to_string()),
+            user_home: None,
+        };
+        let mut headers = headers_with_token("tok");
+        headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        let resp = post_exec(
+            State(no_home_state),
+            headers,
+            Bytes::from_static(br#"{"command":"pwd"}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(resp).await["error"],
+            json!("cwd does not exist: undefined")
+        );
+    }
+
+    // Node's express `json()` body-limit funnels (server/index.ts:191,
+    // `limit: '1mb'`): bodies OVER the 1 MiB route-scoped limit are 413,
+    // bodies of EXACTLY the limit are parsed and served. A body between
+    // 1 MiB and axum's old 2 MiB default would previously have been
+    // accepted here while Node rejects it.
+    #[tokio::test]
+    async fn exec_bodies_over_1mib_are_413() {
+        let home = tempfile::tempdir().unwrap();
+        let app = router(state(home.path()));
+        let body = format!(
+            r#"{{"command":"true","padding":"{}"}}"#,
+            "x".repeat(EXEC_MAX_JSON_BYTES)
+        );
+        assert!(body.len() > EXEC_MAX_JSON_BYTES);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/fresh-agent/exec")
+                    .header("x-auth-token", "tok")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn exec_body_of_exactly_1mib_is_accepted() {
+        let home = tempfile::tempdir().unwrap();
+        let app = router(state(home.path()));
+        // Valid JSON followed by trailing spaces (tolerated by both
+        // body-parser and serde_json) padded to EXACTLY the limit.
+        let mut body = r#"{"command":"true"}"#.to_string();
+        body.push_str(&" ".repeat(EXEC_MAX_JSON_BYTES - body.len()));
+        assert_eq!(body.len(), EXEC_MAX_JSON_BYTES);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/fresh-agent/exec")
+                    .header("x-auth-token", "tok")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // The Node wrong-content-type funnel: express's `json()` leaves
+    // `req.body` undefined for a non-JSON content type, so the request
+    // surfaces the missing-command 400 — never a 415.
+    #[tokio::test]
+    async fn exec_wrong_content_type_funnels_to_command_required() {
+        let home = tempfile::tempdir().unwrap();
+        let mut headers = headers_with_token("tok");
+        headers.insert(header::CONTENT_TYPE, "text/plain".parse().unwrap());
+        let resp = post_exec(
+            State(state(home.path())),
+            headers,
+            Bytes::from_static(br#"{"command":"true"}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp).await["error"], json!("command is required"));
+    }
+
+    // An empty JSON-typed body parses as `{}` in express (the missing-command
+    // 400 funnel) — not a parse error.
+    #[tokio::test]
+    async fn exec_empty_json_body_funnels_to_command_required() {
+        let home = tempfile::tempdir().unwrap();
+        let mut headers = headers_with_token("tok");
+        headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        let resp = post_exec(State(state(home.path())), headers, Bytes::new()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp).await["error"], json!("command is required"));
+    }
+
+    // A malformed JSON body under a JSON content type is the oracle's
+    // pre-handler 400 (express routes it through its HTML error page; the
+    // body-shape divergence is recorded in the module header).
+    #[tokio::test]
+    async fn exec_malformed_json_is_a_400() {
+        let home = tempfile::tempdir().unwrap();
+        let mut headers = headers_with_token("tok");
+        headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        let resp = post_exec(
+            State(state(home.path())),
+            headers,
+            Bytes::from_static(b"{not json"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(resp).await["error"],
+            json!("request body is not valid JSON")
+        );
     }
 
     // Oracle :36-43 — a stream crossing the 200 KiB cap kills the child
@@ -800,17 +1106,26 @@ mod tests {
 
     // Exec-specific auth-ordering pin (Task 3 review, Nit 5a): the exec
     // route is registered BEFORE the router-level `.layer(...)`, so the auth
-    // gate short-circuits BEFORE the `Json` extractor — an UNAUTHENTICATED
-    // request the extractor would otherwise reject (wrong content type →
-    // 415, malformed JSON → 400) must be 401, mirroring the Node global
-    // httpAuthMiddleware's run-before-parsers ordering on this same router
-    // instance. With the route registered after the layer, both requests
-    // below would surface the extractor's rejection instead.
+    // gate short-circuits BEFORE the body-limit layer and the manual parse —
+    // an UNAUTHENTICATED request the body handling would otherwise reject
+    // (wrong content type, malformed JSON, an over-1-MiB body) must be 401,
+    // mirroring the Node global httpAuthMiddleware's run-before-parsers
+    // ordering on this same router instance. With the route registered after
+    // the layer, the requests below would surface the body-level rejection
+    // instead.
     #[tokio::test]
     async fn unauthenticated_exec_is_401_before_json_extraction() {
         let home = tempfile::tempdir().unwrap();
         let app = router(state(home.path()));
-        for (content_type, body) in [("text/plain", "{}"), ("application/json", "{not json")] {
+        let over_limit = format!(
+            r#"{{"command":"true","padding":"{}"}}"#,
+            "x".repeat(EXEC_MAX_JSON_BYTES)
+        );
+        for (content_type, body) in [
+            ("text/plain", "{}".to_string()),
+            ("application/json", "{not json".to_string()),
+            ("application/json", over_limit),
+        ] {
             let resp = app
                 .clone()
                 .oneshot(
@@ -826,7 +1141,7 @@ mod tests {
             assert_eq!(
                 resp.status(),
                 StatusCode::UNAUTHORIZED,
-                "content-type {content_type} must be 401 before extractor rejection"
+                "content-type {content_type} must be 401 before body-level rejection"
             );
             assert_eq!(body_json(resp).await["error"], json!("Unauthorized"));
         }

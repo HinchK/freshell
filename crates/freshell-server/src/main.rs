@@ -1607,12 +1607,14 @@ async fn main() -> ExitCode {
 
     // `GET /api/fresh-agent/diff` + `POST /api/fresh-agent/exec`
     // (`fresh-agent-extras-router.ts:289-321`): the transcript diff panel and
-    // the `!command` shell-escape path. `home` is the SAME boot-resolved value
-    // as above (exec's cwd fallback when the request carries no usable cwd --
-    // a `None` home falls back to the cwd-relative `.` likewise).
+    // the `!command` shell-escape path. `user_home` is the USER's home via
+    // `session_directory::provider_home()` (HOME set+non-empty else the
+    // passwd entry — Node's `os.homedir()` for exec's cwd fallback,
+    // `fresh-agent-extras-router.ts:291`) — deliberately NOT the
+    // FRESHELL_HOME-preferring storage `home` above.
     let fresh_agent_extras_state = fresh_agent_extras::FreshAgentExtrasApiState {
         auth_token: Arc::clone(&auth_token),
-        home: Arc::new(home.clone().unwrap_or_else(|| PathBuf::from("."))),
+        user_home: session_directory::provider_home().map(Arc::new),
     };
 
     // SAFE-02: the global authenticated API rate limiter (checklist:
