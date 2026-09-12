@@ -64,7 +64,9 @@ No filtering, turn-dropping, or caption-gating for hidden content remains.
 **D2 — Two expansion-default settings, compact by default, mount-only.** Browser-local keys
 `freshAgent.expandThinking` / `freshAgent.expandTools` (both default `false`), replacing
 `showThinking`/`showTools` everywhere (`shared/settings.ts:97-101` FRESH_AGENT_LOCAL_KEYS,
-`:229-233` LocalSettings type, `:631-645` normalizeLocalPatch, `:920-924` defaults,
+`:229-233` LocalSettings type, `:631-645` the per-key extraction gates in
+`normalizeExtractedLocalSeed` (NOT `normalizeLocalPatch`, which lives at
+`src/store/settingsSlice.ts:45` and is keyless), `:920-924` defaults,
 `:942-956` sanitize pick; `browserPreferencesPersistence.ts:132-138`). Old-key values are
 deliberately NOT mapped (show/hide has no meaning-preserving mapping to expansion);
 stale keys are stripped on read by the existing pick-list machinery and scrubbed from
@@ -167,7 +169,10 @@ patch/sanitize/seed paths, persistence writes).
     seeds resolve; stale show*/fontScale dropped.
   - `test/unit/server/` Rust-parity note: the `legacy_local_seed` oracle lives in Rust (below).
   Run: `npm run test:vitest -- run test/unit/shared/settings.test.ts test/unit/client/store/browserPreferencesPersistence.test.ts test/unit/client/browser-preferences.fresh-agent-settings.test.ts`
-  Expected: the rewritten tests fail (old keys/defaults in code); all other tests in those files pass.
+  Expected: the rewritten tests fail on key-name/defaults mismatches, with two documented
+  by-construction exceptions that pass at RED under both old and new code (the strict
+  server-patch rejection of unknown freshAgent keys; the equal-to-defaults no-write pin) —
+  verified in task R1's review.
 - [ ] **Step 2: Verify the intended failure matches** — failures are key-name/defaults mismatches only.
 - [ ] **Step 3: Implement.** `shared/settings.ts` five sites (D2), `browserPreferencesPersistence.ts:132-138`,
   `crates/freshell-server/src/legacy_local_seed.rs:31` + its byte-exact oracle fixtures/tests
