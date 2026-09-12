@@ -194,6 +194,7 @@ impl OwnershipState {
             | OwnershipState::Handoff { initiator, .. }
             | OwnershipState::Stopping { initiator, .. }
             | OwnershipState::Fenced { initiator, .. } => Some(initiator.clone()),
+            OwnershipState::Aliased { .. } => None,
             _ => None,
         }
     }
@@ -202,7 +203,7 @@ impl OwnershipState {
     /// event fields.
     fn kind(&self) -> Option<RuntimeOwnerKind> {
         match self {
-            OwnershipState::Vacant => None,
+            OwnershipState::Vacant | OwnershipState::Aliased { .. } => None,
             OwnershipState::Starting { kind, .. } => Some(*kind),
             OwnershipState::Live { owner, .. } => Some(owner.kind),
             OwnershipState::Handoff { to_kind, .. } => Some(*to_kind),
@@ -217,7 +218,9 @@ impl OwnershipState {
     /// owning operation (`None` for the settled states Vacant/Live).
     pub fn operation_id(&self) -> Option<&str> {
         match self {
-            OwnershipState::Vacant | OwnershipState::Live { .. } => None,
+            OwnershipState::Vacant
+            | OwnershipState::Live { .. }
+            | OwnershipState::Aliased { .. } => None,
             OwnershipState::Starting { operation_id, .. }
             | OwnershipState::Handoff { operation_id, .. }
             | OwnershipState::Stopping { operation_id, .. }
@@ -230,7 +233,7 @@ impl OwnershipState {
     /// observability contract requires).
     fn since_ms(&self) -> Option<u64> {
         match self {
-            OwnershipState::Vacant => None,
+            OwnershipState::Vacant | OwnershipState::Aliased { .. } => None,
             OwnershipState::Live { since_ms, .. }
             | OwnershipState::Starting { since_ms, .. }
             | OwnershipState::Handoff { since_ms, .. }
@@ -356,6 +359,22 @@ pub enum OwnershipState {
         generation: u64,
         initiator: String,
         since_ms: u64,
+    },
+    /// b8ke focused episode-2 round-3 F1/F3: this key's session was
+    /// RE-KEYED — ownership moved to the client-visible new durable id
+    /// ([`RuntimeOwnershipRegistry::commit_live_rekey`] /
+    /// [`RuntimeOwnershipRegistry::rekey_live`]). The coordinator itself
+    /// is the single source of truth for old→new resolution: a stale wire
+    /// id landing here resolves to the canonical key through
+    /// [`RuntimeOwnershipRegistry::resolve_canonical`] (walked to the
+    /// fixpoint — never a bounded-link cap), and the record replays as
+    /// VACANT to clients (the old key holds no writer; stale divergence
+    /// clears). The lane-side process-local alias maps are NOT
+    /// load-bearing: every lifecycle path resolves through the registry.
+    Aliased {
+        to: String,
+        /// The rekey's own generation (preserved for fence arithmetic).
+        generation: u64,
     },
 }
 
@@ -596,8 +615,13 @@ pub struct StaleStartFence {
     pub operation_id: String,
     pub generation: u64,
     /// The fenced prior's recorded pid — the probe's target. `None` (no
-    /// recorded runtime identity) can never confirm: the fence holds.
+    /// recorded runtime identity) resolves through the kind-aware
+    /// liveness check instead.
     pub prior_pid: Option<u32>,
+    /// b8ke focused episode-2 round-3 F8: the fencing initiator + the
+    /// fenced prior's kind — the release record's schema fields.
+    pub initiator: String,
+    pub prior_kind: Option<RuntimeOwnerKind>,
 }
 
 /// One replayed owner record for the `ready.runtimeOwners` handshake field
@@ -871,6 +895,23 @@ impl RuntimeOwnershipRegistry {
         }
         let record = inner.entry(key).or_default();
         match record.state.clone() {
+            // b8ke focused episode-2 round-3 F3: a superseded (re-keyed)
+            // id is NEVER directly claimable — the caller resolves to the
+            // canonical key first (`resolve_canonical`); a direct begin
+            // under the old id would fork ownership beside the live
+            // re-keyed runtime. Typed Blocked so the caller learns to
+            // resolve.
+            OwnershipState::Aliased { to, generation } => {
+                tracing::warn!(target: "freshell_ownership",
+                    event = "ownership.begin.on_aliased_key",
+                    operation_id, provider, session_id,
+                    aliased_to = %to, epoch = self.epoch, generation,
+                    outcome = "refused", failure_reason = "REKEYED_ALIAS_KEY");
+                BeginOutcome::Blocked {
+                    state: OwnershipState::Aliased { to, generation },
+                    retry_after_ms: OWNERSHIP_RETRY_AFTER_MS,
+                }
+            }
             OwnershipState::Vacant => {
                 // Every entry into `Starting` goes through this arm, so
                 // resetting the registration fields here is the single
@@ -967,6 +1008,19 @@ impl RuntimeOwnershipRegistry {
         }
         let record = inner.entry(key).or_default();
         match record.state.clone() {
+            // b8ke focused episode-2 round-3 F3: as begin_start — a
+            // superseded id refuses typed; resolve to the canonical key.
+            OwnershipState::Aliased { to, generation } => {
+                tracing::warn!(target: "freshell_ownership",
+                    event = "ownership.handoff.on_aliased_key",
+                    operation_id, provider, session_id,
+                    aliased_to = %to, epoch = self.epoch, generation,
+                    outcome = "refused", failure_reason = "REKEYED_ALIAS_KEY");
+                BeginOutcome::Blocked {
+                    state: OwnershipState::Aliased { to, generation },
+                    retry_after_ms: OWNERSHIP_RETRY_AFTER_MS,
+                }
+            }
             OwnershipState::Vacant => {
                 record.generation += 1;
                 record.state = OwnershipState::Handoff {
@@ -1111,6 +1165,7 @@ impl RuntimeOwnershipRegistry {
         // Validation pass (immutable reads — the mutation below cannot
         // interleave with any of these checks).
         let initiator;
+        let since_ms;
         {
             let Some(record) = inner.get(&old_key) else {
                 return CommitOutcome::ForeignOperation;
@@ -1127,6 +1182,7 @@ impl RuntimeOwnershipRegistry {
                 };
             }
             initiator = record.state.initiator().unwrap_or_default();
+            since_ms = record.state.since_ms();
             match &record.state {
                 OwnershipState::Starting {
                     operation_id: op, ..
@@ -1151,8 +1207,9 @@ impl RuntimeOwnershipRegistry {
         if owner.ownership_id.is_none() {
             owner.ownership_id = Some(operation_id.to_string());
         }
-        // THE MOVE (still one lock scope): old key → Vacant (clears stale
-        // divergence), new key → Live{owner} at the same generation.
+        // THE MOVE (still one lock scope): old key → Aliased{to: new} (the
+        // coordinator's own old→new resolution record), new key →
+        // Live{owner} at the same generation.
         let new_key = SessionKey::new(provider, new_session_id);
         let new_record = SessionRecord {
             generation,
@@ -1163,20 +1220,126 @@ impl RuntimeOwnershipRegistry {
             },
             ..SessionRecord::default()
         };
+        let duration_ms = since_ms
+            .map(|start| now_epoch_ms().saturating_sub(start))
+            .unwrap_or(0);
         if let Some(record) = inner.get_mut(&old_key) {
-            record.state = OwnershipState::Vacant;
+            record.state = OwnershipState::Aliased {
+                to: new_session_id.to_string(),
+                generation,
+            };
         }
         inner.insert(new_key, new_record);
         tracing::info!(target: "freshell_ownership",
             event = "ownership.live.commit_rekey", operation_id, provider,
             old_session_id, new_session_id,
-            initiator, to_kind = ?owner.kind,
+            initiator, from_kind = ?owner.kind,
+            to_kind = ?owner.kind,
             runtime_id = ?owner.terminal_id,
             live_session_key = ?owner.live_session_key, pid = ?owner.pid,
-            epoch = self.epoch, generation, outcome = "rekeyed_committed",
+            epoch = self.epoch, generation, duration_ms,
+            outcome = "rekeyed_committed",
             "the start's record moved to the client-visible durable id in one \
-             atomic step — the old key is Vacant, the new key is Live");
+             atomic step — the old key is Aliased, the new key is Live");
         CommitOutcome::Committed
+    }
+
+    /// b8ke focused episode-2 round-3 F1: re-key an ALREADY-LIVE record —
+    /// the normal Claude rollback shape whose lane claim observes the
+    /// existing `Live{FreshAgent}` owner and answers Adopt with NO ticket.
+    /// The coordinator record (and its writer identity) moves old→new in
+    /// ONE atomic registry step: never both-Live, never both-Vacant; the
+    /// old key becomes `Aliased{to: new}` (the registry's own resolution
+    /// record). A record already present under the NEW key refuses typed —
+    /// never an overwrite. Full transition schema (finding 8): from_kind,
+    /// to_kind, runtime id/pid, duration.
+    pub fn rekey_live(
+        &self,
+        provider: &str,
+        old_session_id: &str,
+        new_session_id: &str,
+        initiator: &str,
+    ) -> CommitOutcome {
+        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let old_key = SessionKey::new(provider, old_session_id);
+        let (owner, generation, since_ms) = {
+            let Some(record) = inner.get(&old_key) else {
+                return CommitOutcome::ForeignOperation;
+            };
+            match record.state.clone() {
+                OwnershipState::Live {
+                    owner,
+                    generation,
+                    since_ms,
+                } => (owner, generation, since_ms),
+                _ => return CommitOutcome::ForeignOperation,
+            }
+        };
+        if inner.contains_key(&SessionKey::new(provider, new_session_id)) {
+            tracing::error!(target: "invariant",
+                event = "ownership.rekey_live.target_occupied",
+                provider, old_session_id, new_session_id,
+                epoch = self.epoch, generation,
+                outcome = "refused", failure_reason = "FOREIGN_TARGET_KEY");
+            return CommitOutcome::ForeignOperation;
+        }
+        let duration_ms = now_epoch_ms().saturating_sub(since_ms);
+        if let Some(record) = inner.get_mut(&old_key) {
+            record.state = OwnershipState::Aliased {
+                to: new_session_id.to_string(),
+                generation,
+            };
+        }
+        let new_key = SessionKey::new(provider, new_session_id);
+        let new_record = SessionRecord {
+            generation,
+            state: OwnershipState::Live {
+                owner: owner.clone(),
+                generation,
+                since_ms: now_epoch_ms(),
+            },
+            ..SessionRecord::default()
+        };
+        inner.insert(new_key, new_record);
+        tracing::info!(target: "freshell_ownership",
+            event = "ownership.live.rekey_live", provider,
+            old_session_id, new_session_id, initiator,
+            from_kind = ?owner.kind, to_kind = ?owner.kind,
+            runtime_id = ?owner.terminal_id,
+            live_session_key = ?owner.live_session_key, pid = ?owner.pid,
+            epoch = self.epoch, generation, duration_ms,
+            outcome = "rekeyed_committed",
+            "the LIVE record moved to the client-visible durable id in one \
+             atomic step — the old key is Aliased, the new key is Live");
+        CommitOutcome::Committed
+    }
+
+    /// b8ke focused episode-2 round-3 F3: resolve a wire session id to its
+    /// CANONICAL coordinator key — the id itself, unless its record is
+    /// `Aliased` (the durable re-key residue the coordinator itself
+    /// owns). Walked to the FIXPOINT — never a bounded link cap — with a
+    /// visited guard so a corrupt cycle terminates at the first repeat.
+    pub fn resolve_canonical(&self, provider: &str, session_id: &str) -> String {
+        let inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut current = session_id.to_string();
+        let mut visited = std::collections::HashSet::new();
+        loop {
+            if !visited.insert(current.clone()) {
+                break;
+            }
+            let aliased_to = match inner.get(&SessionKey::new(provider, &current)) {
+                Some(record) => match &record.state {
+                    OwnershipState::Aliased { to, .. } => Some(to.clone()),
+                    _ => None,
+                },
+                None => None,
+            };
+            match aliased_to {
+                Some(next) => current = next,
+                None => break,
+            }
+        }
+        current
     }
 
     /// Fail an in-flight operation: `Starting` → Vacant; `Handoff` → restore
@@ -1437,12 +1600,16 @@ impl RuntimeOwnershipRegistry {
                 ..
             } if op == operation_id => {
                 let duration_ms = now_epoch_ms().saturating_sub(since_ms);
+                // F8: capture the fencing initiator BEFORE the record clears.
+                let fencing_initiator = record.state.initiator();
                 record.state = OwnershipState::Vacant;
                 tracing::info!(target: "freshell_ownership",
                     event = "ownership.fenced.released", operation_id, provider, session_id,
                     from_kind = ?prior.as_ref().map(|(o, _)| o.kind),
+                    to_kind = ?prior.as_ref().map(|(o, _)| o.kind),
                     runtime_id = ?prior.as_ref().and_then(|(o, _)| o.terminal_id.clone()),
                     pid = ?prior.as_ref().and_then(|(o, _)| o.pid),
+                    initiator = ?fencing_initiator,
                     epoch = self.epoch, generation, duration_ms,
                     fence_reason = ?reason, outcome = "released_on_confirmed_death");
                 CommitOutcome::Committed
@@ -1473,6 +1640,7 @@ impl RuntimeOwnershipRegistry {
                 reason: FenceReason::StaleStart,
                 operation_id,
                 generation,
+                initiator,
                 ..
             } = &record.state
             {
@@ -1482,6 +1650,8 @@ impl RuntimeOwnershipRegistry {
                     operation_id: operation_id.clone(),
                     generation: *generation,
                     prior_pid: prior.as_ref().and_then(|(owner, _)| owner.pid),
+                    initiator: initiator.clone(),
+                    prior_kind: prior.as_ref().map(|(owner, _)| owner.kind),
                 });
             }
         }
@@ -1529,30 +1699,42 @@ impl RuntimeOwnershipRegistry {
         }
         match record.state.clone() {
             OwnershipState::Fenced {
-                reason: FenceReason::PlatformLimited,
+                reason: reason @ (FenceReason::PlatformLimited | FenceReason::StaleStart),
                 operation_id,
                 prior,
                 since_ms,
                 ..
             } => {
+                // b8ke focused episode-2 round-3 F7: the acknowledged
+                // operator force-clear accepts BOTH fence reasons. A
+                // PID-less StaleStart fence is a SUPPORTED production
+                // shape (the opencode lane registers no per-session pid
+                // and no settle/cancellation future) — without this
+                // recovery path those fences were permanent and every
+                // retryable lifecycle op on the session blocked until a
+                // server restart. The operator's acknowledged risk is
+                // documented identically: the recorded runtime identity
+                // could not be CONFIRMED dead (no pid to probe / the
+                // recorded tree unreadable on this platform), so
+                // surviving processes are the operator's acknowledged
+                // risk — never a silent licensing.
                 let duration_ms = now_epoch_ms().saturating_sub(since_ms);
                 record.state = OwnershipState::Vacant;
                 tracing::warn!(target: "freshell_ownership",
-                    event = "ownership.fenced.force_released_platform_limited",
+                    event = "ownership.fenced.force_released_unconfirmable",
                     provider, session_id, initiator,
                     fenced_operation_id = %operation_id,
                     from_kind = ?prior.as_ref().map(|(o, _)| o.kind),
                     runtime_id = ?prior.as_ref().and_then(|(o, _)| o.terminal_id.clone()),
                     pid = ?prior.as_ref().and_then(|(o, _)| o.pid),
                     epoch = self.epoch, generation = record.generation, duration_ms,
-                    fence_reason = "platform-limited",
-                    confirmed = "direct-child-exit",
-                    unverified = "descendant-tree",
+                    fence_reason = ?reason,
                     outcome = "force_released_on_operator_action",
-                    "an explicit operator retry cleared a PlatformLimited fence: the direct \
-                     child's awaited exit was confirmed; the DESCENDANT tree is UNVERIFIED \
-                     (the platform cannot read it) — recorded honestly, never as a confirmed \
-                     reap");
+                    "an explicit acknowledged operator force-clear released an \
+                     UNCONFIRMABLE fence (PlatformLimited or PID-less StaleStart): the \
+                     recorded runtime identity could not be confirmed dead — surviving \
+                     processes are the operator's acknowledged risk, recorded honestly, \
+                     never a confirmed reap");
                 ForceReleaseOutcome::Released
             }
             state => ForceReleaseOutcome::NotPlatformLimited { state },
@@ -1856,7 +2038,7 @@ impl RuntimeOwnershipRegistry {
             // death — the fenced record's operation id is the fencing
             // (handoff/stop) operation, which no lane TTL claim carries.
             OwnershipState::Fenced { .. } => false,
-            OwnershipState::Vacant => false,
+            OwnershipState::Vacant | OwnershipState::Aliased { .. } => false,
         };
         if matched {
             let from_kind = record.state.kind();
@@ -2041,7 +2223,9 @@ impl RuntimeOwnershipRegistry {
             .iter()
             .map(|(key, record)| {
                 let (owner_kind, terminal_id, replay_state, reason) = match &record.state {
-                    OwnershipState::Vacant => ("vacant", None, ReplayOwnerState::Live, None),
+                    OwnershipState::Vacant | OwnershipState::Aliased { .. } => {
+                        ("vacant", None, ReplayOwnerState::Live, None)
+                    }
                     OwnershipState::Live { owner, .. } => (
                         kind_wire(&owner.kind),
                         owner.terminal_id.clone(),
@@ -2816,6 +3000,127 @@ mod tests {
         ));
     }
 
+    /// b8ke focused episode-2 round-3 F1: `rekey_live` — the Adopt-path
+    /// move the claude rollback's NORMAL live-rollback takes (its lane
+    /// claim observes the existing Live{FreshAgent} owner and answers
+    /// Adopt with NO ticket; pre-e2r3 the lane helper reported success
+    /// without doing ANYTHING, leaving ownership + stamp under the old id
+    /// while the client pane carried the new id — the deterministic
+    /// split identity). The Live record moves old→new atomically; the
+    /// old key becomes Aliased{to: new}; an occupied target key refuses
+    /// typed; a non-Live old key refuses typed.
+    #[test]
+    fn rekey_live_moves_the_live_record_and_refuses_typed() {
+        let r = RuntimeOwnershipRegistry::new();
+        // A LIVE owner under the old id (the post-Adopt rollback shape).
+        let BeginOutcome::Granted { generation } = r.begin_start(
+            PROVIDER,
+            "old-live",
+            RuntimeOwnerKind::FreshAgent,
+            "op-original",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!()
+        };
+        let owner = OwnerIdentity {
+            kind: RuntimeOwnerKind::FreshAgent,
+            terminal_id: None,
+            live_session_key: Some("map-key".into()),
+            pid: Some(4321),
+            ownership_id: None,
+        };
+        assert!(matches!(
+            r.commit_live(PROVIDER, "old-live", "op-original", generation, owner),
+            CommitOutcome::Committed
+        ));
+
+        // THE MOVE: the Live record (same owner, same generation) lands
+        // under the new id; the old key holds ONLY the Aliased residue.
+        assert!(matches!(
+            r.rekey_live(PROVIDER, "old-live", "new-live", "test-rekey"),
+            CommitOutcome::Committed
+        ));
+        match r.observe(PROVIDER, "new-live").state {
+            OwnershipState::Live { owner: moved, .. } => {
+                assert_eq!(moved.kind, RuntimeOwnerKind::FreshAgent);
+                assert_eq!(moved.live_session_key.as_deref(), Some("map-key"));
+                assert_eq!(moved.pid, Some(4321));
+            }
+            other => panic!("expected Live under the new id, got {other:?}"),
+        }
+        assert!(matches!(
+            r.observe(PROVIDER, "old-live").state,
+            OwnershipState::Aliased { to, .. } if to == "new-live"
+        ));
+        assert_eq!(r.resolve_canonical(PROVIDER, "old-live"), "new-live");
+
+        // An OCCUPIED target key refuses typed — never an overwrite.
+        let r2 = RuntimeOwnershipRegistry::new();
+        let BeginOutcome::Granted { generation: ga } = r2.begin_start(
+            PROVIDER,
+            "old-2",
+            RuntimeOwnerKind::FreshAgent,
+            "op-a",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!()
+        };
+        let owner_a = OwnerIdentity {
+            kind: RuntimeOwnerKind::FreshAgent,
+            terminal_id: None,
+            live_session_key: None,
+            pid: None,
+            ownership_id: None,
+        };
+        assert!(matches!(
+            r2.commit_live(PROVIDER, "old-2", "op-a", ga, owner_a),
+            CommitOutcome::Committed
+        ));
+        let BeginOutcome::Granted { generation: gb } = r2.begin_start(
+            PROVIDER,
+            "target-2",
+            RuntimeOwnerKind::Terminal,
+            "op-b",
+            None,
+            "test",
+            1,
+        ) else {
+            panic!()
+        };
+        let owner_b = OwnerIdentity {
+            kind: RuntimeOwnerKind::Terminal,
+            terminal_id: Some("t-b".into()),
+            live_session_key: None,
+            pid: None,
+            ownership_id: None,
+        };
+        assert!(matches!(
+            r2.commit_live(PROVIDER, "target-2", "op-b", gb, owner_b),
+            CommitOutcome::Committed
+        ));
+        assert!(matches!(
+            r2.rekey_live(PROVIDER, "old-2", "target-2", "test-rekey"),
+            CommitOutcome::ForeignOperation
+        ));
+        match r2.observe(PROVIDER, "target-2").state {
+            OwnershipState::Live { owner, .. } => {
+                assert_eq!(owner.kind, RuntimeOwnerKind::Terminal);
+            }
+            other => panic!("the foreign target must keep its owner, got {other:?}"),
+        }
+
+        // A NON-LIVE old key refuses typed.
+        let r3 = RuntimeOwnershipRegistry::new();
+        assert!(matches!(
+            r3.rekey_live(PROVIDER, "absent", "anywhere", "test-rekey"),
+            CommitOutcome::ForeignOperation
+        ));
+    }
+
     /// b8ke focused episode-2 round-2 F1: the atomic re-key — a start's
     /// `Starting{op}` record under the OLD key moves to the NEW key as
     /// `Live{owner}` in ONE registry step: never both-Live, never
@@ -2855,9 +3160,17 @@ mod tests {
             ),
             CommitOutcome::Committed
         ));
-        // The move: old key Vacant, new key Live{FreshAgent} at the same
-        // generation — never both-Live, never both-Vacant.
-        assert_eq!(r.observe(PROVIDER, "old-id").state, OwnershipState::Vacant);
+        // The move (e2r3 contract): old key Aliased{to: new} — the
+        // coordinator's OWN old→new resolution record; new key
+        // Live{FreshAgent} at the same generation — never both-Live,
+        // never both-Vacant.
+        assert!(matches!(
+            r.observe(PROVIDER, "old-id").state,
+            OwnershipState::Aliased { to, .. } if to == "new-id"
+        ));
+        // The fixpoint resolution walks the alias to the canonical key.
+        assert_eq!(r.resolve_canonical(PROVIDER, "old-id"), "new-id");
+        assert_eq!(r.resolve_canonical(PROVIDER, "new-id"), "new-id");
         match r.observe(PROVIDER, "new-id").state {
             OwnershipState::Live {
                 owner: observed, ..
@@ -2868,8 +3181,9 @@ mod tests {
             }
             other => panic!("expected Live under the new id, got {other:?}"),
         }
-        // The fenced replay of the OLD key clears stale divergence and the
-        // new key is the sole authoritative record.
+        // The Aliased key replays writer-VACANT to clients (stale
+        // divergence clears) and the new key is the sole authoritative
+        // record.
         let records = r.snapshot_records();
         assert!(records.iter().any(|rec| rec.session_id == "new-id"
             && rec.owner_kind == "fresh-agent"
