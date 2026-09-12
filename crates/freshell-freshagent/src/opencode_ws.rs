@@ -1000,6 +1000,27 @@ impl FreshOpencodeState {
                         }
                     }
                 }
+                // b8ke e3r4 F4: a TERMINAL owner means a handoff
+                // committed — the delayed create is a TYPED refusal,
+                // never a wildcard fall-through that reasserts a Fresh
+                // Agent binding beside the terminal owner.
+                freshell_ownership::OwnershipState::Live {
+                    owner: observed_owner,
+                    ..
+                } if observed_owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %durable_id,
+                        "fresh_agent_create_refused: a TERMINAL owner owns the \
+                         session (a handoff committed) — the delayed create is a \
+                         typed refusal, never a Fresh Agent reassertion beside it");
+                    self.fail_create(
+                        &request_id,
+                        "SESSION_RESERVED",
+                        "The session is owned by a terminal runtime; reopen it as \
+                         the terminal instead",
+                    );
+                    return;
+                }
                 _ => {}
             }
         }
@@ -1114,6 +1135,41 @@ impl FreshOpencodeState {
                 },
             })
             .await;
+        }
+
+        // b8ke e3r4 F4: the POST-AWAIT RECHECK — a handoff can have
+        // begun or COMMITTED during the session-mutation + durable
+        // binding awaits above (the create path holds no coordinator
+        // lease across them). Re-observe BEFORE any reassertion: if the
+        // key moved (a Terminal owner, a handoff in flight, a fence), the
+        // delayed create ABORTS TYPED — no `freshAgent.created`
+        // reassertion beside the committed owner, no binding re-write.
+        {
+            let snap = self.fresh_agent.ownership_snapshot(PROVIDER, &durable_id);
+            let stale = !matches!(
+                &snap.state,
+                freshell_ownership::OwnershipState::Live { owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+            ) && !matches!(
+                &snap.state,
+                freshell_ownership::OwnershipState::Vacant
+                    | freshell_ownership::OwnershipState::Aliased { .. }
+            );
+            if stale {
+                tracing::warn!(target: "freshell_freshagent::opencode",
+                    session_id = %durable_id, state = ?snap.state,
+                    "fresh_agent_create_aborted_post_await: a lifecycle transition \
+                     committed while the delayed create awaited its binding writes — \
+                     the create aborts typed (never a Fresh Agent reassertion beside \
+                     the committed owner)");
+                self.fail_create(
+                    &request_id,
+                    "SESSION_RESERVED",
+                    "A lifecycle operation committed while this create was in flight; \
+                     retry after it settles",
+                );
+                return;
+            }
         }
 
         // requestId dedup cache: a duplicate create replays the DURABLE id (never a
@@ -1825,7 +1881,20 @@ impl FreshOpencodeState {
                 .expect("rest opencode turns lock")
                 .remove(session_id);
             let Some(rest_turn) = rest_turn else {
-                return false;
+                // b8ke e3r4 F3: the PID-less lane's kind-aware answer —
+                // the session map + the daemon-side witness registries are
+                // this runtime's WHOLE identity; holding NOTHING for the
+                // session means no per-session writer exists anywhere:
+                // CONFIRMED DEAD (pre-e3r4 this arm returned false, so a
+                // cancelled/panicked opencode stop could never recover
+                // through the probe — blocked until restart).
+                tracing::info!(target: "freshell_freshagent::opencode",
+                    session_id = %session_id,
+                    "opencode.confirm_fenced_prior_dead: the lane holds nothing for \
+                     the session — the PID-less runtime's whole identity is absent, \
+                     confirmed dead"
+                );
+                return true;
             };
             rest_turn.condemned.store(true, Ordering::SeqCst);
             let accepted = rest_turn.daemon_turn_accepted.load(Ordering::SeqCst);
@@ -2293,8 +2362,35 @@ impl FreshOpencodeState {
                         match stop_outcome {
                             freshell_ownership::StopOutcome::Granted { generation } => {
                                 stop_generation = Some(generation);
-                                stop_op_id = Some(kill_op_id);
+                                stop_op_id = Some(kill_op_id.clone());
                                 stop_key = Some(canonical_observed.clone());
+                                // b8ke e3r4 F1: the same stop bookkeeping
+                                // as the stamp-present path — the
+                                // settlement guard + rollback evidence
+                                // (a synthesized stamp from the OBSERVED
+                                // owner; opencode's owner pid is None —
+                                // the shared daemon — so the unwind's
+                                // atomic restore treats an unprobeable
+                                // stamp as live by policy, and the
+                                // registry follows).
+                                taken_stop_stamp = Some((
+                                    canonical_observed.clone(),
+                                    crate::ownership_lane::OwnershipStamp {
+                                        epoch: registry.boot_epoch(),
+                                        generation,
+                                        operation_id: kill_op_id.clone(),
+                                        owner: owner.clone(),
+                                    },
+                                ));
+                                _stop_settlement = Some(
+                                    crate::ownership_lane::register_stop_settlement_for_claim(
+                                        &self.fresh_agent.ownership,
+                                        PROVIDER,
+                                        &canonical_observed,
+                                        &kill_op_id,
+                                        generation,
+                                    ),
+                                );
                             }
                             freshell_ownership::StopOutcome::NotLive {
                                 state: freshell_ownership::OwnershipState::Vacant,
@@ -4163,6 +4259,27 @@ impl FreshOpencodeState {
                         }
                     }
                 }
+                // b8ke e3r4 F4: a TERMINAL owner (a handoff committed)
+                // refuses the attach TYPED — never the wildcard reuse that
+                // restarts the old serve-event bridge beside the terminal
+                // owner.
+                freshell_ownership::OwnershipState::Live {
+                    owner: observed_owner,
+                    ..
+                } if observed_owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %msg.session_id,
+                        "fresh_agent_attach_refused: a TERMINAL owner owns the \
+                         session (a handoff committed) — the delayed attach is a \
+                         typed refusal, never a bridge restart beside it");
+                    self.emit_fresh_agent_error(
+                        &msg.session_id,
+                        "SESSION_RESERVED",
+                        "The session is owned by a terminal runtime; reopen it as \
+                         the terminal instead",
+                    );
+                    return;
+                }
                 _ => {}
             }
         }
@@ -5837,7 +5954,220 @@ mod tests {
     /// re-offer a pane the user just closed inside the 7s creation-race grace
     /// window — and (b) clear the pending marker, so a late resolution can
     /// never carry evidence for a pane that provably no longer exists.
+    /// b8ke e3r4 F4: a handoff committing MID-CREATE-AWAIT — the delayed
+    /// create's post-await recheck sees the committed TERMINAL owner and
+    /// ABORTS TYPED: no `freshAgent.created` reassertion beside the new
+    /// owner, no binding re-write. Deterministic via the identity sink's
+    /// binding stall (the create parks in its durable binding write).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_delayed_create_after_a_mid_await_handoff_commit_aborts_typed() {
+        // A manually-built state so the broadcast receiver is RETAINED
+        // (the created-frame reassertion is the observable).
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let mut st = FreshOpencodeState::new(fresh_agent);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
 
+        st.handle_create(create_msg("req-e3r4-f4"), None).await;
+        let placeholder = "freshopencode-req-e3r4-f4";
+        st.handle_send(send_msg(placeholder, "hi")).await;
+        let real_id = {
+            let sessions = st.sessions.lock().await;
+            let guard = sessions
+                .get(placeholder)
+                .expect("placeholder tracked")
+                .lock()
+                .await;
+            guard
+                .real_session_id
+                .clone()
+                .expect("the session materialized")
+        };
+
+        // The in-memory create-resume shape: the DURABLE id tracked in
+        // the lane map (the "already rebound locally" keying), then the
+        // binding write STALLED — the handoff commits while the create
+        // awaits.
+        st.insert_live_session_for_test(&real_id).await;
+        // Drain the setup's frames (the created/materialized broadcasts).
+        while rx.try_recv().is_ok() {}
+        let stall = fake.arm_binding_stall("opencode", &real_id);
+        let st2 = st.clone();
+        let real_id_for_task = real_id.clone();
+        // MEANINGFUL provenance so the in-memory path performs its
+        // re-park + refresh binding write (the stall's park point).
+        let provenance = crate::identity_sink::BindProvenance {
+            client_instance_id: Some("client-e3r4-f4".into()),
+            device_id: Some("device-e3r4-f4".into()),
+            tab_key: Some("device-e3r4-f4:tab-1".into()),
+            asserted_at: 1,
+        };
+        let create_task = tokio::spawn(async move {
+            st2.handle_create_resume(
+                "req-e3r4-f4-resume".to_string(),
+                real_id_for_task,
+                &create_msg("req-e3r4-f4-resume"),
+                Some(provenance),
+            )
+            .await;
+        });
+        // Wait until the create is parked INSIDE its binding write.
+        stall
+            .entered
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the create reached its binding write");
+
+        // THE HANDOFF COMMITS mid-await: the key goes Live{Terminal}.
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_handoff(
+            "opencode",
+            &real_id,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "handoff-mid-await",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("expected the handoff begin granted")
+        };
+        assert!(matches!(
+            registry.commit_live(
+                "opencode",
+                &real_id,
+                "handoff-mid-await",
+                generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("t-mid-await".into()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        ));
+
+        // Release the stall: the create's POST-AWAIT RECHECK sees the
+        // Terminal owner → aborts typed — no freshAgent.created.
+        let _ = stall.release.send(());
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(15), create_task).await;
+        // THE F4 CONTRACT: the delayed create ABORTED TYPED — NO
+        // `freshAgent.created` reassertion for its request id (pre-e3r4:
+        // the wildcard broadcast reasserted the Fresh Agent beside the
+        // committed terminal owner).
+        let mut saw_created_reassertion = false;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.created" && frame["requestId"] == "req-e3r4-f4-resume" {
+                saw_created_reassertion = true;
+            }
+        }
+        assert!(
+            !saw_created_reassertion,
+            "the delayed create emitted NO freshAgent.created reassertion \
+             beside the committed terminal owner"
+        );
+        // And the committed Terminal owner stays authoritative.
+        assert!(
+            matches!(
+                registry.observe("opencode", &real_id).state,
+                freshell_ownership::OwnershipState::Live { owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal,
+            ),
+            "the committed Terminal owner stays authoritative"
+        );
+    }
+
+    /// b8ke e3r4 F4: the ATTACH path refuses a TERMINAL-owned session
+    /// typed — never the wildcard reuse that restarts the old serve-event
+    /// bridge beside the committed terminal owner.
+    #[tokio::test]
+    async fn an_attach_after_a_terminal_handoff_is_refused_typed() {
+        let (mut st, _killed) = state().await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-e3r4-f4b"), None).await;
+        let placeholder = "freshopencode-req-e3r4-f4b";
+        st.handle_send(send_msg(placeholder, "hi")).await;
+        let real_id = {
+            let sessions = st.sessions.lock().await;
+            let guard = sessions
+                .get(placeholder)
+                .expect("placeholder tracked")
+                .lock()
+                .await;
+            guard
+                .real_session_id
+                .clone()
+                .expect("the session materialized")
+        };
+
+        // The committed TERMINAL owner (a completed handoff).
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_handoff(
+            "opencode",
+            &real_id,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "handoff-terminal",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("expected the handoff begin granted")
+        };
+        assert!(matches!(
+            registry.commit_live(
+                "opencode",
+                &real_id,
+                "handoff-terminal",
+                generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("t-attach".into()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        ));
+
+        // THE DELAYED ATTACH: the session is still in the lane's map —
+        // the terminal-owner gate must answer the TYPED refusal (never
+        // the wildcard reuse that restarts the serve bridge).
+        st.handle_attach(FreshAgentAttach {
+            provider: AgentProvider::Opencode,
+            session_id: real_id.clone(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+            observed_epoch: None,
+            observed_generation: None,
+            resume_session_id: None,
+            session_ref: None,
+        })
+        .await;
+
+        assert!(
+            matches!(
+                registry.observe("opencode", &real_id).state,
+                freshell_ownership::OwnershipState::Live { owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal,
+            ),
+            "the terminal owner stays authoritative — the attach was \
+             refused typed (no bridge restart beside it)"
+        );
+    }
+
+    /// Retire-on-kill (delta-review round 5, restore-open-sessions-only): an
+    /// explicit kill is an intentional session END. Killing a MATERIALIZED
+    /// session must (a) retire its durable row `Closed` through the identity
+    /// sink and (b) clear the pending marker.
     #[tokio::test]
     async fn handle_kill_retires_the_materialized_row_and_clears_the_pending_marker() {
         let (st, _killed) = state().await;

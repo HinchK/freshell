@@ -52,14 +52,15 @@ export function SessionHandoffErrorBanner({ error, appStore, tabId, paneId }: {
 
   // R4-4: the force-clear action surfaces for the platform-limited fence
   // shapes — the original PLATFORM_LIMITED failure and the ordinary
-  // retry's PLATFORM_LIMITED_FENCED refusal. b8ke delta round-3 F5: the
-  // STALE_START_FENCED refusal joins the set — the acknowledged
-  // force-clear accepts StaleStart fences with the same typed risk (the
-  // probe keeps its own confirmed-death discipline; this is the operator
-  // path).
+  // retry's PLATFORM_LIMITED_FENCED refusal. b8ke e3r4 F2 (the DESIGN
+  // RECONCILIATION): the STALE-reason refusals (STALE_START_FENCED /
+  // STALE_STOP_FENCED) NEVER offer the force-clear — those states mean
+  // the prior runtime may STILL BE LIVE, so clearing to Vacant and
+  // chaining a writer would weaken active-writer refusal; their recovery
+  // is the server's CONFIRMED-DEATH PROBE ONLY (the Banner presents the
+  // fenced state and probe-based retry guidance).
   const platformLimited = error.code === 'PLATFORM_LIMITED'
     || error.code === 'PLATFORM_LIMITED_FENCED'
-    || error.code === 'STALE_START_FENCED'
 
   if (!error.retryable) {
     return (

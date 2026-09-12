@@ -645,12 +645,19 @@ pub struct StaleStartFence {
     /// fenced prior's kind — the release record's schema fields.
     pub initiator: String,
     pub prior_kind: Option<RuntimeOwnerKind>,
-    /// b8ke focused episode-2 post-cap F4: the fenced operation's
-    /// settle/cancellation state — `Some(true)`: the registering guard
-    /// dropped (the operation concluded); `Some(false)`: registered but
-    /// still in flight; `None`: NO registration ever armed (the
-    /// PID-less pre-registration shape — unprobe-able, the fence HOLDS).
-    pub settle_fired: Option<bool>,
+    /// b8ke focused episode-2 post-cap F4 + e3r4 F3: the fenced
+    /// operation's settlement state — REASON-AWARE: for StaleStart it is
+    /// the START's settle_fired flag; for StaleStop it is the STOP's
+    /// stop_settled flag. `Some(true)`: the registering guard dropped
+    /// (the operation concluded); `Some(false)`: still in flight (the
+    /// fence holds); `None`: NO registration — the probe routes the
+    /// PID-less shape through the kind-aware lane confirmation instead
+    /// of rejecting forever (the opencode production shape: no
+    /// per-session pid, no start settlement).
+    pub settle_concluded: Option<bool>,
+    /// b8ke e3r4 F3: WHICH stale reason is fenced — the probe's evidence
+    /// discipline is reason-aware and the release records carry it.
+    pub reason: FenceReason,
 }
 
 /// One replayed owner record for the `ready.runtimeOwners` handshake field
@@ -1749,7 +1756,21 @@ impl RuntimeOwnershipRegistry {
                 ..
             } = &record.state
             {
-                let _ = reason;
+                // e3r4 F3: the settle evidence is REASON-AWARE — the
+                // start's flag for StaleStart, the stop's flag for
+                // StaleStop (pre-e3r4 the enumerator read settle_fired for
+                // BOTH, so a stop fence consulted evidence its stop never
+                // armed).
+                let settle_concluded = match reason {
+                    FenceReason::StaleStart => record
+                        .settle_fired
+                        .as_ref()
+                        .map(|f| f.load(std::sync::atomic::Ordering::SeqCst)),
+                    _ => record
+                        .stop_settled
+                        .as_ref()
+                        .map(|f| f.load(std::sync::atomic::Ordering::SeqCst)),
+                };
                 out.push(StaleStartFence {
                     provider: key.provider.clone(),
                     session_id: key.session_id.clone(),
@@ -1758,10 +1779,8 @@ impl RuntimeOwnershipRegistry {
                     prior_pid: prior.as_ref().and_then(|(owner, _)| owner.pid),
                     initiator: initiator.clone(),
                     prior_kind: prior.as_ref().map(|(owner, _)| owner.kind),
-                    settle_fired: record
-                        .settle_fired
-                        .as_ref()
-                        .map(|f| f.load(std::sync::atomic::Ordering::SeqCst)),
+                    settle_concluded,
+                    reason: *reason,
                 });
             }
         }
@@ -1809,27 +1828,26 @@ impl RuntimeOwnershipRegistry {
         }
         match record.state.clone() {
             OwnershipState::Fenced {
-                reason:
-                    reason @ (FenceReason::PlatformLimited
-                    | FenceReason::StaleStart
-                    | FenceReason::StaleStop),
+                reason: reason @ FenceReason::PlatformLimited,
                 operation_id,
                 prior,
                 since_ms,
                 ..
             } => {
-                // b8ke focused episode-2 round-3 F7: the acknowledged
-                // operator force-clear accepts BOTH fence reasons. A
-                // PID-less StaleStart fence is a SUPPORTED production
-                // shape (the opencode lane registers no per-session pid
-                // and no settle/cancellation future) — without this
-                // recovery path those fences were permanent and every
-                // retryable lifecycle op on the session blocked until a
-                // server restart. The operator's acknowledged risk is
-                // documented identically: the recorded runtime identity
-                // could not be CONFIRMED dead (no pid to probe / the
-                // recorded tree unreadable on this platform), so
-                // surviving processes are the operator's acknowledged
+                // b8ke e3r4 F2 (the DESIGN RECONCILIATION): the
+                // acknowledged operator force-clear is PLATFORM-LIMITED
+                // ONLY — the one fence reason whose unverification is a
+                // documented platform limitation (the direct child's
+                // awaited exit IS confirmed; only the descendant tree is
+                // unverifiable here). The STALE reasons mean the prior
+                // runtime may STILL BE LIVE — clearing them to Vacant
+                // and chaining a writer would weaken active-writer
+                // refusal; their recovery is the CONFIRMED-DEATH PROBE
+                // ONLY (the kind-aware lane confirmation), never an
+                // unconfirmed clear. The operator's acknowledged risk:
+                // the recorded runtime's DESCENDANT tree is UNVERIFIED on
+                // this platform — surviving processes are the operator's
+                // acknowledged
                 // risk — never a silent licensing.
                 let duration_ms = now_epoch_ms().saturating_sub(since_ms);
                 record.state = OwnershipState::Vacant;
@@ -2308,6 +2326,14 @@ impl RuntimeOwnershipRegistry {
                     event = "ownership.stop.stale_stopping_fenced",
                     operation_id = %operation_id, provider = %key.provider,
                     session_id = %key.session_id,
+                    // b8ke e3r4 F5: the complete structured transition
+                    // schema — the initiating client/device, the old/new
+                    // runtime kinds, the recorded runtime identity.
+                    initiator = %initiator,
+                    from_kind = ?stale.prior.as_ref().map(|(o, _)| o.kind),
+                    to_kind = ?stale.prior.as_ref().map(|(o, _)| o.kind),
+                    runtime_id = ?stale.prior.as_ref().and_then(|(o, _)| o.terminal_id.clone()),
+                    pid = ?stale.prior.as_ref().and_then(|(o, _)| o.pid),
                     epoch = self.epoch, generation,
                     stale_age_ms = now_ms.saturating_sub(since_ms),
                     outcome = "fenced", failure_reason = "STALE_STOP",
@@ -3862,11 +3888,132 @@ mod tests {
         let fences = r.stale_start_fences();
         assert_eq!(fences.len(), 1);
         assert_eq!(
-            fences[0].settle_fired, None,
+            fences[0].settle_concluded, None,
             "begin_start cleared the predecessor's settle_fired — the new \
              operation is NOT pre-concluded"
         );
+        assert_eq!(fences[0].reason, FenceReason::StaleStart);
         let _ = g2;
+    }
+
+    /// b8ke e3r4 F3: the probe's enumeration is REASON-AWARE — a
+    /// StaleStart fence carries the START's settle_fired evidence, a
+    /// StaleStop fence carries the STOP's stop_settled evidence (pre-e3r4
+    /// the enumerator read settle_fired for both, so a stop fence
+    /// consulted evidence its stop never armed).
+    #[test]
+    fn the_fence_enumeration_is_reason_aware() {
+        let r = RuntimeOwnershipRegistry::new();
+        // A StaleStop fence: the STOP's flag registered+FIRED.
+        let BeginOutcome::Granted { generation } = r.begin_start(
+            PROVIDER,
+            "sid-r",
+            RuntimeOwnerKind::FreshAgent,
+            "op-live",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!()
+        };
+        assert!(matches!(
+            r.commit_live(
+                PROVIDER,
+                "sid-r",
+                "op-live",
+                generation,
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("map".into()),
+                    pid: None,
+                    ownership_id: None,
+                }
+            ),
+            CommitOutcome::Committed
+        ));
+        let claim = StopClaim {
+            expected_kind: RuntimeOwnerKind::FreshAgent,
+            expected_runtime: None,
+            observed: ObservedFence {
+                epoch: r.boot_epoch(),
+                generation,
+            },
+        };
+        match r.begin_stop(PROVIDER, "sid-r", "op-stop-r", &claim, "test", 0) {
+            StopOutcome::Granted {
+                generation: stop_gen,
+            } => {
+                let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                assert!(r.register_stop_settlement(
+                    PROVIDER,
+                    "sid-r",
+                    "op-stop-r",
+                    stop_gen,
+                    Arc::clone(&stop_flag),
+                ));
+            }
+            other => panic!("expected the stop claim granted, got {other:?}"),
+        }
+        let fenced = r.recover_stale_stoppings(10_000, 5_000);
+        assert_eq!(fenced.len(), 1);
+        let fences = r.stale_start_fences();
+        assert_eq!(fences.len(), 1);
+        // THE F3 CONTRACT: the StaleStop fence carries the STOP's
+        // evidence — settle_concluded == Some(true) — and the reason.
+        assert_eq!(fences[0].reason, FenceReason::StaleStop);
+        assert_eq!(
+            fences[0].settle_concluded,
+            Some(true),
+            "the STOP's fired evidence is carried (pre-e3r4: the START's \
+             never-armed flag read as None forever)"
+        );
+
+        // The StaleStart twin: a start fence carries the START's flag.
+        let BeginOutcome::Granted { generation: g2 } = r.begin_start(
+            PROVIDER,
+            "sid-s",
+            RuntimeOwnerKind::FreshAgent,
+            "op-live-s",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!()
+        };
+        let start_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(r.register_start_cancellation(
+            PROVIDER,
+            "sid-s",
+            "op-live-s",
+            g2,
+            Arc::new(|| {}),
+            Box::new(std::future::ready(())),
+            Some(Arc::clone(&start_flag)),
+        ));
+        let recovered = r.recover_stale_starts(0, 0);
+        assert_eq!(recovered.len(), 1);
+        assert!(matches!(
+            r.fence_unconfirmed_stop(
+                PROVIDER,
+                "sid-s",
+                "op-live-s",
+                recovered[0].generation,
+                FenceReason::StaleStart,
+            ),
+            FenceOutcome::Fenced
+        ));
+        let fences2 = r.stale_start_fences();
+        let f2 = fences2
+            .iter()
+            .find(|f| f.session_id == "sid-s")
+            .expect("the start fence enumerated");
+        assert_eq!(f2.reason, FenceReason::StaleStart);
+        assert_eq!(
+            f2.settle_concluded,
+            Some(false),
+            "the START's unfired evidence is carried for the StaleStart fence"
+        );
     }
 
     /// b8ke e3r3 F7: the watchdog consults the stop's settlement evidence
@@ -4034,8 +4181,11 @@ mod tests {
                 ..
             }
         ));
-        // Still blocked (typed), but now RECOVERABLE: the acknowledged
-        // force-clear accepts StaleStop.
+        // Still blocked (typed). b8ke e3r4 F2 (the DESIGN RECONCILIATION):
+        // the acknowledged force-clear REFUSES StaleStop — a stale-reason
+        // fence means the prior runtime may STILL BE LIVE; recovery is
+        // the CONFIRMED-DEATH PROBE ONLY (the kind-aware lane
+        // confirmation), never an unconfirmed clear.
         let snap = r.observe(PROVIDER, "sid-stale-stop");
         assert!(matches!(
             r.force_release_platform_limited(
@@ -4047,11 +4197,11 @@ mod tests {
                 },
                 "operator",
             ),
-            ForceReleaseOutcome::Released
+            ForceReleaseOutcome::NotPlatformLimited { .. }
         ));
         assert!(matches!(
             r.observe(PROVIDER, "sid-stale-stop").state,
-            OwnershipState::Vacant
+            OwnershipState::Fenced { .. }
         ));
     }
 

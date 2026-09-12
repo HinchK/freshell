@@ -69,6 +69,30 @@ describe('SessionHandoffErrorBanner (kata b8ke R4-4 force-clear action)', () => 
     expect(screen.getByRole('button', { name: /force clear/i })).toBeDefined()
   })
 
+  // b8ke e3r4 F2 (the DESIGN RECONCILIATION): the stale-reason refusals
+  // NEVER offer the force-clear — those states mean the prior runtime may
+  // STILL BE LIVE (clearing to Vacant + chaining a writer would weaken
+  // active-writer refusal); their recovery is the server's
+  // confirmed-death probe, so the Banner presents the fenced state with
+  // Retry guidance only.
+  it('renders NO force-clear for the stale-reason fences (probe-based recovery only)', () => {
+    for (const code of ['STALE_START_FENCED', 'STALE_STOP_FENCED']) {
+      const { unmount } = render(
+        <SessionHandoffErrorBanner
+          error={errorWith({ code })}
+          appStore={store}
+          tabId="tab-1"
+          paneId="pane-1"
+        />,
+      )
+      expect(
+        screen.queryByRole('button', { name: /force clear/i }),
+        code,
+      ).toBeNull()
+      unmount()
+    }
+  })
+
   it('no force-clear action for ordinary retryable failures — Retry stays the only action', async () => {
     const user = userEvent.setup()
     render(

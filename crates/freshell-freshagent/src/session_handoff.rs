@@ -475,12 +475,15 @@ impl SessionHandoffRunner {
                 // is the operator path, with the risk typed identically.
                 state:
                     freshell_ownership::OwnershipState::Fenced {
-                        // b8ke e3r3 F3: the acknowledged force-clear takes
-                        // ALL three unconfirmable fence reasons (the e3r2
-                        // stale-Stopping watchdog made StaleStop reachable;
-                        // pre-e3r3 a handoff through a StaleStop fence fell
-                        // to generic HANDOFF_IN_PROGRESS — wedged until
-                        // restart).
+                        // b8ke e3r4 F2 (the DESIGN RECONCILIATION):
+                        // the acknowledged force-clear is PLATFORM-LIMITED
+                        // ONLY. The STALE reasons mean the prior runtime
+                        // may STILL BE LIVE — clearing them to Vacant and
+                        // chaining a writer would weaken active-writer
+                        // refusal; their recovery is the CONFIRMED-DEATH
+                        // PROBE ONLY. Stale-reason fences enter the same
+                        // reason-typed refusal arm below — the
+                        // acknowledgment flag does NOT clear them.
                         reason:
                             reason @ (freshell_ownership::FenceReason::PlatformLimited
                             | freshell_ownership::FenceReason::StaleStart
@@ -491,17 +494,26 @@ impl SessionHandoffRunner {
                 ..
             } => {
                 // The reason-aware typed refusal: an ordinary retry never
-                // clears an UNCONFIRMABLE fence — the acknowledged
-                // force-clear is the only recovery (d3 F5: StaleStart
-                // types its own code so the client's recovery UI can offer
-                // the force-clear for exactly the fences that need it).
-                // b8ke e3r3 F3: the refusal code is REASON-TYPED.
+                // clears an UNCONFIRMABLE fence. b8ke e3r4 F2: for the
+                // STALE reasons the acknowledgment flag does NOT clear
+                // either — their recovery is the CONFIRMED-DEATH PROBE
+                // ONLY (retry after the probe clears the fence); the
+                // acknowledged force-clear stays PlatformLimited-only
+                // (the documented platform limitation). The refusal code
+                // is REASON-TYPED so the client's recovery UI presents
+                // the truthful guidance.
                 let fence_code = match reason {
                     freshell_ownership::FenceReason::PlatformLimited => "PLATFORM_LIMITED_FENCED",
                     freshell_ownership::FenceReason::StaleStop => "STALE_STOP_FENCED",
                     _ => "STALE_START_FENCED",
                 };
-                if !req.acknowledge_platform_limited_risk {
+                if !req.acknowledge_platform_limited_risk
+                    || matches!(
+                        reason,
+                        freshell_ownership::FenceReason::StaleStart
+                            | freshell_ownership::FenceReason::StaleStop
+                    )
+                {
                     let generation = self
                         .ownership
                         .observe(&req.provider, &req.session_id)
@@ -523,12 +535,19 @@ impl SessionHandoffRunner {
                                  verify the prior runtime's descendant processes. Retry with the \
                                  acknowledged force-clear (acknowledgePlatformLimitedRisk: true) to \
                                  release the fence, accepting that unverified descendants may remain.",
+                            freshell_ownership::FenceReason::StaleStop =>
+                                "the session is fenced pending recovery: a stop operation ended \
+                                 without confirming the prior runtime's death. The server's \
+                                 confirmed-death probe recovers the fence once the prior is \
+                                 confirmed gone — retry after the probe clears it (the \
+                                 acknowledgment flag cannot clear an unconfirmed stale fence).",
                             _ =>
                                 "the session is fenced pending recovery: the prior runtime's \
                                  death could not be confirmed (a stale start left it \
-                                 unconfirmable). Retry with the acknowledged force-clear \
-                                 (acknowledgePlatformLimitedRisk: true) to release the fence, \
-                                 accepting that the unconfirmed runtime's processes may remain.",
+                                 unconfirmable). The server's confirmed-death probe recovers the \
+                                 fence once the prior is confirmed gone — retry after the probe \
+                                 clears it (the acknowledgment flag cannot clear an unconfirmed \
+                                 stale fence).",
                         },
                         true,
                         generation,

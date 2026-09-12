@@ -1262,10 +1262,12 @@ describe('requestSessionHandoff()', () => {
   })
 
   it('accepts EVERY server-emitted cleared label (the force-clear result)', () => {
+    // b8ke e3r4 F2 (the DESIGN RECONCILIATION): the force-clear is
+    // PlatformLimited-only — the stale-reason fences are never cleared
+    // (their recovery is the confirmed-death probe), so this is the
+    // server's COMPLETE emitted label set.
     const SERVER_EMITTED_CLEARED_LABELS = [
       'platform-limited-fence',
-      'stale-start-fence',
-      'stale-stop-fence',
     ] as const
     for (const cleared of SERVER_EMITTED_CLEARED_LABELS) {
       const parsed = SessionHandoffResultSchema.safeParse({
@@ -1276,6 +1278,16 @@ describe('requestSessionHandoff()', () => {
       })
       expect(parsed.success, cleared).toBe(true)
     }
+    // And a stale-reason cleared label CANNOT parse (the server never
+    // emits one — the closed literal rejects it loudly).
+    expect(
+      SessionHandoffResultSchema.safeParse({
+        ok: true,
+        cleared: 'stale-start-fence',
+        operationId: 'op-clear',
+        generation: 3,
+      }).success,
+    ).toBe(false)
   })
 
   it('parses the server-emitted STALE_START_FENCED refusal frame', async () => {

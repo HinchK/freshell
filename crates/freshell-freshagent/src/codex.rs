@@ -3760,7 +3760,31 @@ impl FreshCodexState {
                         match stop_outcome {
                             freshell_ownership::StopOutcome::Granted { generation } => {
                                 stop_generation = Some(generation);
-                                stop_op_id = Some(kill_op_id);
+                                stop_op_id = Some(kill_op_id.clone());
+                                // b8ke e3r4 F1: the same stop bookkeeping
+                                // as the stamp-present path — the
+                                // settlement guard + the rollback evidence
+                                // (a synthesized stamp from the OBSERVED
+                                // owner; the unwind verifies the runtime's
+                                // liveness directly, never stamp-absence).
+                                taken_stop_stamp = Some((
+                                    session_id.clone(),
+                                    crate::ownership_lane::OwnershipStamp {
+                                        epoch: registry.boot_epoch(),
+                                        generation,
+                                        operation_id: kill_op_id.clone(),
+                                        owner: owner.clone(),
+                                    },
+                                ));
+                                _stop_settlement = Some(
+                                    crate::ownership_lane::register_stop_settlement_for_claim(
+                                        &self.ownership,
+                                        PROVIDER,
+                                        &session_id,
+                                        &kill_op_id,
+                                        generation,
+                                    ),
+                                );
                             }
                             freshell_ownership::StopOutcome::NotLive {
                                 state: freshell_ownership::OwnershipState::Vacant,

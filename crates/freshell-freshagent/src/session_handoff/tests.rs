@@ -1862,24 +1862,29 @@ async fn a_stale_stop_fence_recovers_through_the_handoff_runner() {
         OwnershipState::Fenced { .. }
     ));
 
-    // (b) THE ACKNOWLEDGED FORCE-CLEAR: releases with the truthful
-    // stale-stop-fence label.
+    // (b) b8ke e3r4 F2 (the DESIGN RECONCILIATION): the acknowledged
+    // flag does NOT clear a StaleStop fence — recovery is the
+    // CONFIRMED-DEATH PROBE ONLY; the fence HOLDS under the acknowledged
+    // request.
     let snap = rig.ownership.observe("claude", &sid);
     let mut clear_req = handoff_req_terminal("claude", &sid, "claude");
     clear_req.acknowledge_platform_limited_risk = true;
     clear_req.observed_epoch = Some(snap.epoch);
     clear_req.observed_generation = Some(snap.generation);
     let clear = rig.runner.spawn_handoff(clear_req);
-    let cleared = clear.completion.await.expect("force-clear completed");
-    assert_eq!(cleared["ok"], json!(true), "the clear succeeds: {cleared}");
+    let cleared = clear
+        .completion
+        .await
+        .expect("the acknowledged request completed");
     assert_eq!(
-        cleared.get("cleared"),
-        Some(&json!("stale-stop-fence")),
-        "the truthful reason-typed label: {cleared}"
+        cleared["error"]["code"],
+        json!("STALE_STOP_FENCED"),
+        "the acknowledged flag answers the SAME typed refusal (never a \
+         clear): {cleared}"
     );
     assert!(matches!(
         rig.ownership.observe("claude", &sid).state,
-        OwnershipState::Vacant
+        OwnershipState::Fenced { .. }
     ));
 }
 
@@ -2200,34 +2205,35 @@ async fn a_stale_start_fence_recovers_through_the_acknowledged_force_clear() {
         "the ordinary retry left the fence held"
     );
 
-    // (b) THE acknowledged force-clear: clears the key Vacant and
-    // answers the TYPED CLEAR — the operator path with the risk
-    // acknowledged (the unconfirmed runtime's processes may remain).
+    // (b) b8ke e3r4 F2 (the DESIGN RECONCILIATION): the acknowledged
+    // flag does NOT clear a stale-reason fence — the prior runtime may
+    // STILL BE LIVE, and clearing to Vacant + chaining a writer would
+    // weaken active-writer refusal. Recovery is the CONFIRMED-DEATH
+    // PROBE ONLY: the same reason-typed refusal answers regardless of the
+    // acknowledgment, and the fence HOLDS.
     let snap = rig.ownership.observe("claude", &sid);
     let mut clear_req = handoff_req_terminal("claude", &sid, "claude");
     clear_req.acknowledge_platform_limited_risk = true;
     clear_req.observed_epoch = Some(snap.epoch);
     clear_req.observed_generation = Some(snap.generation);
     let clear = rig.runner.spawn_handoff(clear_req);
-    let cleared = clear.completion.await.expect("force-clear completed");
+    let cleared = clear
+        .completion
+        .await
+        .expect("the acknowledged request completed");
     assert_eq!(
-        cleared["ok"],
-        json!(true),
-        "the acknowledged force-clear released the StaleStart fence: {cleared}"
-    );
-    // b8ke e3r1 F5: the CLEAR answer's reason label is TRUTHFUL for a
-    // StaleStart fence — never the hard-coded platform-limited string.
-    assert_eq!(
-        cleared.get("cleared"),
-        Some(&json!("stale-start-fence")),
-        "the typed CLEAR answer carries the reason-typed label: {cleared}"
+        cleared["error"]["code"],
+        json!("STALE_START_FENCED"),
+        "the acknowledged flag answers the SAME typed refusal (never a \
+         clear): {cleared}"
     );
     assert!(
         matches!(
             rig.ownership.observe("claude", &sid).state,
-            OwnershipState::Vacant
+            OwnershipState::Fenced { .. }
         ),
-        "the StaleStart fence is CLEARED — never permanently wedged"
+        "the stale-reason fence HOLDS under the acknowledged request — \
+         recovery is the confirmed-death probe only"
     );
 }
 

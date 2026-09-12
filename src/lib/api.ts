@@ -773,12 +773,13 @@ export const SessionHandoffResultSchema = z.union([
   // handoff explicitly as a fresh no-prior sequence.
   z.object({
     ok: z.literal(true),
-    /** b8ke e3r3 F6: the cleared label is reason-typed — the server
-     *  returns the truthful label for the fence it cleared (the
-     *  pre-e3r3 literal rejected 'stale-start-fence', so the 200
-     *  THREW during parse and the recursive re-handoff never ran).
-     *  e3r3 F3 adds the StaleStop label. */
-    cleared: z.enum(['platform-limited-fence', 'stale-start-fence', 'stale-stop-fence']),
+    /** b8ke e3r4 F2 (the DESIGN RECONCILIATION): the cleared label is
+     *  platform-limited ONLY — the stale-reason fences are never
+     *  force-cleared (their recovery is the confirmed-death probe), so
+     *  the server cannot emit a stale-reason cleared label. The enum
+     *  stays a closed literal: a server that ever emits an unexpected
+     *  label fails the parse loudly. */
+    cleared: z.literal('platform-limited-fence'),
     operationId: z.string(),
     generation: z.number().int().nonnegative(),
   }),

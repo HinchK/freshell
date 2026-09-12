@@ -511,7 +511,9 @@ async fn start_cancellation_registers_on_the_tickets_canonical_key() {
          registration targeted the aliased wire id and silently declined"
     );
     // The settle evidence: fence, drop the guard (the operation concluded),
-    // and the probe's enumerate carries settle_fired = Some(true).
+    // and the probe's enumerate carries the reason-appropriate
+    // settle_concluded = Some(true) (a START fence reads the start's
+    // settle_fired flag).
     assert!(matches!(
         registry.fence_unconfirmed_stop(
             "claude",
@@ -526,7 +528,7 @@ async fn start_cancellation_registers_on_the_tickets_canonical_key() {
     let fences = registry.stale_start_fences();
     assert_eq!(fences.len(), 1);
     assert_eq!(
-        fences[0].settle_fired,
+        fences[0].settle_concluded,
         Some(true),
         "the guard's Drop sets the SENDER-side settle evidence — the probe \
          can answer 'the operation concluded' without polling the boxed future"

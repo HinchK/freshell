@@ -116,6 +116,7 @@ fn snapshot_close_evidence_references(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn recover_stale_start(
     ownership: &Arc<freshell_ownership::RuntimeOwnershipRegistry>,
     registry: &freshell_terminal::TerminalRegistry,
@@ -124,6 +125,7 @@ async fn recover_stale_start(
     fresh_opencode: freshell_freshagent::FreshOpencodeState,
     rec: freshell_ownership::RecoveredStart,
     settle_budget: std::time::Duration,
+    state_broadcast_tx: &tokio::sync::broadcast::Sender<String>,
 ) {
     // 1. The operation's OWN cancellation first (the registered
     //    handle — the production start paths register through
@@ -300,6 +302,18 @@ async fn recover_stale_start(
              or partial reap unconfirmed) — the key fences typed StaleStart, \
              NEVER plain Vacant; a confirmed-death probe or the lane teardowns \
              release it");
+        // b8ke e3r4 F5: broadcast the fence so every connected device
+        // converges on the typed recovery state immediately.
+        broadcast_fenced_transition(
+            state_broadcast_tx,
+            &rec.provider,
+            &rec.session_id,
+            ownership.boot_epoch(),
+            rec.generation,
+            Some(rec.kind),
+            "stale-start",
+            &rec.operation_id,
+        );
     }
 }
 
@@ -316,6 +330,48 @@ async fn recover_stale_start(
 /// fence holds (the partial records no start time, so a live pid cannot
 /// be identified as the original — fail closed; no signal is ever sent).
 /// A fence with NO recorded pid can never confirm: it holds.
+/// b8ke e3r4 F5: broadcast a FENCE transition so every connected device
+/// converges on the fenced state immediately (previously the stale
+/// watchdogs mutated ownership silently — devices kept their stale owner
+/// state until reconnect). The frame mirrors the handoff failure
+/// broadcast: transition "handoff-failed", `fenced: true`, the typed
+/// reason.
+#[allow(clippy::too_many_arguments)] // the fence transition's field set
+fn broadcast_fenced_transition(
+    broadcast_tx: &tokio::sync::broadcast::Sender<String>,
+    provider: &str,
+    session_id: &str,
+    epoch: u64,
+    generation: u64,
+    prior_kind: Option<freshell_ownership::RuntimeOwnerKind>,
+    reason: &str,
+    operation_id: &str,
+) {
+    use freshell_protocol::{ServerMessage, SessionRuntimeOwner};
+    let owner_kind = prior_kind
+        .map(|k| match k {
+            freshell_ownership::RuntimeOwnerKind::Terminal => "terminal",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent => "fresh-agent",
+        })
+        .unwrap_or("vacant");
+    let frame = serde_json::to_string(&ServerMessage::SessionRuntimeOwner(SessionRuntimeOwner {
+        provider: provider.to_string(),
+        session_id: session_id.to_string(),
+        epoch,
+        generation,
+        owner_kind: owner_kind.to_string(),
+        previous_kind: None,
+        terminal_id: None,
+        operation_id: operation_id.to_string(),
+        transition: "handoff-failed".to_string(),
+        reason: Some(reason.to_string()),
+        fenced: Some(true),
+        alias_of: None,
+    }))
+    .unwrap_or_default();
+    let _ = broadcast_tx.send(frame);
+}
+
 async fn probe_stale_start_fences(
     ownership: &Arc<freshell_ownership::RuntimeOwnershipRegistry>,
     fresh_codex: &freshell_freshagent::FreshCodexState,
@@ -323,26 +379,23 @@ async fn probe_stale_start_fences(
     fresh_opencode: &freshell_freshagent::FreshOpencodeState,
 ) {
     for fence in ownership.stale_start_fences() {
-        // b8ke focused episode-2 post-cap F4: the probe releases ONLY on
-        // REAL confirmed evidence — NEVER on absence. The probe runs in
-        // the SAME watchdog pass as recovery, so a fence created moments
-        // ago (the operation possibly still in flight, pre-registration)
-        // must never reopen on the mere fact that a map has no entry or a
-        // pid is gone from /proc.
+        // b8ke focused episode-2 post-cap F4 + e3r4 F2/F3: the probe
+        // releases ONLY on REAL confirmed evidence — NEVER on absence —
+        // and it is now the ONLY recovery for the stale-reason fences
+        // (the acknowledged force-clear is PlatformLimited-only; the
+        // design reconciliation). Reason-aware:
         //   • A recorded PID requires the LANE's confirmed-tree reap (the
-        //     `confirm_fenced_prior_dead` machinery: condemned-record
-        //     kill-and-confirm over the RECORDED tree, or the quiescing
-        //     teardown of a live session) — never bare /proc absence
-        //     (recover_stale_start itself refuses that evidence: a
-        //     descendant can outlive the direct pid and keep writing).
-        //   • A PID-LESS fence requires BOTH a positive kind-aware
-        //     liveness answer (the lane's authoritative session map says
-        //     the session is absent) AND the operation's registered
-        //     settle/cancellation CONCLUDED (`settle_fired == Some(true)`
-        //     — the guard dropped). A fence whose operation never armed a
-        //     registration (the pre-registration window) can NEVER prove
-        //     conclusion: it HOLDS, and the acknowledged operator
-        //     force-clear (which accepts StaleStart) is the escape.
+        //     `confirm_fenced_prior_dead` machinery) — never bare /proc
+        //     absence (a descendant can outlive the direct pid and keep
+        //     writing).
+        //   • A PID-LESS fence: the REASON-APPROPRIATE settle evidence
+        //     gates the release — `Some(false)` (the operation is STILL
+        //     RUNNING) holds; `Some(true)` (concluded) releases on the
+        //     kind-aware lane-absence answer; `None` (NO registration —
+        //     the opencode production shape: no per-session pid and no
+        //     start settlement) routes through
+        //     `confirm_fenced_prior_dead`, the kind-aware lane
+        //     confirmation, instead of rejecting forever.
         let confirmed_gone = match fence.prior_pid {
             Some(_pid) => match fence.provider.as_str() {
                 "codex" => {
@@ -362,10 +415,11 @@ async fn probe_stale_start_fences(
                 }
                 _ => false,
             },
-            None => {
-                if fence.settle_fired != Some(true) {
-                    false
-                } else {
+            None => match fence.settle_concluded {
+                // Still in flight: the fence holds (fail closed).
+                Some(false) => false,
+                // Concluded: the kind-aware lane-absence answer.
+                Some(true) => {
                     let live = match fence.provider.as_str() {
                         "codex" => fresh_codex.has_live_session(&fence.session_id).await,
                         "claude" => fresh_claude.has_live_session(&fence.session_id).await,
@@ -374,7 +428,27 @@ async fn probe_stale_start_fences(
                     };
                     !live
                 }
-            }
+                // NO registration (the opencode shape): the kind-aware
+                // lane confirmation decides — never a permanent hold.
+                None => match fence.provider.as_str() {
+                    "codex" => {
+                        fresh_codex
+                            .confirm_fenced_prior_dead(&fence.session_id)
+                            .await
+                    }
+                    "claude" => {
+                        fresh_claude
+                            .confirm_fenced_prior_dead(&fence.session_id)
+                            .await
+                    }
+                    "opencode" => {
+                        fresh_opencode
+                            .confirm_fenced_prior_dead(&fence.session_id)
+                            .await
+                    }
+                    _ => false,
+                },
+            },
         };
         if !confirmed_gone {
             continue;
@@ -393,7 +467,14 @@ async fn probe_stale_start_fences(
                 pid = ?fence.prior_pid, generation = fence.generation,
                 initiator = %fence.initiator,
                 to_kind = ?fence.prior_kind,
-                probe = if fence.prior_pid.is_some() { "lane-confirmed-tree-reap" } else { "kind-aware-liveness-absent-and-settled" },
+                probe = if fence.prior_pid.is_some() {
+                    "lane-confirmed-tree-reap"
+                } else if fence.settle_concluded.is_some() {
+                    "kind-aware-liveness-absent-and-settled"
+                } else {
+                    "kind-aware-lane-confirmation"
+                },
+                fence_reason = ?fence.reason,
                 epoch = ownership.boot_epoch(),
                 outcome = ?released,
                 failure_reason = "STARTING_TIMEOUT",
@@ -881,6 +962,9 @@ async fn main() -> ExitCode {
         let fresh_codex = fresh_codex_state.clone();
         let fresh_claude = fresh_claude_state.clone();
         let fresh_opencode = fresh_opencode_state.clone();
+        // b8ke e3r4 F5: the watchdog's own broadcast handle (the fence
+        // transitions broadcast; the outer Arc stays with the server).
+        let broadcast_tx = Arc::clone(&broadcast_tx);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
@@ -889,13 +973,27 @@ async fn main() -> ExitCode {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
-                // b8ke e3r2 F2: the stale-Stopping watchdog — over-aged
-                // Stopping records (a stop operation that died between
-                // claim and commit) fence TYPED alongside the stale-start
-                // sweep, so a key can never strand in Stopping until
-                // restart. The fence releases through the confirmed-death
-                // probe or the acknowledged operator force-clear.
-                let _ = ownership.recover_stale_stoppings(now, 30_000);
+                // b8ke e3r2 F2 + e3r4 F5: the stale-Stopping watchdog —
+                // over-aged Stopping records (a stop operation that died
+                // between claim and commit) fence TYPED alongside the
+                // stale-start sweep, so a key can never strand in Stopping
+                // until restart. The fence releases through the
+                // confirmed-death probe only (the e3r4 reconciliation);
+                // and every fence BROADCASTS the transition so connected
+                // devices converge immediately (previously the sweep
+                // discarded every returned transition).
+                for rec in ownership.recover_stale_stoppings(now, 30_000) {
+                    broadcast_fenced_transition(
+                        &broadcast_tx,
+                        &rec.provider,
+                        &rec.session_id,
+                        ownership.boot_epoch(),
+                        rec.generation,
+                        rec.prior.as_ref().map(|(owner, _)| owner.kind),
+                        "stale-stop",
+                        &rec.operation_id,
+                    );
+                }
                 for rec in ownership.recover_stale_starts(now, 30_000) {
                     recover_stale_start(
                         &ownership,
@@ -905,6 +1003,7 @@ async fn main() -> ExitCode {
                         fresh_opencode.clone(),
                         rec,
                         std::time::Duration::from_secs(5),
+                        &broadcast_tx,
                     )
                     .await;
                 }
@@ -4326,6 +4425,8 @@ mod stale_start_watchdog_tests {
         let recs = states.0.recover_stale_starts(0, 0);
         assert_eq!(recs.len(), 1, "exactly one stale start recovered");
         let rec = recs.into_iter().next().unwrap();
+        // e3r4 F5: the broadcast handle (tests drain it when needed).
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
         recover_stale_start(
             &states.0,
             &states.1,
@@ -4334,6 +4435,7 @@ mod stale_start_watchdog_tests {
             states.4.clone(),
             rec,
             settle_budget,
+            &tx,
         )
         .await;
         // The recovery consumed the record: no second recovery fires.
@@ -4433,6 +4535,7 @@ mod stale_start_watchdog_tests {
 
         let recs = states.0.recover_stale_starts(0, 0);
         assert_eq!(recs.len(), 1);
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
         recover_stale_start(
             &states.0,
             &states.1,
@@ -4441,6 +4544,7 @@ mod stale_start_watchdog_tests {
             states.4.clone(),
             recs.into_iter().next().unwrap(),
             std::time::Duration::from_secs(5),
+            &tx,
         )
         .await;
 
@@ -4736,6 +4840,7 @@ mod stale_start_watchdog_tests {
         drop(guard); // the settle fires
         let recs = states2.0.recover_stale_starts(0, 0);
         assert_eq!(recs.len(), 1);
+        let (tx2, _rx2) = tokio::sync::broadcast::channel::<String>(64);
         recover_stale_start(
             &states2.0,
             &states2.1,
@@ -4744,6 +4849,7 @@ mod stale_start_watchdog_tests {
             states2.4.clone(),
             recs.into_iter().next().unwrap(),
             std::time::Duration::from_secs(5),
+            &tx2,
         )
         .await;
         assert_eq!(
@@ -4892,6 +4998,91 @@ mod stale_start_watchdog_tests {
         }
     }
 
+    /// b8ke e3r4 F5: the stale-stop watchdog's fence transition
+    /// BROADCASTS (the session.runtimeOwner frame) so connected devices
+    /// converge immediately; the frame carries the fenced marker + the
+    /// typed reason.
+    #[tokio::test]
+    async fn the_stale_stop_fence_transition_broadcasts_the_owner_frame() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        broadcast_fenced_transition(
+            &tx,
+            "claude",
+            "sid-bcast",
+            7,
+            3,
+            Some(freshell_ownership::RuntimeOwnerKind::FreshAgent),
+            "stale-stop",
+            "op-bcast",
+        );
+        let raw = rx.try_recv().expect("the fence transition broadcast");
+        let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(frame["type"], "session.runtimeOwner");
+        assert_eq!(frame["sessionId"], "sid-bcast");
+        assert_eq!(frame["ownerKind"], "fresh-agent");
+        assert_eq!(frame["transition"], "handoff-failed");
+        assert_eq!(frame["reason"], "stale-stop");
+        assert_eq!(frame["fenced"], true);
+        assert_eq!(frame["epoch"], 7);
+        assert_eq!(frame["generation"], 3);
+    }
+
+    /// b8ke e3r4 F3: an OpenCode-shaped stale fence (PID-less, NO start
+    /// settlement — the production shape) releases through the
+    /// kind-aware LANE CONFIRMATION instead of rejecting forever. The
+    /// probe's `None`-evidence arm routes to confirm_fenced_prior_dead,
+    /// which answers true when the lane holds nothing for the session
+    /// (the PID-less runtime's whole identity is absent).
+    #[tokio::test]
+    async fn an_opencode_shaped_stale_fence_releases_through_the_lane_confirmation() {
+        let states = watchdog_states();
+        // The OpenCode shape: NO partial (PID-less) + NO start settlement —
+        // the stale start begins under the OPENCODE provider.
+        let BeginOutcome::Granted { generation } = states.0.begin_start(
+            "opencode",
+            "sid-stale",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-fence-oc",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("expected Granted")
+        };
+        let _ = generation;
+        let recs = states.0.recover_stale_starts(0, 0);
+        assert_eq!(recs.len(), 1);
+        let rec = recs.into_iter().next().unwrap();
+        assert!(rec.partial_runtime.is_none());
+        assert!(matches!(
+            states.0.fence_unconfirmed_stop(
+                "opencode",
+                "sid-stale",
+                "op-fence-oc",
+                rec.generation,
+                FenceReason::StaleStart,
+            ),
+            freshell_ownership::FenceOutcome::Fenced
+        ));
+        // The enumerated fence carries NO settle evidence (the opencode
+        // lane never registers start settlement) and NO pid.
+        let fences = states.0.stale_start_fences();
+        assert_eq!(fences.len(), 1);
+        assert_eq!(fences[0].prior_pid, None);
+        assert_eq!(fences[0].settle_concluded, None);
+        // THE PROBE: the None-evidence arm routes through the lane
+        // confirmation — the empty opencode lane holds nothing for the
+        // session → confirmed dead → RELEASES (pre-e3r4: rejected
+        // forever, blocked until restart).
+        probe_stale_start_fences(&states.0, &states.2, &states.3, &states.4).await;
+        assert_eq!(
+            states.0.observe("opencode", "sid-stale").state,
+            OwnershipState::Vacant,
+            "the opencode-shaped stale fence released through the kind-aware \
+             lane confirmation"
+        );
+    }
+
     /// b8ke focused episode-2 round-3 F6: an UNCONFIRMABLE partial reap
     /// (a REAL LIVE runtime the lane cannot confirm — no lease handle, no
     /// condemned record) fences — the reap result is CONSUMED, never
@@ -4988,6 +5179,7 @@ mod stale_start_watchdog_tests {
 
         let recs = states.0.recover_stale_starts(0, 0);
         assert_eq!(recs.len(), 1);
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
         recover_stale_start(
             &states.0,
             &states.1,
@@ -4996,6 +5188,7 @@ mod stale_start_watchdog_tests {
             states.4.clone(),
             recs.into_iter().next().unwrap(),
             std::time::Duration::from_secs(5),
+            &tx,
         )
         .await;
 
@@ -5084,6 +5277,7 @@ mod stale_start_watchdog_tests {
 
         let recs = states.0.recover_stale_starts(0, 0);
         assert_eq!(recs.len(), 1);
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
         recover_stale_start(
             &states.0,
             &states.1,
@@ -5092,6 +5286,7 @@ mod stale_start_watchdog_tests {
             states.4.clone(),
             recs.into_iter().next().unwrap(),
             std::time::Duration::from_secs(5),
+            &tx,
         )
         .await;
 

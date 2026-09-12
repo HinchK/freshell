@@ -2763,8 +2763,38 @@ impl FreshClaudeState {
                         match stop_outcome {
                             freshell_ownership::StopOutcome::Granted { generation } => {
                                 stop_generation = Some(generation);
-                                stop_op_id = Some(kill_op_id);
-                                stop_key = Some(canonical);
+                                stop_op_id = Some(kill_op_id.clone());
+                                stop_key = Some(canonical.clone());
+                                // b8ke e3r4 F1: the no-stamp Granted path
+                                // records the SAME stop bookkeeping as the
+                                // stamp-present path — the settlement
+                                // guard (so a slow-but-running stop is
+                                // never fenced as unregistered) and the
+                                // rollback evidence (a synthesized stamp
+                                // from the OBSERVED owner, so the unwind
+                                // verifies the runtime's liveness directly
+                                // — NEVER stamp-absence, which was
+                                // converted to "runtime exited" and
+                                // committed a LIVE runtime to Vacant on a
+                                // clean close failure).
+                                taken_stop_stamp = Some((
+                                    canonical.clone(),
+                                    crate::ownership_lane::OwnershipStamp {
+                                        epoch: registry.boot_epoch(),
+                                        generation,
+                                        operation_id: kill_op_id.clone(),
+                                        owner: owner.clone(),
+                                    },
+                                ));
+                                _stop_settlement = Some(
+                                    crate::ownership_lane::register_stop_settlement_for_claim(
+                                        &self.ownership,
+                                        PROVIDER,
+                                        &canonical,
+                                        &kill_op_id,
+                                        generation,
+                                    ),
+                                );
                             }
                             freshell_ownership::StopOutcome::NotLive {
                                 state: freshell_ownership::OwnershipState::Vacant,
@@ -10929,6 +10959,73 @@ rl.on('line', (line) => {
             .is_none(),
             "the stamp is NOT restored for the dead sidecar (the atomic \
              re-validation refused it under the lock)"
+        );
+    }
+
+    /// b8ke e3r4 F1: the NO-STAMP live-owner close failure is NOT
+    /// converted to "runtime exited" — the fallback's Granted path records
+    /// the SAME bookkeeping as the stamp-present path (the synthesized
+    /// rollback stamp + the settlement guard), so the unwind verifies the
+    /// runtime's liveness directly (the LIVE sidecar stays Live; the key
+    /// is never committed to Vacant over a live runtime). A slow-but-
+    /// running no-stamp stop is never fenced as unregistered (the guard).
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_no_stamp_live_owner_close_failure_stays_live_never_vacant() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(sink.clone());
+
+        let mut create = dedup_create_msg("req-e3r4-f1");
+        create.model = Some("opus".into());
+        st.handle_create(create, None).await;
+        let created = await_claude_created(&mut rx, "req-e3r4-f1").await;
+        let placeholder = created["sessionId"].as_str().unwrap().to_string();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !sink.was_recorded("claude", FRESH_CREATE_DURABLE_ID) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the create's adoption never recorded the binding"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // THE NO-STAMP SHAPE: consume the retained stamp (the handoff's
+        // kill_for_handoff consumption) — the kill runs the no-stamp
+        // fallback with a LIVE owner observed.
+        crate::ownership_lane::take_retained_stamp(&st.ownership_stamps, FRESH_CREATE_DURABLE_ID);
+
+        // The clean close failure.
+        sink.fail_retires_for("claude", FRESH_CREATE_DURABLE_ID);
+        st.handle_kill(kill_msg(&placeholder)).await;
+        let frame = await_specific_frame(&mut rx, "freshAgent.killed", &placeholder).await;
+        assert_eq!(
+            frame["code"],
+            json!("DURABLE_CLOSE_FAILED"),
+            "the recoverable close failure answers typed: {frame}"
+        );
+
+        // THE F1 CONTRACT: the LIVE runtime stays LIVE (abort_stop
+        // restored it) — NEVER committed to Vacant over a live runtime
+        // (pre-e3r4 the absent stamp was converted to "exited" and the
+        // key vacated, licensing a second writer).
+        assert!(
+            matches!(
+                registry.observe("claude", FRESH_CREATE_DURABLE_ID).state,
+                freshell_ownership::OwnershipState::Live { owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            ),
+            "the no-stamp live-owner close failure keeps the runtime LIVE \
+             (the synthesized rollback evidence verified the live sidecar)"
+        );
+        // And the session stays live in the lane.
+        assert!(
+            st.has_live_session(FRESH_CREATE_DURABLE_ID).await,
+            "the runtime still runs — nothing was killed"
         );
     }
 
