@@ -13,7 +13,8 @@ test.describe('Settings', () => {
   async function openSettingsSection(page: any, section: string) {
     await openSettings(page)
     await page.getByRole('tab', { name: new RegExp(`^${section}$`, 'i') }).click()
-    await expect(page.getByRole('tabpanel', { name: new RegExp(`${section} settings`, 'i') })).toBeVisible({
+    const panelName = section.toLowerCase().replace(/ /g, '-')
+    await expect(page.getByRole('tabpanel', { name: new RegExp(`${panelName} settings`, 'i') })).toBeVisible({
       timeout: 5_000,
     })
   }
@@ -175,5 +176,44 @@ test.describe('Settings', () => {
     await expect(
       page.getByRole('button', { name: /system|light|dark/i }).first()
     ).toBeVisible()
+  })
+
+  test('fresh agent display toggles persist locally and clear on re-enable', async ({ freshellPage, page, harness, serverInfo }) => {
+    await openSettingsSection(page, 'Coding Agents')
+
+    const switchFor = (label: string) => page.getByText(label).locator('..').getByRole('switch')
+    const thinkingToggle = switchFor('Show thinking')
+    const toolsToggle = switchFor('Show tools')
+    await expect(thinkingToggle).toHaveAttribute('aria-checked', 'true')
+    await expect(toolsToggle).toHaveAttribute('aria-checked', 'true')
+
+    // Opt out of BOTH display settings.
+    await thinkingToggle.click()
+    await toolsToggle.click()
+    await page.waitForTimeout(600) // browser-preferences persist debounce is 500ms
+    expect((await harness.getSettings()).freshAgent.showThinking).toBe(false)
+    expect((await harness.getSettings()).freshAgent.showTools).toBe(false)
+
+    // Both opt-outs persist across reload; the blob holds ONLY non-default values.
+    await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+    await harness.waitForHarness()
+    await harness.waitForConnection()
+    const afterReload = (await harness.getSettings()).freshAgent
+    expect(afterReload.showThinking).toBe(false)
+    expect(afterReload.showTools).toBe(false)
+    const blob = await page.evaluate(() => localStorage.getItem('freshell.browser-preferences.v1'))
+    const parsed = JSON.parse(blob ?? '{}')
+    expect(parsed.settings?.freshAgent?.showThinking).toBe(false)
+    expect(parsed.settings?.freshAgent?.showTools).toBe(false)
+
+    // Re-enabling both drops the keys from the blob (diff-vs-defaults).
+    await openSettingsSection(page, 'Coding Agents')
+    await thinkingToggle.click()
+    await toolsToggle.click()
+    await expect(thinkingToggle).toHaveAttribute('aria-checked', 'true')
+    await expect(toolsToggle).toHaveAttribute('aria-checked', 'true')
+    await page.waitForTimeout(600)
+    const blobOn = await page.evaluate(() => localStorage.getItem('freshell.browser-preferences.v1'))
+    expect(JSON.parse(blobOn ?? '{}').settings?.freshAgent).toBeUndefined()
   })
 })

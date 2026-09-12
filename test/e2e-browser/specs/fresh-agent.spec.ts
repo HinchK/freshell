@@ -974,7 +974,9 @@ test.describe('Fresh Agent', () => {
     // point). Activate both toggles by keyboard Enter instead: focus +
     // keypress targets the element, not the point, so the overlay cannot
     // intercept the activation.
-    await freshcodexRoot.getByRole('button', { name: 'Toggle activity details' }).press('Enter')
+    // New default: the strip (and its tool blocks) mount EXPANDED — pin it
+    // instead of blind-pressing the toggle (a press would now collapse).
+    await expect(freshcodexRoot.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'true')
     await expect(freshcodexRoot.getByText('private style reasoning should stay hidden')).toHaveCount(0)
     await freshcodexRoot.getByRole('button', { name: 'Thinking' }).press('Enter')
     await expect(freshcodexRoot.getByText('private style reasoning should stay hidden')).toBeVisible()
@@ -1653,11 +1655,18 @@ test.describe('activity line collapse', () => {
     await expect(pane).toBeVisible({ timeout: 10_000 })
     const strips = pane.getByRole('region', { name: 'Activity strip' })
     await expect(strips).toHaveCount(1)
-    await expect(strips.first()).toContainText('5 tools used')
-    await pane.getByRole('button', { name: 'Toggle activity details' }).click()
+    // New default: the strip mounts EXPANDED — tool detail rows render with no click.
     await expect(pane.getByRole('button', { name: 'Read tool call' })).toHaveCount(5)
-    await expect(pane.getByText('src/a.ts')).toBeVisible()
-    await expect(pane.getByText('src/e.ts')).toBeVisible()
+    const toggle = pane.getByRole('button', { name: 'Toggle activity details' })
+    // Collapse still accumulates the line into one summary.
+    await toggle.click()
+    await expect(strips.first()).toContainText('5 tools used')
+    await toggle.click()
+    await expect(pane.getByRole('button', { name: 'Read tool call' })).toHaveCount(5)
+    // Tool blocks mount expanded (span preview + <pre data-tool-input> both
+    // carry the path) — assert the pre, strict-mode-safe.
+    await expect(pane.locator('pre[data-tool-input]').filter({ hasText: 'src/a.ts' })).toBeVisible()
+    await expect(pane.locator('pre[data-tool-input]').filter({ hasText: 'src/e.ts' })).toBeVisible()
     // A merged line's fork affordance resolves to the line's LAST contributing turn.
     const lineArticle = pane.locator('article[data-turn-index="1"]')
     await lineArticle.hover()
@@ -1677,8 +1686,87 @@ test.describe('activity line collapse', () => {
     await expect(pane).toBeVisible({ timeout: 10_000 })
     const strips = pane.getByRole('region', { name: 'Activity strip' })
     await expect(strips).toHaveCount(2)
+    // New default: expanded mounts — each line shows its single tool row.
+    await expect(strips.nth(0).getByRole('button', { name: 'Read tool call' })).toHaveCount(1)
+    await expect(strips.nth(1).getByRole('button', { name: 'Read tool call' })).toHaveCount(1)
+    await strips.nth(0).getByRole('button', { name: 'Toggle activity details' }).click()
+    await strips.nth(1).getByRole('button', { name: 'Toggle activity details' }).click()
     await expect(strips.nth(0)).toContainText('1 tool used')
     await expect(strips.nth(1)).toContainText('1 tool used')
+  })
+
+  test('shows thinking rows and expanded activity details by default', async ({ freshellPage: _freshellPage, page, terminal }) => {
+    await seedCollapsePane(page, terminal, 'defaults-thread', [
+      { id: 'turn-user', turnId: 'turn-user', role: 'user', summary: 'read files',
+        items: [{ id: 'item-user', kind: 'text', text: 'read these files' }] },
+      {
+        id: 'turn-mixed', turnId: 'turn-mixed', role: 'assistant', summary: 'thought and read',
+        items: [
+          { id: 'think-mixed', kind: 'thinking', text: 'weighing which files to read first' },
+          { id: 'tool-mixed', kind: 'tool_use', toolUseId: 'c-mixed', name: 'Read', input: { file_path: 'src/a.ts' } },
+        ],
+      },
+    ])
+    const pane = page.locator('[data-context="fresh-agent"]').last()
+    await expect(pane).toBeVisible({ timeout: 10_000 })
+    const strip = pane.getByRole('region', { name: 'Activity strip' }).first()
+    // showTools defaults on: the strip mounts EXPANDED without any click.
+    await expect(strip.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'true')
+    await expect(strip.getByRole('button', { name: 'Read tool call' })).toHaveCount(1)
+    // Tool blocks mount expanded under the new default, so the input renders
+    // BOTH as the preview span and as the raw <pre data-tool-input> body —
+    // assert the pre (strict-mode-safe; pins the tool-block-expanded default).
+    await expect(pane.locator('pre[data-tool-input]').filter({ hasText: 'src/a.ts' })).toBeVisible()
+    // showThinking defaults on: the Thinking disclosure renders.
+    const thinking = strip.getByRole('button', { name: 'Thinking' })
+    await expect(thinking).toBeVisible()
+    await thinking.click()
+    await expect(strip.getByText('weighing which files to read first')).toBeVisible()
+
+    // The full user loop: turn Show thinking off in the real Settings UI and
+    // see the pane re-render on return. (Opening Settings unmounts the pane
+    // tree — App.tsx:1788-1796 — so the pane reflects the new value by
+    // remount; that IS the single-tab user flow.)
+    // Pin the sidebar button's exact accessible name — every fresh-agent
+    // pane header also renders an "Agent settings" button
+    // (FreshAgentSettingsButton.tsx:280), which a /settings/i regex would
+    // match too (Playwright strict-mode violation).
+    await page.getByRole('button', { name: 'Settings (Ctrl+B ,)' }).click()
+    await expect(page.getByRole('tab', { name: /^Coding Agents$/i })).toBeVisible({ timeout: 5_000 })
+    await page.getByRole('tab', { name: /^Coding Agents$/i }).click()
+    const thinkingRow = page.getByText('Show thinking')
+    const showThinkingSwitch = thinkingRow.locator('..').getByRole('switch')
+    await expect(showThinkingSwitch).toHaveAttribute('aria-checked', 'true')
+    await showThinkingSwitch.click()
+    await expect(showThinkingSwitch).toHaveAttribute('aria-checked', 'false')
+    // Return to the terminal view (sidebar "Coding Agents" nav button —
+    // same affordance as title-sync-convergence.spec.ts:356).
+    await page.getByTitle('Coding Agents (Ctrl+B T)').click()
+    const paneAfter = page.locator('[data-context="fresh-agent"]').last()
+    await expect(paneAfter).toBeVisible({ timeout: 10_000 })
+    await expect(paneAfter.getByRole('button', { name: 'Thinking' })).toHaveCount(0)
+    // showTools is still on: tool detail stays expanded.
+    await expect(paneAfter.getByRole('button', { name: 'Read tool call' })).toHaveCount(1)
+
+    // Now flip Show tools off as well: the pane's strip must mount collapsed
+    // on return (the Show-tools pane effect, end to end).
+    // Pin the sidebar button's exact accessible name — every fresh-agent
+    // pane header also renders an "Agent settings" button
+    // (FreshAgentSettingsButton.tsx:280), which a /settings/i regex would
+    // match too (Playwright strict-mode violation).
+    await page.getByRole('button', { name: 'Settings (Ctrl+B ,)' }).click()
+    await page.getByRole('tab', { name: /^Coding Agents$/i }).click()
+    const toolsRow = page.getByText('Show tools')
+    const showToolsSwitch = toolsRow.locator('..').getByRole('switch')
+    await expect(showToolsSwitch).toHaveAttribute('aria-checked', 'true')
+    await showToolsSwitch.click()
+    await expect(showToolsSwitch).toHaveAttribute('aria-checked', 'false')
+    await page.getByTitle('Coding Agents (Ctrl+B T)').click()
+    const paneToolsOff = page.locator('[data-context="fresh-agent"]').last()
+    await expect(paneToolsOff).toBeVisible({ timeout: 10_000 })
+    // Collapsed strip: the settled summary replaces the expanded tool detail.
+    await expect(paneToolsOff.getByText('1 tool used')).toBeVisible()
+    await expect(paneToolsOff.getByRole('button', { name: 'Read tool call' })).toHaveCount(0)
   })
 })
 
@@ -1771,15 +1859,14 @@ test.describe('foldable echo captions', () => {
       toolTurn('turn-c', [['c3', 'src/c.ts']]),
     ])
     // Superseded: the caption left the stream (blank-captioned turn-c paints
-    // nothing) and lives only in the line's expansion.
-    await expect(pane.getByText('Considering options')).toHaveCount(0, { timeout: 10_000 })
-    await expect(pane.getByTestId('fresh-agent-tail-caption')).toHaveCount(0)
+    // nothing) and lives only in the line's expansion — which now mounts
+    // expanded, so no toggle click is needed.
+    await expect(pane.getByTestId('fresh-agent-tail-caption')).toHaveCount(0, { timeout: 10_000 })
     await expect(pane.getByRole('region', { name: 'Activity strip' })).toHaveCount(1)
-    await pane.getByRole('button', { name: 'Toggle activity details' }).click()
     const caption = pane.getByTestId('fresh-agent-activity-caption')
     await expect(caption).toHaveCount(1)
     await expect(caption).toContainText('Considering options')
-    await expect(pane.getByText('src/b.ts')).toBeVisible()
+    await expect(pane.locator('pre[data-tool-input]').filter({ hasText: 'src/b.ts' })).toBeVisible()
     // (Anchor order — caption row precedes the superseded turn's first item row —
     // is pinned by the unit test's compareDocumentPosition assertion.)
   })
@@ -1812,8 +1899,13 @@ test.describe('foldable echo captions', () => {
     ])
     await expect(pane.getByRole('region', { name: 'Activity strip' })).toHaveCount(2, { timeout: 10_000 })
     await expect(pane.getByTestId('fresh-agent-tail-caption')).toHaveCount(0)
-    await pane.getByRole('button', { name: 'Toggle activity details' }).nth(0).click()
-    await pane.getByRole('button', { name: 'Toggle activity details' }).nth(1).click()
+    // New default: showThinking renders the authored reasoning row; its
+    // disclosure starts collapsed — expand and assert the prose.
+    const stripTwo = pane.getByRole('region', { name: 'Activity strip' }).nth(1)
+    const thinking = stripTwo.getByRole('button', { name: 'Thinking' })
+    await expect(thinking).toBeVisible()
+    await thinking.click()
+    await expect(stripTwo.getByText('Pausing to plan the next step').first()).toBeVisible()
     await expect(pane.getByTestId('fresh-agent-activity-caption')).toHaveCount(0)
   })
 })
