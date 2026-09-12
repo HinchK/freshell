@@ -34,17 +34,26 @@ worktree HEAD `4731fc66e` unless stated.)
 
 ## Design contract (pinned decisions)
 
-**D1 — Always-visible.** Thinking/reasoning transcript items are never filtered. The entire
+**D1 — Always-visible, hoisted thinking rows.** Thinking/reasoning transcript items are
+never filtered, and their rows are NOT hidden behind the strip's tool disclosure. The entire
 display-filter subsystem is deleted: `TranscriptDisplayOptions` + `shouldDisplayTranscriptItem`
 (`FreshAgentTranscript.tsx:71-83`), `filterTurnsForDisplay` (`:467-495`), the
 `DisplayTurn.hadFilteredItems` marker (`:457-465`), its `foldCaption` clause (`:295`), the
 filtered-echo null-render branch (`:870-875`), and the `displayOptions` memo (`:969-972`).
-"Visible" for a collapsed strip means the `settledSummary` part `'thought'`
-(`FreshAgentTranscript.tsx:210-219`) — a thinking-only line reads `thought`, a mixed line reads
-`thought · N tools used` — and the `Thinking` disclosure rows render whenever the strip is
-expanded. No filtering, turn-dropping, or caption-gating for hidden content remains.
+Rendering contract (restructures `FreshAgentActivityStrip` `:605-715`):
+- The strip container always renders the summary row (`settledSummary`, `:210-219` — 'thought'
+  part stays; a thinking-only line reads `thought`, mixed reads `thought · N tools used`).
+- **Thinking rows render always**, inside the strip container, below the summary, in row order
+  (row pipeline and merge rules — consecutive thinking chunks merge into one row — unchanged).
+  Each is a compact `FreshAgentThinkingRow` disclosure: one line until expanded.
+- **Tool rows and captions render only when the strip is expanded** (the disclosure gates tool
+  detail and echo captions, whose anchoring belongs to the tool supersession flow; a caption
+  never renders while collapsed).
+- The live reel/streaming behavior is unchanged (reel shows 'Thinking' while a thinking row is
+  live; hoisting affects settled rows only).
+No filtering, turn-dropping, or caption-gating for hidden content remains.
 
-**D2 — Two expansion-default settings, compact by default.** Browser-local keys
+**D2 — Two expansion-default settings, compact by default, mount-only.** Browser-local keys
 `freshAgent.expandThinking` / `freshAgent.expandTools` (both default `false`), replacing
 `showThinking`/`showTools` everywhere (`shared/settings.ts:97-101` FRESH_AGENT_LOCAL_KEYS,
 `:229-233` LocalSettings type, `:631-645` normalizeLocalPatch, `:920-924` defaults,
@@ -52,25 +61,36 @@ expanded. No filtering, turn-dropping, or caption-gating for hidden content rema
 deliberately NOT mapped (show/hide has no meaning-preserving mapping to expansion);
 stale keys are stripped on read by the existing pick-list machinery and scrubbed from
 storage on the next wholesale flush — accepted residual, no migration code.
-- `expandTools` feeds the strip's existing `initialExpanded` pipe (`:861-866`, `:883-885`).
-  The strip's live re-sync effect (`:614-615`) is **kept** (renamed source): a live settings
-  flip re-expands/re-collapses mounted strips, preserving the cross-tab propagation pinned by
-  `FreshAgentView.test.tsx:822-873` and `persistBroadcast`→`crossTabSync.ts:257`. "Controls the
-  default" holds at mount; the stomp-on-settings-change is cycle-1's shipped behavior.
+- `expandTools` feeds the strip's existing `initialExpanded` pipe (`:861-866`, `:883-885`) —
+  **mount-only**: the strip is `useState(initialExpanded)` and the live re-sync effect
+  (`:614-615`) is DELETED. The setting controls only the starting state: a live settings flip
+  never stomps a mounted strip's in-pane expansion/collapse state. Cross-tab cost accepted and
+  pinned by tests: `persistBroadcast` → `crossTabSync.ts:257` still updates other tabs' stores,
+  but their mounted strips keep their state until they remount (Settings open/close unmounts
+  the pane tree, `App.tsx:1788-1796`, so the active tab always reflects the new default on
+  return).
 - `expandThinking` feeds a new `initialExpanded` prop on `FreshAgentThinkingRow` (`:582-603`,
-  `useState(initialExpanded)` — **mount-only**, matching the `FreshAgentToolBlock` precedent at
-  `FreshAgentItemCard.tsx:71`). Strip collapse/expand already unmounts the row subtree
-  (`{!expanded ? … : …}` at `:653-711`), so strip re-expansion re-applies row initial state.
+  `useState(initialExpanded)` — mount-only, matching the `FreshAgentToolBlock` precedent at
+  `FreshAgentItemCard.tsx:71`). Independently observable: thinking rows are always visible
+  (D1), so "Expand thinking" on = their text visible at mount with the strip still compact.
 - Component prop defaults: `expandThinking = false`, `expandTools = false`
   (`:916-917`, `:944-945`).
 
-**D3 — Per-pane display-override fields are removed.** No production writer has set
-`paneContent.showThinking`/`showTools` since `6d0f4ef84` (2026-04-06, popover removal); no
-REST/MCP surface accepts them. Removing: `paneTypes.ts:243-244` (showTimecodes at `:245` STAYS —
-out of scope), `panesSlice.ts:202-203, 282-283`, `paneTreeValidation.ts:93-94`,
-`tab-registry-open.ts:169-170`, `tab-registry-snapshot.ts:61-62`, `shared/fresh-agent.ts:50-51`
-(the `...rest` passthrough in `migrateLegacyFreshAgentContent` then drops them from legacy
-agent-chat panes), and `FreshAgentView.tsx:596-597` resolution (View reads globals only).
+**D3 — Per-pane display-override fields are removed (types AND runtime).** No production
+writer has set `paneContent.showThinking`/`showTools` since `6d0f4ef84` (2026-04-06, popover
+removal); no REST/MCP surface accepts them. Type removal alone is INSUFFICIENT — runtime
+rest-spread construction sites carry the values through migrations and rehydration, so each
+site must explicitly omit the two names (verified in plan review round 1):
+- Type/decl removal: `paneTypes.ts:243-244` (showTimecodes at `:245` STAYS — out of scope),
+  `shared/fresh-agent.ts:50-51`.
+- Explicit runtime omission (destructure-and-drop, or construct without the keys):
+  `panesSlice.ts:202-203, 282-283` (normalizePaneContent copies), `paneTreeValidation.ts:93-94`
+  clauses, `tab-registry-open.ts:169-170` + `tab-registry-snapshot.ts:61-62` stamps,
+  `shared/fresh-agent.ts` `migrateLegacyFreshAgentContent` `...rest` passthrough (`:300-320`,
+  `:334-356`), `persistedState.ts` rehydration rest-paths, `storage-migration.ts`,
+  `persistMiddleware.ts`, and the server layout-store rest paths
+  (`server/agent-api/layout-store.ts`).
+- `FreshAgentView.tsx:596-597` resolution (View reads globals only).
 Rust `crates/freshell-ws/src/tabs_persist_validation.rs:391-392`: **keep** the two
 `optional_bool` lines as legacy tolerance (old persisted generations still validate their
 boolean shape; wrong-typed legacy values still rejected) with a "legacy-only, no writer since
@@ -158,57 +178,74 @@ patch/sanitize/seed paths, persistence writes).
 ## Task 2: Always-visible transcript + expansion plumbing
 
 - [ ] **Step 1: RED.** In `test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx`
-  apply redo-display-components.md §d: DELETE @244 (hide pin), @1148, @1260, @2007, @2045, @2076;
-  REWRITE @273 ("starts the strip expanded when expandTools is true"), @1160 (genuinely-zero-item
+  apply redo-display-components.md §d (updated for D1 hoisting + D2 mount-only): DELETE @244
+  (hide pin), @1148, @1260, @2007, @2045, @2076; REWRITE @273 ("starts the strip expanded when
+  expandTools is true" — tool rows visible, and thinking rows visible in BOTH states), @211
+  ("folds thinking into the activity strip with tools" — under hoisting the `Thinking` trigger
+  is visible WITHOUT expanding the strip; expand reveals the tool rows), @1160 (genuinely-zero-item
   streaming fixture), @1175 (zero-item↔tool transitions), @1221 (one spinner; visible
   thinking-only tail), @1273-light, @2097/@2120 (visible-thinking merge rationale), @2178
   split (positive stash survives; negative gated lane deleted), @2222; ADD-MISSING T1-T7:
-  T1 "renders thinking rows regardless of the expandThinking setting" (strip expanded via
-  `expandTools`; trigger visible, body absent until click), T2 "starts thinking rows expanded
-  when expandThinking is true", T3 "starts thinking rows collapsed by default", T4 "mounts the
-  strip collapsed by default (expandTools unset)" (`aria-expanded="false"`, settled summary,
-  no tool rows), T5 "a thinking-only turn renders an activity strip and is never dropped",
-  T6 "stashes a superseded echo caption from a thinking-bearing turn", T7 "in-pane expansion
-  is temporary state, not a setting" (rerender with unchanged props keeps state; rerender with
-  CHANGED `expandTools` re-syncs the strip — F1=keep).
+  T1 "renders thinking rows regardless of the expandThinking setting and of strip expansion" —
+  compact mount (expandTools unset): `Thinking` trigger visible while the strip is collapsed;
+  body absent until click. T2 "starts thinking rows expanded when expandThinking is true" —
+  body (`fresh-agent-thinking-body`) visible at mount with the strip still collapsed.
+  T3 "starts thinking rows collapsed by default". T4 "mounts the strip collapsed by default
+  (expandTools unset)" — toggle `aria-expanded="false"`, settled summary visible, NO tool
+  rows/captions, thinking rows PRESENT. T5 "a thinking-only turn renders an activity strip and
+  is never dropped". T6 "stashes a superseded echo caption from a thinking-bearing turn".
+  T7 "expansion is per-mount temporary state, not a setting" — expand the strip, rerender with
+  a CHANGED `expandTools` prop → the strip KEEPS the user's in-pane state (no re-sync);
+  unmount/remount with `expandTools` true → starts expanded.
   In `FreshAgentView.test.tsx`: REWRITE @709 ("flows expandThinking/expandTools from global
   settings into the transcript"), @775 ("mounts thinking rows and a collapsed strip by
-  default"), @822 (DELETE hide semantics; REPLACE with "re-renders the strip expansion when
-  expandTools changes on the live store" + "keeps thinking visible when expandThinking flips").
+  default" — Thinking trigger visible at compact mount), @822 (DELETE hide semantics; REPLACE
+  with "applies a changed expandTools default on REMOUNT, not on live re-render" — live
+  `updateSettingsLocal` dispatch does NOT move a mounted strip; remount starts expanded).
   Run: `npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.test.tsx`
-  Expected: new/rewritten tests fail (filter still hides; no initialExpanded plumb; props
-  still show*); all KEEP tests still pass.
+  Expected: new/rewritten tests fail (filter still hides; no initialExpanded plumb; thinking
+  rows still gated behind strip expansion; re-sync effect still present); all KEEP tests pass.
 - [ ] **Step 2: Verify the intended failure matches.**
-- [ ] **Step 3: Implement** per redo-display-components.md §a: delete the filter subsystem
-  (D1 list); `FreshAgentThinkingRow` gains `initialExpanded` (mount-only); strip gains
-  `initialThinkingExpanded`, keeps re-sync on `initialExpanded` (source renamed to expandTools);
-  `FreshAgentTurnArticle` props renamed `expandTools` + added `expandThinking` (`:748/:763`,
-  `:861-866`, `:883-885`, `:707-709`, `:1155`); component props/defaults per D2
+- [ ] **Step 3: Implement** per redo-display-components.md §a (updated for D1/D2): delete the
+  filter subsystem (D1 list); `FreshAgentThinkingRow` gains `initialExpanded` (mount-only);
+  restructure `FreshAgentActivityStrip` per the D1 rendering contract — summary row always;
+  thinking rows always (wired `initialExpanded={expandThinking}`); tool rows + captions only
+  when expanded; DELETE the re-sync effect (`:614-615`) so the strip is `useState(initialExpanded)`
+  mount-only; `FreshAgentTurnArticle` props renamed `expandTools` + added `expandThinking`
+  (`:748/:763`, `:861-866`, `:883-885`, `:707-709`, `:1155`); component props/defaults per D2
   (`:916-917`, `:944-945`); `displayTurns = useMemo(() => coalesceSyntheticToolResultTurns(turns), [turns])`
   (`:973-979`); FreshAgentView: global `expandThinking`/`expandTools` selectors (`?? false`),
   per-pane resolution lines deleted, transcript call site updated (`:584-597`, `:2927-2928`).
 - [ ] **Step 4: GREEN.** Step 1's command: all pass.
 - [ ] **Step 5: Refactor while green.** Confirm zero references to `shouldDisplayTranscriptItem`,
-  `filterTurnsForDisplay`, `hadFilteredItems`, `TranscriptDisplayOptions` remain.
+  `filterTurnsForDisplay`, `hadFilteredItems`, `TranscriptDisplayOptions` remain, and the
+  re-sync effect is gone.
 - [ ] **Step 6: Impacted-test verification.** `npm run test:vitest -- run test/unit/client/components/fresh-agent/ test/unit/client/fresh-agent-pane-migration.test.ts test/unit/client/store/persisted-state.fresh-agent.test.ts`
-  Expected: pane-payload migration tests (per-pane fields) fail — Task 3 RED material, recorded.
+  Expected: GREEN — Tasks 1-2 do not touch the migration/persistence paths, so the existing
+  pane-payload preservation assertions still pass; their rewrite is Task 3's RED (verified in
+  plan review round 1).
 - [ ] **Step 7: Commit.** `feat(fresh-agent): always render thinking; expansion settings control initial state`
 
 ## Task 3: Remove per-pane display-override fields
 
 - [ ] **Step 1: RED.** Re-base the migration-preservation tests per redo-pane-payload-e2e.md A3:
-  `persisted-state.fresh-agent.test.ts` @92/@204, `panesPersistence.test.ts` @1116/@1161/@1241,
-  `panesSlice.test.ts` @438/@4956, `fresh-agent-pane-migration.test.ts` @158,
-  `tab-registry-snapshot.test.ts` @128-129, `tab-registry-fresh-agent-migration.test.ts` @70/@90,
+  `test/unit/client/store/persisted-state.fresh-agent.test.ts` @92/@204, `test/unit/client/store/panesPersistence.test.ts` @1116/@1161/@1241,
+  `test/unit/client/store/panesSlice.test.ts` @438/@4956, `test/unit/client/fresh-agent-pane-migration.test.ts` @158,
+  `test/unit/client/lib/tab-registry-snapshot.test.ts` @128-129, `test/unit/client/tab-registry-fresh-agent-migration.test.ts` @70/@90,
   `test/unit/server/agent-layout-schema.test.ts` @151/@169,
   `test/unit/server/tabs-registry/fresh-agent-migration.test.ts` @133/@149 — from "preserves …
   as pane overrides" to "drops legacy display fields during migration" (legacy panes load;
-  the two fields vanish; `showTimecodes` behavior unchanged).
-  Run: `npm run test:vitest -- run <the eight files>`
-  Expected: rewritten tests fail (fields still copied/stamped/validated).
-- [ ] **Step 2: Verify the intended failure matches.**
-- [ ] **Step 3: Implement** D3: delete the fields from `paneTypes.ts`, the two normalizePaneContent
-  copies, the validation clauses, both registry stamps, `shared/fresh-agent.ts:50-51`; Rust
+  the two fields never reach constructed pane content — the RUNTIME strip sites in D3 are the
+  implementation target; `showTimecodes` behavior unchanged).
+  Run: `npm run test:vitest -- run test/unit/client/store/persisted-state.fresh-agent.test.ts test/unit/client/store/panesPersistence.test.ts test/unit/client/store/panesSlice.test.ts test/unit/client/fresh-agent-pane-migration.test.ts test/unit/client/lib/tab-registry-snapshot.test.ts test/unit/client/tab-registry-fresh-agent-migration.test.ts test/unit/server/agent-layout-schema.test.ts test/unit/server/tabs-registry/fresh-agent-migration.test.ts`
+  Expected: rewritten tests fail (fields still copied/stamped/spread through the runtime
+  construction sites).
+- [ ] **Step 2: Verify the intended failure matches** — failures are field-preservation
+  mismatches only (the runtime rest-spread paths still carry the fields).
+- [ ] **Step 3: Implement** D3: remove the type declarations AND the explicit runtime omissions
+  at every construction site (normalizePaneContent copies, validation clauses, registry
+  stamps, `migrateLegacyFreshAgentContent` rest-passthrough, `persistedState.ts`,
+  `storage-migration.ts`, `persistMiddleware.ts`, server layout-store rest paths); Rust
   `tabs_persist_validation.rs:391-392` keep-with-comment; no Rust seed change (Task 1 done).
 - [ ] **Step 4: GREEN.** Step 1's command passes; then `cargo test -p freshell-ws` — the
   persist-validation suite stays green (tolerated legacy fields still validate).
@@ -250,16 +287,19 @@ patch/sanitize/seed paths, persistence writes).
   - fresh-agent.spec.ts: REWRITE #1 (`:1647`, collapsed mount `5 tools used` + strict-safe
     expanded assertions), #2 (`:1678`, two collapsed `1 tool used` summaries), #4 (`:1836`,
     strip-toggle click before caption/pre assertions; reword name), #5 (`:1874`, stripTwo
-    expand click before Thinking; comment updates), #6 (`:814` — delete the `:957` per-pane
-    seed; restore the strip-expand Enter-press before the Thinking press; rename the
+    Thinking disclosure is visible WITHOUT expanding the strip under hoisting — only the
+    Thinking press is needed; comment updates), #6 (`:814` — delete the `:957` per-pane
+    seed; the Thinking press needs no strip-expand under hoisting; rename the
     'should stay hidden' string); DELETE+REPLACE #3 (`:1698`) with the new default test:
-    compact mount (`aria-expanded="false"`, `thought · 1 tool used` summary), expand →
-    `Read tool call` + `pre[data-tool-input]` visible AND `Thinking` disclosure visible,
-    click Thinking → body visible; new settings loop per B3.2/B3.3 (flip "Expand tools" on →
-    strip mounts expanded on return; "Expand thinking" on → Thinking mounts expanded; both
-    off again → compact; Thinking trigger NEVER absent in any state); new B3.4 test
-    (temporary in-pane expansion never writes settings: expand in-pane → Settings shows
-    "Expand tools" `aria-checked="false"` → return → compact remount; blob gained no key).
+    compact mount (`aria-expanded="false"`, `thought · 1 tool used` summary) with the
+    `Thinking` disclosure ALREADY visible (hoisted — no strip expansion needed); click
+    Thinking → body visible; expand strip → `Read tool call` + `pre[data-tool-input]`
+    visible; new settings loop per B3.2/B3.3 (flip "Expand tools" on → strip mounts expanded
+    on return; "Expand thinking" on → Thinking rows mount text-expanded with the strip still
+    compact; both off again → compact; the Thinking trigger is NEVER absent in any state);
+    new B3.4 test (temporary in-pane expansion never writes settings: expand in-pane →
+    Settings shows "Expand tools" `aria-checked="false"` → return → compact remount; blob
+    gained no key).
     KEEP #7 (`:1111`, delete only the `:1199` seed; helper is state-robust), #8, #9.
     Fold in the recap's optional improvements on touched lines: `getByRole('switch', { name })`
     locators; a named constant for the 600ms debounce wait.
