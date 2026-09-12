@@ -108,16 +108,18 @@ describe('FreshAgentDiffPanel', () => {
       expect(apiGet).toHaveBeenCalledTimes(1)
     })
 
-    it('retry is gated on prerequisites present at click time', async () => {
+    it('retry disappears when a later snapshot drops the prerequisite', async () => {
       apiGet.mockRejectedValue(new ApiError(500, 'git diff failed', { error: 'git diff failed' }))
       const { rerender } = render(<FreshAgentDiffPanel diffs={[entry]} cwd="/repo" />)
       await userEvent.click(screen.getByRole('button', { name: 'Diff: src/a.ts' }))
       await screen.findByText(/git diff failed/)
+      expect(screen.getByRole('button', { name: 'Retry loading diff' })).toBeTruthy()
       apiGet.mockClear()
-      // Props are snapshot-fed; if a later snapshot drops cwd, Retry must not
-      // fire a prerequisite-less fetch.
+      // Props are snapshot-fed; if a later snapshot drops cwd, the stale
+      // error's Retry affordance must disappear rather than sit as a dead
+      // no-op button next to the "Diff unavailable" explanation.
       rerender(<FreshAgentDiffPanel diffs={[entry]} cwd={undefined} />)
-      await userEvent.click(screen.getByRole('button', { name: 'Retry loading diff' }))
+      expect(screen.queryByRole('button', { name: 'Retry loading diff' })).toBeNull()
       expect(apiGet).not.toHaveBeenCalled()
     })
 

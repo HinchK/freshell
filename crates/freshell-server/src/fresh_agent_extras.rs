@@ -730,8 +730,12 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let diff = body_json(resp).await["diff"].as_str().unwrap().to_string();
         assert!(!diff.is_empty());
+        // The oracle's LITERAL 512 KiB cap (fresh-agent-extras-router.ts:13),
+        // deliberately not DIFF_MAX_BYTES: a wrong constant change must move
+        // this boundary, not the assertion with it.
+        const ORACLE_DIFF_MAX_BYTES: usize = 512 * 1024;
         assert!(
-            diff.len() <= DIFF_MAX_BYTES + 1024,
+            diff.len() <= ORACLE_DIFF_MAX_BYTES + 1024,
             "clipped at the cap (+ small tolerance): {} bytes",
             diff.len()
         );
@@ -763,7 +767,10 @@ mod tests {
     /// (`gitattributes` + `[diff "<name>"] command`), letting a test script
     /// control git's stdout timing deterministically: the driver script's
     /// stdout IS the diff output git streams out, so a driver that emits and
-    /// then sleeps makes git produce a partial prefix and hang.
+    /// then sleeps makes git produce a partial prefix and hang. Unix-only
+    /// (POSIX `chmod` + an `sh` driver script), gated like the neighboring
+    /// unix-only tests.
+    #[cfg(unix)]
     fn git_repo_with_diff_driver(driver_body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
@@ -803,6 +810,7 @@ mod tests {
     // driver emits one line then sleeps 60 s; the 15 s timeout kills git
     // with the prefix already captured.
     #[tokio::test]
+    #[cfg(unix)]
     async fn diff_timeout_with_partial_stdout_resolves_200_with_prefix() {
         let (_d, repo) =
             git_repo_with_diff_driver("#!/bin/sh\necho diff-driver-output\nsleep 60\n");
@@ -821,6 +829,7 @@ mod tests {
     // The reject side of the same branch: a git that hangs WITHOUT any
     // stdout keeps the oracle's 500 timeout contract.
     #[tokio::test]
+    #[cfg(unix)]
     async fn diff_timeout_with_empty_stdout_is_a_500() {
         let (_d, repo) = git_repo_with_diff_driver("#!/bin/sh\nsleep 60\n");
         let home = tempfile::tempdir().unwrap();
@@ -966,11 +975,16 @@ mod tests {
     async fn exec_bodies_over_1mib_are_413() {
         let home = tempfile::tempdir().unwrap();
         let app = router(state(home.path()));
+        // The oracle's LITERAL 1 MiB limit (server/index.ts:191,
+        // express.json({limit: '1mb'})), deliberately not
+        // EXEC_MAX_JSON_BYTES: a wrong constant change must move this
+        // boundary, not the fixture with it.
+        const ORACLE_JSON_LIMIT_BYTES: usize = 1024 * 1024;
         let body = format!(
             r#"{{"command":"true","padding":"{}"}}"#,
-            "x".repeat(EXEC_MAX_JSON_BYTES)
+            "x".repeat(ORACLE_JSON_LIMIT_BYTES)
         );
-        assert!(body.len() > EXEC_MAX_JSON_BYTES);
+        assert!(body.len() > ORACLE_JSON_LIMIT_BYTES);
         let resp = app
             .oneshot(
                 Request::builder()
@@ -991,10 +1005,12 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let app = router(state(home.path()));
         // Valid JSON followed by trailing spaces (tolerated by both
-        // body-parser and serde_json) padded to EXACTLY the limit.
+        // body-parser and serde_json) padded to EXACTLY the oracle's literal
+        // 1 MiB limit (server/index.ts:191).
+        const ORACLE_JSON_LIMIT_BYTES: usize = 1024 * 1024;
         let mut body = r#"{"command":"true"}"#.to_string();
-        body.push_str(&" ".repeat(EXEC_MAX_JSON_BYTES - body.len()));
-        assert_eq!(body.len(), EXEC_MAX_JSON_BYTES);
+        body.push_str(&" ".repeat(ORACLE_JSON_LIMIT_BYTES - body.len()));
+        assert_eq!(body.len(), ORACLE_JSON_LIMIT_BYTES);
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1117,9 +1133,10 @@ mod tests {
     async fn unauthenticated_exec_is_401_before_json_extraction() {
         let home = tempfile::tempdir().unwrap();
         let app = router(state(home.path()));
+        const ORACLE_JSON_LIMIT_BYTES: usize = 1024 * 1024;
         let over_limit = format!(
             r#"{{"command":"true","padding":"{}"}}"#,
-            "x".repeat(EXEC_MAX_JSON_BYTES)
+            "x".repeat(ORACLE_JSON_LIMIT_BYTES)
         );
         for (content_type, body) in [
             ("text/plain", "{}".to_string()),

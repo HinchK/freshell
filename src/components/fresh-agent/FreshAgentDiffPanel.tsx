@@ -82,16 +82,18 @@ function FreshAgentFileDiff({
           {error ? (
             <div className="px-3 py-2 text-destructive">
               {error}{' '}
-              <button
-                type="button"
-                aria-label="Retry loading diff"
-                className="underline hover:text-destructive/80"
-                onClick={() => {
-                  if (cwd && summary.path) load(cwd, summary.path)
-                }}
-              >
-                Retry
-              </button>
+              {cwd && summary.path ? (
+                <button
+                  type="button"
+                  aria-label="Retry loading diff"
+                  className="underline hover:text-destructive/80"
+                  onClick={() => {
+                    if (cwd && summary.path) load(cwd, summary.path)
+                  }}
+                >
+                  Retry
+                </button>
+              ) : null}
             </div>
           ) : null}
           {!cwd || !summary.path ? (
