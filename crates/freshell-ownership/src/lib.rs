@@ -944,9 +944,16 @@ impl RuntimeOwnershipRegistry {
                 // fail/commit_live/force_release leaves them behind; only
                 // the sweep takes them) — the watchdog's RecoveredStart
                 // must only ever carry handles the CURRENT resident
-                // registered itself.
+                // registered itself. b8ke delta round-3 F7: `settle_fired`
+                // resets here too — a settled-and-failed predecessor's
+                // fired flag must never mark the NEXT operation as
+                // concluded before it registers (the probe would release
+                // its fence as already-settled while it still runs, and a
+                // third operation could start inside the dual-runtime
+                // window).
                 record.cancellation = None;
                 record.settle = None;
+                record.settle_fired = None;
                 record.partial_runtime = None;
                 record.generation += 1;
                 record.state = OwnershipState::Starting {
@@ -2384,43 +2391,54 @@ impl RuntimeOwnershipRegistry {
                 // is never a permanent "vacant" for a stale pane; it folds
                 // the authoritative owner state and can navigate to the
                 // canonical id.
-                let alias_of = match &record.state {
-                    OwnershipState::Aliased { to, .. } => {
-                        Some(Self::resolve_canonical_locked(&inner, &key.provider, to))
-                    }
-                    _ => None,
-                };
-                let (owner_kind, terminal_id, replay_state, reason) = match &record.state {
-                    // b8ke focused episode-2 post-cap F5: an ALIASED key
-                    // replays the CANONICAL record's resolved truth (the
-                    // server walks the fixpoint) plus `alias_of` — the old
-                    // key is never a permanent "vacant" for a stale pane;
-                    // it folds the authoritative owner state and can
-                    // navigate to the canonical id.
-                    OwnershipState::Aliased { to, .. } => {
-                        match inner.get(&SessionKey::new(&key.provider, to)) {
-                            Some(resolved) => Self::replay_fields_for(&resolved.state),
-                            // The canonical record is absent (post-restart
-                            // residue): the honest vacant truth.
-                            None => ("vacant", None, ReplayOwnerState::Live, None),
+                // b8ke delta round-3 F6: an ALIASED key derives ALL of
+                // its replayed truth — aliasOf, owner fields, AND
+                // generation — from the SAME fixpoint target. The
+                // pre-fix shape resolved aliasOf to the final canonical
+                // id but read the owner fields from the IMMEDIATE hop: a
+                // multi-hop chain A→B→C replayed A as aliasOf:C while
+                // deriving ownership from B (itself Aliased → vacant) —
+                // an offline device holding A got contradictory state and
+                // never converged on C. One resolve, one read: the
+                // record the client can navigate to is exactly the record
+                // whose truth it folds.
+                let (alias_of, owner_kind, terminal_id, replay_state, reason, generation) =
+                    match &record.state {
+                        OwnershipState::Aliased { to, .. } => {
+                            let canonical =
+                                Self::resolve_canonical_locked(&inner, &key.provider, to);
+                            let resolved = inner.get(&SessionKey::new(&key.provider, &canonical));
+                            match resolved {
+                                Some(resolved) => {
+                                    let (kind, tid, st, rsn) =
+                                        Self::replay_fields_for(&resolved.state);
+                                    (
+                                        Some(canonical),
+                                        kind,
+                                        tid,
+                                        st,
+                                        rsn,
+                                        snapshot_generation(resolved),
+                                    )
+                                }
+                                // The canonical record is absent
+                                // (post-restart residue): the honest
+                                // vacant truth.
+                                None => (
+                                    Some(canonical),
+                                    "vacant",
+                                    None,
+                                    ReplayOwnerState::Live,
+                                    None,
+                                    snapshot_generation(record),
+                                ),
+                            }
                         }
-                    }
-                    _ => Self::replay_fields_for(&record.state),
-                };
-                // An aliased key replays the CANONICAL record's
-                // generation too (the old key's own generation is the
-                // rekey-era residue; the authoritative number is the
-                // canonical record's).
-                let (generation, resolved_alias_of) = match (&record.state, &alias_of) {
-                    (OwnershipState::Aliased { to, .. }, _) => (
-                        inner
-                            .get(&SessionKey::new(&key.provider, to))
-                            .map(snapshot_generation)
-                            .unwrap_or_else(|| snapshot_generation(record)),
-                        alias_of,
-                    ),
-                    _ => (snapshot_generation(record), None),
-                };
+                        _ => {
+                            let (kind, tid, st, rsn) = Self::replay_fields_for(&record.state);
+                            (None, kind, tid, st, rsn, snapshot_generation(record))
+                        }
+                    };
                 RuntimeOwnerReplayRecord {
                     provider: key.provider.clone(),
                     session_id: key.session_id.clone(),
@@ -2430,7 +2448,7 @@ impl RuntimeOwnershipRegistry {
                     terminal_id,
                     state: replay_state,
                     reason,
-                    alias_of: resolved_alias_of,
+                    alias_of,
                 }
             })
             .collect()
@@ -3513,6 +3531,187 @@ mod tests {
             ),
             CommitOutcome::ForeignOperation
         ));
+    }
+
+    /// b8ke delta round-3 F6: MULTI-HOP alias replay. Consecutive rekeys
+    /// A→B→C: the A-keyed record must derive ALL of its replayed truth
+    /// (owner fields AND generation) from the FIXPOINT target C — the
+    /// same id its aliasOf names. Pre-fix, A read the owner fields from
+    /// the IMMEDIATE hop B (itself Aliased → rendered vacant) while
+    /// aliasOf said C: an offline device holding A got contradictory
+    /// state and never converged on C's live owner.
+    #[test]
+    fn multi_hop_alias_replay_derives_from_the_fixpoint_target() {
+        let r = RuntimeOwnershipRegistry::new();
+
+        fn live_owner(pid: u32) -> OwnerIdentity {
+            OwnerIdentity {
+                kind: RuntimeOwnerKind::FreshAgent,
+                terminal_id: None,
+                live_session_key: Some("map-key".into()),
+                pid: Some(pid),
+                ownership_id: Some("own-1".into()),
+            }
+        }
+        fn seed_live(r: &RuntimeOwnershipRegistry, id: &str, op: &str) -> u64 {
+            let BeginOutcome::Granted { generation } = r.begin_start(
+                PROVIDER,
+                id,
+                RuntimeOwnerKind::FreshAgent,
+                op,
+                None,
+                "test",
+                0,
+            ) else {
+                panic!("expected Granted for {id}")
+            };
+            assert!(matches!(
+                r.commit_live(PROVIDER, id, op, generation, live_owner(1000)),
+                CommitOutcome::Committed
+            ));
+            generation
+        }
+
+        // A→B (the first rekey), then B→C (the second).
+        seed_live(&r, "A", "op-a");
+        assert!(matches!(
+            r.rekey_live(
+                PROVIDER,
+                "A",
+                "B",
+                "map-key",
+                live_owner(1001),
+                "test-rekey-ab"
+            ),
+            CommitOutcome::Committed
+        ));
+        assert!(matches!(
+            r.rekey_live(
+                PROVIDER,
+                "B",
+                "C",
+                "map-key",
+                live_owner(1002),
+                "test-rekey-bc"
+            ),
+            CommitOutcome::Committed
+        ));
+
+        let records = r.snapshot_records();
+        // The fixpoint: both old keys name C.
+        let rec_a = records
+            .iter()
+            .find(|rec| rec.session_id == "A")
+            .expect("A replays");
+        let rec_b = records
+            .iter()
+            .find(|rec| rec.session_id == "B")
+            .expect("B replays");
+        let rec_c = records
+            .iter()
+            .find(|rec| rec.session_id == "C")
+            .expect("C replays");
+        assert_eq!(rec_a.alias_of.as_deref(), Some("C"));
+        assert_eq!(rec_b.alias_of.as_deref(), Some("C"));
+        // THE F6 CONTRACT: A's owner truth is C's Live owner (pid 1002,
+        // fresh-agent, live) — NOT the immediate hop B's Aliased residue
+        // (rendered vacant pre-fix).
+        assert_eq!(rec_a.owner_kind, "fresh-agent");
+        assert_eq!(rec_a.state, ReplayOwnerState::Live);
+        // And A's generation is C's authoritative generation (the
+        // fixpoint record's), so an old-key pane fences its next action
+        // against the right number.
+        assert_eq!(rec_a.generation, rec_c.generation);
+        assert_eq!(rec_b.generation, rec_c.generation);
+    }
+
+    /// b8ke delta round-3 F7: `begin_start` clears the predecessor's
+    /// `settle_fired` too. A settled-and-failed operation leaves its fired
+    /// flag behind; without the clear, the NEXT operation inherits
+    /// settle_fired=true before it registers anything — if it crosses the
+    /// stale-start deadline pre-registration, the watchdog fences it and
+    /// the probe releases that fence as "already settled" while the
+    /// operation still runs, and a THIRD operation can start inside the
+    /// dual-runtime window the generation fence exists to prevent.
+    #[test]
+    fn begin_start_clears_the_predecessors_settle_fired_flag() {
+        let r = Arc::new(RuntimeOwnershipRegistry::new());
+        // The predecessor: claims, registers (arming the sender-side
+        // settle flag), settles (the guard drops), and FAILS its claim —
+        // the record returns to Vacant with the fired flag still on it.
+        let BeginOutcome::Granted { generation: g1 } = r.begin_start(
+            PROVIDER,
+            "sid",
+            RuntimeOwnerKind::FreshAgent,
+            "op-predecessor",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!()
+        };
+        let settle_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(r.register_start_cancellation(
+            PROVIDER,
+            "sid",
+            "op-predecessor",
+            g1,
+            Arc::new(|| {}),
+            Box::new(std::future::ready(())),
+            Some(Arc::clone(&settle_fired)),
+        ));
+        settle_fired.store(true, std::sync::atomic::Ordering::SeqCst); // it settled
+        let ticket = OperationTicket::new(
+            Arc::clone(&r),
+            PROVIDER,
+            "sid",
+            "op-predecessor",
+            RuntimeOwnerKind::FreshAgent,
+            g1,
+            "test",
+        );
+        drop(ticket); // the failed claim → the record returns to Vacant
+
+        // THE NEXT OPERATION: begins on the same key BEFORE registering
+        // anything of its own.
+        let BeginOutcome::Granted { generation: g2 } = r.begin_start(
+            PROVIDER,
+            "sid",
+            RuntimeOwnerKind::FreshAgent,
+            "op-next",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!()
+        };
+        // It crosses the stale-start deadline pre-registration; the
+        // watchdog fences it.
+        let recovered = r.recover_stale_starts(0, 0);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].operation_id, "op-next");
+        assert!(matches!(
+            r.fence_unconfirmed_stop(
+                PROVIDER,
+                "sid",
+                "op-next",
+                recovered[0].generation,
+                FenceReason::StaleStart,
+            ),
+            FenceOutcome::Fenced
+        ));
+        // THE F7 CONTRACT: the fence enumerates settle_fired as None —
+        // the new operation has NOT concluded (pre-fix it inherited the
+        // predecessor's fired flag and the probe released it as settled
+        // while it still ran).
+        let fences = r.stale_start_fences();
+        assert_eq!(fences.len(), 1);
+        assert_eq!(
+            fences[0].settle_fired, None,
+            "begin_start cleared the predecessor's settle_fired — the new \
+             operation is NOT pre-concluded"
+        );
+        let _ = g2;
     }
 
     /// b8ke focused episode-2 round-2 F1: the atomic re-key — a start's
