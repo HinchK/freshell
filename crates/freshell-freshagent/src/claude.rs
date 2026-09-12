@@ -1531,7 +1531,7 @@ impl FreshClaudeState {
         let sidecar_pid = child.id();
         // b8ke delta round-2 F2: arm the registered start cancellation —
         // from here the watchdog's cancel SIGTERMs this child.
-        *start_pid_slot.lock().expect("sidecar pid cancel slot lock") = sidecar_pid;
+        crate::ownership_lane::arm_sidecar_pid_slot(&start_pid_slot, sidecar_pid);
         if let Some(sid) = resume_sid.as_deref() {
             crate::ownership_lane::register_partial_fresh_runtime(
                 &self.ownership,
@@ -4563,7 +4563,7 @@ impl FreshClaudeState {
         // before `child` moves into the session entry).
         let sidecar_pid = child.id();
         // b8ke delta round-2 F2: arm the registered start cancellation.
-        *start_pid_slot.lock().expect("sidecar pid cancel slot lock") = sidecar_pid;
+        crate::ownership_lane::arm_sidecar_pid_slot(&start_pid_slot, sidecar_pid);
         crate::ownership_lane::register_partial_fresh_runtime(
             &self.ownership,
             PROVIDER,
@@ -5135,7 +5135,7 @@ impl FreshClaudeState {
         // `child` moves into the session entry).
         let sidecar_pid = child.id();
         // b8ke delta round-2 F2: arm the registered start cancellation.
-        *start_pid_slot.lock().expect("sidecar pid cancel slot lock") = sidecar_pid;
+        crate::ownership_lane::arm_sidecar_pid_slot(&start_pid_slot, sidecar_pid);
         crate::ownership_lane::register_partial_fresh_runtime(
             &self.ownership,
             PROVIDER,
@@ -5438,23 +5438,170 @@ impl FreshClaudeState {
         identity_sink: Option<SharedPaneIdentitySink>,
         provenance: Option<&crate::BindProvenance>,
     ) {
-        // The sidecar's pid (the fresh create's canonical owner runtime),
-        // read under the mint-gate lock scope below, before the ownership
-        // adoption.
-        let sidecar_pid;
+        self.adopt_session_init_inner(
+            cli_id,
+            session_id,
+            session_type,
+            settings,
+            supersedes,
+            identity_sink,
+            provenance,
+            false,
+        )
+        .await;
+    }
+
+    /// b8ke focused episode-2 round-1 F2: the pre-registration deferral.
+    /// `handle_create` starts the detached consumer BEFORE it inserts the
+    /// `ClaudeSession` into `self.sessions`, so the consumer's
+    /// `sdk.session.init` adoption can run while the runtime is NOT yet
+    /// registered/killable — committing a Live{FreshAgent} owner that a
+    /// handoff cannot stop (kill_for_handoff answers AlreadyGone, the
+    /// terminal target starts, and the create then inserts its still-live
+    /// sidecar with no later commit: two writers). The deferred task
+    /// waits (bounded) for the registration and re-runs the FULL
+    /// adoption — gate, claim, publish-or-teardown — once the session is
+    /// killable. A timeout means the create failed before registering
+    /// (its own failure path killed the child): nothing adopted, nothing
+    /// committed.
+    fn defer_session_init_adoption(
+        &self,
+        cli_id: &str,
+        session_id: &str,
+        session_type: &str,
+        settings: Option<&crate::identity_sink::FreshAgentSettings>,
+        identity_sink: Option<SharedPaneIdentitySink>,
+        provenance: Option<&crate::BindProvenance>,
+    ) {
+        let state = self.clone();
+        let cli_id = cli_id.to_string();
+        let session_id = session_id.to_string();
+        let session_type = session_type.to_string();
+        let settings = settings.cloned();
+        let provenance = provenance.cloned();
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                if state.sessions.lock().await.contains_key(&session_id) {
+                    state
+                        .adopt_session_init_inner(
+                            &cli_id,
+                            &session_id,
+                            &session_type,
+                            settings.as_ref(),
+                            None,
+                            identity_sink.clone(),
+                            provenance.as_ref(),
+                            true,
+                        )
+                        .await;
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    tracing::warn!(target: "freshell_freshagent::claude",
+                        cli_id = %cli_id, placeholder = %session_id,
+                        "freshagent.claude.init_ownership_adoption_deferred_timeout: the \
+                         session never registered (the create failed and tore its child \
+                         down) — nothing adopted, nothing committed"
+                    );
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        });
+    }
+
+    /// b8ke focused episode-2 round-1 F3: the refused-adoption teardown.
+    /// A refused canonical claim (a foreign owner or an in-flight
+    /// transition) must NEVER leave the freshly spawned runtime live and
+    /// unowned — the pre-fix path only logged and the sidecar kept
+    /// running while a competitor acquired the vacant key. Fail closed:
+    /// remove the registered session, run the standard typed teardown,
+    /// evict its placeholder aliases, and engage the client's
+    /// lost-session recovery.
+    async fn teardown_unadopted_session(&self, session_id: &str, session_type: &str) {
+        tracing::error!(target: "invariant",
+            placeholder = %session_id,
+            "freshagent.claude.init_ownership_adoption_torn_down: the canonical key moved \
+             on — the freshly spawned runtime is torn down, never left unowned"
+        );
+        // DETACHED: the adoption's caller is usually the session's OWN
+        // consumer task, and the standard teardown aborts + joins the
+        // consumer — running it inline would abort the caller mid-teardown
+        // (the self-abort drops the teardown before the reap or the
+        // lost-session frame). The spawned task performs the whole
+        // fail-closed sequence; the consumer unwinds at its next await.
+        let state = self.clone();
+        let session_id = session_id.to_string();
+        let session_type = session_type.to_string();
+        tokio::spawn(async move {
+            if let Some(session) = state.sessions.lock().await.remove(&session_id) {
+                // R2-2: the typed outcome is propagated; this unwind path
+                // holds no coordinator fence, so the helper's typed log +
+                // its detached escalation are the whole discipline here.
+                let _teardown: LoggedTeardown =
+                    state.teardown_removed_session_logged(session).await;
+            }
+            state.evict_cli_index_aliases(&session_id).await;
+            let typed = match session_type.as_str() {
+                "kilroy" => SessionType::Kilroy,
+                _ => SessionType::Freshclaude,
+            };
+            state.broadcast(&lost_session_frame(&session_id, typed));
+        });
+    }
+
+    /// The adoption's alias publication (the mint-gated section): inserts
+    /// `cli_index[durable] = map key` and stamps the session's durable id.
+    /// Re-checks the kill's close gate under the SAME lock acquisition the
+    /// gate discipline requires — a kill that armed the gate between the
+    /// adoption's first read and this publication owns the session, so the
+    /// publication abandons (`false`). Returns whether the publication
+    /// landed.
+    async fn publish_session_init_alias(&self, cli_id: &str, session_id: &str) -> bool {
+        let mut index = self.cli_index.lock().await;
+        let mut sessions = self.sessions.lock().await;
+        let gated = {
+            let gates = self.close_pending.lock().expect("close-pending lock");
+            gates.get(session_id).copied().unwrap_or(0) > 0
+        };
+        if gated {
+            tracing::info!(target: "freshell_freshagent::claude",
+                cli_id = %cli_id,
+                session_id = %session_id,
+                "freshagent.claude.adoption_abandoned_by_kill_gate: the kill's one \
+                 envelope already enumerated this session; the mint lands nowhere"
+            );
+            return false;
+        }
+        index.insert(cli_id.to_string(), session_id.to_string());
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.cli_session_id = Some(cli_id.to_string());
+        }
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)] // the adoption field set (the deferral adds the re-entry flag)
+    async fn adopt_session_init_inner(
+        &self,
+        cli_id: &str,
+        session_id: &str,
+        session_type: &str,
+        settings: Option<&crate::identity_sink::FreshAgentSettings>,
+        supersedes: Option<&str>,
+        identity_sink: Option<SharedPaneIdentitySink>,
+        provenance: Option<&crate::BindProvenance>,
+        deferred_reentry: bool,
+    ) {
+        // Phase 1 — the mint-gate READ scope (never publishes): the gate
+        // flag, the session's existing durable id (the rollback-fork remint
+        // test), the registration presence (the F2 pre-registration test),
+        // and the sidecar pid.
+        let (gated, existing_cli_id, registered, sidecar_pid);
         {
-            // Focused-episode-6 round 4 (Finding F5): the mint gate. The
-            // lock order (cli_index → sessions → close_pending) is THE order
-            // the kill's enumeration acquires, so a kill that already
-            // enumerated this session is read here under the identical
-            // acquisition: the durable id this adoption was about to mint
-            // is invisible to that close by construction, so this adoption
-            // must land NOTHING — no alias insert, no session field, no
-            // alias record, no ledger row (the kill's teardown owns the
-            // session now).
-            let mut index = self.cli_index.lock().await;
-            let mut sessions = self.sessions.lock().await;
-            let gated = {
+            let _index = self.cli_index.lock().await;
+            let sessions = self.sessions.lock().await;
+            gated = {
                 let gates = self.close_pending.lock().expect("close-pending lock");
                 gates.get(session_id).copied().unwrap_or(0) > 0
             };
@@ -5467,54 +5614,143 @@ impl FreshClaudeState {
                 );
                 return;
             }
-            index.insert(cli_id.to_string(), session_id.to_string());
-            if let Some(session) = sessions.get_mut(session_id) {
-                session.cli_session_id = Some(cli_id.to_string());
-            }
+            existing_cli_id = sessions
+                .get(session_id)
+                .and_then(|s| s.cli_session_id.clone());
+            registered = sessions.contains_key(session_id);
             sidecar_pid = sessions.get(session_id).and_then(|s| s.child.id());
         }
-        // b8ke delta round-2 F1: the CANONICAL-KEY ADOPTION. A normally
-        // created claude/kilroy session (NO explicit sessionRef) claims
-        // nothing at create time — the durable id only materializes HERE,
-        // at `sdk.session.init` — so the coordinator saw the canonical key
-        // as Vacant and a handoff skipped stopping the live sidecar (the
-        // target then hit the D7 sidecar-liveness refusal, or worse the
-        // two-writer shape), and no device ever learned the authoritative
-        // Live{FreshAgent} owner. Reconcile the provisional creation-time
-        // identity with the durable canonical one: claim-and-commit the
-        // authoritative ownership under the durable id (idempotent — a
-        // resume/attach that already committed at create answers Adopt and
-        // adopts nothing; a foreign owner is refused loudly, never stolen)
-        // and BROADCAST the authoritative owner record so every device
-        // converges.
-        let mut adoption_ticket = match self.begin_lane_claim_at(
-            cli_id,
-            &format!("claude-init-adopt-{}", uuid::Uuid::new_v4()),
-            None,
-            "claude/session-init-adoption",
-        ) {
-            // Granted: the canonical key is vacant (a fresh create's first
-            // init) — THIS adoption claims it.
-            crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
-            // Unwired (no coordinator): the legacy behavior.
-            crate::ownership_lane::LaneClaim::Unwired => None,
-            // Adopt: the canonical key is ALREADY Live{FreshAgent} — a
-            // resume/attach committed at create time; the record is already
-            // authoritative.
-            crate::ownership_lane::LaneClaim::Adopt => None,
-            // Refused: the canonical key moved on (a foreign owner or an
-            // in-flight transition). NEVER steal — the session stays
-            // unclaimed and the D7 backstop holds; log loud.
-            crate::ownership_lane::LaneClaim::Refused(outcome) => {
+        // b8ke focused episode-2 round-1 F4: the ROLLBACK-FORK gate. A
+        // rollback's `sdk.session.init` deliberately MINTS A NEW durable
+        // id (the fork re-key) while the rollback path owns and commits
+        // the runtime under the OLD durable id — adopting under the NEW
+        // id here would commit a second Live{FreshAgent} record + stamp
+        // beside the old key's (contradictory snapshots; the old key
+        // left falsely Live after the runtime moves). Fork re-keys (a
+        // supersedes-carrying preseed, or an in-stream remint of a
+        // session that already carries a DIFFERENT durable id) publish
+        // the re-key bookkeeping ONLY — ownership stays wherever the
+        // rollback committed it.
+        let fork_rekey = supersedes.is_some()
+            || existing_cli_id
+                .as_deref()
+                .is_some_and(|existing| existing != cli_id);
+        if !fork_rekey && !registered {
+            // b8ke focused episode-2 round-1 F2: the pre-registration
+            // window must not expose a Live owner that cannot be killed —
+            // defer the whole adoption (claim + publication) until the
+            // create registered the runtime. A deferred re-entry that
+            // STILL finds the session absent gives up (the create died;
+            // its failure path killed the child).
+            if deferred_reentry {
                 tracing::warn!(target: "freshell_freshagent::claude",
                     cli_id = %cli_id, placeholder = %session_id,
-                    outcome = ?outcome,
-                    "freshagent.claude.init_ownership_adoption_refused: the canonical key \
-                     moved on while the durable id minted — the session stays unclaimed"
+                    "freshagent.claude.init_ownership_adoption_deferred_unregistered: \
+                     the session vanished before the deferred adoption — nothing \
+                     published, nothing committed"
                 );
-                None
+                return;
             }
-        };
+            tracing::info!(target: "freshell_freshagent::claude",
+                cli_id = %cli_id, placeholder = %session_id,
+                "freshagent.claude.init_ownership_adoption_deferred: the session is not \
+                 yet registered (the create's insert window) — the adoption waits for \
+                 the registration before claiming or publishing"
+            );
+            self.defer_session_init_adoption(
+                cli_id,
+                session_id,
+                session_type,
+                settings,
+                identity_sink,
+                provenance,
+            );
+            return;
+        }
+        // b8ke focused episode-2 round-1 F3: CLAIM BEFORE PUBLISHING. The
+        // pre-fix order minted the alias + the session's durable field
+        // BEFORE the coordinator claim, so a REFUSED claim left the
+        // freshly spawned sidecar running unowned under a published
+        // identity while a competitor acquired the key. The publication
+        // below happens only after the claim decision; a refused claim
+        // tears the runtime down instead (fail closed).
+        let mut adoption_ticket = None;
+        if !fork_rekey {
+            adoption_ticket = match self.begin_lane_claim_at(
+                cli_id,
+                &format!("claude-init-adopt-{}", uuid::Uuid::new_v4()),
+                None,
+                // b8ke focused episode-2 round-1 F7: the provenance-derived
+                // initiator (the device id), never a fixed lane string.
+                &Self::initiator_for(provenance, "claude/session-init-adoption"),
+            ) {
+                // Granted: the canonical key is vacant (a fresh create's
+                // first init) — THIS adoption claims it.
+                crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+                // Unwired (no coordinator): the legacy behavior.
+                crate::ownership_lane::LaneClaim::Unwired => None,
+                // Adopt: the canonical key is ALREADY Live{FreshAgent} — a
+                // resume/attach committed at create time; the record is
+                // already authoritative.
+                crate::ownership_lane::LaneClaim::Adopt => None,
+                // Refused: the canonical key moved on (a foreign owner or
+                // an in-flight transition). NEVER steal — and NEVER leave
+                // the freshly spawned runtime live and unowned: tear it
+                // down and engage the client's lost-session recovery,
+                // publishing nothing.
+                crate::ownership_lane::LaneClaim::Refused(outcome) => {
+                    match &outcome {
+                        // ANY in-flight transition or claim (Handoff /
+                        // Starting / Stopping / Fenced) owns the key's
+                        // resolution — the adoption claims nothing and
+                        // tears NOTHING down: this runtime is either that
+                        // transition's own target (the handoff runner's
+                        // under-ticket resume — the runner performs the
+                        // ONE commit + broadcast) or its prior (a handoff
+                        // already stopping it through kill_for_handoff),
+                        // and in both cases the owning operation resolves
+                        // the key. The publication proceeds so the alias
+                        // bookkeeping matches the transition's commit.
+                        freshell_ownership::BeginOutcome::Blocked { .. } => {
+                            tracing::info!(target: "freshell_freshagent::claude",
+                                cli_id = %cli_id, placeholder = %session_id,
+                                outcome = ?outcome,
+                                "freshagent.claude.init_ownership_adoption_skipped_in_flight: \\
+                                 a lifecycle transition owns this key — the adoption claims \\
+                                 nothing, the owning operation resolves it"
+                            );
+                            None
+                        }
+                        // A genuinely FOREIGN owner (another kind holds
+                        // the key): fail closed — the freshly spawned
+                        // runtime is torn down, never left live and
+                        // unowned beside the foreign owner.
+                        _ => {
+                            tracing::warn!(target: "freshell_freshagent::claude",
+                                cli_id = %cli_id, placeholder = %session_id,
+                                outcome = ?outcome,
+                                "freshagent.claude.init_ownership_adoption_refused: the \\
+                                 canonical key is held by a foreign owner — the freshly \\
+                                 spawned runtime is torn down (fail closed), nothing published"
+                            );
+                            self.teardown_unadopted_session(session_id, session_type)
+                                .await;
+                            return;
+                        }
+                    }
+                }
+            };
+        }
+        // The (re-gated) publication: abandons when the kill gate armed
+        // between the read scope and here — the kill owns the session.
+        if !self.publish_session_init_alias(cli_id, session_id).await {
+            return;
+        }
+        // b8ke delta round-2 F1: the canonical-key adoption commit — for
+        // the ordinary-create path (no fork re-key), a Granted claim
+        // commits the authoritative Live{FreshAgent} ownership under the
+        // durable id and broadcasts the owner record so every device
+        // converges.
         if let Some(ticket) = adoption_ticket.as_ref() {
             let generation = ticket.generation();
             let operation_id = ticket.operation_id().to_string();
@@ -5540,15 +5776,19 @@ impl FreshClaudeState {
                 }
                 Err(outcome) => {
                     // Stale/foreign commit: the coordinator moved on between
-                    // the claim and the commit — the adoption lands nothing
-                    // (the ticket's Drop performs the typed fail); the D7
-                    // backstop holds for this session.
+                    // the claim and the commit. Fail closed exactly like the
+                    // refused claim — the freshly spawned runtime is never
+                    // left live and unowned (the ticket's Drop performs the
+                    // typed fail on the claimed key).
                     tracing::warn!(target: "freshell_freshagent::claude",
                         cli_id = %cli_id, placeholder = %session_id,
                         outcome = ?outcome,
                         "freshagent.claude.init_ownership_adoption_commit_stale: the \
-                         coordinator moved on while the adoption committed"
+                         coordinator moved on while the adoption committed — the freshly \
+                         spawned runtime is torn down (fail closed)"
                     );
+                    self.teardown_unadopted_session(session_id, session_type)
+                        .await;
                 }
             }
         }
@@ -9813,6 +10053,351 @@ rl.on('line', (line) => {
                 .any(|(_, _, d)| d == gated),
             "the gated adoption writes no alias record: {:?}",
             fake.alias_record_writes.lock().unwrap()
+        );
+    }
+
+    // ── b8ke focused episode-2 round-1: the adoption's atomicity tests ─────
+
+    /// The fake sidecar's durable id for a create with NO resumeSessionId.
+    const FRESH_CREATE_DURABLE_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+    /// A minimal thread-local tracing capture (the session_handoff
+    /// tracing_capture pattern, trimmed to the events the e2r1 tests need).
+    mod init_capture {
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::{Event, Subscriber};
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+        use tracing_subscriber::registry::LookupSpan;
+        use tracing_subscriber::Layer;
+
+        #[derive(Default)]
+        struct FieldVisitor {
+            pub event: String,
+            pub initiator: String,
+            pub operation_id: String,
+        }
+
+        impl Visit for FieldVisitor {
+            fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
+            fn record_str(&mut self, field: &Field, value: &str) {
+                match field.name() {
+                    "event" => self.event = value.to_string(),
+                    "initiator" => self.initiator = value.to_string(),
+                    "operation_id" => self.operation_id = value.to_string(),
+                    _ => {}
+                }
+            }
+        }
+
+        struct CaptureLayer(Arc<Mutex<Vec<CapturedOwnershipEvent>>>);
+
+        impl<S> Layer<S> for CaptureLayer
+        where
+            S: Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+                if event.metadata().target() != "freshell_ownership" {
+                    return;
+                }
+                let mut visitor = FieldVisitor::default();
+                event.record(&mut visitor);
+                self.0.lock().expect("capture lock").push((
+                    visitor.event,
+                    visitor.initiator,
+                    visitor.operation_id,
+                ));
+            }
+        }
+
+        /// One captured `freshell_ownership` event: (event, initiator,
+        /// operation_id).
+        pub type CapturedOwnershipEvent = (String, String, String);
+
+        /// Install a thread-local capture of `freshell_ownership` events;
+        /// returns the shared sink and the scope guard (HOLD the guard for
+        /// as long as the capture must stay installed — dropping it removes
+        /// the thread-local default). Every event: (event, initiator,
+        /// operation_id).
+        pub fn install() -> (
+            Arc<Mutex<Vec<CapturedOwnershipEvent>>>,
+            tracing::subscriber::DefaultGuard,
+        ) {
+            let sink = Arc::new(Mutex::new(Vec::new()));
+            let layer = CaptureLayer(Arc::clone(&sink));
+            let subscriber = tracing_subscriber::registry().with(layer);
+            (sink, tracing::subscriber::set_default(subscriber))
+        }
+    }
+
+    /// b8ke focused episode-2 round-1 F2: the pre-registration window must
+    /// not expose a Live owner that cannot be killed. An adoption for a
+    /// session that is NOT yet registered defers the WHOLE adoption — no
+    /// claim, no commit, no alias — until the create registers the
+    /// runtime. Pre-fix: the consumer's init committed Live{FreshAgent}
+    /// and minted the alias immediately (a handoff in the window saw a
+    /// killable-owner lie: kill_for_handoff answered AlreadyGone and the
+    /// create then inserted its still-live sidecar — two writers).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_init_adoption_defers_until_the_runtime_is_registered() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (mut st, _rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+
+        // An adoption for a session that was never registered (the
+        // create's insert window): nothing commits, nothing publishes.
+        st.adopt_session_init(
+            "dur-e2r2-f2",
+            "placeholder-never-registered",
+            "freshclaude",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        // Give the immediate (pre-fix) commit ample time to land, then
+        // assert the deferral: NO Live owner, NO alias.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !matches!(
+                registry.observe("claude", "dur-e2r2-f2").state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ),
+            "the pre-registration window must not expose a Live owner, got {:?}",
+            registry.observe("claude", "dur-e2r2-f2").state
+        );
+        assert!(
+            st.cli_index.lock().await.get("dur-e2r2-f2").is_none(),
+            "the deferred adoption publishes no alias"
+        );
+    }
+
+    /// b8ke focused episode-2 round-1 F3: a REFUSED adoption fails closed.
+    /// A foreign owner (a live terminal) holds the canonical key — the
+    /// freshly spawned runtime is TORN DOWN (removed + the standard
+    /// teardown + the lost-session recovery), the alias is never
+    /// published, and the foreign owner is never stolen. Pre-fix: the
+    /// refusal only logged — the sidecar kept running unowned beside the
+    /// foreign owner while the alias minted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_init_adoption_tears_the_fresh_runtime_down() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+
+        // The FOREIGN OWNER: a live terminal under the durable id the
+        // fresh create's sidecar is about to mint.
+        let foreign = freshell_ownership::OwnerIdentity {
+            kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+            terminal_id: Some("t-foreign".into()),
+            live_session_key: None,
+            pid: None,
+            ownership_id: None,
+        };
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
+            "claude",
+            FRESH_CREATE_DURABLE_ID,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-foreign-owner",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("expected Granted")
+        };
+        assert!(matches!(
+            registry.commit_live(
+                "claude",
+                FRESH_CREATE_DURABLE_ID,
+                "op-foreign-owner",
+                generation,
+                foreign
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        ));
+
+        // The ordinary fresh create: the consumer's init mints the durable
+        // id; the adoption claim is REFUSED (OwnedByOtherKind) → teardown.
+        st.handle_create(dedup_create_msg("req-e2r3-f3"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "req-e2r3-f3").await;
+        let placeholder = created["sessionId"].as_str().unwrap().to_string();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let removed = !st.sessions.lock().await.contains_key(&placeholder);
+            if removed {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the refused adoption must tear the fresh runtime down — the \
+                 session stays registered"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // Nothing published: no alias for the minted durable id.
+        assert!(
+            st.cli_index
+                .lock()
+                .await
+                .get(FRESH_CREATE_DURABLE_ID)
+                .is_none(),
+            "the refused adoption publishes nothing"
+        );
+        // The foreign owner is NEVER stolen.
+        assert!(matches!(
+            registry.observe("claude", FRESH_CREATE_DURABLE_ID).state,
+            freshell_ownership::OwnershipState::Live { owner, .. }
+                if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal
+        ));
+        // The lost-session recovery frame reached the bus (bounded: the
+        // teardown's reap precedes the broadcast).
+        let mut saw_lost = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !saw_lost && tokio::time::Instant::now() < deadline {
+            while let Ok(raw) = rx.try_recv() {
+                if raw.contains("freshAgent.error") && raw.contains(&placeholder) {
+                    saw_lost = true;
+                }
+            }
+            if !saw_lost {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }
+        assert!(saw_lost, "the teardown engages the lost-session recovery");
+    }
+
+    /// b8ke focused episode-2 round-1 F4: a ROLLBACK-FORK re-key never
+    /// adopts ownership under the NEW durable id — the rollback owns and
+    /// commits the runtime under the OLD durable id, so a second
+    /// Live{FreshAgent} record under the fork id would leave contradictory
+    /// snapshots (the old key falsely Live after the runtime moves).
+    /// The re-key bookkeeping (the alias) still lands.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rollback_fork_rekey_never_adopts_ownership_under_the_new_id() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+
+        // An ordinary fresh create: the runtime registers + the adoption
+        // commits Live{FreshAgent} under the minted durable id (the OLD id
+        // of this scenario's rollback).
+        st.handle_create(dedup_create_msg("req-e2r4-f4"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "req-e2r4-f4").await;
+        let placeholder = created["sessionId"].as_str().unwrap().to_string();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if matches!(
+                registry.observe("claude", FRESH_CREATE_DURABLE_ID).state,
+                freshell_ownership::OwnershipState::Live { owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+            ) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the ordinary create's adoption must commit under the old id"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // The ROLLBACK FORK: the respawned sidecar's sdk.session.init mints
+        // a NEW durable id (the supersedes-carrying preseed shape). The
+        // re-key bookkeeping lands — but NO ownership under the new id.
+        st.adopt_session_init(
+            "new-fork-id-e2r4",
+            &placeholder,
+            "freshclaude",
+            None,
+            Some("old-durable-id"),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            !matches!(
+                registry.observe("claude", "new-fork-id-e2r4").state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ),
+            "the rollback fork must NOT adopt ownership under the new id (the \
+             pre-fix dual-key Live): {:?}",
+            registry.observe("claude", "new-fork-id-e2r4").state
+        );
+        // The re-key bookkeeping: the alias maps the fork id to the session.
+        assert_eq!(
+            st.cli_index.lock().await.get("new-fork-id-e2r4"),
+            Some(&placeholder),
+            "the fork re-key alias still lands"
+        );
+        // The OLD durable id stays the authoritative owner.
+        assert!(matches!(
+            registry.observe("claude", FRESH_CREATE_DURABLE_ID).state,
+            freshell_ownership::OwnershipState::Live { owner, .. }
+                if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+        ));
+    }
+
+    /// b8ke focused episode-2 round-1 F7: the adoption's claim records the
+    /// PROVENANCE-derived initiator (the device id) — never the fixed lane
+    /// string. Captured off the coordinator's `ownership.start.begin` event
+    /// for the adoption's own claim (operation_id `claude-init-adopt-*`).
+    #[tokio::test]
+    async fn the_init_adoption_claim_records_the_provenance_initiator() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (mut st, _rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+
+        let (sink, _capture_guard) = init_capture::install();
+        let provenance = Some(crate::identity_sink::BindProvenance {
+            client_instance_id: Some("client-e2r7".into()),
+            device_id: Some("dev-e2r7".into()),
+            tab_key: None,
+            asserted_at: 1,
+        });
+        st.handle_create(dedup_create_msg("req-e2r7-f7"), provenance)
+            .await;
+
+        // The deferred adoption claims under the minted durable id once the
+        // create registers the runtime.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if matches!(
+                registry.observe("claude", FRESH_CREATE_DURABLE_ID).state,
+                freshell_ownership::OwnershipState::Live { owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+            ) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the provenance-carrying create's adoption must commit"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let events = sink.lock().expect("capture lock").clone();
+        let claim = events
+            .iter()
+            .find(|(event, _initiator, op)| {
+                event == "ownership.start.begin" && op.starts_with("claude-init-adopt-")
+            })
+            .expect("the adoption's claim event is captured");
+        assert_eq!(
+            claim.1, "dev-e2r7",
+            "the adoption claim records the provenance device id, got {:?}",
+            events
         );
     }
 
