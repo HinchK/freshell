@@ -1700,6 +1700,105 @@ async fn handoff_with_a_platform_limited_prior_stop_fences_the_key_typed() {
     assert_eq!(retried["error"]["code"], json!("PLATFORM_LIMITED_FENCED"));
 }
 
+/// b8ke delta round-3 F5: a STALE-START fence recovers through the SAME
+/// acknowledged operator force-clear. The coordinator's force-release API
+/// accepts PlatformLimited AND StaleStart (the registry's docs name
+/// PID-less OpenCode starts as the production case that otherwise stays
+/// fenced until restart), but pre-d3 the runner's force-release branch
+/// matched PlatformLimited only — a StaleStart fence fell to generic
+/// HANDOFF_IN_PROGRESS even with the acknowledgment flag set, permanently
+/// wedging the documented recoverable state through the lifecycle API.
+/// The two-phase contract:
+///   (a) an ordinary retry is the typed STALE_START_FENCED refusal and
+///       the key STAYS fenced;
+///   (b) the acknowledged force-clear clears the key Vacant and answers
+///       the TYPED CLEAR (the probe keeps its own confirmed-death
+///       discipline; this is the operator path).
+#[tokio::test]
+async fn a_stale_start_fence_recovers_through_the_acknowledged_force_clear() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let mut rig = build_rig_with_options(None, None, None, 8_000, None, true);
+
+    // Arm a StaleStart fence on the key (the watchdog's own shape): a
+    // stale Starting record recovered + fenced with the typed reason.
+    let freshell_ownership::BeginOutcome::Granted { generation } = rig.ownership.begin_start(
+        "claude",
+        &sid,
+        freshell_ownership::RuntimeOwnerKind::FreshAgent,
+        "op-stale-arm",
+        None,
+        "test",
+        0,
+    ) else {
+        panic!("expected Granted")
+    };
+    let _ = generation;
+    let recovered = rig.ownership.recover_stale_starts(0, 0);
+    assert_eq!(recovered.len(), 1);
+    let rec = recovered.into_iter().next().unwrap();
+    assert!(matches!(
+        rig.ownership.fence_unconfirmed_stop(
+            "claude",
+            &sid,
+            &rec.operation_id,
+            rec.generation,
+            freshell_ownership::FenceReason::StaleStart,
+        ),
+        freshell_ownership::FenceOutcome::Fenced
+    ));
+    let _ = drain_runtime_owner_frames(&mut rig.rx);
+
+    // (a) An ordinary retry: the typed STALE_START_FENCED refusal, the
+    // fence HELD (pre-d3 this fell to generic HANDOFF_IN_PROGRESS).
+    let ordinary = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let ordinary_result = ordinary.completion.await.expect("retry completed");
+    assert_eq!(
+        ordinary_result["error"]["code"],
+        json!("STALE_START_FENCED"),
+        "an ordinary retry against a StaleStart fence answers the typed refusal: {ordinary_result}"
+    );
+    assert_eq!(ordinary_result["error"]["retryable"], json!(true));
+    assert!(
+        matches!(
+            rig.ownership.observe("claude", &sid).state,
+            OwnershipState::Fenced { .. }
+        ),
+        "the ordinary retry left the fence held"
+    );
+
+    // (b) THE acknowledged force-clear: clears the key Vacant and
+    // answers the TYPED CLEAR — the operator path with the risk
+    // acknowledged (the unconfirmed runtime's processes may remain).
+    let snap = rig.ownership.observe("claude", &sid);
+    let mut clear_req = handoff_req_terminal("claude", &sid, "claude");
+    clear_req.acknowledge_platform_limited_risk = true;
+    clear_req.observed_epoch = Some(snap.epoch);
+    clear_req.observed_generation = Some(snap.generation);
+    let clear = rig.runner.spawn_handoff(clear_req);
+    let cleared = clear.completion.await.expect("force-clear completed");
+    assert_eq!(
+        cleared["ok"],
+        json!(true),
+        "the acknowledged force-clear released the StaleStart fence: {cleared}"
+    );
+    assert!(
+        cleared.get("cleared").is_some(),
+        "the typed CLEAR answer (no handoff ran, no owner committed): {cleared}"
+    );
+    assert!(
+        matches!(
+            rig.ownership.observe("claude", &sid).state,
+            OwnershipState::Vacant
+        ),
+        "the StaleStart fence is CLEARED — never permanently wedged"
+    );
+}
+
 /// 3k. b8ke focused round-3 review R3-4, redesigned by the round-4 R4-4
 /// review: a PlatformLimited fence recovers ONLY through the EXPLICIT
 /// acknowledged operator force-clear — an ORDINARY retry (even with a

@@ -1680,12 +1680,14 @@ impl FreshClaudeState {
                 self.fail_create_session_reserved_with_owner(&request_id, owner_fields.as_ref());
                 return;
             }
-            // Fast-path ADOPT (V1: new server behavior): the durable id already has a
-            // live session -- answer created against it, spawn nothing.
-            if self.has_live_session(sid).await {
-                self.adopt_live_create(&request_id, sid, session_type).await;
-                return;
-            }
+            // b8ke delta round-3 F2: the existing-session ADOPT is
+            // COORDINATED — the coordinator claim decides BEFORE any
+            // map-hit fast path (the map-hit adopt now runs INSIDE the
+            // claim's Adopt/Unwired/Granted arms below). Pre-d3 a live
+            // in-map session adopted and answered created WITHOUT
+            // consulting the coordinator: a delayed create during a
+            // Handoff (the map entry still exists until the stop lands)
+            // slipped past the fence.
             // kata b8ke Task 3: the coordinator claim comes FIRST — before
             // the provider lease — so the cross-kind authority decides
             // atomically. The wire pair on `freshAgent.create` is the
@@ -1712,6 +1714,15 @@ impl FreshClaudeState {
                 &Self::initiator_for(provenance.as_ref(), "freshclaude/create-resume"),
             ) {
                 crate::ownership_lane::LaneClaim::Granted(ticket) => {
+                    // b8ke delta round-3 F2: the unowned-runtime shape —
+                    // the key was Vacant but THIS lane's map holds a live
+                    // session. Adopt it, spawn nothing; the fresh claim
+                    // drops (RAII fail) with the key returning to the
+                    // Vacant it held (no spawn happened under it).
+                    if self.has_live_session(sid).await {
+                        self.adopt_live_create(&request_id, sid, session_type).await;
+                        return;
+                    }
                     own_ticket = Some(ticket);
                     // b8ke delta round-2 F2: register the start's
                     // cancellation + settle with the watchdog (the
@@ -1726,10 +1737,19 @@ impl FreshClaudeState {
                         ),
                     );
                 }
-                crate::ownership_lane::LaneClaim::Unwired => {}
+                crate::ownership_lane::LaneClaim::Unwired => {
+                    // The unwired lane's map fast path (V1 behavior): a
+                    // live session adopts, spawn nothing. With no
+                    // coordinator there is no fence to consult.
+                    if self.has_live_session(sid).await {
+                        self.adopt_live_create(&request_id, sid, session_type).await;
+                        return;
+                    }
+                }
                 crate::ownership_lane::LaneClaim::Adopt => {
-                    // A same-kind live runtime the map fast-path missed —
-                    // adopt it, spawn nothing.
+                    // A same-kind live runtime the coordinator names —
+                    // adopt it, spawn nothing (the COORDINATED map-hit:
+                    // the claim already verified the key's state).
                     self.adopt_live_create(&request_id, sid, session_type).await;
                     return;
                 }
@@ -2369,61 +2389,29 @@ impl FreshClaudeState {
                 &mut tombstones,
             );
         }
-        // THE durable close — ONE envelope over the whole set, BEFORE any
-        // live-state destruction (the map removal, the consumer abort). On
-        // Clean failure the kill aborts with NOTHING touched and NOTHING
-        // durable: the mint gate releases (the session resumes untouched).
-        // Delta-r6-r4 (round 3 Finding 3): the PERSISTED class — the close
-        // IS durable despite the reported error — proceeds instead (the
-        // session ends, consistent with the durable close) while the answer
-        // still reports `success:false` (the kill visibly fails).
-        let close_answer = self.retire_closed_rows(&retire_ids).await;
-        if close_answer == crate::identity_sink::CloseAnswer::Failed {
-            {
-                let _index = self.cli_index.lock().await;
-                let _sessions = self.sessions.lock().await;
-                let mut gates = self.close_pending.lock().expect("close-pending lock");
-                if let Some(n) = gates.get_mut(&map_key) {
-                    *n -= 1;
-                    if *n == 0 {
-                        gates.remove(&map_key);
-                    }
-                }
-            }
-            self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
-                provider: PROVIDER.to_string(),
-                session_id,
-                session_type: session_type.to_string(),
-                success: false,
-                code: None,
-                message: None,
-            }));
-            return;
-        }
-        let main_close_reported_failure =
-            close_answer == crate::identity_sink::CloseAnswer::Persisted;
-        // kata b8ke Task 3: the fenced coordinator stop — placed AFTER the
-        // durable close envelope (a Clean-failure close aborts the kill with
-        // the session left live, which must never strand the coordinator in
-        // `Stopping`) and BEFORE any live-state destruction below. The claim is built
-        // from the lane's OWN retained stamp (its believed runtime identity
-        // plus the `(epoch, generation)` its `commit_live` stamped; the wire
-        // pair on `freshAgent.kill` feeds the same fence when present) —
-        // resolved for the wire id (a durable) or through the live
-        // session's recorded cli id (a placeholder-addressed kill).
-        // `BlockedHandoff` / `StaleClaim` / an in-flight `Starting`/`Stopping`
-        // are typed refusals: the caller does NOT kill. `BlockedHandoff`:
-        // the handoff is already stopping this runtime. `StaleClaim`:
-        // ownership moved under a newer generation. The in-flight
-        // `NotLive{Starting/Stopping}` case converges the same way — the
-        // in-flight operation either commits (a later kill with a fresh
-        // fence succeeds) or fails (the key reopens) — and every refusal
-        // exit rolls the pre-kill mint gate back so the still-live session
-        // keeps serving (adoptions proceed; retry-after-settle is honest).
-        // `NotLive{Vacant}`: the kill proceeds (idempotent lane cleanup)
-        // and skips the commit. No retained stamp: lane-local cleanup, no
-        // transition. (The fence itself was resolved at entry — a half-sent
-        // pair never reaches this point.)
+        // b8ke delta round-3 F1: THE COORDINATOR CLAIM COMES FIRST —
+        // BEFORE any durable mutation. Pre-d3 the durable close envelope
+        // retired the pane-ledger rows BEFORE this claim, so every typed
+        // refusal (BlockedHandoff / StaleClaim / an in-flight transition)
+        // returned with the durable row CLOSED although the runtime still
+        // ran — cross-device/history restoration misidentified a killed
+        // session that is alive. Now: the claim decides first; the durable
+        // close runs ONLY after the coordinator licenses the stop, and a
+        // Clean-failure close after a GRANTED claim unwinds the claim via
+        // `abort_stop` (Stopping → Live at the pre-stop generation) so the
+        // coordinator is never stranded by a ledger failure. The claim is
+        // built from the lane's OWN retained stamp (its believed runtime
+        // identity plus the `(epoch, generation)` its `commit_live`
+        // stamped; the wire pair on `freshAgent.kill` feeds the same fence
+        // when present) — resolved for the wire id (a durable) or through
+        // the live session's recorded cli id (a placeholder-addressed
+        // kill). `NotLive{Vacant}`: the kill proceeds (idempotent lane
+        // cleanup) and skips the commit. NO retained stamp: the kill
+        // still CONSULTS the coordinator through an observed-owner claim
+        // (the record the coordinator itself holds for this session) —
+        // never a silent lane-local skip; a refusal answers typed. (The
+        // fence itself was resolved at entry — a half-sent pair never
+        // reaches this point.)
         let mut stop_generation: Option<u64> = None;
         let mut stop_op_id: Option<String> = None;
         let mut stop_key: Option<String> = None;
@@ -2487,18 +2475,23 @@ impl FreshClaudeState {
                         );
                         None
                     }
-                    freshell_ownership::StopOutcome::NotLive { state } => Some(format!(
-                        "a lifecycle operation is in flight ({state:?}); retry after it settles"
+                    freshell_ownership::StopOutcome::NotLive { state } => Some((
+                        "LIFECYCLE_IN_FLIGHT",
+                        format!(
+                            "a lifecycle operation is in flight ({state:?}); retry after it settles"
+                        ),
                     )),
-                    freshell_ownership::StopOutcome::BlockedHandoff { .. } => Some(
+                    freshell_ownership::StopOutcome::BlockedHandoff { .. } => Some((
+                        "HANDOFF_IN_FLIGHT",
                         "a handoff owns this session's transition; retry after it settles"
                             .to_string(),
-                    ),
-                    freshell_ownership::StopOutcome::StaleClaim { .. } => {
-                        Some("ownership moved to a newer runtime; refresh and retry".to_string())
-                    }
+                    )),
+                    freshell_ownership::StopOutcome::StaleClaim { .. } => Some((
+                        "STALE_CLAIM",
+                        "ownership moved to a newer runtime; refresh and retry".to_string(),
+                    )),
                 };
-                if let Some(_reason) = refused {
+                if let Some((refusal_code, refusal_message)) = refused {
                     tracing::warn!(target: "freshell_freshagent::claude",
                         session_id = %session_id, outcome = ?stop_outcome,
                         "fresh_agent_kill_refused: the ownership coordinator refused the \
@@ -2528,13 +2521,159 @@ impl FreshClaudeState {
                         session_id,
                         session_type: session_type.to_string(),
                         success: false,
-                        code: None,
-                        message: None,
+                        code: Some(refusal_code.to_string()),
+                        message: Some(refusal_message),
                     }));
                     return;
                 }
+            } else {
+                // b8ke delta round-3 F1: NO retained stamp — the kill STILL
+                // consults the coordinator (never a silent lane-local
+                // skip). An observed-owner claim: the record the
+                // coordinator itself holds for this session licenses (or
+                // refuses) the stop; the ledger stays bound on refusal.
+                let canonical = self.resolve_ownership_key(&session_id);
+                let snap = registry.observe(PROVIDER, &canonical);
+                match snap.state.clone() {
+                    freshell_ownership::OwnershipState::Live {
+                        owner, generation, ..
+                    } => {
+                        let claim = freshell_ownership::StopClaim {
+                            expected_kind: owner.kind,
+                            expected_runtime: Some(owner.clone()),
+                            observed: freshell_ownership::ObservedFence {
+                                epoch: snap.epoch,
+                                generation,
+                            },
+                        };
+                        let kill_op_id = format!("kill-{}", uuid::Uuid::new_v4());
+                        let stop_outcome = crate::ownership_lane::begin_fresh_agent_stop(
+                            registry,
+                            PROVIDER,
+                            &canonical,
+                            &kill_op_id,
+                            &claim,
+                            "freshclaude/kill",
+                            crate::session_lease::now_epoch_ms(),
+                        );
+                        match stop_outcome {
+                            freshell_ownership::StopOutcome::Granted { generation } => {
+                                stop_generation = Some(generation);
+                                stop_op_id = Some(kill_op_id);
+                                stop_key = Some(canonical);
+                            }
+                            freshell_ownership::StopOutcome::NotLive {
+                                state: freshell_ownership::OwnershipState::Vacant,
+                            } => {}
+                            other => {
+                                let (refusal_code, refusal_message) = match &other {
+                                    freshell_ownership::StopOutcome::NotLive { state } => (
+                                        "LIFECYCLE_IN_FLIGHT",
+                                        format!(
+                                            "a lifecycle operation is in flight ({state:?}); \
+                                             retry after it settles"
+                                        ),
+                                    ),
+                                    freshell_ownership::StopOutcome::BlockedHandoff { .. } => (
+                                        "HANDOFF_IN_FLIGHT",
+                                        "a handoff owns this session's transition; \
+                                         retry after it settles"
+                                            .to_string(),
+                                    ),
+                                    _ => (
+                                        "STALE_CLAIM",
+                                        "ownership moved to a newer runtime; \
+                                         refresh and retry"
+                                            .to_string(),
+                                    ),
+                                };
+                                tracing::warn!(target: "freshell_freshagent::claude",
+                                    session_id = %session_id, outcome = ?other,
+                                    "fresh_agent_kill_refused_no_stamp: the ownership \
+                                     coordinator refused the observed-owner stop — nothing \
+                                     is killed, nothing durable is touched"
+                                );
+                                {
+                                    let _index = self.cli_index.lock().await;
+                                    let _sessions = self.sessions.lock().await;
+                                    let mut gates =
+                                        self.close_pending.lock().expect("close-pending lock");
+                                    if let Some(n) = gates.get_mut(&map_key) {
+                                        *n -= 1;
+                                        if *n == 0 {
+                                            gates.remove(&map_key);
+                                        }
+                                    }
+                                }
+                                self.broadcast(&ServerMessage::FreshAgentKilled(
+                                    FreshAgentKilled {
+                                        provider: PROVIDER.to_string(),
+                                        session_id,
+                                        session_type: session_type.to_string(),
+                                        success: false,
+                                        code: Some(refusal_code.to_string()),
+                                        message: Some(refusal_message),
+                                    },
+                                ));
+                                return;
+                            }
+                        }
+                    }
+                    _ => {
+                        // Vacant (or residue): lane-local cleanup proceeds —
+                        // the coordinator holds nothing to stop.
+                    }
+                }
             }
         }
+
+        // THE durable close — ONE envelope over the whole set, BEFORE any
+        // live-state destruction (the map removal, the consumer abort). On
+        // Clean failure the kill aborts with NOTHING touched and NOTHING
+        // durable: the mint gate releases (the session resumes untouched).
+        // Delta-r6-r4 (round 3 Finding 3): the PERSISTED class — the close
+        // IS durable despite the reported error — proceeds instead (the
+        // session ends, consistent with the durable close) while the answer
+        // still reports `success:false` (the kill visibly fails).
+        let close_answer = self.retire_closed_rows(&retire_ids).await;
+        if close_answer == crate::identity_sink::CloseAnswer::Failed {
+            // b8ke delta round-3 F1: a GRANTED stop claim must not strand
+            // the coordinator in `Stopping` when the ledger close failed
+            // clean — unwind it (Stopping → Live at the pre-stop
+            // generation) before the abort. The runtime still runs; the
+            // ledger is untouched; the session resumes fully operational.
+            if let (Some(key), Some(op_id), Some(generation)) =
+                (stop_key.clone(), stop_op_id.clone(), stop_generation)
+            {
+                if let Some(registry) = self.ownership.as_ref() {
+                    let _ = registry.abort_stop(PROVIDER, &key, &op_id, generation);
+                }
+            }
+            {
+                let _index = self.cli_index.lock().await;
+                let _sessions = self.sessions.lock().await;
+                let mut gates = self.close_pending.lock().expect("close-pending lock");
+                if let Some(n) = gates.get_mut(&map_key) {
+                    *n -= 1;
+                    if *n == 0 {
+                        gates.remove(&map_key);
+                    }
+                }
+            }
+            self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                provider: PROVIDER.to_string(),
+                session_id,
+                session_type: session_type.to_string(),
+                success: false,
+                code: Some("DURABLE_CLOSE_FAILED".to_string()),
+                message: Some(
+                    "the pane-ledger close failed; nothing was killed — retry".to_string(),
+                ),
+            }));
+            return;
+        }
+        let main_close_reported_failure =
+            close_answer == crate::identity_sink::CloseAnswer::Persisted;
 
         // Live-state destruction begins (every durable id the one envelope
         // covers is durably closed by this point). The consumer ABORT stays
@@ -5133,7 +5272,45 @@ impl FreshClaudeState {
                     return;
                 }
             };
+        // b8ke delta round-3 F2: BOTH existing-session early exits consult
+        // the coordinator — a delayed attach during a Handoff (the map
+        // entry exists until the stop lands) must be BLOCKED or typed,
+        // never a silent parity no-op or rebind against a runtime the
+        // handoff owns.
+        let coordinator_in_flight = |state: &freshell_ownership::OwnershipState| {
+            matches!(
+                state,
+                freshell_ownership::OwnershipState::Handoff { .. }
+                    | freshell_ownership::OwnershipState::Starting { .. }
+                    | freshell_ownership::OwnershipState::Stopping { .. }
+                    | freshell_ownership::OwnershipState::Fenced { .. }
+            )
+        };
         if self.sessions.lock().await.contains_key(&msg.session_id) {
+            // The gate observes the session's CANONICAL durable id (the
+            // registry keys the coordinator record there — the map key is
+            // the lane's own).
+            let durable = {
+                let sessions = self.sessions.lock().await;
+                sessions
+                    .get(&msg.session_id)
+                    .and_then(|s| s.cli_session_id.clone())
+            };
+            let observed_id = durable.as_deref().unwrap_or(&msg.session_id);
+            let snap = self.ownership_snapshot(PROVIDER, observed_id);
+            if coordinator_in_flight(&snap.state) {
+                tracing::warn!(target: "freshell_freshagent::claude",
+                    session_id = %msg.session_id, state = ?snap.state,
+                    "fresh_agent_attach_refused: a lifecycle transition owns this \
+                     session — the tracked-and-alive fast path is blocked (typed)");
+                self.emit_fresh_agent_error(
+                    &msg.session_id,
+                    session_type_str(msg.session_type),
+                    "SESSION_RESERVED",
+                    "A lifecycle operation owns this session; retry after it settles",
+                );
+                return;
+            }
             return; // tracked-and-alive: no frame (wire-shape parity with codex)
         }
         let Some(durable) = attach_durable_id(&msg) else {
@@ -5141,6 +5318,25 @@ impl FreshClaudeState {
             self.broadcast(&lost_session_frame(&msg.session_id, msg.session_type));
             return;
         };
+        {
+            // The rebind targets a LIVE session — the same coordinator
+            // gate applies before pointing a pane at it.
+            let resolved = self.resolve_ownership_key(&durable);
+            let snap = self.ownership_snapshot(PROVIDER, &resolved);
+            if coordinator_in_flight(&snap.state) {
+                tracing::warn!(target: "freshell_freshagent::claude",
+                    session_id = %durable, state = ?snap.state,
+                    "fresh_agent_attach_refused: a lifecycle transition owns this \
+                     session — the rebind fast path is blocked (typed)");
+                self.emit_fresh_agent_error(
+                    &msg.session_id,
+                    session_type_str(msg.session_type),
+                    "SESSION_RESERVED",
+                    "A lifecycle operation owns this session; retry after it settles",
+                );
+                return;
+            }
+        }
         if self
             .try_rebind_to_live(&durable, session_type_str(msg.session_type))
             .await
@@ -10006,6 +10202,216 @@ rl.on('line', (line) => {
             "the kill must evict the dedup cache, so the duplicate create genuinely \
              re-spawns"
         );
+    }
+
+    /// b8ke delta round-3 F1: a coordinator-REFUSED kill mutates NOTHING
+    /// durable — the pane-ledger row stays BOUND, the session stays live,
+    /// and the refusal broadcast is TYPED (code + message, never
+    /// code:None). Pre-d3 the durable close retired the row BEFORE the
+    /// claim, so a BlockedHandoff/StaleClaim refusal returned with the
+    /// durable row closed although the runtime still ran.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_kill_keeps_the_durable_ledger_bound_and_answers_typed() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(sink.clone());
+
+        let mut create_f1 = dedup_create_msg("req-d3-f1");
+        create_f1.model = Some("opus".into());
+        st.handle_create(create_f1, None).await;
+        let created = await_claude_created(&mut rx, "req-d3-f1").await;
+        let placeholder = created["sessionId"].as_str().unwrap().to_string();
+        // The adoption publishes + commits ownership under the durable id
+        // (non-default settings make the binding RECORDABLE so the
+        // ledger-bound assertions are non-vacuous).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !sink.was_recorded("claude", FRESH_CREATE_DURABLE_ID) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the create's adoption never recorded the binding"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // THE REFUSAL WINDOW: a handoff owns the key's transition.
+        let freshell_ownership::BeginOutcome::Granted { generation: _ } = registry.begin_handoff(
+            "claude",
+            FRESH_CREATE_DURABLE_ID,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "handoff-blocking-d3-f1",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("expected the Handoff begin to be granted")
+        };
+
+        st.handle_kill(kill_msg(&placeholder)).await;
+
+        // THE TYPED refusal broadcast (code + message set — pre-d3 both
+        // were None).
+        let frame = await_specific_frame(&mut rx, "freshAgent.killed", &placeholder).await;
+        assert_eq!(frame["success"], json!(false));
+        assert_eq!(
+            frame["code"],
+            json!("HANDOFF_IN_FLIGHT"),
+            "the refusal broadcast is TYPED: {frame}"
+        );
+        assert!(
+            frame["message"].is_string(),
+            "the refusal broadcast carries the typed message"
+        );
+
+        // THE F1 CONTRACT: the durable ledger stays BOUND on refusal — the
+        // row was never closed (pre-d3 the close retired it before the
+        // claim). The load-settings path still resolves the record.
+        assert!(
+            sink.was_recorded("claude", FRESH_CREATE_DURABLE_ID),
+            "the durable ledger row stays recorded (bound) on refusal"
+        );
+        // THE deterministic closed-vs-bound probe: the fake's retire log is
+        // EMPTY for this session — the kill never reached the durable
+        // close (pre-d3 the close retired the row before the claim).
+        assert!(
+            sink.retires
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, id)| id != FRESH_CREATE_DURABLE_ID),
+            "the durable ledger row was NOT closed on refusal — the retire \
+             log must not name it"
+        );
+        // And the runtime is still live in the map (has_live_session keys
+        // through cli_index — the DURABLE id is the index's entry).
+        assert!(
+            st.has_live_session(FRESH_CREATE_DURABLE_ID).await,
+            "the refused kill left the session live"
+        );
+    }
+
+    /// b8ke delta round-3 F2: a DELAYED create/attach against a session
+    /// whose key a Handoff owns is blocked TYPED — never a silent
+    /// map-hit adopt (the create) or a silent parity no-op (the attach).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delayed_create_and_attach_during_handoff_answer_typed() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+
+        st.handle_create(dedup_create_msg("req-d3-f2"), None).await;
+        let created = await_claude_created(&mut rx, "req-d3-f2").await;
+        let placeholder = created["sessionId"].as_str().unwrap().to_string();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while st
+            .cli_index
+            .lock()
+            .await
+            .get(FRESH_CREATE_DURABLE_ID)
+            .is_none()
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the create's adoption never published"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // The Handoff window: the map entry still exists (the runtime has
+        // not stopped yet) — the pre-d3 fast paths adopted/no-op'd here.
+        let freshell_ownership::BeginOutcome::Granted { generation: _ } = registry.begin_handoff(
+            "claude",
+            FRESH_CREATE_DURABLE_ID,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "handoff-blocking-d3-f2",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("expected the Handoff begin to be granted")
+        };
+
+        // A delayed CREATE (resume through the live session): the claim
+        // sees the Handoff state and answers the typed refusal — never
+        // adopt_live_create's created frame.
+        // The delayed create addresses the DURABLE id (the pane's
+        // sessionRef) — the claim resolves and sees the Handoff state.
+        let mut delayed_create = dedup_create_msg("req-d3-f2-delayed");
+        delayed_create.resume_session_id = Some(FRESH_CREATE_DURABLE_ID.to_string());
+        st.handle_create(delayed_create, None).await;
+        let refused =
+            await_specific_frame(&mut rx, "freshAgent.create.failed", "req-d3-f2-delayed").await;
+        assert_eq!(
+            refused["code"],
+            json!("SESSION_RESERVED"),
+            "the delayed create answers the TYPED refusal: {refused}"
+        );
+
+        // A delayed ATTACH: the tracked-and-alive fast path is BLOCKED
+        // with the typed error (pre-d3: the silent parity return).
+        st.handle_attach(freshell_protocol::FreshAgentAttach {
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: placeholder.clone(),
+            session_type: SessionType::Freshclaude,
+            cwd: None,
+            observed_epoch: None,
+            observed_generation: None,
+            resume_session_id: None,
+            session_ref: None,
+        })
+        .await;
+        // The typed attach refusal rides a freshAgent.event envelope
+        // (inner type freshAgent.error).
+        let attach_refused = await_frame_of_inner_type(&mut rx, "freshAgent.error").await;
+        assert_eq!(
+            attach_refused["event"]["code"],
+            json!("SESSION_RESERVED"),
+            "the delayed attach answers the TYPED refusal: {attach_refused}"
+        );
+        assert_eq!(
+            attach_refused["event"]["sessionId"],
+            json!(placeholder),
+            "the refusal names the addressed session"
+        );
+    }
+
+    /// b8ke delta round-3: bounded drain until a frame of the given TYPE
+    /// whose `requestId` OR `sessionId` matches the key arrives.
+    async fn await_specific_frame(
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        frame_type: &str,
+        key: &str,
+    ) -> Value {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = match rx.recv().await {
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(err) => panic!("broadcast recv failed: {err}"),
+                    Ok(raw) => serde_json::from_str(&raw).unwrap(),
+                };
+                if frame["type"] != frame_type {
+                    continue;
+                }
+                let request_match = frame
+                    .get("requestId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|v| v == key);
+                let session_match = frame
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|v| v == key);
+                if request_match || session_match {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("the expected frame arrived within budget")
     }
 
     /// `freshAgent.kill` for an session id this process never created is idempotent

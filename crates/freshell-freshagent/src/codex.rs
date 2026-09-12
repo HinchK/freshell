@@ -3590,44 +3590,19 @@ impl FreshCodexState {
                 }
             };
 
-        // Durable close first (see the comment block above): retire the
-        // pane-ledger row before any teardown; a Failed close fails the kill
-        // and runs nothing below.
-        let close_answer = self.retire_closed_row(&session_id).await;
-        if close_answer == crate::identity_sink::CloseAnswer::Failed {
-            self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
-                provider: PROVIDER.to_string(),
-                session_id,
-                session_type: SESSION_TYPE.to_string(),
-                success: false,
-                code: None,
-                message: None,
-            }));
-            return;
-        }
-        let close_reported_failure = close_answer == crate::identity_sink::CloseAnswer::Persisted;
-
-        // kata b8ke Task 3: the fenced coordinator stop — placed AFTER the
-        // durable close decision (a Clean-failure close aborts the kill with
-        // the session left live, which must never strand the coordinator in
-        // `Stopping`) and BEFORE any live-state mutation below. The claim is built
-        // from the lane's OWN retained stamp (its believed runtime identity
-        // plus the `(epoch, generation)` its `commit_live` stamped; the wire
-        // pair on `freshAgent.kill` feeds the same fence when present).
-        // `BlockedHandoff` / `StaleClaim` / an in-flight `Starting`/`Stopping`
-        // are typed refusals: the caller does NOT kill (an in-flight handoff
-        // owns the transition, or ownership moved under a newer generation —
-        // round-2 review). The in-flight `NotLive{Starting/Stopping}` case
-        // converges the same way — the in-flight operation either commits
-        // (a later kill with a fresh fence succeeds) or fails (the key
-        // reopens) — and this handler arms no close gate, so a refusal
-        // leaves the still-live session fully operational
-        // (retry-after-settle is honest). `NotLive{Vacant}`: the kill
-        // proceeds (idempotent lane cleanup; nothing to stop in the
-        // coordinator) and skips the commit. No retained stamp (never
-        // claimed through the coordinator): the kill is lane-local
-        // cleanup, no transition. (The fence itself was resolved at entry —
-        // a half-sent pair never reaches this point.)
+        // b8ke delta round-3 F1: THE COORDINATOR CLAIM COMES FIRST —
+        // BEFORE any durable mutation. Pre-d3 the durable close retired
+        // the pane-ledger row BEFORE this claim, so every typed refusal
+        // (BlockedHandoff / StaleClaim / an in-flight transition) returned
+        // with the durable row CLOSED although the runtime still ran. Now:
+        // the claim decides first; the durable close runs ONLY after the
+        // coordinator licenses the stop, and a Clean-failure close after
+        // a GRANTED claim unwinds it via `abort_stop` (Stopping → Live at
+        // the pre-stop generation). The claim is built from the lane's
+        // OWN retained stamp; `NotLive{Vacant}`: the kill proceeds
+        // (idempotent lane cleanup) and skips the commit. NO retained
+        // stamp: the kill still CONSULTS the coordinator through an
+        // observed-owner claim — never a silent lane-local skip.
         let mut stop_generation: Option<u64> = None;
         let mut stop_op_id: Option<String> = None;
         if let Some(registry) = self.ownership.as_ref() {
@@ -3668,18 +3643,23 @@ impl FreshCodexState {
                         );
                         None
                     }
-                    freshell_ownership::StopOutcome::NotLive { state } => Some(format!(
-                        "a lifecycle operation is in flight ({state:?}); retry after it settles"
+                    freshell_ownership::StopOutcome::NotLive { state } => Some((
+                        "LIFECYCLE_IN_FLIGHT",
+                        format!(
+                            "a lifecycle operation is in flight ({state:?}); retry after it settles"
+                        ),
                     )),
-                    freshell_ownership::StopOutcome::BlockedHandoff { .. } => Some(
+                    freshell_ownership::StopOutcome::BlockedHandoff { .. } => Some((
+                        "HANDOFF_IN_FLIGHT",
                         "a handoff owns this session's transition; retry after it settles"
                             .to_string(),
-                    ),
-                    freshell_ownership::StopOutcome::StaleClaim { .. } => {
-                        Some("ownership moved to a newer runtime; refresh and retry".to_string())
-                    }
+                    )),
+                    freshell_ownership::StopOutcome::StaleClaim { .. } => Some((
+                        "STALE_CLAIM",
+                        "ownership moved to a newer runtime; refresh and retry".to_string(),
+                    )),
                 };
-                if let Some(_reason) = refused {
+                if let Some((refusal_code, refusal_message)) = refused {
                     tracing::warn!(target: "freshell_freshagent::codex",
                         session_id = %session_id, outcome = ?stop_outcome,
                         "fresh_agent_kill_refused: the ownership coordinator refused the \
@@ -3690,13 +3670,123 @@ impl FreshCodexState {
                         session_id,
                         session_type: SESSION_TYPE.to_string(),
                         success: false,
-                        code: None,
-                        message: None,
+                        code: Some(refusal_code.to_string()),
+                        message: Some(refusal_message),
                     }));
                     return;
                 }
+            } else {
+                // b8ke delta round-3 F1: NO retained stamp — the kill STILL
+                // consults the coordinator through an observed-owner claim
+                // (never a silent lane-local skip); a refusal answers
+                // typed with the ledger bound.
+                let snap = registry.observe(PROVIDER, &session_id);
+                match snap.state.clone() {
+                    freshell_ownership::OwnershipState::Live {
+                        owner, generation, ..
+                    } => {
+                        let claim = freshell_ownership::StopClaim {
+                            expected_kind: owner.kind,
+                            expected_runtime: Some(owner.clone()),
+                            observed: freshell_ownership::ObservedFence {
+                                epoch: snap.epoch,
+                                generation,
+                            },
+                        };
+                        let kill_op_id = format!("kill-{}", uuid::Uuid::new_v4());
+                        let stop_outcome = crate::ownership_lane::begin_fresh_agent_stop(
+                            registry,
+                            PROVIDER,
+                            &session_id,
+                            &kill_op_id,
+                            &claim,
+                            "freshcodex/kill",
+                            crate::session_lease::now_epoch_ms(),
+                        );
+                        match stop_outcome {
+                            freshell_ownership::StopOutcome::Granted { generation } => {
+                                stop_generation = Some(generation);
+                                stop_op_id = Some(kill_op_id);
+                            }
+                            freshell_ownership::StopOutcome::NotLive {
+                                state: freshell_ownership::OwnershipState::Vacant,
+                            } => {}
+                            other => {
+                                let (refusal_code, refusal_message) = match &other {
+                                    freshell_ownership::StopOutcome::NotLive { state } => (
+                                        "LIFECYCLE_IN_FLIGHT",
+                                        format!(
+                                            "a lifecycle operation is in flight ({state:?}); \
+                                             retry after it settles"
+                                        ),
+                                    ),
+                                    freshell_ownership::StopOutcome::BlockedHandoff { .. } => (
+                                        "HANDOFF_IN_FLIGHT",
+                                        "a handoff owns this session's transition; \
+                                         retry after it settles"
+                                            .to_string(),
+                                    ),
+                                    _ => (
+                                        "STALE_CLAIM",
+                                        "ownership moved to a newer runtime; \
+                                         refresh and retry"
+                                            .to_string(),
+                                    ),
+                                };
+                                tracing::warn!(target: "freshell_freshagent::codex",
+                                    session_id = %session_id, outcome = ?other,
+                                    "fresh_agent_kill_refused_no_stamp: the ownership \
+                                     coordinator refused the observed-owner stop — nothing \
+                                     is killed, nothing durable is touched"
+                                );
+                                self.broadcast(&ServerMessage::FreshAgentKilled(
+                                    FreshAgentKilled {
+                                        provider: PROVIDER.to_string(),
+                                        session_id,
+                                        session_type: SESSION_TYPE.to_string(),
+                                        success: false,
+                                        code: Some(refusal_code.to_string()),
+                                        message: Some(refusal_message),
+                                    },
+                                ));
+                                return;
+                            }
+                        }
+                    }
+                    _ => {
+                        // Vacant (or residue): lane-local cleanup proceeds —
+                        // the coordinator holds nothing to stop.
+                    }
+                }
             }
         }
+
+        // Durable close first (see the comment block above): retire the
+        // pane-ledger row before any teardown; a Failed close fails the kill
+        // and runs nothing below.
+        let close_answer = self.retire_closed_row(&session_id).await;
+        if close_answer == crate::identity_sink::CloseAnswer::Failed {
+            // b8ke delta round-3 F1: unwind a GRANTED stop claim (Stopping →
+            // Live at the pre-stop generation) — a clean ledger failure
+            // must never strand the coordinator.
+            if let (Some(op_id), Some(generation)) = (stop_op_id.clone(), stop_generation) {
+                if let Some(registry) = self.ownership.as_ref() {
+                    let _ = registry.abort_stop(PROVIDER, &session_id, &op_id, generation);
+                }
+            }
+            self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                provider: PROVIDER.to_string(),
+                session_id,
+                session_type: SESSION_TYPE.to_string(),
+                success: false,
+                code: Some("DURABLE_CLOSE_FAILED".to_string()),
+                message: Some(
+                    "the pane-ledger close failed; nothing was killed — retry".to_string(),
+                ),
+            }));
+            return;
+        }
+        let close_reported_failure = close_answer == crate::identity_sink::CloseAnswer::Persisted;
 
         self.clear_controls(&session_id).await;
 
@@ -3851,6 +3941,32 @@ impl FreshCodexState {
                 }
             };
         let tracked = self.sessions.lock().await.contains_key(&msg.session_id);
+
+        // b8ke delta round-3 F2: a tracked-and-alive attach still CONSULTS
+        // the coordinator — a delayed attach during a Handoff (the map
+        // entry exists until the stop lands) must be BLOCKED or typed,
+        // never a silent parity no-op against a runtime the handoff owns.
+        if tracked {
+            let snap = self.ownership_snapshot(PROVIDER, &msg.session_id);
+            match snap.state {
+                freshell_ownership::OwnershipState::Handoff { .. }
+                | freshell_ownership::OwnershipState::Starting { .. }
+                | freshell_ownership::OwnershipState::Stopping { .. }
+                | freshell_ownership::OwnershipState::Fenced { .. } => {
+                    tracing::warn!(target: "freshell_freshagent::codex",
+                        session_id = %msg.session_id, state = ?snap.state,
+                        "fresh_agent_attach_refused: a lifecycle transition owns this \
+                         session — the tracked-and-alive fast path is blocked (typed)");
+                    self.emit_fresh_agent_error(
+                        &msg.session_id,
+                        "SESSION_RESERVED",
+                        "A lifecycle operation owns this session; retry after it settles",
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
 
         let (session_id, active_turn_present, should_emit_snapshot) = if tracked {
             let (resolved_id, should_emit_snapshot) =

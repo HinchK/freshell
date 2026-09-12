@@ -402,33 +402,66 @@ impl SessionHandoffRunner {
             // session, the unverified descendants being the operator's
             // acknowledged risk).
             BeginOutcome::Blocked {
+                // b8ke delta round-3 F5: the acknowledged operator
+                // force-clear accepts BOTH unconfirmable fence reasons —
+                // the coordinator's own force_release API takes
+                // PlatformLimited AND StaleStart (the registry's docs name
+                // PID-less OpenCode starts as the production case that
+                // otherwise stays fenced until restart), but pre-d3 this
+                // branch matched PlatformLimited only and a StaleStart
+                // fence fell to generic HANDOFF_IN_PROGRESS even with the
+                // acknowledgment flag set — the documented recoverable
+                // state was permanently wedged through the lifecycle API.
+                // The probe keeps its OWN confirmed-death discipline; this
+                // is the operator path, with the risk typed identically.
                 state:
                     freshell_ownership::OwnershipState::Fenced {
-                        reason: freshell_ownership::FenceReason::PlatformLimited,
+                        reason:
+                            reason @ (freshell_ownership::FenceReason::PlatformLimited
+                            | freshell_ownership::FenceReason::StaleStart),
                         prior,
                         ..
                     },
                 ..
             } => {
+                // The reason-aware typed refusal: an ordinary retry never
+                // clears an UNCONFIRMABLE fence — the acknowledged
+                // force-clear is the only recovery (d3 F5: StaleStart
+                // types its own code so the client's recovery UI can offer
+                // the force-clear for exactly the fences that need it).
+                let fence_code = match reason {
+                    freshell_ownership::FenceReason::PlatformLimited => "PLATFORM_LIMITED_FENCED",
+                    _ => "STALE_START_FENCED",
+                };
                 if !req.acknowledge_platform_limited_risk {
                     let generation = self
                         .ownership
                         .observe(&req.provider, &req.session_id)
                         .generation;
                     tracing::warn!(target: "freshell_ownership",
-                        event = "ownership.handoff.platform_limited_fence_refused",
+                        event = "ownership.handoff.unconfirmable_fence_refused",
                         operation_id = %operation_id, provider = %req.provider, session_id = %req.session_id,
                         epoch = self.ownership.boot_epoch(), generation,
-                        outcome = "refused", failure_reason = "PLATFORM_LIMITED_FENCED",
-                        "an ordinary retry does not clear a PlatformLimited fence: this \
-                         platform cannot verify the prior runtime's descendant processes — \
-                         the acknowledged force-clear is the only recovery");
+                        fence_reason = ?reason,
+                        outcome = "refused", failure_reason = fence_code,
+                        "an ordinary retry does not clear an unconfirmable fence: the \
+                         prior runtime's death could not be confirmed — the acknowledged \
+                         force-clear is the only recovery");
                     return typed_failure(
-                        "PLATFORM_LIMITED_FENCED",
-                        "the session is fenced pending recovery: this platform cannot \
-                         verify the prior runtime's descendant processes. Retry with the \
-                         acknowledged force-clear (acknowledgePlatformLimitedRisk: true) to \
-                         release the fence, accepting that unverified descendants may remain.",
+                        fence_code,
+                        match reason {
+                            freshell_ownership::FenceReason::PlatformLimited =>
+                                "the session is fenced pending recovery: this platform cannot \
+                                 verify the prior runtime's descendant processes. Retry with the \
+                                 acknowledged force-clear (acknowledgePlatformLimitedRisk: true) to \
+                                 release the fence, accepting that unverified descendants may remain.",
+                            _ =>
+                                "the session is fenced pending recovery: the prior runtime's \
+                                 death could not be confirmed (a stale start left it \
+                                 unconfirmable). Retry with the acknowledged force-clear \
+                                 (acknowledgePlatformLimitedRisk: true) to release the fence, \
+                                 accepting that the unconfirmed runtime's processes may remain.",
+                        },
                         true,
                         generation,
                     );

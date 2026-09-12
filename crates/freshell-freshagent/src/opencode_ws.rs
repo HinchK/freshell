@@ -931,6 +931,31 @@ impl FreshOpencodeState {
             guard.get(&durable_id).cloned()
         };
         let in_memory_hit = existing.is_some();
+        // b8ke delta round-3 F2: an in-memory hit still CONSULTS the
+        // coordinator — a delayed create-resume during a Handoff must be
+        // blocked or typed, never a silent reuse of a runtime the handoff
+        // owns.
+        if in_memory_hit {
+            let snap = self.fresh_agent.ownership_snapshot(PROVIDER, &durable_id);
+            match snap.state {
+                freshell_ownership::OwnershipState::Handoff { .. }
+                | freshell_ownership::OwnershipState::Starting { .. }
+                | freshell_ownership::OwnershipState::Stopping { .. }
+                | freshell_ownership::OwnershipState::Fenced { .. } => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %durable_id, state = ?snap.state,
+                        "fresh_agent_create_refused: a lifecycle transition owns this \
+                         session — the in-memory fast path is blocked (typed)");
+                    self.fail_create(
+                        &request_id,
+                        "SESSION_RESERVED",
+                        "A lifecycle operation owns this session; retry after it settles",
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
         // b8ke delta review F7: a half-sent observed pair (exactly one of
         // epoch/generation) is the typed invalid-fence refusal — never a
         // silently downgraded legacy request.
@@ -2002,100 +2027,22 @@ impl FreshOpencodeState {
             }
         }
 
-        // Phase 2 — THE durable close: ONE failure-atomic envelope over the
-        // COMPLETE identity set plus the pending markers
-        // (`retire_closed_batch` → `PaneLedger::close_identities`,
-        // delta-r6-r3, focused-episode-6 round 2 Finding 5). An explicit
-        // kill is an intentional session END: it retires the session's
-        // DURABLE row(s) `Closed` (the ledger row is keyed on the
-        // materialized `ses_*` id) so the recovery inventory (Bound-only
-        // pre-filter) can never re-offer a pane the user just closed inside
-        // the 7s creation-race grace window; and deletes the pending marker
-        // (LAST — once the closes are durable) so a late materialization
-        // resolution can never carry evidence for a pane that provably no
-        // longer exists. The per-identity loop it replaced wrote several
-        // retires + marker deletes BEFORE checking any failure: an early
-        // success stayed durable over the still-live session a later failure
-        // left behind — recovery would classify that session closed. The
-        // delta-r6-r2 post-envelope completion retire (whose Clean failure
-        // could not roll back the phase-2 placeholder close, focused-
-        // episode-6 round 4 Finding F6) is gone: phase 1's session-lock
-        // enumeration + mint gate made post-envelope discovery impossible,
-        // and this envelope's Clean failure also rolls nothing back BY
-        // CONSTRUCTION — nothing stands yet. The answer is classed (delta-
-        // r6-r4, round 3 Finding 3): `Failed` (Clean): nothing durable —
-        // the kill releases the enumeration gate and leaves ALL live state
-        // untouched: the session stays live and Bound (self-consistent:
-        // nothing has been closed), and a retried kill re-attempts
-        // idempotently. `Persisted`: the close IS durable despite the
-        // reported error — the kill PROCEEDS (the session ends, consistent
-        // with the durable close) while the answer still reports
-        // `success:false` (the kill visibly fails).
-        let mut close_reported_failure = false;
-        let mut close_invariant_broken = false;
-        if let Some(sink) = self.identity_sink() {
-            match sink
-                .retire_closed_batch(PROVIDER, &retire_ids, &marker_ids)
-                .await
-            {
-                Ok(()) => {}
-                Err(e) => {
-                    let persisted = e.is_persisted();
-                    if persisted {
-                        tracing::error!(error = %e, sessions = ?retire_ids,
-                            "freshagent.opencode.retire_on_kill_persisted_despite_error: the close \
-                             is durable; the kill ends the session and answers failure");
-                        close_reported_failure = true;
-                    } else {
-                        tracing::warn!(error = %e, sessions = ?retire_ids, "freshagent.opencode.retire_on_kill_failed");
-                        // Failure propagation: the durable close did not
-                        // land — NOTHING of it survived — so the kill must
-                        // NOT acknowledge success and must leave ALL live
-                        // state untouched. Release the enumeration gate
-                        // first: the session is resumable exactly as if the
-                        // kill never ran (F6: no placeholder close stands to
-                        // roll back — the one envelope landed nothing).
-                        if let Some(session_arc) = &session_arc {
-                            let mut s = session_arc.lock().await;
-                            s.close_pending = s.close_pending.saturating_sub(1);
-                        }
-                        self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
-                            provider: PROVIDER.to_string(),
-                            session_id: msg.session_id,
-                            session_type: SESSION_TYPE.to_string(),
-                            success: false,
-                            code: None,
-                            message: None,
-                        }));
-                        return;
-                    }
-                }
-            }
-        }
-
-        // kata b8ke Task 3: the fenced coordinator stop — placed AFTER the
-        // phase-2 durable close envelope (its Clean-failure abort leaves the
-        // session live, which must never strand the coordinator in
-        // `Stopping`) and BEFORE the phase-3 live-state mutation. The claim is built from the lane's OWN
-        // retained stamp (its believed runtime identity — pid `None`, the
-        // shared serve daemon is NEVER a kill target — plus the
-        // `(epoch, generation)` its `commit_live` stamped; the wire pair on
-        // `freshAgent.kill` feeds the same fence when present), resolved for
-        // the wire id (a durable `ses_*`) or through the live session's
+        // b8ke delta round-3 F1: THE COORDINATOR CLAIM COMES FIRST —
+        // BEFORE the phase-2 durable close envelope. Pre-d3 the envelope
+        // retired the pane-ledger rows BEFORE this claim, so every typed
+        // refusal returned with the durable rows CLOSED although the
+        // runtime still ran. Now: the claim decides first; the envelope
+        // runs ONLY after the coordinator licenses the stop, and its
+        // Clean failure unwinds a GRANTED claim via `abort_stop`
+        // (Stopping → Live at the pre-stop generation). The claim is built
+        // from the lane's OWN retained stamp (pid `None` — the shared
+        // serve daemon is NEVER a kill target), resolved for the wire id
+        // (a durable `ses_*`) or through the live session's
         // `real_session_id` (a placeholder-addressed kill).
-        // `BlockedHandoff` / `StaleClaim` / an in-flight `Starting`/`Stopping`
-        // are typed refusals: the caller does NOT kill. `BlockedHandoff`:
-        // the handoff is already stopping this runtime. `StaleClaim`:
-        // ownership moved under a newer generation. The in-flight
-        // `NotLive{Starting/Stopping}` case converges the same way — the
-        // in-flight operation either commits (a later kill with a fresh
-        // fence succeeds) or fails (the key reopens) — and every refusal
-        // exit rolls the pre-kill enumeration gate back so the still-live
-        // session keeps serving (sends proceed; retry-after-settle is
-        // honest). `NotLive{Vacant}`: the kill proceeds (idempotent lane
-        // cleanup) and skips the commit. No retained stamp: lane-local
-        // cleanup, no transition. (The fence itself was resolved at entry —
-        // a half-sent pair never reaches this point.)
+        // `NotLive{Vacant}`: the kill proceeds (idempotent lane cleanup)
+        // and skips the commit. NO retained stamp: the kill still CONSULTS
+        // the coordinator through an observed-owner claim — never a
+        // silent lane-local skip.
         let mut stop_generation: Option<u64> = None;
         let mut stop_op_id: Option<String> = None;
         let mut stop_key: Option<String> = None;
@@ -2151,18 +2098,23 @@ impl FreshOpencodeState {
                         );
                         None
                     }
-                    freshell_ownership::StopOutcome::NotLive { state } => Some(format!(
-                        "a lifecycle operation is in flight ({state:?}); retry after it settles"
+                    freshell_ownership::StopOutcome::NotLive { state } => Some((
+                        "LIFECYCLE_IN_FLIGHT",
+                        format!(
+                            "a lifecycle operation is in flight ({state:?}); retry after it settles"
+                        ),
                     )),
-                    freshell_ownership::StopOutcome::BlockedHandoff { .. } => Some(
+                    freshell_ownership::StopOutcome::BlockedHandoff { .. } => Some((
+                        "HANDOFF_IN_FLIGHT",
                         "a handoff owns this session's transition; retry after it settles"
                             .to_string(),
-                    ),
-                    freshell_ownership::StopOutcome::StaleClaim { .. } => {
-                        Some("ownership moved to a newer runtime; refresh and retry".to_string())
-                    }
+                    )),
+                    freshell_ownership::StopOutcome::StaleClaim { .. } => Some((
+                        "STALE_CLAIM",
+                        "ownership moved to a newer runtime; refresh and retry".to_string(),
+                    )),
                 };
-                if let Some(_reason) = refused {
+                if let Some((refusal_code, refusal_message)) = refused {
                     tracing::warn!(target: "freshell_freshagent::opencode",
                         session_id = %msg.session_id, outcome = ?stop_outcome,
                         "fresh_agent_kill_refused: the ownership coordinator refused the \
@@ -2185,10 +2137,182 @@ impl FreshOpencodeState {
                         session_id: msg.session_id,
                         session_type: SESSION_TYPE.to_string(),
                         success: false,
-                        code: None,
-                        message: None,
+                        code: Some(refusal_code.to_string()),
+                        message: Some(refusal_message),
                     }));
                     return;
+                }
+            } else {
+                // b8ke delta round-3 F1: NO retained stamp — the kill STILL
+                // consults the coordinator through an observed-owner claim
+                // (never a silent lane-local skip); a refusal answers typed
+                // with the ledger bound.
+                let snap = registry.observe(PROVIDER, &msg.session_id);
+                match snap.state.clone() {
+                    freshell_ownership::OwnershipState::Live {
+                        owner, generation, ..
+                    } => {
+                        let claim = freshell_ownership::StopClaim {
+                            expected_kind: owner.kind,
+                            expected_runtime: Some(owner.clone()),
+                            observed: freshell_ownership::ObservedFence {
+                                epoch: snap.epoch,
+                                generation,
+                            },
+                        };
+                        let kill_op_id = format!("kill-{}", uuid::Uuid::new_v4());
+                        let stop_outcome = crate::ownership_lane::begin_fresh_agent_stop(
+                            registry,
+                            PROVIDER,
+                            &msg.session_id,
+                            &kill_op_id,
+                            &claim,
+                            "freshopencode/kill",
+                            crate::session_lease::now_epoch_ms(),
+                        );
+                        match stop_outcome {
+                            freshell_ownership::StopOutcome::Granted { generation } => {
+                                stop_generation = Some(generation);
+                                stop_op_id = Some(kill_op_id);
+                                stop_key = Some(msg.session_id.clone());
+                            }
+                            freshell_ownership::StopOutcome::NotLive {
+                                state: freshell_ownership::OwnershipState::Vacant,
+                            } => {}
+                            other => {
+                                let (refusal_code, refusal_message) = match &other {
+                                    freshell_ownership::StopOutcome::NotLive { state } => (
+                                        "LIFECYCLE_IN_FLIGHT",
+                                        format!(
+                                            "a lifecycle operation is in flight ({state:?}); \
+                                             retry after it settles"
+                                        ),
+                                    ),
+                                    freshell_ownership::StopOutcome::BlockedHandoff { .. } => (
+                                        "HANDOFF_IN_FLIGHT",
+                                        "a handoff owns this session's transition; \
+                                         retry after it settles"
+                                            .to_string(),
+                                    ),
+                                    _ => (
+                                        "STALE_CLAIM",
+                                        "ownership moved to a newer runtime; \
+                                         refresh and retry"
+                                            .to_string(),
+                                    ),
+                                };
+                                tracing::warn!(target: "freshell_freshagent::opencode",
+                                    session_id = %msg.session_id, outcome = ?other,
+                                    "fresh_agent_kill_refused_no_stamp: the ownership \
+                                     coordinator refused the observed-owner stop — nothing \
+                                     is killed, nothing durable is touched"
+                                );
+                                if let Some(session_arc) = &session_arc {
+                                    let mut s = session_arc.lock().await;
+                                    s.close_pending = s.close_pending.saturating_sub(1);
+                                }
+                                self.broadcast(&ServerMessage::FreshAgentKilled(
+                                    FreshAgentKilled {
+                                        provider: PROVIDER.to_string(),
+                                        session_id: msg.session_id,
+                                        session_type: SESSION_TYPE.to_string(),
+                                        success: false,
+                                        code: Some(refusal_code.to_string()),
+                                        message: Some(refusal_message),
+                                    },
+                                ));
+                                return;
+                            }
+                        }
+                    }
+                    _ => {
+                        // Vacant (or residue): lane-local cleanup proceeds —
+                        // the coordinator holds nothing to stop.
+                    }
+                }
+            }
+        }
+
+        // Phase 2 — THE durable close: ONE failure-atomic envelope over the
+        // COMPLETE identity set plus the pending markers
+        // (`retire_closed_batch` → `PaneLedger::close_identities`,
+        // delta-r6-r3, focused-episode-6 round 2 Finding 5). An explicit
+        // kill is an intentional session END: it retires the session's
+        // DURABLE row(s) `Closed` (the ledger row is keyed on the
+        // materialized `ses_*` id) so the recovery inventory (Bound-only
+        // pre-filter) can never re-offer a pane the user just closed inside
+        // the 7s creation-race grace window; and deletes the pending marker
+        // (LAST — once the closes are durable) so a late materialization
+        // resolution can never carry evidence for a pane that provably no
+        // longer exists. The per-identity loop it replaced wrote several
+        // retires + marker deletes BEFORE checking any failure: an early
+        // success stayed durable over the still-live session a later failure
+        // left behind — recovery would classify that session closed. The
+        // delta-r6-r2 post-envelope completion retire (whose Clean failure
+        // could not roll back the phase-2 placeholder close, focused-
+        // episode-6 round 4 Finding F6) is gone: phase 1's session-lock
+        // enumeration + mint gate made post-envelope discovery impossible,
+        // and this envelope's Clean failure also rolls nothing back BY
+        // CONSTRUCTION — nothing stands yet. The answer is classed (delta-
+        // r6-r4, round 3 Finding 3): `Failed` (Clean): nothing durable —
+        // the kill releases the enumeration gate and leaves ALL live state
+        // untouched: the session stays live and Bound (self-consistent:
+        // nothing has been closed), and a retried kill re-attempts
+        // idempotently. `Persisted`: the close IS durable despite the
+        // reported error — the kill PROCEEDS (the session ends, consistent
+        // with the durable close) while the answer still reports
+        // `success:false` (the kill visibly fails).
+        let mut close_reported_failure = false;
+        let mut close_invariant_broken = false;
+        if let Some(sink) = self.identity_sink() {
+            match sink
+                .retire_closed_batch(PROVIDER, &retire_ids, &marker_ids)
+                .await
+            {
+                Ok(()) => {}
+                Err(e) => {
+                    let persisted = e.is_persisted();
+                    if persisted {
+                        tracing::error!(error = %e, sessions = ?retire_ids,
+                            "freshagent.opencode.retire_on_kill_persisted_despite_error: the close \
+                             is durable; the kill ends the session and answers failure");
+                        close_reported_failure = true;
+                    } else {
+                        tracing::warn!(error = %e, sessions = ?retire_ids, "freshagent.opencode.retire_on_kill_failed");
+                        // Failure propagation: the durable close did not
+                        // land — NOTHING of it survived — so the kill must
+                        // NOT acknowledge success and must leave ALL live
+                        // state untouched. Release the enumeration gate
+                        // first: the session is resumable exactly as if the
+                        // kill never ran (F6: no placeholder close stands to
+                        // roll back — the one envelope landed nothing).
+                        // b8ke delta round-3 F1: unwind a GRANTED stop
+                        // claim (Stopping → Live) — a clean ledger failure
+                        // must never strand the coordinator.
+                        if let (Some(key), Some(op_id), Some(generation)) =
+                            (stop_key.clone(), stop_op_id.clone(), stop_generation)
+                        {
+                            if let Some(registry) = self.fresh_agent.ownership.as_ref() {
+                                let _ = registry.abort_stop(PROVIDER, &key, &op_id, generation);
+                            }
+                        }
+                        if let Some(session_arc) = &session_arc {
+                            let mut s = session_arc.lock().await;
+                            s.close_pending = s.close_pending.saturating_sub(1);
+                        }
+                        self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                            provider: PROVIDER.to_string(),
+                            session_id: msg.session_id,
+                            session_type: SESSION_TYPE.to_string(),
+                            success: false,
+                            code: Some("DURABLE_CLOSE_FAILED".to_string()),
+                            message: Some(
+                                "the pane-ledger close failed; nothing was killed — retry"
+                                    .to_string(),
+                            ),
+                        }));
+                        return;
+                    }
                 }
             }
         }
@@ -3727,6 +3851,33 @@ impl FreshOpencodeState {
             let guard = self.sessions.lock().await;
             guard.get(&msg.session_id).cloned()
         };
+        // b8ke delta round-3 F2: an existing-session attach still CONSULTS
+        // the coordinator — a delayed attach during a Handoff (the map entry
+        // exists until the stop lands) must be BLOCKED or typed, never a
+        // silent reuse against a runtime the handoff owns.
+        if session_arc.is_some() {
+            let snap = self
+                .fresh_agent
+                .ownership_snapshot(PROVIDER, &msg.session_id);
+            match snap.state {
+                freshell_ownership::OwnershipState::Handoff { .. }
+                | freshell_ownership::OwnershipState::Starting { .. }
+                | freshell_ownership::OwnershipState::Stopping { .. }
+                | freshell_ownership::OwnershipState::Fenced { .. } => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %msg.session_id, state = ?snap.state,
+                        "fresh_agent_attach_refused: a lifecycle transition owns this \
+                         session — the existing-session fast path is blocked (typed)");
+                    self.emit_fresh_agent_error(
+                        &msg.session_id,
+                        "SESSION_RESERVED",
+                        "A lifecycle operation owns this session; retry after it settles",
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
         let session_arc = match session_arc {
             Some(session_arc) => session_arc,
             // Conn-less lane (D8): attach carries no tab identity — keep-when-None
