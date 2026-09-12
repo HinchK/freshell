@@ -3608,6 +3608,8 @@ impl FreshCodexState {
         // b8ke e3r1 F2: the granted claim's consumed stamp, captured for
         // the abort path's restoration.
         let mut taken_stop_stamp: Option<(String, crate::ownership_lane::OwnershipStamp)> = None;
+        // b8ke e3r3 F7: the granted stop's settlement guard.
+        let mut _stop_settlement: Option<crate::ownership_lane::StopSettlementGuard> = None;
         if let Some(registry) = self.ownership.as_ref() {
             if let Some(stamp) =
                 crate::ownership_lane::peek_retained_stamp(&self.ownership_stamps, &session_id)
@@ -3646,7 +3648,15 @@ impl FreshCodexState {
                             );
                         }
                         stop_generation = Some(generation);
-                        stop_op_id = Some(kill_op_id);
+                        stop_op_id = Some(kill_op_id.clone());
+                        _stop_settlement =
+                            Some(crate::ownership_lane::register_stop_settlement_for_claim(
+                                &self.ownership,
+                                PROVIDER,
+                                &session_id,
+                                &kill_op_id,
+                                generation,
+                            ));
                         None
                     }
                     freshell_ownership::StopOutcome::NotLive {
@@ -3873,44 +3883,45 @@ impl FreshCodexState {
         // and runs nothing below.
         let close_answer = self.retire_closed_row(&session_id).await;
         if close_answer == crate::identity_sink::CloseAnswer::Failed {
-            // b8ke delta round-3 F1: unwind a GRANTED stop claim (Stopping →
-            // Live at the pre-stop generation) — a clean ledger failure
-            // must never strand the coordinator.
-            if let (Some(op_id), Some(generation)) = (stop_op_id.clone(), stop_generation) {
-                if let Some(registry) = self.ownership.as_ref() {
-                    let _ = registry.abort_stop(PROVIDER, &session_id, &op_id, generation);
-                }
-            }
-            // b8ke e3r1 F2 + e3r2 F4: restore the consumed stamp — but
-            // ONLY if the runtime is still LIVE. If it exited during the
-            // awaited close, the exit watcher already observed the stamp
-            // absent and completed; restoring would resurrect a DEAD
-            // runtime as Live with no future watcher — it ends Vacant
-            // instead, never falsely Live.
-            if let Some((stamp_key, stamp)) = taken_stop_stamp {
-                let runtime_still_live = stamp
-                    .owner
-                    .pid
-                    .map(|pid| !crate::ownership_lane::partial_pid_confirmed_dead(pid))
-                    .unwrap_or(false);
-                if runtime_still_live {
-                    crate::ownership_lane::restore_retained_stamp(
+            // b8ke e3r2 F4 + e3r3 F2/F8: THE LIVENESS VERDICT COMES FIRST —
+            // exactly ONE mutation path follows from it (pre-e3r3 the
+            // abort_stop ran BEFORE the verdict, so a sidecar that died
+            // during the awaited close was already flipped Stopping → Live
+            // and the follow-up commit_stop was rejected: a dead runtime
+            // recorded Live). The verdict+restore is ATOMIC w.r.t. the exit
+            // watcher (the stamp's recorded incarnation is re-validated
+            // UNDER the stamps lock at restore time — a sidecar exiting
+            // after the verdict can never have its stamp restored for a
+            // dead process).
+            // b8ke e3r3 F2/F8: THE ATOMIC VERDICT PRECEDES the registry
+            // mutation (pre-e3r3 the abort_stop ran BEFORE the liveness
+            // verdict: a sidecar that died during the awaited close was
+            // flipped Stopping → Live and the follow-up commit rejected —
+            // dead recorded Live). restore_retained_stamp_if_live probes
+            // the incarnation UNDER the stamps lock and restores only a
+            // LIVE one; the restore's verdict drives the registry.
+            let restored_live_stamp = taken_stop_stamp
+                .map(|(stamp_key, stamp)| {
+                    crate::ownership_lane::restore_retained_stamp_if_live(
                         &self.ownership_stamps,
                         &stamp_key,
                         stamp,
-                    );
-                } else {
-                    tracing::warn!(target: "freshell_freshagent::codex",
-                        session_id = %stamp_key,
-                        "fresh_agent_kill_abort_runtime_exited: the runtime exited during \
-                         the awaited close — NOT restored (never a dead runtime recorded \
-                         Live); the key ends Vacant"
-                    );
-                    if let (Some(op_id), Some(generation)) = (stop_op_id.clone(), stop_generation) {
-                        if let Some(registry) = self.ownership.as_ref() {
-                            let _ = registry.abort_stop(PROVIDER, &session_id, &op_id, generation);
-                            let _ = registry.commit_stop(PROVIDER, &session_id, &op_id, generation);
-                        }
+                        false,
+                    )
+                })
+                .unwrap_or(false);
+            if let (Some(op_id), Some(generation)) = (stop_op_id.clone(), stop_generation) {
+                if let Some(registry) = self.ownership.as_ref() {
+                    if restored_live_stamp {
+                        let _ = registry.abort_stop(PROVIDER, &session_id, &op_id, generation);
+                    } else {
+                        tracing::warn!(target: "freshell_freshagent::codex",
+                            session_id = %session_id,
+                            "fresh_agent_kill_abort_runtime_exited: the runtime exited \
+                             during the awaited close — NOT restored (never a dead runtime \
+                             recorded Live); the key ends Vacant"
+                        );
+                        let _ = registry.commit_stop(PROVIDER, &session_id, &op_id, generation);
                     }
                 }
             }
@@ -9488,6 +9499,125 @@ pub(crate) mod tests {
         let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(frame["type"], "freshAgent.killed");
         assert_eq!(frame["success"], true);
+    }
+
+    /// b8ke e3r3 F2: the codex clean-close failure's LIVENESS VERDICT
+    /// precedes the registry mutation — a sidecar that died during the
+    /// awaited close ends the key VACANT (commit_stop), never flipped
+    /// Stopping→Live by an abort-first ordering whose follow-up commit is
+    /// then rejected (dead recorded Live).
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dead_sidecar_at_the_codex_close_failure_ends_vacant_never_live() {
+        let (transport, _peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (mut st, mut rx, sink) = state_with_sink();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        let child = spawn_sleeper();
+        let pid = child.id().expect("pid");
+        insert_fake_session(
+            &st,
+            "thread-dead-close",
+            client,
+            Arc::new(StdMutex::new(None)),
+            child,
+            "codex-sidecar-dead-close",
+        )
+        .await;
+
+        // A Live owner + a retained stamp carrying the sidecar's pid.
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
+            "codex",
+            "thread-dead-close",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-live",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!()
+        };
+        let owner = freshell_ownership::OwnerIdentity {
+            kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            terminal_id: None,
+            live_session_key: Some("thread-dead-close".into()),
+            pid: Some(pid),
+            ownership_id: None,
+        };
+        assert!(matches!(
+            registry.commit_live("codex", "thread-dead-close", "op-live", generation, owner),
+            freshell_ownership::CommitOutcome::Committed
+        ));
+        crate::ownership_lane::restore_retained_stamp(
+            &st.ownership_stamps,
+            "thread-dead-close",
+            crate::ownership_lane::OwnershipStamp {
+                epoch: registry.boot_epoch(),
+                generation,
+                operation_id: "op-live".into(),
+                owner: freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("thread-dead-close".into()),
+                    pid: Some(pid),
+                    ownership_id: None,
+                },
+            },
+        );
+
+        // THE SIDECAR DIES (dead at the kill's close verdict).
+        let kill_res = tokio::process::Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .status()
+            .await
+            .expect("kill -9 the sidecar");
+        assert!(kill_res.success());
+        let reap_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !crate::ownership_lane::partial_pid_confirmed_dead(pid) {
+            assert!(
+                tokio::time::Instant::now() < reap_deadline,
+                "the killed sidecar was never reaped"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // The clean close failure → the verdict (dead) → commit_stop.
+        sink.fail_retires_for("codex", "thread-dead-close");
+        st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: "thread-dead-close".to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+
+        let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(frame["type"], "freshAgent.killed");
+        assert_eq!(
+            frame["code"],
+            json!("DURABLE_CLOSE_FAILED"),
+            "the recoverable close failure answers typed: {frame}"
+        );
+        // THE F2 CONTRACT: the key ends VACANT — never a dead runtime
+        // recorded Live (the abort-first ordering's flip).
+        assert!(
+            matches!(
+                registry.observe("codex", "thread-dead-close").state,
+                freshell_ownership::OwnershipState::Vacant
+            ),
+            "the dead sidecar ends VACANT, never Live"
+        );
+        assert!(
+            crate::ownership_lane::peek_retained_stamp(&st.ownership_stamps, "thread-dead-close")
+                .is_none(),
+            "no release stamp restored for the dead sidecar"
+        );
     }
 
     /// Retire-on-kill (delta-review round 5, restore-open-sessions-only): an

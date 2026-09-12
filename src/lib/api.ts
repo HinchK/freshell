@@ -725,6 +725,13 @@ export const SessionHandoffErrorCodeSchema = z.enum([
    *  fence (the unconfirmed stale-start residue) — the acknowledged
    *  force-clear accepts StaleStart with the same typed risk. */
   'STALE_START_FENCED',
+  /** b8ke e3r3 F5: the in-window durable flavor write failed (both
+   *  runtimes reaped; the typed recoverable result must reach the
+   *  caller). */
+  'SESSION_METADATA_WRITE_FAILED',
+  /** b8ke e3r3 F3: an ordinary retry against a StaleStop fence (the
+   *  stale-Stopping watchdog's unconfirmed residue). */
+  'STALE_STOP_FENCED',
 ])
 export type SessionHandoffErrorCode = z.infer<typeof SessionHandoffErrorCodeSchema>
 
@@ -766,7 +773,12 @@ export const SessionHandoffResultSchema = z.union([
   // handoff explicitly as a fresh no-prior sequence.
   z.object({
     ok: z.literal(true),
-    cleared: z.literal('platform-limited-fence'),
+    /** b8ke e3r3 F6: the cleared label is reason-typed — the server
+     *  returns the truthful label for the fence it cleared (the
+     *  pre-e3r3 literal rejected 'stale-start-fence', so the 200
+     *  THREW during parse and the recursive re-handoff never ran).
+     *  e3r3 F3 adds the StaleStop label. */
+    cleared: z.enum(['platform-limited-fence', 'stale-start-fence', 'stale-stop-fence']),
     operationId: z.string(),
     generation: z.number().int().nonnegative(),
   }),

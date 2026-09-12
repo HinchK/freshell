@@ -1767,6 +1767,188 @@ async fn handoff_with_a_platform_limited_prior_stop_fences_the_key_typed() {
     assert_eq!(retried["error"]["code"], json!("PLATFORM_LIMITED_FENCED"));
 }
 
+/// b8ke e3r3 F3: a STALE-STOP fence recovers through the SAME full path
+/// as StaleStart — the runner's recoverable-fence match accepts it (the
+/// ordinary retry answers the reason-typed STALE_STOP_FENCED refusal; the
+/// acknowledged force-clear releases with the truthful stale-stop-fence
+/// label). Pre-e3r3 the watchdog made StaleStop reachable but handoff
+/// requests fell to generic HANDOFF_IN_PROGRESS — wedged until restart.
+#[tokio::test]
+async fn a_stale_stop_fence_recovers_through_the_handoff_runner() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let mut rig = build_rig(None);
+
+    // Arm a StaleStop fence: a Live owner, a stranded stop claim, the
+    // settlement flag FIRED (the handler ended), the watchdog fences.
+    let freshell_ownership::BeginOutcome::Granted { generation } = rig.ownership.begin_start(
+        "claude",
+        &sid,
+        RuntimeOwnerKind::FreshAgent,
+        "op-live-ss",
+        None,
+        "test",
+        0,
+    ) else {
+        panic!("expected Granted")
+    };
+    let owner = freshell_ownership::OwnerIdentity {
+        kind: RuntimeOwnerKind::FreshAgent,
+        terminal_id: None,
+        live_session_key: Some(sid.clone()),
+        pid: None,
+        ownership_id: None,
+    };
+    assert!(matches!(
+        rig.ownership
+            .commit_live("claude", &sid, "op-live-ss", generation, owner),
+        freshell_ownership::CommitOutcome::Committed
+    ));
+    let stop_claim = freshell_ownership::StopClaim {
+        expected_kind: RuntimeOwnerKind::FreshAgent,
+        expected_runtime: None,
+        observed: freshell_ownership::ObservedFence {
+            epoch: rig.ownership.boot_epoch(),
+            generation,
+        },
+    };
+    match rig
+        .ownership
+        .begin_stop("claude", &sid, "op-stranded-ss", &stop_claim, "test", 0)
+    {
+        freshell_ownership::StopOutcome::Granted {
+            generation: stop_gen,
+        } => {
+            let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            assert!(rig.ownership.register_stop_settlement(
+                "claude",
+                &sid,
+                "op-stranded-ss",
+                stop_gen,
+                Arc::clone(&flag),
+            ));
+            // The handler ENDED without commit/abort (the vanished stop).
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        other => panic!("expected the stop claim granted, got {other:?}"),
+    }
+    let fenced = rig.ownership.recover_stale_stoppings(10_000, 5_000);
+    assert_eq!(fenced.len(), 1, "the fired-flag stop fences typed");
+    assert!(matches!(
+        rig.ownership.observe("claude", &sid).state,
+        OwnershipState::Fenced {
+            reason: freshell_ownership::FenceReason::StaleStop,
+            ..
+        }
+    ));
+    let _ = drain_runtime_owner_frames(&mut rig.rx);
+
+    // (a) The ORDINARY retry: the reason-typed refusal (pre-e3r3: generic
+    // HANDOFF_IN_PROGRESS).
+    let ordinary = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let ordinary_result = ordinary.completion.await.expect("retry completed");
+    assert_eq!(
+        ordinary_result["error"]["code"],
+        json!("STALE_STOP_FENCED"),
+        "the ordinary retry answers the reason-typed refusal: {ordinary_result}"
+    );
+    assert_eq!(ordinary_result["error"]["retryable"], json!(true));
+    assert!(matches!(
+        rig.ownership.observe("claude", &sid).state,
+        OwnershipState::Fenced { .. }
+    ));
+
+    // (b) THE ACKNOWLEDGED FORCE-CLEAR: releases with the truthful
+    // stale-stop-fence label.
+    let snap = rig.ownership.observe("claude", &sid);
+    let mut clear_req = handoff_req_terminal("claude", &sid, "claude");
+    clear_req.acknowledge_platform_limited_risk = true;
+    clear_req.observed_epoch = Some(snap.epoch);
+    clear_req.observed_generation = Some(snap.generation);
+    let clear = rig.runner.spawn_handoff(clear_req);
+    let cleared = clear.completion.await.expect("force-clear completed");
+    assert_eq!(cleared["ok"], json!(true), "the clear succeeds: {cleared}");
+    assert_eq!(
+        cleared.get("cleared"),
+        Some(&json!("stale-stop-fence")),
+        "the truthful reason-typed label: {cleared}"
+    );
+    assert!(matches!(
+        rig.ownership.observe("claude", &sid).state,
+        OwnershipState::Vacant
+    ));
+}
+
+/// b8ke e3r3 F4: the durable flavor derives from the session's kind
+/// pairing, NEVER the wire mode — a Kilroy Fresh Agent reopened as its
+/// Claude CLI (mode "claude") persists flavor "kilroy" (the pairing
+/// contract; pre-e3r3 the wire mode remapped the session to freshclaude
+/// for other devices/history).
+struct FixedFlavorWriter {
+    log: FlavorWriteLog,
+    current: Option<String>,
+}
+
+impl crate::session_handoff::FlavorWrite for FixedFlavorWriter {
+    fn write(
+        &self,
+        provider: &str,
+        session_id: &str,
+        flavor: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
+        self.log.lock().expect("flavor log lock").push((
+            provider.to_string(),
+            session_id.to_string(),
+            flavor.to_string(),
+        ));
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    fn current_flavor(
+        &self,
+        _provider: &str,
+        _session_id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>> {
+        let current = self.current.clone();
+        Box::pin(std::future::ready(current))
+    }
+}
+
+#[tokio::test]
+async fn a_kilroy_to_claude_cli_handoff_preserves_the_kilroy_flavor() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let log: FlavorWriteLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+    // The session's current durable flavor is KILROY (the hidden type).
+    let rig = build_rig_with_flavor_writer(Arc::new(FixedFlavorWriter {
+        log: Arc::clone(&log),
+        current: Some("kilroy".to_string()),
+    }));
+    establish_fresh_claude_owner(&rig, &sid).await;
+
+    // The Kilroy→Claude-CLI handoff (the wire mode is "claude").
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let result = handle.completion.await.expect("runner completed");
+    assert_eq!(result["ok"], json!(true), "the handoff commits: {result}");
+
+    // THE F4 CONTRACT: the durable flavor stays KILROY — the hidden
+    // pairing, never the wire mode.
+    let flavors = log.lock().expect("flavor log lock").clone();
+    assert_eq!(
+        flavors,
+        vec![("claude".to_string(), sid.clone(), "kilroy".to_string())],
+        "the hidden flavor is PRESERVED across the CLI handoff"
+    );
+}
+
 /// b8ke e3r2 F3: a FAILING flavor writer — the failure surfaces as the
 /// TYPED handoff failure (SESSION_METADATA_WRITE_FAILED), never a
 /// log-only success; the spawned target is reaped and the key ends Vacant

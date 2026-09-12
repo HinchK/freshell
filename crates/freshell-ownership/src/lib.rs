@@ -736,6 +736,13 @@ struct SessionRecord {
     /// fence release: "the operation's settle/cancellation has concluded"
     /// is probe-able HERE, never inferred from registration absence.
     settle_fired: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// b8ke e3r3 F7: the STOP operation's sender-side settlement flag —
+    /// the kill handler's scope guard sets it on Drop, so the
+    /// stale-Stopping watchdog can distinguish a SLOW-BUT-LIVE stop (flag
+    /// not fired: the handler is still running — NOT stale, never fenced
+    /// on age) from a genuinely-vanished one (flag fired — fence typed).
+    /// `None`: the stop predates the registration (age-only fencing).
+    stop_settled: Option<Arc<std::sync::atomic::AtomicBool>>,
     partial_runtime: Option<OwnerIdentity>,
 }
 
@@ -747,6 +754,7 @@ impl Default for SessionRecord {
             cancellation: None,
             settle: None,
             settle_fired: None,
+            stop_settled: None,
             partial_runtime: None,
         }
     }
@@ -1722,15 +1730,26 @@ impl RuntimeOwnershipRegistry {
         let inner = self.inner.lock().expect("ownership lock poisoned");
         let mut out = Vec::new();
         for (key, record) in inner.iter() {
+            // b8ke e3r3 F3: the probe-recoverable set is BOTH stale
+            // reasons — StaleStart AND the e3r2 watchdog's StaleStop
+            // (pre-e3r3 the probe enumerated StaleStart only and a StaleStop
+            // fence held until restart). Same confirmed-death discipline for
+            // both: a recorded pid needs the lane's confirmed-tree reap;
+            // a PID-less fence needs the kind-aware liveness absence AND the
+            // operation's settle concluded (a stop's settle_fired is None —
+            // it never registered — so PID-LESS stop fences HOLD, fail
+            // closed, and the acknowledged operator force-clear is the
+            // escape; PID-FUL stop fences release on the lane's confirm).
             if let OwnershipState::Fenced {
                 prior,
-                reason: FenceReason::StaleStart,
+                reason: reason @ (FenceReason::StaleStart | FenceReason::StaleStop),
                 operation_id,
                 generation,
                 initiator,
                 ..
             } = &record.state
             {
+                let _ = reason;
                 out.push(StaleStartFence {
                     provider: key.provider.clone(),
                     session_id: key.session_id.clone(),
@@ -2190,6 +2209,34 @@ impl RuntimeOwnershipRegistry {
         false
     }
 
+    /// b8ke e3r3 F7: register the STOP operation's settlement flag — the
+    /// sender-side evidence the stale-Stopping watchdog consults before
+    /// fencing on age (a progressing stop is not stale).
+    pub fn register_stop_settlement(
+        &self,
+        provider: &str,
+        session_id: &str,
+        operation_id: &str,
+        generation: u64,
+        flag: Arc<std::sync::atomic::AtomicBool>,
+    ) -> bool {
+        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        if let Some(record) = inner.get_mut(&SessionKey::new(provider, session_id)) {
+            if let OwnershipState::Stopping {
+                operation_id: op,
+                generation: gen,
+                ..
+            } = &record.state
+            {
+                if op == operation_id && *gen == generation {
+                    record.stop_settled = Some(flag);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// b8ke e3r2 F2: the stale-Stopping watchdog — the stop-claim unwind
     /// analogous to the stale-start machinery. An over-aged `Stopping`
     /// record (whose stop operation died without commit_stop/abort_stop —
@@ -2215,6 +2262,27 @@ impl RuntimeOwnershipRegistry {
             {
                 if now_ms.saturating_sub(since_ms) < max_age_ms {
                     continue;
+                }
+                // b8ke e3r3 F7: consult the STOP's settlement evidence
+                // BEFORE fencing on age — a SLOW-BUT-LIVE stop (its
+                // handler's flag NOT fired: the reap or ledger write is
+                // still progressing) is NOT stale and must never fence (a
+                // successfully reaped session would otherwise end fenced
+                // and its commit rejected). Only a FIRED flag (the
+                // handler ended without commit/abort) or an UNREGISTERED
+                // stop (a pre-e3r3 path) fences.
+                if let Some(flag) = &record.stop_settled {
+                    if !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        tracing::info!(target: "freshell_ownership",
+                            event = "ownership.stop.stale_stopping_skipped_live",
+                            operation_id = %operation_id, provider = %key.provider,
+                            session_id = %key.session_id,
+                            stale_age_ms = now_ms.saturating_sub(since_ms),
+                            outcome = "skipped",
+                            "the over-aged stop is STILL RUNNING (its settlement \
+                             flag has not fired) — a progressing stop is not stale");
+                        continue;
+                    }
                 }
                 let prior = owner
                     .as_ref()
@@ -3799,6 +3867,95 @@ mod tests {
              operation is NOT pre-concluded"
         );
         let _ = g2;
+    }
+
+    /// b8ke e3r3 F7: the watchdog consults the stop's settlement evidence
+    /// BEFORE fencing on age — a SLOW-BUT-LIVE stop (its handler's flag NOT
+    /// fired: the reap or ledger write is still progressing) is NOT stale
+    /// and must never fence. Only the FIRED flag (or an unregistered stop)
+    /// fences.
+    #[test]
+    fn a_slow_but_live_stop_is_not_fenced_by_the_watchdog() {
+        let r = RuntimeOwnershipRegistry::new();
+        let BeginOutcome::Granted { generation } = r.begin_start(
+            PROVIDER,
+            "sid-slow-stop",
+            RuntimeOwnerKind::FreshAgent,
+            "op-live",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!()
+        };
+        let owner = OwnerIdentity {
+            kind: RuntimeOwnerKind::FreshAgent,
+            terminal_id: None,
+            live_session_key: Some("map".into()),
+            pid: Some(4321),
+            ownership_id: None,
+        };
+        assert!(matches!(
+            r.commit_live(PROVIDER, "sid-slow-stop", "op-live", generation, owner),
+            CommitOutcome::Committed
+        ));
+        let stop_claim = StopClaim {
+            expected_kind: RuntimeOwnerKind::FreshAgent,
+            expected_runtime: None,
+            observed: ObservedFence {
+                epoch: r.boot_epoch(),
+                generation,
+            },
+        };
+        let mut fired_flags = Vec::new();
+        match r.begin_stop(
+            PROVIDER,
+            "sid-slow-stop",
+            "op-slow-stop",
+            &stop_claim,
+            "test",
+            0,
+        ) {
+            StopOutcome::Granted {
+                generation: stop_gen,
+            } => {
+                let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                assert!(r.register_stop_settlement(
+                    PROVIDER,
+                    "sid-slow-stop",
+                    "op-slow-stop",
+                    stop_gen,
+                    Arc::clone(&flag),
+                ));
+                fired_flags.push(flag);
+            }
+            other => panic!("expected the stop claim granted, got {other:?}"),
+        }
+
+        // Over-aged BUT the flag has NOT fired (the handler is STILL
+        // RUNNING): NOT fenced.
+        let fenced = r.recover_stale_stoppings(10_000, 5_000);
+        assert!(fenced.is_empty(), "a progressing stop is not stale");
+        assert!(matches!(
+            r.observe(PROVIDER, "sid-slow-stop").state,
+            OwnershipState::Stopping { .. }
+        ));
+
+        // The handler ENDS (the flag fires) without commit/abort: NOW the
+        // over-aged stop fences typed.
+        fired_flags
+            .pop()
+            .expect("the flag")
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let fenced2 = r.recover_stale_stoppings(10_000, 5_000);
+        assert_eq!(fenced2.len(), 1, "the FIRED (vanished) stop fences");
+        assert!(matches!(
+            r.observe(PROVIDER, "sid-slow-stop").state,
+            OwnershipState::Fenced {
+                reason: FenceReason::StaleStop,
+                ..
+            }
+        ));
     }
 
     /// b8ke e3r2 F2: the stale-Stopping watchdog — an over-aged Stopping

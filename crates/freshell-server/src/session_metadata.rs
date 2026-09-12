@@ -116,11 +116,8 @@ impl SessionMetadataStore {
 
     /// `get(provider, sessionId)` (`session-metadata-store.ts:102-106`).
     ///
-    /// Test-only today: the port's production surface is the write path
-    /// (`POST /api/session-metadata` -> `set`). The reference's read callers
-    /// (`session-indexer.ts:1370`'s `getAll()` join) are not ported yet; when
-    /// that lands, the compiler will force this gate off.
-    #[cfg(test)]
+    /// b8ke e3r3 F4: the handoff commit's hidden-flavor preservation read
+    /// is this method's first production caller (the gate is off).
     pub async fn get(&self, provider: &str, session_id: &str) -> Option<Value> {
         let mut guard = self.inner.lock().await;
         let data = Self::load_locked(&mut guard, &self.path).await;

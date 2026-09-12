@@ -156,6 +156,14 @@ pub struct FreshClaudeState {
     /// the released take must be Option-tolerant, never a panic).
     #[cfg(test)]
     kill_stop_take_pause: Option<std::sync::Arc<AdoptionTestPause>>,
+    /// b8ke e3r3 F8 test seam: park in the KILL path's clean-close
+    /// FAILURE arm, after the granted take and immediately BEFORE the
+    /// atomic verdict+restore — the deterministic exit-after-verdict
+    /// window (the test kills the sidecar while parked; the released
+    /// restore must re-validate under the lock and refuse the dead
+    /// runtime's stamp).
+    #[cfg(test)]
+    kill_close_failure_pause: Option<std::sync::Arc<AdoptionTestPause>>,
     /// P1.13 identity-event sink (the pane-ledger bridge,
     /// [`crate::identity_sink`]). Clone-shared + set-once: the state is cloned
     /// into consumer tasks, so the `OnceLock` sits behind an `Arc`. Wired
@@ -719,6 +727,8 @@ impl FreshClaudeState {
             adoption_commit_pause: None,
             #[cfg(test)]
             kill_stop_take_pause: None,
+            #[cfg(test)]
+            kill_close_failure_pause: None,
         }
     }
 
@@ -756,6 +766,15 @@ impl FreshClaudeState {
     #[cfg(test)]
     pub fn set_adoption_test_pause(&mut self, pause: Option<std::sync::Arc<AdoptionTestPause>>) {
         self.adoption_pause = pause;
+    }
+
+    /// b8ke e3r3 F8 test seam installer (the clean-failure pre-restore park).
+    #[cfg(test)]
+    pub fn set_kill_close_failure_test_pause(
+        &mut self,
+        pause: Option<std::sync::Arc<AdoptionTestPause>>,
+    ) {
+        self.kill_close_failure_pause = pause;
     }
 
     /// b8ke e3r2 F2 test seam installer (the kill's take-race park).
@@ -2501,6 +2520,10 @@ impl FreshClaudeState {
         // the retained stamp, so the natural-exit watcher can still release
         // ownership on the runtime's eventual exit/crash).
         let mut taken_stop_stamp: Option<(String, crate::ownership_lane::OwnershipStamp)> = None;
+        // b8ke e3r3 F7: the granted stop's settlement guard — its Drop
+        // fires the flag the stale-Stopping watchdog consults (a
+        // progressing stop is not stale; never fenced on age alone).
+        let mut _stop_settlement: Option<crate::ownership_lane::StopSettlementGuard> = None;
         if let Some(registry) = self.ownership.as_ref() {
             let stop_stamp = match crate::ownership_lane::peek_retained_stamp(
                 &self.ownership_stamps,
@@ -2573,8 +2596,16 @@ impl FreshClaudeState {
                             );
                         }
                         stop_generation = Some(generation);
-                        stop_op_id = Some(kill_op_id);
-                        stop_key = Some(stop_session_id);
+                        stop_op_id = Some(kill_op_id.clone());
+                        stop_key = Some(stop_session_id.clone());
+                        _stop_settlement =
+                            Some(crate::ownership_lane::register_stop_settlement_for_claim(
+                                &self.ownership,
+                                PROVIDER,
+                                &stop_session_id,
+                                &kill_op_id,
+                                generation,
+                            ));
                         None
                     }
                     freshell_ownership::StopOutcome::NotLive {
@@ -2924,38 +2955,51 @@ impl FreshClaudeState {
             //     exit watcher already observed the stamp absent and
             //     completed) → commit_stop (Vacant): NEVER resurrect a
             //     dead runtime as Live with no future watcher.
-            let runtime_still_live = {
-                let sessions = self.sessions.lock().await;
-                sessions.get(&map_key).and_then(|sess| sess.child.id())
+            // b8ke e3r3 F8 test seam: the pre-restore park (never armed
+            // in production) — the deterministic exit-after-verdict window.
+            #[cfg(test)]
+            if let Some(pause) = &self.kill_close_failure_pause {
+                pause
+                    .reached
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = pause.notify.notified().await;
             }
-            .map(|pid| !crate::ownership_lane::partial_pid_confirmed_dead(pid))
-            .unwrap_or(false);
+            // b8ke e3r3 F2/F8: THE ATOMIC VERDICT PRECEDES the registry
+            // mutation — restore_retained_stamp_if_live probes the
+            // recorded incarnation UNDER the stamps lock and restores only
+            // a LIVE one, in one step atomic w.r.t. the exit watcher. The
+            // restore's own verdict then drives the registry: restored
+            // (live) → abort_stop (Stopping → Live at the pre-stop
+            // generation, and the restored stamp keeps the exit watcher
+            // armed for the runtime's eventual natural exit); refused
+            // (dead — it exited during the awaited close, after any
+            // pre-verdict) → commit_stop (Vacant): never a dead runtime
+            // recorded Live, never a stamp restored for a dead process.
+            let restored_live_stamp = taken_stop_stamp
+                .map(|(stamp_key, stamp)| {
+                    crate::ownership_lane::restore_retained_stamp_if_live(
+                        &self.ownership_stamps,
+                        &stamp_key,
+                        stamp,
+                        false,
+                    )
+                })
+                .unwrap_or(false);
             if let (Some(key), Some(op_id), Some(generation)) =
                 (stop_key.clone(), stop_op_id.clone(), stop_generation)
             {
                 if let Some(registry) = self.ownership.as_ref() {
-                    if runtime_still_live {
+                    if restored_live_stamp {
                         let _ = registry.abort_stop(PROVIDER, &key, &op_id, generation);
                     } else {
                         tracing::warn!(target: "freshell_freshagent::claude",
                             session_id = %session_id,
                             "fresh_agent_kill_abort_runtime_exited: the runtime exited \
-                             during the awaited close — NOT restored (never a dead \
-                             runtime recorded Live); the key ends Vacant"
+                             during the awaited close — NOT restored (never a dead runtime \
+                             recorded Live); the key ends Vacant"
                         );
                         let _ = registry.commit_stop(PROVIDER, &key, &op_id, generation);
                     }
-                }
-            }
-            // The stamp restore follows the SAME liveness verdict (only a
-            // live runtime gets its release stamp back).
-            if runtime_still_live {
-                if let Some((stamp_key, stamp)) = taken_stop_stamp {
-                    crate::ownership_lane::restore_retained_stamp(
-                        &self.ownership_stamps,
-                        &stamp_key,
-                        stamp,
-                    );
                 }
             }
             {
@@ -10774,6 +10818,117 @@ rl.on('line', (line) => {
             ),
             "the natural exit released the restored stamp — the owner is \
              vacated (pre-e3r1: a crash stayed recorded live forever)"
+        );
+    }
+
+    /// b8ke e3r3 F8: a sidecar that exits AFTER the live verdict — the
+    /// atomic re-validation under the stamps lock refuses to restore its
+    /// stamp (pre-e3r3 the restore wrote the stamp back for a dead
+    /// process after ownership returned to Live — a zombie stamp with no
+    /// future watcher). The deterministic window: the clean-close
+    /// failure's pre-restore park holds the kill AFTER its granted take;
+    /// the sidecar dies while parked.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sidecar_exit_after_the_live_verdict_never_gets_its_stamp_restored() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(sink.clone());
+
+        let mut create = dedup_create_msg("req-e3r3-f8");
+        create.model = Some("opus".into());
+        st.handle_create(create, None).await;
+        let created = await_claude_created(&mut rx, "req-e3r3-f8").await;
+        let placeholder = created["sessionId"].as_str().unwrap().to_string();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !sink.was_recorded("claude", FRESH_CREATE_DURABLE_ID) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the create's adoption never recorded the binding"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let stamp = crate::ownership_lane::peek_retained_stamp(
+            &st.ownership_stamps,
+            FRESH_CREATE_DURABLE_ID,
+        )
+        .expect("the create's stamp");
+        let runtime_pid = stamp.owner.pid.expect("the sidecar pid");
+
+        // Arm the close failure + the pre-restore park; the kill parks
+        // AFTER its granted take (the stamp is consumed, the sidecar LIVE).
+        sink.fail_retires_for("claude", FRESH_CREATE_DURABLE_ID);
+        let pause = std::sync::Arc::new(AdoptionTestPause {
+            notify: tokio::sync::Notify::new(),
+            reached: std::sync::atomic::AtomicBool::new(false),
+        });
+        st.set_kill_close_failure_test_pause(Some(std::sync::Arc::clone(&pause)));
+        let st2 = st.clone();
+        let ph = placeholder.clone();
+        let kill_task = tokio::spawn(async move {
+            st2.handle_kill(kill_msg(&ph)).await;
+        });
+        let park_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !pause.reached.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < park_deadline,
+                "the kill never reached the pre-restore park"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        st.set_kill_close_failure_test_pause(None);
+
+        // THE SIDECAR EXITS AFTER the take, while the kill is parked in
+        // the clean-failure arm (before the verdict+restore).
+        let kill_res = tokio::process::Command::new("kill")
+            .arg("-9")
+            .arg(runtime_pid.to_string())
+            .status()
+            .await
+            .expect("kill -9 the sidecar");
+        assert!(kill_res.success());
+        let reap_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !crate::ownership_lane::partial_pid_confirmed_dead(runtime_pid) {
+            assert!(
+                tokio::time::Instant::now() < reap_deadline,
+                "the killed sidecar was never reaped"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // Release: the atomic re-validation (under the stamps lock) sees
+        // the DEAD incarnation → NO restore; the registry ends Vacant.
+        pause.notify.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(15), kill_task)
+            .await
+            .expect("the kill task completed")
+            .expect("the kill task did not panic");
+        let frame = await_specific_frame(&mut rx, "freshAgent.killed", &placeholder).await;
+        assert_eq!(
+            frame["code"],
+            json!("DURABLE_CLOSE_FAILED"),
+            "the recoverable close failure answers typed: {frame}"
+        );
+        assert!(
+            matches!(
+                registry.observe("claude", FRESH_CREATE_DURABLE_ID).state,
+                freshell_ownership::OwnershipState::Vacant
+            ),
+            "the dead sidecar ends VACANT — the registry followed the same \
+             verdict (never a dead runtime resurrected as Live)"
+        );
+        assert!(
+            crate::ownership_lane::peek_retained_stamp(
+                &st.ownership_stamps,
+                FRESH_CREATE_DURABLE_ID
+            )
+            .is_none(),
+            "the stamp is NOT restored for the dead sidecar (the atomic \
+             re-validation refused it under the lock)"
         );
     }
 

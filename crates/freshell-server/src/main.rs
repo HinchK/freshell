@@ -1981,6 +1981,24 @@ async fn main() -> ExitCode {
                 .map_err(|err| err.to_string())
             })
         }
+
+        /// b8ke e3r3 F4: the hidden-flavor preservation read — the
+        /// session's current durable flavor from the store.
+        fn current_flavor(
+            &self,
+            provider: &str,
+            session_id: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>> {
+            let store = self.store.clone();
+            let (provider, session_id) = (provider.to_string(), session_id.to_string());
+            Box::pin(async move {
+                store.get(&provider, &session_id).await.and_then(|entry| {
+                    entry
+                        .get("sessionType")
+                        .and_then(|v| v.as_str().map(str::to_string))
+                })
+            })
+        }
     }
     let flavor_writer: freshell_freshagent::session_handoff::FlavorWriter =
         Arc::new(HandoffFlavorWriter {

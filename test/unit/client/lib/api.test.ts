@@ -18,6 +18,8 @@ import {
   searchTerminalView,
   setSessionMetadata,
   requestSessionHandoff,
+  SessionHandoffErrorCodeSchema,
+  SessionHandoffResultSchema,
 } from '@/lib/api'
 import {
   FreshAgentThreadTurnBodyQuerySchema,
@@ -1218,6 +1220,64 @@ describe('requestSessionHandoff()', () => {
   // b8ke delta round-3 F5: the StaleStart-fence ordinary-retry refusal
   // (the acknowledged force-clear is the only recovery) parses through
   // the same integration path.
+  // b8ke e3r3 F5/F6 — THE PARSER-BOUNDARY CLASS-KILLER: every failure
+  // code and cleared value the SERVER can emit MUST be accepted by the
+  // client schemas. This enumeration is the LOCKED CONTRACT LIST —
+  // mirroring session_handoff.rs's complete typed_failure + cleared-label
+  // set. Adding a server-emitted code or label REQUIRES updating this list
+  // and the schemas in the SAME commit; a miss fails here loudly (the
+  // pre-e3r3 class: SESSION_METADATA_WRITE_FAILED rejected by the schema
+  // and the cleared 'stale-start-fence' threw during parse — the typed
+  // recoverable results were lost at the parser boundary).
+  it('accepts EVERY server-emitted handoff failure code (the locked contract list)', () => {
+    const SERVER_EMITTED_FAILURE_CODES = [
+      'BAD_REQUEST',
+      'STALE_GENERATION',
+      'SESSION_FENCED',
+      'HANDOFF_IN_PROGRESS',
+      'REAP_TIMEOUT',
+      'PLATFORM_LIMITED',
+      'PLATFORM_LIMITED_FENCED',
+      'TARGET_SPAWN_FAILED',
+      'SESSION_METADATA_WRITE_FAILED',
+      'STALE_START_FENCED',
+      'STALE_STOP_FENCED',
+    ] as const
+    for (const code of SERVER_EMITTED_FAILURE_CODES) {
+      expect(SessionHandoffErrorCodeSchema.safeParse(code).success, code).toBe(true)
+    }
+    // The failure frame with each code parses through the RESULT schema.
+    for (const code of SERVER_EMITTED_FAILURE_CODES) {
+      const parsed = SessionHandoffResultSchema.safeParse({
+        ok: false,
+        error: {
+          code,
+          message: `typed ${code}`,
+          retryable: true,
+          ownerGeneration: 2,
+        },
+      })
+      expect(parsed.success, code).toBe(true)
+    }
+  })
+
+  it('accepts EVERY server-emitted cleared label (the force-clear result)', () => {
+    const SERVER_EMITTED_CLEARED_LABELS = [
+      'platform-limited-fence',
+      'stale-start-fence',
+      'stale-stop-fence',
+    ] as const
+    for (const cleared of SERVER_EMITTED_CLEARED_LABELS) {
+      const parsed = SessionHandoffResultSchema.safeParse({
+        ok: true,
+        cleared,
+        operationId: 'op-clear',
+        generation: 3,
+      })
+      expect(parsed.success, cleared).toBe(true)
+    }
+  })
+
   it('parses the server-emitted STALE_START_FENCED refusal frame', async () => {
     mockFetch.mockResolvedValueOnce(mockJsonResponse(409, {
       ok: false,

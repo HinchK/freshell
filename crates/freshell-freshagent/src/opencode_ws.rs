@@ -2096,6 +2096,8 @@ impl FreshOpencodeState {
         // b8ke e3r1 F2: the granted claim's consumed stamp, captured for
         // the abort path's restoration.
         let mut taken_stop_stamp: Option<(String, crate::ownership_lane::OwnershipStamp)> = None;
+        // b8ke e3r3 F7: the granted stop's settlement guard.
+        let mut _stop_settlement: Option<crate::ownership_lane::StopSettlementGuard> = None;
         if let Some(registry) = self.fresh_agent.ownership.as_ref() {
             // Round-6 lock order (map guard NEVER held across a per-session
             // lock wait): clone the Arc out under a short map section, drop
@@ -2147,8 +2149,16 @@ impl FreshOpencodeState {
                             );
                         }
                         stop_generation = Some(generation);
-                        stop_op_id = Some(kill_op_id);
-                        stop_key = Some(stop_session_id);
+                        stop_op_id = Some(kill_op_id.clone());
+                        stop_key = Some(stop_session_id.clone());
+                        _stop_settlement =
+                            Some(crate::ownership_lane::register_stop_settlement_for_claim(
+                                &self.fresh_agent.ownership,
+                                PROVIDER,
+                                &stop_session_id,
+                                &kill_op_id,
+                                generation,
+                            ));
                         None
                     }
                     freshell_ownership::StopOutcome::NotLive {
@@ -2262,10 +2272,19 @@ impl FreshOpencodeState {
                             }),
                         };
                         let kill_op_id = format!("kill-{}", uuid::Uuid::new_v4());
+                        // b8ke e3r3 F1: observe, claim, and stop on the SAME
+                        // CANONICAL key (canonical_observed). Pre-e3r3 the
+                        // claim ran against the WIRE id (msg.session_id): a
+                        // placeholder-addressed materialized session observed
+                        // the durable Live owner, claimed the VACANT
+                        // placeholder, tore down both map aliases, and never
+                        // committed the stop against the canonical record —
+                        // a successful kill while the registry still showed
+                        // the runtime Live.
                         let stop_outcome = crate::ownership_lane::begin_fresh_agent_stop(
                             registry,
                             PROVIDER,
-                            &msg.session_id,
+                            &canonical_observed,
                             &kill_op_id,
                             &claim,
                             "freshopencode/kill",
@@ -2275,7 +2294,7 @@ impl FreshOpencodeState {
                             freshell_ownership::StopOutcome::Granted { generation } => {
                                 stop_generation = Some(generation);
                                 stop_op_id = Some(kill_op_id);
-                                stop_key = Some(msg.session_id.clone());
+                                stop_key = Some(canonical_observed.clone());
                             }
                             freshell_ownership::StopOutcome::NotLive {
                                 state: freshell_ownership::OwnershipState::Vacant,
@@ -2461,55 +2480,56 @@ impl FreshOpencodeState {
                         // first: the session is resumable exactly as if the
                         // kill never ran (F6: no placeholder close stands to
                         // roll back — the one envelope landed nothing).
-                        // b8ke delta round-3 F1: unwind a GRANTED stop
-                        // claim (Stopping → Live) — a clean ledger failure
-                        // must never strand the coordinator.
+                        // b8ke e3r2 F4 + e3r3 F2/F8: THE LIVENESS
+                        // VERDICT COMES FIRST — exactly ONE mutation path
+                        // follows. LIVE → abort_stop + the atomic-if-live
+                        // stamp restore; EXITED during the awaited close →
+                        // commit_stop (Vacant), never a dead runtime
+                        // recorded Live. The verdict+restore is ATOMIC
+                        // w.r.t. the exit watcher (the recorded incarnation
+                        // is re-validated under the stamps lock at restore
+                        // time).
+                        // b8ke e3r3 F2/F8: THE ATOMIC VERDICT PRECEDES
+                        // the registry mutation (probe+restore under the
+                        // stamps lock; the restore's verdict drives the
+                        // registry — restored/live → abort_stop; refused/
+                        // dead → commit_stop/Vacant, never a dead runtime
+                        // recorded Live). opencode's shared daemon has no
+                        // per-session pid: a None-pid stamp restores by
+                        // default (the daemon handle is managed
+                        // separately).
+                        let restored_live_stamp = taken_stop_stamp
+                            .clone()
+                            .map(|(stamp_key, stamp)| {
+                                crate::ownership_lane::restore_retained_stamp_if_live(
+                                    &self.fresh_agent.ownership_stamps,
+                                    &stamp_key,
+                                    stamp,
+                                    true,
+                                )
+                            })
+                            .unwrap_or(false);
                         if let (Some(key), Some(op_id), Some(generation)) =
                             (stop_key.clone(), stop_op_id.clone(), stop_generation)
                         {
                             if let Some(registry) = self.fresh_agent.ownership.as_ref() {
-                                let _ = registry.abort_stop(PROVIDER, &key, &op_id, generation);
-                            }
-                        }
-                        // b8ke e3r1 F2 + e3r2 F4: restore the consumed
-                        // stamp — but ONLY if the runtime is still live
-                        // (opencode's runtime is the shared daemon with NO
-                        // per-session pid: the stamp's pid is None, so the
-                        // liveness floor is the daemon handle itself —
-                        // a None-pid stamp restores as before; the
-                        // exited-runtime shape this lane can observe is the
-                        // stamp ABSENCE race handled by F2).
-                        if let Some((stamp_key, stamp)) = taken_stop_stamp.clone() {
-                            let runtime_still_live = stamp
-                                .owner
-                                .pid
-                                .map(|pid| !crate::ownership_lane::partial_pid_confirmed_dead(pid))
-                                .unwrap_or(true);
-                            if runtime_still_live {
-                                crate::ownership_lane::restore_retained_stamp(
-                                    &self.fresh_agent.ownership_stamps,
-                                    &stamp_key,
-                                    stamp,
-                                );
-                            } else {
-                                tracing::warn!(target: "freshell_freshagent::opencode",
-                                    session_id = %stamp_key,
-                                    "fresh_agent_kill_abort_runtime_exited: the runtime \
-                                     exited during the awaited close — NOT restored; the key \
-                                     ends Vacant"
-                                );
-                                if let (Some(key), Some(op_id), Some(generation)) =
-                                    (stop_key.clone(), stop_op_id.clone(), stop_generation)
-                                {
-                                    if let Some(registry) = self.fresh_agent.ownership.as_ref() {
-                                        let _ =
-                                            registry.abort_stop(PROVIDER, &key, &op_id, generation);
-                                        let _ = registry
-                                            .commit_stop(PROVIDER, &key, &op_id, generation);
-                                    }
+                                if restored_live_stamp {
+                                    let _ = registry.abort_stop(PROVIDER, &key, &op_id, generation);
+                                } else {
+                                    tracing::warn!(target: "freshell_freshagent::opencode",
+                                        session_id = %key,
+                                        "fresh_agent_kill_abort_runtime_exited: the runtime \
+                                         exited during the awaited close — NOT restored; the \
+                                         key ends Vacant"
+                                    );
+                                    let _ =
+                                        registry.commit_stop(PROVIDER, &key, &op_id, generation);
                                 }
                             }
                         }
+                        // Release the enumeration gate (the abort leaves
+                        // the session resumable exactly as if the kill never
+                        // ran — F6: the one envelope landed nothing).
                         if let Some(session_arc) = &session_arc {
                             let mut s = session_arc.lock().await;
                             s.close_pending = s.close_pending.saturating_sub(1);
@@ -5735,6 +5755,81 @@ mod tests {
         }
     }
 
+    /// b8ke e3r3 F1: a PLACEHOLDER-ADDRESSED kill on a materialized session
+    /// observes, claims, and stops on the CANONICAL durable key — the
+    /// canonical record commits to Vacant (pre-e3r3 the claim ran against
+    /// the wire id: the VACANT placeholder was claimed while the durable
+    /// Live owner stayed untouched — a successful kill with the registry
+    /// still showing the runtime Live).
+    #[tokio::test]
+    async fn a_placeholder_addressed_kill_commits_the_canonical_record_to_vacant() {
+        let (mut st, _killed) = state().await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-e3r3-f1"), None).await;
+        let placeholder = "freshopencode-req-e3r3-f1";
+        st.handle_send(send_msg(placeholder, "hi")).await;
+        let real_id = {
+            let sessions = st.sessions.lock().await;
+            let guard = sessions
+                .get(placeholder)
+                .expect("placeholder tracked")
+                .lock()
+                .await;
+            guard
+                .real_session_id
+                .clone()
+                .expect("the session materialized")
+        };
+
+        // The CANONICAL durable key holds a Live owner — the materialized
+        // runtime registered through the map-hit gate's adopting commit
+        // (e3r1 F3). CONSUME the retained stamp (the handoff's
+        // kill_for_handoff shape) so the kill runs the NO-STAMP FALLBACK —
+        // the path the canonical-claim contract lives on.
+        let _stamp =
+            crate::ownership_lane::take_retained_stamp(&st.fresh_agent.ownership_stamps, &real_id)
+                .expect("the map-hit registration retained the stamp");
+        assert!(
+            matches!(
+                registry.observe("opencode", &real_id).state,
+                freshell_ownership::OwnershipState::Live {
+                    owner,
+                    ..
+                } if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            ),
+            "precondition: the materialized runtime is the canonical Live owner — \
+             got {:?}",
+            registry.observe("opencode", &real_id).state
+        );
+
+        // THE PLACEHOLDER-ADDRESSED KILL.
+        st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
+            provider: AgentProvider::Opencode,
+            session_id: placeholder.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+
+        // THE F1 CONTRACT: the CANONICAL record committed to Vacant (the
+        // kill's stop ran against the durable key — never a vacant
+        // placeholder claim with the real owner left Live).
+        assert!(
+            matches!(
+                registry.observe("opencode", &real_id).state,
+                freshell_ownership::OwnershipState::Vacant
+            ),
+            "the canonical record commits to Vacant — the registry no \
+             longer shows the killed runtime Live"
+        );
+    }
+
     /// Retire-on-kill (delta-review round 5, restore-open-sessions-only): an
     /// explicit kill is an intentional session END. Killing a MATERIALIZED
     /// session must (a) retire its durable row `Closed` through the identity
@@ -5742,6 +5837,7 @@ mod tests {
     /// re-offer a pane the user just closed inside the 7s creation-race grace
     /// window — and (b) clear the pending marker, so a late resolution can
     /// never carry evidence for a pane that provably no longer exists.
+
     #[tokio::test]
     async fn handle_kill_retires_the_materialized_row_and_clears_the_pending_marker() {
         let (st, _killed) = state().await;

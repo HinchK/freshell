@@ -779,6 +779,89 @@ pub mod ownership_lane {
             .insert(session_id.to_string(), stamp);
     }
 
+    /// b8ke e3r3 F7: the stop operation's settlement guard — its Drop
+    /// fires the sender-side flag the stale-Stopping watchdog consults (a
+    /// progressing stop is not stale; the watchdog skips over-aged
+    /// Stopping records whose flag has NOT fired). Created at the stop
+    /// claim's grant in the kill handlers; the guard lives to the
+    /// handler's scope end (completion, unwind, OR panic — the flag fires
+    /// on every exit path, so only a handler STILL RUNNING reads as
+    /// live).
+    pub struct StopSettlementGuard {
+        flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    }
+
+    impl Drop for StopSettlementGuard {
+        fn drop(&mut self) {
+            if let Some(flag) = &self.flag {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Register the granted stop's settlement flag with the coordinator
+    /// (returns the guard; a DECLINED registration — the record moved on —
+    /// is a no-op guard, loudly logged).
+    pub fn register_stop_settlement_for_claim(
+        registry: &Option<Arc<RuntimeOwnershipRegistry>>,
+        provider: &str,
+        session_id: &str,
+        operation_id: &str,
+        generation: u64,
+    ) -> StopSettlementGuard {
+        let Some(registry) = registry.as_ref() else {
+            return StopSettlementGuard { flag: None };
+        };
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if !registry.register_stop_settlement(
+            provider,
+            session_id,
+            operation_id,
+            generation,
+            Arc::clone(&flag),
+        ) {
+            tracing::warn!(target: "invariant",
+                provider, session_id, operation_id, generation,
+                event = "freshagent.stop_settlement_registration_declined",
+                "the stop-settlement registration declined — the record moved on; \
+                 the watchdog will treat the stop as unregistered (age-only fencing)");
+            return StopSettlementGuard { flag: None };
+        }
+        StopSettlementGuard { flag: Some(flag) }
+    }
+
+    /// b8ke e3r3 F8: restore a consumed stamp ATOMICALLY with the
+    /// liveness re-validation — the recorded incarnation is checked UNDER
+    /// the stamps lock at restore time, so a sidecar that exits between
+    /// the verdict and the restore can never have its stamp written back
+    /// for a dead process (the exit watcher's take observes either the
+    /// stamp present [it releases] or absent [it already completed] —
+    /// never a restored-after-exit zombie stamp).
+    pub fn restore_retained_stamp_if_live(
+        stamps: &OwnershipStamps,
+        session_id: &str,
+        stamp: OwnershipStamp,
+        none_pid_means_live: bool,
+    ) -> bool {
+        let mut guard = stamps.lock().expect("ownership stamps lock");
+        // Re-validate the recorded incarnation under the lock: the stamp's
+        // pid must still be alive NOW (the exit watcher's release path
+        // takes the stamp under this same lock, so this read cannot
+        // interleave with it). A None-pid stamp (the opencode shared
+        // daemon) defers to the caller's policy.
+        let still_live = stamp
+            .owner
+            .pid
+            .map(|pid| !crate::ownership_lane::partial_pid_confirmed_dead(pid))
+            .unwrap_or(none_pid_means_live);
+        if still_live {
+            guard.insert(session_id.to_string(), stamp);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Exit-watcher release of a retained stamp: takes the stamp (if any)
     /// and releases with its fenced claim — a delayed watcher can never
     /// erase a newer owner or an in-flight handoff. No-op when unwired or

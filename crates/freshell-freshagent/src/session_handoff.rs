@@ -228,6 +228,31 @@ pub trait FlavorWrite: Send + Sync {
         session_id: &str,
         flavor: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
+
+    /// b8ke e3r3 F4: the session's CURRENT durable flavor — the
+    /// hidden-flavor preservation read. A terminal-target handoff whose
+    /// current flavor is a HIDDEN type paired with the target's CLI mode
+    /// (kilroy ↔ claude) KEEPS the hidden flavor (the pairing contract:
+    /// reopening a Kilroy Fresh Agent as its Claude CLI never remaps the
+    /// session for other devices/history). Default `None` (no durable
+    /// record → the wire mode stands).
+    fn current_flavor(
+        &self,
+        _provider: &str,
+        _session_id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>> {
+        Box::pin(std::future::ready(None))
+    }
+}
+
+/// b8ke e3r3 F4: the hidden-flavor table server-side — the same pairing
+/// the client encodes (`shared/session-flavor.ts`
+/// HIDDEN_SESSION_METADATA_TYPES: kilroy's CLI is claude).
+fn hidden_flavor_for_cli(mode: &str) -> Option<&'static str> {
+    match mode {
+        "claude" => Some("kilroy"),
+        _ => None,
+    }
 }
 
 pub type FlavorWriter = Arc<dyn FlavorWrite>;
@@ -450,9 +475,16 @@ impl SessionHandoffRunner {
                 // is the operator path, with the risk typed identically.
                 state:
                     freshell_ownership::OwnershipState::Fenced {
+                        // b8ke e3r3 F3: the acknowledged force-clear takes
+                        // ALL three unconfirmable fence reasons (the e3r2
+                        // stale-Stopping watchdog made StaleStop reachable;
+                        // pre-e3r3 a handoff through a StaleStop fence fell
+                        // to generic HANDOFF_IN_PROGRESS — wedged until
+                        // restart).
                         reason:
                             reason @ (freshell_ownership::FenceReason::PlatformLimited
-                            | freshell_ownership::FenceReason::StaleStart),
+                            | freshell_ownership::FenceReason::StaleStart
+                            | freshell_ownership::FenceReason::StaleStop),
                         prior,
                         ..
                     },
@@ -463,8 +495,10 @@ impl SessionHandoffRunner {
                 // force-clear is the only recovery (d3 F5: StaleStart
                 // types its own code so the client's recovery UI can offer
                 // the force-clear for exactly the fences that need it).
+                // b8ke e3r3 F3: the refusal code is REASON-TYPED.
                 let fence_code = match reason {
                     freshell_ownership::FenceReason::PlatformLimited => "PLATFORM_LIMITED_FENCED",
+                    freshell_ownership::FenceReason::StaleStop => "STALE_STOP_FENCED",
                     _ => "STALE_START_FENCED",
                 };
                 if !req.acknowledge_platform_limited_risk {
@@ -545,6 +579,17 @@ impl SessionHandoffRunner {
                                      the operator's acknowledged risk; the key is Vacant and a \
                                      subsequent explicit handoff starts the target fresh from \
                                      the durable session",
+                            ),
+                            freshell_ownership::FenceReason::StaleStop => (
+                                "STALE_STOP_FORCE_CLEARED",
+                                "stale-stop-unconfirmed-runtime-risk",
+                                "stale-stop-fence",
+                                "STALE-STOP RISK ACKNOWLEDGED: the operator force-cleared \
+                                 the fence — a stop operation vanished mid-flight and the \
+                                 prior runtime's death was NEVER CONFIRMED. Surviving \
+                                 processes are the operator's acknowledged risk; the key is \
+                                 Vacant and a subsequent explicit handoff starts the target \
+                                 fresh from the durable session",
                             ),
                             _ => (
                                 "STALE_START_FORCE_CLEARED",
@@ -969,8 +1014,28 @@ impl SessionHandoffRunner {
                 // spawned target is reaped + the entry fails, mirroring
                 // the stale-commit unwind — never log-only success).
                 if let Some(writer) = &self.flavor_writer {
+                    // b8ke e3r3 F4: the durable flavor derives from the
+                    // session's provider/kind pairing — NEVER the wire mode
+                    // alone. A terminal target whose CURRENT durable flavor
+                    // is a hidden type paired with the target's CLI keeps
+                    // the hidden flavor (kilroy stays kilroy across a
+                    // Kilroy→Claude-CLI handoff; pre-e3r3 the wire mode
+                    // "claude" remapped the session for other
+                    // devices/history).
+                    let prior_flavor = writer.current_flavor(&req.provider, &req.session_id).await;
                     let flavor: Option<String> = match owner.kind {
-                        RuntimeOwnerKind::Terminal => req.mode.clone().filter(|m| !m.is_empty()),
+                        RuntimeOwnerKind::Terminal => {
+                            let mode = req.mode.clone().filter(|m| !m.is_empty());
+                            match (&prior_flavor, &mode) {
+                                (Some(current), Some(mode))
+                                    if hidden_flavor_for_cli(mode)
+                                        .is_some_and(|hidden| hidden == current) =>
+                                {
+                                    Some(current.clone())
+                                }
+                                _ => mode,
+                            }
+                        }
                         RuntimeOwnerKind::FreshAgent => {
                             req.session_type.clone().filter(|t| !t.is_empty())
                         }
