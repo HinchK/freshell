@@ -49,7 +49,7 @@ Fresh-agent panes show thinking blocks and tool blocks by default, with user-fac
 - Consumes: `LocalSettings['freshAgent'] = { showThinking: boolean; showTools: boolean; showTimecodes: boolean }` (`shared/settings.ts:229-233`), the diff-vs-defaults persistence (`assignChangedScalar`, `src/store/browserPreferencesPersistence.ts:76-85`, freshAgent block `:132-138`), and the per-pane override precedence `paneContent.showThinking ?? globalShowThinking` (`FreshAgentView.tsx:596-598`).
 - Produces: new canonical defaults `showThinking: true, showTools: true, showTimecodes: false` resolving through every layer — store defaults, `FreshAgentView` effective values, transcript rendering (thinking rows visible, activity strips mounted expanded).
 
-- [ ] **Step 1: Write the failing behavioral tests**
+- [x] **Step 1: Write the failing behavioral tests**
 
 (a) Update the two default pins in `test/unit/shared/settings.test.ts` (describe `deprecated fresh-agent font scale is dropped`) to the new defaults:
 
@@ -210,7 +210,7 @@ And in `drops legacy freshAgent.fontScale records when rehydrating old preferenc
 
 (`createStore()` uses the real `settingsReducer` with no preloaded settings state, so its module-scope init resolves `defaultLocalSettings` — this is exactly why the test is red before the flip and green after it, and why the `?? false` selector fallbacks are never what it exercises.)
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+- [x] **Step 2: Run the test and verify the intended failure**
 
 Run: `npm run test:vitest -- run test/unit/shared/settings.test.ts test/unit/client/store/browserPreferencesPersistence.test.ts test/unit/client/components/fresh-agent/FreshAgentView.test.tsx -t 'shows thinking rows and expanded activity details by default'`
 
@@ -218,7 +218,7 @@ Also run the two default-test files without the `-t` filter (their other tests m
 
 Expected: FAIL — the settings pins expect `showThinking: true`/`showTools: true` but the defaults are still `false`; the persistence fixtures expect `{ showThinking: false }` to persist but it still equals the default and is dropped; the view test finds no `Thinking` button and no `npm run display-check` detail because the store resolves the old defaults (thinking filtered, strip collapsed).
 
-- [ ] **Step 3: Add the minimal production implementation**
+- [x] **Step 3: Add the minimal production implementation**
 
 In `shared/settings.ts:920-924`, flip the two defaults (`showTimecodes` unchanged):
 
@@ -245,17 +245,17 @@ Also flip the two matching defensive fallbacks in `src/components/fresh-agent/Fr
 
 Note: the fallback flip is consistency-only — the real store always defines these keys (`resolveLocalSettings` fills defaults), so no test can exercise the fallback without fabricating an unreachable store shape; it ships in this task's commit to keep the defensive layer aligned with the canonical defaults.
 
-- [ ] **Step 4: Run the focused test**
+- [x] **Step 4: Run the focused test**
 
 Run: `npm run test:vitest -- run test/unit/shared/settings.test.ts test/unit/client/store/browserPreferencesPersistence.test.ts test/unit/client/components/fresh-agent/FreshAgentView.test.tsx`
 
 Expected: PASS (including the existing precedence test :709, which sets globals and overrides explicitly and must stay green)
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Update the now-false "production default showThinking=false" comments in `test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx` (:2017-2020, :2097-2100, :2177-2180, :2220-2222) to state that production defaults are on and these tests pass explicit `showThinking={false}` to exercise the opt-out path. No production refactor needed beyond Step 3.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 Impacted set: every test that resolves, persists, or migrates local settings, and every fresh-agent component test that renders transcripts through `FreshAgentView` or `FreshAgentTranscript` (default-driven rendering):
 
@@ -263,7 +263,7 @@ Run: `npm run test:vitest -- run test/unit/client/store/settingsSlice.test.ts te
 
 Expected: PASS (the migration suites use explicit values that remain non-default or explicitly preserved; transcript tests pass explicit props; mobile/item-card tests use text-only or item-level fixtures).
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 ```bash
 git add shared/settings.ts src/components/fresh-agent/FreshAgentView.tsx test/unit/shared/settings.test.ts test/unit/client/store/browserPreferencesPersistence.test.ts test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx
@@ -284,7 +284,7 @@ git commit -m "feat(fresh-agent): default thinking and tool display on"
 - Consumes: Task 1's defaults (`settings.freshAgent.showThinking/showTools` resolve true); `SettingsSectionProps.applyLocalSetting` (already passed to every section by `SettingsView.tsx:93-98`); `SettingsRow`/`Toggle` from `src/components/settings/settings-controls.tsx:32-54,93-126`; `updateSettingsLocal` for the direct-dispatch toggle-effect test.
 - Produces: two `role="switch"` controls named `Show thinking` and `Show tools` under Settings → Coding Agents, persisting via `applyLocalSetting` (browser-local), plus a pinned settings→pane re-render contract (a mounted pane hides thinking rows and collapses its activity strip when the global settings flip off).
 
-- [ ] **Step 1: Write the failing behavioral tests**
+- [x] **Step 1: Write the failing behavioral tests**
 
 In `test/unit/client/components/SettingsView.agent-chat.test.tsx`:
 
@@ -384,13 +384,13 @@ In `test/unit/client/components/SettingsView.agent-chat.test.tsx`:
 
 (`updateSettingsLocal` is imported from `@/store/settingsSlice` in that test file if not already; `act` from `@testing-library/react`. The collapsed summary for one tool reads `1 tool used` — `settledSummary`, `FreshAgentTranscript.tsx:210-219`.)
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+- [x] **Step 2: Run the test and verify the intended failure**
 
 Run: `npm run test:vitest -- run test/unit/client/components/SettingsView.agent-chat.test.tsx`
 
 Expected: FAIL — no `Show thinking`/`Show tools` switches exist yet (both the updated presence assertions and the new toggle test fail).
 
-- [ ] **Step 3: Add the minimal production implementation**
+- [x] **Step 3: Add the minimal production implementation**
 
 In `src/components/settings/CodingAgentsSettings.tsx`:
 
@@ -456,17 +456,17 @@ Update the docs mock `docs/index.html` — inside `#settings-panel-agents` (:993
 
 (Match the exact wrapper classes of neighboring sections — mirror `settings-panel-panes` at :1052-1059; if the mock's section wrapper differs, copy the nearest section's structure verbatim and only swap title/desc/rows.)
 
-- [ ] **Step 4: Run the focused test**
+- [x] **Step 4: Run the focused test**
 
 Run: `npm run test:vitest -- run test/unit/client/components/SettingsView.agent-chat.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.test.tsx`
 
 Expected: PASS (including the toggle-effect companion pin)
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 None — the section mirrors the removed `b29f7133a^` `WorkspaceSettings.tsx:265-300` markup (verified via `git show b29f7133a^:src/components/settings/WorkspaceSettings.tsx`) under its post-refactor home.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 Impacted set: all SettingsView section tests (the shell re-renders; section-split files per `settings-view-test-utils.tsx:251-252`) plus lint (a11y):
 
@@ -474,7 +474,7 @@ Run: `npm run test:vitest -- run test/unit/client/components/SettingsView.agent-
 
 Expected: PASS. Then run `npm run lint` — expected: PASS (no new a11y violations; both toggles carry explicit `aria-label`s).
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 ```bash
 git add src/components/settings/CodingAgentsSettings.tsx test/unit/client/components/SettingsView.agent-chat.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.test.tsx docs/index.html
@@ -493,7 +493,7 @@ git commit -m "feat(settings): add fresh-agent display toggles to Coding Agents"
 - Consumes: Tasks 1–2 (defaults resolve through the e2e harness's fresh store — verified: Playwright contexts start with empty localStorage, no storageState/init scripts, and the test server writes no legacy seed; the settings toggles exist under Coding Agents). The seeding helpers `seedCollapsePane` (:1596-1643) and `seedFoldablePane` (:1686-1746) create panes with NO display overrides, so effective values now come from the flipped defaults: strips mount EXPANDED (`initialExpanded={showTools}`, `FreshAgentTranscript.tsx:865`) and thinking/reasoning rows render.
 - Produces: cloud-runnable e2e proof of the new defaults, the toggles, and the full user loop (toggle off in Settings → pane re-renders without thinking on return; opening Settings unmounts the pane tree — `App.tsx:1788-1796` — so the return is remount-based, which is the real single-tab flow).
 
-- [ ] **Step 1: Run the now-broken default-assuming describes and verify the intended failure**
+- [x] **Step 1: Run the now-broken default-assuming describes and verify the intended failure**
 
 Tasks 1–2 changed the default rendering these describes assume. Observe the red this run must repair before adapting:
 
@@ -501,7 +501,7 @@ Run: `export GCLOUD_ROBOT_HOME="$HOME/.codex/skills/gcloud-robot"; scripts/e2e-c
 
 Expected: FAIL — the three store-default tests (:1645, :1669, :1748) expect collapsed summaries / need an expand click, but strips now mount expanded; :1787 may instead PASS VACUOUSLY (its expand clicks collapse the strips, hiding any caption from its count-0 assertion — the same defect its adaptation repairs; observed reality during execution). Additionally run the style-persists test and observe the fifth default-assuming failure it inherits from Task 1: `scripts/e2e-cloud.sh run --local --project=chromium test/e2e-browser/specs/fresh-agent.spec.ts --grep "style setting persists per Fresh Agent pane type"` — expected FAIL at the :977 press (the strip mounts expanded, so the press collapses it and the Thinking disclosure vanishes; adaptation item 5 below repairs it).
 
-- [ ] **Step 2: Write the new tests**
+- [x] **Step 2: Write the new tests**
 
 (a) New default-visibility test in `fresh-agent.spec.ts` (inside the `activity line collapse` describe, reusing `seedCollapsePane`):
 
@@ -639,7 +639,7 @@ Then add the test, operating BOTH toggles (each requested toggle gets store, rel
 
 (Locators are lazy in Playwright, so reusing `thinkingToggle`/`toolsToggle` after the `goto` re-resolves against the reloaded page.)
 
-- [ ] **Step 3: Adapt the broken tests**
+- [x] **Step 3: Adapt the broken tests**
 
 No production code in this task. Adapt the four default-assuming tests in `fresh-agent.spec.ts`:
 
@@ -730,17 +730,17 @@ Replace the whole post-`pushSnapshot` block (:1773-1784) with:
     await expect(freshcodexRoot.getByText('private style reasoning should stay hidden')).toBeVisible()
 ```
 
-- [ ] **Step 4: Run the focused test**
+- [x] **Step 4: Run the focused test**
 
 Run: `export GCLOUD_ROBOT_HOME="$HOME/.codex/skills/gcloud-robot"; scripts/e2e-cloud.sh run --local --project=chromium test/e2e-browser/specs/fresh-agent.spec.ts test/e2e-browser/specs/settings.spec.ts`
 
 Expected: PASS — all adapted + new tests green locally.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 None — the adaptations keep each describe's original intent (collapse accumulation, line separation, fold boundary) while pinning the expanded-by-default mount.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 Cloud lane (the configured e2e backend; required before any PR):
 
@@ -748,7 +748,7 @@ Run: `export GCLOUD_ROBOT_HOME="$HOME/.codex/skills/gcloud-robot"; scripts/e2e-c
 
 Expected: PASS (neither spec is in `CLOUD_SKIP_SPECS`). Then the full coordinated suite gate per the repo's documented procedure (`npm test` through the coordinator) — the pre-existing flaky base test documented in the run-state baseline ledger does not count against this run if it recurs.
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 ```bash
 git add test/e2e-browser/specs/fresh-agent.spec.ts test/e2e-browser/specs/settings.spec.ts
