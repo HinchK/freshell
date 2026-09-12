@@ -213,6 +213,10 @@ enum StopOutcomePriv {
 /// The server-wide atomic handoff runner. Minted in `freshell-server::main`
 /// with the SAME fresh states, registry, coordinator, broadcast bus, and CLI
 /// specs every other lane holds.
+/// b8ke e3r1 F4: the host-wired durable flavor writer — (provider,
+/// session_id, flavor), invoked inside the handoff COMMIT.
+pub type FlavorWriter = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
+
 pub struct SessionHandoffRunner {
     auth_token: Arc<String>,
     broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
@@ -229,6 +233,14 @@ pub struct SessionHandoffRunner {
     cli_commands: Arc<Vec<freshell_platform::CliCommandSpec>>,
     reap_timeout_ms: u64,
     test_hooks: Option<Arc<HandoffTestHooks>>,
+    /// b8ke e3r1 F4: the SERVER-side durable flavor writer, wired by the
+    /// host (the session-metadata store lives in freshell-server). The
+    /// handoff COMMIT performs the flavor write itself — inside the atomic
+    /// transition, single-server-ordered — so the client's separate
+    /// unversioned POST (cross-device out-of-order overwrites; log-only
+    /// failure) is GONE. The callback is fire-and-forget (the host spawns
+    /// its async store write; failures log server-side structured).
+    flavor_writer: Option<FlavorWriter>,
 }
 
 impl SessionHandoffRunner {
@@ -256,7 +268,14 @@ impl SessionHandoffRunner {
             cli_commands,
             reap_timeout_ms: 10_000,
             test_hooks: None,
+            flavor_writer: None,
         }
+    }
+
+    /// b8ke e3r1 F4: wire the host's durable flavor writer.
+    pub fn with_flavor_writer(mut self, writer: Option<FlavorWriter>) -> Self {
+        self.flavor_writer = writer;
+        self
     }
 
     pub fn with_reap_timeout_ms(mut self, ms: u64) -> Self {
@@ -468,14 +487,17 @@ impl SessionHandoffRunner {
                 }
                 // The acknowledged force-clear requires the CURRENT
                 // observed fence pair — the operator clears the fence they
-                // are looking at, never a stale one.
+                // are looking at, never a stale one. b8ke e3r1 F5: the
+                // missing-fence refusal is REASON-TYPED (previously
+                // hard-coded PLATFORM_LIMITED_FENCED even for a StaleStart
+                // fence).
                 let Some(observed) = observed else {
                     let generation = self
                         .ownership
                         .observe(&req.provider, &req.session_id)
                         .generation;
                     return typed_failure(
-                        "PLATFORM_LIMITED_FENCED",
+                        fence_code,
                         "the acknowledged force-clear requires the current observed \
                          (epoch, generation) fence pair; refresh and retry",
                         true,
@@ -489,21 +511,46 @@ impl SessionHandoffRunner {
                     &initiator,
                 ) {
                     freshell_ownership::ForceReleaseOutcome::Released => {
-                        // The prominent limitation record: the registry's
-                        // own line (ownership.fenced.force_released_platform_limited)
-                        // plus the operator-action acknowledgment here.
+                        // b8ke e3r1 F5: the event/reason/cleared strings are
+                        // REASON-TYPED — a StaleStart force-clear records
+                        // STALE_START_FORCE_CLEARED and the truthful
+                        // unconfirmed-runtime risk (never a claim about a
+                        // platform-specific direct-child condition); the
+                        // PlatformLimited strings stay on the
+                        // PlatformLimited case.
+                        let (clear_event, clear_ack, cleared_label, clear_log) = match reason {
+                            freshell_ownership::FenceReason::PlatformLimited => (
+                                "PLATFORM_LIMITED_FORCE_CLEARED",
+                                "platform-limited-descendant-tree-risk",
+                                "platform-limited-fence",
+                                "PLATFORM-LIMITED RISK ACKNOWLEDGED: the operator \
+                                     force-cleared the fence — the prior runtime's DESCENDANT \
+                                     tree is UNVERIFIED on this platform (only the direct \
+                                     child's exit was confirmed). Surviving descendants are \
+                                     the operator's acknowledged risk; the key is Vacant and a \
+                                     subsequent explicit handoff starts the target fresh from \
+                                     the durable session",
+                            ),
+                            _ => (
+                                "STALE_START_FORCE_CLEARED",
+                                "stale-start-unconfirmed-runtime-risk",
+                                "stale-start-fence",
+                                "STALE-START RISK ACKNOWLEDGED: the operator \
+                                     force-cleared the fence — the prior runtime's death was \
+                                     NEVER CONFIRMED (a stale start left it unconfirmable). \
+                                     Surviving processes are the operator's acknowledged \
+                                     risk; the key is Vacant and a subsequent explicit \
+                                     handoff starts the target fresh from the durable session",
+                            ),
+                        };
                         tracing::warn!(target: "freshell_ownership",
-                            event = "ownership.handoff.platform_limited_force_cleared",
+                            event = "ownership.handoff.unconfirmable_force_cleared",
+                            fence_reason = ?reason,
                             operation_id = %operation_id, provider = %req.provider, session_id = %req.session_id,
                             epoch = self.ownership.boot_epoch(), generation = observed.generation,
                             from_kind = ?prior.as_ref().map(|(o, _)| o.kind),
-                            acknowledged = "platform-limited-descendant-tree-risk",
-                            "PLATFORM-LIMITED RISK ACKNOWLEDGED: the operator force-cleared \
-                             the fence — the prior runtime's DESCENDANT tree is UNVERIFIED on \
-                             this platform (only the direct child's exit was confirmed). \
-                             Surviving descendants are the operator's acknowledged risk; the \
-                             key is Vacant and a subsequent explicit handoff starts the \
-                             target fresh from the durable session");
+                            acknowledged = clear_ack,
+                            "{clear_log}");
                         // Broadcast the cleared state so every device
                         // holding the sessionRef converges on the Vacant
                         // key (their fenced recovery cards clear).
@@ -515,7 +562,7 @@ impl SessionHandoffRunner {
                             &operation_id,
                             observed.generation,
                             prior.as_ref().map(|(owner, _)| owner.kind),
-                            Some("PLATFORM_LIMITED_FORCE_CLEARED"),
+                            Some(clear_event),
                             None,
                         );
                         // The typed clear — the force-clear's own answer.
@@ -524,7 +571,7 @@ impl SessionHandoffRunner {
                         // explicitly (the fresh no-prior sequence).
                         return json!({
                             "ok": true,
-                            "cleared": "platform-limited-fence",
+                            "cleared": cleared_label,
                             "operationId": operation_id,
                             "generation": observed.generation,
                         });
@@ -926,6 +973,26 @@ impl SessionHandoffRunner {
                             None,
                             None,
                         );
+                        // b8ke e3r1 F4: the durable flavor write IS part of
+                        // the server's atomic commit — the target's flavor
+                        // recorded under the session the handoff just
+                        // switched (single-server-ordered; cross-device
+                        // out-of-order delivery is impossible by
+                        // construction). The host's writer logs its own
+                        // failure server-side.
+                        if let Some(writer) = &self.flavor_writer {
+                            let flavor: Option<String> = match owner.kind {
+                                RuntimeOwnerKind::Terminal => {
+                                    req.mode.clone().filter(|m| !m.is_empty())
+                                }
+                                RuntimeOwnerKind::FreshAgent => {
+                                    req.session_type.clone().filter(|t| !t.is_empty())
+                                }
+                            };
+                            if let Some(flavor) = flavor {
+                                writer(&req.provider, &req.session_id, &flavor);
+                            }
+                        }
                         self.log_transition(
                             TransitionLog {
                                 operation_id: &operation_id,

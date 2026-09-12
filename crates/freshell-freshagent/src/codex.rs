@@ -3605,6 +3605,9 @@ impl FreshCodexState {
         // observed-owner claim — never a silent lane-local skip.
         let mut stop_generation: Option<u64> = None;
         let mut stop_op_id: Option<String> = None;
+        // b8ke e3r1 F2: the granted claim's consumed stamp, captured for
+        // the abort path's restoration.
+        let mut taken_stop_stamp: Option<(String, crate::ownership_lane::OwnershipStamp)> = None;
         if let Some(registry) = self.ownership.as_ref() {
             if let Some(stamp) =
                 crate::ownership_lane::peek_retained_stamp(&self.ownership_stamps, &session_id)
@@ -3620,15 +3623,20 @@ impl FreshCodexState {
                     "freshcodex/kill",
                     crate::session_lease::now_epoch_ms(),
                 );
-                let refused = match &stop_outcome {
+                let refused = match stop_outcome {
                     freshell_ownership::StopOutcome::Granted { generation } => {
                         // Consume the stamp; the commit follows the
-                        // confirmed reap below.
-                        crate::ownership_lane::take_retained_stamp(
-                            &self.ownership_stamps,
-                            &session_id,
-                        );
-                        stop_generation = Some(*generation);
+                        // confirmed reap below (captured for the abort
+                        // path's restoration — e3r1 F2).
+                        taken_stop_stamp = Some((
+                            session_id.clone(),
+                            crate::ownership_lane::take_retained_stamp(
+                                &self.ownership_stamps,
+                                &session_id,
+                            )
+                            .expect("the stamp was peeked moments ago"),
+                        ));
+                        stop_generation = Some(generation);
                         stop_op_id = Some(kill_op_id);
                         None
                     }
@@ -3643,7 +3651,7 @@ impl FreshCodexState {
                         );
                         None
                     }
-                    freshell_ownership::StopOutcome::NotLive { state } => Some((
+                    freshell_ownership::StopOutcome::NotLive { ref state } => Some((
                         "LIFECYCLE_IN_FLIGHT",
                         format!(
                             "a lifecycle operation is in flight ({state:?}); retry after it settles"
@@ -3685,13 +3693,40 @@ impl FreshCodexState {
                     freshell_ownership::OwnershipState::Live {
                         owner, generation, ..
                     } => {
+                        // b8ke e3r1 F1: the fallback authorizes ONLY THIS
+                        // LANE'S runtime — a foreign-kind live owner (a
+                        // completed handoff's terminal) is refused typed,
+                        // never fabricated into a claim; the request's
+                        // fence is honored (a stale pair refuses by
+                        // generation arithmetic).
+                        if owner.kind != freshell_ownership::RuntimeOwnerKind::FreshAgent {
+                            tracing::warn!(target: "freshell_freshagent::codex",
+                                session_id = %session_id, observed_kind = ?owner.kind,
+                                "fresh_agent_kill_refused_no_stamp: the coordinator's live \
+                                 owner is NOT this lane's Fresh Agent runtime — a delayed \
+                                 kill never fabricates a foreign-kind claim"
+                            );
+                            self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                                provider: PROVIDER.to_string(),
+                                session_id,
+                                session_type: SESSION_TYPE.to_string(),
+                                success: false,
+                                code: Some("FOREIGN_OWNER".to_string()),
+                                message: Some(
+                                    "the session's live owner is not this agent runtime; \
+                                     refresh and retry"
+                                        .to_string(),
+                                ),
+                            }));
+                            return;
+                        }
                         let claim = freshell_ownership::StopClaim {
-                            expected_kind: owner.kind,
+                            expected_kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
                             expected_runtime: Some(owner.clone()),
-                            observed: freshell_ownership::ObservedFence {
+                            observed: stop_fence.unwrap_or(freshell_ownership::ObservedFence {
                                 epoch: snap.epoch,
                                 generation,
-                            },
+                            }),
                         };
                         let kill_op_id = format!("kill-{}", uuid::Uuid::new_v4());
                         let stop_outcome = crate::ownership_lane::begin_fresh_agent_stop(
@@ -3773,6 +3808,15 @@ impl FreshCodexState {
                 if let Some(registry) = self.ownership.as_ref() {
                     let _ = registry.abort_stop(PROVIDER, &session_id, &op_id, generation);
                 }
+            }
+            // b8ke e3r1 F2: restore the consumed stamp — the abort must
+            // restore what the grant consumed.
+            if let Some((stamp_key, stamp)) = taken_stop_stamp {
+                crate::ownership_lane::restore_retained_stamp(
+                    &self.ownership_stamps,
+                    &stamp_key,
+                    stamp,
+                );
             }
             self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
                 provider: PROVIDER.to_string(),

@@ -953,6 +953,53 @@ impl FreshOpencodeState {
                     );
                     return;
                 }
+                // b8ke e3r1 F3: a live session over a VACANT key is
+                // REGISTERED as the authoritative owner before the reuse
+                // proceeds — never reused unowned.
+                freshell_ownership::OwnershipState::Vacant => {
+                    let adopt_op = format!("adopt-{}", uuid::Uuid::new_v4());
+                    match self.begin_lane_claim_at(
+                        &durable_id,
+                        &adopt_op,
+                        None,
+                        "freshopencode/map-hit-adopt",
+                    ) {
+                        crate::ownership_lane::LaneClaim::Granted(ticket) => {
+                            let mut ticket_opt = Some(ticket);
+                            if let Err(outcome) = crate::ownership_lane::commit_lane_claim(
+                                &self.fresh_agent.ownership,
+                                &self.fresh_agent.ownership_stamps,
+                                PROVIDER,
+                                &durable_id,
+                                &mut ticket_opt,
+                                &durable_id,
+                                None,
+                            ) {
+                                tracing::warn!(target: "freshell_freshagent::opencode",
+                                    session_id = %durable_id, outcome = ?outcome,
+                                    "fresh_agent_create_adopt_commit_stale: the coordinator \
+                                     moved on while registering the existing session — the \
+                                     reuse is refused (never a live writer left unowned)");
+                                self.fail_create(
+                                    &request_id,
+                                    "SESSION_RESERVED",
+                                    "A lifecycle operation owns this session; retry after it settles",
+                                );
+                                return;
+                            }
+                        }
+                        crate::ownership_lane::LaneClaim::Unwired
+                        | crate::ownership_lane::LaneClaim::Adopt => {}
+                        crate::ownership_lane::LaneClaim::Refused(_) => {
+                            self.fail_create(
+                                &request_id,
+                                "SESSION_RESERVED",
+                                "A lifecycle operation owns this session; retry after it settles",
+                            );
+                            return;
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -2046,6 +2093,9 @@ impl FreshOpencodeState {
         let mut stop_generation: Option<u64> = None;
         let mut stop_op_id: Option<String> = None;
         let mut stop_key: Option<String> = None;
+        // b8ke e3r1 F2: the granted claim's consumed stamp, captured for
+        // the abort path's restoration.
+        let mut taken_stop_stamp: Option<(String, crate::ownership_lane::OwnershipStamp)> = None;
         if let Some(registry) = self.fresh_agent.ownership.as_ref() {
             // Round-6 lock order (map guard NEVER held across a per-session
             // lock wait): clone the Arc out under a short map section, drop
@@ -2078,13 +2128,17 @@ impl FreshOpencodeState {
                     "freshopencode/kill",
                     crate::session_lease::now_epoch_ms(),
                 );
-                let refused = match &stop_outcome {
+                let refused = match stop_outcome {
                     freshell_ownership::StopOutcome::Granted { generation } => {
-                        crate::ownership_lane::take_retained_stamp(
-                            &self.fresh_agent.ownership_stamps,
-                            &stop_session_id,
-                        );
-                        stop_generation = Some(*generation);
+                        taken_stop_stamp = Some((
+                            stop_session_id.clone(),
+                            crate::ownership_lane::take_retained_stamp(
+                                &self.fresh_agent.ownership_stamps,
+                                &stop_session_id,
+                            )
+                            .expect("the stamp was peeked moments ago"),
+                        ));
+                        stop_generation = Some(generation);
                         stop_op_id = Some(kill_op_id);
                         stop_key = Some(stop_session_id);
                         None
@@ -2098,7 +2152,7 @@ impl FreshOpencodeState {
                         );
                         None
                     }
-                    freshell_ownership::StopOutcome::NotLive { state } => Some((
+                    freshell_ownership::StopOutcome::NotLive { ref state } => Some((
                         "LIFECYCLE_IN_FLIGHT",
                         format!(
                             "a lifecycle operation is in flight ({state:?}); retry after it settles"
@@ -2152,13 +2206,43 @@ impl FreshOpencodeState {
                     freshell_ownership::OwnershipState::Live {
                         owner, generation, ..
                     } => {
+                        // b8ke e3r1 F1: the fallback authorizes ONLY THIS
+                        // LANE'S runtime — a foreign-kind live owner (a
+                        // completed handoff's terminal) is refused typed,
+                        // never fabricated into a claim; the request's
+                        // fence is honored.
+                        if owner.kind != freshell_ownership::RuntimeOwnerKind::FreshAgent {
+                            tracing::warn!(target: "freshell_freshagent::opencode",
+                                session_id = %msg.session_id, observed_kind = ?owner.kind,
+                                "fresh_agent_kill_refused_no_stamp: the coordinator's live \
+                                 owner is NOT this lane's Fresh Agent runtime — a delayed \
+                                 kill never fabricates a foreign-kind claim"
+                            );
+                            if let Some(session_arc) = &session_arc {
+                                let mut s = session_arc.lock().await;
+                                s.close_pending = s.close_pending.saturating_sub(1);
+                            }
+                            self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                                provider: PROVIDER.to_string(),
+                                session_id: msg.session_id,
+                                session_type: SESSION_TYPE.to_string(),
+                                success: false,
+                                code: Some("FOREIGN_OWNER".to_string()),
+                                message: Some(
+                                    "the session's live owner is not this agent runtime; \
+                                     refresh and retry"
+                                        .to_string(),
+                                ),
+                            }));
+                            return;
+                        }
                         let claim = freshell_ownership::StopClaim {
-                            expected_kind: owner.kind,
+                            expected_kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
                             expected_runtime: Some(owner.clone()),
-                            observed: freshell_ownership::ObservedFence {
+                            observed: stop_fence.unwrap_or(freshell_ownership::ObservedFence {
                                 epoch: snap.epoch,
                                 generation,
-                            },
+                            }),
                         };
                         let kill_op_id = format!("kill-{}", uuid::Uuid::new_v4());
                         let stop_outcome = crate::ownership_lane::begin_fresh_agent_stop(
@@ -2295,6 +2379,15 @@ impl FreshOpencodeState {
                             if let Some(registry) = self.fresh_agent.ownership.as_ref() {
                                 let _ = registry.abort_stop(PROVIDER, &key, &op_id, generation);
                             }
+                        }
+                        // b8ke e3r1 F2: restore the consumed stamp — the
+                        // abort must restore what the grant consumed.
+                        if let Some((stamp_key, stamp)) = taken_stop_stamp.clone() {
+                            crate::ownership_lane::restore_retained_stamp(
+                                &self.fresh_agent.ownership_stamps,
+                                &stamp_key,
+                                stamp,
+                            );
                         }
                         if let Some(session_arc) = &session_arc {
                             let mut s = session_arc.lock().await;
@@ -3874,6 +3967,60 @@ impl FreshOpencodeState {
                         "A lifecycle operation owns this session; retry after it settles",
                     );
                     return;
+                }
+                // b8ke e3r1 F3: a live session over a VACANT key is
+                // REGISTERED as the authoritative owner (claim + commit)
+                // before the reuse proceeds — never reused unowned
+                // (pre-e3r1 a terminal claim could start a second writer
+                // beside the live one).
+                freshell_ownership::OwnershipState::Vacant => {
+                    let durable = match session_arc.as_ref() {
+                        Some(arc) => arc.lock().await.real_session_id.clone(),
+                        None => None,
+                    }
+                    .unwrap_or_else(|| msg.session_id.clone());
+                    let adopt_op = format!("adopt-{}", uuid::Uuid::new_v4());
+                    match self.begin_lane_claim_at(
+                        &durable,
+                        &adopt_op,
+                        None,
+                        "freshopencode/map-hit-adopt",
+                    ) {
+                        crate::ownership_lane::LaneClaim::Granted(ticket) => {
+                            let mut ticket_opt = Some(ticket);
+                            if let Err(outcome) = crate::ownership_lane::commit_lane_claim(
+                                &self.fresh_agent.ownership,
+                                &self.fresh_agent.ownership_stamps,
+                                PROVIDER,
+                                &durable,
+                                &mut ticket_opt,
+                                &durable,
+                                None,
+                            ) {
+                                tracing::warn!(target: "freshell_freshagent::opencode",
+                                    session_id = %durable, outcome = ?outcome,
+                                    "fresh_agent_attach_adopt_commit_stale: the coordinator \
+                                     moved on while registering the existing session — the \
+                                     reuse is refused (never a live writer left unowned)");
+                                self.emit_fresh_agent_error(
+                                    &msg.session_id,
+                                    "SESSION_RESERVED",
+                                    "A lifecycle operation owns this session; retry after it settles",
+                                );
+                                return;
+                            }
+                        }
+                        crate::ownership_lane::LaneClaim::Unwired
+                        | crate::ownership_lane::LaneClaim::Adopt => {}
+                        crate::ownership_lane::LaneClaim::Refused(_) => {
+                            self.emit_fresh_agent_error(
+                                &msg.session_id,
+                                "SESSION_RESERVED",
+                                "A lifecycle operation owns this session; retry after it settles",
+                            );
+                            return;
+                        }
+                    }
                 }
                 _ => {}
             }

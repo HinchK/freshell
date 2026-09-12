@@ -10,6 +10,7 @@
 //! fake `opencode serve` (the `freshagent_session_lease.rs` shape), and the
 //! common sleeper CLI spec so terminal targets genuinely spawn Running PTYs.
 //! `ENV_LOCK` serializes this file's tests (process-global env knobs).
+use crate::session_handoff::FlavorWriter;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -364,6 +365,9 @@ fn sleeper_cli_spec(name: &str) -> freshell_platform::CliCommandSpec {
 
 // ── the rig: runner + every shared state, exactly like main.rs ──────────────
 
+/// b8ke e3r1 F4: the rig's recording flavor-writer log.
+type FlavorWriteLog = Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
+
 struct Rig {
     runner: Arc<SessionHandoffRunner>,
     ownership: Arc<RuntimeOwnershipRegistry>,
@@ -372,6 +376,8 @@ struct Rig {
     fresh_opencode: crate::FreshOpencodeState,
     fresh_agent: crate::FreshAgentState,
     rx: tokio::sync::broadcast::Receiver<String>,
+    /// b8ke e3r1 F4: the recording flavor-writer log.
+    flavor_log: FlavorWriteLog,
 }
 
 fn build_rig(hooks: Option<Arc<HandoffTestHooks>>) -> Rig {
@@ -475,6 +481,18 @@ fn build_rig_with_options(
     let mut fresh_opencode = crate::FreshOpencodeState::new(fresh_agent.clone());
     fresh_opencode.set_ownership(Arc::clone(&ownership));
 
+    // b8ke e3r1 F4: the rig wires a RECORDING flavor writer so the
+    // commit-side durable-flavor contract is testable.
+    let flavor_log: FlavorWriteLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer_log = Arc::clone(&flavor_log);
+    let flavor_writer: FlavorWriter =
+        Arc::new(move |provider: &str, session_id: &str, flavor: &str| {
+            writer_log.lock().expect("flavor log lock").push((
+                provider.to_string(),
+                session_id.to_string(),
+                flavor.to_string(),
+            ));
+        });
     let mut runner = SessionHandoffRunner::new(
         auth_token,
         broadcast_tx,
@@ -486,7 +504,8 @@ fn build_rig_with_options(
         fresh_agent.clone(),
         cli_commands,
     )
-    .with_reap_timeout_ms(reap_timeout_ms);
+    .with_reap_timeout_ms(reap_timeout_ms)
+    .with_flavor_writer(Some(flavor_writer));
     if let Some(hooks) = hooks.clone() {
         runner = runner.with_test_hooks(hooks);
     }
@@ -498,6 +517,7 @@ fn build_rig_with_options(
         fresh_opencode,
         fresh_agent,
         rx,
+        flavor_log,
     }
 }
 
@@ -1700,6 +1720,37 @@ async fn handoff_with_a_platform_limited_prior_stop_fences_the_key_typed() {
     assert_eq!(retried["error"]["code"], json!("PLATFORM_LIMITED_FENCED"));
 }
 
+/// b8ke e3r1 F4: the handoff COMMIT writes the durable flavor SERVER-SIDE
+/// (inside the atomic transition). The recording writer observes exactly
+/// (provider, session, flavor) — the TARGET's flavor, once, at the commit.
+/// Pre-e3r1 the client performed a separate unversioned POST after the
+/// reply (cross-device out-of-order overwrites; log-only failure).
+#[tokio::test]
+async fn the_handoff_commit_writes_the_durable_flavor_server_side() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let rig = build_rig(None);
+    establish_fresh_claude_owner(&rig, &sid).await;
+
+    // The handoff to the CLI terminal commits; the flavor recorded is the
+    // TERMINAL target's mode ("claude" — the CLI flavor).
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let result = handle.completion.await.expect("runner completed");
+    assert_eq!(result["ok"], json!(true), "the handoff commits: {result}");
+
+    let flavors = rig.flavor_log.lock().expect("flavor log lock").clone();
+    assert_eq!(
+        flavors,
+        vec![("claude".to_string(), sid.clone(), "claude".to_string())],
+        "the commit recorded the TARGET's flavor exactly once — the \
+         server-atomic durable write (no client POST exists)"
+    );
+}
+
 /// b8ke delta round-3 F5: a STALE-START fence recovers through the SAME
 /// acknowledged operator force-clear. The coordinator's force-release API
 /// accepts PlatformLimited AND StaleStart (the registry's docs name
@@ -1786,9 +1837,12 @@ async fn a_stale_start_fence_recovers_through_the_acknowledged_force_clear() {
         json!(true),
         "the acknowledged force-clear released the StaleStart fence: {cleared}"
     );
-    assert!(
-        cleared.get("cleared").is_some(),
-        "the typed CLEAR answer (no handoff ran, no owner committed): {cleared}"
+    // b8ke e3r1 F5: the CLEAR answer's reason label is TRUTHFUL for a
+    // StaleStart fence — never the hard-coded platform-limited string.
+    assert_eq!(
+        cleared.get("cleared"),
+        Some(&json!("stale-start-fence")),
+        "the typed CLEAR answer carries the reason-typed label: {cleared}"
     );
     assert!(
         matches!(

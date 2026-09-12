@@ -761,6 +761,24 @@ pub mod ownership_lane {
         }
     }
 
+    /// b8ke e3r1 F2: RESTORE a retained stamp (the abort path's rollback
+    /// of a granted kill's consumption). A clean-close failure unwinds the
+    /// stop via `abort_stop` — the registry returns to Live, and the
+    /// natural-exit watcher needs the stamp back to release ownership on
+    /// the runtime's eventual exit/crash (pre-e3r1 the abort restored the
+    /// registry but left it release-less: a later crash stayed recorded
+    /// live).
+    pub fn restore_retained_stamp(
+        stamps: &OwnershipStamps,
+        session_id: &str,
+        stamp: OwnershipStamp,
+    ) {
+        stamps
+            .lock()
+            .expect("ownership stamps lock")
+            .insert(session_id.to_string(), stamp);
+    }
+
     /// Exit-watcher release of a retained stamp: takes the stamp (if any)
     /// and releases with its fenced claim — a delayed watcher can never
     /// erase a newer owner or an in-flight handoff. No-op when unwired or

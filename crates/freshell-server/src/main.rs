@@ -1929,17 +1929,50 @@ async fn main() -> ExitCode {
     // every other lane holds (the REST spawn state is the fully-wired
     // `fresh_agent_state` — the terminal-target pipeline needs its registry
     // and CLI-spec wiring; the opencode slice carries the shared serve).
-    let handoff_runner = Arc::new(freshell_freshagent::SessionHandoffRunner::new(
-        Arc::clone(&auth_token),
-        Arc::clone(&broadcast_tx),
-        Arc::clone(&ownership),
-        registry.clone(),
-        fresh_codex_state.clone(),
-        fresh_claude_state.clone(),
-        fresh_opencode_state.clone(),
-        fresh_agent_state.clone(),
-        Arc::clone(&cli_commands),
-    ));
+    // b8ke e3r1 F4: the handoff COMMIT writes the durable flavor itself
+    // (the host's session-metadata store), inside the server's atomic
+    // transition — the client's separate unversioned POST (cross-device
+    // out-of-order overwrites; log-only failure) is gone. The writer
+    // spawns the store's async set; failures log server-side structured.
+    let flavor_store = Arc::new(session_metadata_store.clone());
+    let flavor_writer: freshell_freshagent::session_handoff::FlavorWriter =
+        Arc::new(move |provider: &str, session_id: &str, flavor: &str| {
+            let store = Arc::clone(&flavor_store);
+            let (provider, session_id, flavor) = (
+                provider.to_string(),
+                session_id.to_string(),
+                flavor.to_string(),
+            );
+            tokio::spawn(async move {
+                if let Err(err) = store
+                    .set(&provider, &session_id, &flavor, Some("explicit"))
+                    .await
+                {
+                    tracing::warn!(target: "freshell_server",
+                        provider = %provider, session_id = %session_id, session_type = %flavor,
+                        error = %err,
+                        event = "session_metadata.handoff_commit_write_failed",
+                        "the handoff committed the owner but the durable flavor write \
+                         failed — the flavor remains derivable from the owner state; \
+                         this is a durability gap, not an ownership error"
+                    );
+                }
+            });
+        });
+    let handoff_runner = Arc::new(
+        freshell_freshagent::SessionHandoffRunner::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+            Arc::clone(&ownership),
+            registry.clone(),
+            fresh_codex_state.clone(),
+            fresh_claude_state.clone(),
+            fresh_opencode_state.clone(),
+            fresh_agent_state.clone(),
+            Arc::clone(&cli_commands),
+        )
+        .with_flavor_writer(Some(Arc::clone(&flavor_writer))),
+    );
 
     // `POST /api/session-metadata` (`server/sessions-router.ts:220-244` +
     // `session-metadata-store.ts`): persists sidebar/fresh-agent `sessionType` tags to

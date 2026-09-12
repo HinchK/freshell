@@ -1714,12 +1714,75 @@ impl FreshClaudeState {
                 &Self::initiator_for(provenance.as_ref(), "freshclaude/create-resume"),
             ) {
                 crate::ownership_lane::LaneClaim::Granted(ticket) => {
-                    // b8ke delta round-3 F2: the unowned-runtime shape —
-                    // the key was Vacant but THIS lane's map holds a live
-                    // session. Adopt it, spawn nothing; the fresh claim
-                    // drops (RAII fail) with the key returning to the
-                    // Vacant it held (no spawn happened under it).
+                    // b8ke delta round-3 F2 + e3r1 F3: the unowned-runtime
+                    // shape — the key was Vacant but THIS lane's map holds
+                    // a live session. Adopt it, spawn nothing, and COMMIT
+                    // the adopted runtime as the authoritative Live owner
+                    // (pre-e3r1 the ticket's drop restored Vacant while
+                    // the runtime kept running — acknowledging a live
+                    // writer with an unowned key licensed a SECOND writer).
                     if self.has_live_session(sid).await {
+                        // The live runtime's identity: the session's map
+                        // key + its sidecar pid.
+                        own_ticket = Some(ticket);
+                        let map_key = self.resolve_session_key(sid).await;
+                        let adopted_pid = match map_key.as_ref() {
+                            Some(mk) => self
+                                .sessions
+                                .lock()
+                                .await
+                                .get(mk)
+                                .and_then(|sess| sess.child.id()),
+                            None => None,
+                        };
+                        let adopted_map_key = map_key.clone().unwrap_or_else(|| sid.to_string());
+                        match self.commit_lane_claim_at(
+                            &mut own_ticket,
+                            &adopted_map_key,
+                            adopted_pid,
+                        ) {
+                            Ok(()) => {
+                                self.broadcast(&ServerMessage::SessionRuntimeOwner(
+                                    SessionRuntimeOwner {
+                                        provider: PROVIDER.to_string(),
+                                        session_id: sid.to_string(),
+                                        epoch: self
+                                            .ownership
+                                            .as_ref()
+                                            .map(|r| r.boot_epoch())
+                                            .unwrap_or(0),
+                                        generation: self
+                                            .ownership
+                                            .as_ref()
+                                            .map(|r| r.observe(PROVIDER, sid).generation)
+                                            .unwrap_or(0),
+                                        owner_kind: "fresh-agent".into(),
+                                        previous_kind: None,
+                                        terminal_id: None,
+                                        operation_id: format!("adopt-{request_id}"),
+                                        transition: "handoff-committed".into(),
+                                        reason: None,
+                                        fenced: None,
+                                        alias_of: None,
+                                    },
+                                ));
+                            }
+                            Err(outcome) => {
+                                tracing::warn!(target: "freshell_freshagent::claude",
+                                    session_id = %sid, request_id = %request_id,
+                                    outcome = ?outcome,
+                                    "fresh_agent_create_adopt_commit_stale: the coordinator \
+                                     moved on while the live-runtime adopt committed — the \
+                                     create is refused (never a live writer left unowned)"
+                                );
+                                self.fail_create(
+                                    &request_id,
+                                    "STALE_CLAIM",
+                                    "ownership moved on while adopting the live session; refresh and retry",
+                                );
+                                return;
+                            }
+                        }
                         self.adopt_live_create(&request_id, sid, session_type).await;
                         return;
                     }
@@ -2415,6 +2478,12 @@ impl FreshClaudeState {
         let mut stop_generation: Option<u64> = None;
         let mut stop_op_id: Option<String> = None;
         let mut stop_key: Option<String> = None;
+        // b8ke e3r1 F2: the granted claim's consumed stamp, captured for
+        // the abort path's restoration (a clean-close failure must restore
+        // EVERYTHING the grant consumed — the registry via abort_stop AND
+        // the retained stamp, so the natural-exit watcher can still release
+        // ownership on the runtime's eventual exit/crash).
+        let mut taken_stop_stamp: Option<(String, crate::ownership_lane::OwnershipStamp)> = None;
         if let Some(registry) = self.ownership.as_ref() {
             let stop_stamp = match crate::ownership_lane::peek_retained_stamp(
                 &self.ownership_stamps,
@@ -2455,13 +2524,17 @@ impl FreshClaudeState {
                     "freshclaude/kill",
                     crate::session_lease::now_epoch_ms(),
                 );
-                let refused = match &stop_outcome {
+                let refused = match stop_outcome {
                     freshell_ownership::StopOutcome::Granted { generation } => {
-                        crate::ownership_lane::take_retained_stamp(
-                            &self.ownership_stamps,
-                            &stop_session_id,
-                        );
-                        stop_generation = Some(*generation);
+                        taken_stop_stamp = Some((
+                            stop_session_id.clone(),
+                            crate::ownership_lane::take_retained_stamp(
+                                &self.ownership_stamps,
+                                &stop_session_id,
+                            )
+                            .expect("the stamp was peeked moments ago"),
+                        ));
+                        stop_generation = Some(generation);
                         stop_op_id = Some(kill_op_id);
                         stop_key = Some(stop_session_id);
                         None
@@ -2475,7 +2548,7 @@ impl FreshClaudeState {
                         );
                         None
                     }
-                    freshell_ownership::StopOutcome::NotLive { state } => Some((
+                    freshell_ownership::StopOutcome::NotLive { ref state } => Some((
                         "LIFECYCLE_IN_FLIGHT",
                         format!(
                             "a lifecycle operation is in flight ({state:?}); retry after it settles"
@@ -2532,19 +2605,81 @@ impl FreshClaudeState {
                 // skip). An observed-owner claim: the record the
                 // coordinator itself holds for this session licenses (or
                 // refuses) the stop; the ledger stays bound on refusal.
-                let canonical = self.resolve_ownership_key(&session_id);
+                // The observed key is the CANONICAL DURABLE id — the same
+                // lane resolution the stamp path uses (placeholder wire
+                // ids resolve through the live session's recorded cli id;
+                // a durable wire id is itself).
+                let canonical = match self.resolve_session_key(&session_id).await {
+                    Some(mk) => {
+                        let durable = self
+                            .sessions
+                            .lock()
+                            .await
+                            .get(&mk)
+                            .and_then(|sess| sess.cli_session_id.clone());
+                        durable.unwrap_or_else(|| self.resolve_ownership_key(&session_id))
+                    }
+                    None => self.resolve_ownership_key(&session_id),
+                };
                 let snap = registry.observe(PROVIDER, &canonical);
                 match snap.state.clone() {
                     freshell_ownership::OwnershipState::Live {
                         owner, generation, ..
                     } => {
+                        // b8ke e3r1 F1: the fallback authorizes ONLY THIS
+                        // LANE'S runtime — the observed owner must be a
+                        // Fresh Agent. A delayed kill that observes a
+                        // TERMINAL owner (a completed handoff removed the
+                        // stamp and committed the terminal) is refused
+                        // typed — NEVER fabricated into a matching claim
+                        // that would commit the coordinator to Vacant
+                        // while the live terminal is never torn down (the
+                        // untracked-PTY second-writer hole).
+                        if owner.kind != freshell_ownership::RuntimeOwnerKind::FreshAgent {
+                            tracing::warn!(target: "freshell_freshagent::claude",
+                                session_id = %session_id, observed_kind = ?owner.kind,
+                                "fresh_agent_kill_refused_no_stamp: the coordinator's live \
+                                 owner is NOT this lane's Fresh Agent runtime — a delayed \
+                                 kill never fabricates a foreign-kind claim"
+                            );
+                            {
+                                let _index = self.cli_index.lock().await;
+                                let _sessions = self.sessions.lock().await;
+                                let mut gates =
+                                    self.close_pending.lock().expect("close-pending lock");
+                                if let Some(n) = gates.get_mut(&map_key) {
+                                    *n -= 1;
+                                    if *n == 0 {
+                                        gates.remove(&map_key);
+                                    }
+                                }
+                            }
+                            self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                                provider: PROVIDER.to_string(),
+                                session_id,
+                                session_type: session_type.to_string(),
+                                success: false,
+                                code: Some("FOREIGN_OWNER".to_string()),
+                                message: Some(
+                                    "the session's live owner is not this agent runtime; \
+                                     refresh and retry"
+                                        .to_string(),
+                                ),
+                            }));
+                            return;
+                        }
+                        // e3r1 F1: honor the REQUEST'S fence — a delayed
+                        // kill carrying a stale observed pair is refused by
+                        // the same generation arithmetic the stamp path
+                        // uses (a fence-less legacy kill claims against the
+                        // CURRENT pair — the snapshot's).
                         let claim = freshell_ownership::StopClaim {
-                            expected_kind: owner.kind,
+                            expected_kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
                             expected_runtime: Some(owner.clone()),
-                            observed: freshell_ownership::ObservedFence {
+                            observed: stop_fence.unwrap_or(freshell_ownership::ObservedFence {
                                 epoch: snap.epoch,
                                 generation,
-                            },
+                            }),
                         };
                         let kill_op_id = format!("kill-{}", uuid::Uuid::new_v4());
                         let stop_outcome = crate::ownership_lane::begin_fresh_agent_stop(
@@ -2648,6 +2783,16 @@ impl FreshClaudeState {
                 if let Some(registry) = self.ownership.as_ref() {
                     let _ = registry.abort_stop(PROVIDER, &key, &op_id, generation);
                 }
+            }
+            // b8ke e3r1 F2: restore the consumed stamp — the abort must
+            // restore what the grant consumed, or the natural-exit watcher
+            // can never release the live owner.
+            if let Some((stamp_key, stamp)) = taken_stop_stamp {
+                crate::ownership_lane::restore_retained_stamp(
+                    &self.ownership_stamps,
+                    &stamp_key,
+                    stamp,
+                );
             }
             {
                 let _index = self.cli_index.lock().await;
@@ -10290,6 +10435,279 @@ rl.on('line', (line) => {
         assert!(
             st.has_live_session(FRESH_CREATE_DURABLE_ID).await,
             "the refused kill left the session live"
+        );
+    }
+
+    /// b8ke e3r1 F1: a DELAYED kill after a completed handoff NEVER
+    /// fabricates a claim against the replacement owner. The handoff
+    /// consumed the Fresh Agent stamp and committed a TERMINAL owner; the
+    /// stale `freshAgent.kill` reaches the no-stamp fallback, observes the
+    /// terminal, and must answer the TYPED refusal — the terminal owner
+    /// stays Live and untouched (pre-e3r1 the fallback fabricated a
+    /// matching terminal StopClaim, got Granted, and committed the key to
+    /// Vacant while the live PTY was never torn down — the untracked
+    /// second-writer hole).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delayed_kill_after_a_handoff_never_fabricates_a_foreign_owner_claim() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+
+        st.handle_create(dedup_create_msg("req-e3r1-f1"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "req-e3r1-f1").await;
+        let placeholder = created["sessionId"].as_str().unwrap().to_string();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while st
+            .cli_index
+            .lock()
+            .await
+            .get(FRESH_CREATE_DURABLE_ID)
+            .is_none()
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the create's adoption never published"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // THE COMPLETED HANDOFF (simulated at the coordinator level): the
+        // stamp is consumed and a TERMINAL owner is committed under the
+        // durable id.
+        crate::ownership_lane::take_retained_stamp(&st.ownership_stamps, FRESH_CREATE_DURABLE_ID);
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_handoff(
+            "claude",
+            FRESH_CREATE_DURABLE_ID,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "handoff-completed-e3r1",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("expected the Handoff begin to be granted")
+        };
+        let terminal_owner = freshell_ownership::OwnerIdentity {
+            kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+            terminal_id: Some("t-replacement".into()),
+            live_session_key: None,
+            pid: None,
+            ownership_id: Some("handoff-completed-e3r1".into()),
+        };
+        assert!(matches!(
+            registry.commit_live(
+                "claude",
+                FRESH_CREATE_DURABLE_ID,
+                "handoff-completed-e3r1",
+                generation,
+                terminal_owner.clone(),
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        ));
+
+        // THE DELAYED KILL (no stamp — the fallback path).
+        st.handle_kill(kill_msg(&placeholder)).await;
+
+        let frame = await_specific_frame(&mut rx, "freshAgent.killed", &placeholder).await;
+        assert_eq!(frame["success"], json!(false));
+        assert_eq!(
+            frame["code"],
+            json!("FOREIGN_OWNER"),
+            "the delayed kill answers the TYPED foreign-owner refusal: {frame}"
+        );
+        // The replacement TERMINAL owner is untouched — the coordinator
+        // still holds it Live (never fabricated into a Vacant commit).
+        match registry.observe("claude", FRESH_CREATE_DURABLE_ID).state {
+            freshell_ownership::OwnershipState::Live { owner, .. } => {
+                assert_eq!(owner.kind, freshell_ownership::RuntimeOwnerKind::Terminal);
+                assert_eq!(owner.terminal_id.as_deref(), Some("t-replacement"));
+            }
+            other => panic!(
+                "the terminal owner must stay Live — got {other:?} \
+                 (pre-e3r1: the fabricated claim committed it to Vacant)"
+            ),
+        }
+    }
+
+    /// b8ke e3r1 F2: a clean-close failure after a GRANTED kill unwinds
+    /// EVERYTHING the grant consumed — the registry via abort_stop AND the
+    /// retained stamp — so the natural-exit watcher can still release
+    /// ownership (pre-e3r1 the abort restored the registry but left the
+    /// runtime release-less: a later crash stayed recorded live).
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_clean_close_failure_unwinds_the_grant_and_restores_the_release_stamp() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(sink.clone());
+
+        let mut create = dedup_create_msg("req-e3r1-f2");
+        create.model = Some("opus".into());
+        st.handle_create(create, None).await;
+        let created = await_claude_created(&mut rx, "req-e3r1-f2").await;
+        let placeholder = created["sessionId"].as_str().unwrap().to_string();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !sink.was_recorded("claude", FRESH_CREATE_DURABLE_ID) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the create's adoption never recorded the binding"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            crate::ownership_lane::peek_retained_stamp(
+                &st.ownership_stamps,
+                FRESH_CREATE_DURABLE_ID
+            )
+            .is_some(),
+            "the create's commit retained the release stamp"
+        );
+
+        // The clean close failure (identity-conditional on the durable id).
+        sink.fail_retires_for("claude", FRESH_CREATE_DURABLE_ID);
+        st.handle_kill(kill_msg(&placeholder)).await;
+
+        let frame = await_specific_frame(&mut rx, "freshAgent.killed", &placeholder).await;
+        assert_eq!(
+            frame["code"],
+            json!("DURABLE_CLOSE_FAILED"),
+            "the recoverable close failure answers typed: {frame}"
+        );
+        // THE ABORT restored the registry to Live{FreshAgent} ...
+        assert!(matches!(
+            registry.observe("claude", FRESH_CREATE_DURABLE_ID).state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ));
+        // ... AND the stamp is back (pre-e3r1: consumed forever).
+        assert!(
+            crate::ownership_lane::peek_retained_stamp(
+                &st.ownership_stamps,
+                FRESH_CREATE_DURABLE_ID
+            )
+            .is_some(),
+            "the abort RESTORED the consumed release stamp — the exit watcher \
+             can release ownership after the recoverable failure"
+        );
+        // THE NATURAL EXIT now works: the release path takes the restored
+        // stamp and vacates the key.
+        crate::ownership_lane::release_retained_stamp(
+            &Some(Arc::clone(&registry)),
+            &st.ownership_stamps,
+            "claude",
+            FRESH_CREATE_DURABLE_ID,
+            "claude-exit",
+        );
+        assert!(
+            matches!(
+                registry.observe("claude", FRESH_CREATE_DURABLE_ID).state,
+                freshell_ownership::OwnershipState::Vacant
+            ),
+            "the natural exit released the restored stamp — the owner is \
+             vacated (pre-e3r1: a crash stayed recorded live forever)"
+        );
+    }
+
+    /// b8ke e3r1 F3: an adopt over a LIVE runtime COMMITS that runtime as
+    /// the authoritative owner — the ticket's drop never leaves a live
+    /// writer's key Vacant (pre-e3r1 the adopt returned while the drop
+    /// restored Vacant, licensing a terminal claim to start a second
+    /// writer beside the live one).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_adopt_over_a_live_runtime_commits_the_owner() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+
+        st.handle_create(dedup_create_msg("req-e3r1-f3"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "req-e3r1-f3").await;
+        let _placeholder = created["sessionId"].as_str().unwrap().to_string();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while st
+            .cli_index
+            .lock()
+            .await
+            .get(FRESH_CREATE_DURABLE_ID)
+            .is_none()
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the create's adoption never published"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // THE UNOWNED-LIVE shape: the coordinator key goes Vacant (a
+        // confirmed-kill release) while the lane map still holds the live
+        // session.
+        let stamp = crate::ownership_lane::take_retained_stamp(
+            &st.ownership_stamps,
+            FRESH_CREATE_DURABLE_ID,
+        )
+        .expect("the create's stamp");
+        registry.force_release_for_confirmed_kill(
+            "claude",
+            FRESH_CREATE_DURABLE_ID,
+            &freshell_ownership::ReleaseClaim {
+                operation_id: stamp.operation_id.clone(),
+                generation: stamp.generation,
+                runtime: Some(stamp.owner.clone()),
+            },
+            "test-release",
+        );
+        assert!(matches!(
+            registry.observe("claude", FRESH_CREATE_DURABLE_ID).state,
+            freshell_ownership::OwnershipState::Vacant
+        ));
+
+        // A resume-create against the live session: the claim grants (the
+        // key is Vacant) and the ADOPT must COMMIT the live runtime as the
+        // owner.
+        let mut resume = dedup_create_msg("req-e3r1-f3-resume");
+        resume.resume_session_id = Some(FRESH_CREATE_DURABLE_ID.to_string());
+        st.handle_create(resume, None).await;
+        let adopted =
+            await_specific_frame(&mut rx, "freshAgent.created", "req-e3r1-f3-resume").await;
+        assert_eq!(
+            adopted["sessionId"],
+            json!(FRESH_CREATE_DURABLE_ID),
+            "the live session was adopted under its durable id (no fresh spawn): {adopted}"
+        );
+
+        // THE F3 CONTRACT: the adopted runtime is the AUTHORITATIVE Live
+        // owner — the key is NOT Vacant (pre-e3r1: the ticket's drop
+        // restored Vacant while the runtime kept running).
+        match registry.observe("claude", FRESH_CREATE_DURABLE_ID).state {
+            freshell_ownership::OwnershipState::Live { owner, .. } => {
+                assert_eq!(owner.kind, freshell_ownership::RuntimeOwnerKind::FreshAgent);
+            }
+            other => panic!("the adopt COMMITTED the live runtime as owner — got {other:?}"),
+        }
+        // And a subsequent TERMINAL start claim is refused while the
+        // adopted owner holds (never a second writer).
+        assert!(
+            !matches!(
+                registry.begin_start(
+                    "claude",
+                    FRESH_CREATE_DURABLE_ID,
+                    freshell_ownership::RuntimeOwnerKind::Terminal,
+                    "op-second-writer",
+                    None,
+                    "test",
+                    0,
+                ),
+                freshell_ownership::BeginOutcome::Granted { .. }
+            ),
+            "a terminal claim cannot start a second writer beside the \
+             adopted live owner"
         );
     }
 
