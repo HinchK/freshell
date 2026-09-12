@@ -1,5 +1,9 @@
 import { test, expect } from '../helpers/fixtures.js'
 
+// The browser-preferences persist path debounces localStorage writes by
+// 500ms; wait past it before reading the blob.
+const PERSIST_DEBOUNCE_WAIT_MS = 600
+
 test.describe('Settings', () => {
   // Helper: navigate to the settings view.
   // Sidebar nav buttons have title="Settings (Ctrl+B ,)" which Playwright
@@ -178,42 +182,50 @@ test.describe('Settings', () => {
     ).toBeVisible()
   })
 
-  test('fresh agent display toggles persist locally and clear on re-enable', async ({ freshellPage, page, harness, serverInfo }) => {
+  test('Expand thinking and Expand tools switches persist locally and reset to defaults', async ({ freshellPage, page, harness, serverInfo }) => {
     await openSettingsSection(page, 'Coding Agents')
 
-    const switchFor = (label: string) => page.getByText(label).locator('..').getByRole('switch')
-    const thinkingToggle = switchFor('Show thinking')
-    const toolsToggle = switchFor('Show tools')
-    await expect(thinkingToggle).toHaveAttribute('aria-checked', 'true')
-    await expect(toolsToggle).toHaveAttribute('aria-checked', 'true')
+    // Accessible-name switch locators (each Toggle carries an exact aria-label
+    // matching its row label).
+    const expandThinkingSwitch = page.getByRole('switch', { name: 'Expand thinking' })
+    const expandToolsSwitch = page.getByRole('switch', { name: 'Expand tools' })
+    // Compact defaults: both switches start off.
+    await expect(expandThinkingSwitch).toHaveAttribute('aria-checked', 'false')
+    await expect(expandToolsSwitch).toHaveAttribute('aria-checked', 'false')
 
-    // Opt out of BOTH display settings.
-    await thinkingToggle.click()
-    await toolsToggle.click()
-    await page.waitForTimeout(600) // browser-preferences persist debounce is 500ms
-    expect((await harness.getSettings()).freshAgent.showThinking).toBe(false)
-    expect((await harness.getSettings()).freshAgent.showTools).toBe(false)
+    // Opt in to both expansion defaults.
+    await expandThinkingSwitch.click()
+    await expandToolsSwitch.click()
+    await page.waitForTimeout(PERSIST_DEBOUNCE_WAIT_MS)
+    const settings = await harness.getSettings()
+    expect(settings.freshAgent.expandThinking).toBe(true)
+    expect(settings.freshAgent.expandTools).toBe(true)
+    // The blob holds ONLY non-default values (diff-vs-defaults).
+    const blob = await page.evaluate(() => localStorage.getItem('freshell.browser-preferences.v1'))
+    const parsed = JSON.parse(blob ?? '{}')
+    expect(parsed.settings?.freshAgent?.expandThinking).toBe(true)
+    expect(parsed.settings?.freshAgent?.expandTools).toBe(true)
 
-    // Both opt-outs persist across reload; the blob holds ONLY non-default values.
+    // The opt-in persists across reload.
     await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
     await harness.waitForHarness()
     await harness.waitForConnection()
     const afterReload = (await harness.getSettings()).freshAgent
-    expect(afterReload.showThinking).toBe(false)
-    expect(afterReload.showTools).toBe(false)
-    const blob = await page.evaluate(() => localStorage.getItem('freshell.browser-preferences.v1'))
-    const parsed = JSON.parse(blob ?? '{}')
-    expect(parsed.settings?.freshAgent?.showThinking).toBe(false)
-    expect(parsed.settings?.freshAgent?.showTools).toBe(false)
+    expect(afterReload.expandThinking).toBe(true)
+    expect(afterReload.expandTools).toBe(true)
+    const blobReload = await page.evaluate(() => localStorage.getItem('freshell.browser-preferences.v1'))
+    const parsedReload = JSON.parse(blobReload ?? '{}')
+    expect(parsedReload.settings?.freshAgent?.expandThinking).toBe(true)
+    expect(parsedReload.settings?.freshAgent?.expandTools).toBe(true)
 
-    // Re-enabling both drops the keys from the blob (diff-vs-defaults).
+    // Resetting both to defaults drops the keys from the blob (diff-vs-defaults).
     await openSettingsSection(page, 'Coding Agents')
-    await thinkingToggle.click()
-    await toolsToggle.click()
-    await expect(thinkingToggle).toHaveAttribute('aria-checked', 'true')
-    await expect(toolsToggle).toHaveAttribute('aria-checked', 'true')
-    await page.waitForTimeout(600)
-    const blobOn = await page.evaluate(() => localStorage.getItem('freshell.browser-preferences.v1'))
-    expect(JSON.parse(blobOn ?? '{}').settings?.freshAgent).toBeUndefined()
+    await expandThinkingSwitch.click()
+    await expandToolsSwitch.click()
+    await expect(expandThinkingSwitch).toHaveAttribute('aria-checked', 'false')
+    await expect(expandToolsSwitch).toHaveAttribute('aria-checked', 'false')
+    await page.waitForTimeout(PERSIST_DEBOUNCE_WAIT_MS)
+    const blobOff = await page.evaluate(() => localStorage.getItem('freshell.browser-preferences.v1'))
+    expect(JSON.parse(blobOff ?? '{}').settings?.freshAgent).toBeUndefined()
   })
 })
