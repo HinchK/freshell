@@ -1141,35 +1141,16 @@ impl RuntimeOwnershipRegistry {
                     }
                 }
             }
-            // b8ke delta round-2 F2: the stale-Starting watchdog's
-            // UNCONFIRMED fence, released by the stale-start operation's
-            // OWN unwind. The ticket's Drop performs exactly this `fail`
-            // — the unwind IS the operation's confirmed death (nothing it
-            // created can still commit: every commit in `Fenced` is the
-            // typed foreign refusal), so the fence reopens to Vacant
-            // instead of wedging the session until a server restart.
-            // Scoped to [`FenceReason::StaleStart`] ONLY: the handoff/stop
-            // fences keep the strict release discipline (a confirmed-death
-            // probe + release_fenced, never a stray fail). Fenced exactly
-            // on (operation_id, generation).
-            OwnershipState::Fenced {
-                operation_id: op,
-                reason: FenceReason::StaleStart,
-                ..
-            } if op == operation_id => {
-                let duration_ms = now_epoch_ms()
-                    .saturating_sub(record.state.since_ms().unwrap_or(now_epoch_ms()));
-                record.state = OwnershipState::Vacant;
-                tracing::warn!(target: "freshell_ownership",
-                    event = "ownership.start.watchdog_fence_released_by_unwind",
-                    operation_id, provider, session_id, initiator,
-                    epoch = self.epoch, generation, duration_ms,
-                    outcome = "released_vacant",
-                    "the stale-start operation unwound (its ticket's typed fail) — the \
-                     watchdog's unconfirmed fence releases on the operation's own \
-                     confirmed death");
-                FailOutcome::Released
-            }
+            // b8ke focused episode-2 round-1 F1: a Fenced record — ANY
+            // reason, including the watchdog's StaleStart — is NEVER
+            // released by this generic fail. The delta-r2 arm cleared a
+            // StaleStart fence merely because the operation's ticket
+            // dropped, but a handler unwind proves only that the handler
+            // cannot COMMIT; it does not prove the detached sidecar or its
+            // descendants died. The strict release discipline is the only
+            // path: a CONFIRMED-death probe invoking [`Self::release_fenced`]
+            // (or the lane teardowns), never a stray fail — never plain
+            // Vacant over an unconfirmed runtime.
             _ => FailOutcome::ForeignOperation,
         }
     }
@@ -2664,16 +2645,16 @@ mod tests {
         ));
     }
 
-    /// b8ke delta round-2 F2: the watchdog's UNCONFIRMED fence releases
-    /// when the stale-start operation UNWINDS — the ticket's typed fail
-    /// on a `Fenced{op, generation}` record IS the operation's own
-    /// confirmed death (the pre-fix `fail()` answered ForeignOperation
-    /// and the fence held forever: a normally-recoverable session wedged
-    /// until a server restart). Fenced exactly on the operation id +
-    /// generation — a foreign fail can never release another operation's
-    /// fence.
+    /// b8ke focused episode-2 round-1 F1: the watchdog's UNCONFIRMED
+    /// StaleStart fence is NEVER released by the operation's own unwind —
+    /// the ticket's typed `fail` proves only that the handler cannot
+    /// commit, NOT that the detached sidecar or its descendants died (the
+    /// delta-r2 arm cleared it to Vacant, licensing a second writer over
+    /// an unconfirmed runtime). The STRICT release discipline is the only
+    /// path: a CONFIRMED-death probe invoking `release_fenced` (or the
+    /// lane teardowns); the unwind's `fail` is the typed no-op.
     #[test]
-    fn a_watchdog_fence_releases_when_the_stale_start_operation_unwinds() {
+    fn a_watchdog_fence_survives_the_operations_unwind_and_releases_only_on_confirmed_death() {
         let r = RuntimeOwnershipRegistry::new();
         let BeginOutcome::Granted { generation } = r.begin_start(
             PROVIDER,
@@ -2702,15 +2683,26 @@ mod tests {
             ),
             FenceOutcome::Fenced
         ));
-        // A foreign fail (a different operation / generation) must NEVER
-        // release this fence.
+        // THE OPERATION UNWINDS (the ticket's Drop performs exactly this
+        // fail): the unwind is NOT a confirmed runtime death — the fence
+        // HOLDS (the pre-e2r1 arm released it to Vacant over the
+        // unconfirmed runtime).
         assert!(matches!(
-            r.fail(PROVIDER, "sid", "op-foreign", generation, false),
+            r.fail(PROVIDER, "sid", "op-watchdog", generation, false),
             FailOutcome::ForeignOperation
         ));
         assert!(matches!(
             r.observe(PROVIDER, "sid").state,
-            OwnershipState::Fenced { .. }
+            OwnershipState::Fenced {
+                reason: FenceReason::StaleStart,
+                ..
+            }
+        ));
+        // A foreign fail (a different operation / generation) never
+        // releases it either.
+        assert!(matches!(
+            r.fail(PROVIDER, "sid", "op-foreign", generation, false),
+            FailOutcome::ForeignOperation
         ));
         assert!(matches!(
             r.fail(PROVIDER, "sid", "op-watchdog", generation + 1, false),
@@ -2720,12 +2712,12 @@ mod tests {
             r.observe(PROVIDER, "sid").state,
             OwnershipState::Fenced { .. }
         ));
-        // THE OPERATION UNWINDS (the ticket's Drop performs exactly this
-        // fail): the unwind IS the operation's confirmed death — the
-        // watchdog fence releases to Vacant.
+        // THE ONLY RELEASE: a confirmed-death probe invoking release_fenced
+        // — never a stray fail, never plain Vacant over the unconfirmed
+        // runtime.
         assert!(matches!(
-            r.fail(PROVIDER, "sid", "op-watchdog", generation, false),
-            FailOutcome::Released
+            r.release_fenced(PROVIDER, "sid", "op-watchdog", generation),
+            CommitOutcome::Committed
         ));
         assert_eq!(r.observe(PROVIDER, "sid").state, OwnershipState::Vacant);
         // The recovered key reopens for a new writer.

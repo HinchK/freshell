@@ -4236,9 +4236,11 @@ mod stale_start_watchdog_tests {
             "the settle timeout is UNCONFIRMED — the still-running start's key fences, \
              never Vacant"
         );
-        // THE RECOVERY (the ownership-layer test pins it too): the
-        // operation's own unwind (its ticket's typed fail) releases the
-        // watchdog fence.
+        // b8ke focused episode-2 round-1 F1: the operation's own unwind
+        // (its ticket's typed fail) is NOT a confirmed runtime death — it
+        // proves only the handler cannot commit, never that the detached
+        // sidecar died. The fence HOLDS through the unwind (the delta-r2
+        // arm released it to Vacant over the unconfirmed runtime).
         assert!(matches!(
             states.0.fail(
                 "claude",
@@ -4247,7 +4249,22 @@ mod stale_start_watchdog_tests {
                 generation,
                 false
             ),
-            freshell_ownership::FailOutcome::Released
+            freshell_ownership::FailOutcome::ForeignOperation
+        ));
+        assert!(matches!(
+            states.0.observe("claude", "sid-stale").state,
+            OwnershipState::Fenced {
+                reason: FenceReason::StaleStart,
+                ..
+            }
+        ));
+        // THE ONLY RELEASE: a confirmed-death probe invoking release_fenced
+        // — never a stray fail, never plain Vacant.
+        assert!(matches!(
+            states
+                .0
+                .release_fenced("claude", "sid-stale", "op-settle-timeout", generation),
+            freshell_ownership::CommitOutcome::Committed
         ));
         assert_eq!(
             states.0.observe("claude", "sid-stale").state,
