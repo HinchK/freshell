@@ -768,6 +768,39 @@ impl FreshCodexState {
 
     /// kata b8ke Task 3: begin this lane's coordinator claim. See
     /// [`crate::ownership_lane::begin_lane_claim`].
+    /// b8ke focused episode-2 round-2 F4: re-register the in-flight start's
+    /// partial runtime with the REAL pid the moment the child exists
+    /// (idempotent re-registration, fenced to the ticket's operation id +
+    /// generation exactly like the original) — the mid-startup arming the
+    /// spawn hook performs so the watchdog's sweep over a slow
+    /// (30-45s) startup finds cancellable, confirmable evidence instead
+    /// of fencing a healthy start whose registration lands after the
+    /// window.
+    fn rearm_start_evidence(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+        generation: u64,
+        pid: Option<u32>,
+    ) {
+        let Some(registry) = self.ownership.as_ref() else {
+            return;
+        };
+        registry.register_partial_runtime(
+            PROVIDER,
+            session_id,
+            operation_id,
+            generation,
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                terminal_id: None,
+                live_session_key: Some(session_id.to_string()),
+                pid,
+                ownership_id: None,
+            },
+        );
+    }
+
     fn begin_lane_claim_at(
         &self,
         session_id: &str,
@@ -1497,6 +1530,30 @@ impl FreshCodexState {
         provenance: Option<crate::BindProvenance>,
     ) {
         let _ = &mut own_ticket; // moved to finish_create below on the success path
+                                 // b8ke focused episode-2 round-2 F4: the claim exists — register the
+                                 // watchdog machinery NOW, before the spawn + thread/resume awaits (up
+                                 // to 45s): the cancellation slot + the settle guard (held to THIS
+                                 // handler's unwind) + the partial runtime (pid None until the spawn
+                                 // hook arms the real identity). A slow startup swept at 30s is then
+                                 // cancellable-and-confirmable, never a registration-ignored
+                                 // StaleStart fence.
+        let resume_start_pid_slot = crate::ownership_lane::sidecar_pid_cancel_slot();
+        let _resume_start_cancellation =
+            crate::ownership_lane::register_start_cancellation_for_ticket(
+                &self.ownership,
+                PROVIDER,
+                &resume_session_id,
+                &own_ticket,
+                crate::ownership_lane::pid_slot_cancellation(&resume_start_pid_slot),
+            );
+        crate::ownership_lane::register_partial_fresh_runtime(
+            &self.ownership,
+            PROVIDER,
+            &resume_session_id,
+            &own_ticket,
+            &resume_session_id,
+            None,
+        );
         if self.is_known_dead_thread(&resume_session_id).await {
             if let Some(mut g) = lease_guard.take() {
                 g.fail();
@@ -1516,7 +1573,33 @@ impl FreshCodexState {
         // REFUSES instead of undoing the newer close.
         let claim_dead_state = self.claim_dead_state_snapshot(&resume_session_id);
 
-        let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd.as_deref()).await {
+        // b8ke focused episode-2 round-2 F4: the watchdog machinery registered
+        // at the claim (top of this handler) — the spawn hook arms the
+        // mid-startup evidence (the cancellation slot + the partial's real
+        // pid) the moment the child exists, BEFORE the 45s health-connect
+        // window.
+        let spawn_slot = Arc::clone(&resume_start_pid_slot);
+        let spawn_state = self.clone();
+        let spawn_session_id = resume_session_id.clone();
+        let (spawn_op_id, spawn_generation) = match own_ticket.as_ref() {
+            Some(ticket) => (ticket.operation_id().to_string(), ticket.generation()),
+            None => (String::new(), 0),
+        };
+        let on_spawned = move |pid: u32| {
+            crate::ownership_lane::arm_sidecar_pid_slot(&spawn_slot, Some(pid));
+            if !spawn_op_id.is_empty() {
+                spawn_state.rearm_start_evidence(
+                    &spawn_session_id,
+                    &spawn_op_id,
+                    spawn_generation,
+                    Some(pid),
+                );
+            }
+        };
+        let (client, notifs, ownership_id, child) = match self
+            .spawn_sidecar_notifying(cwd.as_deref(), Some(&on_spawned))
+            .await
+        {
             Ok(parts) => parts,
             Err(err) => {
                 if let Some(mut g) = lease_guard.take() {
@@ -1649,33 +1732,11 @@ impl FreshCodexState {
             }
         };
 
-        // kata b8ke Task 3: register the spawn's partial runtime for the
-        // watchdog (the resume lane's claim happened in `handle_create`).
-        let sidecar_pid = child.id();
-        // b8ke delta round-2 F2: the start's watchdog machinery — the
-        // direct-pid cancellation (the child exists: the watchdog's cancel
-        // SIGTERMs it; the start's own gates tear down and unwind) + the
-        // settle guard held to this handler's end (the watchdog's bounded
-        // settle treats its firing as the operation's confirmed death).
-        let _start_cancellation = crate::ownership_lane::register_start_cancellation_for_ticket(
-            &self.ownership,
-            PROVIDER,
-            &thread_id,
-            &own_ticket,
-            crate::ownership_lane::sidecar_pid_cancellation(
-                sidecar_pid,
-                crate::session_lease::recorded_start_time(sidecar_pid),
-            ),
-        );
-        crate::ownership_lane::register_partial_fresh_runtime(
-            &self.ownership,
-            PROVIDER,
-            &thread_id,
-            &own_ticket,
-            &thread_id,
-            sidecar_pid,
-        );
-
+        // kata b8ke Task 3 + episode-2 round-2 F4: the partial runtime's real
+        // pid was armed by the spawn hook (the slot + the rearm), and the
+        // cancellation + settle registered at the handler top cover this
+        // handler's whole unwind — the delta-r2 late registration here is
+        // superseded.
         self.finish_create(
             request_id,
             thread_id.clone(),
@@ -3253,8 +3314,52 @@ impl FreshCodexState {
             }
         };
 
+        // b8ke focused episode-2 round-2 F4: the fork's claim exists — the
+        // watchdog machinery registers NOW, before the spawn + unarchive
+        // awaits (up to 45s): cancellation slot + settle guard + the
+        // partial runtime (pid None until the spawn hook arms the real
+        // identity).
+        let fork_start_pid_slot = crate::ownership_lane::sidecar_pid_cancel_slot();
+        let _fork_start_cancellation =
+            crate::ownership_lane::register_start_cancellation_for_ticket(
+                &self.ownership,
+                PROVIDER,
+                &child_id,
+                &own_ticket,
+                crate::ownership_lane::pid_slot_cancellation(&fork_start_pid_slot),
+            );
+        crate::ownership_lane::register_partial_fresh_runtime(
+            &self.ownership,
+            PROVIDER,
+            &child_id,
+            &own_ticket,
+            &child_id,
+            None,
+        );
+
         // ── post-archive (failure containment applies to every step below) ──
-        let child_parts = match self.spawn_sidecar(eff_cwd.as_deref()).await {
+        let fork_spawn_slot = Arc::clone(&fork_start_pid_slot);
+        let fork_spawn_state = self.clone();
+        let fork_spawn_session = child_id.clone();
+        let (fork_spawn_op, fork_spawn_gen) = match own_ticket.as_ref() {
+            Some(ticket) => (ticket.operation_id().to_string(), ticket.generation()),
+            None => (String::new(), 0),
+        };
+        let fork_on_spawned = move |pid: u32| {
+            crate::ownership_lane::arm_sidecar_pid_slot(&fork_spawn_slot, Some(pid));
+            if !fork_spawn_op.is_empty() {
+                fork_spawn_state.rearm_start_evidence(
+                    &fork_spawn_session,
+                    &fork_spawn_op,
+                    fork_spawn_gen,
+                    Some(pid),
+                );
+            }
+        };
+        let child_parts = match self
+            .spawn_sidecar_notifying(eff_cwd.as_deref(), Some(&fork_on_spawned))
+            .await
+        {
             Ok(parts) => parts,
             Err(err) => {
                 self.fail_fork_after_archive(
@@ -3270,32 +3375,12 @@ impl FreshCodexState {
         };
         let (child_client, child_notifs, child_ownership_id, mut child_proc) = child_parts;
 
-        // kata b8ke Task 3: the child sidecar exists — register its partial
-        // runtime for the watchdog (before the commit below).
+        // kata b8ke Task 3 + episode-2 round-2 F4: the partial runtime's real
+        // pid was armed by the spawn hook (the slot + the rearm); the
+        // cancellation + settle registered at the claim cover this
+        // handler's whole unwind — the delta-r2 late registration here is
+        // superseded.
         let child_pid = child_proc.id();
-        // b8ke delta round-2 F2: the start's watchdog machinery — the
-        // direct-pid cancellation (the child exists: the watchdog's cancel
-        // SIGTERMs it; the start's own gates tear down and unwind) + the
-        // settle guard held to this handler's end (the watchdog's bounded
-        // settle treats its firing as the operation's confirmed death).
-        let _start_cancellation = crate::ownership_lane::register_start_cancellation_for_ticket(
-            &self.ownership,
-            PROVIDER,
-            &child_id,
-            &own_ticket,
-            crate::ownership_lane::sidecar_pid_cancellation(
-                child_pid,
-                crate::session_lease::recorded_start_time(child_pid),
-            ),
-        );
-        crate::ownership_lane::register_partial_fresh_runtime(
-            &self.ownership,
-            PROVIDER,
-            &child_id,
-            &own_ticket,
-            &child_id,
-            child_pid,
-        );
 
         if let Err(err) = child_client.unarchive_thread(&child_id).await {
             shut_down_fork_child(&child_client, &mut child_proc, &child_ownership_id).await;
@@ -4081,6 +4166,31 @@ impl FreshCodexState {
             }
         }
 
+        // b8ke focused episode-2 round-2 F4: the claim exists — register the
+        // watchdog machinery NOW, before the spawn + thread/resume awaits (up
+        // to 45s): the cancellation slot + the settle guard (held to THIS
+        // handler's unwind) + the partial runtime (pid None until the spawn
+        // hook arms the real identity). The delta-r2 late registration
+        // after the spawn left a 30s sweep during a slow startup fenced with
+        // nothing registered.
+        let attach_start_pid_slot = crate::ownership_lane::sidecar_pid_cancel_slot();
+        let _attach_start_cancellation =
+            crate::ownership_lane::register_start_cancellation_for_ticket(
+                &self.ownership,
+                PROVIDER,
+                session_id,
+                &own_ticket,
+                crate::ownership_lane::pid_slot_cancellation(&attach_start_pid_slot),
+            );
+        crate::ownership_lane::register_partial_fresh_runtime(
+            &self.ownership,
+            PROVIDER,
+            session_id,
+            &own_ticket,
+            session_id,
+            None,
+        );
+
         // FIX (CODEX-FIRST triage Finding 2): this exact thread id was already confirmed
         // genuinely gone within its negative-cache TTL window -- skip the doomed resume
         // attempt (and the sidecar it would burn to re-prove it) and go straight to the
@@ -4104,7 +4214,30 @@ impl FreshCodexState {
                 .await;
         }
 
-        let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd.as_deref()).await {
+        // F4: the spawn hook arms the mid-startup evidence the moment the
+        // child exists.
+        let attach_spawn_slot = Arc::clone(&attach_start_pid_slot);
+        let attach_spawn_state = self.clone();
+        let attach_spawn_session = session_id.to_string();
+        let (attach_spawn_op, attach_spawn_gen) = match own_ticket.as_ref() {
+            Some(ticket) => (ticket.operation_id().to_string(), ticket.generation()),
+            None => (String::new(), 0),
+        };
+        let attach_on_spawned = move |pid: u32| {
+            crate::ownership_lane::arm_sidecar_pid_slot(&attach_spawn_slot, Some(pid));
+            if !attach_spawn_op.is_empty() {
+                attach_spawn_state.rearm_start_evidence(
+                    &attach_spawn_session,
+                    &attach_spawn_op,
+                    attach_spawn_gen,
+                    Some(pid),
+                );
+            }
+        };
+        let (client, notifs, ownership_id, child) = match self
+            .spawn_sidecar_notifying(cwd.as_deref(), Some(&attach_on_spawned))
+            .await
+        {
             Ok(parts) => parts,
             Err(err) => {
                 if let Some(mut g) = lease_guard.take() {
@@ -4119,31 +4252,12 @@ impl FreshCodexState {
                 g.set_kill_handle(pid, &ownership_id);
             }
         }
-        // kata b8ke Task 3: the spawn's partial runtime for the watchdog.
-        let sidecar_pid = child.id();
-        // b8ke delta round-2 F2: the start's watchdog machinery — the
-        // direct-pid cancellation (the child exists: the watchdog's cancel
-        // SIGTERMs it; the start's own gates tear down and unwind) + the
-        // settle guard held to this handler's end (the watchdog's bounded
-        // settle treats its firing as the operation's confirmed death).
-        let _start_cancellation = crate::ownership_lane::register_start_cancellation_for_ticket(
-            &self.ownership,
-            PROVIDER,
-            session_id,
-            &own_ticket,
-            crate::ownership_lane::sidecar_pid_cancellation(
-                sidecar_pid,
-                crate::session_lease::recorded_start_time(sidecar_pid),
-            ),
-        );
-        crate::ownership_lane::register_partial_fresh_runtime(
-            &self.ownership,
-            PROVIDER,
-            session_id,
-            &own_ticket,
-            session_id,
-            sidecar_pid,
-        );
+        // kata b8ke Task 3 + episode-2 round-2 F4: the watchdog machinery
+        // registered at the claim (the top of this branch) and the spawn
+        // hook armed the slot + the partial's real pid — the delta-r2 late
+        // registration here is superseded (a re-registration would only
+        // replace the slot closure with a same-pid direct one and orphan
+        // the first settle guard's receiver).
 
         // `toCodexResumeInput` (adapter.ts:151-162): forward only settings this process
         // actually has recorded for the thread. An empty `model` means `handle_send` never
@@ -4715,6 +4829,33 @@ impl FreshCodexState {
         ),
         String,
     > {
+        self.spawn_sidecar_notifying(cwd, None).await
+    }
+
+    /// b8ke focused episode-2 round-2 F4: [`Self::spawn_sidecar`] with an
+    /// on-spawned hook — invoked with the child's pid the moment the
+    /// process exists, BEFORE the (up-to-45s) health-connect window. The
+    /// claim-then-spawn lifecycle paths (create-resume, fork, attach)
+    /// register their watchdog machinery at the CLAIM — cancellation +
+    /// settle + the slot-armed partial runtime — and the hook arms the
+    /// evidence the watchdog needs DURING the window: the cancellation
+    /// slot (the watchdog's kill lands on the mid-startup sidecar) and
+    /// the partial-runtime re-registration with the REAL pid. A slow
+    /// startup swept at 30s is then cancellable-and-confirmable, never a
+    /// registration-ignored StaleStart fence.
+    async fn spawn_sidecar_notifying(
+        &self,
+        cwd: Option<&str>,
+        on_spawned: Option<&(dyn Fn(u32) + Send + Sync)>,
+    ) -> Result<
+        (
+            Arc<CodexAppServerClient>,
+            tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
+            String,
+            tokio::process::Child,
+        ),
+        String,
+    > {
         use std::process::Stdio;
 
         let port = allocate_loopback_port()?;
@@ -4766,6 +4907,11 @@ impl FreshCodexState {
         if let Some(pid) = child.id() {
             crate::codex_sidecar_tracking::record_spawned_sidecar(&ownership_id, pid, &ws_url)
                 .await;
+            // b8ke focused episode-2 round-2 F4: arm the watchdog's
+            // mid-startup evidence the instant the child exists.
+            if let Some(on_spawned) = on_spawned {
+                on_spawned(pid);
+            }
         }
 
         let deadline = Instant::now() + SIDECAR_START_BUDGET;
@@ -5445,13 +5591,61 @@ impl FreshCodexState {
             }
         }
 
+        // b8ke focused episode-2 round-2 F4: the claim exists — the
+        // watchdog machinery registers NOW, before the spawn (up to 45s) +
+        // `thread/resume` awaits: cancellation slot + settle guard (held to
+        // THIS handler's unwind) + the partial runtime (pid None until the
+        // spawn hook arms the real identity). The delta-r2 late
+        // registration after the spawn left a 30s sweep during a slow
+        // startup fenced with nothing registered.
+        let ws_attach_start_pid_slot = crate::ownership_lane::sidecar_pid_cancel_slot();
+        let _ws_attach_start_cancellation =
+            crate::ownership_lane::register_start_cancellation_for_ticket(
+                &self.ownership,
+                PROVIDER,
+                thread_id,
+                &own_ticket,
+                crate::ownership_lane::pid_slot_cancellation(&ws_attach_start_pid_slot),
+            );
+        crate::ownership_lane::register_partial_fresh_runtime(
+            &self.ownership,
+            PROVIDER,
+            thread_id,
+            &own_ticket,
+            thread_id,
+            None,
+        );
+
         // Round 4 (focused-ep5-r3 Finding 1): the claim's dead-state
         // SNAPSHOT — taken at claim start, after the lease and before the
         // sidecar spawn + `thread/resume` await — so a kill landing while
         // this resume is in flight advances the durable tombstone past it
         // and the commit below REFUSES instead of undoing the newer close.
         let claim_dead_state = self.claim_dead_state_snapshot(thread_id);
-        let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd).await {
+        // F4: the spawn hook arms the mid-startup evidence the moment the
+        // child exists.
+        let ws_attach_spawn_slot = Arc::clone(&ws_attach_start_pid_slot);
+        let ws_attach_spawn_state = self.clone();
+        let ws_attach_spawn_session = thread_id.to_string();
+        let (ws_attach_spawn_op, ws_attach_spawn_gen) = match own_ticket.as_ref() {
+            Some(ticket) => (ticket.operation_id().to_string(), ticket.generation()),
+            None => (String::new(), 0),
+        };
+        let ws_attach_on_spawned = move |pid: u32| {
+            crate::ownership_lane::arm_sidecar_pid_slot(&ws_attach_spawn_slot, Some(pid));
+            if !ws_attach_spawn_op.is_empty() {
+                ws_attach_spawn_state.rearm_start_evidence(
+                    &ws_attach_spawn_session,
+                    &ws_attach_spawn_op,
+                    ws_attach_spawn_gen,
+                    Some(pid),
+                );
+            }
+        };
+        let (client, notifs, ownership_id, child) = match self
+            .spawn_sidecar_notifying(cwd, Some(&ws_attach_on_spawned))
+            .await
+        {
             Ok(parts) => parts,
             Err(err) => {
                 if let Some(mut g) = lease_guard.take() {
@@ -5466,33 +5660,13 @@ impl FreshCodexState {
                 g.set_kill_handle(pid, &ownership_id);
             }
         }
-        // kata b8ke Task 3: register the spawn's partial runtime (the
-        // watchdog's reap target) the moment the child exists — before the
-        // commit.
+        // kata b8ke Task 3 + episode-2 round-2 F4: the partial runtime's real
+        // pid was armed by the spawn hook (the slot + the rearm); the
+        // cancellation + settle registered at the claim cover this
+        // handler's whole unwind — the delta-r2 late registration here is
+        // superseded. The child's pid stays captured for the commit's
+        // owner identity below.
         let sidecar_pid = child.id();
-        // b8ke delta round-2 F2: the start's watchdog machinery — the
-        // direct-pid cancellation (the child exists: the watchdog's cancel
-        // SIGTERMs it; the start's own gates tear down and unwind) + the
-        // settle guard held to this handler's end (the watchdog's bounded
-        // settle treats its firing as the operation's confirmed death).
-        let _start_cancellation = crate::ownership_lane::register_start_cancellation_for_ticket(
-            &self.ownership,
-            PROVIDER,
-            thread_id,
-            &own_ticket,
-            crate::ownership_lane::sidecar_pid_cancellation(
-                sidecar_pid,
-                crate::session_lease::recorded_start_time(sidecar_pid),
-            ),
-        );
-        crate::ownership_lane::register_partial_fresh_runtime(
-            &self.ownership,
-            PROVIDER,
-            thread_id,
-            &own_ticket,
-            thread_id,
-            sidecar_pid,
-        );
 
         // P1.13 (Task 5, R3): recover this thread's recorded settings snapshot BEFORE
         // issuing `thread/resume`, gated per V7/A10.
@@ -16854,6 +17028,140 @@ pub(crate) mod tests {
             frame["sessionId"], thread_id,
             "the post-recovery snapshot must carry the SAME thread id"
         );
+    }
+
+    /// b8ke focused episode-2 round-2 F4: the watchdog machinery registers
+    /// BEFORE the long awaits. The claim exists the moment the create-with-
+    /// resume enters `handle_create_resume`; the delta-r2 ordering registered
+    /// cancellation/settle/partial only AFTER `spawn_sidecar` (45s budget)
+    /// and `thread/resume` — a slow startup swept at 30s recovered a record
+    /// with NOTHING registered (a healthy start became a registration-
+    /// ignored StaleStart fence). The red/green: a REAL fake-app-server
+    /// create-with-resume with `thread/resume` parked mid-RPC; the sweep
+    /// DURING the RPC must recover a record carrying the cancellation, the
+    /// settle, AND the partial runtime with the REAL spawned pid.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slow_resume_startup_is_watchdog_evidenced_during_the_await() {
+        let _guard = ENV_LOCK.lock().await;
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+
+        // First create a REAL session (thread/start), then crash it — no:
+        // for the resume lane we need a REAL durable id that a create-with-
+        // resume can claim. Use the real fake to mint one, then hand-kill.
+        configure_fake_codex_cmd(r#"{"delayMethodsMs": {}}"#);
+        let durable = create_real_fake_session(&st, &mut rx).await;
+        // Kill + remove the live session so a create-with-resume on the
+        // durable id runs the resume lane end-to-end (the fake answers).
+        let map_key = {
+            let sessions = st.sessions.lock().await;
+            sessions
+                .keys()
+                .next()
+                .cloned()
+                .expect("the live session's map key")
+        };
+        st.handle_kill(freshell_protocol::FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: map_key.clone(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Park `thread/resume` mid-RPC: the create-with-resume below enters
+        // handle_create_resume, claims, spawns, and blocks inside the RPC.
+        configure_fake_codex_cmd(
+            &json!({ "delayMethodsMs": { "thread/resume": 4000 } }).to_string(),
+        );
+        let st2 = st.clone();
+        let dur2 = durable.clone();
+        let create_task = tokio::spawn(async move {
+            st2.handle_create(
+                FreshAgentCreate {
+                    observed_epoch: None,
+                    observed_generation: None,
+                    request_id: "req-e2r2-f4".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    provider: Some(freshell_protocol::AgentProvider::Codex),
+                    cwd: None,
+                    legacy_restore_context: None,
+                    resume_session_id: Some(dur2),
+                    session_ref: None,
+                    model: None,
+                    model_selection: None,
+                    permission_mode: None,
+                    sandbox: None,
+                    effort: None,
+                    plugins: None,
+                    tab_id: None,
+                },
+                None,
+            )
+            .await;
+        });
+
+        // Wait until the claim exists (the registry shows Starting under the
+        // durable id), then sweep — the RPC is still parked (4s delay).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if matches!(
+                registry.observe("codex", &durable).state,
+                freshell_ownership::OwnershipState::Starting { .. }
+            ) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the resume lane's claim never entered Starting"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        // Let the parked RPC be genuinely mid-flight.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        // THE e2r2 F4 red/green: the sweep DURING the await recovers a
+        // record carrying the machinery (pre-fix: cancellation + settle +
+        // partial were all unregistered — nothing for the watchdog to use).
+        let recs = registry.recover_stale_starts(0, 0);
+        let rec = recs
+            .into_iter()
+            .find(|rec| rec.session_id == durable)
+            .expect("the mid-RPC start is recovered by the sweep");
+        assert!(
+            rec.cancellation.is_some(),
+            "the cancellation registered BEFORE the long awaits (pre-fix: None)"
+        );
+        assert!(
+            rec.settle.is_some(),
+            "the settle registered BEFORE the long awaits (pre-fix: None)"
+        );
+        let partial_pid = rec
+            .partial_runtime
+            .as_ref()
+            .and_then(|partial| partial.pid)
+            .expect("the partial runtime registered with the REAL spawned pid (pre-fix: None)");
+        // The recorded pid is a REAL live process (the sidecar mid-startup).
+        assert!(
+            crate::session_lease::proc_starttime(partial_pid as i32).is_some(),
+            "the recorded partial pid is the live mid-startup sidecar"
+        );
+
+        // Cleanup: let the create finish and tear the session down.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(15), create_task).await;
+        st.handle_kill(freshell_protocol::FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: map_key,
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
     }
 
     /// FIX-2: a `freshAgent.send` and a `freshAgent.attach` racing on the SAME crashed
