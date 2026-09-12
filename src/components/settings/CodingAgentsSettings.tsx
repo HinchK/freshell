@@ -153,24 +153,30 @@ export default function CodingAgentsSettings({
       </SettingsSection>
       <SettingsSection
         title="Fresh agent display"
-        description="What fresh-agent panes show by default"
+        description="Whether fresh-agent panes start with thinking and tool details expanded"
       >
-        <SettingsRow label="Show thinking">
+        <SettingsRow
+          label="Expand thinking"
+          description="Thinking is always shown compact; this sets whether it starts expanded. In-pane expand/collapse is temporary and never saved."
+        >
           <Toggle
-            checked={settings.freshAgent?.showThinking ?? true}
+            checked={settings.freshAgent?.expandThinking ?? false}
             onChange={(checked) => {
-              applyLocalSetting({ freshAgent: { showThinking: checked } })
+              applyLocalSetting({ freshAgent: { expandThinking: checked } })
             }}
-            aria-label="Show thinking"
+            aria-label="Expand thinking"
           />
         </SettingsRow>
-        <SettingsRow label="Show tools">
+        <SettingsRow
+          label="Expand tools"
+          description="Tool activity is always shown compact; this sets whether it starts expanded. In-pane expand/collapse is temporary and never saved."
+        >
           <Toggle
-            checked={settings.freshAgent?.showTools ?? true}
+            checked={settings.freshAgent?.expandTools ?? false}
             onChange={(checked) => {
-              applyLocalSetting({ freshAgent: { showTools: checked } })
+              applyLocalSetting({ freshAgent: { expandTools: checked } })
             }}
-            aria-label="Show tools"
+            aria-label="Expand tools"
           />
         </SettingsRow>
       </SettingsSection>
