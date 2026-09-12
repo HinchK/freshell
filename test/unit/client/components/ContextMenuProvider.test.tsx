@@ -1072,14 +1072,9 @@ describe('ContextMenuProvider', () => {
     await user.pointer({ target: screen.getByText('Terminal body'), keys: '[MouseRight]' })
     await user.click(await screen.findByRole('menuitem', { name: 'Reopen as freshclaude' }))
 
-    await waitFor(() => {
-      expect(apiMocks.setSessionMetadata).toHaveBeenCalledWith(
-        'claude',
-        VALID_SESSION_ID,
-        'freshclaude',
-        { sessionTypeSource: 'explicit' },
-      )
-    })
+    // b8ke e3r1 F4: the client NEVER POSTs the durable flavor — the
+    // server's handoff commit writes it atomically.
+    expect(apiMocks.setSessionMetadata).not.toHaveBeenCalled()
 
     // kata b8ke: the kill-and-replace sequence is now ONE atomic server-side
     // handoff — the replacement conversation starts under the server's
@@ -1167,14 +1162,9 @@ describe('ContextMenuProvider', () => {
     await user.pointer({ target: screen.getByText('FreshAgent body'), keys: '[MouseRight]' })
     await user.click(await screen.findByRole('menuitem', { name: 'Reopen as Claude CLI' }))
 
-    await waitFor(() => {
-      expect(apiMocks.setSessionMetadata).toHaveBeenCalledWith(
-        'claude',
-        VALID_SESSION_ID,
-        'claude',
-        { sessionTypeSource: 'explicit' },
-      )
-    })
+    // b8ke e3r1 F4: the client NEVER POSTs the durable flavor — the
+    // server's handoff commit writes it atomically.
+    expect(apiMocks.setSessionMetadata).not.toHaveBeenCalled()
     await waitFor(() => {
       expect(apiMocks.requestSessionHandoff).toHaveBeenCalledWith(expect.objectContaining({
         provider: 'claude',
@@ -1260,14 +1250,9 @@ describe('ContextMenuProvider', () => {
     await user.pointer({ target: screen.getByText('FreshCodex transcript body'), keys: '[MouseRight]' })
     await user.click(await screen.findByRole('menuitem', { name: 'Reopen as Codex CLI' }))
 
-    await waitFor(() => {
-      expect(apiMocks.setSessionMetadata).toHaveBeenCalledWith(
-        'codex',
-        CODEX_THREAD_ID,
-        'codex',
-        { sessionTypeSource: 'explicit' },
-      )
-    })
+    // b8ke e3r1 F4: the client NEVER POSTs the durable flavor — the
+    // server's handoff commit writes it atomically.
+    expect(apiMocks.setSessionMetadata).not.toHaveBeenCalled()
     await waitFor(() => {
       expect(apiMocks.requestSessionHandoff).toHaveBeenCalledWith(expect.objectContaining({
         provider: 'codex',
@@ -1357,14 +1342,9 @@ describe('ContextMenuProvider', () => {
     await user.pointer({ target: screen.getByText('FreshOpenCode transcript body'), keys: '[MouseRight]' })
     await user.click(await screen.findByRole('menuitem', { name: 'Reopen as OpenCode CLI' }))
 
-    await waitFor(() => {
-      expect(apiMocks.setSessionMetadata).toHaveBeenCalledWith(
-        'opencode',
-        OPENCODE_SESSION_ID,
-        'opencode',
-        { sessionTypeSource: 'explicit' },
-      )
-    })
+    // b8ke e3r1 F4: the client NEVER POSTs the durable flavor — the
+    // server's handoff commit writes it atomically.
+    expect(apiMocks.setSessionMetadata).not.toHaveBeenCalled()
     await waitFor(() => {
       expect(apiMocks.requestSessionHandoff).toHaveBeenCalledWith(expect.objectContaining({
         provider: 'opencode',
@@ -1542,7 +1522,12 @@ describe('ContextMenuProvider', () => {
     })
   })
 
-  it('a successful reopen writes the durable session metadata AFTER the handoff commit (the atomic transition)', async () => {
+  // b8ke e3r1 F4: the durable flavor write is SERVER-ATOMIC — the
+  // handoff commit records the flavor inside the server's transition.
+  // The client performs NO metadata POST on success (pre-e3r1 it POSTed
+  // a separate unversioned write that two devices could deliver out of
+  // order, and its failure was log-only success).
+  it('a successful reopen performs NO client metadata POST (the server commits the flavor atomically)', async () => {
     const user = userEvent.setup()
     const store = createTestStore()
     store.dispatch(initLayout({
@@ -1553,7 +1538,7 @@ describe('ContextMenuProvider', () => {
         provider: 'codex',
         sessionType: 'freshcodex',
         status: 'idle',
-        createRequestId: 'req-f3-ok',
+        createRequestId: 'req-e3r1-f4',
         sessionRef: {
           provider: 'codex',
           sessionId: CODEX_THREAD_ID,
@@ -1576,33 +1561,28 @@ describe('ContextMenuProvider', () => {
             data-provider="codex"
             data-session-type="freshcodex"
           >
-            <div data-context="fresh-agent-transcript">FreshCodex success-path body</div>
+            <div data-context="fresh-agent-transcript">FreshCodex server-atomic body</div>
           </div>
         </ContextMenuProvider>
       </Provider>,
     )
 
-    await user.pointer({ target: screen.getByText('FreshCodex success-path body'), keys: '[MouseRight]' })
+    await user.pointer({ target: screen.getByText('FreshCodex server-atomic body'), keys: '[MouseRight]' })
     await user.click(await screen.findByRole('menuitem', { name: 'Reopen as Codex CLI' }))
 
-    // The handoff commits, THEN the durable flavor write lands (the
-    // atomic transition's home — the write order is asserted by the
-    // invocation sequence).
+    // The handoff commits and the pane folds ...
     await waitFor(() => {
-      expect(apiMocks.setSessionMetadata).toHaveBeenCalledTimes(1)
+      expect(apiMocks.requestSessionHandoff).toHaveBeenCalledTimes(1)
     })
-    expect(apiMocks.setSessionMetadata).toHaveBeenCalledWith(
-      'codex',
-      CODEX_THREAD_ID,
-      'codex',
-      { sessionTypeSource: 'explicit' },
-    )
     await waitFor(() => {
       expect(store.getState().panes.layouts['tab-1']).toMatchObject({
         type: 'leaf',
         content: { kind: 'terminal', terminalId: 't-default' },
       })
     })
+    // ... and the client NEVER writes the durable flavor — the server's
+    // commit owns it (the unversioned cross-device POST is gone).
+    expect(apiMocks.setSessionMetadata).not.toHaveBeenCalled()
   })
 
   it('sessionRef-only freshcodex pane reopens as CLI via one awaited handoff using sessionRef.sessionId', async () => {
@@ -1839,14 +1819,9 @@ describe('ContextMenuProvider', () => {
 
     // The metadata leg records KILROY — the runtime-kind change must not
     // orphan the flavor (round-2 review R2-10), never 'claude'.
-    await waitFor(() => {
-      expect(apiMocks.setSessionMetadata).toHaveBeenCalledWith(
-        'claude',
-        VALID_SESSION_ID,
-        'kilroy',
-        { sessionTypeSource: 'explicit' },
-      )
-    })
+    // b8ke e3r1 F4: the client NEVER POSTs the durable flavor — the
+    // server's handoff commit writes it atomically (kilroy included).
+    expect(apiMocks.setSessionMetadata).not.toHaveBeenCalled()
 
     await waitFor(() => {
       expect(store.getState().panes.layouts['tab-1']).toMatchObject({
@@ -2058,95 +2033,6 @@ describe('ContextMenuProvider', () => {
     }
   })
 
-  // b8ke delta round-3 F3: the durable metadata write follows the atomic
-  // handoff — a POST-SUCCESS write failure cannot undo the committed
-  // runtime switch (the local fold + the server's owner broadcasts are
-  // authoritative); it logs. Pre-d3 the write preceded the request and a
-  // failure aborted the reopen keeping the pane untouched — the reviewer's
-  // finding: on every failure path the durable flavor kept identifying
-  // the live owner, which the pre-write violated.
-  it('a post-success metadata write failure logs but does not undo the committed handoff', async () => {
-    const user = userEvent.setup()
-    const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
-    apiMocks.setSessionMetadata.mockRejectedValueOnce(new Error('persist failed'))
-    apiMocks.requestSessionHandoff.mockResolvedValueOnce({
-      ok: true,
-      operationId: 'handoff-persist-fail',
-      generation: 2,
-      owner: { kind: 'fresh-agent', sessionId: VALID_SESSION_ID, sessionType: 'freshclaude', provider: 'claude' },
-    })
-    const store = createTestStore()
-    store.dispatch(initLayout({
-      tabId: 'tab-1',
-      paneId: 'pane-1',
-      content: {
-        kind: 'terminal',
-        mode: 'claude',
-        status: 'running',
-        terminalId: 'term-1',
-        sessionRef: {
-          provider: 'claude',
-          sessionId: VALID_SESSION_ID,
-        },
-        initialCwd: '/test/project',
-      },
-    }))
-
-    try {
-      render(
-        <Provider store={store}>
-          <ContextMenuProvider
-            view="terminal"
-            onViewChange={() => {}}
-            onToggleSidebar={() => {}}
-            sidebarCollapsed={false}
-          >
-            <div
-              data-context={ContextIds.Terminal}
-              data-tab-id="tab-1"
-              data-pane-id="pane-1"
-            >
-              Terminal body
-            </div>
-          </ContextMenuProvider>
-        </Provider>
-      )
-
-      await user.pointer({ target: screen.getByText('Terminal body'), keys: '[MouseRight]' })
-      await user.click(await screen.findByRole('menuitem', { name: 'Reopen as freshclaude' }))
-
-      // The handoff commits (the server switched the runtime) ...
-      await waitFor(() => {
-        expect(apiMocks.requestSessionHandoff).toHaveBeenCalledTimes(1)
-      })
-      // ... THEN the durable write lands and fails (warn-only) ...
-      await waitFor(() => {
-        expect(apiMocks.setSessionMetadata).toHaveBeenCalledWith(
-          'claude',
-          VALID_SESSION_ID,
-          'freshclaude',
-          { sessionTypeSource: 'explicit' },
-        )
-      })
-      await waitFor(() => {
-        expect(consoleWarnSpy).toHaveBeenCalled()
-      })
-
-      expect(wsMocks.send).not.toHaveBeenCalled()
-      // ... and the pane DID fold to the committed owner — the runtime
-      // switch is authoritative, a flavor-write failure cannot undo it.
-      await waitFor(() => {
-        expect(store.getState().panes.layouts['tab-1']).toMatchObject({
-          type: 'leaf',
-          content: {
-            kind: 'fresh-agent',
-          },
-        })
-      })
-    } finally {
-      consoleWarnSpy.mockRestore()
-    }
-  })
 
   // b8ke delta round-3 F3: the pane-race guard now spans the HANDOFF
   // REQUEST (the pre-d3 shape raced the metadata write). A pane that

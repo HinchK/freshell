@@ -1,7 +1,7 @@
 import type { AppStore } from '@/store/store'
 import { updateTab } from '@/store/tabsSlice'
 import { updatePaneContent, setPaneHandoffError } from '@/store/panesSlice'
-import { requestSessionHandoff, setSessionMetadata, type SessionHandoffResult } from '@/lib/api'
+import { requestSessionHandoff, type SessionHandoffResult } from '@/lib/api'
 import { buildResumeContent, buildTerminalAttachContent } from '@/lib/session-type-utils'
 import { findPaneContent } from '@/lib/pane-utils'
 import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
@@ -258,26 +258,8 @@ export async function runPaneSessionHandoff(
       tabId,
       paneId,
     })
-    // The durable flavor write still records what is NOW true (the
-    // server committed the new owner) — see below.
-    try {
-      await setSessionMetadata(
-        latest.target.provider,
-        latest.target.sessionId,
-        latest.target.metadataSessionType,
-        { sessionTypeSource: 'explicit' },
-      )
-    } catch (err) {
-      log.warn({
-        event: 'reopen_session_flavor_metadata_persist_failed',
-        provider: latest.target.provider,
-        sessionId: latest.target.sessionId,
-        targetSessionType: latest.target.targetSessionType,
-        tabId,
-        paneId,
-        err,
-      })
-    }
+    // The durable flavor write happened SERVER-SIDE inside the handoff
+    // commit (e3r1 F4) — nothing for the client to write here.
     return true
   }
 
@@ -313,29 +295,12 @@ export async function runPaneSessionHandoff(
       updates: { sessionMetadataByKey },
     }))
   }
-  // F3: the durable flavor write — INSIDE the atomic transition (the
-  // server committed the new owner; this records what now IS true).
-  // Flavor-preserving (kilroy keeps recording itself — the runtime-kind
-  // change must not orphan the flavor). A post-success write failure
-  // cannot fail the handoff itself (the runtime IS switched; the local
-  // fold + the server's owner broadcasts are authoritative) — it logs.
-  try {
-    await setSessionMetadata(
-      latest.target.provider,
-      latest.target.sessionId,
-      latest.target.metadataSessionType,
-      { sessionTypeSource: 'explicit' },
-    )
-  } catch (err) {
-    log.warn({
-      event: 'reopen_session_flavor_metadata_persist_failed',
-      provider: latest.target.provider,
-      sessionId: latest.target.sessionId,
-      targetSessionType: latest.target.targetSessionType,
-      tabId,
-      paneId,
-      err,
-    })
-  }
+  // b8ke e3r1 F4: the durable flavor write is SERVER-ATOMIC — the
+  // handoff commit records the target's flavor inside the server's
+  // transition (single-server-ordered; cross-device out-of-order
+  // delivery is impossible by construction). The client's separate
+  // unversioned POST is GONE (pre-e3r1: two devices could deliver the
+  // metadata POSTs out of order and an earlier generation's flavor
+  // overwrote the later owner; failure was log-only success).
   return true
 }
