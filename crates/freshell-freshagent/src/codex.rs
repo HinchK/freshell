@@ -1418,7 +1418,10 @@ impl FreshCodexState {
             PROVIDER,
             &thread_id,
             &own_ticket,
-            crate::ownership_lane::sidecar_pid_cancellation(sidecar_pid),
+            crate::ownership_lane::sidecar_pid_cancellation(
+                sidecar_pid,
+                crate::session_lease::recorded_start_time(sidecar_pid),
+            ),
         );
         crate::ownership_lane::register_partial_fresh_runtime(
             &self.ownership,
@@ -1659,7 +1662,10 @@ impl FreshCodexState {
             PROVIDER,
             &thread_id,
             &own_ticket,
-            crate::ownership_lane::sidecar_pid_cancellation(sidecar_pid),
+            crate::ownership_lane::sidecar_pid_cancellation(
+                sidecar_pid,
+                crate::session_lease::recorded_start_time(sidecar_pid),
+            ),
         );
         crate::ownership_lane::register_partial_fresh_runtime(
             &self.ownership,
@@ -3277,7 +3283,10 @@ impl FreshCodexState {
             PROVIDER,
             &child_id,
             &own_ticket,
-            crate::ownership_lane::sidecar_pid_cancellation(child_pid),
+            crate::ownership_lane::sidecar_pid_cancellation(
+                child_pid,
+                crate::session_lease::recorded_start_time(child_pid),
+            ),
         );
         crate::ownership_lane::register_partial_fresh_runtime(
             &self.ownership,
@@ -4122,7 +4131,10 @@ impl FreshCodexState {
             PROVIDER,
             session_id,
             &own_ticket,
-            crate::ownership_lane::sidecar_pid_cancellation(sidecar_pid),
+            crate::ownership_lane::sidecar_pid_cancellation(
+                sidecar_pid,
+                crate::session_lease::recorded_start_time(sidecar_pid),
+            ),
         );
         crate::ownership_lane::register_partial_fresh_runtime(
             &self.ownership,
@@ -4508,7 +4520,10 @@ impl FreshCodexState {
             PROVIDER,
             &new_thread_id,
             &own_ticket,
-            crate::ownership_lane::sidecar_pid_cancellation(sidecar_pid),
+            crate::ownership_lane::sidecar_pid_cancellation(
+                sidecar_pid,
+                crate::session_lease::recorded_start_time(sidecar_pid),
+            ),
         );
         crate::ownership_lane::register_partial_fresh_runtime(
             &self.ownership,
@@ -5465,7 +5480,10 @@ impl FreshCodexState {
             PROVIDER,
             thread_id,
             &own_ticket,
-            crate::ownership_lane::sidecar_pid_cancellation(sidecar_pid),
+            crate::ownership_lane::sidecar_pid_cancellation(
+                sidecar_pid,
+                crate::session_lease::recorded_start_time(sidecar_pid),
+            ),
         );
         crate::ownership_lane::register_partial_fresh_runtime(
             &self.ownership,

@@ -266,3 +266,96 @@ fn fresh_agent_fail_reopens_the_key() {
         claim_fresh_agent_ownership(&registry, "opencode", "ses-3", "op-4", None, "test", 2);
     assert!(matches!(retry, BeginOutcome::Granted { .. }));
 }
+
+/// b8ke focused episode-2 round-1 F6: the start-cancellation slot signals
+/// ONLY through the recorded-incarnation path. The slot records (pid, start
+/// time) at spawn; a forged MISMATCHED start time models the recycled-pid
+/// shape (the original exited; an unrelated process took the id within the
+/// watchdog's sweep window) — the cancellation must NEVER signal it.
+/// Pre-fix the closure SIGTERMed the bare numeric pid and the unrelated
+/// process died.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_start_cancellation_slot_never_signals_a_recycled_pid() {
+    // A live "unrelated replacement" process.
+    let mut unrelated = tokio::process::Command::new("sleep")
+        .arg("300")
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn the unrelated replacement");
+    let pid = unrelated.id().expect("unrelated pid");
+
+    // The slot armed with the ORIGINAL (dead) incarnation's identity — the
+    // start time forged to differ, the pid-reuse shape.
+    let slot = crate::ownership_lane::sidecar_pid_cancel_slot();
+    crate::ownership_lane::arm_sidecar_pid_slot(&slot, Some(pid));
+    {
+        let mut armed = slot.lock().expect("slot lock");
+        let (recorded_pid, _) = armed.expect("the slot armed");
+        assert_eq!(recorded_pid, pid);
+        // Forge the mismatch: the pid now belongs to a different
+        // incarnation than the one the slot recorded.
+        *armed = Some((
+            pid,
+            crate::session_lease::recorded_start_time(Some(pid)).map(|st| st + 1),
+        ));
+    }
+    (crate::ownership_lane::pid_slot_cancellation(&slot))();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        crate::session_lease::proc_starttime(pid as i32).is_some(),
+        "the recycled pid's unrelated process must NEVER be signaled by the \
+         start cancellation"
+    );
+
+    // The matching-incarnation control: the recorded identity still holds
+    // — the cancellation signals and the process dies.
+    crate::ownership_lane::arm_sidecar_pid_slot(&slot, Some(pid));
+    (crate::ownership_lane::pid_slot_cancellation(&slot))();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while crate::session_lease::proc_starttime(pid as i32).is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the recorded incarnation was never signaled"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let _ = unrelated.wait().await;
+}
+
+/// F6 (the post-spawn direct variant): a mismatched recorded incarnation
+/// never signals; the matching one does.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_start_cancellation_direct_variant_verifies_the_incarnation() {
+    let mut child = tokio::process::Command::new("sleep")
+        .arg("300")
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn the child");
+    let pid = child.id().expect("child pid");
+    let start = crate::session_lease::recorded_start_time(Some(pid));
+
+    // The recycled shape: the recorded start time does not match the pid's
+    // current occupant — never signaled.
+    let wrong = crate::ownership_lane::sidecar_pid_cancellation(Some(pid), start.map(|st| st + 1));
+    wrong();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        crate::session_lease::proc_starttime(pid as i32).is_some(),
+        "the mismatched incarnation must never be signaled"
+    );
+
+    // The matching control.
+    let right = crate::ownership_lane::sidecar_pid_cancellation(Some(pid), start);
+    right();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while crate::session_lease::proc_starttime(pid as i32).is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the matching incarnation was never signaled"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let _ = child.wait().await;
+}

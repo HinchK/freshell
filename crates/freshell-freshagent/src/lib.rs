@@ -458,10 +458,12 @@ pub mod ownership_lane {
     }
 
     /// The shared sidecar-pid slot behind the fresh lanes' REAL start
-    /// cancellation ([`pid_slot_cancellation`]): the start fills it the
-    /// moment its child spawns; the cancellation closure SIGTERMs the
-    /// recorded pid.
-    pub type SidecarPidSlot = Arc<std::sync::Mutex<Option<u32>>>;
+    /// cancellation ([`pid_slot_cancellation`]): the start records the
+    /// spawned child's RECORDED INCARNATION — (pid, start time) — the
+    /// moment its child spawns; the cancellation closure signals only
+    /// through the incarnation-verified path (a recycled pid is never
+    /// signaled).
+    pub type SidecarPidSlot = Arc<std::sync::Mutex<Option<(u32, Option<u64>)>>>;
 
     /// b8ke delta round-2 F2: register a REAL lifecycle start's
     /// cancellation + settle with the coordinator's watchdog machinery.
@@ -495,42 +497,93 @@ pub mod ownership_lane {
         }
     }
 
-    /// A fresh (empty) sidecar pid slot — see [`SidecarPidSlot`].
+    /// A fresh (empty) sidecar incarnation slot — see [`SidecarPidSlot`].
     pub fn sidecar_pid_cancel_slot() -> SidecarPidSlot {
         Arc::new(std::sync::Mutex::new(None))
     }
 
+    /// Record a spawned child's RECORDED INCARNATION into a cancellation
+    /// slot: (pid, start time) — the identity the closure verifies before
+    /// signaling (b8ke focused episode-2 round-1 F6: a bare numeric pid
+    /// could be recycled within the watchdog's sweep window; the recorded
+    /// start time is the reuse guard).
+    pub fn arm_sidecar_pid_slot(slot: &SidecarPidSlot, pid: Option<u32>) {
+        let armed = pid
+            .filter(|p| *p != 0)
+            .map(|p| (p, crate::session_lease::recorded_start_time(Some(p))));
+        *slot.lock().expect("sidecar pid cancel slot lock") = armed;
+    }
+
     /// The fresh lanes' REAL start cancellation: SIGTERM the spawned
-    /// sidecar's pid — the start's own awaits then fail through their
-    /// existing teardown gates and the operation unwinds (its settle
-    /// fires). A no-op before the child spawns (nothing to cancel).
+    /// sidecar — ONLY through the incarnation-verified signal path (the
+    /// r5 `signal_recorded_incarnation` discipline: the pidfd-pinned
+    /// verify-then-send — a recycled pid never receives the signal).
+    /// The start's own awaits then fail through its existing teardown
+    /// gates and the operation unwinds (its settle fires). A no-op
+    /// before the child spawns (nothing to cancel).
+    #[cfg(target_os = "linux")]
     pub fn pid_slot_cancellation(slot: &SidecarPidSlot) -> Arc<dyn Fn() + Send + Sync> {
         let slot = Arc::clone(slot);
         Arc::new(move || {
-            if let Some(pid) = *slot.lock().expect("sidecar pid cancel slot lock") {
+            if let Some((pid, start_time)) = *slot.lock().expect("sidecar pid cancel slot lock") {
                 tracing::warn!(target: "freshell_ownership", pid,
                     event = "ownership.start.cancel_signal",
-                    "the watchdog's start cancellation SIGTERMs the spawned sidecar pid");
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGTERM);
-                }
+                    "the watchdog's start cancellation signals the recorded sidecar \
+                     incarnation (pidfd-pinned, start-time verified)");
+                crate::session_lease::signal_recorded_incarnation(pid, start_time, libc::SIGTERM);
             }
         })
     }
 
+    /// Non-Linux (b8ke focused episode-2 round-1 F5): no identity-safe
+    /// signal path exists without `/proc` — the cancellation is
+    /// unconfirmable by construction and NEVER signals. The fail-closed
+    /// watchdog treats the start as unconfirmed (the typed StaleStart
+    /// fence), exactly like the rest of this crate's platform-limited
+    /// teardown.
+    #[cfg(not(target_os = "linux"))]
+    pub fn pid_slot_cancellation(_slot: &SidecarPidSlot) -> Arc<dyn Fn() + Send + Sync> {
+        Arc::new(|| {
+            tracing::warn!(target: "freshell_ownership",
+                event = "ownership.start.cancel_signal_platform_limited",
+                "this platform cannot verify a sidecar incarnation — the start \
+                 cancellation signals nothing (fail-closed)");
+        })
+    }
+
     /// The post-spawn variant of [`pid_slot_cancellation`]: the claim was
-    /// taken AFTER the child existed, so the cancellation carries the pid
-    /// directly (no slot needed).
-    pub fn sidecar_pid_cancellation(pid: Option<u32>) -> Arc<dyn Fn() + Send + Sync> {
+    /// taken AFTER the child existed, so the cancellation carries the
+    /// recorded incarnation (pid + start time) directly (no slot needed).
+    /// Signals only through the incarnation-verified path (F6).
+    #[cfg(target_os = "linux")]
+    pub fn sidecar_pid_cancellation(
+        pid: Option<u32>,
+        start_time: Option<u64>,
+    ) -> Arc<dyn Fn() + Send + Sync> {
         Arc::new(move || {
             if let Some(pid) = pid {
                 tracing::warn!(target: "freshell_ownership", pid,
                     event = "ownership.start.cancel_signal",
-                    "the watchdog's start cancellation SIGTERMs the spawned sidecar pid");
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGTERM);
-                }
+                    "the watchdog's start cancellation signals the recorded sidecar \
+                     incarnation (pidfd-pinned, start-time verified)");
+                crate::session_lease::signal_recorded_incarnation(pid, start_time, libc::SIGTERM);
             }
+        })
+    }
+
+    /// Non-Linux (F5): no identity-safe signal path — never signals; the
+    /// fail-closed watchdog owns the recovery.
+    #[cfg(not(target_os = "linux"))]
+    pub fn sidecar_pid_cancellation(
+        pid: Option<u32>,
+        _start_time: Option<u64>,
+    ) -> Arc<dyn Fn() + Send + Sync> {
+        let _ = pid;
+        Arc::new(|| {
+            tracing::warn!(target: "freshell_ownership",
+                event = "ownership.start.cancel_signal_platform_limited",
+                 "this platform cannot verify a sidecar incarnation — the start \
+                  cancellation signals nothing (fail-closed)");
         })
     }
 

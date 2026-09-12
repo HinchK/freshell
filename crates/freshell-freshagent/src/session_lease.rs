@@ -470,6 +470,24 @@ pub(crate) fn pid_is_recorded_incarnation(pid: u32, recorded_start: Option<u64>)
     }
 }
 
+/// b8ke focused episode-2 round-1 F5/F6: the process's recorded start time
+/// for the delayed start-cancellation machinery — the pid-reuse guard the
+/// cancellation signals verify against. `None` when the pid is absent or
+/// (non-Linux) the platform cannot read it: the cancellation then carries
+/// no confirmable identity and never signals (the fail-closed watchdog
+/// treats it as unconfirmed).
+#[cfg(target_os = "linux")]
+pub(crate) fn recorded_start_time(pid: Option<u32>) -> Option<u64> {
+    pid.and_then(|p| proc_starttime(p as i32))
+}
+
+/// Non-Linux: no `/proc` — no identity can be recorded; the cancellation
+/// is unconfirmable by construction and never signals.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn recorded_start_time(_pid: Option<u32>) -> Option<u64> {
+    None
+}
+
 /// b8ke focused round-4 review R4-8: the RECORDED-INCARNATION grace wait —
 /// the kill path's quiescence poll. The pid counts as gone when it is no
 /// longer the recorded incarnation: dead/zombie (`starttime` reads None)
