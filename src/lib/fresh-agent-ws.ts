@@ -317,6 +317,7 @@ export function foldReadyRuntimeOwners(
       generation: owner.generation,
       ownerKind: owner.ownerKind,
       ...(owner.terminalId !== undefined ? { terminalId: owner.terminalId } : {}),
+      ...(owner.aliasOf !== undefined ? { aliasOf: owner.aliasOf } : {}),
       operationId: 'ready-replay',
       transition: fenced
         ? 'handoff-failed'

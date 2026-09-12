@@ -323,26 +323,57 @@ async fn probe_stale_start_fences(
     fresh_opencode: &freshell_freshagent::FreshOpencodeState,
 ) {
     for fence in ownership.stale_start_fences() {
-        // b8ke focused episode-2 round-3 F7: the probe covers PID-LESS
-        // fences (the opencode production shape — no per-session pid, no
-        // settle/cancellation registered) through the KIND-AWARE liveness
-        // check: a recorded runtime with NO pid has the lane session as
-        // its only identity, so the lane's authoritative live-session map
-        // answers "is the recorded runtime still present?" — a live answer
-        // HOLDS the fence (fail closed); an absent runtime with no pid to
-        // verify is the honest positive-absence release. A fence WITH a
-        // recorded pid still requires the confirmed `/proc` death of that
-        // exact incarnation.
+        // b8ke focused episode-2 post-cap F4: the probe releases ONLY on
+        // REAL confirmed evidence — NEVER on absence. The probe runs in
+        // the SAME watchdog pass as recovery, so a fence created moments
+        // ago (the operation possibly still in flight, pre-registration)
+        // must never reopen on the mere fact that a map has no entry or a
+        // pid is gone from /proc.
+        //   • A recorded PID requires the LANE's confirmed-tree reap (the
+        //     `confirm_fenced_prior_dead` machinery: condemned-record
+        //     kill-and-confirm over the RECORDED tree, or the quiescing
+        //     teardown of a live session) — never bare /proc absence
+        //     (recover_stale_start itself refuses that evidence: a
+        //     descendant can outlive the direct pid and keep writing).
+        //   • A PID-LESS fence requires BOTH a positive kind-aware
+        //     liveness answer (the lane's authoritative session map says
+        //     the session is absent) AND the operation's registered
+        //     settle/cancellation CONCLUDED (`settle_fired == Some(true)`
+        //     — the guard dropped). A fence whose operation never armed a
+        //     registration (the pre-registration window) can NEVER prove
+        //     conclusion: it HOLDS, and the acknowledged operator
+        //     force-clear (which accepts StaleStart) is the escape.
         let confirmed_gone = match fence.prior_pid {
-            Some(pid) => freshell_freshagent::ownership_lane::partial_pid_confirmed_dead(pid),
+            Some(_pid) => match fence.provider.as_str() {
+                "codex" => {
+                    fresh_codex
+                        .confirm_fenced_prior_dead(&fence.session_id)
+                        .await
+                }
+                "claude" => {
+                    fresh_claude
+                        .confirm_fenced_prior_dead(&fence.session_id)
+                        .await
+                }
+                "opencode" => {
+                    fresh_opencode
+                        .confirm_fenced_prior_dead(&fence.session_id)
+                        .await
+                }
+                _ => false,
+            },
             None => {
-                let live = match fence.provider.as_str() {
-                    "codex" => fresh_codex.has_live_session(&fence.session_id).await,
-                    "claude" => fresh_claude.has_live_session(&fence.session_id).await,
-                    "opencode" => fresh_opencode.has_live_session(&fence.session_id).await,
-                    _ => true,
-                };
-                !live
+                if fence.settle_fired != Some(true) {
+                    false
+                } else {
+                    let live = match fence.provider.as_str() {
+                        "codex" => fresh_codex.has_live_session(&fence.session_id).await,
+                        "claude" => fresh_claude.has_live_session(&fence.session_id).await,
+                        "opencode" => fresh_opencode.has_live_session(&fence.session_id).await,
+                        _ => true,
+                    };
+                    !live
+                }
             }
         };
         if !confirmed_gone {
@@ -362,7 +393,7 @@ async fn probe_stale_start_fences(
                 pid = ?fence.prior_pid, generation = fence.generation,
                 initiator = %fence.initiator,
                 to_kind = ?fence.prior_kind,
-                probe = if fence.prior_pid.is_some() { "confirmed-pid-death" } else { "kind-aware-liveness-absent" },
+                probe = if fence.prior_pid.is_some() { "lane-confirmed-tree-reap" } else { "kind-aware-liveness-absent-and-settled" },
                 epoch = ownership.boot_epoch(),
                 outcome = ?released,
                 failure_reason = "STARTING_TIMEOUT",
@@ -4684,9 +4715,20 @@ mod stale_start_watchdog_tests {
             freshell_ownership::CommitOutcome::Committed
         ));
         assert!(matches!(
-            states_rk
-                .0
-                .rekey_live("claude", "rk-old", "rk-new", "test-rekey"),
+            states_rk.0.rekey_live(
+                "claude",
+                "rk-old",
+                "rk-new",
+                "rk-map-key",
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("rk-map-key".into()),
+                    pid: Some(4242),
+                    ownership_id: Some("rekey-op-schema".into()),
+                },
+                "test-rekey",
+            ),
             freshell_ownership::CommitOutcome::Committed
         ));
         let events_rk = sink_rk.events();
@@ -4704,29 +4746,29 @@ mod stale_start_watchdog_tests {
         }
 
         // F8: the fence-release record carries the initiator + target
-        // kind + the probe that confirmed — drive a fence and release it
-        // through the kind-aware probe's confirmed-pid path.
+        // kind + the probe that confirmed — drive a PID-LESS fence whose
+        // operation CONCLUDED (the guard dropped → settle fired) and whose
+        // lane reports no live session: the kind-aware positive answer
+        // releases it (the fail-closed contract's one honest release
+        // shape for a PID-less fence).
         let states_fr = watchdog_states();
         let sink_fr = transition_log_capture::install();
         let generation_fr = begin_stale_start(&states_fr.0, "op-fence-release-log").await;
-        let mut fr_child = tokio::process::Command::new("true")
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn the fence-release child");
-        let fr_pid = fr_child.id().expect("fr pid");
-        let _ = fr_child.wait().await;
-        states_fr.0.register_partial_runtime(
+        let own_ticket_fr = Some(freshell_ownership::OperationTicket::new(
+            Arc::clone(&states_fr.0),
             "claude",
             "sid-stale",
             "op-fence-release-log",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
             generation_fr,
-            freshell_ownership::OwnerIdentity {
-                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
-                terminal_id: None,
-                live_session_key: Some("sid-stale".into()),
-                pid: Some(fr_pid),
-                ownership_id: None,
-            },
+            "test",
+        ));
+        let guard_fr = freshell_freshagent::ownership_lane::register_start_cancellation_for_ticket(
+            &Some(Arc::clone(&states_fr.0)),
+            "claude",
+            "sid-stale",
+            &own_ticket_fr,
+            Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>,
         );
         let recs_fr = states_fr.0.recover_stale_starts(0, 0);
         assert_eq!(recs_fr.len(), 1);
@@ -4741,6 +4783,7 @@ mod stale_start_watchdog_tests {
             ),
             freshell_ownership::FenceOutcome::Fenced
         ));
+        drop(guard_fr); // the operation concluded → the settle fired
         probe_stale_start_fences(&states_fr.0, &states_fr.2, &states_fr.3, &states_fr.4).await;
         assert_eq!(
             states_fr.0.observe("claude", "sid-stale").state,
@@ -4811,20 +4854,19 @@ mod stale_start_watchdog_tests {
         let _ = live.kill().await;
     }
 
-    /// b8ke focused episode-2 round-3 F6 (the consolidated semantics): a
-    /// handler-reaped runtime with NO TREE EVIDENCE fences at recovery —
-    /// direct-pid disappearance is NEVER sufficient to confirm the WHOLE
-    /// runtime (the claude runtime includes the ownership-tagged CLI
-    /// grandchild; descendants are only signaled best-effort on several
-    /// failure paths). The real production shape: the handler unwinds
-    /// (the settle fires) after reaping its runtime, but its lease
-    /// guard's `fail()` removed the kill handle and left no condemned
-    /// record — the recovery has no tree identity to confirm and HOLDS
-    /// the fence; the revisitable probe then releases it on the later
-    /// confirmed-pid-death sweep (finding 7's recovery path).
+    /// b8ke focused episode-2 post-cap F4: a handler-reaped runtime with
+    /// NO TREE EVIDENCE fences at recovery — and the probe HOLDS it
+    /// (fail-closed). Direct-pid disappearance is NEVER sufficient
+    /// (recover_stale_start refuses it; the probe must not re-accept
+    /// the same evidence one call later), and with no condemned record
+    /// the lane's confirmed-tree confirm answers false. The fence's
+    /// escape is the acknowledged operator force-clear (which accepts
+    /// StaleStart), never the probe. Pre-fix the probe released this
+    /// exact shape on bare /proc absence — the same watchdog pass that
+    /// created the fence reopened it.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn a_reaped_runtime_with_no_tree_evidence_fences_then_heals_via_the_probe() {
+    async fn a_reaped_runtime_with_no_tree_evidence_fences_and_the_probe_holds() {
         let states = watchdog_states();
         let generation = begin_stale_start(&states.0, "op-reaped").await;
         let mut reaped = tokio::process::Command::new("true")
@@ -4888,12 +4930,18 @@ mod stale_start_watchdog_tests {
             "a reaped runtime with NO tree evidence fences at recovery — \
              direct-pid disappearance is never sufficient"
         );
+        // The probe cannot confirm either (no condemned record, no live
+        // session) — the fence HOLDS. The operator force-clear is the
+        // escape.
         probe_stale_start_fences(&states.0, &states.2, &states.3, &states.4).await;
-        assert_eq!(
-            states.0.observe("claude", "sid-stale").state,
-            OwnershipState::Vacant,
-            "the confirmed-pid-death probe heals the fence — never a \
-             permanent block"
+        assert!(
+            matches!(
+                states.0.observe("claude", "sid-stale").state,
+                OwnershipState::Fenced { .. }
+            ),
+            "the probe HOLDS a PID-ful fence without tree evidence — never \
+             re-accepts bare /proc absence (pre-fix: the same watchdog pass \
+             that created the fence reopened it)"
         );
     }
 
@@ -4975,18 +5023,22 @@ mod stale_start_watchdog_tests {
         );
     }
 
-    /// b8ke focused episode-2 round-2 F5 + round-3 F7: the StaleStart
-    /// fence is REVISITABLE by the confirmed-death probe. A fence whose
-    /// recorded prior pid is a REAL EXITED process releases; a fence
-    /// whose prior pid is a REAL LIVE process HOLDS (unconfirmable —
-    /// fail closed); a PID-LESS fence over a lane with no live session
-    /// releases via the kind-aware liveness check (the opencode
-    /// production shape was permanent pre-fix).
+    /// b8ke focused episode-2 post-cap F4: the StaleStart fence probe is
+    /// FAIL-CLOSED. A PID-ful fence releases ONLY through the lane's
+    /// confirmed-tree reap (an exited pid with NO tree evidence holds);
+    /// a PID-LESS fence releases ONLY on the positive kind-aware answer
+    /// (lane session absent) AND the operation's registered settle
+    /// CONCLUDED (`settle_fired == Some(true)`). The unregistered
+    /// pre-registration shape — the exact state `an_unregistered_stale_
+    /// start_fences_never_vacant` pins as fenced — can NEVER prove
+    /// conclusion: the probe HOLDS it (the contradictory e2r3 release
+    /// assertion is gone), and the operator force-clear is the escape.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn stale_start_fences_are_revisited_by_the_confirmed_death_probe() {
-        // (a) A fenced key whose prior pid is a REAL EXITED process —
-        // the probe releases it.
+        // (a) A PID-ful fence with NO tree evidence: an exited prior pid
+        // is NOT sufficient — the lane confirm answers false (no condemned
+        // record, no live session) and the fence HOLDS.
         let states = watchdog_states();
         let generation_dead = begin_stale_start(&states.0, "op-fence-dead").await;
         let mut exited = tokio::process::Command::new("true")
@@ -5022,15 +5074,18 @@ mod stale_start_watchdog_tests {
             freshell_ownership::FenceOutcome::Fenced
         ));
         probe_stale_start_fences(&states.0, &states.2, &states.3, &states.4).await;
-        assert_eq!(
-            states.0.observe("claude", "sid-stale").state,
-            OwnershipState::Vacant,
-            "the fence whose recorded runtime is confirmed dead self-heals \
-             through the probe"
+        assert!(
+            matches!(
+                states.0.observe("claude", "sid-stale").state,
+                OwnershipState::Fenced { .. }
+            ),
+            "an exited prior pid with NO tree evidence HOLDS — bare /proc \
+             absence is never sufficient (the same rule recover_stale_start \
+             enforces)"
         );
 
-        // (b) A fenced key whose prior pid is a REAL LIVE process — the
-        // probe cannot confirm; the fence HOLDS.
+        // (b) A PID-ful fence whose prior pid is a REAL LIVE process:
+        // unconfirmable — the fence HOLDS.
         let states2 = watchdog_states();
         let generation_live = begin_stale_start(&states2.0, "op-fence-live").await;
         let mut live = tokio::process::Command::new("sleep")
@@ -5074,12 +5129,9 @@ mod stale_start_watchdog_tests {
             "a LIVE recorded pid is unconfirmable — the probe must not release"
         );
 
-        // (c) b8ke focused episode-2 round-3 F7: a PID-LESS fence whose
-        // lane shows NO live session — the kind-aware liveness probe
-        // RELEASES it (the recorded runtime's only identity is the lane
-        // session; its absence is the honest positive). The opencode
-        // production shape: no per-session pid, no settle — permanent
-        // pre-fix.
+        // (c) A PID-LESS fence with NO registration ever armed (the
+        // pre-registration shape — the same state the unregistered test
+        // pins as fenced): conclusion is UNPROVABLE, the probe HOLDS.
         let states3 = watchdog_states();
         begin_stale_start(&states3.0, "op-fence-nopid").await;
         let recs3 = states3.0.recover_stale_starts(0, 0);
@@ -5097,11 +5149,71 @@ mod stale_start_watchdog_tests {
             freshell_ownership::FenceOutcome::Fenced
         ));
         probe_stale_start_fences(&states3.0, &states3.2, &states3.3, &states3.4).await;
+        assert!(
+            matches!(
+                states3.0.observe("claude", "sid-stale").state,
+                OwnershipState::Fenced { .. }
+            ),
+            "a PID-LESS fence with no registration can never prove the \
+             operation concluded — the probe HOLDS (never re-accept the \
+             mere absence of a registration)"
+        );
+
+        // (d) THE POSITIVE SHAPE: a PID-LESS fence whose operation armed
+        // its registration and CONCLUDED (the guard dropped → settle
+        // fired) AND whose lane reports no live session — the kind-aware
+        // positive answer releases it. This is the opencode recovery
+        // path: retryable ops unblock WITHOUT a restart.
+        let states4 = watchdog_states();
+        let generation_settled = begin_stale_start(&states4.0, "op-fence-settled").await;
+        let own_ticket = Some(freshell_ownership::OperationTicket::new(
+            Arc::clone(&states4.0),
+            "claude",
+            "sid-stale",
+            "op-fence-settled",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            generation_settled,
+            "test",
+        ));
+        let guard = freshell_freshagent::ownership_lane::register_start_cancellation_for_ticket(
+            &Some(Arc::clone(&states4.0)),
+            "claude",
+            "sid-stale",
+            &own_ticket,
+            Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>,
+        );
+        let recs4 = states4.0.recover_stale_starts(0, 0);
+        assert_eq!(recs4.len(), 1);
+        let rec4 = recs4.into_iter().next().unwrap();
+        assert!(matches!(
+            states4.0.fence_unconfirmed_stop(
+                "claude",
+                "sid-stale",
+                "op-fence-settled",
+                rec4.generation,
+                FenceReason::StaleStart
+            ),
+            freshell_ownership::FenceOutcome::Fenced
+        ));
+        // The operation is STILL in flight (the guard lives): the probe
+        // must NOT release on the lane-absent answer alone.
+        probe_stale_start_fences(&states4.0, &states4.2, &states4.3, &states4.4).await;
+        assert!(
+            matches!(
+                states4.0.observe("claude", "sid-stale").state,
+                OwnershipState::Fenced { .. }
+            ),
+            "an UNSETTLED operation keeps the fence held even when the lane \
+             reports no live session"
+        );
+        // The operation concludes (the guard drops → the settle fired).
+        drop(guard);
+        probe_stale_start_fences(&states4.0, &states4.2, &states4.3, &states4.4).await;
         assert_eq!(
-            states3.0.observe("claude", "sid-stale").state,
+            states4.0.observe("claude", "sid-stale").state,
             OwnershipState::Vacant,
-            "a PID-LESS fence over a lane with no live session releases — \
-             the opencode shape is never permanently blocked"
+            "a CONCLUDED operation + a lane with no live session releases — \
+             the kind-aware positive answer (the opencode recovery path)"
         );
 
         let _ = live.kill().await;

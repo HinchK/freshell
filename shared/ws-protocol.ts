@@ -1112,6 +1112,13 @@ export type ReadyMessage = {
      *  'watcher-failed' | 'platform-limited'. */
     reason?: string
     terminalId?: string
+    /** b8ke focused episode-2 post-cap F5 (wire-additive): for an ALIASED
+     *  (re-keyed) key, the CANONICAL id the server resolved. The record's
+     *  ownerKind/state/generation are the CANONICAL record's truth, so a
+     *  cross-device pane holding the PRE-REKEY id folds the authoritative
+     *  owner state (never a permanent "vacant") and `aliasOf` carries the
+     *  navigation to the canonical key. */
+    aliasOf?: string
   }>
 }
 
@@ -1631,6 +1638,12 @@ export type SessionRuntimeOwnerMessage = {
    *  old-kind pane keeps the typed recovery state (no polling
    *  resumption) after the fenced failure frame. */
   fenced?: boolean
+  /** b8ke focused episode-2 post-cap F5 (wire-additive): the CANONICAL id
+   *  this frame's sessionId was re-keyed to. The rekey transition emits a
+   *  mirror frame under the OLD key carrying the resolved owner state, so
+   *  a device holding the pre-rekey id folds the canonical owner (never a
+   *  permanent "vacant") and can navigate to the canonical key. */
+  aliasOf?: string
 }
 
 // -- Extensions --

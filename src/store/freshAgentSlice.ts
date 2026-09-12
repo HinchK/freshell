@@ -650,6 +650,7 @@ const freshAgentSlice = createSlice({
         transition: f.transition,
         ...(f.reason !== undefined ? { reason: f.reason } : {}),
         ...(f.fenced !== undefined ? { fenced: f.fenced } : {}),
+        ...(f.aliasOf !== undefined ? { aliasOf: f.aliasOf } : {}),
         updatedAt: Date.now(),
       }
     },

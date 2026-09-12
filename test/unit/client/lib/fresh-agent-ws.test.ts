@@ -1051,6 +1051,57 @@ describe('runtime-owner folds (kata b8ke)', () => {
       }
     }
 
+    // b8ke focused episode-2 post-cap F5: an ALIASED (re-keyed) replay
+    // record carries the CANONICAL record's resolved truth + `aliasOf`
+    // through the parser — a cross-device pane holding the PRE-REKEY id
+    // folds the authoritative owner state (never a permanent "vacant")
+    // and the record names the canonical id for navigation.
+    it('an aliased replay record keeps aliasOf through the parser and folds the canonical owner truth', () => {
+      const store = createFreshAgentStore()
+      const owners = parseReadyRuntimeOwners(readyFrame([
+        {
+          provider: 'claude',
+          sessionId: 'sid-pre-rekey',
+          epoch: 3,
+          generation: 11,
+          ownerKind: 'fresh-agent',
+          state: 'live',
+          aliasOf: 'sid-canonical',
+        },
+      ]))
+      foldReadyRuntimeOwners(store.dispatch, owners)
+      const record = store.getState().freshAgent.runtimeOwners['claude:sid-pre-rekey']
+      expect(record).toMatchObject({
+        // The CANONICAL record's truth — the old key is never vacant.
+        ownerKind: 'fresh-agent',
+        transition: 'handoff-committed',
+        epoch: 3,
+        generation: 11,
+        aliasOf: 'sid-canonical',
+      })
+    })
+
+    // The live broadcast fold carries aliasOf too (the rekey transition's
+    // OLD-key mirror frame — an ONLINE old-key pane converges, not just a
+    // reconnecting one).
+    it('the rekey old-key mirror broadcast folds the canonical owner state with aliasOf', () => {
+      const store = createFreshAgentStore()
+      foldSessionRuntimeOwnerFrame(store.dispatch, ownerFrame({
+        provider: 'claude',
+        sessionId: 'sid-pre-rekey',
+        ownerKind: 'fresh-agent',
+        generation: 12,
+        operationId: 'rekey-op-1',
+        transition: 'handoff-committed',
+        aliasOf: 'sid-canonical',
+      }))
+      expect(store.getState().freshAgent.runtimeOwners['claude:sid-pre-rekey']).toMatchObject({
+        ownerKind: 'fresh-agent',
+        generation: 12,
+        aliasOf: 'sid-canonical',
+      })
+    })
+
     it('a fenced replay record keeps state/reason through the parser — typed recovery, never committed', () => {
       const store = createFreshAgentStore()
       const owners = parseReadyRuntimeOwners(readyFrame([

@@ -46,5 +46,12 @@ export const ReadyMessageSchema = z.object({
     state: z.enum(['live', 'fenced', 'starting', 'handoff', 'stopping']).optional(),
     reason: z.string().optional(),
     terminalId: z.string().optional(),
+    // b8ke focused episode-2 post-cap F5 (wire-additive): the CANONICAL id
+    // an ALIASED (re-keyed) key resolved to. The record's ownerKind/state/
+    // generation are the CANONICAL record's truth (the server walks the
+    // fixpoint), so a cross-device pane holding the PRE-REKEY id folds the
+    // authoritative owner state — never a permanent "vacant" — and
+    // `aliasOf` carries the navigation to the canonical key.
+    aliasOf: z.string().min(1).optional(),
   })).optional().catch(undefined),
 })

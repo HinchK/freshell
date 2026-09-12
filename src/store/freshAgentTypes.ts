@@ -70,6 +70,13 @@ export type RuntimeOwnerRecord = {
    *  prior, not a live owner) — every pane holding the sessionRef shows
    *  the typed recovery state. */
   fenced?: boolean
+  /** b8ke focused episode-2 post-cap F5: this key was RE-KEYED — the
+   *  record's owner state is the CANONICAL key's (the server resolved the
+   *  fixpoint) and `aliasOf` names the canonical id. A pane holding the
+   *  pre-rekey sessionRef folds the authoritative owner state through
+   *  this record and navigates future lifecycle operations to the
+   *  canonical key. */
+  aliasOf?: string
   updatedAt: number
 }
 
