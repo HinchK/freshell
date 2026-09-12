@@ -706,12 +706,12 @@ describe('FreshAgentView', () => {
     })
   })
 
-  it('honors pane display overrides ahead of global fresh-agent settings', async () => {
+  it('flows expandThinking/expandTools from global settings into the transcript', async () => {
     const store = createStore()
     store.dispatch(updateSettingsLocal({
       freshAgent: {
-        showThinking: false,
-        showTools: false,
+        expandThinking: true,
+        expandTools: true,
         showTimecodes: false,
       },
     }))
@@ -751,8 +751,8 @@ describe('FreshAgentView', () => {
             createRequestId: 'req-display',
             sessionId: CLAUDE_THREAD_ID,
             status: 'connected',
-            showThinking: true,
-            showTools: true,
+            // showTimecodes keeps its per-pane override (out of redesign
+            // scope): the pane wins over the global default.
             showTimecodes: true,
           }}
         />
@@ -760,9 +760,14 @@ describe('FreshAgentView', () => {
     )
 
     await waitFor(() => {
+      // expandTools flows from the global settings: the strip mounts
+      // EXPANDED, so the tool call detail renders with no click.
       expect(screen.getByText('npm run display-check')).toBeInTheDocument()
     })
-    expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()
+    // expandThinking flows from the global settings: the Thinking row mounts
+    // with its body already visible.
+    expect(screen.getByText('pane-level thinking')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Thinking' })).toHaveAttribute('aria-expanded', 'true')
     expect(screen.getByText('claude-opus-4-6')).toBeInTheDocument()
     // Local time h:mm AM/PM — no seconds, never UTC.
     const expectedTimecode = new Date('2026-06-15T12:34:56.000Z')
@@ -772,7 +777,7 @@ describe('FreshAgentView', () => {
     expect(timecodeEl.textContent).toMatch(/^\d{1,2}:\d{2}\s?(AM|PM)$/i)
   })
 
-  it('shows thinking rows and expanded activity details by default', async () => {
+  it('mounts thinking rows and a collapsed strip by default', async () => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
       status: 'idle',
@@ -811,17 +816,30 @@ describe('FreshAgentView', () => {
     )
 
     await waitFor(() => {
-      // showTools defaults on: the activity strip mounts EXPANDED, so the
-      // tool call detail renders with no click.
-      expect(screen.getByText('npm run display-check')).toBeInTheDocument()
+      // Compact defaults: the strip mounts COLLAPSED — the settled summary
+      // replaces the tool detail.
+      expect(screen.getByText('thought · 1 tool used')).toBeInTheDocument()
     })
-    // showThinking defaults on: the Thinking disclosure renders.
-    expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'false')
+    // Thinking rows always render: the trigger is visible at the compact
+    // mount, with its body gated behind the click.
+    const thinking = screen.getByRole('button', { name: 'Thinking' })
+    expect(thinking).toBeInTheDocument()
+    expect(thinking).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.queryByText('default-visible thinking')).not.toBeInTheDocument()
+    // Expanding the strip reveals the tool row; the block itself starts
+    // collapsed (expandTools governs the strip's starting state, not the
+    // per-block in-pane toggles) and opens on its own click.
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+    const toolButton = screen.getByRole('button', { name: 'Bash tool call' })
+    expect(toolButton).toBeInTheDocument()
+    fireEvent.click(toolButton)
+    expect(screen.getByText('npm run display-check')).toBeInTheDocument()
   })
 
-  it('hides thinking rows and collapses activity details when the global settings turn off', async () => {
+  it('applies a changed expandTools default on remount, not on live re-render', async () => {
     const store = createStore()
-    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
       status: 'idle',
       summary: 'Display summary',
       capabilities: { send: true, interrupt: true, fork: false },
@@ -849,26 +867,41 @@ describe('FreshAgentView', () => {
       </Provider>,
     )
 
-    // Task 1 defaults: expanded + thinking visible.
+    // Compact mount: the strip starts collapsed.
     await waitFor(() => {
-      expect(screen.getByText('npm run live-check')).toBeInTheDocument()
+      expect(screen.getByText('thought · 1 tool used')).toBeInTheDocument()
     })
-    expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'false')
 
-    // Flip both display settings off on the live store (the reducer path the
-    // Settings toggle drives) — the pane must re-render, not need a remount.
+    // Flip expandTools on via the live store (the reducer path the Settings
+    // toggle drives): the MOUNTED strip keeps its in-pane state — the
+    // setting is a mount-time default, never a live override.
     act(() => {
       store.dispatch(updateSettingsLocal({
-        freshAgent: { showThinking: false, showTools: false },
+        freshAgent: { expandTools: true },
       }))
     })
+    expect(screen.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'false')
 
-    expect(screen.queryByRole('button', { name: 'Thinking' })).not.toBeInTheDocument()
-    // Collapsed strip: the summary line replaces the expanded detail rows.
+    // Remount (the real single-tab flow: opening Settings unmounts the pane
+    // tree): the new default applies at mount.
+    unmount()
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude',
+            createRequestId: 'req-live', sessionId: CLAUDE_THREAD_ID, status: 'connected',
+          }}
+        />
+      </Provider>,
+    )
     await waitFor(() => {
-      expect(screen.getByText('1 tool used')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'true')
     })
-    expect(screen.queryByText('npm run live-check')).not.toBeInTheDocument()
+    expect(screen.getByText('npm run live-check')).toBeInTheDocument()
     unmount()
   })
 

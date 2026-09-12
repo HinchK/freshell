@@ -234,52 +234,30 @@ describe('FreshAgentTranscript', () => {
     )
 
     expect(screen.getByRole('region', { name: 'Activity strip' })).toHaveTextContent('thought · 1 tool used')
+    // Hoisted: the Thinking trigger is visible WITHOUT expanding the strip —
+    // the collapsed strip already carries the expandable thinking row.
+    const thinking = screen.getByRole('button', { name: 'Thinking' })
+    expect(thinking).toBeInTheDocument()
     expect(screen.queryByText('the race is in the close handler')).not.toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
-    expect(screen.queryByText('the race is in the close handler')).not.toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Thinking' }))
+    fireEvent.click(thinking)
     expect(screen.getAllByText('the race is in the close handler').length).toBeGreaterThanOrEqual(1)
+    // Expanding the strip reveals the tool rows (tool detail stays gated
+    // behind the strip's own disclosure).
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+    expect(screen.getByRole('button', { name: 'Bash tool call' })).toBeInTheDocument()
   })
 
-  it('hides thinking rows when showThinking is false', () => {
+  it('starts the strip expanded when expandTools is true', () => {
     render(
       <FreshAgentTranscript
-        showThinking={false}
+        expandTools
         turns={[
           {
             id: 'turn-1',
             role: 'assistant',
             summary: 'thought then ran',
             items: [
-              { id: 'think-1', kind: 'thinking', text: 'hidden reasoning' },
-              {
-                id: 'tool-1',
-                kind: 'tool_use',
-                toolUseId: 'call-1',
-                name: 'Bash',
-                input: { command: 'npm test' },
-              },
-            ],
-          },
-        ]}
-      />,
-    )
-
-    expect(screen.getByRole('region', { name: 'Activity strip' })).toHaveTextContent('1 tool used')
-    expect(screen.queryByText(/thought/)).not.toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: 'Thinking' })).not.toBeInTheDocument()
-  })
-
-  it('opens activity details by default when showTools is true', () => {
-    render(
-      <FreshAgentTranscript
-        showTools
-        turns={[
-          {
-            id: 'turn-1',
-            role: 'assistant',
-            summary: 'used tools',
-            items: [
+              { id: 'think-1', kind: 'thinking', text: 'reasoning before the run' },
               {
                 id: 'tool-1',
                 kind: 'tool_use',
@@ -295,6 +273,165 @@ describe('FreshAgentTranscript', () => {
 
     expect(screen.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'true')
     expect(screen.getByText('npm run check')).toBeInTheDocument()
+    // Thinking rows render in the expanded detail regardless of the setting.
+    expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()
+  })
+
+  describe('expansion defaults (mount-only)', () => {
+    const mixedTurn = {
+      id: 'turn-1',
+      role: 'assistant' as const,
+      summary: 'thought then ran',
+      items: [
+        { id: 'think-1', kind: 'thinking' as const, text: 'the race is in the close handler' },
+        { id: 'tool-1', kind: 'tool_use' as const, toolUseId: 'call-1', name: 'Bash', input: { command: 'npm test' } },
+      ],
+    }
+
+    it('renders thinking rows regardless of the expandThinking setting and of strip expansion', () => {
+      const first = render(<FreshAgentTranscript turns={[mixedTurn]} />)
+      // Compact mount (expandTools unset): the Thinking trigger is visible
+      // while the strip is collapsed, and the body stays gated behind the
+      // click.
+      expect(screen.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'false')
+      const thinking = screen.getByRole('button', { name: 'Thinking' })
+      expect(thinking).toBeInTheDocument()
+      expect(screen.queryByText('the race is in the close handler')).not.toBeInTheDocument()
+      fireEvent.click(thinking)
+      expect(screen.getAllByText('the race is in the close handler').length).toBeGreaterThanOrEqual(1)
+      // The trigger survives strip expansion — thinking rows render in BOTH
+      // strip states.
+      fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+      expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()
+      first.unmount()
+
+      // The row renders identically with expandThinking on: the setting
+      // changes only the initial body state, never the row's presence.
+      render(<FreshAgentTranscript expandThinking turns={[mixedTurn]} />)
+      expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'false')
+    })
+
+    it('starts thinking rows expanded when expandThinking is true', () => {
+      const { container } = render(<FreshAgentTranscript expandThinking turns={[mixedTurn]} />)
+      // The strip itself stays compact; the thinking body is visible at
+      // mount with no click.
+      expect(screen.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'false')
+      expect(container.querySelector('.fresh-agent-thinking-body')).toBeTruthy()
+      expect(screen.getAllByText('the race is in the close handler').length).toBeGreaterThanOrEqual(1)
+    })
+
+    it('starts thinking rows collapsed by default', () => {
+      const { container } = render(<FreshAgentTranscript turns={[mixedTurn]} />)
+      const thinking = screen.getByRole('button', { name: 'Thinking' })
+      expect(thinking).toHaveAttribute('aria-expanded', 'false')
+      expect(container.querySelector('.fresh-agent-thinking-body')).toBeNull()
+      expect(screen.queryByText('the race is in the close handler')).not.toBeInTheDocument()
+    })
+
+    it('mounts the strip collapsed by default (expandTools unset)', () => {
+      render(<FreshAgentTranscript turns={[mixedTurn]} />)
+      expect(screen.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'false')
+      expect(screen.getByRole('region', { name: 'Activity strip' })).toHaveTextContent('thought · 1 tool used')
+      // Tool rows and captions render only when the strip is expanded;
+      // thinking rows are present even while collapsed.
+      expect(screen.queryByRole('button', { name: 'Bash tool call' })).not.toBeInTheDocument()
+      expect(screen.queryByTestId('fresh-agent-activity-caption')).not.toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()
+    })
+
+    it('expansion is per-mount state, never re-synced from props', () => {
+      const thinkingTurnA = {
+        id: 'turn-think-a', role: 'assistant' as const, summary: '',
+        items: [{ id: 'think-a', kind: 'thinking' as const, text: 'first stretch of reasoning' }],
+      }
+      const messageTurn = {
+        id: 'turn-msg', role: 'assistant' as const, summary: 'note',
+        items: [{ id: 'item-msg', kind: 'text' as const, text: 'Between the two lines.' }],
+      }
+      const thinkingTurnB = {
+        id: 'turn-think-b', role: 'assistant' as const, summary: '',
+        items: [{ id: 'think-b', kind: 'thinking' as const, text: 'second stretch of reasoning' }],
+      }
+      const turns = [thinkingTurnA, messageTurn, thinkingTurnB]
+
+      // Two strips, each with its own thinking row, mounted with the compact
+      // defaults and left UNTOUCHED. A boolean flip alone cannot distinguish
+      // mount-only from re-sync (the user's toggle always converges with the
+      // new prop value), so the discriminator is untouched instances.
+      const { rerender, unmount } = render(<FreshAgentTranscript turns={turns} />)
+      expect(screen.getAllByRole('button', { name: 'Toggle activity details' })).toHaveLength(2)
+      expect(screen.getAllByRole('button', { name: 'Thinking' })).toHaveLength(2)
+
+      // Rerender with both expand props flipped on: mount-only keeps BOTH
+      // strips and BOTH thinking rows collapsed (a re-sync effect would
+      // expand them).
+      rerender(<FreshAgentTranscript expandTools expandThinking turns={turns} />)
+      for (const toggle of screen.getAllByRole('button', { name: 'Toggle activity details' })) {
+        expect(toggle).toHaveAttribute('aria-expanded', 'false')
+      }
+      for (const row of screen.getAllByRole('button', { name: 'Thinking' })) {
+        expect(row).toHaveAttribute('aria-expanded', 'false')
+      }
+      expect(screen.queryByText('first stretch of reasoning')).not.toBeInTheDocument()
+      expect(screen.queryByText('second stretch of reasoning')).not.toBeInTheDocument()
+
+      // Remount with the props on: the new defaults apply at mount.
+      unmount()
+      render(<FreshAgentTranscript expandTools expandThinking turns={turns} />)
+      for (const toggle of screen.getAllByRole('button', { name: 'Toggle activity details' })) {
+        expect(toggle).toHaveAttribute('aria-expanded', 'true')
+      }
+      expect(screen.getByText('first stretch of reasoning')).toBeInTheDocument()
+      expect(screen.getByText('second stretch of reasoning')).toBeInTheDocument()
+    })
+
+    it('the expanded state swaps the summary for detail behind the persistent toggle', () => {
+      render(<FreshAgentTranscript turns={[mixedTurn]} />)
+      const strip = screen.getByRole('region', { name: 'Activity strip' })
+      // Collapsed: the settled summary is the strip's one line.
+      expect(strip).toHaveTextContent('thought · 1 tool used')
+      expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()
+      // Expand: the toggle row persists and the summary text is REPLACED by
+      // the detail rows.
+      fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+      expect(screen.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'true')
+      expect(strip).not.toHaveTextContent('1 tool used')
+      expect(screen.getByRole('button', { name: 'Bash tool call' })).toBeInTheDocument()
+      // Thinking rows are present in BOTH states.
+      expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()
+      // Collapse: the summary returns; the thinking row survives the cycle.
+      fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+      expect(strip).toHaveTextContent('thought · 1 tool used')
+      expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()
+    })
+
+    it('renders a live thinking row disclosure while streaming with the strip collapsed', () => {
+      const { container } = render(
+        <FreshAgentTranscript
+          isStreaming
+          turns={[{
+            id: 'turn-1',
+            role: 'assistant',
+            summary: '',
+            items: [{ id: 'think-1', kind: 'thinking', text: 'actively reasoning mid-stream' }],
+          }]}
+        />,
+      )
+      expect(screen.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'false')
+      // The reel still shows 'Thinking' in the status slot while the row
+      // streams (the reel is the status slot; the hoisted row is the
+      // expandable affordance).
+      expect(screen.getByLabelText('running')).toBeInTheDocument()
+      expect(container.querySelector('[data-slot="name"]')).toHaveTextContent('Thinking')
+      // The live thinking row renders its disclosure while the strip is
+      // collapsed: the body is absent until click and expandable mid-stream.
+      const thinking = screen.getByRole('button', { name: 'Thinking' })
+      expect(thinking).toBeInTheDocument()
+      expect(screen.queryByText('actively reasoning mid-stream')).not.toBeInTheDocument()
+      fireEvent.click(thinking)
+      expect(screen.getAllByText('actively reasoning mid-stream').length).toBeGreaterThanOrEqual(1)
+    })
   })
 
   it('shows timestamp and model when showTimecodes is true', () => {
@@ -374,7 +511,7 @@ describe('FreshAgentTranscript', () => {
   })
 
   it('treats trailing thinking in the latest turn as live activity', () => {
-    render(
+    const { container } = render(
       <FreshAgentTranscript
         turns={[
           {
@@ -390,7 +527,11 @@ describe('FreshAgentTranscript', () => {
     )
 
     expect(screen.getByLabelText('running')).toBeInTheDocument()
-    expect(screen.getByText('Thinking')).toBeInTheDocument()
+    // The reel's status slot carries the 'Thinking' chip. (The hoisted
+    // thinking row renders its own 'Thinking' label alongside it — assert
+    // the REEL's name slot so the two text nodes can never collide in a
+    // strict getByText.)
+    expect(container.querySelector('[data-slot="name"]')).toHaveTextContent('Thinking')
     expect(screen.queryByText('still reasoning about the fix')).not.toBeInTheDocument()
   })
 
@@ -1135,34 +1276,11 @@ describe('FreshAgentTranscript', () => {
       items: [{ id: thinkId, kind: 'thinking' as const, text }],
     })
 
-    const withTool = (turnId: string, thinkId: string, text: string, toolId: string, callId: string) => ({
-      id: turnId,
-      role: 'assistant' as const,
-      summary: 'thinking + tool',
-      items: [
-        { id: thinkId, kind: 'thinking' as const, text },
-        { id: toolId, kind: 'tool_use' as const, toolUseId: callId, name: 'Bash', input: { command: 'true' } },
-      ],
-    })
-
-    it('keeps the streaming last turn even when all items are filtered out', () => {
+    it('renders a live activity strip placeholder when a streaming turn has no items', () => {
       render(
         <FreshAgentTranscript
           isStreaming
-          showThinking={false}
-          turns={[thinkingOnly('turn-1', 'think-1', 'hidden reasoning')]}
-        />,
-      )
-
-      expect(screen.getByRole('article', { name: 'Assistant transcript turn' })).toBeInTheDocument()
-    })
-
-    it('renders a live activity strip placeholder when no displayable rows exist during streaming', () => {
-      render(
-        <FreshAgentTranscript
-          isStreaming
-          showThinking={false}
-          turns={[thinkingOnly('turn-1', 'think-1', 'hidden reasoning')]}
+          turns={[{ id: 'turn-1', role: 'assistant', summary: '', items: [] }]}
         />,
       )
 
@@ -1172,57 +1290,59 @@ describe('FreshAgentTranscript', () => {
       expect(screen.getByLabelText('running')).toBeInTheDocument()
     })
 
-    it('keeps the live activity strip present across empty/non-empty displayRows transitions', () => {
+    it('keeps the live activity strip present across zero-item/tool transitions', () => {
+      const zeroItem = (turnId: string) => ({
+        id: turnId,
+        role: 'assistant' as const,
+        summary: '',
+        items: [] as FreshAgentTranscriptItem[],
+      })
+      const withTool = (turnId: string, toolId: string, callId: string) => ({
+        id: turnId,
+        role: 'assistant' as const,
+        summary: '',
+        items: [{
+          id: toolId,
+          kind: 'tool_use' as const,
+          toolUseId: callId,
+          name: 'Bash',
+          input: { command: 'true' },
+        }],
+      })
+
       const { rerender } = render(
-        <FreshAgentTranscript
-          isStreaming
-          showThinking={false}
-          turns={[thinkingOnly('turn-1', 'think-1', 'reasoning')]}
-        />,
+        <FreshAgentTranscript isStreaming turns={[zeroItem('turn-1')]} />,
       )
 
       const assertStripPresent = () => {
         const strip = screen.getByRole('region', { name: 'Activity strip' })
         expect(strip).toBeInTheDocument()
         expect(strip.className).toContain('my-0.5')
-        expect(screen.getByLabelText('running')).toBeInTheDocument()
+        expect(screen.getAllByLabelText('running')).toHaveLength(1)
       }
 
       assertStripPresent()
 
       rerender(
-        <FreshAgentTranscript
-          isStreaming
-          showThinking={false}
-          turns={[withTool('turn-1', 'think-1', 'reasoning', 'tool-1', 'call-1')]}
-        />,
+        <FreshAgentTranscript isStreaming turns={[withTool('turn-1', 'tool-1', 'call-1')]} />,
       )
       assertStripPresent()
 
       rerender(
-        <FreshAgentTranscript
-          isStreaming
-          showThinking={false}
-          turns={[thinkingOnly('turn-2', 'think-2', 'more reasoning')]}
-        />,
+        <FreshAgentTranscript isStreaming turns={[zeroItem('turn-2')]} />,
       )
       assertStripPresent()
 
       rerender(
-        <FreshAgentTranscript
-          isStreaming
-          showThinking={false}
-          turns={[withTool('turn-2', 'think-2', 'more reasoning', 'tool-2', 'call-2')]}
-        />,
+        <FreshAgentTranscript isStreaming turns={[withTool('turn-2', 'tool-2', 'call-2')]} />,
       )
       assertStripPresent()
     })
 
-    it('does not show a second running indicator on an earlier turn when the streaming last turn has no displayable items', () => {
+    it('does not show a second running indicator on an earlier line while a thinking-only tail streams visibly', () => {
       render(
         <FreshAgentTranscript
           isStreaming
-          showThinking={false}
           turns={[
             {
               id: 'turn-1',
@@ -1239,42 +1359,56 @@ describe('FreshAgentTranscript', () => {
                 { id: 'result-1', kind: 'tool_result', toolUseId: 'call-1', content: 'ok', isError: false },
               ],
             },
-            thinkingOnly('turn-2', 'think-2', 'hidden reasoning'),
+            {
+              id: 'turn-note',
+              role: 'assistant',
+              summary: 'note',
+              items: [{ id: 'item-note', kind: 'text', text: 'Interim note.' }],
+            },
+            thinkingOnly('turn-2', 'think-2', 'live reasoning tail'),
           ]}
         />,
       )
 
-      // The final turn has a visible summary, so it closes the line and
-      // renders its own article (summary + injected live strip) instead of
-      // handing liveness to the earlier line — the earlier turn completed
-      // before the final turn started, so its line settles. Exactly one
-      // running indicator remains, on the live strip, and none on the
-      // earlier turn.
+      // The message closes the first line, so the thinking-only tail streams
+      // on its own visible line: exactly one running indicator, on the live
+      // tail; the earlier line settles with its summary.
       expect(screen.getAllByLabelText('running')).toHaveLength(1)
       const strips = screen.getAllByRole('region', { name: 'Activity strip' })
       expect(strips).toHaveLength(2)
       expect(strips[0]).toHaveTextContent('1 tool used')
-      expect(screen.getByText('thinking')).toBeInTheDocument()
+      // The thinking-only tail renders visibly (hoisted row + 'Thinking'
+      // reel), never filtered away.
+      expect(strips[1]).toHaveTextContent('Thinking')
+      expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()
     })
 
-    it('drops a non-streaming turn when all items are filtered out', () => {
+    it('renders a thinking-only turn as an activity strip (never dropped)', () => {
       render(
         <FreshAgentTranscript
-          showThinking={false}
-          // Echo-tagged (Rust server output): a fully-filtered echo caption is
-          // superseded now-hidden content, so the turn drops outright.
-          turns={[{ ...thinkingOnly('turn-1', 'think-1', 'hidden reasoning'), summaryKind: 'echo' as const }]}
+          turns={[{
+            id: 'turn-1',
+            role: 'assistant',
+            summary: '',
+            items: [{ id: 'think-1', kind: 'thinking', text: 'deliberating quietly' }],
+          }]}
         />,
       )
 
-      expect(screen.queryByRole('article', { name: 'Assistant transcript turn' })).not.toBeInTheDocument()
+      // The turn keeps its article and renders an activity strip — a
+      // thinking-only turn is never dropped, and its row is always present.
+      expect(screen.getByRole('article', { name: 'Assistant transcript turn' })).toBeInTheDocument()
+      const strip = screen.getByRole('region', { name: 'Activity strip' })
+      expect(strip).toBeInTheDocument()
+      expect(strip).toHaveTextContent('Thinking')
+      expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()
     })
 
     it('does not resnap autoscroll when re-rendering with the same streaming items', () => {
       let scrollHeight = 1000
-      const turn = thinkingOnly('turn-1', 'think-1', 'hidden reasoning')
+      const turn = thinkingOnly('turn-1', 'think-1', 'streaming reasoning')
       const { container, rerender } = render(
-        <FreshAgentTranscript isStreaming showThinking={false} turns={[turn]} />,
+        <FreshAgentTranscript isStreaming turns={[turn]} />,
       )
       const scroller = container.querySelector('[data-context="fresh-agent-transcript"]') as HTMLDivElement
       Object.defineProperty(scroller, 'clientHeight', { configurable: true, get: () => 200 })
@@ -1285,7 +1419,7 @@ describe('FreshAgentTranscript', () => {
       expect(scroller.scrollTop).toBe(1000)
 
       scrollHeight = 1200
-      rerender(<FreshAgentTranscript isStreaming showThinking={false} turns={[turn]} />)
+      rerender(<FreshAgentTranscript isStreaming turns={[turn]} />)
 
       expect(scroller.scrollTop).toBe(1000)
     })
@@ -2004,106 +2138,14 @@ describe('FreshAgentTranscript', () => {
       expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(2)
     })
 
-    it('drops a superseded hidden-thinking echo caption instead of holding a permanent boundary', () => {
-      const turnA = {
-        id: 'turn-a', turnId: 'turn-a', role: 'assistant' as const, summary: '',
-        items: [{ id: 'tool-c1', kind: 'tool_use' as const, toolUseId: 'c1', name: 'Read', input: { file_path: 'src/a.ts' } }],
-      }
-      const thinkingTurn = {
-        id: 'turn-thinking', turnId: 'turn-thinking', role: 'assistant' as const,
-        summary: 'Considering options', summaryKind: 'echo' as const,
-        items: [{ id: 'think-1', kind: 'thinking' as const, text: 'Considering options' }],
-      }
-      // Frame 1 (explicit showThinking={false} — the opt-out path; production
-      // defaults are on): the thinking-only streaming tail is fully filtered —
-      // it MUST NOT paint its echo caption: the summary derives from a hidden
-      // item, and the paint gate matches the stash gate (LB-1 closes both
-      // directions).
-      const { rerender } = render(
-        <FreshAgentTranscript isStreaming showThinking={false} turns={[turnA, thinkingTurn]} />,
-      )
-      expect(screen.queryByText('Considering options')).not.toBeInTheDocument()
-
-      // Frame 2: the next tool arrives in a NEW turn. The echo caption is
-      // superseded: it disappears from the stream and the tool runs merge —
-      // no permanent boundary, and the hidden thinking text is NOT stashed
-      // into the expansion (the user chose to hide it).
-      const turnB = {
-        id: 'turn-b', turnId: 'turn-b', role: 'assistant' as const, summary: 'Read', summaryKind: 'echo' as const,
-        items: [{ id: 'tool-c2', kind: 'tool_use' as const, toolUseId: 'c2', name: 'Read', input: { file_path: 'src/b.ts' } }],
-      }
-      rerender(<FreshAgentTranscript isStreaming showThinking={false} turns={[turnA, thinkingTurn, turnB]} />)
-      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
-      expect(screen.queryByText('Considering options')).not.toBeInTheDocument()
-      // FULLY-filtered no-leak (the lane tests cover the partially-filtered
-      // absorb case): the hidden thinking text must not appear in the
-      // expansion either.
-      fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
-      expect(screen.queryByText('Considering options')).not.toBeInTheDocument()
-    })
-
-    it('keeps the fold after the session goes idle (isStreaming flips false)', () => {
-      const turnA = {
-        id: 'turn-a', turnId: 'turn-a', role: 'assistant' as const, summary: '',
-        items: [{ id: 'tool-c1', kind: 'tool_use' as const, toolUseId: 'c1', name: 'Read', input: { file_path: 'src/a.ts' } }],
-      }
-      const thinkingTurn = {
-        id: 'turn-thinking', turnId: 'turn-thinking', role: 'assistant' as const,
-        summary: 'Considering options', summaryKind: 'echo' as const,
-        items: [{ id: 'think-1', kind: 'thinking' as const, text: 'Considering options' }],
-      }
-      const turnB = {
-        id: 'turn-b', turnId: 'turn-b', role: 'assistant' as const, summary: 'Read', summaryKind: 'echo' as const,
-        items: [{ id: 'tool-c2', kind: 'tool_use' as const, toolUseId: 'c2', name: 'Read', input: { file_path: 'src/b.ts' } }],
-      }
-      const { rerender } = render(
-        <FreshAgentTranscript isStreaming showThinking={false} turns={[turnA, thinkingTurn]} />,
-      )
-      // The fully-filtered thinking-only tail never paints its hidden-derived
-      // caption (task (c)); the placeholder article renders nothing.
-      expect(screen.queryByText('Considering options')).not.toBeInTheDocument()
-      rerender(<FreshAgentTranscript isStreaming showThinking={false} turns={[turnA, thinkingTurn, turnB]} />)
-      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
-      expect(screen.queryByText('Considering options')).not.toBeInTheDocument()
-      // The session completes (FreshAgentView passes isStreaming=isBusy). The
-      // fold is a layout function of the turn list, not of paint history, so
-      // the idle flip changes nothing.
-      rerender(<FreshAgentTranscript isStreaming={false} showThinking={false} turns={[turnA, thinkingTurn, turnB]} />)
-      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
-      expect(screen.queryByText('Considering options')).not.toBeInTheDocument()
-    })
-
-    it('collapses freely across hidden-thinking turns whose summary never painted (settled history)', () => {
-      // A transcript mounted already-settled never rendered the hidden thinking
-      // turn's summary, so nothing stood between the tool runs in this view.
-      render(
-        <FreshAgentTranscript
-          isStreaming={false}
-          showThinking={false}
-          turns={[
-            { id: 'turn-a', turnId: 'turn-a', role: 'assistant', summary: '',
-              items: [{ id: 'tool-c1', kind: 'tool_use', toolUseId: 'c1', name: 'Read', input: { file_path: 'src/a.ts' } }] },
-            { id: 'turn-thinking', turnId: 'turn-thinking', role: 'assistant',
-              summary: 'Considering options', summaryKind: 'echo' as const,
-              items: [{ id: 'think-1', kind: 'thinking', text: 'Considering options' }] },
-            { id: 'turn-b', turnId: 'turn-b', role: 'assistant', summary: 'Read', summaryKind: 'echo' as const,
-              items: [{ id: 'tool-c2', kind: 'tool_use', toolUseId: 'c2', name: 'Read', input: { file_path: 'src/b.ts' } }] },
-          ]}
-        />,
-      )
-      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
-    })
-
-    it('merges a mixed thinking-plus-tool turn whose hidden thinking is part of the summary (live claude shape)', () => {
-      // Explicit showThinking={false} (the opt-out path; production defaults
-      // are on): the thinking item is filtered out, and the summary
-      // ('Considering Read', space-joined by the live summarizer) never
-      // renders — the article renders its activity block. The server-tagged
-      // echo provenance replaces echo classification.
+    it('merges a mixed thinking-plus-tool turn whose summary mixes thinking and tool (live claude shape)', () => {
+      // Thinking always renders now; the turn merges into the open line
+      // because its activity items chain — the thinking row and the tool row
+      // both join the line, and the space-joined echo summary never paints
+      // in-stream (the article renders its activity block).
       render(
         <FreshAgentTranscript
           isStreaming
-          showThinking={false}
           turns={[
             toolTurn('turn-a', [['c1', 'src/a.ts']]),
             { id: 'turn-b', turnId: 'turn-b', role: 'assistant', summary: 'Considering Read', summaryKind: 'echo',
@@ -2117,11 +2159,10 @@ describe('FreshAgentTranscript', () => {
       expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
     })
 
-    it('merges a mixed thinking-plus-tool turn whose summary is the hidden thinking text (Rust snapshot shape)', () => {
+    it('merges a mixed thinking-plus-tool turn whose summary is the thinking text (Rust snapshot shape)', () => {
       render(
         <FreshAgentTranscript
           isStreaming
-          showThinking={false}
           turns={[
             toolTurn('turn-a', [['c1', 'src/a.ts']]),
             { id: 'turn-b', turnId: 'turn-b', role: 'assistant', summary: 'Considering', summaryKind: 'echo',
@@ -2175,12 +2216,46 @@ describe('FreshAgentTranscript', () => {
     })
 
     describe('foldable echo captions', () => {
-      it('stashes a superseded echo caption only when its turn was fully visible (claude lane)', () => {
-        // Claude lane (LB-1): [thinking "secret", tool_use] with explicit
-        // showThinking={false} (the opt-out path; production defaults are on).
-        // The echo summary derives from the HIDDEN thinking item; the turn is
-        // partially filtered, so its caption is NEITHER painted at the tail
-        // NOR stashed into the expansion.
+      it('stashes a superseded echo caption from a thinking-bearing turn', () => {
+        const thinkingToolTurn = {
+          id: 'turn-thinking', turnId: 'turn-thinking', role: 'assistant' as const,
+          summary: 'Considering options', summaryKind: 'echo' as const,
+          items: [
+            { id: 'think-1', kind: 'thinking' as const, text: 'Considering options' },
+            { id: 'tool-c2', kind: 'tool_use' as const, toolUseId: 'c2', name: 'Read', input: { file_path: 'src/b.ts' } },
+          ],
+        }
+        render(
+          <FreshAgentTranscript
+            isStreaming
+            turns={[
+              toolTurn('turn-a', [['c1', 'src/a.ts']]),
+              thinkingToolTurn,
+              toolTurn('turn-z', [['c3', 'src/d.ts']]),
+            ]}
+          />,
+        )
+        // One merged line; the blank-captioned turn-z is the tail, so the
+        // superseded caption paints nothing in-stream.
+        expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
+        expect(screen.queryByTestId('fresh-agent-tail-caption')).not.toBeInTheDocument()
+        // The caption stashes into the line's expansion, and the thinking row
+        // renders alongside it — thinking-bearing turns are fully visible.
+        fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+        const caption = screen.getByTestId('fresh-agent-activity-caption')
+        expect(caption).toHaveTextContent('Considering options')
+        const thinking = screen.getByRole('button', { name: 'Thinking' })
+        expect(thinking).toBeInTheDocument()
+        fireEvent.click(thinking)
+        expect(screen.getAllByText('Considering options').length).toBeGreaterThanOrEqual(1)
+      })
+
+      it('stashes superseded echo captions from a thinking-bearing turn (claude lane)', () => {
+        // Claude lane: [thinking "secret plans", tool_use] plus a visible
+        // echo control turn. Under always-visible semantics every item-bearing
+        // turn is fully visible, so BOTH superseded echo captions stash — the
+        // old hidden-item no-leak gate died with the display filter, and the
+        // thinking row renders with its own expandable body.
         const secretTurn = {
           id: 'turn-secret', turnId: 'turn-secret', role: 'assistant' as const,
           summary: 'secret plans', summaryKind: 'echo' as const,
@@ -2189,9 +2264,6 @@ describe('FreshAgentTranscript', () => {
             { id: 'tool-c2', kind: 'tool_use' as const, toolUseId: 'c2', name: 'Read', input: { file_path: 'src/b.ts' } },
           ],
         }
-        // Positive control: a fully-visible superseded echo turn DOES stash. The
-        // same test therefore red-flags BOTH failure modes — no stash machinery
-        // at all (zero captions) and an ungated stash (the hidden text leaks).
         const visibleTurn = {
           id: 'turn-visible', turnId: 'turn-visible', role: 'assistant' as const,
           summary: 'Read', summaryKind: 'echo' as const,
@@ -2200,7 +2272,6 @@ describe('FreshAgentTranscript', () => {
         render(
           <FreshAgentTranscript
             isStreaming
-            showThinking={false}
             turns={[toolTurn('turn-a', [['c1', 'src/a.ts']]), secretTurn, visibleTurn, toolTurn('turn-z', [['c4', 'src/d.ts']])]}
           />,
         )
@@ -2209,21 +2280,24 @@ describe('FreshAgentTranscript', () => {
         expect(screen.queryByTestId('fresh-agent-tail-caption')).not.toBeInTheDocument()
         fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
         const captions = screen.getAllByTestId('fresh-agent-activity-caption')
-        expect(captions).toHaveLength(1)
-        expect(captions[0]).toHaveTextContent('Read')
-        // The hidden thinking text appears NOWHERE — not in the stream, not in
-        // the expansion.
-        expect(screen.queryByText('secret plans')).not.toBeInTheDocument()
-        // The visible item from the partially-filtered turn still absorbed.
+        expect(captions).toHaveLength(2)
+        expect(captions[0]).toHaveTextContent('secret plans')
+        expect(captions[1]).toHaveTextContent('Read')
+        // The thinking row renders, visible by contract — its body carries
+        // the same text the caption echoes.
+        const thinking = screen.getByRole('button', { name: 'Thinking' })
+        expect(thinking).toBeInTheDocument()
+        fireEvent.click(thinking)
+        expect(screen.getAllByText('secret plans').length).toBeGreaterThanOrEqual(1)
+        // The visible items from the thinking-bearing turn still absorbed.
         expect(screen.getByText('src/b.ts')).toBeInTheDocument()
         expect(screen.getByText('src/c.ts')).toBeInTheDocument()
       })
 
-      it('stashes a superseded echo caption only when its turn was fully visible (codex lane)', () => {
-        // Codex lane (LB-1): [reasoning{summary: [], text: "secret"}, command]
-        // with explicit showThinking={false} (the opt-out path; production
-        // defaults are on) — the reasoning item is hidden, the command item
-        // renders; the echo summary derives from the hidden reasoning.
+      it('stashes superseded echo captions from a reasoning-bearing turn (codex lane)', () => {
+        // Codex lane: [reasoning{summary: []}, command] plus a visible echo
+        // control turn — reasoning rows are always visible now, so BOTH
+        // superseded echo captions stash and the reasoning row renders.
         const secretTurn = {
           id: 'turn-secret', turnId: 'turn-secret', role: 'assistant' as const,
           summary: 'secret plans', summaryKind: 'echo' as const,
@@ -2240,16 +2314,19 @@ describe('FreshAgentTranscript', () => {
         render(
           <FreshAgentTranscript
             isStreaming
-            showThinking={false}
             turns={[toolTurn('turn-a', [['c1', 'src/a.ts']]), secretTurn, visibleTurn, toolTurn('turn-z', [['c4', 'src/d.ts']])]}
           />,
         )
         expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
         fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
         const captions = screen.getAllByTestId('fresh-agent-activity-caption')
-        expect(captions).toHaveLength(1)
-        expect(captions[0]).toHaveTextContent('ls test')
-        expect(screen.queryByText('secret plans')).not.toBeInTheDocument()
+        expect(captions).toHaveLength(2)
+        expect(captions[0]).toHaveTextContent('secret plans')
+        expect(captions[1]).toHaveTextContent('ls test')
+        const thinking = screen.getByRole('button', { name: 'Thinking' })
+        expect(thinking).toBeInTheDocument()
+        fireEvent.click(thinking)
+        expect(screen.getAllByText('secret plans').length).toBeGreaterThanOrEqual(1)
       })
 
       it('treats a zero-item blank-summary turn as a benign line boundary (opencode structural-message shape)', () => {
@@ -2403,15 +2480,17 @@ describe('FreshAgentTranscript', () => {
           summary: '', summaryKind: 'echo' as const,
           items: [{ id: 'think-c', kind: 'thinking' as const, text: 'Final deliberation' }],
         }
-        const { rerender } = render(
+        const { container, rerender } = render(
           <FreshAgentTranscript isStreaming turns={[turnA, turnB, turnC]} />,
         )
         // Streaming: one merged line; the strip stays live on the merged
         // THINKING row — the spinner and the 'Thinking' reel survive even
-        // though the line's final row is the stashed caption.
+        // though the line's final row is the stashed caption. (The hoisted
+        // thinking row renders its own 'Thinking' label alongside the reel —
+        // assert the reel's name slot so the text nodes can't collide.)
         expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
         expect(screen.getByLabelText('running')).toBeInTheDocument()
-        expect(screen.getByText('Thinking')).toBeInTheDocument()
+        expect(container.querySelector('[data-slot="name"]')).toHaveTextContent('Thinking')
         // The superseded caption is folded: nothing paints in the stream.
         expect(screen.queryByTestId('fresh-agent-tail-caption')).not.toBeInTheDocument()
         expect(screen.queryByText('Weighing the next file')).not.toBeInTheDocument()
@@ -2422,7 +2501,7 @@ describe('FreshAgentTranscript', () => {
         // settled branch's candidate either.
         rerender(<FreshAgentTranscript isStreaming={false} turns={[turnA, turnB, turnC]} />)
         expect(screen.getByLabelText('running')).toBeInTheDocument()
-        expect(screen.getByText('Thinking')).toBeInTheDocument()
+        expect(container.querySelector('[data-slot="name"]')).toHaveTextContent('Thinking')
         expect(screen.queryByText('Weighing the next file')).not.toBeInTheDocument()
 
         // The stashed caption lives inside the expansion, AFTER the merged
