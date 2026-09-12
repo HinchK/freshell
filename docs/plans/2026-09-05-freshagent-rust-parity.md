@@ -462,7 +462,7 @@ Expected: PASS — all module tests green, including the 2 MiB body OK and the 1
 
 - [ ] **Step 5: Refactor while green**
 
-Check: doc-comment citations accurate after final edits; no dead code; `cargo fmt --all --check -p` scope passes; run `cargo clippy -p freshell-server --all-targets -- -D warnings` and fix anything raised in the new module.
+Check: doc-comment citations accurate after final edits; no dead code; `cargo fmt --all --check` passes; run `cargo clippy -p freshell-server --all-targets -- -D warnings` and fix anything raised in the new module.
 
 - [ ] **Step 6: Run impacted-test verification**
 

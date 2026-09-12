@@ -12,11 +12,23 @@
 //!
 //! Recorded parity divergences from the Node oracle:
 //! - Query-string edge cases: an authenticated-but-malformed query string
-//!   (invalid percent-encoding/UTF-8, duplicated params) is rejected by axum's
-//!   `Query` extractor with a plain-text 400 BEFORE the handler — status
-//!   parity with the oracle's pinned 400s, but the body shape diverges
+//!   (invalid percent-encoding/UTF-8) is rejected by axum's `Query`
+//!   extractor with a plain-text 400 BEFORE the handler — status parity
+//!   with the oracle's pinned 400s, but the body shape diverges
 //!   (consistent with this crate's other `Query` extractors, e.g.
-//!   `checkpoints.rs`).
+//!   `checkpoints.rs`). DUPLICATED params diverge per key: a duplicated
+//!   `cwd` lands in Node's missing-cwd 400 (its `typeof req.query.cwd ===
+//!   'string'` gate rejects qs's array) while a duplicated `path` makes
+//!   Node return the FULL diff 200 (the array fails the same string gate
+//!   and reads as "no path filter") where this port rejects with 400.
+//!   The SPA always sends each param once, so the `path` edge is
+//!   unreachable from the client; recorded, not repaired.
+//! - Kill signals: Node's `execFile` timeout/maxBuffer kills deliver
+//!   SIGTERM on Unix; this port's kills (timeout, cap) are tokio's
+//!   SIGKILL. Response contracts are identical (kills keep the captured
+//!   prefix and surface exitCode 1); only commands with TERM handlers
+//!   observe the difference (their cleanup handlers never run here).
+//!   Recorded, not repaired.
 //! - Diff 500 detail suffix: Node's `git diff failed: <detail>` uses the
 //!   execFile error text (`Command failed: …\n<stderr>`); this port uses
 //!   git's stderr (trimmed), and `git exited without output` when git fails
@@ -94,8 +106,10 @@ pub struct FreshAgentExtrasApiState {
     /// the exec route's cwd fallback when the request carries no usable `cwd`.
     /// Resolved from `session_directory::provider_home()` semantics — HOME set
     /// and non-empty, else the passwd-entry home — NOT the FRESHELL_HOME-preferring
-    /// storage root. `None` mirrors Node's `os.homedir()` returning undefined
-    /// (the 400 `cwd does not exist: undefined` funnel).
+    /// storage root. `None` is a defensive funnel this port turns into the
+    /// 400 `cwd does not exist: undefined` (Node docs type `os.homedir()` as
+    /// always returning a string and real systems never hit the edge, so
+    /// there is no observable Node behavior to mirror there).
     pub user_home: Option<Arc<PathBuf>>,
 }
 
@@ -205,8 +219,10 @@ async fn post_exec(
         return bad_request("command is required");
     };
     // `:291`: a non-string or empty cwd falls back to the USER's home
-    // (`os.homedir()`), never a 400 by itself — except Node's undefined-home
-    // edge, where `fsp.access(undefined)` rejects through the same 400.
+    // (`os.homedir()`), never a 400 by itself — except the defensive
+    // unresolvable-home funnel below (Node docs type `os.homedir()` as
+    // always returning a string; real systems never hit the edge, so the
+    // 400 names the missing cwd rather than mirroring any Node behavior).
     let cwd = match body
         .get("cwd")
         .and_then(Value::as_str)
@@ -941,10 +957,11 @@ mod tests {
         assert_eq!(v["output"], json!(expected.to_string_lossy()));
     }
 
-    // Node's undefined-home edge: `os.homedir()` can return undefined, and
-    // the oracle then fails `fsp.access(undefined)` into the same 400
-    // funnel (`fresh-agent-extras-router.ts:291-298`) — verbatim
-    // `cwd does not exist: undefined`.
+    // The defensive unresolvable-home funnel: provider_home() can return
+    // None (no HOME and no passwd entry — Node docs type os.homedir() as
+    // always returning a string, and real systems never hit the edge, so
+    // there is no observable Node behavior to mirror). The 400 names the
+    // missing cwd honestly instead of running in an arbitrary directory.
     #[tokio::test]
     async fn exec_without_resolvable_home_is_the_undefined_cwd_400() {
         let no_home_state = FreshAgentExtrasApiState {

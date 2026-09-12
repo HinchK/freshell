@@ -8807,3 +8807,93 @@ describe('FreshAgentView provider-advertised session commands', () => {
     expect(within(menu).getByRole('menuitem', { name: /\/review/ })).toBeInTheDocument()
   })
 })
+
+describe('!command shell escape (exec route)', () => {
+  function renderShellEscapePane(store: ReturnType<typeof createStore>) {
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-shell-escape',
+        sessionId: 'thread-shell-escape',
+        status: 'idle',
+      },
+    }))
+    return render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+  }
+
+  it('runs in the live session cwd when the pane has no initial cwd', async () => {
+    const store = createStore()
+    store.dispatch(sessionInit({
+      sessionId: 'thread-shell-escape',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      cwd: '/live/session/cwd',
+    }))
+    apiMock.post.mockImplementation((url: string) =>
+      url === '/api/fresh-agent/exec'
+        ? Promise.resolve({ output: '', exitCode: 0, truncated: false })
+        : Promise.resolve({ title: null, source: 'none' }))
+    renderShellEscapePane(store)
+
+    const textbox = await screen.findByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+    await waitFor(() => expect(textbox).not.toBeDisabled())
+    fireEvent.change(textbox, { target: { value: '!pwd' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    await waitFor(() => {
+      expect(apiMock.post).toHaveBeenCalledWith('/api/fresh-agent/exec', { command: 'pwd', cwd: '/live/session/cwd' })
+    })
+  })
+
+  it('a shell command finishing after the conversation was replaced never lands in the new queue', async () => {
+    let resolveExec!: (value: { output: string; exitCode: number; truncated: boolean }) => void
+    apiMock.post.mockImplementation((url: string) => {
+      if (url !== '/api/fresh-agent/exec') return Promise.resolve({ title: null, source: 'none' })
+      return new Promise((resolve) => {
+        resolveExec = resolve
+      })
+    })
+    const store = createStore()
+    renderShellEscapePane(store)
+
+    const textbox = await screen.findByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+    await waitFor(() => expect(textbox).not.toBeDisabled())
+    fireEvent.change(textbox, { target: { value: '!echo stale' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    await waitFor(() => expect(apiMock.post).toHaveBeenCalledWith('/api/fresh-agent/exec', expect.objectContaining({ command: 'echo stale' })))
+
+    // The /new equivalent: the pane's session identity is replaced while
+    // the (up to 30 s) exec is still in flight.
+    act(() => {
+      store.dispatch(updatePaneContent({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-shell-escape-2',
+          sessionId: 'thread-shell-escape-new',
+          status: 'idle',
+        },
+      }))
+    })
+
+    act(() => {
+      resolveExec({ output: 'stale output', exitCode: 0, truncated: false })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent(/was not sent/)
+    })
+    expect(screen.queryByRole('status', { name: 'Queued messages' })).toBeNull()
+  })
+})

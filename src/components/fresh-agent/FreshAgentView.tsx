@@ -654,6 +654,12 @@ export function FreshAgentView({
   const freshOpenCodeRouteCwd = getFreshOpenCodeRouteCwd(paneContent, { sessionCwd: agentSession?.cwd })
   const freshOpenCodeRouteCwdRef = useRef(freshOpenCodeRouteCwd)
   freshOpenCodeRouteCwdRef.current = freshOpenCodeRouteCwd
+  // The LIVE session cwd (snapshot-fed): the `!command` exec escape's
+  // fallback when the pane carries no `initialCwd` (resumed/API-created
+  // panes), so a shell command runs in the session's working directory —
+  // never silently in the user's home.
+  const agentSessionCwdRef = useRef(agentSession?.cwd)
+  agentSessionCwdRef.current = agentSession?.cwd
   const refreshRequest = useAppSelector((state) => state.panes.refreshRequestsByPane?.[tabId]?.[paneId] ?? null)
   const activeTabId = useAppSelector((state) => state.tabs.activeTabId)
   const activePaneId = useAppSelector((state) => state.panes.activePane[tabId])
@@ -2633,14 +2639,28 @@ export function FreshAgentView({
    * command + output to the agent as explicit user-provided context. */
   const runShellCommand = useCallback((command: string) => {
     const current = paneContentRef.current
+    // Prefer the pane's starting directory; a resumed/API-created pane
+    // without one falls back to the LIVE session cwd (the snapshot's), so
+    // the command runs in the session's working directory rather than the
+    // server's user-home default when the directory is actually known.
+    const cwd = current.initialCwd ?? agentSessionCwdRef.current
+    // Bind the async result to THIS conversation: the exec budget is 30 s,
+    // and a /new (or any session replacement) mid-command must never let
+    // the stale completion append into — and auto-send within — the new
+    // conversation's queue.
+    const launchSessionId = current.sessionId
     void Promise
       .resolve(api.post<{ output: string; exitCode: number | null; truncated: boolean }>(
         '/api/fresh-agent/exec',
-        { command, cwd: current.initialCwd },
+        { command, ...(cwd ? { cwd } : {}) },
       ))
       .then((result) => {
+        if (paneContentRef.current.sessionId !== launchSessionId) {
+          setNotice('Shell command finished after the conversation was replaced; its output was not sent.')
+          return
+        }
         const status = result.exitCode === 0 ? '' : ` (exit ${result.exitCode})`
-        const body = `I ran \`${command}\`${status} in ${current.initialCwd ?? 'the home directory'}. Output:\n\`\`\`\n${result.output || '(no output)'}\n\`\`\``
+        const body = `I ran \`${command}\`${status} in ${cwd ?? 'the home directory'}. Output:\n\`\`\`\n${result.output || '(no output)'}\n\`\`\``
         setQueuedMessages((queue) => [...queue, body])
       })
       .catch((error: unknown) => {
