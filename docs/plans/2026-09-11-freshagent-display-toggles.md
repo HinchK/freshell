@@ -538,7 +538,11 @@ Expected: FAIL — the three store-default tests (:1645, :1669, :1748) expect co
     // see the pane re-render on return. (Opening Settings unmounts the pane
     // tree — App.tsx:1788-1796 — so the pane reflects the new value by
     // remount; that IS the single-tab user flow.)
-    await page.getByRole('button', { name: /settings/i }).click()
+    // Pin the sidebar button's exact accessible name — every fresh-agent
+    // pane header also renders an "Agent settings" button
+    // (FreshAgentSettingsButton.tsx:280), which a /settings/i regex would
+    // match too (Playwright strict-mode violation).
+    await page.getByRole('button', { name: 'Settings (Ctrl+B ,)' }).click()
     await expect(page.getByRole('tab', { name: /^Coding Agents$/i })).toBeVisible({ timeout: 5_000 })
     await page.getByRole('tab', { name: /^Coding Agents$/i }).click()
     const thinkingRow = page.getByText('Show thinking')
@@ -557,7 +561,11 @@ Expected: FAIL — the three store-default tests (:1645, :1669, :1748) expect co
 
     // Now flip Show tools off as well: the pane's strip must mount collapsed
     // on return (the Show-tools pane effect, end to end).
-    await page.getByRole('button', { name: /settings/i }).click()
+    // Pin the sidebar button's exact accessible name — every fresh-agent
+    // pane header also renders an "Agent settings" button
+    // (FreshAgentSettingsButton.tsx:280), which a /settings/i regex would
+    // match too (Playwright strict-mode violation).
+    await page.getByRole('button', { name: 'Settings (Ctrl+B ,)' }).click()
     await page.getByRole('tab', { name: /^Coding Agents$/i }).click()
     const toolsRow = page.getByText('Show tools')
     const showToolsSwitch = toolsRow.locator('..').getByRole('switch')
