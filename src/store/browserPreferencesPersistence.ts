@@ -130,8 +130,8 @@ export function buildLocalSettingsPatch(localSettings: LocalSettings): LocalSett
   }
 
   const freshAgent: LocalSettingsPatch['freshAgent'] = {}
-  assignChangedScalar(freshAgent, localSettings.freshAgent, defaultLocalSettings.freshAgent, 'showThinking')
-  assignChangedScalar(freshAgent, localSettings.freshAgent, defaultLocalSettings.freshAgent, 'showTools')
+  assignChangedScalar(freshAgent, localSettings.freshAgent, defaultLocalSettings.freshAgent, 'expandThinking')
+  assignChangedScalar(freshAgent, localSettings.freshAgent, defaultLocalSettings.freshAgent, 'expandTools')
   assignChangedScalar(freshAgent, localSettings.freshAgent, defaultLocalSettings.freshAgent, 'showTimecodes')
   if (Object.keys(freshAgent).length > 0) {
     patch.freshAgent = freshAgent
