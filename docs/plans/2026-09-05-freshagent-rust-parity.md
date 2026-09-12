@@ -48,10 +48,11 @@ implementations of two of the three katas via PR #727:
   `fresh-agent-control-rust.spec.ts`. Plan Tasks 6, 7, and 8 are superseded
   and dropped, along with the corresponding per-send legs of Task 9.
 - **ekc6 (diff panel + AGENT-13 diff/exec) — still OPEN.** Main has no
-  `GET /api/fresh-agent/diff` / `POST /api/fresh-agent/exec` routes and the
-  panel still lacks retry/unsupported/empty states; the SPA already calls
-  both routes (`FreshAgentDiffPanel.tsx`, `FreshAgentView.tsx`
-  `runShellCommand`).
+  `GET /api/fresh-agent/diff` / `POST /api/fresh-agent/exec` routes; the panel already
+  renders an empty-changes state but lacks retry, unsupported-server, and
+  missing-prerequisite handling (this delta adds those, plus a pin for the
+  pre-existing empty state); the SPA already calls both routes
+  (`FreshAgentDiffPanel.tsx`, `FreshAgentView.tsx` `runShellCommand`).
 
 This branch was rebased onto `origin/main` at `2e05dd9e2` and now carries only
 the surviving ekc6 delta: **Task 2** (diff route), **Task 3** (exec route) —
