@@ -208,7 +208,19 @@ export function isLifecycleStartSuperseded(
   const canonical = canonicalPaneSession(pane)
   if (!canonical) return false
   const record = selectSessionRuntimeOwner(state, canonical.provider, canonical.sessionId)
-  if (!record || record.ownerKind === 'vacant' || record.ownerKind === paneKind) return false
+  if (!record) return false
+  // b8ke delta round-3 F2: a handoff IN FLIGHT supersedes EVERY lifecycle
+  // start for the session — checked BEFORE the kind-equality shortcut.
+  // Pre-d3, a pane whose kind matched the announced TARGET kind returned
+  // false here and a delayed attach during the Handoff window slipped the
+  // client-side suppression (the server-side coordinator fence is the
+  // backstop; this selector is the client half that keeps stale scheduled
+  // callbacks from issuing the start at all).
+  if (record.transition === 'handoff-started') {
+    if (!observedFence) return true
+    return record.epoch !== observedFence.epoch || record.generation >= observedFence.generation
+  }
+  if (record.ownerKind === 'vacant' || record.ownerKind === paneKind) return false
   if (!observedFence) return true
   return record.epoch !== observedFence.epoch || record.generation >= observedFence.generation
 }

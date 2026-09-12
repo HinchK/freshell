@@ -17,6 +17,7 @@ import { terminalDetachMiddleware } from '@/store/terminalDetachMiddleware'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
 import { registerFreshAgentTurnItems } from '@/lib/pane-action-registry'
 import type { ClientExtensionEntry } from '@shared/extension-types'
+import type { SessionHandoffResult } from '@/lib/api'
 
 const defaultCliExtensions: ClientExtensionEntry[] = [
   {
@@ -1397,6 +1398,213 @@ describe('ContextMenuProvider', () => {
 
   // ── kata b8ke Task 9: the atomic server-side reopen handoff ──
 
+  // b8ke delta round-3 F3: the durable flavor write belongs to the
+  // ATOMIC transition. On EVERY failure path (the typed REAP_TIMEOUT, the
+  // request throw) NOTHING durable is written — cross-device and history
+  // restoration keep identifying the LIVE owner (pre-fix the client
+  // flipped the flavor BEFORE the request and returned without
+  // restoring).
+  it('reopen failure writes NO durable session metadata (the flavor keeps identifying the live owner)', async () => {
+    const user = userEvent.setup()
+    const store = createTestStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        provider: 'codex',
+        sessionType: 'freshcodex',
+        status: 'idle',
+        createRequestId: 'req-f3-fail',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: CODEX_THREAD_ID,
+        },
+      },
+    }))
+
+    apiMocks.requestSessionHandoff.mockResolvedValueOnce({
+      ok: false,
+      error: {
+        code: 'REAP_TIMEOUT',
+        message: 'the prior runtime did not confirm its exit in time',
+        retryable: true,
+        ownerGeneration: 3,
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.FreshAgent}
+            data-tab-id="tab-1"
+            data-pane-id="pane-1"
+            data-provider="codex"
+            data-session-type="freshcodex"
+          >
+            <div data-context="fresh-agent-transcript">FreshCodex failure-path body</div>
+          </div>
+        </ContextMenuProvider>
+      </Provider>,
+    )
+
+    await user.pointer({ target: screen.getByText('FreshCodex failure-path body'), keys: '[MouseRight]' })
+    await user.click(await screen.findByRole('menuitem', { name: 'Reopen as Codex CLI' }))
+
+    await waitFor(() => {
+      expect(apiMocks.requestSessionHandoff).toHaveBeenCalledTimes(1)
+    })
+    await waitFor(() => {
+      expect(store.getState().panes.layouts['tab-1']).toMatchObject({
+        type: 'leaf',
+        content: expect.objectContaining({
+          handoffError: expect.objectContaining({ code: 'REAP_TIMEOUT' }),
+        }),
+      })
+    })
+    // THE F3 CONTRACT: NO durable metadata write happened — the flavor
+    // still identifies the live Fresh Agent owner (pre-fix the write had
+    // already landed before the request).
+    expect(apiMocks.setSessionMetadata).not.toHaveBeenCalled()
+    // And the pane never swapped.
+    expect(store.getState().panes.layouts['tab-1']).toMatchObject({
+      type: 'leaf',
+      content: { kind: 'fresh-agent' },
+    })
+  })
+
+  it('reopen request throw writes NO durable session metadata', async () => {
+    const user = userEvent.setup()
+    const store = createTestStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        provider: 'codex',
+        sessionType: 'freshcodex',
+        status: 'idle',
+        createRequestId: 'req-f3-throw',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: CODEX_THREAD_ID,
+        },
+      },
+    }))
+
+    apiMocks.requestSessionHandoff.mockRejectedValueOnce(new Error('network down'))
+
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.FreshAgent}
+            data-tab-id="tab-1"
+            data-pane-id="pane-1"
+            data-provider="codex"
+            data-session-type="freshcodex"
+          >
+            <div data-context="fresh-agent-transcript">FreshCodex throw-path body</div>
+          </div>
+        </ContextMenuProvider>
+      </Provider>,
+    )
+
+    await user.pointer({ target: screen.getByText('FreshCodex throw-path body'), keys: '[MouseRight]' })
+    await user.click(await screen.findByRole('menuitem', { name: 'Reopen as Codex CLI' }))
+
+    await waitFor(() => {
+      expect(apiMocks.setSessionMetadata.mock.calls.length).toBeGreaterThanOrEqual(0)
+    })
+    await waitFor(() => {
+      expect(store.getState().panes.layouts['tab-1']).toMatchObject({
+        type: 'leaf',
+        content: expect.objectContaining({
+          handoffError: expect.objectContaining({ code: 'HANDOFF_REQUEST_FAILED' }),
+        }),
+      })
+    })
+    expect(apiMocks.setSessionMetadata).not.toHaveBeenCalled()
+    expect(store.getState().panes.layouts['tab-1']).toMatchObject({
+      type: 'leaf',
+      content: { kind: 'fresh-agent' },
+    })
+  })
+
+  it('a successful reopen writes the durable session metadata AFTER the handoff commit (the atomic transition)', async () => {
+    const user = userEvent.setup()
+    const store = createTestStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        provider: 'codex',
+        sessionType: 'freshcodex',
+        status: 'idle',
+        createRequestId: 'req-f3-ok',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: CODEX_THREAD_ID,
+        },
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.FreshAgent}
+            data-tab-id="tab-1"
+            data-pane-id="pane-1"
+            data-provider="codex"
+            data-session-type="freshcodex"
+          >
+            <div data-context="fresh-agent-transcript">FreshCodex success-path body</div>
+          </div>
+        </ContextMenuProvider>
+      </Provider>,
+    )
+
+    await user.pointer({ target: screen.getByText('FreshCodex success-path body'), keys: '[MouseRight]' })
+    await user.click(await screen.findByRole('menuitem', { name: 'Reopen as Codex CLI' }))
+
+    // The handoff commits, THEN the durable flavor write lands (the
+    // atomic transition's home — the write order is asserted by the
+    // invocation sequence).
+    await waitFor(() => {
+      expect(apiMocks.setSessionMetadata).toHaveBeenCalledTimes(1)
+    })
+    expect(apiMocks.setSessionMetadata).toHaveBeenCalledWith(
+      'codex',
+      CODEX_THREAD_ID,
+      'codex',
+      { sessionTypeSource: 'explicit' },
+    )
+    await waitFor(() => {
+      expect(store.getState().panes.layouts['tab-1']).toMatchObject({
+        type: 'leaf',
+        content: { kind: 'terminal', terminalId: 't-default' },
+      })
+    })
+  })
+
   it('sessionRef-only freshcodex pane reopens as CLI via one awaited handoff using sessionRef.sessionId', async () => {
     const user = userEvent.setup()
     const store = createTestStore()
@@ -1850,10 +2058,23 @@ describe('ContextMenuProvider', () => {
     }
   })
 
-  it('does not kill or replace a pane when reopen metadata persistence fails', async () => {
+  // b8ke delta round-3 F3: the durable metadata write follows the atomic
+  // handoff — a POST-SUCCESS write failure cannot undo the committed
+  // runtime switch (the local fold + the server's owner broadcasts are
+  // authoritative); it logs. Pre-d3 the write preceded the request and a
+  // failure aborted the reopen keeping the pane untouched — the reviewer's
+  // finding: on every failure path the durable flavor kept identifying
+  // the live owner, which the pre-write violated.
+  it('a post-success metadata write failure logs but does not undo the committed handoff', async () => {
     const user = userEvent.setup()
     const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
     apiMocks.setSessionMetadata.mockRejectedValueOnce(new Error('persist failed'))
+    apiMocks.requestSessionHandoff.mockResolvedValueOnce({
+      ok: true,
+      operationId: 'handoff-persist-fail',
+      generation: 2,
+      owner: { kind: 'fresh-agent', sessionId: VALID_SESSION_ID, sessionType: 'freshclaude', provider: 'claude' },
+    })
     const store = createTestStore()
     store.dispatch(initLayout({
       tabId: 'tab-1',
@@ -1894,6 +2115,11 @@ describe('ContextMenuProvider', () => {
       await user.pointer({ target: screen.getByText('Terminal body'), keys: '[MouseRight]' })
       await user.click(await screen.findByRole('menuitem', { name: 'Reopen as freshclaude' }))
 
+      // The handoff commits (the server switched the runtime) ...
+      await waitFor(() => {
+        expect(apiMocks.requestSessionHandoff).toHaveBeenCalledTimes(1)
+      })
+      // ... THEN the durable write lands and fails (warn-only) ...
       await waitFor(() => {
         expect(apiMocks.setSessionMetadata).toHaveBeenCalledWith(
           'claude',
@@ -1907,29 +2133,30 @@ describe('ContextMenuProvider', () => {
       })
 
       expect(wsMocks.send).not.toHaveBeenCalled()
-      expect(store.getState().panes.layouts['tab-1']).toMatchObject({
-        type: 'leaf',
-        content: {
-          kind: 'terminal',
-          mode: 'claude',
-          status: 'running',
-          terminalId: 'term-1',
-          sessionRef: {
-            provider: 'claude',
-            sessionId: VALID_SESSION_ID,
+      // ... and the pane DID fold to the committed owner — the runtime
+      // switch is authoritative, a flavor-write failure cannot undo it.
+      await waitFor(() => {
+        expect(store.getState().panes.layouts['tab-1']).toMatchObject({
+          type: 'leaf',
+          content: {
+            kind: 'fresh-agent',
           },
-          initialCwd: '/test/project',
-        },
+        })
       })
     } finally {
       consoleWarnSpy.mockRestore()
     }
   })
 
-  it('does not kill or overwrite a pane that changes while reopen metadata is pending', async () => {
+  // b8ke delta round-3 F3: the pane-race guard now spans the HANDOFF
+  // REQUEST (the pre-d3 shape raced the metadata write). A pane that
+  // changes identity while the request is in flight is NEVER clobbered
+  // by the post-response fold — the server handoff committed (nothing
+  // undoes that), but the local pane moved on.
+  it('does not overwrite a pane that changes identity while the handoff request is in flight', async () => {
     const user = userEvent.setup()
-    const deferred = createDeferred<void>()
-    apiMocks.setSessionMetadata.mockReturnValueOnce(deferred.promise)
+    const deferred = createDeferred<SessionHandoffResult>()
+    apiMocks.requestSessionHandoff.mockReturnValueOnce(deferred.promise)
     const store = createTestStore()
     store.dispatch(initLayout({
       tabId: 'tab-1',
@@ -1970,14 +2197,10 @@ describe('ContextMenuProvider', () => {
     await user.click(await screen.findByRole('menuitem', { name: 'Reopen as freshclaude' }))
 
     await waitFor(() => {
-      expect(apiMocks.setSessionMetadata).toHaveBeenCalledWith(
-        'claude',
-        VALID_SESSION_ID,
-        'freshclaude',
-        { sessionTypeSource: 'explicit' },
-      )
+      expect(apiMocks.requestSessionHandoff).toHaveBeenCalledTimes(1)
     })
 
+    // The pane changes identity while the request is pending.
     store.dispatch(updatePaneContent({
       tabId: 'tab-1',
       paneId: 'pane-1',
@@ -1989,12 +2212,18 @@ describe('ContextMenuProvider', () => {
     }))
 
     await act(async () => {
-      deferred.resolve()
-      await deferred.promise
+      deferred.resolve({
+        ok: true,
+        operationId: 'handoff-race',
+        generation: 2,
+        owner: { kind: 'fresh-agent', sessionId: VALID_SESSION_ID, sessionType: 'freshclaude', provider: 'claude' },
+      })
+      await Promise.resolve()
       await Promise.resolve()
     })
 
     expect(wsMocks.send).not.toHaveBeenCalled()
+    // The pane is NOT clobbered by the post-response fold.
     expect(store.getState().panes.layouts['tab-1']).toMatchObject({
       type: 'leaf',
       content: {

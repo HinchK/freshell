@@ -712,6 +712,19 @@ export const SessionHandoffErrorCodeSchema = z.enum([
    *  acknowledged force-clear is the only recovery. */
   'PLATFORM_LIMITED_FENCED',
   'SESSION_FENCED',
+  /** b8ke delta round-3 F4: the INITIAL reap-time platform-limited
+   *  failure (session_handoff.rs emits it when the prior's confirmed
+   *  reap cannot verify the descendant tree on this platform) — the
+   *  fence it leaves behind is recoverable through the acknowledged
+   *  force-clear, so the frame must PARSE (pre-fix the schema rejected
+   *  the code, requestSessionHandoff rethrew, and the caller converted
+   *  it to generic HANDOFF_REQUEST_FAILED — the Banner's Force-clear
+   *  action was unreachable through the real API path). */
+  'PLATFORM_LIMITED',
+  /** b8ke delta round-3 F5: an ordinary retry against a StaleStart
+   *  fence (the unconfirmed stale-start residue) — the acknowledged
+   *  force-clear accepts StaleStart with the same typed risk. */
+  'STALE_START_FENCED',
 ])
 export type SessionHandoffErrorCode = z.infer<typeof SessionHandoffErrorCodeSchema>
 

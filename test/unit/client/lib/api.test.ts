@@ -1178,6 +1178,75 @@ describe('requestSessionHandoff()', () => {
     })
   })
 
+  // b8ke delta round-3 F4: the REAL server frame for the INITIAL
+  // PLATFORM_LIMITED reap failure (session_handoff.rs's typed_failure
+  // serializes exactly this shape) must PARSE — pre-fix the schema
+  // rejected the code, requestSessionHandoff rethrew, and the caller
+  // converted it to generic HANDOFF_REQUEST_FAILED, making the Banner's
+  // Force-clear action unreachable through the real API path. This is
+  // the integration path (the emitted frame body through the schema),
+  // not a directly-constructed enum value.
+  it('parses the server-emitted initial PLATFORM_LIMITED failure frame (the integration path)', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(409, {
+      ok: false,
+      error: {
+        code: 'PLATFORM_LIMITED',
+        message: "the prior runtime's teardown cannot confirm the descendant tree on this platform; the session stays fenced (no new writer can start) and remains recoverable",
+        retryable: true,
+        ownerGeneration: 6,
+      },
+    }))
+
+    const result = await requestSessionHandoff({
+      provider: 'claude',
+      sessionId: 'sid-pl',
+      targetKind: 'terminal',
+      mode: 'claude',
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        code: 'PLATFORM_LIMITED',
+        message: "the prior runtime's teardown cannot confirm the descendant tree on this platform; the session stays fenced (no new writer can start) and remains recoverable",
+        retryable: true,
+        ownerGeneration: 6,
+      },
+    })
+  })
+
+  // b8ke delta round-3 F5: the StaleStart-fence ordinary-retry refusal
+  // (the acknowledged force-clear is the only recovery) parses through
+  // the same integration path.
+  it('parses the server-emitted STALE_START_FENCED refusal frame', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(409, {
+      ok: false,
+      error: {
+        code: 'STALE_START_FENCED',
+        message: 'the session is fenced pending recovery: the prior runtime\u0027s death could not be confirmed (a stale start left it unconfirmable). Retry with the acknowledged force-clear (acknowledgePlatformLimitedRisk: true) to release the fence, accepting that the unconfirmed runtime\u0027s processes may remain.',
+        retryable: true,
+        ownerGeneration: 9,
+      },
+    }))
+
+    const result = await requestSessionHandoff({
+      provider: 'claude',
+      sessionId: 'sid-ss',
+      targetKind: 'terminal',
+      mode: 'claude',
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        code: 'STALE_START_FENCED',
+        message: 'the session is fenced pending recovery: the prior runtime\u0027s death could not be confirmed (a stale start left it unconfirmable). Retry with the acknowledged force-clear (acknowledgePlatformLimitedRisk: true) to release the fence, accepting that the unconfirmed runtime\u0027s processes may remain.',
+        retryable: true,
+        ownerGeneration: 9,
+      },
+    })
+  })
+
   it('surfaces the typed failure body of a 409 conflict as the failure arm instead of throwing', async () => {
     mockFetch.mockResolvedValueOnce(mockJsonResponse(409, {
       ok: false,

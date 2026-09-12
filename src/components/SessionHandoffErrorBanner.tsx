@@ -52,9 +52,14 @@ export function SessionHandoffErrorBanner({ error, appStore, tabId, paneId }: {
 
   // R4-4: the force-clear action surfaces for the platform-limited fence
   // shapes — the original PLATFORM_LIMITED failure and the ordinary
-  // retry's PLATFORM_LIMITED_FENCED refusal.
+  // retry's PLATFORM_LIMITED_FENCED refusal. b8ke delta round-3 F5: the
+  // STALE_START_FENCED refusal joins the set — the acknowledged
+  // force-clear accepts StaleStart fences with the same typed risk (the
+  // probe keeps its own confirmed-death discipline; this is the operator
+  // path).
   const platformLimited = error.code === 'PLATFORM_LIMITED'
     || error.code === 'PLATFORM_LIMITED_FENCED'
+    || error.code === 'STALE_START_FENCED'
 
   if (!error.retryable) {
     return (

@@ -137,29 +137,16 @@ export async function runPaneSessionHandoff(
   if (!current || current.target.disabled) return false
   if (expected && !sameReopenTargetIdentity(current.target, expected)) return false
 
-  // Durable metadata FIRST, flavor-preserving (kilroy keeps recording
-  // itself — the runtime-kind change must not orphan the flavor), with its
-  // failure abort keeping the pane untouched.
-  try {
-    await setSessionMetadata(
-      current.target.provider,
-      current.target.sessionId,
-      current.target.metadataSessionType,
-      { sessionTypeSource: 'explicit' },
-    )
-  } catch (err) {
-    log.warn({
-      event: 'reopen_session_flavor_metadata_persist_failed',
-      provider: current.target.provider,
-      sessionId: current.target.sessionId,
-      targetSessionType: current.target.targetSessionType,
-      tabId,
-      paneId,
-      err,
-    })
-    return false
-  }
-
+  // b8ke delta round-3 F3: the durable metadata write belongs to the
+  // ATOMIC transition — it happens AFTER the server commits the new
+  // owner, never before the request. Pre-d3 the client flipped the
+  // durable flavor first and every failure path (a pane race, a request
+  // throw, REAP_TIMEOUT / TARGET_SPAWN_FAILED / STALE_GENERATION / the
+  // typed fence refusals) returned WITHOUT restoring it — cross-device
+  // and history restoration identified a session as terminal CLI while
+  // its live owner was still the Fresh Agent, or vice versa. On failure
+  // the durable flavor now still identifies the live owner by
+  // construction (nothing was written).
   const latest = resolveReopenContext(appStore.getState(), tabId, paneId)
   if (!latest || latest.target.disabled) return false
   if (expected && !sameReopenTargetIdentity(latest.target, expected)) return false
@@ -254,6 +241,46 @@ export async function runPaneSessionHandoff(
     return false
   }
 
+  // F3's preserved pane-race guard (the pre-d3 shape raced the metadata
+  // write; the atomic home races the REQUEST): re-resolve after the
+  // response and before the local fold. The SERVER handoff committed —
+  // nothing undoes that — but a pane that changed identity mid-request
+  // is NEVER clobbered by the fold (it moved on; the owner broadcasts
+  // converge every surface).
+  const post = resolveReopenContext(appStore.getState(), tabId, paneId)
+  if (!post
+    || (expected && !sameReopenTargetIdentity(post.target, expected))
+    || !sameReopenTargetIdentity(post.target, latest.target)) {
+    log.info({
+      event: 'session_handoff_pane_changed_mid_request',
+      provider: latest.target.provider,
+      sessionId: latest.target.sessionId,
+      tabId,
+      paneId,
+    })
+    // The durable flavor write still records what is NOW true (the
+    // server committed the new owner) — see below.
+    try {
+      await setSessionMetadata(
+        latest.target.provider,
+        latest.target.sessionId,
+        latest.target.metadataSessionType,
+        { sessionTypeSource: 'explicit' },
+      )
+    } catch (err) {
+      log.warn({
+        event: 'reopen_session_flavor_metadata_persist_failed',
+        provider: latest.target.provider,
+        sessionId: latest.target.sessionId,
+        targetSessionType: latest.target.targetSessionType,
+        tabId,
+        paneId,
+        err,
+      })
+    }
+    return true
+  }
+
   appStore.dispatch(updatePaneContent({
     tabId,
     paneId,
@@ -285,6 +312,30 @@ export async function runPaneSessionHandoff(
       id: latest.tab.id,
       updates: { sessionMetadataByKey },
     }))
+  }
+  // F3: the durable flavor write — INSIDE the atomic transition (the
+  // server committed the new owner; this records what now IS true).
+  // Flavor-preserving (kilroy keeps recording itself — the runtime-kind
+  // change must not orphan the flavor). A post-success write failure
+  // cannot fail the handoff itself (the runtime IS switched; the local
+  // fold + the server's owner broadcasts are authoritative) — it logs.
+  try {
+    await setSessionMetadata(
+      latest.target.provider,
+      latest.target.sessionId,
+      latest.target.metadataSessionType,
+      { sessionTypeSource: 'explicit' },
+    )
+  } catch (err) {
+    log.warn({
+      event: 'reopen_session_flavor_metadata_persist_failed',
+      provider: latest.target.provider,
+      sessionId: latest.target.sessionId,
+      targetSessionType: latest.target.targetSessionType,
+      tabId,
+      paneId,
+      err,
+    })
   }
   return true
 }

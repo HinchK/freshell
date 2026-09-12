@@ -3,6 +3,7 @@ import freshAgentReducer, { applyRuntimeOwner, type RuntimeOwnerRecord } from '@
 import {
   canonicalPaneSession,
   derivePaneOwnerDivergence,
+  isLifecycleStartSuperseded,
   selectOwnerFence,
   selectPaneOwnerDivergence,
   selectSessionRuntimeOwner,
@@ -411,5 +412,90 @@ describe('selectSessionRuntimeOwner and fence helpers', () => {
     expect(derivePaneOwnerDivergence(record, 'fresh-agent')).toBeNull()
     expect(derivePaneOwnerDivergence({ ...record, ownerKind: 'terminal', terminalId: 't-1' }, 'fresh-agent'))
       .toEqual({ ownerKind: 'terminal', terminalId: 't-1', generation: 1, transition: 'handoff-committed' })
+  })
+})
+
+describe('isLifecycleStartSuperseded (kata b8ke lifecycle-start suppression)', () => {
+  // b8ke delta round-3 F2: a handoff IN FLIGHT supersedes a lifecycle
+  // start EVEN WHEN the pane's kind matches the announced TARGET kind —
+  // the handoff-started check must run BEFORE the kind-equality shortcut.
+  // Pre-d3 the selector returned false for the matching kind and a
+  // delayed attach during the Handoff window slipped the client-side
+  // suppression (a fresh-agent pane while the handoff transitions it to
+  // terminal, and the terminal twin for the reverse direction).
+  it('supersedes a same-kind pane while the handoff is in flight (handoff-started precedes kind equality)', () => {
+    const state = stateWithRuntimeOwner({
+      provider: 'claude',
+      sessionId: 'sid-sup',
+      // The TARGET is a fresh-agent owner — the same kind as the pane
+      // below — and the transition is IN FLIGHT.
+      ownerKind: 'fresh-agent',
+      transition: 'handoff-started',
+      previousKind: 'terminal',
+      generation: 12,
+    })
+    expect(isLifecycleStartSuperseded(
+      state,
+      'fresh-agent',
+      { provider: 'claude', sessionRef: { provider: 'claude', sessionId: 'sid-sup' } },
+      undefined,
+    )).toBe(true)
+    // The reverse direction: a terminal pane while the handoff targets
+    // a terminal owner.
+    const state2 = stateWithRuntimeOwner({
+      provider: 'codex',
+      sessionId: 'sid-sup-2',
+      ownerKind: 'terminal',
+      transition: 'handoff-started',
+      previousKind: 'fresh-agent',
+      generation: 3,
+    })
+    expect(isLifecycleStartSuperseded(
+      state2,
+      'terminal',
+      { provider: 'codex', sessionRef: { provider: 'codex', sessionId: 'sid-sup-2' } },
+      undefined,
+    )).toBe(true)
+  })
+
+  it('fence-aware: a handoff-started record at an older observed generation still supersedes once current', () => {
+    const state = stateWithRuntimeOwner({
+      provider: 'claude',
+      sessionId: 'sid-sup-3',
+      ownerKind: 'fresh-agent',
+      transition: 'handoff-started',
+      generation: 7,
+    })
+    // The captured fence is OLDER than the in-flight record → superseded.
+    expect(isLifecycleStartSuperseded(
+      state,
+      'fresh-agent',
+      { provider: 'claude', sessionRef: { provider: 'claude', sessionId: 'sid-sup-3' } },
+      { epoch: 5, generation: 6 },
+    )).toBe(true)
+    // A NEWER observed fence (the decision already captured a later
+    // state) → not superseded by this record.
+    expect(isLifecycleStartSuperseded(
+      state,
+      'fresh-agent',
+      { provider: 'claude', sessionRef: { provider: 'claude', sessionId: 'sid-sup-3' } },
+      { epoch: 5, generation: 8 },
+    )).toBe(false)
+  })
+
+  it('a committed same-kind owner does NOT supersede (the multi-device attachment shape)', () => {
+    const state = stateWithRuntimeOwner({
+      provider: 'claude',
+      sessionId: 'sid-same',
+      ownerKind: 'fresh-agent',
+      transition: 'handoff-committed',
+      generation: 4,
+    })
+    expect(isLifecycleStartSuperseded(
+      state,
+      'fresh-agent',
+      { provider: 'claude', sessionRef: { provider: 'claude', sessionId: 'sid-same' } },
+      undefined,
+    )).toBe(false)
   })
 })
