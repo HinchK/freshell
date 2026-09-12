@@ -145,9 +145,14 @@ patch/sanitize/seed paths, persistence writes).
   (worktree root) — legacy_local_seed tests pass with the renamed keys and dropped legacy values.
 - [ ] **Step 5: Refactor while green.** Dead paths: none expected beyond the renamed picks.
 - [ ] **Step 6: Impacted-test verification.** `npm run test:vitest -- run test/unit/client/store/persisted-state.fresh-agent.test.ts test/unit/client/components/SettingsView.agent-chat.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.test.tsx`
-  Expected: cycle-1 default-flip assertions fail (they pin show*=true defaults and Show*/Expand
-  labels) — this is Task 2/4 RED material, recorded, not fixed here. Unit suites untouched by
-  the rename must pass.
+  Expected (verified against the sanitize path in load-bearing): tests that PATCH the old keys
+  FAIL — the patches are sanitized away so the store never flips: `FreshAgentView.test.tsx @822`
+  ("hides… when the global settings turn off" — fallbacks keep thinking visible/strip expanded)
+  and `SettingsView.agent-chat.test.tsx @50` (toggle patch never lands). Tests relying on the
+  unchanged components' `?? true` fallbacks (e.g. FreshAgentView @775) still PASS — they pin
+  old-default behavior and are Task 2/4 RED material, recorded, not fixed here.
+  `persisted-state.fresh-agent.test.ts` is unaffected by the key rename (pane payloads, not
+  settings keys) and must pass.
 - [ ] **Step 7: Commit.** `feat(settings): rename fresh-agent display keys to expandThinking/expandTools`
 
 ## Task 2: Always-visible transcript + expansion plumbing
