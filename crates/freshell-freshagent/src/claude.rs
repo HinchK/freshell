@@ -131,11 +131,25 @@ pub struct FreshClaudeState {
     /// fenced key releases on. Cleared by whichever path confirms death.
     condemned_priors:
         Arc<std::sync::Mutex<HashMap<String, crate::session_lease::CondemnedRuntimeIdentity>>>,
+    /// b8ke focused episode-2 round-2 F1: the durable-id RE-KEY alias map
+    /// (superseded durable id → the client-visible canonical id). The
+    /// rollback's fork moved ownership to the new id (the coordinator
+    /// record moved with it via `commit_live_rekey`); stale panes still
+    /// addressing the old id resolve through this map. See
+    /// [`FreshClaudeState::resolve_ownership_key`].
+    durable_rekeys: Arc<std::sync::Mutex<HashMap<String, String>>>,
     /// Test seam (Task 6 round-3 review I-1): park `resume_for_attach`
     /// right after the target session is REGISTERED — the fresh-arm
     /// target-spawn-window abort test's deterministic hold. `None` in
     /// production and every other test.
     handoff_resume_pause: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// b8ke focused episode-2 round-2 F3 test seam: when set, the
+    /// session-init adoption parks BETWEEN its phase-1 read scope and the
+    /// claim/publication — the deterministic hold for the
+    /// kill-between-read-and-publish window the publication's incarnation
+    /// revalidation closes. `None` in production and every other test.
+    #[cfg(test)]
+    adoption_pause: Option<std::sync::Arc<tokio::sync::Notify>>,
     /// P1.13 identity-event sink (the pane-ledger bridge,
     /// [`crate::identity_sink`]). Clone-shared + set-once: the state is cloned
     /// into consumer tasks, so the `OnceLock` sits behind an `Arc`. Wired
@@ -486,6 +500,18 @@ struct ClaudeSession {
     /// forward slot.
     #[allow(dead_code)]
     cli_session_id: Option<String>,
+    /// b8ke focused episode-2 round-2 F2: the operation id of the lifecycle
+    /// op that OWNS this runtime's coordinator claim — the create-resume
+    /// claim's op id, or the handoff runner's op id for an under-ticket
+    /// target resume. The session-init adoption's Blocked arm correlates
+    /// the blocking coordinator state's operation id against this marker:
+    /// only the runtime's OWN operation (which will resolve the key — the
+    /// create's commit, the runner's commit) may proceed without a claim;
+    /// an UNRELATED blocking operation (another device's handoff on the
+    /// still-vacant canonical key, a foreign start) fails CLOSED — the
+    /// freshly spawned runtime is torn down, never left running unowned
+    /// while the other operation believes there was no prior owner.
+    owning_operation: Option<String>,
     /// The envelope-stamp id the stdout consumer reads PER EVENT (Task 10b). Starts as
     /// the sessions-map key; an attach-by-durable REBIND flips it to the durable id so
     /// the pane keyed on the durable receives events. A shared mutable handle because
@@ -655,7 +681,47 @@ impl FreshClaudeState {
             handoff_platform_limited: None,
             handoff_resume_pause: None,
             condemned_priors: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            durable_rekeys: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            adoption_pause: None,
         }
+    }
+
+    /// b8ke focused episode-2 round-2 F3 test seam installer.
+    #[cfg(test)]
+    pub fn set_adoption_test_pause(&mut self, pause: Option<std::sync::Arc<tokio::sync::Notify>>) {
+        self.adoption_pause = pause;
+    }
+
+    /// b8ke focused episode-2 round-2 F1: record a durable-id RE-KEY —
+    /// the rollback's fork moved ownership to the client-visible new id
+    /// (the coordinator record moved with it), so the OLD id is now an
+    /// ALIAS. Lifecycle operations addressing the old id (a stale pane's
+    /// handoff, a snapshot) resolve through this map to the canonical key.
+    pub fn record_durable_rekey(&self, old_id: &str, new_id: &str) {
+        self.durable_rekeys
+            .lock()
+            .expect("durable rekeys lock")
+            .insert(old_id.to_string(), new_id.to_string());
+    }
+
+    /// b8ke focused episode-2 round-2 F1: resolve a wire session id to
+    /// its canonical coordinator key — the id itself, unless it is a
+    /// superseded durable alias of a re-keyed session (the rollback fork).
+    /// Bounded transitive following: chained rollbacks re-point old
+    /// aliases' successors, and the walk terminates at the current
+    /// canonical id.
+    pub fn resolve_ownership_key(&self, session_id: &str) -> String {
+        let rekeys = self.durable_rekeys.lock().expect("durable rekeys lock");
+        let mut current = session_id.to_string();
+        for _ in 0..8 {
+            match rekeys.get(&current) {
+                Some(next) => current = next.clone(),
+                None => break,
+            }
+        }
+        drop(rekeys);
+        current
     }
 
     /// Test seam (Task 6 round-3 review I-1): arm the deterministic holds
@@ -853,13 +919,18 @@ impl FreshClaudeState {
 
     /// Side-effect-free coordinator read for `(provider, session_id)`
     /// (kata b8ke Task 3). `Vacant`/0 when the registry is unwired.
+    /// b8ke focused episode-2 round-2 F1: the wire id resolves through the
+    /// re-key alias map first — a snapshot/D7 read for a stale pane's
+    /// superseded durable id reports the CANONICAL record, never a false
+    /// Vacant over a live re-keyed runtime.
     pub fn ownership_snapshot(
         &self,
         provider: &str,
         session_id: &str,
     ) -> freshell_ownership::OwnershipSnapshot {
+        let resolved = self.resolve_ownership_key(session_id);
         match &self.ownership {
-            Some(registry) => registry.observe(provider, session_id),
+            Some(registry) => registry.observe(provider, &resolved),
             None => freshell_ownership::OwnershipSnapshot {
                 epoch: 0,
                 generation: 0,
@@ -1125,7 +1196,16 @@ impl FreshClaudeState {
         // tail's commit is a no-op — the runner performs the one commit_live.
         let mut own_ticket: Option<freshell_ownership::OperationTicket> = None;
         let outcome = self
-            .resume_for_attach(&msg, session_id, &mut lease_guard, &mut own_ticket)
+            .resume_for_attach(
+                &msg,
+                session_id,
+                &mut lease_guard,
+                &mut own_ticket,
+                // b8ke focused episode-2 round-2 F2: the RUNNER's handoff op
+                // owns this target resume's coordinator transition — the
+                // session records it for the adoption's Blocked correlation.
+                Some(operation_id.to_string()),
+            )
             .await;
         if let Some(mut g) = lease_guard.take() {
             // A leftover armed guard means the resume ended WITHOUT a
@@ -1180,23 +1260,110 @@ impl FreshClaudeState {
     }
 
     /// kata b8ke Task 3: commit this lane's claim and retain the stamp. See
-    /// [`crate::ownership_lane::commit_lane_claim`].
+    /// [`crate::ownership_lane::commit_lane_claim`]. The registry key comes
+    /// from the TICKET (the key the claim minted), never the caller's wire
+    /// id — b8ke focused episode-2 round-2 F1 keeps claim and commit on
+    /// the same key even when a resolved id differs from the wire id.
     fn commit_lane_claim_at(
         &self,
         ticket: &mut Option<freshell_ownership::OperationTicket>,
-        session_id: &str,
         live_session_key: &str,
         pid: Option<u32>,
     ) -> Result<(), freshell_ownership::CommitOutcome> {
+        let Some(ticket_ref) = ticket.as_ref() else {
+            return Ok(());
+        };
+        let session_id = ticket_ref.session_id().to_string();
         crate::ownership_lane::commit_lane_claim(
             &self.ownership,
             &self.ownership_stamps,
             PROVIDER,
-            session_id,
+            &session_id,
             ticket,
             live_session_key,
             pid,
         )
+    }
+
+    /// b8ke focused episode-2 round-2 F1: commit the rollback's claim by
+    /// RE-KEYING — the start's `Starting{op}` record under the OLD durable
+    /// id moves to the NEW client-visible durable id in ONE atomic registry
+    /// step (`commit_live_rekey`: never both-Live, never both-Vacant), the
+    /// stamp is retained under the NEW id (the lane's kill/exit paths key
+    /// off it), and the OLD id becomes a resolvable alias
+    /// ([`Self::record_durable_rekey`]). One source of truth: the
+    /// materialization already replaced the pane's sessionRef with the new
+    /// id, so every later lifecycle operation — handoff included — finds
+    /// the owner under the id the client actually holds. `Err` (stale /
+    /// foreign / occupied target key) is the caller's existing teardown
+    /// path — never a partial move.
+    fn commit_lane_claim_rekey_at(
+        &self,
+        ticket: &mut Option<freshell_ownership::OperationTicket>,
+        new_durable_id: &str,
+        live_session_key: &str,
+        pid: Option<u32>,
+    ) -> Result<(), freshell_ownership::CommitOutcome> {
+        let Some(ticket_ref) = ticket.as_ref() else {
+            return Ok(());
+        };
+        let old_durable_id = ticket_ref.session_id().to_string();
+        let owner = freshell_ownership::OwnerIdentity {
+            kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            terminal_id: None,
+            live_session_key: Some(live_session_key.to_string()),
+            pid,
+            ownership_id: Some(ticket_ref.operation_id().to_string()),
+        };
+        let Some(registry) = self.ownership.as_ref() else {
+            // Unwired (no coordinator): nothing to rekey; disarm the ticket
+            // so its drop does not fail a nonexistent claim.
+            if let Some(ticket) = ticket.as_mut() {
+                ticket.disarm();
+            }
+            return Ok(());
+        };
+        let outcome = registry.commit_live_rekey(
+            PROVIDER,
+            &old_durable_id,
+            new_durable_id,
+            ticket_ref.operation_id(),
+            ticket_ref.generation(),
+            owner,
+        );
+        match outcome {
+            freshell_ownership::CommitOutcome::Committed => {
+                // Retain the stamp under the NEW id (the lane's kill/exit
+                // paths resolve the canonical durable through the session's
+                // current cli_session_id — the new id — and take the stamp
+                // from exactly this key).
+                let stamp = crate::ownership_lane::OwnershipStamp {
+                    epoch: registry.boot_epoch(),
+                    generation: ticket_ref.generation(),
+                    operation_id: ticket_ref.operation_id().to_string(),
+                    owner: freshell_ownership::OwnerIdentity {
+                        kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                        terminal_id: None,
+                        live_session_key: Some(live_session_key.to_string()),
+                        pid,
+                        ownership_id: Some(ticket_ref.operation_id().to_string()),
+                    },
+                };
+                self.ownership_stamps
+                    .lock()
+                    .expect("ownership stamps lock")
+                    .insert(new_durable_id.to_string(), stamp);
+                // The old id is now an alias of the new canonical id.
+                self.record_durable_rekey(&old_durable_id, new_durable_id);
+                // The claim is consumed: disarm so the ticket's Drop does
+                // not fail the (now moved) claim.
+                if let Some(ticket) = ticket.as_mut() {
+                    ticket.disarm();
+                }
+                Ok(())
+            }
+            stale => Err(stale),
+        }
     }
 
     /// The initiator label for a coordinator transition event: the
@@ -1706,6 +1873,11 @@ impl FreshClaudeState {
                 consumer,
                 sidecar_session_id: created.clone(),
                 cli_session_id: resume_sid.clone(),
+                // b8ke focused episode-2 round-2 F2: the owning lifecycle op
+                // — the create-resume claim's op id, so the session-init
+                // adoption's Blocked arm can correlate its OWN in-flight
+                // claim (a foreign blocker tears down instead).
+                owning_operation: own_ticket.as_ref().map(|t| t.operation_id().to_string()),
                 broadcast_id,
                 pending,
                 in_turn,
@@ -1796,8 +1968,7 @@ impl FreshClaudeState {
         // canonical durable id only materializes at `sdk.session.init`; the
         // residual is covered by the D7 probe backstop).
         if let Some(sid) = resume_sid.as_deref() {
-            if let Err(outcome) =
-                self.commit_lane_claim_at(&mut own_ticket, sid, &created, sidecar_pid)
+            if let Err(outcome) = self.commit_lane_claim_at(&mut own_ticket, &created, sidecar_pid)
             {
                 tracing::error!(target: "invariant",
                     provider = PROVIDER, session_id = %sid, request_id = %request_id,
@@ -4617,6 +4788,10 @@ impl FreshClaudeState {
                 consumer,
                 sidecar_session_id,
                 cli_session_id: Some(cli_id.clone()),
+                // b8ke focused episode-2 round-2 F2: the ROLLBACK's claim
+                // owns this respawn's coordinator transition — the
+                // adoption's Blocked arm correlates through the op id.
+                owning_operation: own_ticket.as_ref().map(|t| t.operation_id().to_string()),
                 broadcast_id: Arc::clone(&broadcast_id),
                 pending,
                 in_turn: in_turn.clone(),
@@ -4671,13 +4846,19 @@ impl FreshClaudeState {
             }
         }
 
-        // kata b8ke Task 3: the rollback's replacement session is registered —
-        // commit `Live{FreshAgent}` under the (same) durable lane. The
-        // adopted durable id (`adopted_id` below) supersedes it in the LEDGER
-        // only; the coordinator key stays the lane's canonical pre-rollback
-        // durable (the runtime writer identity did not move).
+        // kata b8ke Task 3 + focused episode-2 round-2 F1: the rollback's
+        // replacement session is registered — commit `Live{FreshAgent}`
+        // under the CLIENT-VISIBLE durable id. The fork's
+        // `sdk.session.init` minted `adopted_id`, and the materialization
+        // below replaces every pane's sessionRef with it — so the
+        // coordinator record RE-KEYS to the same id (one atomic registry
+        // step: the old key goes Vacant, the new key goes Live; the old id
+        // becomes a resolvable alias). One source of truth: a later
+        // handoff on the pane's sessionRef finds the prior owner, stops
+        // it, and transfers atomically — never a Vacant-looking split
+        // identity with a live runtime beside a second writer.
         if let Err(outcome) =
-            self.commit_lane_claim_at(&mut own_ticket, &durable_id, &map_key, sidecar_pid)
+            self.commit_lane_claim_rekey_at(&mut own_ticket, &adopted_id, &map_key, sidecar_pid)
         {
             tracing::error!(target: "invariant",
                 provider = PROVIDER, session_id = %durable_id,
@@ -4967,8 +5148,18 @@ impl FreshClaudeState {
                 }
             }
         }
+        // b8ke focused episode-2 round-2 F2: the attach's OWN claim owns
+        // the transition while it is in flight — recorded for the
+        // session-init adoption's Blocked correlation.
+        let attach_owning_operation = own_ticket.as_ref().map(|t| t.operation_id().to_string());
         let outcome = self
-            .resume_for_attach(&msg, &durable, &mut lease_guard, &mut own_ticket)
+            .resume_for_attach(
+                &msg,
+                &durable,
+                &mut lease_guard,
+                &mut own_ticket,
+                attach_owning_operation,
+            )
             .await;
         self.resuming
             .lock()
@@ -5046,6 +5237,15 @@ impl FreshClaudeState {
         // at the registration tail below; every error return leaves it armed
         // for the caller's drop (RAII typed fail).
         own_ticket: &mut Option<freshell_ownership::OperationTicket>,
+        // b8ke focused episode-2 round-2 F2: the operation id of the
+        // lifecycle op that OWNS this runtime's coordinator transition —
+        // the attach's own claim, or the handoff runner's op for the
+        // under-ticket target resume. Recorded on the session so the
+        // session-init adoption's Blocked arm can correlate a blocking
+        // coordinator state with the runtime being adopted (only the
+        // runtime's OWN operation may proceed claim-free; an unrelated
+        // blocker fails closed).
+        owning_operation: Option<String>,
     ) -> Result<(), ResumeClaudeError> {
         // b8ke delta round-2 F2: the attach-start's REAL watchdog machinery
         // — the sidecar pid slot (the registered cancellation SIGTERMs the
@@ -5262,6 +5462,7 @@ impl FreshClaudeState {
                 consumer,
                 sidecar_session_id,
                 cli_session_id: Some(durable.to_string()),
+                owning_operation,
                 broadcast_id,
                 pending,
                 in_turn,
@@ -5353,9 +5554,7 @@ impl FreshClaudeState {
         // kata b8ke Task 3: the attach-resume's registration survived every
         // teardown gate — commit `Live{FreshAgent}` under the durable id
         // (the sessions-map key is the CLIENT's msg.session_id).
-        if let Err(outcome) =
-            self.commit_lane_claim_at(own_ticket, durable, &msg.session_id, sidecar_pid)
-        {
+        if let Err(outcome) = self.commit_lane_claim_at(own_ticket, &msg.session_id, sidecar_pid) {
             tracing::error!(target: "invariant",
                 provider = PROVIDER, session_id = %durable,
                 outcome = ?outcome,
@@ -5558,7 +5757,23 @@ impl FreshClaudeState {
     /// adoption's first read and this publication owns the session, so the
     /// publication abandons (`false`). Returns whether the publication
     /// landed.
-    async fn publish_session_init_alias(&self, cli_id: &str, session_id: &str) -> bool {
+    ///
+    /// b8ke focused episode-2 round-2 F3: the publication ALSO revalidates
+    /// the session's INCARNATION — the session must still exist AND its
+    /// sidecar child must still be the exact runtime the adoption read at
+    /// phase 1 (`expect_pid`). An explicit kill that completed between the
+    /// read and here removed the session AND its close-pending entry, so
+    /// the gate check alone cannot see it; without this validation the
+    /// adoption would mint a dangling alias and commit `Live` over the
+    /// captured pid of a KILLED runtime (snapshots then reported the dead
+    /// runtime as the authoritative owner). Missing/incarnation-changed →
+    /// `false`: no alias, no commit — the kill owns the session.
+    async fn publish_session_init_alias(
+        &self,
+        cli_id: &str,
+        session_id: &str,
+        expect_pid: Option<u32>,
+    ) -> bool {
         let mut index = self.cli_index.lock().await;
         let mut sessions = self.sessions.lock().await;
         let gated = {
@@ -5569,15 +5784,40 @@ impl FreshClaudeState {
             tracing::info!(target: "freshell_freshagent::claude",
                 cli_id = %cli_id,
                 session_id = %session_id,
-                "freshagent.claude.adoption_abandoned_by_kill_gate: the kill's one \
+                "freshagent.claude.adoption_abandoned_by_kill_gate: the kill's one \\
                  envelope already enumerated this session; the mint lands nowhere"
             );
             return false;
         }
-        index.insert(cli_id.to_string(), session_id.to_string());
-        if let Some(session) = sessions.get_mut(session_id) {
-            session.cli_session_id = Some(cli_id.to_string());
+        // F3: the session must still exist with the SAME runtime incarnation
+        // the adoption observed — a completed kill (or a re-registered
+        // replacement) invalidates the adoption's captured identity.
+        match sessions.get_mut(session_id) {
+            None => {
+                tracing::warn!(target: "freshell_freshagent::claude",
+                    cli_id = %cli_id, placeholder = %session_id,
+                    "freshagent.claude.adoption_abandoned_session_gone: the session was \\
+                     removed (a completed kill) before the publication — no alias, no \\
+                     commit of the dead runtime's identity"
+                );
+                return false;
+            }
+            Some(session) => {
+                if session.child.id() != expect_pid {
+                    tracing::warn!(target: "freshell_freshagent::claude",
+                        cli_id = %cli_id, placeholder = %session_id,
+                        expected_pid = ?expect_pid,
+                        current_pid = ?session.child.id(),
+                        "freshagent.claude.adoption_abandoned_incarnation_changed: the \\
+                         session's runtime was replaced since the adoption's read — no \\
+                         alias, no commit of a stale identity"
+                    );
+                    return false;
+                }
+                session.cli_session_id = Some(cli_id.to_string());
+            }
         }
+        index.insert(cli_id.to_string(), session_id.to_string());
         true
     }
 
@@ -5619,6 +5859,13 @@ impl FreshClaudeState {
                 .and_then(|s| s.cli_session_id.clone());
             registered = sessions.contains_key(session_id);
             sidecar_pid = sessions.get(session_id).and_then(|s| s.child.id());
+        }
+        eprintln!();
+        // b8ke focused episode-2 round-2 F3 test seam: the deterministic
+        // kill-between-read-and-publication hold (never armed in production).
+        #[cfg(test)]
+        if let Some(pause) = &self.adoption_pause {
+            let _ = pause.notified().await;
         }
         // b8ke focused episode-2 round-1 F4: the ROLLBACK-FORK gate. A
         // rollback's `sdk.session.init` deliberately MINTS A NEW durable
@@ -5700,26 +5947,80 @@ impl FreshClaudeState {
                 // publishing nothing.
                 crate::ownership_lane::LaneClaim::Refused(outcome) => {
                     match &outcome {
-                        // ANY in-flight transition or claim (Handoff /
-                        // Starting / Stopping / Fenced) owns the key's
-                        // resolution — the adoption claims nothing and
-                        // tears NOTHING down: this runtime is either that
-                        // transition's own target (the handoff runner's
-                        // under-ticket resume — the runner performs the
-                        // ONE commit + broadcast) or its prior (a handoff
-                        // already stopping it through kill_for_handoff),
-                        // and in both cases the owning operation resolves
-                        // the key. The publication proceeds so the alias
-                        // bookkeeping matches the transition's commit.
-                        freshell_ownership::BeginOutcome::Blocked { .. } => {
-                            tracing::info!(target: "freshell_freshagent::claude",
-                                cli_id = %cli_id, placeholder = %session_id,
-                                outcome = ?outcome,
-                                "freshagent.claude.init_ownership_adoption_skipped_in_flight: \\
-                                 a lifecycle transition owns this key — the adoption claims \\
-                                 nothing, the owning operation resolves it"
+                        // A BLOCKED coordinator state: correlate the
+                        // blocking operation with the runtime being
+                        // adopted (b8ke focused episode-2 round-2 F2).
+                        // ONLY the runtime's OWN operation — recorded on
+                        // the session as its `owning_operation` (the
+                        // create-resume claim, the attach's claim, or the
+                        // handoff runner's under-ticket target op) — may
+                        // proceed: that operation owns the key's
+                        // resolution and will perform the ONE commit, so
+                        // the adoption claims nothing, tears nothing
+                        // down, and the publication keeps the alias
+                        // bookkeeping consistent with its commit.
+                        // An UNRELATED blocker (another device's handoff
+                        // on the still-vacant canonical key, a foreign
+                        // start, a fenced/stop transition that does not
+                        // name this runtime's owner) fails CLOSED: the
+                        // freshly spawned runtime is torn down — never
+                        // left running unowned while the other operation
+                        // believes there was no prior owner.
+                        freshell_ownership::BeginOutcome::Blocked { state, .. } => {
+                            let blocking_op = state.operation_id().map(str::to_string);
+                            let (own_op, own_live_key) = {
+                                let sessions = self.sessions.lock().await;
+                                match sessions.get(session_id) {
+                                    Some(session) => (
+                                        session.owning_operation.clone(),
+                                        Some(session.sidecar_session_id.clone()),
+                                    ),
+                                    None => (None, None),
+                                }
+                            };
+                            // The handoff stopping THIS runtime as its
+                            // PRIOR is also "our" transition: the runner's
+                            // Handoff state captures this session's runtime
+                            // identity as the prior it is stopping — the
+                            // deferred adoption (a create whose bookkeeping
+                            // landed mid-handoff) must neither claim nor
+                            // tear down; the handoff's kill_for_handoff is
+                            // the one stopping this session, and the
+                            // runner resolves the key.
+                            let handoff_stops_this_runtime = matches!(
+                                &state,
+                                freshell_ownership::OwnershipState::Handoff {
+                                    prior: Some((prior_owner, _)),
+                                    ..
+                                } if own_live_key.is_some()
+                                    && prior_owner.live_session_key == own_live_key
                             );
-                            None
+                            if (blocking_op.is_some() && blocking_op == own_op)
+                                || handoff_stops_this_runtime
+                            {
+                                eprintln!();
+                                tracing::info!(target: "freshell_freshagent::claude",
+                                    cli_id = %cli_id, placeholder = %session_id,
+                                    operation_id = ?blocking_op,
+                                    "freshagent.claude.init_ownership_adoption_skipped_own_operation: \\
+                                     the runtime's OWN lifecycle operation owns this key — the \\
+                                     adoption claims nothing, the owning operation resolves it"
+                                );
+                                None
+                            } else {
+                                eprintln!();
+                                tracing::warn!(target: "freshell_freshagent::claude",
+                                    cli_id = %cli_id, placeholder = %session_id,
+                                    outcome = ?outcome,
+                                    owning_operation = ?own_op,
+                                    "freshagent.claude.init_ownership_adoption_blocked_foreign: an \\
+                                     UNRELATED operation owns this key — the freshly spawned \\
+                                     runtime is torn down (fail closed), nothing published"
+                                );
+                                self.teardown_unadopted_session(session_id, session_type)
+                                    .await;
+                                return;
+                            }
                         }
                         // A genuinely FOREIGN owner (another kind holds
                         // the key): fail closed — the freshly spawned
@@ -5743,7 +6044,10 @@ impl FreshClaudeState {
         }
         // The (re-gated) publication: abandons when the kill gate armed
         // between the read scope and here — the kill owns the session.
-        if !self.publish_session_init_alias(cli_id, session_id).await {
+        if !self
+            .publish_session_init_alias(cli_id, session_id, sidecar_pid)
+            .await
+        {
             return;
         }
         // b8ke delta round-2 F1: the canonical-key adoption commit — for
@@ -5754,7 +6058,7 @@ impl FreshClaudeState {
         if let Some(ticket) = adoption_ticket.as_ref() {
             let generation = ticket.generation();
             let operation_id = ticket.operation_id().to_string();
-            match self.commit_lane_claim_at(&mut adoption_ticket, cli_id, session_id, sidecar_pid) {
+            match self.commit_lane_claim_at(&mut adoption_ticket, session_id, sidecar_pid) {
                 Ok(()) => {
                     // Broadcast the authoritative owner record: every device
                     // holding the durable sessionRef converges on the
@@ -7623,6 +7927,7 @@ pub(crate) mod tests {
                 consumer,
                 sidecar_session_id: session_id.to_string(),
                 cli_session_id: None,
+                owning_operation: None,
                 broadcast_id: Arc::new(std::sync::Mutex::new(session_id.to_string())),
                 pending: Arc::new(std::sync::Mutex::new(ClaudePending::default())),
                 in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -10330,8 +10635,8 @@ rl.on('line', (line) => {
                 registry.observe("claude", "new-fork-id-e2r4").state,
                 freshell_ownership::OwnershipState::Live { .. }
             ),
-            "the rollback fork must NOT adopt ownership under the new id (the \
-             pre-fix dual-key Live): {:?}",
+            "the fork ADOPTION must NOT claim under the new id — the ROLLBACK's \
+             commit owns the one move (the delta-r2 dual-record shape): {:?}",
             registry.observe("claude", "new-fork-id-e2r4").state
         );
         // The re-key bookkeeping: the alias maps the fork id to the session.
@@ -10340,12 +10645,263 @@ rl.on('line', (line) => {
             Some(&placeholder),
             "the fork re-key alias still lands"
         );
-        // The OLD durable id stays the authoritative owner.
+        // b8ke focused episode-2 round-2 F1: after the rollback's COMMIT, the
+        // canonical ownership MOVES to the client-visible new id
+        // (`commit_lane_claim_rekey_at` — pinned by the registry's
+        // commit_live_rekey test), and the OLD id becomes a resolvable
+        // alias: the lane resolves it for every lifecycle operation, and
+        // the snapshot reports the CANONICAL record for it — never a false
+        // Vacant that licenses a second writer beside the live runtime.
+        st.record_durable_rekey(FRESH_CREATE_DURABLE_ID, "new-fork-id-e2r4");
+        assert_eq!(
+            st.resolve_ownership_key(FRESH_CREATE_DURABLE_ID),
+            "new-fork-id-e2r4",
+            "the superseded old id resolves to the client-visible canonical id"
+        );
+        assert_eq!(
+            st.resolve_ownership_key("new-fork-id-e2r4"),
+            "new-fork-id-e2r4",
+            "the canonical id resolves to itself"
+        );
+        // The snapshot for the OLD id reports the CANONICAL record.
+        let snap = st.ownership_snapshot("claude", FRESH_CREATE_DURABLE_ID);
+        assert_eq!(
+            snap.state,
+            registry.observe("claude", "new-fork-id-e2r4").state,
+            "a snapshot on the superseded id reports the canonical record — \
+             never a false Vacant over the live re-keyed runtime"
+        );
+    }
+
+    /// b8ke focused episode-2 round-2 F2: an adoption whose claim is BLOCKED
+    /// by an UNRELATED operation fails CLOSED. The finding's shape: a fresh
+    /// create exposes its cliSessionId while the adoption is deferred;
+    /// another device starts a handoff on the still-vacant canonical key —
+    /// the deferred adoption then sees Blocked{Handoff} whose op id is NOT
+    /// this runtime's own owning operation (a plain create's session
+    /// carries none): the freshly spawned runtime must be TORN DOWN and
+    /// NOTHING published — never left running unowned while the handoff
+    /// believes there was no prior owner. The runtime's OWN operation
+    /// (the session's recorded owning op — the create-resume claim's op id)
+    /// still proceeds claim-free.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_foreign_blocked_adoption_tears_down_while_the_own_operation_proceeds() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+
+        // (a) The FOREIGN blocker: an ordinary fresh create's session (no
+        // owning operation) + an UNRELATED handoff holding the key.
+        st.handle_create(dedup_create_msg("req-e2r2-f2a"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "req-e2r2-f2a").await;
+        let placeholder_a = created["sessionId"].as_str().unwrap().to_string();
+        // Let the fresh create's OWN adoption commit first (it is the first
+        // claimant — this part is the pre-existing behavior).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if matches!(
+                registry.observe("claude", FRESH_CREATE_DURABLE_ID).state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the fresh create's own adoption must commit"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // A SECOND session registered with NO owning operation (the plain
+        // create's shape) whose durable id is already blocked by a FOREIGN
+        // handoff: enter Handoff on the id directly, then adopt for the
+        // second session under the same id.
+        let foreign_dur = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
         assert!(matches!(
-            registry.observe("claude", FRESH_CREATE_DURABLE_ID).state,
-            freshell_ownership::OwnershipState::Live { owner, .. }
-                if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+            registry.begin_handoff(
+                "claude",
+                foreign_dur,
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "foreign-handoff-op",
+                None,
+                "other-device",
+                1,
+            ),
+            freshell_ownership::BeginOutcome::Granted { .. }
         ));
+        // The second session (a plain create's session: owning op None).
+        st.sessions
+            .lock()
+            .await
+            .get_mut(&placeholder_a)
+            .expect("session")
+            .owning_operation = None;
+        st.sessions
+            .lock()
+            .await
+            .get_mut(&placeholder_a)
+            .expect("session")
+            .cli_session_id = None;
+        st.adopt_session_init(
+            foreign_dur,
+            &placeholder_a,
+            "freshclaude",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        // The teardown is DETACHED (the adoption's caller is the session's
+        // own consumer — the standard teardown aborts it, so the sequence
+        // runs in a spawned task): bounded-poll for the fail-closed result.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while st.sessions.lock().await.contains_key(&placeholder_a) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the foreign-blocked adoption must TEAR the runtime down (pre-fix: \
+                 published over it and left the sidecar running unowned)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            st.cli_index.lock().await.get(foreign_dur).is_none(),
+            "the foreign-blocked adoption publishes NOTHING"
+        );
+        assert!(
+            !matches!(
+                registry.observe("claude", foreign_dur).state,
+                freshell_ownership::OwnershipState::Live {
+                    owner,
+                    ..
+                } if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+            ),
+            "the foreign handoff's key never becomes FreshAgent-owned by the adoption"
+        );
+
+        // (b) The OWN operation: a session whose recorded owning op IS the
+        // blocking operation — the under-ticket handoff-target shape. The
+        // adoption proceeds claim-free (the owning operation performs the
+        // one commit); the runtime stays.
+        let own_dur = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        assert!(matches!(
+            registry.begin_handoff(
+                "claude",
+                own_dur,
+                freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                "own-runner-op",
+                None,
+                "runner",
+                2,
+            ),
+            freshell_ownership::BeginOutcome::Granted { .. }
+        ));
+        // A second live session carrying the runner's op id.
+        st.handle_create(dedup_create_msg("req-e2r2-f2b"), None)
+            .await;
+        let created_b = await_claude_created(&mut rx, "req-e2r2-f2b").await;
+        let placeholder_b = created_b["sessionId"].as_str().unwrap().to_string();
+        {
+            let mut sessions = st.sessions.lock().await;
+            let session = sessions.get_mut(&placeholder_b).expect("second session");
+            session.owning_operation = Some("own-runner-op".to_string());
+            session.cli_session_id = None;
+        }
+        st.adopt_session_init(
+            own_dur,
+            &placeholder_b,
+            "freshclaude",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            st.sessions.lock().await.contains_key(&placeholder_b),
+            "the runtime's OWN operation proceeds — no teardown"
+        );
+        assert_eq!(
+            st.cli_index.lock().await.get(own_dur),
+            Some(&placeholder_b),
+            "the own-operation adoption publishes the bookkeeping"
+        );
+    }
+
+    /// b8ke focused episode-2 round-2 F3: the publication revalidates the
+    /// session's INCARNATION. A kill that COMPLETES between the adoption's
+    /// read and its publication (the session removed AND its close-pending
+    /// entry gone — the gate check alone cannot see it) must fail the
+    /// publication: no dangling alias, no Live commit of the killed
+    /// runtime's captured pid. Pre-fix the publication returned success and
+    /// committed the dead runtime as the authoritative owner.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_completed_kill_before_publication_abandons_the_adoption() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        // The deterministic hold: the adoption parks between its phase-1
+        // read (session LIVE, pid captured) and the publication.
+        let pause = std::sync::Arc::new(tokio::sync::Notify::new());
+        st.set_adoption_test_pause(Some(std::sync::Arc::clone(&pause)));
+
+        st.handle_create(dedup_create_msg("req-e2r2-f3"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "req-e2r2-f3").await;
+        let placeholder = created["sessionId"].as_str().unwrap().to_string();
+        // The durable id the sidecar will mint must differ from the FIRST
+        // create's own adoption (which completes before the pause — the
+        // pause holds the SECOND adoption for a fresh id).
+        let killed_dur = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+
+        let st2 = st.clone();
+        let ph = placeholder.clone();
+        let mut adoption = tokio::spawn(async move {
+            st2.adopt_session_init(killed_dur, &ph, "freshclaude", None, None, None, None)
+                .await;
+        });
+        // The adoption is parked (its phase-1 read captured the LIVE
+        // session + pid). Give it a beat to reach the park.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // THE COMPLETED KILL between the read and the publication: the
+        // session REMOVED and its close-pending entry GONE (the kill
+        // finished; nothing re-arms the mint gate — the gate check alone
+        // cannot see this).
+        let removed = st.sessions.lock().await.remove(&placeholder);
+        assert!(removed.is_some(), "the kill removed the session");
+        assert!(
+            st.close_pending
+                .lock()
+                .expect("close-pending probe")
+                .get(&placeholder)
+                .is_none(),
+            "the completed kill left no close-pending entry"
+        );
+
+        // Release the adoption: the publication must fail closed on the
+        // session-incarnation revalidation.
+        pause.notify_waiters();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(15), &mut adoption).await;
+
+        assert!(
+            st.cli_index.lock().await.get(killed_dur).is_none(),
+            "the adoption over a killed session publishes NO alias (pre-fix: \
+             the dangling alias landed)"
+        );
+        assert!(
+            !matches!(
+                registry.observe("claude", killed_dur).state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ),
+            "the adoption never commits the KILLED runtime as the owner \
+             (pre-fix: snapshots reported the dead runtime as authoritative)"
+        );
     }
 
     /// b8ke focused episode-2 round-1 F7: the adoption's claim records the
@@ -13040,6 +13596,7 @@ rl.on('line', (line) => {
                 consumer,
                 sidecar_session_id: session_id.to_string(),
                 cli_session_id: None,
+                owning_operation: None,
                 broadcast_id: Arc::new(std::sync::Mutex::new(session_id.to_string())),
                 pending: Arc::new(std::sync::Mutex::new(pending)),
                 in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -14370,6 +14927,7 @@ rl.on('line', (line) => {
                 consumer,
                 sidecar_session_id: map_key.to_string(),
                 cli_session_id: Some(durable.to_string()),
+                owning_operation: None,
                 broadcast_id,
                 pending,
                 in_turn,
@@ -14418,6 +14976,7 @@ rl.on('line', (line) => {
                 consumer,
                 sidecar_session_id: map_key.to_string(),
                 cli_session_id: Some(durable.to_string()),
+                owning_operation: None,
                 broadcast_id: Arc::new(std::sync::Mutex::new(map_key.to_string())),
                 pending: Arc::new(std::sync::Mutex::new(ClaudePending::default())),
                 in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -14510,6 +15069,7 @@ rl.on('line', (line) => {
                 consumer,
                 sidecar_session_id: map_key.to_string(),
                 cli_session_id: Some(durable.to_string()),
+                owning_operation: None,
                 broadcast_id,
                 pending,
                 in_turn,

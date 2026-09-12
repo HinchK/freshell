@@ -3463,6 +3463,63 @@ fn fresh_create_msg(session_type: SessionType) -> FreshAgentCreate {
     }
 }
 
+/// 8c. b8ke focused episode-2 round-2 F1: a handoff addressing a
+/// SUPERSEDED durable id (a stale pane's sessionRef after a rollback fork
+/// re-keyed the session) resolves through the lane's re-key alias map to
+/// the CANONICAL coordinator key — the runner enters Handoff on the key
+/// that holds the prior owner, stops it, and transfers atomically.
+/// Pre-fix the runner passed the wire id straight to begin_handoff: the
+/// canonical key read Vacant, no prior was captured, the sidecar was never
+/// stopped, and the terminal target started beside the live Fresh Agent
+/// (the split-identity two-writer shape).
+#[tokio::test]
+async fn a_handoff_on_a_superseded_rekeyed_id_resolves_the_canonical_owner() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let env = FakeSidecarEnv::install();
+    let canonical = uuid::Uuid::new_v4().to_string();
+    let superseded = uuid::Uuid::new_v4().to_string();
+    let rig = build_rig(None);
+    establish_fresh_claude_owner(&rig, &canonical).await;
+    let sidecar_pid = env.sidecar_pid_for(&canonical);
+    assert!(sidecar_pid.is_some(), "the live owner's sidecar pid");
+
+    // The rollback's re-key alias: the superseded id points at the canonical.
+    rig.fresh_claude
+        .record_durable_rekey(&superseded, &canonical);
+
+    // THE e2r2 F1 red/green: the handoff on the SUPERSEDED id resolves the
+    // canonical key and stops the prior owner.
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &superseded, "claude"));
+    let result = handle.completion.await.expect("handoff completed");
+    assert_eq!(
+        result["ok"],
+        json!(true),
+        "the superseded-id handoff must resolve and succeed: {result}"
+    );
+    let terminal_id = result["owner"]["terminalId"].as_str().unwrap().to_string();
+    // The CANONICAL key carries the terminal owner (never the wire id).
+    match rig.ownership.observe("claude", &canonical).state {
+        OwnershipState::Live { owner, .. } => {
+            assert_eq!(owner.kind, RuntimeOwnerKind::Terminal);
+            assert_eq!(owner.terminal_id.as_deref(), Some(terminal_id.as_str()));
+        }
+        other => panic!("expected the committed terminal owner, got {other:?}"),
+    }
+    // The SUPERSEDED key was never the operation's key.
+    assert!(matches!(
+        rig.ownership.observe("claude", &superseded).state,
+        OwnershipState::Vacant
+    ));
+    // The prior's sidecar is dead (the resolved handoff stopped it).
+    if let Some(pid) = sidecar_pid {
+        await_pid_dead(pid).await;
+    }
+    rig.registry.kill(&terminal_id);
+}
+
 /// 8a. b8ke delta round-2 F1: a NORMALLY created freshclaude session (no
 /// explicit sessionRef) adopts the canonical key at `sdk.session.init` —
 /// the coordinator holds authoritative Live{FreshAgent} under the durable

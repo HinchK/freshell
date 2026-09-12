@@ -211,6 +211,20 @@ impl OwnershipState {
         }
     }
 
+    /// b8ke focused episode-2 round-2 F2: the operation id of the
+    /// in-flight transition this state represents — the correlation key a
+    /// lane-side adoption can compare against its runtime's recorded
+    /// owning operation (`None` for the settled states Vacant/Live).
+    pub fn operation_id(&self) -> Option<&str> {
+        match self {
+            OwnershipState::Vacant | OwnershipState::Live { .. } => None,
+            OwnershipState::Starting { operation_id, .. }
+            | OwnershipState::Handoff { operation_id, .. }
+            | OwnershipState::Stopping { operation_id, .. }
+            | OwnershipState::Fenced { operation_id, .. } => Some(operation_id.as_str()),
+        }
+    }
+
     /// The record's `since_ms` (round-2 review: `Live` carries it too, so
     /// release/commit events include the terminal-transition duration the
     /// observability contract requires).
@@ -563,9 +577,27 @@ pub struct RecoveredStart {
     pub generation: u64,
     pub kind: RuntimeOwnerKind,
     pub initiator: String,
+    /// b8ke focused episode-2 round-2 F6: the stale age at recovery — the
+    /// `Starting` record's own `since_ms`, so the transition logs carry the
+    /// required duration on every outcome.
+    pub since_ms: u64,
     pub cancellation: Option<Arc<dyn Fn() + Send + Sync>>,
     pub settle: Option<Box<dyn std::future::Future<Output = ()> + Send>>,
     pub partial_runtime: Option<OwnerIdentity>,
+}
+
+/// One `Fenced{StaleStart}` record for the watchdog's confirmed-death
+/// probe (b8ke focused episode-2 round-2 F5) — see
+/// [`RuntimeOwnershipRegistry::stale_start_fences`].
+#[derive(Debug, Clone)]
+pub struct StaleStartFence {
+    pub provider: String,
+    pub session_id: String,
+    pub operation_id: String,
+    pub generation: u64,
+    /// The fenced prior's recorded pid — the probe's target. `None` (no
+    /// recorded runtime identity) can never confirm: the fence holds.
+    pub prior_pid: Option<u32>,
 }
 
 /// One replayed owner record for the `ready.runtimeOwners` handshake field
@@ -693,6 +725,15 @@ impl OperationTicket {
 
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// b8ke focused episode-2 round-2 F1: the ticket's coordinator key —
+    /// the key the claim was minted under (the claude lane's commit
+    /// derives its registry key from the ticket, never a caller-passed
+    /// wire id, so a claim minted under a resolved/aliased key commits
+    /// under the same key).
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     pub fn operation_id(&self) -> &str {
@@ -1043,6 +1084,101 @@ impl RuntimeOwnershipRegistry {
         CommitOutcome::Committed
     }
 
+    /// b8ke focused episode-2 round-2 F1: atomically RE-KEY a live claim —
+    /// commit the start's `Starting{op}` record under a NEW canonical
+    /// session id while vacating the old key, in ONE lock scope (never
+    /// both-Live, never both-Vacant; no window in which either key holds a
+    /// half-committed record). The claude rollback's fork re-key uses this
+    /// to move ownership to the durable id the CLIENT now sees (the
+    /// materialization replaced the pane's sessionRef) — one source of
+    /// truth: every later lifecycle operation on the new id finds the
+    /// owner; the old key replays Vacant so stale divergence clears.
+    ///
+    /// Refused typed exactly like [`Self::commit_live`]: a foreign record
+    /// under either key, or a stale generation, is the caller's
+    /// teardown path — never a partial move.
+    pub fn commit_live_rekey(
+        &self,
+        provider: &str,
+        old_session_id: &str,
+        new_session_id: &str,
+        operation_id: &str,
+        generation: u64,
+        mut owner: OwnerIdentity,
+    ) -> CommitOutcome {
+        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let old_key = SessionKey::new(provider, old_session_id);
+        // Validation pass (immutable reads — the mutation below cannot
+        // interleave with any of these checks).
+        let initiator;
+        {
+            let Some(record) = inner.get(&old_key) else {
+                return CommitOutcome::ForeignOperation;
+            };
+            if generation != record.generation {
+                tracing::warn!(target: "freshell_ownership",
+                    event = "ownership.commit_live_rekey.stale_generation",
+                    operation_id, provider,
+                    old_session_id, new_session_id,
+                    epoch = self.epoch, generation, current_generation = record.generation,
+                    outcome = "refused", failure_reason = "STALE_GENERATION");
+                return CommitOutcome::StaleGeneration {
+                    current_generation: record.generation,
+                };
+            }
+            initiator = record.state.initiator().unwrap_or_default();
+            match &record.state {
+                OwnershipState::Starting {
+                    operation_id: op, ..
+                } if op == operation_id => {}
+                _ => return CommitOutcome::ForeignOperation,
+            }
+            // A record already present under the NEW key means a competitor
+            // claimed the client-visible id in the claim window — the typed
+            // refusal; the caller tears its runtime down. Never overwrite.
+            if inner
+                .get(&SessionKey::new(provider, new_session_id))
+                .is_some()
+            {
+                tracing::error!(target: "invariant",
+                    event = "ownership.commit_live_rekey.target_occupied",
+                    operation_id, provider, old_session_id, new_session_id,
+                    epoch = self.epoch, generation,
+                    outcome = "refused", failure_reason = "FOREIGN_TARGET_KEY");
+                return CommitOutcome::ForeignOperation;
+            }
+        }
+        if owner.ownership_id.is_none() {
+            owner.ownership_id = Some(operation_id.to_string());
+        }
+        // THE MOVE (still one lock scope): old key → Vacant (clears stale
+        // divergence), new key → Live{owner} at the same generation.
+        let new_key = SessionKey::new(provider, new_session_id);
+        let new_record = SessionRecord {
+            generation,
+            state: OwnershipState::Live {
+                owner: owner.clone(),
+                generation,
+                since_ms: now_epoch_ms(),
+            },
+            ..SessionRecord::default()
+        };
+        if let Some(record) = inner.get_mut(&old_key) {
+            record.state = OwnershipState::Vacant;
+        }
+        inner.insert(new_key, new_record);
+        tracing::info!(target: "freshell_ownership",
+            event = "ownership.live.commit_rekey", operation_id, provider,
+            old_session_id, new_session_id,
+            initiator, to_kind = ?owner.kind,
+            runtime_id = ?owner.terminal_id,
+            live_session_key = ?owner.live_session_key, pid = ?owner.pid,
+            epoch = self.epoch, generation, outcome = "rekeyed_committed",
+            "the start's record moved to the client-visible durable id in one \
+             atomic step — the old key is Vacant, the new key is Live");
+        CommitOutcome::Committed
+    }
+
     /// Fail an in-flight operation: `Starting` → Vacant; `Handoff` → restore
     /// the prior owner ONLY when the caller confirms it is still live
     /// (`prior_confirmed_live: true`) — restored at the RECORD's CURRENT
@@ -1318,6 +1454,40 @@ impl RuntimeOwnershipRegistry {
     /// b8ke focused round-3 review R3-4: the typed operator recovery for a
     /// `Fenced{PlatformLimited}` key — the bounded path that keeps the
     /// session from being permanently disabled on non-Linux hosts. The
+    /// b8ke focused episode-2 round-2 F5: enumerate the live
+    /// `Fenced{StaleStart}` records — the watchdog's CONFIRMED-DEATH
+    /// PROBE input. The stale-start sweep itself never revisits fenced
+    /// records (it only recovers `Starting`), so a fence created before
+    /// its runtime's reap evidence existed would otherwise be permanent:
+    /// the host re-probes each fence's recorded prior pid every sweep and
+    /// releases through [`Self::release_fenced`] ONLY on confirmed death
+    /// (the pid is GONE — no signal is ever sent, so a recycled pid's
+    /// unrelated occupant is safe: a LIVE pid, whatever its incarnation,
+    /// keeps the fence held).
+    pub fn stale_start_fences(&self) -> Vec<StaleStartFence> {
+        let inner = self.inner.lock().expect("ownership lock poisoned");
+        let mut out = Vec::new();
+        for (key, record) in inner.iter() {
+            if let OwnershipState::Fenced {
+                prior,
+                reason: FenceReason::StaleStart,
+                operation_id,
+                generation,
+                ..
+            } = &record.state
+            {
+                out.push(StaleStartFence {
+                    provider: key.provider.clone(),
+                    session_id: key.session_id.clone(),
+                    operation_id: operation_id.clone(),
+                    generation: *generation,
+                    prior_pid: prior.as_ref().and_then(|(owner, _)| owner.pid),
+                });
+            }
+        }
+        out
+    }
+
     /// non-Linux teardown semantics: the direct child's awaited exit WAS
     /// confirmed (the portable floor); only the DESCENDANT-tree
     /// verification is platform-limited. An EXPLICIT operator action — a
@@ -1813,6 +1983,7 @@ impl RuntimeOwnershipRegistry {
                     recovered.push(RecoveredStart {
                         provider: key.provider.clone(),
                         session_id: key.session_id.clone(),
+                        since_ms,
                         operation_id,
                         generation,
                         kind,
@@ -2643,6 +2814,120 @@ mod tests {
             ),
             BeginOutcome::Granted { .. }
         ));
+    }
+
+    /// b8ke focused episode-2 round-2 F1: the atomic re-key — a start's
+    /// `Starting{op}` record under the OLD key moves to the NEW key as
+    /// `Live{owner}` in ONE registry step: never both-Live, never
+    /// both-Vacant, no half-moved record. The claude rollback's fork uses
+    /// this to put ownership under the client-visible new durable id; the
+    /// old key replays Vacant so stale divergence clears. A foreign record
+    /// under the TARGET key is the typed refusal — never an overwrite.
+    #[test]
+    fn commit_live_rekey_moves_the_record_atomically() {
+        let r = RuntimeOwnershipRegistry::new();
+        let BeginOutcome::Granted { generation } = r.begin_start(
+            PROVIDER,
+            "old-id",
+            RuntimeOwnerKind::FreshAgent,
+            "op-rekey",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!()
+        };
+        let owner = OwnerIdentity {
+            kind: RuntimeOwnerKind::FreshAgent,
+            terminal_id: None,
+            live_session_key: Some("map-key".into()),
+            pid: Some(4242),
+            ownership_id: None,
+        };
+        assert!(matches!(
+            r.commit_live_rekey(
+                PROVIDER,
+                "old-id",
+                "new-id",
+                "op-rekey",
+                generation,
+                owner.clone()
+            ),
+            CommitOutcome::Committed
+        ));
+        // The move: old key Vacant, new key Live{FreshAgent} at the same
+        // generation — never both-Live, never both-Vacant.
+        assert_eq!(r.observe(PROVIDER, "old-id").state, OwnershipState::Vacant);
+        match r.observe(PROVIDER, "new-id").state {
+            OwnershipState::Live {
+                owner: observed, ..
+            } => {
+                assert_eq!(observed.kind, RuntimeOwnerKind::FreshAgent);
+                assert_eq!(observed.live_session_key.as_deref(), Some("map-key"));
+                assert_eq!(observed.pid, Some(4242));
+            }
+            other => panic!("expected Live under the new id, got {other:?}"),
+        }
+        // The fenced replay of the OLD key clears stale divergence and the
+        // new key is the sole authoritative record.
+        let records = r.snapshot_records();
+        assert!(records.iter().any(|rec| rec.session_id == "new-id"
+            && rec.owner_kind == "fresh-agent"
+            && rec.state == ReplayOwnerState::Live));
+        assert!(records
+            .iter()
+            .any(|rec| rec.session_id == "old-id" && rec.owner_kind == "vacant"));
+
+        // A foreign record under the TARGET key refuses — never an
+        // overwrite; the caller tears its runtime down.
+        let r2 = RuntimeOwnershipRegistry::new();
+        let BeginOutcome::Granted { generation: g2 } = r2.begin_start(
+            PROVIDER,
+            "old-2",
+            RuntimeOwnerKind::FreshAgent,
+            "op-rekey-2",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!()
+        };
+        let BeginOutcome::Granted {
+            generation: foreign,
+        } = r2.begin_start(
+            PROVIDER,
+            "new-2",
+            RuntimeOwnerKind::Terminal,
+            "op-foreign",
+            None,
+            "test",
+            1,
+        )
+        else {
+            panic!()
+        };
+        let foreign_owner = OwnerIdentity {
+            kind: RuntimeOwnerKind::Terminal,
+            terminal_id: Some("t-foreign".into()),
+            live_session_key: None,
+            pid: None,
+            ownership_id: None,
+        };
+        assert!(matches!(
+            r2.commit_live(PROVIDER, "new-2", "op-foreign", foreign, foreign_owner),
+            CommitOutcome::Committed
+        ));
+        assert!(matches!(
+            r2.commit_live_rekey(PROVIDER, "old-2", "new-2", "op-rekey-2", g2, owner),
+            CommitOutcome::ForeignOperation
+        ));
+        // The foreign target record is UNTOUCHED.
+        match r2.observe(PROVIDER, "new-2").state {
+            OwnershipState::Live { owner, .. } => {
+                assert_eq!(owner.kind, RuntimeOwnerKind::Terminal);
+            }
+            other => panic!("the foreign target must keep its owner, got {other:?}"),
+        }
     }
 
     /// b8ke focused episode-2 round-1 F1: the watchdog's UNCONFIRMED

@@ -293,6 +293,30 @@ impl SessionHandoffRunner {
     /// typed, retryable JSON body and leaves the coordinator in a coherent
     /// state (restored prior, or Vacant — never a stranded Handoff).
     async fn run(self: &Arc<Self>, req: HandoffRequest) -> Value {
+        // b8ke focused episode-2 round-2 F1: resolve the wire session id to
+        // its CANONICAL coordinator key FIRST. The claude rollback's fork
+        // re-keys ownership to the client-visible new durable id; a stale
+        // pane's handoff addressing the SUPERSEDED id resolves through the
+        // lane's re-key alias map so the runner enters Handoff on the key
+        // that actually holds the prior owner (never a false-Vacant split
+        // identity that skips the prior stop and starts a second writer).
+        // Every downstream surface — the coordinator enter, the lane stop,
+        // the broadcast frames — then uses the one canonical id, so the
+        // panes holding EITHER id converge. Other providers have no re-key
+        // machinery: identity.
+        let mut req = req;
+        if req.provider == "claude" {
+            let resolved = self.fresh_claude.resolve_ownership_key(&req.session_id);
+            if resolved != req.session_id {
+                tracing::info!(target: "freshell_ownership",
+                    event = "ownership.handoff.rekey_alias_resolved",
+                    provider = %req.provider,
+                    wire_session_id = %req.session_id, canonical_session_id = %resolved,
+                    "the handoff's wire id is a superseded re-key alias — the runner \
+                     operates on the canonical coordinator key");
+                req.session_id = resolved;
+            }
+        }
         // b8ke delta review F5: the provider↔target validation — BEFORE the
         // coordinator enter, so a mismatched target never stops the prior
         // runtime or bumps the generation. The HTTP handler already refuses
@@ -323,7 +347,6 @@ impl SessionHandoffRunner {
         // the owner frames all name the lane the request actually targets
         // — never a silent freshcodex default under a foreign provider's
         // key. (An ambiguous absent type — claude — was refused above.)
-        let mut req = req;
         if req.target_kind == RuntimeOwnerKind::FreshAgent && req.session_type.is_none() {
             if let Some(canonical) =
                 canonical_session_types(&req.provider).filter(|list| list.len() == 1)
