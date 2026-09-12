@@ -7,7 +7,7 @@ type DiffSummary = { id: string; path?: string; title?: string; status?: string 
 
 /**
  * A 404 from /api/fresh-agent/diff means the connected server predates the
- * route entirely (the Rust server has no diff route yet) — say so explicitly
+ * route entirely (an older Rust-server build without it) — say so explicitly
  * instead of surfacing a bare "Not found". Everything else shows the
  * server/ApiError message inline, unchanged.
  */
