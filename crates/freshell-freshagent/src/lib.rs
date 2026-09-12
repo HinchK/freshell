@@ -582,9 +582,32 @@ pub mod ownership_lane {
         Arc::new(|| {
             tracing::warn!(target: "freshell_ownership",
                 event = "ownership.start.cancel_signal_platform_limited",
-                 "this platform cannot verify a sidecar incarnation — the start \
-                  cancellation signals nothing (fail-closed)");
+                "this platform cannot verify a sidecar incarnation — the start \
+                 cancellation signals nothing (fail-closed)");
         })
+    }
+
+    /// b8ke focused episode-2 round-2 F5: is the recorded partial runtime's
+    /// pid CONFIRMED GONE? The watchdog's reap evidence must be
+    /// consultable independent of the settle-guard's ordering — a handler
+    /// that already reaped its runtime (the lease guard's `fail()` removed
+    /// the kill handle BEFORE the settle guard dropped) must never fence.
+    /// `true` only when `/proc/<pid>` is ABSENT (no signal is ever sent;
+    /// an absent pid is honest evidence the recorded runtime exited —
+    /// whatever holds the numeric id now is not our runtime). A PRESENT
+    /// pid cannot be confirmed (the partial records no start time), so it
+    /// answers `false` — the fence holds (fail closed). Non-Linux: no
+    /// `/proc` — never confirmable.
+    #[cfg(target_os = "linux")]
+    pub fn partial_pid_confirmed_dead(pid: u32) -> bool {
+        crate::session_lease::proc_starttime(pid as i32).is_none()
+    }
+
+    /// Non-Linux (F5): no `/proc` — a partial pid can never be confirmed
+    /// gone; the fence holds.
+    #[cfg(not(target_os = "linux"))]
+    pub fn partial_pid_confirmed_dead(_pid: u32) -> bool {
+        false
     }
 
     /// Commit a lane claim and retain the stamp: builds the fresh-agent
