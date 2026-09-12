@@ -41,14 +41,18 @@ display-filter subsystem is deleted: `TranscriptDisplayOptions` + `shouldDisplay
 `DisplayTurn.hadFilteredItems` marker (`:457-465`), its `foldCaption` clause (`:295`), the
 filtered-echo null-render branch (`:870-875`), and the `displayOptions` memo (`:969-972`).
 Rendering contract (restructures `FreshAgentActivityStrip` `:605-715`):
-- The strip container always renders the summary row (`settledSummary`, `:210-219` — 'thought'
-  part stays; a thinking-only line reads `thought`, mixed reads `thought · N tools used`).
-- **Thinking rows render always**, inside the strip container, below the summary, in row order
-  (row pipeline and merge rules — consecutive thinking chunks merge into one row — unchanged).
-  Each is a compact `FreshAgentThinkingRow` disclosure: one line until expanded.
-- **Tool rows and captions render only when the strip is expanded** (the disclosure gates tool
-  detail and echo captions, whose anchoring belongs to the tool supersession flow; a caption
-  never renders while collapsed).
+- The strip container always renders; its toggle row is never hidden. COLLAPSED state
+  (default): the summary row (`settledSummary`, `:210-219` — 'thought' part stays; a
+  thinking-only line reads `thought`, mixed reads `thought · N tools used`) followed by the
+  **hoisted thinking rows**.
+- **Thinking rows render always**, inside the strip container, in row order (row pipeline and
+  merge rules — consecutive thinking chunks merge into one row — unchanged). Each is a compact
+  `FreshAgentThinkingRow` disclosure: one line until expanded.
+- EXPANDED state (the pre-existing swap, unchanged): the toggle row (rotated chevron) renders
+  and the summary text is REPLACED by the rows in order — thinking rows, **tool rows, and
+  captions render only when the strip is expanded** (the disclosure gates tool detail and
+  echo captions, whose anchoring belongs to the tool supersession flow; a caption never
+  renders while collapsed).
 - The live reel/streaming behavior is unchanged (reel shows 'Thinking' while a thinking row is
   live; hoisting affects settled rows only).
 No filtering, turn-dropping, or caption-gating for hidden content remains.
@@ -90,6 +94,10 @@ site must explicitly omit the two names (verified in plan review round 1):
   `:334-356`), `persistedState.ts` rehydration rest-paths, `storage-migration.ts`,
   `persistMiddleware.ts`, and the server layout-store rest paths
   (`server/agent-api/layout-store.ts`).
+- Rust layout-store content twin: `crates/freshell-freshagent/src/layout_store_content.rs`
+  strips only identity keys at `:247-251` and spreads all remaining keys at `:282`/`:347`, so
+  `showThinking`/`showTools` flow through Rust layout normalization; extend that strip to omit
+  the two legacy display keys and pin it with a `layout_store_tests.rs` case.
 - `FreshAgentView.tsx:596-597` resolution (View reads globals only).
 Rust `crates/freshell-ws/src/tabs_persist_validation.rs:391-392`: **keep** the two
 `optional_bool` lines as legacy tolerance (old persisted generations still validate their
@@ -194,9 +202,18 @@ patch/sanitize/seed paths, persistence writes).
   (expandTools unset)" — toggle `aria-expanded="false"`, settled summary visible, NO tool
   rows/captions, thinking rows PRESENT. T5 "a thinking-only turn renders an activity strip and
   is never dropped". T6 "stashes a superseded echo caption from a thinking-bearing turn".
-  T7 "expansion is per-mount temporary state, not a setting" — expand the strip, rerender with
-  a CHANGED `expandTools` prop → the strip KEEPS the user's in-pane state (no re-sync);
-  unmount/remount with `expandTools` true → starts expanded.
+  T7 "expansion is per-mount state, never re-synced from props" — DISCRIMINATING shape (a
+  boolean flip alone cannot distinguish mount-only from re-sync, since the user's toggle always
+  converges with the new prop value): render TWO strip instances with `expandTools` unset,
+  leave BOTH untouched, rerender with `expandTools` true → mount-only keeps BOTH collapsed
+  (a re-sync effect would expand them); the same shape for thinking rows with `expandThinking`
+  (two untouched rows stay collapsed across a prop flip to true); then remount with the prop
+  true → starts expanded. This protects BOTH the strip and `FreshAgentThinkingRow` against a
+  reintroduced synchronization effect.
+  T8 "the expanded state swaps the summary for detail behind the persistent toggle" —
+  collapsed: summary text visible; expand → summary text ABSENT, tool rows visible, toggle row
+  still present with `aria-expanded="true"`, thinking rows present in BOTH states (pins the
+  D1 swap contract and the never-hidden toggle row).
   In `FreshAgentView.test.tsx`: REWRITE @709 ("flows expandThinking/expandTools from global
   settings into the transcript"), @775 ("mounts thinking rows and a collapsed strip by
   default" — Thinking trigger visible at compact mount), @822 (DELETE hide semantics; REPLACE
@@ -245,10 +262,13 @@ patch/sanitize/seed paths, persistence writes).
 - [ ] **Step 3: Implement** D3: remove the type declarations AND the explicit runtime omissions
   at every construction site (normalizePaneContent copies, validation clauses, registry
   stamps, `migrateLegacyFreshAgentContent` rest-passthrough, `persistedState.ts`,
-  `storage-migration.ts`, `persistMiddleware.ts`, server layout-store rest paths); Rust
+  `storage-migration.ts`, `persistMiddleware.ts`, server layout-store rest paths); extend the
+  Rust content strip in `crates/freshell-freshagent/src/layout_store_content.rs:247-251` to
+  omit the two legacy display keys (with a `layout_store_tests.rs` case); Rust
   `tabs_persist_validation.rs:391-392` keep-with-comment; no Rust seed change (Task 1 done).
-- [ ] **Step 4: GREEN.** Step 1's command passes; then `cargo test -p freshell-ws` — the
-  persist-validation suite stays green (tolerated legacy fields still validate).
+- [ ] **Step 4: GREEN.** Step 1's command passes; then `cargo test -p freshell-ws -p freshell-freshagent` — the
+  persist-validation suite stays green (tolerated legacy fields still validate) and the
+  freshagent layout-store content tests pin the extended strip.
 - [ ] **Step 5: Refactor while green.** Grep: `paneContent.showThinking|showTools` → no client refs.
 - [ ] **Step 6: Impacted-test verification.** `npm run test:vitest -- run test/unit/client/store/ test/unit/client/lib/tab-registry-snapshot.test.ts`
   Expected: green (Task 2 already removed the reader).
@@ -277,9 +297,13 @@ patch/sanitize/seed paths, persistence writes).
   pin, so BEFORE any spec edit, run the current specs and record the intended failure:
   `export GCLOUD_ROBOT_HOME="$HOME/.codex/skills/gcloud-robot"; scripts/e2e-cloud.sh run --local --project=chromium test/e2e-browser/specs/fresh-agent.spec.ts test/e2e-browser/specs/settings.spec.ts`
   Expected failures (the removed behavior): the cycle-1 default test (`:1698`) pins
-  expanded-by-default + Show* switch loops; `:1647`/`:1678`/`:1836`/`:1874`/`:814` choreographies
-  assume expanded mounts or per-pane `showThinking` seeds; `settings.spec.ts:181` pins Show*
-  labels/keys. Tests that must still PASS: every KEEP-classified test (#7/#8/#9 in B1, the
+  expanded-by-default + Show* switch loops; `:1647`/`:1678`/`:1836` assert expanded-mount tool
+  detail; `:814` fails on its cycle-1 `aria-expanded="true"` pin under the compact default (and
+  its per-pane `showThinking` seed); `settings.spec.ts:181` pins Show* labels/keys. NOTE:
+  `:1874` (authored prose) does NOT fail — under Task 2's hoisting its existing
+  find-Thinking-and-expand choreography remains valid at the compact mount; it gets a
+  comment-update rewrite only (verified in plan review round 2).
+  Tests that must still PASS: every KEEP-classified test (#7/#8/#9 in B1, the
   settings.spec helper + non-fresh-agent tests) — they pin behavior the redesign preserves.
 - [ ] **Step 2: Verify the intended failure matches** — each failure is a mount-state,
   label/key, or per-pane-seed mismatch; no infrastructure or unrelated failure.
@@ -324,7 +348,7 @@ patch/sanitize/seed paths, persistence writes).
 
 ## Verification and gates
 
-1. After Task 5: `cargo test -p freshell-server -p freshell-ws` (worktree root) — Rust parity green.
+1. After Task 5: `cargo test -p freshell-server -p freshell-ws -p freshell-freshagent` (worktree root) — Rust parity green.
 2. Stage-4 final gate: coordinated `npm test` on the redo HEAD (cloud backends,
    `GCLOUD_ROBOT_HOME` exported, `FRESHELL_TEST_SUMMARY` set). Pass criterion: green excluding
    the two ledger-recorded pre-existing flakes (`agent-cli-flow` rename, `ws-terminal-idle` 1 ms
