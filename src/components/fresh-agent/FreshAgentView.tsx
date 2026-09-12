@@ -2920,7 +2920,11 @@ export function FreshAgentView({
               ))}
               <FreshAgentDiffPanel
                 diffs={diffs}
-                cwd={paneContent.initialCwd}
+                // Same resolution as the !command exec escape: the pane's
+                // starting directory, falling back to the LIVE session cwd
+                // so a resumed/API-created pane without an initialCwd still
+                // fetches diffs instead of showing "Diff unavailable".
+                cwd={paneContent.initialCwd ?? agentSession?.cwd}
                 onComment={(text) => composerRef.current?.insertText(text)}
               />
             </div>
@@ -3002,7 +3006,7 @@ export function FreshAgentView({
               }
               storageKey={`fresh-agent-draft:${paneContent.sessionType}:${paneContent.sessionId ?? paneContent.createRequestId}`}
               historyKey={`fresh-agent-prompt-history:${paneContent.sessionType}`}
-              cwd={paneContent.initialCwd}
+              cwd={paneContent.initialCwd ?? agentSession?.cwd}
               provider={paneContent.provider}
               thinking={isBusy}
               queuedMessages={queuedMessages}

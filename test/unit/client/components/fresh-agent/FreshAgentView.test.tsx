@@ -8897,3 +8897,49 @@ describe('!command shell escape (exec route)', () => {
     expect(screen.queryByRole('status', { name: 'Queued messages' })).toBeNull()
   })
 })
+
+describe('diff panel view wiring (ekc6)', () => {
+  it('expands a diff using the live session cwd when the pane has no initial cwd', async () => {
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'Codex summary',
+      capabilities: { send: true, interrupt: true, fork: true },
+      diffs: [{ id: 'diff-1', title: 'README.md', path: 'README.md' }],
+      turns: [],
+    })
+    const store = createStore()
+    store.dispatch(sessionInit({
+      sessionId: 'thread-diff-cwd',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      cwd: '/live/session/cwd',
+    }))
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-diff-cwd',
+        sessionId: 'thread-diff-cwd',
+        status: 'idle',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    // The pane carries NO initialCwd but a live session cwd; the snapshot
+    // carries a path-bearing diff. Expanding it must FETCH with the live
+    // session cwd —
+    // not show the missing-prerequisite "Diff unavailable" copy the
+    // initialCwd-only wiring produced for resumed/API-created panes.
+    const trigger = await screen.findByRole('button', { name: 'Diff: README.md' })
+    fireEvent.click(trigger)
+    await waitFor(() => expect(trigger).toHaveAttribute('aria-expanded', 'true'))
+    expect(screen.queryByText('Diff unavailable for this file.')).toBeNull()
+  })
+})

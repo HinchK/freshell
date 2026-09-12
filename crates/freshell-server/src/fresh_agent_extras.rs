@@ -163,8 +163,8 @@ async fn get_diff(
     if !is_authed(&headers, &state.auth_token) {
         return unauthorized();
     }
-    // `fresh-agent-extras-router.ts:305-314` (verbatim strings; `state.home`
-    // is unused by diff — the cwd comes from the query).
+    // `fresh-agent-extras-router.ts:305-314` (verbatim strings; the state's
+    // `user_home` is unused by diff — the cwd comes from the query).
     let cwd = match query.cwd.filter(|c| !c.is_empty()) {
         Some(c) => c,
         None => return bad_request("cwd query parameter required"),
