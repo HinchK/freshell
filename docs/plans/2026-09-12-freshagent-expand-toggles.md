@@ -45,16 +45,20 @@ Rendering contract (restructures `FreshAgentActivityStrip` `:605-715`):
   (default): the summary row (`settledSummary`, `:210-219` — 'thought' part stays; a
   thinking-only line reads `thought`, mixed reads `thought · N tools used`) followed by the
   **hoisted thinking rows**.
-- **Thinking rows render always**, inside the strip container, in row order (row pipeline and
-  merge rules — consecutive thinking chunks merge into one row — unchanged). Each is a compact
+- **Thinking rows render always — including LIVE rows**: a live thinking row (streaming)
+  renders its `FreshAgentThinkingRow` disclosure inside the strip container even while the
+  strip is collapsed, so the user can see and expand the thinking text while the agent is
+  actively thinking. The live reel still shows 'Thinking' (unchanged); the reel is the status
+  slot, the hoisted row is the expandable affordance. Row pipeline and merge rules —
+  consecutive thinking chunks merge into one row — unchanged. Each row is a compact
   `FreshAgentThinkingRow` disclosure: one line until expanded.
 - EXPANDED state (the pre-existing swap, unchanged): the toggle row (rotated chevron) renders
   and the summary text is REPLACED by the rows in order — thinking rows, **tool rows, and
   captions render only when the strip is expanded** (the disclosure gates tool detail and
   echo captions, whose anchoring belongs to the tool supersession flow; a caption never
   renders while collapsed).
-- The live reel/streaming behavior is unchanged (reel shows 'Thinking' while a thinking row is
-  live; hoisting affects settled rows only).
+- The live reel's own behavior is unchanged (reel shows 'Thinking' while a thinking row is
+  live); hoisting adds the expandable live row, it does not alter the reel.
 No filtering, turn-dropping, or caption-gating for hidden content remains.
 
 **D2 — Two expansion-default settings, compact by default, mount-only.** Browser-local keys
@@ -214,12 +218,26 @@ patch/sanitize/seed paths, persistence writes).
   collapsed: summary text visible; expand → summary text ABSENT, tool rows visible, toggle row
   still present with `aria-expanded="true"`, thinking rows present in BOTH states (pins the
   D1 swap contract and the never-hidden toggle row).
+  T9 "a LIVE thinking row renders its disclosure while streaming with the strip collapsed" —
+  mount with `isStreaming` and a live thinking row, strip collapsed: the `Thinking` trigger is
+  visible (the reel shows 'Thinking' in the status slot), the body is absent until click and
+  expandable mid-stream (pins the D1 live-row hoisting; verified in plan review round 3).
   In `FreshAgentView.test.tsx`: REWRITE @709 ("flows expandThinking/expandTools from global
   settings into the transcript"), @775 ("mounts thinking rows and a collapsed strip by
   default" — Thinking trigger visible at compact mount), @822 (DELETE hide semantics; REPLACE
   with "applies a changed expandTools default on REMOUNT, not on live re-render" — live
   `updateSettingsLocal` dispatch does NOT move a mounted strip; remount starts expanded).
-  Run: `npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.test.tsx`
+  Also in this step (e2e red-first, before any component implementation lands — verified in
+  plan review round 3): author the NEW e2e coverage per redo-pane-payload-e2e.md B3 — the new
+  compact-default test (B3.1), the "Expand tools"/"Expand thinking" settings loops (B3.2/B3.3),
+  and the temporary-toggle-never-writes-settings test (B3.4) — in the two Playwright specs, and
+  record their RED with an isolated run:
+  `export GCLOUD_ROBOT_HOME="$HOME/.codex/skills/gcloud-robot"; scripts/e2e-cloud.sh run --local --project=chromium test/e2e-browser/specs/fresh-agent.spec.ts test/e2e-browser/specs/settings.spec.ts --grep "compact|Expand thinking|Expand tools|never writes settings"`
+  Expected: the new tests fail against the current components (switches absent, thinking rows
+  gated behind strip expansion, expanded-mount defaults). The spec files stay uncommitted in
+  the worktree (like cycle 1) until Task 5's green commits them.
+  Then run the unit RED:
+  `npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.test.tsx`
   Expected: new/rewritten tests fail (filter still hides; no initialExpanded plumb; thinking
   rows still gated behind strip expansion; re-sync effect still present); all KEEP tests pass.
 - [ ] **Step 2: Verify the intended failure matches.**
@@ -286,7 +304,10 @@ patch/sanitize/seed paths, persistence writes).
 - [ ] **Step 2: Verify the intended failure matches.**
 - [ ] **Step 3: Implement** D4: `CodingAgentsSettings.tsx` relabel + help text + new keys;
   `docs/index.html` mock relabel + off-state.
-- [ ] **Step 4: GREEN.** Step 1 passes; `npm run lint` — 0 errors in changed files.
+- [ ] **Step 4: GREEN.** Step 1 passes; `npm run lint` — 0 errors in changed files;
+  `npm run typecheck:client` — GREEN (all renames are complete after this task; Task 1's
+  documented interim consumer type errors — old prop names against the renamed
+  `LocalSettings`/prop types — are resolved by Tasks 2 and 4; verified in plan review round 3).
 - [ ] **Step 5: Refactor while green.**
 - [ ] **Step 6: Impacted-test verification.** `npm run test:vitest -- run test/unit/client/components/SettingsView.agent-chat.test.tsx test/unit/shared/settings.test.ts`
 - [ ] **Step 7: Commit.** `feat(settings): expand thinking/tools switches control initial expansion`
@@ -349,8 +370,11 @@ patch/sanitize/seed paths, persistence writes).
 ## Verification and gates
 
 1. After Task 5: `cargo test -p freshell-server -p freshell-ws -p freshell-freshagent` (worktree root) — Rust parity green.
-2. Stage-4 final gate: coordinated `npm test` on the redo HEAD (cloud backends,
-   `GCLOUD_ROBOT_HOME` exported, `FRESHELL_TEST_SUMMARY` set). Pass criterion: green excluding
+2. Stage-4 final gate: coordinated `npm run check` (typecheck, then the full suite) on the redo
+   HEAD (cloud backends, `GCLOUD_ROBOT_HOME` exported, `FRESHELL_TEST_SUMMARY` set) — the plan's
+   renames span shared types, component props, and pane-content types, so the gate MUST include
+   the typechecker (`npm test` alone does not typecheck; verified in plan review round 3).
+   Pass criterion: typecheck green; suite green excluding
    the two ledger-recorded pre-existing flakes (`agent-cli-flow` rename, `ws-terminal-idle` 1 ms
    boundary — receipts R1-R3 in run-state.md); electron + port phases green (direct phase runs
    if a ledger flake aborts phase 1 — same assembled-gate procedure as cycle 1).
@@ -358,5 +382,6 @@ patch/sanitize/seed paths, persistence writes).
    rounds + focused episodes per the skill.
 4. Stage-6 recap: outcome block, both cycles accounted; no PR without explicit user approval;
    Rust deploy (rebuild+restart) flagged as needing the user's "APPROVED" at deploy time.
-5. Lint: `npm run lint` after Task 4 and again after Task 5 (spec edits) — the a11y plugin
-   requires the new switch labels/aria to stay consistent; 0 new errors in changed files.
+5. Lint: `npm run lint` after Task 4 — scoped to `src/` (the repo lint script is
+   `eslint src …` and does not inspect `test/e2e-browser`, so no lint evidence is claimed for
+   spec files); 0 new errors in changed files.
