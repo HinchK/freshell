@@ -3515,9 +3515,26 @@ async fn a_handoff_on_a_superseded_rekeyed_id_resolves_the_canonical_owner() {
     // coordinator move (the same step the rollback's Adopt-path commit
     // performs), leaving Aliased{to: canonical} at the superseded key —
     // the COORDINATOR as the single source of truth (e2r3 F3).
+    let rekey_map_key = rig
+        .fresh_claude
+        .test_resolve_session_key(&superseded)
+        .await
+        .expect("the live session's map key");
     assert!(matches!(
-        rig.ownership
-            .rekey_live("claude", &superseded, &canonical, "test-rekey"),
+        rig.ownership.rekey_live(
+            "claude",
+            &superseded,
+            &canonical,
+            &rekey_map_key,
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                terminal_id: None,
+                live_session_key: Some(rekey_map_key.clone()),
+                pid: sidecar_pid,
+                ownership_id: Some("test-rekey-op".into()),
+            },
+            "test-rekey",
+        ),
         freshell_ownership::CommitOutcome::Committed
     ));
 

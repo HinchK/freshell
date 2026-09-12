@@ -359,3 +359,177 @@ async fn the_start_cancellation_direct_variant_verifies_the_incarnation() {
     }
     let _ = child.wait().await;
 }
+
+/// b8ke focused episode-2 post-cap F6: the start-cancellation registration
+/// targets the TICKET'S canonical key — the claim path resolves aliases
+/// before acquiring, so a legitimate resume through a superseded (re-keyed)
+/// wire id arms its cancellation on the record the watchdog actually
+/// sweeps. Pre-fix the helper registered against the caller's wire id: the
+/// registry looked for `Starting` under the old `Aliased` key, silently
+/// declined, and the operation ran unkillable (a slow resume fenced with
+/// nothing armed). The decline is LOUD now (the invariant log) — this test
+/// pins the POSITIVE contract: registered on the canonical record, the
+/// settle-fired evidence observable.
+#[tokio::test]
+async fn start_cancellation_registers_on_the_tickets_canonical_key() {
+    let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+
+    // The re-key residue: wire-old was Live, then re-keyed to wire-canonical
+    // (the claude rollback's move). A stale pane still addresses wire-old.
+    let BeginOutcome::Granted { generation: g0 } = registry.begin_start(
+        "claude",
+        "wire-old",
+        RuntimeOwnerKind::FreshAgent,
+        "op-original",
+        None,
+        "test",
+        0,
+    ) else {
+        panic!("expected Granted")
+    };
+    assert!(matches!(
+        registry.commit_live(
+            "claude",
+            "wire-old",
+            "op-original",
+            g0,
+            freshell_ownership::OwnerIdentity {
+                kind: RuntimeOwnerKind::FreshAgent,
+                terminal_id: None,
+                live_session_key: Some("map-key".into()),
+                pid: Some(4321),
+                ownership_id: None,
+            }
+        ),
+        CommitOutcome::Committed
+    ));
+    assert!(matches!(
+        registry.rekey_live(
+            "claude",
+            "wire-old",
+            "wire-canonical",
+            "map-key",
+            freshell_ownership::OwnerIdentity {
+                kind: RuntimeOwnerKind::FreshAgent,
+                terminal_id: None,
+                live_session_key: Some("map-key".into()),
+                pid: Some(4322),
+                ownership_id: Some("rekey-op".into()),
+            },
+            "test-rekey",
+        ),
+        CommitOutcome::Committed
+    ));
+
+    // The canonical runtime exits (the rekeyed owner releases) — the
+    // stale pane's RESUME shape: the pane still holds wire-old, the
+    // canonical key is Vacant.
+    assert!(matches!(
+        registry.force_release_for_confirmed_kill(
+            "claude",
+            "wire-canonical",
+            &freshell_ownership::ReleaseClaim {
+                operation_id: "rekey-op".into(),
+                generation: g0 + 1,
+                runtime: Some(freshell_ownership::OwnerIdentity {
+                    kind: RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("map-key".into()),
+                    pid: Some(4322),
+                    ownership_id: Some("rekey-op".into()),
+                }),
+            },
+            "claude-exit",
+        ),
+        ()
+    ));
+    assert!(matches!(
+        registry.observe("claude", "wire-canonical").state,
+        OwnershipState::Vacant
+    ));
+    // The lane claim — the claude lane's production shape: resolve the
+    // alias FIRST (resolve_ownership_key → the registry's fixpoint walk),
+    // then claim the canonical key (the ticket carries it).
+    let canonical = registry.resolve_canonical("claude", "wire-old");
+    assert_eq!(canonical, "wire-canonical");
+    let claim = crate::ownership_lane::begin_lane_claim(
+        &Some(Arc::clone(&registry)),
+        "claude",
+        &canonical,
+        "op-resume",
+        None,
+        "test",
+        0,
+    );
+    let ticket = match claim {
+        crate::ownership_lane::LaneClaim::Granted(ticket) => ticket,
+        crate::ownership_lane::LaneClaim::Unwired => panic!("expected Granted through the alias"),
+        crate::ownership_lane::LaneClaim::Adopt => panic!("expected Granted, got Adopt"),
+        crate::ownership_lane::LaneClaim::Refused(_) => panic!("expected Granted, got Refused"),
+    };
+    assert_eq!(
+        ticket.session_id(),
+        "wire-canonical",
+        "the ticket carries the CANONICAL key (the claim resolved the alias)"
+    );
+
+    // THE REGISTRATION through the stale wire id (the production call
+    // shape): it must land on the CANONICAL record — the pre-fix helper
+    // passed the wire id straight through and the registry silently
+    // declined (no cancellation, unkillable).
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancel = {
+        let cancelled = Arc::clone(&cancelled);
+        Arc::new(move || cancelled.store(true, std::sync::atomic::Ordering::SeqCst))
+            as Arc<dyn Fn() + Send + Sync>
+    };
+    // The ticket binding must OUTLIVE the registration (the production
+    // shape: `&own_ticket` where the Option is a long-lived local — a
+    // temporary `&Some(ticket)` would drop the ticket at the call's end
+    // and FAIL the claim).
+    let own_ticket = Some(ticket);
+    let guard = crate::ownership_lane::register_start_cancellation_for_ticket(
+        &Some(Arc::clone(&registry)),
+        "claude",
+        "wire-old",
+        &own_ticket,
+        cancel,
+    );
+    // The watchdog's sweep finds the CANCELLATION + the settle-fired
+    // evidence on the canonical record.
+    let recovered = registry.recover_stale_starts(0, 0);
+    assert_eq!(
+        recovered.len(),
+        1,
+        "the canonical Starting record is sweep-visible"
+    );
+    let rec = &recovered[0];
+    assert_eq!(rec.session_id, "wire-canonical");
+    assert!(
+        rec.cancellation.is_some(),
+        "the cancellation ARMED on the canonical record — the pre-fix \
+         registration targeted the aliased wire id and silently declined"
+    );
+    // The settle evidence: fence, drop the guard (the operation concluded),
+    // and the probe's enumerate carries settle_fired = Some(true).
+    assert!(matches!(
+        registry.fence_unconfirmed_stop(
+            "claude",
+            "wire-canonical",
+            &rec.operation_id,
+            rec.generation,
+            freshell_ownership::FenceReason::StaleStart,
+        ),
+        freshell_ownership::FenceOutcome::Fenced
+    ));
+    drop(guard);
+    let fences = registry.stale_start_fences();
+    assert_eq!(fences.len(), 1);
+    assert_eq!(
+        fences[0].settle_fired,
+        Some(true),
+        "the guard's Drop sets the SENDER-side settle evidence — the probe \
+         can answer 'the operation concluded' without polling the boxed future"
+    );
+    let _ = cancelled;
+}

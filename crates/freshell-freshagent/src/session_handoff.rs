@@ -2495,6 +2495,7 @@ impl SessionHandoffRunner {
                 transition: transition.to_string(),
                 reason: reason.map(str::to_string),
                 fenced,
+                alias_of: None,
             },
         ))
         .unwrap_or_default();

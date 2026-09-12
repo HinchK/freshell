@@ -447,12 +447,21 @@ pub mod ownership_lane {
     /// signal as the operation's confirmed death.
     pub struct StartCancellationGuard {
         settle_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        /// b8ke focused episode-2 post-cap F4: the sender-side settle
+        /// evidence — set on Drop so the stale-start probe can answer
+        /// "has this operation concluded?" WITHOUT polling the boxed
+        /// future (an un-polled future never runs its body; the flag is
+        /// the only honest probe).
+        settle_fired: Option<Arc<std::sync::atomic::AtomicBool>>,
     }
 
     impl Drop for StartCancellationGuard {
         fn drop(&mut self) {
             if let Some(tx) = self.settle_tx.take() {
                 let _ = tx.send(());
+            }
+            if let Some(flag) = &self.settle_fired {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         }
     }
@@ -479,21 +488,48 @@ pub mod ownership_lane {
         cancel: Arc<dyn Fn() + Send + Sync>,
     ) -> StartCancellationGuard {
         let (Some(registry), Some(ticket)) = (registry.as_ref(), ticket.as_ref()) else {
-            return StartCancellationGuard { settle_tx: None };
+            return StartCancellationGuard {
+                settle_tx: None,
+                settle_fired: None,
+            };
         };
+        // b8ke focused episode-2 post-cap F6: the registration targets the
+        // TICKET'S canonical key — the claim path already resolved the
+        // alias, so a legitimate resume through a superseded (re-keyed)
+        // wire id arms its cancellation on the record the watchdog actually
+        // sweeps. The caller's wire id is only a label.
+        let canonical_id = ticket.session_id();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        registry.register_start_cancellation(
+        let settle_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let registered = registry.register_start_cancellation(
             provider,
-            session_id,
+            canonical_id,
             ticket.operation_id(),
             ticket.generation(),
             cancel,
             Box::new(async move {
                 let _ = rx.await;
             }),
+            Some(Arc::clone(&settle_fired)),
         );
+        if !registered {
+            // b8ke F6: NEVER a silent decline — the operation runs with no
+            // cancellation armed, which the watchdog would otherwise turn
+            // into an unkillable fence. Loud, structured, actionable.
+            tracing::error!(target: "invariant",
+                provider, session_id = %canonical_id,
+                wire_session_id = %session_id,
+                operation_id = %ticket.operation_id(),
+                generation = ticket.generation(),
+                event = "freshagent.start_cancellation_registration_declined",
+                "the watchdog registration declined — the operation proceeds with NO \
+                 cancellation/settle armed (fail-closed fencing risk: a slow start \
+                 fences unkillable). Investigate the claim/registration ordering."
+            );
+        }
         StartCancellationGuard {
             settle_tx: Some(tx),
+            settle_fired: Some(settle_fired),
         }
     }
 
