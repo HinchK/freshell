@@ -30,6 +30,37 @@ Fix three fresh-agent parity bugs on the Rust server, tracked as kata items te1m
 
 **Tech Stack:** Rust (axum 0.8, tokio, serde_json; tracing) under `crates/`; vendored Node sidecar `crates/freshell-claude-sidecar/index.mjs`; React 18 + Redux Toolkit client (Vitest); Playwright e2e on the Rust server (`rust-chromium` project).
 
+## Post-execution amendment (2026-09-12): second rebase onto current main
+
+All nine tasks below were executed to completion at the original base
+(`db8e09cb…`) with per-task reviews and a green final gate (receipts in the
+run's usual-sdd ledger). During the approved post-recap extension (rebase +
+additional delta rounds), `origin/main` advanced twice and landed independent
+implementations of two of the three katas via PR #727:
+
+- **te1m (attachments) — CLOSED on main.** `crates/freshell-server/src/attachments.rs`
+  (78b8d9d7a) + `agent-attachments.spec.ts` + the composer's 413/size-limit
+  surfacing. Plan Tasks 1 and 4 are superseded and dropped from this branch.
+- **z7j7 (per-send settings) — CLOSED on main.** The codex/claude per-send
+  engine (codex turn/start merge + persist-after-acceptance; claude
+  `configure`→`sdk.configured` handshake) landed before the first rebase;
+  b28bda34a then landed the honesty scope copy and the per-send e2e proofs in
+  `fresh-agent-control-rust.spec.ts`. Plan Tasks 6, 7, and 8 are superseded
+  and dropped, along with the corresponding per-send legs of Task 9.
+- **ekc6 (diff panel + AGENT-13 diff/exec) — still OPEN.** Main has no
+  `GET /api/fresh-agent/diff` / `POST /api/fresh-agent/exec` routes and the
+  panel still lacks retry/unsupported/empty states; the SPA already calls
+  both routes (`FreshAgentDiffPanel.tsx`, `FreshAgentView.tsx`
+  `runShellCommand`).
+
+This branch was rebased onto `origin/main` at `2e05dd9e2` and now carries only
+the surviving ekc6 delta: **Task 2** (diff route), **Task 3** (exec route) —
+both in `crates/freshell-server/src/fresh_agent_extras.rs` with the
+attachments code stripped, **Task 5** (diff-panel retry/unsupported/empty
+states), and **Task 9** (e2e proof, trimmed to the diff/exec tests). All
+dropped tasks remain documented below for the record; their acceptance
+criteria are satisfied by main's landed implementations, not by this branch.
+
 ## Global Constraints
 
 1. **Worktree/git.** Work only in `/home/dan/code/freshell/.worktrees/freshagent-rust-parity` on branch `the-usual/freshagent-rust-parity` (base `db8e09cb67e08a1028ab50b71b99b160a2e7f35f`). Focused conventional commits per task. Never touch the main checkout, other worktrees, or `origin/main`.
