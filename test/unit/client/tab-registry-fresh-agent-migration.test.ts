@@ -57,18 +57,19 @@ function freshAgentPane(payload: Record<string, unknown>) {
 
 describe('client tab registry fresh-agent migration', () => {
   it('serializes live fresh-agent pane snapshots without agent-chat kinds', () => {
+    const legacyContent = {
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      createRequestId: 'req-fresh',
+      status: 'idle',
+      sessionRef: { provider: 'claude', sessionId: '00000000-0000-4000-8000-000000000001' },
+      showTools: true,
+    }
     const layout: PaneNode = {
       type: 'leaf',
       id: 'pane-fresh',
-      content: {
-        kind: 'fresh-agent',
-        sessionType: 'freshclaude',
-        provider: 'claude',
-        createRequestId: 'req-fresh',
-        status: 'idle',
-        sessionRef: { provider: 'claude', sessionId: '00000000-0000-4000-8000-000000000001' },
-        showTools: true,
-      },
+      content: legacyContent as PaneNode['content'],
     }
 
     const record = buildOpenTabRegistryRecord({
@@ -87,9 +88,9 @@ describe('client tab registry fresh-agent migration', () => {
       payload: {
         sessionType: 'freshclaude',
         provider: 'claude',
-        showTools: true,
       },
     })
+    expect(record.panes[0].payload.showTools).toBeUndefined()
   })
 
   it('normalizes incoming registry records in tabRegistrySync', () => {

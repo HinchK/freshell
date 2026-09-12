@@ -1179,3 +1179,68 @@ fn update_from_ui_migrates_legacy_agent_chat_and_fresh_agent_content() {
     assert!(p.get("sessionRef").is_none());
     assert!(p.get("resumeSessionId").is_none());
 }
+
+#[test]
+fn update_from_ui_drops_legacy_display_override_keys_from_fresh_agent_content() {
+    const CANONICAL: &str = "123e4567-e89b-42d3-a456-426614174000";
+
+    let store = LayoutStore::default();
+    let sync = sync_from(json!({
+        "tabs": [{ "id": "t1" }, { "id": "t2" }],
+        "activeTabId": "t1",
+        "layouts": {
+            "t1": leaf("p1", json!({
+                "kind": "agent-chat",
+                "provider": "claude",
+                "resumeSessionId": CANONICAL,
+                "showThinking": false,
+                "showTools": true,
+                "showTimecodes": true,
+            })),
+            "t2": leaf("p2", json!({
+                "kind": "fresh-agent",
+                "sessionType": "freshclaude",
+                "provider": "claude",
+                "sessionRef": { "provider": "claude", "sessionId": CANONICAL },
+                "showThinking": true,
+                "showTools": false,
+                "showTimecodes": true,
+            })),
+        },
+        "activePane": { "t1": "p1", "t2": "p2" },
+        "timestamp": 1,
+    }));
+    store.update_from_ui(&sync, "conn");
+
+    // Both migration arms drop the vestigial per-pane display overrides
+    // (no writer since 2026-04) while showTimecodes keeps flowing through.
+    let p1 = store
+        .get_pane_snapshot("p1")
+        .expect("p1")
+        .pane_content
+        .expect("content");
+    assert!(
+        p1.get("showThinking").is_none(),
+        "agent-chat arm strips showThinking"
+    );
+    assert!(
+        p1.get("showTools").is_none(),
+        "agent-chat arm strips showTools"
+    );
+    assert_eq!(p1["showTimecodes"], json!(true));
+
+    let p2 = store
+        .get_pane_snapshot("p2")
+        .expect("p2")
+        .pane_content
+        .expect("content");
+    assert!(
+        p2.get("showThinking").is_none(),
+        "fresh-agent arm strips showThinking"
+    );
+    assert!(
+        p2.get("showTools").is_none(),
+        "fresh-agent arm strips showTools"
+    );
+    assert_eq!(p2["showTimecodes"], json!(true));
+}

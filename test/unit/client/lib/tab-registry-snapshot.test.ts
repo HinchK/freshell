@@ -89,23 +89,30 @@ describe('collectPaneSnapshots', () => {
     }])
   })
 
-  it('serializes fresh-agent selection strategies and explicit effort overrides', () => {
+  it('serializes fresh-agent selection strategies and drops legacy display overrides from payloads', () => {
+    // The content carries legacy per-pane display overrides (no writer since
+    // 2026-04); the registry payload must never carry showThinking/showTools
+    // forward, while showTimecodes keeps stamping through.
+    const legacyContent = {
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      createRequestId: 'req-agent',
+      status: 'idle',
+      resumeSessionId: '00000000-0000-4000-8000-000000000123',
+      sessionRef: { provider: 'claude', sessionId: '00000000-0000-4000-8000-000000000123' },
+      modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
+      permissionMode: 'default',
+      effort: 'turbo',
+      plugins: ['planner'],
+      showThinking: true,
+      showTools: true,
+      showTimecodes: true,
+    }
     const node: PaneNode = {
       type: 'leaf',
       id: 'pane-agent',
-      content: {
-        kind: 'fresh-agent',
-        sessionType: 'freshclaude',
-        provider: 'claude',
-        createRequestId: 'req-agent',
-        status: 'idle',
-        resumeSessionId: '00000000-0000-4000-8000-000000000123',
-        sessionRef: { provider: 'claude', sessionId: '00000000-0000-4000-8000-000000000123' },
-        modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
-        permissionMode: 'default',
-        effort: 'turbo',
-        plugins: ['planner'],
-      },
+      content: legacyContent as PaneNode['content'],
     }
 
     const snapshots = collectPaneSnapshots(node, 'server-1')
@@ -125,11 +132,11 @@ describe('collectPaneSnapshots', () => {
         effort: 'turbo',
         plugins: ['planner'],
         settingsDismissed: undefined,
-        showThinking: undefined,
-        showTools: undefined,
-        showTimecodes: undefined,
+        showTimecodes: true,
       },
     }])
+    expect('showThinking' in snapshots[0].payload).toBe(false)
+    expect('showTools' in snapshots[0].payload).toBe(false)
   })
 
   it('keeps fresh-agent style in tab-registry pane payloads', () => {

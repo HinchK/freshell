@@ -145,6 +145,12 @@ const LEGACY_STRIP_KEYS: [&str; 7] = [
     "restoreError",
 ];
 
+/// Vestigial per-pane display overrides dropped from constructed fresh-agent
+/// content (shared/fresh-agent.ts D3): no writer since 2026-04; old persisted
+/// generations may still carry them, so the strip omits them instead of
+/// spreading them through.
+const LEGACY_DISPLAY_KEYS: [&str; 2] = ["showThinking", "showTools"];
+
 /// `FRESH_AGENT_DESCRIPTORS` runtime-provider mapping (`shared/fresh-agent.ts:77-120`).
 fn runtime_provider_for(session_type: &str) -> Option<&'static str> {
     match session_type {
@@ -246,7 +252,10 @@ fn migrate_durable_state(
 
 fn strip_legacy_keys(obj: &Map<String, Value>) -> Map<String, Value> {
     obj.iter()
-        .filter(|(key, _)| !LEGACY_STRIP_KEYS.contains(&key.as_str()))
+        .filter(|(key, _)| {
+            !LEGACY_STRIP_KEYS.contains(&key.as_str())
+                && !LEGACY_DISPLAY_KEYS.contains(&key.as_str())
+        })
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
 }

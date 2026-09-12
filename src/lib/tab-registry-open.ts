@@ -166,8 +166,6 @@ export function sanitizePaneSnapshot(
       plugins: payload.plugins as string[] | undefined,
       ...(style ? { style } : {}),
       settingsDismissed: typeof payload.settingsDismissed === 'boolean' ? payload.settingsDismissed : undefined,
-      showThinking: typeof payload.showThinking === 'boolean' ? payload.showThinking : undefined,
-      showTools: typeof payload.showTools === 'boolean' ? payload.showTools : undefined,
       showTimecodes: typeof payload.showTimecodes === 'boolean' ? payload.showTimecodes : undefined,
     }
   }

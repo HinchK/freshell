@@ -459,8 +459,8 @@ describe('panesSlice', () => {
         provider: 'claude',
         restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'invalid_legacy_restore_target' },
         initialCwd: '/repo',
-        showTools: true,
       })
+      expect((leaf.content as { showTools?: unknown }).showTools).toBeUndefined()
       expect(leaf.content.sessionRef).toBeUndefined()
       expect(leaf.content.resumeSessionId).toBeUndefined()
     })
@@ -5003,10 +5003,10 @@ describe('panesSlice', () => {
         modelSelection: { kind: 'exact', modelId: 'claude-opus-4-6' },
         permissionMode: 'acceptEdits',
         effort: 'high',
-        showThinking: false,
-        showTools: true,
         showTimecodes: true,
       })
+      expect((restoredLayout.content as { showThinking?: unknown }).showThinking).toBeUndefined()
+      expect((restoredLayout.content as { showTools?: unknown }).showTools).toBeUndefined()
     })
 
     it('does not overwrite an existing layout', () => {

@@ -146,10 +146,10 @@ describe('persistedState fresh-agent migration', () => {
       sessionType: 'freshclaude',
       provider: 'claude',
       sessionRef: { provider: 'claude', sessionId: canonical },
-      showThinking: false,
-      showTools: true,
       showTimecodes: true,
     })
+    expect(byPane['req-pane-freshclaude'].showThinking).toBeUndefined()
+    expect(byPane['req-pane-freshclaude'].showTools).toBeUndefined()
     expect(byPane['req-pane-kilroy']).toMatchObject({
       kind: 'fresh-agent',
       sessionType: 'kilroy',
@@ -224,8 +224,8 @@ describe('persistedState fresh-agent migration', () => {
       restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'invalid_legacy_restore_target' },
       initialCwd: '/repo',
       modelSelection: { kind: 'exact', modelId: 'claude-opus-4-6' },
-      showTools: true,
     })
+    expect(content.showTools).toBeUndefined()
     expect(content.sessionRef).toBeUndefined()
     expect(content.resumeSessionId).toBeUndefined()
   })

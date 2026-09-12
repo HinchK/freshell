@@ -129,8 +129,8 @@ describe('fresh-agent pane migration', () => {
       provider: 'claude',
       restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'invalid_legacy_restore_target' },
       initialCwd: '/work',
-      showTools: true,
     })
+    expect((migrated as { showTools?: unknown }).showTools).toBeUndefined()
     expect((migrated as { sessionRef?: unknown }).sessionRef).toBeUndefined()
   })
 
@@ -155,7 +155,7 @@ describe('fresh-agent pane migration', () => {
     expect((migrated as { resumeSessionId?: unknown }).resumeSessionId).toBeUndefined()
   })
 
-  it('preserves legacy display overrides', () => {
+  it('drops legacy display overrides during migration', () => {
     const migrated = migrateLegacyFreshAgentContent({
       kind: 'agent-chat',
       provider: 'freshclaude',
@@ -168,9 +168,9 @@ describe('fresh-agent pane migration', () => {
     })
     expect(migrated).toMatchObject({
       kind: 'fresh-agent',
-      showThinking: false,
-      showTools: true,
       showTimecodes: true,
     })
+    expect((migrated as { showThinking?: unknown }).showThinking).toBeUndefined()
+    expect((migrated as { showTools?: unknown }).showTools).toBeUndefined()
   })
 })
