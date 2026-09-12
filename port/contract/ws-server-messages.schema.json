@@ -2671,6 +2671,9 @@
           "items": {
             "additionalProperties": false,
             "properties": {
+              "aliasOf": {
+                "type": "string"
+              },
               "epoch": {
                 "type": "number"
               },
@@ -2782,6 +2785,9 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
+        "aliasOf": {
+          "type": "string"
+        },
         "epoch": {
           "type": "number"
         },

@@ -600,6 +600,12 @@ pub async fn build_handshake_with_capabilities(
                     .to_string(),
                     reason: rec.reason,
                     terminal_id: rec.terminal_id,
+                    // b8ke focused episode-2 post-cap F5 (wire-additive):
+                    // the canonical id an ALIASED (re-keyed) key resolved
+                    // to — the record's owner/state/generation are the
+                    // CANONICAL record's truth, so an old-key pane folds
+                    // the authoritative owner and can navigate.
+                    alias_of: rec.alias_of,
                 })
                 .collect()
         });

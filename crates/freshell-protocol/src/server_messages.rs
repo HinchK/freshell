@@ -995,6 +995,13 @@ pub struct RuntimeOwnerReplay {
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_id: Option<String>,
+    /// b8ke focused episode-2 post-cap F5 (wire-additive): for an
+    /// ALIASED (re-keyed) key, the CANONICAL id the server resolved —
+    /// the record's owner_kind/state/generation are the canonical
+    /// record's truth, and `aliasOf` carries the navigation so an
+    /// old-key pane converges on the authoritative owner.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias_of: Option<String>,
 }
 
 /// `session.runtimeOwner` — kata b8ke: one server-authoritative runtime
@@ -1027,6 +1034,13 @@ pub struct SessionRuntimeOwner {
     pub operation_id: String,
     /// "handoff-started" | "handoff-committed" | "handoff-failed" | "released"
     pub transition: String,
+    /// b8ke focused episode-2 post-cap F5 (wire-additive): the CANONICAL id
+    /// this frame's session id was re-keyed to. Set on the rekey
+    /// transition's OLD-key mirror frame so a device holding the pre-rekey
+    /// id folds the canonical owner state and can navigate to the
+    /// canonical key — never a permanent "vacant".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias_of: Option<String>,
     /// Machine-readable failure reason (handoff-failed frames).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -1716,6 +1730,7 @@ mod tests {
             transition: "handoff-committed".into(),
             reason: None,
             fenced: None,
+            alias_of: None,
         });
         let json = serde_json::to_string(&msg).expect("serialize");
         assert!(
@@ -1748,6 +1763,7 @@ mod tests {
             transition: "handoff-failed".into(),
             reason: Some("REAP_TIMEOUT".into()),
             fenced: Some(true),
+            alias_of: None,
         });
         let json = serde_json::to_string(&msg).expect("serialize");
         assert!(
@@ -1776,6 +1792,7 @@ mod tests {
             transition: "handoff-started".into(),
             reason: None,
             fenced: None,
+            alias_of: None,
         });
         let json = serde_json::to_string(&msg).expect("serialize");
         assert!(
@@ -1897,6 +1914,7 @@ mod tests {
                     state: "live".into(),
                     reason: None,
                     terminal_id: Some("t-91".into()),
+                    alias_of: None,
                 },
                 RuntimeOwnerReplay {
                     provider: "claude".into(),
@@ -1907,6 +1925,7 @@ mod tests {
                     state: "fenced".into(),
                     reason: Some("platform-limited".into()),
                     terminal_id: None,
+                    alias_of: None,
                 },
             ]),
         });
