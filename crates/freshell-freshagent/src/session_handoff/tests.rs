@@ -6722,3 +6722,95 @@ async fn handoff_route_resolves_absent_session_type_when_unambiguous() {
     }
     let _ = env;
 }
+
+/// b8ke ext r6 F2: the PRIOR-stop terminal arm confirms death on the
+/// recorded pid's OS-LEVEL death — never registry.kill()'s return.
+/// kill_internal removes the row BEFORE signaling/reaping the PTY, so a
+/// concurrent kill can own the removed row while the process lives: the
+/// old kill()=false arm answered Reaped and the handoff started the
+/// replacement before confirmed reap. The row-removed-but-pid-alive
+/// window fences (the watcher regime resolves it), never reaps.
+#[tokio::test]
+async fn the_prior_stop_never_confirms_on_a_missing_row() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    // A SHORT reap budget: the pid-alive window deterministically fences
+    // within the test.
+    let rig = build_rig_inner(None, None, None, 50, None, false, None);
+    // The prior's stand-in process: ALIVE, its registry row ABSENT — the
+    // exact row-removed-but-not-yet-reaped shape a concurrent kill
+    // produces.
+    let mut prior = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn the prior's stand-in");
+    let prior_pid = prior.id();
+    let absent_tid = "T-r6-f2-absent";
+    assert!(
+        rig.registry.terminal_is_dead(absent_tid),
+        "precondition: the recorded pane's row is absent"
+    );
+    assert!(
+        freshell_terminal::registry::pid_alive(prior_pid),
+        "precondition: the recorded runtime still lives"
+    );
+    let live_owner = freshell_ownership::OwnerIdentity {
+        kind: RuntimeOwnerKind::Terminal,
+        terminal_id: Some(absent_tid.to_string()),
+        live_session_key: None,
+        pid: Some(prior_pid),
+        ownership_id: None,
+    };
+
+    // THE WINDOW: kill() answers false (the row is gone) while the pid
+    // lives — pre-r6 the prior-stop arm answered Reaped and the handoff
+    // started the replacement before the reap confirmed.
+    let outcome = rig
+        .runner
+        .stop_runtime(
+            &handoff_req_terminal("claude", &sid, "claude"),
+            &live_owner,
+            "test",
+            "op-r6-f2",
+            1,
+        )
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            super::StopOutcomePriv::ReapTimeout { fenced: true }
+        ),
+        "the row-removed-but-pid-alive window fences typed — got {outcome:?}"
+    );
+
+    // The confirmed pid-death path still reaps.
+    prior.kill().expect("SIGKILL the stand-in");
+    let _ = prior.wait().expect("reap the stand-in");
+    assert!(
+        !freshell_terminal::registry::pid_alive(prior_pid),
+        "precondition: the recorded runtime is confirmed dead"
+    );
+    let dead_owner = freshell_ownership::OwnerIdentity {
+        kind: RuntimeOwnerKind::Terminal,
+        terminal_id: Some(absent_tid.to_string()),
+        live_session_key: None,
+        pid: Some(prior_pid),
+        ownership_id: None,
+    };
+    let outcome = rig
+        .runner
+        .stop_runtime(
+            &handoff_req_terminal("claude", &sid, "claude"),
+            &dead_owner,
+            "test",
+            "op-r6-f2-dead",
+            2,
+        )
+        .await;
+    assert!(
+        matches!(outcome, super::StopOutcomePriv::Reaped),
+        "the confirmed pid-death path still reaps — got {outcome:?}"
+    );
+}

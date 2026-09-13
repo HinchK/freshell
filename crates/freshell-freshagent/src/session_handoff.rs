@@ -2559,45 +2559,108 @@ impl SessionHandoffRunner {
                 let Some(terminal_id) = owner.terminal_id.as_deref() else {
                     return StopOutcomePriv::Reaped; // no runtime identity: nothing to stop
                 };
-                if !self.registry.kill(terminal_id) {
-                    // Already gone (killed/exited elsewhere): the row is dead.
-                    return StopOutcomePriv::Reaped;
-                }
-                // Round-3 review I-1 (prior-reap window): the kill is now
-                // ISSUED (SIGKILL sent) but unconfirmed — the abort-window
-                // test's deterministic hold parks HERE, inside the window
-                // where a dropped runner must re-probe before any restore.
-                if let Some(hooks) = self.test_hooks.as_ref() {
-                    if let Some(pause) = hooks.pause_after_terminal_prior_kill.as_ref() {
-                        let _ = pause.notified().await;
+                // b8ke ext r6 F2: confirmed death is the recorded pid's
+                // OS-LEVEL death — NEVER registry.kill()'s return and never
+                // the row-based predicate. kill_internal removes the row
+                // BEFORE signaling/reaping the PTY, so a concurrent kill can
+                // own the removed row while the process lives: the old
+                // kill()=false arm answered Reaped and the handoff started
+                // the replacement before confirmed reap. Issue the kill
+                // (idempotent — false only means the row is gone) and poll
+                // the pid within the budget; the row-removed-but-pid-alive
+                // window fences with the watcher regime (the same fix the
+                // uncommitted-target reap took).
+                match owner.pid {
+                    Some(pid) => {
+                        self.registry.kill(terminal_id);
+                        // Round-3 review I-1 (prior-reap window): the kill is
+                        // now ISSUED (SIGKILL sent) but unconfirmed — the
+                        // abort-window test's deterministic hold parks HERE,
+                        // inside the window where a dropped runner must
+                        // re-probe before any restore.
+                        if let Some(hooks) = self.test_hooks.as_ref() {
+                            if let Some(pause) = hooks.pause_after_terminal_prior_kill.as_ref() {
+                                let _ = pause.notified().await;
+                            }
+                        }
+                        let mut confirm = std::pin::pin!(async {
+                            while freshell_terminal::registry::pid_alive(pid) {
+                                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                            }
+                        });
+                        tokio::select! {
+                            () = &mut confirm => StopOutcomePriv::Reaped,
+                            _ = tokio::time::sleep(budget) => {
+                                // The SIGKILL was issued (ours or the
+                                // concurrent one); the process's death is
+                                // merely unobserved. Keep polling DETACHED
+                                // (the watcher releases the fenced key once
+                                // the pid is dead) — the failure frame FIRST
+                                // (FR5), strictly before the watcher exists.
+                                self.broadcast_fenced_reap_timeout(req, owner, operation_id, generation);
+                                self.spawn_reap_confirmation_watcher(
+                                    req,
+                                    operation_id,
+                                    generation,
+                                    initiator,
+                                    owner,
+                                    "REAP_TIMEOUT",
+                                    async move {
+                                        while freshell_terminal::registry::pid_alive(pid) {
+                                            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                                        }
+                                        ReapAnswer::Confirmed
+                                    },
+                                );
+                                StopOutcomePriv::ReapTimeout { fenced: true }
+                            }
+                        }
                     }
-                }
-                let mut confirm = std::pin::pin!(await_terminal_dead(&self.registry, terminal_id));
-                tokio::select! {
-                    () = &mut confirm => StopOutcomePriv::Reaped,
-                    _ = tokio::time::sleep(budget) => {
-                        // The SIGKILL was issued; the row's death is merely
-                        // unobserved. Keep polling DETACHED (the watcher
-                        // releases the fenced key once the row is dead) — the
-                        // failure frame FIRST (FR5), strictly before the
-                        // watcher exists.
-                        self.broadcast_fenced_reap_timeout(req, owner, operation_id, generation);
-                        let registry = self.registry.clone();
-                        let tid = terminal_id.to_string();
-                        self.spawn_reap_confirmation_watcher(
-                            req,
-                            operation_id,
-                            generation,
-                            initiator,
-                            owner,
-                            "REAP_TIMEOUT",
-                            async move {
-                                await_terminal_dead(&registry, &tid).await;
-                                // The registry row is dead — confirmed.
-                                ReapAnswer::Confirmed
-                            },
-                        );
-                        StopOutcomePriv::ReapTimeout { fenced: true }
+                    None => {
+                        // No recorded pid (a degenerate identity): the best
+                        // available evidence is the row-based poll after our
+                        // OWN kill — a pid-less identity has no
+                        // concurrent-kill window (a real row would carry a
+                        // pid).
+                        if !self.registry.kill(terminal_id) {
+                            // Already gone (killed/exited elsewhere): the row
+                            // is dead.
+                            return StopOutcomePriv::Reaped;
+                        }
+                        // Round-3 review I-1 (prior-reap window): the kill is
+                        // now ISSUED (SIGKILL sent) but unconfirmed — the
+                        // abort-window test's deterministic hold parks HERE,
+                        // inside the window where a dropped runner must
+                        // re-probe before any restore.
+                        if let Some(hooks) = self.test_hooks.as_ref() {
+                            if let Some(pause) = hooks.pause_after_terminal_prior_kill.as_ref() {
+                                let _ = pause.notified().await;
+                            }
+                        }
+                        let mut confirm =
+                            std::pin::pin!(await_terminal_dead(&self.registry, terminal_id));
+                        tokio::select! {
+                            () = &mut confirm => StopOutcomePriv::Reaped,
+                            _ = tokio::time::sleep(budget) => {
+                                self.broadcast_fenced_reap_timeout(req, owner, operation_id, generation);
+                                let registry = self.registry.clone();
+                                let tid = terminal_id.to_string();
+                                self.spawn_reap_confirmation_watcher(
+                                    req,
+                                    operation_id,
+                                    generation,
+                                    initiator,
+                                    owner,
+                                    "REAP_TIMEOUT",
+                                    async move {
+                                        await_terminal_dead(&registry, &tid).await;
+                                        // The registry row is dead — confirmed.
+                                        ReapAnswer::Confirmed
+                                    },
+                                );
+                                StopOutcomePriv::ReapTimeout { fenced: true }
+                            }
+                        }
                     }
                 }
             }
