@@ -60,13 +60,18 @@ COPY . .
 RUN FRESHELL_BUILD_COMMIT="$FRESHELL_BUILD_COMMIT" npm run build:client && npm run build:tools
 
 # ---------------------------------------------------------------------------
-# Stage 3: test runtime with no compiler toolchain.
+# Stage 3: test runtime. Vitest behaviorally compiles isolated Rust build-script
+# fixtures, so this test-only image retains the Rust toolchain. The shipped
+# Freshell runtime boundary remains the staged Rust server/client/tools artifacts.
 # ---------------------------------------------------------------------------
 FROM node:22-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive \
     NONINTERACTIVE=1 \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:${PATH}
 
 LABEL org.opencontainers.image.title="freshell-e2e" \
       org.opencontainers.image.description="Cloud Run Jobs image for Playwright browser tests" \
@@ -83,9 +88,15 @@ RUN npx --yes playwright@1.58.2 install --with-deps chromium
 
 WORKDIR /app
 COPY --from=rust-builder /build/target/release/freshell-server /app/target/release/freshell-server
+COPY --from=rust-builder /usr/local/cargo /usr/local/cargo
+COPY --from=rust-builder /usr/local/rustup /usr/local/rustup
 COPY --from=node-builder /app/dist/client ./dist/client
 COPY --from=node-builder /app/dist/tools ./dist/tools
 COPY --from=node-builder /app/node_modules ./node_modules
+
+# Fail the image build if the copied test toolchain cannot execute in this
+# Debian runtime. A container-level test checks the configured runtime user.
+RUN cargo --version && rustc --version
 
 # Preserve the source tree for local release checks. Build outputs and
 # dependency directories are excluded by .dockerignore, so these copies cannot

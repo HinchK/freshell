@@ -109,6 +109,20 @@ const DEAD_THREADS_CAP: usize = 256;
 /// requirement, so only a LONG silence with a turn in flight flags `stuck`.
 const DEFAULT_CODEX_QUIET_WINDOW_MS: u64 = 600_000;
 
+/// Shared ownership-bearing state for one Codex notification consumer.
+///
+/// Keeping these handles together makes the consumer's concurrency contract
+/// explicit: every lifecycle path must give the reducer, quiet-deadman, compact
+/// guard, and emission barrier for the same thread to the same task.
+struct CodexConsumerRuntime {
+    thread_id: String,
+    active_turn: Arc<StdMutex<Option<String>>>,
+    quiet_deadman: Arc<StdMutex<QuietDeadman>>,
+    compact_in_flight: Arc<AtomicBool>,
+    compact_turn_id: Arc<StdMutex<Option<String>>>,
+    event_emission_gate: Arc<TokioMutex<()>>,
+}
+
 /// Seed the quiet window from `FRESHELL_FRESHCODEX_QUIET_WINDOW_MS` (positive integer
 /// milliseconds; missing or unparseable falls back to [`DEFAULT_CODEX_QUIET_WINDOW_MS`]).
 fn codex_quiet_window_ms_from_env() -> u64 {
@@ -1316,12 +1330,14 @@ impl FreshCodexState {
         let (created_tx, created_rx) = oneshot::channel();
         let consumer = self.spawn_consumer_after(
             notifs,
-            thread_id.clone(),
-            active_turn.clone(),
-            quiet_deadman.clone(),
-            compact_in_flight.clone(),
-            compact_turn_id.clone(),
-            event_emission_gate.clone(),
+            CodexConsumerRuntime {
+                thread_id: thread_id.clone(),
+                active_turn: active_turn.clone(),
+                quiet_deadman: quiet_deadman.clone(),
+                compact_in_flight: compact_in_flight.clone(),
+                compact_turn_id: compact_turn_id.clone(),
+                event_emission_gate: event_emission_gate.clone(),
+            },
             Some(created_rx),
         );
 
@@ -3532,12 +3548,14 @@ impl FreshCodexState {
         let exited = Arc::new(AtomicBool::new(false));
         let consumer = self.spawn_consumer(
             notifs,
-            session_id.to_string(),
-            active_turn.clone(),
-            quiet_deadman.clone(),
-            compact_in_flight.clone(),
-            compact_turn_id.clone(),
-            event_emission_gate.clone(),
+            CodexConsumerRuntime {
+                thread_id: session_id.to_string(),
+                active_turn: active_turn.clone(),
+                quiet_deadman: quiet_deadman.clone(),
+                compact_in_flight: compact_in_flight.clone(),
+                compact_turn_id: compact_turn_id.clone(),
+                event_emission_gate: event_emission_gate.clone(),
+            },
         );
         let (kill_tx, kill_rx) = oneshot::channel();
         let watcher = spawn_exit_watcher(
@@ -3709,12 +3727,14 @@ impl FreshCodexState {
         let exited = Arc::new(AtomicBool::new(false));
         let consumer = self.spawn_consumer(
             notifs,
-            new_thread_id.clone(),
-            active_turn.clone(),
-            quiet_deadman.clone(),
-            compact_in_flight.clone(),
-            compact_turn_id.clone(),
-            event_emission_gate.clone(),
+            CodexConsumerRuntime {
+                thread_id: new_thread_id.clone(),
+                active_turn: active_turn.clone(),
+                quiet_deadman: quiet_deadman.clone(),
+                compact_in_flight: compact_in_flight.clone(),
+                compact_turn_id: compact_turn_id.clone(),
+                event_emission_gate: event_emission_gate.clone(),
+            },
         );
         let (kill_tx, kill_rx) = oneshot::channel();
         let watcher = spawn_exit_watcher(
@@ -3968,23 +3988,9 @@ impl FreshCodexState {
     fn spawn_consumer(
         &self,
         notifs: tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
-        thread_id: String,
-        active_turn: Arc<StdMutex<Option<String>>>,
-        quiet_deadman: Arc<StdMutex<QuietDeadman>>,
-        compact_in_flight: Arc<AtomicBool>,
-        compact_turn_id: Arc<StdMutex<Option<String>>>,
-        event_emission_gate: Arc<TokioMutex<()>>,
+        runtime: CodexConsumerRuntime,
     ) -> tokio::task::JoinHandle<()> {
-        self.spawn_consumer_after(
-            notifs,
-            thread_id,
-            active_turn,
-            quiet_deadman,
-            compact_in_flight,
-            compact_turn_id,
-            event_emission_gate,
-            None,
-        )
+        self.spawn_consumer_after(notifs, runtime, None)
     }
 
     /// Like [`Self::spawn_consumer`], but if `created_gate` is given, the consumer's first
@@ -3996,18 +4002,20 @@ impl FreshCodexState {
     /// sender resolves its receiver immediately with `Err`, which this ignores) --
     /// callers must still fire it on every path, but a bug that forgets to can never
     /// wedge the consumer forever.
-    #[allow(clippy::too_many_arguments)]
     fn spawn_consumer_after(
         &self,
         mut notifs: tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
-        thread_id: String,
-        active_turn: Arc<StdMutex<Option<String>>>,
-        quiet_deadman: Arc<StdMutex<QuietDeadman>>,
-        compact_in_flight: Arc<AtomicBool>,
-        compact_turn_id: Arc<StdMutex<Option<String>>>,
-        event_emission_gate: Arc<TokioMutex<()>>,
+        runtime: CodexConsumerRuntime,
         created_gate: Option<oneshot::Receiver<()>>,
     ) -> tokio::task::JoinHandle<()> {
+        let CodexConsumerRuntime {
+            thread_id,
+            active_turn,
+            quiet_deadman,
+            compact_in_flight,
+            compact_turn_id,
+            event_emission_gate,
+        } = runtime;
         let broadcast_tx = self.broadcast_tx.clone();
         // The deadman feed needs the state handle (window config + waiter spawn); a
         // clone is all-Arc, cheap, and adds no lifecycle coupling (the state is the
@@ -4796,12 +4804,14 @@ impl FreshCodexState {
         let exited = Arc::new(AtomicBool::new(false));
         let consumer = self.spawn_consumer(
             notifs,
-            thread_id.to_string(),
-            active_turn.clone(),
-            quiet_deadman.clone(),
-            compact_in_flight.clone(),
-            compact_turn_id.clone(),
-            event_emission_gate.clone(),
+            CodexConsumerRuntime {
+                thread_id: thread_id.to_string(),
+                active_turn: active_turn.clone(),
+                quiet_deadman: quiet_deadman.clone(),
+                compact_in_flight: compact_in_flight.clone(),
+                compact_turn_id: compact_turn_id.clone(),
+                event_emission_gate: event_emission_gate.clone(),
+            },
         );
         let (kill_tx, kill_rx) = oneshot::channel();
         let watcher = spawn_exit_watcher(
@@ -7046,12 +7056,14 @@ pub(crate) mod tests {
         let event_emission_gate = Arc::new(TokioMutex::new(()));
         let consumer = state.spawn_consumer(
             notifs,
-            thread_id.to_string(),
-            active_turn.clone(),
-            quiet_deadman.clone(),
-            compact_in_flight.clone(),
-            compact_turn_id.clone(),
-            event_emission_gate.clone(),
+            CodexConsumerRuntime {
+                thread_id: thread_id.to_string(),
+                active_turn: active_turn.clone(),
+                quiet_deadman: quiet_deadman.clone(),
+                compact_in_flight: compact_in_flight.clone(),
+                compact_turn_id: compact_turn_id.clone(),
+                event_emission_gate: event_emission_gate.clone(),
+            },
         );
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));

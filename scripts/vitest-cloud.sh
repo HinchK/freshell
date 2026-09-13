@@ -230,13 +230,19 @@ cmd_build() {
   freshell_resolve_cloud_identity "cloudbuild.builds.create"
 
   # Content-addressed tag (see image_tag_for_head): the only tag `run` pins.
-  local tag remote_base
+  local tag remote_base build_commit
   tag="$(image_tag_for_head)"
   remote_base="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/${IMAGE_NAME}"
+  build_commit="$(git -C "$ROOT" rev-parse HEAD)"
+  if ! [[ "$build_commit" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "[vitest-cloud] ERROR: HEAD is not a lowercase 40-hex commit: $build_commit" >&2
+    exit 1
+  fi
 
   if $local_build; then
     echo "[vitest-cloud] Building Docker image locally (tag: $tag)..."
     docker build -f "$ROOT/docker/cloud-run/Dockerfile" \
+      --build-arg "FRESHELL_BUILD_COMMIT=${build_commit}" \
       -t "$IMAGE_LOCAL" \
       -t "${IMAGE_NAME}:${tag}" \
       "$ROOT"
@@ -248,7 +254,7 @@ cmd_build() {
       --config "$ROOT/docker/cloud-run/cloudbuild.yaml" \
       $(account_flag) \
       --project="$GCP_PROJECT" \
-      --substitutions=_IMAGE="${remote_base}:${tag}" \
+      --substitutions=_IMAGE="${remote_base}:${tag}",_FRESHELL_BUILD_COMMIT="$build_commit" \
       "$ROOT"
     echo "[vitest-cloud] Cloud Build complete: ${remote_base}:${tag}"
   fi
