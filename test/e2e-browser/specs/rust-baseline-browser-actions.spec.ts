@@ -2,7 +2,7 @@ import { readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import type { Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
-import { createFreshE2eBrowserContext } from '../helpers/fixtures.js'
+import { createE2eBrowserContext, registerE2eMachine } from '../helpers/fixtures.js'
 
 const FORBIDDEN = [
   '/api/proxy/forward',
@@ -129,7 +129,12 @@ test.describe('Rust baseline browser actions', () => {
       baseUrl: serverInfo.baseUrl.replace('127.0.0.1', 'freshell-baseline.localhost'),
       wsUrl: serverInfo.wsUrl.replace('127.0.0.1', 'freshell-baseline.localhost'),
     }
-    const { context: remoteContext } = await createFreshE2eBrowserContext(browser, alternateInfo)
+    // The test runner's Node resolver cannot resolve arbitrary `*.localhost`
+    // names in Cloud, while Chromium correctly maps them to loopback. Register
+    // through the server's reachable origin, then install that server-known
+    // machine only for the alternate browser origin.
+    const remoteMachine = await registerE2eMachine(serverInfo)
+    const remoteContext = await createE2eBrowserContext(browser, alternateInfo, remoteMachine.id)
     try {
       const remotePage = await remoteContext.newPage()
       const remoteForbidden = captureForbiddenRequests(remotePage)
