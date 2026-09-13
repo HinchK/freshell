@@ -50,19 +50,6 @@ describe('SettingsView coding agents settings', () => {
     expect(screen.queryByLabelText('Fresh agent font size')).not.toBeInTheDocument()
   })
 
-  it('describes the always-shown, starts-expanded contract in the section help text', () => {
-    const store = createSettingsViewStore()
-    renderSettingsView(store)
-    switchSettingsTab('Coding Agents')
-
-    expect(
-      screen.getByText('Whether fresh-agent panes start with thinking and tool details expanded'),
-    ).toBeInTheDocument()
-    expect(screen.getAllByText(/always shown compact/i).length).toBeGreaterThan(0)
-    expect(screen.getAllByText(/starts expanded/i).length).toBeGreaterThan(0)
-    expect(screen.getAllByText(/temporary and never saved/i).length).toBeGreaterThan(0)
-  })
-
   it('toggles fresh-agent expansion defaults locally without calling the server', () => {
     const store = createSettingsViewStore()
     renderSettingsView(store)

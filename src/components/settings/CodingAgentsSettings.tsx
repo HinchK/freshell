@@ -153,11 +153,11 @@ export default function CodingAgentsSettings({
       </SettingsSection>
       <SettingsSection
         title="Fresh agent display"
-        description="Whether fresh-agent panes start with thinking and tool details expanded"
+        description="Whether fresh-agent panes start with thinking rows and the tool activity line expanded"
       >
         <SettingsRow
           label="Expand thinking"
-          description="Thinking is always shown compact; this sets whether it starts expanded. In-pane expand/collapse is temporary and never saved."
+          description="Thinking rows are always present in fresh-agent panes; this sets whether they start expanded. Expanding or collapsing in a pane is temporary and never saved."
         >
           <Toggle
             checked={settings.freshAgent?.expandThinking ?? false}
@@ -169,7 +169,7 @@ export default function CodingAgentsSettings({
         </SettingsRow>
         <SettingsRow
           label="Expand tools"
-          description="Tool activity is always shown compact; this sets whether it starts expanded. In-pane expand/collapse is temporary and never saved."
+          description="The tool activity line is always present in fresh-agent panes; this sets whether it starts expanded. Expanding or collapsing in a pane is temporary and never saved."
         >
           <Toggle
             checked={settings.freshAgent?.expandTools ?? false}
