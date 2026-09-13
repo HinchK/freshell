@@ -4020,8 +4020,31 @@ impl FreshCodexState {
             state.clear_controls(&thread_id).await;
             let mut subscription = CodexSubscription::new(thread_id.clone());
             while let Some(notification) = notifs.recv().await {
+                // `turn/started` has no wire output, but establishes state that later
+                // notifications depend on (notably the compact turn's ownership id).
+                // Let it fold while a send holds the emission barrier; otherwise the
+                // compact's queued start can land only AFTER a newer send's direct
+                // active-turn update, and its delayed completion can retire the wrong
+                // turn. Every notification capable of emitting a wire frame stays
+                // behind the barrier below.
+                if matches!(&notification, CodexNotification::TurnStarted(_)) {
+                    let events = reduce_notification(
+                        &mut subscription,
+                        notification,
+                        &active_turn,
+                        &quiet_deadman,
+                        &state,
+                        &compact_in_flight,
+                        &compact_turn_id,
+                    );
+                    debug_assert!(events.is_empty(), "turn/started must not emit wire frames");
+                    continue;
+                }
+
                 // Lock around the whole notification fold, not each individual frame:
-                // a completed turn emits snapshot then chime as one ordered unit.
+                // a completed turn emits snapshot then chime as one ordered unit. This
+                // also ensures an immediate completion cannot retire a just-started
+                // turn before handle_send has recorded its returned turn id.
                 let _emission = event_emission_gate.lock().await;
                 if state
                     .consume_control_notification(&thread_id, &notification)
@@ -5958,7 +5981,18 @@ fn reduce_notification(
             if let Some(turn_id) = &event.turn_id {
                 subscription.set_active_turn(turn_id.clone());
                 if event.thread_id == subscription.session_id() {
-                    *active_turn.lock().expect("active_turn mutex") = Some(turn_id.clone());
+                    // `handle_send` records the provider-returned turn id before its
+                    // matching `turn/started` notification necessarily reaches this
+                    // consumer. Treat that direct record as authoritative over a
+                    // different, delayed start notification (the compact lifecycle
+                    // can produce exactly that overlap); the matching start remains
+                    // an idempotent refresh, and an empty tracker still adopts an
+                    // externally observed start.
+                    let mut active = active_turn.lock().expect("active_turn mutex");
+                    if active.as_deref().is_none_or(|id| id == turn_id) {
+                        *active = Some(turn_id.clone());
+                    }
+                    drop(active);
                     // ep1-r3 F4: capture the compact turn's OWNERSHIP id — the FIRST
                     // turn/started observed while the compact window is armed with
                     // no id captured (provider FIFO: the compact was submitted
