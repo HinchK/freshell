@@ -526,16 +526,15 @@ function selectLiveActivityBlockIdFromLayout(
   return null
 }
 
-function FreshAgentThinkingRow({ text, initialExpanded = false }: { text: string; initialExpanded?: boolean }) {
-  // Mount-only, matching FreshAgentToolBlock: the "Expand thinking" setting
-  // controls only whether the row STARTS expanded; a live settings flip never
-  // stomps the user's in-pane toggle.
-  const [expanded, setExpanded] = useState(initialExpanded)
+function FreshAgentThinkingRow({ text, expanded, onToggle }: { text: string; expanded: boolean; onToggle: () => void }) {
+  // Controlled/presentational: the expansion state lives in the owning
+  // FreshAgentActivityStrip, which never unmounts across the collapsed/
+  // expanded branch swap — so a user's toggle survives the strip toggle.
   return (
     <div className="fresh-agent-thinking-row my-0.5 text-xs">
       <button
         type="button"
-        onClick={() => setExpanded((value) => !value)}
+        onClick={onToggle}
         className="fresh-agent-thinking-trigger flex w-full items-center gap-2 rounded-r px-2 py-0.5 text-left transition-colors hover:bg-accent/50"
         aria-expanded={expanded}
         aria-label="Thinking"
@@ -566,9 +565,19 @@ function FreshAgentActivityStrip({
   /** Thinking rows' starting state ("Expand thinking"). */
   expandThinking?: boolean
 }) {
-  // Mount-only, matching FreshAgentToolBlock/FreshAgentThinkingRow: the
-  // settings control only whether the strip STARTS expanded.
+  // Mount-only, matching FreshAgentToolBlock and the thinking-row default
+  // below: the settings control only whether things START expanded; a live
+  // settings flip never stomps in-pane toggles.
   const [expanded, setExpanded] = useState(initialExpanded)
+  // "Expand thinking" captured at strip mount — the per-row default. Untouched
+  // rows follow it for the strip's lifetime; user-touched rows keep their
+  // override in thinkingExpandedById.
+  const [initialThinkingExpanded] = useState(expandThinking)
+  // Per-row expansion overrides live HERE, not in the row: the strip never
+  // unmounts across the collapsed/expanded branch swap (only its children
+  // swap), so the overrides survive the tool-disclosure toggle — the row
+  // itself remounts, controlled and stateless.
+  const [thinkingExpandedById, setThinkingExpandedById] = useState<Record<string, boolean>>({})
   const displayRows = useMemo(() => (
     normalizeActivityRows(rows, live)
   ), [live, rows])
@@ -585,6 +594,18 @@ function FreshAgentActivityStrip({
   const running = live && (activeTool !== null || thinkingLive)
 
   const thinkingRows = displayRows.filter((row): row is Extract<ActivityRow, { type: 'thinking' }> => row.type === 'thinking')
+
+  const renderThinkingRow = (row: { id: string; text: string }) => (
+    <FreshAgentThinkingRow
+      key={row.id}
+      text={row.text}
+      expanded={thinkingExpandedById[row.id] ?? initialThinkingExpanded}
+      onToggle={() => setThinkingExpandedById((prev) => ({
+        ...prev,
+        [row.id]: !(prev[row.id] ?? initialThinkingExpanded),
+      }))}
+    />
+  )
 
   if (displayRows.length === 0) {
     if (!live) return null
@@ -640,14 +661,12 @@ function FreshAgentActivityStrip({
             />
           </div>
           {/* Hoisted thinking rows: thinking is NEVER hidden behind the
-           * strip's tool disclosure. While collapsed, every thinking row —
-           * including LIVE rows mid-stream — renders its own expandable
-           * disclosure under the summary; the reel keeps its status slot.
-           * Tool rows and echo captions render only when expanded (their
-           * anchoring belongs to the tool supersession flow). */}
-          {thinkingRows.map((row) => (
-            <FreshAgentThinkingRow key={row.id} text={row.text} initialExpanded={expandThinking} />
-          ))}
+            * strip's tool disclosure. While collapsed, every thinking row —
+            * including LIVE rows mid-stream — renders its own expandable
+            * disclosure under the summary; the reel keeps its status slot.
+            * Tool rows and echo captions render only when expanded (their
+            * anchoring belongs to the tool supersession flow). */}
+          {thinkingRows.map(renderThinkingRow)}
         </>
       ) : (
         <div className="fresh-agent-activity-details">
@@ -674,7 +693,7 @@ function FreshAgentActivityStrip({
               )
             }
             return row.type === 'thinking'
-              ? <FreshAgentThinkingRow key={row.id} text={row.text} initialExpanded={expandThinking} />
+              ? renderThinkingRow(row)
               : <FreshAgentToolBlock key={row.tool.id} tool={row.tool} initialExpanded={initialExpanded || singleToolExpand} />
           })}
         </div>

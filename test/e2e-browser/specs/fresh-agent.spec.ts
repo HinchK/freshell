@@ -1740,19 +1740,24 @@ test.describe('expansion defaults and settings', () => {
     await thinking.click()
     await expect(strip.getByText('weighing which files to read first').first()).toBeVisible()
     // Expanding the strip reveals the tool row; the thinking row stays
-    // visible. The tool row mounts as its own collapsed disclosure under the
-    // compact default — expand it and assert its raw input via the pre,
-    // strict-mode-safe (the expanded tool block renders the path as both
-    // preview span and pre body).
+    // visible AND its user-opened body REMAINS expanded (the thinking-row
+    // expansion is independent of the strip's tool disclosure). The tool row
+    // mounts as its own collapsed disclosure under the compact default —
+    // expand it and assert its raw input via the pre, strict-mode-safe (the
+    // expanded tool block renders the path as both preview span and pre
+    // body).
     await strip.getByRole('button', { name: 'Toggle activity details' }).click()
     await expect(strip.getByRole('button', { name: 'Read tool call' })).toHaveCount(1)
+    await expect(strip.getByText('weighing which files to read first').first()).toBeVisible()
     await strip.getByRole('button', { name: 'Read tool call' }).click()
     await expect(pane.locator('pre[data-tool-input]').filter({ hasText: 'src/a.ts' })).toBeVisible()
     await expect(strip.getByRole('button', { name: 'Thinking' })).toBeVisible()
-    // Collapse again: the summary returns and the Thinking trigger survives.
+    // Collapse again: the summary returns, the Thinking trigger survives, and
+    // the user-opened thinking body is STILL expanded.
     await strip.getByRole('button', { name: 'Toggle activity details' }).click()
     await expect(strip).toContainText('thought · 1 tool used')
     await expect(strip.getByRole('button', { name: 'Thinking' })).toBeVisible()
+    await expect(strip.getByText('weighing which files to read first').first()).toBeVisible()
   })
 
   test('the Expand tools setting starts strips expanded on return from settings', async ({ freshellPage: _freshellPage, page, terminal }) => {

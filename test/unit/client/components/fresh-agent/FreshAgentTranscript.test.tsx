@@ -329,6 +329,39 @@ describe('FreshAgentTranscript', () => {
       expect(screen.queryByText('the race is in the close handler')).not.toBeInTheDocument()
     })
 
+    it('a user-expanded thinking row stays expanded across the tool-disclosure toggle', () => {
+      render(<FreshAgentTranscript turns={[mixedTurn]} />)
+      // Defaults off: expand the thinking body by hand while the strip is
+      // collapsed.
+      fireEvent.click(screen.getByRole('button', { name: 'Thinking' }))
+      expect(screen.getAllByText('the race is in the close handler').length).toBeGreaterThanOrEqual(1)
+      // Expand the strip for tool detail: the thinking body must STILL be
+      // visible (the row's expansion is independent of the strip's).
+      fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+      expect(screen.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'true')
+      expect(screen.getAllByText('the race is in the close handler').length).toBeGreaterThanOrEqual(1)
+      // Collapse the strip again: the thinking body is STILL visible.
+      fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+      expect(screen.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'false')
+      expect(screen.getAllByText('the race is in the close handler').length).toBeGreaterThanOrEqual(1)
+    })
+
+    it('a user-collapsed thinking row stays collapsed across the tool-disclosure toggle with expandThinking on', () => {
+      render(<FreshAgentTranscript expandThinking turns={[mixedTurn]} />)
+      // "Expand thinking" on: the body mounts visible; the user collapses it.
+      expect(screen.getAllByText('the race is in the close handler').length).toBeGreaterThanOrEqual(1)
+      fireEvent.click(screen.getByRole('button', { name: 'Thinking' }))
+      expect(screen.queryByText('the race is in the close handler')).not.toBeInTheDocument()
+      // Toggle the strip twice (expanded branch and back): the body stays
+      // hidden — the setting never re-asserts itself mid-session.
+      fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+      expect(screen.getByRole('button', { name: 'Thinking' })).toHaveAttribute('aria-expanded', 'false')
+      expect(screen.queryByText('the race is in the close handler')).not.toBeInTheDocument()
+      fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+      expect(screen.getByRole('button', { name: 'Thinking' })).toHaveAttribute('aria-expanded', 'false')
+      expect(screen.queryByText('the race is in the close handler')).not.toBeInTheDocument()
+    })
+
     it('mounts the strip collapsed by default (expandTools unset)', () => {
       render(<FreshAgentTranscript turns={[mixedTurn]} />)
       expect(screen.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'false')
