@@ -38,10 +38,12 @@ import {
   canonicalPaneSession,
   derivePaneOwnerDivergence,
   isLifecycleStartSuperseded,
+  resolveCanonicalPaneSession,
   selectPaneOwnerFence,
   selectSessionRuntimeOwner,
   type ObservedOwnerFence,
 } from '@/store/selectors/runtimeOwner'
+import type { RuntimeOwnerRecord } from '@/store/freshAgentTypes'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
 import {
@@ -453,10 +455,15 @@ function isSnapshotInvalidatingFreshAgentEvent(message: Record<string, unknown>)
   return Boolean(eventType && SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS.has(eventType))
 }
 
-function locatorMatchesPane(
+/**
+ * b8ke ext F1: exported for the alias-convergence unit tests (the pure
+ * pane-locator predicate).
+ */
+export function locatorMatchesPane(
   message: Record<string, unknown>,
   content: FreshAgentPaneContent,
   knownCwd?: string,
+  runtimeOwners?: Record<string, RuntimeOwnerRecord>,
 ): boolean {
   if (typeof message.sessionType === 'string' && message.sessionType !== content.sessionType) return false
   if (typeof message.provider === 'string' && message.provider !== content.provider) return false
@@ -470,6 +477,13 @@ function locatorMatchesPane(
     if (content.sessionId) validSessionIds.add(content.sessionId)
     if (content.resumeSessionId) validSessionIds.add(content.resumeSessionId)
     if (content.sessionRef?.provider === content.provider) validSessionIds.add(content.sessionRef.sessionId)
+    // b8ke ext F1: the pane's RESOLVED canonical key is valid too — a
+    // pane holding the pre-rekey id accepts canonical-session events
+    // (pre-ext an old-key pane rejected them and never converged).
+    if (runtimeOwners) {
+      const canonical = canonicalPaneSession(content, runtimeOwners)
+      if (canonical) validSessionIds.add(canonical.sessionId)
+    }
     if (!validSessionIds.has(locatorSessionId)) return false
   }
 
@@ -678,8 +692,21 @@ export function FreshAgentView({
   // locally — a derived object inside the selector would re-render on every
   // store notification. Null divergence = same-mode multi-device attachment
   // (or no owner known) — the pane keeps operating exactly as before.
+  // b8ke ext F1: the store's runtime-owners map for the pure
+  // locatorMatchesPane predicate (the pane-identity resolution consumes
+  // the stored rekey alias chain).
+  const runtimeOwnersForLocator = useCallback(
+    (): Record<string, RuntimeOwnerRecord> => appStore.getState().freshAgent?.runtimeOwners ?? {},
+    [appStore],
+  )
+
   const runtimeOwner = useAppSelector((state) => {
-    const canonical = canonicalPaneSession(paneContent)
+    // b8ke ext F1: the pane's identity resolves through the stored rekey
+    // alias chain to the CANONICAL key — an old-key pane observes the
+    // canonical record (never the same-kind mirror), so the divergence
+    // card (the "opened as CLI elsewhere"/attach flow) renders and the
+    // pane converges.
+    const canonical = resolveCanonicalPaneSession(state, paneContent)
     return canonical ? selectSessionRuntimeOwner(state, canonical.provider, canonical.sessionId) : undefined
   })
   const ownerDivergence = derivePaneOwnerDivergence(runtimeOwner, 'fresh-agent')
@@ -2027,7 +2054,8 @@ export function FreshAgentView({
         const echo = localEchoRef.current
         const ownsRequest = pendingSendMetadataRef.current.has(message.requestId)
           || echo?.requestId === message.requestId
-        if (!ownsRequest || !locatorMatchesPane(message, current, freshOpenCodeRouteCwdRef.current)) {
+        if (!ownsRequest
+          || !locatorMatchesPane(message, current, freshOpenCodeRouteCwdRef.current, runtimeOwnersForLocator())) {
           return
         }
         const submittedTurnId = typeof message.submittedTurnId === 'string'
@@ -2107,7 +2135,7 @@ export function FreshAgentView({
       }
       if (
         message.type === 'freshAgent.event'
-        && locatorMatchesPane(message, paneContentRef.current, freshOpenCodeRouteCwdRef.current)
+        && locatorMatchesPane(message, paneContentRef.current, freshOpenCodeRouteCwdRef.current, runtimeOwnersForLocator())
         && outgoingTurnRef.current && isRecord(message.event)
       ) {
         const event = message.event
@@ -2121,7 +2149,7 @@ export function FreshAgentView({
       }
       if (
         isSnapshotInvalidatingFreshAgentEvent(message)
-        && locatorMatchesPane(message, paneContentRef.current, freshOpenCodeRouteCwdRef.current)
+        && locatorMatchesPane(message, paneContentRef.current, freshOpenCodeRouteCwdRef.current, runtimeOwnersForLocator())
       ) {
         requestSnapshotRefresh('event')
       }

@@ -8,7 +8,7 @@ import sessionsReducer, { applySessionsPatch, applyContextUsageExtras } from '@/
 import freshAgentReducer, { applyRuntimeOwner, sessionInit, setSessionStatus, markSessionLost } from '@/store/freshAgentSlice'
 import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
-import { FreshAgentView, IDLE_INCOMPLETE_MAX_RETRIES } from '@/components/fresh-agent/FreshAgentView'
+import { FreshAgentView, IDLE_INCOMPLETE_MAX_RETRIES, locatorMatchesPane } from '@/components/fresh-agent/FreshAgentView'
 import { FreshAgentSettingsButton } from '@/components/fresh-agent/FreshAgentSettingsButton'
 import { initLayout, requestPaneRefresh, setActivePane, setPaneHandoffError, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
 import { useAppSelector } from '@/store/hooks'
@@ -9737,5 +9737,67 @@ describe('b8ke ext F2: sessionRef-only panes kill the old runtime on replacement
       .filter((action: any) => action?.type === 'panes/updatePaneContent'
         && action.payload?.content?.status === 'creating')
     expect(remints).toHaveLength(1)
+  })
+})
+
+describe('b8ke ext F1: locatorMatchesPane accepts canonical-session events for an old-key pane', () => {
+  // The rekey mirror pair: the old key's record carries aliasOf naming the
+  // canonical id. A pane holding the pre-rekey sessionRef must accept
+  // CANONICAL-session events (its resolved key) — pre-ext the locator's
+  // valid-id set only held the pane's raw ids, so canonical-session events
+  // were rejected and the old-key pane never converged.
+  const OLD_SESSION_ID = '11111111-2222-4333-8444-555555555555'
+  const NEW_SESSION_ID = '66666666-7777-4888-8999-aaaaaaaaaaaa'
+  const runtimeOwners = {
+    [`claude:${OLD_SESSION_ID}`]: {
+      provider: 'claude',
+      sessionId: OLD_SESSION_ID,
+      epoch: 3,
+      generation: 2,
+      ownerKind: 'fresh-agent',
+      operationId: 'rekey-1',
+      transition: 'handoff-committed',
+      aliasOf: NEW_SESSION_ID,
+      updatedAt: 1,
+    },
+  } as Record<string, import('@/store/freshAgentTypes').RuntimeOwnerRecord>
+  const oldKeyPaneContent = {
+    kind: 'fresh-agent',
+    sessionType: 'freshclaude',
+    provider: 'claude',
+    createRequestId: 'req-locator',
+    sessionRef: { provider: 'claude', sessionId: OLD_SESSION_ID },
+    status: 'idle',
+  } as Parameters<typeof locatorMatchesPane>[1]
+
+  it('accepts the canonical session id for a pane holding the pre-rekey id', () => {
+    expect(locatorMatchesPane(
+      { sessionId: NEW_SESSION_ID, provider: 'claude' },
+      oldKeyPaneContent,
+      undefined,
+      runtimeOwners,
+    )).toBe(true)
+    // The pane's own (old) id still matches, and unrelated ids still do not.
+    expect(locatorMatchesPane(
+      { sessionId: OLD_SESSION_ID, provider: 'claude' },
+      oldKeyPaneContent,
+      undefined,
+      runtimeOwners,
+    )).toBe(true)
+    expect(locatorMatchesPane(
+      { sessionId: 'unrelated-session', provider: 'claude' },
+      oldKeyPaneContent,
+      undefined,
+      runtimeOwners,
+    )).toBe(false)
+  })
+
+  it('a foreign provider is never a valid canonical target (the chain is per-provider)', () => {
+    expect(locatorMatchesPane(
+      { sessionId: NEW_SESSION_ID, provider: 'codex' },
+      oldKeyPaneContent,
+      undefined,
+      runtimeOwners,
+    )).toBe(false)
   })
 })

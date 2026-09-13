@@ -7,7 +7,7 @@ import { findPaneContent } from '@/lib/pane-utils'
 import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
 import { hasWaitingPrompt, resolvePaneActivity } from '@/lib/pane-activity'
 import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
-import { selectSessionRuntimeOwner } from '@/store/selectors/runtimeOwner'
+import { resolveCanonicalPaneSession, selectSessionRuntimeOwner } from '@/store/selectors/runtimeOwner'
 import { resolveReopenPaneSessionTarget, type ReopenPaneSessionTarget } from '@/lib/session-flavor-reopen'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type { FreshAgentProviderSettings } from '@/lib/fresh-agent-provider-types'
@@ -151,28 +151,42 @@ export async function runPaneSessionHandoff(
   if (!latest || latest.target.disabled) return false
   if (expected && !sameReopenTargetIdentity(latest.target, expected)) return false
 
+  // b8ke ext F1: the pane's CANONICAL key — the stored rekey alias chain
+  // resolved to the fixpoint. A pane holding the pre-rekey sessionRef
+  // navigates to the canonical durable id: the server typed-refuses the
+  // superseded aliased key (REKEYED_ALIAS_KEY), and the local fold must
+  // never write the old key back (pre-ext the request AND the fold both
+  // carried the superseded id, re-anchoring the pane on it).
+  const canonicalPaneKey = resolveCanonicalPaneSession(appStore.getState(), latest.content)
+  const canonicalSessionId = canonicalPaneKey?.provider === latest.target.provider
+    ? canonicalPaneKey.sessionId
+    : latest.target.sessionId
+
   const resolvedCwd = latest.target.cwd ?? getFreshOpenCodeRouteCwd(
     latest.content,
     {
       freshAgentSessions: latest.freshAgentSessions,
-      sessionId: latest.target.sessionId,
+      sessionId: canonicalSessionId,
     },
   )
 
   // The observed (epoch, generation) fence pair is read at SEND time — a
   // retry after a stale-generation failure always carries the refreshed
   // pair from the runtime-owner record, never the stale one (round-2).
+  // b8ke ext F1: the record is the CANONICAL key's (the alias chain
+  // resolves to it).
   const ownerRecord = selectSessionRuntimeOwner(
     appStore.getState(),
     latest.target.provider,
-    latest.target.sessionId,
+    canonicalSessionId,
   )
 
   let handoff: SessionHandoffResult
   try {
     handoff = await requestSessionHandoff({
       provider: latest.target.provider,
-      sessionId: latest.target.sessionId,
+      // b8ke ext F1: the request rides the pane's CANONICAL key.
+      sessionId: canonicalSessionId,
       targetKind: latest.target.targetKind,
       ...(latest.target.targetKind === 'fresh-agent'
         ? { sessionType: latest.target.targetSessionType }
@@ -263,6 +277,13 @@ export async function runPaneSessionHandoff(
     return true
   }
 
+  // b8ke ext F1: the fold records the CANONICAL id — the fresh-agent
+  // arm writes the server-answered canonical owner sessionId; the
+  // terminal arm writes the pane's resolved canonical key (pre-ext both
+  // wrote latest.target.sessionId — the pane's possibly-superseded id).
+  const committedSessionId = handoff.owner.kind === 'fresh-agent'
+    ? handoff.owner.sessionId
+    : canonicalSessionId
   appStore.dispatch(updatePaneContent({
     tabId,
     paneId,
@@ -271,13 +292,13 @@ export async function runPaneSessionHandoff(
         createRequestId: latest.content.createRequestId,
         mode: handoff.owner.mode,
         provider: latest.target.provider,
-        sessionId: latest.target.sessionId,
+        sessionId: committedSessionId,
         terminalId: handoff.owner.terminalId,
         cwd: resolvedCwd,
       })
       : buildResumeContent({
         sessionType: handoff.owner.sessionType,
-        sessionId: latest.target.sessionId,
+        sessionId: committedSessionId,
         cwd: resolvedCwd,
         freshAgentProviderSettings: latest.providerSettings,
       }),
@@ -286,7 +307,7 @@ export async function runPaneSessionHandoff(
   const sessionMetadataByKey = mergeSessionMetadataByKey(
     latest.tab.sessionMetadataByKey,
     latest.target.provider,
-    latest.target.sessionId,
+    committedSessionId,
     { sessionType: latest.target.metadataSessionType },
   )
   if (sessionMetadataByKey !== latest.tab.sessionMetadataByKey) {

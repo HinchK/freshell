@@ -6,6 +6,7 @@ import {
   isLifecycleStartSuperseded,
   selectOwnerFence,
   selectPaneOwnerDivergence,
+  selectPaneOwnerFence,
   selectSessionRuntimeOwner,
 } from '@/store/selectors/runtimeOwner'
 import type { SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
@@ -497,5 +498,98 @@ describe('isLifecycleStartSuperseded (kata b8ke lifecycle-start suppression)', (
       { provider: 'claude', sessionRef: { provider: 'claude', sessionId: 'sid-same' } },
       undefined,
     )).toBe(false)
+  })
+})
+
+describe('b8ke ext F1: rekey alias chains resolve to the canonical key', () => {
+  // The Claude rollback/fork rekey broadcasts a MIRROR record for the old
+  // key (the canonical owner state + aliasOf naming the canonical id) and
+  // the canonical record for the new key. A pane holding the pre-rekey
+  // sessionRef must resolve THROUGH the alias chain to the canonical key
+  // — pre-ext the stored aliasOf was parsed but never consumed, so the
+  // pane kept referencing the superseded id and saw the same-kind mirror
+  // record (no divergence, no convergence).
+
+  function ownersState(
+    frames: Array<Partial<SessionRuntimeOwnerMessage> & { provider: string; sessionId: string }>,
+  ): RootState {
+    let freshAgent = freshAgentReducer(undefined, { type: '@@INIT' })
+    for (const record of frames) {
+      const frame: SessionRuntimeOwnerMessage = {
+        type: 'session.runtimeOwner',
+        epoch: 5,
+        generation: 4,
+        ownerKind: 'terminal',
+        operationId: 'handoff-1',
+        transition: 'handoff-committed',
+        ...record,
+      }
+      freshAgent = freshAgentReducer(freshAgent, applyRuntimeOwner(frame))
+    }
+    return { freshAgent } as unknown as RootState
+  }
+
+  it('canonicalPaneSession resolves the stored aliasOf chain to the fixpoint', () => {
+    const ownersStateMap = {
+      'claude:old-id': { aliasOf: 'new-id' },
+      'claude:mid-id': { aliasOf: 'final-id' },
+      'claude:chain-a': { aliasOf: 'chain-b' },
+      'claude:chain-b': { aliasOf: 'chain-c' },
+    } as Record<string, RuntimeOwnerRecord>
+    expect(canonicalPaneSession(
+      { provider: 'claude', sessionRef: { provider: 'claude', sessionId: 'old-id' } },
+      ownersStateMap,
+    )).toEqual({ provider: 'claude', sessionId: 'new-id' })
+    expect(canonicalPaneSession(
+      { provider: 'claude', sessionId: 'mid-id' },
+      ownersStateMap,
+    )).toEqual({ provider: 'claude', sessionId: 'final-id' })
+    // Multi-hop chains walk to the fixpoint.
+    expect(canonicalPaneSession(
+      { provider: 'claude', sessionRef: { provider: 'claude', sessionId: 'chain-a' } },
+      ownersStateMap,
+    )).toEqual({ provider: 'claude', sessionId: 'chain-c' })
+    // A key with no alias record stays itself; a foreign provider's alias
+    // record never applies (the chain is per-provider).
+    expect(canonicalPaneSession(
+      { provider: 'claude', sessionRef: { provider: 'claude', sessionId: 'plain' } },
+      ownersStateMap,
+    )).toEqual({ provider: 'claude', sessionId: 'plain' })
+    expect(canonicalPaneSession(
+      { provider: 'codex', sessionRef: { provider: 'codex', sessionId: 'old-id' } },
+      ownersStateMap,
+    )).toEqual({ provider: 'codex', sessionId: 'old-id' })
+  })
+
+  it('an old-key pane diverges through the mirror record to the canonical owner (the convergence flow)', () => {
+    // The old key holds the SAME-KIND mirror record (aliasOf → new-id);
+    // the CANONICAL key holds a TERMINAL owner — an old-key fresh-agent
+    // pane must see the terminal divergence ("opened as CLI elsewhere"),
+    // never the same-kind mirror's null.
+    const state = ownersState([
+      { provider: 'claude', sessionId: 'old-id', ownerKind: 'fresh-agent', aliasOf: 'new-id' },
+      { provider: 'claude', sessionId: 'new-id', ownerKind: 'terminal', terminalId: 't-1' },
+    ])
+    expect(selectPaneOwnerDivergence(state, {
+      paneKind: 'fresh-agent',
+      provider: 'claude',
+      sessionRef: { provider: 'claude', sessionId: 'old-id' },
+    })).toEqual({
+      ownerKind: 'terminal',
+      terminalId: 't-1',
+      generation: 4,
+      transition: 'handoff-committed',
+    })
+  })
+
+  it('selectPaneOwnerFence observes through the alias chain', () => {
+    const state = ownersState([
+      { provider: 'claude', sessionId: 'old-id', ownerKind: 'fresh-agent', aliasOf: 'new-id', epoch: 9, generation: 7 },
+      { provider: 'claude', sessionId: 'new-id', ownerKind: 'terminal', epoch: 9, generation: 7 },
+    ])
+    expect(selectPaneOwnerFence(state, {
+      provider: 'claude',
+      sessionRef: { provider: 'claude', sessionId: 'old-id' },
+    })).toEqual({ epoch: 9, generation: 7 })
   })
 })

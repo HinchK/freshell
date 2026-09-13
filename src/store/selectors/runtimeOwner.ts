@@ -84,14 +84,59 @@ function runtimeOwnersMap(state: RootState): Record<string, RuntimeOwnerRecord> 
  * `sessionRef.sessionId ?? sessionId` + provider (sessionRef's provider
  * wins — the ref is the durable identity; the pane-level provider is the
  * fallback for panes that only carry a content sessionId).
+ *
+ * b8ke ext F1: with the runtime-owners map the derivation CONSUMES the
+ * stored rekey alias chain to the fixpoint — the Claude rollback/fork
+ * rekey mirrors the canonical owner state onto the old key with
+ * `aliasOf` naming the canonical id, and a pane holding the pre-rekey
+ * sessionRef resolves THROUGH that chain to the pane's canonical key
+ * (pre-ext the alias was parsed and stored but never consumed: panes
+ * kept referencing the superseded id, saw the same-kind mirror record,
+ * and never converged). The chain walk is per-provider and cycle-bounded
+ * (a repeated key ends the walk — cycles are impossible by construction).
  */
 export function canonicalPaneSession(
   pane: { provider?: string; sessionRef?: SessionLocator; sessionId?: string },
+  runtimeOwners?: Record<string, RuntimeOwnerRecord>,
 ): { provider: string; sessionId: string } | undefined {
   const provider = pane.sessionRef?.provider ?? pane.provider
   const sessionId = pane.sessionRef?.sessionId ?? pane.sessionId
   if (!provider || !sessionId) return undefined
-  return { provider, sessionId }
+  if (!runtimeOwners) return { provider, sessionId }
+  return { provider, sessionId: resolveAliasFixpoint(runtimeOwners, provider, sessionId) }
+}
+
+/**
+ * b8ke ext F1: walk the stored `aliasOf` chain to the fixpoint — the
+ * pane's canonical key. Bounded by the visited set (a repeated key ends
+ * the walk), so a corrupt cycle can never spin.
+ */
+function resolveAliasFixpoint(
+  runtimeOwners: Record<string, RuntimeOwnerRecord>,
+  provider: string,
+  sessionId: string,
+): string {
+  let current = sessionId
+  const visited = new Set<string>()
+  while (!visited.has(current)) {
+    visited.add(current)
+    const next = runtimeOwners[`${provider}:${current}`]?.aliasOf
+    if (!next) break
+    current = next
+  }
+  return current
+}
+
+/**
+ * b8ke ext F1: [`canonicalPaneSession`] with the store's runtime-owners
+ * map — the state-taking variant every store-backed pane-identity
+ * consumer uses (the alias chain resolves to the pane's canonical key).
+ */
+export function resolveCanonicalPaneSession(
+  state: RootState,
+  pane: { provider?: string; sessionRef?: SessionLocator; sessionId?: string },
+): { provider: string; sessionId: string } | undefined {
+  return canonicalPaneSession(pane, runtimeOwnersMap(state))
 }
 
 export function selectSessionRuntimeOwner(
@@ -117,7 +162,7 @@ export function selectPaneOwnerFence(
   state: RootState,
   pane: { provider?: string; sessionRef?: SessionLocator; sessionId?: string },
 ): ObservedOwnerFence | undefined {
-  const canonical = canonicalPaneSession(pane)
+  const canonical = canonicalPaneSession(pane, runtimeOwnersMap(state))
   if (!canonical) return undefined
   return selectOwnerFence(state, canonical.provider, canonical.sessionId)
 }
@@ -181,7 +226,7 @@ export function selectPaneOwnerDivergence(
   state: RootState,
   pane: PaneOwnerIdentityInput,
 ): PaneOwnerDivergence | null {
-  const canonical = canonicalPaneSession(pane)
+  const canonical = canonicalPaneSession(pane, runtimeOwnersMap(state))
   if (!canonical) return null
   const record = selectSessionRuntimeOwner(state, canonical.provider, canonical.sessionId)
   return derivePaneOwnerDivergence(record, pane.paneKind)
