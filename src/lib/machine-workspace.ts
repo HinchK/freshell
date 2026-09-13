@@ -1,4 +1,8 @@
 import { getRecoveryInventory } from '@/lib/api'
+import {
+  getMachineWorkspaceOriginId,
+  persistMachineWorkspaceOriginId,
+} from '@/lib/machine-identity'
 import { bootCapturedAtMs } from '@/lib/recovery/boot-state'
 import { buildRecoveryPlan } from '@/lib/recovery/build-recovery-plan'
 import type { RecoveryInventory } from '@/lib/recovery/types'
@@ -142,7 +146,13 @@ export async function restoreMachineWorkspace(
   // Crash traces are a deliberate local-only UI decoration. Capture exactly
   // that decoration before replacing the local cache; the server inventory
   // remains authoritative for every recovered workspace field.
-  const localCrashTraceDecorations = collectLocalCrashTraceDecorations(store.getState())
+  // The selected-machine key is updated before a switch reload, while this
+  // persisted layout may still belong to the prior selection. Retain a local
+  // crash trace only when this layout was last restored for this same machine;
+  // exact pane identifiers alone are not a cross-machine identity proof.
+  const localCrashTraceDecorations = getMachineWorkspaceOriginId() === machineId
+    ? collectLocalCrashTraceDecorations(store.getState())
+    : []
   const recoveredTabIds = new Set(plans.map((plan) => plan.tabId))
 
   // bb58dc001 follow-up (reload-safety): the recovery inventory EXCLUDES the
@@ -187,5 +197,9 @@ export async function restoreMachineWorkspace(
     store.dispatch(setActiveTab(priorActiveTabId))
   }
   armTerminalRestores(store.getState(), plans.map((plan) => plan.tabId))
+  // Record the origin only after the scoped inventory has replaced the local
+  // workspace successfully. This marker is local metadata, never server
+  // snapshot state and never a cross-device recovery channel.
+  persistMachineWorkspaceOriginId(machineId)
   return { restoredTabs: plans.length }
 }

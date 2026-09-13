@@ -3,11 +3,13 @@ import {
   MACHINE_ID_STORAGE_KEY as STORED_MACHINE_ID_STORAGE_KEY,
   MACHINE_SELECTION_RESET_STORAGE_KEY as STORED_MACHINE_SELECTION_RESET_STORAGE_KEY,
   MACHINE_SELECTIONS_STORAGE_KEY as STORED_MACHINE_SELECTIONS_STORAGE_KEY,
+  MACHINE_WORKSPACE_ORIGIN_STORAGE_KEY as STORED_MACHINE_WORKSPACE_ORIGIN_STORAGE_KEY,
 } from '@/store/storage-keys'
 
 export const MACHINE_ID_STORAGE_KEY = STORED_MACHINE_ID_STORAGE_KEY
 export const MACHINE_SELECTIONS_STORAGE_KEY = STORED_MACHINE_SELECTIONS_STORAGE_KEY
 export const MACHINE_SELECTION_RESET_STORAGE_KEY = STORED_MACHINE_SELECTION_RESET_STORAGE_KEY
+export const MACHINE_WORKSPACE_ORIGIN_STORAGE_KEY = STORED_MACHINE_WORKSPACE_ORIGIN_STORAGE_KEY
 export const LEGACY_DEVICE_ID_STORAGE_KEY = DEVICE_ID_STORAGE_KEY
 
 export interface Machine {
@@ -177,6 +179,34 @@ export function persistSelectedMachineId(
   const selections = readSelections(storage)
   selections[normalizedServerInstanceId] = normalizedMachineId
   writeSelections(storage, selections)
+}
+
+/**
+ * The selected machine is changed before a machine-switch reload, while the
+ * local tab layout still belongs to the prior selection. This marker tracks
+ * that layout's last successfully restored machine independently of selection
+ * so local-only UI state can never bridge that boundary.
+ */
+export function getMachineWorkspaceOriginId(storage = safeStorage()): string | undefined {
+  try {
+    return nonEmptyString(storage?.getItem(MACHINE_WORKSPACE_ORIGIN_STORAGE_KEY))
+  } catch {
+    return undefined
+  }
+}
+
+export function persistMachineWorkspaceOriginId(
+  machineId: string,
+  storage = safeStorage(),
+): void {
+  const normalizedMachineId = nonEmptyString(machineId)
+  if (!normalizedMachineId || !storage) return
+  try {
+    storage.setItem(MACHINE_WORKSPACE_ORIGIN_STORAGE_KEY, normalizedMachineId)
+  } catch {
+    // A blocked local storage must conservatively disable local decoration
+    // preservation, not change the selected machine or server workspace.
+  }
 }
 
 /** Clear every cached selection for this browser origin. The reset marker
