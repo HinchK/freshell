@@ -471,7 +471,10 @@ async fn probe_stale_start_fences(
                     provider = %fence.provider, session_id = %fence.session_id,
                     runtime_id = ?fence.prior_terminal_id, generation = fence.generation,
                     initiator = %fence.initiator,
-                    to_kind = ?fence.prior_kind,
+                    // b8ke e4r1 F3: NO to_kind — the release creates no new
+                    // runtime owner (the record is Vacant), so a to_kind
+                    // field would falsely describe a terminal-to-terminal
+                    // transition and contradict the vacant release broadcast.
                     probe = "terminal-row-liveness",
                     fence_reason = ?fence.reason,
                     epoch = ownership.boot_epoch(),
@@ -608,7 +611,10 @@ async fn probe_stale_start_fences(
                 provider = %fence.provider, session_id = %fence.session_id,
                 pid = ?fence.prior_pid, generation = fence.generation,
                 initiator = %fence.initiator,
-                to_kind = ?fence.prior_kind,
+                // b8ke e4r1 F3: NO to_kind — the release creates no new
+                // runtime owner (the record is Vacant), so a to_kind field
+                // would falsely describe a terminal-to-terminal transition
+                // and contradict the vacant release broadcast.
                 probe = if fence.prior_pid.is_some() {
                     "lane-confirmed-tree-reap"
                 } else if fence.settle_concluded.is_some() {
@@ -5080,12 +5086,12 @@ mod stale_start_watchdog_tests {
             );
         }
 
-        // F8: the fence-release record carries the initiator + target
-        // kind + the probe that confirmed — drive a PID-LESS fence whose
-        // operation CONCLUDED (the guard dropped → settle fired) and whose
-        // lane reports no live session: the kind-aware positive answer
-        // releases it (the fail-closed contract's one honest release
-        // shape for a PID-less fence).
+        // F8: the fence-release record carries the initiator + the probe
+        // that confirmed — b8ke e4r1 F3: a RELEASE transition creates NO
+        // new runtime owner (the record is Vacant after release_fenced), so
+        // the log carries NO to_kind — the field falsely described a
+        // terminal-to-terminal transition and contradicted the vacant
+        // release broadcast.
         let states_fr = watchdog_states();
         let sink_fr = transition_log_capture::install();
         let generation_fr = begin_stale_start(&states_fr.0, "op-fence-release-log").await;
@@ -5146,7 +5152,6 @@ mod stale_start_watchdog_tests {
             "generation=",
             "outcome=",
             "initiator=",
-            "to_kind=",
         ] {
             assert!(
                 released_fr.1.iter().any(|f| f.starts_with(field)),
@@ -5154,6 +5159,16 @@ mod stale_start_watchdog_tests {
                 released_fr.1
             );
         }
+        // b8ke e4r1 F3: the RELEASE diagnostic carries NO to_kind — the
+        // release creates no new runtime owner, so a to_kind field would
+        // falsely describe a terminal-to-terminal transition and contradict
+        // the accompanying vacant release broadcast.
+        assert!(
+            !released_fr.1.iter().any(|f| f.starts_with("to_kind=")),
+            "the fence-release log must carry NO to_kind (a release \
+             transition has no new runtime owner) — got {:?}",
+            released_fr.1
+        );
 
         // b8ke e3 post-cap F5: a STOP-reason release logs through the
         // STOP's own diagnostic (ownership.stop.fence_probe_released +
