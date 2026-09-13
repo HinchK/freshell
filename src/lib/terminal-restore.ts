@@ -121,11 +121,10 @@ export function addTerminalFreshRecoveryRequestId(
 // never re-arming this target. A server reconcile verdict naming the pane
 // always wins: the consult runs only after the pre-verdict wait releases.
 //
-// KEY: `tabId:paneId` — NOT createRequestId. restoreLayout normalization
-// re-mints terminal createRequestIds but preserves pane node ids, so the
-// plan (pre-normalization) and the mounted pane (post-normalization) share
-// exactly one stable key. Nanoid pane ids + the tabId prefix make the key
-// unique across tabs.
+// KEY: `tabId:paneId` — NOT createRequestId. Same-machine bootstrap preserves
+// valid snapshot createRequestIds, while cross-device and ledger-only recovery
+// remint them; pane node ids still remain the plan-to-mount key in every path.
+// Nanoid pane ids + the tabId prefix make the key unique across tabs.
 const recoveredLiveTerminalTargets = new Map<string, string>()
 
 function recoveredLiveTerminalKey(tabId: string, paneId: string): string {
