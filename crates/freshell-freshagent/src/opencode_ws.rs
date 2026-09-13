@@ -70,10 +70,9 @@ use freshell_opencode::{
 };
 use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCompact, FreshAgentConfigure,
-    FreshAgentCreate, FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent,
-    FreshAgentFork, FreshAgentForked, FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled,
-    FreshAgentSend, FreshAgentSendAccepted, FreshAgentSessionMaterialized, ServerMessage,
-    SessionLocator,
+    FreshAgentCreate, FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent, FreshAgentFork,
+    FreshAgentForked, FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled, FreshAgentSend,
+    FreshAgentSendAccepted, FreshAgentSessionMaterialized, ServerMessage, SessionLocator,
 };
 use freshell_terminal::FrameSink;
 
@@ -1130,9 +1129,9 @@ impl FreshOpencodeState {
                     effort: session.effort.clone(),
                     cwd: session.cwd.clone(),
                 },
-             })
-             .await;
-         }
+            })
+            .await;
+        }
 
         // A send whose settings CHANGED the session record converges every
         // device's model surfaces (the same frame `handle_configure` emits —
@@ -8760,9 +8759,7 @@ mod tests {
         let warn = events
             .iter()
             .find(|e| e.message.contains("freshagent.opencode.compact_failed"))
-            .expect(
-                "compact failures must be visible in server logs, not just the client banner",
-            );
+            .expect("compact failures must be visible in server logs, not just the client banner");
         assert_eq!(
             warn.fields.get("session").map(String::as_str),
             Some("ses_1"),
@@ -11868,7 +11865,11 @@ mod tests {
 
     // ── freshAgent.configure: live model convergence ─────────────────────────
 
-    fn configure_msg(session_id: &str, model: Option<&str>, effort: Option<&str>) -> FreshAgentConfigure {
+    fn configure_msg(
+        session_id: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> FreshAgentConfigure {
         FreshAgentConfigure {
             provider: AgentProvider::Opencode,
             session_id: session_id.to_string(),
@@ -11935,7 +11936,11 @@ mod tests {
 
         // The session record holds the staged pair…
         let sessions = st.sessions.lock().await;
-        let session = sessions.get(placeholder).expect("session tracked").lock().await;
+        let session = sessions
+            .get(placeholder)
+            .expect("session tracked")
+            .lock()
+            .await;
         assert_eq!(session.model.as_deref(), Some("prov/mdl-b"));
         assert_eq!(session.effort.as_deref(), Some("low"));
         drop(session);
@@ -11946,8 +11951,10 @@ mod tests {
         let frames = drain(&mut rx).await;
         let metadata = frames
             .iter()
-            .find(|f| f["type"] == "freshAgent.event"
-                && f["event"]["type"] == "freshAgent.session.metadata")
+            .find(|f| {
+                f["type"] == "freshAgent.event"
+                    && f["event"]["type"] == "freshAgent.session.metadata"
+            })
             .expect("a metadata frame is broadcast");
         assert_eq!(metadata["provider"], json!("opencode"));
         assert_eq!(metadata["sessionType"], json!("freshopencode"));
@@ -11999,14 +12006,17 @@ mod tests {
         let st = FreshOpencodeState::new(fresh_agent);
         let mut rx = rx;
 
-        st.handle_configure(configure_msg("freshopencode-nope", Some("prov/mdl-b"), None))
-            .await;
+        st.handle_configure(configure_msg(
+            "freshopencode-nope",
+            Some("prov/mdl-b"),
+            None,
+        ))
+        .await;
 
         let frames = drain(&mut rx).await;
         let error = frames
             .iter()
-            .find(|f| f["type"] == "freshAgent.event"
-                && f["event"]["type"] == "freshAgent.error")
+            .find(|f| f["type"] == "freshAgent.event" && f["event"]["type"] == "freshAgent.error")
             .expect("the unknown session surfaces a freshAgent.error frame");
         assert_eq!(error["event"]["code"], json!("INVALID_SESSION_ID"));
         assert_eq!(error["sessionId"], json!("freshopencode-nope"));
@@ -12028,7 +12038,11 @@ mod tests {
             let sessions = st.sessions.lock().await;
             sessions.get(placeholder).expect("session tracked").clone()
         };
-        session_arc.lock().await.killed.store(true, Ordering::SeqCst);
+        session_arc
+            .lock()
+            .await
+            .killed
+            .store(true, Ordering::SeqCst);
         let mut rx = rx;
 
         st.handle_configure(configure_msg(placeholder, Some("prov/mdl-b"), None))
@@ -12037,8 +12051,7 @@ mod tests {
         let frames = drain(&mut rx).await;
         let error = frames
             .iter()
-            .find(|f| f["type"] == "freshAgent.event"
-                && f["event"]["type"] == "freshAgent.error")
+            .find(|f| f["type"] == "freshAgent.event" && f["event"]["type"] == "freshAgent.error")
             .expect("the killed session refuses with an error frame");
         assert_eq!(error["event"]["code"], json!("INVALID_SESSION_ID"));
         // The record is untouched: no metadata, no binding write.
@@ -12065,20 +12078,32 @@ mod tests {
         let placeholder = "freshopencode-req-cfg-send";
 
         // First send carries the initial pair (materializes + records)…
-        st.handle_send(send_msg_with_settings(placeholder, "one", Some("prov/mdl-a"), Some("high")))
-            .await;
+        st.handle_send(send_msg_with_settings(
+            placeholder,
+            "one",
+            Some("prov/mdl-a"),
+            Some("high"),
+        ))
+        .await;
         let _ = drain(&mut rx).await;
 
         // …the second send CHANGES the pair: the accepted-turn apply path must
         // converge the metadata broadcast, keyed at the durable id the pane now
         // holds (the same stamp the accepted frame uses).
-        st.handle_send(send_msg_with_settings(placeholder, "two", Some("prov/mdl-b"), Some("low")))
-            .await;
+        st.handle_send(send_msg_with_settings(
+            placeholder,
+            "two",
+            Some("prov/mdl-b"),
+            Some("low"),
+        ))
+        .await;
         let frames = drain(&mut rx).await;
         let metadata = frames
             .iter()
-            .find(|f| f["type"] == "freshAgent.event"
-                && f["event"]["type"] == "freshAgent.session.metadata")
+            .find(|f| {
+                f["type"] == "freshAgent.event"
+                    && f["event"]["type"] == "freshAgent.session.metadata"
+            })
             .expect("a settings-changing send broadcasts metadata");
         assert_eq!(metadata["event"]["model"], json!("prov/mdl-b"));
         assert_eq!(metadata["event"]["effort"], json!("low"));
@@ -12088,8 +12113,13 @@ mod tests {
         );
 
         // A send with UNCHANGED settings adds no second metadata frame.
-        st.handle_send(send_msg_with_settings(placeholder, "three", Some("prov/mdl-b"), Some("low")))
-            .await;
+        st.handle_send(send_msg_with_settings(
+            placeholder,
+            "three",
+            Some("prov/mdl-b"),
+            Some("low"),
+        ))
+        .await;
         let frames = drain(&mut rx).await;
         assert!(
             !frames.iter().any(|f| f["type"] == "freshAgent.event"
@@ -12111,8 +12141,13 @@ mod tests {
 
         st.handle_create(create_msg("req-cfg-row"), None).await;
         let placeholder = "freshopencode-req-cfg-row";
-        st.handle_send(send_msg_with_settings(placeholder, "one", Some("prov/mdl-a"), Some("high")))
-            .await;
+        st.handle_send(send_msg_with_settings(
+            placeholder,
+            "one",
+            Some("prov/mdl-a"),
+            Some("high"),
+        ))
+        .await;
         let _ = drain(&mut rx).await;
         let durable = {
             let sessions = st.sessions.lock().await;
@@ -12126,11 +12161,9 @@ mod tests {
             .await;
         let frames = drain(&mut rx).await;
         assert!(
-            frames
-                .iter()
-                .any(|f| f["type"] == "freshAgent.event"
-                    && f["event"]["type"] == "freshAgent.session.metadata"
-                    && f["event"]["model"] == json!("prov/mdl-b")),
+            frames.iter().any(|f| f["type"] == "freshAgent.event"
+                && f["event"]["type"] == "freshAgent.session.metadata"
+                && f["event"]["model"] == json!("prov/mdl-b")),
             "the durable-id configure converges too"
         );
         let bindings = fake.bindings.lock().unwrap();
