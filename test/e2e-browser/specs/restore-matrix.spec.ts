@@ -1068,10 +1068,19 @@ test.describe('Restore Matrix', () => {
         }, { timeout: 20_000 }).toBe(true)
 
         const sentAfterRestart = await harness.getSentWsMessages()
-        const createsAfterRestart = sentAfterRestart.filter((m: any) => m?.type === 'freshAgent.create')
-        for (const create of createsAfterRestart) {
-          const resumeTarget = (create as any).resumeSessionId ?? (create as any).sessionRef?.sessionId
-          expect(resumeTarget).toBe(originalSessionId)
+        const recoveryMessagesAfterRestart = sentAfterRestart.filter((m: any) => (
+          m?.type === 'freshAgent.create' || m?.type === 'freshAgent.attach'
+        ))
+        expect(recoveryMessagesAfterRestart).not.toHaveLength(0)
+        for (const message of recoveryMessagesAfterRestart) {
+          const applicableTargets = message.type === 'freshAgent.attach'
+            ? [message.sessionId]
+            : [message.resumeSessionId, message.sessionRef?.sessionId]
+          expect(applicableTargets.filter((target) => target !== undefined && target !== null))
+            .not.toHaveLength(0)
+          for (const target of applicableTargets) {
+            if (target !== undefined && target !== null) expect(target).toBe(originalSessionId)
+          }
         }
 
         const rehydratedTabId = await harness.getActiveTabId()
@@ -1591,6 +1600,22 @@ test.describe('Restore Matrix', () => {
               || m?.sessionRef?.sessionId === originalSessionId),
           )
         }, { timeout: 20_000 }).toBe(true)
+
+        const sentAfterReload = await harness.getSentWsMessages()
+        const recoveryMessagesAfterReload = sentAfterReload.filter((m: any) => (
+          m?.type === 'freshAgent.create' || m?.type === 'freshAgent.attach'
+        ))
+        expect(recoveryMessagesAfterReload).not.toHaveLength(0)
+        for (const message of recoveryMessagesAfterReload) {
+          const applicableTargets = message.type === 'freshAgent.attach'
+            ? [message.sessionId]
+            : [message.resumeSessionId, message.sessionRef?.sessionId]
+          expect(applicableTargets.filter((target) => target !== undefined && target !== null))
+            .not.toHaveLength(0)
+          for (const target of applicableTargets) {
+            if (target !== undefined && target !== null) expect(target).toBe(originalSessionId)
+          }
+        }
 
         const rehydratedTabId = await harness.getActiveTabId()
         const rehydratedLayout = await harness.getPaneLayout(rehydratedTabId!)

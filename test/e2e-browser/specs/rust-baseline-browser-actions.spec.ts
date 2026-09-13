@@ -240,30 +240,40 @@ test.describe('Rust baseline browser actions', () => {
     const pane = page.locator('[data-context="fresh-agent"]').last()
     await expect(pane.getByLabel(/attach|attachment|upload/i)).toBeVisible()
     await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.clearSentWsMessages?.())
-    const shellMarker = 'freshell-shell-marker'
+    // Keep the command's identifying token distinct from stdout. Otherwise a
+    // queued context message that repeats only the command could accidentally
+    // satisfy the output assertion below.
+    const shellCommandToken = 'freshell-shell-command-token'
+    const shellOutputToken = 'freshell-shell-output-token'
+    const shellCommand = `printf %s ${shellOutputToken} # ${shellCommandToken}`
     const execResponse = page.waitForResponse((response) => (
       response.url().includes('/api/fresh-agent/exec')
       && response.request().method() === 'POST'
     ))
-    await pane.getByRole('textbox', { name: 'Chat message input' }).fill(`!printf ${shellMarker}`)
+    await pane.getByRole('textbox', { name: 'Chat message input' }).fill(`!${shellCommand}`)
     await pane.getByRole('button', { name: 'Send' }).click()
     const response = await execResponse
     expect(response.status()).toBe(200)
     expect(JSON.parse(response.request().postData() ?? '{}')).toEqual({
-      command: `printf ${shellMarker}`,
+      command: shellCommand,
       cwd: repoDir,
+    })
+    expect(await response.json()).toEqual({
+      output: shellOutputToken,
+      exitCode: 0,
+      truncated: false,
     })
     await expect.poll(async () => page.evaluate(() => (
       window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
-    ).filter((message: any) => message?.type === 'freshAgent.send'))).toEqual([
-      expect.objectContaining({
-        text: expect.stringContaining(`printf ${shellMarker}`),
-      }),
-    ])
+    ).filter((message: any) => message?.type === 'freshAgent.send'))).toEqual([expect.objectContaining({
+      cwd: repoDir,
+      text: `I ran \`${shellCommand}\` in ${repoDir}. Output:\n\`\`\`\n${shellOutputToken}\n\`\`\``,
+    })])
     const sent = await page.evaluate(() => (
       window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
     ).filter((message: any) => message?.type === 'freshAgent.send'))
-    expect((sent[0] as { text?: string }).text).toContain(shellMarker)
+    expect((sent[0] as { text?: string }).text).toContain(shellCommandToken)
+    expect((sent[0] as { text?: string }).text).toContain(shellOutputToken)
     const diff = pane.locator('.fresh-agent-file-diff')
     await expect(diff).toContainText('README.md')
     await expect(diff).toContainText('modified')
