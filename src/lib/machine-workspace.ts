@@ -108,6 +108,10 @@ export async function restoreMachineWorkspace(
       tabId: plan.tabId,
       layout: plan.layout,
       paneTitles: plan.paneTitles,
+      // The inventory is scoped to this selected machine and the plan already
+      // chose only valid snapshot IDs. Preserve that durable pane identity;
+      // ordinary and cross-device restore callers intentionally omit this.
+      preserveCreateRequestIds: true,
     }))
     for (const target of plan.liveTerminalReattach ?? []) {
       armRecoveredLiveTerminalTarget(plan.tabId, target.paneId, target.terminalId)

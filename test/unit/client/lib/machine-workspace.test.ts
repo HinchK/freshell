@@ -111,6 +111,83 @@ describe('restoreMachineWorkspace', () => {
     expect(store.getState().panes.layouts['foreign-tab']).toBeUndefined()
   })
 
+  it('preserves snapshot createRequestIds through the same-machine restore reducer for terminals and every fresh-agent variant', async () => {
+    const store = createStore()
+    const inventory = inventoryFor(MACHINE_ID)
+    const recoveredTab = inventory.device!.tabs[0]
+    recoveredTab.panes = [
+      {
+        paneId: 'terminal-pane',
+        kind: 'terminal',
+        mode: 'shell',
+        shell: null,
+        cwd: '/work',
+        payload: {
+          createRequestId: 'server-terminal-create-request-id',
+          terminalId: 'stale-terminal-id',
+          status: 'running',
+        },
+        sessionRef: null,
+        ledgerState: 'unknown',
+        live: false,
+      },
+      ...([
+        ['freshclaude', 'claude'],
+        ['kilroy', 'claude'],
+        ['freshcodex', 'codex'],
+        ['freshopencode', 'opencode'],
+      ] as const).map(([sessionType, provider]) => ({
+        paneId: `${sessionType}-pane`,
+        kind: 'fresh-agent',
+        mode: sessionType,
+        shell: null,
+        cwd: '/work',
+        payload: {
+          sessionType,
+          provider,
+          createRequestId: `server-${sessionType}-create-request-id`,
+          sessionId: `stale-${sessionType}-session`,
+          status: 'running',
+          serverInstanceId: 'stale-server',
+        },
+        sessionRef: null,
+        ledgerState: 'unknown' as const,
+        live: false,
+      })),
+    ]
+    vi.mocked(getRecoveryInventory).mockResolvedValue(inventory)
+
+    await restoreMachineWorkspace(store, MACHINE_ID)
+
+    const layout = store.getState().panes.layouts['recovered-tab']
+    if (!layout) throw new Error('expected recovered layout')
+    const leaves: Record<string, import('@/store/paneTypes').PaneContent> = {}
+    const collectLeaves = (node: typeof layout): void => {
+      if (node.type === 'leaf') {
+        leaves[node.id] = node.content
+        return
+      }
+      collectLeaves(node.children[0])
+      collectLeaves(node.children[1])
+    }
+    collectLeaves(layout)
+
+    const terminal = leaves['terminal-pane']
+    if (terminal?.kind !== 'terminal') throw new Error('expected recovered terminal')
+    expect(terminal.createRequestId).toBe('server-terminal-create-request-id')
+    expect(terminal.terminalId).toBeUndefined()
+    expect(terminal.status).toBe('creating')
+
+    for (const sessionType of ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode']) {
+      const content = leaves[`${sessionType}-pane`]
+      if (content?.kind !== 'fresh-agent') throw new Error(`expected recovered ${sessionType}`)
+      expect(content.createRequestId).toBe(`server-${sessionType}-create-request-id`)
+      expect(content.sessionId).toBeUndefined()
+      expect(content.serverInstanceId).toBeUndefined()
+      expect(content.status).toBe('creating')
+    }
+  })
+
   it('preserves a still-recovered active tab across machine workspace replacement', async () => {
     const store = createStore()
     const inventory = inventoryFor(MACHINE_ID)
