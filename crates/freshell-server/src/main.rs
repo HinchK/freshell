@@ -418,22 +418,32 @@ async fn probe_stale_start_fences(
     for fence in ownership.stale_start_fences() {
         // b8ke d4 F2: the death probe is selected by the fence's
         // PRIOR KIND, never the provider. A TERMINAL prior gets the
-        // TERMINAL liveness evidence — the recorded pane/pty identity:
-        // the row is dead (gone or not Running) → confirmed; running →
-        // the fence holds. Pre-d4 a terminal prior went to the provider's
-        // FRESH probe: the opencode Fresh probe answered "true" because
-        // no Fresh Agent map/turn existed (releasing while the terminal
-        // still ran), and the claude/codex Fresh probes answered "false"
-        // forever (wedging even a dead terminal's fence).
+        // TERMINAL liveness evidence — the recorded pid/pane identity
+        // (e4r3 F2: the PID's OS-level death, with the row-based probe
+        // only for the pid-less pre-spawn shape). Pre-d4 a terminal
+        // prior went to the provider's FRESH probe: the opencode Fresh
+        // probe answered "true" because no Fresh Agent map/turn existed
+        // (releasing while the terminal still ran), and the claude/codex
+        // Fresh probes answered "false" forever (wedging even a dead
+        // terminal's fence).
         if fence.prior_kind == Some(freshell_ownership::RuntimeOwnerKind::Terminal) {
-            let confirmed_gone = match fence.prior_terminal_id.as_deref() {
-                // The recorded pane identity: the registry's own row state.
-                Some(tid) => registry.terminal_is_dead(tid),
-                // No recorded terminal identity: nothing positive can
-                // confirm — fail closed, the fence holds (the operator
-                // force-clear is PlatformLimited's, not this one's; the
-                // probe retries every sweep).
-                None => false,
+            // b8ke e4r3 F2: the confirmed-reap evidence is the recorded
+            // PID's OS-level death, NEVER row absence — kill() removes the
+            // row BEFORE signaling/reaping the PTY, so a probe landing in
+            // the row-removed-but-not-yet-reaped interval would read the
+            // missing row as confirmed reap and release the fence while
+            // the old runtime's reap is still in progress (permitting a
+            // second writer). The pid probe reads the ACTUAL process: a
+            // kill-in-progress runtime stays "alive" until the waiter
+            // thread's reap completes (a not-yet-reaped zombie still
+            // answers kill(pid, 0)). No recorded pid: the pid-less
+            // terminal-prior shape is the PRE-SPAWN partial registration
+            // (nothing was spawned — no kill can be in progress for this
+            // id), so the row-based probe is the honest evidence.
+            let confirmed_gone = match (fence.prior_terminal_id.as_deref(), fence.prior_pid) {
+                (_, Some(pid)) => !freshell_terminal::registry::pid_alive(pid),
+                (Some(tid), None) => registry.terminal_is_dead(tid),
+                (None, None) => false,
             };
             if !confirmed_gone {
                 continue;
@@ -5540,6 +5550,106 @@ mod stale_start_watchdog_tests {
             "the terminal-prior release's from_kind names the fenced \
              TERMINAL prior — got {:?}",
             released_d4f2c.1
+        );
+    }
+
+    /// b8ke e4r3 F2: the terminal-prior fence probe's evidence is the
+    /// recorded PID's OS-level death, NEVER row absence — kill() removes
+    /// the row BEFORE signaling/reaping the PTY, so a probe landing in the
+    /// row-removed-but-not-yet-reaped interval must HOLD the fence (row
+    /// absence becomes true merely because the kill is in progress);
+    /// the release happens only after the reap completes (the recorded
+    /// runtime is actually gone).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_kill_in_flight_terminal_prior_holds_its_fence_until_the_reap_completes() {
+        let states = watchdog_states();
+        // A REAL live runtime the registry never knew (the recorded pid)
+        // plus a terminal id whose row is ABSENT — the exact shape a kill
+        // in progress produces after removing the row (and the shape a
+        // never-spawned id produces before any kill).
+        let mut prior = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn the recorded prior's stand-in process");
+        let prior_pid = prior.id();
+        let reaping_tid = "T-e4r3-f2-reaping";
+        assert!(
+            states.1.terminal_is_dead(reaping_tid),
+            "precondition: the recorded terminal id's row is absent (the \
+             kill-in-progress interval's row shape)"
+        );
+        assert!(
+            freshell_terminal::registry::pid_alive(prior_pid),
+            "precondition: the recorded runtime still lives"
+        );
+
+        let freshell_ownership::BeginOutcome::Granted { generation } = states.0.begin_start(
+            "claude",
+            "sid-stale",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-e4r3-f2",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("expected Granted")
+        };
+        states.0.register_partial_runtime(
+            "claude",
+            "sid-stale",
+            "op-e4r3-f2",
+            generation,
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                terminal_id: Some(reaping_tid.to_string()),
+                live_session_key: None,
+                pid: Some(prior_pid),
+                ownership_id: None,
+            },
+        );
+        let recs = states.0.recover_stale_starts(0, 0);
+        assert_eq!(recs.len(), 1);
+        assert!(matches!(
+            states.0.fence_unconfirmed_stop(
+                "claude",
+                "sid-stale",
+                "op-e4r3-f2",
+                recs[0].generation,
+                FenceReason::StaleStart,
+            ),
+            freshell_ownership::FenceOutcome::Fenced
+        ));
+
+        // THE PROBE, mid-interval: the row is absent but the recorded
+        // runtime STILL LIVES — the fence must HOLD (pre-e4r3 the
+        // row-absence predicate read the missing row as confirmed reap
+        // and released, permitting another writer before the old
+        // runtime's reap completed).
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        probe_stale_start_fences(&states.0, &states.1, &states.2, &states.3, &states.4, &tx).await;
+        assert!(
+            matches!(
+                states.0.observe("claude", "sid-stale").state,
+                OwnershipState::Fenced { .. }
+            ),
+            "the fence HOLDS while the recorded runtime still lives — row \
+             absence is not confirmed reap"
+        );
+
+        // The reap completes (the recorded runtime is actually gone): the
+        // probe now releases.
+        prior.kill().expect("SIGKILL the recorded prior");
+        let _ = prior.wait().expect("reap the recorded prior");
+        assert!(
+            !freshell_terminal::registry::pid_alive(prior_pid),
+            "precondition: the reap completed"
+        );
+        probe_stale_start_fences(&states.0, &states.1, &states.2, &states.3, &states.4, &tx).await;
+        assert_eq!(
+            states.0.observe("claude", "sid-stale").state,
+            OwnershipState::Vacant,
+            "the reap completed — the probe releases"
         );
     }
 
