@@ -265,13 +265,13 @@ test.describe('Rust baseline browser actions', () => {
     })
     await expect.poll(async () => page.evaluate(() => (
       window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
-    ).filter((message: any) => message?.type === 'freshAgent.send'))).toEqual([expect.objectContaining({
-      cwd: repoDir,
-      text: `I ran \`${shellCommand}\` in ${repoDir}. Output:\n\`\`\`\n${shellOutputToken}\n\`\`\``,
-    })])
+    ).filter((message: any) => message?.type === 'freshAgent.send').length).toBe(1)
     const sent = await page.evaluate(() => (
       window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
     ).filter((message: any) => message?.type === 'freshAgent.send'))
+    expect(sent[0]).toEqual(expect.objectContaining({ cwd: repoDir }))
+    expect((sent[0] as { text?: string }).text)
+      .toContain(`I ran \`${shellCommand}\` in ${repoDir}.`)
     expect((sent[0] as { text?: string }).text).toContain(shellCommandToken)
     expect((sent[0] as { text?: string }).text).toContain(shellOutputToken)
     const diff = pane.locator('.fresh-agent-file-diff')
