@@ -11,31 +11,9 @@ import path from 'path'
 import fs from 'fs'
 import os from 'os'
 import { RustServer } from '../e2e-browser/helpers/rust-server.js'
+import type { E2eServerInfo } from '../e2e-browser/helpers/server-fixture-support.js'
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, '..', '..')
-
-/** The auth token of the running Freshell server (read from main repo .env, not the worktree). */
-function getRunningServerToken(): string {
-  const mainRepoRoot = path.resolve(PROJECT_ROOT, '..', '..')
-  const envPaths = [
-    path.join(mainRepoRoot, '.env'),
-    path.join(PROJECT_ROOT, '.env'),
-  ]
-  for (const envPath of envPaths) {
-    try {
-      const content = fs.readFileSync(envPath, 'utf-8')
-      for (const line of content.split('\n')) {
-        const trimmed = line.trim()
-        if (trimmed.startsWith('AUTH_TOKEN=')) {
-          return trimmed.slice('AUTH_TOKEN='.length).trim().replace(/^["']|["']$/g, '')
-        }
-      }
-    } catch {
-      continue
-    }
-  }
-  throw new Error('Could not find AUTH_TOKEN in .env files')
-}
 
 function createTempHome(desktopConfig?: Record<string, unknown>): string {
   const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-e2e-'))
@@ -54,13 +32,6 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
-function writeDesktopEnv(tmpHome: string): void {
-  fs.writeFileSync(
-    path.join(tmpHome, '.freshell', '.env'),
-    `AUTH_TOKEN=${getRunningServerToken()}\n`,
-  )
-}
-
 async function launchApp(tmpHome: string, captureOutput = false): Promise<ElectronApplication> {
   const app = await electron.launch({
     args: [PROJECT_ROOT],
@@ -68,6 +39,9 @@ async function launchApp(tmpHome: string, captureOutput = false): Promise<Electr
       ...process.env,
       HOME: tmpHome,
       NODE_PATH: path.join(PROJECT_ROOT, 'node_modules'),
+      // The Electron launch chooser normally probes local development ports,
+      // including :3001. E2E supplies an explicit owned target instead.
+      FRESHELL_ELECTRON_TEST_NO_LOCAL_DISCOVERY: '1',
     },
     cwd: PROJECT_ROOT,
   })
@@ -125,12 +99,12 @@ async function waitForWindowUrl(
   throw new Error(`Timed out waiting for window URL matching ${pattern}`)
 }
 
-function remoteConfig() {
+function remoteConfig(server: E2eServerInfo) {
   return {
     serverMode: 'remote',
-    port: 3001,
-    remoteUrl: 'http://localhost:3001',
-    remoteToken: getRunningServerToken(),
+    port: server.port,
+    remoteUrl: server.baseUrl,
+    remoteToken: server.token,
     knownServers: [],
     alwaysAskOnLaunch: false,
     globalHotkey: 'CommandOrControl+`',
@@ -138,6 +112,35 @@ function remoteConfig() {
     minimizeToTray: true,
     setupCompleted: true,
   }
+}
+
+/**
+ * Each Electron test that connects to a server gets its own fixture-owned Rust
+ * process and Electron HOME. That keeps a prior test's durable machine
+ * workspace from affecting the next test's recovery or chooser state.
+ * RustServer owns the exact process tree and ephemeral port; it never probes
+ * the live server.
+ */
+let remoteServer: RustServer | undefined
+let remoteServerInfo: E2eServerInfo | undefined
+
+function requireRemoteServerInfo(): E2eServerInfo {
+  if (!remoteServerInfo) throw new Error('Electron remote-server fixture is not running')
+  return remoteServerInfo
+}
+
+async function startRemoteServer(): Promise<E2eServerInfo> {
+  if (remoteServer) throw new Error('Electron remote-server fixture is already running')
+  remoteServer = new RustServer()
+  remoteServerInfo = await remoteServer.start()
+  expect(remoteServerInfo.port).not.toBe(3001)
+  return remoteServerInfo
+}
+
+async function stopRemoteServer(): Promise<void> {
+  await remoteServer?.stop().catch(() => {})
+  remoteServer = undefined
+  remoteServerInfo = undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -252,15 +255,18 @@ test.describe('Wizard flow', () => {
   let tmpHome: string
 
   test.beforeEach(async () => {
+    await startRemoteServer()
     tmpHome = createTempHome()
   })
 
   test.afterEach(async () => {
     if (app) await app.close().catch(() => {})
-    fs.rmSync(tmpHome, { recursive: true, force: true })
+    await stopRemoteServer()
+    if (tmpHome) fs.rmSync(tmpHome, { recursive: true, force: true })
   })
 
   test('shows wizard on first launch and completes setup', async () => {
+    const serverInfo = requireRemoteServerInfo()
     app = await launchApp(tmpHome, true)
     const wizardPage = await app.firstWindow()
     await wizardPage.waitForLoadState('domcontentloaded')
@@ -279,8 +285,8 @@ test.describe('Wizard flow', () => {
     // Configuration step
     await expect(wizardPage.locator('h2:has-text("Configuration")')).toBeVisible()
     await wizardPage.screenshot({ path: 'test-results/wizard-03-configuration.png' })
-    await wizardPage.locator('#remote-url').fill('http://localhost:3001')
-    await wizardPage.locator('#remote-token').fill(getRunningServerToken())
+    await wizardPage.locator('#remote-url').fill(serverInfo.baseUrl)
+    await wizardPage.locator('#remote-token').fill(serverInfo.token)
     await wizardPage.getByRole('button', { name: /next/i }).click()
 
     // Hotkey step
@@ -323,6 +329,7 @@ test.describe('Wizard flow', () => {
     const savedConfig = JSON.parse(fs.readFileSync(configPath, 'utf-8'))
     expect(savedConfig.setupCompleted).toBe(true)
     expect(savedConfig.serverMode).toBe('remote')
+    expect(savedConfig.remoteUrl).toBe(serverInfo.baseUrl)
   })
 })
 
@@ -334,24 +341,18 @@ test.describe('Launch chooser', () => {
   let app: ElectronApplication
   let tmpHome: string
 
+  test.beforeEach(async () => {
+    await startRemoteServer()
+  })
+
   test.afterEach(async () => {
     if (app) await app.close().catch(() => {})
+    await stopRemoteServer()
     if (tmpHome) fs.rmSync(tmpHome, { recursive: true, force: true })
   })
 
   test('shows launch chooser when alwaysAskOnLaunch is true', async () => {
-    tmpHome = createTempHome({
-      serverMode: 'remote',
-      port: 3001,
-      remoteUrl: 'http://localhost:3001',
-      remoteToken: getRunningServerToken(),
-      knownServers: [],
-      alwaysAskOnLaunch: true,
-      globalHotkey: 'CommandOrControl+`',
-      startOnLogin: false,
-      minimizeToTray: true,
-      setupCompleted: true,
-    })
+    tmpHome = createTempHome({ ...remoteConfig(requireRemoteServerInfo()), alwaysAskOnLaunch: true })
 
     app = await launchApp(tmpHome)
     const chooser = await app.firstWindow()
@@ -361,31 +362,26 @@ test.describe('Launch chooser', () => {
     await expect(chooser.getByRole('checkbox', { name: 'Always ask on launch' })).toBeChecked()
   })
 
-  test('connects to an existing server from chooser', async () => {
-    tmpHome = createTempHome({
-      serverMode: 'app-bound',
-      port: 3001,
-      knownServers: [{ url: 'http://localhost:3001', label: 'Test server' }],
-      alwaysAskOnLaunch: true,
-      globalHotkey: 'CommandOrControl+`',
-      startOnLogin: false,
-      minimizeToTray: true,
-      setupCompleted: true,
-    })
-    writeDesktopEnv(tmpHome)
+  test('connects to an explicit remote server from chooser', async () => {
+    const serverInfo = requireRemoteServerInfo()
+    tmpHome = createTempHome({ ...remoteConfig(serverInfo), alwaysAskOnLaunch: true })
 
     app = await launchApp(tmpHome)
     const chooser = await app.firstWindow()
     await chooser.waitForLoadState('domcontentloaded')
 
-    // The candidate button's accessible name is "Connect to <label|url>".
-    // Selecting it must connect this launch even with "Always ask on launch"
-    // still checked — that is exactly the forced-launch behavior under test.
-    await chooser.getByRole('button', { name: /^Connect to / }).first().click()
-    const mainPage = await waitForWindowUrl(app, /http:\/\/localhost:3001/, 60_000)
+    // An explicit remote choice must connect this launch even with "Always
+    // ask on launch" still checked — that is the forced-launch behavior.
+    await chooser.getByLabel('Token').fill(serverInfo.token)
+    await chooser.getByRole('button', { name: 'Connect remote' }).click()
+    const mainPage = await waitForWindowUrl(
+      app,
+      new RegExp(`^${escapeRegExp(serverInfo.baseUrl)}(?:[/?#]|$)`),
+      60_000,
+    )
     await mainPage.waitForLoadState('domcontentloaded')
 
-    await expect(mainPage).toHaveURL(/http:\/\/localhost:3001/)
+    await expect(mainPage).toHaveURL(new RegExp(`^${escapeRegExp(serverInfo.baseUrl)}(?:[/?#]|$)`))
   })
 })
 
@@ -398,12 +394,14 @@ test.describe('Main window with remote server', () => {
   let tmpHome: string
 
   test.beforeEach(async () => {
-    tmpHome = createTempHome(remoteConfig())
+    await startRemoteServer()
+    tmpHome = createTempHome(remoteConfig(requireRemoteServerInfo()))
   })
 
   test.afterEach(async () => {
     if (app) await app.close().catch(() => {})
-    fs.rmSync(tmpHome, { recursive: true, force: true })
+    await stopRemoteServer()
+    if (tmpHome) fs.rmSync(tmpHome, { recursive: true, force: true })
   })
 
   test('loads authenticated Freshell UI', async () => {
@@ -429,10 +427,18 @@ test.describe('Main window with remote server', () => {
   })
 
   test('shows terminal launcher grid', async () => {
+    const serverInfo = requireRemoteServerInfo()
     app = await launchApp(tmpHome)
     const mainPage = await app.firstWindow()
     await mainPage.waitForLoadState('domcontentloaded')
     await mainPage.waitForTimeout(5000)
+
+    // This is the isolation receipt: the test is connected to its own
+    // ephemeral RustServer, has no inherited recovery offer, and still sees
+    // the real launcher choices.
+    expect(serverInfo.port).not.toBe(3001)
+    await expect(mainPage).toHaveURL(new RegExp(`^${escapeRegExp(serverInfo.baseUrl)}(?:[/?#]|$)`))
+    await expect(mainPage.getByTestId('recovery-offer-panel')).toHaveCount(0)
 
     // The launcher grid should have recognizable session types.
     // Use the specific launcher area (main content, not sidebar).
