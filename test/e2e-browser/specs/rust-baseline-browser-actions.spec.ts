@@ -265,7 +265,7 @@ test.describe('Rust baseline browser actions', () => {
     })
     await expect.poll(async () => page.evaluate(() => (
       window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
-    ).filter((message: any) => message?.type === 'freshAgent.send').length).toBe(1)
+    ).filter((message: any) => message?.type === 'freshAgent.send').length)).toBe(1)
     const sent = await page.evaluate(() => (
       window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
     ).filter((message: any) => message?.type === 'freshAgent.send'))
