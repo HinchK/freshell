@@ -62,6 +62,7 @@ import * as os from 'node:os'
 import { fileURLToPath } from 'node:url'
 import WebSocket from 'ws'
 import { RustServer, ensureRustServerBuilt } from '../helpers/rust-server.js'
+import { installE2eMachineIdentity, registerE2eMachine } from '../helpers/fixtures.js'
 import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
@@ -173,6 +174,12 @@ function nextMessage(ws: WebSocket, predicate: (msg: any) => boolean, timeoutMs 
 
 type RawSnapshotRecord = Record<string, unknown> & { status?: string }
 
+interface RawClientIdentity {
+  deviceId: string
+  deviceLabel: string
+  clientInstanceId: string
+}
+
 // Copied VERBATIM from sidebar-remote-status-rings-rust.spec.ts, PLUS the
 // `sendRaw` escape hatch (used by Phase 5 to inject a ratchet-free
 // terminal.input busy edge). Handshake: bare ws:// connect then in-band
@@ -256,7 +263,8 @@ async function connectRawDevice(wsUrl: string, token: string): Promise<{
 // the all-grey Phase-0 order: S_GREY newest, S_BUSY middle, S_OPEN oldest.
 // ---------------------------------------------------------------------------
 
-const DEVICE_B_ID = 'e2e-device-b-status-sort'
+const DEVICE_A_LABEL = 'E2E Device A'
+const DEVICE_B_LABEL = 'E2E Device B'
 const DEVICE_B_CLIENT = 'e2e-device-b-status-sort-window'
 
 const NOW = Date.now()
@@ -278,12 +286,12 @@ const S_GREY_T1 = T(1)
 // per-session tab/pane keying uses the LAST 8 chars: the fixed scenario ids
 // share their FIRST 8 chars ('00000000'), and the Rust registry rejects a
 // push carrying duplicate tabKeys (the whole push then goes unacked).
-function buildRemoteTabRecord(sessionId: string, busy: boolean): RawSnapshotRecord {
+function buildRemoteTabRecord(identity: RawClientIdentity, sessionId: string, busy: boolean): RawSnapshotRecord {
   const now = Date.now()
   const sessionKey = `claude:${sessionId}`
   const short = sessionId.slice(-8)
   return {
-    tabKey: `${DEVICE_B_ID}:claude-tab-${short}`,
+    tabKey: `${identity.deviceId}:claude-tab-${short}`,
     tabId: `claude-tab-${short}`,
     tabName: 'Claude (e2e device b)',
     status: 'open',
@@ -481,6 +489,8 @@ test.describe.serial('sidebar status-tier sort (rust)', () => {
   let sharedRoot = ''
   let projectDir = ''
   let deviceB: Awaited<ReturnType<typeof connectRawDevice>>
+  let deviceBIdentity: RawClientIdentity
+  let pageMachineId: string
 
   test.beforeAll(async () => {
     // Hook-timeout + prebuild-guard pattern copied from the rings spec: the
@@ -531,7 +541,18 @@ test.describe.serial('sidebar status-tier sort (rust)', () => {
       },
     })
     info = await server.start()
+    pageMachineId = (await registerE2eMachine(info, DEVICE_A_LABEL)).id
+    const machine = await registerE2eMachine(info, DEVICE_B_LABEL)
+    deviceBIdentity = {
+      deviceId: machine.id,
+      deviceLabel: machine.label,
+      clientInstanceId: DEVICE_B_CLIENT,
+    }
     deviceB = await connectRawDevice(info.wsUrl, info.token)
+  })
+
+  test.beforeEach(async ({ page }) => {
+    await installE2eMachineIdentity(page.context(), info, pageMachineId)
   })
 
   test.afterAll(async () => {
@@ -560,10 +581,8 @@ test.describe.serial('sidebar status-tier sort (rust)', () => {
     // recency: [remote-busy, remote-open, grey]. Rings confirm the remote
     // state is live before the sort assertion's poll completes.
     await deviceB.pushSnapshot({
-      deviceId: DEVICE_B_ID,
-      deviceLabel: 'E2E Device B',
-      clientInstanceId: DEVICE_B_CLIENT,
-      records: [buildRemoteTabRecord(S_OPEN, false), buildRemoteTabRecord(S_BUSY, true)],
+      ...deviceBIdentity,
+      records: [buildRemoteTabRecord(deviceBIdentity, S_OPEN, false), buildRemoteTabRecord(deviceBIdentity, S_BUSY, true)],
     })
     await expectSidebarOrder(page, [S_BUSY, S_OPEN, S_GREY])
     await expectRing(rowBusy, 'busy')
@@ -575,10 +594,8 @@ test.describe.serial('sidebar status-tier sort (rust)', () => {
     // watcher recency would yield [S_OPEN, S_GREY, S_BUSY] — non-vacuous
     // touch proof.
     await deviceB.pushSnapshot({
-      deviceId: DEVICE_B_ID,
-      deviceLabel: 'E2E Device B',
-      clientInstanceId: DEVICE_B_CLIENT,
-      records: [buildRemoteTabRecord(S_OPEN, false)],
+      ...deviceBIdentity,
+      records: [buildRemoteTabRecord(deviceBIdentity, S_OPEN, false)],
     })
     await expectSidebarOrder(page, [S_OPEN, S_BUSY, S_GREY])
     await expectNoRemoteStatusRing(rowBusy)
@@ -666,9 +683,7 @@ test.describe.serial('sidebar status-tier sort (rust)', () => {
     // user-visible float, not the ratchet in isolation (mechanism
     // isolation lives in the unit tests' watcher-gap shapes, Task 2).
     await deviceB.pushSnapshot({
-      deviceId: DEVICE_B_ID,
-      deviceLabel: 'E2E Device B',
-      clientInstanceId: DEVICE_B_CLIENT,
+      ...deviceBIdentity,
       records: [],
     })
     // Remote-driven liveness (the spec's 30s query model, poll ≤45s): the
