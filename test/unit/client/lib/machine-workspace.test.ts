@@ -87,6 +87,24 @@ function addRecoveredTab(inventory: RecoveryInventory, machineId: string, tabId:
   })
 }
 
+function terminalContentAt(
+  store: ReturnType<typeof createStore>,
+  tabId: string,
+  paneId: string,
+) {
+  const layout = store.getState().panes.layouts[tabId]
+  if (!layout) throw new Error(`missing layout for ${tabId}`)
+  const findLeaf = (node: typeof layout): import('@/store/paneTypes').TerminalPaneContent | undefined => {
+    if (node.type === 'leaf') {
+      return node.id === paneId && node.content.kind === 'terminal' ? node.content : undefined
+    }
+    return findLeaf(node.children[0]) ?? findLeaf(node.children[1])
+  }
+  const content = findLeaf(layout)
+  if (!content) throw new Error(`missing terminal pane ${paneId}`)
+  return content
+}
+
 describe('restoreMachineWorkspace', () => {
   beforeEach(() => {
     vi.mocked(getRecoveryInventory).mockReset()
@@ -186,6 +204,57 @@ describe('restoreMachineWorkspace', () => {
       expect(content.serverInstanceId).toBeUndefined()
       expect(content.status).toBe('creating')
     }
+  })
+
+  it('keeps a local crash trace when same-machine recovery restores the same terminal identity', async () => {
+    const store = createStore()
+    const crashTrace = { exitCode: 137, resumedAtMs: 2_345 }
+    store.dispatch(addTab({ id: 'recovered-tab', title: 'Cached workspace' }))
+    store.dispatch(initLayout({
+      tabId: 'recovered-tab',
+      paneId: 'recovered-pane',
+      content: {
+        kind: 'terminal',
+        createRequestId: 'same-create-request',
+        status: 'creating',
+        mode: 'shell',
+        crashTrace,
+      },
+    }))
+    const inventory = inventoryFor(MACHINE_ID)
+    inventory.device!.tabs[0].panes[0].payload = { createRequestId: 'same-create-request' }
+    vi.mocked(getRecoveryInventory).mockResolvedValue(inventory)
+
+    await restoreMachineWorkspace(store, MACHINE_ID)
+
+    expect(terminalContentAt(store, 'recovered-tab', 'recovered-pane').crashTrace).toEqual(crashTrace)
+  })
+
+  it.each([
+    ['a different create request id', 'shell', 'different-create-request'],
+    ['a different terminal mode', 'codex', 'same-create-request'],
+  ] as const)('does not copy a crash trace onto recovery with %s', async (_description, mode, createRequestId) => {
+    const store = createStore()
+    store.dispatch(addTab({ id: 'recovered-tab', title: 'Cached workspace' }))
+    store.dispatch(initLayout({
+      tabId: 'recovered-tab',
+      paneId: 'recovered-pane',
+      content: {
+        kind: 'terminal',
+        createRequestId: 'same-create-request',
+        status: 'creating',
+        mode: 'shell',
+        crashTrace: { exitCode: 137, resumedAtMs: 2_345 },
+      },
+    }))
+    const inventory = inventoryFor(MACHINE_ID)
+    inventory.device!.tabs[0].panes[0].mode = mode
+    inventory.device!.tabs[0].panes[0].payload = { createRequestId }
+    vi.mocked(getRecoveryInventory).mockResolvedValue(inventory)
+
+    await restoreMachineWorkspace(store, MACHINE_ID)
+
+    expect(terminalContentAt(store, 'recovered-tab', 'recovered-pane').crashTrace).toBeUndefined()
   })
 
   it('preserves a still-recovered active tab across machine workspace replacement', async () => {

@@ -6,8 +6,8 @@ import { addTerminalRestoreRequestId, armRecoveredLiveTerminalTarget } from '@/l
 import { getCurrentTabRegistryClientInstanceId } from '@/store/tabRegistrySync'
 import { clearTabRegistryLocalClosed } from '@/store/tabRegistrySlice'
 import { clearTabsForMachine, addTab, setActiveTab } from '@/store/tabsSlice'
-import { clearPanesForMachine, restoreLayout } from '@/store/panesSlice'
-import type { PaneNode } from '@/store/paneTypes'
+import { clearPanesForMachine, restoreLayout, setPaneCrashTrace } from '@/store/panesSlice'
+import type { CrashTrace, PaneNode } from '@/store/paneTypes'
 import type { RootState } from '@/store/store'
 
 type MachineWorkspaceStore = {
@@ -29,6 +29,64 @@ function armTerminalRestores(state: Pick<RootState, 'panes'>, tabIds: string[]):
     for (const child of node.children) walk(child)
   }
   for (const tabId of tabIds) walk(state.panes.layouts[tabId])
+}
+
+type CrashTraceDecoration = {
+  tabId: string
+  paneId: string
+  mode: string
+  createRequestId: string
+  crashTrace: CrashTrace
+}
+
+function collectLocalCrashTraceDecorations(state: Pick<RootState, 'panes'>): CrashTraceDecoration[] {
+  const decorations: CrashTraceDecoration[] = []
+  const walk = (tabId: string, node: PaneNode | undefined): void => {
+    if (!node) return
+    if (node.type === 'leaf') {
+      const { content } = node
+      if (content.kind === 'terminal' && content.crashTrace) {
+        decorations.push({
+          tabId,
+          paneId: node.id,
+          mode: content.mode,
+          createRequestId: content.createRequestId,
+          crashTrace: content.crashTrace,
+        })
+      }
+      return
+    }
+    for (const child of node.children) walk(tabId, child)
+  }
+  for (const [tabId, layout] of Object.entries(state.panes.layouts)) walk(tabId, layout)
+  return decorations
+}
+
+function reapplyMatchingCrashTraceDecorations(
+  store: MachineWorkspaceStore,
+  decorations: CrashTraceDecoration[],
+): void {
+  for (const decoration of decorations) {
+    const layout = store.getState().panes.layouts[decoration.tabId]
+    const findMatchingPane = (node: PaneNode | undefined): boolean => {
+      if (!node) return false
+      if (node.type === 'leaf') {
+        const { content } = node
+        return node.id === decoration.paneId
+          && content.kind === 'terminal'
+          && content.mode === decoration.mode
+          && content.createRequestId === decoration.createRequestId
+      }
+      return findMatchingPane(node.children[0]) || findMatchingPane(node.children[1])
+    }
+    if (findMatchingPane(layout)) {
+      store.dispatch(setPaneCrashTrace({
+        tabId: decoration.tabId,
+        paneId: decoration.paneId,
+        crashTrace: decoration.crashTrace,
+      }))
+    }
+  }
 }
 
 function assertInventoryIsScopedToMachine(inventory: RecoveryInventory, machineId: string): void {
@@ -81,6 +139,10 @@ export async function restoreMachineWorkspace(
     ? buildRecoveryPlan(inventory, { preserveIdsForMachine: machineId })
     : []
   const priorActiveTabId = store.getState().tabs.activeTabId
+  // Crash traces are a deliberate local-only UI decoration. Capture exactly
+  // that decoration before replacing the local cache; the server inventory
+  // remains authoritative for every recovered workspace field.
+  const localCrashTraceDecorations = collectLocalCrashTraceDecorations(store.getState())
   const recoveredTabIds = new Set(plans.map((plan) => plan.tabId))
 
   // bb58dc001 follow-up (reload-safety): the recovery inventory EXCLUDES the
@@ -117,6 +179,10 @@ export async function restoreMachineWorkspace(
       armRecoveredLiveTerminalTarget(plan.tabId, target.paneId, target.terminalId)
     }
   }
+  // A local trace follows only the exact same terminal identity on this
+  // machine. In particular, a new create request or a different terminal mode
+  // cannot inherit a stale "crashed and resumed" notice.
+  reapplyMatchingCrashTraceDecorations(store, localCrashTraceDecorations)
   if (priorActiveTabId && recoveredTabIds.has(priorActiveTabId)) {
     store.dispatch(setActiveTab(priorActiveTabId))
   }
