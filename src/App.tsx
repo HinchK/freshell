@@ -1924,6 +1924,14 @@ export default function App() {
     }
   }, [exitFullscreen, isFullscreen, isLandscapeTerminalView, isMobile, view])
 
+  // Machine discovery is authenticated. If that bootstrap request rejects the
+  // current token, the auth prompt must take precedence over the machine gate;
+  // otherwise the user is stranded forever on "Preparing this machine" with
+  // no way to supply a valid token.
+  if (machineIdentity && machineIdentity.status !== 'ready' && authRequiredVisible) {
+    return <AuthRequiredModal />
+  }
+
   if (machineIdentity && machineIdentity.status !== 'ready') {
     if (machineIdentity.status === 'choosing') {
       return (

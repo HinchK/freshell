@@ -32,7 +32,9 @@ vi.mock('@/components/TabBar', () => ({ default: () => <div /> }))
 vi.mock('@/components/OverviewView', () => ({ default: () => <div /> }))
 vi.mock('@/components/TabsView', () => ({ default: () => <div /> }))
 vi.mock('@/components/TerminalInterestReporter', () => ({ TerminalInterestReporter: () => null }))
-vi.mock('@/components/AuthRequiredModal', () => ({ AuthRequiredModal: () => null }))
+vi.mock('@/components/AuthRequiredModal', () => ({
+  AuthRequiredModal: () => <div data-testid="auth-required-modal" />,
+}))
 vi.mock('@/components/DeadSessionPanel', () => ({ DeadSessionPanel: () => null }))
 vi.mock('@/components/ReconcileWarmingBanner', () => ({ ReconcileWarmingBanner: () => null }))
 vi.mock('@/components/SetupWizard', () => ({ SetupWizard: () => null }))
@@ -157,6 +159,7 @@ describe('App machine identity bootstrap', () => {
   beforeEach(() => {
     localStorage.clear()
     sessionStorage.clear()
+    localStorage.setItem('freshell.auth-token', 'test-token')
     cleanup()
     vi.clearAllMocks()
     mocks.onMessage.mockReturnValue(() => {})
@@ -182,6 +185,21 @@ describe('App machine identity bootstrap', () => {
     cleanup()
     localStorage.clear()
     sessionStorage.clear()
+  })
+
+  it('shows the authentication prompt when bootstrap auth fails before machine selection', async () => {
+    mocks.apiGet.mockRejectedValue({ status: 401 })
+    mocks.getMachines.mockResolvedValue([])
+    const store = createStore()
+
+    render(<Provider store={store}><App /></Provider>)
+
+    await waitFor(() => {
+      expect(store.getState().connection.lastError).toBe('Authentication failed')
+    })
+    expect(screen.getByTestId('auth-required-modal')).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Preparing this machine' })).not.toBeInTheDocument()
+    expect(mocks.getMachines).not.toHaveBeenCalled()
   })
 
   it('holds hello and tab sync behind the explicit chooser for a fresh browser with existing machines', async () => {
