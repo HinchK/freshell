@@ -6815,3 +6815,77 @@ async fn the_prior_stop_never_confirms_on_a_missing_row() {
         "the confirmed pid-death path still reaps — got {outcome:?}"
     );
 }
+
+/// b8ke ext r7 F5: the replacement fence watcher's TERMINAL prior
+/// confirmation uses the recorded PID's OS-level death — never the
+/// registry row's disappearance. kill_internal removes the row BEFORE the
+/// blocking kill/reap, so a concurrent kill can create a short interval
+/// where the row is gone while the prior process still lives: pre-r7 the
+/// watcher released the fence in that window (a dual-writer consequence);
+/// post-r7 the row-absent/live-pid window HOLDS the fence and the
+/// confirmed pid-death path releases.
+#[tokio::test]
+async fn the_replacement_probe_never_confirms_a_terminal_prior_on_a_missing_row() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    let rig = build_rig_inner(None, None, None, 10_000, None, false, None);
+    // The prior's stand-in process: ALIVE, its registry row ABSENT — the
+    // exact row-removed-but-not-yet-reaped shape a concurrent kill
+    // produces.
+    let mut prior = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn the prior's stand-in");
+    let prior_pid = prior.id();
+    let absent_tid = "T-r7-f5-absent";
+    assert!(
+        rig.registry.terminal_is_dead(absent_tid),
+        "precondition: the recorded pane's row is absent"
+    );
+    assert!(
+        freshell_terminal::registry::pid_alive(prior_pid),
+        "precondition: the recorded runtime still lives"
+    );
+    let live_prior = freshell_ownership::OwnerIdentity {
+        kind: RuntimeOwnerKind::Terminal,
+        terminal_id: Some(absent_tid.to_string()),
+        live_session_key: None,
+        pid: Some(prior_pid),
+        ownership_id: None,
+    };
+
+    // THE WINDOW: the row is gone while the pid lives — the replacement
+    // probe must NOT confirm in that window (pre-r7 the row-based
+    // predicate confirmed immediately).
+    let probe = tokio::time::timeout(
+        Duration::from_millis(600),
+        rig.runner
+            .prior_death_reconfirmation("claude", "sid-r7-f5", &live_prior),
+    )
+    .await;
+    assert!(
+        probe.is_err(),
+        "the row-absent/live-pid window must NOT confirm the prior's death \
+         (the probe kept polling — pre-r7 the row predicate confirmed \
+         immediately over the still-live prior)"
+    );
+
+    // The confirmed pid-death path releases: the stand-in dies and is
+    // reaped (a zombie still answers kill(pid, 0)), then the probe
+    // confirms.
+    prior.kill().expect("SIGKILL the stand-in");
+    let _ = prior.wait().expect("reap the stand-in");
+    assert!(
+        !freshell_terminal::registry::pid_alive(prior_pid),
+        "precondition: the recorded runtime is confirmed dead"
+    );
+    let answer = tokio::time::timeout(
+        Duration::from_secs(5),
+        rig.runner
+            .prior_death_reconfirmation("claude", "sid-r7-f5", &live_prior),
+    )
+    .await
+    .expect("the probe confirms once the pid is dead");
+    assert!(matches!(answer, super::ReapAnswer::Confirmed));
+}

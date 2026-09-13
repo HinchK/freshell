@@ -874,7 +874,18 @@ pub(crate) async fn attach_pane(
     };
 
     // The coordinator decides; the identity seam resolves the terminal.
-    let snapshot = state.ownership_snapshot(&session_ref.provider, &session_ref.session_id);
+    // b8ke ext r7 F3: the caller's raw id resolves through the
+    // coordinator's ALIAS CHAIN first — a superseded (rekeyed) session
+    // follows the CANONICAL live owner (the old key is Aliased forever;
+    // observing it raw dead-ends on the alias state instead of attaching).
+    let canonical_session_id =
+        state.resolve_canonical_session(&session_ref.provider, &session_ref.session_id);
+    let session_ref = freshell_protocol::SessionLocator {
+        provider: session_ref.provider.clone(),
+        session_id: canonical_session_id,
+    };
+    let snapshot =
+        state.canonical_ownership_snapshot(&session_ref.provider, &session_ref.session_id);
     match snapshot.state {
         freshell_ownership::OwnershipState::Live {
             ref owner,

@@ -34,6 +34,7 @@ import { buildReconcileRequestForPanes, foldVerdicts } from '@/lib/pane-reconcil
 import type { PaneReconcileRequest } from '@shared/ws-protocol'
 import {
   derivePaneOwnerDivergence,
+  resolveCanonicalPaneSession,
   selectPaneOwnerFence,
   selectSessionRuntimeOwner,
 } from '@/store/selectors/runtimeOwner'
@@ -792,11 +793,19 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   // terminal as live (no attach / auto-reattach attempts) and Task 9's
   // terminal-side recovery card renders with the direct "Open as Fresh
   // Agent here" action.
-  const terminalRuntimeOwner = useAppSelector((s) => (
-    terminalContent?.sessionRef
-      ? selectSessionRuntimeOwner(s, terminalContent.sessionRef.provider, terminalContent.sessionRef.sessionId)
+  const terminalRuntimeOwner = useAppSelector((s) => {
+    // b8ke ext r7 F3: the pane's identity resolves through the stored
+    // rekey alias chain to the CANONICAL key (the same resolver the
+    // Fresh Agent panes use) — a terminal pane holding the pre-rekey
+    // sessionRef observes the canonical record's CURRENT state, never the
+    // old key's frozen mirror (pre-r7 a later canonical-only transition
+    // left the pane on the stale mirror's owner state).
+    if (!terminalContent?.sessionRef) return undefined
+    const canonical = resolveCanonicalPaneSession(s, terminalContent)
+    return canonical
+      ? selectSessionRuntimeOwner(s, canonical.provider, canonical.sessionId)
       : undefined
-  ))
+  })
   const freshAgentOwnerDivergence = derivePaneOwnerDivergence(terminalRuntimeOwner, 'terminal')
   const freshAgentOwnerDivergenceRef = useRef(freshAgentOwnerDivergence)
   freshAgentOwnerDivergenceRef.current = freshAgentOwnerDivergence

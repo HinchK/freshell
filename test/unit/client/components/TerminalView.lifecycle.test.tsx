@@ -3631,6 +3631,92 @@ describe('TerminalView lifecycle updates', () => {
       })
     })
 
+    it('b8ke ext r7: a terminal pane holding the PRE-REKEY id resolves the alias chain to the canonical owner', async () => {
+      // The pane's sessionRef names the OLD durable id; the runtime-owners
+      // map carries the multi-hop rekey mirror chain (old → mid →
+      // canonical) and the CANONICAL key holds a fresh-agent owner. The
+      // terminal pane must observe the CANONICAL record through the chain
+      // (pre-r7 it selected the old key raw — no divergence, no recovery
+      // card).
+      const { store } = setupTypedPane({
+        content: {
+          status: 'running',
+          terminalId: 't-dead',
+        },
+      })
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+      })
+
+      act(() => {
+        // The multi-hop chain: old → mid → canonical.
+        store.dispatch(applyRuntimeOwner({
+          type: 'session.runtimeOwner',
+          provider: 'codex',
+          sessionId: TYPED_SESSION_ID,
+          epoch: 1,
+          generation: 2,
+          ownerKind: 'fresh-agent',
+          operationId: 'rekey-1',
+          transition: 'handoff-committed',
+          aliasOf: 'mid-key',
+        }))
+        store.dispatch(applyRuntimeOwner({
+          type: 'session.runtimeOwner',
+          provider: 'codex',
+          sessionId: 'mid-key',
+          epoch: 1,
+          generation: 2,
+          ownerKind: 'fresh-agent',
+          operationId: 'rekey-1',
+          transition: 'handoff-committed',
+          aliasOf: 'canonical-key',
+        }))
+        store.dispatch(applyRuntimeOwner({
+          type: 'session.runtimeOwner',
+          provider: 'codex',
+          sessionId: 'canonical-key',
+          epoch: 1,
+          generation: 2,
+          ownerKind: 'fresh-agent',
+          operationId: 'handoff-to-fresh',
+          transition: 'handoff-committed',
+        }))
+      })
+
+      // A LATER canonical-only transition: the canonical key moves to
+      // handoff-STARTED (in progress) while the old-key mirror stays the
+      // frozen handoff-committed record. The pane must observe the
+      // CANONICAL state through the chain — the in-progress transition
+      // card (pre-r7 the raw old-key selection rendered the stale
+      // committed mirror with its open action).
+      act(() => {
+        store.dispatch(applyRuntimeOwner({
+          type: 'session.runtimeOwner',
+          provider: 'codex',
+          sessionId: 'canonical-key',
+          epoch: 1,
+          generation: 3,
+          ownerKind: 'fresh-agent',
+          operationId: 'handoff-back-2',
+          transition: 'handoff-started',
+        }))
+      })
+
+      // THE CONTRACT: the pane follows the CANONICAL record's
+      // handoff-started state — the in-progress (non-committed) divergence
+      // card with NO open action (the raw old-key selection would render
+      // the stale committed mirror's "open as a Fresh Agent pane on
+      // another device" text WITH the Open-as-Fresh-Agent button).
+      const card = await screen.findByTestId('terminal-owner-divergence-card')
+      expect(card).toHaveAttribute('role', 'alert')
+      expect(card).toHaveTextContent(/being reopened as a Fresh Agent pane elsewhere/i)
+      expect(
+        screen.queryByRole('button', { name: 'Open as Fresh Agent here' }),
+      ).toBeNull()
+    })
+
     it('a terminal pane whose session is fresh-agent-owned renders the recovery card with a direct open action', async () => {
       const { store } = setupTypedPane({
         content: {

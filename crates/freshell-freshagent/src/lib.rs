@@ -1452,6 +1452,42 @@ impl FreshAgentState {
         }
     }
 
+    /// b8ke ext r7 F3: [`Self::ownership_snapshot`] with the coordinator's
+    /// ALIAS CHAIN resolved to the canonical key — the pane-recovery
+    /// read. A superseded (rekeyed) session id answers with the CANONICAL
+    /// record's state (the rekey mirrors the owner state onto the old key,
+    /// but the old key is Aliased forever: a consumer that observes the raw
+    /// key dead-ends on the alias state instead of following the live
+    /// canonical owner).
+    pub fn canonical_ownership_snapshot(
+        &self,
+        provider: &str,
+        session_id: &str,
+    ) -> freshell_ownership::OwnershipSnapshot {
+        match &self.ownership {
+            Some(registry) => {
+                let canonical = registry.resolve_canonical(provider, session_id);
+                registry.observe(provider, &canonical)
+            }
+            None => freshell_ownership::OwnershipSnapshot {
+                epoch: 0,
+                generation: 0,
+                state: freshell_ownership::OwnershipState::Vacant,
+            },
+        }
+    }
+
+    /// b8ke ext r7 F3: the coordinator's alias-chain fixpoint for
+    /// `(provider, session_id)` — pane recovery resolves the caller's raw
+    /// id through this before any identity-seam lookup (the canonical key
+    /// is the identity the resolvable terminal lives under).
+    pub fn resolve_canonical_session(&self, provider: &str, session_id: &str) -> String {
+        match &self.ownership {
+            Some(registry) => registry.resolve_canonical(provider, session_id),
+            None => session_id.to_string(),
+        }
+    }
+
     /// The watchdog's raw-teardown hook for opencode (kata b8ke Task 3): the
     /// shared `opencode serve` daemon is NOT the per-session writer and must
     /// NEVER be killed (OpenCode invariant); an uncommitted `Starting`

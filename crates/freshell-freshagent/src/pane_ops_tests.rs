@@ -1541,6 +1541,97 @@ async fn attach_pane_binds_a_terminal_owned_session_and_broadcasts_pane_attach()
         .kill(&shell_terminal_id);
 }
 
+/// b8ke ext r7 F3: pane recovery resolves the coordinator's ALIAS CHAIN —
+/// a pre-rekey sessionRef follows the canonical live owner and ATTACHES,
+/// never the raw key's Aliased→HANDOFF_IN_PROGRESS dead end (the rekey
+/// mirrors the canonical owner state onto the old key, so a superseded
+/// pane holding the pre-rekey sessionRef must converge on the canonical
+/// runtime).
+#[tokio::test]
+async fn attach_pane_for_a_rekeyed_session_resolves_the_canonical_owner() {
+    const OLD_SID: &str = "33333333-4444-5555-8666-777777777777";
+    const CANONICAL_SID: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const TID: &str = "t-r7-canonical-owner";
+    let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+    let state = state_with_registry()
+        .with_ownership(ownership.clone())
+        .with_session_identity(Arc::new(Task10SessionIdentity {
+            provider: "claude",
+            session_id: CANONICAL_SID,
+            terminal_id: TID,
+        }));
+    let registry = state.terminal_registry.clone().unwrap();
+    registry.register_headless(freshell_terminal::registry::HeadlessTerminal {
+        terminal_id: TID.to_string(),
+        stream_id: "s-r7".to_string(),
+        mode: "claude".to_string(),
+        resume_session_id: Some(CANONICAL_SID.to_string()),
+        create_request_id: None,
+        created_at: None,
+    });
+    // The live terminal owner under the OLD key, then the rekey: OLD becomes
+    // Aliased{to: CANONICAL} and the CANONICAL key holds Live{Terminal}
+    // (committed without a terminal id so the identity seam is the
+    // resolving surface).
+    let generation = task10_seed_live_owner(
+        &ownership,
+        "claude",
+        OLD_SID,
+        freshell_ownership::RuntimeOwnerKind::Terminal,
+        None,
+    );
+    assert!(matches!(
+        ownership.rekey_live(
+            "claude",
+            OLD_SID,
+            CANONICAL_SID,
+            "task10-live-key",
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                terminal_id: None,
+                live_session_key: Some("task10-live-key".to_string()),
+                pid: None,
+                ownership_id: Some("op-task10".to_string()),
+            },
+            "test-rekey",
+            "op-rekey-r7",
+        ),
+        freshell_ownership::CommitOutcome::Committed
+    ));
+    assert!(matches!(
+        ownership.observe("claude", OLD_SID).state,
+        freshell_ownership::OwnershipState::Aliased { .. }
+    ));
+
+    let router = app(state.clone());
+    let (tab_id, pane_id, shell_terminal_id) = create_shell_tab(router.clone()).await;
+
+    // THE CONTRACT: the pre-rekey sessionRef's recovery follows the alias
+    // chain to the CANONICAL owner and attaches (pre-r7 the raw Aliased
+    // state fell to HANDOFF_IN_PROGRESS).
+    let (status, body) = post(
+        router,
+        &format!("/api/panes/{pane_id}/attach"),
+        json!({ "sessionRef": { "provider": "claude", "sessionId": OLD_SID } }),
+        true,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the rekeyed session's recovery attaches through the canonical owner: {body}"
+    );
+    assert_eq!(body["data"]["ok"], json!(true));
+    assert_eq!(body["data"]["terminalId"], json!(TID));
+    let _ = generation;
+    let _ = tab_id;
+    state
+        .terminal_registry
+        .clone()
+        .unwrap()
+        .kill(&shell_terminal_id);
+}
+
 /// kata b8ke Task 10: attach for a session owned by a live FRESH-AGENT
 /// runtime answers the typed 409 owner info — never a blind rebind, and
 /// (per the ownership-first contract) never a "pane not found" even for a

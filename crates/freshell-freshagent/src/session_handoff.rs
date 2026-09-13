@@ -3145,7 +3145,21 @@ impl SessionHandoffRunner {
             loop {
                 match prior.kind {
                     RuntimeOwnerKind::Terminal => {
-                        if let Some(tid) = prior.terminal_id.as_deref() {
+                        // b8ke ext r7 F5: the recorded PID's OS-level death
+                        // is the confirmation — NEVER the registry row's
+                        // disappearance (kill_internal removes the row BEFORE
+                        // the blocking kill/reap, so a concurrent kill can
+                        // create a short row-absent/live-pid window; the
+                        // row-based predicate released the fence over the
+                        // still-live prior in that window). The pid-less
+                        // degenerate identity keeps the row-based poll (no
+                        // concurrent-kill window can apply to a pid-less
+                        // row).
+                        if let Some(pid) = prior.pid {
+                            if !freshell_terminal::registry::pid_alive(pid) {
+                                return ReapAnswer::Confirmed;
+                            }
+                        } else if let Some(tid) = prior.terminal_id.as_deref() {
                             await_terminal_dead(&registry, tid).await;
                             return ReapAnswer::Confirmed;
                         }
