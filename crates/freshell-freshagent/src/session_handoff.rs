@@ -90,6 +90,15 @@ pub struct HandoffTestHooks {
     pub pause_in_failure_truth_broadcast: Option<std::sync::Arc<tokio::sync::Notify>>,
     pub pause_in_failure_truth_once: std::sync::atomic::AtomicBool,
     pub pause_in_failure_truth_parked: std::sync::atomic::AtomicBool,
+    /// b8ke e4r3 F1: park `broadcast_post_abort_authority` AT ENTRY —
+    /// BEFORE its snapshot observe — the deterministic hold for the
+    /// foreign-commit-during-the-abort-broadcast-window race (the test
+    /// lets another device's claim commit while the queued abort
+    /// broadcast waits). The ONCE flag parks only the first call; the
+    /// PARKED flag signals the hold engaged; never armed in production.
+    pub pause_post_abort_broadcast: Option<std::sync::Arc<tokio::sync::Notify>>,
+    pub pause_post_abort_broadcast_once: std::sync::atomic::AtomicBool,
+    pub pause_post_abort_broadcast_parked: std::sync::atomic::AtomicBool,
     /// Ordered step labels ("Reaped", "TargetStarted") — test assertions.
     pub events: std::sync::Mutex<Vec<&'static str>>,
 }
@@ -112,6 +121,9 @@ impl Default for HandoffTestHooks {
             pause_in_failure_truth_broadcast: None,
             pause_in_failure_truth_once: std::sync::atomic::AtomicBool::new(false),
             pause_in_failure_truth_parked: std::sync::atomic::AtomicBool::new(false),
+            pause_post_abort_broadcast: None,
+            pause_post_abort_broadcast_once: std::sync::atomic::AtomicBool::new(false),
+            pause_post_abort_broadcast_parked: std::sync::atomic::AtomicBool::new(false),
             events: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -1978,6 +1990,9 @@ impl SessionHandoffRunner {
             operation_id,
             payload.target_kind,
             prior.as_ref().map(|(owner, _)| owner.kind),
+            // b8ke e4r3 F1: the abort's OWN generation — the broadcast
+            // refuses to publish when the record has moved on.
+            *generation,
         )
         .await;
         tracing::warn!(target: "freshell_ownership",
@@ -2008,8 +2023,53 @@ impl SessionHandoffRunner {
         operation_id: &str,
         target_kind: RuntimeOwnerKind,
         previous_kind: Option<RuntimeOwnerKind>,
+        abort_generation: u64,
     ) {
+        // b8ke e4r3 F1: the deterministic entry hold for the
+        // foreign-commit race test — park BEFORE the snapshot observe
+        // (never armed in production; the ONCE flag parks only the first
+        // call).
+        if let Some(hooks) = self.test_hooks.as_ref() {
+            if hooks
+                .pause_post_abort_broadcast_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                if let Some(pause) = hooks.pause_post_abort_broadcast.as_ref() {
+                    hooks
+                        .pause_post_abort_broadcast_parked
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    let _ = pause.notified().await;
+                }
+            }
+        }
         let snapshot = self.ownership.observe(provider, session_id);
+        // b8ke e4r3 F1: the abort broadcast is ORDERED with the failed
+        // transition — the sync-abort path releases the coordinator
+        // (disarm_and_fail) and then queues this broadcast as an
+        // independent task, so a lifecycle request on another device can
+        // claim and commit the NEXT generation before the task runs.
+        // REFUSE to publish when the observed generation has moved past
+        // the abort's own: the record belongs to the newer operation,
+        // whose own frames own it. (Pre-e4r3 this task observed the new
+        // Live state and stamped the OLD operation's
+        // RUNNER_ABORTED/handoff-failed frame with the NEW generation —
+        // the client folds every same-generation frame, so the stale
+        // abort frame overwrote the new operation's handoff-committed
+        // transition, leaving opposite-kind panes at "being reopened
+        // elsewhere" with the attach action suppressed.)
+        if snapshot.generation != abort_generation {
+            tracing::warn!(target: "freshell_ownership",
+                operation_id = %operation_id, provider = %provider, session_id = %session_id,
+                epoch = self.ownership.boot_epoch(),
+                abort_generation,
+                observed_generation = snapshot.generation,
+                event = "ownership.handoff.abort_broadcast_superseded",
+                "the post-abort broadcast was superseded — the record moved to \
+                 a newer generation before the queued task ran; the newer \
+                 operation's own frames own the record"
+            );
+            return;
+        }
         let cleanup_req = self.cleanup_request(provider, session_id, target_kind);
         match &snapshot.state {
             freshell_ownership::OwnershipState::Fenced {
@@ -3540,6 +3600,9 @@ impl Drop for HandoffGuard {
             let operation_id = self.operation_id.clone();
             let target_kind = self.target_kind;
             let previous_kind = self.prior.as_ref().map(|(owner, _)| owner.kind);
+            // b8ke e4r3 F1: the abort's OWN generation — the queued
+            // broadcast refuses to publish when the record has moved on.
+            let abort_generation = self.generation;
             handle.spawn(async move {
                 runner
                     .broadcast_post_abort_authority(
@@ -3548,6 +3611,7 @@ impl Drop for HandoffGuard {
                         &operation_id,
                         target_kind,
                         previous_kind,
+                        abort_generation,
                     )
                     .await;
             });

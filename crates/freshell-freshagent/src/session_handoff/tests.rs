@@ -2551,6 +2551,127 @@ async fn a_watcher_release_mid_failure_window_leaves_the_final_frame_resolved() 
     rig.registry.kill(&target_terminal);
 }
 
+/// b8ke e4r3 F1: the sync-abort path's queued authoritative broadcast is
+/// ORDERED with the failed transition — a lifecycle request on another
+/// device claims and commits the NEXT generation while the queued task
+/// waits, and the task must REFUSE to publish over the moved-on record
+/// (pre-e4r3 it observed the NEW Live state and stamped the OLD
+/// operation's RUNNER_ABORTED/handoff-failed frame with the NEW
+/// generation — the client folds every same-generation frame, so the
+/// stale abort frame overwrote the committed owner's handoff-committed
+/// transition and opposite-kind panes stayed at "being reopened
+/// elsewhere" with the attach action suppressed until reconnect).
+#[tokio::test]
+async fn a_foreign_commit_during_the_abort_broadcast_window_is_never_overwritten() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let abort_broadcast_pause = Arc::new(tokio::sync::Notify::new());
+    let hooks = Arc::new(HandoffTestHooks {
+        pause_after_enter: Some(tokio::sync::Notify::new()),
+        pause_post_abort_broadcast: Some(Arc::clone(&abort_broadcast_pause)),
+        pause_post_abort_broadcast_once: std::sync::atomic::AtomicBool::new(true),
+        ..HandoffTestHooks::default()
+    });
+    let mut rig = build_rig(Some(Arc::clone(&hooks)));
+    establish_fresh_claude_owner(&rig, &sid).await;
+
+    // Handoff 1 parks right after the coordinator enter. The abort lands
+    // in the sync-unwind window (nothing spawned, no kill in flight): the
+    // Drop fails the record — restoring the prior at the handoff's
+    // generation — and queues the authoritative broadcast, which PARKS at
+    // its entry (before its snapshot observe).
+    let first = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let _ = await_owner_frames(&mut rig.rx, &["handoff-started"]).await;
+    first.abort();
+    let _ = first.task.await;
+    await_cond("the queued abort broadcast must park at its entry", || {
+        hooks
+            .pause_post_abort_broadcast_parked
+            .load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
+    let abort_generation = {
+        let snap = rig.ownership.observe("claude", &sid);
+        assert!(
+            matches!(snap.state, OwnershipState::Live { .. }),
+            "the sync abort must restore the untouched prior — got {:?}",
+            snap.state
+        );
+        snap.generation
+    };
+
+    // ANOTHER DEVICE's lifecycle request claims and commits the NEXT
+    // generation while the abort broadcast waits: the enter permit lets
+    // handoff 2 pass the enter, reap the prior, spawn the terminal
+    // target, and commit handoff-committed.
+    hooks
+        .pause_after_enter
+        .as_ref()
+        .expect("the enter pause is armed")
+        .notify_one();
+    let second = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let frames = await_owner_frames(&mut rig.rx, &["handoff-committed"]).await;
+    let committed = runtime_owner_frame(&frames, "handoff-committed");
+    assert_eq!(
+        committed["generation"],
+        json!(abort_generation + 1),
+        "the foreign handoff committed the NEXT generation: {frames:?}"
+    );
+    let committed_terminal = committed["terminalId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    // Release the queued abort broadcast. THE CONTRACT: the committed
+    // owner's handoff-committed frame is the FINAL frame — no stale abort
+    // frame stamped with the new generation (pre-e4r3 the stale
+    // RUNNER_ABORTED/handoff-failed frame postceded and overwrote it).
+    abort_broadcast_pause.notify_one();
+    let result = second.completion.await.expect("handoff 2 completed");
+    assert_eq!(result["ok"], json!(true), "handoff 2 commits: {result}");
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    // The frames AFTER the release: the queued abort broadcast must have
+    // published NOTHING over the moved-on record.
+    let new_frames = drain_runtime_owner_frames(&mut rig.rx);
+    assert!(
+        !new_frames.iter().any(|f| {
+            f["transition"] == json!("handoff-failed")
+                && f["reason"] == json!("RUNNER_ABORTED")
+                && f["generation"] == json!(abort_generation + 1)
+        }),
+        "no stale abort frame is stamped with the committed owner's \
+         generation: {new_frames:?}"
+    );
+    // THE FINAL-frame contract: the committed owner's handoff-committed
+    // frame is the client's final state.
+    let mut all_frames = frames;
+    all_frames.extend(new_frames);
+    let final_frame = all_frames.last().expect("at least one frame");
+    assert_eq!(
+        final_frame["transition"],
+        json!("handoff-committed"),
+        "the committed owner's handoff-committed frame is the final one — \
+         the queued abort broadcast refused to publish over the moved-on \
+         record: {all_frames:?}"
+    );
+    assert_eq!(
+        final_frame["generation"],
+        json!(abort_generation + 1),
+        "the final frame rides the committed owner's generation: {all_frames:?}"
+    );
+
+    // Cleanup: reap the committed terminal.
+    rig.registry.kill(&committed_terminal);
+}
+
 /// b8ke e4r1 F1 control: a CONFIRMED target reap (the key truly ends
 /// Vacant) still broadcasts the truthful vacancy — the fix tightens the
 /// fenced/in-progress conversion, never the honest one. The done outcome
