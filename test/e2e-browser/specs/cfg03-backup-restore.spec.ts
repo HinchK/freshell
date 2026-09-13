@@ -305,7 +305,7 @@ test.describe('CFG-03 backup/fallback matrix', () => {
       const settings = await getSettings(server.baseUrl, token)
       // Both kinds: ordinary defaults, no forensic/corrupt artifacts of any
       // kind should exist for a plain fresh install.
-      expect(settings.safety.autoKillIdleMinutes).toBe(LEGACY_DEFAULT_AUTO_KILL_MINUTES)
+      expect(settings.safety.autoKillIdleMinutes).toBe(DEFAULT_AUTO_KILL_MINUTES)
       const entries = await fsp.readdir(freshellDir)
       expect(entries.some((name) => name.includes('.corrupt-'))).toBe(false)
     } finally {

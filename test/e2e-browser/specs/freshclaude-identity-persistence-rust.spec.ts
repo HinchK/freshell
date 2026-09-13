@@ -154,6 +154,33 @@ function findFreshAgentLeaf(node: any): any {
   return null
 }
 
+async function persistedFreshAgentIdentity(page: Page, tabId: string): Promise<string> {
+  return page.evaluate((id) => {
+    const raw = window.localStorage.getItem('freshell.layout.v3')
+    if (!raw) return ''
+    try {
+      const layout = JSON.parse(raw)
+      const visit = (node: any): string => {
+        if (!node) return ''
+        if (node.type === 'leaf' && node.content?.kind === 'fresh-agent') {
+          return node.content.sessionRef?.sessionId
+            ?? node.content.resumeSessionId
+            ?? node.content.sessionId
+            ?? ''
+        }
+        for (const child of node.children ?? []) {
+          const found = visit(child)
+          if (found) return found
+        }
+        return ''
+      }
+      return visit(layout?.panes?.layouts?.[id])
+    } catch {
+      return ''
+    }
+  }, tabId)
+}
+
 /** Send one chat turn in the last fresh-agent pane and wait for idle. */
 async function sendFreshAgentTurn(
   page: Page,
@@ -374,6 +401,14 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
         .poll(async () => durableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId!))), { timeout: 15_000 })
         .toMatch(CANONICAL_UUID_RE)
       const originalDurable: string = durableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId!)))
+
+      // Wait for the real 500 ms debounce to persist the identity. This does
+      // not dispatch the test-only flush action: it proves the natural writer
+      // completed before navigation, removing cloud scheduling from whether
+      // the behavior under test gets exercised.
+      await expect
+        .poll(() => persistedFreshAgentIdentity(page, tabId!), { timeout: 15_000 })
+        .toBe(originalDurable)
 
       // Audit the reload window like test 1 does (any create fired must
       // carry the original id -- never a bare identity-losing create).

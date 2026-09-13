@@ -156,6 +156,18 @@ function authed(info: E2eServerInfo): Record<string, string> {
   return { 'content-type': 'application/json', 'x-auth-token': info.token }
 }
 
+async function createMachine(info: E2eServerInfo, label: string): Promise<string> {
+  const response = await fetch(`${info.baseUrl}/api/machines`, {
+    method: 'POST',
+    headers: authed(info),
+    body: JSON.stringify({ label }),
+  })
+  expect(response.status).toBe(200)
+  const body = await response.json() as { machine?: { id?: unknown } }
+  expect(typeof body.machine?.id).toBe('string')
+  return body.machine!.id as string
+}
+
 /** POST /api/tabs (fresh-agent agent:opencode lane) with an arbitrary body. */
 async function postCreateTab(info: E2eServerInfo, body: Record<string, unknown>) {
   const res = await fetch(`${info.baseUrl}/api/tabs`, {
@@ -541,19 +553,21 @@ test.describe('REST fresh-agent resume + registry placeholder clamp (Task 6, rus
     try {
       const info = await server.start()
       const now = Date.now()
+      const primaryMachineId = await createMachine(info, 'Task 6 Device')
+      const observerMachineId = await createMachine(info, 'Task 6 Observer')
 
       // Client-B is a LATER client instance on the SAME device (the
       // page-reload/re-push window where the regression shipped): its
       // snapshot carries the same tabKeys+paneIds, so same-device identity
       // fields must match across both envelopes.
       const identityA: ClientIdentity = {
-        deviceId: 'task6-device',
+        deviceId: primaryMachineId,
         deviceLabel: 'Task 6 Device',
         clientInstanceId: 'task6-client-a',
       }
       const identityB: ClientIdentity = { ...identityA, clientInstanceId: 'task6-client-b' }
       const identityC: ClientIdentity = {
-        deviceId: 'task6-observer',
+        deviceId: observerMachineId,
         deviceLabel: 'Task 6 Observer',
         clientInstanceId: 'task6-client-c',
       }

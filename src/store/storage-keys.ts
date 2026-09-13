@@ -22,6 +22,9 @@ export const STORAGE_KEYS = {
   inputHistory: 'freshell.input-history.v1',
 } as const
 
+export const STORAGE_VERSION_KEY = 'freshell_version'
+export const STORAGE_VERSION = 5
+
 export const LAYOUT_STORAGE_KEY = STORAGE_KEYS.layout
 export const LAYOUT_BACKUP_STORAGE_KEY = STORAGE_KEYS.layoutBackup
 export const TABS_STORAGE_KEY = STORAGE_KEYS.tabs

@@ -7,6 +7,31 @@ import {
   installRecoveryOfferAutoDeclineOnContext,
   type RecoveryOfferHandling,
 } from './recovery-offer.js'
+import {
+  MACHINE_ID_STORAGE_KEY,
+  STORAGE_VERSION,
+  STORAGE_VERSION_KEY,
+} from '../../../src/store/storage-keys.js'
+
+type MachineIdentityHandling = 'auto-select' | 'manual'
+
+async function createTestMachine(serverInfo: E2eServerInfo): Promise<string> {
+  const headers = { 'x-auth-token': serverInfo.token }
+  const created = await fetch(`${serverInfo.baseUrl}/api/machines`, {
+    method: 'POST',
+    headers: { ...headers, 'content-type': 'application/json' },
+    body: JSON.stringify({ label: `Playwright test machine ${Date.now()}` }),
+  })
+  if (!created.ok) {
+    throw new Error(`Could not create E2E machine: HTTP ${created.status}`)
+  }
+  const createBody = await created.json() as { machine?: { id?: unknown } }
+  const createdId = createBody.machine?.id
+  if (typeof createdId !== 'string' || createdId.length === 0) {
+    throw new Error('E2E machine response did not contain an id')
+  }
+  return createdId
+}
 
 /**
  * Select a shell from the PanePicker, handling the race condition where
@@ -73,6 +98,10 @@ export const test = base.extend<{
    * that OWN panel assertions opt out: test.use({ recoveryOfferHandling: 'manual' }).
    */
   recoveryOfferHandling: RecoveryOfferHandling
+  /** Select this test's isolated server-owned machine before App bootstrap. */
+  machineIdentityHandling: MachineIdentityHandling
+  /** Stable server-owned machine shared by contexts inside this test. */
+  e2eMachineId: string
 }, {
   // NOTE: testServer is worker-scoped, so its TYPE belongs in the
   // worker-scope generic group — declaring it in the test-scope group used to
@@ -82,6 +111,7 @@ export const test = base.extend<{
   testServer: E2eServerHandle
 }>({
   recoveryOfferHandling: ['auto-decline', { option: true }],
+  machineIdentityHandling: ['auto-select', { option: true }],
 
   // RESTORE-01 — every page of the default context carries the
   // recovery-offer auto-decline watcher (the harness answering a designed
@@ -90,9 +120,22 @@ export const test = base.extend<{
   // `browser.newContext()` pages bypass it; those specs adopt
   // `installRecoveryOfferAutoDeclineOnContext` directly (multi-client,
   // `recoveryOfferHandling: 'manual'` (panel-owning specs).
-  context: async ({ context, recoveryOfferHandling }, use) => {
+  context: async ({ context, recoveryOfferHandling, machineIdentityHandling, e2eMachineId, testServer }, use) => {
     if (recoveryOfferHandling === 'auto-decline') {
       installRecoveryOfferAutoDeclineOnContext(context)
+    }
+    if (machineIdentityHandling === 'auto-select') {
+      await context.addInitScript(({ machineKey, machineId, serverOrigin, versionKey, version }) => {
+        if (window.location.origin !== serverOrigin) return
+        localStorage.setItem(versionKey, String(version))
+        localStorage.setItem(machineKey, machineId)
+      }, {
+        machineKey: MACHINE_ID_STORAGE_KEY,
+        machineId: e2eMachineId,
+        serverOrigin: new URL(testServer.info.baseUrl).origin,
+        versionKey: STORAGE_VERSION_KEY,
+        version: STORAGE_VERSION,
+      })
     }
     await use(context)
   },
@@ -109,6 +152,13 @@ export const test = base.extend<{
     await use(server)
     await server.stop()
   }, { scope: 'worker' }],
+
+  // Each test gets a distinct machine so the worker-scoped server cannot
+  // restore the preceding test's workspace into a fresh browser context.
+  // The id remains stable for every context that one test intentionally uses.
+  e2eMachineId: async ({ testServer }, use) => {
+    await use(await createTestMachine(testServer.info))
+  },
 
   serverInfo: async ({ testServer }, use) => {
     await use(testServer.info)
