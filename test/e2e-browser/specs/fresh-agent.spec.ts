@@ -1738,7 +1738,7 @@ test.describe('expansion defaults and settings', () => {
     await expect(strip.getByText('weighing which files to read first')).toHaveCount(0)
     // Click Thinking → the body opens while the strip stays compact.
     await thinking.click()
-    await expect(strip.getByText('weighing which files to read first').first()).toBeVisible()
+    await expect(strip.locator('.fresh-agent-thinking-body', { hasText: 'weighing which files to read first' })).toBeVisible()
     // Expanding the strip reveals the tool row; the thinking row stays
     // visible AND its user-opened body REMAINS expanded (the thinking-row
     // expansion is independent of the strip's tool disclosure). The tool row
@@ -1748,7 +1748,7 @@ test.describe('expansion defaults and settings', () => {
     // body).
     await strip.getByRole('button', { name: 'Toggle activity details' }).click()
     await expect(strip.getByRole('button', { name: 'Read tool call' })).toHaveCount(1)
-    await expect(strip.getByText('weighing which files to read first').first()).toBeVisible()
+    await expect(strip.locator('.fresh-agent-thinking-body', { hasText: 'weighing which files to read first' })).toBeVisible()
     await strip.getByRole('button', { name: 'Read tool call' }).click()
     await expect(pane.locator('pre[data-tool-input]').filter({ hasText: 'src/a.ts' })).toBeVisible()
     await expect(strip.getByRole('button', { name: 'Thinking' })).toBeVisible()
@@ -1757,7 +1757,7 @@ test.describe('expansion defaults and settings', () => {
     await strip.getByRole('button', { name: 'Toggle activity details' }).click()
     await expect(strip).toContainText('thought · 1 tool used')
     await expect(strip.getByRole('button', { name: 'Thinking' })).toBeVisible()
-    await expect(strip.getByText('weighing which files to read first').first()).toBeVisible()
+    await expect(strip.locator('.fresh-agent-thinking-body', { hasText: 'weighing which files to read first' })).toBeVisible()
   })
 
   test('the Expand tools setting starts strips expanded on return from settings', async ({ freshellPage: _freshellPage, page, terminal }) => {
@@ -1791,6 +1791,10 @@ test.describe('expansion defaults and settings', () => {
     // The strip now STARTS expanded: tool detail rows with no click.
     await expect(stripAfter.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'true')
     await expect(stripAfter.getByRole('button', { name: 'Read tool call' })).toHaveCount(1)
+    // The tool BLOCK also starts expanded under the setting — its raw input
+    // renders with no tool-block click, pinning the switch's full
+    // user-visible semantics end-to-end.
+    await expect(stripAfter.locator('pre[data-tool-input]').filter({ hasText: 'src/a.ts' })).toBeVisible()
     // Thinking trigger still present in the expanded state.
     await expect(stripAfter.getByRole('button', { name: 'Thinking' })).toBeVisible()
 
@@ -1839,7 +1843,7 @@ test.describe('expansion defaults and settings', () => {
     await expect(stripAfter.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'false')
     const thinkingAfter = stripAfter.getByRole('button', { name: 'Thinking' })
     await expect(thinkingAfter).toHaveAttribute('aria-expanded', 'true')
-    await expect(stripAfter.getByText('weighing which files to read first').first()).toBeVisible()
+    await expect(stripAfter.locator('.fresh-agent-thinking-body', { hasText: 'weighing which files to read first' })).toBeVisible()
 
     // Flip it back off: the next remount starts the rows collapsed again.
     await page.getByRole('button', { name: 'Settings (Ctrl+B ,)' }).click()

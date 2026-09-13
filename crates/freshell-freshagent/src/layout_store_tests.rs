@@ -1244,3 +1244,51 @@ fn update_from_ui_drops_legacy_display_override_keys_from_fresh_agent_content() 
     );
     assert_eq!(p2["showTimecodes"], json!(true));
 }
+
+/// Pins the documented passthrough asymmetry on unresolvable fresh-agent
+/// content: when BOTH `sessionType` and `provider` fail to resolve,
+/// `migrate_fresh_agent_kind` bails and the Rust layout mirror stores the
+/// payload VERBATIM — the legacy `showThinking`/`showTools` keys ride along
+/// untouched, because no field stripping runs on the passthrough path. The
+/// TS rehydration path (`persistedState.ts` `normalizeFreshAgentContent`)
+/// drops those keys unconditionally instead. The asymmetry is intentional:
+/// the mirror must not rewrite a payload whose shape it cannot resolve.
+#[test]
+fn update_from_ui_stores_unresolvable_fresh_agent_content_verbatim() {
+    let store = LayoutStore::default();
+    let sync = sync_from(json!({
+        "tabs": [{ "id": "t1" }],
+        "activeTabId": "t1",
+        "layouts": {
+            "t1": leaf("p1", json!({
+                "kind": "fresh-agent",
+                "sessionType": "not-a-session-type",
+                "provider": "not-a-provider",
+                "showThinking": false,
+                "showTools": true
+            })),
+        },
+        "activePane": { "t1": "p1" },
+        "timestamp": 1,
+    }));
+    store.update_from_ui(&sync, "conn");
+
+    let p = store
+        .get_pane_snapshot("p1")
+        .expect("p1")
+        .pane_content
+        .expect("content");
+    assert_eq!(p["kind"], json!("fresh-agent"));
+    assert_eq!(p["sessionType"], json!("not-a-session-type"));
+    assert_eq!(p["provider"], json!("not-a-provider"));
+    assert_eq!(
+        p["showThinking"],
+        json!(false),
+        "unresolvable payload passes through verbatim — legacy key rides along"
+    );
+    assert_eq!(
+        p["showTools"],
+        json!(true),
+        "unresolvable payload passes through verbatim — legacy key rides along"
+    );
+}

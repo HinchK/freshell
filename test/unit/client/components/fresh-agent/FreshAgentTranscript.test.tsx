@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { useLayoutEffect, useRef } from 'react'
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { createRoot, type Root } from 'react-dom/client'
 import { flushSync } from 'react-dom'
 import { FreshAgentTranscript, type FreshAgentTranscriptHandle } from '@/components/fresh-agent/FreshAgentTranscript'
@@ -544,7 +544,7 @@ describe('FreshAgentTranscript', () => {
   })
 
   it('treats trailing thinking in the latest turn as live activity', () => {
-    const { container } = render(
+    render(
       <FreshAgentTranscript
         turns={[
           {
@@ -561,10 +561,11 @@ describe('FreshAgentTranscript', () => {
 
     expect(screen.getByLabelText('running')).toBeInTheDocument()
     // The reel's status slot carries the 'Thinking' chip. (The hoisted
-    // thinking row renders its own 'Thinking' label alongside it — assert
-    // the REEL's name slot so the two text nodes can never collide in a
-    // strict getByText.)
-    expect(container.querySelector('[data-slot="name"]')).toHaveTextContent('Thinking')
+    // thinking row renders its own 'Thinking' label alongside it — scope
+    // the query to the reel's status element so the two text nodes can
+    // never collide in a strict getByText.)
+    const reel = screen.getByRole('status')
+    expect(within(reel).getByText('Thinking')).toBeInTheDocument()
     expect(screen.queryByText('still reasoning about the fix')).not.toBeInTheDocument()
   })
 
@@ -2236,8 +2237,8 @@ describe('FreshAgentTranscript', () => {
       rerender(<FreshAgentTranscript isStreaming turns={[turnA, turnB, turnC]} />)
       expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
       expect(screen.queryByText('Wrapping up shortly')).not.toBeInTheDocument()
-      // This is the POSITIVE fully-visible case: all turns are item-bearing and
-      // showThinking is on, so display filtering removes nothing and the
+      // This is the POSITIVE fully-visible case: all turns are item-bearing
+      // and thinking always renders, so nothing is filtered out and the
       // caption stashes.
       fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
       const caption = screen.getByTestId('fresh-agent-activity-caption')
@@ -2513,17 +2514,18 @@ describe('FreshAgentTranscript', () => {
           summary: '', summaryKind: 'echo' as const,
           items: [{ id: 'think-c', kind: 'thinking' as const, text: 'Final deliberation' }],
         }
-        const { container, rerender } = render(
+        const { rerender } = render(
           <FreshAgentTranscript isStreaming turns={[turnA, turnB, turnC]} />,
         )
         // Streaming: one merged line; the strip stays live on the merged
         // THINKING row — the spinner and the 'Thinking' reel survive even
         // though the line's final row is the stashed caption. (The hoisted
         // thinking row renders its own 'Thinking' label alongside the reel —
-        // assert the reel's name slot so the text nodes can't collide.)
+        // scope the query to the reel's status element so the text nodes
+        // can't collide.)
         expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
         expect(screen.getByLabelText('running')).toBeInTheDocument()
-        expect(container.querySelector('[data-slot="name"]')).toHaveTextContent('Thinking')
+        expect(within(screen.getByRole('status')).getByText('Thinking')).toBeInTheDocument()
         // The superseded caption is folded: nothing paints in the stream.
         expect(screen.queryByTestId('fresh-agent-tail-caption')).not.toBeInTheDocument()
         expect(screen.queryByText('Weighing the next file')).not.toBeInTheDocument()
@@ -2534,7 +2536,7 @@ describe('FreshAgentTranscript', () => {
         // settled branch's candidate either.
         rerender(<FreshAgentTranscript isStreaming={false} turns={[turnA, turnB, turnC]} />)
         expect(screen.getByLabelText('running')).toBeInTheDocument()
-        expect(container.querySelector('[data-slot="name"]')).toHaveTextContent('Thinking')
+        expect(within(screen.getByRole('status')).getByText('Thinking')).toBeInTheDocument()
         expect(screen.queryByText('Weighing the next file')).not.toBeInTheDocument()
 
         // The stashed caption lives inside the expansion, AFTER the merged

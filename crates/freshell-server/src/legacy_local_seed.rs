@@ -579,16 +579,16 @@ mod tests {
         assert_eq!(canonical_invalid, None);
     }
 
-    /// The `agentChat` -> `freshAgent` alias still merges shallowly with
-    /// canonical wins per key (`migrateLegacyFreshAgentSettingsInput`), but the
-    /// renamed pick list drops the legacy display keys: neither the agentChat
-    /// `showThinking`/`showTools` values nor the canonical `showThinking`
-    /// survive into the seed; only same-named survivors (`showTimecodes`)
-    /// carry.
+    /// The `agentChat` -> `freshAgent` alias merges shallowly with canonical
+    /// wins per key (`migrateLegacyFreshAgentSettingsInput`): `showTimecodes`
+    /// comes from canonical (true) over the conflicting legacy value (false).
+    /// The renamed pick list still drops the stale display keys — neither the
+    /// agentChat `showThinking`/`showTools` values nor the canonical
+    /// `showThinking` survive into the seed.
     #[test]
-    fn agent_chat_alias_drops_legacy_display_keys() {
+    fn agent_chat_alias_canonical_wins_per_key() {
         let raw = json!({
-            "agentChat": { "showThinking": false, "showTools": false, "enabled": true },
+            "agentChat": { "showThinking": false, "showTools": false, "showTimecodes": false, "enabled": true },
             "freshAgent": { "showThinking": true, "showTimecodes": true }
         });
         let seed = extract(raw).expect("seed extracted");
