@@ -1001,15 +1001,17 @@ test.describe('Restore Matrix', () => {
         // `recordTurns` makes each accepted turn a durable user/assistant
         // pair. The helper verifies the actual submit, provider reply, and
         // idle transition before the next turn begins.
-        async function sendLiveTurn(text: string): Promise<void> {
+        async function sendLiveTurn(text: string, expectedReplyCount: number): Promise<void> {
           await expect.poll(async () => {
             const layout = await harness.getPaneLayout(tabId!)
             return findFreshAgentLeaf(layout)?.content?.status
           }, { timeout: 20_000 }).toBe('idle')
           await composer.fill(text)
           await sendButton.click()
-          await expect(paneRoot.getByText(text)).toBeVisible({ timeout: 10_000 })
-          await expect(paneRoot.getByText('Fixture turn')).toBeVisible({ timeout: 20_000 })
+          await expect(paneRoot.getByText(text, { exact: true })).toBeVisible({ timeout: 10_000 })
+          const fixtureReplies = paneRoot.getByText('Fixture turn', { exact: true })
+          await expect(fixtureReplies).toHaveCount(expectedReplyCount, { timeout: 20_000 })
+          await expect(fixtureReplies.nth(expectedReplyCount - 1)).toBeVisible()
           await expect.poll(async () => {
             const layout = await harness.getPaneLayout(tabId!)
             return findFreshAgentLeaf(layout)?.content?.status
@@ -1021,8 +1023,8 @@ test.describe('Restore Matrix', () => {
         // assumed from the client's optimistic send.
         const turn1Text = `term02-restart-turn-one-${Math.random().toString(36).slice(2, 8)}`
         const turn2Text = `term02-restart-turn-two-${Math.random().toString(36).slice(2, 8)}`
-        await sendLiveTurn(turn1Text)
-        await sendLiveTurn(turn2Text)
+        await sendLiveTurn(turn1Text, 1)
+        await sendLiveTurn(turn2Text, 2)
 
         // These survive the second authoritative snapshot before the restart,
         // proving this is the fixture's durable transcript rather than two
@@ -1082,9 +1084,11 @@ test.describe('Restore Matrix', () => {
         // non-blank content (never silently blank/broken) and settles idle
         // -- "resumed streaming" in spirit, since the pane is interactive
         // again rather than stuck restoring.
-        await expect(page.locator('[data-context="fresh-agent"]').last().getByText('Fixture turn'))
-          .toBeVisible({ timeout: 20_000 })
         const resumedPane = page.locator('[data-context="fresh-agent"]').last()
+        const resumedReplies = resumedPane.getByText('Fixture turn', { exact: true })
+        await expect(resumedReplies).toHaveCount(2, { timeout: 20_000 })
+        await expect(resumedReplies.nth(0)).toBeVisible()
+        await expect(resumedReplies.nth(1)).toBeVisible()
         await expect(resumedPane.getByText(turn1Text)).toBeVisible({ timeout: 20_000 })
         await expect(resumedPane.getByText(turn2Text)).toBeVisible({ timeout: 20_000 })
         await expect.poll(async () => {
@@ -1323,52 +1327,19 @@ test.describe('Restore Matrix', () => {
   // transcript with every earlier turn still visible (no reload/restart in
   // this scenario -- SCENARIO 8 below covers the reload-mid-turn leg).
   // -------------------------------------------------------------------
-  // AGENT-02's acceptance text asks (as part of a combined reload+restart
-  // flow) for "exactly three user/assistant turn pairs". SCENARIO 5's own
-  // HONEST SCOPE NOTE already established that the fake Codex app-server
-  // (`test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs` -- out
-  // of scope for this pass, which owns only `test/e2e-browser/**`) always
-  // answers `turn/start` with the SAME static turn id (`makeTurn('turn-1')`)
-  // no matter how many turns are sent, so `thread/turns/list`/`thread/read`
-  // never reflect real submitted turn content -- a fixture limitation (a
-  // real provider that only ever emits one message string would behave
-  // identically), not a client defect.
-  //
-  // EMPIRICALLY DISCOVERED WHILE BUILDING THIS SCENARIO: that limitation
-  // reaches further than SCENARIO 5's assistant-side note describes. The
-  // client's own optimistic local-echo reconciliation
-  // (`FreshAgentView.tsx`'s `localEchoLanded`/`shouldClearStaleLocalEcho`)
-  // determines whether a just-sent user turn's echo has "landed" by
-  // looking for a matching `role: 'user'` entry in the freshly-fetched
-  // snapshot turns -- which this fixture NEVER provides (its turns are
-  // assistant-only). Depending on exactly when a `freshAgent.send.accepted`
-  // ack races against the next periodic snapshot re-fetch, a submitted
-  // turn's echo can be judged "stale" and cleared before ever being
-  // confirmed by anything else, so a SECOND or THIRD turn's own prompt text
-  // is not reliably guaranteed to remain simultaneously visible alongside
-  // earlier turns in this fixture -- confirmed by an earlier draft of this
-  // scenario that asserted exactly that and failed non-deterministically on
-  // the second turn's echo. That is a fixture/timing interaction (this pass
-  // owns only `test/e2e-browser/**`, not the fixture or the client), not
-  // something provable at the DOM layer with the tooling available here.
-  //
-  // What IS fully and DETERMINISTICALLY provable, and is this scenario's
-  // job: three DISTINCT, independently round-tripped live turns -- three
-  // separate `freshAgent.send` messages, one per typed prompt, each
-  // individually confirmed visible at send time and each settling the pane
-  // back to `idle` before the next is sent (proving real sequential
-  // round trips, never a rolling/collapsed single turn) -- matching
-  // SCENARIO 5's own already-established, proven-reliable per-turn-visible-
-  // at-send-time pattern exactly, just repeated a third time and backed by
-  // an explicit wire-level count assertion.
-  test('three sequential live Codex turns are each independently sent, visible at send time, and settle to idle', async ({ page }) => {
+  // The durable fixture transcript makes each user prompt and repeated
+  // assistant reply a post-snapshot receipt rather than a local echo.
+  test('three sequential live Codex turns persist distinct prompts and replies before settling idle', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-restore-matrix-codex-3turns-'))
     try {
       const fakeCodexPath = await installFakeCodexAppServer(path.join(sharedRoot, 'bin'))
 
       const server = await createE2eServerHandle(process.env, {
         construct: {
-          env: { CODEX_CMD: fakeCodexPath },
+          env: {
+            CODEX_CMD: fakeCodexPath,
+            FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({ recordTurns: true }),
+          },
           setupHome: async (homeDir) => {
             const freshellDir = path.join(homeDir, '.freshell')
             await fs.mkdir(freshellDir, { recursive: true })
@@ -1412,15 +1383,17 @@ test.describe('Restore Matrix', () => {
         const composer = paneRoot.getByRole('textbox', { name: 'Chat message input' })
         const sendButton = paneRoot.getByRole('button', { name: 'Send' })
 
-        async function sendLiveTurn(text: string): Promise<void> {
+        async function sendLiveTurn(text: string, expectedReplyCount: number): Promise<void> {
           await expect.poll(async () => {
             const layout = await harness.getPaneLayout(tabId!)
             return findFreshAgentLeaf(layout)?.content?.status
           }, { timeout: 20_000 }).toBe('idle')
           await composer.fill(text)
           await sendButton.click()
-          await expect(paneRoot.getByText(text)).toBeVisible({ timeout: 10_000 })
-          await expect(paneRoot.getByText('Fixture turn')).toBeVisible({ timeout: 20_000 })
+          await expect(paneRoot.getByText(text, { exact: true })).toBeVisible({ timeout: 10_000 })
+          const fixtureReplies = paneRoot.getByText('Fixture turn', { exact: true })
+          await expect(fixtureReplies).toHaveCount(expectedReplyCount, { timeout: 20_000 })
+          await expect(fixtureReplies.nth(expectedReplyCount - 1)).toBeVisible()
           await expect.poll(async () => {
             const layout = await harness.getPaneLayout(tabId!)
             return findFreshAgentLeaf(layout)?.content?.status
@@ -1432,21 +1405,16 @@ test.describe('Restore Matrix', () => {
         const turn2Text = `agent02-3turns-two-${rand()}`
         const turn3Text = `agent02-3turns-three-${rand()}`
 
-        // Each call independently confirms (inside `sendLiveTurn`): the
-        // pane was genuinely idle beforehand, this turn's own prompt text
-        // became visible immediately after sending, the fixture's reply
-        // arrived, and the pane settled back to idle before the NEXT turn
-        // is sent -- three real, sequential, non-overlapping round trips.
-        await sendLiveTurn(turn1Text)
-        await sendLiveTurn(turn2Text)
-        await sendLiveTurn(turn3Text)
+        await sendLiveTurn(turn1Text, 1)
+        await sendLiveTurn(turn2Text, 2)
+        await sendLiveTurn(turn3Text, 3)
 
-        // Turn-pair count proven at the WS-message layer (the "pair" unit --
-        // one submitted user turn that round-tripped to a settled assistant
-        // reply) rather than by counting DOM nodes: exactly three distinct
-        // `freshAgent.send` messages were dispatched, one per typed prompt,
-        // each already independently confirmed above to have settled back
-        // to idle before the next was sent.
+        await expect(paneRoot.getByText(turn1Text, { exact: true })).toBeVisible()
+        await expect(paneRoot.getByText(turn2Text, { exact: true })).toBeVisible()
+        await expect(paneRoot.getByText(turn3Text, { exact: true })).toBeVisible()
+        await expect(paneRoot.getByText('Fixture turn', { exact: true })).toHaveCount(3)
+
+        // Wire delivery remains an independent receipt for all three sends.
         const sent = await harness.getSentWsMessages()
         const sendMessages = sent.filter((m: any) => m?.type === 'freshAgent.send')
         expect(sendMessages).toHaveLength(3)
@@ -1492,7 +1460,10 @@ test.describe('Restore Matrix', () => {
             // all three turns below (each turn's 20s idle-poll timeout
             // easily absorbs the extra 3s for turns 1/2); turn 3 is the one
             // this scenario deliberately reloads DURING that window.
-            FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({ delayMethodsMs: { 'turn/start': 3000 } }),
+            FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
+              delayMethodsMs: { 'turn/start': 3000 },
+              recordTurns: true,
+            }),
           },
           setupHome: async (homeDir) => {
             const freshellDir = path.join(homeDir, '.freshell')
@@ -1547,7 +1518,7 @@ test.describe('Restore Matrix', () => {
         })
         expect(originalSessionId).toBeTruthy()
 
-        async function sendLiveTurn(text: string): Promise<void> {
+        async function sendLiveTurn(text: string, expectedReplyCount: number): Promise<void> {
           const paneRoot = page.locator('[data-context="fresh-agent"]').last()
           await expect.poll(async () => {
             const layout = await harness.getPaneLayout(tabId!)
@@ -1555,8 +1526,10 @@ test.describe('Restore Matrix', () => {
           }, { timeout: 20_000 }).toBe('idle')
           await paneRoot.getByRole('textbox', { name: 'Chat message input' }).fill(text)
           await paneRoot.getByRole('button', { name: 'Send' }).click()
-          await expect(paneRoot.getByText(text)).toBeVisible({ timeout: 10_000 })
-          await expect(paneRoot.getByText('Fixture turn')).toBeVisible({ timeout: 20_000 })
+          await expect(paneRoot.getByText(text, { exact: true })).toBeVisible({ timeout: 10_000 })
+          const fixtureReplies = paneRoot.getByText('Fixture turn', { exact: true })
+          await expect(fixtureReplies).toHaveCount(expectedReplyCount, { timeout: 20_000 })
+          await expect(fixtureReplies.nth(expectedReplyCount - 1)).toBeVisible()
           await expect.poll(async () => {
             const layout = await harness.getPaneLayout(tabId!)
             return findFreshAgentLeaf(layout)?.content?.status
@@ -1568,8 +1541,8 @@ test.describe('Restore Matrix', () => {
         const turn2Text = `agent02-midreload-two-${rand()}`
         const turn3Text = `agent02-midreload-three-${rand()}`
 
-        await sendLiveTurn(turn1Text)
-        await sendLiveTurn(turn2Text)
+        await sendLiveTurn(turn1Text, 1)
+        await sendLiveTurn(turn2Text, 2)
 
         // Turn 3: send, then reload IMMEDIATELY -- proving this is a
         // genuinely mid-flight reload relies on TIMING, not on
@@ -1630,15 +1603,16 @@ test.describe('Restore Matrix', () => {
         // app-server socket (unaffected by the browser reload having torn
         // down and re-established only the browser<->Freshell WS), the pane
         // settles idle, and its reply becomes visible -- "resumed
-        // streaming" in spirit, per AGENT-02's acceptance text. (Turn 3's
-        // OWN prompt text is not re-asserted here post-reload: like
-        // SCENARIO 5, this fixture doesn't persist per-turn transcript
-        // content for a client-side re-fetch, only the live in-page DOM
-        // state which the reload itself discards -- the achievable,
-        // honestly-scoped proof is that the pane recovers to a real,
-        // non-blank, idle, still-interactive state under the SAME session.)
-        await expect(page.locator('[data-context="fresh-agent"]').last().getByText('Fixture turn'))
-          .toBeVisible({ timeout: 20_000 })
+        // streaming" in spirit, per AGENT-02's acceptance text. The durable
+        // transcript must contain the three unique prompts and exactly three
+        // repeated fixture replies after the reload.
+        const resumedPane = page.locator('[data-context="fresh-agent"]').last()
+        await expect(resumedPane.getByText(turn1Text, { exact: true })).toBeVisible({ timeout: 20_000 })
+        await expect(resumedPane.getByText(turn2Text, { exact: true })).toBeVisible({ timeout: 20_000 })
+        await expect(resumedPane.getByText(turn3Text, { exact: true })).toBeVisible({ timeout: 20_000 })
+        const resumedReplies = resumedPane.getByText('Fixture turn', { exact: true })
+        await expect(resumedReplies).toHaveCount(3, { timeout: 20_000 })
+        await expect(resumedReplies.nth(2)).toBeVisible()
         await expect.poll(async () => {
           const layout = await harness.getPaneLayout(rehydratedTabId!)
           return findFreshAgentLeaf(layout)?.content?.status

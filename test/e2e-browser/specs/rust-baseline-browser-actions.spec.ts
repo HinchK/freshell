@@ -6,7 +6,6 @@ import { createE2eBrowserContext, registerE2eMachine } from '../helpers/fixtures
 
 const FORBIDDEN = [
   '/api/proxy/forward',
-  '/api/fresh-agent/exec',
   '/api/fresh-agent/diff',
   '/api/files/open',
   '/api/extensions/',
@@ -74,7 +73,7 @@ async function installExtensionPane(page: Page, extensionName: string) {
   }, extensionName)
 }
 
-async function installFakeProviderPane(page: Page) {
+async function installFakeProviderPane(page: Page, initialCwd: string) {
   await page.route('**/api/fresh-agent/threads/freshclaude/claude/**', async (route) => {
     await route.fulfill({
       contentType: 'application/json',
@@ -90,7 +89,7 @@ async function installFakeProviderPane(page: Page) {
       }),
     })
   })
-  await page.evaluate(() => {
+  await page.evaluate((cwd) => {
     const harness = window.__FRESHELL_TEST_HARNESS__
     const state = harness?.getState()
     const tabId = state?.tabs?.activeTabId as string | undefined
@@ -104,10 +103,10 @@ async function installFakeProviderPane(page: Page) {
         kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude',
         createRequestId: 'fake-provider-request', sessionId,
         sessionRef: { provider: 'claude', sessionId }, resumeSessionId: sessionId,
-        status: 'idle', initialCwd: '/tmp/fake-provider', model: 'fake-model', settingsDismissed: true,
+        status: 'idle', initialCwd: cwd, model: 'fake-model', settingsDismissed: true,
       } },
     })
-  })
+  }, initialCwd)
   await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible({ timeout: 10_000 })
 }
 
@@ -221,15 +220,37 @@ test.describe('Rust baseline browser actions', () => {
     expect(forbidden).toEqual([])
   })
 
-  test('keeps supported attachments while rejecting Node-only shell and expandable-diff actions', async ({ freshellPage, page, terminal }) => {
+  test('keeps supported attachments and shell execution while rejecting the unavailable expandable-diff action', async ({ freshellPage, page, serverInfo, terminal }) => {
     const forbidden = captureForbiddenRequests(page)
     await terminal.waitForTerminal()
-    await installFakeProviderPane(page)
+    await installFakeProviderPane(page, serverInfo.homeDir)
     const pane = page.locator('[data-context="fresh-agent"]').last()
     await expect(pane.getByLabel(/attach|attachment|upload/i)).toBeVisible()
-    await pane.getByRole('textbox', { name: 'Chat message input' }).fill('!echo blocked')
+    await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.clearSentWsMessages?.())
+    const shellMarker = 'freshell-shell-marker'
+    const execResponse = page.waitForResponse((response) => (
+      response.url().includes('/api/fresh-agent/exec')
+      && response.request().method() === 'POST'
+    ))
+    await pane.getByRole('textbox', { name: 'Chat message input' }).fill(`!printf ${shellMarker}`)
     await pane.getByRole('button', { name: 'Send' }).click()
-    await expect(pane.getByRole('status')).toHaveText('Shell commands are unavailable here; open a shell pane instead')
+    const response = await execResponse
+    expect(response.status()).toBe(200)
+    expect(JSON.parse(response.request().postData() ?? '{}')).toEqual({
+      command: `printf ${shellMarker}`,
+      cwd: serverInfo.homeDir,
+    })
+    await expect.poll(async () => page.evaluate(() => (
+      window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
+    ).filter((message: any) => message?.type === 'freshAgent.send'))).toEqual([
+      expect.objectContaining({
+        text: expect.stringContaining(`printf ${shellMarker}`),
+      }),
+    ])
+    const sent = await page.evaluate(() => (
+      window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
+    ).filter((message: any) => message?.type === 'freshAgent.send'))
+    expect((sent[0] as { text?: string }).text).toContain(shellMarker)
     const diff = pane.locator('.fresh-agent-file-diff')
     await expect(diff).toContainText('README.md')
     await expect(diff).toContainText('modified')

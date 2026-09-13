@@ -574,6 +574,24 @@ test.describe('CFG-01 lossless config.json writes (rust)', () => {
     const afterBoot = await readConfig(homeDir)
     await stopProcessGracefully(server.proc)
 
+    const expectedAfterBoot: any = {
+      ...regressed,
+      completedMigrations: [...regressed.completedMigrations, 'ai-title-shadow-cleanup'],
+      settings: {
+        ...regressed.settings,
+        codingCli: {
+          ...regressed.settings.codingCli,
+          knownProviders: [],
+        },
+      },
+      legacyLocalSettingsSeed: {
+        theme: 'dark',
+        uiScale: 1.5,
+      },
+    }
+    delete expectedAfterBoot.settings.theme
+    delete expectedAfterBoot.settings.uiScale
+
     expectDiffWithin(
       collectDiffPaths(regressed, afterBoot),
       [
@@ -581,8 +599,15 @@ test.describe('CFG-01 lossless config.json writes (rust)', () => {
         ['settings', 'theme'],
         ['settings', 'uiScale'],
         ['legacyLocalSettingsSeed'],
+        ['completedMigrations'],
       ],
       'provider-seed + seed-strip boot persist',
+    )
+    expect(afterBoot.completedMigrations).toEqual(expectedAfterBoot.completedMigrations)
+    expectDiffWithin(
+      collectDiffPaths(expectedAfterBoot, afterBoot),
+      [],
+      'provider-seed + seed-strip normalized boot has no other drift',
     )
     expect(afterBoot.settings?.codingCli?.knownProviders).toEqual([])
     expect(afterBoot.settings?.theme).toBeUndefined()
@@ -590,12 +615,25 @@ test.describe('CFG-01 lossless config.json writes (rust)', () => {
     expect(afterBoot.legacyLocalSettingsSeed?.theme).toBe('dark')
     expect(afterBoot.legacyLocalSettingsSeed?.uiScale).toBe(1.5)
     expectSentinelsIntact(
-      { ...regressed, legacyLocalSettingsSeed: afterBoot.legacyLocalSettingsSeed },
+      expectedAfterBoot,
       afterBoot,
       'boot normalization persist',
     )
     expect(afterBoot.serverSecrets?.codexDisplayIdSecret).toBe(
       firstWrite.serverSecrets?.codexDisplayIdSecret,
     )
+
+    // The supported migration is once-only: another boot leaves this exact
+    // normalized snapshot unchanged, including every sentinel.
+    server = await spawnRustServer(homeDir, emptyExtDir)
+    const afterSecondBoot = await readConfig(homeDir)
+    await stopProcessGracefully(server.proc)
+    expect(afterSecondBoot.completedMigrations).toEqual(expectedAfterBoot.completedMigrations)
+    expectDiffWithin(
+      collectDiffPaths(expectedAfterBoot, afterSecondBoot),
+      [],
+      'second provider-seed + seed-strip boot is idempotent',
+    )
+    expectSentinelsIntact(expectedAfterBoot, afterSecondBoot, 'second boot normalization persist')
   })
 })
