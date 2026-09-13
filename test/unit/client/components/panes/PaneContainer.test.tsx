@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import PaneContainer from '@/components/panes/PaneContainer'
@@ -10,7 +10,7 @@ import connectionReducer, { ConnectionState } from '@/store/connectionSlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
 import sessionsReducer, { applySessionsPatch, type SessionsState } from '@/store/sessionsSlice'
-import freshAgentReducer, { turnResult } from '@/store/freshAgentSlice'
+import freshAgentReducer, { applyRuntimeOwner, turnResult } from '@/store/freshAgentSlice'
 import opencodeActivityReducer, { upsertOpencodeActivity } from '@/store/opencodeActivitySlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import { markTabAttention, markPaneAttention } from '@/store/turnCompletionSlice'
@@ -1180,6 +1180,109 @@ describe('PaneContainer', () => {
         sessionType: 'freshcodex',
         provider: 'codex',
       })
+    })
+
+    // b8ke ext r6 F3/F4: the ordinary pane-close lifecycle for restored
+    // panes — the kill target is the durable session (content.sessionId OR
+    // the provider-matched sessionRef.sessionId; pre-r6 a sessionRef-only
+    // pane skipped the kill and removed the pane over the live runtime),
+    // and the close carries the pane's observed (epoch, generation) fence
+    // so the server's generation fencing refuses stale closes (the WS
+    // client queues across disconnects — an old close arriving after a
+    // handoff-away-and-back must never kill the newer runtime).
+    it('sends freshAgent.kill for a sessionRef-only pane close before removal', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-ref-only-close',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-ref-only-close',
+          // The restored-pane shape: persistence strips content.sessionId,
+          // leaving ONLY the durable sessionRef.
+          sessionRef: { provider: 'codex', sessionId: 'thread-ref-only-close' },
+          status: 'connected',
+        },
+      }
+
+      const store = createStore(
+        {
+          layouts: { 'tab-1': node },
+          activePane: { 'tab-1': 'pane-ref-only-close' },
+        },
+      )
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
+
+      // F3: the kill targets the durable sessionRef session.
+      expect(mockSend).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'freshAgent.kill',
+        sessionId: 'thread-ref-only-close',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+      }))
+    })
+
+    it('carries the observed epoch/generation fence on the close kill', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-fenced-close',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-fenced-close',
+          sessionId: 'thread-fenced-close',
+          status: 'connected',
+        },
+      }
+
+      const store = createStore(
+        {
+          layouts: { 'tab-1': node },
+          activePane: { 'tab-1': 'pane-fenced-close' },
+        },
+        {},
+        {},
+        { runtimeOwners: {} },
+      )
+      act(() => {
+        store.dispatch(applyRuntimeOwner({
+          type: 'session.runtimeOwner',
+          provider: 'codex',
+          sessionId: 'thread-fenced-close',
+          epoch: 11,
+          generation: 4,
+          ownerKind: 'fresh-agent',
+          operationId: 'handoff-fc',
+          transition: 'handoff-committed',
+        }))
+      })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
+
+      // F4: the close kill carries the observed fence pair so the server
+      // typed-refuses a stale-generation close (pre-r6 the close sent no
+      // fence and a delayed close could kill the newer generation).
+      expect(mockSend).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'freshAgent.kill',
+        sessionId: 'thread-fenced-close',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        observedEpoch: 11,
+        observedGeneration: 4,
+      }))
     })
 
     it('sends the pane cwd when a FreshOpenCode pane is closed', () => {
