@@ -14,7 +14,7 @@ vi.mock('@/lib/recovery/boot-state', () => ({
 
 import { getRecoveryInventory } from '@/lib/api'
 import { restoreMachineWorkspace } from '@/lib/machine-workspace'
-import tabsReducer, { addTab } from '@/store/tabsSlice'
+import tabsReducer, { addTab, setActiveTab } from '@/store/tabsSlice'
 import panesReducer, { initLayout } from '@/store/panesSlice'
 import tabRegistryReducer from '@/store/tabRegistrySlice'
 import type { RecoveryInventory } from '@/lib/recovery/types'
@@ -69,6 +69,24 @@ function inventoryFor(machineId: string): RecoveryInventory {
   }
 }
 
+function addRecoveredTab(inventory: RecoveryInventory, machineId: string, tabId: string, title: string) {
+  inventory.device?.tabs.push({
+    tabKey: `${machineId}:${tabId}`,
+    tabName: title,
+    panes: [{
+      paneId: `${tabId}-pane`,
+      kind: 'terminal',
+      mode: 'shell',
+      shell: null,
+      cwd: '/work',
+      payload: {},
+      sessionRef: null,
+      ledgerState: 'unknown',
+      live: false,
+    }],
+  })
+}
+
 describe('restoreMachineWorkspace', () => {
   beforeEach(() => {
     vi.mocked(getRecoveryInventory).mockReset()
@@ -91,6 +109,41 @@ describe('restoreMachineWorkspace', () => {
     expect(store.getState().panes.layouts['recovered-tab']?.id).toBe('recovered-pane')
     expect(store.getState().tabs.tabs.map((tab) => tab.id)).not.toContain('foreign-tab')
     expect(store.getState().panes.layouts['foreign-tab']).toBeUndefined()
+  })
+
+  it('preserves a still-recovered active tab across machine workspace replacement', async () => {
+    const store = createStore()
+    const inventory = inventoryFor(MACHINE_ID)
+    inventory.device!.tabs[0].tabKey = `${MACHINE_ID}:tab-a`
+    inventory.device!.tabs[0].tabName = 'Tab A'
+    inventory.device!.tabs[0].panes[0].paneId = 'tab-a-pane'
+    addRecoveredTab(inventory, MACHINE_ID, 'tab-b', 'Tab B')
+    vi.mocked(getRecoveryInventory).mockResolvedValue(inventory)
+
+    store.dispatch(addTab({ id: 'tab-a', title: 'Cached Tab A' }))
+    store.dispatch(addTab({ id: 'tab-b', title: 'Cached Tab B' }))
+    store.dispatch(setActiveTab('tab-a'))
+
+    await restoreMachineWorkspace(store, MACHINE_ID)
+
+    expect(store.getState().tabs.tabs.map((tab) => tab.id)).toEqual(['tab-a', 'tab-b'])
+    expect(store.getState().tabs.activeTabId).toBe('tab-a')
+  })
+
+  it('keeps the deterministic restored-tab fallback when the prior active tab is absent', async () => {
+    const store = createStore()
+    const inventory = inventoryFor(MACHINE_ID)
+    inventory.device!.tabs[0].tabKey = `${MACHINE_ID}:tab-a`
+    inventory.device!.tabs[0].tabName = 'Tab A'
+    inventory.device!.tabs[0].panes[0].paneId = 'tab-a-pane'
+    addRecoveredTab(inventory, MACHINE_ID, 'tab-b', 'Tab B')
+    vi.mocked(getRecoveryInventory).mockResolvedValue(inventory)
+    addForeignWorkspace(store)
+
+    await restoreMachineWorkspace(store, MACHINE_ID)
+
+    expect(store.getState().tabs.tabs.map((tab) => tab.id)).toEqual(['tab-a', 'tab-b'])
+    expect(store.getState().tabs.activeTabId).toBe('tab-b')
   })
 
   it('refuses an unscoped foreign recovery response and preserves the current cache', async () => {

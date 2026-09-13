@@ -5,14 +5,14 @@ import type { RecoveryInventory } from '@/lib/recovery/types'
 import { addTerminalRestoreRequestId, armRecoveredLiveTerminalTarget } from '@/lib/terminal-restore'
 import { getCurrentTabRegistryClientInstanceId } from '@/store/tabRegistrySync'
 import { clearTabRegistryLocalClosed } from '@/store/tabRegistrySlice'
-import { clearTabsForMachine, addTab } from '@/store/tabsSlice'
+import { clearTabsForMachine, addTab, setActiveTab } from '@/store/tabsSlice'
 import { clearPanesForMachine, restoreLayout } from '@/store/panesSlice'
 import type { PaneNode } from '@/store/paneTypes'
 import type { RootState } from '@/store/store'
 
 type MachineWorkspaceStore = {
   dispatch: (action: any) => unknown
-  getState: () => Pick<RootState, 'panes'>
+  getState: () => Pick<RootState, 'panes' | 'tabs'>
 }
 
 const MACHINE_BOOTSTRAP_RECOVERY_EXCLUSION_PREFIX = 'machine-bootstrap:'
@@ -80,6 +80,8 @@ export async function restoreMachineWorkspace(
   const plans = inventory.recoverable
     ? buildRecoveryPlan(inventory, { preserveIdsForMachine: machineId })
     : []
+  const priorActiveTabId = store.getState().tabs.activeTabId
+  const recoveredTabIds = new Set(plans.map((plan) => plan.tabId))
 
   // bb58dc001 follow-up (reload-safety): the recovery inventory EXCLUDES the
   // requester's own generations by design (D2 — a live client owns its own
@@ -110,6 +112,9 @@ export async function restoreMachineWorkspace(
     for (const target of plan.liveTerminalReattach ?? []) {
       armRecoveredLiveTerminalTarget(plan.tabId, target.paneId, target.terminalId)
     }
+  }
+  if (priorActiveTabId && recoveredTabIds.has(priorActiveTabId)) {
+    store.dispatch(setActiveTab(priorActiveTabId))
   }
   armTerminalRestores(store.getState(), plans.map((plan) => plan.tabId))
   return { restoredTabs: plans.length }
