@@ -1328,9 +1328,34 @@ pub struct PaneLedger {
     /// the held guard while the resolver is provably mid-write.
     #[cfg(test)]
     resolve_gate: Mutex<Option<ResolveGate>>,
+    /// b8ke d4 F3: test-only close-park gate (cross-crate integration
+    /// tests — doc-hidden, production never arms it). When armed, every
+    /// `close_pane` BLOCKS at entry until the test releases — the
+    /// deterministic slow-ledger window the terminal-kill settlement-guard
+    /// test needs.
+    close_pause: Mutex<Option<std::sync::Arc<ClosePauseGate>>>,
+}
+
+/// b8ke d4 F3: the test-only close-park gate — `paused=true` blocks every
+/// `close_pane` at entry; `paused=false` + notify releases them all.
+pub struct ClosePauseGate {
+    pub paused: std::sync::Mutex<bool>,
+    pub release: std::sync::Condvar,
 }
 
 impl PaneLedger {
+    /// b8ke d4 F3: arm the test-only close-park (doc-hidden; production
+    /// never calls). Returns the gate so the test can release it.
+    #[doc(hidden)]
+    pub fn arm_close_pause_for_tests(&self) -> std::sync::Arc<ClosePauseGate> {
+        let gate = std::sync::Arc::new(ClosePauseGate {
+            paused: std::sync::Mutex::new(true),
+            release: std::sync::Condvar::new(),
+        });
+        *self.close_pause.lock().expect("close pause lock") = Some(std::sync::Arc::clone(&gate));
+        gate
+    }
+
     /// Read a scan directory, mapping `NotFound` to "absent" (`Ok(None)`) and
     /// propagating every other error with the faulted path attached. The
     /// `std::io::Error` `Display` already carries the errno text (f3wp lesson:
@@ -1378,6 +1403,7 @@ impl PaneLedger {
                 close_envelope_delete_failures: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
                 resolve_gate: Mutex::new(None),
+                close_pause: Mutex::new(None),
             };
         };
         match Self::load_index(&r) {
@@ -1396,6 +1422,7 @@ impl PaneLedger {
                 close_envelope_delete_failures: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
                 resolve_gate: Mutex::new(None),
+                close_pause: Mutex::new(None),
             },
             Err(err) => {
                 tracing::error!(
@@ -3444,6 +3471,15 @@ impl PaneLedger {
     /// Every choice is idempotent: a retried kill re-derives the same set,
     /// re-stamps the same record, and re-merges the same fences.
     pub fn close_pane(&self, w: &PaneCloseWrite) -> Result<(), CloseEnvelopeError> {
+        // b8ke d4 F3: the test-only close-park (never armed in
+        // production): the deterministic slow-ledger window.
+        let close_gate = self.close_pause.lock().expect("close pause lock").clone();
+        if let Some(gate) = close_gate {
+            let mut paused = gate.paused.lock().expect("close pause gate lock");
+            while *paused {
+                paused = gate.release.wait(paused).expect("close pause gate condvar");
+            }
+        }
         let Some(root) = self.root.clone() else {
             return Ok(());
         };

@@ -6761,6 +6761,10 @@ async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) ->
     // yet). Terminals without a retained coordinator claim (shell panes,
     // pre-coordinator-era rows) keep the plain kill path.
     let mut stop_commit: Option<(String, String, String, u64)> = None;
+    // b8ke d4 F3: the granted stop's settlement guard (held to the
+    // handler's scope end — fires on completion, unwind, OR panic).
+    let mut _stop_settlement: Option<freshell_freshagent::ownership_lane::StopSettlementGuard> =
+        None;
     if let (Some(ownership), Some(retained)) = (
         state.ownership.as_ref(),
         state.registry.retained_ownership_claim(&kill.terminal_id),
@@ -6844,6 +6848,23 @@ async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) ->
                     stop_op_id.clone(),
                     *generation,
                 ));
+                // b8ke d4 F3: the granted terminal stop registers its
+                // SETTLEMENT GUARD (parity with the Fresh Agent kill
+                // lanes) — the stale-Stopping watchdog consults the flag
+                // before fencing on age, so a legitimate kill blocked on a
+                // slow pane-ledger close (>30s) is NEVER fenced as
+                // abandoned while its handler still runs (its eventual
+                // abort_stop/commit_stop would then be rejected as
+                // foreign — a clean ledger failure left the live terminal
+                // permanently fenced).
+                _stop_settlement =
+                    Some(freshell_freshagent::ownership_lane::register_stop_settlement_for_claim(
+                        &Some(Arc::clone(ownership)),
+                        &retained.locator.provider,
+                        &retained.locator.session_id,
+                        &stop_op_id,
+                        *generation,
+                    ));
                 None
             }
             // Not Live and VACANT: the kill proceeds (idempotent lane

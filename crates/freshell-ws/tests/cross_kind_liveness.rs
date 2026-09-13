@@ -1251,6 +1251,139 @@ async fn d7_cross_kind_refusal_omits_live_terminal_id() {
     );
 }
 
+/// b8ke d4 F3: a terminal kill BLOCKED on a slow pane-ledger close (>30s
+/// equivalent — the close-park holds it mid-write) is NOT fenced by the
+/// stale-Stopping watchdog: the terminal stop path registers its
+/// settlement guard at the claim (parity with the Fresh Agent kill lanes),
+/// so the watchdog's age sweep SKIPS the progressing stop (pre-d4 every
+/// unregistered stop older than 30s fenced, and the handler's eventual
+/// abort/commit was then rejected as foreign — a clean ledger failure left
+/// the live terminal permanently fenced). Released, the kill's commit_stop
+/// succeeds: the key ends Vacant.
+#[tokio::test]
+async fn a_slow_terminal_kill_on_its_ledger_close_is_not_fenced_and_commits() {
+    let (url, _registry, ws_state) = spawn_server().await;
+    let mut ws = connect(&url).await;
+    let session_id = format!("d4-f3-{}", uuid::Uuid::new_v4());
+
+    // 1. A negotiated terminal create (the sessionRef-bearing shape that
+    // commits the coordinator Live record).
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-d4-f3",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": session_id },
+        }),
+    )
+    .await;
+    let created = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "terminal.created" && v["requestId"] == "req-d4-f3"
+    })
+    .await;
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    let ownership = ws_state.ownership.as_ref().expect("coordinator wired");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !matches!(
+        ownership.observe("claude", &session_id).state,
+        freshell_ownership::OwnershipState::Live { .. }
+    ) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the terminal create never committed Live"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // 2. Arm the pane-ledger close-park, then send terminal.kill — the
+    // handler claims the stop (Stopping) and blocks in its ledger write.
+    // The gate is armed with a PANIC-SAFE release guard: ANY test exit
+    // (assert failure, unwind, or normal completion) un-parks the blocked
+    // close first — a parked spawn_blocking close otherwise deadlocks the
+    // current-thread runtime's teardown (Runtime::drop joins its blocking
+    // threads), turning every failure inside the parked window into a
+    // harness hang instead of a clean assertion failure.
+    let gate = ws_state.pane_ledger.arm_close_pause_for_tests();
+    struct GateReleaseOnDrop(std::sync::Arc<freshell_ws::pane_ledger::ClosePauseGate>);
+    impl Drop for GateReleaseOnDrop {
+        fn drop(&mut self) {
+            let mut paused = self.0.paused.lock().expect("close pause gate lock");
+            *paused = false;
+            self.0.release.notify_all();
+        }
+    }
+    let _gate_release_on_any_exit = GateReleaseOnDrop(std::sync::Arc::clone(&gate));
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.kill",
+            "terminalId": terminal_id,
+            "requestId": "req-d4-f3-kill",
+        }),
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !matches!(
+        ownership.observe("claude", &session_id).state,
+        freshell_ownership::OwnershipState::Stopping { .. }
+    ) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the kill's stop claim never granted (state: {:?})",
+            ownership.observe("claude", &session_id).state
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // 3. THE WATCHDOG SWEEP over-aged (the >30s shape): the progressing
+    // stop is NOT fenced (the settlement guard is unfired — pre-d4 the
+    // unregistered stop fenced here and the handler's eventual commit was
+    // rejected as foreign).
+    let fenced = ownership.recover_stale_stoppings(10_000, 0);
+    assert!(
+        fenced.is_empty(),
+        "the guard-registered terminal stop is NOT fenced by the age sweep \
+         (a progressing stop is not stale) — fenced: {:?}",
+        fenced.len()
+    );
+    assert!(matches!(
+        ownership.observe("claude", &session_id).state,
+        freshell_ownership::OwnershipState::Stopping { .. }
+    ));
+
+    // 4. Release the park: the ledger write lands, the kill's reap
+    // confirms, and its commit_stop SUCCEEDS (the key ends Vacant —
+    // the handler was never fenced).
+    {
+        let mut paused = gate.paused.lock().expect("gate lock");
+        *paused = false;
+        gate.release.notify_all();
+    }
+    let _killed = await_frame(&mut ws, Duration::from_secs(20), |v| {
+        v["type"] == "terminal.killed" && v["requestId"] == "req-d4-f3-kill"
+    })
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match ownership.observe("claude", &session_id).state {
+            freshell_ownership::OwnershipState::Vacant => break,
+            other => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the released kill's commit_stop never settled — state: {other:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+}
+
 /// kata b8ke Task 3: a real freshclaude create/kill drives the shared
 /// coordinator — Live{FreshAgent} while alive, Vacant after the awaited kill.
 #[tokio::test]
