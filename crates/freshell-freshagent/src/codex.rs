@@ -5864,10 +5864,13 @@ fn disarm_codex_quiet(
 /// compact's start before any later send's). A `turn/completed` carrying a
 /// DIFFERENT id (a DELAYED PRIOR-turn completion can land inside the
 /// armed-clear-pending window — the probed sequence emits `thread/status:idle`
-/// BEFORE that stale completion) NEVER clears the window, and neither does a
-/// completion arriving with no id captured yet. The quiet-deadman disarm in that
-/// arm is keyed the same way: it rides the ACTIVE turn's retirement, so a stale
-/// completion that retires nothing leaves the still-in-flight turn's window armed.
+/// BEFORE that stale completion) NEVER clears the window; nor does a completion
+/// arriving before a compact ownership id has been captured. An ID-less completion
+/// that follows a newer active turn and a captured compact owner is the one FIFO-safe exception: it
+/// retires only the compact marker, never the active turn or its outward completion
+/// state. The quiet-deadman disarm in that arm is keyed to the ACTIVE turn's
+/// retirement, so a stale completion that retires no active turn leaves the
+/// still-in-flight turn's window armed.
 fn reduce_notification(
     subscription: &mut CodexSubscription,
     notification: CodexNotification,
@@ -5931,29 +5934,30 @@ fn reduce_notification(
             // while it was still running (the rollback gate then observed
             // false||false and admitted a mid-turn thread/revert that
             // force-interrupts the newer turn). A completion carrying NO id can
-            // never retire anything (fail-closed).
+            // never retire the active turn (fail-closed); the compact marker has
+            // its narrower FIFO-safe ownership exception below.
             if event.thread_id == subscription.session_id() {
                 // Scoped: the `active_turn` guard must be dropped BEFORE the
                 // quiet-deadman disarm below (the file-wide lock order is
                 // `quiet_deadman` outer / `active_turn` inner — never lock
                 // `quiet_deadman` while holding `active_turn`).
-                let (retired, superseded_by_active_turn) = {
+                let (retired, superseded_by_active_turn, active_turn_id) = {
                     let mut active = active_turn.lock().expect("active_turn mutex");
                     // A delayed compact completion can arrive after a newer send
                     // installed its own active id. It may retire its compact-window
                     // ownership below, but it cannot truthfully publish this
                     // session as idle or complete: the client has no completion turn
                     // id with which to reject such a stale event.
-                    let superseded_by_active_turn = matches!(
-                        (active.as_deref(), event.turn_id.as_deref()),
-                        (Some(active_id), Some(completed_id)) if active_id != completed_id
-                    );
+                    let superseded_by_active_turn = active
+                        .as_deref()
+                        .is_some_and(|active_id| event.turn_id.as_deref() != Some(active_id));
                     let retired = event.turn_id.as_deref().is_some()
                         && active.as_deref() == event.turn_id.as_deref();
+                    let active_turn_id = active.clone();
                     if retired {
                         *active = None;
                     }
-                    (retired, superseded_by_active_turn)
+                    (retired, superseded_by_active_turn, active_turn_id)
                 };
                 // Delta-r1 F2 + ep1-r3 F4 (completion-id OWNERSHIP): the compact
                 // window ends HERE — but ONLY on the `turn/completed` whose params
@@ -5964,11 +5968,27 @@ fn reduce_notification(
                 // `thread/status:idle` and the compact's own `turn/started`) and a
                 // completion while no id is captured yet BOTH leave the window
                 // armed: the compact's own completion never landed, so the
-                // pre-start/post-RPC rollback window stays closed.
+                // pre-start/post-RPC rollback window stays closed. The sole
+                // exception is the documented ID-less completion after a newer
+                // active turn supersedes an already-captured compact owner.
                 let mut owned_turn_id = compact_turn_id.lock().expect("compact_turn_id mutex");
+                // The accepted app-server shape permits an ID-less completion.
+                // With a newer tracked turn distinct from the compact owner, the
+                // FIFO notification stream makes that completion the compact's:
+                // it cannot retire the newer active turn or publish completion
+                // state for it, but it must release the compact's separate busy
+                // marker. Without this inference the marker stays armed forever
+                // after the newer turn later completes.
+                let idless_superseded_compact_completion = compact_in_flight.load(Ordering::SeqCst)
+                    && event.turn_id.is_none()
+                    && superseded_by_active_turn
+                    && owned_turn_id
+                        .as_deref()
+                        .is_some_and(|owned_id| active_turn_id.as_deref() != Some(owned_id));
                 if compact_in_flight.load(Ordering::SeqCst)
                     && owned_turn_id.is_some()
-                    && event.turn_id.as_deref() == owned_turn_id.as_deref()
+                    && (event.turn_id.as_deref() == owned_turn_id.as_deref()
+                        || idless_superseded_compact_completion)
                 {
                     compact_in_flight.store(false, Ordering::SeqCst);
                     *owned_turn_id = None;
@@ -9347,6 +9367,120 @@ pub(crate) mod tests {
             captured_frames(&captured)[0]["event"]["code"],
             json!("NOTHING_TO_UNDO"),
             "the newer turn's own completion released the gate"
+        );
+    }
+
+    /// An accepted `turn/completed` shape need only carry `threadId`; a delayed
+    /// compact completion can therefore arrive without the compact's turn id
+    /// after a newer send has installed its own active turn. It must not publish
+    /// idle or a positive completion for that newer turn, and it must retire the
+    /// compact window so the newer turn's own matching completion can reopen the
+    /// rollback gate.
+    #[tokio::test]
+    async fn an_idless_compact_completion_inside_a_newer_turns_window_stays_busy_and_retires_the_compact(
+    ) {
+        let (st, _rx_boot) = state_with_bus();
+        let (peer, mut wire) = insert_idle_compact_session(&st, "thread-cnewer-idless").await;
+
+        peer.emit_notification(
+            "thread/status/changed",
+            json!({ "threadId": "thread-cnewer-idless", "status": { "type": "idle" } }),
+        );
+
+        let compact_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-cnewer-idless")).await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (compact_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        peer.respond(&compact_id, json!({}));
+        compact_driver.await.expect("compact task");
+        peer.emit_notification(
+            "turn/started",
+            json!({ "threadId": "thread-cnewer-idless", "turn": { "id": "turn-c-idless" } }),
+        );
+
+        let send_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_send(FreshAgentSend {
+                    request_id: Some("req-cnewer-idless".to_string()),
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    session_id: "thread-cnewer-idless".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    text: "fresh submission".to_string(),
+                    images: None,
+                    cwd: None,
+                    settings: None,
+                })
+                .await;
+            })
+        };
+        let (turn_req, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        peer.respond(&turn_req, json!({ "turn": { "id": "turn-new-idless" } }));
+        send_driver.await.expect("send task");
+
+        drain_wire(&mut wire);
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-cnewer-idless", "turn": { "status": "completed" } }),
+        );
+        let stale_completion_snapshot =
+            await_next_status_snapshot(&mut wire, "thread-cnewer-idless").await;
+        assert_eq!(
+            stale_completion_snapshot["event"]["status"],
+            json!("running"),
+            "an id-less completion cannot claim the newer active turn is idle"
+        );
+        assert_wire_quiet(&mut wire).await;
+
+        let (active_turn, compact_in_flight, compact_turn_id) = {
+            let sessions = st.sessions.lock().await;
+            let session = sessions
+                .get("thread-cnewer-idless")
+                .expect("session remains registered");
+            (
+                session.active_turn.clone(),
+                session.compact_in_flight.clone(),
+                session.compact_turn_id.clone(),
+            )
+        };
+        assert_eq!(
+            active_turn.lock().expect("active_turn mutex").as_deref(),
+            Some("turn-new-idless"),
+            "the newer turn remains the active owner"
+        );
+        assert!(
+            !compact_in_flight.load(Ordering::SeqCst),
+            "the delayed id-less completion retires the already superseded compact window"
+        );
+        assert!(
+            compact_turn_id
+                .lock()
+                .expect("compact_turn_id mutex")
+                .is_none(),
+            "retiring the compact also clears its ownership id"
+        );
+
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-cnewer-idless", "turn": { "id": "turn-new-idless", "status": "completed" } }),
+        );
+        await_next_idle_snapshot(&mut wire, "thread-cnewer-idless").await;
+        let chime = tokio::time::timeout(std::time::Duration::from_secs(5), wire.recv())
+            .await
+            .expect("the newer completion chime arrived")
+            .expect("wire remains open");
+        let chime: Value = serde_json::from_str(&chime).unwrap();
+        assert_eq!(chime["event"]["type"], json!("freshAgent.turn.complete"));
+        assert_wire_quiet(&mut wire).await;
+        assert!(
+            active_turn.lock().expect("active_turn mutex").is_none(),
+            "the newer matching completion retires the active turn"
         );
     }
 
