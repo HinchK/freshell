@@ -1495,14 +1495,15 @@ impl TerminalRegistry {
         }
     }
 
-    /// TERM-07: apply the `terminal.attach`-supplied viewport geometry BEFORE
-    /// the broker attach/replay, replicating Node's `shouldResize`
-    /// (`broker.ts:358-362`): `viewport_hydrate` always resizes;
-    /// `transport_reconnect` resizes only when no OTHER socket is attached or
-    /// this same connection is re-attaching; `keepalive_delta` never resizes.
-    /// Node samples the client set PRE-attach, so call this before `attach`
-    /// inserts the subscriber (the insert would also destroy the
-    /// "existing attachment" evidence for the same `conn_id`).
+    /// Apply `terminal.attach`-supplied viewport geometry BEFORE attach/replay.
+    /// A `viewport_hydrate` establishes geometry only for the first viewer:
+    /// once any subscriber exists, every secondary hydrate is replay-only and
+    /// cannot silently resize a shared PTY. `transport_reconnect` retains its
+    /// narrower reconnect policy, while `keepalive_delta` never resizes.
+    ///
+    /// Sample the subscriber map PRE-attach. `attach` inserts/replaces a
+    /// subscriber, which would otherwise turn a first viewer into an apparent
+    /// secondary viewer and erase the topology needed for this decision.
     /// Epoch semantics match `resize` (Task 2): the first-ever client
     /// geometry record never bumps; later real changes bump. A record also
     /// happens on unchanged dims when the resize is allowed, but never when
@@ -1523,10 +1524,11 @@ impl TerminalRegistry {
         };
         {
             let mut s = handle.shared.lock().expect("terminal lock");
+            let has_any_attached = !s.subscribers.is_empty();
             let has_other_attached = s.subscribers.keys().any(|k| *k != conn_id);
             let existing_attachment = s.subscribers.contains_key(&conn_id);
             let should_resize = match intent {
-                TerminalAttachIntent::ViewportHydrate => true,
+                TerminalAttachIntent::ViewportHydrate => !has_any_attached,
                 TerminalAttachIntent::TransportReconnect => {
                     !has_other_attached || existing_attachment
                 }
@@ -3851,6 +3853,34 @@ mod tests {
         // First-ever client geometry: applied, epoch NOT bumped (Node
         // first-record-no-bump, broker.ts:666-686).
         assert_eq!(reg.geometry("T"), Some((95, 41, 1)));
+    }
+
+    #[test]
+    fn resize_for_attach_viewport_hydrate_keeps_secondary_viewers_geometry_neutral() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+
+        // The first viewer establishes the shared PTY geometry before its
+        // subscriber record exists.
+        let out = reg.resize_for_attach("T", 1, TerminalAttachIntent::ViewportHydrate, 131, 48);
+        assert_eq!(out, AttachResizeStatus::Resized);
+        assert_eq!(reg.geometry("T"), Some((131, 48, 1)));
+        let (sink_a, _seen_a) = collector();
+        let _ = reg.attach("T", 1, sink_a, Some("a-1".into()), 0, false, None, None);
+
+        // A secondary viewer must be able to attach without silently taking
+        // over the shared terminal's geometry.
+        let out = reg.resize_for_attach("T", 2, TerminalAttachIntent::ViewportHydrate, 67, 30);
+        assert_eq!(out, AttachResizeStatus::Skipped);
+        assert_eq!(reg.geometry("T"), Some((131, 48, 1)));
+        let (sink_b, _seen_b) = collector();
+        let _ = reg.attach("T", 2, sink_b, Some("b-1".into()), 0, false, None, None);
+
+        // Later attach generations from that same second socket are still
+        // replay operations, not implicit geometry transfers.
+        let out = reg.resize_for_attach("T", 2, TerminalAttachIntent::ViewportHydrate, 67, 30);
+        assert_eq!(out, AttachResizeStatus::Skipped);
+        assert_eq!(reg.geometry("T"), Some((131, 48, 1)));
     }
 
     #[test]
