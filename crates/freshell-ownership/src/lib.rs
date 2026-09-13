@@ -1014,10 +1014,19 @@ impl RuntimeOwnershipRegistry {
                     initiator: initiator.to_string(),
                     since_ms: now_ms,
                 };
+                // b8ke ext F3: the STABLE transition-log schema — every
+                // field present at every transition, the not-yet-known
+                // values None-valued (the same contract the release
+                // records follow): a start begin logs the vacated key's
+                // from-side as None (no prior owner exists) and the empty
+                // (not-applicable) failure reason.
                 tracing::info!(target: "freshell_ownership",
                     event = "ownership.start.begin", operation_id, provider, session_id,
-                    initiator, to_kind = ?kind,
-                    epoch = self.epoch, generation = record.generation, outcome = "granted");
+                    initiator,
+                    from_kind = ?Option::<RuntimeOwnerKind>::None, to_kind = ?kind,
+                    runtime_id = ?Option::<String>::None, pid = ?Option::<u32>::None,
+                    epoch = self.epoch, generation = record.generation,
+                    duration_ms = 0u64, outcome = "granted", failure_reason = "");
                 BeginOutcome::Granted {
                     generation: record.generation,
                 }
@@ -1112,10 +1121,15 @@ impl RuntimeOwnershipRegistry {
                     initiator: initiator.to_string(),
                     since_ms: now_ms,
                 };
+                // b8ke ext F3: the STABLE transition-log schema (the
+                // vacated-key handoff begin: the from-side is None-valued).
                 tracing::info!(target: "freshell_ownership",
                     event = "ownership.handoff.begin", operation_id, provider, session_id,
-                    initiator, to_kind = ?to_kind,
-                    epoch = self.epoch, generation = record.generation, outcome = "granted");
+                    initiator,
+                    from_kind = ?Option::<RuntimeOwnerKind>::None, to_kind = ?to_kind,
+                    runtime_id = ?Option::<String>::None, pid = ?Option::<u32>::None,
+                    epoch = self.epoch, generation = record.generation,
+                    duration_ms = 0u64, outcome = "granted", failure_reason = "");
                 BeginOutcome::Granted {
                     generation: record.generation,
                 }
@@ -1133,11 +1147,19 @@ impl RuntimeOwnershipRegistry {
                     initiator: initiator.to_string(),
                     since_ms: now_ms,
                 };
+                // b8ke ext F3: the STABLE transition-log schema — the live
+                // begin carries the prior owner's tenure (duration_ms) and
+                // the empty (not-applicable) failure reason alongside the
+                // prior's identity fields.
                 tracing::info!(target: "freshell_ownership",
                     event = "ownership.handoff.begin", operation_id, provider, session_id,
                     initiator, from_kind = ?owner.kind, to_kind = ?to_kind,
                     runtime_id = ?owner.terminal_id, pid = ?owner.pid,
-                    epoch = self.epoch, generation = record.generation, outcome = "granted");
+                    epoch = self.epoch, generation = record.generation,
+                    duration_ms = now_ms.saturating_sub(
+                        record.state.since_ms().unwrap_or(now_ms),
+                    ),
+                    outcome = "granted", failure_reason = "");
                 BeginOutcome::Granted {
                     generation: record.generation,
                 }
@@ -1186,7 +1208,17 @@ impl RuntimeOwnershipRegistry {
             };
         }
         let initiator = record.state.initiator().unwrap_or_default();
-        let old_kind = record.state.kind();
+        // b8ke ext F3: the TRUE prior kind — for a Handoff record the
+        // PRE-HANDOFF owner (the Handoff-prior identity), NOT the
+        // Handoff's TARGET kind: `kind()` maps Handoff to its target, so a
+        // fresh-agent→terminal commit logged as terminal-to-terminal. A
+        // vacant-entered handoff has no prior owner (None — the honest
+        // vacancy); a Starting record's prior kind is the operation's own
+        // kind.
+        let old_kind = match &record.state {
+            OwnershipState::Handoff { prior, .. } => prior.as_ref().map(|(owner, _)| owner.kind),
+            other => other.kind(),
+        };
         let since_ms = record.state.since_ms();
         match record.state.clone() {
             OwnershipState::Starting {
@@ -2783,14 +2815,16 @@ mod tests {
     }
 
     /// One captured `tracing` event: the level, target, the crate-convention
-    /// `event` field's value, and every visited field name. The M2/N1
-    /// log-hygiene regression tests assert through this.
+    /// `event` field's value, every visited field name, and every field's
+    /// rendered value. The M2/N1 log-hygiene regression tests assert names
+    /// through this; the b8ke ext F3 stable-schema tests assert VALUES.
     #[derive(Debug, Clone)]
     struct CapturedEvent {
         level: tracing::Level,
         target: String,
         event: Option<String>,
         fields: Vec<String>,
+        values: std::collections::BTreeMap<String, String>,
     }
 
     /// A subscriber capturing every event fired on the installing thread.
@@ -2833,6 +2867,7 @@ mod tests {
                 target: event.metadata().target().to_string(),
                 event: visitor.event,
                 fields: visitor.fields,
+                values: visitor.values,
             });
         }
 
@@ -2850,6 +2885,7 @@ mod tests {
     struct EventFieldVisitor {
         event: Option<String>,
         fields: Vec<String>,
+        values: std::collections::BTreeMap<String, String>,
     }
 
     impl tracing::field::Visit for EventFieldVisitor {
@@ -2857,6 +2893,10 @@ mod tests {
             if field.name() == "event" {
                 self.event = Some(format!("{value:?}"));
             }
+            // b8ke ext F3: the rendered VALUE of every visited field (the
+            // kind-VALUE assertions the stable-schema contract tests need).
+            self.values
+                .insert(field.name().to_string(), format!("{value:?}"));
             self.fields.push(field.name().to_string());
         }
 
@@ -2864,6 +2904,8 @@ mod tests {
             if field.name() == "event" {
                 self.event = Some(value.to_string());
             }
+            self.values
+                .insert(field.name().to_string(), value.to_string());
             self.fields.push(field.name().to_string());
         }
     }
@@ -6082,6 +6124,261 @@ mod tests {
             start_failed.fields.contains(&"duration_ms".to_string()),
             "ownership.start.failed must carry duration_ms (got fields {:?})",
             start_failed.fields
+        );
+    }
+
+    /// b8ke ext F3: a committed TERMINAL owner identity for the stable-schema
+    /// tests.
+    fn live_terminal_owner() -> OwnerIdentity {
+        OwnerIdentity {
+            kind: RuntimeOwnerKind::Terminal,
+            terminal_id: Some("t-live".into()),
+            live_session_key: None,
+            pid: None,
+            ownership_id: None,
+        }
+    }
+
+    /// b8ke ext F3: the begin events carry the COMPLETE stable field set —
+    /// every field present at every coordinator transition, the
+    /// not-yet-known values None-valued (the same contract the release
+    /// records follow). Pre-ext `ownership.start.begin` and the vacant
+    /// `ownership.handoff.begin` omitted the old kind, runtime ID/PID,
+    /// duration, and the typed failure reason ENTIRELY, and the live
+    /// handoff begin lacked duration/failure reason.
+    #[test]
+    fn begin_events_carry_the_stable_schema() {
+        let r = RuntimeOwnershipRegistry::new();
+        let capture = EventCapture::default();
+        let _guard = capture.install();
+
+        let BeginOutcome::Granted { .. } = r.begin_start(
+            PROVIDER,
+            "sid-start",
+            RuntimeOwnerKind::Terminal,
+            "op-start",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("expected Granted")
+        };
+        let BeginOutcome::Granted { .. } = r.begin_handoff(
+            PROVIDER,
+            "sid-vacant-handoff",
+            RuntimeOwnerKind::Terminal,
+            "op-vacant-ho",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("expected Granted")
+        };
+        // A LIVE prior handoff begin: Live{Terminal} → a fresh-agent target.
+        let BeginOutcome::Granted {
+            generation: live_gen,
+        } = r.begin_start(
+            PROVIDER,
+            "sid-live-handoff",
+            RuntimeOwnerKind::Terminal,
+            "op-live",
+            None,
+            "test",
+            1_000,
+        )
+        else {
+            panic!("expected Granted")
+        };
+        assert!(matches!(
+            r.commit_live(
+                PROVIDER,
+                "sid-live-handoff",
+                "op-live",
+                live_gen,
+                live_terminal_owner(),
+            ),
+            CommitOutcome::Committed
+        ));
+        let BeginOutcome::Granted { .. } = r.begin_handoff(
+            PROVIDER,
+            "sid-live-handoff",
+            RuntimeOwnerKind::FreshAgent,
+            "op-live-ho",
+            None,
+            "test",
+            2_000,
+        ) else {
+            panic!("expected Granted")
+        };
+
+        let events = capture.events();
+        let stable_fields = [
+            "operation_id",
+            "provider",
+            "session_id",
+            "initiator",
+            "from_kind",
+            "to_kind",
+            "runtime_id",
+            "pid",
+            "epoch",
+            "generation",
+            "duration_ms",
+            "outcome",
+            "failure_reason",
+        ];
+        for (event_name, sid) in [
+            ("ownership.start.begin", "sid-start"),
+            ("ownership.handoff.begin", "sid-vacant-handoff"),
+            ("ownership.handoff.begin", "sid-live-handoff"),
+        ] {
+            let begin = events
+                .iter()
+                .find(|e| {
+                    e.target == "freshell_ownership"
+                        && e.event.as_deref() == Some(event_name)
+                        && e.values.get("session_id").map(String::as_str) == Some(sid)
+                })
+                .unwrap_or_else(|| panic!("the {event_name} event for {sid} must fire"));
+            for field in stable_fields {
+                assert!(
+                    begin.fields.contains(&field.to_string()),
+                    "{event_name} for {sid} must carry {field} — got {:?}",
+                    begin.fields
+                );
+            }
+        }
+        // The vacant begins log the None-valued not-yet-known fields.
+        for (event_name, sid) in [
+            ("ownership.start.begin", "sid-start"),
+            ("ownership.handoff.begin", "sid-vacant-handoff"),
+        ] {
+            let begin = events
+                .iter()
+                .find(|e| {
+                    e.target == "freshell_ownership"
+                        && e.event.as_deref() == Some(event_name)
+                        && e.values.get("session_id").map(String::as_str) == Some(sid)
+                })
+                .unwrap();
+            assert_eq!(
+                begin.values.get("from_kind").map(String::as_str),
+                Some("None"),
+                "{event_name} from Vacant logs the None from_kind — got {:?}",
+                begin.values
+            );
+            assert_eq!(
+                begin.values.get("runtime_id").map(String::as_str),
+                Some("None"),
+                "{event_name} from Vacant logs the None runtime_id — got {:?}",
+                begin.values
+            );
+            assert_eq!(
+                begin.values.get("pid").map(String::as_str),
+                Some("None"),
+                "{event_name} from Vacant logs the None pid — got {:?}",
+                begin.values
+            );
+            assert_eq!(
+                begin.values.get("failure_reason").map(String::as_str),
+                Some(""),
+                "{event_name} carries the empty (not-applicable) failure_reason — got {:?}",
+                begin.values
+            );
+        }
+        // The live handoff begin names the TRUE prior (the live terminal
+        // owner) and carries duration + failure_reason.
+        let live_begin = events
+            .iter()
+            .find(|e| {
+                e.target == "freshell_ownership"
+                    && e.event.as_deref() == Some("ownership.handoff.begin")
+                    && e.values.get("session_id").map(String::as_str) == Some("sid-live-handoff")
+            })
+            .unwrap();
+        assert_eq!(
+            live_begin.values.get("from_kind").map(String::as_str),
+            Some("Terminal"),
+            "the live handoff begin names the prior owner's kind — got {:?}",
+            live_begin.values
+        );
+    }
+
+    /// b8ke ext F3: the commit records the TRUE prior kind — the
+    /// PRE-HANDOFF owner, never the Handoff record's TARGET kind
+    /// (`kind()` maps Handoff to its target, so a fresh-agent→terminal
+    /// commit logged as terminal-to-terminal).
+    #[test]
+    fn cross_kind_commit_logs_the_true_prior_kind() {
+        let r = RuntimeOwnershipRegistry::new();
+        // Live{FreshAgent}:
+        let BeginOutcome::Granted {
+            generation: fresh_gen,
+        } = r.begin_start(
+            PROVIDER,
+            "sid",
+            RuntimeOwnerKind::FreshAgent,
+            "op-fresh",
+            None,
+            "test",
+            1_000,
+        )
+        else {
+            panic!("expected Granted")
+        };
+        assert!(matches!(
+            r.commit_live(
+                PROVIDER,
+                "sid",
+                "op-fresh",
+                fresh_gen,
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("sid".into()),
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            CommitOutcome::Committed
+        ));
+        // The handoff to a TERMINAL target:
+        let BeginOutcome::Granted { generation: ho_gen } = r.begin_handoff(
+            PROVIDER,
+            "sid",
+            RuntimeOwnerKind::Terminal,
+            "ho-1",
+            None,
+            "test",
+            2_000,
+        ) else {
+            panic!("expected Granted")
+        };
+        let capture = EventCapture::default();
+        let _guard = capture.install();
+        assert!(matches!(
+            r.commit_live(PROVIDER, "sid", "ho-1", ho_gen, live_terminal_owner(),),
+            CommitOutcome::Committed
+        ));
+        let commit = capture
+            .events()
+            .into_iter()
+            .find(|e| {
+                e.target == "freshell_ownership"
+                    && e.event.as_deref() == Some("ownership.live.commit")
+            })
+            .expect("the commit event must fire");
+        assert_eq!(
+            commit.values.get("from_kind").map(String::as_str),
+            Some("Some(FreshAgent)"),
+            "the cross-kind commit logs the TRUE prior kind (the              pre-handoff fresh-agent owner) — got {:?}",
+            commit.values
+        );
+        assert_eq!(
+            commit.values.get("to_kind").map(String::as_str),
+            Some("Terminal"),
+            "the cross-kind commit logs the committed target kind — got {:?}",
+            commit.values
         );
     }
 }
