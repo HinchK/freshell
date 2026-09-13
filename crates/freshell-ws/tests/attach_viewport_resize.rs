@@ -10,6 +10,7 @@ mod common;
 use common::*;
 
 use futures_util::SinkExt;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -52,6 +53,92 @@ async fn viewport_hydrate_attach_resizes_pty_to_attached_geometry() {
         acc.contains("__GEO__41 95__"),
         "PTY must report the attached geometry (41 rows, 95 cols); got output: {acc}"
     );
+}
+
+#[tokio::test]
+async fn simultaneous_first_viewer_attaches_claim_one_shared_pty_geometry() {
+    let (url, registry) = spawn_server().await;
+    let (mut ws_create, _inventory_create) = connect_and_capture_inventory(&url).await;
+    let terminal_id = create_shell_terminal(&mut ws_create, "req-geo-concurrent").await;
+    let (mut ws_a, _inventory_a) = connect_and_capture_inventory(&url).await;
+    let (mut ws_b, _inventory_b) = connect_and_capture_inventory(&url).await;
+
+    // The barrier makes the two real WebSocket clients release their
+    // geometry-bearing attach frames together. The registry must choose one
+    // claimant while it installs the corresponding subscription; the other
+    // viewer still receives attach.ready/replay but remains geometry-neutral.
+    let start = Arc::new(tokio::sync::Barrier::new(3));
+    let send_a = {
+        let terminal_id = terminal_id.clone();
+        let start = Arc::clone(&start);
+        tokio::spawn(async move {
+            start.wait().await;
+            attach_with(
+                &mut ws_a,
+                &terminal_id,
+                "att-geo-concurrent-a",
+                "viewport_hydrate",
+                131,
+                48,
+                None,
+            )
+            .await;
+            (ws_a, terminal_id)
+        })
+    };
+    let send_b = {
+        let terminal_id = terminal_id.clone();
+        let start = Arc::clone(&start);
+        tokio::spawn(async move {
+            start.wait().await;
+            attach_with(
+                &mut ws_b,
+                &terminal_id,
+                "att-geo-concurrent-b",
+                "transport_reconnect",
+                67,
+                30,
+                None,
+            )
+            .await;
+            (ws_b, terminal_id)
+        })
+    };
+    start.wait().await;
+    let (mut ws_a, terminal_a) = send_a.await.expect("first attach task");
+    let (mut ws_b, terminal_b) = send_b.await.expect("second attach task");
+
+    wait_for_attach_ready(&mut ws_a, "att-geo-concurrent-a").await;
+    wait_for_attach_ready(&mut ws_b, "att-geo-concurrent-b").await;
+    let geometry = registry.geometry(&terminal_id).expect("terminal geometry");
+    assert_eq!(
+        geometry.2, 1,
+        "two simultaneous first attaches must produce exactly one first geometry record"
+    );
+    assert!(
+        matches!(geometry, (131, 48, 1) | (67, 30, 1)),
+        "one of the released viewers must be the sole geometry claimant: {geometry:?}"
+    );
+
+    let expected_size = match geometry {
+        (131, 48, _) => "48 131",
+        (67, 30, _) => "30 67",
+        other => panic!("unexpected concurrent attach geometry: {other:?}"),
+    };
+    send_input(
+        &mut ws_a,
+        &terminal_a,
+        "echo __GEO_CONCURRENT__$(stty size)__\r",
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let marker = format!("__GEO_CONCURRENT__{expected_size}__");
+    let (acc, _gap, _closed) = drain_until_marker_or_deadline(&mut ws_a, &marker, deadline).await;
+    assert!(
+        acc.contains(&marker),
+        "real PTY size must match the sole attach claimant; got output: {acc}"
+    );
+    assert_eq!(terminal_a, terminal_b);
 }
 
 #[tokio::test]

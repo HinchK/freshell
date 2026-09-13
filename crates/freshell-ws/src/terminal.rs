@@ -5510,37 +5510,47 @@ fn handle_attach(
     // registry crate is identity-agnostic, so it's resolved here.
     let canonical_session_ref = state.identity.session_ref_for(&attach.terminal_id);
 
-    // TERM-07 (`broker.ts:358-397` parity): apply the attach-supplied viewport
-    // geometry to the PTY BEFORE attach/replay. The intent + pre-attach
-    // subscriber condition lives in `resize_for_attach`; the session-identity
-    // guard (Node `resizeIfSessionMatches`) lives here because this crate owns
-    // the identity registry. This MUST run before `registry.attach`: attach's
-    // subscriber insert would destroy the pre-attach evidence the condition
-    // needs, and resizing under attach's per-terminal lock would deadlock.
-    if attach_geometry_identity_ok(
+    // TERM-07 (`broker.ts:358-397` parity): the session-identity guard lives
+    // here because this crate owns the identity registry. When it permits the
+    // geometry, the registry applies it AND installs this subscriber in one
+    // terminal-state handoff. That prevents concurrent first viewers from
+    // both observing an empty subscriber map and silently replacing each
+    // other's PTY dimensions before either attach reaches replay.
+    let geometry_identity_ok = attach_geometry_identity_ok(
         attach.expected_session_ref.as_ref(),
         canonical_session_ref.as_ref(),
-    ) {
+    );
+    let outcome = if geometry_identity_ok {
         let cols = attach.cols.clamp(0, u16::MAX as i64) as u16;
         let rows = attach.rows.clamp(0, u16::MAX as i64) as u16;
-        state
-            .registry
-            .resize_for_attach(&attach.terminal_id, conn_id, attach.intent, cols, rows);
-    }
-
-    let outcome = state.registry.attach(
-        &attach.terminal_id,
-        conn_id,
-        Arc::clone(conn_sink),
-        attach.attach_request_id.clone(),
-        attach.since_seq.unwrap_or(0),
-        terminal_output_batch_v1,
-        canonical_session_ref,
-        // Mode replay-sync: the client's positive surface-fresh marker
-        // (xterm recreation / user reset). Forwards the wire field 1:1; the
-        // registry owns the emit-vs-skip gating.
-        attach.surface_reset,
-    );
+        state.registry.attach_with_geometry(
+            &attach.terminal_id,
+            conn_id,
+            Arc::clone(conn_sink),
+            attach.attach_request_id.clone(),
+            attach.since_seq.unwrap_or(0),
+            terminal_output_batch_v1,
+            canonical_session_ref,
+            // Mode replay-sync: the client's positive surface-fresh marker
+            // (xterm recreation / user reset). Forwards the wire field 1:1; the
+            // registry owns the emit-vs-skip gating.
+            attach.surface_reset,
+            attach.intent,
+            cols,
+            rows,
+        )
+    } else {
+        state.registry.attach(
+            &attach.terminal_id,
+            conn_id,
+            Arc::clone(conn_sink),
+            attach.attach_request_id.clone(),
+            attach.since_seq.unwrap_or(0),
+            terminal_output_batch_v1,
+            canonical_session_ref,
+            attach.surface_reset,
+        )
+    };
     if outcome.found {
         return None;
     }

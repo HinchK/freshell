@@ -637,6 +637,10 @@ impl Default for TerminalRegistry {
 #[must_use]
 pub struct AttachOutcome {
     pub found: bool,
+    /// The attach-time geometry decision when the caller used
+    /// [`TerminalRegistry::attach_with_geometry`]. Plain [`TerminalRegistry::attach`]
+    /// has no geometry input and returns `None`.
+    pub geometry: Option<AttachResizeStatus>,
 }
 
 /// Outcome of [`TerminalRegistry::input`]: whether the terminal existed (the
@@ -665,6 +669,53 @@ pub enum AttachResizeStatus {
     NotRunning,
     /// Unknown terminal id (Node `missing`).
     Missing,
+}
+
+/// Apply an attach-supplied geometry while the caller holds the terminal-state
+/// lock. `attach_with_geometry` invokes this immediately before it snapshots
+/// replay and installs the subscriber, which makes the first-viewer claim
+/// indivisible from the subscriber topology that authorizes it.
+fn apply_attach_geometry(
+    s: &mut TerminalShared,
+    intent: TerminalAttachIntent,
+    cols: u16,
+    rows: u16,
+    pty: Option<&PtyTerminal>,
+) -> AttachResizeStatus {
+    let cols = cols.max(TerminalRegistry::MIN_GEOMETRY_DIM);
+    let rows = rows.max(TerminalRegistry::MIN_GEOMETRY_DIM);
+    let should_resize = match intent {
+        TerminalAttachIntent::ViewportHydrate | TerminalAttachIntent::TransportReconnect => {
+            s.subscribers.is_empty()
+        }
+        TerminalAttachIntent::KeepaliveDelta => false,
+    };
+    if !should_resize {
+        return AttachResizeStatus::Skipped;
+    }
+    if s.status != TerminalRunStatus::Running {
+        return AttachResizeStatus::NotRunning;
+    }
+
+    // Node records geometry for both `resized` and `unchanged` results when
+    // the attach is allowed. The first client record never bumps the epoch.
+    let first_record = !s.has_client_geometry;
+    s.has_client_geometry = true;
+    if s.cols == cols && s.rows == rows {
+        return AttachResizeStatus::Unchanged;
+    }
+    s.cols = cols;
+    s.rows = rows;
+    if !first_record {
+        s.geometry_epoch += 1;
+    }
+    // The PTY master's mutex is independent from this terminal-state lock and
+    // has no registry callback. Resizing here keeps OS geometry ahead of the
+    // attach.ready/replay handoff without opening a second first-viewer race.
+    if let Some(pty) = pty {
+        pty.resize(cols, rows);
+    }
+    AttachResizeStatus::Resized
 }
 
 /// Read-only lookup into a session-identity store (in production: the WS-side
@@ -1232,11 +1283,92 @@ impl TerminalRegistry {
             let inner = self.inner.lock().expect("registry lock");
             match inner.terminals.get(terminal_id) {
                 Some(h) => Arc::clone(&h.shared),
-                None => return AttachOutcome { found: false },
+                None => {
+                    return AttachOutcome {
+                        found: false,
+                        geometry: None,
+                    }
+                }
             }
         };
 
+        self.attach_to_shared(
+            terminal_id,
+            conn_id,
+            sink,
+            attach_request_id,
+            since_seq,
+            terminal_output_batch_v1,
+            session_ref,
+            surface_reset,
+            shared,
+            None,
+        )
+    }
+
+    /// Atomically apply a geometry-bearing `terminal.attach` and install its
+    /// subscriber. The geometry decision, PTY resize, subscriber insertion,
+    /// ready, and replay share the same per-terminal lock, so two concurrent
+    /// first viewers cannot both claim the PTY dimensions.
+    ///
+    /// The registry lock stays held only long enough to keep the PTY handle
+    /// alive while the per-terminal handoff runs. Lock ordering remains
+    /// registry → terminal everywhere that needs both locks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attach_with_geometry(
+        &self,
+        terminal_id: &str,
+        conn_id: u64,
+        sink: FrameSink,
+        attach_request_id: Option<String>,
+        since_seq: i64,
+        terminal_output_batch_v1: bool,
+        session_ref: Option<SessionLocator>,
+        surface_reset: Option<bool>,
+        intent: TerminalAttachIntent,
+        cols: u16,
+        rows: u16,
+    ) -> AttachOutcome {
+        let inner = self.inner.lock().expect("registry lock");
+        let Some(handle) = inner.terminals.get(terminal_id) else {
+            return AttachOutcome {
+                found: false,
+                geometry: Some(AttachResizeStatus::Missing),
+            };
+        };
+
+        self.attach_to_shared(
+            terminal_id,
+            conn_id,
+            sink,
+            attach_request_id,
+            since_seq,
+            terminal_output_batch_v1,
+            session_ref,
+            surface_reset,
+            Arc::clone(&handle.shared),
+            Some((intent, cols, rows, handle.pty.as_ref())),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attach_to_shared(
+        &self,
+        terminal_id: &str,
+        conn_id: u64,
+        sink: FrameSink,
+        attach_request_id: Option<String>,
+        since_seq: i64,
+        terminal_output_batch_v1: bool,
+        session_ref: Option<SessionLocator>,
+        surface_reset: Option<bool>,
+        shared: Arc<Mutex<TerminalShared>>,
+        geometry: Option<(TerminalAttachIntent, u16, u16, Option<&PtyTerminal>)>,
+    ) -> AttachOutcome {
         let mut s = shared.lock().expect("terminal lock");
+        let geometry = geometry.map(|(intent, cols, rows, pty)| {
+            apply_attach_geometry(&mut s, intent, cols, rows, pty)
+        });
         let effective_since = since_seq.max(0);
 
         // Snapshot the replay window: every retained frame newer than the client's
@@ -1355,7 +1487,10 @@ impl TerminalRegistry {
             s.subscribers.remove(&conn_id);
         }
 
-        AttachOutcome { found: true }
+        AttachOutcome {
+            found: true,
+            geometry,
+        }
     }
 
     /// `broker.detach()` (`broker.ts:618-639`): drop `conn_id`'s subscription. The PTY
@@ -1495,20 +1630,11 @@ impl TerminalRegistry {
         }
     }
 
-    /// Apply `terminal.attach`-supplied viewport geometry BEFORE attach/replay.
-    /// Geometry-bearing attach intents establish geometry only for the first
-    /// viewer: once any subscriber exists, every secondary attach or replay
-    /// is geometry-neutral and cannot silently resize a shared PTY.
-    /// `keepalive_delta` never resizes.
-    ///
-    /// Sample the subscriber map PRE-attach. `attach` inserts/replaces a
-    /// subscriber, which would otherwise turn a first viewer into an apparent
-    /// secondary viewer and erase the topology needed for this decision.
-    /// Epoch semantics match `resize` (Task 2): the first-ever client
-    /// geometry record never bumps; later real changes bump. A record also
-    /// happens on unchanged dims when the resize is allowed, but never when
-    /// the intent condition skips it (Node `broker.ts:373, 387-392`).
-    pub fn resize_for_attach(
+    /// Test-only direct seam for the shared attach-geometry predicate. The
+    /// production path is [`Self::attach_with_geometry`], which combines this
+    /// decision with subscriber insertion under one terminal-state lock.
+    #[cfg(test)]
+    fn resize_for_attach(
         &self,
         terminal_id: &str,
         _conn_id: u64,
@@ -1522,40 +1648,8 @@ impl TerminalRegistry {
         let Some(handle) = inner.terminals.get(terminal_id) else {
             return AttachResizeStatus::Missing;
         };
-        {
-            let mut s = handle.shared.lock().expect("terminal lock");
-            let has_any_attached = !s.subscribers.is_empty();
-            let should_resize = match intent {
-                TerminalAttachIntent::ViewportHydrate
-                | TerminalAttachIntent::TransportReconnect => !has_any_attached,
-                TerminalAttachIntent::KeepaliveDelta => false,
-            };
-            if !should_resize {
-                return AttachResizeStatus::Skipped;
-            }
-            if s.status != TerminalRunStatus::Running {
-                return AttachResizeStatus::NotRunning;
-            }
-            // Node records geometry for BOTH 'resized' and 'unchanged' results
-            // when shouldResize is true (broker.ts:387-392); a skipped attach
-            // never records (broker.ts:373). The first-ever record applies
-            // dims WITHOUT bumping the epoch (recordTerminalGeometry,
-            // broker.ts:666-686) -- the same rule `resize` follows since Task 2.
-            let first_record = !s.has_client_geometry;
-            s.has_client_geometry = true;
-            if s.cols == cols && s.rows == rows {
-                return AttachResizeStatus::Unchanged;
-            }
-            s.cols = cols;
-            s.rows = rows;
-            if !first_record {
-                s.geometry_epoch += 1;
-            }
-        }
-        if let Some(pty) = handle.pty.as_ref() {
-            pty.resize(cols, rows);
-        }
-        AttachResizeStatus::Resized
+        let mut s = handle.shared.lock().expect("terminal lock");
+        apply_attach_geometry(&mut s, intent, cols, rows, handle.pty.as_ref())
     }
 
     /// Current geometry bookkeeping as `(cols, rows, geometry_epoch)`; `None`
@@ -3849,6 +3943,81 @@ mod tests {
         // First-ever client geometry: applied, epoch NOT bumped (Node
         // first-record-no-bump, broker.ts:666-686).
         assert_eq!(reg.geometry("T"), Some((95, 41, 1)));
+    }
+
+    #[test]
+    fn simultaneous_first_geometry_attaches_have_one_claimant() {
+        use std::sync::Barrier;
+
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        let start = Arc::new(Barrier::new(3));
+
+        let attach_a = {
+            let reg = reg.clone();
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                let (sink, _seen) = collector();
+                start.wait();
+                reg.attach_with_geometry(
+                    "T",
+                    1,
+                    sink,
+                    Some("a-1".into()),
+                    0,
+                    false,
+                    None,
+                    None,
+                    TerminalAttachIntent::ViewportHydrate,
+                    131,
+                    48,
+                )
+            })
+        };
+        let attach_b = {
+            let reg = reg.clone();
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                let (sink, _seen) = collector();
+                start.wait();
+                reg.attach_with_geometry(
+                    "T",
+                    2,
+                    sink,
+                    Some("b-1".into()),
+                    0,
+                    false,
+                    None,
+                    None,
+                    TerminalAttachIntent::TransportReconnect,
+                    67,
+                    30,
+                )
+            })
+        };
+
+        start.wait();
+        let a = attach_a.join().expect("first attach thread");
+        let b = attach_b.join().expect("second attach thread");
+
+        assert!(a.found && b.found, "both simultaneous viewers must attach");
+        assert_eq!(
+            [a.geometry, b.geometry]
+                .into_iter()
+                .filter(|status| matches!(status, Some(AttachResizeStatus::Resized)))
+                .count(),
+            1,
+            "exactly one first attach may claim shared PTY geometry"
+        );
+        let geometry = reg.geometry("T").expect("terminal geometry");
+        assert_eq!(
+            geometry.2, 1,
+            "the first client geometry record must not bump the epoch"
+        );
+        assert!(
+            matches!(geometry, (131, 48, 1) | (67, 30, 1)),
+            "the final dimensions must belong to the one successful first claim: {geometry:?}"
+        );
     }
 
     #[test]
