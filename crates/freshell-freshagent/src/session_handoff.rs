@@ -78,6 +78,18 @@ pub struct HandoffTestHooks {
     pub drop_abort_target_confirmation_once: std::sync::atomic::AtomicBool,
     /// Make the NEXT `start_target` fail before spawning anything.
     pub fail_target_spawn_once: std::sync::atomic::AtomicBool,
+    /// b8ke e4r2 F3: park `broadcast_failure_truth` BETWEEN its snapshot
+    /// read and its frame send — the deterministic hold for the
+    /// watcher-release race window (the test releases the detached
+    /// watcher mid-window, so the stale failure frame would postcede the
+    /// watcher's `released` frame). The ONCE flag parks only the FIRST
+    /// send (the send-then-recheck regime's later rounds never park);
+    /// PARKED flags the moment the hold engaged (the test's positive
+    /// signal that the snapshot read already happened); never armed in
+    /// production.
+    pub pause_in_failure_truth_broadcast: Option<std::sync::Arc<tokio::sync::Notify>>,
+    pub pause_in_failure_truth_once: std::sync::atomic::AtomicBool,
+    pub pause_in_failure_truth_parked: std::sync::atomic::AtomicBool,
     /// Ordered step labels ("Reaped", "TargetStarted") — test assertions.
     pub events: std::sync::Mutex<Vec<&'static str>>,
 }
@@ -97,6 +109,9 @@ impl Default for HandoffTestHooks {
             abort_reap_confirmation_once: std::sync::atomic::AtomicBool::new(false),
             drop_abort_target_confirmation_once: std::sync::atomic::AtomicBool::new(false),
             fail_target_spawn_once: std::sync::atomic::AtomicBool::new(false),
+            pause_in_failure_truth_broadcast: None,
+            pause_in_failure_truth_once: std::sync::atomic::AtomicBool::new(false),
+            pause_in_failure_truth_parked: std::sync::atomic::AtomicBool::new(false),
             events: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -924,7 +939,8 @@ impl SessionHandoffRunner {
                         generation,
                         prior_kind,
                         "REAP_TIMEOUT",
-                    );
+                    )
+                    .await;
                     let outcome = if prior_live {
                         "reap_timeout_restored_prior"
                     } else {
@@ -977,7 +993,8 @@ impl SessionHandoffRunner {
                     generation,
                     prior_kind,
                     "TARGET_SPAWN_FAILED",
-                );
+                )
+                .await;
                 self.log_transition(
                     TransitionLog {
                         operation_id: &operation_id,
@@ -1120,7 +1137,8 @@ impl SessionHandoffRunner {
                                 generation,
                                 prior_kind,
                                 "SESSION_METADATA_WRITE_FAILED",
-                            );
+                            )
+                            .await;
                             let current = self
                                 .ownership
                                 .observe(&req.provider, &req.session_id)
@@ -1262,7 +1280,8 @@ impl SessionHandoffRunner {
                             generation,
                             prior_kind,
                             "STALE_GENERATION",
-                        );
+                        )
+                        .await;
                         let current = self
                             .ownership
                             .observe(&req.provider, &req.session_id)
@@ -1317,7 +1336,8 @@ impl SessionHandoffRunner {
                     generation,
                     prior_kind,
                     "TARGET_SPAWN_FAILED",
-                );
+                )
+                .await;
                 self.log_transition(
                     TransitionLog {
                         operation_id: &operation_id,
@@ -1473,7 +1493,7 @@ impl SessionHandoffRunner {
     /// unconfirmed-reap timeout the fenced `handoff-failed` frame stands as
     /// the last same-generation frame, and a foreign transition owns the
     /// record in the snapshot's place.
-    fn broadcast_failure_truth(
+    async fn broadcast_failure_truth(
         &self,
         req: &HandoffRequest,
         operation_id: &str,
@@ -1481,55 +1501,108 @@ impl SessionHandoffRunner {
         previous_kind: Option<RuntimeOwnerKind>,
         reason: &str,
     ) {
-        let snap = self.ownership.observe(&req.provider, &req.session_id);
-        let (owner_kind, terminal_id, reason, fenced) = match snap.state {
-            freshell_ownership::OwnershipState::Live { ref owner, .. } => (
-                Some(owner.kind),
-                owner.terminal_id.clone(),
-                reason.to_string(),
-                None,
-            ),
-            freshell_ownership::OwnershipState::Fenced {
-                ref prior,
-                reason: fence_reason,
-                ..
-            } => {
-                // b8ke e4r1 F1: the typed fenced truth — the record's own
-                // captured identity, the fenced marker, and the fence's
-                // typed wire reason (never the generic failure reason over
-                // a fenced record).
-                let (owner_kind, terminal_id) = match prior {
-                    Some((owner, _)) => (Some(owner.kind), owner.terminal_id.clone()),
-                    None => (None, None),
-                };
-                (
-                    owner_kind,
-                    terminal_id,
-                    fence_reason.wire_str().to_string(),
-                    Some(true),
-                )
+        // b8ke e4r2 F3: the snapshot read and the failure send are ordered
+        // atomically w.r.t. same-generation resolver broadcasts (the
+        // detached confirmation watcher's `released` frame) by the
+        // SEND-THEN-RECHECK regime: after each send the record is
+        // re-observed, and if it moved WITHIN this operation's
+        // generation the resolved state is broadcast — the corrective
+        // frame always trails the stale one, so the client's FINAL
+        // same-generation frame is the server's. The loop is bounded: the
+        // only same-generation resolution in play is the fenced record's
+        // release to Vacant (terminal); a record that moved to a foreign
+        // in-progress/newer operation is never asserted over (its own
+        // frames own the record, and its newer generation wins the
+        // client's fold regardless).
+        for round in 0..4u8 {
+            let snap = self.ownership.observe(&req.provider, &req.session_id);
+            let (owner_kind, terminal_id, reason, fenced) = match snap.state {
+                freshell_ownership::OwnershipState::Live { ref owner, .. } => (
+                    Some(owner.kind),
+                    owner.terminal_id.clone(),
+                    reason.to_string(),
+                    None,
+                ),
+                freshell_ownership::OwnershipState::Fenced {
+                    ref prior,
+                    reason: fence_reason,
+                    ..
+                } => {
+                    // b8ke e4r1 F1: the typed fenced truth — the record's
+                    // own captured identity, the fenced marker, and the
+                    // fence's typed wire reason (never the generic failure
+                    // reason over a fenced record).
+                    let (owner_kind, terminal_id) = match prior {
+                        Some((owner, _)) => (Some(owner.kind), owner.terminal_id.clone()),
+                        None => (None, None),
+                    };
+                    (
+                        owner_kind,
+                        terminal_id,
+                        fence_reason.wire_str().to_string(),
+                        Some(true),
+                    )
+                }
+                // In-progress records: never a vacant conversion, never an
+                // assertion over a foreign transition — the owning
+                // operation's own phase frames stand.
+                freshell_ownership::OwnershipState::Handoff { .. }
+                | freshell_ownership::OwnershipState::Starting { .. }
+                | freshell_ownership::OwnershipState::Stopping { .. } => return,
+                // Vacant (or a resolved foreign/Aliased record): the only
+                // truthful vacant conversion.
+                _ => (None, None, reason.to_string(), None),
+            };
+            // b8ke e4r2 F3: the deterministic mid-window hold for the
+            // watcher-release race test — park BETWEEN the snapshot read
+            // and the frame send (never armed in production; the ONCE flag
+            // parks only the first send).
+            if let Some(hooks) = self.test_hooks.as_ref() {
+                if hooks
+                    .pause_in_failure_truth_once
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    if let Some(pause) = hooks.pause_in_failure_truth_broadcast.as_ref() {
+                        hooks
+                            .pause_in_failure_truth_parked
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        let _ = pause.notified().await;
+                    }
+                }
             }
-            // In-progress records: never a vacant conversion, never an
-            // assertion over a foreign transition — the owning operation's
-            // own phase frames stand.
-            freshell_ownership::OwnershipState::Handoff { .. }
-            | freshell_ownership::OwnershipState::Starting { .. }
-            | freshell_ownership::OwnershipState::Stopping { .. } => return,
-            // Vacant (or a resolved foreign/Aliased record): the only
-            // truthful vacant conversion.
-            _ => (None, None, reason.to_string(), None),
-        };
-        self.broadcast_owner(
-            req,
-            "handoff-failed",
-            owner_kind,
-            terminal_id,
-            operation_id,
-            generation,
-            previous_kind,
-            Some(&reason),
-            fenced,
-        );
+            self.broadcast_owner(
+                req,
+                "handoff-failed",
+                owner_kind,
+                terminal_id,
+                operation_id,
+                generation,
+                previous_kind,
+                Some(&reason),
+                fenced,
+            );
+            // THE RECHECK: if the record moved while the frame was being
+            // sent, the frame is stale — broadcast the resolved state (the
+            // next round re-observes). An unchanged record ends the
+            // regime: the sent frame is the server's truth.
+            let after = self.ownership.observe(&req.provider, &req.session_id);
+            if after.state == snap.state {
+                return;
+            }
+            if round == 3 {
+                // Still moving after the bounded rounds — impossible in
+                // practice (the only same-generation resolution is the
+                // terminal Vacant release); fail loud, never silent.
+                tracing::error!(target: "freshell_ownership",
+                    operation_id = %operation_id,
+                    provider = %req.provider, session_id = %req.session_id,
+                    epoch = self.ownership.boot_epoch(), generation,
+                    event = "ownership.handoff.failure_truth_unresolved",
+                    "the failure-truth broadcast could not settle on a stable \
+                     snapshot within its bounded recheck rounds — the last \
+                     sent frame may trail the record");
+            }
+        }
     }
 
     /// Round-1 review: reap a target runtime whose commit was refused
@@ -1905,7 +1978,8 @@ impl SessionHandoffRunner {
             operation_id,
             payload.target_kind,
             prior.as_ref().map(|(owner, _)| owner.kind),
-        );
+        )
+        .await;
         tracing::warn!(target: "freshell_ownership",
             event = "ownership.handoff.abort_settled",
             operation_id = %operation_id, provider = %provider, session_id = %session_id,
@@ -1927,7 +2001,7 @@ impl SessionHandoffRunner {
     /// the `released` frame. A foreign in-progress transition owns the
     /// record in the snapshot's place — its own operation broadcasts its
     /// frames, never this one.
-    fn broadcast_post_abort_authority(
+    async fn broadcast_post_abort_authority(
         &self,
         provider: &str,
         session_id: &str,
@@ -1969,7 +2043,8 @@ impl SessionHandoffRunner {
                     snapshot.generation,
                     previous_kind,
                     "RUNNER_ABORTED",
-                );
+                )
+                .await;
             }
             freshell_ownership::OwnershipState::Vacant => {
                 self.broadcast_owner(
@@ -2067,9 +2142,60 @@ impl SessionHandoffRunner {
             ..
         } = payload;
         if let Some(target) = target.as_ref() {
+            // b8ke e4r2 F1: the post-spawn abort's teardown OUTCOME is
+            // CONSUMED, identically to the runner's flavor/stale-commit
+            // callers — the target RETURNED before the abort landed (the
+            // flavor-window cancellation), so THIS teardown owns the
+            // confirmation regime: a fenced timeout keeps the kill's
+            // confirmation DETACHED (the watcher spawned inside resolves
+            // the fence) and a platform-limited teardown can never confirm
+            // — neither may vacate. Pre-e4r2 the outcome was discarded and
+            // the second lane kill below ran over it: it answered
+            // AlreadyGone (the map entry the first teardown removed),
+            // which was converted to Reaped, and `abort_cleanup` VACATED
+            // while the first teardown was unconfirmed — a competing
+            // lifecycle request could start a second writer.
             let req = self.cleanup_request(provider, session_id, target.kind);
-            self.reap_uncommitted_target(&req, target, operation_id, *generation)
+            let outcome = self
+                .reap_uncommitted_target(&req, target, operation_id, *generation)
                 .await;
+            match outcome {
+                // Confirmed death (or the pre-kill short-circuit proved
+                // nothing was spawned): the second lane kill is redundant
+                // idempotence — the first teardown already owns the reap,
+                // and its AlreadyGone can only ever repeat the confirmed
+                // truth. Release the fresh lane's held lease exactly like
+                // the second-kill arm did (the awaited confirmed tree
+                // death is the precise release).
+                StopOutcomePriv::Reaped | StopOutcomePriv::ReapTimeout { fenced: false } => {
+                    if target.kind == RuntimeOwnerKind::FreshAgent {
+                        self.release_fresh_lane_lease(provider, session_id);
+                    }
+                    return UncommittedTargetOutcome::Reaped;
+                }
+                // Unconfirmed first teardown: NEVER vacate — the typed
+                // verdicts fence (abort_cleanup's Unconfirmed arm fences
+                // + the replacement confirmation watcher; the
+                // PlatformLimited arm fences the typed reason). The
+                // confirmation watcher owns the resolution, and the second
+                // lane kill never runs — its AlreadyGone can never be
+                // converted to a confirmed reap over the unconfirmed first
+                // teardown.
+                StopOutcomePriv::ReapTimeout { fenced: true } => {
+                    tracing::warn!(target: "freshell_ownership",
+                        operation_id = %operation_id, provider = %provider,
+                        session_id = %session_id,
+                        event = "ownership.handoff.abort_target_teardown_unconfirmed",
+                        "the aborted handoff's post-spawn target teardown is \
+                         unconfirmed — the key fences typed (never Vacant over \
+                         an unconfirmed target); the confirmation watcher owns \
+                         the resolution");
+                    return UncommittedTargetOutcome::Unconfirmed;
+                }
+                StopOutcomePriv::PlatformLimitedFenced => {
+                    return UncommittedTargetOutcome::PlatformLimited;
+                }
+            }
         }
         if let Some(watch) = spawn_watch.as_ref() {
             watch.wait_settled().await;
@@ -3403,13 +3529,29 @@ impl Drop for HandoffGuard {
         // one are the two abort exits, and devices hold the stale
         // `handoff-started` record after either (the same envelope: the
         // restored owner, the vacancy, or the fenced marker/reason).
-        self.runner.broadcast_post_abort_authority(
-            &self.provider,
-            &self.session_id,
-            &self.operation_id,
-            self.target_kind,
-            self.prior.as_ref().map(|(owner, _)| owner.kind),
-        );
+        // b8ke e4r2 F3: the failure-truth broadcast is ASYNC (the
+        // send-then-recheck regime) — spawn it on the current reactor; a
+        // Drop with NO reactor (runtime shutdown) has nothing left to
+        // serve the frames anyway.
+        if let Ok(handle) = &reactor {
+            let runner = Arc::clone(&self.runner);
+            let provider = self.provider.clone();
+            let session_id = self.session_id.clone();
+            let operation_id = self.operation_id.clone();
+            let target_kind = self.target_kind;
+            let previous_kind = self.prior.as_ref().map(|(owner, _)| owner.kind);
+            handle.spawn(async move {
+                runner
+                    .broadcast_post_abort_authority(
+                        &provider,
+                        &session_id,
+                        &operation_id,
+                        target_kind,
+                        previous_kind,
+                    )
+                    .await;
+            });
+        }
     }
 }
 

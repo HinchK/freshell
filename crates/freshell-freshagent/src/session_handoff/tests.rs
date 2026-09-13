@@ -2385,6 +2385,167 @@ async fn the_stale_commit_unconfirmed_reap_frame_stays_fenced_never_vacant() {
          stale_commit_reaped_target — got {done_outcomes:?}"
     );
 
+    // b8ke e4r2 F3: the FINAL-frame contract — the detached noop watcher
+    // resolves the fence (~300ms) and broadcasts `released`; the FINAL
+    // runtimeOwner frame the client folds reflects the server's ACTUAL
+    // (now Vacant) state, never the stale fenced failure frame.
+    let frames = await_owner_frames(&mut rig.rx, &["released"]).await;
+    let final_frame = frames.last().expect("at least one frame");
+    assert_eq!(
+        final_frame["ownerKind"],
+        json!("vacant"),
+        "the final frame reflects the watcher-released vacant state — \
+         frames: {frames:?}"
+    );
+    assert_eq!(
+        final_frame["transition"],
+        json!("released"),
+        "the watcher's corrective released frame is the final one — \
+         frames: {frames:?}"
+    );
+
+    // Cleanup: reap the spawned target the forced-timeout path left
+    // running.
+    rig.registry.kill(&target_terminal);
+}
+
+/// b8ke e4r2 F3: the fenced-snapshot read and the failure send are
+/// ordered atomically w.r.t. the detached watcher's release broadcast —
+/// when the watcher resolves MID-WINDOW (releases the fence, broadcasts
+/// `released`) between the failure-truth's snapshot read and its send,
+/// the corrective frame for the RESOLVED state is sent AFTER the stale
+/// failure frame, so the FINAL same-generation frame the client folds
+/// reflects the server's actual (vacant) state. Pre-e4r2 the stale
+/// fenced frame postceded the `released` frame and became the final
+/// client state though the server was vacant.
+#[tokio::test]
+async fn a_watcher_release_mid_failure_window_leaves_the_final_frame_resolved() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let pause = Arc::new(tokio::sync::Notify::new());
+    let failure_park = Arc::new(tokio::sync::Notify::new());
+    let hooks = Arc::new(HandoffTestHooks {
+        pause_in_target_spawn: Some(Arc::clone(&pause)),
+        pause_in_failure_truth_broadcast: Some(Arc::clone(&failure_park)),
+        pause_in_failure_truth_once: std::sync::atomic::AtomicBool::new(true),
+        ..HandoffTestHooks::default()
+    });
+    // The target reap consults AFTER the prior stop consumed the skip.
+    hooks
+        .force_reap_timeout_fenced
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    hooks
+        .force_reap_timeout_fenced_skip
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let mut rig = build_rig(Some(Arc::clone(&hooks)));
+    establish_fresh_claude_owner(&rig, &sid).await;
+
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    // Park proof: the settle published the spawned terminal and parked.
+    let target_terminal = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(watch) = hooks.spawn_watch_slot.lock().unwrap().clone() {
+                if let Some(terminal_id) = watch.published_terminal() {
+                    break terminal_id;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the settle never published the spawned terminal"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+
+    // Ownership moves mid-handoff: the record is fenced with the runner's
+    // op/generation, so the runner's commit answers foreign — the
+    // stale-commit arm whose failure-truth reads the FENCED snapshot.
+    let (op, gen) = match rig.ownership.observe("claude", &sid).state {
+        OwnershipState::Handoff {
+            operation_id,
+            generation,
+            ..
+        } => (operation_id, generation),
+        other => panic!("the runner must hold the Handoff record: {other:?}"),
+    };
+    assert!(matches!(
+        rig.ownership.fence_unconfirmed_handoff(
+            "claude",
+            &sid,
+            &op,
+            gen,
+            FenceReason::WatcherFailed,
+        ),
+        freshell_ownership::FenceOutcome::Fenced
+    ));
+    pause.notify_one();
+
+    // The runner's stale-commit arm runs: the forced-timeout reap
+    // broadcasts the fenced frame and spawns the noop watcher, then the
+    // failure-truth READS the fenced snapshot and PARKS between the read
+    // and its send (the deterministic mid-window hold — the PARKED flag
+    // is the positive signal the snapshot read already happened).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !hooks
+        .pause_in_failure_truth_parked
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the runner never reached its parked failure broadcast"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // MID-WINDOW: the detached noop watcher resolves (its confirmation
+    // lands), releases the fence, and broadcasts `released` — BEFORE the
+    // parked failure send.
+    let frames = await_owner_frames(&mut rig.rx, &["released"]).await;
+    let released = runtime_owner_frame(&frames, "released");
+    assert_eq!(
+        released["ownerKind"],
+        json!("vacant"),
+        "the watcher's released frame names the vacancy: {frames:?}"
+    );
+    assert_eq!(
+        rig.ownership.observe("claude", &sid).state,
+        OwnershipState::Vacant,
+        "the watcher released the fence mid-window — the server is vacant"
+    );
+
+    // Release the parked send: the (now-stale) failure frame goes out
+    // AFTER the corrective `released` frame.
+    failure_park.notify_one();
+    let result = handle.completion.await.expect("runner completed");
+    assert_eq!(
+        result["error"]["code"],
+        json!("STALE_GENERATION"),
+        "the typed stale-commit failure answers: {result}"
+    );
+
+    // THE e4r2 F3 CONTRACT: the FINAL frame the client folds reflects the
+    // server's ACTUAL (vacant) state — the corrective frame for the
+    // resolved state postcedes the stale failure frame (pre-e4r2 the
+    // stale fenced frame was the final client state).
+    let frames = drain_runtime_owner_frames(&mut rig.rx);
+    let final_frame = frames.last().expect("at least one frame");
+    assert_ne!(
+        final_frame["fenced"],
+        json!(true),
+        "the final frame must not be the stale fenced failure — frames: {frames:?}"
+    );
+    assert_eq!(
+        final_frame["ownerKind"],
+        json!("vacant"),
+        "the final frame reflects the watcher-released vacant state — \
+         frames: {frames:?}"
+    );
+
     // Cleanup: reap the spawned target the forced-timeout path left
     // running.
     rig.registry.kill(&target_terminal);
@@ -2445,6 +2606,139 @@ async fn the_confirmed_reap_flavor_failure_broadcasts_the_truthful_vacancy() {
         "the confirmed-reap flavor failure's done outcome keeps the \
          truthful flavor_write_failed_target_reaped — got {done_outcomes:?}"
     );
+}
+
+/// b8ke e4r2 F1: an abort landing in the FLAVOR WINDOW (the fresh target
+/// RETURNED; the write is parked) whose FIRST target teardown is
+/// UNCONFIRMED (a fenced reap timeout — the kill's confirmation runs
+/// detached) must CONSUME that outcome: the abort fences typed (the
+/// confirmation watcher owns the resolution), never vacates. Pre-e4r2
+/// the discarded outcome fell through to the SECOND lane kill — its
+/// AlreadyGone/Reaped answer was converted to a confirmed reap and
+/// `abort_cleanup` VACATED while the first teardown was unconfirmed
+/// (a competing lifecycle request could start a second writer).
+#[tokio::test]
+async fn an_abort_in_the_flavor_window_with_an_unconfirmed_target_teardown_fences_not_vacates() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    // The claude-lane resume gates on transcript presence (the 6b pattern)
+    // — the fresh TARGET's resume needs the fake transcript.
+    let store_dir =
+        std::env::temp_dir().join(format!("freshell-e4r2-f1-store-{}", uuid_like_suffix()));
+    let project_dir = store_dir.join("projects").join("slug");
+    std::fs::create_dir_all(&project_dir).expect("create transcript project dir");
+    std::fs::write(
+        project_dir.join(format!("{sid}.jsonl")),
+        "{\"cwd\": \"/tmp\"}\n",
+    )
+    .expect("write fake transcript");
+    std::env::set_var("CLAUDE_CONFIG_DIR", &store_dir);
+    let hooks = Arc::new(HandoffTestHooks::default());
+    // The PRIOR stop consumes the skip; the post-spawn abort's FIRST
+    // teardown is forced to the fenced timeout (kill issued, confirmation
+    // detached — the noop watcher owns the resolution).
+    hooks
+        .force_reap_timeout_fenced
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    hooks
+        .force_reap_timeout_fenced_skip
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    // A BLOCKING flavor writer parks the write — the abort window (the
+    // fresh target has returned, so the guard's target_runtime is set).
+    let release = Arc::new(tokio::sync::Notify::new());
+    let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let log: FlavorWriteLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let rig = build_rig_inner(
+        Some(Arc::clone(&hooks) as Arc<HandoffTestHooks>),
+        None,
+        None,
+        10_000,
+        None,
+        false,
+        Some(Arc::new(BlockingFlavorWriter {
+            log: Arc::clone(&log),
+            release: Arc::clone(&release),
+            reached: Arc::clone(&reached),
+        })),
+    );
+    establish_fresh_claude_owner(&rig, &sid).await;
+
+    // A handoff to a FRESH target (the reviewer's scenario) parks inside
+    // its awaited flavor write.
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_fresh("claude", &sid, "freshclaude"));
+    let HandoffHandle {
+        mut completion,
+        task,
+    } = handle;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            result = &mut completion => {
+                panic!(
+                    "the fresh-target handoff failed before the flavor \
+                     write: {result:?}"
+                );
+            }
+        }
+        if reached.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the handoff never reached its flavor write"
+        );
+    }
+
+    // Abort inside the write await — the guard's detached cleanup runs
+    // the post-spawn target reap.
+    task.abort();
+    let _ = task.await;
+
+    // THE e4r2 F1 CONTRACT: the first teardown's unconfirmed outcome is
+    // CONSUMED — the key fences typed, never vacates over the
+    // unconfirmed target (pre-e4r2: the second lane kill's answer
+    // vacated the key).
+    await_cond("the aborted handoff must fence (never vacate)", || {
+        matches!(
+            rig.ownership.observe("claude", &sid).state,
+            OwnershipState::Fenced { .. }
+        )
+    })
+    .await;
+    // New claims stay BLOCKED (no second writer over the unconfirmed
+    // target).
+    assert!(matches!(
+        rig.ownership.begin_start(
+            "claude",
+            &sid,
+            RuntimeOwnerKind::Terminal,
+            "op-second-writer-e4r2",
+            None,
+            "test",
+            0,
+        ),
+        freshell_ownership::BeginOutcome::Blocked { .. }
+    ));
+    // The detached confirmation watcher owns the resolution: once its
+    // confirmation lands the fence releases to Vacant (recoverable, not
+    // wedged).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !matches!(
+        rig.ownership.observe("claude", &sid).state,
+        OwnershipState::Vacant
+    ) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the confirmation watcher never resolved the fence — state: {:?}",
+            rig.ownership.observe("claude", &sid).state
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// b8ke e3r2 F3: a FAILING flavor writer — the failure surfaces as the
