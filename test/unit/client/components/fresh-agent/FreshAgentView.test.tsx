@@ -9614,3 +9614,128 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
     }
   })
 })
+
+describe('b8ke ext F2: sessionRef-only panes kill the old runtime on replacement/restart', () => {
+  // The restored-pane shape: persistence strips content.sessionId, leaving
+  // ONLY the durable sessionRef — BOTH kill paths must use
+  // sessionRef.sessionId (pre-ext the `content.sessionId` gate skipped the
+  // awaited kill entirely, clearing the durable reference and starting a
+  // blank conversation while the prior runtime stayed live and
+  // unrepresented).
+
+  it('startNewConversation kills the sessionRef session before starting the new one', async () => {
+    const handlers: Array<(msg: Record<string, unknown>) => void> = []
+    wsMock.onMessage.mockReset()
+    wsMock.onMessage.mockImplementation((listener: (msg: Record<string, unknown>) => void) => {
+      handlers.push(listener)
+      return () => {}
+    })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-ref-only-new',
+        sessionRef: { provider: 'codex', sessionId: 'thread-ref-only' },
+        status: 'stuck',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshcodex',
+            provider: 'codex',
+            createRequestId: 'req-ref-only-new',
+            sessionRef: { provider: 'codex', sessionId: 'thread-ref-only' },
+            status: 'stuck',
+          }}
+        />
+      </Provider>,
+    )
+
+    await screen.findByRole('alert')
+    wsMock.send.mockClear()
+
+    // The stuck card's Start-new action (the same startNewConversation
+    // callback the /new command and the context menu drive).
+    fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
+
+    // THE F2 CONTRACT: the awaited kill targets the durable sessionRef
+    // session — pre-ext a sessionRef-only pane sent NO kill at all and the
+    // pane swapped straight to a blank conversation over the live runtime.
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.kill',
+      sessionId: 'thread-ref-only',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    }))
+    // Ungated before the ack: the pane keeps its durable reference.
+    const before = store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+    expect(before.content).toMatchObject({ status: 'idle' })
+
+    for (const handler of handlers) {
+      handler({
+        type: 'freshAgent.killed',
+        sessionId: 'thread-ref-only',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        success: true,
+      })
+    }
+    await waitFor(() => {
+      const after = store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(after.content).toMatchObject({ status: 'creating' })
+      expect((after.content as { sessionId?: string }).sessionId).toBeUndefined()
+      expect((after.content as { sessionRef?: { sessionId: string } }).sessionRef).toBeUndefined()
+    })
+  })
+
+  it('restartStuckSidecar kills the sessionRef session before re-driving creation', async () => {
+    const store = createStore()
+    const dispatchSpy = vi.spyOn(store, 'dispatch')
+
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshcodex',
+            provider: 'codex',
+            createRequestId: 'req-ref-stuck',
+            sessionRef: { provider: 'codex', sessionId: 'thread-ref-stuck' },
+            status: 'stuck',
+          }}
+        />
+      </Provider>,
+    )
+
+    await screen.findByRole('alert')
+    wsMock.send.mockClear()
+    fireEvent.click(screen.getByRole('button', { name: /restart sidecar and resume session/i }))
+
+    // THE F2 CONTRACT: the restart's kill targets the durable sessionRef
+    // session — pre-ext a sessionRef-only pane sent NO kill and the
+    // recovery re-drove creation over the live wedged runtime.
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.kill',
+      sessionId: 'thread-ref-stuck',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    }))
+    const remints = dispatchSpy.mock.calls
+      .map(([action]) => action)
+      .filter((action: any) => action?.type === 'panes/updatePaneContent'
+        && action.payload?.content?.status === 'creating')
+    expect(remints).toHaveLength(1)
+  })
+})

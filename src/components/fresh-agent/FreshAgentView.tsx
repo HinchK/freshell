@@ -1320,7 +1320,18 @@ export function FreshAgentView({
     // tab. On failure the current conversation stays (the killed fold's
     // session-error banner — or the await's timeout write — explains it).
     void (async () => {
-      if (current.sessionId) {
+      // b8ke ext F2: the kill target is the pane's DURABLE session —
+      // content.sessionId OR the restored pane's sessionRef.sessionId
+      // (the sessionRef's provider must match the pane's). Pre-ext the
+      // content.sessionId gate skipped the awaited kill entirely for a
+      // sessionRef-only restored pane, clearing the durable reference
+      // and starting a blank conversation while the prior runtime
+      // stayed live and unrepresented.
+      const killSessionId = current.sessionId
+        ?? (current.sessionRef?.provider === current.provider
+          ? current.sessionRef.sessionId
+          : undefined)
+      if (killSessionId) {
         const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
         // kata b8ke (round-3 F6): the kill is a lifecycle producer — carry
         // the observed (epoch, generation) fence so a delayed kill naming
@@ -1329,7 +1340,7 @@ export function FreshAgentView({
         const fence = selectPaneOwnerFence(appStore.getState(), current)
         const ack = await sendFreshAgentKillAndAwait(
           {
-            sessionId: current.sessionId,
+            sessionId: killSessionId,
             sessionType: current.sessionType,
             provider: current.provider,
             ...(cwd ? { cwd } : {}),
@@ -1339,7 +1350,7 @@ export function FreshAgentView({
         )
         if (!ack.ok) {
           dispatch(sessionError({
-            sessionId: current.sessionId,
+            sessionId: killSessionId,
             sessionType: current.sessionType,
             provider: current.provider,
             code: 'KILL_FAILED',
@@ -1577,14 +1588,22 @@ export function FreshAgentView({
   // triggerRecovery path so the canonical resume id keeps the durable thread.
   const restartStuckSidecar = useCallback(() => {
     const current = paneContentRef.current
-    if (current.sessionId) {
+    // b8ke ext F2: the kill target is the pane's DURABLE session —
+    // content.sessionId OR the restored pane's sessionRef.sessionId
+    // (pre-ext a sessionRef-only pane skipped the kill and re-drove
+    // creation over the live wedged runtime).
+    const killSessionId = current.sessionId
+      ?? (current.sessionRef?.provider === current.provider
+        ? current.sessionRef.sessionId
+        : undefined)
+    if (killSessionId) {
       const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
       // kata b8ke (round-3 F6): the kill carries the observed
       // (epoch, generation) fence like every lifecycle producer.
       const fence = selectPaneOwnerFence(appStore.getState(), current)
       sendFreshAgentMessage({
         type: 'freshAgent.kill',
-        sessionId: current.sessionId,
+        sessionId: killSessionId,
         sessionType: current.sessionType,
         provider: current.provider,
         ...(cwd ? { cwd } : {}),
