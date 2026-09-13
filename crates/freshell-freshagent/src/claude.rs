@@ -2742,6 +2742,7 @@ impl FreshClaudeState {
                         // the same generation arithmetic the stamp path
                         // uses (a fence-less legacy kill claims against the
                         // CURRENT pair — the snapshot's).
+                        let observed_live_generation = generation;
                         let claim = freshell_ownership::StopClaim {
                             expected_kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
                             expected_runtime: Some(owner.clone()),
@@ -2777,12 +2778,30 @@ impl FreshClaudeState {
                                 // converted to "runtime exited" and
                                 // committed a LIVE runtime to Vacant on a
                                 // clean close failure).
+                                // b8ke e3 post-cap F1: the rollback stamp
+                                // mirrors EXACTLY what abort_stop restores —
+                                // the ORIGINAL owner identity at the PRE-stop
+                                // Live generation (the snapshot's), with the
+                                // owner's own ownership_id as the stamp's
+                                // operation id (release's runtime_matches
+                                // requires stamp.operation_id == the live
+                                // owner's ownership_id AND stamp.generation ==
+                                // the Live record's generation; pre-post-cap
+                                // the minted stop generation + kill_op_id
+                                // could never satisfy either, so a later
+                                // natural exit could never release and an
+                                // unfenced retry derived a stale stop claim —
+                                // a recovered close failure left the
+                                // coordinator falsely Live until restart).
                                 taken_stop_stamp = Some((
                                     canonical.clone(),
                                     crate::ownership_lane::OwnershipStamp {
                                         epoch: registry.boot_epoch(),
-                                        generation,
-                                        operation_id: kill_op_id.clone(),
+                                        generation: observed_live_generation,
+                                        operation_id: owner
+                                            .ownership_id
+                                            .clone()
+                                            .unwrap_or_default(),
                                         owner: owner.clone(),
                                     },
                                 ));
@@ -11027,6 +11046,54 @@ rl.on('line', (line) => {
             st.has_live_session(FRESH_CREATE_DURABLE_ID).await,
             "the runtime still runs — nothing was killed"
         );
+
+        // b8ke e3 post-cap F1: THE END-TO-END natural-exit path — the
+        // restored stamp must SATISFY release's identity checks (the
+        // exact end-to-end recovery, not just the stamp's presence):
+        // the sidecar later exits; the exit watcher releases; the key
+        // goes Vacant (pre-post-cap the minted stop generation + kill
+        // op id could never match abort_stop's restored Live, so a
+        // recovered close failure stayed falsely Live until restart).
+        {
+            let stamp = crate::ownership_lane::peek_retained_stamp(
+                &st.ownership_stamps,
+                FRESH_CREATE_DURABLE_ID,
+            )
+            .expect("the recovered stamp (the original identity)");
+            // Kill the sidecar so the exit shape is real.
+            let sidecar_pid = stamp.owner.pid.expect("the sidecar pid");
+            let kill_res = tokio::process::Command::new("kill")
+                .arg("-9")
+                .arg(sidecar_pid.to_string())
+                .status()
+                .await
+                .expect("kill -9 the sidecar");
+            assert!(kill_res.success());
+            let reap_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+            while !crate::ownership_lane::partial_pid_confirmed_dead(sidecar_pid) {
+                assert!(
+                    tokio::time::Instant::now() < reap_deadline,
+                    "the killed sidecar was never reaped"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            // THE EXIT WATCHER's path.
+            crate::ownership_lane::release_retained_stamp(
+                &Some(Arc::clone(&registry)),
+                &st.ownership_stamps,
+                "claude",
+                FRESH_CREATE_DURABLE_ID,
+                "claude-exit",
+            );
+            assert!(
+                matches!(
+                    registry.observe("claude", FRESH_CREATE_DURABLE_ID).state,
+                    freshell_ownership::OwnershipState::Vacant
+                ),
+                "the natural exit RELEASES the key — the recovered stamp \
+                 matched abort_stop's restored identity"
+            );
+        }
     }
 
     /// b8ke e3r2 F1: a DELAYED kill arriving MID-HANDOFF is refused typed.

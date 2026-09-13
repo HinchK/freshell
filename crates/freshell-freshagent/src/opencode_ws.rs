@@ -506,6 +506,38 @@ pub(crate) async fn settle_accepted_daemon_turn(
 }
 
 impl FreshOpencodeState {
+    /// b8ke e3 post-cap F2: test seam — retain a condemned-session
+    /// witness (the kill path's retained accepted-daemon-turn evidence).
+    /// Test-only seeding route for cross-crate consumers; production code
+    /// must never call this.
+    #[doc(hidden)]
+    pub fn insert_condemned_for_test(
+        &self,
+        session_id: &str,
+        daemon_turn_accepted: Arc<std::sync::atomic::AtomicBool>,
+        route: Option<String>,
+    ) {
+        self.condemned_sessions
+            .lock()
+            .expect("condemned sessions lock")
+            .insert(
+                session_id.to_string(),
+                CondemnedOpencodeSession {
+                    daemon_turn_accepted,
+                    route,
+                },
+            );
+    }
+
+    /// b8ke e3 post-cap F2: test seam — peek a condemned-session witness.
+    /// Test-only; production code must never call this.
+    #[doc(hidden)]
+    pub fn has_condemned_for_test(&self, session_id: &str) -> bool {
+        self.condemned_sessions
+            .lock()
+            .expect("condemned sessions lock")
+            .contains_key(session_id)
+    }
     /// Build the state around an existing [`FreshAgentState`] (REUSED, not duplicated),
     /// so this slice and the REST tabs slice share exactly one `opencode serve` sidecar.
     pub fn new(fresh_agent: FreshAgentState) -> Self {
@@ -931,6 +963,20 @@ impl FreshOpencodeState {
             guard.get(&durable_id).cloned()
         };
         let in_memory_hit = existing.is_some();
+        // b8ke e3 post-cap F4: the PRE-AWAIT observation — the coordinator's
+        // generation + the owner identity captured BEFORE any of this
+        // handler's session-mutation/binding awaits. The post-await recheck
+        // compares AGAINST THIS (generation AND identity must match);
+        // pre-post-cap the predicate accepted any Live{FreshAgent} or
+        // Vacant/Aliased, so a kill or same-kind turnover during the await
+        // left stale durable metadata and still succeeded.
+        let pre_await = self.fresh_agent.ownership_snapshot(PROVIDER, &durable_id);
+        let (pre_await_generation, pre_await_owner) = match &pre_await.state {
+            freshell_ownership::OwnershipState::Live {
+                owner, generation, ..
+            } => (Some(*generation), Some(owner.clone())),
+            _ => (None, None),
+        };
         // b8ke delta round-3 F2: an in-memory hit still CONSULTS the
         // coordinator — a delayed create-resume during a Handoff must be
         // blocked or typed, never a silent reuse of a runtime the handoff
@@ -1080,6 +1126,23 @@ impl FreshOpencodeState {
         // precedence): merge msg over the resumed session's values BEFORE
         // normalization, so an omitted param recovers the recorded value instead of
         // being rewritten to the default.
+        // b8ke e3 post-cap F4: the PRE-PARK row state — captured BEFORE the
+        // session-mutation scope (the re-park overwrites session.provenance),
+        // so the binding write's rollback restores the row's EARLIER
+        // attribution, never the turnover's stale one.
+        let (pre_park_provenance, pre_park_settings) = {
+            let session = session_arc.lock().await;
+            (
+                session.provenance.clone(),
+                crate::identity_sink::FreshAgentSettings {
+                    model: session.model.clone(),
+                    sandbox: None,
+                    permission_mode: None,
+                    effort: session.effort.clone(),
+                    cwd: session.cwd.clone(),
+                },
+            )
+        };
         {
             let mut session = session_arc.lock().await;
             // D8 (focused-ep1 Finding A, branch 1 — same-process in-memory
@@ -1103,6 +1166,53 @@ impl FreshOpencodeState {
             }
         }
 
+        // b8ke e3 post-cap F4: the durable write's rollback payload —
+        // the PRE-write settings + parked provenance captured BEFORE the
+        // binding write, so a turnover during the write's own await can
+        // restore the row (a compensating upsert).
+        let mut binding_write_rollback: Option<crate::identity_sink::FreshAgentBindingUpsert> =
+            None;
+
+        // b8ke e3 post-cap F4: the PRE-WRITE recheck — after the
+        // session-mutation awaits, BEFORE the durable binding write: the
+        // coordinator's generation and the owner identity must STILL match
+        // the pre-await capture (a kill or turnover during the awaits
+        // answers typed and the durable write NEVER happens).
+        {
+            let snap = self.fresh_agent.ownership_snapshot(PROVIDER, &durable_id);
+            let still_owns = match (&snap.state, &pre_await_owner) {
+                (
+                    freshell_ownership::OwnershipState::Live {
+                        owner, generation, ..
+                    },
+                    Some(pre_owner),
+                ) => {
+                    owner.kind == pre_owner.kind
+                        && owner.ownership_id == pre_owner.ownership_id
+                        && owner.live_session_key == pre_owner.live_session_key
+                        && Some(*generation) == pre_await_generation
+                }
+                _ => false,
+            };
+            // The unwired-coordinator shape (pre_await_owner == None — no
+            // coordinator observed): the legacy path proceeds; the strict
+            // comparison only gates a COORDINATED create.
+            if in_memory_hit && pre_await_owner.is_some() && !still_owns {
+                tracing::warn!(target: "freshell_freshagent::opencode",
+                    session_id = %durable_id, state = ?snap.state,
+                    "fresh_agent_create_aborted_pre_write: a lifecycle transition \
+                     moved the key during this create's awaits — the durable \
+                     binding write is PREVENTED and the create answers typed");
+                self.fail_create(
+                    &request_id,
+                    "SESSION_RESERVED",
+                    "A lifecycle operation committed while this create was in flight; \
+                     retry after it settles",
+                );
+                return;
+            }
+        }
+
         // D8 (focused-ep1 Finding A, branch 1): the in-memory hit bypasses
         // `resume_durable_session`, so it must perform that lane's SAME
         // awaited refresh write itself (durable-before-answer) — the CURRENT
@@ -1118,6 +1228,22 @@ impl FreshOpencodeState {
                     session.cwd.clone(),
                 )
             };
+            // Capture the PRE-write row state for the rollback (the
+            // PRE-PARK capture above — the row's state before this
+            // handler's own re-park).
+            binding_write_rollback = Some(crate::identity_sink::FreshAgentBindingUpsert {
+                provider: PROVIDER.into(),
+                session_id: durable_id.clone(),
+                mode: SESSION_TYPE.into(),
+                create_request_id: None,
+                resolves_pending: None,
+                supersedes: None,
+                provenance: match pre_park_provenance.clone() {
+                    Some(parked) => crate::identity_sink::ProvenanceUpdate::Replace(parked),
+                    None => crate::identity_sink::ProvenanceUpdate::Inherit,
+                },
+                settings: pre_park_settings.clone(),
+            });
             self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
                 provider: PROVIDER.into(),
                 session_id: durable_id.clone(),
@@ -1137,25 +1263,38 @@ impl FreshOpencodeState {
             .await;
         }
 
-        // b8ke e3r4 F4: the POST-AWAIT RECHECK — a handoff can have
-        // begun or COMMITTED during the session-mutation + durable
-        // binding awaits above (the create path holds no coordinator
-        // lease across them). Re-observe BEFORE any reassertion: if the
-        // key moved (a Terminal owner, a handoff in flight, a fence), the
-        // delayed create ABORTS TYPED — no `freshAgent.created`
-        // reassertion beside the committed owner, no binding re-write.
+        // b8ke e3r4 F4 + e3 post-cap F4: the POST-WRITE RECHECK — strict:
+        // the coordinator's generation and owner identity must STILL match
+        // the pre-await capture. A turnover during the BINDING WRITE's own
+        // await rolled the durable row already (the write landed during the
+        // race) — so on mismatch the write is ROLLED BACK (a compensating
+        // upsert restoring the PRE-write settings; the provenance merge's
+        // keep-when-None restores the row's earlier attribution), then the
+        // create answers typed — no `freshAgent.created` reassertion.
         {
             let snap = self.fresh_agent.ownership_snapshot(PROVIDER, &durable_id);
-            let stale = !matches!(
-                &snap.state,
-                freshell_ownership::OwnershipState::Live { owner, .. }
-                    if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
-            ) && !matches!(
-                &snap.state,
-                freshell_ownership::OwnershipState::Vacant
-                    | freshell_ownership::OwnershipState::Aliased { .. }
-            );
+            let still_owns = match (&snap.state, &pre_await_owner) {
+                (
+                    freshell_ownership::OwnershipState::Live {
+                        owner, generation, ..
+                    },
+                    Some(pre_owner),
+                ) => {
+                    owner.kind == pre_owner.kind
+                        && owner.ownership_id == pre_owner.ownership_id
+                        && owner.live_session_key == pre_owner.live_session_key
+                        && Some(*generation) == pre_await_generation
+                }
+                _ => false,
+            };
+            let stale = in_memory_hit && pre_await_owner.is_some() && !still_owns;
             if stale {
+                // ROLL the durable binding write back — the compensating
+                // upsert restores the PRE-write settings (captured before
+                // the mutation scope) with keep-when-None provenance.
+                if let Some(rollback) = binding_write_rollback.take() {
+                    self.record_binding_row(rollback).await;
+                }
                 tracing::warn!(target: "freshell_freshagent::opencode",
                     session_id = %durable_id, state = ?snap.state,
                     "fresh_agent_create_aborted_post_await: a lifecycle transition \
@@ -2373,12 +2512,20 @@ impl FreshOpencodeState {
                                 // atomic restore treats an unprobeable
                                 // stamp as live by policy, and the
                                 // registry follows).
+                                // b8ke e3 post-cap F1: the rollback stamp
+                                // mirrors what abort_stop restores — the
+                                // ORIGINAL owner identity at the PRE-stop
+                                // Live generation with the owner's own
+                                // ownership_id.
                                 taken_stop_stamp = Some((
                                     canonical_observed.clone(),
                                     crate::ownership_lane::OwnershipStamp {
                                         epoch: registry.boot_epoch(),
                                         generation,
-                                        operation_id: kill_op_id.clone(),
+                                        operation_id: owner
+                                            .ownership_id
+                                            .clone()
+                                            .unwrap_or_default(),
                                         owner: owner.clone(),
                                     },
                                 ));
@@ -2707,6 +2854,27 @@ impl FreshOpencodeState {
                 }
             }
 
+            // b8ke e3 post-cap F2: RETAIN THE WITNESS BEFORE the map
+            // removal — the accepted-daemon-turn witness (the
+            // condemned-session record) enters the shared registry HERE,
+            // so a kill task dying between the map removal and its
+            // phase-5 daemon-turn abort leaves the evidence the probe
+            // (confirm_fenced_prior_dead) needs to settle the turn and
+            // confirm. Pre-post-cap the witness lived only in this task's
+            // locals: a dying kill left the probe seeing bare map
+            // absence (releasing to Vacant while the old daemon turn
+            // could still write) or bare map presence (an unrecoverable
+            // fence when the kill died before removal).
+            if let Some(real_id) = real.as_deref() {
+                self.condemned_sessions
+                    .lock()
+                    .expect("condemned sessions lock")
+                    .entry(real_id.to_string())
+                    .or_insert_with(|| CondemnedOpencodeSession {
+                        daemon_turn_accepted: daemon_turn_accepted.clone(),
+                        route: route.clone(),
+                    });
+            }
             // Phase 4 — the map removal, its own short synchronous section
             // (every key aliasing this Arc goes; the killed flag has gated
             // sends since phase 3, so no new key can appear for it).
@@ -2734,7 +2902,20 @@ impl FreshOpencodeState {
                 if let Some(real) = real.as_deref() {
                     self.abort_accepted_daemon_turn(real, &route, &daemon_turn_accepted)
                         .await;
+                    // The kill SURVIVED its own abort — the retained
+                    // witness clears (it exists only for a dying kill).
+                    self.condemned_sessions
+                        .lock()
+                        .expect("condemned sessions lock")
+                        .remove(real);
                 }
+            } else if let Some(real) = real.as_deref() {
+                // No accepted turn: the witness was retained defensively —
+                // clear it so it cannot outlive the completed kill.
+                self.condemned_sessions
+                    .lock()
+                    .expect("condemned sessions lock")
+                    .remove(real);
             }
             // b8ke focused round-3 R3-1: a REST-driven turn on the SAME
             // canonical id is an in-flight writer the WS session map never
@@ -6080,6 +6261,29 @@ mod tests {
             ),
             "the committed Terminal owner stays authoritative"
         );
+
+        // b8ke e3 post-cap F4: THE DURABLE STATE — the turnover happened
+        // during the binding write's own await, so the write landed; the
+        // post-write recheck must have ROLLED IT BACK: the LAST recorded
+        // upsert for the key is the compensating one (keep-when-None
+        // provenance — the PRE-write parked attribution restored), not
+        // the create's Replace reassertion.
+        {
+            let bindings = fake.bindings.lock().unwrap();
+            let last = bindings
+                .iter()
+                .rev()
+                .find(|b| b.session_id == real_id)
+                .expect("at least one binding write for the key");
+            assert_eq!(
+                last.provenance,
+                crate::identity_sink::ProvenanceUpdate::Inherit,
+                "the LAST durable write is the compensating ROLLBACK \
+                 (keep-when-None provenance) — the turnover's stale \
+                 metadata did not survive: {:?}",
+                last.provenance
+            );
+        }
     }
 
     /// b8ke e3r4 F4: the ATTACH path refuses a TERMINAL-owned session

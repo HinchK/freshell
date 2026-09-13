@@ -330,6 +330,41 @@ async fn recover_stale_start(
 /// fence holds (the partial records no start time, so a live pid cannot
 /// be identified as the original — fail closed; no signal is ever sent).
 /// A fence with NO recorded pid can never confirm: it holds.
+/// b8ke e3 post-cap F3: broadcast a fence RELEASE (the key reopened to
+/// Vacant through the confirmed-death probe) so connected devices drop
+/// their fenced recovery state immediately — pre-post-cap the probe
+/// released without broadcasting and clients retained `fenced:true`
+/// indefinitely.
+#[allow(clippy::too_many_arguments)] // the fence release transition's field set
+fn broadcast_fence_released(
+    broadcast_tx: &tokio::sync::broadcast::Sender<String>,
+    provider: &str,
+    session_id: &str,
+    epoch: u64,
+    generation: u64,
+    _prior_kind: Option<freshell_ownership::RuntimeOwnerKind>,
+    reason: &str,
+    operation_id: &str,
+) {
+    use freshell_protocol::{ServerMessage, SessionRuntimeOwner};
+    let frame = serde_json::to_string(&ServerMessage::SessionRuntimeOwner(SessionRuntimeOwner {
+        provider: provider.to_string(),
+        session_id: session_id.to_string(),
+        epoch,
+        generation,
+        owner_kind: "vacant".to_string(),
+        previous_kind: None,
+        terminal_id: None,
+        operation_id: operation_id.to_string(),
+        transition: "released".to_string(),
+        reason: Some(reason.to_string()),
+        fenced: None,
+        alias_of: None,
+    }))
+    .unwrap_or_default();
+    let _ = broadcast_tx.send(frame);
+}
+
 /// b8ke e3r4 F5: broadcast a FENCE transition so every connected device
 /// converges on the fenced state immediately (previously the stale
 /// watchdogs mutated ownership silently — devices kept their stale owner
@@ -377,6 +412,7 @@ async fn probe_stale_start_fences(
     fresh_codex: &freshell_freshagent::FreshCodexState,
     fresh_claude: &freshell_freshagent::FreshClaudeState,
     fresh_opencode: &freshell_freshagent::FreshOpencodeState,
+    broadcast_tx: &tokio::sync::broadcast::Sender<String>,
 ) {
     for fence in ownership.stale_start_fences() {
         // b8ke focused episode-2 post-cap F4 + e3r4 F2/F3: the probe
@@ -418,16 +454,25 @@ async fn probe_stale_start_fences(
             None => match fence.settle_concluded {
                 // Still in flight: the fence holds (fail closed).
                 Some(false) => false,
-                // Concluded: the kind-aware lane-absence answer.
-                Some(true) => {
-                    let live = match fence.provider.as_str() {
-                        "codex" => fresh_codex.has_live_session(&fence.session_id).await,
-                        "claude" => fresh_claude.has_live_session(&fence.session_id).await,
-                        "opencode" => fresh_opencode.has_live_session(&fence.session_id).await,
-                        _ => true,
-                    };
-                    !live
-                }
+                // Concluded: the kind-aware lane confirmation. For
+                // OpenCode this is confirm_fenced_prior_dead — the KILL
+                // PATH'S OWN EVIDENCE (the retained accepted-daemon-turn
+                // witness + the REST-turn registry + the session map),
+                // NEVER bare map presence: an explicit kill removes every
+                // map alias BEFORE it aborts the daemon-side turn, so
+                // bare absence released to Vacant while the old turn
+                // could still write, and a kill dying before the removal
+                // left an unrecoverable "live" fence (e3 post-cap F2).
+                Some(true) => match fence.provider.as_str() {
+                    "codex" => !fresh_codex.has_live_session(&fence.session_id).await,
+                    "claude" => !fresh_claude.has_live_session(&fence.session_id).await,
+                    "opencode" => {
+                        fresh_opencode
+                            .confirm_fenced_prior_dead(&fence.session_id)
+                            .await
+                    }
+                    _ => false,
+                },
                 // NO registration (the opencode shape): the kind-aware
                 // lane confirmation decides — never a permanent hold.
                 None => match fence.provider.as_str() {
@@ -460,8 +505,36 @@ async fn probe_stale_start_fences(
             fence.generation,
         );
         if released == freshell_ownership::CommitOutcome::Committed {
+            // b8ke e3 post-cap F3: broadcast the RELEASE — connected
+            // devices drop their fenced recovery state immediately
+            // (pre-post-cap the probe reopened the key silently and
+            // clients retained fenced:true indefinitely).
+            broadcast_fence_released(
+                broadcast_tx,
+                &fence.provider,
+                &fence.session_id,
+                ownership.boot_epoch(),
+                fence.generation,
+                fence.prior_kind,
+                if fence.reason == freshell_ownership::FenceReason::StaleStop {
+                    "stale-stop"
+                } else {
+                    "stale-start"
+                },
+                &fence.operation_id,
+            );
+            // b8ke e3 post-cap F5: the event name + failure reason are
+            // REASON-APPROPRIATE — a stop-reason release is a STOP
+            // diagnostic (STOPPING_TIMEOUT), never a misclassified
+            // STARTING_TIMEOUT start diagnostic.
+            let (release_event, release_failure_reason) =
+                if fence.reason == freshell_ownership::FenceReason::StaleStop {
+                    ("ownership.stop.fence_probe_released", "STOPPING_TIMEOUT")
+                } else {
+                    ("ownership.start.fence_probe_released", "STARTING_TIMEOUT")
+                };
             tracing::warn!(target: "freshell_ownership",
-                event = "ownership.start.fence_probe_released",
+                event = release_event,
                 operation_id = %fence.operation_id,
                 provider = %fence.provider, session_id = %fence.session_id,
                 pid = ?fence.prior_pid, generation = fence.generation,
@@ -477,7 +550,7 @@ async fn probe_stale_start_fences(
                 fence_reason = ?fence.reason,
                 epoch = ownership.boot_epoch(),
                 outcome = ?released,
-                failure_reason = "STARTING_TIMEOUT",
+                failure_reason = release_failure_reason,
                 "the stale-start fence's recorded runtime is confirmed gone — the \
                  probe releases the key (never plain faith)");
         }
@@ -1012,8 +1085,14 @@ async fn main() -> ExitCode {
                 // releases a fence whose recorded runtime is provably
                 // gone (a fence created before its reap evidence
                 // existed), so the StaleStart state is never permanent.
-                probe_stale_start_fences(&ownership, &fresh_codex, &fresh_claude, &fresh_opencode)
-                    .await;
+                probe_stale_start_fences(
+                    &ownership,
+                    &fresh_codex,
+                    &fresh_claude,
+                    &fresh_opencode,
+                    &broadcast_tx,
+                )
+                .await;
             }
         });
     }
@@ -4970,7 +5049,15 @@ mod stale_start_watchdog_tests {
             freshell_ownership::FenceOutcome::Fenced
         ));
         drop(guard_fr); // the operation concluded → the settle fired
-        probe_stale_start_fences(&states_fr.0, &states_fr.2, &states_fr.3, &states_fr.4).await;
+        let (probe_tx, _probe_rx) = tokio::sync::broadcast::channel::<String>(64);
+        probe_stale_start_fences(
+            &states_fr.0,
+            &states_fr.2,
+            &states_fr.3,
+            &states_fr.4,
+            &probe_tx,
+        )
+        .await;
         assert_eq!(
             states_fr.0.observe("claude", "sid-stale").state,
             OwnershipState::Vacant
@@ -4996,6 +5083,105 @@ mod stale_start_watchdog_tests {
                 released_fr.1
             );
         }
+
+        // b8ke e3 post-cap F5: a STOP-reason release logs through the
+        // STOP's own diagnostic (ownership.stop.fence_probe_released +
+        // STOPPING_TIMEOUT) — never the misclassified start event.
+        let states_ss = watchdog_states();
+        let sink_ss = transition_log_capture::install();
+        let freshell_ownership::BeginOutcome::Granted { generation: g_ss } =
+            states_ss.0.begin_start(
+                "opencode",
+                "sid-stale",
+                freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                "op-live-ss",
+                None,
+                "test",
+                0,
+            )
+        else {
+            panic!()
+        };
+        assert!(matches!(
+            states_ss.0.commit_live(
+                "opencode",
+                "sid-stale",
+                "op-live-ss",
+                g_ss,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("sid-stale".into()),
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        ));
+        let claim_ss = freshell_ownership::StopClaim {
+            expected_kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            expected_runtime: None,
+            observed: freshell_ownership::ObservedFence {
+                epoch: states_ss.0.boot_epoch(),
+                generation: g_ss,
+            },
+        };
+        match states_ss.0.begin_stop(
+            "opencode",
+            "sid-stale",
+            "op-stranded-ss",
+            &claim_ss,
+            "test",
+            0,
+        ) {
+            freshell_ownership::StopOutcome::Granted { generation: sg } => {
+                let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                assert!(states_ss.0.register_stop_settlement(
+                    "opencode",
+                    "sid-stale",
+                    "op-stranded-ss",
+                    sg,
+                    Arc::clone(&flag),
+                ));
+            }
+            other => panic!("expected the stop claim granted, got {other:?}"),
+        }
+        assert_eq!(states_ss.0.recover_stale_stoppings(10_000, 5_000).len(), 1);
+        let (tx_ss, _rx_ss) = tokio::sync::broadcast::channel::<String>(64);
+        probe_stale_start_fences(
+            &states_ss.0,
+            &states_ss.2,
+            &states_ss.3,
+            &states_ss.4,
+            &tx_ss,
+        )
+        .await;
+        assert_eq!(
+            states_ss.0.observe("opencode", "sid-stale").state,
+            OwnershipState::Vacant
+        );
+        let events_ss = sink_ss.events();
+        let stop_release = events_ss
+            .iter()
+            .find(|(event, _)| event == "ownership.stop.fence_probe_released")
+            .expect("the STOP-reason release logs through the STOP event")
+            .clone();
+        assert!(
+            stop_release
+                .1
+                .iter()
+                .any(|f| f == "failure_reason=STOPPING_TIMEOUT"),
+            "the STOP release's failure reason is STOPPING_TIMEOUT — got {:?}",
+            stop_release.1
+        );
+        assert!(
+            !events_ss
+                .iter()
+                .any(|(e, f)| e == "ownership.start.fence_probe_released"
+                    && f.iter().any(|x| x == "failure_reason=STARTING_TIMEOUT")
+                    && f.iter().any(|x| x.starts_with("session_id=sid-stale"))),
+            "no misclassified START diagnostic for the stop-reason release"
+        );
     }
 
     /// b8ke e3r4 F5: the stale-stop watchdog's fence transition
@@ -5025,6 +5211,212 @@ mod stale_start_watchdog_tests {
         assert_eq!(frame["fenced"], true);
         assert_eq!(frame["epoch"], 7);
         assert_eq!(frame["generation"], 3);
+    }
+
+    /// b8ke e3 post-cap F3: the COMPLETE fence-to-release convergence
+    /// sequence — the ENTRY broadcast (the fenced transition, from the
+    /// stale-start recovery) AND the RELEASE broadcast (the probe's
+    /// reopened-to-Vacant frame) both reach the bus: connected devices see
+    /// the fence, then see it clear. Pre-post-cap the probe released
+    /// silently and clients retained fenced:true indefinitely.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_fence_entry_and_release_both_broadcast_the_convergence_sequence() {
+        let states = watchdog_states();
+        let (bus_tx, mut bus_rx) = tokio::sync::broadcast::channel::<String>(64);
+
+        // The stale-stop shape (the watchdog's fenced transition): a Live
+        // owner, a stranded stop with a FIRED settlement flag, the watchdog
+        // fences typed StaleStop — the sweep's ENTRY broadcast fires (the
+        // same helper the watchdog loop calls) — then the probe releases
+        // (the PID-less Some(true) arm → the opencode lane confirms) and
+        // its RELEASE broadcast fires.
+        let freshell_ownership::BeginOutcome::Granted { generation } = states.0.begin_start(
+            "opencode",
+            "sid-stale",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-live-seq",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("expected Granted")
+        };
+        assert!(matches!(
+            states.0.commit_live(
+                "opencode",
+                "sid-stale",
+                "op-live-seq",
+                generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("sid-stale".into()),
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        ));
+        let stop_claim = freshell_ownership::StopClaim {
+            expected_kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            expected_runtime: None,
+            observed: freshell_ownership::ObservedFence {
+                epoch: states.0.boot_epoch(),
+                generation,
+            },
+        };
+        match states.0.begin_stop(
+            "opencode",
+            "sid-stale",
+            "op-stranded-seq",
+            &stop_claim,
+            "test",
+            0,
+        ) {
+            freshell_ownership::StopOutcome::Granted {
+                generation: stop_gen,
+            } => {
+                let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                assert!(states.0.register_stop_settlement(
+                    "opencode",
+                    "sid-stale",
+                    "op-stranded-seq",
+                    stop_gen,
+                    Arc::clone(&stop_flag),
+                ));
+            }
+            other => panic!("expected the stop claim granted, got {other:?}"),
+        }
+        let fenced = states.0.recover_stale_stoppings(10_000, 5_000);
+        assert_eq!(fenced.len(), 1, "the watchdog fenced the vanished stop");
+
+        // THE ENTRY broadcast — the sweep's own helper.
+        broadcast_fenced_transition(
+            &bus_tx,
+            "opencode",
+            "sid-stale",
+            states.0.boot_epoch(),
+            fenced[0].generation,
+            fenced[0].prior.as_ref().map(|(o, _)| o.kind),
+            "stale-stop",
+            &fenced[0].operation_id,
+        );
+        let mut saw_entry = false;
+        while let Ok(raw) = bus_rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "session.runtimeOwner"
+                && frame["transition"] == "handoff-failed"
+                && frame["fenced"] == true
+                && frame["sessionId"] == "sid-stale"
+            {
+                saw_entry = true;
+            }
+        }
+        assert!(saw_entry, "the fence ENTRY broadcast reached the bus");
+
+        // THE RELEASE: the probe (PID-less, stop evidence fired → the
+        // opencode lane confirms) + its broadcast.
+        probe_stale_start_fences(&states.0, &states.2, &states.3, &states.4, &bus_tx).await;
+        assert_eq!(
+            states.0.observe("opencode", "sid-stale").state,
+            OwnershipState::Vacant
+        );
+        let mut saw_release = false;
+        while let Ok(raw) = bus_rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "session.runtimeOwner"
+                && frame["transition"] == "released"
+                && frame["sessionId"] == "sid-stale"
+            {
+                saw_release = true;
+            }
+        }
+        assert!(
+            saw_release,
+            "the probe's RELEASE broadcast reached the bus (pre-post-cap the \
+             probe released silently and clients kept fenced:true forever)"
+        );
+    }
+
+    /// b8ke e3 post-cap F2: a kill task dying AFTER the map removal but
+    /// BEFORE its daemon-turn abort leaves the RETAINED witness — the
+    /// probe consults it (never bare map presence): the turn is SETTLED
+    /// (the accepted flag cleared) and only then does the key release.
+    /// Pre-post-cap the bare map-absence check released to Vacant while
+    /// the old daemon turn could still write (the competing-writer hole).
+    #[tokio::test]
+    async fn a_dying_kill_s_retained_witness_settles_the_turn_before_release() {
+        let states = watchdog_states();
+        // The stale-start record with REGISTERED, FIRED settle evidence
+        // (the concluded operation) under the OPENCODE provider.
+        let freshell_ownership::BeginOutcome::Granted { generation } = states.0.begin_start(
+            "opencode",
+            "sid-stale",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-witness",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("expected Granted")
+        };
+        let settle_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(states.0.register_start_cancellation(
+            "opencode",
+            "sid-stale",
+            "op-witness",
+            generation,
+            Arc::new(|| {}),
+            Box::new(std::future::ready(())),
+            Some(Arc::clone(&settle_flag)),
+        ));
+        settle_flag.store(true, std::sync::atomic::Ordering::SeqCst); // concluded
+        let recs = states.0.recover_stale_starts(0, 0);
+        assert_eq!(recs.len(), 1);
+        assert!(matches!(
+            states.0.fence_unconfirmed_stop(
+                "opencode",
+                "sid-stale",
+                "op-witness",
+                recs[0].generation,
+                FenceReason::StaleStart,
+            ),
+            freshell_ownership::FenceOutcome::Fenced
+        ));
+
+        // THE DYING-KILL SHAPE: the map aliases are GONE (the kill died
+        // after the removal) but the retained witness holds an ACCEPTED
+        // daemon-side turn the kill never aborted.
+        let accepted_turn = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        states
+            .4
+            .insert_condemned_for_test("sid-stale", Arc::clone(&accepted_turn), None);
+        assert!(
+            accepted_turn.load(std::sync::atomic::Ordering::SeqCst),
+            "precondition: the daemon turn is still accepted"
+        );
+
+        // THE PROBE: consults the witness — the turn SETTLES, then the
+        // key releases (pre-post-cap: released with the turn still
+        // accepted).
+        let (probe_tx, _probe_rx) = tokio::sync::broadcast::channel::<String>(64);
+        probe_stale_start_fences(&states.0, &states.2, &states.3, &states.4, &probe_tx).await;
+        assert!(
+            !accepted_turn.load(std::sync::atomic::Ordering::SeqCst),
+            "the probe SETTLED the retained daemon turn before releasing \
+             (pre-post-cap: bare map absence released with the turn still \
+             accepted — the competing-writer hole)"
+        );
+        assert_eq!(
+            states.0.observe("opencode", "sid-stale").state,
+            OwnershipState::Vacant,
+            "the key released AFTER the turn settled"
+        );
+        assert!(
+            !states.4.has_condemned_for_test("sid-stale"),
+            "the consumed witness cleared"
+        );
     }
 
     /// b8ke e3r4 F3: an OpenCode-shaped stale fence (PID-less, NO start
@@ -5074,7 +5466,8 @@ mod stale_start_watchdog_tests {
         // confirmation — the empty opencode lane holds nothing for the
         // session → confirmed dead → RELEASES (pre-e3r4: rejected
         // forever, blocked until restart).
-        probe_stale_start_fences(&states.0, &states.2, &states.3, &states.4).await;
+        let (probe_tx, _probe_rx) = tokio::sync::broadcast::channel::<String>(64);
+        probe_stale_start_fences(&states.0, &states.2, &states.3, &states.4, &probe_tx).await;
         assert_eq!(
             states.0.observe("opencode", "sid-stale").state,
             OwnershipState::Vacant,
@@ -5206,7 +5599,8 @@ mod stale_start_watchdog_tests {
         // The probe cannot confirm either (no condemned record, no live
         // session) — the fence HOLDS. The operator force-clear is the
         // escape.
-        probe_stale_start_fences(&states.0, &states.2, &states.3, &states.4).await;
+        let (probe_tx, _probe_rx) = tokio::sync::broadcast::channel::<String>(64);
+        probe_stale_start_fences(&states.0, &states.2, &states.3, &states.4, &probe_tx).await;
         assert!(
             matches!(
                 states.0.observe("claude", "sid-stale").state,
@@ -5348,7 +5742,8 @@ mod stale_start_watchdog_tests {
             ),
             freshell_ownership::FenceOutcome::Fenced
         ));
-        probe_stale_start_fences(&states.0, &states.2, &states.3, &states.4).await;
+        let (probe_tx, _probe_rx) = tokio::sync::broadcast::channel::<String>(64);
+        probe_stale_start_fences(&states.0, &states.2, &states.3, &states.4, &probe_tx).await;
         assert!(
             matches!(
                 states.0.observe("claude", "sid-stale").state,
@@ -5395,7 +5790,8 @@ mod stale_start_watchdog_tests {
             ),
             freshell_ownership::FenceOutcome::Fenced
         ));
-        probe_stale_start_fences(&states2.0, &states2.2, &states2.3, &states2.4).await;
+        let (probe_tx, _probe_rx) = tokio::sync::broadcast::channel::<String>(64);
+        probe_stale_start_fences(&states2.0, &states2.2, &states2.3, &states2.4, &probe_tx).await;
         assert!(
             matches!(
                 states2.0.observe("claude", "sid-stale").state,
@@ -5423,7 +5819,8 @@ mod stale_start_watchdog_tests {
             ),
             freshell_ownership::FenceOutcome::Fenced
         ));
-        probe_stale_start_fences(&states3.0, &states3.2, &states3.3, &states3.4).await;
+        let (probe_tx, _probe_rx) = tokio::sync::broadcast::channel::<String>(64);
+        probe_stale_start_fences(&states3.0, &states3.2, &states3.3, &states3.4, &probe_tx).await;
         assert!(
             matches!(
                 states3.0.observe("claude", "sid-stale").state,
@@ -5472,7 +5869,8 @@ mod stale_start_watchdog_tests {
         ));
         // The operation is STILL in flight (the guard lives): the probe
         // must NOT release on the lane-absent answer alone.
-        probe_stale_start_fences(&states4.0, &states4.2, &states4.3, &states4.4).await;
+        let (probe_tx, _probe_rx) = tokio::sync::broadcast::channel::<String>(64);
+        probe_stale_start_fences(&states4.0, &states4.2, &states4.3, &states4.4, &probe_tx).await;
         assert!(
             matches!(
                 states4.0.observe("claude", "sid-stale").state,
@@ -5483,7 +5881,8 @@ mod stale_start_watchdog_tests {
         );
         // The operation concludes (the guard drops → the settle fired).
         drop(guard);
-        probe_stale_start_fences(&states4.0, &states4.2, &states4.3, &states4.4).await;
+        let (probe_tx, _probe_rx) = tokio::sync::broadcast::channel::<String>(64);
+        probe_stale_start_fences(&states4.0, &states4.2, &states4.3, &states4.4, &probe_tx).await;
         assert_eq!(
             states4.0.observe("claude", "sid-stale").state,
             OwnershipState::Vacant,

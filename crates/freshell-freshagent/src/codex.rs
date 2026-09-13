@@ -3767,12 +3767,21 @@ impl FreshCodexState {
                                 // (a synthesized stamp from the OBSERVED
                                 // owner; the unwind verifies the runtime's
                                 // liveness directly, never stamp-absence).
+                                // b8ke e3 post-cap F1: the rollback stamp
+                                // mirrors what abort_stop restores — the
+                                // ORIGINAL owner identity at the PRE-stop
+                                // Live generation with the owner's own
+                                // ownership_id (release's identity checks
+                                // require exactly these).
                                 taken_stop_stamp = Some((
                                     session_id.clone(),
                                     crate::ownership_lane::OwnershipStamp {
                                         epoch: registry.boot_epoch(),
                                         generation,
-                                        operation_id: kill_op_id.clone(),
+                                        operation_id: owner
+                                            .ownership_id
+                                            .clone()
+                                            .unwrap_or_default(),
                                         owner: owner.clone(),
                                     },
                                 ));
@@ -9621,8 +9630,29 @@ pub(crate) mod tests {
         })
         .await;
 
-        let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
-        assert_eq!(frame["type"], "freshAgent.killed");
+        // Drain until the KILLED frame (the dead sidecar's EOF consumer
+        // can race an eviction event onto the bus first — the frame order
+        // is not the contract; the killed frame is).
+        let frame = {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                let raw = match rx.try_recv() {
+                    Ok(raw) => raw,
+                    Err(_) => {
+                        assert!(
+                            tokio::time::Instant::now() < deadline,
+                            "the killed frame never arrived"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        continue;
+                    }
+                };
+                let f: Value = serde_json::from_str(&raw).unwrap();
+                if f["type"] == "freshAgent.killed" {
+                    break f;
+                }
+            }
+        };
         assert_eq!(
             frame["code"],
             json!("DURABLE_CLOSE_FAILED"),
