@@ -436,13 +436,27 @@ async fn probe_stale_start_fences(
             // second writer). The pid probe reads the ACTUAL process: a
             // kill-in-progress runtime stays "alive" until the waiter
             // thread's reap completes (a not-yet-reaped zombie still
-            // answers kill(pid, 0)). No recorded pid: the pid-less
-            // terminal-prior shape is the PRE-SPAWN partial registration
-            // (nothing was spawned — no kill can be in progress for this
-            // id), so the row-based probe is the honest evidence.
+            // answers kill(pid, 0)).
+            //
+            // b8ke e4r4: the PID-less shape (the PRE-SPAWN partial
+            // registration) consults the stale operation's SETTLEMENT
+            // evidence exactly like the other stale-reason probes — the
+            // production create registers the pre-spawn identity BEFORE
+            // its async work (up to 45s), and the watchdog's 5s
+            // settlement wait can expire with the operation STILL ACTIVE,
+            // so an UNSETTLED start holds the fence (the old-generation
+            // handler can still spawn its CLI — the cancellation callback
+            // is only a registry kill, a no-op before spawn — and
+            // releasing would admit a second writer over the
+            // still-capable one). Only the CONCLUDED settlement plus the
+            // absent-row evidence releases; an UNREGISTERED settlement
+            // (no evidence the operation ever concluded) fails closed.
             let confirmed_gone = match (fence.prior_terminal_id.as_deref(), fence.prior_pid) {
                 (_, Some(pid)) => !freshell_terminal::registry::pid_alive(pid),
-                (Some(tid), None) => registry.terminal_is_dead(tid),
+                (Some(tid), None) => match fence.settle_concluded {
+                    Some(true) => registry.terminal_is_dead(tid),
+                    Some(false) | None => false,
+                },
                 (None, None) => false,
             };
             if !confirmed_gone {
@@ -5383,6 +5397,26 @@ mod stale_start_watchdog_tests {
         ) else {
             panic!("expected Granted")
         };
+        // b8ke e4r4: the production create's settlement registration —
+        // the PID-less prior releases only once the stale operation's
+        // settlement CONCLUDED (the settled-vs-unsettled contract).
+        let own_ticket_d4f2 = Some(freshell_ownership::OperationTicket::new(
+            Arc::clone(&states.0),
+            "opencode",
+            "sid-stale",
+            "op-d4-f2",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            generation,
+            "test",
+        ));
+        let settle_guard_d4f2 =
+            freshell_freshagent::ownership_lane::register_start_cancellation_for_ticket(
+                &Some(Arc::clone(&states.0)),
+                "opencode",
+                "sid-stale",
+                &own_ticket_d4f2,
+                Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>,
+            );
         states.0.register_partial_runtime(
             "opencode",
             "sid-stale",
@@ -5421,7 +5455,12 @@ mod stale_start_watchdog_tests {
             "the fence HOLDS while the recorded terminal still runs"
         );
 
-        // (b) The terminal's confirmed death releases the fence.
+        // (b) The terminal's confirmed death is necessary but NOT
+        // sufficient while the stale operation's settlement is
+        // UNSETTLED — b8ke e4r4: the PID-less prior additionally needs
+        // the operation to have concluded (the settled-vs-unsettled
+        // contract; the operation's handler can still hold the recorded
+        // pane's lease shape even after its runtime died).
         states.1.kill(live_tid);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         while !states.1.terminal_is_dead(live_tid) {
@@ -5432,17 +5471,32 @@ mod stale_start_watchdog_tests {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         probe_stale_start_fences(&states.0, &states.1, &states.2, &states.3, &states.4, &tx).await;
+        assert!(
+            matches!(
+                states.0.observe("opencode", "sid-stale").state,
+                OwnershipState::Fenced { .. }
+            ),
+            "the fence HOLDS through the dead row while the stale \
+             operation's settlement is still unsettled"
+        );
+        // The settlement concludes (the operation's guard dropped): the
+        // confirmed terminal death now releases the fence.
+        drop(settle_guard_d4f2);
+        probe_stale_start_fences(&states.0, &states.1, &states.2, &states.3, &states.4, &tx).await;
         assert_eq!(
             states.0.observe("opencode", "sid-stale").state,
             OwnershipState::Vacant,
-            "the confirmed terminal death releases the fence"
+            "the confirmed terminal death + the concluded settlement \
+             release the fence"
         );
     }
 
-    /// b8ke d4 F2: a TERMINAL-prior stale fence for the CLAUDE provider
-    /// releases on the terminal's confirmed death — pre-d4 the Fresh
-    /// probe answered "false" forever (no Fresh record exists), wedging
-    /// even a dead terminal's fence.
+    /// b8ke d4 F2 + e4r4: a TERMINAL-prior stale fence for the CLAUDE
+    /// provider releases on the terminal's confirmed death ONCE the
+    /// stale operation's settlement CONCLUDED — the settled-vs-unsettled
+    /// contract (an unsettled start holds even through a gone row). Pre-d4
+    /// the Fresh probe answered "false" forever (no Fresh record exists),
+    /// wedging even a dead terminal's fence.
     #[tokio::test]
     async fn a_claude_terminal_prior_fence_releases_on_confirmed_terminal_death() {
         let states = watchdog_states();
@@ -5465,6 +5519,26 @@ mod stale_start_watchdog_tests {
         ) else {
             panic!("expected Granted")
         };
+        // b8ke e4r4: the production create's settlement registration —
+        // the PID-less prior releases only once the stale operation's
+        // settlement CONCLUDED (the settled-vs-unsettled contract).
+        let own_ticket_d4f2c = Some(freshell_ownership::OperationTicket::new(
+            Arc::clone(&states.0),
+            "claude",
+            "sid-stale",
+            "op-d4-f2c",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            generation,
+            "test",
+        ));
+        let settle_guard_d4f2c =
+            freshell_freshagent::ownership_lane::register_start_cancellation_for_ticket(
+                &Some(Arc::clone(&states.0)),
+                "claude",
+                "sid-stale",
+                &own_ticket_d4f2c,
+                Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>,
+            );
         states.0.register_partial_runtime(
             "claude",
             "sid-stale",
@@ -5491,16 +5565,31 @@ mod stale_start_watchdog_tests {
             freshell_ownership::FenceOutcome::Fenced
         ));
 
-        // THE PROBE: the terminal row's death confirms → RELEASES
-        // (pre-d4: the claude Fresh probe's false held it forever).
+        // THE PROBE (unsettled): the terminal row is gone, but the stale
+        // operation's settlement has NOT concluded — b8ke e4r4: the
+        // fence HOLDS (an absent row alone never proves a PID-less start
+        // safe; pre-d4 the claude Fresh probe's false held it forever,
+        // pre-e4r4 the absent row released it too early).
         let sink_d4f2c = transition_log_capture::install();
         let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        probe_stale_start_fences(&states.0, &states.1, &states.2, &states.3, &states.4, &tx).await;
+        assert!(
+            matches!(
+                states.0.observe("claude", "sid-stale").state,
+                OwnershipState::Fenced { .. }
+            ),
+            "the fence HOLDS through the gone row while the stale \
+             operation's settlement is still unsettled"
+        );
+        // The settlement concludes (the operation's guard dropped): the
+        // terminal row's confirmed absence now releases.
+        drop(settle_guard_d4f2c);
         probe_stale_start_fences(&states.0, &states.1, &states.2, &states.3, &states.4, &tx).await;
         assert_eq!(
             states.0.observe("claude", "sid-stale").state,
             OwnershipState::Vacant,
-            "the dead terminal's fence releases (pre-d4: the Fresh probe \
-             wedged it forever)"
+            "the dead terminal's fence releases once the settlement \
+             concluded (pre-d4: the Fresh probe wedged it forever)"
         );
 
         // b8ke e4r2 F2: the TERMINAL-prior release record carries the same
@@ -5650,6 +5739,116 @@ mod stale_start_watchdog_tests {
             states.0.observe("claude", "sid-stale").state,
             OwnershipState::Vacant,
             "the reap completed — the probe releases"
+        );
+    }
+
+    /// b8ke e4r4: the PID-less PRE-SPAWN terminal identity is only safely
+    /// dead when the stale operation's settlement CONCLUDED — the
+    /// production create registers the pre-spawn identity BEFORE its
+    /// async work (up to 45s); the 30s watchdog cancels the stale start
+    /// and its 5s settlement wait can expire with the operation STILL
+    /// ACTIVE, so the same-pass StaleStart fence must HOLD (the
+    /// old-generation handler can still spawn its CLI — the cancellation
+    /// callback is only a registry kill, a no-op before spawn — and
+    /// releasing would admit a second writer over the still-capable
+    /// one). The release needs BOTH the concluded settlement and the
+    /// absent-row evidence.
+    #[tokio::test]
+    async fn a_pidless_terminal_fence_holds_until_its_start_settlement_concludes() {
+        let states = watchdog_states();
+        // The PRE-SPAWN shape: the terminal id is recorded, the row is
+        // absent (the CLI has not spawned), the pid is not recorded.
+        let pre_spawn_tid = "T-e4r4-presence";
+        assert!(
+            states.1.terminal_is_dead(pre_spawn_tid),
+            "precondition: the pre-spawn row is absent"
+        );
+
+        let freshell_ownership::BeginOutcome::Granted { generation } = states.0.begin_start(
+            "claude",
+            "sid-stale",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-e4r4-f1",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("expected Granted")
+        };
+        // The production create's settlement registration (the ticket the
+        // start-cancellation machinery arms — the operation's guard; its
+        // drop concludes the settlement).
+        let own_ticket = Some(freshell_ownership::OperationTicket::new(
+            Arc::clone(&states.0),
+            "claude",
+            "sid-stale",
+            "op-e4r4-f1",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            generation,
+            "test",
+        ));
+        let settle_guard =
+            freshell_freshagent::ownership_lane::register_start_cancellation_for_ticket(
+                &Some(Arc::clone(&states.0)),
+                "claude",
+                "sid-stale",
+                &own_ticket,
+                Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>,
+            );
+        states.0.register_partial_runtime(
+            "claude",
+            "sid-stale",
+            "op-e4r4-f1",
+            generation,
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                terminal_id: Some(pre_spawn_tid.to_string()),
+                live_session_key: None,
+                pid: None,
+                ownership_id: None,
+            },
+        );
+        // THE WATCHDOG PASS: the sweep fences the stale start (the
+        // operation is still active — its settlement has NOT concluded)
+        // and the probe runs in the SAME pass.
+        let recs = states.0.recover_stale_starts(0, 0);
+        assert_eq!(recs.len(), 1);
+        assert!(matches!(
+            states.0.fence_unconfirmed_stop(
+                "claude",
+                "sid-stale",
+                "op-e4r4-f1",
+                recs[0].generation,
+                FenceReason::StaleStart,
+            ),
+            freshell_ownership::FenceOutcome::Fenced
+        ));
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        probe_stale_start_fences(&states.0, &states.1, &states.2, &states.3, &states.4, &tx).await;
+        // THE CONTRACT: the UNSETTLED pre-spawn operation holds the fence
+        // through the same-pass probe (pre-e4r4 the absent row read as
+        // confirmed death and the key vacated while the handler could
+        // still spawn its CLI).
+        assert!(
+            matches!(
+                states.0.observe("claude", "sid-stale").state,
+                OwnershipState::Fenced { .. }
+            ),
+            "the fence HOLDS while the pre-spawn operation is still \
+             unsettled — an absent row is not confirmed death for a \
+             start that never spawned"
+        );
+
+        // The settlement concludes (the operation's guard dropped — the
+        // handler will never spawn): the absent-row evidence now
+        // releases.
+        drop(settle_guard);
+        probe_stale_start_fences(&states.0, &states.1, &states.2, &states.3, &states.4, &tx).await;
+        assert_eq!(
+            states.0.observe("claude", "sid-stale").state,
+            OwnershipState::Vacant,
+            "the settlement concluded and the row is absent — the probe \
+             releases"
         );
     }
 
