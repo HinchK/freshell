@@ -251,7 +251,7 @@ test.describe('Rust baseline browser actions', () => {
     expect(response.status()).toBe(200)
     expect(JSON.parse(response.request().postData() ?? '{}')).toEqual({
       command: `printf ${shellMarker}`,
-      cwd: serverInfo.homeDir,
+      cwd: repoDir,
     })
     await expect.poll(async () => page.evaluate(() => (
       window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
