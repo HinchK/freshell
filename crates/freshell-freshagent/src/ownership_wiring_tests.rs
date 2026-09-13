@@ -417,6 +417,7 @@ async fn start_cancellation_registers_on_the_tickets_canonical_key() {
                 ownership_id: Some("rekey-op".into()),
             },
             "test-rekey",
+            "rekey-op",
         ),
         CommitOutcome::Committed
     ));

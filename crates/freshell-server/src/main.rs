@@ -5117,6 +5117,7 @@ mod stale_start_watchdog_tests {
                     ownership_id: Some("rekey-op-schema".into()),
                 },
                 "test-rekey",
+                "rekey-op-schema",
             ),
             freshell_ownership::CommitOutcome::Committed
         ));

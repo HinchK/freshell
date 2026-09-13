@@ -5118,6 +5118,7 @@ async fn a_handoff_on_a_superseded_rekeyed_id_resolves_the_canonical_owner() {
                 ownership_id: Some("test-rekey-op".into()),
             },
             "test-rekey",
+            "test-rekey-op",
         ),
         freshell_ownership::CommitOutcome::Committed
     ));

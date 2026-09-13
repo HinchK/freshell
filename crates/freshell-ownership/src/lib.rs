@@ -1135,9 +1135,16 @@ impl RuntimeOwnershipRegistry {
                 }
             }
             OwnershipState::Live {
-                owner, generation, ..
+                owner,
+                generation,
+                since_ms,
             } => {
                 let prior = (owner.clone(), generation);
+                // b8ke ext r6 F5: the prior owner's REAL tenure — computed
+                // BEFORE the state replacement (pre-r6 the log read the
+                // just-replaced Handoff state's own timestamp, so the
+                // duration was always zero).
+                let prior_tenure_ms = now_ms.saturating_sub(since_ms);
                 record.generation += 1;
                 record.state = OwnershipState::Handoff {
                     prior: Some(prior),
@@ -1156,9 +1163,7 @@ impl RuntimeOwnershipRegistry {
                     initiator, from_kind = ?owner.kind, to_kind = ?to_kind,
                     runtime_id = ?owner.terminal_id, pid = ?owner.pid,
                     epoch = self.epoch, generation = record.generation,
-                    duration_ms = now_ms.saturating_sub(
-                        record.state.since_ms().unwrap_or(now_ms),
-                    ),
+                    duration_ms = prior_tenure_ms,
                     outcome = "granted", failure_reason = "");
                 BeginOutcome::Granted {
                     generation: record.generation,
@@ -1247,7 +1252,10 @@ impl RuntimeOwnershipRegistry {
             initiator, from_kind = ?old_kind, to_kind = ?owner.kind,
             runtime_id = ?owner.terminal_id,
             live_session_key = ?owner.live_session_key, pid = ?owner.pid,
-            epoch = self.epoch, generation, duration_ms, outcome = "committed");
+            // b8ke ext r6 F5: the STABLE schema — the empty
+            // (not-applicable) failure_reason on the success transition.
+            epoch = self.epoch, generation, duration_ms, outcome = "committed",
+            failure_reason = "");
         CommitOutcome::Committed
     }
 
@@ -1375,6 +1383,9 @@ impl RuntimeOwnershipRegistry {
         expected_live_session_key: &str,
         new_owner: OwnerIdentity,
         initiator: &str,
+        // b8ke ext r6 F5: the rekey transition's operation id — the
+        // uniform schema's operation_id (the caller's rekey operation).
+        operation_id: &str,
     ) -> CommitOutcome {
         let mut inner = self.inner.lock().expect("ownership lock poisoned");
         let old_key = SessionKey::new(provider, old_session_id);
@@ -1447,14 +1458,17 @@ impl RuntimeOwnershipRegistry {
             ..SessionRecord::default()
         };
         inner.insert(new_key, new_record);
+        // b8ke ext r6 F5: the STABLE transition-log schema — the rekey
+        // event carries the operation id and the empty (not-applicable)
+        // failure_reason (pre-r6 both were omitted).
         tracing::info!(target: "freshell_ownership",
-            event = "ownership.live.rekey_live", provider,
+            event = "ownership.live.rekey_live", operation_id, provider,
             old_session_id, new_session_id, initiator,
             from_kind = ?old_owner.kind, to_kind = ?new_owner.kind,
             runtime_id = ?new_owner.terminal_id,
             live_session_key = ?new_owner.live_session_key, pid = ?new_owner.pid,
             epoch = self.epoch, generation = new_generation, duration_ms,
-            outcome = "rekeyed_committed",
+            outcome = "rekeyed_committed", failure_reason = "",
             "the LIVE record moved to the client-visible durable id in one \
              atomic step — expected-owner verified, generation incremented, \
              the old key is Aliased, the new key carries the REPLACEMENT identity");
@@ -2175,13 +2189,18 @@ impl RuntimeOwnershipRegistry {
                     // released owner's kind; there is NO `to_kind` (no new
                     // runtime kind exists) — and it carries the
                     // terminal-transition `duration_ms`.
+                    // b8ke ext r6 F5: the STABLE schema — the release
+                    // creates no new runtime, so to_kind is the None VALUE
+                    // (never a deleted field) and the failure_reason is the
+                    // empty not-applicable string.
                     tracing::info!(target: "freshell_ownership",
                         event = "ownership.released", provider, session_id,
                         operation_id = %claim.operation_id, initiator,
                         from_kind = ?owner.kind,
+                        to_kind = ?Option::<RuntimeOwnerKind>::None,
                         runtime_id = ?owner.terminal_id, pid = ?owner.pid,
                         epoch = self.epoch, generation, duration_ms,
-                        outcome = "released");
+                        outcome = "released", failure_reason = "");
                 } else {
                     tracing::warn!(target: "freshell_ownership",
                         event = "ownership.release.fenced_noop", provider, session_id,
@@ -2376,7 +2395,7 @@ impl RuntimeOwnershipRegistry {
                             event = "ownership.stop.stale_stopping_skipped_live",
                             operation_id = %operation_id, provider = %key.provider,
                             session_id = %key.session_id,
-                            stale_age_ms = now_ms.saturating_sub(since_ms),
+                            duration_ms = now_ms.saturating_sub(since_ms),
                             outcome = "skipped",
                             "the over-aged stop is STILL RUNNING (its settlement \
                              flag has not fired) — a progressing stop is not stale");
@@ -2416,7 +2435,7 @@ impl RuntimeOwnershipRegistry {
                     runtime_id = ?stale.prior.as_ref().and_then(|(o, _)| o.terminal_id.clone()),
                     pid = ?stale.prior.as_ref().and_then(|(o, _)| o.pid),
                     epoch = self.epoch, generation,
-                    stale_age_ms = now_ms.saturating_sub(since_ms),
+                    duration_ms = now_ms.saturating_sub(since_ms),
                     outcome = "fenced", failure_reason = "STALE_STOP",
                     "an over-aged Stopping record whose stop operation vanished — \
                      the key fences TYPED (never stranded until restart)");
@@ -3493,7 +3512,8 @@ mod tests {
                 "new-live",
                 "map-key",
                 replacement.clone(),
-                "test-rekey"
+                "test-rekey",
+                "rekey-op-1"
             ),
             CommitOutcome::Committed
         ));
@@ -3599,7 +3619,8 @@ mod tests {
                 "new-live-2",
                 "map-key-2",
                 replacement_2.clone(),
-                "test-rekey-2"
+                "test-rekey-2",
+                "rekey-op-2"
             ),
             CommitOutcome::Committed
         ));
@@ -3677,7 +3698,8 @@ mod tests {
                     pid: Some(7777),
                     ownership_id: Some("rekey-op-x".into()),
                 },
-                "test-rekey"
+                "test-rekey",
+                "op-rekey"
             ),
             CommitOutcome::ForeignOperation
         ));
@@ -3732,7 +3754,8 @@ mod tests {
                     pid: Some(5),
                     ownership_id: Some("rekey-op-4".into()),
                 },
-                "test-rekey"
+                "test-rekey",
+                "op-rekey"
             ),
             CommitOutcome::ForeignOperation
         ));
@@ -3779,7 +3802,8 @@ mod tests {
                     pid: Some(6),
                     ownership_id: Some("rekey-op-5".into()),
                 },
-                "test-rekey"
+                "test-rekey",
+                "op-rekey"
             ),
             CommitOutcome::ForeignOperation
         ));
@@ -3799,7 +3823,8 @@ mod tests {
                     pid: None,
                     ownership_id: None,
                 },
-                "test-rekey"
+                "test-rekey",
+                "op-rekey"
             ),
             CommitOutcome::ForeignOperation
         ));
@@ -3853,7 +3878,8 @@ mod tests {
                 "B",
                 "map-key",
                 live_owner(1001),
-                "test-rekey-ab"
+                "test-rekey-ab",
+                "op-rekey-ab"
             ),
             CommitOutcome::Committed
         ));
@@ -3864,7 +3890,8 @@ mod tests {
                 "C",
                 "map-key",
                 live_owner(1002),
-                "test-rekey-bc"
+                "test-rekey-bc",
+                "op-rekey-bc"
             ),
             CommitOutcome::Committed
         ));
@@ -6379,6 +6406,313 @@ mod tests {
             Some("Terminal"),
             "the cross-kind commit logs the committed target kind — got {:?}",
             commit.values
+        );
+    }
+
+    /// b8ke ext r6 F5: the UNIFORM transition-log schema — every
+    /// transition records the complete stable field set:
+    /// `ownership.live.commit` gains the (empty) failure_reason;
+    /// `ownership.released` gains the None-valued to_kind (the release
+    /// creates no new runtime — the vacancy is a VALUE, never a deleted
+    /// field) and the empty failure_reason; `ownership.live.rekey_live`
+    /// gains the operation id + failure_reason; the stale-stop sweep logs
+    /// `duration_ms` (never `stale_age_ms`); and the live handoff-begin's
+    /// duration is the PRIOR OWNER'S REAL TENURE (computed before the
+    /// state replacement — pre-r6 it read the just-replaced state's
+    /// timestamp and was always zero).
+    #[test]
+    fn commit_release_rekey_events_carry_the_stable_schema() {
+        let r = RuntimeOwnershipRegistry::new();
+        let capture = EventCapture::default();
+        let _guard = capture.install();
+
+        // Live{Terminal} → the commit + the released events.
+        let BeginOutcome::Granted { generation } = r.begin_start(
+            PROVIDER,
+            "sid-schema",
+            RuntimeOwnerKind::Terminal,
+            "op-schema",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("expected Granted")
+        };
+        assert!(matches!(
+            r.commit_live(
+                PROVIDER,
+                "sid-schema",
+                "op-schema",
+                generation,
+                live_terminal_owner(),
+            ),
+            CommitOutcome::Committed
+        ));
+        r.release(
+            PROVIDER,
+            "sid-schema",
+            &ReleaseClaim {
+                operation_id: "op-schema".to_string(),
+                generation,
+                runtime: Some(live_terminal_owner()),
+            },
+            "test-release",
+        );
+        assert!(
+            matches!(
+                r.observe(PROVIDER, "sid-schema").state,
+                OwnershipState::Vacant
+            ),
+            "the released key is Vacant"
+        );
+        let events = capture.events();
+        let commit = events
+            .iter()
+            .find(|e| e.event.as_deref() == Some("ownership.live.commit"))
+            .expect("the commit event fires");
+        assert_eq!(
+            commit.values.get("failure_reason").map(String::as_str),
+            Some(""),
+            "ownership.live.commit carries the empty (not-applicable) \
+             failure_reason — got {:?}",
+            commit.values
+        );
+        let released = events
+            .iter()
+            .find(|e| e.event.as_deref() == Some("ownership.released"))
+            .expect("the released event fires");
+        assert_eq!(
+            released.values.get("to_kind").map(String::as_str),
+            Some("None"),
+            "ownership.released carries the None-valued to_kind (a release \
+             creates no new runtime) — got {:?}",
+            released.values
+        );
+        assert_eq!(
+            released.values.get("failure_reason").map(String::as_str),
+            Some(""),
+            "ownership.released carries the empty failure_reason — got {:?}",
+            released.values
+        );
+
+        // Live{FreshAgent} → the rekey event.
+        let BeginOutcome::Granted {
+            generation: fresh_gen,
+        } = r.begin_start(
+            PROVIDER,
+            "sid-rekey",
+            RuntimeOwnerKind::FreshAgent,
+            "op-rekey-src",
+            None,
+            "test",
+            1_000,
+        )
+        else {
+            panic!("expected Granted")
+        };
+        assert!(matches!(
+            r.commit_live(
+                PROVIDER,
+                "sid-rekey",
+                "op-rekey-src",
+                fresh_gen,
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("sid-rekey".into()),
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            CommitOutcome::Committed
+        ));
+        assert!(matches!(
+            r.rekey_live(
+                PROVIDER,
+                "sid-rekey",
+                "sid-rekeyed",
+                "sid-rekey",
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("sid-rekey".into()),
+                    pid: None,
+                    ownership_id: None,
+                },
+                "test",
+                "op-rekey-move",
+            ),
+            CommitOutcome::Committed
+        ));
+        let rekey = capture
+            .events()
+            .into_iter()
+            .find(|e| e.event.as_deref() == Some("ownership.live.rekey_live"))
+            .expect("the rekey event fires");
+        assert_eq!(
+            rekey.values.get("operation_id").map(String::as_str),
+            Some("op-rekey-move"),
+            "ownership.live.rekey_live carries the rekey operation id — got {:?}",
+            rekey.values
+        );
+        assert_eq!(
+            rekey.values.get("failure_reason").map(String::as_str),
+            Some(""),
+            "ownership.live.rekey_live carries the empty failure_reason — got {:?}",
+            rekey.values
+        );
+    }
+
+    /// b8ke ext r6 F5: the stale-stop sweep logs `duration_ms` naming —
+    /// never `stale_age_ms`.
+    #[test]
+    fn stale_stop_events_log_duration_ms_naming() {
+        let r = RuntimeOwnershipRegistry::new();
+        let capture = EventCapture::default();
+        let _guard = capture.install();
+
+        // Live{FreshAgent} → a stranded stop → the watchdog fences.
+        let BeginOutcome::Granted { generation } = r.begin_start(
+            PROVIDER,
+            "sid-stale-naming",
+            RuntimeOwnerKind::FreshAgent,
+            "op-live-naming",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("expected Granted")
+        };
+        assert!(matches!(
+            r.commit_live(
+                PROVIDER,
+                "sid-stale-naming",
+                "op-live-naming",
+                generation,
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("sid-stale-naming".into()),
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            CommitOutcome::Committed
+        ));
+        let claim = StopClaim {
+            expected_kind: RuntimeOwnerKind::FreshAgent,
+            expected_runtime: None,
+            observed: ObservedFence {
+                epoch: r.boot_epoch(),
+                generation,
+            },
+        };
+        match r.begin_stop(
+            PROVIDER,
+            "sid-stale-naming",
+            "op-stranded-naming",
+            &claim,
+            "test",
+            1_000,
+        ) {
+            StopOutcome::Granted { generation: sg } => {
+                let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                assert!(r.register_stop_settlement(
+                    PROVIDER,
+                    "sid-stale-naming",
+                    "op-stranded-naming",
+                    sg,
+                    Arc::clone(&flag),
+                ));
+            }
+            other => panic!("expected the stop claim granted, got {other:?}"),
+        }
+        let fenced = r.recover_stale_stoppings(10_000, 0);
+        assert_eq!(fenced.len(), 1);
+        let sweep_event = capture
+            .events()
+            .into_iter()
+            .find(|e| {
+                e.event.as_deref() == Some("ownership.stop.stale_stopping_fenced")
+                    || e.event.as_deref() == Some("ownership.start.recovery_fenced")
+            })
+            .expect("the stale-stop sweep fence event fires");
+        assert!(
+            sweep_event.fields.contains(&"duration_ms".to_string()),
+            "the stale-stop fence logs duration_ms naming — got {:?}",
+            sweep_event.fields
+        );
+        assert!(
+            !sweep_event.fields.contains(&"stale_age_ms".to_string()),
+            "the stale-stop fence never logs stale_age_ms — got {:?}",
+            sweep_event.fields
+        );
+    }
+
+    /// b8ke ext r6 F5: the live handoff-begin's duration is the PRIOR
+    /// OWNER'S REAL TENURE — computed before the state replacement
+    /// (pre-r6 it read the just-replaced Handoff state's own timestamp,
+    /// so it was always zero).
+    #[test]
+    fn the_live_handoff_begin_duration_is_the_prior_tenure() {
+        let r = RuntimeOwnershipRegistry::new();
+        let capture = EventCapture::default();
+        let _guard = capture.install();
+
+        let BeginOutcome::Granted { generation } = r.begin_start(
+            PROVIDER,
+            "sid-tenure",
+            RuntimeOwnerKind::Terminal,
+            "op-tenure",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("expected Granted")
+        };
+        assert!(matches!(
+            r.commit_live(
+                PROVIDER,
+                "sid-tenure",
+                "op-tenure",
+                generation,
+                live_terminal_owner(),
+            ),
+            CommitOutcome::Committed
+        ));
+        // The handoff begin carries a now_ms 10s past the REAL epoch: the
+        // prior's tenure is at least 10s by construction (pre-r6 the log
+        // read the replaced state's timestamp and printed 0).
+        let begin_now = now_epoch_ms() + 10_000;
+        let BeginOutcome::Granted { .. } = r.begin_handoff(
+            PROVIDER,
+            "sid-tenure",
+            RuntimeOwnerKind::FreshAgent,
+            "ho-tenure",
+            None,
+            "test",
+            begin_now,
+        ) else {
+            panic!("expected Granted")
+        };
+        let begin = capture
+            .events()
+            .into_iter()
+            .find(|e| {
+                e.event.as_deref() == Some("ownership.handoff.begin")
+                    && e.values.get("session_id").map(String::as_str) == Some("sid-tenure")
+            })
+            .expect("the handoff begin event fires");
+        let duration: u64 = begin
+            .values
+            .get("duration_ms")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        assert!(
+            duration >= 10_000,
+            "the live handoff-begin duration is the prior's REAL tenure — \
+             got {duration} ({:?})",
+            begin.values
         );
     }
 }

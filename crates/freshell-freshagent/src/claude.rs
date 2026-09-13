@@ -1457,6 +1457,9 @@ impl FreshClaudeState {
                     live_session_key,
                     replacement_owner,
                     initiator,
+                    // b8ke ext r6 F5: the rekey transition's operation id —
+                    // the uniform log schema's operation_id.
+                    &rekey_operation_id,
                 )
             }
         };
@@ -12533,6 +12536,7 @@ rl.on('line', (line) => {
                     ownership_id: Some("rekey-op-fork-e2r4".into()),
                 },
                 "test-rekey",
+                "rekey-op-fork-e2r4",
             ),
             freshell_ownership::CommitOutcome::Committed
         ));
