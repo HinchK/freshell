@@ -1,4 +1,5 @@
-import { readFile, writeFile } from 'node:fs/promises'
+import { execFileSync } from 'node:child_process'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import type { Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
@@ -6,7 +7,6 @@ import { createE2eBrowserContext, registerE2eMachine } from '../helpers/fixtures
 
 const FORBIDDEN = [
   '/api/proxy/forward',
-  '/api/fresh-agent/diff',
   '/api/files/open',
   '/api/extensions/',
 ]
@@ -220,10 +220,23 @@ test.describe('Rust baseline browser actions', () => {
     expect(forbidden).toEqual([])
   })
 
-  test('keeps supported attachments and shell execution while rejecting the unavailable expandable-diff action', async ({ freshellPage, page, serverInfo, terminal }) => {
+  test('keeps supported attachments, shell execution, and diff loading on the Rust baseline', async ({ freshellPage, page, serverInfo, terminal }) => {
     const forbidden = captureForbiddenRequests(page)
     await terminal.waitForTerminal()
-    await installFakeProviderPane(page, serverInfo.homeDir)
+    const repoDir = path.join(serverInfo.homeDir, 'fresh-agent-diff-repo')
+    await mkdir(repoDir, { recursive: true })
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: repoDir })
+    git('init', '-b', 'main')
+    await writeFile(path.join(repoDir, 'README.md'), 'freshell diff original\n')
+    git('add', 'README.md')
+    git(
+      '-c', 'user.name=Freshell E2E',
+      '-c', 'user.email=e2e@example.invalid',
+      '-c', 'commit.gpgsign=false',
+      'commit', '-m', 'initial commit',
+    )
+    await writeFile(path.join(repoDir, 'README.md'), 'freshell diff changed\n')
+    await installFakeProviderPane(page, repoDir)
     const pane = page.locator('[data-context="fresh-agent"]').last()
     await expect(pane.getByLabel(/attach|attachment|upload/i)).toBeVisible()
     await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.clearSentWsMessages?.())
@@ -254,7 +267,17 @@ test.describe('Rust baseline browser actions', () => {
     const diff = pane.locator('.fresh-agent-file-diff')
     await expect(diff).toContainText('README.md')
     await expect(diff).toContainText('modified')
-    await expect(diff.getByRole('button')).toHaveCount(0)
+    const diffResponse = page.waitForResponse((response) => (
+      response.url().includes('/api/fresh-agent/diff')
+      && response.request().method() === 'GET'
+    ))
+    await diff.getByRole('button', { name: 'Diff: README.md' }).click()
+    const diffResult = await diffResponse
+    expect(diffResult.status()).toBe(200)
+    expect(await diffResult.json()).toEqual({
+      diff: expect.stringContaining('+freshell diff changed'),
+    })
+    await expect(diff).toContainText('freshell diff changed')
     expect(forbidden).toEqual([])
   })
 })
