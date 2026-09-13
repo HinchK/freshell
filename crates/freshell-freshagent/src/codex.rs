@@ -284,6 +284,11 @@ struct CodexSession {
     /// rollback busy gate). Rollback-vs-rollback additionally single-flights on
     /// `rollback_in_flight`, acquired FIRST (never the reverse order).
     turn_lock: Arc<TokioMutex<()>>,
+    /// Serializes notification-consumer emission with a `freshAgent.send` acceptance.
+    /// Codex can send `turn/completed` immediately after the `turn/start` response;
+    /// the request-correlated accepted frame must reach the client first so its
+    /// submitted-turn identity is available before completion state is folded.
+    event_emission_gate: Arc<TokioMutex<()>>,
     /// The notification-consumer task (aborted on shutdown/kill).
     consumer: tokio::task::JoinHandle<()>,
     /// Signals the exit-watcher to gracefully tear the sidecar down (a REQUESTED
@@ -1307,6 +1312,7 @@ impl FreshCodexState {
         // only its delivery to the consumer is deferred.
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
+        let event_emission_gate = Arc::new(TokioMutex::new(()));
         let (created_tx, created_rx) = oneshot::channel();
         let consumer = self.spawn_consumer_after(
             notifs,
@@ -1315,6 +1321,7 @@ impl FreshCodexState {
             quiet_deadman.clone(),
             compact_in_flight.clone(),
             compact_turn_id.clone(),
+            event_emission_gate.clone(),
             Some(created_rx),
         );
 
@@ -1348,6 +1355,7 @@ impl FreshCodexState {
                 compact_turn_id,
                 history_mode,
                 turn_lock: Arc::new(TokioMutex::new(())),
+                event_emission_gate,
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -1650,11 +1658,13 @@ impl FreshCodexState {
                     s.client.clone(),
                     s.active_turn.clone(),
                     s.turn_lock.clone(),
+                    s.event_emission_gate.clone(),
                     s.quiet_deadman.clone(),
                 )
             })
         };
-        let Some((client, active_turn, turn_lock, quiet_deadman)) = looked_up else {
+        let Some((client, active_turn, turn_lock, event_emission_gate, quiet_deadman)) = looked_up
+        else {
             self.send_error(&request_id, "SESSION_NOT_FOUND", "codex session not found");
             return;
         };
@@ -1743,6 +1753,12 @@ impl FreshCodexState {
             sandbox_policy: sandbox.as_deref().map(sandbox_policy_value),
             approval_policy: permission_mode.as_deref().map(|p| json!(p)),
         };
+
+        // The app-server can write a terminal notification immediately after its
+        // turn/start response. Hold the session-local emission gate from before that
+        // RPC through the accepted broadcast below, so the client first receives the
+        // request-correlated submittedTurnId and then the completion-derived frames.
+        let _event_emission = event_emission_gate.lock().await;
 
         let submitted_turn_id = match client.start_turn(params).await {
             Ok(started) => {
@@ -3512,6 +3528,7 @@ impl FreshCodexState {
         let quiet_deadman = QuietDeadman::new_shared();
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
+        let event_emission_gate = Arc::new(TokioMutex::new(()));
         let exited = Arc::new(AtomicBool::new(false));
         let consumer = self.spawn_consumer(
             notifs,
@@ -3520,6 +3537,7 @@ impl FreshCodexState {
             quiet_deadman.clone(),
             compact_in_flight.clone(),
             compact_turn_id.clone(),
+            event_emission_gate.clone(),
         );
         let (kill_tx, kill_rx) = oneshot::channel();
         let watcher = spawn_exit_watcher(
@@ -3559,6 +3577,7 @@ impl FreshCodexState {
                     // missing/unparseable meta stamps legacy).
                     history_mode: read_rollout_history_mode(session_id),
                     turn_lock: Arc::new(TokioMutex::new(())),
+                    event_emission_gate,
                     consumer,
                     kill_tx: Some(kill_tx),
                     watcher,
@@ -3686,6 +3705,7 @@ impl FreshCodexState {
         let quiet_deadman = QuietDeadman::new_shared();
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
+        let event_emission_gate = Arc::new(TokioMutex::new(()));
         let exited = Arc::new(AtomicBool::new(false));
         let consumer = self.spawn_consumer(
             notifs,
@@ -3694,6 +3714,7 @@ impl FreshCodexState {
             quiet_deadman.clone(),
             compact_in_flight.clone(),
             compact_turn_id.clone(),
+            event_emission_gate.clone(),
         );
         let (kill_tx, kill_rx) = oneshot::channel();
         let watcher = spawn_exit_watcher(
@@ -3724,6 +3745,7 @@ impl FreshCodexState {
                     compact_turn_id,
                     history_mode: Some(HistoryMode::Paginated),
                     turn_lock: Arc::new(TokioMutex::new(())),
+                    event_emission_gate,
                     consumer,
                     kill_tx: Some(kill_tx),
                     watcher,
@@ -3951,6 +3973,7 @@ impl FreshCodexState {
         quiet_deadman: Arc<StdMutex<QuietDeadman>>,
         compact_in_flight: Arc<AtomicBool>,
         compact_turn_id: Arc<StdMutex<Option<String>>>,
+        event_emission_gate: Arc<TokioMutex<()>>,
     ) -> tokio::task::JoinHandle<()> {
         self.spawn_consumer_after(
             notifs,
@@ -3959,11 +3982,12 @@ impl FreshCodexState {
             quiet_deadman,
             compact_in_flight,
             compact_turn_id,
+            event_emission_gate,
             None,
         )
     }
 
-    /// Like [`Self::spawn_consumer`], but if `gate` is given, the consumer's first
+    /// Like [`Self::spawn_consumer`], but if `created_gate` is given, the consumer's first
     /// `notifs.recv()` waits for it to fire before consuming anything -- see
     /// [`Self::finish_create`]'s ordering-fix doc for why this exists. The unbounded
     /// `notifs` channel buffers whatever arrives while gated; nothing is lost, only its
@@ -3981,7 +4005,8 @@ impl FreshCodexState {
         quiet_deadman: Arc<StdMutex<QuietDeadman>>,
         compact_in_flight: Arc<AtomicBool>,
         compact_turn_id: Arc<StdMutex<Option<String>>>,
-        gate: Option<oneshot::Receiver<()>>,
+        event_emission_gate: Arc<TokioMutex<()>>,
+        created_gate: Option<oneshot::Receiver<()>>,
     ) -> tokio::task::JoinHandle<()> {
         let broadcast_tx = self.broadcast_tx.clone();
         // The deadman feed needs the state handle (window config + waiter spawn); a
@@ -3989,12 +4014,15 @@ impl FreshCodexState {
         // server-global `FreshCodexState`, alive for the process's whole life anyway).
         let state = self.clone();
         tokio::spawn(async move {
-            if let Some(gate) = gate {
+            if let Some(gate) = created_gate {
                 let _ = gate.await;
             }
             state.clear_controls(&thread_id).await;
             let mut subscription = CodexSubscription::new(thread_id.clone());
             while let Some(notification) = notifs.recv().await {
+                // Lock around the whole notification fold, not each individual frame:
+                // a completed turn emits snapshot then chime as one ordered unit.
+                let _emission = event_emission_gate.lock().await;
                 if state
                     .consume_control_notification(&thread_id, &notification)
                     .await
@@ -4741,6 +4769,7 @@ impl FreshCodexState {
         let quiet_deadman = QuietDeadman::new_shared();
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
+        let event_emission_gate = Arc::new(TokioMutex::new(()));
         let exited = Arc::new(AtomicBool::new(false));
         let consumer = self.spawn_consumer(
             notifs,
@@ -4749,6 +4778,7 @@ impl FreshCodexState {
             quiet_deadman.clone(),
             compact_in_flight.clone(),
             compact_turn_id.clone(),
+            event_emission_gate.clone(),
         );
         let (kill_tx, kill_rx) = oneshot::channel();
         let watcher = spawn_exit_watcher(
@@ -4775,6 +4805,7 @@ impl FreshCodexState {
                 compact_turn_id: compact_turn_id.clone(),
                 history_mode,
                 turn_lock: Arc::new(TokioMutex::new(())),
+                event_emission_gate,
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -4843,6 +4874,7 @@ impl FreshCodexState {
                 // This fixture models a thread freshell started (paginated).
                 history_mode: Some(HistoryMode::Paginated),
                 turn_lock: Arc::new(TokioMutex::new(())),
+                event_emission_gate: Arc::new(TokioMutex::new(())),
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -6895,6 +6927,7 @@ pub(crate) mod tests {
                 // These fixtures model threads freshell started (paginated).
                 history_mode: Some(HistoryMode::Paginated),
                 turn_lock: Arc::new(TokioMutex::new(())),
+                event_emission_gate: Arc::new(TokioMutex::new(())),
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -6933,6 +6966,7 @@ pub(crate) mod tests {
         let quiet_deadman = QuietDeadman::new_shared();
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
+        let event_emission_gate = Arc::new(TokioMutex::new(()));
         let consumer = state.spawn_consumer(
             notifs,
             thread_id.to_string(),
@@ -6940,6 +6974,7 @@ pub(crate) mod tests {
             quiet_deadman.clone(),
             compact_in_flight.clone(),
             compact_turn_id.clone(),
+            event_emission_gate.clone(),
         );
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
@@ -6968,6 +7003,7 @@ pub(crate) mod tests {
                 // These fixtures model threads freshell started (paginated).
                 history_mode: Some(HistoryMode::Paginated),
                 turn_lock: Arc::new(TokioMutex::new(())),
+                event_emission_gate,
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -7966,6 +8002,7 @@ pub(crate) mod tests {
                 compact_turn_id: Arc::new(StdMutex::new(None)),
                 history_mode: Some(HistoryMode::Paginated),
                 turn_lock: Arc::new(TokioMutex::new(())),
+                event_emission_gate: Arc::new(TokioMutex::new(())),
                 consumer,
                 kill_tx: None,
                 watcher,
@@ -8636,6 +8673,105 @@ pub(crate) mod tests {
             json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
         );
         let _ = peer.expect_notification().await; // initialized
+    }
+
+    /// A `turn/start` reply and its terminal notification can arrive back-to-back: the
+    /// app-server writes the RPC reply, then immediately writes `turn/completed` on the
+    /// same socket. The request-correlated acceptance frame MUST nevertheless reach the
+    /// browser first, so its `submittedTurnId` is available when the snapshot/chime is
+    /// folded. Repeat the exact no-slack delivery window enough times to exercise the
+    /// independent RPC waiter and notification-consumer tasks on the multi-thread runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn handle_send_always_broadcasts_accepted_before_an_immediate_completion_snapshot_and_chime(
+    ) {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+        let (st, mut rx) = state_with_bus();
+        let thread_id = "thread-send-accepted-order";
+
+        insert_fake_session_with_real_consumer(
+            &st,
+            thread_id,
+            client,
+            Arc::new(StdMutex::new(None)),
+            notifs,
+            spawn_sleeper(),
+            "codex-sidecar-test-send-accepted-order",
+        )
+        .await;
+
+        for attempt in 0..30 {
+            let mut send = send_msg(thread_id, "hi");
+            send.request_id = Some(format!("send-accepted-order-{attempt}"));
+            let driver = {
+                let st = st.clone();
+                tokio::spawn(async move { st.handle_send(send).await })
+            };
+
+            if attempt == 0 {
+                answer_initialize(&peer).await;
+            }
+            let (turn_request_id, method, _params) = peer.expect_request().await;
+            assert_eq!(method, "turn/start");
+
+            // Deliberately enqueue the completion immediately after the success response,
+            // with no yield between the two writes. This is the production race boundary.
+            peer.respond(
+                &turn_request_id,
+                json!({ "turn": { "id": format!("turn-{attempt}") } }),
+            );
+            peer.emit_notification(
+                "turn/completed",
+                json!({
+                    "threadId": thread_id,
+                    "turn": { "id": format!("turn-{attempt}"), "status": "completed" },
+                }),
+            );
+            driver.await.expect("send driver completes");
+
+            let mut frames = Vec::new();
+            let mut saw_accepted = false;
+            let mut saw_complete = false;
+            loop {
+                let raw = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("turn frames arrive within budget")
+                    .expect("broadcast bus remains open");
+                let frame: Value = serde_json::from_str(&raw).unwrap();
+                saw_accepted |= frame["type"] == "freshAgent.send.accepted";
+                saw_complete |= frame["type"] == "freshAgent.event"
+                    && frame["event"]["type"] == "freshAgent.turn.complete";
+                frames.push(frame);
+                if saw_accepted && saw_complete {
+                    break;
+                }
+            }
+
+            let accepted = frames
+                .iter()
+                .position(|frame| frame["type"] == "freshAgent.send.accepted")
+                .expect("turn acceptance frame");
+            let snapshot = frames
+                .iter()
+                .position(|frame| {
+                    frame["type"] == "freshAgent.event"
+                        && frame["event"]["type"] == "freshAgent.session.snapshot"
+                        && frame["event"]["status"] == "idle"
+                })
+                .expect("completion-derived idle snapshot");
+            let complete = frames
+                .iter()
+                .position(|frame| {
+                    frame["type"] == "freshAgent.event"
+                        && frame["event"]["type"] == "freshAgent.turn.complete"
+                })
+                .expect("completion chime");
+            assert!(
+                accepted < snapshot && snapshot < complete,
+                "attempt {attempt}: accepted must precede its completion snapshot and chime: {frames:?}"
+            );
+        }
     }
 
     /// Drive the PROBED real-0.147.0 post-compact notification sequence (plan Task 4,
