@@ -2246,6 +2246,44 @@ async fn the_platform_limited_reap_failure_frame_stays_fenced_never_vacant() {
         "the platform-limited failure frame carries the fence's typed wire \
          reason: {frames:?}"
     );
+    // b8ke e4 post-cap F2: the fence records the UNCONFIRMED TARGET's
+    // identity, never the already-reaped source — the failure frame (and
+    // the authoritative snapshot below) name the TERMINAL target the
+    // handoff spawned (pre-post-cap the fence copied the Handoff prior —
+    // the reaped fresh-agent source — and the frame carried ITS kind).
+    assert_eq!(
+        last_failed["ownerKind"],
+        json!("terminal"),
+        "the platform-limited failure frame names the unconfirmed TARGET's \
+         kind — frames: {frames:?}"
+    );
+    let fenced_target_id = last_failed["terminalId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !fenced_target_id.is_empty(),
+        "the platform-limited failure frame carries the unconfirmed \
+         TARGET's terminal id — frames: {frames:?}"
+    );
+    match rig.ownership.observe("claude", &sid).state {
+        OwnershipState::Fenced {
+            prior: Some((owner, _)),
+            ..
+        } => {
+            assert_eq!(
+                owner.kind,
+                RuntimeOwnerKind::Terminal,
+                "the authoritative snapshot's fenced prior is the TARGET"
+            );
+            assert_eq!(
+                owner.terminal_id.as_deref(),
+                Some(fenced_target_id.as_str()),
+                "the authoritative snapshot's fenced prior is the TARGET's id"
+            );
+        }
+        other => panic!("the platform-limited fence must stand: {other:?}"),
+    }
 
     let events = sink.lock().expect("capture lock").clone();
     let done_outcomes: Vec<&str> = events
@@ -2263,6 +2301,10 @@ async fn the_platform_limited_reap_failure_frame_stays_fenced_never_vacant() {
         "a platform-limited reap was explicitly NOT confirmed — never log \
          flavor_write_failed_target_reaped: {done_outcomes:?}"
     );
+
+    // Cleanup: the forced platform-limited path never killed the spawned
+    // target — reap it.
+    rig.registry.kill(&fenced_target_id);
 }
 
 /// b8ke e4r1 F1: the STALE-COMMIT arm's duplicated flaw — a stale commit
@@ -2670,6 +2712,103 @@ async fn a_foreign_commit_during_the_abort_broadcast_window_is_never_overwritten
 
     // Cleanup: reap the committed terminal.
     rig.registry.kill(&committed_terminal);
+}
+
+/// b8ke e4 post-cap F1: the uncommitted-target reap's terminal arm
+/// confirms death on the recorded pid's OS-LEVEL death — NEVER the
+/// registry kill's return. kill_internal removes the row BEFORE
+/// signaling/reaping the PTY, so a CONCURRENT kill can own the removed
+/// row while the process lives: a kill() answering false ("no row") was
+/// classified as the confirmed reap and the callers vacated the key —
+/// another writer before the first kill's reap confirmed. The
+/// row-removed-but-pid-alive window fences typed unconfirmed (the
+/// detached watcher resolves it on the pid's death); the confirmed
+/// pid-death path still reaps.
+#[tokio::test]
+async fn the_uncommitted_target_reap_never_confirms_on_a_missing_row() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    // A SHORT reap budget: the pid-alive window deterministically fences
+    // within the test instead of waiting the production budget.
+    let rig = build_rig_inner(None, None, None, 50, None, false, None);
+    // The target's stand-in process: ALIVE, its registry row ABSENT —
+    // the exact row-removed-but-not-yet-reaped shape a concurrent kill
+    // produces.
+    let mut target = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn the uncommitted target's stand-in");
+    let target_pid = target.id();
+    let absent_tid = "T-e4pc-f1-absent";
+    assert!(
+        rig.registry.terminal_is_dead(absent_tid),
+        "precondition: the recorded pane's row is absent"
+    );
+    assert!(
+        freshell_terminal::registry::pid_alive(target_pid),
+        "precondition: the recorded runtime still lives"
+    );
+    let live_owner = freshell_ownership::OwnerIdentity {
+        kind: RuntimeOwnerKind::Terminal,
+        terminal_id: Some(absent_tid.to_string()),
+        live_session_key: None,
+        pid: Some(target_pid),
+        ownership_id: None,
+    };
+
+    // THE WINDOW: kill() answers false (the row is gone) while the pid
+    // lives — pre-post-cap the arm answered Reaped (the row's absence
+    // misread as the confirmed reap) and the callers vacated over the
+    // still-live target.
+    let outcome = rig
+        .runner
+        .reap_uncommitted_target(
+            &handoff_req_terminal("claude", &sid, "claude"),
+            &live_owner,
+            "op-e4pc-f1",
+            1,
+        )
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            super::StopOutcomePriv::ReapTimeout { fenced: true }
+        ),
+        "the row-removed-but-pid-alive window fences typed unconfirmed — \
+         got {outcome:?}"
+    );
+
+    // The confirmed pid-death path still reaps: the stand-in dies (and
+    // is reaped — a zombie still answers kill(pid, 0)), then the same
+    // absent-row shape confirms through the pid.
+    target.kill().expect("SIGKILL the stand-in");
+    let _ = target.wait().expect("reap the stand-in");
+    assert!(
+        !freshell_terminal::registry::pid_alive(target_pid),
+        "precondition: the recorded runtime is confirmed dead"
+    );
+    let dead_owner = freshell_ownership::OwnerIdentity {
+        kind: RuntimeOwnerKind::Terminal,
+        terminal_id: Some(absent_tid.to_string()),
+        live_session_key: None,
+        pid: Some(target_pid),
+        ownership_id: None,
+    };
+    let outcome = rig
+        .runner
+        .reap_uncommitted_target(
+            &handoff_req_terminal("claude", &sid, "claude"),
+            &dead_owner,
+            "op-e4pc-f1-dead",
+            2,
+        )
+        .await;
+    assert!(
+        matches!(outcome, super::StopOutcomePriv::Reaped),
+        "the confirmed pid-death path still reaps — got {outcome:?}"
+    );
 }
 
 /// b8ke e4r1 F1 control: a CONFIRMED target reap (the key truly ends

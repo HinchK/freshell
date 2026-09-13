@@ -222,6 +222,7 @@ pub(crate) enum ReapAnswer {
 }
 
 /// Why a prior runtime's stop could not be confirmed reaped.
+#[derive(Debug)]
 enum StopOutcomePriv {
     /// The runtime is confirmed gone (awaited reap, or it never existed).
     Reaped,
@@ -1123,13 +1124,21 @@ impl SessionHandoffRunner {
                                 // b8ke d4 F1: the platform-limited teardown
                                 // fences the typed fence (no watcher can
                                 // ever confirm the descendant tree here).
+                                // b8ke e4 post-cap F2: the fence records
+                                // the UNCONFIRMED TARGET's identity — the
+                                // runtime with the unverifiable descendant
+                                // tree is the newly spawned target, not the
+                                // already-reaped source, so the snapshot/
+                                // broadcast/typed answers name the right
+                                // runtime.
                                 guard.disarm();
-                                let _ = self.ownership.fence_unconfirmed_handoff(
+                                let _ = self.ownership.fence_unconfirmed_handoff_with_prior(
                                     &req.provider,
                                     &req.session_id,
                                     &operation_id,
                                     generation,
                                     freshell_ownership::FenceReason::PlatformLimited,
+                                    Some((owner.clone(), generation)),
                                 );
                             } else if !self
                                 .uncommitted_target_reap_vacates(&reap_outcome, &mut guard)
@@ -1268,13 +1277,17 @@ impl SessionHandoffRunner {
                             .await;
                         if let StopOutcomePriv::PlatformLimitedFenced = reap_outcome {
                             // b8ke d4 F1: the typed PlatformLimited fence.
+                            // b8ke e4 post-cap F2: the fence records the
+                            // UNCONFIRMED TARGET's identity (the same
+                            // reversed-identity fix as the flavor arm).
                             guard.disarm();
-                            let _ = self.ownership.fence_unconfirmed_handoff(
+                            let _ = self.ownership.fence_unconfirmed_handoff_with_prior(
                                 &req.provider,
                                 &req.session_id,
                                 &operation_id,
                                 generation,
                                 freshell_ownership::FenceReason::PlatformLimited,
+                                Some((owner.clone(), generation)),
                             );
                         } else if !self.uncommitted_target_reap_vacates(&reap_outcome, &mut guard) {
                             tracing::warn!(target: "freshell_ownership",
@@ -1649,23 +1662,43 @@ impl SessionHandoffRunner {
         }
         match owner.kind {
             RuntimeOwnerKind::Terminal => {
-                if let Some(terminal_id) = owner.terminal_id.as_deref() {
-                    if self.registry.kill(terminal_id) {
+                let Some(terminal_id) = owner.terminal_id.as_deref() else {
+                    return StopOutcomePriv::Reaped;
+                };
+                // b8ke e4 post-cap F1: confirmed death is the recorded
+                // pid's OS-LEVEL death — NEVER the registry kill's return
+                // and never the row-based predicate. kill_internal removes
+                // the row BEFORE signaling/reaping the PTY, so a CONCURRENT
+                // kill can own the removed row while the process lives:
+                // a kill() answering false ("no row") was classified as
+                // the confirmed reap and the callers vacated the key —
+                // another writer before the first kill's reap confirmed.
+                // Issue the kill (idempotent — false only means the row is
+                // gone) and confirm on the pid; the
+                // row-removed-but-pid-alive interval fences typed
+                // unconfirmed and the DETACHED watcher (pid-based
+                // confirmation) resolves it — never vacates.
+                match owner.pid {
+                    Some(pid) => {
+                        self.registry.kill(terminal_id);
                         let budget = std::time::Duration::from_millis(self.reap_timeout_ms);
-                        let mut confirm =
-                            std::pin::pin!(await_terminal_dead(&self.registry, terminal_id));
+                        let mut confirm = std::pin::pin!(async {
+                            while freshell_terminal::registry::pid_alive(pid) {
+                                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                            }
+                        });
                         tokio::select! {
                             () = &mut confirm => StopOutcomePriv::Reaped,
                             _ = tokio::time::sleep(budget) => {
-                                // The kill was issued; the row's death is
+                                // The kill was issued (ours or the
+                                // concurrent one); the process's death is
                                 // merely unobserved — the DETACHED watcher
-                                // owns the release (the failure frame first,
-                                // FR5), exactly like the prior-stop arm.
+                                // owns the release (the failure frame
+                                // first, FR5), exactly like the prior-stop
+                                // arm.
                                 self.broadcast_fenced_reap_timeout(
                                     req, owner, operation_id, generation,
                                 );
-                                let registry = self.registry.clone();
-                                let tid = terminal_id.to_string();
                                 self.spawn_reap_confirmation_watcher(
                                     req,
                                     operation_id,
@@ -1674,19 +1707,61 @@ impl SessionHandoffRunner {
                                     owner,
                                     "REAP_TIMEOUT",
                                     async move {
-                                        await_terminal_dead(&registry, &tid).await;
+                                        while freshell_terminal::registry::pid_alive(pid) {
+                                            tokio::time::sleep(
+                                                std::time::Duration::from_millis(25),
+                                            )
+                                            .await;
+                                        }
                                         ReapAnswer::Confirmed
                                     },
                                 );
                                 StopOutcomePriv::ReapTimeout { fenced: true }
                             }
                         }
-                    } else {
-                        // No row to kill (already gone): confirmed absent.
-                        StopOutcomePriv::Reaped
                     }
-                } else {
-                    StopOutcomePriv::Reaped
+                    None => {
+                        // No recorded pid (a degenerate identity): the best
+                        // available evidence is the row-based poll after
+                        // OUR OWN kill removed the row — a kill() answering
+                        // false means nothing existed under this identity
+                        // (no row, no pid — no concurrent-kill window CAN
+                        // apply to a pid-less identity, whose row a real
+                        // concurrent killer would have spawned with a pid).
+                        if self.registry.kill(terminal_id) {
+                            let budget = std::time::Duration::from_millis(self.reap_timeout_ms);
+                            let mut confirm =
+                                std::pin::pin!(await_terminal_dead(&self.registry, terminal_id,));
+                            tokio::select! {
+                                () = &mut confirm => StopOutcomePriv::Reaped,
+                                _ = tokio::time::sleep(budget) => {
+                                    self.broadcast_fenced_reap_timeout(
+                                        req, owner, operation_id, generation,
+                                    );
+                                    let registry = self.registry.clone();
+                                    let tid = terminal_id.to_string();
+                                    self.spawn_reap_confirmation_watcher(
+                                        req,
+                                        operation_id,
+                                        generation,
+                                        "handoff-runner-stale-commit",
+                                        owner,
+                                        "REAP_TIMEOUT",
+                                        async move {
+                                            await_terminal_dead(&registry, &tid).await;
+                                            ReapAnswer::Confirmed
+                                        },
+                                    );
+                                    StopOutcomePriv::ReapTimeout { fenced: true }
+                                }
+                            }
+                        } else {
+                            // No row to kill (already gone — and no pid was
+                            // ever recorded for this identity): confirmed
+                            // absent.
+                            StopOutcomePriv::Reaped
+                        }
+                    }
                 }
             }
             RuntimeOwnerKind::FreshAgent => {

@@ -1589,6 +1589,34 @@ impl RuntimeOwnershipRegistry {
         generation: u64,
         reason: FenceReason,
     ) -> FenceOutcome {
+        self.fence_unconfirmed_handoff_with_prior(
+            provider,
+            session_id,
+            operation_id,
+            generation,
+            reason,
+            None,
+        )
+    }
+
+    /// b8ke e4 post-cap F2: [`Self::fence_unconfirmed_handoff`] with the
+    /// UNCONFIRMED RUNTIME'S OWN identity as the fenced prior — the
+    /// uncommitted-TARGET teardown path's fence: the runtime whose
+    /// descendant tree is unconfirmed is the newly started TARGET, not
+    /// the Handoff record's already-reaped SOURCE, so the authoritative
+    /// snapshot, the failure broadcast, and the typed answers must name
+    /// the TARGET's kind/id (fencing with the Handoff-captured prior
+    /// reported the wrong runtime on every channel). `None` keeps the
+    /// Handoff record's captured prior (the prior-stop watchdog's shape).
+    pub fn fence_unconfirmed_handoff_with_prior(
+        &self,
+        provider: &str,
+        session_id: &str,
+        operation_id: &str,
+        generation: u64,
+        reason: FenceReason,
+        unconfirmed: Option<(OwnerIdentity, u64)>,
+    ) -> FenceOutcome {
         let mut inner = self.inner.lock().expect("ownership lock poisoned");
         let key = SessionKey::new(provider, session_id);
         let Some(record) = inner.get_mut(&key) else {
@@ -1607,7 +1635,10 @@ impl RuntimeOwnershipRegistry {
                 let duration_ms = now_epoch_ms()
                     .saturating_sub(record.state.since_ms().unwrap_or(now_epoch_ms()));
                 record.state = OwnershipState::Fenced {
-                    prior,
+                    // b8ke e4 post-cap F2: the unconfirmed runtime's OWN
+                    // identity when the caller names it (the uncommitted
+                    // TARGET), else the Handoff record's captured prior.
+                    prior: unconfirmed.or(prior),
                     reason,
                     operation_id: op,
                     generation,
