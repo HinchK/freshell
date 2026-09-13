@@ -39,10 +39,35 @@ describe('SettingsView coding agents settings', () => {
     ]) {
       expect(screen.getByRole('switch', { name })).toBeInTheDocument()
     }
-    expect(screen.queryByText('Show thinking')).not.toBeInTheDocument()
-    expect(screen.queryByText('Show tools')).not.toBeInTheDocument()
+    // Expansion-default switches (off = compact start); the old Show*
+    // visibility switches are gone, and the timecodes toggle and the
+    // font-size control are NOT revived (out of scope).
+    expect(screen.getByRole('switch', { name: 'Expand thinking' })).toBeInTheDocument()
+    expect(screen.getByRole('switch', { name: 'Expand tools' })).toBeInTheDocument()
+    expect(screen.queryByRole('switch', { name: 'Show thinking' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('switch', { name: 'Show tools' })).not.toBeInTheDocument()
     expect(screen.queryByText('Show timecodes & model')).not.toBeInTheDocument()
     expect(screen.queryByLabelText('Fresh agent font size')).not.toBeInTheDocument()
+  })
+
+  it('toggles fresh-agent expansion defaults locally without calling the server', () => {
+    const store = createSettingsViewStore()
+    renderSettingsView(store)
+    switchSettingsTab('Coding Agents')
+
+    const thinkingToggle = screen.getByRole('switch', { name: 'Expand thinking' })
+    expect(thinkingToggle).toHaveAttribute('aria-checked', 'false')
+    const toolsToggle = screen.getByRole('switch', { name: 'Expand tools' })
+    expect(toolsToggle).toHaveAttribute('aria-checked', 'false')
+
+    fireEvent.click(thinkingToggle)
+    expect(store.getState().settings.settings.freshAgent.expandThinking).toBe(true)
+    expect(store.getState().settings.settings.freshAgent.expandTools).toBe(false)
+    expect(api.patch).not.toHaveBeenCalled()
+
+    fireEvent.click(toolsToggle)
+    expect(store.getState().settings.settings.freshAgent.expandTools).toBe(true)
+    expect(api.patch).not.toHaveBeenCalled()
   })
 
   it('hides unavailable CLI agents and their Fresh variants', () => {

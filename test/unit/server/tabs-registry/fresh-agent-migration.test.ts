@@ -146,9 +146,9 @@ describe('server tabs registry fresh-agent migration', () => {
       kind: 'fresh-agent',
       payload: {
         restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'invalid_legacy_restore_target' },
-        showTools: true,
       },
     })
+    expect(result.remoteOpen[0]?.panes[0]?.payload.showTools).toBeUndefined()
     expect(result.remoteOpen[0]?.panes[0]?.payload.sessionRef).toBeUndefined()
     expect(result.remoteOpen[0]?.panes[0]?.payload.resumeSessionId).toBeUndefined()
   })

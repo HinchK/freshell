@@ -18,6 +18,7 @@ describe('browser preferences fresh-agent settings compatibility', () => {
         agentChat: {
           showTools: true,
           showThinking: true,
+          expandTools: true,
           fontScale: 1.25,
         },
       },
@@ -28,12 +29,13 @@ describe('browser preferences fresh-agent settings compatibility', () => {
 
     expect(record.settings).toEqual({
       freshAgent: {
-        showTools: true,
-        showThinking: true,
+        expandTools: true,
       },
     })
-    expect(resolved.freshAgent.showTools).toBe(true)
-    expect(resolved.freshAgent.showThinking).toBe(true)
+    expect(resolved.freshAgent.expandTools).toBe(true)
+    expect(resolved.freshAgent.expandThinking).toBe(false)
+    expect('showThinking' in resolved.freshAgent).toBe(false)
+    expect('showTools' in resolved.freshAgent).toBe(false)
     expect('fontScale' in resolved.freshAgent).toBe(false)
     expect('agentChat' in (record.settings ?? {})).toBe(false)
     expect('agentChat' in resolved).toBe(false)
@@ -43,6 +45,7 @@ describe('browser preferences fresh-agent settings compatibility', () => {
     patchBrowserPreferencesRecord({
       settings: {
         agentChat: {
+          expandTools: true,
           showTools: true,
           fontScale: 1.25,
         },
@@ -53,7 +56,7 @@ describe('browser preferences fresh-agent settings compatibility', () => {
 
     expect(raw.settings).toEqual({
       freshAgent: {
-        showTools: true,
+        expandTools: true,
       },
     })
     expect(raw.settings.agentChat).toBeUndefined()

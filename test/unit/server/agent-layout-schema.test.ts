@@ -166,8 +166,8 @@ describe('UiLayoutSyncSchema', () => {
       provider: 'claude',
       restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'invalid_legacy_restore_target' },
       initialCwd: '/repo',
-      showTools: true,
     })
+    expect(parsed.data.layouts.tab_a.content.showTools).toBeUndefined()
     expect(parsed.data.layouts.tab_a.content.sessionRef).toBeUndefined()
   })
 })

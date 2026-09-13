@@ -155,11 +155,14 @@ describe('shared settings contract', () => {
 
   it('resolves browser-local fresh-agent settings without exposing agentChat', () => {
     const resolved = resolveLocalSettings({
+      freshAgent: { expandThinking: true },
       agentChat: { showTools: true, showThinking: true, fontScale: 1.25 },
     } as never)
 
-    expect(resolved.freshAgent.showTools).toBe(true)
-    expect(resolved.freshAgent.showThinking).toBe(true)
+    expect(resolved.freshAgent.expandThinking).toBe(true)
+    expect(resolved.freshAgent.expandTools).toBe(false)
+    expect('showThinking' in resolved.freshAgent).toBe(false)
+    expect('showTools' in resolved.freshAgent).toBe(false)
     expect('fontScale' in resolved.freshAgent).toBe(false)
     expect('agentChat' in resolved).toBe(false)
   })
@@ -264,8 +267,8 @@ describe('shared settings contract', () => {
     expect(schema.safeParse({ sidebar: { sortMode: 'activity' } }).success).toBe(false)
     expect(schema.safeParse({ sidebar: { showSubagents: true } }).success).toBe(false)
     expect(schema.safeParse({ sidebar: { ignoreCodexSubagents: true } }).success).toBe(false)
-    expect(schema.safeParse({ freshAgent: { showThinking: true } }).success).toBe(false)
-    expect(schema.safeParse({ freshAgent: { showTools: true } }).success).toBe(false)
+    expect(schema.safeParse({ freshAgent: { expandThinking: true } }).success).toBe(false)
+    expect(schema.safeParse({ freshAgent: { expandTools: true } }).success).toBe(false)
     expect(schema.safeParse({ freshAgent: { showTimecodes: true } }).success).toBe(false)
     expect(schema.safeParse({ agentChat: { defaultPlugins: ['fs'] } }).success).toBe(false)
   })
@@ -377,6 +380,10 @@ describe('shared settings contract', () => {
         showThinking: true,
         showTools: true,
       },
+      freshAgent: {
+        expandThinking: true,
+        expandTools: true,
+      },
     }
 
     expect(extractLegacyLocalSettingsSeed(rawMixedSettings)).toEqual({
@@ -396,8 +403,8 @@ describe('shared settings contract', () => {
         ignoreCodexSubagents: false,
       },
       freshAgent: {
-        showThinking: true,
-        showTools: true,
+        expandThinking: true,
+        expandTools: true,
       },
       notifications: {
         soundEnabled: false,
@@ -673,8 +680,8 @@ describe('shared settings contract', () => {
   describe('deprecated fresh-agent font scale is dropped', () => {
     it('resolves the default fresh-agent settings without a fontScale key', () => {
       expect(resolveLocalSettings(undefined).freshAgent).toEqual({
-        showThinking: false,
-        showTools: false,
+        expandThinking: false,
+        expandTools: false,
         showTimecodes: false,
       })
     })
@@ -682,16 +689,17 @@ describe('shared settings contract', () => {
     it('drops a canonical freshAgent.fontScale regardless of value', () => {
       for (const value of [1.75, 5, 'big']) {
         expect(resolveLocalSettings({ freshAgent: { fontScale: value } } as never).freshAgent).toEqual({
-          showThinking: false,
-          showTools: false,
+          expandThinking: false,
+          expandTools: false,
           showTimecodes: false,
         })
       }
     })
 
     it('drops the legacy agentChat alias fontScale while keeping its siblings', () => {
-      const resolved = resolveLocalSettings({ agentChat: { showTools: true, fontScale: 1.25 } } as never)
-      expect(resolved.freshAgent.showTools).toBe(true)
+      const resolved = resolveLocalSettings({ agentChat: { showTools: true, expandTools: true, fontScale: 1.25 } } as never)
+      expect(resolved.freshAgent.expandTools).toBe(true)
+      expect('showTools' in resolved.freshAgent).toBe(false)
       expect('fontScale' in resolved.freshAgent).toBe(false)
       expect('agentChat' in resolved).toBe(false)
     })
@@ -709,8 +717,8 @@ describe('shared settings contract', () => {
         extractLegacyLocalSettingsSeed({ agentChat: { fontScale: 9 } } as Record<string, unknown>),
       ).toEqual(undefined)
       expect(
-        extractLegacyLocalSettingsSeed({ agentChat: { showTools: true, fontScale: 9 } } as Record<string, unknown>),
-      ).toEqual({ freshAgent: { showTools: true } })
+        extractLegacyLocalSettingsSeed({ agentChat: { expandTools: true, fontScale: 9 } } as Record<string, unknown>),
+      ).toEqual({ freshAgent: { expandTools: true } })
     })
   })
 })

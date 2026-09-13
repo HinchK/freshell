@@ -90,8 +90,6 @@ function isPaneContentShape(content: unknown): boolean {
         && (content.plugins === undefined
           || (Array.isArray(content.plugins) && content.plugins.every((plugin) => typeof plugin === 'string')))
         && (content.settingsDismissed === undefined || typeof content.settingsDismissed === 'boolean')
-        && (content.showThinking === undefined || typeof content.showThinking === 'boolean')
-        && (content.showTools === undefined || typeof content.showTools === 'boolean')
         && (content.showTimecodes === undefined || typeof content.showTimecodes === 'boolean')
     }
     case 'extension':

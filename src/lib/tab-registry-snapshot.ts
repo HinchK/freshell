@@ -58,8 +58,6 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
         ...(content.style ? { style: content.style } : {}),
         ...(content.restoreError ? { restoreError: content.restoreError } : {}),
         settingsDismissed: content.settingsDismissed,
-        showThinking: content.showThinking,
-        showTools: content.showTools,
         showTimecodes: content.showTimecodes,
       }
     case 'extension':

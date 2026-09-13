@@ -47,8 +47,6 @@ export type FreshAgentCompatibilityShape = {
   plugins?: unknown
   style?: unknown
   settingsDismissed?: unknown
-  showThinking?: unknown
-  showTools?: unknown
   showTimecodes?: unknown
 }
 
@@ -307,6 +305,10 @@ export function migrateLegacyFreshAgentContent<T extends FreshAgentCompatibility
         restoreError: _legacyRestoreError,
         ...rest
       } = input
+      // Vestigial per-pane display overrides (no writer since 2026-04):
+      // dropped, never migrated into constructed fresh-agent content.
+      delete (rest as { showThinking?: unknown; showTools?: unknown }).showThinking
+      delete (rest as { showThinking?: unknown; showTools?: unknown }).showTools
 
       return {
         ...rest,
@@ -341,6 +343,10 @@ export function migrateLegacyFreshAgentContent<T extends FreshAgentCompatibility
       restoreError: _legacyRestoreError,
       ...rest
     } = input
+    // Vestigial per-pane display overrides (no writer since 2026-04):
+    // dropped, never migrated into constructed fresh-agent content.
+    delete (rest as { showThinking?: unknown; showTools?: unknown }).showThinking
+    delete (rest as { showThinking?: unknown; showTools?: unknown }).showTools
 
     return {
       ...rest,
@@ -393,6 +399,10 @@ export function migrateLegacyFreshAgentContent<T extends FreshAgentCompatibility
     restoreError: _legacyRestoreError,
     ...rest
   } = input
+  // Vestigial per-pane display overrides (no writer since 2026-04):
+  // dropped, never migrated into constructed fresh-agent content.
+  delete (rest as { showThinking?: unknown; showTools?: unknown }).showThinking
+  delete (rest as { showThinking?: unknown; showTools?: unknown }).showTools
 
   return {
     ...rest,

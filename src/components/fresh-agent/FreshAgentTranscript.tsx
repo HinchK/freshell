@@ -68,20 +68,6 @@ function isActivityLike(item: FreshAgentTranscriptItem): boolean {
   return isToolLike(item) || item.kind === 'thinking' || item.kind === 'reasoning'
 }
 
-type TranscriptDisplayOptions = {
-  showThinking: boolean
-}
-
-function shouldDisplayTranscriptItem(
-  item: FreshAgentTranscriptItem,
-  options: TranscriptDisplayOptions,
-): boolean {
-  if (item.kind === 'thinking' || item.kind === 'reasoning') {
-    return options.showThinking
-  }
-  return true
-}
-
 function formatJson(value: unknown): string {
   if (typeof value === 'string') return value
   try {
@@ -264,7 +250,7 @@ type LineCaption = { id: string; text: string; atItemIndex: number }
 type LineMember = { turnIndex: number; atItemIndex: number; caption: LineCaption | null }
 
 function buildTranscriptLayout(
-  turns: DisplayTurn[],
+  turns: FreshAgentTurn[],
 ): {
   layouts: TurnLayout[]
   lineEndIndex: Map<number, number>
@@ -284,15 +270,16 @@ function buildTranscriptLayout(
   let captionSeq = 0
   let tailCaption: LineCaption | null = null
 
-  /** echo AND non-blank AND fully visible — the one gate for paint and stash (LB-1).
-   * Sanitize BEFORE the blank gate (delta review R1-F1): both caption copies
-   * (painted tail, stashed expansion) render this string verbatim, so the
-   * summary must pass the same stripSystemReminders sanitation the text/
-   * thinking/summary-fallback render paths use. A reminder-only summary
-   * strips to '' → gated out → neither copy paints anything. */
-  const foldCaption = (turn: DisplayTurn, atItemIndex: number): LineCaption | null => {
+  /** echo AND non-blank — the one gate for paint and stash. Sanitize BEFORE
+   * the blank gate (delta review R1-F1): both caption copies (painted tail,
+   * stashed expansion) render this string verbatim, so the summary must pass
+   * the same stripSystemReminders sanitation the text/thinking/
+   * summary-fallback render paths use. A reminder-only summary strips to ''
+   * → gated out → neither copy paints anything. Authored summaries stay
+   * painted as prose and never fold. */
+  const foldCaption = (turn: FreshAgentTurn, atItemIndex: number): LineCaption | null => {
     const text = stripSystemReminders(turn.summary ?? '').trim()
-    if (text.length === 0 || turn.hadFilteredItems || turnSummaryIsAuthored(turn)) return null
+    if (text.length === 0 || turnSummaryIsAuthored(turn)) return null
     const id = `caption:${captionSeq++}`
     return { id, text, atItemIndex }
   }
@@ -454,46 +441,6 @@ function coalesceSyntheticToolResultTurns(turns: FreshAgentTurn[]): FreshAgentTu
   return coalesced
 }
 
-/**
- * A display turn stamped by `filterTurnsForDisplay` when display filtering
- * removed ANY of its items. The fold gate reads the marker: a turn's echo
- * caption paints/stashes ONLY when the turn was fully visible — every item
- * rendered — because the echo summary may derive from a filtered-out (hidden)
- * thinking/reasoning item, and showing it would leak content the user chose
- * to hide (LB-1).
- */
-type DisplayTurn = FreshAgentTurn & { hadFilteredItems?: boolean }
-
-function filterTurnsForDisplay(
-  turns: FreshAgentTurn[],
-  options: TranscriptDisplayOptions,
-  isStreaming: boolean,
-): DisplayTurn[] {
-  return turns
-    .map((turn, index): DisplayTurn | null => {
-      const items = turn.items.filter((item) => shouldDisplayTranscriptItem(item, options))
-      if (turn.items.length > 0 && items.length === 0) {
-        // The streaming tail keeps its (invisible-bodied) article so the busy
-        // affordance does not flash out and back while the turn produces only
-        // hidden items.
-        if (isStreaming && index === turns.length - 1) {
-          return { ...turn, items: [], hadFilteredItems: true }
-        }
-        // Blank summary: nothing to show — drop the turn outright.
-        if ((turn.summary ?? '').trim().length === 0) return null
-        // Authored prose is real content: keep it painted as a summary-only
-        // article (a permanent boundary between the surrounding lines).
-        if (turnSummaryIsAuthored(turn)) return { ...turn, items: [], hadFilteredItems: true }
-        // Echo caption of now-hidden items: superseded — drop it. Its content
-        // stays hidden, matching the user's showThinking choice.
-        return null
-      }
-      if (items.length === turn.items.length) return turn
-      return { ...turn, items, hadFilteredItems: true }
-    })
-    .filter((turn): turn is DisplayTurn => turn !== null)
-}
-
 function normalizeActivityRows(rows: ActivityRow[], live: boolean): ActivityRow[] {
   const runningToolIds = rows
     .filter((row): row is Extract<ActivityRow, { type: 'tool' }> => row.type === 'tool' && row.tool.status === 'running')
@@ -579,13 +526,15 @@ function selectLiveActivityBlockIdFromLayout(
   return null
 }
 
-function FreshAgentThinkingRow({ text }: { text: string }) {
-  const [expanded, setExpanded] = useState(false)
+function FreshAgentThinkingRow({ text, expanded, onToggle }: { text: string; expanded: boolean; onToggle: () => void }) {
+  // Controlled/presentational: the expansion state lives in the owning
+  // FreshAgentActivityStrip, which never unmounts across the collapsed/
+  // expanded branch swap — so a user's toggle survives the strip toggle.
   return (
     <div className="fresh-agent-thinking-row my-0.5 text-xs">
       <button
         type="button"
-        onClick={() => setExpanded((value) => !value)}
+        onClick={onToggle}
         className="fresh-agent-thinking-trigger flex w-full items-center gap-2 rounded-r px-2 py-0.5 text-left transition-colors hover:bg-accent/50"
         aria-expanded={expanded}
         aria-label="Thinking"
@@ -606,13 +555,29 @@ function FreshAgentActivityStrip({
   rows,
   live = false,
   initialExpanded = false,
+  expandThinking = false,
 }: {
   rows: ActivityRow[]
   live?: boolean
+  /** Strip's starting state — mount-only ("Expand tools"): a live settings
+   * flip never stomps a mounted strip's in-pane expansion/collapse. */
   initialExpanded?: boolean
+  /** Thinking rows' starting state ("Expand thinking"). */
+  expandThinking?: boolean
 }) {
+  // Mount-only, matching FreshAgentToolBlock and the thinking-row default
+  // below: the settings control only whether things START expanded; a live
+  // settings flip never stomps in-pane toggles.
   const [expanded, setExpanded] = useState(initialExpanded)
-  useEffect(() => { setExpanded(initialExpanded) }, [initialExpanded])
+  // "Expand thinking" captured at strip mount — the per-row default. Untouched
+  // rows follow it for the strip's lifetime; user-touched rows keep their
+  // override in thinkingExpandedById.
+  const [initialThinkingExpanded] = useState(expandThinking)
+  // Per-row expansion overrides live HERE, not in the row: the strip never
+  // unmounts across the collapsed/expanded branch swap (only its children
+  // swap), so the overrides survive the tool-disclosure toggle — the row
+  // itself remounts, controlled and stateless.
+  const [thinkingExpandedById, setThinkingExpandedById] = useState<Record<string, boolean>>({})
   const displayRows = useMemo(() => (
     normalizeActivityRows(rows, live)
   ), [live, rows])
@@ -627,6 +592,20 @@ function FreshAgentActivityStrip({
   const liveTool = !thinkingLive && live ? (tools[tools.length - 1] ?? null) : null
   const activeTool = runningTool ?? liveTool
   const running = live && (activeTool !== null || thinkingLive)
+
+  const thinkingRows = displayRows.filter((row): row is Extract<ActivityRow, { type: 'thinking' }> => row.type === 'thinking')
+
+  const renderThinkingRow = (row: { id: string; text: string }) => (
+    <FreshAgentThinkingRow
+      key={row.id}
+      text={row.text}
+      expanded={thinkingExpandedById[row.id] ?? initialThinkingExpanded}
+      onToggle={() => setThinkingExpandedById((prev) => ({
+        ...prev,
+        [row.id]: !(prev[row.id] ?? initialThinkingExpanded),
+      }))}
+    />
+  )
 
   if (displayRows.length === 0) {
     if (!live) return null
@@ -651,35 +630,44 @@ function FreshAgentActivityStrip({
   return (
     <div role="region" aria-label="Activity strip" className="fresh-agent-activity-strip my-0.5">
       {!expanded ? (
-        <div
-          className={cn(
-            'fresh-agent-activity-summary flex min-w-0 items-center gap-1.5 px-2 py-0.5 text-xs',
-            hasErrors && 'bg-destructive/10',
-          )}
-        >
-          <button
-            type="button"
-            onClick={() => setExpanded(true)}
-            className="shrink-0 rounded p-0.5 transition-colors hover:bg-accent/50"
-            aria-label="Toggle activity details"
-            aria-expanded={false}
+        <>
+          <div
+            className={cn(
+              'fresh-agent-activity-summary flex min-w-0 items-center gap-1.5 px-2 py-0.5 text-xs',
+              hasErrors && 'bg-destructive/10',
+            )}
           >
-            <ChevronRight className="h-3 w-3" />
-          </button>
-          <span
-            className="fresh-agent-activity-status-slot"
-            data-testid="fresh-agent-activity-status-slot"
-            aria-hidden={running || hasErrors ? undefined : true}
-          >
-            {running ? <Loader2 className="h-3 w-3 animate-spin" aria-label="running" /> : null}
-            {!running && hasErrors ? <X className="h-3 w-3 text-destructive" aria-label="error" /> : null}
-          </span>
-          <SlotReel
-            toolName={running ? reelName : null}
-            previewText={running ? reelPreview : null}
-            settledText={running ? undefined : settledSummary(displayRows)}
-          />
-        </div>
+            <button
+              type="button"
+              onClick={() => setExpanded(true)}
+              className="shrink-0 rounded p-0.5 transition-colors hover:bg-accent/50"
+              aria-label="Toggle activity details"
+              aria-expanded={false}
+            >
+              <ChevronRight className="h-3 w-3" />
+            </button>
+            <span
+              className="fresh-agent-activity-status-slot"
+              data-testid="fresh-agent-activity-status-slot"
+              aria-hidden={running || hasErrors ? undefined : true}
+            >
+              {running ? <Loader2 className="h-3 w-3 animate-spin" aria-label="running" /> : null}
+              {!running && hasErrors ? <X className="h-3 w-3 text-destructive" aria-label="error" /> : null}
+            </span>
+            <SlotReel
+              toolName={running ? reelName : null}
+              previewText={running ? reelPreview : null}
+              settledText={running ? undefined : settledSummary(displayRows)}
+            />
+          </div>
+          {/* Hoisted thinking rows: thinking is NEVER hidden behind the
+            * strip's tool disclosure. While collapsed, every thinking row —
+            * including LIVE rows mid-stream — renders its own expandable
+            * disclosure under the summary; the reel keeps its status slot.
+            * Tool rows and echo captions render only when expanded (their
+            * anchoring belongs to the tool supersession flow). */}
+          {thinkingRows.map(renderThinkingRow)}
+        </>
       ) : (
         <div className="fresh-agent-activity-details">
           <button
@@ -705,7 +693,7 @@ function FreshAgentActivityStrip({
               )
             }
             return row.type === 'thinking'
-              ? <FreshAgentThinkingRow key={row.id} text={row.text} />
+              ? renderThinkingRow(row)
               : <FreshAgentToolBlock key={row.tool.id} tool={row.tool} initialExpanded={initialExpanded || singleToolExpand} />
           })}
         </div>
@@ -745,14 +733,15 @@ function FreshAgentTurnArticle({
   actions,
   agentLabel,
   showTimecodes,
-  showTools,
+  expandThinking,
+  expandTools,
   showHeader,
   continuation,
   liveActivityBlockId,
   isStreamingLastTurn,
   index,
 }: {
-  turn: DisplayTurn
+  turn: FreshAgentTurn
   /** Turn the action affordances target — the line's LAST contributing turn
    * when this article's activity line absorbed later turns, else `turn`. */
   actionTurn: FreshAgentTurn
@@ -760,7 +749,8 @@ function FreshAgentTurnArticle({
   actions: TurnActionProps
   agentLabel?: string
   showTimecodes: boolean
-  showTools: boolean
+  expandThinking: boolean
+  expandTools: boolean
   showHeader: boolean
   continuation: boolean
   liveActivityBlockId: string | null
@@ -862,18 +852,13 @@ function FreshAgentTurnArticle({
                 key={block.id}
                 rows={block.rows}
                 live={block.id === liveActivityBlockId}
-                initialExpanded={showTools}
+                initialExpanded={expandTools}
+                expandThinking={expandThinking}
               />
             )
           }
           return <FreshAgentItemCard key={block.item.id} item={block.item} markdown={!isUser} />
-        }) : turn.hadFilteredItems && !turnSummaryIsAuthored(turn) ? (
-          // Display-filtered echo placeholder: the summary derives from items
-          // the user chose to hide (hidden thinking/reasoning), so a filtered
-          // echo caption renders nothing visible. Authored placeholders keep
-          // painting their prose.
-          null
-        ) : isUser ? (
+        }) : isUser ? (
           <p className="whitespace-pre-wrap break-words leading-[inherit]">{stripSystemReminders(turn.summary)}</p>
         ) : (
           // Summary-only agent turns went through the plain-text path and
@@ -881,7 +866,7 @@ function FreshAgentTurnArticle({
           <FreshAgentMarkdownBody text={turn.summary ?? ''} />
         )}
         {isStreamingLastTurn && blocks.length === 0 && liveActivityBlockId === null ? (
-          <FreshAgentActivityStrip rows={[]} live initialExpanded={showTools} />
+          <FreshAgentActivityStrip rows={[]} live initialExpanded={expandTools} />
         ) : null}
       </div>
     </article>
@@ -913,8 +898,10 @@ export type FreshAgentTranscriptProps = {
   canFork?: boolean
   agentLabel?: string
   showModel?: boolean
-  showThinking?: boolean
-  showTools?: boolean
+  /** "Expand thinking": thinking rows' starting state (they always render). */
+  expandThinking?: boolean
+  /** "Expand tools": the activity strip's starting state. */
+  expandTools?: boolean
   showTimecodes?: boolean
   isStreaming?: boolean
   onForkFromTurn?: (turnId: string) => void
@@ -941,8 +928,8 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
   canFork = false,
   agentLabel,
   showModel = false,
-  showThinking = true,
-  showTools = false,
+  expandThinking = false,
+  expandTools = false,
   showTimecodes,
   isStreaming = false,
   onForkFromTurn,
@@ -967,16 +954,9 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
     [redoableTurnIds],
   )
   const resolvedShowTimecodes = showTimecodes ?? showModel
-  const displayOptions = useMemo<TranscriptDisplayOptions>(() => ({
-    showThinking,
-  }), [showThinking])
   const displayTurns = useMemo(() => (
-    filterTurnsForDisplay(
-      coalesceSyntheticToolResultTurns(turns),
-      displayOptions,
-      isStreaming,
-    )
-  ), [displayOptions, turns, isStreaming])
+    coalesceSyntheticToolResultTurns(turns)
+  ), [turns])
   const { layouts: turnLayouts, lineEndIndex, tail, tailCaption } = useMemo(
     () => buildTranscriptLayout(displayTurns),
     [displayTurns],
@@ -1152,7 +1132,8 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
               actions={actions}
               agentLabel={agentLabel}
               showTimecodes={resolvedShowTimecodes}
-              showTools={showTools}
+              expandThinking={expandThinking}
+              expandTools={expandTools}
               showHeader={index === 0 || displayTurns[index - 1]?.role !== turn.role}
               continuation={index > 0 && displayTurns[index - 1]?.role === turn.role}
               liveActivityBlockId={liveActivityBlockId}

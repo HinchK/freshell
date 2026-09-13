@@ -95,8 +95,8 @@ const SIDEBAR_LOCAL_KEYS = [
   'collapsed',
 ] as const
 const FRESH_AGENT_LOCAL_KEYS = [
-  'showThinking',
-  'showTools',
+  'expandThinking',
+  'expandTools',
   'showTimecodes',
 ] as const
 
@@ -227,8 +227,8 @@ export type LocalSettings = {
     collapsed: boolean
   }
   freshAgent: {
-    showThinking: boolean
-    showTools: boolean
+    expandThinking: boolean
+    expandTools: boolean
     showTimecodes: boolean
   }
   notifications: {
@@ -630,11 +630,11 @@ function normalizeExtractedLocalSeed(patch: Record<string, unknown>): LocalSetti
 
   if (isRecord(patch.freshAgent)) {
     const freshAgent: LocalSettingsPatch['freshAgent'] = {}
-    if (typeof patch.freshAgent.showThinking === 'boolean') {
-      freshAgent.showThinking = patch.freshAgent.showThinking as boolean
+    if (typeof patch.freshAgent.expandThinking === 'boolean') {
+      freshAgent.expandThinking = patch.freshAgent.expandThinking as boolean
     }
-    if (typeof patch.freshAgent.showTools === 'boolean') {
-      freshAgent.showTools = patch.freshAgent.showTools as boolean
+    if (typeof patch.freshAgent.expandTools === 'boolean') {
+      freshAgent.expandTools = patch.freshAgent.expandTools as boolean
     }
     if (typeof patch.freshAgent.showTimecodes === 'boolean') {
       freshAgent.showTimecodes = patch.freshAgent.showTimecodes as boolean
@@ -918,8 +918,8 @@ export const defaultLocalSettings: LocalSettings = {
     collapsed: false,
   },
   freshAgent: {
-    showThinking: false,
-    showTools: false,
+    expandThinking: false,
+    expandTools: false,
     showTimecodes: false,
   },
   notifications: {
@@ -943,11 +943,11 @@ function sanitizeFreshAgentLocalSettingsPatchInput(
   rawFreshAgent: Record<string, unknown>,
 ): LocalSettingsPatch['freshAgent'] {
   const freshAgent: LocalSettingsPatch['freshAgent'] = {}
-  if (typeof rawFreshAgent.showThinking === 'boolean') {
-    freshAgent.showThinking = rawFreshAgent.showThinking
+  if (typeof rawFreshAgent.expandThinking === 'boolean') {
+    freshAgent.expandThinking = rawFreshAgent.expandThinking
   }
-  if (typeof rawFreshAgent.showTools === 'boolean') {
-    freshAgent.showTools = rawFreshAgent.showTools
+  if (typeof rawFreshAgent.expandTools === 'boolean') {
+    freshAgent.expandTools = rawFreshAgent.expandTools
   }
   if (typeof rawFreshAgent.showTimecodes === 'boolean') {
     freshAgent.showTimecodes = rawFreshAgent.showTimecodes

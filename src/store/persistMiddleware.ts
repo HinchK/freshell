@@ -190,7 +190,15 @@ function migratePaneContent(content: any): any {
   }
   content = migrateLegacyFreshAgentContent(content)
   if (content.kind === 'fresh-agent') {
-    const { model: legacyModel, modelSelection: legacyModelSelection, ...rest } = content
+    const {
+      model: legacyModel,
+      modelSelection: legacyModelSelection,
+      // Vestigial per-pane display overrides (no writer since 2026-04):
+      // dropped, never persisted or rehydrated into pane content.
+      showThinking: _legacyShowThinking,
+      showTools: _legacyShowTools,
+      ...rest
+    } = content
     if (content.provider === 'codex') {
       return {
         ...rest,
@@ -258,6 +266,10 @@ function stripTransientSessionFields(content: any): any {
     // Delta-r7-r3 (F2): the close-gate failure surface is volatile too —
     // the unconfirmed close stands (the pane reloads), the banner does not.
     closeError: _closeError,
+    // Vestigial per-pane display overrides (no writer since 2026-04):
+    // scrubbed from persisted layouts on the next wholesale flush.
+    showThinking: _legacyShowThinking,
+    showTools: _legacyShowTools,
     ...rest
   } = content
 

@@ -388,6 +388,9 @@ fn validate_fresh_agent(path: &Path, payload: &Value, name: &str) -> std::io::Re
     )?;
     for field in [
         "settingsDismissed",
+        // Legacy-only per-pane display overrides: no writer since 2026-04
+        // (removed from the fresh-agent surface); kept so old persisted
+        // generations still validate their boolean shape.
         "showThinking",
         "showTools",
         "showTimecodes",

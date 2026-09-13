@@ -240,8 +240,6 @@ export type FreshAgentPaneContent = {
   /** Visual style for this pane; missing legacy panes resolve from provider defaults, then sans. */
   style?: FreshAgentStyle
   settingsDismissed?: boolean
-  showThinking?: boolean
-  showTools?: boolean
   showTimecodes?: boolean
   /** Persisted optimistic user turn that has not yet appeared in a durable provider snapshot. */
   pendingLocalEcho?: FreshAgentPendingLocalEcho

@@ -28,7 +28,7 @@ use serde_json::{json, Map, Value};
 /// the extractor because each member carries its own normalization rule (enum /
 /// clamp / typeof), and the inline sequence IS the pick list, in declaration
 /// order.
-const FRESH_AGENT_LOCAL_KEYS: [&str; 3] = ["showThinking", "showTools", "showTimecodes"];
+const FRESH_AGENT_LOCAL_KEYS: [&str; 3] = ["expandThinking", "expandTools", "showTimecodes"];
 
 const THEME_VALUES: [&str; 3] = ["system", "light", "dark"];
 const TERMINAL_THEME_VALUES: [&str; 8] = [
@@ -456,7 +456,12 @@ mod tests {
     }
 
     /// The crown jewel: a full legacy mixed config's seed, byte-identical to the
-    /// legacy server's extraction (`JSON.stringify` on the Node side).
+    /// legacy server's extraction (`JSON.stringify` on the Node side). The
+    /// freshAgent section carries both the stale `showThinking`/`showTools`
+    /// names and their `expandThinking`/`expandTools` replacements: the pick
+    /// list keeps only the expand keys (`showThinking`/`showTools` drop, no
+    /// mapping) plus the unchanged `showTimecodes`; the server-only `enabled`
+    /// key is never picked.
     #[test]
     fn full_mixed_seed_byte_matches_legacy() {
         let raw = json!({
@@ -464,14 +469,14 @@ mod tests {
             "terminal": { "scrollback": 4000, "fontSize": 18, "fontFamily": "Fira Code", "lineHeight": 1.4, "cursorBlink": false, "theme": "dracula", "warnExternalLinks": true, "osc52Clipboard": "always", "renderer": "canvas" },
             "panes": { "defaultNewPane": "shell", "snapThreshold": 3.6, "iconsOnTabs": true, "tabAttentionStyle": "pulse", "attentionDismiss": "type", "sessionOpenMode": "split", "multirowTabs": true, "repoIconsOnTabs": false, "tabBarRows": 5 },
             "sidebar": { "excludeFirstChatSubstrings": ["welcome"], "excludeFirstChatMustStart": false, "autoGenerateTitles": true, "sortMode": "project", "worktreeGrouping": "worktree", "showProjectBadges": false, "showSubagents": true, "ignoreCodexSubagents": true, "showNoninteractiveSessions": true, "hideEmptySessions": true, "width": 280, "collapsed": true },
-            "freshAgent": { "showThinking": false, "showTools": true, "showTimecodes": true, "enabled": true },
+            "freshAgent": { "showThinking": false, "showTools": true, "expandThinking": true, "expandTools": false, "showTimecodes": true, "enabled": true },
             "notifications": { "soundEnabled": false },
             "streamDeck": { "enabled": true, "brightness": 2.5, "idleBrightness": 1, "idleTimeoutSeconds": 300, "tileStyle": "terminal-previews", "keyLayout": "newest-first" }
         });
         let seed = extract(raw).expect("seed extracted");
         assert_eq!(
             as_json_string(&seed),
-            r#"{"theme":"light","uiScale":1.25,"terminal":{"fontSize":18,"fontFamily":"Fira Code","lineHeight":1.4,"cursorBlink":false,"theme":"dracula","warnExternalLinks":true,"osc52Clipboard":"always","renderer":"canvas"},"panes":{"snapThreshold":4,"iconsOnTabs":true,"tabAttentionStyle":"pulse","attentionDismiss":"type","sessionOpenMode":"split","multirowTabs":true,"repoIconsOnTabs":false,"tabBarRows":5},"sidebar":{"sortMode":"project","worktreeGrouping":"worktree","showProjectBadges":false,"showSubagents":true,"ignoreCodexSubagents":true,"showNoninteractiveSessions":true,"hideEmptySessions":true,"width":280,"collapsed":true},"freshAgent":{"showThinking":false,"showTools":true,"showTimecodes":true},"notifications":{"soundEnabled":false},"streamDeck":{"enabled":true,"brightness":2.5,"idleBrightness":1,"idleTimeoutSeconds":300,"tileStyle":"terminal-previews","keyLayout":"newest-first"}}"#
+            r#"{"theme":"light","uiScale":1.25,"terminal":{"fontSize":18,"fontFamily":"Fira Code","lineHeight":1.4,"cursorBlink":false,"theme":"dracula","warnExternalLinks":true,"osc52Clipboard":"always","renderer":"canvas"},"panes":{"snapThreshold":4,"iconsOnTabs":true,"tabAttentionStyle":"pulse","attentionDismiss":"type","sessionOpenMode":"split","multirowTabs":true,"repoIconsOnTabs":false,"tabBarRows":5},"sidebar":{"sortMode":"project","worktreeGrouping":"worktree","showProjectBadges":false,"showSubagents":true,"ignoreCodexSubagents":true,"showNoninteractiveSessions":true,"hideEmptySessions":true,"width":280,"collapsed":true},"freshAgent":{"expandThinking":true,"expandTools":false,"showTimecodes":true},"notifications":{"soundEnabled":false},"streamDeck":{"enabled":true,"brightness":2.5,"idleBrightness":1,"idleTimeoutSeconds":300,"tileStyle":"terminal-previews","keyLayout":"newest-first"}}"#
         );
     }
 
@@ -574,19 +579,22 @@ mod tests {
         assert_eq!(canonical_invalid, None);
     }
 
-    /// The `agentChat` -> `freshAgent` alias merges shallowly with canonical wins
-    /// per key (`migrateLegacyFreshAgentSettingsInput`): `showThinking` comes from
-    /// canonical (true), `showTools` survives from legacy (false).
+    /// The `agentChat` -> `freshAgent` alias merges shallowly with canonical
+    /// wins per key (`migrateLegacyFreshAgentSettingsInput`): `showTimecodes`
+    /// comes from canonical (true) over the conflicting legacy value (false).
+    /// The renamed pick list still drops the stale display keys — neither the
+    /// agentChat `showThinking`/`showTools` values nor the canonical
+    /// `showThinking` survive into the seed.
     #[test]
     fn agent_chat_alias_canonical_wins_per_key() {
         let raw = json!({
-            "agentChat": { "showThinking": false, "showTools": false, "enabled": true },
+            "agentChat": { "showThinking": false, "showTools": false, "showTimecodes": false, "enabled": true },
             "freshAgent": { "showThinking": true, "showTimecodes": true }
         });
         let seed = extract(raw).expect("seed extracted");
         assert_eq!(
             as_json_string(&seed),
-            r#"{"freshAgent":{"showThinking":true,"showTools":false,"showTimecodes":true}}"#
+            r#"{"freshAgent":{"showTimecodes":true}}"#
         );
     }
 

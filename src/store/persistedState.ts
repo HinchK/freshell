@@ -266,6 +266,10 @@ function normalizeFreshAgentContent(content: Record<string, unknown>): Record<st
     const {
       sessionRef: _legacySessionRef,
       restoreError: _legacyRestoreError,
+      // Vestigial per-pane display overrides (no writer since 2026-04):
+      // dropped during rehydration, never constructed into pane content.
+      showThinking: _legacyShowThinking,
+      showTools: _legacyShowTools,
       ...restWithPossibleResume
     } = content
 
@@ -300,7 +304,15 @@ function normalizeFreshAgentContent(content: Record<string, unknown>): Record<st
           : (typeof content.cliSessionId === 'string' ? content.cliSessionId : undefined)),
     rejectNonCanonicalClaudeSessionRef: true,
   })
-  const { sessionRef: _legacySessionRef, restoreError: _legacyRestoreError, ...rest } = content
+  const {
+    sessionRef: _legacySessionRef,
+    restoreError: _legacyRestoreError,
+    // Vestigial per-pane display overrides (no writer since 2026-04):
+    // dropped during rehydration, never constructed into pane content.
+    showThinking: _legacyShowThinking,
+    showTools: _legacyShowTools,
+    ...rest
+  } = content
   const restWithNormalizedModel = content.sessionType === 'freshopencode' && content.provider === 'opencode'
     ? (() => {
         const {

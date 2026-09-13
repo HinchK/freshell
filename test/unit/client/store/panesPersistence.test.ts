@@ -1113,7 +1113,7 @@ describe('legacy agent-chat display settings migration', () => {
     resetPersistedLayoutCacheForTests()
   })
 
-  it('preserves showThinking/showTools/showTimecodes from agent-chat panes as pane overrides', async () => {
+  it('drops legacy showThinking/showTools from agent-chat panes during migration, keeping showTimecodes', async () => {
     localStorageMock.clear()
     localStorage.setItem('freshell.layout.v3', JSON.stringify({
       version: 3,
@@ -1151,14 +1151,14 @@ describe('legacy agent-chat display settings migration', () => {
       kind: 'fresh-agent',
       sessionType: 'freshclaude',
       provider: 'claude',
-      showThinking: true,
-      showTools: true,
       showTimecodes: true,
     })
+    expect(content.showThinking).toBeUndefined()
+    expect(content.showTools).toBeUndefined()
     expect(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY)).toBeNull()
   })
 
-  it('migrates legacy display settings from panes inside splits', async () => {
+  it('drops legacy display settings from panes inside splits during migration', async () => {
     localStorageMock.clear()
     localStorage.setItem('freshell.layout.v3', JSON.stringify({
       version: 3,
@@ -1205,8 +1205,8 @@ describe('legacy agent-chat display settings migration', () => {
 
     expect(split.children[1].content).toMatchObject({
       kind: 'fresh-agent',
-      showTools: true,
     })
+    expect(split.children[1].content.showTools).toBeUndefined()
     expect(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY)).toBeNull()
   })
 
@@ -1280,8 +1280,8 @@ describe('legacy agent-chat display settings migration', () => {
     const content = (store.getState().panes.layouts['tab1'] as any).content
     expect(content).toMatchObject({
       kind: 'fresh-agent',
-      showThinking: true,
     })
+    expect(content.showThinking).toBeUndefined()
   })
 })
 

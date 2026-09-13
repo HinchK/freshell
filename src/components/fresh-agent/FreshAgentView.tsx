@@ -582,20 +582,18 @@ export function FreshAgentView({
     (state) => state.settings.settings.freshAgent?.providers?.[paneContent.sessionType]
       ?? state.settings.serverSettings?.freshAgent?.providers?.[paneContent.sessionType],
   )
-  const globalShowThinking = useAppSelector(
-    (state) => state.settings.settings.freshAgent?.showThinking
+  const globalExpandThinking = useAppSelector(
+    (state) => state.settings.settings.freshAgent?.expandThinking
       ?? false,
   )
-  const globalShowTools = useAppSelector(
-    (state) => state.settings.settings.freshAgent?.showTools
+  const globalExpandTools = useAppSelector(
+    (state) => state.settings.settings.freshAgent?.expandTools
       ?? false,
   )
   const globalShowTimecodes = useAppSelector(
     (state) => state.settings.settings.freshAgent?.showTimecodes
       ?? false,
   )
-  const effectiveShowThinking = paneContent.showThinking ?? globalShowThinking
-  const effectiveShowTools = paneContent.showTools ?? globalShowTools
   const effectiveShowTimecodes = paneContent.showTimecodes ?? globalShowTimecodes
   const activeStyle = normalizeFreshAgentStyle(
     paneContent.style ?? providerDefaults?.style ?? DEFAULT_FRESH_AGENT_STYLE,
@@ -2948,8 +2946,8 @@ export function FreshAgentView({
               canRedo={canRedoNow}
               redoableTurnIds={snapshot?.rollback?.redoableTurnIds}
               agentLabel={descriptor?.label}
-              showThinking={effectiveShowThinking}
-              showTools={effectiveShowTools}
+              expandThinking={globalExpandThinking}
+              expandTools={globalExpandTools}
               showTimecodes={effectiveShowTimecodes}
               isStreaming={isBusy}
               onForkFromTurn={(turnId) => sendFork(turnId)}
@@ -3068,9 +3066,9 @@ export function FreshAgentView({
     canRedoNow,
     canRollback,
     effectiveStatus,
-    effectiveShowThinking,
+    globalExpandThinking,
     effectiveShowTimecodes,
-    effectiveShowTools,
+    globalExpandTools,
     isBusy,
     isRestoring,
     loadError,
