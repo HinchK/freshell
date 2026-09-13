@@ -22,14 +22,14 @@
  * opencode-terminal-restore-rust.spec.ts, restore-double-restart.spec.ts,
  * freshopencode-restart-recovery.spec.ts).
  */
-import { createFreshE2eBrowserContext, test, expect } from '../helpers/fixtures.js'
+import { createFreshE2eBrowserContext, createFreshE2ePage, test, expect } from '../helpers/fixtures.js'
 import { RustServer } from '../helpers/rust-server.js'
 import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { installRecoveryOfferAutoDeclineOnContext } from '../helpers/recovery-offer.js'
 import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
-import type { Page } from '@playwright/test'
+import type { Browser, BrowserContext, Page } from '@playwright/test'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -162,19 +162,25 @@ function seedWallConfig(input: {
 
 /** Boot an owned RustServer, navigate, and wait for harness + WS. */
 async function bootWall(
-  page: Page,
+  browser: Browser,
   options: {
     env?: Record<string, string>
     setupHome?: (homeDir: string) => Promise<void>
   } = {},
-): Promise<{ server: RustServer; info: E2eServerInfo; harness: TestHarness }> {
+): Promise<{ server: RustServer; info: E2eServerInfo; context: BrowserContext; page: Page; harness: TestHarness }> {
   const server = new RustServer({ env: options.env, setupHome: options.setupHome })
   const info = await server.start()
-  await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
-  const harness = new TestHarness(page)
-  await harness.waitForHarness()
-  await harness.waitForConnection()
-  return { server, info, harness }
+  try {
+    const { context, page } = await createFreshE2ePage(browser, info)
+    await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+    const harness = new TestHarness(page)
+    await harness.waitForHarness()
+    await harness.waitForConnection()
+    return { server, info, context, page, harness }
+  } catch (error) {
+    await server.stop().catch(() => {})
+    throw error
+  }
 }
 
 /** Seed ~/.codex/sessions/<id>.jsonl so the sidebar shows a resumable codex session. */
@@ -552,14 +558,12 @@ process.exit(result.status ?? 1)
 test.describe('Restore Contract Wall (P0.1)', () => {
   test.setTimeout(180_000)
 
-  test('shell terminal: SIGKILL restore yields a fresh shell in initialCwd', async ({
-    page,
-  }) => {
+  test('shell terminal: SIGKILL restore yields a fresh shell in initialCwd', async ({ browser }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-shell-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
 
-    const { server, harness, info } = await bootWall(page)
+    const { server, harness, info, context, page } = await bootWall(browser)
     try {
       await selectShellIfPickerShowing(page)
 
@@ -620,14 +624,13 @@ test.describe('Restore Contract Wall (P0.1)', () => {
         }, { timeout: 15_000 })
         .toBe(true)
     } finally {
+      await context.close().catch(() => {})
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })
     }
   })
 
-  test('claude terminal: pre-allocated session resumes with --resume after SIGKILL', async ({
-    page,
-  }) => {
+  test('claude terminal: pre-allocated session resumes with --resume after SIGKILL', async ({ browser }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-claude-term-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
@@ -638,7 +641,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       path.join(sharedRoot, 'bin'),
     )
 
-    const { server, harness, info } = await bootWall(page, {
+    const { server, harness, info, context, page } = await bootWall(browser, {
       env: { CLAUDE_CMD: fakeClaudePath, FAKE_CLAUDE_ARGV_LOG: argLogPath },
       setupHome: seedWallConfig({ providers: ['claude'] }),
     })
@@ -767,14 +770,13 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       expect((await claudeContent())?.status).not.toBe('error')
       expect((await claudeContent())?.sessionRef?.sessionId).toBe(preallocatedId)
     } finally {
+      await context.close().catch(() => {})
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })
     }
   })
 
-  test('codex terminal: sessionRef-bound pane resumes with `resume <id>` after SIGKILL', async ({
-    page,
-  }) => {
+  test('codex terminal: sessionRef-bound pane resumes with `resume <id>` after SIGKILL', async ({ browser }) => {
     const CODEX_SESSION_ID = '11111111-2222-4333-8444-555555555555'
     const SESSION_TITLE = 'wall codex session'
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-codex-term-'))
@@ -786,7 +788,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     // must answer both app-server argv (fake app-server) and terminal argv.
     const fakeCodexPath = await installDualRoleCodex(path.join(sharedRoot, 'bin'), argLogPath)
 
-    const { server, harness } = await bootWall(page, {
+    const { server, harness, context, page } = await bootWall(browser, {
       env: { CODEX_CMD: fakeCodexPath, FAKE_CODEX_ARGV_LOG: argLogPath },
       setupHome: seedCodexHome(CODEX_SESSION_ID, SESSION_TITLE, projectDir),
     })
@@ -857,14 +859,13 @@ test.describe('Restore Contract Wall (P0.1)', () => {
         }, { timeout: 20_000 })
         .toBe(true)
     } finally {
+      await context.close().catch(() => {})
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })
     }
   })
 
-  test('opencode terminal: locator-resolved session resumes with --session after SIGKILL', async ({
-    page,
-  }) => {
+  test('opencode terminal: locator-resolved session resumes with --session after SIGKILL', async ({ browser }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-opencode-term-'))
     const argLogPath = path.join(sharedRoot, 'opencode-argv.jsonl')
     const fakeOpencodePath = await installFakeCli(
@@ -873,7 +874,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       path.join(sharedRoot, 'bin'),
     )
 
-    const { server, harness } = await bootWall(page, {
+    const { server, harness, context, page } = await bootWall(browser, {
       env: {
         OPENCODE_CMD: fakeOpencodePath,
         FAKE_OPENCODE_TERMINAL_ARGV_LOG: argLogPath,
@@ -945,6 +946,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
         }, { timeout: 20_000 })
         .toBe(true)
     } finally {
+      await context.close().catch(() => {})
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })
     }
@@ -954,13 +956,11 @@ test.describe('Restore Contract Wall (P0.1)', () => {
   // SIGKILL+restart+reload the pane must rebind to the SAME durable thread
   // with history rehydrated ('Fixture turn' is the fake's deterministic
   // reply) and a non-wedged status.
-  test('freshcodex: SIGKILL restore rebinds the same thread with history rehydrated', async ({
-    page,
-  }) => {
+  test('freshcodex: SIGKILL restore rebinds the same thread with history rehydrated', async ({ browser }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-freshcodex-'))
     const fakeCodexPath = await installFakeCodexAppServer(path.join(sharedRoot, 'bin'))
 
-    const { server, harness } = await bootWall(page, {
+    const { server, harness, context, page } = await bootWall(browser, {
       env: { CODEX_CMD: fakeCodexPath },
       setupHome: seedWallConfig({ providers: ['codex'], freshAgent: true }),
     })
@@ -1020,6 +1020,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
         expect(resumeTarget).toBe(originalSessionId)
       }
     } finally {
+      await context.close().catch(() => {})
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })
     }
@@ -1028,9 +1029,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
   // Per plan §2.7: the serve DB survives; after SIGKILL+restart+reload the
   // pane must carry the SAME ses_* identity, rehydrate prompt+response, and
   // mint NO new session.
-  test('freshopencode: SIGKILL restore keeps the ses_* identity and rehydrates history', async ({
-    page,
-  }) => {
+  test('freshopencode: SIGKILL restore keeps the ses_* identity and rehydrates history', async ({ browser }) => {
     // HISTORY: this test was pinned `test.fail()` as P1.8/P1.13 (observed
     // 2026-07-24): after SIGKILL+restart+RELOAD the pane re-minted a
     // lazy-create `freshopencode-<requestId>` placeholder instead of
@@ -1059,7 +1058,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       path.join(sharedRoot, 'bin'),
     )
 
-    const { server, harness } = await bootWall(page, {
+    const { server, harness, context, page } = await bootWall(browser, {
       env: { OPENCODE_CMD: fakeOpencodePath, FAKE_OPENCODE_AUDIT_LOG: auditLogPath },
       setupHome: seedWallConfig({ providers: ['opencode'], freshAgent: true }),
     })
@@ -1139,6 +1138,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
         ),
       ).toEqual([])
     } finally {
+      await context.close().catch(() => {})
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })
     }
@@ -1148,9 +1148,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
   // swallowed, snapshot 503s. The CONTRACT asserted is the target state
   // (rebound with history rehydrated, status not wedged); the pin records
   // today's reality.
-  test('freshclaude: SIGKILL restore rebinds with history rehydrated and status not wedged', async ({
-    page,
-  }) => {
+  test('freshclaude: SIGKILL restore rebinds with history rehydrated and status not wedged', async ({ browser }) => {
     // HISTORY: the P0.2 pin was FLIPPED 2026-07-27 by lane D4
     // (freshclaude-identity-persistence). Investigation showed the durable
     // identity ALREADY survives reload: FreshAgentView's merge effect folds
@@ -1170,7 +1168,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
 
-    const { server, harness, info } = await bootWall(page, {
+    const { server, harness, info, context, page } = await bootWall(browser, {
       env: { FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE },
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
     })
@@ -1322,6 +1320,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       )
       expect(transcriptLines.filter((l: any) => l.type === 'assistant').length).toBeGreaterThanOrEqual(2)
     } finally {
+      await context.close().catch(() => {})
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })
     }
@@ -1330,9 +1329,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
   // Per plan §2.9: browser/editor panes are pure client state -- after
   // SIGKILL+restart+reload the browser url and the editor filePath+viewMode
   // must be intact. First-ever reload/restart coverage for these pane kinds.
-  test('browser and editor panes: state intact after SIGKILL restart', async ({
-    page,
-  }) => {
+  test('browser and editor panes: state intact after SIGKILL restart', async ({ browser }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-broweditor-'))
     // FILE-BACKED editor pane: content.content never survives persistence
     // (stripEditorContent blanks it at flush AND load, persistMiddleware.ts:
@@ -1347,7 +1344,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     const editorMarker = `wall-editor-${Math.random().toString(36).slice(2, 8)}`
     const editorFilePath = path.join(sharedRoot, 'wall-editor.txt')
     await fs.writeFile(editorFilePath, `wall\n\n${editorMarker}\n`)
-    const { server, harness, info } = await bootWall(page)
+    const { server, harness, info, context, page } = await bootWall(browser)
     try {
       await selectShellIfPickerShowing(page)
       const tabId = (await harness.getActiveTabId())!
@@ -1429,14 +1426,13 @@ test.describe('Restore Contract Wall (P0.1)', () => {
         timeout: 15_000,
       })
     } finally {
+      await context.close().catch(() => {})
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })
     }
   })
 
-  test('THE RULER: all pane types live, one SIGKILL, every §2 contract holds', async ({
-    page,
-  }) => {
+  test('THE RULER: all pane types live, one SIGKILL, every §2 contract holds', async ({ browser }) => {
     // DEFLAKE (f3wp refresh): 300 s timed out twice back-to-back under
     // concurrent-suite load (2026-07-28, runs at 01:28 and 01:37; both
     // failure screenshots show a healthy, still-progressing page -- slow,
@@ -1473,7 +1469,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     const fakeCodexPath = await installDualRoleCodex(binDir, codexArgLog)
     const fakeOpencodePath = await installDualRoleOpencode(binDir, opencodeArgLog, opencodeAuditLog)
 
-    const { server, harness, info } = await bootWall(page, {
+    const { server, harness, info, context, page } = await bootWall(browser, {
       env: {
         CLAUDE_CMD: fakeClaudePath,
         FAKE_CLAUDE_ARGV_LOG: claudeArgLog,
@@ -1771,6 +1767,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       // still counted.
       await expect(page.locator('[role="alert"]:not(.monaco-alert)')).toHaveCount(0)
     } finally {
+      await context.close().catch(() => {})
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })
     }
@@ -1780,9 +1777,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
   // The six named red tests from plan §5 P0.1
   // -------------------------------------------------------------------------
 
-  test('SIGKILL-within-5s-of-pane-creation: identity survives without client state', async ({
-    page,
-  }) => {
+  test('SIGKILL-within-5s-of-pane-creation: identity survives without client state', async ({ browser }) => {
     // P1.8+P1.9 (D3, §4.2) LANDED -- pin flipped: the claude binding row is
     // written durably to the pane-identity ledger BEFORE the PTY spawn, so a
     // SIGKILL the moment the row lands (ahead of any snapshot cadence) still
@@ -1801,7 +1796,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       path.join(sharedRoot, 'bin'),
     )
     let capturedHome = ''
-    const { server, harness, info } = await bootWall(page, {
+    const { server, harness, info, context, page } = await bootWall(browser, {
       env: { CLAUDE_CMD: fakeClaudePath, FAKE_CLAUDE_ARGV_LOG: argLogPath },
       setupHome: async (homeDir) => {
         capturedHome = homeDir
@@ -1985,14 +1980,13 @@ test.describe('Restore Contract Wall (P0.1)', () => {
         'Recovered sessions',
       )
     } finally {
+      await context.close().catch(() => {})
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })
     }
   })
 
-  test('SIGKILL-inside-locator-window: never silently fresh', async ({
-    page,
-  }) => {
+  test('SIGKILL-inside-locator-window: never silently fresh', async ({ browser }) => {
     // P1.8 (§2.4/§4.2 pending markers) LANDED -- pin flipped: killing the
     // server inside the opencode locator's ~2s correlation window is no
     // longer silently fresh. The server derives a loud Fresh{fresh_by_race}
@@ -2015,7 +2009,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       'opencode',
       path.join(sharedRoot, 'bin'),
     )
-    const { server, harness } = await bootWall(page, {
+    const { server, harness, context, page } = await bootWall(browser, {
       env: {
         OPENCODE_CMD: fakeOpencodePath,
         FAKE_OPENCODE_TERMINAL_ARGV_LOG: argLogPath,
@@ -2077,15 +2071,13 @@ test.describe('Restore Contract Wall (P0.1)', () => {
         }, { timeout: 30_000 })
         .toMatch(/^ses_/)
     } finally {
+      await context.close().catch(() => {})
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })
     }
   })
 
-  test('two-clients-same-sessionRef: duplicate respawn must yield exactly 1 PTY', async ({
-    page,
-    browser,
-  }) => {
+  test('two-clients-same-sessionRef: duplicate respawn must yield exactly 1 PTY', async ({ browser }) => {
     // Cloud (2-worker shard) wall-clock: SIGKILL + dual-client recovery + a
     // stable-count settle on the arg log exceeds the describe-level 180s.
     test.setTimeout(300_000)
@@ -2104,7 +2096,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     // app-server` sidecar FIRST (PTY_SPAWN_FAILED otherwise), so the fake
     // must answer both app-server argv (fake app-server) and terminal argv.
     const fakeCodexPath = await installDualRoleCodex(path.join(sharedRoot, 'bin'), argLogPath)
-    const { server, harness, info } = await bootWall(page, {
+    const { server, harness, info, context, page } = await bootWall(browser, {
       env: { CODEX_CMD: fakeCodexPath, FAKE_CODEX_ARGV_LOG: argLogPath },
       setupHome: seedCodexHome(CODEX_SESSION_ID, SESSION_TITLE, projectDir),
     })
@@ -2184,14 +2176,13 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       expect(respawns.length).toBe(1)
     } finally {
       await contextB.close()
+      await context.close().catch(() => {})
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })
     }
   })
 
-  test('freshclaude busy-restart: a pane that was BUSY at SIGKILL must not wedge BUSY', async ({
-    page,
-  }) => {
+  test('freshclaude busy-restart: a pane that was BUSY at SIGKILL must not wedge BUSY', async ({ browser }) => {
     // PREDICTED-FAIL P0.2 (§2.8.1) but OBSERVED GREEN (run of 2026-07-24), so
     // per the decision rule this test is NOT pinned. The plan predicted a
     // forever-BUSY wedge (freshAgent.attach for claude is silently swallowed,
@@ -2207,7 +2198,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-fcbusy-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
-    const { server, harness } = await bootWall(page, {
+    const { server, harness, context, page } = await bootWall(browser, {
       env: {
         FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE,
         FAKE_CLAUDE_SIDECAR_HOLD_TURN: '1',
@@ -2256,14 +2247,13 @@ test.describe('Restore Contract Wall (P0.1)', () => {
         )
         .not.toBe('running')
     } finally {
+      await context.close().catch(() => {})
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })
     }
   })
 
-  test('double-restart mid-recovery: a second SIGKILL during recovery must not duplicate or wedge', async ({
-    page,
-  }) => {
+  test('double-restart mid-recovery: a second SIGKILL during recovery must not duplicate or wedge', async ({ browser }) => {
     // DEFLAKE (f3wp): this test's serial gate budget (20+45+60+30+60+30 s
     // = 245 s) plus 3 serialized boot/health budgets (~91 s bootWall +
     // 2 x 65 s restartAbrupt) structurally exceeds the describe-level 180 s
@@ -2289,7 +2279,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     // app-server` sidecar FIRST (PTY_SPAWN_FAILED otherwise), so the fake
     // must answer both app-server argv (fake app-server) and terminal argv.
     const fakeCodexPath = await installDualRoleCodex(path.join(sharedRoot, 'bin'), argLogPath)
-    const { server, harness, info } = await bootWall(page, {
+    const { server, harness, info, context, page } = await bootWall(browser, {
       env: { CODEX_CMD: fakeCodexPath, FAKE_CODEX_ARGV_LOG: argLogPath },
       setupHome: seedCodexHome(CODEX_SESSION_ID, SESSION_TITLE, projectDir),
     })
@@ -2376,14 +2366,13 @@ test.describe('Restore Contract Wall (P0.1)', () => {
         }, { timeout: 30_000 })
         .toBe(true)
     } finally {
+      await context.close().catch(() => {})
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })
     }
   })
 
-  test('hidden-pane rebind: a background tab pane must rebind without being revealed', async ({
-    page,
-  }) => {
+  test('hidden-pane rebind: a background tab pane must rebind without being revealed', async ({ browser }) => {
     // PREDICTED-FAIL P1.11 (F8) but OBSERVED GREEN (run of 2026-07-24), so
     // per the decision rule this test is NOT pinned. The plan predicted that
     // hidden panes never send create/attach on reconnect; observed instead
@@ -2392,7 +2381,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     // reached hidden tabs' layouts and their resume argv polls went green.
     // If F8's prediction materializes in some other composition, pin P1.11
     // here at that point.
-    const { server, harness, info } = await bootWall(page)
+    const { server, harness, info, context, page } = await bootWall(browser)
     try {
       await selectShellIfPickerShowing(page)
       const hiddenTabId = (await harness.getActiveTabId())!
@@ -2426,6 +2415,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
         }, { timeout: 30_000 })
         .not.toBeNull()
     } finally {
+      await context.close().catch(() => {})
       await server.stop()
     }
   })

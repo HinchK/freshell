@@ -14,7 +14,7 @@ import * as os from 'node:os'
 import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { RustServer, ensureRustServerBuilt, type E2eServerInfo } from '../helpers/rust-server.js'
-import { createFreshE2eBrowserContext } from '../helpers/fixtures.js'
+import { createFreshE2eBrowserContext, createFreshE2ePage } from '../helpers/fixtures.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -179,6 +179,7 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
   let server: RustServer
   let info: E2eServerInfo
   let sharedRoot: string
+  const ownedContexts = new Set<import('@playwright/test').BrowserContext>()
 
   test.beforeAll(async () => {
     // Same hook-timeout + prebuild pattern as recover-my-panes-rust.spec.ts:194-195:
@@ -240,6 +241,11 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
     await server?.stop()
   })
 
+  test.afterEach(async () => {
+    await Promise.all([...ownedContexts].map((context) => context.close().catch(() => {})))
+    ownedContexts.clear()
+  })
+
   // Copied VERBATIM from recover-my-panes-rust.spec.ts:175-191 (capturedHome
   // -> info.homeDir; this suite's RustServer exposes the isolated HOME there).
   /**
@@ -285,6 +291,14 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
     return (await createFreshE2eBrowserContext(browser, info, FRESH_CONTEXT_OPTIONS)).context
   }
 
+  async function createOwnedPage(
+    browser: import('@playwright/test').Browser,
+  ): Promise<{ context: import('@playwright/test').BrowserContext; page: import('@playwright/test').Page }> {
+    const owned = await createFreshE2ePage(browser, info)
+    ownedContexts.add(owned.context)
+    return owned
+  }
+
   // Copied VERBATIM from recover-my-panes-rust.spec.ts:228-246 (its
   // openFreshContextWithOffer; connect -> connectWithoutShellPick).
   /**
@@ -306,7 +320,8 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
     return { ctx, page, harness }
   }
 
-  test('case-c: fresh codex terminal collapses to a single green row', async ({ page }) => {
+  test('case-c: fresh codex terminal collapses to a single green row', async ({ browser }) => {
+    const { page } = await createOwnedPage(browser)
     const harness = await bootAndConnect(page, info)
 
     // REST-create a fresh codex terminal tab (no resume id) --
@@ -365,7 +380,8 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
     }).toPass({ timeout: 45_000 })
   })
 
-  test('case-b: REST-created resume tabs are green and dedupe on click', async ({ page }) => {
+  test('case-b: REST-created resume tabs are green and dedupe on click', async ({ browser }) => {
+    const { page } = await createOwnedPage(browser)
     const harness = await bootAndConnect(page, info) // keep the TestHarness -- the dedupe gate below needs it
     await declineRecoveryOfferIfShowing(page) // case-c's server-memory panes trigger the offer overlay
     await seedCodexRollout(info.homeDir, SEEDED_CODEX_THREAD_ID, PROJECT_DIR)
@@ -413,7 +429,8 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
     }
   })
 
-  test('case-a: sidebar joins survive a graceful server restart', async ({ page }) => {
+  test('case-a: sidebar joins survive a graceful server restart', async ({ browser }) => {
+    const { page } = await createOwnedPage(browser)
     await bootAndConnect(page, info)
     // Server memory still holds panes from case-b/case-c on this shared
     // serial server, so the fresh browser context gets the recovery offer
@@ -643,7 +660,8 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
   // KEEP THIS SCENARIO LAST in the serial suite: it destroys the local
   // client layout (the "lost client" is simulated by abandoning the boot
   // context entirely) and SIGKILLs the server.
-  test('case-d: recovered panes join green in the sidebar', async ({ page, browser }) => {
+  test('case-d: recovered panes join green in the sidebar', async ({ browser }) => {
+    const { page } = await createOwnedPage(browser)
     await bootAndConnect(page, info)
     // Pre-restart boot offer: earlier cases' panes are still in server memory,
     // so THIS boot gets a recovery offer too. Decline it -- it is suite-order

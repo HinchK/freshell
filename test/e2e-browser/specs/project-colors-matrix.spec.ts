@@ -1,7 +1,7 @@
 import fs from 'fs/promises'
 import path from 'path'
 import type { Page } from '@playwright/test'
-import { createFreshE2eBrowserContext, test, expect } from '../helpers/fixtures.js'
+import { createFreshE2ePage, test, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle } from '../helpers/external-target.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { installRecoveryOfferAutoDeclineOnContext } from '../helpers/recovery-offer.js'
@@ -154,7 +154,7 @@ async function pickProjectColor(page: Page, projectPath: string, hex: string): P
 test.describe('SESSION-05 project colors (History project headers)', () => {
   test.setTimeout(120_000)
 
-  test('color set in one browser renders in two contexts, persists across reload and restart, and leaves other projects unchanged', async ({ browser, page }) => {
+  test('color set in one browser renders in two contexts, persists across reload and restart, and leaves other projects unchanged', async ({ browser }) => {
     const server = await createE2eServerHandle(process.env, {
       construct: {
         setupHome: async (homeDir) => {
@@ -186,12 +186,12 @@ test.describe('SESSION-05 project colors (History project headers)', () => {
     })
     const info = await server.start()
 
-    const { context: contextB } = await createFreshE2eBrowserContext(browser, info)
+    const { context: contextA, page } = await createFreshE2ePage(browser, info)
+    const { context: contextB, page: pageB } = await createFreshE2ePage(browser, info)
     // RESTORE-01: manual contexts bypass the fixtures' `context` override —
-    // adopt the shared recovery auto-decline watcher directly (the default
-    // `page` fixture's context is covered automatically).
+    // adopt the shared recovery auto-decline watcher directly.
+    installRecoveryOfferAutoDeclineOnContext(contextA)
     installRecoveryOfferAutoDeclineOnContext(contextB)
-    const pageB = await contextB.newPage()
 
     try {
       // --- Context A + Context B both open, both on the History (Projects)
@@ -262,6 +262,7 @@ test.describe('SESSION-05 project colors (History project headers)', () => {
       await expect(headerSwatch(pageB, ALPHA_PROJECT)).toHaveCSS('background-color', PICKED_COLOR_RGB)
       await expect(headerSwatch(pageB, BETA_PROJECT)).toHaveCSS('background-color', DEFAULT_COLOR_RGB)
     } finally {
+      await contextA.close().catch(() => {})
       await contextB.close().catch(() => {})
       await server.stop().catch(() => {})
     }

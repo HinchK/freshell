@@ -98,6 +98,26 @@ export async function createFreshE2eBrowserContext(
 }
 
 /**
+ * Create a page backed by a newly registered machine for a spec-owned server.
+ * The returned context owns the page and must be closed by the caller before
+ * that server is stopped.
+ */
+export async function createFreshE2ePage(
+  browser: Browser,
+  serverInfo: E2eServerInfo,
+  options?: BrowserContextOptions,
+): Promise<{ context: BrowserContext; page: Page; machine: E2eMachine }> {
+  const { context, machine } = await createFreshE2eBrowserContext(browser, serverInfo, options)
+  try {
+    const page = await context.newPage()
+    return { context, page, machine }
+  } catch (error) {
+    await context.close().catch(() => {})
+    throw error
+  }
+}
+
+/**
  * Select a shell from the PanePicker, handling the race condition where
  * buttons can be detached during the platform-info Redux update.
  *

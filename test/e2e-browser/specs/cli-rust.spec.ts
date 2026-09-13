@@ -6,6 +6,7 @@ import path from 'node:path'
 import { test, expect } from '@playwright/test'
 import { ensureMcpServerBuilt, REPO_ROOT } from '../helpers/mcp-stdio-client.js'
 import { RustServer } from '../helpers/rust-server.js'
+import { createFreshE2ePage } from '../helpers/fixtures.js'
 import { TestHarness } from '../helpers/test-harness.js'
 
 type CliRun = { code: number | null; stdout: string; stderr: string }
@@ -80,7 +81,7 @@ async function runCliJson<T>(baseUrl: string, token: string, args: string[]): Pr
 test.describe('standalone CLI -- Rust server replacement', () => {
   test.setTimeout(120_000)
 
-  test('drives current Rust tab, pane, browser, screenshot, session, and unsupported-action contracts', async ({ page }) => {
+  test('drives current Rust tab, pane, browser, screenshot, session, and unsupported-action contracts', async ({ browser: playwrightBrowser }) => {
     let sessionIds: string[] = []
     const server = new RustServer({
       verbose: false,
@@ -92,6 +93,7 @@ test.describe('standalone CLI -- Rust server replacement', () => {
     expect(serverInfo.port).not.toBe(3001)
     expect(serverInfo.port).not.toBe(3002)
 
+    const { context, page } = await createFreshE2ePage(playwrightBrowser, serverInfo)
     ensureMcpServerBuilt(REPO_ROOT)
     await expect(fs.access(CLI_BIN)).resolves.toBeUndefined()
 
@@ -205,14 +207,16 @@ test.describe('standalone CLI -- Rust server replacement', () => {
       expect(unsupported.code).toBe(2)
       expect(unsupported.stderr).toContain("Action 'run' is unavailable with the Rust Freshell server.")
     } finally {
+      await context.close().catch(() => {})
       await fs.rm(scratchDir, { recursive: true, force: true })
       await server.stop()
     }
   })
 
-  test('creates and splits Host Stats panes without allocating terminals', async ({ page }) => {
+  test('creates and splits Host Stats panes without allocating terminals', async ({ browser: playwrightBrowser }) => {
     const server = new RustServer({ verbose: false })
     const info = await server.start()
+    const { context, page } = await createFreshE2ePage(playwrightBrowser, info)
 
     try {
       ensureMcpServerBuilt(REPO_ROOT)
@@ -255,6 +259,7 @@ test.describe('standalone CLI -- Rust server replacement', () => {
       await expect(regions.nth(1)).toBeVisible()
       expect(await inventory()).toEqual([])
     } finally {
+      await context.close().catch(() => {})
       await server.stop()
     }
   })
