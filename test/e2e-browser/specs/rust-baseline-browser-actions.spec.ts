@@ -269,7 +269,7 @@ test.describe('Rust baseline browser actions', () => {
     const sent = await page.evaluate(() => (
       window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
     ).filter((message: any) => message?.type === 'freshAgent.send'))
-    expect((sent[0] as { cwd?: string }).cwd).toBe(repoDir)
+    expect((sent[0] as { settings?: { cwd?: string } }).settings?.cwd).toBe(repoDir)
     expect((sent[0] as { text?: string }).text)
       .toContain(`I ran \`${shellCommand}\` in ${repoDir}.`)
     expect((sent[0] as { text?: string }).text).toContain(shellCommandToken)
