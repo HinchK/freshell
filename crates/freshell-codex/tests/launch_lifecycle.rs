@@ -1117,7 +1117,7 @@ fn assert_captured_spawn_context(captured: &serde_json::Value) {
     );
     assert_eq!(argv.get(app_server_index + 1).copied(), Some("--listen"));
     assert!(
-        !argv.iter().any(|value| *value == SYNTHETIC_CONTEXT_TOKEN),
+        !argv.contains(&SYNTHETIC_CONTEXT_TOKEN),
         "context values must stay out of the child argv"
     );
     assert_eq!(

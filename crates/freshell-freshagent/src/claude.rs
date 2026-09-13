@@ -1992,7 +1992,10 @@ impl FreshClaudeState {
             let settings_before = {
                 let guard = self.sessions.lock().await;
                 guard.get(&map_key).map(|s| {
-                    (s.configuration.settings.model.clone(), s.configuration.settings.effort.clone())
+                    (
+                        s.configuration.settings.model.clone(),
+                        s.configuration.settings.effort.clone(),
+                    )
                 })
             };
             if let Err(err) = self
@@ -2008,7 +2011,10 @@ impl FreshClaudeState {
             let settings_after = {
                 let guard = self.sessions.lock().await;
                 guard.get(&map_key).map(|s| {
-                    (s.configuration.settings.model.clone(), s.configuration.settings.effort.clone())
+                    (
+                        s.configuration.settings.model.clone(),
+                        s.configuration.settings.effort.clone(),
+                    )
                 })
             };
             if settings_before != settings_after {
@@ -2263,9 +2269,12 @@ impl FreshClaudeState {
 
         let before = {
             let guard = self.sessions.lock().await;
-            guard
-                .get(&map_key)
-                .map(|s| (s.configuration.settings.model.clone(), s.configuration.settings.effort.clone()))
+            guard.get(&map_key).map(|s| {
+                (
+                    s.configuration.settings.model.clone(),
+                    s.configuration.settings.effort.clone(),
+                )
+            })
         };
         if let Err(err) = self
             .configure_for_send(&map_key, &msg.settings, session_type)
@@ -2273,19 +2282,17 @@ impl FreshClaudeState {
         {
             // The refusal/failure is user-facing session state (busy turn,
             // sidecar death): the pane banner is the surface, on every device.
-            self.emit_fresh_agent_error(
-                &session_id,
-                session_type,
-                "CLAUDE_SETTINGS_FAILED",
-                &err,
-            );
+            self.emit_fresh_agent_error(&session_id, session_type, "CLAUDE_SETTINGS_FAILED", &err);
             return;
         }
         let after = {
             let guard = self.sessions.lock().await;
-            guard
-                .get(&map_key)
-                .map(|s| (s.configuration.settings.model.clone(), s.configuration.settings.effort.clone()))
+            guard.get(&map_key).map(|s| {
+                (
+                    s.configuration.settings.model.clone(),
+                    s.configuration.settings.effort.clone(),
+                )
+            })
         };
         if before == after {
             // Idempotent configure: nothing to converge.
@@ -15198,7 +15205,11 @@ rl.on('line', (line) => {
 
     // ── freshAgent.configure: live model convergence ─────────────────────────
 
-    fn configure_msg(session_id: &str, model: Option<&str>, effort: Option<&str>) -> FreshAgentConfigure {
+    fn configure_msg(
+        session_id: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> FreshAgentConfigure {
         FreshAgentConfigure {
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: session_id.to_string(),
@@ -15252,7 +15263,10 @@ rl.on('line', (line) => {
         // …the session record holds the applied pair…
         let (record_model, record_effort) = {
             let guard = state.sessions.lock().await;
-            let session = guard.values().find(|s| s.sidecar_session_id == session_id).expect("session");
+            let session = guard
+                .values()
+                .find(|s| s.sidecar_session_id == session_id)
+                .expect("session");
             (
                 session.configuration.settings.model.clone(),
                 session.configuration.settings.effort.clone(),
@@ -15266,8 +15280,10 @@ rl.on('line', (line) => {
         let frames = drain(&mut rx).await;
         let metadata = frames
             .iter()
-            .find(|f| f["type"] == "freshAgent.event"
-                && f["event"]["type"] == "freshAgent.session.metadata")
+            .find(|f| {
+                f["type"] == "freshAgent.event"
+                    && f["event"]["type"] == "freshAgent.session.metadata"
+            })
             .expect("a metadata frame is broadcast");
         assert_eq!(metadata["provider"], json!("claude"));
         assert_eq!(metadata["sessionType"], json!("freshclaude"));
@@ -15299,8 +15315,7 @@ rl.on('line', (line) => {
         let frames = drain(&mut rx).await;
         let error = frames
             .iter()
-            .find(|f| f["type"] == "freshAgent.event"
-                && f["event"]["type"] == "freshAgent.error")
+            .find(|f| f["type"] == "freshAgent.event" && f["event"]["type"] == "freshAgent.error")
             .expect("the refusal surfaces a freshAgent.error frame");
         assert_eq!(error["event"]["code"], json!("CLAUDE_SETTINGS_FAILED"));
         assert_eq!(error["sessionType"], json!("freshclaude"));
@@ -15385,8 +15400,10 @@ rl.on('line', (line) => {
         let frames = drain(&mut rx).await;
         let metadata = frames
             .iter()
-            .find(|f| f["type"] == "freshAgent.event"
-                && f["event"]["type"] == "freshAgent.session.metadata")
+            .find(|f| {
+                f["type"] == "freshAgent.event"
+                    && f["event"]["type"] == "freshAgent.session.metadata"
+            })
             .expect("a settings-changing send broadcasts metadata");
         assert_eq!(metadata["sessionId"], json!(session_id));
         assert_eq!(metadata["event"]["model"], json!("opus[1m]"));

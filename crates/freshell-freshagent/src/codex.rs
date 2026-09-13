@@ -69,9 +69,9 @@ use freshell_codex::{
 };
 use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCompact, FreshAgentConfigure,
-    FreshAgentCreate, FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent,
-    FreshAgentFork, FreshAgentForked, FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled,
-    FreshAgentSend, FreshAgentSessionMaterialized, ServerMessage, SessionLocator,
+    FreshAgentCreate, FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent, FreshAgentFork,
+    FreshAgentForked, FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled, FreshAgentSend,
+    FreshAgentSessionMaterialized, ServerMessage, SessionLocator,
 };
 use freshell_terminal::FrameSink;
 
@@ -1891,7 +1891,7 @@ impl FreshCodexState {
             .clone()
             .or_else(|| stored_permission.clone());
         if let Err(error) = normalize_codex_permission(&mut permission_mode, &mut sandbox) {
-            self.emit_fresh_agent_error(&session_id, "INVALID_PERMISSION_MODE", &error);
+            self.emit_fresh_agent_error(&session_id, "INVALID_PERMISSION_MODE", error);
             return;
         }
         // Re-normalize on configure (the same idempotent pass send applies).
@@ -1902,9 +1902,10 @@ impl FreshCodexState {
             return;
         }
 
-        let settings_changed =
-            stored_model != model || stored_effort != effort || stored_sandbox != sandbox
-                || stored_permission != permission_mode;
+        let settings_changed = stored_model != model
+            || stored_effort != effort
+            || stored_sandbox != sandbox
+            || stored_permission != permission_mode;
         if !settings_changed {
             // Idempotent configure: nothing to converge.
             return;
@@ -17538,7 +17539,11 @@ pub(crate) mod tests {
 
     // ── freshAgent.configure: live model convergence ─────────────────────────
 
-    fn configure_msg(session_id: &str, model: Option<&str>, effort: Option<&str>) -> FreshAgentConfigure {
+    fn configure_msg(
+        session_id: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> FreshAgentConfigure {
         FreshAgentConfigure {
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: session_id.to_string(),
@@ -17565,7 +17570,8 @@ pub(crate) mod tests {
         let (transport, _peer) = freshell_codex::new_channel_transport();
         let (client, _notifs) = CodexAppServerClient::connect(transport);
         let client = Arc::new(client);
-        st.insert_session_for_test(thread_id, client.clone(), None).await;
+        st.insert_session_for_test(thread_id, client.clone(), None)
+            .await;
         client
     }
 
@@ -17586,8 +17592,12 @@ pub(crate) mod tests {
         let mut rx = rx;
         inserted_session(&st, "thread-cfg").await;
 
-        st.handle_configure(configure_msg("thread-cfg", Some("gpt-5.6-luna"), Some("high")))
-            .await;
+        st.handle_configure(configure_msg(
+            "thread-cfg",
+            Some("gpt-5.6-luna"),
+            Some("high"),
+        ))
+        .await;
 
         let (model, effort) = {
             let sessions = st.sessions.lock().await;
@@ -17600,8 +17610,10 @@ pub(crate) mod tests {
         let frames = drain(&mut rx).await;
         let metadata = frames
             .iter()
-            .find(|f| f["type"] == "freshAgent.event"
-                && f["event"]["type"] == "freshAgent.session.metadata")
+            .find(|f| {
+                f["type"] == "freshAgent.event"
+                    && f["event"]["type"] == "freshAgent.session.metadata"
+            })
             .expect("a metadata frame is broadcast");
         assert_eq!(metadata["provider"], json!("codex"));
         assert_eq!(metadata["sessionType"], json!("freshcodex"));
@@ -17638,8 +17650,10 @@ pub(crate) mod tests {
         let frames = drain(&mut rx).await;
         let metadata = frames
             .iter()
-            .find(|f| f["type"] == "freshAgent.event"
-                && f["event"]["type"] == "freshAgent.session.metadata")
+            .find(|f| {
+                f["type"] == "freshAgent.event"
+                    && f["event"]["type"] == "freshAgent.session.metadata"
+            })
             .expect("a metadata frame is broadcast");
         assert_eq!(metadata["event"]["effort"], json!("max"));
     }
@@ -17651,8 +17665,12 @@ pub(crate) mod tests {
         let mut rx = rx;
         inserted_session(&st, "thread-cfg-idem").await;
 
-        st.handle_configure(configure_msg("thread-cfg-idem", Some("gpt-5.6-luna"), Some("high")))
-            .await;
+        st.handle_configure(configure_msg(
+            "thread-cfg-idem",
+            Some("gpt-5.6-luna"),
+            Some("high"),
+        ))
+        .await;
         let first = drain(&mut rx).await;
         assert_eq!(
             first
@@ -17663,8 +17681,12 @@ pub(crate) mod tests {
             1
         );
 
-        st.handle_configure(configure_msg("thread-cfg-idem", Some("gpt-5.6-luna"), Some("high")))
-            .await;
+        st.handle_configure(configure_msg(
+            "thread-cfg-idem",
+            Some("gpt-5.6-luna"),
+            Some("high"),
+        ))
+        .await;
         let second = drain(&mut rx).await;
         assert!(
             !second.iter().any(|f| f["type"] == "freshAgent.event"
@@ -17686,8 +17708,7 @@ pub(crate) mod tests {
         let frames = drain(&mut rx).await;
         let error = frames
             .iter()
-            .find(|f| f["type"] == "freshAgent.event"
-                && f["event"]["type"] == "freshAgent.error")
+            .find(|f| f["type"] == "freshAgent.event" && f["event"]["type"] == "freshAgent.error")
             .expect("the unknown session surfaces a freshAgent.error frame");
         assert_eq!(error["event"]["code"], json!("INVALID_SESSION_ID"));
         assert!(
@@ -17729,25 +17750,18 @@ pub(crate) mod tests {
         // First send carries the initial pair.
         st.handle_send(send_with_settings("one", "gpt-5.6-luna", "high"))
             .await;
-        let first = collect_frames_until(
-            &mut rx,
-            std::time::Duration::from_secs(5),
-            |f| f["type"] == "freshAgent.send.accepted",
-        )
+        let first = collect_frames_until(&mut rx, std::time::Duration::from_secs(5), |f| {
+            f["type"] == "freshAgent.send.accepted"
+        })
         .await;
         assert!(first.matched, "the fake app-server accepts the turn");
 
         // Second send CHANGES the pair: the apply site must converge.
         st.handle_send(send_with_settings("two", "gpt-5.6-sol", "low"))
             .await;
-        let second = collect_frames_until(
-            &mut rx,
-            std::time::Duration::from_secs(5),
-            |f| {
-                f["type"] == "freshAgent.event"
-                    && f["event"]["type"] == "freshAgent.session.metadata"
-            },
-        )
+        let second = collect_frames_until(&mut rx, std::time::Duration::from_secs(5), |f| {
+            f["type"] == "freshAgent.event" && f["event"]["type"] == "freshAgent.session.metadata"
+        })
         .await;
         assert!(
             second.matched,
@@ -17758,8 +17772,10 @@ pub(crate) mod tests {
             .frames
             .iter()
             .rev()
-            .find(|f| f["type"] == "freshAgent.event"
-                && f["event"]["type"] == "freshAgent.session.metadata")
+            .find(|f| {
+                f["type"] == "freshAgent.event"
+                    && f["event"]["type"] == "freshAgent.session.metadata"
+            })
             .expect("the metadata frame");
         assert_eq!(metadata["sessionId"], json!(thread_id));
         assert_eq!(metadata["event"]["model"], json!("gpt-5.6-sol"));

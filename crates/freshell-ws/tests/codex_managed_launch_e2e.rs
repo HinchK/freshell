@@ -710,7 +710,7 @@ async fn codex_terminal_create_argv_default_managed_and_flag_zero_optout() {
         &["-c".to_string(), "features.apps=false".to_string()]
     );
     // The resume pair rides LAST (G-X2's resolver shape, now pinned live).
-    let position = resume_pair_position(&resume_argv, "thread-e2e-resume")
+    let position = resume_pair_position(resume_argv, "thread-e2e-resume")
         .expect("managed resume argv must contain `resume thread-e2e-resume`");
     assert_eq!(
         position + 2,
