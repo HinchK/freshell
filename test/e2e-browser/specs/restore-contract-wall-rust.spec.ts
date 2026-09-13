@@ -22,7 +22,14 @@
  * opencode-terminal-restore-rust.spec.ts, restore-double-restart.spec.ts,
  * freshopencode-restart-recovery.spec.ts).
  */
-import { createFreshE2eBrowserContext, createFreshE2ePage, test, expect } from '../helpers/fixtures.js'
+import {
+  createE2eBrowserContext,
+  createFreshE2eBrowserContext,
+  createFreshE2ePage,
+  test,
+  expect,
+  type E2eMachine,
+} from '../helpers/fixtures.js'
 import { RustServer } from '../helpers/rust-server.js'
 import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
@@ -167,17 +174,28 @@ async function bootWall(
     env?: Record<string, string>
     setupHome?: (homeDir: string) => Promise<void>
   } = {},
-): Promise<{ server: RustServer; info: E2eServerInfo; context: BrowserContext; page: Page; harness: TestHarness }> {
+): Promise<{
+  server: RustServer
+  info: E2eServerInfo
+  context: BrowserContext
+  page: Page
+  harness: TestHarness
+  machine: E2eMachine
+}> {
   const server = new RustServer({ env: options.env, setupHome: options.setupHome })
-  const info = await server.start()
+  let context: BrowserContext | undefined
   try {
-    const { context, page } = await createFreshE2ePage(browser, info)
+    const info = await server.start()
+    const owned = await createFreshE2ePage(browser, info)
+    context = owned.context
+    const { page, machine } = owned
     await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
     const harness = new TestHarness(page)
     await harness.waitForHarness()
     await harness.waitForConnection()
-    return { server, info, context, page, harness }
+    return { server, info, context, page, harness, machine }
   } catch (error) {
+    await context?.close().catch(() => {})
     await server.stop().catch(() => {})
     throw error
   }
@@ -1781,11 +1799,9 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     // P1.8+P1.9 (D3, §4.2) LANDED -- pin flipped: the claude binding row is
     // written durably to the pane-identity ledger BEFORE the PTY spawn, so a
     // SIGKILL the moment the row lands (ahead of any snapshot cadence) still
-    // leaves a recoverable row. After browser-state loss the recovery
-    // inventory reports it (recoverable: true) and the "recover my panes"
-    // offer (data-testid="recovery-offer-panel") surfaces it -- the poll
-    // below accepts either an auto-restored pane or the visible offer, and
-    // the tail after it pins WHERE the offered row lands (D8 placement).
+    // leaves a recoverable row. A fresh browser profile for the SAME selected
+    // machine bootstraps that machine's workspace automatically; the legacy
+    // cross-machine recovery offer is intentionally absent in this mode.
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-5s-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
@@ -1796,7 +1812,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       path.join(sharedRoot, 'bin'),
     )
     let capturedHome = ''
-    const { server, harness, info, context, page } = await bootWall(browser, {
+    let { server, harness, info, context, page, machine } = await bootWall(browser, {
       env: { CLAUDE_CMD: fakeClaudePath, FAKE_CLAUDE_ARGV_LOG: argLogPath },
       setupHome: async (homeDir) => {
         capturedHome = homeDir
@@ -1843,26 +1859,16 @@ test.describe('Restore Contract Wall (P0.1)', () => {
 
       // ...and the SIGKILL lands immediately after the identity row is
       // durably on disk -- no snapshot cadence could have observed it. The
-      // browser dies FIRST (about:blank): the compound loss the offer exists
-      // for is a dead browser AND a dead server -- and it is load-bearing for
+      // browser dies FIRST (about:blank): the compound loss is a dead browser
+      // AND a dead server -- and it is load-bearing for
       // determinism, not just fidelity: if the old page survived the restart
       // it would reconnect and force-push its (possibly sessionRef-stamped)
       // live registry (pushNow(true) on 'ready', tabRegistrySync.ts:470-473),
       // re-referencing the row AFTER the shaping below had pruned it. Then
-      // the browser loses its state. TWO deviations from the naive
-      // clear+reload
-      // (observed hang, run of 2026-07-24, DEBUG=pw:api):
-      //   (1) an evaluate-time localStorage.clear() is racy -- the persist
-      //       middleware re-writes the whole state on the next store update
-      //       (reconnect churn), so the "lost" tabs came back. The clear must
-      //       run at NAVIGATION time (init script) to be deterministic.
-      //   (2) the app strips ?token= from the URL after stashing it in the
-      //       (now-cleared) localStorage, so a bare reload can never
-      //       re-authenticate -- WS stays offline forever and waitForConnection
-      //       hung to the 180s test timeout (setup hang, not the contract
-      //       red). Re-enter through the token URL instead -- the same door a
-      //       user who lost their browser state walks back in through.
+      // the browser loses its state. Closing the context, rather than clearing
+      // storage in a live page, is the deterministic browser-loss model.
       await page.goto('about:blank')
+      await context.close().catch(() => {})
       await server.restartAbrupt()
 
       // POST-KILL EVIDENCE SHAPING (deterministic placement discrimination):
@@ -1900,21 +1906,27 @@ test.describe('Restore Contract Wall (P0.1)', () => {
         'evidence shaping must leave a session-free generation behind (the shell-pane push)',
       ).toBe(true)
 
-      await page.addInitScript(() => {
-        try {
-          localStorage.clear()
-          sessionStorage.clear()
-        } catch {
-          /* about:blank etc. */
-        }
+      // Model browser-profile loss without changing the selected physical
+      // machine. A fresh context receives the server-owned machine id before
+      // first navigation and therefore runs automatic machine bootstrap.
+      context = await createE2eBrowserContext(browser, info, machine.id, {
+        serviceWorkers: 'block',
+      })
+      page = await context.newPage()
+      const inventoryResponse = page.waitForResponse((response) => {
+        const url = new URL(response.url())
+        return url.pathname === '/api/recovery/inventory'
+          && url.searchParams.get('machineId') === machine.id
       })
       await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+      harness = new TestHarness(page)
       await harness.waitForHarness()
       await harness.waitForConnection()
+      expect((await inventoryResponse).ok()).toBe(true)
+      await expect(page.getByTestId('recovery-offer-panel')).toHaveCount(0)
 
-      // TARGET CONTRACT (§4.2/§4.4): the server still knows the binding --
-      // some pane resuming <preallocatedId> becomes reachable (auto-restored
-      // or offered via "recover my panes").
+      // TARGET CONTRACT (§4.2/§4.4): the server still knows the binding and
+      // automatic same-machine bootstrap restores it without a legacy offer.
       await expect
         .poll(async () => {
           const state = await harness.getState()
@@ -1925,25 +1937,9 @@ test.describe('Restore Contract Wall (P0.1)', () => {
             )
             if (hit) return true
           }
-          const recoverOffer = await page
-            .getByTestId('recovery-offer-panel')
-            .isVisible()
-            .catch(() => false)
-          return recoverOffer
+          return false
         }, { timeout: 30_000 })
         .toBe(true)
-
-      // D8 PLACEMENT TAIL (unconditional, review-round-3): the init-script
-      // storage clear means this boot has NO persisted layout, so auto-restore
-      // is unreachable and the offer is the only reachable evidence for the
-      // kill-window row. Hard-expect it here: if the offer ever fails to
-      // appear, the kill-window keep rule regressed -- fail loud, never skip.
-      const offerPanel = page.getByTestId('recovery-offer-panel')
-      await expect(
-        offerPanel,
-        'the recovery offer must appear after browser-state loss (kill-window keep rule)',
-      ).toBeVisible()
-      await offerPanel.getByTestId('recovery-accept').click()
 
       // (a) The restored claude pane lands in the SAME restored tab as the
       // boot shell pane: the row is unreferenced by construction (the shaping

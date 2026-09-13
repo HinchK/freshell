@@ -1,6 +1,6 @@
 import fs from 'fs/promises'
 import path from 'path'
-import type { Page } from '@playwright/test'
+import type { BrowserContext, Page } from '@playwright/test'
 import { createFreshE2ePage, test, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle } from '../helpers/external-target.js'
 import { TestHarness } from '../helpers/test-harness.js'
@@ -184,16 +184,21 @@ test.describe('SESSION-05 project colors (History project headers)', () => {
         },
       },
     })
-    const info = await server.start()
-
-    const { context: contextA, page } = await createFreshE2ePage(browser, info)
-    const { context: contextB, page: pageB } = await createFreshE2ePage(browser, info)
-    // RESTORE-01: manual contexts bypass the fixtures' `context` override —
-    // adopt the shared recovery auto-decline watcher directly.
-    installRecoveryOfferAutoDeclineOnContext(contextA)
-    installRecoveryOfferAutoDeclineOnContext(contextB)
-
+    let contextA: BrowserContext | undefined
+    let contextB: BrowserContext | undefined
     try {
+      const info = await server.start()
+      const ownedA = await createFreshE2ePage(browser, info)
+      contextA = ownedA.context
+      const { page } = ownedA
+      const ownedB = await createFreshE2ePage(browser, info)
+      contextB = ownedB.context
+      const { page: pageB } = ownedB
+      // RESTORE-01: manual contexts bypass the fixtures' `context` override —
+      // adopt the shared recovery auto-decline watcher directly.
+      installRecoveryOfferAutoDeclineOnContext(contextA)
+      installRecoveryOfferAutoDeclineOnContext(contextB)
+
       // --- Context A + Context B both open, both on the History (Projects)
       // view, BEFORE any color is set: both swatches show the default. ---
       const harnessA = await bootFreshPage(page, info)
@@ -262,8 +267,8 @@ test.describe('SESSION-05 project colors (History project headers)', () => {
       await expect(headerSwatch(pageB, ALPHA_PROJECT)).toHaveCSS('background-color', PICKED_COLOR_RGB)
       await expect(headerSwatch(pageB, BETA_PROJECT)).toHaveCSS('background-color', DEFAULT_COLOR_RGB)
     } finally {
-      await contextA.close().catch(() => {})
-      await contextB.close().catch(() => {})
+      await contextA?.close().catch(() => {})
+      await contextB?.close().catch(() => {})
       await server.stop().catch(() => {})
     }
   })

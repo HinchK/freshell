@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { test, expect } from '@playwright/test'
+import { test, expect, type BrowserContext } from '@playwright/test'
 import { ensureMcpServerBuilt, REPO_ROOT } from '../helpers/mcp-stdio-client.js'
 import { RustServer } from '../helpers/rust-server.js'
 import { createFreshE2ePage } from '../helpers/fixtures.js'
@@ -89,18 +89,20 @@ test.describe('standalone CLI -- Rust server replacement', () => {
         sessionIds = await seedPagedSessions(homeDir)
       },
     })
-    const serverInfo = await server.start()
-    expect(serverInfo.port).not.toBe(3001)
-    expect(serverInfo.port).not.toBe(3002)
-
-    const { context, page } = await createFreshE2ePage(playwrightBrowser, serverInfo)
-    ensureMcpServerBuilt(REPO_ROOT)
-    await expect(fs.access(CLI_BIN)).resolves.toBeUndefined()
-
-    const scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-cli-rust-'))
-    const screenshotDir = path.join(scratchDir, 'screenshots')
-
+    let context: BrowserContext | undefined
+    let scratchDir = ''
     try {
+      const serverInfo = await server.start()
+      expect(serverInfo.port).not.toBe(3001)
+      expect(serverInfo.port).not.toBe(3002)
+      const owned = await createFreshE2ePage(playwrightBrowser, serverInfo)
+      context = owned.context
+      const { page } = owned
+      ensureMcpServerBuilt(REPO_ROOT)
+      await expect(fs.access(CLI_BIN)).resolves.toBeUndefined()
+
+      scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-cli-rust-'))
+      const screenshotDir = path.join(scratchDir, 'screenshots')
       await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
       await page.getByRole('button', { name: /^Shell$/i }).click({ timeout: 15_000 })
       await page.locator('.xterm').first().waitFor({ state: 'visible', timeout: 30_000 })
@@ -207,18 +209,20 @@ test.describe('standalone CLI -- Rust server replacement', () => {
       expect(unsupported.code).toBe(2)
       expect(unsupported.stderr).toContain("Action 'run' is unavailable with the Rust Freshell server.")
     } finally {
-      await context.close().catch(() => {})
-      await fs.rm(scratchDir, { recursive: true, force: true })
-      await server.stop()
+      await context?.close().catch(() => {})
+      if (scratchDir) await fs.rm(scratchDir, { recursive: true, force: true })
+      await server.stop().catch(() => {})
     }
   })
 
   test('creates and splits Host Stats panes without allocating terminals', async ({ browser: playwrightBrowser }) => {
     const server = new RustServer({ verbose: false })
-    const info = await server.start()
-    const { context, page } = await createFreshE2ePage(playwrightBrowser, info)
-
+    let context: BrowserContext | undefined
     try {
+      const info = await server.start()
+      const owned = await createFreshE2ePage(playwrightBrowser, info)
+      context = owned.context
+      const { page } = owned
       ensureMcpServerBuilt(REPO_ROOT)
       await page.goto(info.baseUrl + '/?token=' + info.token + '&e2e=1')
       const harness = new TestHarness(page)
@@ -240,6 +244,10 @@ test.describe('standalone CLI -- Rust server replacement', () => {
       )
       expect(created.status).toBe('ok')
       expect(created.data.terminalId).toBeUndefined()
+      await runCliJson<ActionResult<{ tabId: string }>>(
+        info.baseUrl, info.token, ['select-tab', '--target', created.data.tabId],
+      )
+      await expect.poll(async () => harness.getActiveTabId()).toBe(created.data.tabId)
       const regions = page.getByRole('region', { name: 'Host stats' })
       await expect(regions).toHaveCount(1)
       await expect(regions.first()).toBeVisible()
@@ -259,8 +267,8 @@ test.describe('standalone CLI -- Rust server replacement', () => {
       await expect(regions.nth(1)).toBeVisible()
       expect(await inventory()).toEqual([])
     } finally {
-      await context.close().catch(() => {})
-      await server.stop()
+      await context?.close().catch(() => {})
+      await server.stop().catch(() => {})
     }
   })
 })

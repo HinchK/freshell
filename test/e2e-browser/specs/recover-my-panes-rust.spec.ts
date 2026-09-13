@@ -3,9 +3,9 @@
  * (docs/plans/2026-07-26-recover-my-panes.md, Task 8).
  *
  * Scenario 1 (accept path): a browser with a claude CLI pane + a browser pane
- * is LOST (context closed), the server restarts, and a fresh browser context
- * (empty storage = new machine) is OFFERED recovery — accepting recreates the
- * panes, resumes the dead claude session (`--resume <sessionId>` argv proof +
+ * is LOST (context closed), the server restarts, and a fresh browser profile
+ * for that same server-owned machine automatically recreates the panes,
+ * resumes the dead claude session (`--resume <sessionId>` argv proof +
  * the fake CLI's scrollback marker), recreates the mixed-kind browser pane,
  * and a same-browser reload never re-offers (localStorage now has a layout).
  *
@@ -104,7 +104,12 @@
  * directly (ephemeral loopback port — NEVER 3001/3002). The application
  * Chromium lane is Rust-only and selects this spec by default.
  */
-import { createFreshE2eBrowserContext, test, expect } from '../helpers/fixtures.js'
+import {
+  createE2eBrowserContext,
+  createFreshE2eBrowserContext,
+  test,
+  expect,
+} from '../helpers/fixtures.js'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import * as os from 'node:os'
@@ -565,11 +570,13 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
   // Scenario 1's claude session — scenario 2/3 reason about the same log.
   let sessionIdA = ''
 
-  test('scenario 1: lose the browser, restart the server, accept — panes recreated, claude resumed, reload never re-offers', async ({ browser }) => {
+  test('scenario 1: lose the browser, restart the server, same-machine bootstrap recreates panes and reload never offers recovery', async ({ browser }) => {
     test.setTimeout(240_000)
 
     // ---- Context A: populate a tab with a claude CLI pane + a browser pane ----
-    const ctxA: BrowserContext = await createFreshContext(browser)
+    const ownedA = await createFreshE2eBrowserContext(browser, info, FRESH_CONTEXT_OPTIONS)
+    const ctxA: BrowserContext = ownedA.context
+    const machineA = ownedA.machine
     const pageA = await ctxA.newPage()
     await connect(pageA, info)
     await selectShellIfPickerShowing(pageA)
@@ -606,16 +613,20 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     await ctxA.close()
     await server.restart()
 
-    // ---- Context B: fresh storage = new machine; the offer is REQUIRED ----
-    const { ctx: ctxB, page: pageB } = await openFreshContextWithOffer(browser, 'contextB')
-
-    const panelB = pageB.getByTestId('recovery-offer-panel')
-    await expect(panelB).toBeVisible()
-    await expect(panelB.getByRole('heading')).toHaveText(/restore \d+ pane/i)
-
-    const argvCountBeforeAccept = (await readArgvLog(argLog)).length
-    await pageB.getByTestId('recovery-accept').click()
-    await expect(panelB).toHaveCount(0)
+    // ---- Context B: empty browser storage, but still machine A. ----
+    // The selected machine is server-owned, so its workspace restores during
+    // bootstrap rather than through the legacy cross-machine recovery offer.
+    const argvCountBeforeRestore = (await readArgvLog(argLog)).length
+    const ctxB = await createE2eBrowserContext(browser, info, machineA.id, FRESH_CONTEXT_OPTIONS)
+    const pageB = await ctxB.newPage()
+    const inventoryResponse = pageB.waitForResponse((response) => {
+      const url = new URL(response.url())
+      return url.pathname === '/api/recovery/inventory'
+        && url.searchParams.get('machineId') === machineA.id
+    })
+    await connect(pageB, info)
+    expect((await inventoryResponse).ok()).toBe(true)
+    await expect(pageB.getByTestId('recovery-offer-panel')).toHaveCount(0)
 
     // A recreated terminal pane renders.
     await expect(pageB.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
@@ -625,8 +636,8 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     await expect(async () => {
       const entries = await readArgvLog(argLog)
       expect(
-        entries.slice(argvCountBeforeAccept).some((e) => hasClaudeResumePair(e.argv, sessionIdA)),
-        'accept must exec `claude --resume <sessionId>`',
+        entries.slice(argvCountBeforeRestore).some((e) => hasClaudeResumePair(e.argv, sessionIdA)),
+        'same-machine bootstrap must exec `claude --resume <sessionId>`',
       ).toBe(true)
     }).toPass({ timeout: 30_000 })
 
