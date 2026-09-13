@@ -451,14 +451,26 @@ async fn probe_stale_start_fences(
             // still-capable one). Only the CONCLUDED settlement plus the
             // absent-row evidence releases; an UNREGISTERED settlement
             // (no evidence the operation ever concluded) fails closed.
-            let confirmed_gone = match (fence.prior_terminal_id.as_deref(), fence.prior_pid) {
-                (_, Some(pid)) => !freshell_terminal::registry::pid_alive(pid),
-                (Some(tid), None) => match fence.settle_concluded {
-                    Some(true) => registry.terminal_is_dead(tid),
-                    Some(false) | None => false,
-                },
-                (None, None) => false,
-            };
+            let (confirmed_gone, probe_evidence) =
+                match (fence.prior_terminal_id.as_deref(), fence.prior_pid) {
+                    // b8ke e4 post-cap F3: branch-accurate probe labels — the
+                    // PID-bearing branch releases solely from the OS-level
+                    // pid_alive check and records THAT evidence, never the
+                    // row-liveness label (the wrong safety evidence in the
+                    // structured transition log misled diagnosis).
+                    (_, Some(pid)) => (
+                        !freshell_terminal::registry::pid_alive(pid),
+                        "terminal-pid-death",
+                    ),
+                    (Some(tid), None) => (
+                        match fence.settle_concluded {
+                            Some(true) => registry.terminal_is_dead(tid),
+                            Some(false) | None => false,
+                        },
+                        "terminal-row-liveness",
+                    ),
+                    (None, None) => (false, "terminal-row-liveness"),
+                };
             if !confirmed_gone {
                 continue;
             }
@@ -505,7 +517,7 @@ async fn probe_stale_start_fences(
                     initiator = %fence.initiator,
                     duration_ms = freshell_ownership::now_epoch_ms()
                         .saturating_sub(fence.since_ms),
-                    probe = "terminal-row-liveness",
+                    probe = probe_evidence,
                     fence_reason = ?fence.reason,
                     epoch = ownership.boot_epoch(),
                     outcome = ?released,
@@ -5631,6 +5643,17 @@ mod stale_start_watchdog_tests {
              value — got {:?}",
             released_d4f2c.1
         );
+        // b8ke e4 post-cap F3: branch-accurate probe labels — the
+        // PID-less row branch records the row-liveness evidence.
+        assert!(
+            released_d4f2c
+                .1
+                .iter()
+                .any(|f| f == "probe=terminal-row-liveness"),
+            "the PID-less row-branch release records the row-liveness \
+             evidence label — got {:?}",
+            released_d4f2c.1
+        );
         assert!(
             released_d4f2c
                 .1
@@ -5653,6 +5676,7 @@ mod stale_start_watchdog_tests {
     #[tokio::test]
     async fn a_kill_in_flight_terminal_prior_holds_its_fence_until_the_reap_completes() {
         let states = watchdog_states();
+        let sink_e4r3 = transition_log_capture::install();
         // A REAL live runtime the registry never knew (the recorded pid)
         // plus a terminal id whose row is ABSENT — the exact shape a kill
         // in progress produces after removing the row (and the shape a
@@ -5739,6 +5763,27 @@ mod stale_start_watchdog_tests {
             states.0.observe("claude", "sid-stale").state,
             OwnershipState::Vacant,
             "the reap completed — the probe releases"
+        );
+
+        // b8ke e4 post-cap F3: the PID-bearing branch's release record
+        // carries ITS OWN evidence label — the OS-level pid-death probe —
+        // never the row-liveness label (pre-post-cap every terminal
+        // release logged probe=terminal-row-liveness, recording the wrong
+        // safety evidence for the pid branch).
+        let events_e4r3 = sink_e4r3.events();
+        let released_e4r3 = events_e4r3
+            .iter()
+            .find(|(event, _)| *event == "ownership.start.fence_probe_released")
+            .expect("the pid-branch release event is captured")
+            .clone();
+        assert!(
+            released_e4r3
+                .1
+                .iter()
+                .any(|f| f == "probe=terminal-pid-death"),
+            "the PID-bearing release records the pid-death evidence label — \
+             got {:?}",
+            released_e4r3.1
         );
     }
 
