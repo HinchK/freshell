@@ -5937,14 +5937,23 @@ fn reduce_notification(
                 // quiet-deadman disarm below (the file-wide lock order is
                 // `quiet_deadman` outer / `active_turn` inner — never lock
                 // `quiet_deadman` while holding `active_turn`).
-                let retired = {
+                let (retired, superseded_by_active_turn) = {
                     let mut active = active_turn.lock().expect("active_turn mutex");
+                    // A delayed compact completion can arrive after a newer send
+                    // installed its own active id. It may retire its compact-window
+                    // ownership below, but it cannot truthfully publish this
+                    // session as idle or complete: the client has no completion turn
+                    // id with which to reject such a stale event.
+                    let superseded_by_active_turn = matches!(
+                        (active.as_deref(), event.turn_id.as_deref()),
+                        (Some(active_id), Some(completed_id)) if active_id != completed_id
+                    );
                     let retired = event.turn_id.as_deref().is_some()
                         && active.as_deref() == event.turn_id.as_deref();
                     if retired {
                         *active = None;
                     }
-                    retired
+                    (retired, superseded_by_active_turn)
                 };
                 // Delta-r1 F2 + ep1-r3 F4 (completion-id OWNERSHIP): the compact
                 // window ends HERE — but ONLY on the `turn/completed` whose params
@@ -5974,6 +5983,20 @@ fn reduce_notification(
                 if retired {
                     disarm_codex_quiet(quiet_deadman, subscription.session_id(), "turn_complete");
                 }
+
+                // Preserve the subscription's per-session completion bookkeeping
+                // (including its monotonic clock) even when its normal idle/chime
+                // output is stale. The outward replacement keeps the client busy
+                // until the active turn's OWN completion arrives.
+                let completion_events = subscription.on_turn_completed(&event, now_ms());
+                if superseded_by_active_turn {
+                    return vec![CodexAdapterEvent::StatusSnapshot {
+                        session_id: subscription.session_id().to_string(),
+                        status: CodexStatus::Running,
+                        revision: None,
+                    }];
+                }
+                return completion_events;
             }
             subscription.on_turn_completed(&event, now_ms())
         }
@@ -8643,6 +8666,44 @@ pub(crate) mod tests {
         }
     }
 
+    /// Await the session's next status snapshot, preserving its status so a
+    /// regression can distinguish a stale completion's truthful `running`
+    /// correction from a false idle assertion.
+    async fn await_next_status_snapshot(
+        wire: &mut tokio::sync::broadcast::Receiver<String>,
+        thread_id: &str,
+    ) -> Value {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "the expected status snapshot never flowed"
+            );
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, wire.recv()).await else {
+                continue;
+            };
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["sessionId"] == thread_id
+                && frame["event"]["type"] == "freshAgent.session.snapshot"
+            {
+                return frame;
+            }
+        }
+    }
+
+    /// No further frame may follow a completion-derived snapshot when this
+    /// helper is used: a stale compact completion must not ring while a newer
+    /// turn is running, and a real completion must ring exactly once.
+    async fn assert_wire_quiet(wire: &mut tokio::sync::broadcast::Receiver<String>) {
+        let received =
+            tokio::time::timeout(std::time::Duration::from_millis(100), wire.recv()).await;
+        assert!(
+            received.is_err(),
+            "unexpected extra wire frame: {received:?}"
+        );
+    }
+
     /// Insert a live, IDLE fake codex session whose notification consumer is the REAL
     /// one ([`FreshCodexState::spawn_consumer`]), returning the scripted server end of
     /// the channel plus a fresh bus receiver.
@@ -9200,15 +9261,25 @@ pub(crate) mod tests {
         peer.respond(&turn_req, json!({ "turn": { "id": "turn-new-9" } }));
         send_driver.await.expect("send task");
 
-        // The compact's OWN delayed completion lands NOW: clears the compact
-        // window (ownership match) — and MUST leave the newer send's
-        // `active_turn` untouched. The rollback gate stays BUSY on it.
+        // The compact's OWN delayed completion lands NOW: it clears the compact
+        // window (ownership match) but MUST leave the newer send's `active_turn`
+        // untouched. Because the client has only a session-scoped status/chime
+        // channel (no completion turn id), this stale completion must correct it
+        // to RUNNING and must never ring; an idle snapshot/chime would falsely
+        // make the newer turn look complete.
         drain_wire(&mut wire);
         peer.emit_notification(
             "turn/completed",
             json!({ "threadId": "thread-cnewer", "turn": { "id": "turn-c-1", "status": "completed" } }),
         );
-        await_next_idle_snapshot(&mut wire, "thread-cnewer").await;
+        let stale_completion_snapshot =
+            await_next_status_snapshot(&mut wire, "thread-cnewer").await;
+        assert_eq!(
+            stale_completion_snapshot["event"]["status"],
+            json!("running"),
+            "the compact completion is stale against the newer active turn"
+        );
+        assert_wire_quiet(&mut wire).await;
         let (sink, captured) = capturing_sink();
         let rollback_driver = {
             let st = st.clone();
@@ -9233,13 +9304,21 @@ pub(crate) mod tests {
             "ep2-r4: the compact's completion never reaches past its own window — the newer turn still owns the gate"
         );
 
-        // The newer turn's OWN completion releases the gate exactly here.
-        drain_wire(&mut wire);
+        // The newer turn's OWN completion releases the gate exactly here: the
+        // first idle snapshot and only chime in this overlap belong to it.
         peer.emit_notification(
             "turn/completed",
             json!({ "threadId": "thread-cnewer", "turn": { "id": "turn-new-9", "status": "completed" } }),
         );
         await_next_idle_snapshot(&mut wire, "thread-cnewer").await;
+        let next = tokio::time::timeout(std::time::Duration::from_secs(5), wire.recv())
+            .await
+            .expect("the newer completion chime arrived")
+            .expect("wire remains open");
+        let next: Value = serde_json::from_str(&next).unwrap();
+        assert_eq!(next["sessionId"], json!("thread-cnewer"));
+        assert_eq!(next["event"]["type"], json!("freshAgent.turn.complete"));
+        assert_wire_quiet(&mut wire).await;
         let (sink, captured) = capturing_sink();
         let rollback_driver = {
             let st = st.clone();
