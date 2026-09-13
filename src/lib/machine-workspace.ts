@@ -15,6 +15,8 @@ type MachineWorkspaceStore = {
   getState: () => Pick<RootState, 'panes'>
 }
 
+const MACHINE_BOOTSTRAP_RECOVERY_EXCLUSION_PREFIX = 'machine-bootstrap:'
+
 function armTerminalRestores(state: Pick<RootState, 'panes'>, tabIds: string[]): void {
   const walk = (node: PaneNode | undefined): void => {
     if (!node) return
@@ -61,13 +63,23 @@ export async function restoreMachineWorkspace(
   machineId: string,
   options: RestoreMachineWorkspaceOptions = {},
 ): Promise<{ restoredTabs: number }> {
+  // The recovery endpoint treats clientInstanceId as an opaque exclusion key.
+  // The general recovery offer passes the real id so it cannot offer the page
+  // its own already-loaded state. Machine bootstrap is different: local state
+  // is about to be replaced, and a reload keeps the same sessionStorage id.
+  // A reserved, non-client prefix therefore includes that window's last
+  // durable snapshot without changing the normal recovery-offer contract.
+  const bootstrapExclusionId =
+    `${MACHINE_BOOTSTRAP_RECOVERY_EXCLUSION_PREFIX}${getCurrentTabRegistryClientInstanceId()}`
   const inventory = await getRecoveryInventory(
-    getCurrentTabRegistryClientInstanceId(),
+    bootstrapExclusionId,
     Math.max(0, Date.now() - bootCapturedAtMs),
     { machineId },
   )
   assertInventoryIsScopedToMachine(inventory, machineId)
-  const plans = inventory.recoverable ? buildRecoveryPlan(inventory) : []
+  const plans = inventory.recoverable
+    ? buildRecoveryPlan(inventory, { preserveIdsForMachine: machineId })
+    : []
 
   // bb58dc001 follow-up (reload-safety): the recovery inventory EXCLUDES the
   // requester's own generations by design (D2 — a live client owns its own

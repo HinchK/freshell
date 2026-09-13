@@ -82,11 +82,13 @@ describe('restoreMachineWorkspace', () => {
     await restoreMachineWorkspace(store, MACHINE_ID)
 
     expect(getRecoveryInventory).toHaveBeenCalledWith(
-      'client-machine-test',
+      'machine-bootstrap:client-machine-test',
       expect.any(Number),
       { machineId: MACHINE_ID },
     )
     expect(store.getState().tabs.tabs.map((tab) => tab.title)).toEqual(['Recovered workspace'])
+    expect(store.getState().tabs.tabs.map((tab) => tab.id)).toEqual(['recovered-tab'])
+    expect(store.getState().panes.layouts['recovered-tab']?.id).toBe('recovered-pane')
     expect(store.getState().tabs.tabs.map((tab) => tab.id)).not.toContain('foreign-tab')
     expect(store.getState().panes.layouts['foreign-tab']).toBeUndefined()
   })
