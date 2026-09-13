@@ -352,7 +352,7 @@ test.describe('Session Directory Matrix', () => {
     async function iconViewBox(sessionId: string): Promise<string | null> {
       const row = page.locator(`[data-session-id="${sessionId}"]`)
       await expect(row).toBeVisible({ timeout: 10_000 })
-      return row.locator('svg').first().getAttribute('viewBox')
+      return row.locator('div.relative > svg').getAttribute('viewBox')
     }
 
     const alphaViewBox = await iconViewBox(SESSION_ALPHA_ID)

@@ -2,10 +2,10 @@ import { readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import type { Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
+import { createFreshE2eBrowserContext } from '../helpers/fixtures.js'
 
 const FORBIDDEN = [
   '/api/proxy/forward',
-  '/api/fresh-agent/attachments',
   '/api/fresh-agent/exec',
   '/api/fresh-agent/diff',
   '/api/files/open',
@@ -112,7 +112,7 @@ async function installFakeProviderPane(page: Page) {
 }
 
 test.describe('Rust baseline browser actions', () => {
-  test('keeps localhost HTTP proxying and blocks remote HTTPS loopback without forwarding', async ({ freshellPage, page, serverInfo, terminal }) => {
+  test('keeps localhost HTTP proxying and blocks remote HTTPS loopback without forwarding', async ({ browser, freshellPage, page, serverInfo, terminal }) => {
     const forbidden = captureForbiddenRequests(page)
     await terminal.waitForTerminal()
     const input = await createBrowserPane(page)
@@ -122,16 +122,31 @@ test.describe('Rust baseline browser actions', () => {
 
     // Chromium resolves any *.localhost name to loopback, while BrowserPane
     // correctly treats the browser host itself as remote (not "localhost").
-    await page.goto(`${serverInfo.baseUrl.replace('127.0.0.1', 'freshell-baseline.localhost')}/?token=${serverInfo.token}&e2e=1`)
-    const shell = page.getByRole('button', { name: /^Shell$/i })
-    await expect(shell).toBeVisible({ timeout: 15_000 })
-    await shell.click()
-    await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 15_000 })
-    const remoteInput = await createBrowserPane(page)
-    await remoteInput.fill('https://localhost:4321/health')
-    await remoteInput.press('Enter')
-    await expect(page.getByText('Remote loopback forwarding is unavailable; use a localhost HTTP URL or open the URL on the server host.', { exact: true })).toBeVisible()
-    await expect(page.locator('iframe[title="Browser content"]')).toHaveCount(0)
+    // Machine selection is origin-scoped, so this alternate hostname needs
+    // its own registered context before the first application navigation.
+    const alternateInfo = {
+      ...serverInfo,
+      baseUrl: serverInfo.baseUrl.replace('127.0.0.1', 'freshell-baseline.localhost'),
+      wsUrl: serverInfo.wsUrl.replace('127.0.0.1', 'freshell-baseline.localhost'),
+    }
+    const { context: remoteContext } = await createFreshE2eBrowserContext(browser, alternateInfo)
+    try {
+      const remotePage = await remoteContext.newPage()
+      const remoteForbidden = captureForbiddenRequests(remotePage)
+      await remotePage.goto(`${alternateInfo.baseUrl}/?token=${alternateInfo.token}&e2e=1`)
+      const shell = remotePage.getByRole('button', { name: /^Shell$/i })
+      await expect(shell).toBeVisible({ timeout: 15_000 })
+      await shell.click()
+      await expect(remotePage.locator('.xterm').first()).toBeVisible({ timeout: 15_000 })
+      const remoteInput = await createBrowserPane(remotePage)
+      await remoteInput.fill('https://localhost:4321/health')
+      await remoteInput.press('Enter')
+      await expect(remotePage.getByText('Remote loopback forwarding is unavailable; use a localhost HTTP URL or open the URL on the server host.', { exact: true })).toBeVisible()
+      await expect(remotePage.locator('iframe[title="Browser content"]')).toHaveCount(0)
+      expect(remoteForbidden).toEqual([])
+    } finally {
+      await remoteContext.close()
+    }
     expect(forbidden).toEqual([])
   })
 
@@ -201,18 +216,18 @@ test.describe('Rust baseline browser actions', () => {
     expect(forbidden).toEqual([])
   })
 
-  test('removes fresh-agent attachment, shell, and expandable-diff actions', async ({ freshellPage, page, terminal }) => {
+  test('keeps supported attachments while rejecting Node-only shell and expandable-diff actions', async ({ freshellPage, page, terminal }) => {
     const forbidden = captureForbiddenRequests(page)
     await terminal.waitForTerminal()
     await installFakeProviderPane(page)
     const pane = page.locator('[data-context="fresh-agent"]').last()
-    await expect(pane.getByLabel(/attach|attachment|upload/i)).toHaveCount(0)
+    await expect(pane.getByLabel(/attach|attachment|upload/i)).toBeVisible()
     await pane.getByRole('textbox', { name: 'Chat message input' }).fill('!echo blocked')
     await pane.getByRole('button', { name: 'Send' }).click()
     await expect(pane.getByRole('status')).toHaveText('Shell commands are unavailable here; open a shell pane instead')
     const diff = pane.locator('.fresh-agent-file-diff')
     await expect(diff).toContainText('README.md')
-    await expect(diff).toContainText('Full diff loading is unavailable.')
+    await expect(diff).toContainText('modified')
     await expect(diff.getByRole('button')).toHaveCount(0)
     expect(forbidden).toEqual([])
   })

@@ -374,7 +374,7 @@ test.describe('CFG-01 lossless config.json writes (rust)', () => {
     }
   })
 
-  test('every REST writer preserves all sentinels; restart writes nothing', async () => {
+  test('every REST writer preserves all sentinels; restart writes only its supported migration once', async () => {
     test.setTimeout(120_000)
     const homeDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-e2e-cfg01-'))
     const emptyExtDir = path.join(homeDir, 'no-extensions')
@@ -398,18 +398,35 @@ test.describe('CFG-01 lossless config.json writes (rust)', () => {
     }
     await writeConfig(homeDir, seeded)
 
-    // ── Restart leg: a fully-normalized config boots to a NO-OP — the file
-    // after boot 2 must be byte-for-byte semantically identical (knownProviders
-    // present, stored seed canonical, no stray local keys).
+    // ── Restart leg: startup records the one supported migration exactly once.
+    // Everything else remains byte-for-byte semantically identical.
     await stopProcessGracefully(server.proc)
     server = await spawnRustServer(homeDir, emptyExtDir)
     const afterRestart = await readConfig(homeDir)
+    const expectedAfterRestart = {
+      ...seeded,
+      completedMigrations: [...seeded.completedMigrations, 'ai-title-shadow-cleanup'],
+    }
+    expect(afterRestart.completedMigrations).toEqual(expectedAfterRestart.completedMigrations)
     expectDiffWithin(
-      collectDiffPaths(seeded, afterRestart),
+      collectDiffPaths(expectedAfterRestart, afterRestart),
       [],
       'normalized boot with sentinels present',
     )
-    expectSentinelsIntact(seeded, afterRestart, 'restart')
+    expectSentinelsIntact(expectedAfterRestart, afterRestart, 'restart')
+
+    // The migration is idempotent: a later restart neither appends it again
+    // nor changes any unrelated config field.
+    await stopProcessGracefully(server.proc)
+    server = await spawnRustServer(homeDir, emptyExtDir)
+    const afterSecondRestart = await readConfig(homeDir)
+    expect(afterSecondRestart.completedMigrations).toEqual(expectedAfterRestart.completedMigrations)
+    expectDiffWithin(
+      collectDiffPaths(expectedAfterRestart, afterSecondRestart),
+      [],
+      'second normalized boot with sentinels present',
+    )
+    expectSentinelsIntact(expectedAfterRestart, afterSecondRestart, 'second restart')
 
     // ── Writer legs: after each action, only that writer's intended paths
     // may differ, and every sentinel key must be intact.

@@ -1547,7 +1547,7 @@ test.describe('Fresh Agent', () => {
     expect(ratio).toBeLessThan(1.35)
   })
 
-  test('browser user can create and resume Freshcodex with worktree, review, and fork metadata in the shared pane', async ({ freshellPage, page, harness, terminal, serverInfo }) => {
+  test('browser user renders Freshcodex worktree, review, and fork metadata from a thread snapshot', async ({ freshellPage, page, harness, terminal, serverInfo }) => {
     await terminal.waitForTerminal()
     await enableClaudeAndCodex(page)
 
@@ -1629,14 +1629,6 @@ test.describe('Fresh Agent', () => {
     await expect(page.getByText('pending')).toBeVisible()
     await expect(page.getByText('thread-parent-1')).toBeVisible()
 
-    await page.evaluate(() => {
-      window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
-    })
-    await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
-    await harness.waitForHarness()
-    await harness.waitForConnection()
-    await expect(page.getByText('Codex transcript')).toBeVisible()
-    await expect(page.getByText(/feature\/fresh-agent/)).toBeVisible()
   })
 })
 

@@ -394,21 +394,27 @@ test.describe('TERM-04 terminal.create requestId dedupe', () => {
     const leafAfter = findTerminalLeaf(await harnessA.getPaneLayout(tabIdA))
     expect(leafAfter.content.terminalId).toBe(terminalId)
     expect(leafAfter.content.createRequestId).toBe(requestId)
-    // One pane owner, BOTH halves: page B's own pane tree must not have
-    // adopted the terminal either (the checklist's "one pane owner").
-    const pageBOwnersT: boolean = await pageB.evaluate((tid) => {
+    // Page B is another view of the same machine workspace. It must render
+    // the already-created terminal with its exact durable identities rather
+    // than minting a second terminal or a remapped create request.
+    const pageBTerminal = await pageB.evaluate((tid) => {
       const st = window.__FRESHELL_TEST_HARNESS__?.getState()
       const layouts = st?.panes?.layouts ?? {}
       const stack: any[] = Object.values(layouts)
       while (stack.length) {
         const node = stack.pop()
         if (!node) continue
-        if (node.type === 'leaf' && node.content?.terminalId === tid) return true
+        if (node.type === 'leaf' && node.content?.terminalId === tid) {
+          return {
+            terminalId: node.content.terminalId,
+            createRequestId: node.content.createRequestId,
+          }
+        }
         for (const child of node.children ?? []) stack.push(child)
       }
-      return false
+      return null
     }, terminalId)
-    expect(pageBOwnersT).toBe(false)
+    expect(pageBTerminal).toEqual({ terminalId, createRequestId: requestId })
     // Page B stays healthy (its unicast reply must not wedge its app).
     expect(await harnessB.getConnectionStatus()).toBe('ready')
 

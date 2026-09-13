@@ -872,26 +872,13 @@ test.describe('Restore Matrix', () => {
   // two full live turns, asserting the SAME durable session is targeted
   // afterward and no second/duplicate thread is ever created.
   //
-  // HONEST SCOPE NOTE (AGENT-02's "exactly three user/assistant turn
-  // pairs"): the fake Codex app-server
-  // (`test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs` --
-  // OUT OF SCOPE for this pass, which owns only `test/e2e-browser/**`) does
-  // not persist per-turn transcript content across a process restart --
-  // `thread/turns/list`/`thread/read` always answer with the fixture's
-  // single generic default turn (`makeTurn()`, text "Fixture turn")
-  // regardless of how many LIVE turns preceded the restart, because that
-  // handler doesn't accumulate a growing turns array (see `successResult`'s
-  // `thread/turns/list` branch -- it reads `behavior.threadTurns`, a static
-  // config value, never something turn/start calls append to). Proving an
-  // EXACT, per-turn-content-faithful count survives a real restart would
-  // require adding persistent turn storage to that fixture -- a fixture
-  // change, which this pass cannot make. This test instead proves
-  // everything that IS achievable within that real constraint: two full
-  // live turns exchanged pre-restart (each independently confirmed via a
-  // real fixture round trip, not a client-side assumption), the SAME
-  // durable session (never a fresh one) is targeted post-restart via every
-  // `freshAgent.create`/`freshAgent.attach` sent, and the resumed pane
-  // renders real non-blank content rather than a blank/broken pane.
+  // The fake Codex app-server's optional durable-turn mode is enabled below;
+  // it is a pre-existing fixture behavior, not a production substitute.
+  // This scenario enables the fake app-server's existing `recordTurns`
+  // behavior. It records each user/assistant pair under the test-owned
+  // CODEX_HOME and replays that durable transcript after the owned server
+  // restarts, so the two distinct prompts below are meaningful continuity
+  // evidence rather than short-lived optimistic echoes.
   // FIXED (codex-first triage): `crates/freshell-freshagent/src/codex.rs`'s
   // `build_codex_snapshot_json` used to fold an independently-tracked,
   // server-local `active_turn_present` bit into `capabilities.send`'s
@@ -928,7 +915,10 @@ test.describe('Restore Matrix', () => {
             // rejects the second `thread/start` with an RPC error (see
             // `fake-app-server.mjs`'s `assertNoDuplicateActiveThread`
             // handling), which would surface as a visible pane error.
-            FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({ assertNoDuplicateActiveThread: true }),
+            FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
+              assertNoDuplicateActiveThread: true,
+              recordTurns: true,
+            }),
           },
           setupHome: async (homeDir) => {
             const freshellDir = path.join(homeDir, '.freshell')
@@ -1008,15 +998,9 @@ test.describe('Restore Matrix', () => {
         const composer = paneRoot.getByRole('textbox', { name: 'Chat message input' })
         const sendButton = paneRoot.getByRole('button', { name: 'Send' })
 
-        // The fake app-server's `turn/start` handler always answers with
-        // the SAME static turn id (`makeTurn('turn-1')` -- see
-        // `fake-app-server.mjs`'s `successResult`), so the client correctly
-        // treats repeat replies as updates to that one item rather than
-        // appending a new transcript entry each time (real React-key
-        // de-duplication behavior, not a bug to work around by counting
-        // "Fixture turn" occurrences). Each turn is instead independently
-        // confirmed via its OWN unique prompt text becoming visible in the
-        // transcript, which IS distinct per send.
+        // `recordTurns` makes each accepted turn a durable user/assistant
+        // pair. The helper verifies the actual submit, provider reply, and
+        // idle transition before the next turn begins.
         async function sendLiveTurn(text: string): Promise<void> {
           await expect.poll(async () => {
             const layout = await harness.getPaneLayout(tabId!)
@@ -1039,6 +1023,12 @@ test.describe('Restore Matrix', () => {
         const turn2Text = `term02-restart-turn-two-${Math.random().toString(36).slice(2, 8)}`
         await sendLiveTurn(turn1Text)
         await sendLiveTurn(turn2Text)
+
+        // These survive the second authoritative snapshot before the restart,
+        // proving this is the fixture's durable transcript rather than two
+        // local optimistic echoes.
+        await expect(paneRoot.getByText(turn1Text)).toBeVisible({ timeout: 20_000 })
+        await expect(paneRoot.getByText(turn2Text)).toBeVisible({ timeout: 20_000 })
 
         await page.evaluate(() => {
           window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
@@ -1094,6 +1084,9 @@ test.describe('Restore Matrix', () => {
         // again rather than stuck restoring.
         await expect(page.locator('[data-context="fresh-agent"]').last().getByText('Fixture turn'))
           .toBeVisible({ timeout: 20_000 })
+        const resumedPane = page.locator('[data-context="fresh-agent"]').last()
+        await expect(resumedPane.getByText(turn1Text)).toBeVisible({ timeout: 20_000 })
+        await expect(resumedPane.getByText(turn2Text)).toBeVisible({ timeout: 20_000 })
         await expect.poll(async () => {
           const layout = await harness.getPaneLayout(rehydratedTabId!)
           return findFreshAgentLeaf(layout)?.content?.status

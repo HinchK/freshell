@@ -127,6 +127,7 @@ function terminalContentAt(
 describe('restoreMachineWorkspace', () => {
   beforeEach(() => {
     vi.mocked(getRecoveryInventory).mockReset()
+    localStorage.clear()
   })
 
   it('replaces local state with only the selected machine scoped workspace before sync can start', async () => {
@@ -348,6 +349,10 @@ describe('restoreMachineWorkspace', () => {
     ['a different terminal mode', 'codex', 'same-create-request'],
   ] as const)('does not copy a crash trace onto recovery with %s', async (_description, mode, createRequestId) => {
     const store = createStore()
+    // These are identity-mismatch tests, not origin-gate tests. Seed the
+    // same-machine origin explicitly so either mismatch is what rejects the
+    // stale decoration when this case runs independently.
+    localStorage.setItem(MACHINE_WORKSPACE_ORIGIN_STORAGE_KEY, MACHINE_ID)
     store.dispatch(addTab({ id: 'recovered-tab', title: 'Cached workspace' }))
     store.dispatch(initLayout({
       tabId: 'recovered-tab',
