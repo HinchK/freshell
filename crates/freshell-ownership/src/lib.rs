@@ -658,6 +658,13 @@ pub struct StaleStartFence {
     /// b8ke e3r4 F3: WHICH stale reason is fenced — the probe's evidence
     /// discipline is reason-aware and the release records carry it.
     pub reason: FenceReason,
+    /// b8ke d4 F2: the fenced TERMINAL prior's recorded pane/pty identity —
+    /// the probe's terminal-liveness evidence (a terminal prior is NEVER
+    /// probed through the Fresh Agent lanes: the opencode Fresh probe
+    /// answers "true" because no Fresh map/turn exists, releasing while
+    /// the terminal still runs; the claude/codex Fresh probes answer
+    /// "false" forever, wedging even a dead terminal's fence).
+    pub prior_terminal_id: Option<String>,
 }
 
 /// One replayed owner record for the `ready.runtimeOwners` handshake field
@@ -1781,6 +1788,9 @@ impl RuntimeOwnershipRegistry {
                     prior_kind: prior.as_ref().map(|(owner, _)| owner.kind),
                     settle_concluded,
                     reason: *reason,
+                    prior_terminal_id: prior
+                        .as_ref()
+                        .and_then(|(owner, _)| owner.terminal_id.clone()),
                 });
             }
         }

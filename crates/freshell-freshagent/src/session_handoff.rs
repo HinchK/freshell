@@ -54,6 +54,17 @@ pub struct HandoffTestHooks {
     /// exactly as alive as the test made it). Atomic so a test can clear it
     /// for the retry assertion.
     pub force_reap_timeout: std::sync::atomic::AtomicBool,
+    /// b8ke d4 F1: short-circuit `stop_runtime` to the FENCED reap-timeout
+    /// shape (`ReapTimeout { fenced: true }` — the kill was issued, its
+    /// confirmation detached) and to the PlatformLimited teardown — the
+    /// uncommitted-target consumption tests' deterministic outcomes. The
+    /// SKIP counter is decremented per `stop_runtime` call and the forced
+    /// outcome applies only once it reaches zero, so a test can pass the
+    /// PRIOR stop normally (skip = 1) and force the TARGET reap (call 2).
+    pub force_reap_timeout_fenced: std::sync::atomic::AtomicBool,
+    pub force_reap_timeout_fenced_skip: std::sync::atomic::AtomicUsize,
+    pub force_platform_limited: std::sync::atomic::AtomicBool,
+    pub force_platform_limited_skip: std::sync::atomic::AtomicUsize,
     /// b8ke focused review FR6: abort the detached reap-confirmation task
     /// at the NEXT watcher spawn — the injected REAL JoinError (cancelled)
     /// the watcher's fail-open typed release is tested against. Atomic so
@@ -79,6 +90,10 @@ impl Default for HandoffTestHooks {
             pause_in_target_spawn: None,
             spawn_watch_slot: std::sync::Mutex::new(None),
             force_reap_timeout: std::sync::atomic::AtomicBool::new(false),
+            force_reap_timeout_fenced: std::sync::atomic::AtomicBool::new(false),
+            force_reap_timeout_fenced_skip: std::sync::atomic::AtomicUsize::new(0),
+            force_platform_limited: std::sync::atomic::AtomicBool::new(false),
+            force_platform_limited_skip: std::sync::atomic::AtomicUsize::new(0),
             abort_reap_confirmation_once: std::sync::atomic::AtomicBool::new(false),
             drop_abort_target_confirmation_once: std::sync::atomic::AtomicBool::new(false),
             fail_target_spawn_once: std::sync::atomic::AtomicBool::new(false),
@@ -1072,9 +1087,33 @@ impl SessionHandoffRunner {
                                  window — the uncommitted target is reaped and the \
                                  handoff answers the typed failure"
                             );
-                            self.reap_uncommitted_target(&req, &owner, &operation_id, generation)
+                            let reap_outcome = self
+                                .reap_uncommitted_target(&req, &owner, &operation_id, generation)
                                 .await;
-                            let _ = guard.disarm_and_fail();
+                            if let StopOutcomePriv::PlatformLimitedFenced = reap_outcome {
+                                // b8ke d4 F1: the platform-limited teardown
+                                // fences the typed fence (no watcher can
+                                // ever confirm the descendant tree here).
+                                guard.disarm();
+                                let _ = self.ownership.fence_unconfirmed_handoff(
+                                    &req.provider,
+                                    &req.session_id,
+                                    &operation_id,
+                                    generation,
+                                    freshell_ownership::FenceReason::PlatformLimited,
+                                );
+                            } else if !self
+                                .uncommitted_target_reap_vacates(&reap_outcome, &mut guard)
+                            {
+                                tracing::warn!(target: "freshell_ownership",
+                                    operation_id = %operation_id,
+                                    provider = %req.provider,
+                                    session_id = %req.session_id,
+                                    "ownership.handoff.uncommitted_target_reap_unconfirmed: \
+                                     the flavor-write failure's target reap is unconfirmed — \
+                                     the key stays FENCED (the detached watcher resolves it), \
+                                     never Vacant over an unconfirmed target");
+                            }
                             self.broadcast_failure_truth(
                                 &req,
                                 &operation_id,
@@ -1182,9 +1221,29 @@ impl SessionHandoffRunner {
                     // owner record — then fail typed (round-1 review).
                     stale @ (CommitOutcome::StaleGeneration { .. }
                     | CommitOutcome::ForeignOperation) => {
-                        self.reap_uncommitted_target(&req, &owner, &operation_id, generation)
+                        let reap_outcome = self
+                            .reap_uncommitted_target(&req, &owner, &operation_id, generation)
                             .await;
-                        let _ = guard.disarm_and_fail();
+                        if let StopOutcomePriv::PlatformLimitedFenced = reap_outcome {
+                            // b8ke d4 F1: the typed PlatformLimited fence.
+                            guard.disarm();
+                            let _ = self.ownership.fence_unconfirmed_handoff(
+                                &req.provider,
+                                &req.session_id,
+                                &operation_id,
+                                generation,
+                                freshell_ownership::FenceReason::PlatformLimited,
+                            );
+                        } else if !self.uncommitted_target_reap_vacates(&reap_outcome, &mut guard) {
+                            tracing::warn!(target: "freshell_ownership",
+                                operation_id = %operation_id,
+                                provider = %req.provider,
+                                session_id = %req.session_id,
+                                "ownership.handoff.uncommitted_target_reap_unconfirmed: \
+                                 the stale-commit's target reap is unconfirmed — the key \
+                                 stays FENCED (the detached watcher resolves it), never \
+                                 Vacant over an unconfirmed target");
+                        }
                         self.broadcast_failure_truth(
                             &req,
                             &operation_id,
@@ -1409,35 +1468,143 @@ impl SessionHandoffRunner {
     /// detaches the confirmation the same way — the watcher's coordinator
     /// release is the op/generation-fenced no-op it should be for a target
     /// that never committed).
+    /// b8ke d4 F1: the uncommitted-target teardown's OUTCOME is consumed —
+    /// only a CONFIRMED reap lets the caller vacate the coordinator entry.
+    /// A reap timeout keeps the kill's confirmation running DETACHED (the
+    /// watcher regime — `stop_runtime`/the terminal arm spawn the
+    /// confirmation watcher, the failure frame precedes it) and the caller
+    /// answers the typed failure with the key FENCED in Handoff (the
+    /// watcher releases it once death is confirmed — pre-d4 both callers
+    /// discarded the result and vacated the key while the target was
+    /// alive/unconfirmed, and the stale-start watcher could no longer
+    /// resolve it: the record was already Vacant).
     async fn reap_uncommitted_target(
         self: &Arc<Self>,
         req: &HandoffRequest,
         owner: &OwnerIdentity,
         operation_id: &str,
         generation: u64,
-    ) {
+    ) -> StopOutcomePriv {
+        // b8ke d4 F1: the deterministic forced outcome (shared counter
+        // budget with stop_runtime — the prior stop consumes the skip).
+        if let Some(outcome) = self.forced_stop_outcome(req, owner, operation_id, generation) {
+            return outcome;
+        }
         match owner.kind {
             RuntimeOwnerKind::Terminal => {
                 if let Some(terminal_id) = owner.terminal_id.as_deref() {
                     if self.registry.kill(terminal_id) {
-                        let _ = tokio::time::timeout(
-                            std::time::Duration::from_millis(self.reap_timeout_ms),
-                            await_terminal_dead(&self.registry, terminal_id),
-                        )
-                        .await;
+                        let budget = std::time::Duration::from_millis(self.reap_timeout_ms);
+                        let mut confirm =
+                            std::pin::pin!(await_terminal_dead(&self.registry, terminal_id));
+                        tokio::select! {
+                            () = &mut confirm => StopOutcomePriv::Reaped,
+                            _ = tokio::time::sleep(budget) => {
+                                // The kill was issued; the row's death is
+                                // merely unobserved — the DETACHED watcher
+                                // owns the release (the failure frame first,
+                                // FR5), exactly like the prior-stop arm.
+                                self.broadcast_fenced_reap_timeout(
+                                    req, owner, operation_id, generation,
+                                );
+                                let registry = self.registry.clone();
+                                let tid = terminal_id.to_string();
+                                self.spawn_reap_confirmation_watcher(
+                                    req,
+                                    operation_id,
+                                    generation,
+                                    "handoff-runner-stale-commit",
+                                    owner,
+                                    "REAP_TIMEOUT",
+                                    async move {
+                                        await_terminal_dead(&registry, &tid).await;
+                                        ReapAnswer::Confirmed
+                                    },
+                                );
+                                StopOutcomePriv::ReapTimeout { fenced: true }
+                            }
+                        }
+                    } else {
+                        // No row to kill (already gone): confirmed absent.
+                        StopOutcomePriv::Reaped
                     }
+                } else {
+                    StopOutcomePriv::Reaped
                 }
             }
             RuntimeOwnerKind::FreshAgent => {
-                let _ = self
-                    .stop_runtime(
-                        req,
-                        owner,
-                        "handoff-runner-stale-commit",
-                        operation_id,
-                        generation,
-                    )
-                    .await;
+                self.stop_runtime(
+                    req,
+                    owner,
+                    "handoff-runner-stale-commit",
+                    operation_id,
+                    generation,
+                )
+                .await
+            }
+        }
+    }
+
+    /// b8ke d4 F1: the hook's deterministic fenced-timeout watcher —
+    /// a confirmation that resolves CONFIRMED after a short delay, so the
+    /// tests can observe BOTH halves of the regime: the key stays FENCED
+    /// in Handoff immediately after the typed failure (never Vacant over
+    /// an unconfirmed target), then the detached watcher RESOLVES it to
+    /// Vacant once its confirmation lands.
+    fn spawn_noop_reap_watcher(
+        self: &Arc<Self>,
+        req: &HandoffRequest,
+        operation_id: &str,
+        generation: u64,
+        owner: &OwnerIdentity,
+    ) {
+        let confirmation = async {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            ReapAnswer::Confirmed
+        };
+        self.spawn_reap_confirmation_watcher(
+            req,
+            operation_id,
+            generation,
+            "handoff-runner-stale-commit",
+            owner,
+            "REAP_TIMEOUT",
+            confirmation,
+        );
+    }
+
+    /// b8ke d4 F1: consume the uncommitted-target reap's outcome. Only a
+    /// CONFIRMED reap lets the caller vacate the coordinator entry; a reap
+    /// timeout keeps the key FENCED in Handoff (the detached watcher owns
+    /// the release — same regime as the prior-stop path), and a
+    /// platform-limited teardown fences `Fenced{PlatformLimited}` (the
+    /// documented no-watcher tradeoff). Returns `true` when the caller may
+    /// vacate (the confirmed-reap shape).
+    fn uncommitted_target_reap_vacates(
+        &self,
+        outcome: &StopOutcomePriv,
+        guard: &mut HandoffGuard,
+    ) -> bool {
+        match outcome {
+            StopOutcomePriv::Reaped => {
+                let _ = guard.disarm_and_fail();
+                true
+            }
+            StopOutcomePriv::ReapTimeout { fenced: true } => {
+                // The watcher performs the release — the key stays FENCED in
+                // Handoff; a timeout-watcher/probe can still resolve it.
+                guard.disarm();
+                false
+            }
+            StopOutcomePriv::PlatformLimitedFenced => {
+                guard.disarm();
+                false
+            }
+            StopOutcomePriv::ReapTimeout { fenced: false } => {
+                // The pre-kill short-circuit (no teardown was issued):
+                // nothing was killed, the entry may vacate.
+                let _ = guard.disarm_and_fail();
+                true
             }
         }
     }
@@ -1968,6 +2135,66 @@ impl SessionHandoffRunner {
     /// [`StopResult::NotConfirmed`] (its bounded tree-death confirmation
     /// window expired with the runtime still alive) takes the SAME fenced
     /// path — the carried continuation is the watcher's confirmation.
+    /// b8ke d4 F1: the test hooks' deterministic forced outcomes — the
+    /// pre-kill `fenced:false` short-circuit, plus the fenced timeout /
+    /// PlatformLimited shapes gated on the shared skip counters (so a
+    /// test can pass the prior stop normally and force the TARGET reap —
+    /// consulted at the top of BOTH `stop_runtime` and
+    /// `reap_uncommitted_target`, one shared counter budget).
+    fn forced_stop_outcome(
+        self: &Arc<Self>,
+        req: &HandoffRequest,
+        owner: &OwnerIdentity,
+        operation_id: &str,
+        generation: u64,
+    ) -> Option<StopOutcomePriv> {
+        let hooks = self.test_hooks.as_ref()?;
+        if hooks
+            .force_reap_timeout
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Some(StopOutcomePriv::ReapTimeout { fenced: false });
+        }
+        if hooks
+            .force_reap_timeout_fenced
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && hooks
+                .force_reap_timeout_fenced_skip
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |n| if n == 0 { None } else { Some(n - 1) },
+                )
+                .is_err()
+        {
+            self.broadcast_fenced_reap_timeout(req, owner, operation_id, generation);
+            self.spawn_noop_reap_watcher(req, operation_id, generation, owner);
+            return Some(StopOutcomePriv::ReapTimeout { fenced: true });
+        }
+        if hooks
+            .force_platform_limited
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && hooks
+                .force_platform_limited_skip
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |n| if n == 0 { None } else { Some(n - 1) },
+                )
+                .is_err()
+        {
+            self.broadcast_fenced_stop_refusal(
+                req,
+                owner,
+                operation_id,
+                generation,
+                "PLATFORM_LIMITED",
+            );
+            return Some(StopOutcomePriv::PlatformLimitedFenced);
+        }
+        None
+    }
+
     async fn stop_runtime(
         self: &Arc<Self>,
         req: &HandoffRequest,
@@ -1976,13 +2203,8 @@ impl SessionHandoffRunner {
         operation_id: &str,
         generation: u64,
     ) -> StopOutcomePriv {
-        if let Some(hooks) = self.test_hooks.as_ref() {
-            if hooks
-                .force_reap_timeout
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
-                return StopOutcomePriv::ReapTimeout { fenced: false };
-            }
+        if let Some(outcome) = self.forced_stop_outcome(req, owner, operation_id, generation) {
+            return outcome;
         }
         let budget = std::time::Duration::from_millis(self.reap_timeout_ms);
         match owner.kind {

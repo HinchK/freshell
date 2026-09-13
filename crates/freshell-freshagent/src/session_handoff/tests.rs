@@ -19,7 +19,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use freshell_ownership::{
-    BeginOutcome, OwnershipState, RuntimeOwnerKind, RuntimeOwnershipRegistry,
+    BeginOutcome, FenceReason, OwnershipState, RuntimeOwnerKind, RuntimeOwnershipRegistry,
 };
 use freshell_protocol::{
     AgentProvider, FreshAgentAttach, FreshAgentCompact, FreshAgentCreate, FreshAgentKill,
@@ -1732,7 +1732,7 @@ async fn handoff_with_a_platform_limited_prior_stop_fences_the_key_typed() {
         matches!(
             rig.ownership.observe("claude", &sid).state,
             OwnershipState::Fenced {
-                reason: freshell_ownership::FenceReason::PlatformLimited,
+                reason: FenceReason::PlatformLimited,
                 ..
             }
         ),
@@ -1951,6 +1951,140 @@ async fn a_kilroy_to_claude_cli_handoff_preserves_the_kilroy_flavor() {
         flavors,
         vec![("claude".to_string(), sid.clone(), "kilroy".to_string())],
         "the hidden flavor is PRESERVED across the CLI handoff"
+    );
+}
+
+/// b8ke d4 F1: the uncommitted-target teardown's outcome is CONSUMED —
+/// a flavor-write failure whose target reap TIMES OUT (the kill issued,
+/// the confirmation detached) fences the key in Handoff instead of
+/// vacating it: the typed failure answers immediately, new claims stay
+/// BLOCKED (never a second writer over an unconfirmed target — pre-d4
+/// the discarded outcome vacated the key while the target lived), and
+/// the detached watcher RESOLVES the fence to Vacant once its
+/// confirmation lands.
+#[tokio::test]
+async fn an_unconfirmed_target_reap_on_the_flavor_failure_fences_then_the_watcher_resolves() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let hooks = Arc::new(HandoffTestHooks::default());
+    hooks
+        .force_reap_timeout_fenced
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    hooks
+        .force_reap_timeout_fenced_skip
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let rig = build_rig_inner(
+        Some(Arc::clone(&hooks) as Arc<HandoffTestHooks>),
+        None,
+        None,
+        10_000,
+        None,
+        false,
+        Some(Arc::new(FailingFlavorWriter)),
+    );
+    establish_fresh_claude_owner(&rig, &sid).await;
+
+    // A handoff to a TERMINAL target (the rig's supported direction; the
+    // forced fenced-timeout hook consults at the reap's top).
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let result = handle.completion.await.expect("runner completed");
+    assert_eq!(
+        result["error"]["code"],
+        json!("SESSION_METADATA_WRITE_FAILED"),
+        "the typed failure answers: {result}"
+    );
+    // THE F1 CONTRACT: the key is FENCED in Handoff — NOT Vacant (pre-d4
+    // the discarded outcome vacated the key while the target was
+    // unconfirmed).
+    assert!(
+        matches!(
+            rig.ownership.observe("claude", &sid).state,
+            OwnershipState::Handoff { .. }
+        ),
+        "the unconfirmed target's key stays FENCED in Handoff — got {:?}",
+        rig.ownership.observe("claude", &sid).state
+    );
+    // New claims are BLOCKED (the active-writer refusal held).
+    assert!(matches!(
+        rig.ownership.begin_start(
+            "claude",
+            &sid,
+            RuntimeOwnerKind::Terminal,
+            "op-second-writer-d4",
+            None,
+            "test",
+            0,
+        ),
+        freshell_ownership::BeginOutcome::Blocked { .. }
+    ));
+    // The detached watcher RESOLVES the fence (the hook's confirmation
+    // lands after its short delay).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !matches!(
+        rig.ownership.observe("claude", &sid).state,
+        OwnershipState::Vacant
+    ) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the detached watcher never resolved the fence — state: {:?}",
+            rig.ownership.observe("claude", &sid).state
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// b8ke d4 F1: a PLATFORM-LIMITED target teardown fences the typed
+/// PlatformLimited fence (the documented no-watcher tradeoff) — never
+/// Vacant over an unconfirmable descendant tree.
+#[tokio::test]
+async fn a_platform_limited_target_reap_on_the_flavor_failure_fences_typed() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let hooks = Arc::new(HandoffTestHooks::default());
+    hooks
+        .force_platform_limited
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    hooks
+        .force_platform_limited_skip
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let rig = build_rig_inner(
+        Some(Arc::clone(&hooks) as Arc<HandoffTestHooks>),
+        None,
+        None,
+        10_000,
+        None,
+        false,
+        Some(Arc::new(FailingFlavorWriter)),
+    );
+    establish_fresh_claude_owner(&rig, &sid).await;
+
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let result = handle.completion.await.expect("runner completed");
+    assert_eq!(
+        result["error"]["code"],
+        json!("SESSION_METADATA_WRITE_FAILED"),
+        "the typed failure answers: {result}"
+    );
+    // THE F1 CONTRACT: the typed PlatformLimited fence — never Vacant.
+    assert!(
+        matches!(
+            rig.ownership.observe("claude", &sid).state,
+            OwnershipState::Fenced {
+                reason: FenceReason::PlatformLimited,
+                ..
+            }
+        ),
+        "the platform-limited target's key ends the typed PlatformLimited \
+         fence — got {:?}",
+        rig.ownership.observe("claude", &sid).state
     );
 }
 
@@ -2274,7 +2408,7 @@ async fn a_platform_limited_fence_recovers_only_through_the_acknowledged_force_c
     assert!(matches!(
         snap.state,
         OwnershipState::Fenced {
-            reason: freshell_ownership::FenceReason::PlatformLimited,
+            reason: FenceReason::PlatformLimited,
             ..
         }
     ));
@@ -2428,7 +2562,7 @@ async fn a_delayed_platform_limited_reap_fences_the_key_and_never_releases() {
             matches!(
                 rig.ownership.observe("claude", &sid).state,
                 OwnershipState::Fenced {
-                    reason: freshell_ownership::FenceReason::PlatformLimited,
+                    reason: FenceReason::PlatformLimited,
                     ..
                 }
             )
@@ -3725,7 +3859,7 @@ async fn an_aborted_from_vacant_platform_limited_target_fences_typed_and_recover
         matches!(
             snap.state,
             OwnershipState::Fenced {
-                reason: freshell_ownership::FenceReason::PlatformLimited,
+                reason: FenceReason::PlatformLimited,
                 prior: None,
                 ..
             }
