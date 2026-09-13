@@ -1496,10 +1496,10 @@ impl TerminalRegistry {
     }
 
     /// Apply `terminal.attach`-supplied viewport geometry BEFORE attach/replay.
-    /// A `viewport_hydrate` establishes geometry only for the first viewer:
-    /// once any subscriber exists, every secondary hydrate is replay-only and
-    /// cannot silently resize a shared PTY. `transport_reconnect` retains its
-    /// narrower reconnect policy, while `keepalive_delta` never resizes.
+    /// Geometry-bearing attach intents establish geometry only for the first
+    /// viewer: once any subscriber exists, every secondary attach or replay
+    /// is geometry-neutral and cannot silently resize a shared PTY.
+    /// `keepalive_delta` never resizes.
     ///
     /// Sample the subscriber map PRE-attach. `attach` inserts/replaces a
     /// subscriber, which would otherwise turn a first viewer into an apparent
@@ -1511,7 +1511,7 @@ impl TerminalRegistry {
     pub fn resize_for_attach(
         &self,
         terminal_id: &str,
-        conn_id: u64,
+        _conn_id: u64,
         intent: TerminalAttachIntent,
         cols: u16,
         rows: u16,
@@ -1525,13 +1525,9 @@ impl TerminalRegistry {
         {
             let mut s = handle.shared.lock().expect("terminal lock");
             let has_any_attached = !s.subscribers.is_empty();
-            let has_other_attached = s.subscribers.keys().any(|k| *k != conn_id);
-            let existing_attachment = s.subscribers.contains_key(&conn_id);
             let should_resize = match intent {
-                TerminalAttachIntent::ViewportHydrate => !has_any_attached,
-                TerminalAttachIntent::TransportReconnect => {
-                    !has_other_attached || existing_attachment
-                }
+                TerminalAttachIntent::ViewportHydrate
+                | TerminalAttachIntent::TransportReconnect => !has_any_attached,
                 TerminalAttachIntent::KeepaliveDelta => false,
             };
             if !should_resize {
@@ -3945,19 +3941,28 @@ mod tests {
     }
 
     #[test]
-    fn resize_for_attach_transport_reconnect_applies_when_same_conn_reattaches() {
+    fn resize_for_attach_transport_reconnect_keeps_repeated_and_fresh_secondary_attaches_neutral() {
         let reg = TerminalRegistry::new();
         reg.insert_headless("T", "S");
-        let (sink1, _seen1) = collector();
-        let (sink2, _seen2) = collector();
-        let _ = reg.attach("T", 1, sink1, Some("a".into()), 0, false, None, None);
-        let _ = reg.attach("T", 2, sink2, Some("b".into()), 0, false, None, None);
-        // conn 2 already has an attachment -> resize even though conn 1 is also attached
-        // (Node: existingAttachment wins over hasOtherAttachedSockets).
+        let (sink_a, _seen_a) = collector();
+        let _ = reg.attach("T", 1, sink_a, Some("a".into()), 0, false, None, None);
+
+        // The first transport reconnect from B is replay-only while A views
+        // the terminal. Register B so its second generation exercises the
+        // same-socket lifecycle path.
         let out = reg.resize_for_attach("T", 2, TerminalAttachIntent::TransportReconnect, 95, 41);
-        assert_eq!(out, AttachResizeStatus::Resized);
-        // First-ever geometry record: no epoch bump.
-        assert_eq!(reg.geometry("T"), Some((95, 41, 1)));
+        assert_eq!(out, AttachResizeStatus::Skipped);
+        let (sink_b, _seen_b) = collector();
+        let _ = reg.attach("T", 2, sink_b, Some("b".into()), 0, false, None, None);
+
+        let out = reg.resize_for_attach("T", 2, TerminalAttachIntent::TransportReconnect, 95, 41);
+        assert_eq!(out, AttachResizeStatus::Skipped);
+        assert_eq!(reg.geometry("T"), Some((120, 30, 1)));
+
+        // A fresh secondary socket is equally replay-only while A remains.
+        let out = reg.resize_for_attach("T", 3, TerminalAttachIntent::TransportReconnect, 100, 50);
+        assert_eq!(out, AttachResizeStatus::Skipped);
+        assert_eq!(reg.geometry("T"), Some((120, 30, 1)));
     }
 
     #[test]

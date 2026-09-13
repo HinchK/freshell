@@ -196,7 +196,7 @@ async fn mismatched_expected_session_ref_does_not_resize() {
 }
 
 #[tokio::test]
-async fn transport_reconnect_resizes_only_without_other_sockets_or_when_reattaching() {
+async fn transport_reconnect_secondary_attaches_stay_neutral_until_explicit_resize() {
     let (url, registry) = spawn_server().await;
     let (mut ws_a, _inventory_a) = connect_and_capture_inventory(&url).await;
     let terminal_id = create_shell_terminal(&mut ws_a, "req-geo-3").await;
@@ -236,8 +236,7 @@ async fn transport_reconnect_resizes_only_without_other_sockets_or_when_reattach
         "reconnect with another socket attached and no prior attachment: skip"
     );
 
-    // B re-attaches (existing attachment): resizes despite A being attached.
-    // Second geometry record: this one bumps the epoch.
+    // B's later reconnect generation on the same socket is also replay-only.
     attach_with(
         &mut ws_b,
         &terminal_id,
@@ -251,9 +250,71 @@ async fn transport_reconnect_resizes_only_without_other_sockets_or_when_reattach
     wait_for_attach_ready(&mut ws_b, "att-b-2").await;
     assert_eq!(
         registry.geometry(&terminal_id),
-        Some((100, 50, 2)),
-        "re-attach by the same connection: apply; the second record bumps the epoch"
+        Some((95, 41, 1)),
+        "repeated reconnect attachment by a secondary socket must stay neutral"
     );
+
+    // A fresh secondary socket has the identical geometry-neutral contract
+    // while A remains attached.
+    let (mut ws_c, _inventory_c) = connect_and_capture_inventory(&url).await;
+    attach_with(
+        &mut ws_c,
+        &terminal_id,
+        "att-c-1",
+        "transport_reconnect",
+        110,
+        55,
+        None,
+    )
+    .await;
+    wait_for_attach_ready(&mut ws_c, "att-c-1").await;
+    assert_eq!(
+        registry.geometry(&terminal_id),
+        Some((95, 41, 1)),
+        "fresh secondary reconnect attachment must stay neutral"
+    );
+
+    send_input(
+        &mut ws_a,
+        &terminal_id,
+        "echo __GEO_TRANSPORT_SECONDARY__$(stty size)__\r",
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let (acc, _gap, _closed) =
+        drain_until_marker_or_deadline(&mut ws_a, "__GEO_TRANSPORT_SECONDARY__41 95__", deadline)
+            .await;
+    assert!(
+        acc.contains("__GEO_TRANSPORT_SECONDARY__41 95__"),
+        "secondary transport reconnects must leave A's kernel PTY size intact; got output: {acc}"
+    );
+
+    ws_b.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "terminal.resize",
+            "terminalId": terminal_id,
+            "cols": 100,
+            "rows": 50,
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send explicit resize");
+    send_input(
+        &mut ws_b,
+        &terminal_id,
+        "echo __GEO_TRANSPORT_EXPLICIT__$(stty size)__\r",
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let (acc, _gap, _closed) =
+        drain_until_marker_or_deadline(&mut ws_b, "__GEO_TRANSPORT_EXPLICIT__50 100__", deadline)
+            .await;
+    assert!(
+        acc.contains("__GEO_TRANSPORT_EXPLICIT__50 100__"),
+        "explicit terminal.resize must still transfer shared PTY geometry; got output: {acc}"
+    );
+    assert_eq!(registry.geometry(&terminal_id), Some((100, 50, 2)));
 }
 
 #[tokio::test]
