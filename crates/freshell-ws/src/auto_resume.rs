@@ -1016,7 +1016,7 @@ impl AutoResumeDriver for WsAutoResumeDriver {
                 // registry kill's release covers any partial state) and
                 // answer false exactly like the revoked-lease shape.
                 let parked = pending_slot.lock().expect("pending ownership lock").take();
-                if let Some(claim) = parked {
+                if let Some(mut claim) = parked {
                     let outcome = state.registry.commit_session_ref_ownership(
                         &claim.locator,
                         claim.ticket.operation_id(),
@@ -1043,6 +1043,16 @@ impl AutoResumeDriver for WsAutoResumeDriver {
                         }
                         return false;
                     }
+                    // b8ke d4 F4: the successful commit consumed the claim —
+                    // DISARM the ticket so its Drop (the end of this scope)
+                    // does not also perform the typed fail
+                    // (`ownership.ticket.dropped_unarmed`/TICKET_DROPPED
+                    // would misclassify every successful respawn as an
+                    // abandoned claim; the Live record survives the foreign
+                    // fail, but the diagnostics noise is false). The stale
+                    // arm above keeps the RAII fail (the claim never
+                    // committed).
+                    claim.ticket.disarm();
                 }
                 return true;
             }

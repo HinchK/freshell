@@ -882,8 +882,15 @@ struct RestOwnershipClaim {
 }
 
 impl RestOwnershipClaim {
+    /// b8ke d4 F4: on `Committed` the ticket is DISARMED — the claim is
+    /// consumed, so its Drop must not also perform the typed fail
+    /// (`ownership.ticket.dropped_unarmed`/TICKET_DROPPED would misclassify
+    /// every successful REST create/resume as an abandoned claim; the Live
+    /// record survives the foreign fail, but the diagnostics noise is
+    /// false). On `Err` the drop keeps the RAII fail (the claim never
+    /// committed).
     fn commit(
-        self,
+        mut self,
         registry: &freshell_terminal::TerminalRegistry,
         terminal_id: &str,
     ) -> Result<(), freshell_ownership::CommitOutcome> {
@@ -894,7 +901,10 @@ impl RestOwnershipClaim {
             terminal_id,
         );
         match outcome {
-            freshell_ownership::CommitOutcome::Committed => Ok(()),
+            freshell_ownership::CommitOutcome::Committed => {
+                self.ticket.disarm();
+                Ok(())
+            }
             stale => Err(stale),
         }
     }
@@ -7755,5 +7765,151 @@ if (args.includes('app-server')) {{
             ),
             freshell_ownership::BeginOutcome::OwnedByOtherKind { .. }
         ));
+    }
+
+    /// b8ke d4 F4: the dropped-ticket diagnostics capture for the REST
+    /// claim tests — thread-local `set_default` (the plain `#[tokio::test]`
+    /// current-thread runtime polls the REST handler on this thread, so it
+    /// observes the default; the crate convention from claude.rs's
+    /// `info_capture_for_test`).
+    mod ticket_capture_for_test {
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::{Event, Subscriber};
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+        use tracing_subscriber::Layer;
+
+        #[derive(Default)]
+        struct FieldVisitor {
+            event: String,
+            fields: BTreeMap<String, String>,
+        }
+        impl Visit for FieldVisitor {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                let rendered = format!("{value:?}");
+                if field.name() == "event" {
+                    self.event = rendered;
+                } else {
+                    self.fields.insert(field.name().to_string(), rendered);
+                }
+            }
+
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "event" {
+                    self.event = value.to_string();
+                } else {
+                    self.fields
+                        .insert(field.name().to_string(), value.to_string());
+                }
+            }
+        }
+
+        #[derive(Clone, Debug)]
+        pub struct Captured {
+            pub event: String,
+            pub fields: BTreeMap<String, String>,
+        }
+
+        struct CaptureLayer {
+            events: Arc<Mutex<Vec<Captured>>>,
+        }
+        impl<S: Subscriber> Layer<S> for CaptureLayer {
+            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+                let mut visitor = FieldVisitor::default();
+                event.record(&mut visitor);
+                self.events.lock().expect("capture lock").push(Captured {
+                    event: visitor.event,
+                    fields: visitor.fields,
+                });
+            }
+        }
+
+        pub fn capture() -> (Arc<Mutex<Vec<Captured>>>, tracing::subscriber::DefaultGuard) {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let layer = CaptureLayer {
+                events: Arc::clone(&events),
+            };
+            let subscriber = tracing_subscriber::registry().with(layer);
+            (events, tracing::subscriber::set_default(subscriber))
+        }
+    }
+
+    /// b8ke d4 F4: a successful REST claim commit consumes its
+    /// OperationTicket — the ticket's Drop must not emit
+    /// `ownership.ticket.dropped_unarmed`/TICKET_DROPPED for the resumed
+    /// session (pre-d4 the un-disarmed drop misclassified every successful
+    /// REST create/resume as an abandoned claim in the diagnostics; the
+    /// Live record survived only because the post-commit fail reads as
+    /// foreign). Determinism: the commit and the ticket drop are
+    /// synchronous inside the request future, so the 200 response means
+    /// the drop already fired.
+    #[tokio::test]
+    async fn successful_rest_claim_commit_does_not_drop_its_ticket_unarmed() {
+        let _ = isolate_amplifier_home();
+        let (events, _capture_guard) = ticket_capture_for_test::capture();
+        let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let registry =
+            freshell_terminal::TerminalRegistry::new().with_ownership(Arc::clone(&ownership));
+        let sid = format!("rest-ticket-{}", Uuid::new_v4());
+
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let state = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx))
+            .with_terminal_registry(registry.clone())
+            .with_cli_commands(Arc::new(vec![recording_cli_spec(
+                "claude",
+                &unique_argv_file("rest-ticket"),
+            )]))
+            .with_ownership(Arc::clone(&ownership));
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": tmp.to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": sid },
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the REST resume create must succeed: {body}"
+        );
+        let tid = body["data"]["terminalId"]
+            .as_str()
+            .expect("terminalId")
+            .to_string();
+        match ownership.observe("claude", &sid).state {
+            freshell_ownership::OwnershipState::Live { owner, .. } => {
+                assert_eq!(
+                    owner.terminal_id.as_deref(),
+                    Some(tid.as_str()),
+                    "the REST settle must commit the resumed terminal's ownership"
+                );
+            }
+            other => panic!("the REST settle must commit Live, got {other:?}"),
+        }
+
+        // THE FIX'S ASSERTION: the Live commit consumed the claim — no
+        // dropped_unarmed names this session.
+        let events = events.lock().expect("capture lock").clone();
+        let dropped: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e.event == "ownership.ticket.dropped_unarmed"
+                    && e.fields.get("session_id").map(String::as_str) == Some(sid.as_str())
+            })
+            .collect();
+        assert!(
+            dropped.is_empty(),
+            "a successful REST claim commit must not classify its own ticket \
+             as abandoned: {dropped:?}"
+        );
+
+        // Cleanup: reap the surviving replacement PTY.
+        registry.kill(&tid);
     }
 }

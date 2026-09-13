@@ -1384,6 +1384,76 @@ async fn a_slow_terminal_kill_on_its_ledger_close_is_not_fenced_and_commits() {
     }
 }
 
+/// b8ke d4 F4: a successful negotiated terminal create commits Live and
+/// must CONSUME its OperationTicket — the ticket's Drop must not emit
+/// `ownership.ticket.dropped_unarmed`/TICKET_DROPPED for the created
+/// session (pre-d4 the un-disarmed drop misclassified every successful
+/// create as an abandoned claim in the diagnostics; the Live record
+/// survived only because the post-commit fail reads as foreign).
+/// Determinism: current-thread runtime + thread-local capture — the
+/// settle's commit and the ticket drop are synchronous on this thread,
+/// so observing Live means the drop already fired.
+#[tokio::test]
+async fn a_successful_terminal_create_does_not_drop_its_ticket_unarmed() {
+    let (events, _capture_guard) = race_tracing_capture::capture();
+    let (url, registry, ws_state) = spawn_server().await;
+    let mut ws = connect(&url).await;
+    let session_id = format!("d4-f4-ws-{}", uuid::Uuid::new_v4());
+
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-d4-f4-ws",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": session_id },
+        }),
+    )
+    .await;
+    let created = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "terminal.created" && v["requestId"] == "req-d4-f4-ws"
+    })
+    .await;
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    let ownership = ws_state.ownership.as_ref().expect("coordinator wired");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !matches!(
+        ownership.observe("claude", &session_id).state,
+        freshell_ownership::OwnershipState::Live { .. }
+    ) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the terminal create never committed Live"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // THE FIX'S ASSERTION: the Live commit consumed the claim — no
+    // dropped_unarmed names this session.
+    let events = events.lock().expect("capture lock").clone();
+    let dropped: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.target == "freshell_ownership"
+                && e.event == "ownership.ticket.dropped_unarmed"
+                && e.fields.get("session_id").map(String::as_str) == Some(session_id.as_str())
+        })
+        .collect();
+    assert!(
+        dropped.is_empty(),
+        "a successful terminal create must not classify its own ticket as \
+         abandoned: {dropped:?}"
+    );
+
+    // Cleanup: reap the sleeper PTY the create spawned.
+    registry.kill(&terminal_id);
+}
+
 /// kata b8ke Task 3: a real freshclaude create/kill drives the shared
 /// coordinator — Live{FreshAgent} while alive, Vacant after the awaited kill.
 #[tokio::test]

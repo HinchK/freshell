@@ -2229,7 +2229,13 @@ impl TerminalOwnershipClaim {
     /// `Err` (stale generation / foreign operation) means the key was
     /// recovered out from under us mid-create — the caller must tear its
     /// just-spawned child down exactly like the revoked-lease discipline.
-    fn commit(self, terminal_id: &str) -> Result<(), freshell_ownership::CommitOutcome> {
+    /// b8ke d4 F4: on `Committed` the ticket is DISARMED — the claim is
+    /// consumed, so its Drop must not also perform the typed fail
+    /// (`ownership.ticket.dropped_unarmed`/TICKET_DROPPED would misclassify
+    /// every successful create as an abandoned claim; the Live record
+    /// survives the foreign fail, but the diagnostics noise is false).
+    /// On `Err` the drop keeps the RAII fail (the claim never committed).
+    fn commit(mut self, terminal_id: &str) -> Result<(), freshell_ownership::CommitOutcome> {
         let outcome = self.registry.commit_session_ref_ownership(
             &self.locator,
             self.ticket.operation_id(),
@@ -2237,7 +2243,10 @@ impl TerminalOwnershipClaim {
             terminal_id,
         );
         match outcome {
-            freshell_ownership::CommitOutcome::Committed => Ok(()),
+            freshell_ownership::CommitOutcome::Committed => {
+                self.ticket.disarm();
+                Ok(())
+            }
             stale => Err(stale),
         }
     }
