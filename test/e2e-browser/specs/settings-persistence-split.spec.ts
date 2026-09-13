@@ -1,6 +1,6 @@
 import fs from 'fs/promises'
 import path from 'path'
-import { test as base, expect } from '../helpers/fixtures.js'
+import { createE2eBrowserContext, test as base, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle } from '../helpers/external-target.js'
 
 const BROWSER_PREFERENCES_STORAGE_KEY = 'freshell.browser-preferences.v1'
@@ -89,8 +89,8 @@ test.describe('Settings Persistence Split', () => {
   //     per-connection live-settings handshake contract.
   //     and the pin was deleted; triage entry point for a replication
   //     regression is docs/plans/df1-evidence/CFG-12.md.
-  test('browser-local settings stay local across isolated profiles and reloads', async ({ browser, serverInfo }) => {
-    const contextA = await browser.newContext()
+  test('browser-local settings stay local across isolated profiles and reloads', async ({ browser, serverInfo, e2eMachineId }) => {
+    const contextA = await createE2eBrowserContext(browser, serverInfo, e2eMachineId)
     const pageA = await contextA.newPage()
     await pageA.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
     await waitForReady(pageA)
@@ -122,7 +122,7 @@ test.describe('Settings Persistence Split', () => {
     const preferencesA = await getBrowserPreferences(pageA)
     expect(preferencesA?.settings?.theme).toBe('dark')
 
-    const contextB = await browser.newContext()
+    const contextB = await createE2eBrowserContext(browser, serverInfo, e2eMachineId)
     const pageB = await contextB.newPage()
     await pageB.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
     await waitForReady(pageB)
@@ -146,13 +146,13 @@ test.describe('Settings Persistence Split', () => {
     await contextA.close()
   })
 
-  test('server-shared defaultCwd set by one profile replicates to another and persists to config.json', async ({ browser, serverInfo }) => {
-    const contextA = await browser.newContext()
+  test('server-shared defaultCwd set by one profile replicates to another and persists to config.json', async ({ browser, serverInfo, e2eMachineId }) => {
+    const contextA = await createE2eBrowserContext(browser, serverInfo, e2eMachineId)
     const pageA = await contextA.newPage()
     await pageA.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
     await waitForReady(pageA)
 
-    const contextB = await browser.newContext()
+    const contextB = await createE2eBrowserContext(browser, serverInfo, e2eMachineId)
     const pageB = await contextB.newPage()
     await pageB.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
     await waitForReady(pageB)

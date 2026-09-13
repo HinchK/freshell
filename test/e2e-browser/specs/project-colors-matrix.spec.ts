@@ -1,7 +1,7 @@
 import fs from 'fs/promises'
 import path from 'path'
 import type { Page } from '@playwright/test'
-import { test, expect } from '../helpers/fixtures.js'
+import { createFreshE2eBrowserContext, test, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle } from '../helpers/external-target.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { installRecoveryOfferAutoDeclineOnContext } from '../helpers/recovery-offer.js'
@@ -186,7 +186,7 @@ test.describe('SESSION-05 project colors (History project headers)', () => {
     })
     const info = await server.start()
 
-    const contextB = await browser.newContext()
+    const { context: contextB } = await createFreshE2eBrowserContext(browser, info)
     // RESTORE-01: manual contexts bypass the fixtures' `context` override —
     // adopt the shared recovery auto-decline watcher directly (the default
     // `page` fixture's context is covered automatically).

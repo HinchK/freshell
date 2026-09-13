@@ -3,7 +3,7 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import WebSocket from 'ws'
-import { test, expect } from '../helpers/fixtures.js'
+import { registerE2eMachine, test, expect } from '../helpers/fixtures.js'
 import { RustServer } from '../helpers/rust-server.js'
 import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
@@ -109,6 +109,19 @@ interface ClientIdentity {
   deviceId: string
   deviceLabel: string
   clientInstanceId: string
+}
+
+async function registerClientIdentity(
+  info: E2eServerInfo,
+  deviceLabel: string,
+  clientInstanceId: string,
+): Promise<ClientIdentity> {
+  const machine = await registerE2eMachine(info, deviceLabel)
+  return {
+    deviceId: machine.id,
+    deviceLabel: machine.label,
+    clientInstanceId,
+  }
 }
 
 /** A registry-schema-complete OPEN record (all fields `validate_registry_record`
@@ -235,22 +248,14 @@ test.describe('Durable tabs registry across restart (rust)', () => {
       const info: E2eServerInfo = await server.start()
       const now = Date.now()
 
-      // Context A: deviceId dev-A, revision 1, ONE open record.
-      const identityA: ClientIdentity = {
-        deviceId: 'dev-A',
-        deviceLabel: 'Device A (e2e)',
-        clientInstanceId: 'client-A',
-      }
+      // Context A: a registered server-owned machine, revision 1, ONE open record.
+      const identityA = await registerClientIdentity(info, 'Device A (e2e)', 'client-A')
       const openA = openTabRecord(identityA, { tabId: 'tab-a1', tabName: 'A open tab', at: now })
       wsA = await connectAndHello(info.wsUrl, info.token)
       expectAck(await pushTabs(wsA, identityA, 1, [openA]), { openRecords: 1, closedRecords: 0 })
 
-      // Context B: deviceId dev-B, revision 1, open + closed records.
-      const identityB: ClientIdentity = {
-        deviceId: 'dev-B',
-        deviceLabel: 'Device B (e2e)',
-        clientInstanceId: 'client-B',
-      }
+      // Context B: a separately registered server-owned machine, revision 1, open + closed records.
+      const identityB = await registerClientIdentity(info, 'Device B (e2e)', 'client-B')
       const openB = openTabRecord(identityB, { tabId: 'tab-b1', tabName: 'B open tab', at: now + 1 })
       const closedB = closedTabRecord(identityB, { tabId: 'tab-b2', tabName: 'B closed tab', at: now + 2 })
       wsB = await connectAndHello(info.wsUrl, info.token)
@@ -263,13 +268,9 @@ test.describe('Durable tabs registry across restart (rust)', () => {
       // RESTART the rust server (fixture restart(): same home/port/token).
       await server.restart()
 
-      // From a NEW context C (deviceId dev-C), query BEFORE A or B republish
+      // From a NEW registered context C, query BEFORE A or B republish
       // (raw sockets never republish; B's socket died with the old process).
-      const identityC: ClientIdentity = {
-        deviceId: 'dev-C',
-        deviceLabel: 'Device C (e2e)',
-        clientInstanceId: 'client-C',
-      }
+      const identityC = await registerClientIdentity(info, 'Device C (e2e)', 'client-C')
       wsC = await connectAndHello(info.wsUrl, info.token)
       const data = await queryTabs(wsC, identityC)
 
@@ -280,7 +281,7 @@ test.describe('Durable tabs registry across restart (rust)', () => {
         .toEqual(sortByTabKey([openA, openB]))
       // ... and closed contains B's tombstone.
       expect(data.closed.map(withoutServerInstanceId)).toEqual([closedB])
-      // Nothing leaks into dev-C's own partitions.
+      // Nothing leaks into C's own partitions.
       expect(data.localOpen).toEqual([])
       expect(data.sameDeviceOpen).toEqual([])
     } finally {
@@ -298,11 +299,7 @@ test.describe('Durable tabs registry across restart (rust)', () => {
     try {
       const info = await server.start()
       const now = Date.now()
-      const identity: ClientIdentity = {
-        deviceId: 'dev-D',
-        deviceLabel: 'Device D (e2e)',
-        clientInstanceId: 'client-D',
-      }
+      const identity = await registerClientIdentity(info, 'Device D (e2e)', 'client-D')
       const record = openTabRecord(identity, { tabId: 'tab-d1', tabName: 'D open tab', at: now })
       ws = await connectAndHello(info.wsUrl, info.token)
 
@@ -377,11 +374,7 @@ test.describe('Durable tabs registry across restart (rust)', () => {
     try {
       const info = await serverBefore.start()
       const now = Date.now()
-      const identity: ClientIdentity = {
-        deviceId: 'dev-E',
-        deviceLabel: 'Device E (e2e)',
-        clientInstanceId: 'client-E',
-      }
+      const identity = await registerClientIdentity(info, 'Device E (e2e)', 'client-E')
       ws = await connectAndHello(info.wsUrl, info.token)
       expectAck(
         await pushTabs(ws, identity, 1, [
@@ -403,7 +396,7 @@ test.describe('Durable tabs registry across restart (rust)', () => {
       }
 
       // Delete ONE referenced content-addressed object: the committed
-      // manifest names its component objects; remove dev-E's open-snapshot
+      // manifest names its component objects; remove E's open-snapshot
       // object (objects/<sha256>.json). `fs.unlink` throws if the store
       // layout were not what this spec claims.
       const manifest = JSON.parse(await fs.readFile(path.join(v1Dir, 'manifest.json'), 'utf8'))

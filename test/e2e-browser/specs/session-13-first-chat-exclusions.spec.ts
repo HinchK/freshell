@@ -1,6 +1,6 @@
 import fs from 'fs/promises'
 import path from 'path'
-import { test as base, expect } from '../helpers/fixtures.js'
+import { createE2eBrowserContext, test as base, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle } from '../helpers/external-target.js'
 
 /**
@@ -374,7 +374,7 @@ const PREFIX_MODE = {
 test.describe('SESSION-13 first-chat exclusion controls', () => {
   test.setTimeout(180_000)
 
-  test('server-wide first-chat exclusions replicate and apply across providers, profiles, reload, and restart', async ({ browser, page: pageA, serverInfo, testServer }) => {
+  test('server-wide first-chat exclusions replicate and apply across providers, profiles, reload, and restart', async ({ browser, page: pageA, serverInfo, testServer, e2eMachineId }) => {
     await pageA.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
     await waitForReady(pageA)
 
@@ -406,7 +406,7 @@ test.describe('SESSION-13 first-chat exclusion controls', () => {
     await pageA.keyboard.press('Escape')
 
     // ── Exact membership in B (fresh isolated profile, same server). ──
-    const contextB = await browser.newContext()
+    const contextB = await createE2eBrowserContext(browser, serverInfo, e2eMachineId)
     const pageB = await contextB.newPage()
     try {
       await pageB.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)

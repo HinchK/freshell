@@ -19,7 +19,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import WebSocket from 'ws'
-import { test, expect } from '../helpers/fixtures.js'
+import { createFreshE2eBrowserContext, test, expect } from '../helpers/fixtures.js'
 import { RustServer } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
@@ -476,7 +476,7 @@ test.describe('Amplifier events-lane resilience (Rust only)', () => {
       const [infoA, infoB] = await Promise.all([serverA.start(), serverB.start()])
       expect(infoA.port).not.toBe(infoB.port)
 
-      contextB = await browser.newContext()
+      contextB = (await createFreshE2eBrowserContext(browser, infoB)).context
       const pageB = await contextB.newPage()
 
       captureA = new WsCapture(infoA.baseUrl, infoA.token)

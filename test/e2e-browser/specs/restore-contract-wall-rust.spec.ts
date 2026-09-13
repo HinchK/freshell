@@ -22,7 +22,7 @@
  * opencode-terminal-restore-rust.spec.ts, restore-double-restart.spec.ts,
  * freshopencode-restart-recovery.spec.ts).
  */
-import { test, expect } from '../helpers/fixtures.js'
+import { createFreshE2eBrowserContext, test, expect } from '../helpers/fixtures.js'
 import { RustServer } from '../helpers/rust-server.js'
 import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
@@ -2108,7 +2108,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       env: { CODEX_CMD: fakeCodexPath, FAKE_CODEX_ARGV_LOG: argLogPath },
       setupHome: seedCodexHome(CODEX_SESSION_ID, SESSION_TITLE, projectDir),
     })
-    const contextB = await browser.newContext()
+    const { context: contextB } = await createFreshE2eBrowserContext(browser, info)
     // This spec runs file-wide `recoveryOfferHandling: 'manual'` (the wall
     // owns the recovery-panel assertions), but contextB bypasses the
     // fixtures' `context` override entirely, so no auto-decline watcher

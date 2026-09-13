@@ -17,12 +17,13 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import type { Page } from '@playwright/test'
-import { test, expect } from '../helpers/fixtures.js'
+import type { BrowserContext, Page } from '@playwright/test'
+import { createE2eBrowserContext, test, expect } from '../helpers/fixtures.js'
 import { RustServer } from '../helpers/rust-server.js'
 import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { MACHINE_ID_STORAGE_KEY } from '../../../src/store/storage-keys.js'
 // NOTE: `Page` comes from '@playwright/test' (fixtures.ts exports only
 // `test`/`expect`, as every donor spec does). `openPanePicker` is IMPORTED,
 // not copied -- the copied `createFreshclaudePane` body calls it (wall :29,
@@ -464,7 +465,7 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
       env: { FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE },
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
     })
-    let coldContext: Awaited<ReturnType<typeof browser.newContext>> | null = null
+    let coldContext: BrowserContext | null = null
     try {
       await selectShellIfPickerShowing(page)
       const tabId = (await harness.getActiveTabId())!
@@ -483,10 +484,14 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
         Object.entries(localStorage),
       )
       expect(persistedEntries.length).toBeGreaterThan(0)
+      const persistedMachineId = persistedEntries.find(([key]) => key === MACHINE_ID_STORAGE_KEY)?.[1]
+      if (!persistedMachineId) {
+        throw new Error('Expected persisted browser storage to retain the selected machine id')
+      }
       await page.close()
 
       // Cold open: fresh context, seeded ONLY with the persisted entries.
-      coldContext = await browser.newContext()
+      coldContext = await createE2eBrowserContext(browser, info, persistedMachineId)
       const coldPage = await coldContext.newPage()
       await coldPage.addInitScript((entries: Array<[string, string]>) => {
         for (const [k, v] of entries) localStorage.setItem(k, v)

@@ -36,7 +36,7 @@
  * are "unknown" there and the compare is inert BY DESIGN — this spec can
  * only pass on a lane where at least the client bake is a real sha.
  */
-import { test, expect } from '../helpers/fixtures.js'
+import { createFreshE2eBrowserContext, test, expect } from '../helpers/fixtures.js'
 import { RustServer, ensureRustServerBuilt } from '../helpers/rust-server.js'
 import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
@@ -60,7 +60,7 @@ test.describe('server build mismatch reload (rust)', () => {
   })
 
   test('mismatched ready buildId reloads exactly once and converges', async ({ browser }) => {
-    const context = await browser.newContext({ serviceWorkers: 'block' })
+    const { context } = await createFreshE2eBrowserContext(browser, info, { serviceWorkers: 'block' })
     const page = await context.newPage()
     await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
     const harness = new TestHarness(page)
@@ -109,7 +109,7 @@ test.describe('server build mismatch reload (rust)', () => {
   })
 
   test('sentinel persists across a real navigation', async ({ browser }) => {
-    const context = await browser.newContext({ serviceWorkers: 'block' })
+    const { context } = await createFreshE2eBrowserContext(browser, info, { serviceWorkers: 'block' })
     const page = await context.newPage()
     await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
     const harness = new TestHarness(page)
@@ -144,7 +144,7 @@ test.describe('server build mismatch reload (rust)', () => {
   })
 
   test('a seeded sentinel suppresses a repeat mismatch (no reload)', async ({ browser }) => {
-    const context = await browser.newContext({ serviceWorkers: 'block' })
+    const { context } = await createFreshE2eBrowserContext(browser, info, { serviceWorkers: 'block' })
     const page = await context.newPage()
     await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
     const harness = new TestHarness(page)

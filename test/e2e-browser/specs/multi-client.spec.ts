@@ -1,14 +1,18 @@
 import fs from 'fs/promises'
 import path from 'path'
 import type { Browser, BrowserContext, Page } from '@playwright/test'
-import { test, expect } from '../helpers/fixtures.js'
+import { createE2eBrowserContext, test, expect } from '../helpers/fixtures.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { installRecoveryOfferAutoDeclineOnContext } from '../helpers/recovery-offer.js'
 
-// RESTORE-01: manual contexts bypass the fixtures' built-in `context`
-// override, so they adopt the shared recovery auto-decline watcher directly
-// (docs/plans/df1/RESTORE-01.md). No-op unless a recoverable offer is made.
-async function newClientContext(browser: Browser): Promise<BrowserContext> {
-  const context = await browser.newContext()
+// This spec uses same-device pages, so its manual context selects the test's
+// fixture-owned machine before the first navigation.
+async function newClientContext(
+  browser: Browser,
+  serverInfo: E2eServerInfo,
+  e2eMachineId: string,
+): Promise<BrowserContext> {
+  const context = await createE2eBrowserContext(browser, serverInfo, e2eMachineId)
   installRecoveryOfferAutoDeclineOnContext(context)
   return context
 }
@@ -192,9 +196,9 @@ async function activateTab(page: Page, tabId: string): Promise<void> {
 }
 
 test.describe('Multi-Client', () => {
-  test('two browser tabs share the same server', async ({ browser, serverInfo }) => {
+  test('two browser tabs share the same server', async ({ browser, serverInfo, e2eMachineId }) => {
     // Open two pages to the same server
-    const context = await newClientContext(browser)
+    const context = await newClientContext(browser, serverInfo, e2eMachineId)
     const page1 = await context.newPage()
     const page2 = await context.newPage()
 
@@ -208,8 +212,8 @@ test.describe('Multi-Client', () => {
     await context.close()
   })
 
-  test('terminal output appears in both clients', async ({ browser, serverInfo }) => {
-    const context = await newClientContext(browser)
+  test('terminal output appears in both clients', async ({ browser, serverInfo, e2eMachineId }) => {
+    const context = await newClientContext(browser, serverInfo, e2eMachineId)
     const page1 = await context.newPage()
 
     await page1.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
@@ -234,8 +238,8 @@ test.describe('Multi-Client', () => {
     await context.close()
   })
 
-  test('reconnecting second viewer keeps page 1 PTY size stable and both pages keep shared output', async ({ browser, serverInfo }) => {
-    const context = await newClientContext(browser)
+  test('reconnecting second viewer keeps page 1 PTY size stable and both pages keep shared output', async ({ browser, serverInfo, e2eMachineId }) => {
+    const context = await newClientContext(browser, serverInfo, e2eMachineId)
     const page1 = await context.newPage()
     await page1.setViewportSize({ width: 1500, height: 980 })
 
@@ -370,9 +374,9 @@ test.describe('Multi-Client', () => {
   // (replay-only), and the reveal heals geometry with a terminal.resize
   // whose dims the kernel then confirms via stty.
   // ------------------------------------------------------------------
-  test('reload-restored background tab stays geometry-neutral until reveal heals it with a resize', async ({ browser, serverInfo }) => {
+  test('reload-restored background tab stays geometry-neutral until reveal heals it with a resize', async ({ browser, serverInfo, e2eMachineId }) => {
     test.setTimeout(120_000)
-    const context = await newClientContext(browser)
+    const context = await newClientContext(browser, serverInfo, e2eMachineId)
     const page = await context.newPage()
 
     await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
@@ -525,8 +529,8 @@ test.describe('Multi-Client', () => {
     await context.close()
   })
 
-  test('settings change broadcasts to other clients', async ({ browser, serverInfo }) => {
-    const context = await newClientContext(browser)
+  test('settings change broadcasts to other clients', async ({ browser, serverInfo, e2eMachineId }) => {
+    const context = await newClientContext(browser, serverInfo, e2eMachineId)
     const page1 = await context.newPage()
     const page2 = await context.newPage()
 
@@ -580,8 +584,8 @@ test.describe('Multi-Client', () => {
     await context.close()
   })
 
-  test('server handles many concurrent connections', async ({ browser, serverInfo }) => {
-    const context = await newClientContext(browser)
+  test('server handles many concurrent connections', async ({ browser, serverInfo, e2eMachineId }) => {
+    const context = await newClientContext(browser, serverInfo, e2eMachineId)
     const pages = []
 
     // Open 5 pages
@@ -602,7 +606,7 @@ test.describe('Multi-Client', () => {
     await context.close()
   })
 
-  test('mode replay-sync: fresh surface restores mouse tracking + alt buffer after reload, and claims surfaceReset', async ({ browser, serverInfo }) => {
+  test('mode replay-sync: fresh surface restores mouse tracking + alt buffer after reload, and claims surfaceReset', async ({ browser, serverInfo, e2eMachineId }) => {
     // Regression coverage: an app arms DEC private modes ONCE at startup;
     // the retained replay window does not carry those bytes back, so a
     // freshly-constructed surface (page reload) used to rehydrate contents
@@ -610,7 +614,7 @@ test.describe('Multi-Client', () => {
     // mode projection and answers surfaceReset attaches with ONE
     // terminal.modes.sync preamble (ready < sync < replay).
     test.setTimeout(120_000)
-    const context = await newClientContext(browser)
+    const context = await newClientContext(browser, serverInfo, e2eMachineId)
     const page = await context.newPage()
     await page.setViewportSize({ width: 1400, height: 900 })
     const syncFrames: Array<{ data: string }> = []
@@ -724,7 +728,7 @@ test.describe('Multi-Client', () => {
     await context.close()
   })
 
-  test('mode replay-sync: sync preamble is ordered before replay and excludes ?1004 (junk-focus hazard)', async ({ browser, serverInfo }) => {
+  test('mode replay-sync: sync preamble is ordered before replay and excludes ?1004 (junk-focus hazard)', async ({ browser, serverInfo, e2eMachineId }) => {
     // xterm 6.0.0 fires onRequestSendFocus on EVERY ?1004 arm, and
     // _reportFocus immediately emits ESC[I/ESC[O on a focused surface — so a
     // sync preamble replaying ?1004h would deterministically inject junk
@@ -739,7 +743,7 @@ test.describe('Multi-Client', () => {
     // attach), then observe the live ws frames: exactly one modes.sync frame,
     // it precedes every replay frame, its data contains ?2004h, never 1004.
     test.setTimeout(120_000)
-    const context = await newClientContext(browser)
+    const context = await newClientContext(browser, serverInfo, e2eMachineId)
     const page = await context.newPage()
 
     const syncFrames: Array<{ data: string; attachRequestId: string }> = []
@@ -822,7 +826,7 @@ test.describe('Multi-Client', () => {
     await context.close()
   })
 
-  test('mode replay-sync: replay no longer injects phantom xterm focus reports (kata 9gy8)', async ({ browser, serverInfo }) => {
+  test('mode replay-sync: replay no longer injects phantom xterm focus reports (kata 9gy8)', async ({ browser, serverInfo, e2eMachineId }) => {
     // Kata 9gy8 wire proof. xterm 6.0.0 re-fires the app's ?1004 focus-report
     // switch on EVERY ?1004h parse — including when the arming byte is inside
     // a replayed history chunk (page reload here) — and _reportFocus
@@ -834,7 +838,7 @@ test.describe('Multi-Client', () => {
     // arm byte still sets sendFocusMode on the fresh surface (asserted via
     // the harness modes accessor) — the mode is re-armed, the report is not.
     test.setTimeout(120_000)
-    const context = await newClientContext(browser)
+    const context = await newClientContext(browser, serverInfo, e2eMachineId)
     const page = await context.newPage()
     await page.setViewportSize({ width: 1400, height: 900 })
     await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
@@ -912,8 +916,8 @@ test.describe('Multi-Client', () => {
     await context.close()
   })
 
-  test('client disconnect is handled gracefully', async ({ browser, serverInfo }) => {
-    const context = await newClientContext(browser)
+  test('client disconnect is handled gracefully', async ({ browser, serverInfo, e2eMachineId }) => {
+    const context = await newClientContext(browser, serverInfo, e2eMachineId)
     const page1 = await context.newPage()
     const page2 = await context.newPage()
 

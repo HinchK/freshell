@@ -104,7 +104,7 @@
  * directly (ephemeral loopback port — NEVER 3001/3002). The application
  * Chromium lane is Rust-only and selects this spec by default.
  */
-import { test, expect } from '../helpers/fixtures.js'
+import { createFreshE2eBrowserContext, test, expect } from '../helpers/fixtures.js'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import * as os from 'node:os'
@@ -535,6 +535,13 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
    */
   const FRESH_CONTEXT_OPTIONS = { serviceWorkers: 'block' as const }
 
+  async function createFreshContext(
+    browser: import('@playwright/test').Browser,
+    options = FRESH_CONTEXT_OPTIONS,
+  ): Promise<BrowserContext> {
+    return (await createFreshE2eBrowserContext(browser, info, options)).context
+  }
+
   /**
    * Open a FRESH context (empty storage) and REQUIRE the recovery offer —
    * one context, one hard `toBeVisible` assertion (the brief's contract).
@@ -547,7 +554,7 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     browser: import('@playwright/test').Browser,
     label: string,
   ): Promise<{ ctx: BrowserContext; page: Page; harness: TestHarness }> {
-    const ctx = await browser.newContext(FRESH_CONTEXT_OPTIONS)
+    const ctx = await createFreshContext(browser)
     const page = await ctx.newPage()
     traceInventoryFailures(page, label)
     const harness = await connect(page, info)
@@ -562,7 +569,7 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     test.setTimeout(240_000)
 
     // ---- Context A: populate a tab with a claude CLI pane + a browser pane ----
-    const ctxA: BrowserContext = await browser.newContext(FRESH_CONTEXT_OPTIONS)
+    const ctxA: BrowserContext = await createFreshContext(browser)
     const pageA = await ctxA.newPage()
     await connect(pageA, info)
     await selectShellIfPickerShowing(pageA)
@@ -783,7 +790,7 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     // and restored as a duplicate), the claude pane through its durable
     // session ref. Accepting reattaches both IN THEIR TAB — never a second
     // spawn on top of the still-running sessions. ----
-    const ctxE: BrowserContext = await browser.newContext(FRESH_CONTEXT_OPTIONS)
+    const ctxE: BrowserContext = await createFreshContext(browser)
     const pageE = await ctxE.newPage()
     traceInventoryFailures(pageE, 'contextE')
     await connect(pageE, info)
@@ -873,7 +880,7 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     // navigation), never on visibility timing: offer render latency of >10s
     // has been observed, so a short visibility probe would race a delayed
     // modal into a false "no offer" read.
-    const ctxP = await browser.newContext(FRESH_CONTEXT_OPTIONS)
+    const ctxP = await createFreshContext(browser)
     const pageP = await ctxP.newPage()
     traceInventoryFailures(pageP, 'scenario4-populating')
     const inventoryResponsePromise = pageP.waitForResponse((r) => r.url().includes('/api/recovery/inventory'))
@@ -915,7 +922,7 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     await waitForRecoverable(info)
 
     // ---- Phone-viewport context: the offer must contain itself + scroll ----
-    const ctxPhone = await browser.newContext({
+    const ctxPhone = await createFreshContext(browser, {
       serviceWorkers: 'block',
       viewport: { width: 390, height: 844 },
     })
@@ -987,7 +994,7 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     //    recoverable) — then gains a shell pane and a claude CLI pane in one
     //    tab. Plain connect, NOT openFreshContextWithOffer (which REQUIRES a
     //    panel).
-    const ctxL: BrowserContext = await browser.newContext(FRESH_CONTEXT_OPTIONS)
+    const ctxL: BrowserContext = await createFreshContext(browser)
     const pageL = await ctxL.newPage()
     traceInventoryFailures(pageL, 'early-loss-L')
     const harnessL = await connect(pageL, info)
@@ -1103,7 +1110,7 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     //    BOTH panes (the snapshotted live shell + the ledgerOnly live claude
     //    row), the live note explains the reattach, and accepting puts both
     //    back IN THEIR TAB on their ORIGINAL terminals — never a respawn.
-    const ctxE: BrowserContext = await browser.newContext(FRESH_CONTEXT_OPTIONS)
+    const ctxE: BrowserContext = await createFreshContext(browser)
     const pageE = await ctxE.newPage()
     traceInventoryFailures(pageE, 'early-loss-E')
     await connect(pageE, info)
@@ -1186,7 +1193,7 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     // 2. Context A: boot shell pane, then SPLIT a claude CLI pane beside it
     //    (the shell sibling keeps the tab alive, so closePane — not closeTab
     //    — fires, and no closed-tab record is written).
-    const ctxA: BrowserContext = await browser.newContext(FRESH_CONTEXT_OPTIONS)
+    const ctxA: BrowserContext = await createFreshContext(browser)
     const pageA = await ctxA.newPage()
     const harnessA = await connect(pageA, info)
     await selectShellIfPickerShowing(pageA)
@@ -1416,7 +1423,7 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
 
     // 2. Context A: boot shell pane, then SPLIT a claude CLI pane beside it
     //    (same producer shape as scenario 7).
-    const ctxA: BrowserContext = await browser.newContext(FRESH_CONTEXT_OPTIONS)
+    const ctxA: BrowserContext = await createFreshContext(browser)
     const pageA = await ctxA.newPage()
     traceInventoryFailures(pageA, 'reattach-lapse-A')
     const harnessA = await connect(pageA, info)
@@ -1743,7 +1750,7 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     await fs.rm(path.join(capturedHome, '.freshell', 'tabs-snapshots'), { recursive: true, force: true })
 
     // 2. Context A: boot shell pane, then SPLIT a freshclaude pane beside it.
-    const ctxA: BrowserContext = await browser.newContext(FRESH_CONTEXT_OPTIONS)
+    const ctxA: BrowserContext = await createFreshContext(browser)
     const pageA = await ctxA.newPage()
     const harnessA = await connect(pageA, info)
     await selectShellIfPickerShowing(pageA)
@@ -1965,7 +1972,7 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     // 2. Context A: boot shell pane, then SPLIT a freshclaude pane beside it
     //    (NEVER close a tab's only pane — that collapses to closeTab, whose
     //    closed-tab record would re-reference the row forever).
-    const ctxA: BrowserContext = await browser.newContext(FRESH_CONTEXT_OPTIONS)
+    const ctxA: BrowserContext = await createFreshContext(browser)
     const pageA = await ctxA.newPage()
     const harnessA = await connect(pageA, info)
     await selectShellIfPickerShowing(pageA)
@@ -2159,7 +2166,7 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     //    shell sibling keeps the tab alive so closePane — the single-pane
     //    gate — owns the close; scenario 7's construction). The ws gate is
     //    installed BEFORE the page boots, passthrough until flipped.
-    const ctxA: BrowserContext = await browser.newContext(FRESH_CONTEXT_OPTIONS)
+    const ctxA: BrowserContext = await createFreshContext(browser)
     let blockWs = false
     const liveSockets: Array<{ client: import('@playwright/test').WebSocketRoute; server: import('@playwright/test').WebSocketRoute }> = []
     const blockedSockets: Array<import('@playwright/test').WebSocketRoute> = []

@@ -34,7 +34,11 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { expect } from '@playwright/test'
-import { test } from '../helpers/fixtures.js'
+import {
+  createE2eBrowserContext,
+  createFreshE2eBrowserContext,
+  test,
+} from '../helpers/fixtures.js'
 import { createE2eServerHandle, type E2eServerHandle } from '../helpers/external-target.js'
 import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { RawWsClient, rawHttpRequest } from '../helpers/raw-clients.js'
@@ -272,7 +276,7 @@ test.describe('TERM-04 terminal.create requestId dedupe', () => {
   })
 
   test('C: two pages — pane owner survives forced reconnect; a second page re-issuing the create spawns nothing', async ({ browser }) => {
-    const contextA = await browser.newContext()
+    const { context: contextA, machine } = await createFreshE2eBrowserContext(browser, info)
     const pageA = await contextA.newPage()
     const harnessA = new TestHarness(pageA)
     await pageA.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
@@ -337,7 +341,7 @@ test.describe('TERM-04 terminal.create requestId dedupe', () => {
     //    hit the socket, never for reconcile-held or pre-ready-queued ones;
     //  - the server's answer: Playwright's own WS tap on page B sees the
     //    `terminal.created` frame the dedupe guard replays/forwards.
-    const contextB = await browser.newContext()
+    const contextB = await createE2eBrowserContext(browser, info, machine.id)
     const pageB = await contextB.newPage()
     const harnessB = new TestHarness(pageB)
     // Attach the tap BEFORE navigation creates the socket. (The tap binds

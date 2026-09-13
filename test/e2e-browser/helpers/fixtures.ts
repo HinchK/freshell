@@ -1,4 +1,10 @@
-import { test as base, type Page } from '@playwright/test'
+import {
+  test as base,
+  type Browser,
+  type BrowserContext,
+  type BrowserContextOptions,
+  type Page,
+} from '@playwright/test'
 import { type E2eServerInfo } from './server-fixture-support.js'
 import { TestHarness } from './test-harness.js'
 import { TerminalHelper } from './terminal-helpers.js'
@@ -15,22 +21,80 @@ import {
 
 type MachineIdentityHandling = 'auto-select' | 'manual'
 
-async function createTestMachine(serverInfo: E2eServerInfo): Promise<string> {
+export interface E2eMachine {
+  id: string
+  label: string
+}
+
+/** Register a machine the Rust server will accept before an isolated context boots. */
+export async function registerE2eMachine(
+  serverInfo: E2eServerInfo,
+  label = `Playwright test machine ${Date.now()}`,
+): Promise<E2eMachine> {
   const headers = { 'x-auth-token': serverInfo.token }
   const created = await fetch(`${serverInfo.baseUrl}/api/machines`, {
     method: 'POST',
     headers: { ...headers, 'content-type': 'application/json' },
-    body: JSON.stringify({ label: `Playwright test machine ${Date.now()}` }),
+    body: JSON.stringify({ label }),
   })
   if (!created.ok) {
     throw new Error(`Could not create E2E machine: HTTP ${created.status}`)
   }
-  const createBody = await created.json() as { machine?: { id?: unknown } }
-  const createdId = createBody.machine?.id
-  if (typeof createdId !== 'string' || createdId.length === 0) {
-    throw new Error('E2E machine response did not contain an id')
+  const createBody = await created.json() as { machine?: { id?: unknown; label?: unknown } }
+  const machine = createBody.machine
+  if (
+    typeof machine?.id !== 'string' || machine.id.length === 0
+    || typeof machine.label !== 'string' || machine.label.length === 0
+  ) {
+    throw new Error('E2E machine response did not contain an id and label')
   }
-  return createdId
+  return { id: machine.id, label: machine.label }
+}
+
+/**
+ * Install the machine selection before a context's first navigation. This is
+ * shared by the built-in fixture and spec-owned contexts, which otherwise
+ * stop at the Rust server's machine chooser as soon as a machine exists.
+ */
+export async function installE2eMachineIdentity(
+  context: BrowserContext,
+  serverInfo: E2eServerInfo,
+  machineId: string,
+): Promise<void> {
+  await context.addInitScript(({ machineKey, machineId, serverOrigin, versionKey, version }) => {
+    if (window.location.origin !== serverOrigin) return
+    localStorage.setItem(versionKey, String(version))
+    localStorage.setItem(machineKey, machineId)
+  }, {
+    machineKey: MACHINE_ID_STORAGE_KEY,
+    machineId,
+    serverOrigin: new URL(serverInfo.baseUrl).origin,
+    versionKey: STORAGE_VERSION_KEY,
+    version: STORAGE_VERSION,
+  })
+}
+
+/** Create an isolated browser context that selects an already registered machine. */
+export async function createE2eBrowserContext(
+  browser: Browser,
+  serverInfo: E2eServerInfo,
+  machineId: string,
+  options?: BrowserContextOptions,
+): Promise<BrowserContext> {
+  const context = await browser.newContext(options)
+  await installE2eMachineIdentity(context, serverInfo, machineId)
+  return context
+}
+
+/** Create an isolated context with its own registered machine before it navigates. */
+export async function createFreshE2eBrowserContext(
+  browser: Browser,
+  serverInfo: E2eServerInfo,
+  options?: BrowserContextOptions,
+): Promise<{ context: BrowserContext; machine: E2eMachine }> {
+  const machine = await registerE2eMachine(serverInfo)
+  const context = await createE2eBrowserContext(browser, serverInfo, machine.id, options)
+  return { context, machine }
 }
 
 /**
@@ -117,25 +181,14 @@ export const test = base.extend<{
   // recovery-offer auto-decline watcher (the harness answering a designed
   // NOTHING (the route is absent there — byte-identical behavior). The
   // built-in `context` is overridden, so spec-authored
-  // `browser.newContext()` pages bypass it; those specs adopt
-  // `installRecoveryOfferAutoDeclineOnContext` directly (multi-client,
-  // `recoveryOfferHandling: 'manual'` (panel-owning specs).
+  // `browser.newContext()` pages bypass it; those specs use the exported
+  // context helpers to install their intended machine before boot.
   context: async ({ context, recoveryOfferHandling, machineIdentityHandling, e2eMachineId, testServer }, use) => {
     if (recoveryOfferHandling === 'auto-decline') {
       installRecoveryOfferAutoDeclineOnContext(context)
     }
     if (machineIdentityHandling === 'auto-select') {
-      await context.addInitScript(({ machineKey, machineId, serverOrigin, versionKey, version }) => {
-        if (window.location.origin !== serverOrigin) return
-        localStorage.setItem(versionKey, String(version))
-        localStorage.setItem(machineKey, machineId)
-      }, {
-        machineKey: MACHINE_ID_STORAGE_KEY,
-        machineId: e2eMachineId,
-        serverOrigin: new URL(testServer.info.baseUrl).origin,
-        versionKey: STORAGE_VERSION_KEY,
-        version: STORAGE_VERSION,
-      })
+      await installE2eMachineIdentity(context, testServer.info, e2eMachineId)
     }
     await use(context)
   },
@@ -157,7 +210,7 @@ export const test = base.extend<{
   // restore the preceding test's workspace into a fresh browser context.
   // The id remains stable for every context that one test intentionally uses.
   e2eMachineId: async ({ testServer }, use) => {
-    await use(await createTestMachine(testServer.info))
+    await use((await registerE2eMachine(testServer.info)).id)
   },
 
   serverInfo: async ({ testServer }, use) => {

@@ -1,5 +1,11 @@
 import type { Browser, Page } from '@playwright/test'
-import { test, expect } from '../helpers/fixtures.js'
+import {
+  createE2eBrowserContext,
+  registerE2eMachine,
+  test,
+  expect,
+} from '../helpers/fixtures.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { installRecoveryOfferAutoDeclineOnContext } from '../helpers/recovery-offer.js'
 
 const RETIRED_TAB_TITLE = 'Retire endpoint e2e tab'
@@ -7,29 +13,14 @@ const RETIRED_DEVICE_LABEL = 'closing-device-e2e'
 
 async function newDevicePage(
   browser: Browser,
-  input: {
-    baseUrl: string
-    token: string
-    deviceId: string
-    deviceLabel: string
-  },
+  serverInfo: E2eServerInfo,
+  deviceLabel: string,
 ): Promise<Page> {
-  const context = await browser.newContext()
-  // RESTORE-01: manual contexts bypass the fixtures' `context` override, so
-  // this spec adopts the shared recovery auto-decline watcher directly
-  // (docs/plans/df1/RESTORE-01.md). No-op unless a recoverable offer is made.
+  const machine = await registerE2eMachine(serverInfo, deviceLabel)
+  const context = await createE2eBrowserContext(browser, serverInfo, machine.id)
   installRecoveryOfferAutoDeclineOnContext(context)
-  await context.addInitScript((device) => {
-    localStorage.setItem('freshell.device-id.v2', device.deviceId)
-    localStorage.setItem('freshell.device-label.v2', device.deviceLabel)
-    localStorage.setItem('freshell.device-label-custom.v2', '1')
-    localStorage.setItem('freshell.device-fingerprint.v2', `${navigator.platform}|${navigator.userAgent}`)
-  }, {
-    deviceId: input.deviceId,
-    deviceLabel: input.deviceLabel,
-  })
   const page = await context.newPage()
-  await page.goto(`${input.baseUrl}/?token=${input.token}&e2e=1`)
+  await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
   await waitForReady(page)
   return page
 }
@@ -111,20 +102,10 @@ async function retireByPagehideWithoutWebSocket(page: Page): Promise<void> {
 }
 
 test('closed browser client is removed from the Tabs UI through the unload retire API', async ({ browser, serverInfo }) => {
-  const closingPage = await newDevicePage(browser, {
-    baseUrl: serverInfo.baseUrl,
-    token: serverInfo.token,
-    deviceId: 'closing-device-id-e2e',
-    deviceLabel: RETIRED_DEVICE_LABEL,
-  })
+  const closingPage = await newDevicePage(browser, serverInfo, RETIRED_DEVICE_LABEL)
   await seedBrowserTab(closingPage, RETIRED_TAB_TITLE)
 
-  const beforePage = await newDevicePage(browser, {
-    baseUrl: serverInfo.baseUrl,
-    token: serverInfo.token,
-    deviceId: 'observer-before-device-id-e2e',
-    deviceLabel: 'observer-before-e2e',
-  })
+  const beforePage = await newDevicePage(browser, serverInfo, 'observer-before-e2e')
   await waitForTabsSnapshot(beforePage)
   await openTabsView(beforePage)
   await expect(beforePage.getByRole('button', {
@@ -134,12 +115,7 @@ test('closed browser client is removed from the Tabs UI through the unload retir
 
   await retireByPagehideWithoutWebSocket(closingPage)
 
-  const afterPage = await newDevicePage(browser, {
-    baseUrl: serverInfo.baseUrl,
-    token: serverInfo.token,
-    deviceId: 'observer-after-device-id-e2e',
-    deviceLabel: 'observer-after-e2e',
-  })
+  const afterPage = await newDevicePage(browser, serverInfo, 'observer-after-e2e')
   await waitForTabsSnapshot(afterPage)
   await openTabsView(afterPage)
   await expect(afterPage.getByRole('button', {

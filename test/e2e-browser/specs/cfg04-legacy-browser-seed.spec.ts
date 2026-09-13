@@ -1,6 +1,6 @@
 import fs from 'fs/promises'
 import path from 'path'
-import { test as base, expect } from '../helpers/fixtures.js'
+import { createE2eBrowserContext, test as base, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle } from '../helpers/external-target.js'
 
 const BROWSER_PREFERENCES_STORAGE_KEY = 'freshell.browser-preferences.v1'
@@ -119,8 +119,8 @@ async function expectSeededPreferencesResolved(page: any): Promise<void> {
 }
 
 test.describe('CFG-04 legacy browser-preference seeding', () => {
-  test('legacy seed migrates into browser preferences exactly once', async ({ browser, serverInfo }) => {
-    const context = await browser.newContext()
+  test('legacy seed migrates into browser preferences exactly once', async ({ browser, serverInfo, e2eMachineId }) => {
+    const context = await createE2eBrowserContext(browser, serverInfo, e2eMachineId)
     const page = await context.newPage()
     // 1. Empty browser storage (fresh WebView/browser profile): open and
     //    assert every seeded preference is resolved.

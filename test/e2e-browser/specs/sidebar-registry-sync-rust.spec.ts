@@ -14,6 +14,7 @@ import * as os from 'node:os'
 import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { RustServer, ensureRustServerBuilt, type E2eServerInfo } from '../helpers/rust-server.js'
+import { createFreshE2eBrowserContext } from '../helpers/fixtures.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -278,6 +279,12 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
    */
   const FRESH_CONTEXT_OPTIONS = { serviceWorkers: 'block' as const }
 
+  async function createFreshContext(
+    browser: import('@playwright/test').Browser,
+  ): Promise<import('@playwright/test').BrowserContext> {
+    return (await createFreshE2eBrowserContext(browser, info, FRESH_CONTEXT_OPTIONS)).context
+  }
+
   // Copied VERBATIM from recover-my-panes-rust.spec.ts:228-246 (its
   // openFreshContextWithOffer; connect -> connectWithoutShellPick).
   /**
@@ -291,7 +298,7 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
     browser: import('@playwright/test').Browser,
     label: string,
   ): Promise<{ ctx: import('@playwright/test').BrowserContext; page: import('@playwright/test').Page; harness: TestHarness }> {
-    const ctx = await browser.newContext(FRESH_CONTEXT_OPTIONS)
+    const ctx = await createFreshContext(browser)
     const page = await ctx.newPage()
     traceInventoryFailures(page, label)
     const harness = await connectWithoutShellPick(page, info)

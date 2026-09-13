@@ -4,6 +4,7 @@ import path from 'path'
 import { promisify } from 'util'
 import { chromium, type Browser, type BrowserContext, type Page } from '@playwright/test'
 import WebSocket from 'ws'
+import { createFreshE2eBrowserContext } from '../helpers/fixtures.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { RustServer } from '../helpers/rust-server.js'
 import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
@@ -748,9 +749,11 @@ async function executeSampleDefault(
       headless: true,
     })
 
-    context = await browser.newContext(buildAuditContextOptions({
-      profileId: input.profileId,
-    }))
+    context = (await createFreshE2eBrowserContext(
+      browser,
+      serverInfo,
+      buildAuditContextOptions({ profileId: input.profileId }),
+    )).context
     const page = await context.newPage()
     await installRafGapSampler(page)
     const cdpSession = await context.newCDPSession(page)

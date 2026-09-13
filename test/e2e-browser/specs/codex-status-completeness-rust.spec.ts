@@ -3,7 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import WebSocket from 'ws'
-import { test, expect } from '../helpers/fixtures.js'
+import { createFreshE2eBrowserContext, test, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle } from '../helpers/external-target.js'
 import { RustServer } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
@@ -453,7 +453,7 @@ test.describe('Codex status completeness (Rust only)', () => {
         const terminalA = await openCliPaneAndGetTerminalId(page, harnessA, tabA!, /Codex/i, 'codex')
 
         // Server B: second browser context, its own codex pane + turn.
-        contextB = await browser.newContext()
+        contextB = (await createFreshE2eBrowserContext(browser, infoB)).context
         const pageB = await contextB.newPage()
         const harnessB = await bootAndConnect(pageB, infoB)
         await expect(pageB.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
