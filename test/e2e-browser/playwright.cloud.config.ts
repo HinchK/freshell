@@ -53,12 +53,6 @@ export const CLOUD_SKIP_SPECS = [
   // Rust-only PATH shadow proof requires the local Rust fixture and is not a
   // cloud-compatible match-all run.
   'term28-path-shadow-rust.spec.ts',
-  // The cloud image has no .git metadata, so the build-id mismatch reload
-  // contract is intentionally exercised only by the local Rust project.
-  'server-build-mismatch-rust.spec.ts',
-  // Environment-sensitive: page lifecycle (pagehide/unload) timing differs
-  // in cloud containers; passes locally but flakes in cloud
-  'tabs-client-retire.spec.ts',
   // Environment-sensitive: idle grace period timing + shade transition
   // depends on precise wall-clock scheduling that differs in cloud
   'truly-idle-alerting.spec.ts',

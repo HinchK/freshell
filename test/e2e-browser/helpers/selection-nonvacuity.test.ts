@@ -59,12 +59,14 @@ loadConfigFromFile(process.argv[2]).then((config) => {
 function listedProjects(
   env: NodeJS.ProcessEnv,
   configPath = playwrightConfig,
+  selectors: string[] = [],
 ): { output: string; labels: string[]; tests: number; files: number } {
   const output = execFileSync(process.execPath, [
     playwrightCli,
     'test',
     '--config', configPath,
     '--list',
+    ...selectors,
   ], {
     cwd: projectRoot,
     env,
@@ -126,6 +128,8 @@ describe('browser selection non-vacuity', () => {
       selector: '--project=chromium test/e2e-browser/specs/mcp-qa-smoke-rust.spec.ts',
     })
     expect(CLOUD_SKIP_SPECS).toContain('mcp-qa-smoke-rust.spec.ts')
+    expect(CLOUD_SKIP_SPECS).not.toContain('server-build-mismatch-rust.spec.ts')
+    expect(CLOUD_SKIP_SPECS).not.toContain('tabs-client-retire.spec.ts')
 
     const cloudProjects = resolvedConfig(cloudConfig, cleanEnvironment())
     expect(cloudProjects.map((project) => project.name)).toEqual(['chromium'])
@@ -141,6 +145,17 @@ describe('browser selection non-vacuity', () => {
     expect(cloud.output).toContain('[chromium]')
     expect(cloud.tests).toBeGreaterThan(0)
     expect(cloud.files).toBeGreaterThan(0)
+
+    const migrated = listedProjects(cleanEnvironment(), cloudConfig, [
+      'test/e2e-browser/specs/server-build-mismatch-rust.spec.ts',
+      'test/e2e-browser/specs/tabs-client-retire.spec.ts',
+    ])
+    expect(migrated.tests).toBe(4)
+    expect(migrated.files).toBe(2)
+    expect(migrated.output).toContain('mismatched ready buildId reloads exactly once and converges')
+    expect(migrated.output).toContain('sentinel persists across a real navigation')
+    expect(migrated.output).toContain('a seeded sentinel suppresses a repeat mismatch (no reload)')
+    expect(migrated.output).toContain('closed browser client is removed from the Tabs UI through the unload retire API')
   })
 
   it('rejects a healthy response that does not identify Rust provenance', () => {

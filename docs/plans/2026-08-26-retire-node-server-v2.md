@@ -1952,6 +1952,8 @@ Docker, and GitHub Actions.
   env -u FRESHELL_RUN_REAL_PROVIDER_CONTRACTS npm run test:oracle
   npm run test:e2e:helpers
   npm exec playwright -- test --config test/e2e-browser/playwright.config.ts --project=chromium --list
+  FRESHELL_E2E_BACKEND=cloud npm run test:e2e:cloud -- --shards=1 --project=chromium test/e2e-browser/specs/server-build-mismatch-rust.spec.ts
+  FRESHELL_E2E_BACKEND=cloud npm run test:e2e:cloud -- --shards=1 --project=chromium test/e2e-browser/specs/tabs-client-retire.spec.ts
   FRESHELL_E2E_BACKEND=cloud npm run test:e2e:cloud -- --shards=4
   npm run test:electron
   npm run test:e2e:electron
@@ -1971,7 +1973,10 @@ Docker, and GitHub Actions.
   git diff --exit-code origin/main -- docs/index.html .kata.toml
   ```
 
-  Expected: all commands PASS; Playwright lists at least 308 tests in at least 86
+  Expected: all commands PASS; the focused Cloud Run receipts execute all three
+  `server-build-mismatch-rust.spec.ts` tests and the one
+  `tabs-client-retire.spec.ts` test with no skip or retry substitution before the
+  four-shard run; Playwright lists at least 308 tests in at least 86
   files and no legacy project; full configured E2E has nonzero executed tests and
   zero unexplained required skips, while the explicitly local-only MCP QA spec
   has a positive local receipt; optional real-provider T2 tests are reported as

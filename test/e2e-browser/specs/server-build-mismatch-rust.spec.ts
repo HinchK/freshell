@@ -30,11 +30,9 @@
  * entirely production code.
  *
  * Rust-only: runs in the application Chromium project (owns a
- * RustServer directly rather than the shared server fixture). CLOUD-SKIPPED with
- * justification (see playwright.cloud.config.ts): the Cloud Run image
- * builds WITHOUT git metadata, so both the Rust bake and the Vite define
- * are "unknown" there and the compare is inert BY DESIGN — this spec can
- * only pass on a lane where at least the client bake is a real sha.
+ * RustServer directly rather than the shared server fixture). The Cloud Run
+ * image receives the validated build-time commit input shared by Vite and
+ * Rust, so this same-artifact convergence proof runs in the cloud lane too.
  */
 import { createFreshE2eBrowserContext, test, expect } from '../helpers/fixtures.js'
 import { RustServer, ensureRustServerBuilt } from '../helpers/rust-server.js'
