@@ -321,6 +321,9 @@ export const RUST_ONLY_SPECS = [
   // Reconnect-revive acceptance: socket-drop/freeze revival; drives
   // RustServer + forceDisconnect + SIGSTOP (docs/plans/2026-08-22-reconnect-revive.md).
   /reconnect-revive-rust\.spec\.ts$/,
+  // AGENT-13 (kata ekc6): Rust-server extras routes (diff/exec), REST-level
+  // through an owned RustServer.
+  /freshagent-extras-rust\.spec\.ts$/,
   // MCP/REST focus neutrality: hard `expect(e2eServerKind).toBe('rust')` guard
   // and owned-RustServer wall harness (same convention as the other entries,
   // e.g. terminal-activity-rust).
@@ -637,6 +640,9 @@ export default defineConfig({
         // Reconnect-revive acceptance: socket-drop/freeze revival; drives
         // RustServer + forceDisconnect + SIGSTOP (see RUST_ONLY_SPECS entry).
         /reconnect-revive-rust\.spec\.ts$/,
+        // AGENT-13 (kata ekc6): extras routes (diff/exec) on the Rust
+        // server (see the RUST_ONLY_SPECS entry).
+        /freshagent-extras-rust\.spec\.ts$/,
         // Reconcile handshake (PW-RUST design §9.2): synthetic raw-WS client
         // proof of the reconciliation-on-connect handshake against the REAL
         // Rust server (see the RUST_ONLY_SPECS entry + spec doc comment).

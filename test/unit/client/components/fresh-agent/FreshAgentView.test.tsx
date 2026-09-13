@@ -8807,3 +8807,139 @@ describe('FreshAgentView provider-advertised session commands', () => {
     expect(within(menu).getByRole('menuitem', { name: /\/review/ })).toBeInTheDocument()
   })
 })
+
+describe('!command shell escape (exec route)', () => {
+  function renderShellEscapePane(store: ReturnType<typeof createStore>) {
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-shell-escape',
+        sessionId: 'thread-shell-escape',
+        status: 'idle',
+      },
+    }))
+    return render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+  }
+
+  it('runs in the live session cwd when the pane has no initial cwd', async () => {
+    const store = createStore()
+    store.dispatch(sessionInit({
+      sessionId: 'thread-shell-escape',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      cwd: '/live/session/cwd',
+    }))
+    apiMock.post.mockImplementation((url: string) =>
+      url === '/api/fresh-agent/exec'
+        ? Promise.resolve({ output: '', exitCode: 0, truncated: false })
+        : Promise.resolve({ title: null, source: 'none' }))
+    renderShellEscapePane(store)
+
+    const textbox = await screen.findByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+    await waitFor(() => expect(textbox).not.toBeDisabled())
+    fireEvent.change(textbox, { target: { value: '!pwd' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    await waitFor(() => {
+      expect(apiMock.post).toHaveBeenCalledWith('/api/fresh-agent/exec', { command: 'pwd', cwd: '/live/session/cwd' })
+    })
+  })
+
+  it('a shell command finishing after the conversation was replaced never lands in the new queue', async () => {
+    let resolveExec!: (value: { output: string; exitCode: number; truncated: boolean }) => void
+    apiMock.post.mockImplementation((url: string) => {
+      if (url !== '/api/fresh-agent/exec') return Promise.resolve({ title: null, source: 'none' })
+      return new Promise((resolve) => {
+        resolveExec = resolve
+      })
+    })
+    const store = createStore()
+    renderShellEscapePane(store)
+
+    const textbox = await screen.findByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+    await waitFor(() => expect(textbox).not.toBeDisabled())
+    fireEvent.change(textbox, { target: { value: '!echo stale' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    await waitFor(() => expect(apiMock.post).toHaveBeenCalledWith('/api/fresh-agent/exec', expect.objectContaining({ command: 'echo stale' })))
+
+    // The /new equivalent: the pane's session identity is replaced while
+    // the (up to 30 s) exec is still in flight.
+    act(() => {
+      store.dispatch(updatePaneContent({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-shell-escape-2',
+          sessionId: 'thread-shell-escape-new',
+          status: 'idle',
+        },
+      }))
+    })
+
+    act(() => {
+      resolveExec({ output: 'stale output', exitCode: 0, truncated: false })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent(/was not sent/)
+    })
+    expect(screen.queryByRole('status', { name: 'Queued messages' })).toBeNull()
+  })
+})
+
+describe('diff panel view wiring (ekc6)', () => {
+  it('expands a diff using the live session cwd when the pane has no initial cwd', async () => {
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'Codex summary',
+      capabilities: { send: true, interrupt: true, fork: true },
+      diffs: [{ id: 'diff-1', title: 'README.md', path: 'README.md' }],
+      turns: [],
+    })
+    const store = createStore()
+    store.dispatch(sessionInit({
+      sessionId: 'thread-diff-cwd',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      cwd: '/live/session/cwd',
+    }))
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-diff-cwd',
+        sessionId: 'thread-diff-cwd',
+        status: 'idle',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    // The pane carries NO initialCwd but a live session cwd; the snapshot
+    // carries a path-bearing diff. Expanding it must FETCH with the live
+    // session cwd —
+    // not show the missing-prerequisite "Diff unavailable" copy the
+    // initialCwd-only wiring produced for resumed/API-created panes.
+    const trigger = await screen.findByRole('button', { name: 'Diff: README.md' })
+    fireEvent.click(trigger)
+    await waitFor(() => expect(trigger).toHaveAttribute('aria-expanded', 'true'))
+    expect(screen.queryByText('Diff unavailable for this file.')).toBeNull()
+  })
+})
