@@ -543,21 +543,17 @@ describe('FreshAgentView', () => {
       await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1))
     })
 
-    it('blocks shell commands without disturbing queued follow-ups', async () => {
-      const queue = await setup()
-      queue.send('Continue after the current turn')
-      apiMock.post.mockClear()
+    it('checks current agent status when a shell command finishes', async () => {
+      const queue = await setup('idle')
+      let finishShell!: (result: { output: string; exitCode: number }) => void
+      apiMock.post.mockImplementationOnce(() => new Promise((resolve) => { finishShell = resolve }))
       queue.send('!pwd')
-      expect(screen.getByText('Shell commands are unavailable here; open a shell pane instead')).toBeVisible()
-      expect(apiMock.post).not.toHaveBeenCalled()
+      queue.status('running')
+      await act(async () => finishShell({ output: '/workspace', exitCode: 0 }))
       expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
       expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
-      expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('!pwd')
       queue.status('idle')
-      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1))
-      expect(sentFreshAgentMessages('freshAgent.send')[0]).toMatchObject({ text: 'Continue after the current turn' })
-      expect(screen.queryByRole('status', { name: 'Queued messages' })).toBeNull()
-      expect(apiMock.post.mock.calls.some(([url]) => url === '/api/fresh-agent/exec')).toBe(false)
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')[0]).toMatchObject({ text: expect.stringContaining('/workspace') }))
     })
   })
 
