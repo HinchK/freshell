@@ -2088,6 +2088,365 @@ async fn a_platform_limited_target_reap_on_the_flavor_failure_fences_typed() {
     );
 }
 
+/// b8ke e4r1 F1: the LAST `handoff-failed` frame of the window — the frame
+/// every same-generation client fold ends on (the client applies ALL
+/// same-generation updates, so the LAST one is the visible truth; a later
+/// `released` frame never masks the failure sequence this asserts over).
+fn last_handoff_failed_frame(frames: &[Value]) -> &Value {
+    frames
+        .iter()
+        .rev()
+        .find(|f| f["transition"] == "handoff-failed")
+        .expect("at least one handoff-failed frame")
+}
+
+/// b8ke e4r1 F1 (the truthful-representation channel): the failure-truth
+/// broadcast reflects the ACTUAL coordinator snapshot — after an
+/// unconfirmed-reap flavor-write failure (the reap TIMED OUT, the key
+/// stays fenced in Handoff), the LAST handoff-failed frame carries
+/// fenced:true + REAP_TIMEOUT, never a vacant conversion (pre-e4r1 the
+/// late generic failure frame converted the fenced record to
+/// ownerKind:"vacant" and overwrote the typed fenced frame on every
+/// same-generation client fold — remote panes read a vacant session while
+/// the server kept blocking every lifecycle operation). e4r1 F2: the
+/// done-line's outcome label records the NOT-CONFIRMED reap
+/// (flavor_write_failed_target_unconfirmed), never the blanket "reaped".
+#[tokio::test]
+async fn the_unconfirmed_reap_flavor_failure_frame_stays_fenced_never_vacant() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    let (sink, _capture_guard) = tracing_capture::capture();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let hooks = Arc::new(HandoffTestHooks::default());
+    hooks
+        .force_reap_timeout_fenced
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    hooks
+        .force_reap_timeout_fenced_skip
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let mut rig = build_rig_inner(
+        Some(Arc::clone(&hooks) as Arc<HandoffTestHooks>),
+        None,
+        None,
+        10_000,
+        None,
+        false,
+        Some(Arc::new(FailingFlavorWriter)),
+    );
+    establish_fresh_claude_owner(&rig, &sid).await;
+
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let result = handle.completion.await.expect("runner completed");
+    assert_eq!(
+        result["error"]["code"],
+        json!("SESSION_METADATA_WRITE_FAILED"),
+        "the typed failure answers: {result}"
+    );
+
+    // THE FRAME CONTRACT (the EMITTED frames, not the registry state):
+    // the LAST handoff-failed frame keeps the typed fenced truth.
+    let frames = drain_runtime_owner_frames(&mut rig.rx);
+    let last_failed = last_handoff_failed_frame(&frames);
+    assert_ne!(
+        last_failed["ownerKind"],
+        json!("vacant"),
+        "the unconfirmed-reap failure frame must never convert the fenced \
+         record to a vacant session — frames: {frames:?}"
+    );
+    assert_eq!(
+        last_failed["fenced"],
+        json!(true),
+        "the unconfirmed-reap failure frame carries the fenced marker: {frames:?}"
+    );
+    assert_eq!(
+        last_failed["reason"],
+        json!("REAP_TIMEOUT"),
+        "the unconfirmed-reap failure frame carries the typed fence reason: {frames:?}"
+    );
+
+    // e4r1 F2: the done-line records the NOT-CONFIRMED reap — never the
+    // blanket "reaped" label (the opposite of the safety-critical outcome).
+    let events = sink.lock().expect("capture lock").clone();
+    let done_outcomes: Vec<&str> = events
+        .iter()
+        .filter(|e| e.target == "freshell_ownership" && e.event == "ownership.handoff.done")
+        .filter_map(|e| e.fields.get("outcome").map(String::as_str))
+        .collect();
+    assert!(
+        done_outcomes.contains(&"flavor_write_failed_target_unconfirmed"),
+        "the unconfirmed-reap flavor failure's done outcome must be the \
+         truthful flavor_write_failed_target_unconfirmed — got {done_outcomes:?}"
+    );
+    assert!(
+        !done_outcomes.contains(&"flavor_write_failed_target_reaped"),
+        "a reap that was explicitly NOT confirmed must never log \
+         flavor_write_failed_target_reaped — got {done_outcomes:?}"
+    );
+}
+
+/// b8ke e4r1 F1: the PLATFORM-LIMITED unconfirmed-reap variant — the key
+/// ends the typed Fenced{PlatformLimited} record, and the LAST
+/// handoff-failed frame carries fenced:true + the fence's typed wire
+/// reason, never a vacant conversion. e4r1 F2: the done outcome records
+/// the NOT-CONFIRMED reap.
+#[tokio::test]
+async fn the_platform_limited_reap_failure_frame_stays_fenced_never_vacant() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    let (sink, _capture_guard) = tracing_capture::capture();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let hooks = Arc::new(HandoffTestHooks::default());
+    hooks
+        .force_platform_limited
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    hooks
+        .force_platform_limited_skip
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let mut rig = build_rig_inner(
+        Some(Arc::clone(&hooks) as Arc<HandoffTestHooks>),
+        None,
+        None,
+        10_000,
+        None,
+        false,
+        Some(Arc::new(FailingFlavorWriter)),
+    );
+    establish_fresh_claude_owner(&rig, &sid).await;
+
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let result = handle.completion.await.expect("runner completed");
+    assert_eq!(
+        result["error"]["code"],
+        json!("SESSION_METADATA_WRITE_FAILED"),
+        "the typed failure answers: {result}"
+    );
+
+    let frames = drain_runtime_owner_frames(&mut rig.rx);
+    let last_failed = last_handoff_failed_frame(&frames);
+    assert_ne!(
+        last_failed["ownerKind"],
+        json!("vacant"),
+        "the platform-limited failure frame must never convert the fenced \
+         record to a vacant session — frames: {frames:?}"
+    );
+    assert_eq!(
+        last_failed["fenced"],
+        json!(true),
+        "the platform-limited failure frame carries the fenced marker: {frames:?}"
+    );
+    assert_eq!(
+        last_failed["reason"],
+        json!("platform-limited"),
+        "the platform-limited failure frame carries the fence's typed wire \
+         reason: {frames:?}"
+    );
+
+    let events = sink.lock().expect("capture lock").clone();
+    let done_outcomes: Vec<&str> = events
+        .iter()
+        .filter(|e| e.target == "freshell_ownership" && e.event == "ownership.handoff.done")
+        .filter_map(|e| e.fields.get("outcome").map(String::as_str))
+        .collect();
+    assert!(
+        done_outcomes.contains(&"flavor_write_failed_target_unconfirmed"),
+        "the platform-limited flavor failure's done outcome must be the \
+         truthful flavor_write_failed_target_unconfirmed — got {done_outcomes:?}"
+    );
+    assert!(
+        !done_outcomes.contains(&"flavor_write_failed_target_reaped"),
+        "a platform-limited reap was explicitly NOT confirmed — never log \
+         flavor_write_failed_target_reaped: {done_outcomes:?}"
+    );
+}
+
+/// b8ke e4r1 F1: the STALE-COMMIT arm's duplicated flaw — a stale commit
+/// (ownership moved mid-handoff: the record is Fenced when the runner's
+/// commit arrives) whose uncommitted-target reap is UNCONFIRMED must keep
+/// the typed fenced truth as the LAST handoff-failed frame, never a vacant
+/// conversion. e4r1 F2: the done outcome records the NOT-CONFIRMED reap
+/// (stale_commit_target_unconfirmed), never stale_commit_reaped_target.
+#[tokio::test]
+async fn the_stale_commit_unconfirmed_reap_frame_stays_fenced_never_vacant() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    let (sink, _capture_guard) = tracing_capture::capture();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let pause = Arc::new(tokio::sync::Notify::new());
+    let hooks = Arc::new(HandoffTestHooks {
+        pause_in_target_spawn: Some(Arc::clone(&pause)),
+        ..HandoffTestHooks::default()
+    });
+    // The target reap consults AFTER the prior stop consumed the skip.
+    hooks
+        .force_reap_timeout_fenced
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    hooks
+        .force_reap_timeout_fenced_skip
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let mut rig = build_rig(Some(Arc::clone(&hooks)));
+    establish_fresh_claude_owner(&rig, &sid).await;
+
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    // Park proof: the settle published the spawned terminal and parked.
+    let target_terminal = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(watch) = hooks.spawn_watch_slot.lock().unwrap().clone() {
+                if let Some(terminal_id) = watch.published_terminal() {
+                    break terminal_id;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the settle never published the spawned terminal"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+
+    // Ownership moves mid-handoff: the handoff's own record is fenced by
+    // the watchdog-shaped typed fence (the runner's op/generation), so the
+    // runner's commit answers foreign — the stale-commit arm.
+    let (op, gen) = match rig.ownership.observe("claude", &sid).state {
+        OwnershipState::Handoff {
+            operation_id,
+            generation,
+            ..
+        } => (operation_id, generation),
+        other => panic!("the runner must hold the Handoff record: {other:?}"),
+    };
+    assert!(matches!(
+        rig.ownership.fence_unconfirmed_handoff(
+            "claude",
+            &sid,
+            &op,
+            gen,
+            FenceReason::WatcherFailed,
+        ),
+        freshell_ownership::FenceOutcome::Fenced
+    ));
+    pause.notify_one();
+
+    let result = handle.completion.await.expect("runner completed");
+    assert_eq!(
+        result["error"]["code"],
+        json!("STALE_GENERATION"),
+        "the typed stale-commit failure answers: {result}"
+    );
+
+    // THE FRAME CONTRACT: the LAST handoff-failed frame keeps the typed
+    // fenced truth (fenced:true + the fence record's wire reason), never a
+    // vacant conversion over a fenced record.
+    let frames = drain_runtime_owner_frames(&mut rig.rx);
+    let last_failed = last_handoff_failed_frame(&frames);
+    assert_ne!(
+        last_failed["ownerKind"],
+        json!("vacant"),
+        "the stale-commit's unconfirmed-reap failure frame must never \
+         convert the fenced record to a vacant session — frames: {frames:?}"
+    );
+    assert_eq!(
+        last_failed["fenced"],
+        json!(true),
+        "the stale-commit's unconfirmed-reap failure frame carries the \
+         fenced marker: {frames:?}"
+    );
+    assert_eq!(
+        last_failed["reason"],
+        json!("watcher-failed"),
+        "the stale-commit's unconfirmed-reap failure frame carries the \
+         fence record's typed wire reason: {frames:?}"
+    );
+
+    // e4r1 F2: the done outcome records the NOT-CONFIRMED reap.
+    let events = sink.lock().expect("capture lock").clone();
+    let done_outcomes: Vec<&str> = events
+        .iter()
+        .filter(|e| e.target == "freshell_ownership" && e.event == "ownership.handoff.done")
+        .filter_map(|e| e.fields.get("outcome").map(String::as_str))
+        .collect();
+    assert!(
+        done_outcomes.contains(&"stale_commit_target_unconfirmed"),
+        "the stale-commit's unconfirmed-reap done outcome must be the \
+         truthful stale_commit_target_unconfirmed — got {done_outcomes:?}"
+    );
+    assert!(
+        !done_outcomes.contains(&"stale_commit_reaped_target"),
+        "a reap that was explicitly NOT confirmed must never log \
+         stale_commit_reaped_target — got {done_outcomes:?}"
+    );
+
+    // Cleanup: reap the spawned target the forced-timeout path left
+    // running.
+    rig.registry.kill(&target_terminal);
+}
+
+/// b8ke e4r1 F1 control: a CONFIRMED target reap (the key truly ends
+/// Vacant) still broadcasts the truthful vacancy — the fix tightens the
+/// fenced/in-progress conversion, never the honest one. The done outcome
+/// keeps the truthful flavor_write_failed_target_reaped label.
+#[tokio::test]
+async fn the_confirmed_reap_flavor_failure_broadcasts_the_truthful_vacancy() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    let (sink, _capture_guard) = tracing_capture::capture();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let mut rig = build_rig_with_flavor_writer(Arc::new(FailingFlavorWriter));
+    establish_fresh_claude_owner(&rig, &sid).await;
+
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let result = handle.completion.await.expect("runner completed");
+    assert_eq!(
+        result["error"]["code"],
+        json!("SESSION_METADATA_WRITE_FAILED"),
+        "the typed failure answers: {result}"
+    );
+    await_cond("the confirmed reap must vacate the key", || {
+        rig.ownership.observe("claude", &sid).state == OwnershipState::Vacant
+    })
+    .await;
+
+    // The LAST handoff-failed frame is the truthful vacancy (the record IS
+    // Vacant — the only shape the vacant conversion is honest for).
+    let frames = drain_runtime_owner_frames(&mut rig.rx);
+    let last_failed = last_handoff_failed_frame(&frames);
+    assert_eq!(
+        last_failed["ownerKind"],
+        json!("vacant"),
+        "the confirmed-reap failure broadcasts the truthful vacancy: {frames:?}"
+    );
+    assert_eq!(
+        last_failed["reason"],
+        json!("SESSION_METADATA_WRITE_FAILED"),
+        "the confirmed-reap failure carries the typed failure reason: {frames:?}"
+    );
+
+    // e4r1 F2: the confirmed reap keeps the truthful "reaped" label.
+    let events = sink.lock().expect("capture lock").clone();
+    let done_outcomes: Vec<&str> = events
+        .iter()
+        .filter(|e| e.target == "freshell_ownership" && e.event == "ownership.handoff.done")
+        .filter_map(|e| e.fields.get("outcome").map(String::as_str))
+        .collect();
+    assert!(
+        done_outcomes.contains(&"flavor_write_failed_target_reaped"),
+        "the confirmed-reap flavor failure's done outcome keeps the \
+         truthful flavor_write_failed_target_reaped — got {done_outcomes:?}"
+    );
+}
+
 /// b8ke e3r2 F3: a FAILING flavor writer — the failure surfaces as the
 /// TYPED handoff failure (SESSION_METADATA_WRITE_FAILED), never a
 /// log-only success; the spawned target is reaped and the key ends Vacant

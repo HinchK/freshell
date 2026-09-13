@@ -1125,6 +1125,18 @@ impl SessionHandoffRunner {
                                 .ownership
                                 .observe(&req.provider, &req.session_id)
                                 .generation;
+                            // b8ke e4r1 F2: the truthful outcome label —
+                            // the reap's CONFIRMATION class, never a
+                            // blanket "reaped" (a timeout/platform-limited
+                            // reap was explicitly NOT confirmed; the old
+                            // label recorded the opposite of the
+                            // safety-critical outcome).
+                            let outcome = if Self::uncommitted_target_reap_confirmed(&reap_outcome)
+                            {
+                                "flavor_write_failed_target_reaped"
+                            } else {
+                                "flavor_write_failed_target_unconfirmed"
+                            };
                             self.log_transition(
                                 TransitionLog {
                                     operation_id: &operation_id,
@@ -1138,7 +1150,7 @@ impl SessionHandoffRunner {
                                     to_kind: Some(owner.kind),
                                     runtime_id: owner.terminal_id.as_deref(),
                                     pid: owner.pid,
-                                    outcome: "flavor_write_failed_target_reaped",
+                                    outcome,
                                     duration_ms: began.elapsed().as_millis() as u64,
                                     failure_reason: Some("SESSION_METADATA_WRITE_FAILED"),
                                     stale: None,
@@ -1255,6 +1267,16 @@ impl SessionHandoffRunner {
                             .ownership
                             .observe(&req.provider, &req.session_id)
                             .generation;
+                        // b8ke e4r1 F2: the truthful outcome label — the
+                        // reap's CONFIRMATION class (the old blanket
+                        // "reaped" recorded the opposite of the
+                        // safety-critical outcome for a timeout/
+                        // platform-limited reap).
+                        let outcome = if Self::uncommitted_target_reap_confirmed(&reap_outcome) {
+                            "stale_commit_reaped_target"
+                        } else {
+                            "stale_commit_target_unconfirmed"
+                        };
                         self.log_transition(
                             TransitionLog {
                                 operation_id: &operation_id,
@@ -1268,7 +1290,7 @@ impl SessionHandoffRunner {
                                 to_kind: Some(owner.kind),
                                 runtime_id: owner.terminal_id.as_deref(),
                                 pid: owner.pid,
-                                outcome: "stale_commit_reaped_target",
+                                outcome,
                                 duration_ms: began.elapsed().as_millis() as u64,
                                 failure_reason: Some("STALE_GENERATION"),
                                 stale: Some(&stale),
@@ -1432,6 +1454,25 @@ impl SessionHandoffRunner {
     /// same-generation corrective frame supersedes the handoff-started
     /// transition record on every device (the client fold never drops it —
     /// Task 8).
+    /// The failure-truth broadcast (round-2 review): the frame carries the
+    /// ACTUAL resulting coordinator snapshot — the owner identity for a
+    /// `Live` record, the TYPED fenced truth for a `Fenced` record, or the
+    /// true vacancy for a `Vacant` one — plus previousKind and the typed
+    /// reason. b8ke e4r1 F1: NEVER a vacant conversion for a fenced or
+    /// in-progress record — the client folds EVERY same-generation frame,
+    /// so a late generic "vacant" frame overwrites the specific typed
+    /// fence frame the unconfirmed-reap regime broadcast moments earlier
+    /// (connected remote panes would read a vacant session while the
+    /// server keeps blocking every lifecycle operation). The fenced branch
+    /// mirrors `broadcast_post_abort_authority` (R5-2): the record's
+    /// captured prior identity ("vacant" for a no-prior fence), the
+    /// `fenced: true` marker, and the fence's typed wire reason. An
+    /// IN-PROGRESS record (this runner's own fence-in-`Handoff` window or
+    /// a foreign Starting/Stopping/Handoff) is never asserted over: its
+    /// owning operation broadcasts its own phase frames — for the
+    /// unconfirmed-reap timeout the fenced `handoff-failed` frame stands as
+    /// the last same-generation frame, and a foreign transition owns the
+    /// record in the snapshot's place.
     fn broadcast_failure_truth(
         &self,
         req: &HandoffRequest,
@@ -1441,11 +1482,42 @@ impl SessionHandoffRunner {
         reason: &str,
     ) {
         let snap = self.ownership.observe(&req.provider, &req.session_id);
-        let (owner_kind, terminal_id) = match snap.state {
-            freshell_ownership::OwnershipState::Live { ref owner, .. } => {
-                (Some(owner.kind), owner.terminal_id.clone())
+        let (owner_kind, terminal_id, reason, fenced) = match snap.state {
+            freshell_ownership::OwnershipState::Live { ref owner, .. } => (
+                Some(owner.kind),
+                owner.terminal_id.clone(),
+                reason.to_string(),
+                None,
+            ),
+            freshell_ownership::OwnershipState::Fenced {
+                ref prior,
+                reason: fence_reason,
+                ..
+            } => {
+                // b8ke e4r1 F1: the typed fenced truth — the record's own
+                // captured identity, the fenced marker, and the fence's
+                // typed wire reason (never the generic failure reason over
+                // a fenced record).
+                let (owner_kind, terminal_id) = match prior {
+                    Some((owner, _)) => (Some(owner.kind), owner.terminal_id.clone()),
+                    None => (None, None),
+                };
+                (
+                    owner_kind,
+                    terminal_id,
+                    fence_reason.wire_str().to_string(),
+                    Some(true),
+                )
             }
-            _ => (None, None), // Vacant (or a foreign record): broadcast vacant
+            // In-progress records: never a vacant conversion, never an
+            // assertion over a foreign transition — the owning operation's
+            // own phase frames stand.
+            freshell_ownership::OwnershipState::Handoff { .. }
+            | freshell_ownership::OwnershipState::Starting { .. }
+            | freshell_ownership::OwnershipState::Stopping { .. } => return,
+            // Vacant (or a resolved foreign/Aliased record): the only
+            // truthful vacant conversion.
+            _ => (None, None, reason.to_string(), None),
         };
         self.broadcast_owner(
             req,
@@ -1455,8 +1527,8 @@ impl SessionHandoffRunner {
             operation_id,
             generation,
             previous_kind,
-            Some(reason),
-            None,
+            Some(&reason),
+            fenced,
         );
     }
 
@@ -1580,6 +1652,20 @@ impl SessionHandoffRunner {
     /// platform-limited teardown fences `Fenced{PlatformLimited}` (the
     /// documented no-watcher tradeoff). Returns `true` when the caller may
     /// vacate (the confirmed-reap shape).
+    /// b8ke e4r1 F2: whether the uncommitted-target teardown CONFIRMED the
+    /// target's death — `Reaped` (the reap answered) or the pre-kill
+    /// short-circuit (`ReapTimeout { fenced: false }`: nothing was ever
+    /// spawned/killed). A fenced timeout or a platform-limited teardown
+    /// was explicitly NOT confirmed. The truthful outcome-label class for
+    /// the failure arms' done-lines (a blanket "reaped" would record the
+    /// opposite of the safety-critical outcome).
+    fn uncommitted_target_reap_confirmed(outcome: &StopOutcomePriv) -> bool {
+        matches!(
+            outcome,
+            StopOutcomePriv::Reaped | StopOutcomePriv::ReapTimeout { fenced: false }
+        )
+    }
+
     fn uncommitted_target_reap_vacates(
         &self,
         outcome: &StopOutcomePriv,
