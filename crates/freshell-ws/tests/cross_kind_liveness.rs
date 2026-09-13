@@ -3872,3 +3872,333 @@ async fn race_coordinator_cancellation_and_sidecar_crash_leave_consistent_state(
         Some("released")
     );
 }
+
+// ── b8ke ext r6 F1: learned-identity terminal sessions commit Live ──────────
+
+/// A claude-shaped CLI spec for the compat-restore ladder test: the FIRST
+/// invocation EXITS immediately (naturally — the row is RETAINED for the
+/// ladder's rung-1 read; a registry kill would REMOVE the row and hide it
+/// from the ladder), and every LATER invocation SLEEPS — the ladder's
+/// replacement generation must STAY alive long enough for the Live-commit
+/// observation (an instantly-exiting replacement would have its exit
+/// watcher release the claim before the test can observe it).
+fn exiting_then_sleeper_cli_spec(name: &str) -> freshell_platform::CliCommandSpec {
+    let marker = std::env::temp_dir().join(format!(
+        "freshell-cross-kind-ladder-marker-{name}-{}-{}.marker",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let script_path = std::env::temp_dir().join(format!(
+        "freshell-cross-kind-ladder-{name}-{}-{}.sh",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    // The FIRST invocation DELAYS its exit (1s) past the settle's
+    // ownership commit: the natural-exit release consumes the retained
+    // claim exactly once, and an instant death would race the commit
+    // (the release finds an empty claim map and the record strands Live —
+    // a PRE-EXISTING exit-release/commit race for fast-dying terminals,
+    // outside this test's contract).
+    let script = format!(
+        "#!/bin/sh\nif [ -e \"{marker}\" ]; then exec sleep 300; fi\nsleep 1\n: > \"{marker}\"\nexit 1\n",
+        marker = marker.display()
+    );
+    std::fs::write(&script_path, script).expect("write ladder script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod ladder script");
+    }
+    freshell_platform::CliCommandSpec {
+        name: name.to_string(),
+        label: format!("{name}-label"),
+        env_var: None,
+        default_cmd: script_path.to_string_lossy().to_string(),
+        base_args: vec![],
+        base_env: std::collections::BTreeMap::new(),
+        resume_args: Some(vec!["--resume".to_string(), "{{sessionId}}".to_string()]),
+        create_session_args: Some(vec![
+            "--session-id".to_string(),
+            "{{sessionId}}".to_string(),
+        ]),
+        model_args: None,
+        sandbox_args: None,
+        permission_mode_args: None,
+    }
+}
+
+/// b8ke ext r6 F1: a fresh-Claude PREALLOCATION create (the server mints
+/// the durable `--session-id` AFTER request parsing) commits
+/// Live{Terminal} under the MINTED key — pre-r6 the learned identity was
+/// outside create_session_locator, so the live terminal session never
+/// entered the coordinator, a direct handoff entered from Vacant (no
+/// prior runtime to stop) and used the under-ticket target-resume path
+/// to start a SECOND writer on the same durable session.
+#[tokio::test]
+async fn a_fresh_claude_prealloc_create_commits_live_and_a_direct_handoff_sees_the_prior() {
+    let (url, _registry, ws_state) = spawn_server().await;
+    let mut ws = connect(&url).await;
+
+    // A FRESH claude create (no sessionRef, no resume): the server
+    // preallocates the durable id.
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-r6-f1-prealloc",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+        }),
+    )
+    .await;
+    let created = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "terminal.created" && v["requestId"] == "req-r6-f1-prealloc"
+    })
+    .await;
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    let mint = created["sessionRef"]["sessionId"]
+        .as_str()
+        .expect("a fresh claude create carries its preallocated sessionRef")
+        .to_string();
+
+    // THE CONTRACT: the preallocated session commits Live{Terminal} under
+    // the MINTED durable key (pre-r6: the key stayed Vacant — the session
+    // bypassed the coordinator entirely).
+    let ownership = ws_state.ownership.as_ref().expect("coordinator wired");
+    // DEFLAKE: 30s (the repo's load-budget convention) — the settle's
+    // commit trails the created frame and must not starve under
+    // full-package parallel load.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if matches!(
+            ownership.observe("claude", &mint).state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the fresh-claude prealloc session never committed Live under its \
+             minted key — state: {:?}",
+            ownership.observe("claude", &mint).state
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // THE HANDOFF CONTRACT: a direct handoff on the session SEES THE PRIOR
+    // OWNER (never Vacant-with-target-resume) — the captured prior is the
+    // terminal runtime the runner must stop.
+    let freshell_ownership::BeginOutcome::Granted { .. } = ownership.begin_handoff(
+        "claude",
+        &mint,
+        freshell_ownership::RuntimeOwnerKind::FreshAgent,
+        "op-r6-f1-prealloc-handoff",
+        None,
+        "test",
+        freshell_ownership::now_epoch_ms(),
+    ) else {
+        panic!("the handoff must grant against the committed Live session");
+    };
+    match ownership.observe("claude", &mint).state {
+        freshell_ownership::OwnershipState::Handoff {
+            prior: Some((owner, _)),
+            ..
+        } => {
+            assert_eq!(
+                owner.kind,
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "the handoff's captured prior is the live TERMINAL runtime"
+            );
+            assert_eq!(
+                owner.terminal_id.as_deref(),
+                Some(terminal_id.as_str()),
+                "the captured prior names the prealloc create's terminal"
+            );
+        }
+        other => panic!("the handoff must capture the prior terminal owner — got {other:?}"),
+    }
+    let _ = ownership.fail(
+        "claude",
+        &mint,
+        "op-r6-f1-prealloc-handoff",
+        ownership.observe("claude", &mint).generation,
+        false,
+    );
+}
+
+/// b8ke ext r6 F1: a COMPAT-RESTORE create (the claude P0.4 ladder
+/// resolves the durable identity from persisted state AFTER request
+/// parsing) commits Live{Terminal} under the LADDER-RESOLVED key — the
+/// same learned-identity bypass as the prealloc mint.
+#[tokio::test]
+async fn a_claude_compat_restore_create_commits_live_under_the_ladder_identity() {
+    let sid = format!("ladder-sid-{}", uuid::Uuid::new_v4());
+    let (url, registry, ws_state) = spawn_server_with_ladder_claude().await;
+    let mut ws = connect(&url).await;
+
+    // Generation #1: a sessionRef-bearing claude create whose row EXITS
+    // naturally (retained for the ladder's rung-1 read; its identity row
+    // carries the sessionRef).
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-r6-f1-ladder",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+    let created = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "terminal.created" && v["requestId"] == "req-r6-f1-ladder"
+    })
+    .await;
+    let first_terminal = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let gone = registry
+            .probe(&first_terminal)
+            .map(|row| row.status != freshell_protocol::TerminalRunStatus::Running)
+            .unwrap_or(true);
+        if gone {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first generation never exited"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // The exited generation's COORDINATOR release (the exit watcher's
+    // fenced release of create#1's claim) must land BEFORE generation #2 —
+    // otherwise the ladder restore's late claim observes the still-Live
+    // record, answers Adopt (the fence discipline), and tears its own child
+    // down (the correct never-double-commit behavior; the release trails
+    // the row's death by a watcher quantum).
+    {
+        let ownership = ws_state.ownership.as_ref().expect("coordinator wired");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while !matches!(
+            ownership.observe("claude", &sid).state,
+            freshell_ownership::OwnershipState::Vacant
+        ) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "generation #1's ownership never released after its exit — \
+                 state: {:?}",
+                ownership.observe("claude", &sid).state
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    // Generation #2: the compat-restore create — same createRequestId, no
+    // client-supplied id: the P0.4 ladder resolves the durable identity
+    // from the persisted identity row.
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-r6-f1-ladder",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "restore": true,
+        }),
+    )
+    .await;
+    let _ = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "terminal.created"
+            && v["requestId"] == "req-r6-f1-ladder"
+            && v["terminalId"] != json!(first_terminal)
+    })
+    .await;
+
+    // THE CONTRACT: the ladder-resolved session commits Live{Terminal}
+    // under the LADDER identity (pre-r6: the key stayed Vacant).
+    let ownership = ws_state.ownership.as_ref().expect("coordinator wired");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if matches!(
+            ownership.observe("claude", &sid).state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the compat-restore session never committed Live under the \
+             ladder identity — state: {:?}",
+            ownership.observe("claude", &sid).state
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // The direct handoff sees the prior owner (never
+    // Vacant-with-target-resume).
+    let freshell_ownership::BeginOutcome::Granted { .. } = ownership.begin_handoff(
+        "claude",
+        &sid,
+        freshell_ownership::RuntimeOwnerKind::FreshAgent,
+        "op-r6-f1-ladder-handoff",
+        None,
+        "test",
+        freshell_ownership::now_epoch_ms(),
+    ) else {
+        panic!("the handoff must grant against the committed Live session");
+    };
+    assert!(matches!(
+        ownership.observe("claude", &sid).state,
+        freshell_ownership::OwnershipState::Handoff {
+            prior: Some((owner, _)),
+            ..
+        } if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal
+    ));
+    let replacement_terminal = match ownership.observe("claude", &sid).state {
+        freshell_ownership::OwnershipState::Handoff {
+            prior: Some((owner, _)),
+            ..
+        } => owner.terminal_id,
+        _ => None,
+    };
+    let _ = ownership.fail(
+        "claude",
+        &sid,
+        "op-r6-f1-ladder-handoff",
+        ownership.observe("claude", &sid).generation,
+        false,
+    );
+
+    // Cleanup: reap the ladder's surviving replacement generation.
+    if let Some(tid) = replacement_terminal {
+        registry.kill(&tid);
+    }
+}
+
+/// [`spawn_server`] with the ladder test's two-phase claude spec.
+async fn spawn_server_with_ladder_claude() -> (String, freshell_terminal::TerminalRegistry, WsState)
+{
+    let (state, registry, _fresh_agent_state) =
+        build_ws_state(vec![exiting_then_sleeper_cli_spec("claude")]).await;
+    let router = freshell_ws::router(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral loopback port");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    (format!("ws://{addr}/ws"), registry, state)
+}

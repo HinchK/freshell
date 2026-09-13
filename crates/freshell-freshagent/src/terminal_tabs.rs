@@ -1748,6 +1748,31 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
     // detached, an aborted create is FULLY BOOKKEPT — never a
     // half-initialized orphan. (The WS door solves the same hazard by
     // spawning its settled restore create: `spawn_gated_restore_create`.)
+    // b8ke ext r6 F1: the LEARNED identity joins the late claim's locator —
+    // the REST prealloc mint / gate-healed mint / restore-ladder id is
+    // resolved AFTER request parsing, so the body-only guard_locator is
+    // None for these and the late claim (the commit authority) must carry
+    // the learned durable id: pre-r6 these live REST terminal sessions
+    // never committed Live{Terminal}, and a direct handoff entered from
+    // Vacant to start a second writer on the same durable session.
+    let learned_claim_locator = guard_locator.clone().or_else(|| {
+        resume_session_id
+            .as_deref()
+            .filter(|sid| {
+                // Only DURABLE session ids claim: the mints and ladder
+                // resolutions are canonical by construction; the filter
+                // keeps an implausible legacy resume id (which the
+                // guard_locator's own plausibility gate already rejected)
+                // from claiming a junk key.
+                !sid.is_empty()
+                    && is_session_provider_mode(&mode)
+                    && plausible_resume_session_id(&mode, sid)
+            })
+            .map(|sid| SessionLocator {
+                provider: mode.clone(),
+                session_id: sid.to_string(),
+            })
+    });
     let inputs = GatedSettleInputs {
         state: state.clone(),
         body: body.clone(),
@@ -1765,7 +1790,7 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
         create_request_id,
         session_ref_lease,
         ownership_claim,
-        claim_locator: guard_locator.clone(),
+        claim_locator: learned_claim_locator,
         under_handoff_ticket,
         handoff_spawn_watch,
         registry,
@@ -7911,5 +7936,86 @@ if (args.includes('app-server')) {{
 
         // Cleanup: reap the surviving replacement PTY.
         registry.kill(&tid);
+    }
+
+    /// b8ke ext r6 F1: a fresh-claude PREALLOCATION create through the REST
+    /// door commits Live{Terminal} under the MINTED key — pre-r6 the REST
+    /// late claim carried only the body-derived guard_locator, so the
+    /// REST-minted prealloc session bypassed the coordinator (a direct
+    /// handoff entered from Vacant and started a second writer on the
+    /// same durable session).
+    #[tokio::test]
+    async fn a_rest_fresh_claude_prealloc_create_commits_live_under_the_minted_key() {
+        let _ = isolate_amplifier_home();
+        let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let registry =
+            freshell_terminal::TerminalRegistry::new().with_ownership(Arc::clone(&ownership));
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let state = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx))
+            .with_terminal_registry(registry.clone())
+            .with_cli_commands(Arc::new(vec![claude_prealloc_recording_cli_spec(
+                &unique_argv_file("rest-r6-prealloc"),
+            )]))
+            .with_ownership(Arc::clone(&ownership));
+        let tmp = std::env::temp_dir();
+
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": tmp.to_string_lossy(),
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the fresh REST claude create must succeed: {body}"
+        );
+        // The REST HTTP body carries ONLY {tabId, paneId, terminalId} — the
+        // preallocated sessionRef rides the registry row (the
+        // rest_claude_identity.rs `identity_probe_rows` shape).
+        let terminal_id = body["data"]["terminalId"]
+            .as_str()
+            .expect("terminalId")
+            .to_string();
+        let mint = registry
+            .identity_probe_rows()
+            .iter()
+            .find(|r| r.terminal_id == terminal_id)
+            .unwrap_or_else(|| panic!("registry row for {terminal_id}"))
+            .resume_session_id
+            .clone()
+            .expect("the fresh REST claude row carries the preallocated id");
+
+        // THE CONTRACT: the minted session commits Live{Terminal} under the
+        // MINTED key (pre-r6: the key stayed Vacant).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if matches!(
+                ownership.observe("claude", &mint).state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the REST fresh-claude prealloc session never committed Live \
+                 under its minted key — state: {:?}",
+                ownership.observe("claude", &mint).state
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        match ownership.observe("claude", &mint).state {
+            freshell_ownership::OwnershipState::Live { owner, .. } => {
+                assert_eq!(owner.terminal_id.as_deref(), Some(terminal_id.as_str()));
+            }
+            other => panic!("the minted key must be Live — got {other:?}"),
+        }
+
+        // Cleanup: reap the spawned terminal.
+        registry.kill(&terminal_id);
     }
 }

@@ -4650,7 +4650,27 @@ pub(crate) async fn handle_create(
     // just-spawned terminal is then handled per the stale-teardown path
     // below (never double-committed, never clobbering the later owner).
     if terminal_ownership.is_none() {
-        if let Some(locator) = create_session_locator(&create) {
+        // b8ke ext r6 F1: the LEARNED identity — a durable session id this
+        // create resolved AFTER request parsing (the fresh-claude/amplifier
+        // prealloc mint, the resume-gate's healed mint, the claude P0.4
+        // restore ladder) — joins the late claim's locator. The pre-spawn
+        // claim cannot see these (they are minted/resolved after it); the
+        // late claim is the commit authority and MUST carry them: pre-r6
+        // these live terminal sessions never committed Live{Terminal}, so
+        // a direct handoff entered from Vacant (no prior runtime to stop)
+        // and used the under-ticket target-resume path to start a SECOND
+        // writer on the same durable session. The body locator still wins
+        // (the wire's identity is the canonical one whenever it exists).
+        let learned_locator = create_session_locator(&create).or_else(|| {
+            resume_session_id
+                .as_deref()
+                .filter(|sid| !sid.is_empty() && mode != "shell")
+                .map(|sid| SessionLocator {
+                    provider: mode.clone(),
+                    session_id: sid.to_string(),
+                })
+        });
+        if let Some(locator) = learned_locator {
             let operation_id = format!("term-create-late-{}", create.request_id);
             let initiator = format!("ws-conn-{conn_id}");
             let refusal = match freshell_freshagent::ownership_lane::begin_terminal_lane_claim(
