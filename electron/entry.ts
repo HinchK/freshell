@@ -46,6 +46,39 @@ const isDev = process.env.ELECTRON_DEV === '1'
 const configDir = path.join(os.homedir(), '.freshell')
 const mainProcessLogger = createElectronMainLogger({ configDir })
 
+const ELECTRON_TEST_DISCOVERY_CANDIDATE = 'FRESHELL_ELECTRON_TEST_DISCOVERY_CANDIDATE'
+
+/**
+ * Electron E2E disables the normal local-port sweep so its process can never
+ * probe a developer's live server. This fixture-only seam supplies the one
+ * Rust server that the test started and owns, preserving the real chooser
+ * candidate path without re-enabling discovery.
+ */
+function readElectronTestDiscoveryCandidates(): LaunchServerCandidate[] {
+  const serialized = process.env[ELECTRON_TEST_DISCOVERY_CANDIDATE]
+  if (!serialized) return []
+
+  try {
+    const candidate = JSON.parse(serialized) as Partial<LaunchServerCandidate>
+    if (
+      typeof candidate.id !== 'string' ||
+      typeof candidate.url !== 'string' ||
+      !['configured', 'known', 'port-scan', 'manual'].includes(candidate.origin ?? '') ||
+      !['owned', 'detected-local', 'remote'].includes(candidate.ownership ?? '')
+    ) {
+      throw new Error('candidate must include id, url, origin, and ownership')
+    }
+    new URL(candidate.url)
+    return [candidate as LaunchServerCandidate]
+  } catch (error) {
+    throw new Error(
+      `${ELECTRON_TEST_DISCOVERY_CANDIDATE} must be a serialized launch candidate: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    )
+  }
+}
+
 type EntryBrowserWindow = InstanceType<typeof BrowserWindow>
 type WindowListener = { event: string; callback: (...args: any[]) => void }
 
@@ -392,7 +425,7 @@ async function main(): Promise<void> {
     // prevents the normal local-server discovery sweep from touching another
     // developer's server while the fixture exercises an explicit launch.
     discoverLaunchCandidates: process.env.FRESHELL_ELECTRON_TEST_NO_LOCAL_DISCOVERY === '1'
-      ? async () => []
+      ? async () => readElectronTestDiscoveryCandidates()
       : undefined,
     createBrowserWindow: (options) => {
       return createRecoverableEntryWindow(

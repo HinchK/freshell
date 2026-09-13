@@ -12,6 +12,8 @@ import fs from 'fs'
 import os from 'os'
 import { RustServer } from '../e2e-browser/helpers/rust-server.js'
 import type { E2eServerInfo } from '../e2e-browser/helpers/server-fixture-support.js'
+import type { LaunchServerCandidate } from '../../electron/types.js'
+import { stopOwnedServerAndVerify } from './owned-server-teardown.js'
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, '..', '..')
 
@@ -32,7 +34,11 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
-async function launchApp(tmpHome: string, captureOutput = false): Promise<ElectronApplication> {
+async function launchApp(
+  tmpHome: string,
+  captureOutput = false,
+  discoveryCandidate?: LaunchServerCandidate,
+): Promise<ElectronApplication> {
   const app = await electron.launch({
     args: [PROJECT_ROOT],
     env: {
@@ -42,6 +48,9 @@ async function launchApp(tmpHome: string, captureOutput = false): Promise<Electr
       // The Electron launch chooser normally probes local development ports,
       // including :3001. E2E supplies an explicit owned target instead.
       FRESHELL_ELECTRON_TEST_NO_LOCAL_DISCOVERY: '1',
+      FRESHELL_ELECTRON_TEST_DISCOVERY_CANDIDATE: discoveryCandidate
+        ? JSON.stringify(discoveryCandidate)
+        : undefined,
     },
     cwd: PROJECT_ROOT,
   })
@@ -138,9 +147,67 @@ async function startRemoteServer(): Promise<E2eServerInfo> {
 }
 
 async function stopRemoteServer(): Promise<void> {
-  await remoteServer?.stop().catch(() => {})
+  const server = remoteServer
+  const serverInfo = remoteServerInfo
   remoteServer = undefined
   remoteServerInfo = undefined
+
+  if (!server) return
+  if (!serverInfo) {
+    await server.stop()
+    throw new Error('Electron remote-server fixture stopped without an owned PID/port receipt')
+  }
+  await stopOwnedServerAndVerify(server, serverInfo)
+}
+
+function appendCleanupFailure(failures: Error[], step: string, error: unknown): void {
+  failures.push(new Error(`Electron fixture cleanup failed while ${step}`, { cause: error }))
+}
+
+async function cleanupElectronFixture(options: {
+  app?: ElectronApplication
+  restoreOpenExternal?: boolean
+  stopServer?: () => Promise<void>
+  tmpHome?: string
+}): Promise<void> {
+  const failures: Error[] = []
+
+  // App shutdown must precede server shutdown so renderer/browser teardown
+  // cannot race the fixture's exact PID/port proof.
+  if (options.app && options.restoreOpenExternal) {
+    try {
+      await options.app.evaluate(() => {
+        ;(globalThis as any).__restoreOpenExternal?.()
+      })
+    } catch (error) {
+      appendCleanupFailure(failures, 'restoring shell.openExternal', error)
+    }
+  }
+  if (options.app) {
+    try {
+      await options.app.close()
+    } catch (error) {
+      appendCleanupFailure(failures, 'closing Electron', error)
+    }
+  }
+  if (options.stopServer) {
+    try {
+      await options.stopServer()
+    } catch (error) {
+      appendCleanupFailure(failures, 'stopping the owned Rust server', error)
+    }
+  }
+  if (options.tmpHome) {
+    try {
+      fs.rmSync(options.tmpHome, { recursive: true, force: true })
+    } catch (error) {
+      appendCleanupFailure(failures, 'removing the temporary HOME', error)
+    }
+  }
+
+  if (failures.length > 0) {
+    throw new AggregateError(failures, 'Electron fixture cleanup failed')
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -150,29 +217,35 @@ async function stopRemoteServer(): Promise<void> {
 test.describe('Renderer crash recovery', () => {
   let app: ElectronApplication | undefined
   let server: RustServer | undefined
+  let serverInfo: E2eServerInfo | undefined
   let tmpHome: string | undefined
 
   test.afterEach(async () => {
-    if (app) {
-      await app.evaluate(() => {
-        ;(globalThis as any).__restoreOpenExternal?.()
-      }).catch(() => {})
-      await app.close().catch(() => {})
-      app = undefined
-    }
-    if (server) {
-      await server.stop().catch(() => {})
-      server = undefined
-    }
-    if (tmpHome) {
-      fs.rmSync(tmpHome, { recursive: true, force: true })
-      tmpHome = undefined
-    }
+    const appToClose = app
+    const serverToStop = server
+    const infoToVerify = serverInfo
+    const homeToRemove = tmpHome
+    app = undefined
+    server = undefined
+    serverInfo = undefined
+    tmpHome = undefined
+    await cleanupElectronFixture({
+      app: appToClose,
+      restoreOpenExternal: true,
+      stopServer: serverToStop && infoToVerify
+        ? () => stopOwnedServerAndVerify(serverToStop, infoToVerify)
+        : serverToStop
+          ? () => serverToStop.stop().then(() => {
+            throw new Error('renderer-recovery fixture stopped without an owned PID/port receipt')
+          })
+          : undefined,
+      tmpHome: homeToRemove,
+    })
   })
 
   test('recovers the main Freshell UI after the renderer process crashes', async () => {
     server = new RustServer()
-    const serverInfo = await server.start()
+    serverInfo = await server.start()
     tmpHome = createTempHome({
       serverMode: 'remote',
       port: serverInfo.port,
@@ -204,6 +277,10 @@ test.describe('Renderer crash recovery', () => {
     )
     await recoveredWindow.waitForLoadState('domcontentloaded')
     await expect(recoveredWindow.locator('text=New Tab').first()).toBeVisible({ timeout: 30_000 })
+    // The client may apply its one-time stale-build reload after the first
+    // recovered DOM becomes visible. Wait for that navigation to settle
+    // before injecting the renderer-side IPC probe below.
+    await recoveredWindow.waitForLoadState('networkidle')
 
     await app.evaluate(({ shell }) => {
       const original = shell.openExternal
@@ -260,9 +337,11 @@ test.describe('Wizard flow', () => {
   })
 
   test.afterEach(async () => {
-    if (app) await app.close().catch(() => {})
-    await stopRemoteServer()
-    if (tmpHome) fs.rmSync(tmpHome, { recursive: true, force: true })
+    const appToClose = app
+    const homeToRemove = tmpHome
+    app = undefined
+    tmpHome = undefined
+    await cleanupElectronFixture({ app: appToClose, stopServer: stopRemoteServer, tmpHome: homeToRemove })
   })
 
   test('shows wizard on first launch and completes setup', async () => {
@@ -346,9 +425,11 @@ test.describe('Launch chooser', () => {
   })
 
   test.afterEach(async () => {
-    if (app) await app.close().catch(() => {})
-    await stopRemoteServer()
-    if (tmpHome) fs.rmSync(tmpHome, { recursive: true, force: true })
+    const appToClose = app
+    const homeToRemove = tmpHome
+    app = undefined
+    tmpHome = undefined
+    await cleanupElectronFixture({ app: appToClose, stopServer: stopRemoteServer, tmpHome: homeToRemove })
   })
 
   test('shows launch chooser when alwaysAskOnLaunch is true', async () => {
@@ -362,18 +443,27 @@ test.describe('Launch chooser', () => {
     await expect(chooser.getByRole('checkbox', { name: 'Always ask on launch' })).toBeChecked()
   })
 
-  test('connects to an explicit remote server from chooser', async () => {
+  test('connects to its injected owned-server candidate from chooser', async () => {
     const serverInfo = requireRemoteServerInfo()
     tmpHome = createTempHome({ ...remoteConfig(serverInfo), alwaysAskOnLaunch: true })
+    const candidate: LaunchServerCandidate = {
+      id: `electron-e2e-owned-${serverInfo.port}`,
+      url: serverInfo.baseUrl,
+      origin: 'known',
+      ownership: 'detected-local',
+      label: `Owned fixture ${serverInfo.port}`,
+      requiresAuth: true,
+    }
 
-    app = await launchApp(tmpHome)
+    app = await launchApp(tmpHome, false, candidate)
     const chooser = await app.firstWindow()
     await chooser.waitForLoadState('domcontentloaded')
 
-    // An explicit remote choice must connect this launch even with "Always
-    // ask on launch" still checked — that is the forced-launch behavior.
-    await chooser.getByLabel('Token').fill(serverInfo.token)
-    await chooser.getByRole('button', { name: 'Connect remote' }).click()
+    // The injected candidate is the test-owned ephemeral Rust server. This
+    // exercises the real chooser candidate route without scanning :3001.
+    await expect(chooser.getByText(candidate.label!, { exact: true })).toBeVisible()
+    await chooser.getByLabel(`Token for ${candidate.label}`).fill(serverInfo.token)
+    await chooser.getByRole('button', { name: `Connect to ${candidate.label}` }).click()
     const mainPage = await waitForWindowUrl(
       app,
       new RegExp(`^${escapeRegExp(serverInfo.baseUrl)}(?:[/?#]|$)`),
@@ -399,9 +489,11 @@ test.describe('Main window with remote server', () => {
   })
 
   test.afterEach(async () => {
-    if (app) await app.close().catch(() => {})
-    await stopRemoteServer()
-    if (tmpHome) fs.rmSync(tmpHome, { recursive: true, force: true })
+    const appToClose = app
+    const homeToRemove = tmpHome
+    app = undefined
+    tmpHome = undefined
+    await cleanupElectronFixture({ app: appToClose, stopServer: stopRemoteServer, tmpHome: homeToRemove })
   })
 
   test('loads authenticated Freshell UI', async () => {
