@@ -1059,7 +1059,7 @@ test.describe('OpenCode restart recovery', () => {
   })
 
   test('restores an OpenCode pane when its persisted cwd was deleted with the old server home', async ({ page }) => {
-    // Kata ywwf: a pane created with cwd inside the TestServer's isolated
+    // Kata ywwf: a pane created with cwd inside the RustServer's isolated
     // /tmp/freshell-e2e-* home persists that path as initialCwd; stop()
     // deletes the home, and the post-restart replay used to die in OpenCode
     // MCP config injection ('cwd directory does not exist') with
@@ -1071,14 +1071,14 @@ test.describe('OpenCode restart recovery', () => {
     const sharedOpencodeDataDir = path.join(sharedRoot, 'opencode-data')
     await installFakeOpencode(binDir)
 
-    const server1 = new TestServer(createServerOptions({
+    const server1 = new RustServer(createServerOptions({
       binDir,
       auditLogPath,
       logsDir,
       sharedOpencodeDataDir,
     }))
 
-    let server2: TestServer | undefined
+    let server2: RustServer | undefined
     try {
       const info1 = await server1.start()
       await page.goto(`${info1.baseUrl}/?token=${info1.token}&e2e=1`)
@@ -1103,7 +1103,7 @@ test.describe('OpenCode restart recovery', () => {
       await server1.stop() // deletes info1.homeDir
       await expect(fsp.stat(info1.homeDir)).rejects.toThrow()
 
-      server2 = new TestServer(createServerOptions({
+      server2 = new RustServer(createServerOptions({
         binDir,
         auditLogPath,
         logsDir,

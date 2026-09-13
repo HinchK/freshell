@@ -194,7 +194,9 @@ fn managed_codex_renderings_use_wsl_paths_for_native_windows_unix_tui() {
     let unconvertible_rt = FakeRt::new(
         scratch.path(),
         false,
-        vec![McpServerArg::Path("\\\\server\\share\\server.ts".to_string())],
+        vec![McpServerArg::Path(
+            "\\\\server\\share\\server.ts".to_string(),
+        )],
     );
     let err = build_managed_codex_mcp_renderings(
         &unconvertible_rt,

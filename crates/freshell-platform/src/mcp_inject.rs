@@ -527,10 +527,7 @@ pub fn codex_inline_toml_command_args(server_command: &str, server_args: &[Strin
     ]
 }
 
-fn managed_codex_inline_toml_args(
-    server_command: &str,
-    server_args: &[String],
-) -> Vec<String> {
+fn managed_codex_inline_toml_args(server_command: &str, server_args: &[String]) -> Vec<String> {
     let mut args = codex_inline_toml_command_args(server_command, server_args);
     let env_vars = FRESHELL_MCP_CONTEXT_ENV_VARS
         .iter()
@@ -565,14 +562,7 @@ pub fn build_managed_codex_mcp_renderings(
     };
 
     Ok(ManagedCodexMcpRenderings {
-        tui: managed_codex_mcp_injection(
-            &command,
-            runtime,
-            env,
-            host_os,
-            is_wsl_env,
-            tui_target,
-        )?,
+        tui: managed_codex_mcp_injection(&command, runtime, env, host_os, is_wsl_env, tui_target)?,
         sidecar: managed_codex_mcp_injection(
             &command,
             runtime,
