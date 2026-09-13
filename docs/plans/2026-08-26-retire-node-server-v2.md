@@ -8,24 +8,26 @@
 ## User Request
 
 ### Requested result
-Retire Freshell's legacy Node.js application server so the Rust server is the only supported backend/server path going forward.
+Retire Freshell's legacy Node.js application server so the Rust server is the only supported backend/server path, rebase PR #699 onto the latest `main`, resolve all substantiated review findings, verify it with the cloud test backends and required native checks, and leave it ready to land.
 
 ### Explicit constraints
 - Use the requested the-usual workflow.
-- Work in the fresh isolated `the-usual/retire-node-server-v2` worktree created from updated, green `origin/main`; preserve the first run as a superseded audit record until this replacement plan is validated.
+- Work only in `/home/dan/code/freshell/.worktrees/retire-node-server-v2` on `the-usual/retire-node-server-v2`.
 - Treat current Rust server behavior as the compatibility baseline.
-- Inventory and triage Node-only server features absent from Rust. If important and not tracked elsewhere, file them as katas.
+- Inventory and triage Node-only server features absent from Rust; important untracked capabilities belong in katas rather than being silently lost.
 - Do not carry the prior BrowserPane security-redesign premise into this retirement.
 - Node may remain for non-server frontend/build/test tooling, the Electron shell, standalone CLI/MCP clients, and the isolated Claude SDK sidecar; no Node process may remain as Freshell's HTTP/WebSocket/backend server.
 - Relocate retained CLI/MCP client source and build artifacts out of the legacy `server/` and `dist/server/` namespaces; do not rewrite them in Rust solely for this retirement.
-- Remove or clearly disable current client/CLI/MCP actions that only call Node-only endpoints absent from the Rust baseline; already-tracked future capabilities remain owned by their existing issues.
+- Remove or clearly disable client/CLI/MCP actions that only call Node-only endpoints absent from the Rust baseline; existing future-capability issues retain ownership.
 - Make every supported source, packaged Electron, daemon/service, container, test, and release server path launch `freshell-server` rather than the Node backend.
-- Use Red-Green-Refactor TDD and preserve appropriate unit, integration, and end-to-end coverage for retained behavior.
+- Use Red-Green-Refactor TDD and preserve appropriate unit, integration, and end-to-end coverage.
+- Use the configured cloud backends for Vitest and browser end-to-end tests; do not silently fall back to local runs.
 - Keep end-user documentation in `README.md`; update `docs/index.html` only for a major user-facing UI change.
 - Commit `.kata.toml` whenever it is modified.
-- Do not create or open a PR without explicit user approval, and do not push behavior changes directly to `origin/main`.
+- Rebase the branch onto the latest `origin/main`, push the feature branch at safe checkpoints, and prepare existing PR #699 to land; do not merge it without explicit user approval.
 - Never restart the live self-hosted Rust server on port 3001 without the user's explicit word `APPROVED`.
 - Prefer bash; repository code must use robust structured JSONL logging with severity where logging is needed.
+- Terra subagents may be used as needed.
 
 ### Accepted tradeoffs and residuals
 - Current Rust server behavior, rather than every legacy Node-only behavior, is the compatibility baseline for retirement.
@@ -71,16 +73,16 @@ Docker, and GitHub Actions.
   non-3001 loopback port. Lifecycle/restart-storm tests use
   `scripts/sandbox-test.sh`; no broad kill pattern is allowed.
 - Direct Vitest runs go through `npm run test:vitest -- ...`; broad branch runs
-  use the shared coordinator. Before a configured Playwright run, obey the
-  repository rule for an unset `FRESHELL_E2E_BACKEND`. A required spec in
+  use the configured cloud backend and shared coordinator. Browser E2E runs use
+  the configured cloud backend. A required spec in
   `CLOUD_SKIP_SPECS`, a zero-test filter, or a soft skip is not coverage.
 - New Node/Electron/tooling logs are one JSON object per line with `severity`,
   `event`, and non-secret context. New Rust logs use the configured structured
   `tracing` subscriber. Never log tokens, authorization headers, prompts,
   attachment/file bodies, or sidecar payloads.
-- No task starts a PR. A branch push is permitted for the final review handoff;
-  never push to `origin/main`. Native required checks run only after the user
-  explicitly approves PR creation. Do not deploy the result.
+- Existing PR #699 is the landing vehicle. Push focused checkpoints only to its
+  feature branch, never to `origin/main`, and do not merge without the user's
+  explicit approval. Do not deploy the result.
 - `.kata.toml` is expected to remain byte-identical. If implementation really
   changes it, include it in the focused task commit. Normal Kata create/search
   operations must not change it.
@@ -1938,7 +1940,7 @@ Docker, and GitHub Actions.
 
   ```bash
   npm run test:status
-  FRESHELL_TEST_SUMMARY="retire Node server: final Rust-only proof" npm run check
+  FRESHELL_VITEST_BACKEND=cloud FRESHELL_TEST_SUMMARY="retire Node server: final Rust-only proof" npm run check
   cargo fmt --all --check
   cargo clippy --workspace --all-targets --locked -- -D warnings
   cargo clippy -p freshell-codex --features real-transport --all-targets --locked -- -D warnings
@@ -1950,7 +1952,7 @@ Docker, and GitHub Actions.
   env -u FRESHELL_RUN_REAL_PROVIDER_CONTRACTS npm run test:oracle
   npm run test:e2e:helpers
   npm exec playwright -- test --config test/e2e-browser/playwright.config.ts --project=chromium --list
-  npm run test:e2e -- --project=chromium
+  FRESHELL_E2E_BACKEND=cloud npm run test:e2e:cloud -- --shards=4
   npm run test:electron
   npm run test:e2e:electron
   npm run electron:build
@@ -1981,15 +1983,14 @@ Docker, and GitHub Actions.
   Any selected destructive lifecycle suite runs via `scripts/sandbox-test.sh`,
   never directly on the host.
 
-  Native cross-platform acceptance is a required PR check, not a pre-PR dispatch.
-  After the final commit, push only this feature branch:
+  Native cross-platform acceptance is a required PR check. After each focused
+  checkpoint, push only this feature branch:
 
   ```bash
   git push -u origin the-usual/retire-node-server-v2
   ```
 
-  Then stop and request the user's explicit approval to create the PR. Once
-  approved, the normal required PR matrix must be green on `macos-15-intel`,
+  Existing PR #699 must then be green on `macos-15-intel`,
   `macos-latest`, `ubuntu-latest`, and `windows-2022`; each job reports native
   `freshell-server[.exe]`, authenticated server-info/SPA/PTY acceptance, stdio
   MCP/fake-Claude acceptance, exact cleanup, and no forbidden Node-server
@@ -2004,5 +2005,6 @@ Docker, and GitHub Actions.
   ```
 
   Expected final state: the worktree is clean after the commit; the external
-  triage receipt remains outside tracked worktree history; no PR exists; port
-  3001 was never contacted or restarted; the first retirement run remains intact.
+  triage receipt remains outside tracked worktree history; PR #699 is ready for
+  explicit merge approval; port 3001 was never contacted or restarted; the
+  first retirement run remains intact.
