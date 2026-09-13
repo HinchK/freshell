@@ -240,9 +240,9 @@ test.describe('Rust baseline browser actions', () => {
     const pane = page.locator('[data-context="fresh-agent"]').last()
     await expect(pane.getByLabel(/attach|attachment|upload/i)).toBeVisible()
     await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.clearSentWsMessages?.())
-    // Keep the command's identifying token distinct from stdout. Otherwise a
-    // queued context message that repeats only the command could accidentally
-    // satisfy the output assertion below.
+    // Keep the command's identifying token distinct from stdout. The
+    // forwarded body is parsed below so the fenced output section, rather
+    // than an occurrence in the echoed command, proves output forwarding.
     const shellCommandToken = 'freshell-shell-command-token'
     const shellOutputToken = 'freshell-shell-output-token'
     const shellCommand = `printf %s ${shellOutputToken} # ${shellCommandToken}`
@@ -270,10 +270,14 @@ test.describe('Rust baseline browser actions', () => {
       window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
     ).filter((message: any) => message?.type === 'freshAgent.send'))
     expect((sent[0] as { settings?: { cwd?: string } }).settings?.cwd).toBe(repoDir)
-    expect((sent[0] as { text?: string }).text)
-      .toContain(`I ran \`${shellCommand}\` in ${repoDir}.`)
-    expect((sent[0] as { text?: string }).text).toContain(shellCommandToken)
-    expect((sent[0] as { text?: string }).text).toContain(shellOutputToken)
+    const forwardedBody = (sent[0] as { text?: string }).text
+    const forwardedBodyParts = forwardedBody?.match(
+      /^I ran `(?<command>[\s\S]+)` in (?<cwd>[\s\S]+)\. Output:\n```\n(?<output>[\s\S]*)\n```$/,
+    )
+    expect(forwardedBodyParts).not.toBeNull()
+    expect(forwardedBodyParts?.groups?.command).toBe(shellCommand)
+    expect(forwardedBodyParts?.groups?.cwd).toBe(repoDir)
+    expect(forwardedBodyParts?.groups?.output).toBe(shellOutputToken)
     const diff = pane.locator('.fresh-agent-file-diff')
     await expect(diff).toContainText('README.md')
     await expect(diff).toContainText('modified')
