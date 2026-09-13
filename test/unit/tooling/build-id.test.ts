@@ -28,6 +28,13 @@ afterEach(() => {
 })
 
 describe('client build identity', () => {
+  const originalBuildCommit = process.env.FRESHELL_BUILD_COMMIT
+
+  afterEach(() => {
+    if (originalBuildCommit === undefined) delete process.env.FRESHELL_BUILD_COMMIT
+    else process.env.FRESHELL_BUILD_COMMIT = originalBuildCommit
+  })
+
   it('bakes the commit of the selected repository', () => {
     const root = scratchRepo()
     const sha = commit(root, 'first')
@@ -60,6 +67,38 @@ describe('client build identity', () => {
   it('returns unknown when git metadata is absent', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-build-id-no-git-'))
     roots.push(root)
+    expect(computeClientBuildId(root)).toBe('unknown')
+  })
+
+  it('uses a valid build-time commit override without git metadata', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-build-id-no-git-'))
+    roots.push(root)
+    const commit = 'a'.repeat(40)
+    process.env.FRESHELL_BUILD_COMMIT = commit
+
+    expect(computeClientBuildId(root)).toBe(commit)
+  })
+
+  it('uses a valid build-time commit override before checkout discovery', () => {
+    const root = scratchRepo()
+    const checkoutCommit = commit(root, 'checkout')
+    const artifactCommit = 'c'.repeat(40)
+    process.env.FRESHELL_BUILD_COMMIT = artifactCommit
+
+    expect(checkoutCommit).not.toBe(artifactCommit)
+    expect(computeClientBuildId(root)).toBe(artifactCommit)
+  })
+
+  it.each([
+    '',
+    'A'.repeat(40),
+    'a'.repeat(39),
+    'g'.repeat(40),
+  ])('ignores an invalid build-time commit override: %j', (override) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-build-id-no-git-'))
+    roots.push(root)
+    process.env.FRESHELL_BUILD_COMMIT = override
+
     expect(computeClientBuildId(root)).toBe('unknown')
   })
 })

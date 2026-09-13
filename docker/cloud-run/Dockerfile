@@ -8,10 +8,16 @@
 # Node remains in this image for Playwright and the retained JavaScript tooling.
 # The application backend is always the Rust executable copied from stage one.
 
+# An immutable artifact provenance input. It is deliberately an ARG rather
+# than copied `.git` metadata; the build scripts validate it before use.
+ARG FRESHELL_BUILD_COMMIT
+
 # ---------------------------------------------------------------------------
 # Stage 1: build the Rust server.
 # ---------------------------------------------------------------------------
 FROM rust:1-bookworm AS rust-builder
+
+ARG FRESHELL_BUILD_COMMIT
 
 ENV DEBIAN_FRONTEND=noninteractive \
     RUSTUP_HOME=/usr/local/rustup \
@@ -31,12 +37,14 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 COPY extensions/ ./extensions/
-RUN cargo build --release -p freshell-server --locked
+RUN FRESHELL_BUILD_COMMIT="$FRESHELL_BUILD_COMMIT" cargo build --release -p freshell-server --locked
 
 # ---------------------------------------------------------------------------
 # Stage 2: build retained Node tooling and static artifacts.
 # ---------------------------------------------------------------------------
 FROM node:22-bookworm AS node-builder
+
+ARG FRESHELL_BUILD_COMMIT
 
 ENV DEBIAN_FRONTEND=noninteractive \
     NONINTERACTIVE=1
@@ -49,7 +57,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --ignore-scripts
 
 COPY . .
-RUN npm run build:client && npm run build:tools
+RUN FRESHELL_BUILD_COMMIT="$FRESHELL_BUILD_COMMIT" npm run build:client && npm run build:tools
 
 # ---------------------------------------------------------------------------
 # Stage 3: test runtime with no compiler toolchain.
