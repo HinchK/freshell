@@ -17,6 +17,11 @@ interface DevicePage {
   machine: E2eMachine
 }
 
+interface RetireBeaconCapture {
+  url: string
+  body: string
+}
+
 async function newDevicePage(
   browser: Browser,
   serverInfo: E2eServerInfo,
@@ -101,6 +106,21 @@ async function retireByPagehideWithoutWebSocket(page: Page, machineId: string): 
     const state = window.__FRESHELL_TEST_HARNESS__?.getWsReadyState()
     return state !== 'ready'
   }, { timeout: 5_000 })
+  await page.evaluate(() => {
+    const originalSendBeacon = navigator.sendBeacon.bind(navigator)
+    const capturedKey = '__FRESHELL_E2E_RETIRED_BEACON__'
+    Object.defineProperty(navigator, 'sendBeacon', {
+      configurable: true,
+      value: (url: string, data?: BodyInit | null) => {
+        if (url === '/api/tabs-sync/client-retire' && data instanceof Blob) {
+          void data.text().then((body) => {
+            ;(window as Window & { [capturedKey]?: RetireBeaconCapture })[capturedKey] = { url, body }
+          })
+        }
+        return originalSendBeacon(url, data)
+      },
+    })
+  })
   const receipt = page.waitForResponse((response) => {
     const request = response.request()
     return request.method() === 'POST'
@@ -112,7 +132,13 @@ async function retireByPagehideWithoutWebSocket(page: Page, machineId: string): 
   const response = await receipt
   expect(response.status()).toBe(200)
   await expect(response.json()).resolves.toEqual({ ok: true, accepted: true })
-  const body = response.request().postDataJSON() as {
+  const captured = await page.waitForFunction(() => {
+    return (window as Window & { __FRESHELL_E2E_RETIRED_BEACON__?: RetireBeaconCapture })
+      .__FRESHELL_E2E_RETIRED_BEACON__
+  }, undefined, { timeout: 5_000 })
+  const beacon = await captured.jsonValue() as RetireBeaconCapture
+  expect(beacon.url).toBe('/api/tabs-sync/client-retire')
+  const body = JSON.parse(beacon.body) as {
     deviceId?: unknown
     clientInstanceId?: unknown
     snapshotRevision?: unknown
