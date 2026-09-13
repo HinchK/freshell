@@ -469,12 +469,18 @@ async fn probe_stale_start_fences(
                     event = release_event,
                     operation_id = %fence.operation_id,
                     provider = %fence.provider, session_id = %fence.session_id,
-                    runtime_id = ?fence.prior_terminal_id, generation = fence.generation,
+                    from_kind = ?fence.prior_kind,
+                    // b8ke e4r2 F2: the STABLE transition schema keeps
+                    // to_kind at every transition — a release creates no
+                    // new runtime owner, so the vacancy is the None value
+                    // (never a deleted field).
+                    to_kind = ?Option::<freshell_ownership::RuntimeOwnerKind>::None,
+                    runtime_id = ?fence.prior_terminal_id,
+                    pid = ?fence.prior_pid,
+                    generation = fence.generation,
                     initiator = %fence.initiator,
-                    // b8ke e4r1 F3: NO to_kind — the release creates no new
-                    // runtime owner (the record is Vacant), so a to_kind
-                    // field would falsely describe a terminal-to-terminal
-                    // transition and contradict the vacant release broadcast.
+                    duration_ms = freshell_ownership::now_epoch_ms()
+                        .saturating_sub(fence.since_ms),
                     probe = "terminal-row-liveness",
                     fence_reason = ?fence.reason,
                     epoch = ownership.boot_epoch(),
@@ -609,12 +615,18 @@ async fn probe_stale_start_fences(
                 event = release_event,
                 operation_id = %fence.operation_id,
                 provider = %fence.provider, session_id = %fence.session_id,
-                pid = ?fence.prior_pid, generation = fence.generation,
+                from_kind = ?fence.prior_kind,
+                // b8ke e4r2 F2: the STABLE transition schema keeps to_kind
+                // at every transition — a release creates no new runtime
+                // owner, so the vacancy is the None value (never a deleted
+                // field).
+                to_kind = ?Option::<freshell_ownership::RuntimeOwnerKind>::None,
+                runtime_id = ?fence.prior_terminal_id,
+                pid = ?fence.prior_pid,
+                generation = fence.generation,
                 initiator = %fence.initiator,
-                // b8ke e4r1 F3: NO to_kind — the release creates no new
-                // runtime owner (the record is Vacant), so a to_kind field
-                // would falsely describe a terminal-to-terminal transition
-                // and contradict the vacant release broadcast.
+                duration_ms = freshell_ownership::now_epoch_ms()
+                    .saturating_sub(fence.since_ms),
                 probe = if fence.prior_pid.is_some() {
                     "lane-confirmed-tree-reap"
                 } else if fence.settle_concluded.is_some() {
@@ -5145,13 +5157,26 @@ mod stale_start_watchdog_tests {
             .find(|(event, _)| event == "ownership.start.fence_probe_released")
             .expect("the fence-release event is captured")
             .clone();
+        // b8ke e4r2 F2: the release record carries the STABLE transition
+        // schema — every field present at every coordinator transition, the
+        // vacancy expressed as None values (to_kind=None: a release creates
+        // no new runtime owner — the field is retained, never deleted).
         for field in [
             "operation_id=",
             "provider=",
             "session_id=",
+            "from_kind=",
+            "to_kind=",
+            "runtime_id=",
+            "pid=",
             "generation=",
             "outcome=",
             "initiator=",
+            "duration_ms=",
+            "probe=",
+            "fence_reason=",
+            "epoch=",
+            "failure_reason=",
         ] {
             assert!(
                 released_fr.1.iter().any(|f| f.starts_with(field)),
@@ -5159,14 +5184,10 @@ mod stale_start_watchdog_tests {
                 released_fr.1
             );
         }
-        // b8ke e4r1 F3: the RELEASE diagnostic carries NO to_kind — the
-        // release creates no new runtime owner, so a to_kind field would
-        // falsely describe a terminal-to-terminal transition and contradict
-        // the accompanying vacant release broadcast.
         assert!(
-            !released_fr.1.iter().any(|f| f.starts_with("to_kind=")),
-            "the fence-release log must carry NO to_kind (a release \
-             transition has no new runtime owner) — got {:?}",
+            released_fr.1.iter().any(|f| f == "to_kind=None"),
+            "the release's to_kind is the STABLE-SCHEMA None value (the \
+             release creates no new runtime owner) — got {:?}",
             released_fr.1
         );
 
@@ -5462,6 +5483,7 @@ mod stale_start_watchdog_tests {
 
         // THE PROBE: the terminal row's death confirms → RELEASES
         // (pre-d4: the claude Fresh probe's false held it forever).
+        let sink_d4f2c = transition_log_capture::install();
         let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
         probe_stale_start_fences(&states.0, &states.1, &states.2, &states.3, &states.4, &tx).await;
         assert_eq!(
@@ -5469,6 +5491,55 @@ mod stale_start_watchdog_tests {
             OwnershipState::Vacant,
             "the dead terminal's fence releases (pre-d4: the Fresh probe \
              wedged it forever)"
+        );
+
+        // b8ke e4r2 F2: the TERMINAL-prior release record carries the same
+        // STABLE transition schema as the Fresh Agent arm — every field
+        // present, the vacancy expressed as the None to_kind (the release
+        // creates no new runtime owner).
+        let events_d4f2c = sink_d4f2c.events();
+        let released_d4f2c = events_d4f2c
+            .iter()
+            .find(|(event, _)| event == "ownership.start.fence_probe_released")
+            .expect("the terminal-prior release event is captured")
+            .clone();
+        for field in [
+            "operation_id=",
+            "provider=",
+            "session_id=",
+            "from_kind=",
+            "to_kind=",
+            "runtime_id=",
+            "pid=",
+            "generation=",
+            "outcome=",
+            "initiator=",
+            "duration_ms=",
+            "probe=",
+            "fence_reason=",
+            "epoch=",
+            "failure_reason=",
+        ] {
+            assert!(
+                released_d4f2c.1.iter().any(|f| f.starts_with(field)),
+                "the terminal-prior release log must carry {field} — got {:?}",
+                released_d4f2c.1
+            );
+        }
+        assert!(
+            released_d4f2c.1.iter().any(|f| f == "to_kind=None"),
+            "the terminal-prior release's to_kind is the STABLE-SCHEMA None \
+             value — got {:?}",
+            released_d4f2c.1
+        );
+        assert!(
+            released_d4f2c
+                .1
+                .iter()
+                .any(|f| f == "from_kind=Some(Terminal)"),
+            "the terminal-prior release's from_kind names the fenced \
+             TERMINAL prior — got {:?}",
+            released_d4f2c.1
         );
     }
 

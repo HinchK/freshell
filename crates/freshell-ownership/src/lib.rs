@@ -132,7 +132,9 @@ fn now_epoch_ns() -> u64 {
 
 /// Wall-clock milliseconds since the Unix epoch — for event `duration_ms`
 /// fields ONLY (never for uniqueness; see [`default_boot_epoch`]).
-fn now_epoch_ms() -> u64 {
+/// b8ke e4r2 F2: pub for the release records' fence-age duration (the
+/// stable transition-log schema's duration_ms).
+pub fn now_epoch_ms() -> u64 {
     now_epoch_ns() / 1_000_000
 }
 
@@ -665,6 +667,10 @@ pub struct StaleStartFence {
     /// the terminal still runs; the claude/codex Fresh probes answer
     /// "false" forever, wedging even a dead terminal's fence).
     pub prior_terminal_id: Option<String>,
+    /// b8ke e4r2 F2: the fence's entry timestamp — the release record's
+    /// duration_ms (the fence's age at release) for the STABLE
+    /// transition-log schema.
+    pub since_ms: u64,
 }
 
 /// One replayed owner record for the `ready.runtimeOwners` handshake field
@@ -1760,6 +1766,7 @@ impl RuntimeOwnershipRegistry {
                 operation_id,
                 generation,
                 initiator,
+                since_ms,
                 ..
             } = &record.state
             {
@@ -1791,6 +1798,7 @@ impl RuntimeOwnershipRegistry {
                     prior_terminal_id: prior
                         .as_ref()
                         .and_then(|(owner, _)| owner.terminal_id.clone()),
+                    since_ms: *since_ms,
                 });
             }
         }
