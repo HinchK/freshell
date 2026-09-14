@@ -4464,6 +4464,39 @@ impl FreshOpencodeState {
                 _ => {}
             }
         }
+        // b8ke ext r12 F2: the existing-session attach's REAL claim — the
+        // guard arms under the coordinator lock and is held ACROSS the
+        // serve-bridge restart + the attach tail, so a handoff/stop begin
+        // inside the window answers the typed Blocked outcome (the
+        // coordinator covers the attach through completion; pre-r12 the
+        // point-in-time snapshot closed no window — a handoff could
+        // commit between the check and the bridge restart, and the
+        // delayed attach restarted the torn-down session's SSE bridge).
+        // Armed on the LIVE-key shapes only (the Vacant-key registration
+        // above holds its own claim; the untracked resume below claims
+        // through resume_durable_session).
+        let mut existing_session_attach_guard = None;
+        if session_arc.is_some() {
+            existing_session_attach_guard = match crate::ownership_lane::arm_attach_guard(
+                &self.fresh_agent.ownership,
+                PROVIDER,
+                &msg.session_id,
+                &format!("attach-{}", uuid::Uuid::new_v4()),
+                None,
+                "freshopencode/attach",
+            ) {
+                crate::ownership_lane::LaneAttachGuard::Armed(guard) => Some(guard),
+                crate::ownership_lane::LaneAttachGuard::Unwired => None,
+                crate::ownership_lane::LaneAttachGuard::Refused => {
+                    self.emit_fresh_agent_error(
+                        &msg.session_id,
+                        "SESSION_RESERVED",
+                        "A lifecycle operation owns this session; retry after it settles",
+                    );
+                    return;
+                }
+            };
+        }
         let session_arc = match session_arc {
             Some(session_arc) => session_arc,
             // Conn-less lane (D8): attach carries no tab identity — keep-when-None
@@ -4552,6 +4585,10 @@ impl FreshOpencodeState {
             &status_session_id,
             snapshot_event(&status_session_id, status),
         ));
+        // b8ke ext r12 F2: the existing-session attach's window CLOSES
+        // here — the guard covered the bridge restart + the attach tail
+        // through completion.
+        drop(existing_session_attach_guard);
     }
 
     /// Look up `session_id` against the shared `opencode serve` sidecar (`GET

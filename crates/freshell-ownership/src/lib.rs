@@ -764,6 +764,15 @@ struct SessionRecord {
     /// `None`: the stop predates the registration (age-only fencing).
     stop_settled: Option<Arc<std::sync::atomic::AtomicBool>>,
     partial_runtime: Option<OwnerIdentity>,
+    /// b8ke ext r12 F2: the LIVE key's in-flight ATTACH guards (the
+    /// existing-runtime attach's real claim — see
+    /// [`RuntimeOwnershipRegistry::begin_attach_guard`]). A `begin_handoff`
+    /// or `begin_stop` on a Live key with a held attach guard answers the
+    /// typed `Blocked` outcome: the coordinator covers the attach through
+    /// its completion (the restamp/register/bridge-restart window can never
+    /// interleave with a state move), and the losing lifecycle operation
+    /// retries after the window.
+    in_flight_attaches: u32,
 }
 
 impl Default for SessionRecord {
@@ -776,6 +785,112 @@ impl Default for SessionRecord {
             settle_fired: None,
             stop_settled: None,
             partial_runtime: None,
+            in_flight_attaches: 0,
+        }
+    }
+}
+
+/// b8ke ext r12 F2: the refusal shapes of
+/// [`RuntimeOwnershipRegistry::begin_attach_guard`].
+pub enum AttachGuardOutcome {
+    /// The guard is ARMED and held: the attach owns the key's window
+    /// through its completion — a concurrent `begin_handoff` /
+    /// `begin_stop` answers the typed `Blocked` outcome until the
+    /// guard drops.
+    Armed(Box<AttachGuard>),
+    /// The key's state cannot be attached under a guard right now (a
+    /// lifecycle transition owns it, or the key is not Live — the
+    /// attach paths' own claim machinery owns those windows).
+    Refused {
+        state: OwnershipState,
+        generation: u64,
+    },
+    /// The attach's observed generation is stale — refresh and retry.
+    StaleGeneration {
+        current_epoch: u64,
+        current_generation: u64,
+    },
+}
+
+impl std::fmt::Debug for AttachGuardOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // The guard itself is not inspectable (the Arc'd registry is
+            // opaque); the armed fact is the printable truth.
+            Self::Armed(_) => f.debug_tuple("Armed").finish(),
+            Self::Refused { state, generation } => f
+                .debug_struct("Refused")
+                .field("state", state)
+                .field("generation", generation)
+                .finish(),
+            Self::StaleGeneration {
+                current_epoch,
+                current_generation,
+            } => f
+                .debug_struct("StaleGeneration")
+                .field("current_epoch", current_epoch)
+                .field("current_generation", current_generation)
+                .finish(),
+        }
+    }
+}
+
+/// b8ke ext r12 F2: the existing-runtime attach's RAII guard — a REAL
+/// claim held across the attach's restamp/register/bridge-restart
+/// window. `Drop` (or `disarm`) decrements the key's in-flight count;
+/// a forgotten drop is the safe no-op (the count is clamped at zero).
+pub struct AttachGuard {
+    registry: Arc<RuntimeOwnershipRegistry>,
+    provider: String,
+    session_id: String,
+    operation_id: String,
+    generation: u64,
+    disarmed: std::sync::atomic::AtomicBool,
+}
+
+impl AttachGuard {
+    /// Release the guard's window NOW (the attach completed early or
+    /// aborts before Drop; symmetric with `OperationTicket::disarm`'s
+    /// scope shape). Exactly-once: the Drop of a disarmed guard is a
+    /// no-op.
+    pub fn disarm(&self) {
+        if !self.disarmed.swap(true, Ordering::SeqCst) {
+            self.release_window();
+        }
+    }
+
+    /// The generation the guard armed under (the attach's fenced
+    /// baseline — a state move to a LATER generation aborts the
+    /// attach typed at the call site).
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl AttachGuard {
+    /// The exactly-once window release (disarm or Drop — never both).
+    fn release_window(&self) {
+        let mut inner = self.registry.inner.lock().expect("ownership lock poisoned");
+        let key = SessionKey::new(&self.provider, &self.session_id);
+        if let Some(record) = inner.get_mut(&key) {
+            record.in_flight_attaches = record.in_flight_attaches.saturating_sub(1);
+        }
+        tracing::info!(target: "freshell_ownership",
+            event = "ownership.attach_guard.released",
+            operation_id = %self.operation_id, provider = %self.provider,
+            session_id = %self.session_id,
+            epoch = self.registry.epoch, generation = self.generation,
+            duration_ms = 0u64,
+            outcome = "released", failure_reason = "",
+            "the attach guard released — the key's window is closed and \
+             blocked lifecycle operations may retry");
+    }
+}
+
+impl Drop for AttachGuard {
+    fn drop(&mut self) {
+        if !self.disarmed.swap(true, Ordering::SeqCst) {
+            self.release_window();
         }
     }
 }
@@ -1075,6 +1190,80 @@ impl RuntimeOwnershipRegistry {
     /// (no prior to stop) and from `Live` of any kind; `Starting` /
     /// `Handoff` / `Stopping` block (a handoff from `Starting` is Blocked
     /// BY DESIGN — round-1 review test alignment).
+    /// b8ke ext r12 F2: arm the existing-runtime attach's REAL claim.
+    /// The check-then-arm is ONE critical section (under the registry
+    /// lock): the key must be `Live` (an attach to an existing runtime;
+    /// the not-Live shapes keep their own claim machinery — the
+    /// crash-recovery re-claims, the resume claims) and the attach's
+    /// observed generation (when it carries one) must be current. While
+    /// the guard is held, `begin_handoff` and `begin_stop` on the key
+    /// answer the typed `Blocked` outcome — the handoff CANNOT begin and
+    /// commit inside the attach's restamp/register/bridge-restart window
+    /// (the pre-r12 point-in-time `observe()` closed no window: a
+    /// handoff could begin and commit between the snapshot and the
+    /// durable restamp, leaving the delayed attach persisting stale
+    /// old-runtime binding, answering from the superseded runtime, or
+    /// restarting a torn-down SSE bridge).
+    pub fn begin_attach_guard(
+        self: &Arc<Self>,
+        provider: &str,
+        session_id: &str,
+        operation_id: &str,
+        observed_generation: Option<u64>,
+        initiator: &str,
+    ) -> AttachGuardOutcome {
+        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let key = SessionKey::new(provider, session_id);
+        let Some(record) = inner.get_mut(&key) else {
+            return AttachGuardOutcome::Refused {
+                state: OwnershipState::Vacant,
+                generation: 0,
+            };
+        };
+        // A lifecycle transition (or a non-Live shape) owns the key —
+        // the attach refuses typed; the guard never arms.
+        if !matches!(record.state, OwnershipState::Live { .. }) {
+            return AttachGuardOutcome::Refused {
+                state: record.state.clone(),
+                generation: snapshot_generation(record),
+            };
+        }
+        let current_generation = snapshot_generation(record);
+        if let Some(observed) = observed_generation {
+            if observed < current_generation {
+                tracing::warn!(target: "freshell_ownership",
+                    event = "ownership.attach_guard.stale_generation",
+                    operation_id, provider, session_id, initiator,
+                    observed_generation = observed,
+                    epoch = self.epoch, generation = current_generation,
+                    outcome = "refused", failure_reason = "STALE_GENERATION",
+                    "the attach's observed generation is stale — the attach \
+                     aborts typed (refresh and retry)");
+                return AttachGuardOutcome::StaleGeneration {
+                    current_epoch: self.epoch,
+                    current_generation,
+                };
+            }
+        }
+        record.in_flight_attaches = record.in_flight_attaches.saturating_add(1);
+        tracing::info!(target: "freshell_ownership",
+            event = "ownership.attach_guard.armed",
+            operation_id, provider, session_id, initiator,
+            epoch = self.epoch, generation = current_generation,
+            in_flight_attaches = record.in_flight_attaches,
+            outcome = "armed", failure_reason = "",
+            "the attach guard is armed — the coordinator covers the attach \
+             window; concurrent lifecycle begins answer Blocked");
+        AttachGuardOutcome::Armed(Box::new(AttachGuard {
+            registry: Arc::clone(self),
+            provider: provider.to_string(),
+            session_id: session_id.to_string(),
+            operation_id: operation_id.to_string(),
+            generation: current_generation,
+            disarmed: std::sync::atomic::AtomicBool::new(false),
+        }))
+    }
+
     #[allow(clippy::too_many_arguments)] // The plan-frozen coordinator surface (Tasks 3-10 consume it).
     pub fn begin_handoff(
         &self,
@@ -1161,6 +1350,27 @@ impl RuntimeOwnershipRegistry {
                 generation,
                 since_ms,
             } => {
+                // b8ke ext r12 F2: an in-flight ATTACH guard owns the key's
+                // window — the handoff answers the typed Blocked outcome
+                // (retryable), never interleaving with the attach's
+                // restamp/register/bridge-restart work.
+                if record.in_flight_attaches > 0 {
+                    tracing::warn!(target: "freshell_ownership",
+                        event = "ownership.handoff.blocked_by_attach_guard",
+                        operation_id, provider, session_id, initiator,
+                        from_kind = ?Some(owner.kind),
+                        to_kind = ?Some(to_kind),
+                        runtime_id = ?owner.terminal_id.clone(), pid = ?owner.pid,
+                        epoch = self.epoch, generation,
+                        duration_ms = 0u64,
+                        outcome = "refused", failure_reason = "ATTACH_IN_FLIGHT",
+                        "an in-flight attach holds the key's coordinator window — \
+                         the handoff retries after the attach completes");
+                    return BeginOutcome::Blocked {
+                        state: record.state.clone(),
+                        retry_after_ms: OWNERSHIP_RETRY_AFTER_MS,
+                    };
+                }
                 let prior = (owner.clone(), generation);
                 // b8ke ext r6 F5: the prior owner's REAL tenure — computed
                 // BEFORE the state replacement (pre-r6 the log read the
@@ -2093,6 +2303,26 @@ impl RuntimeOwnershipRegistry {
                 since_ms: live_since_ms,
                 ..
             } => {
+                // b8ke ext r12 F2: an in-flight ATTACH guard owns the key's
+                // window — the stop answers the typed Blocked outcome
+                // (retryable), never interleaving with the attach's work.
+                if record.in_flight_attaches > 0 {
+                    tracing::warn!(target: "freshell_ownership",
+                        event = "ownership.stop.blocked_by_attach_guard",
+                        operation_id, provider, session_id, initiator,
+                        from_kind = ?Some(owner.kind),
+                        to_kind = ?Option::<RuntimeOwnerKind>::None,
+                        runtime_id = ?owner.terminal_id.clone(), pid = ?owner.pid,
+                        epoch = self.epoch, generation,
+                        duration_ms = 0u64,
+                        outcome = "refused", failure_reason = "ATTACH_IN_FLIGHT",
+                        "an in-flight attach holds the key's coordinator window — \
+                         the stop retries after the attach completes");
+                    return StopOutcome::BlockedHandoff {
+                        state: record.state.clone(),
+                        retry_after_ms: OWNERSHIP_RETRY_AFTER_MS,
+                    };
+                }
                 let identity_mismatch = claim.expected_kind != owner.kind
                     || claim
                         .expected_runtime
@@ -7534,5 +7764,195 @@ mod tests {
              got {duration} ({:?})",
             begin.values
         );
+    }
+
+    /// b8ke ext r12 F2: the attach guard is a REAL claim — while armed on
+    /// a Live key, `begin_handoff` and `begin_stop` answer the typed
+    /// Blocked outcome (the handoff can NEVER begin and commit inside the
+    /// attach's window); the guard's Drop closes the window and the
+    /// blocked operation proceeds on retry.
+    #[test]
+    fn an_armed_attach_guard_blocks_handoff_and_stop_then_releases() {
+        let registry = Arc::new(RuntimeOwnershipRegistry::new());
+        let BeginOutcome::Granted { generation } = registry.begin_start(
+            "claude",
+            "sid-a",
+            RuntimeOwnerKind::Terminal,
+            "op-live",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("fixture granted")
+        };
+        assert_eq!(
+            registry.commit_live(
+                "claude",
+                "sid-a",
+                "op-live",
+                generation,
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("t-1".into()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            CommitOutcome::Committed
+        );
+
+        match registry.begin_attach_guard("claude", "sid-a", "attach-1", Some(generation), "test") {
+            AttachGuardOutcome::Armed(guard) => {
+                // THE WINDOW: a handoff begin answers Blocked (typed,
+                // retryable) — never Granted.
+                match registry.begin_handoff(
+                    "claude",
+                    "sid-a",
+                    RuntimeOwnerKind::FreshAgent,
+                    "op-handoff-raced",
+                    None,
+                    "test",
+                    2_000,
+                ) {
+                    BeginOutcome::Blocked {
+                        state,
+                        retry_after_ms,
+                    } => {
+                        assert!(matches!(state, OwnershipState::Live { .. }));
+                        assert!(retry_after_ms > 0);
+                    }
+                    other => {
+                        panic!("the handoff must be Blocked inside the attach window: {other:?}")
+                    }
+                }
+                // A stop begin answers BlockedHandoff too.
+                match registry.begin_stop(
+                    "claude",
+                    "sid-a",
+                    "op-stop-raced",
+                    &StopClaim {
+                        expected_kind: RuntimeOwnerKind::Terminal,
+                        expected_runtime: Some(OwnerIdentity {
+                            kind: RuntimeOwnerKind::Terminal,
+                            terminal_id: Some("t-1".into()),
+                            live_session_key: None,
+                            pid: None,
+                            ownership_id: None,
+                        }),
+                        observed: ObservedFence {
+                            epoch: registry.boot_epoch(),
+                            generation,
+                        },
+                    },
+                    "test",
+                    2_000,
+                ) {
+                    StopOutcome::BlockedHandoff { retry_after_ms, .. } => {
+                        assert!(retry_after_ms > 0);
+                    }
+                    other => panic!("the stop must be Blocked inside the attach window: {other:?}"),
+                }
+                // The record is still Live (nothing moved).
+                assert!(matches!(
+                    registry.observe("claude", "sid-a").state,
+                    OwnershipState::Live { .. }
+                ));
+                guard.disarm();
+            }
+            other => panic!("the guard must arm on a Live key: {other:?}"),
+        }
+
+        // THE WINDOW CLOSED: the handoff proceeds.
+        match registry.begin_handoff(
+            "claude",
+            "sid-a",
+            RuntimeOwnerKind::FreshAgent,
+            "op-handoff-after",
+            None,
+            "test",
+            3_000,
+        ) {
+            BeginOutcome::Granted { .. } => {}
+            other => panic!("the handoff must proceed after the window closed: {other:?}"),
+        }
+    }
+
+    /// b8ke ext r12 F2: the guard arms ONLY on a Live key with a current
+    /// observed generation — a lifecycle transition refuses, a stale
+    /// generation refuses typed, and a non-Live key refuses (the attach
+    /// paths' own claim machinery owns those windows).
+    #[test]
+    fn the_attach_guard_refuses_transitions_stale_generations_and_non_live_keys() {
+        let registry = Arc::new(RuntimeOwnershipRegistry::new());
+        // A Vacant key: Refused.
+        match registry.begin_attach_guard("claude", "sid-v", "attach-v", None, "test") {
+            AttachGuardOutcome::Refused { state, .. } => {
+                assert!(matches!(state, OwnershipState::Vacant));
+            }
+            other => panic!("a Vacant key must refuse the guard: {other:?}"),
+        }
+
+        // A Live key with a STALE observed generation: typed refusal.
+        let BeginOutcome::Granted { generation } = registry.begin_start(
+            "claude",
+            "sid-b",
+            RuntimeOwnerKind::Terminal,
+            "op-live-b",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("fixture granted")
+        };
+        assert_eq!(
+            registry.commit_live(
+                "claude",
+                "sid-b",
+                "op-live-b",
+                generation,
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("t-b".into()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            CommitOutcome::Committed
+        );
+        match registry.begin_attach_guard(
+            "claude",
+            "sid-b",
+            "attach-stale",
+            Some(generation - 1),
+            "test",
+        ) {
+            AttachGuardOutcome::StaleGeneration {
+                current_generation, ..
+            } => {
+                assert_eq!(current_generation, generation);
+            }
+            other => panic!("a stale observed generation must refuse typed: {other:?}"),
+        }
+
+        // A mid-Handoff key: Refused (the transition owns it).
+        let BeginOutcome::Granted { .. } = registry.begin_handoff(
+            "claude",
+            "sid-b",
+            RuntimeOwnerKind::FreshAgent,
+            "op-handoff-b",
+            None,
+            "test",
+            2_000,
+        ) else {
+            panic!("fixture handoff granted")
+        };
+        match registry.begin_attach_guard("claude", "sid-b", "attach-mid", None, "test") {
+            AttachGuardOutcome::Refused { state, .. } => {
+                assert!(matches!(state, OwnershipState::Handoff { .. }));
+            }
+            other => panic!("a mid-Handoff key must refuse the guard: {other:?}"),
+        }
     }
 }

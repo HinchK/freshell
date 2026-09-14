@@ -672,6 +672,10 @@ pub struct TerminalRegistry {
     /// every cloned handle (the WS state's, the REST spawn state's) observes
     /// a test-set hook (the `activity_observer` injection idiom).
     terminal_create_pause: Arc<std::sync::RwLock<Option<TerminalCreatePauseHook>>>,
+    /// b8ke ext r12 F2: the ATTACH-path park seam (see
+    /// [`Self::set_terminal_attach_pause_for_tests`]). Never set in
+    /// production.
+    terminal_attach_pause: Arc<std::sync::RwLock<Option<TerminalCreatePauseHook>>>,
 }
 
 /// The retained coordinator claim for one sessionRef-owning terminal (kata
@@ -835,6 +839,7 @@ impl TerminalRegistry {
             ownership: None,
             session_ref_ownership: Arc::new(Mutex::new(HashMap::new())),
             terminal_create_pause: Arc::new(std::sync::RwLock::new(None)),
+            terminal_attach_pause: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -889,6 +894,37 @@ impl TerminalRegistry {
             .terminal_create_pause
             .write()
             .expect("terminal create pause lock") = Some(hook);
+    }
+
+    /// b8ke ext r12 F2: install the terminal-ATTACH pause hook — the
+    /// deterministic-race tests park the attach handler INSIDE its
+    /// coordinator window (after the guard arms, before the attach
+    /// completes) to prove a concurrent handoff answers the typed Blocked
+    /// outcome. Interior-shared like the create seam. Never set in
+    /// production.
+    pub fn set_terminal_attach_pause_for_tests(&self, hook: TerminalCreatePauseHook) {
+        *self
+            .terminal_attach_pause
+            .write()
+            .expect("terminal attach pause lock") = Some(hook);
+    }
+
+    /// b8ke ext r12 F2: clear the terminal-attach pause hook.
+    pub fn clear_terminal_attach_pause_for_tests(&self) {
+        *self
+            .terminal_attach_pause
+            .write()
+            .expect("terminal attach pause lock") = None;
+    }
+
+    /// b8ke ext r12 F2: the clone-out read of the attach pause hook (the
+    /// caller clones the Arc first, awaits after — never hold a lock
+    /// across an await).
+    pub fn terminal_attach_pause_hook(&self) -> Option<TerminalCreatePauseHook> {
+        self.terminal_attach_pause
+            .read()
+            .expect("terminal attach pause lock")
+            .clone()
     }
 
     /// kata b8ke Task 7: clear the terminal-create pause hook (the race

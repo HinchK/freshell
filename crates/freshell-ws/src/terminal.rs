@@ -1072,7 +1072,13 @@ async fn handle_client_text(
                 // the old terminal without consulting the coordinator at
                 // all), a stale generation answers typed, and a current
                 // attach proceeds and restamps under the held claim.
+                // b8ke ext r12 F2: the resolved session ref + the wire
+                // fence's generation — hoisted for the attach guard below
+                // (the REAL claim held across the restamp + attach).
+                let mut attach_session_ref: Option<SessionLocator> = None;
+                let mut attach_observed_generation: Option<u64> = None;
                 if let Some(session_ref) = state.identity.session_ref_for(&attach.terminal_id) {
+                    attach_session_ref = Some(session_ref.clone());
                     // A half-sent observed pair is the typed invalid-fence
                     // refusal (the F7 discipline — never a silent legacy
                     // downgrade).
@@ -1080,7 +1086,10 @@ async fn handle_client_text(
                         attach.observed_epoch,
                         attach.observed_generation,
                     ) {
-                        Ok(fence) => fence,
+                        Ok(fence) => {
+                            attach_observed_generation = fence.map(|f| f.generation);
+                            fence
+                        }
                         Err(err) => {
                             tracing::warn!(
                                 target: "freshell_ws::terminal",
@@ -1200,6 +1209,114 @@ async fn handle_client_text(
                         }
                     }
                 }
+                // b8ke ext r12 F2: the attach's REAL claim — the guard
+                // arms (under the coordinator lock, an atomic
+                // check-then-count) and is held ACROSS the durable
+                // restamp and the attach registration, so the coordinator
+                // covers the attach through completion: a concurrent
+                // handoff/stop BEGIN answers the typed Blocked outcome
+                // and can never commit inside this window (pre-r12 the
+                // point-in-time observe() closed no window — a handoff
+                // could begin and commit between the snapshot and the
+                // durable restamp, leaving this delayed attach persisting
+                // stale old-runtime binding or answering from the
+                // superseded runtime). Identity-less attaches (no
+                // sessionRef) stay unguarded exactly as they stayed
+                // unfenced.
+                let mut attach_guard = None;
+                if let (Some(ownership), Some(session_ref)) =
+                    (state.ownership.as_ref(), attach_session_ref.as_ref())
+                {
+                    match ownership.begin_attach_guard(
+                        &session_ref.provider,
+                        &session_ref.session_id,
+                        &format!("attach-{}", attach.terminal_id),
+                        attach_observed_generation,
+                        "ws-terminal-attach",
+                    ) {
+                        freshell_ownership::AttachGuardOutcome::Armed(guard) => {
+                            attach_guard = Some(guard);
+                        }
+                        freshell_ownership::AttachGuardOutcome::Refused {
+                            state: refused_state,
+                            generation,
+                        } => {
+                            tracing::warn!(target: "freshell_ws::terminal",
+                                terminal_id = %attach.terminal_id,
+                                session_id = %session_ref.session_id,
+                                state = ?refused_state,
+                                "terminal_attach_refused: the attach guard refused to arm \
+                                 (a lifecycle transition owns the key) — the attach aborts \
+                                 typed, nothing restamps"
+                            );
+                            return send(
+                                ws_tx,
+                                &ServerMessage::Error(ErrorMsg {
+                                    owner_kind: None,
+                                    owner_generation: Some(generation),
+                                    owner_epoch: Some(ownership.boot_epoch()),
+                                    code: ErrorCode::SessionReserved,
+                                    message: "A lifecycle operation is in flight for this session; retry after it settles."
+                                        .to_string(),
+                                    timestamp: crate::now_iso(),
+                                    actual_session_ref: None,
+                                    expected_session_ref: None,
+                                    request_id: None,
+                                    retry_after_ms: None,
+                                    terminal_exit_code: None,
+                                    terminal_id: Some(attach.terminal_id.clone()),
+                                    live_terminal_id: None,
+                                }),
+                            )
+                            .await;
+                        }
+                        freshell_ownership::AttachGuardOutcome::StaleGeneration {
+                            current_epoch,
+                            current_generation,
+                        } => {
+                            tracing::warn!(target: "freshell_ws::terminal",
+                                terminal_id = %attach.terminal_id,
+                                session_id = %session_ref.session_id,
+                                observed_generation = ?attach_observed_generation,
+                                current_epoch, current_generation,
+                                "terminal_attach_refused: the attach guard refused to arm \
+                                 (the observed generation is stale) — the attach aborts \
+                                 typed, nothing restamps"
+                            );
+                            return send(
+                                ws_tx,
+                                &ServerMessage::Error(ErrorMsg {
+                                    owner_kind: None,
+                                    owner_generation: Some(current_generation),
+                                    owner_epoch: Some(current_epoch),
+                                    code: ErrorCode::SessionReserved,
+                                    message: format!(
+                                        "Session ownership moved on (stale observed \
+                                         generation); refresh and retry. (session {})",
+                                        session_ref.session_id
+                                    ),
+                                    timestamp: crate::now_iso(),
+                                    actual_session_ref: None,
+                                    expected_session_ref: None,
+                                    request_id: None,
+                                    retry_after_ms: None,
+                                    terminal_exit_code: None,
+                                    terminal_id: Some(attach.terminal_id.clone()),
+                                    live_terminal_id: None,
+                                }),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                // b8ke ext r12 F2 test seam: park the attach INSIDE its
+                // coordinator window (after the guard arms) — the
+                // deterministic-race tests prove a concurrent handoff
+                // answers the typed Blocked outcome. No-op in production.
+                if let Some(pause) = state.registry.terminal_attach_pause_hook() {
+                    let terminal_id = attach.terminal_id.clone();
+                    pause(&terminal_id).await;
+                }
                 // Delta-r7-round-2 (Finding F3) — the attach-carried pane
                 // identity restamps the terminal's Bound ledger row BEFORE
                 // the attach is observable (the kill lane's
@@ -1211,10 +1328,19 @@ async fn handle_client_text(
                 // session lost before its first snapshot.
                 let asserted_at = now_ms();
                 maybe_restamp_on_attach(&attach, state, conn_identity, asserted_at).await;
-                match handle_attach(attach, state, conn_id, conn_sink, terminal_output_batch_v1) {
+                let attached = match handle_attach(
+                    attach,
+                    state,
+                    conn_id,
+                    conn_sink,
+                    terminal_output_batch_v1,
+                ) {
                     Some(err) => send(ws_tx, &err).await,
                     None => true,
-                }
+                };
+                // The window closes with the guard (exactly-once).
+                drop(attach_guard);
+                attached
             } else {
                 send(ws_tx, &invalid_dims_error(attach.cols, attach.rows)).await
             }

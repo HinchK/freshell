@@ -5723,16 +5723,40 @@ impl FreshClaudeState {
             self.broadcast(&lost_session_frame(&msg.session_id, msg.session_type));
             return;
         };
-        {
-            // The rebind targets a LIVE session — the same coordinator
-            // gate applies before pointing a pane at it.
-            let resolved = self.resolve_ownership_key(&durable);
-            let snap = self.ownership_snapshot(PROVIDER, &resolved);
-            if coordinator_in_flight(&snap.state) {
-                tracing::warn!(target: "freshell_freshagent::claude",
-                    session_id = %durable, state = ?snap.state,
-                    "fresh_agent_attach_refused: a lifecycle transition owns this \
-                     session — the rebind fast path is blocked (typed)");
+        // The rebind targets a LIVE session — the same coordinator gate
+        // applies before pointing a pane at it.
+        let rebind_key = self.resolve_ownership_key(&durable);
+        let rebind_snap = self.ownership_snapshot(PROVIDER, &rebind_key);
+        if coordinator_in_flight(&rebind_snap.state) {
+            tracing::warn!(target: "freshell_freshagent::claude",
+                session_id = %durable, state = ?rebind_snap.state,
+                "fresh_agent_attach_refused: a lifecycle transition owns this \
+                 session — the rebind fast path is blocked (typed)");
+            self.emit_fresh_agent_error(
+                &msg.session_id,
+                session_type_str(msg.session_type),
+                "SESSION_RESERVED",
+                "A lifecycle operation owns this session; retry after it settles",
+            );
+            return;
+        }
+        // b8ke ext r12 F2: the rebind's REAL claim — the guard arms under
+        // the coordinator lock and is held ACROSS the rebind, so the
+        // coordinator covers the attach through completion: a handoff or
+        // stop beginning inside the window answers the typed Blocked
+        // outcome and can never commit around the rebind (pre-r12 the
+        // point-in-time snapshot closed no window).
+        let rebind_guard = match crate::ownership_lane::arm_attach_guard(
+            &self.ownership,
+            PROVIDER,
+            &rebind_key,
+            &format!("attach-rebind-{}", uuid::Uuid::new_v4()),
+            Some(rebind_snap.generation),
+            "freshclaude/attach-rebind",
+        ) {
+            crate::ownership_lane::LaneAttachGuard::Armed(guard) => Some(guard),
+            crate::ownership_lane::LaneAttachGuard::Unwired => None,
+            crate::ownership_lane::LaneAttachGuard::Refused => {
                 self.emit_fresh_agent_error(
                     &msg.session_id,
                     session_type_str(msg.session_type),
@@ -5741,11 +5765,12 @@ impl FreshClaudeState {
                 );
                 return;
             }
-        }
-        if self
+        };
+        let rebound = self
             .try_rebind_to_live(&durable, session_type_str(msg.session_type))
-            .await
-        {
+            .await;
+        drop(rebind_guard);
+        if rebound {
             // Task 10b: durable-in-cli_index on a LIVE session is a REBIND + ACK, not a
             // silent no-op. A stale index row (the aliased session died; consumer
             // eviction in flight) falls through to the resume path below instead --

@@ -931,6 +931,33 @@ pub(crate) async fn attach_pane(
                 .and_then(|registry| registry.probe(&terminal_id))
                 .map(|row| row.mode)
                 .unwrap_or_else(|| "shell".to_string());
+            // b8ke ext r12 F2: the REST attach's REAL claim — the guard
+            // arms under the coordinator lock and is held ACROSS the pane
+            // resolution + the pane.attach broadcast, so a handoff/stop
+            // begin inside the window answers the typed Blocked outcome
+            // (the coordinator covers the attach through completion;
+            // pre-r12 the point-in-time snapshot closed no window — a
+            // handoff could commit between the snapshot and the
+            // broadcast, attaching a superseded runtime).
+            let attach_guard = match crate::ownership_lane::arm_attach_guard(
+                &state.ownership,
+                &session_ref.provider,
+                &session_ref.session_id,
+                &format!("rest-attach-{pane_id}"),
+                Some(snapshot.generation),
+                "rest/pane-attach",
+            ) {
+                crate::ownership_lane::LaneAttachGuard::Armed(guard) => Some(guard),
+                crate::ownership_lane::LaneAttachGuard::Unwired => None,
+                crate::ownership_lane::LaneAttachGuard::Refused => {
+                    return crate::fail_json_code(
+                        StatusCode::CONFLICT,
+                        "SESSION_RESERVED",
+                        "A lifecycle operation owns this session; retry after it settles"
+                            .to_string(),
+                    );
+                }
+            };
             let content = json!({
                 "kind": "terminal",
                 "terminalId": terminal_id,
@@ -947,6 +974,7 @@ pub(crate) async fn attach_pane(
                 command: "pane.attach".to_string(),
                 payload: Some(json!({ "tabId": tab_id, "paneId": pane_id, "content": content })),
             }));
+            drop(attach_guard);
             ok_json(
                 json!({ "ok": true, "terminalId": terminal_id }),
                 "pane attached",

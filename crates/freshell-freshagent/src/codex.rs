@@ -4234,6 +4234,19 @@ impl FreshCodexState {
         // the coordinator — a delayed attach during a Handoff (the map
         // entry exists until the stop lands) must be BLOCKED or typed,
         // never a silent parity no-op against a runtime the handoff owns.
+        // b8ke ext r12 F2: the tracked arm's REAL claim — the guard arms
+        // under the coordinator lock and is held ACROSS the tracked arm's
+        // ensure_session_alive + snapshot work, so a handoff/stop begin
+        // inside the window answers the typed Blocked outcome (the
+        // coordinator covers the attach through completion; pre-r12 the
+        // point-in-time snapshot closed no window). A TERMINAL owner
+        // (a handoff committed; the map entry is mid-teardown) refuses
+        // the attach TYPED — the codex mirror of opencode's e3r4 F4,
+        // never a sidecar resurrection beside the terminal owner. A
+        // non-Live, non-transition key (Vacant / a live codex owner)
+        // arms-or-passes: the crash-recovery and resume arms hold their
+        // own real claims.
+        let mut tracked_attach_guard = None;
         if tracked {
             let snap = self.ownership_snapshot(PROVIDER, &msg.session_id);
             match snap.state {
@@ -4251,6 +4264,43 @@ impl FreshCodexState {
                         "A lifecycle operation owns this session; retry after it settles",
                     );
                     return;
+                }
+                freshell_ownership::OwnershipState::Live {
+                    owner: observed_owner,
+                    ..
+                } if observed_owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal => {
+                    tracing::warn!(target: "freshell_freshagent::codex",
+                        session_id = %msg.session_id,
+                        "fresh_agent_attach_refused: a TERMINAL owner owns the \
+                         session (a handoff committed) — the delayed tracked attach \
+                         is a typed refusal, never a sidecar resurrection beside it");
+                    self.emit_fresh_agent_error(
+                        &msg.session_id,
+                        "SESSION_RESERVED",
+                        "The session is owned by a terminal runtime; reopen it as the terminal instead",
+                    );
+                    return;
+                }
+                freshell_ownership::OwnershipState::Live { .. } => {
+                    tracked_attach_guard = match crate::ownership_lane::arm_attach_guard(
+                        &self.ownership,
+                        PROVIDER,
+                        &msg.session_id,
+                        &format!("attach-{}", uuid::Uuid::new_v4()),
+                        Some(snap.generation),
+                        "freshcodex/attach",
+                    ) {
+                        crate::ownership_lane::LaneAttachGuard::Armed(guard) => Some(guard),
+                        crate::ownership_lane::LaneAttachGuard::Unwired => None,
+                        crate::ownership_lane::LaneAttachGuard::Refused => {
+                            self.emit_fresh_agent_error(
+                                &msg.session_id,
+                                "SESSION_RESERVED",
+                                "A lifecycle operation owns this session; retry after it settles",
+                            );
+                            return;
+                        }
+                    };
                 }
                 _ => {}
             }
@@ -4339,6 +4389,10 @@ impl FreshCodexState {
                 }
             }
         };
+        // b8ke ext r12 F2: the tracked arm's window CLOSES here (the guard
+        // covered the ensure_session_alive + snapshot work through
+        // completion; the not-tracked resume arms held their own claims).
+        drop(tracked_attach_guard);
 
         if !should_emit_snapshot {
             return;
@@ -20107,6 +20161,87 @@ pub(crate) mod tests {
                 "the half-fenced send never answered INVALID_FENCE: {frame}"
             );
         }
+    }
+
+    /// b8ke ext r12 F2: a TRACKED codex attach over a key whose committed
+    /// owner is a TERMINAL (a handoff committed; the codex map entry is
+    /// mid-teardown) answers the typed refusal — never the sidecar
+    /// resurrection/snapshot the pre-r12 point-in-time gate allowed (the
+    /// in-flight check listed only the transition states, so a
+    /// Live{Terminal} post-handoff key let the tracked attach proceed
+    /// against the superseded runtime). The LIVE-KEY window itself is
+    /// covered by the attach guard (the ownership-level
+    /// an_armed_attach_guard_blocks_handoff_and_stop_then_releases
+    /// primitive test + the WS a_handoff_during_the_attach_window test).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tracked_attach_over_a_terminal_owned_key_is_refused_typed() {
+        let _guard = ENV_LOCK.lock().await;
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+
+        configure_fake_codex_cmd("{}");
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
+        assert!(st.sessions.lock().await.contains_key(&thread_id));
+
+        // A HANDOFF COMMITTED a terminal owner over the key (the map entry
+        // is still present — its teardown lands asynchronously).
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_handoff(
+            PROVIDER,
+            &thread_id,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-r12-f2-terminal-owner",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) else {
+            panic!("expected the handoff granted")
+        };
+        assert_eq!(
+            registry.commit_live(
+                PROVIDER,
+                &thread_id,
+                "op-r12-f2-terminal-owner",
+                generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("term-r12".into()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        );
+
+        // THE TRACKED ATTACH: typed refusal (pre-r12 it proceeded to
+        // ensure_session_alive and emitted a snapshot over the
+        // terminal-owned session).
+        st.handle_attach(attach_msg(&thread_id)).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv())
+                .await
+                .expect("a frame within budget")
+                .map(|raw| serde_json::from_str(&raw).expect("json frame"))
+                .expect("the bus stays open");
+            if frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == json!("freshAgent.error")
+                && frame["event"]["code"] == json!("SESSION_RESERVED")
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the tracked attach over a terminal-owned key never answered typed: {frame}"
+            );
+        }
+        // The terminal's owner record is untouched.
+        assert!(matches!(
+            registry.observe(PROVIDER, &thread_id).state,
+            freshell_ownership::OwnershipState::Live { owner, .. }
+                if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal
+        ));
     }
 
     /// b8ke ext r10 F1: a delayed freshAgent.create (resume) arriving

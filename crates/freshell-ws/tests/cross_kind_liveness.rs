@@ -4624,6 +4624,162 @@ async fn the_learned_identity_spawn_interval_holds_a_coordinator_claim() {
 
 // ── b8ke ext r8 F2: terminal.attach participates in the coordinator ─────────
 
+/// b8ke ext r12 F2: the attach holds a REAL claim across its window. The
+/// attach is parked INSIDE its coordinator window (after the guard arms,
+/// before the restamp/attach completes) and a handoff BEGIN is attempted
+/// in the window: it answers the typed Blocked outcome — it can NEVER
+/// begin and commit inside the attach's restamp window (pre-r12 the
+/// point-in-time observe() closed no window: the handoff granted, and the
+/// delayed attach persisted stale old-runtime binding / answered from the
+/// superseded runtime). After the window closes the handoff proceeds.
+#[tokio::test]
+async fn a_handoff_during_the_attach_window_answers_blocked_typed() {
+    let (url, registry, ws_state) = spawn_server().await;
+    let mut ws = connect(&url).await;
+    let ownership = ws_state.ownership.clone().expect("coordinator wired");
+
+    // A negotiated terminal create — the session commits Live{Terminal}.
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-r12-f2-window",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": uuid::Uuid::new_v4().to_string() },
+        }),
+    )
+    .await;
+    let created = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "terminal.created" && v["requestId"] == "req-r12-f2-window"
+    })
+    .await;
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    let sid = created["sessionRef"]["sessionId"]
+        .as_str()
+        .expect("sid")
+        .to_string();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !matches!(
+        ownership.observe("claude", &sid).state,
+        freshell_ownership::OwnershipState::Live { .. }
+    ) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never committed Live"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Park the attach INSIDE its coordinator window.
+    let parked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    {
+        let parked = std::sync::Arc::clone(&parked);
+        let release = std::sync::Arc::clone(&release);
+        let parked_terminal = terminal_id.clone();
+        registry.set_terminal_attach_pause_for_tests(std::sync::Arc::new(move |tid: &str| {
+            let parked = std::sync::Arc::clone(&parked);
+            let release = std::sync::Arc::clone(&release);
+            let tid = tid.to_string();
+            let parked_terminal = parked_terminal.clone();
+            Box::pin(async move {
+                if tid == parked_terminal {
+                    parked.store(true, std::sync::atomic::Ordering::Release);
+                    release.notified().await;
+                }
+            })
+        }));
+    }
+
+    // The cross-device attach (observed fence from the committed record).
+    let snap = ownership.observe("claude", &sid);
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.attach",
+            "terminalId": terminal_id,
+            "intent": "viewport_hydrate",
+            "cols": 120,
+            "rows": 30,
+            "sinceSeq": 0,
+            "attachRequestId": "req-r12-f2-window-attach",
+            "priority": "foreground",
+            "observedEpoch": snap.epoch,
+            "observedGeneration": snap.generation,
+        }),
+    )
+    .await;
+    // Park proof: the attach reached its window.
+    {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !parked.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the attach never reached its window"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    // THE CONTRACT: a handoff BEGIN inside the attach's window answers
+    // the typed Blocked outcome — never Granted (pre-r12 it granted and
+    // could commit around the in-flight attach).
+    match ownership.begin_handoff(
+        "claude",
+        &sid,
+        freshell_ownership::RuntimeOwnerKind::FreshAgent,
+        "op-r12-f2-racing-handoff",
+        None,
+        "test",
+        freshell_ownership::now_epoch_ms(),
+    ) {
+        freshell_ownership::BeginOutcome::Blocked {
+            state,
+            retry_after_ms,
+        } => {
+            assert!(
+                matches!(state, freshell_ownership::OwnershipState::Live { .. }),
+                "the blocked state names the still-Live key: {state:?}"
+            );
+            assert!(retry_after_ms > 0);
+        }
+        other => panic!(
+            "a handoff begin inside the attach window must answer Blocked — \
+             got {other:?}"
+        ),
+    }
+
+    // Release the park: the attach completes and the window closes.
+    release.notify_one();
+    let _ = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "terminal.attach.ready" && v["terminalId"] == json!(terminal_id)
+    })
+    .await;
+
+    // THE WINDOW CLOSED: the handoff proceeds on retry.
+    match ownership.begin_handoff(
+        "claude",
+        &sid,
+        freshell_ownership::RuntimeOwnerKind::FreshAgent,
+        "op-r12-f2-after-window",
+        None,
+        "test",
+        freshell_ownership::now_epoch_ms(),
+    ) {
+        freshell_ownership::BeginOutcome::Granted { .. } => {}
+        other => panic!("the handoff must proceed after the window closed: {other:?}"),
+    }
+    // Cleanup: restore the record + reap.
+    let _ = ownership.fail("claude", &sid, "op-r12-f2-after-window", 3, false);
+    registry.kill(&terminal_id);
+    registry.clear_terminal_attach_pause_for_tests();
+}
+
 /// b8ke ext r8 F2: a queued cross-device attach landing while the canonical
 /// session is in Handoff answers the typed refusal with NO restamp —
 /// pre-r8 the handler wrote the durable pane reattachment record and

@@ -967,6 +967,69 @@ pub mod ownership_lane {
     /// Derive the additive owner fields from a `BeginOutcome` refusal (the
     /// owner the coordinator named) — `None` when the outcome carries no
     /// owner identity.
+    /// b8ke ext r12 F2: the fresh-agent lanes' attach-guard resolution —
+    /// [`LaneAttachGuard::Armed`] holds the REAL claim across the attach's
+    /// window (the coordinator covers the attach through completion);
+    /// [`LaneAttachGuard::Unwired`] is the legacy no-coordinator lane
+    /// (proceed unguarded — there is nothing to serialize); a REFUSED
+    /// resolution (logged here) aborts the attach typed — the caller
+    /// emits its lane's error surface.
+    pub enum LaneAttachGuard {
+        Armed(freshell_ownership::AttachGuard),
+        Unwired,
+        Refused,
+    }
+
+    /// b8ke ext r12 F2: arm the existing-runtime attach's REAL claim (the
+    /// guard held across the attach's window). See [`LaneAttachGuard`].
+    pub fn arm_attach_guard(
+        registry: &Option<Arc<RuntimeOwnershipRegistry>>,
+        provider: &str,
+        session_id: &str,
+        operation_id: &str,
+        observed_generation: Option<u64>,
+        initiator: &str,
+    ) -> LaneAttachGuard {
+        let Some(registry) = registry.as_ref() else {
+            return LaneAttachGuard::Unwired;
+        };
+        match registry.begin_attach_guard(
+            provider,
+            session_id,
+            operation_id,
+            observed_generation,
+            initiator,
+        ) {
+            freshell_ownership::AttachGuardOutcome::Armed(guard) => LaneAttachGuard::Armed(*guard),
+            freshell_ownership::AttachGuardOutcome::Refused { state, generation } => {
+                tracing::warn!(target: "freshell_ownership",
+                    operation_id = %operation_id, provider = %provider,
+                    session_id = %session_id, initiator,
+                    state = ?state, generation,
+                    event = "ownership.attach_guard.refused",
+                    outcome = "refused", failure_reason = "LIFECYCLE_IN_FLIGHT",
+                    "the attach guard refused to arm (a lifecycle transition owns \
+                     the key) — the attach aborts typed, nothing persists");
+                LaneAttachGuard::Refused
+            }
+            freshell_ownership::AttachGuardOutcome::StaleGeneration {
+                current_epoch,
+                current_generation,
+            } => {
+                tracing::warn!(target: "freshell_ownership",
+                    operation_id = %operation_id, provider = %provider,
+                    session_id = %session_id, initiator,
+                    observed_generation = ?observed_generation,
+                    current_epoch, current_generation,
+                    event = "ownership.attach_guard.refused",
+                    outcome = "refused", failure_reason = "STALE_GENERATION",
+                    "the attach guard refused to arm (the observed generation is \
+                     stale) — the attach aborts typed, nothing persists");
+                LaneAttachGuard::Refused
+            }
+        }
+    }
+
     pub fn terminal_owner_fields_from_outcome(
         registry: &Option<Arc<RuntimeOwnershipRegistry>>,
         outcome: &BeginOutcome,
