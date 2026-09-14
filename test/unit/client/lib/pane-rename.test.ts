@@ -52,6 +52,27 @@ describe('renamePaneWithMirrorRetry', () => {
       .toBeLessThanOrEqual(sleep.mock.invocationCallOrder[0])
   })
 
+  it('keeps retrying a transient pane-not-found beyond the former 1.4s mirror window', async () => {
+    // The historical default [200, 400, 800] gave the client only 1.4s for
+    // the resumed layout to reach the server mirror. A real resume may take
+    // longer, so this deliberately succeeds only after that former budget.
+    const patch = vi
+      .fn()
+      .mockImplementationOnce(patchNotFound)
+      .mockImplementationOnce(patchNotFound)
+      .mockImplementationOnce(patchNotFound)
+      .mockImplementationOnce(patchNotFound)
+      .mockImplementation(patchOk)
+    const sleep = vi.fn().mockResolvedValue(undefined)
+
+    const result = await renamePaneWithMirrorRetry('pane-1', 'Ops desk', { patch, sleep })
+
+    expect(result.ok).toBe(true)
+    expect(patch).toHaveBeenCalledTimes(5)
+    expect(sleep).toHaveBeenCalledTimes(4)
+    expect(sleep.mock.calls.map(([delay]) => delay)).toEqual([200, 400, 800, 1_000])
+  })
+
   it('gives up after the retry budget with the last pane-not-found message', async () => {
     const patch = vi.fn().mockImplementation(patchNotFound)
     const sleep = vi.fn().mockResolvedValue(undefined)

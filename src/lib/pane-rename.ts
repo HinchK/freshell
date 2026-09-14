@@ -21,7 +21,11 @@ export type PaneRenameResult =
   | { ok: false; message: string }
 
 const MIRROR_NOT_FOUND_MESSAGE = 'pane not found'
-const DEFAULT_RETRY_DELAYS_MS: readonly number[] = [200, 400, 800]
+// A resumed layout mirror normally arrives within the first 1.4 seconds, but
+// under a cold/reconnecting server it can legitimately take longer. Keep the
+// transient-only retry bounded to five seconds so an unavailable mirror still
+// reports its error rather than hiding it indefinitely.
+const DEFAULT_RETRY_DELAYS_MS: readonly number[] = [200, 400, 800, 1_000, 1_000, 1_000, 600]
 const GENERIC_FAILURE_MESSAGE = 'Failed to rename pane'
 
 export async function renamePaneWithMirrorRetry(
