@@ -707,6 +707,10 @@ mod tests {
         let ids: Vec<&str> = bucket.iter().filter_map(|t| t["turnId"].as_str()).collect();
         assert_eq!(ids, vec!["u2", "a2"]);
         assert!(bucket.iter().all(|t| t["rolledBack"] == json!(true)));
+        assert!(
+            bucket.iter().all(|t| t["restorable"] == json!(true)),
+            "the REST-surfaced bucket carries restorable:true (current chain, redo available)"
+        );
         // The ACTIVE prefix is unaffected by the ledger bucket.
         let prefix: Vec<&str> = value["turns"]
             .as_array()

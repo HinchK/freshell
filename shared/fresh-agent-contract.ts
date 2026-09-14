@@ -198,6 +198,12 @@ export const FreshAgentTurnSchema = z.object({
   // kata 1wxv: stamped on turns surfaced in the snapshot's rolledBackTurns
   // marker bucket (decision 6 — marked in durable history, gone live).
   rolledBack: z.boolean().optional(),
+  // Rolled-back section lifecycle: server-stamped per rolledBackTurns marker
+  // row — true only while the step is still restorable (current rollback
+  // chain, redo available); always false for out-of-band fallback markers.
+  // Absent (an older-server payload) ⇒ not restorable ⇒ collapsed history
+  // presentation. Never stamped on live turns[].
+  restorable: z.boolean().optional(),
 }).strict()
 
 export const FreshAgentPendingApprovalSchema = z.object({

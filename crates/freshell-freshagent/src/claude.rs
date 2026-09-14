@@ -14883,6 +14883,42 @@ rl.on('line', (line) => {
             "the rollback row MOVED old→new (never a stale duplicate)"
         );
 
+        // The snapshot truth at the re-rooted boundary: read through
+        // `get_claude_snapshot` (the staged CLAUDE_CONFIG_DIR transcripts make
+        // locate_transcript resolve "s-prime"; the re-rooted chain's tip recheck
+        // passes over its staged transcript) — the FROZEN prior-epoch markers
+        // (u2/a2) are never restorable; the NEW epoch's (uq/aq) are.
+        let snap =
+            crate::claude_snapshot::get_claude_snapshot("freshclaude", "s-prime", Some(&record))
+                .await
+                .expect("snapshot builds over the staged s-prime transcript");
+        let bucket = snap["rolledBackTurns"].as_array().expect("bucket");
+        assert_eq!(bucket.len(), 4);
+        assert_eq!(bucket[0]["turnId"], json!("u2"));
+        assert_eq!(
+            bucket[0]["restorable"],
+            json!(false),
+            "frozen prior-epoch USER marker"
+        );
+        assert_eq!(bucket[1]["turnId"], json!("a2"));
+        assert_eq!(
+            bucket[1]["restorable"],
+            json!(false),
+            "frozen prior-epoch ASSISTANT marker — ALL roles are stamped"
+        );
+        assert_eq!(bucket[2]["turnId"], json!("uq"));
+        assert_eq!(
+            bucket[2]["restorable"],
+            json!(true),
+            "current-epoch USER marker"
+        );
+        assert_eq!(bucket[3]["turnId"], json!("aq"));
+        assert_eq!(
+            bucket[3]["restorable"],
+            json!(true),
+            "current-epoch ASSISTANT marker — ALL roles are stamped"
+        );
+
         // Simulated SDK write: the forked child's transcript on disk is the kept prefix.
         write_rollback_transcript(
             home.path(),

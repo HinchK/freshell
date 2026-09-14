@@ -1537,6 +1537,11 @@ fn build_opencode_snapshot_json(
         } else {
             let mut turn = turn;
             turn["rolledBack"] = json!(true);
+            // The record-less fallback covers an out-of-band revert this
+            // ledger never observed — never restorable. The new server
+            // adjudicates every marker it serves; an ABSENT key stays
+            // reserved exclusively for older-server payloads.
+            turn["restorable"] = json!(false);
             rolled_back.push(turn);
         }
     }
@@ -4112,6 +4117,12 @@ mod tests {
             markers.iter().all(|t| t["rolledBack"] == json!(true)),
             "every marker is stamped rolledBack:true (decision 6)"
         );
+        assert!(
+            markers.iter().all(|t| t["restorable"] == json!(false)),
+            "the record-LESS fallback bucket stamps an explicit restorable:false — an \
+             out-of-band revert is never restorable, and an absent key stays reserved \
+             for older-server payloads"
+        );
     }
 
     #[test]
@@ -4232,6 +4243,10 @@ mod tests {
             bucket.iter().all(|t| t["rolledBack"] == json!(true)),
             "every marker is stamped rolledBack:true (decision 6)"
         );
+        assert!(
+            bucket.iter().all(|t| t["restorable"] == json!(true)),
+            "the ledger-sourced bucket carries restorable:true (current chain, redo available)"
+        );
         assert_eq!(
             snap["turns"].as_array().expect("turns").len(),
             6,
@@ -4270,7 +4285,13 @@ mod tests {
             json!({ "canRedo": true, "undoneDepth": 2, "redoableTurnIds": ["msg_u2", "msg_u3"] }),
             "two undone USER steps — never entries.len(); every current-epoch user row is redoable"
         );
-        assert_eq!(snap["rolledBackTurns"].as_array().expect("bucket").len(), 4);
+        let bucket = snap["rolledBackTurns"].as_array().expect("bucket");
+        assert_eq!(bucket.len(), 4);
+        assert!(
+            bucket.iter().all(|t| t["restorable"] == json!(true)),
+            "every current-epoch marker row is restorable (canRedo:true, current epoch) — \
+             ALL roles, matching the redoable rule"
+        );
     }
 
     #[test]
@@ -4287,7 +4308,13 @@ mod tests {
             json!({ "canRedo": false, "undoneDepth": 1, "redoableTurnIds": [] }),
             "the stored bit cleared; the bucket's user-step count is untouched; no marker is redoable"
         );
-        assert_eq!(snap["rolledBackTurns"].as_array().expect("bucket").len(), 1);
+        let bucket = snap["rolledBackTurns"].as_array().expect("bucket");
+        assert_eq!(bucket.len(), 1);
+        assert_eq!(
+            bucket[0]["restorable"],
+            json!(false),
+            "destroyed redo ⇒ the marker is collapsed history (the server truth), never restorable"
+        );
         assert_eq!(
             snap["revision"],
             json!(120),
@@ -4339,6 +4366,11 @@ mod tests {
         );
         assert_eq!(snapshot["rolledBackTurns"][0]["turnId"], json!("msg-9"));
         assert_eq!(snapshot["rolledBackTurns"][0]["rolledBack"], json!(true));
+        assert_eq!(
+            snapshot["rolledBackTurns"][0]["restorable"],
+            json!(true),
+            "the live REST route surfaces the same restorable:true stamp (current chain, redo available)"
+        );
         assert_eq!(
             snapshot["revision"],
             json!(1_702_000_000_000i64),
