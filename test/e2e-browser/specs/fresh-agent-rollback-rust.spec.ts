@@ -1134,7 +1134,11 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
       await expect(reloadedToggle).toHaveAttribute('aria-expanded', 'false')
       await expect(page.getByRole('button', { name: 'Redo to here' })).toHaveCount(0)
       await reloadedToggle.click()
-      await expect(page.getByText('prompt two', { exact: true })).toBeVisible()
+      // Region-scoped per the commit's locator discipline: the row text can
+      // 3-way collide with the sidebar session row and pane-header title.
+      await expect(
+        page.getByRole('region', { name: 'Rolled back turns' }).getByText('prompt two', { exact: true }),
+      ).toBeVisible()
       const afterReload = await snap()
       expect(afterReload.rollback?.canRedo).toBe(false)
       expect(((afterReload.rolledBackTurns ?? []) as any[]).filter((t) => t.role === 'user')).toHaveLength(1)
