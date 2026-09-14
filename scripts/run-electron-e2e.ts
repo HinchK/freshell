@@ -10,12 +10,17 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url))
 const PROJECT_ROOT = path.resolve(SCRIPT_DIR, '..')
 
+/** The target platform determines the Rust executable's filename. */
+export function rustArtifactName(platform: NodeJS.Platform = process.platform): string {
+  return platform === 'win32' ? 'freshell-server.exe' : 'freshell-server'
+}
+
 /** Electron E2E runs every Rust fixture against this one freshly built profile. */
 export function rustArtifactPath(
   root = PROJECT_ROOT,
   platform: NodeJS.Platform = process.platform,
 ): string {
-  return path.join(root, 'target', 'release', platform === 'win32' ? 'freshell-server.exe' : 'freshell-server')
+  return path.join(root, 'target', 'release', rustArtifactName(platform))
 }
 
 /** Keep Cargo's output at the artifact path Electron E2E will verify and run. */

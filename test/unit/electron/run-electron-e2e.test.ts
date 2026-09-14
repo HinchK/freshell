@@ -8,6 +8,7 @@ import {
   electronE2eEnvironment,
   playwrightExitResult,
   resolveExactElectronE2eHead,
+  rustArtifactName,
   rustArtifactPath,
 } from '../../../scripts/run-electron-e2e.js'
 
@@ -46,9 +47,16 @@ describe('Electron E2E client preflight', () => {
     expect(playwrightExitResult({ status: 2, signal: null })).toBe(2)
   })
 
-  it('uses the release Rust artifact for the Electron E2E provenance contract', () => {
-    expect(rustArtifactPath('/repo', 'linux')).toBe('/repo/target/release/freshell-server')
-    expect(rustArtifactPath('/repo', 'win32')).toBe('/repo/target/release/freshell-server.exe')
+  it('chooses the release Rust executable name for the target platform', () => {
+    expect(rustArtifactName('linux')).toBe('freshell-server')
+    expect(rustArtifactName('win32')).toBe('freshell-server.exe')
+  })
+
+  it('uses the host-native checkout path for the Electron E2E release artifact', () => {
+    const repoRoot = path.join(path.parse(process.cwd()).root, 'repo')
+
+    expect(rustArtifactPath(repoRoot, 'linux')).toBe(path.join(repoRoot, 'target', 'release', 'freshell-server'))
+    expect(rustArtifactPath(repoRoot, 'win32')).toBe(path.join(repoRoot, 'target', 'release', 'freshell-server.exe'))
   })
 
   it('overrides a hostile inherited Rust binary path with the exact preflight artifact', () => {
