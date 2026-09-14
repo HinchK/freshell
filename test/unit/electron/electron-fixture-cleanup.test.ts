@@ -98,7 +98,7 @@ describe('cleanupElectronFixture', () => {
       },
       electronProcess,
       stopServer: async (context) => {
-        expect(context).toEqual({ gracefulCloseFailed: false })
+        expect(context).toEqual({ gracefulCloseFailed: true })
         order.push('server.stop-and-verify')
       },
       removeHome: async () => {
@@ -115,6 +115,30 @@ describe('cleanupElectronFixture', () => {
       'home.remove',
     ])
     expect(electronProcess.kill).toHaveBeenCalledExactlyOnceWith('SIGTERM')
+  })
+
+  it('keeps server teardown graceful when app.close resolves with an already-exited captured child', async () => {
+    const contexts: unknown[] = []
+    const electronProcess = {
+      exitCode: 0,
+      signalCode: null as NodeJS.Signals | null,
+      kill: vi.fn(() => {
+        throw new Error('must not signal an already-exited captured child')
+      }),
+    }
+
+    await expect(cleanupElectronFixture({
+      app: { close: async () => {} },
+      electronProcess,
+      stopServer: async (context) => {
+        contexts.push(context)
+      },
+      removeHome: async () => {},
+      sleep: async () => {},
+    })).resolves.toBeUndefined()
+
+    expect(contexts).toEqual([{ gracefulCloseFailed: false }])
+    expect(electronProcess.kill).not.toHaveBeenCalled()
   })
 
   it('contains a hung graceful close, still proves/removes fixture resources, and preserves the failure', async () => {

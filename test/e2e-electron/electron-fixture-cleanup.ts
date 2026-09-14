@@ -26,7 +26,11 @@ export interface CancellableTimeout {
 export type CreateCancellableTimeout = (ms: number) => CancellableTimeout
 
 export interface ElectronFixtureServerCleanupContext {
-  /** The app's graceful shutdown rejected or timed out before teardown. */
+  /**
+   * The graceful-close protocol failed, or its exact captured Electron child
+   * was still live immediately afterward. App-bound server teardown must then
+   * use forced exact-owner containment rather than assume parent shutdown.
+   */
   gracefulCloseFailed: boolean
 }
 
@@ -65,6 +69,10 @@ function appendFailure(failures: Error[], step: string, error: unknown): void {
       cause: error,
     }),
   )
+}
+
+function hasCapturedProcessExited(process: OwnedElectronProcess): boolean {
+  return process.exitCode !== null || process.signalCode !== null
 }
 
 async function settleWithin(
@@ -121,7 +129,7 @@ export async function stopExactCapturedProcess(
   sleep: (ms: number) => Promise<void>,
 ): Promise<void> {
   if (!process) throw new Error('no captured process is available for exact-child containment')
-  const hasExited = () => process.exitCode !== null || process.signalCode !== null
+  const hasExited = () => hasCapturedProcessExited(process)
   if (hasExited()) return
 
   let sentTerm = false
@@ -166,7 +174,7 @@ export async function cleanupElectronFixture(options: ElectronFixtureCleanupDeps
   const createTimeout = options.createTimeout ?? defaultCreateTimeout
   const gracefulCloseTimeoutMs = options.gracefulCloseTimeoutMs ?? DEFAULT_GRACEFUL_CLOSE_TIMEOUT_MS
   const forceCloseTimeoutMs = options.forceCloseTimeoutMs ?? DEFAULT_FORCE_CLOSE_TIMEOUT_MS
-  let gracefulCloseFailed = false
+  let requiresForcedServerTeardown = false
   let electronContainmentSucceeded = true
   let serverTeardownSucceeded = true
 
@@ -182,7 +190,7 @@ export async function cleanupElectronFixture(options: ElectronFixtureCleanupDeps
     try {
       await closeElectronGracefully(options.app, gracefulCloseTimeoutMs, createTimeout)
     } catch (error) {
-      gracefulCloseFailed = true
+      requiresForcedServerTeardown = true
       appendFailure(failures, 'closing Electron', error)
     }
 
@@ -191,6 +199,9 @@ export async function cleanupElectronFixture(options: ElectronFixtureCleanupDeps
     // this is a bounded no-op after a normal exit and TERM→KILL containment
     // only when that same captured process still reports live.
     if (options.electronProcess) {
+      if (!hasCapturedProcessExited(options.electronProcess)) {
+        requiresForcedServerTeardown = true
+      }
       try {
         await stopExactCapturedProcess(options.electronProcess, forceCloseTimeoutMs, sleep)
       } catch (containmentError) {
@@ -202,7 +213,7 @@ export async function cleanupElectronFixture(options: ElectronFixtureCleanupDeps
 
   if (options.stopServer) {
     try {
-      await options.stopServer({ gracefulCloseFailed })
+      await options.stopServer({ gracefulCloseFailed: requiresForcedServerTeardown })
     } catch (error) {
       serverTeardownSucceeded = false
       appendFailure(failures, 'stopping the owned Rust server', error)
