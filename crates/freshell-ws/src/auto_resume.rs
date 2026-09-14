@@ -772,6 +772,13 @@ pub(crate) struct WsAutoResumeDriver {
     /// Arc-shared with the claim future so a registry-lease refusal inside
     /// it can drop (typed-fail) the parked ticket.
     pending_ownership: std::sync::Arc<std::sync::Mutex<Option<PendingOwnershipClaim>>>,
+    /// b8ke ext r13 F2: the crash-recovery Adopt path's held authority —
+    /// the ext-r12 attach guard armed when the claim Adopts a live
+    /// same-kind owner (the incumbent terminal's death is in flight), held
+    /// across the resume's spawn window and dropped at complete/fail_claim.
+    /// While held, a handoff or stop begin on the key answers the typed
+    /// Blocked outcome.
+    pending_attach_guard: std::sync::Arc<std::sync::Mutex<Option<freshell_ownership::AttachGuard>>>,
 }
 
 /// The coordinator claim a respawn holds between `claim_session` and
@@ -896,6 +903,16 @@ impl AutoResumeDriver for WsAutoResumeDriver {
         // refusal aborts the resume (the key belongs to a newer owner or an
         // in-flight transition).
         let pending_slot = std::sync::Arc::clone(&self.pending_ownership);
+        let pending_attach_guard_slot = std::sync::Arc::clone(&self.pending_attach_guard);
+        // b8ke ext r13 F2: defensive hygiene — drop any stale guard from an
+        // aborted prior iteration (its Drop closes the window).
+        *pending_attach_guard_slot
+            .lock()
+            .expect("pending attach guard lock") = None;
+        // The sync claim: Granted parks the ticket; the ADOPT shape defers
+        // to the async resolution below (b8ke ext r13 F2 — the wait needs
+        // awaits, and the pending lock must never live across one).
+        let mut adopt_resolution_needed = false;
         let coordinator_refused = {
             let mut pending = pending_slot.lock().expect("pending ownership lock");
             // Defensive hygiene: drop any stale ticket from an aborted prior
@@ -917,8 +934,13 @@ impl AutoResumeDriver for WsAutoResumeDriver {
                     });
                     false
                 }
-                freshell_freshagent::ownership_lane::TerminalLaneClaim::Unwired
-                | freshell_freshagent::ownership_lane::TerminalLaneClaim::Adopt => false,
+                freshell_freshagent::ownership_lane::TerminalLaneClaim::Unwired => false,
+                freshell_freshagent::ownership_lane::TerminalLaneClaim::Adopt => {
+                    // b8ke ext r13 F2: resolved ASYNC below (the dead
+                    // incumbent's release wait).
+                    adopt_resolution_needed = true;
+                    false
+                }
                 freshell_freshagent::ownership_lane::TerminalLaneClaim::Refused(outcome) => {
                     tracing::warn!(target: "freshell_ws::auto_resume",
                         provider, session_id, create_request_id = %create_request_id,
@@ -929,7 +951,117 @@ impl AutoResumeDriver for WsAutoResumeDriver {
                 }
             }
         };
+        let provider = provider.to_string();
+        let session_id = session_id.to_string();
         async move {
+            // b8ke ext r13 F2: the crash-recovery Adopt path RETAINS
+            // AUTHORITY through spawn/commit. A live same-kind owner held
+            // the key at the claim — the crashed incumbent's exit release
+            // (or another terminal's ownership). The DEAD-incumbent shape
+            // (its row is Exited/gone but the watcher's release trails the
+            // crash event) waits for the imminent release and RE-CLAIMS
+            // into a real Granted ticket — the parked ticket is the spawn
+            // window's authority and complete_claim commits it (the
+            // ordinary path; never a live unowned replacement beside a
+            // vacant key — pre-r13 the Adopt path stored NO ticket and the
+            // replacement stayed live while the key sat vacant). A
+            // genuinely-RUNNING incumbent owns the session — the resume
+            // ABORTS typed (never a second writer).
+            let mut coordinator_refused = coordinator_refused;
+            if !coordinator_refused && adopt_resolution_needed {
+                coordinator_refused = true;
+                if let Some(ownership) = state.ownership.as_ref() {
+                    let incumbent = match &ownership.observe(&provider, &session_id).state {
+                        freshell_ownership::OwnershipState::Live { owner, .. } => {
+                            owner.terminal_id.clone()
+                        }
+                        _ => None,
+                    };
+                    let incumbent_row_running = incumbent.as_deref().is_some_and(|tid| {
+                        matches!(
+                            state.registry.probe(tid).map(|row| row.status),
+                            Some(freshell_protocol::TerminalRunStatus::Running)
+                        )
+                    });
+                    if incumbent_row_running {
+                        tracing::warn!(target: "freshell_ws::auto_resume",
+                            provider = %provider, session_id = %session_id,
+                            create_request_id = %create_request_id,
+                            incumbent = ?incumbent,
+                            "auto_resume_adopt_aborted: a live terminal owns the session — \
+                             the resume aborts typed (never a second writer)"
+                        );
+                    } else {
+                        // The dead incumbent's release is imminent — wait
+                        // for it (bounded, never a panic inside the hub
+                        // task), then re-claim into a Granted ticket.
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_millis(2_000);
+                        let released = loop {
+                            if !matches!(
+                                ownership.observe(&provider, &session_id).state,
+                                freshell_ownership::OwnershipState::Live { .. }
+                            ) {
+                                break true;
+                            }
+                            if std::time::Instant::now() >= deadline {
+                                break false;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        };
+                        if !released {
+                            tracing::error!(target: "invariant",
+                                provider = %provider, session_id = %session_id,
+                                create_request_id = %create_request_id,
+                                "auto_resume_adopt_release_timeout: the dead incumbent's \
+                                 ownership release never landed — the resume aborts \
+                                 (fail-closed)"
+                            );
+                        } else {
+                            match freshell_freshagent::ownership_lane::begin_terminal_lane_claim(
+                                &state.ownership,
+                                &provider,
+                                &session_id,
+                                &format!("auto-resume-{create_request_id}"),
+                                None,
+                                "auto-resume/adopt-reclaim",
+                                crate::terminal::now_ms().max(0) as u64,
+                            ) {
+                                freshell_freshagent::ownership_lane::TerminalLaneClaim::Granted(
+                                    ticket,
+                                ) => {
+                                    *pending_slot.lock().expect("pending ownership lock") =
+                                        Some(PendingOwnershipClaim {
+                                            locator: locator.clone(),
+                                            ticket,
+                                        });
+                                    tracing::info!(target: "freshell_ws::auto_resume",
+                                        provider = %provider, session_id = %session_id,
+                                        create_request_id = %create_request_id,
+                                        "auto_resume_adopt_reclaimed: the crashed incumbent's \
+                                         release landed — the respawn proceeds under a real \
+                                         Granted ticket"
+                                    );
+                                    coordinator_refused = false;
+                                }
+                                freshell_freshagent::ownership_lane::TerminalLaneClaim::Refused(
+                                    outcome,
+                                ) => {
+                                    tracing::warn!(target: "freshell_ws::auto_resume",
+                                        provider = %provider, session_id = %session_id,
+                                        create_request_id = %create_request_id,
+                                        outcome = ?outcome,
+                                        "auto_resume_adopt_reclaim_refused: the resume aborts"
+                                    );
+                                }
+                                freshell_freshagent::ownership_lane::TerminalLaneClaim::Unwired
+                                | freshell_freshagent::ownership_lane::TerminalLaneClaim::Adopt => {
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if coordinator_refused {
                 return false;
             }
@@ -1001,6 +1133,7 @@ impl AutoResumeDriver for WsAutoResumeDriver {
     ) -> impl std::future::Future<Output = bool> + Send {
         let state = self.state.clone();
         let pending_slot = std::sync::Arc::clone(&self.pending_ownership);
+        let pending_attach_guard_slot = std::sync::Arc::clone(&self.pending_attach_guard);
         let locator = session_locator(provider, session_id);
         let create_request_id = create_request_id.to_string();
         let new_terminal_id = new_terminal_id.to_string();
@@ -1016,6 +1149,15 @@ impl AutoResumeDriver for WsAutoResumeDriver {
                 // registry kill's release covers any partial state) and
                 // answer false exactly like the revoked-lease shape.
                 let parked = pending_slot.lock().expect("pending ownership lock").take();
+                // b8ke ext r13 F2: the Adopt path's held window closes at
+                // the settle — the guard dropped here, the replacement's
+                // ownership is decided BELOW (the fresh claim).
+                drop(
+                    pending_attach_guard_slot
+                        .lock()
+                        .expect("pending attach guard lock")
+                        .take(),
+                );
                 if let Some(mut claim) = parked {
                     let outcome = state.registry.commit_session_ref_ownership(
                         &claim.locator,
@@ -1053,6 +1195,35 @@ impl AutoResumeDriver for WsAutoResumeDriver {
                     // arm above keeps the RAII fail (the claim never
                     // committed).
                     claim.ticket.disarm();
+                } else {
+                    // b8ke ext r13 F2: the ADOPT path now resolves at the
+                    // CLAIM (the dead incumbent's release wait + the
+                    // re-claimed Granted ticket), so a wired coordinator
+                    // reaching the settle with NO parked ticket means the
+                    // claim's authority was lost — the replacement is an
+                    // unowned live runtime and MUST die (the fail-closed
+                    // backstop; never a live unowned runtime beside a
+                    // vacant key). Unwired coordinators keep the legacy
+                    // proceed.
+                    if state.ownership.is_some() {
+                        tracing::error!(target: "invariant",
+                            terminal_id = %new_terminal_id,
+                            provider = %locator.provider,
+                            session_id = %locator.session_id,
+                            "auto_resume_settle_without_authority: no parked ticket at the \
+                             settle — the replacement is unowned and must die"
+                        );
+                        let pid = state.registry.pid_of(&new_terminal_id);
+                        state.registry.kill(&new_terminal_id);
+                        let confirmed = match pid {
+                            Some(pid) => crate::terminal::confirm_pid_dead_within_500ms(pid).await,
+                            None => true,
+                        };
+                        if confirmed {
+                            state.registry.force_release_after_confirmed_kill(&locator);
+                        }
+                        return false;
+                    }
                 }
                 return true;
             }
@@ -1086,6 +1257,14 @@ impl AutoResumeDriver for WsAutoResumeDriver {
             self.pending_ownership
                 .lock()
                 .expect("pending ownership lock")
+                .take(),
+        );
+        // b8ke ext r13 F2: the Adopt path's held window closes on failure
+        // too.
+        drop(
+            self.pending_attach_guard
+                .lock()
+                .expect("pending attach guard lock")
                 .take(),
         );
         self.state
@@ -1230,6 +1409,7 @@ pub fn spawn_auto_resume_hub(
         WsAutoResumeDriver {
             state,
             pending_ownership: Default::default(),
+            pending_attach_guard: Default::default(),
         },
         rx,
         HubConfig::from_env(),
@@ -1249,6 +1429,7 @@ pub fn spawn_auto_resume_hub_with_schedules(
         WsAutoResumeDriver {
             state,
             pending_ownership: Default::default(),
+            pending_attach_guard: Default::default(),
         },
         rx,
         HubConfig::with_schedules(delays, identity_grace_delays),
@@ -2785,5 +2966,267 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
+    }
+
+    // ── b8ke ext r13 F2: the crash-recovery Adopt path retains authority ─────
+
+    /// The F2 fixture: a WsState with the coordinator wired into both the
+    /// state and the registry, plus the real production driver.
+    fn ownership_state() -> (
+        crate::WsState,
+        std::sync::Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+    ) {
+        let auth_token = std::sync::Arc::new("s3cr3t-token-abcdef".to_string());
+        let broadcast_tx = std::sync::Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
+        let ownership = std::sync::Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let registry = freshell_terminal::TerminalRegistry::new()
+            .with_ownership(std::sync::Arc::clone(&ownership));
+        let state = crate::WsState {
+            pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
+            layout: Default::default(),
+            terminal_meta: Default::default(),
+            identity: crate::identity::TerminalIdentityRegistry::new(),
+            auth_token: std::sync::Arc::clone(&auth_token),
+            server_instance_id: std::sync::Arc::new("srv-1111".to_string()),
+            boot_id: std::sync::Arc::new("boot-2222".to_string()),
+            settings: std::sync::Arc::new(crate::test_settings()),
+            handshake_settings: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::test_settings(),
+            )),
+            broadcast_tx: std::sync::Arc::clone(&broadcast_tx),
+            auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+            auto_resume_cancels: Default::default(),
+            fresh_codex: freshell_freshagent::FreshCodexState::new(
+                std::sync::Arc::clone(&auth_token),
+                std::sync::Arc::clone(&broadcast_tx),
+                serde_json::json!({ "freshAgent": { "enabled": false } }),
+            ),
+            fresh_claude: freshell_freshagent::FreshClaudeState::new(std::sync::Arc::clone(
+                &broadcast_tx,
+            )),
+            fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
+                freshell_freshagent::FreshAgentState::new(auth_token, broadcast_tx.clone()),
+            ),
+            registry,
+            shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
+            tabs: crate::tabs::TabsRegistry::new(),
+            screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
+            subagent_interest: Default::default(),
+            host_stats: Default::default(),
+            terminals_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            sessions_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            cli_commands: std::sync::Arc::new(Vec::new()),
+            ping_interval_ms: 30_000,
+            hello_timeout_ms: 5_000,
+            allowed_origins: std::sync::Arc::new(crate::origin::default_allowed_origins()),
+            ws_max_payload_bytes: 16 * 1024 * 1024,
+            term09: crate::backpressure::Term09Config::default(),
+            create_protect: crate::create_limit::CreateProtectConfig::default(),
+            spawn_gate: std::sync::Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
+            shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
+            config_fallback: None,
+            opencode_locator: None,
+            codex_locator: None,
+            activity: None,
+            session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
+            reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+            fresh_agent_respawn_counts: Default::default(),
+            ownership: Some(std::sync::Arc::clone(&ownership)),
+        };
+        (state, ownership)
+    }
+
+    fn spawn_real_shell_row(state: &crate::WsState, tid: &str, mode: &str) {
+        let spec = freshell_platform::build_spawn_spec(
+            freshell_platform::ShellType::System,
+            freshell_platform::detect::HostOs::Linux,
+            false,
+            Some("/tmp"),
+            &freshell_platform::RealEnv,
+            &freshell_platform::RealFileProbe,
+            &std::collections::BTreeMap::new(),
+            None,
+            None,
+        );
+        state
+            .registry
+            .create(
+                &spec,
+                &std::collections::BTreeMap::new(),
+                tid.to_string(),
+                format!("stream-{tid}"),
+                mode,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("spawn a real shell row for the test PTY");
+    }
+
+    /// b8ke ext r13 F2: the crash-recovery Adopt path retains authority
+    /// through spawn/commit. The claim Adopts a live same-kind incumbent
+    /// whose ROW IS DEAD (the crash shape — the watcher's ownership
+    /// release trails the crash event); the claim's Adopt resolution
+    /// WAITS for the imminent release and RE-CLAIMS into a real Granted
+    /// ticket, which complete_claim commits: the replacement becomes the
+    /// Live{Terminal} owner. Pre-r13 the Adopt path stored NO ticket and
+    /// complete_claim committed NOTHING — the replacement stayed live
+    /// while the key sat Vacant (a Fresh Agent could claim the session
+    /// and become a second writer).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_adopt_crash_recovery_commits_the_replacement_after_the_incumbent_vanishes() {
+        let (state, ownership) = ownership_state();
+        let driver = WsAutoResumeDriver {
+            state: state.clone(),
+            pending_ownership: Default::default(),
+            pending_attach_guard: Default::default(),
+        };
+        let sid = "ses-r13-f2-adopt".to_string();
+        spawn_real_shell_row(&state, "t-incumbent", "claude");
+        let freshell_ownership::BeginOutcome::Granted { generation } = ownership.begin_start(
+            "claude",
+            &sid,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-incumbent",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("fixture granted")
+        };
+        assert_eq!(
+            state.registry.seed_live_session_ref_ownership_for_test(
+                &freshell_protocol::SessionLocator {
+                    provider: "claude".to_string(),
+                    session_id: sid.clone(),
+                },
+                "op-incumbent",
+                generation,
+                "t-incumbent",
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        );
+
+        // The crash shape: the incumbent's ROW dies (its ownership release
+        // trails — scheduled to land shortly after the claim starts).
+        state.registry.kill("t-incumbent");
+        let delayed_release = {
+            let ownership = std::sync::Arc::clone(&ownership);
+            let sid = sid.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                ownership.release(
+                    "claude",
+                    &sid,
+                    &freshell_ownership::ReleaseClaim {
+                        operation_id: "op-incumbent".to_string(),
+                        generation,
+                        runtime: Some(freshell_ownership::OwnerIdentity {
+                            kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                            terminal_id: Some("t-incumbent".into()),
+                            live_session_key: None,
+                            pid: None,
+                            ownership_id: None,
+                        }),
+                    },
+                    "test",
+                );
+            })
+        };
+
+        // THE CLAIM: Adopt (the release has not landed yet) → the
+        // resolution waits → the release lands → the re-claim GRANTS →
+        // the ticket parks. Returns true under held authority.
+        assert!(
+            driver
+                .claim_session("claude", &sid, "req-r13-f2", None)
+                .await,
+            "the Adopt claim re-claims into a Granted ticket"
+        );
+
+        // The replacement spawns (a real row) and the settle commits the
+        // parked ticket.
+        spawn_real_shell_row(&state, "t-replacement", "claude");
+        assert!(
+            driver
+                .complete_claim("claude", &sid, "req-r13-f2", "t-replacement")
+                .await,
+            "the settle succeeds under the held authority"
+        );
+
+        // THE CONTRACT: the replacement is the committed Live owner —
+        // never a live unowned runtime beside a vacant key (pre-r13 the
+        // key stayed Vacant here).
+        match ownership.observe("claude", &sid).state {
+            freshell_ownership::OwnershipState::Live { owner, .. } => {
+                assert_eq!(owner.kind, freshell_ownership::RuntimeOwnerKind::Terminal);
+                assert_eq!(owner.terminal_id.as_deref(), Some("t-replacement"));
+            }
+            other => panic!("the replacement must commit Live(Terminal) — got {other:?}"),
+        }
+        state.registry.kill("t-replacement");
+        let _ = delayed_release.await;
+    }
+
+    /// b8ke ext r13 F2: the losing shape — the incumbent's row is still
+    /// RUNNING at the claim (a genuinely live terminal owns the session).
+    /// The resume ABORTS typed — never a second writer — and nothing
+    /// spawns.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_adopt_crash_recovery_aborts_typed_beside_a_live_incumbent() {
+        let (state, ownership) = ownership_state();
+        let driver = WsAutoResumeDriver {
+            state: state.clone(),
+            pending_ownership: Default::default(),
+            pending_attach_guard: Default::default(),
+        };
+        let sid = "ses-r13-f2-adopt-live".to_string();
+        spawn_real_shell_row(&state, "t-incumbent-live", "claude");
+        let freshell_ownership::BeginOutcome::Granted { generation } = ownership.begin_start(
+            "claude",
+            &sid,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-incumbent-live",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("fixture granted")
+        };
+        assert_eq!(
+            state.registry.seed_live_session_ref_ownership_for_test(
+                &freshell_protocol::SessionLocator {
+                    provider: "claude".to_string(),
+                    session_id: sid.clone(),
+                },
+                "op-incumbent-live",
+                generation,
+                "t-incumbent-live",
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        );
+
+        // THE CLAIM: Adopt with a RUNNING incumbent → aborts typed
+        // (pre-r13 it proceeded and spawned a second writer).
+        assert!(
+            !driver
+                .claim_session("claude", &sid, "req-r13-f2-live", None)
+                .await,
+            "the resume aborts typed beside a live incumbent — never a second writer"
+        );
+        // The incumbent's record is untouched and no ticket parked.
+        assert!(matches!(
+            ownership.observe("claude", &sid).state,
+            freshell_ownership::OwnershipState::Live { owner, .. }
+                if owner.terminal_id.as_deref() == Some("t-incumbent-live")
+        ));
+        assert!(driver
+            .pending_ownership
+            .lock()
+            .expect("pending ownership lock")
+            .is_none());
+        state.registry.kill("t-incumbent-live");
     }
 }

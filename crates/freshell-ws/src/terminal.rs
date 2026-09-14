@@ -3449,7 +3449,7 @@ pub(crate) async fn handle_create(
                         }
                         freshell_ownership::AttachGuardOutcome::Refused {
                             state: refused_state,
-                            generation,
+                            generation: _,
                         } => {
                             tracing::warn!(
                                 target: "freshell_ws::terminal",
