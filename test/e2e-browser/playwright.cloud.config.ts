@@ -89,7 +89,15 @@ export default defineConfig({
   globalTeardown: undefined,
   forbidOnly: true,
   retries: 2,
-  workers: 2,
+  // kata j90s: run specs SEQUENTIALLY per cloud task. Two workers on a 2-vCPU
+  // task starve each other's browser+server (heaviest sibling: fresh-agent
+  // sidecars): the j90s settings test's post-reload WS-ready wait exceeded
+  // both the historical ~30s real window (PR #772) and the 45s cloud window
+  // (2026-09-14 acceptance run, timeout at exactly 46000ms) while the warm
+  // retry passed in ~6s — sibling-worker CPU contention, not cold start.
+  // Sequential execution removes the contention class for every spec; the
+  // lane stays far faster than local (~4-6 min vs ~28 min for the full suite).
+  workers: 1,
   reporter: [['line'], ['html', { open: 'never' }]],
   grepInvert: CLOUD_SKIP_TITLES,
   projects: (baseConfig.projects ?? [])
