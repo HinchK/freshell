@@ -504,8 +504,8 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     // A recreated terminal pane renders.
     await expect(pageB.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
 
-    // PRIMARY resume proof: the accept re-spawned claude with the adjacent
-    // pair `--resume <sessionIdA>` (delta past the pre-accept log).
+    // PRIMARY resume proof: same-machine bootstrap re-spawned claude with the
+    // adjacent pair `--resume <sessionIdA>` (delta past the pre-bootstrap log).
     await expect(async () => {
       const entries = await readArgvLog(argLog)
       expect(
@@ -674,7 +674,7 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     // it never asks the user through the legacy generic offer. ----
     const { ctx: ctxE, page: pageE } = await openSameMachineContext(browser, machineD.id, 'contextE')
 
-    // The accept ran: the tab is restored with both panes visible.
+    // Same-machine bootstrap completed: the tab is restored with both panes visible.
     await expect(pageE.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
 
     // PRIMARY reattach proof: the recovered panes own D's ORIGINAL terminal
@@ -724,10 +724,9 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
       'the live session is never resumed onto a recreated pane',
     ).toBe(false)
 
-    // Deliberately UNGUARDED close (R2a): scenario 4's populating boot never
-    // branches on offer visibility timing — it captures the boot inventory
-    // response payload and declines only when the payload says recoverable,
-    // so it is correct whether or not E's teardown has settled.
+    // Deliberately UNGUARDED close (R2a): scenario 4 bootstraps its registered
+    // machine's workspace directly, so no generic offer is involved and the
+    // next scenario remains correct whether or not E's teardown has settled.
     await ctxE.close()
   })
 
@@ -1495,7 +1494,7 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     }).toPass({ timeout: 30_000 })
     expect(
       (await readArgvLog(argLog)).slice(argvCountAtReattach),
-      'the accept reattached — nothing spawned past the watermark',
+      'same-machine bootstrap reattached — nothing spawned past the watermark',
     ).toHaveLength(0)
 
     await ctxE.close()
