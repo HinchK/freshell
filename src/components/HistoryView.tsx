@@ -9,7 +9,7 @@ import { applySessionRenameCascade } from '@/store/titleSync'
 import { cn } from '@/lib/utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
 import { useMobile } from '@/hooks/useMobile'
-import { AlertCircle, Search, ChevronRight, Play, Pencil, Trash2, RefreshCw } from 'lucide-react'
+import { AlertCircle, Search, ChevronRight, Play, Pencil, Trash2, RefreshCw, X } from 'lucide-react'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 
 function formatTime(ts: number) {
@@ -49,6 +49,10 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
   const [loading, setLoading] = useState(false)
   const [mobileSessionSheet, setMobileSessionSheet] = useState<MobileSessionSheetState | null>(null)
   const [deleteError, setDeleteError] = useState<string | null>(null)
+  // Integrity-banner dismissal: keyed by collision count so a CHANGED count
+  // (a fresh data problem) re-arms the banner; the dismissal never clears the
+  // store's integrity state (the server still quarantines those rows).
+  const [dismissedIntegrityCount, setDismissedIntegrityCount] = useState<number | null>(null)
 
   useEffect(() => {
     if (historyWindow || topLevelSessionCount > 0) return
@@ -196,26 +200,45 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
         </div>
       </div>
 
-      {historyWindow?.integrityError?.kind === 'identity_collision' ? (
+      {historyWindow?.integrityError?.kind === 'identity_collision'
+        && historyWindow.integrityError.collisionCount !== dismissedIntegrityCount ? (
         <div
           role="alert"
           data-testid="history-session-directory-integrity-error"
-          className="flex gap-2 border-b border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-950 dark:text-amber-100 md:px-6"
+          className="flex items-center justify-between gap-2 border-b border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-950 dark:text-amber-100 md:px-6"
         >
-          <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0" aria-hidden="true" />
-          <span>
-            {historyWindow.integrityError.collisionCount} conflicting saved session {historyWindow.integrityError.collisionCount === 1 ? 'identity is' : 'identities are'} hidden.
-            {' '}Running terminals remain available. Check the server log, then remove or rename the duplicate files.
-          </span>
+          <div className="flex gap-2">
+            <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0" aria-hidden="true" />
+            <span>
+              {historyWindow.integrityError.collisionCount} conflicting saved session {historyWindow.integrityError.collisionCount === 1 ? 'identity is' : 'identities are'} hidden.
+              {' '}Running terminals remain available. Check the server log, then remove or rename the duplicate files.
+            </span>
+          </div>
+          <button
+            type="button"
+            aria-label="Dismiss"
+            className="shrink-0 rounded p-0.5"
+            onClick={() => setDismissedIntegrityCount(historyWindow.integrityError?.collisionCount ?? null)}
+          >
+            <X className="h-3.5 w-3.5" aria-hidden="true" />
+          </button>
         </div>
       ) : null}
 
       {deleteError ? (
         <div
           role="alert"
-          className="border-b border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive md:px-6"
+          className="flex items-center justify-between gap-2 border-b border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive md:px-6"
         >
-          {deleteError}
+          <span className="min-w-0">{deleteError}</span>
+          <button
+            type="button"
+            aria-label="Dismiss"
+            className="shrink-0 rounded p-0.5"
+            onClick={() => setDeleteError(null)}
+          >
+            <X className="h-3.5 w-3.5" aria-hidden="true" />
+          </button>
         </div>
       ) : null}
 
