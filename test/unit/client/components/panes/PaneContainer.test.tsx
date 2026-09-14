@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/react'
 import { configureStore, type Middleware } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import PaneContainer from '@/components/panes/PaneContainer'
@@ -1084,23 +1084,34 @@ describe('PaneContainer', () => {
       const rendered = renderWithStore(<PaneContainer tabId="tab-1" node={leafNode} />, store)
 
       const renameInput = await screen.findByLabelText('Rename pane')
-      fireEvent.change(renameInput, { target: { value: 'Ops desk' } })
-      fireEvent.blur(renameInput)
-      await waitFor(() => {
+      vi.useFakeTimers()
+      try {
+        fireEvent.change(renameInput, { target: { value: 'Ops desk' } })
+        fireEvent.blur(renameInput)
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(0)
+        })
         expect(mockApiGet).toHaveBeenCalledWith(
           '/api/panes?tabId=tab-1',
           { signal: expect.any(AbortSignal) },
         )
-      })
+        const mirrorSignal = mockApiGet.mock.calls[0]?.[1]?.signal as AbortSignal
+        const actionCountBeforeUnmount = actions.length
 
-      rendered.unmount()
-      await Promise.resolve()
-      await Promise.resolve()
+        rendered.unmount()
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(250)
+        })
 
-      expect(mockApiPatch).not.toHaveBeenCalled()
-      expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).not.toBe('Ops desk')
-      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
-      expect(actions).not.toContainEqual(expect.objectContaining({ type: 'panes/updatePaneTitle' }))
+        expect(mirrorSignal.aborted).toBe(true)
+        expect(mockApiGet).toHaveBeenCalledTimes(1)
+        expect(mockApiPatch).not.toHaveBeenCalled()
+        expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).not.toBe('Ops desk')
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+        expect(actions).toHaveLength(actionCountBeforeUnmount)
+      } finally {
+        vi.useRealTimers()
+      }
     })
 
     it('cancels a pending mirror wait when its target pane closes without a later PATCH or title update', async () => {
@@ -1129,18 +1140,149 @@ describe('PaneContainer', () => {
       renderWithStore(<PaneContainer tabId="tab-1" node={rootNode} />, store)
 
       const renameInput = await screen.findByLabelText('Rename pane')
-      fireEvent.change(renameInput, { target: { value: 'Ops desk' } })
-      fireEvent.blur(renameInput)
-      await waitFor(() => expect(mockApiGet).toHaveBeenCalled())
+      vi.useFakeTimers()
+      try {
+        fireEvent.change(renameInput, { target: { value: 'Ops desk' } })
+        fireEvent.blur(renameInput)
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(0)
+        })
+        expect(mockApiGet).toHaveBeenCalledTimes(1)
+        const mirrorSignal = mockApiGet.mock.calls[0]?.[1]?.signal as AbortSignal
 
-      fireEvent.click(screen.getAllByTitle('Close pane')[0])
-      await Promise.resolve()
-      await Promise.resolve()
+        fireEvent.click(screen.getAllByTitle('Close pane')[0])
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(0)
+        })
+        const actionCountAfterClose = actions.length
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(250)
+        })
 
-      expect(mockApiPatch).not.toHaveBeenCalled()
-      expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).not.toBe('Ops desk')
-      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
-      expect(actions).not.toContainEqual(expect.objectContaining({ type: 'panes/updatePaneTitle' }))
+        expect(mirrorSignal.aborted).toBe(true)
+        expect(mockApiGet).toHaveBeenCalledTimes(1)
+        expect(mockApiPatch).not.toHaveBeenCalled()
+        expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).not.toBe('Ops desk')
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+        expect(actions).toHaveLength(actionCountAfterClose)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('cancels an in-flight mirror GET on unmount so its late receipt cannot rename the pane', async () => {
+      let resolveGet!: (value: { data: { panes: Array<{ id: string }> } }) => void
+      let mirrorSignal: AbortSignal | undefined
+      mockApiGet.mockImplementation((_: string, { signal }: { signal: AbortSignal }) => {
+        mirrorSignal = signal
+        return new Promise((resolve) => {
+          resolveGet = resolve
+        })
+      })
+      const leafNode: PaneNode = {
+        type: 'leaf',
+        id: 'pane-1',
+        content: createTerminalContent({ terminalId: 'term-1' }),
+      }
+      const actions: unknown[] = []
+      const store = createStore(
+        {
+          layouts: { 'tab-1': leafNode },
+          activePane: { 'tab-1': 'pane-1' },
+          paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
+          renameRequestTabId: 'tab-1',
+          renameRequestPaneId: 'pane-1',
+        },
+        {}, {}, {}, actions,
+      )
+      const rendered = renderWithStore(<PaneContainer tabId="tab-1" node={leafNode} />, store)
+      const renameInput = await screen.findByLabelText('Rename pane')
+
+      vi.useFakeTimers()
+      try {
+        fireEvent.change(renameInput, { target: { value: 'Ops desk' } })
+        fireEvent.blur(renameInput)
+        expect(mockApiGet).toHaveBeenCalledTimes(1)
+        const actionCountBeforeUnmount = actions.length
+
+        rendered.unmount()
+        expect(mirrorSignal?.aborted).toBe(true)
+        resolveGet({ data: { panes: [{ id: 'pane-1' }] } })
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(250)
+        })
+
+        expect(mockApiGet).toHaveBeenCalledTimes(1)
+        expect(mockApiPatch).not.toHaveBeenCalled()
+        expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).toBe('Shell')
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+        expect(actions).toHaveLength(actionCountBeforeUnmount)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('cancels an in-flight PATCH when the target pane closes so its late success cannot rename the pane', async () => {
+      let resolvePatch!: (value: { data: { paneId: string; tabId: string } }) => void
+      let patchSignal: AbortSignal | undefined
+      mockApiPatch.mockImplementation((_: string, __: unknown, { signal }: { signal: AbortSignal }) => {
+        patchSignal = signal
+        return new Promise((resolve) => {
+          resolvePatch = resolve
+        })
+      })
+      const rootNode: PaneNode = {
+        type: 'split',
+        id: 'split-1',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          { type: 'leaf', id: 'pane-1', content: createTerminalContent({ terminalId: 'term-1' }) },
+          { type: 'leaf', id: 'pane-2', content: createTerminalContent({ terminalId: 'term-2' }) },
+        ],
+      }
+      const actions: unknown[] = []
+      const store = createStore(
+        {
+          layouts: { 'tab-1': rootNode },
+          activePane: { 'tab-1': 'pane-1' },
+          paneTitles: { 'tab-1': { 'pane-1': 'Shell', 'pane-2': 'Other' } },
+          renameRequestTabId: 'tab-1',
+          renameRequestPaneId: 'pane-1',
+        },
+        {}, {}, {}, actions,
+      )
+      renderWithStore(<PaneContainer tabId="tab-1" node={rootNode} />, store)
+      const renameInput = await screen.findByLabelText('Rename pane')
+
+      vi.useFakeTimers()
+      try {
+        fireEvent.change(renameInput, { target: { value: 'Ops desk' } })
+        fireEvent.blur(renameInput)
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(0)
+        })
+        expect(mockApiPatch).toHaveBeenCalledTimes(1)
+
+        fireEvent.click(screen.getAllByTitle('Close pane')[0])
+        expect(patchSignal?.aborted).toBe(true)
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(0)
+        })
+        const actionCountAfterClose = actions.length
+        resolvePatch({ data: { paneId: 'pane-1', tabId: 'tab-1' } })
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(250)
+        })
+
+        expect(mockApiGet).toHaveBeenCalledTimes(1)
+        expect(mockApiPatch).toHaveBeenCalledTimes(1)
+        expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).not.toBe('Ops desk')
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+        expect(actions).toHaveLength(actionCountAfterClose)
+      } finally {
+        vi.useRealTimers()
+      }
     })
   })
 

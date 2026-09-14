@@ -41,6 +41,50 @@ function throwIfAborted(signal: AbortSignal): void {
   if (signal.aborted) throw abortError()
 }
 
+function composeAbortSignals(signals: AbortSignal[]): { signal: AbortSignal; dispose: () => void } {
+  const controller = new AbortController()
+  const abort = () => controller.abort()
+  const listeners: Array<{ signal: AbortSignal; listener: () => void }> = []
+
+  for (const signal of signals) {
+    if (signal.aborted) {
+      controller.abort()
+      break
+    }
+    signal.addEventListener('abort', abort, { once: true })
+    listeners.push({ signal, listener: abort })
+  }
+
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      for (const { signal, listener } of listeners) {
+        signal.removeEventListener('abort', listener)
+      }
+    },
+  }
+}
+
+function awaitWithAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  throwIfAborted(signal)
+  return new Promise<T>((resolve, reject) => {
+    let settled = false
+    const finish = (callback: () => void) => {
+      if (settled) return
+      settled = true
+      signal.removeEventListener('abort', onAbort)
+      callback()
+    }
+    const onAbort = () => finish(() => reject(abortError()))
+
+    signal.addEventListener('abort', onAbort, { once: true })
+    operation.then(
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(error)),
+    )
+  })
+}
+
 function sleepUntilNextMirrorProbe(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     throwIfAborted(signal)
@@ -92,20 +136,49 @@ export async function renamePaneAfterMirrorReady(
   const pollIntervalMs = opts.pollIntervalMs ?? MIRROR_POLL_INTERVAL_MS
   const deadlineAt = now() + deadlineMs
   const mirrorPath = `/api/panes?tabId=${encodeURIComponent(tabId)}`
+  const mirrorDeadlineController = new AbortController()
+  let deadlineExpired = false
+  let mirrorDeadlineTimer: number | undefined
+  const { signal: mirrorSignal, dispose } = composeAbortSignals([signal, mirrorDeadlineController.signal])
+  const stopMirrorDeadline = () => {
+    if (mirrorDeadlineTimer !== undefined) {
+      window.clearTimeout(mirrorDeadlineTimer)
+      mirrorDeadlineTimer = undefined
+    }
+    dispose()
+  }
+  mirrorDeadlineTimer = window.setTimeout(() => {
+    deadlineExpired = true
+    mirrorDeadlineController.abort()
+  }, deadlineMs)
 
-  for (;;) {
-    throwIfAborted(signal)
-    const mirror = await opts.get(mirrorPath, { signal })
-    throwIfAborted(signal)
-    if (hasExactPaneReceipt(mirror, paneId)) break
+  try {
+    for (;;) {
+      throwIfAborted(signal)
+      const mirror = await awaitWithAbort(opts.get(mirrorPath, { signal: mirrorSignal }), mirrorSignal)
+      throwIfAborted(signal)
+      if (hasExactPaneReceipt(mirror, paneId)) {
+        stopMirrorDeadline()
+        break
+      }
 
-    const remainingMs = deadlineAt - now()
-    if (remainingMs <= 0) return { ok: false, message: MIRROR_NOT_FOUND_MESSAGE }
-    await sleep(Math.min(pollIntervalMs, remainingMs), signal)
+      const remainingMs = deadlineAt - now()
+      if (remainingMs <= 0) return { ok: false, message: MIRROR_NOT_FOUND_MESSAGE }
+      await awaitWithAbort(sleep(Math.min(pollIntervalMs, remainingMs), mirrorSignal), mirrorSignal)
+    }
+  } catch (error) {
+    if (signal.aborted) throw abortError()
+    if (deadlineExpired) return { ok: false, message: MIRROR_NOT_FOUND_MESSAGE }
+    throw error
+  } finally {
+    stopMirrorDeadline()
   }
 
   throwIfAborted(signal)
-  const response = await opts.patch(`/api/panes/${encodeURIComponent(paneId)}`, { name }, { signal })
+  const response = await awaitWithAbort(
+    opts.patch(`/api/panes/${encodeURIComponent(paneId)}`, { name }, { signal }),
+    signal,
+  )
   throwIfAborted(signal)
   if (response?.data?.paneId === paneId) return { ok: true, response }
   return { ok: false, message: resultMessage(response) }
