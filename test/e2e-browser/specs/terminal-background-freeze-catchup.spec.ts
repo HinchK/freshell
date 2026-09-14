@@ -13,6 +13,9 @@ const STOPPED_PROBE_MS = 2_500
 // Leave a small allowance for signal delivery and scheduler handoff while
 // still requiring nearly the entire requested suspension window.
 const MINIMUM_STOPPED_GAP_MS = STOPPED_PROBE_MS - 250
+// Date.now() is millisecond-resolution on both the test runner and renderer.
+// Exclude a small window at each signal boundary from the protected range.
+const STOP_WINDOW_EDGE_MARGIN_MS = 5
 const RESUMED_PROBE_MS = 500
 const STOPPED_OUTPUT_DELAY_MS = 1_000
 const STOPPED_OUTPUT_LINE_COUNT = 240
@@ -27,6 +30,8 @@ type StopProbeSnapshot = {
   lastWsReadyState: number | null
   maxTimerGapMs: number
   maxRafGapMs: number
+  timerCallbackAtMs: number[]
+  rafCallbackAtMs: number[]
   messageTypes: Record<string, number>
 }
 
@@ -74,6 +79,14 @@ function classifyWsPayload(payload: string): string {
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`
+}
+
+function timestampsWithinInterval(timestamps: number[], startAtMs: number, endAtMs: number): number[] {
+  return timestamps.filter((timestamp) => timestamp >= startAtMs && timestamp < endAtMs)
+}
+
+function timestampsAfter(timestamps: number[], atMs: number): number[] {
+  return timestamps.filter((timestamp) => timestamp >= atMs)
 }
 
 async function selectShellFromPicker(page: Page): Promise<void> {
@@ -130,6 +143,7 @@ async function waitForParserAppliedCheckpoint(page: Page): Promise<number> {
 
 async function installStopProbe(page: Page): Promise<void> {
   await page.addInitScript(() => {
+    const maxCallbackTimestamps = 512
     const state = {
       timerTicks: 0,
       rafTicks: 0,
@@ -142,7 +156,15 @@ async function installStopProbe(page: Page): Promise<void> {
       lastRafAt: 0,
       maxTimerGapMs: 0,
       maxRafGapMs: 0,
+      timerCallbackAtMs: [] as number[],
+      rafCallbackAtMs: [] as number[],
       messageTypes: {} as Record<string, number>,
+    }
+
+    const recordCallbackAt = (timestamps: number[]) => {
+      // The proof needs only the checkpoint-to-resume window. Bound storage so
+      // a pathological renderer cannot turn this diagnostic into unbounded data.
+      if (timestamps.length < maxCallbackTimestamps) timestamps.push(Date.now())
     }
 
     window.setInterval(() => {
@@ -150,6 +172,7 @@ async function installStopProbe(page: Page): Promise<void> {
       state.maxTimerGapMs = Math.max(state.maxTimerGapMs, now - state.lastTimerAt)
       state.lastTimerAt = now
       state.timerTicks += 1
+      recordCallbackAt(state.timerCallbackAtMs)
     }, 50)
 
     const rafTick = (now: number) => {
@@ -158,6 +181,7 @@ async function installStopProbe(page: Page): Promise<void> {
       }
       state.lastRafAt = now
       state.rafTicks += 1
+      recordCallbackAt(state.rafCallbackAtMs)
       window.requestAnimationFrame(rafTick)
     }
     window.requestAnimationFrame(rafTick)
@@ -209,6 +233,8 @@ async function installStopProbe(page: Page): Promise<void> {
         state.lastRafAt = now
         state.maxTimerGapMs = 0
         state.maxRafGapMs = 0
+        state.timerCallbackAtMs = []
+        state.rafCallbackAtMs = []
       },
       snapshot: () => ({
         timerTicks: state.timerTicks,
@@ -220,6 +246,8 @@ async function installStopProbe(page: Page): Promise<void> {
         lastWsReadyState: state.lastWsReadyState,
         maxTimerGapMs: state.maxTimerGapMs,
         maxRafGapMs: state.maxRafGapMs,
+        timerCallbackAtMs: [...state.timerCallbackAtMs],
+        rafCallbackAtMs: [...state.rafCallbackAtMs],
         messageTypes: { ...state.messageTypes },
       }),
     }
@@ -280,6 +308,8 @@ function deltaSnapshots(before: StopProbeSnapshot, after: StopProbeSnapshot): St
     lastWsReadyState: after.lastWsReadyState,
     maxTimerGapMs: after.maxTimerGapMs,
     maxRafGapMs: after.maxRafGapMs,
+    timerCallbackAtMs: after.timerCallbackAtMs,
+    rafCallbackAtMs: after.rafCallbackAtMs,
     messageTypes,
   }
 }
@@ -477,13 +507,36 @@ test.describe('terminal background freeze catch-up', () => {
       const stopStartedAt = Date.now()
       expect(stopStartedAt - scheduledMarkerObservedAt).toBeLessThan(STOPPED_OUTPUT_DELAY_MS)
       signalPids([...stoppedPids].sort((a, b) => b - a), 'SIGSTOP')
+      const stopSignalsReturnedAt = Date.now()
       await sleep(STOPPED_PROBE_MS)
+      const continueSignalsStartedAt = Date.now()
       signalPids([...stoppedPids].sort((a, b) => a - b), 'SIGCONT')
       const stopEndedAt = Date.now()
       const stoppedDurationMs = stopEndedAt - stopStartedAt
       expect(stoppedDurationMs).toBeGreaterThan(STOPPED_OUTPUT_DELAY_MS)
       const afterResumeImmediate = await waitForStopWindowEvidence(page)
       const stoppedDelta = deltaSnapshots(beforeStop, afterResumeImmediate)
+      const protectedStopStartAt = stopSignalsReturnedAt + STOP_WINDOW_EDGE_MARGIN_MS
+      const protectedStopEndAt = continueSignalsStartedAt - STOP_WINDOW_EDGE_MARGIN_MS
+      expect(protectedStopEndAt).toBeGreaterThan(protectedStopStartAt)
+      const timerCallbacksDuringProtectedStop = timestampsWithinInterval(
+        afterResumeImmediate.timerCallbackAtMs,
+        protectedStopStartAt,
+        protectedStopEndAt,
+      )
+      const rafCallbacksDuringProtectedStop = timestampsWithinInterval(
+        afterResumeImmediate.rafCallbackAtMs,
+        protectedStopStartAt,
+        protectedStopEndAt,
+      )
+      const timerCallbacksAfterContinue = timestampsAfter(
+        afterResumeImmediate.timerCallbackAtMs,
+        continueSignalsStartedAt,
+      )
+      const rafCallbacksAfterContinue = timestampsAfter(
+        afterResumeImmediate.rafCallbackAtMs,
+        continueSignalsStartedAt,
+      )
       await waitForFile(startedMarkerPath)
       const outputStartedAt = JSON.parse(await fs.readFile(startedMarkerPath, 'utf8')).startedAt as number
       expect(outputStartedAt).toBeGreaterThanOrEqual(stopStartedAt)
@@ -494,6 +547,10 @@ test.describe('terminal background freeze catch-up', () => {
       // snapshot itself resumes the renderer and may validly observe frames.
       expect(afterResumeImmediate.maxTimerGapMs).toBeGreaterThanOrEqual(MINIMUM_STOPPED_GAP_MS)
       expect(afterResumeImmediate.maxRafGapMs).toBeGreaterThanOrEqual(MINIMUM_STOPPED_GAP_MS)
+      expect(timerCallbacksDuringProtectedStop, 'timer callbacks must stop after SIGSTOP returns').toEqual([])
+      expect(rafCallbacksDuringProtectedStop, 'rAF callbacks must stop after SIGSTOP returns').toEqual([])
+      expect(timerCallbacksAfterContinue, 'timer callbacks must resume after SIGCONT begins').not.toEqual([])
+      expect(rafCallbacksAfterContinue, 'rAF callbacks must resume after SIGCONT begins').not.toEqual([])
 
       await terminal.waitForOutput(finalLine, { terminalId, timeout: 30_000 })
       await page.waitForTimeout(RESUMED_PROBE_MS)
@@ -527,8 +584,17 @@ test.describe('terminal background freeze catch-up', () => {
         stoppedDurationMs,
         stoppedOutputDelayMs: STOPPED_OUTPUT_DELAY_MS,
         minimumStoppedGapMs: MINIMUM_STOPPED_GAP_MS,
+        stopWindowEdgeMarginMs: STOP_WINDOW_EDGE_MARGIN_MS,
         stopWindowTimerGapMs: afterResumeImmediate.maxTimerGapMs,
         stopWindowRafGapMs: afterResumeImmediate.maxRafGapMs,
+        stopSignalsReturnedAt,
+        continueSignalsStartedAt,
+        protectedStopStartAt,
+        protectedStopEndAt,
+        timerCallbacksDuringProtectedStop,
+        rafCallbacksDuringProtectedStop,
+        timerCallbacksAfterContinue,
+        rafCallbacksAfterContinue,
         scheduledToStopMs: stopStartedAt - scheduledMarkerObservedAt,
         outputStartedAt,
         outputStartedAfterStopMs: outputStartedAt - stopStartedAt,
