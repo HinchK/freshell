@@ -4168,38 +4168,40 @@ impl FreshCodexState {
         }
 
         let (session_id, active_turn_present, should_emit_snapshot) = if tracked {
-            let (resolved_id, should_emit_snapshot) =
-                match self.ensure_session_alive(&msg.session_id, attach_fence).await {
-                    Ok(EnsureAliveOutcome::AlreadyRunning) => (msg.session_id.clone(), false),
-                    // FIX-2: a resume-recovered session keeps its ORIGINAL id, but the
-                    // sidecar/turn state is new to this connection (memory MAY have moved,
-                    // an in-flight turn is gone, etc) -- unlike the plain-tracked-and-alive
-                    // no-op case above, this genuinely-new state DOES warrant a fresh
-                    // snapshot, same as the not-tracked-resume and mint-new-respawn
-                    // branches below.
-                    Ok(EnsureAliveOutcome::Recovered) => (msg.session_id.clone(), true),
-                    Ok(EnsureAliveOutcome::Respawned { new_session_id }) => (new_session_id, true),
-                    Err(EnsureAliveError::NotFound) => {
-                        // Raced away between the `tracked` check and here (e.g. a concurrent
-                        // kill) -- fall back to the same "not tracked" handling a plain miss
-                        // would get.
-                        self.broadcast(&lost_session_frame(&msg.session_id));
-                        return;
-                    }
-                    Err(EnsureAliveError::RespawnFailed(err)) => {
-                        self.send_error(&None, "CODEX_ATTACH_RESPAWN_FAILED", &err);
-                        return;
-                    }
-                    Err(EnsureAliveError::Reserved) => {
-                        // Task 13 (D8): loser answer -- retryable, never lost.
-                        self.emit_fresh_agent_error(
-                            &msg.session_id,
-                            "SESSION_RESERVED",
-                            "Another resume for this session is in flight",
-                        );
-                        return;
-                    }
-                };
+            let (resolved_id, should_emit_snapshot) = match self
+                .ensure_session_alive(&msg.session_id, attach_fence)
+                .await
+            {
+                Ok(EnsureAliveOutcome::AlreadyRunning) => (msg.session_id.clone(), false),
+                // FIX-2: a resume-recovered session keeps its ORIGINAL id, but the
+                // sidecar/turn state is new to this connection (memory MAY have moved,
+                // an in-flight turn is gone, etc) -- unlike the plain-tracked-and-alive
+                // no-op case above, this genuinely-new state DOES warrant a fresh
+                // snapshot, same as the not-tracked-resume and mint-new-respawn
+                // branches below.
+                Ok(EnsureAliveOutcome::Recovered) => (msg.session_id.clone(), true),
+                Ok(EnsureAliveOutcome::Respawned { new_session_id }) => (new_session_id, true),
+                Err(EnsureAliveError::NotFound) => {
+                    // Raced away between the `tracked` check and here (e.g. a concurrent
+                    // kill) -- fall back to the same "not tracked" handling a plain miss
+                    // would get.
+                    self.broadcast(&lost_session_frame(&msg.session_id));
+                    return;
+                }
+                Err(EnsureAliveError::RespawnFailed(err)) => {
+                    self.send_error(&None, "CODEX_ATTACH_RESPAWN_FAILED", &err);
+                    return;
+                }
+                Err(EnsureAliveError::Reserved) => {
+                    // Task 13 (D8): loser answer -- retryable, never lost.
+                    self.emit_fresh_agent_error(
+                        &msg.session_id,
+                        "SESSION_RESERVED",
+                        "Another resume for this session is in flight",
+                    );
+                    return;
+                }
+            };
             let active_turn_present = {
                 let guard = self.sessions.lock().await;
                 guard
@@ -19723,294 +19725,298 @@ pub(crate) mod tests {
         );
     }
 
-// ── b8ke ext r8 F5: the crashed-recovery re-claim carries the observed fence ──
+    // ── b8ke ext r8 F5: the crashed-recovery re-claim carries the observed fence ──
 
-/// b8ke ext r8 F5: a delayed attach whose observed generation predates a
-/// generation advance is refused typed (SESSION_RESERVED) — the
-/// crashed-recovery re-claim carries the request's fence, so the stale
-/// attach can no longer recreate the runtime past the advance (pre-r8 the
-/// claim was hard-wired None and the recreation proceeded).
-#[tokio::test(flavor = "multi_thread")]
-async fn a_stale_generation_crashed_attach_is_refused_typed_no_recreation() {
-    let _guard = ENV_LOCK.lock().await;
-    let (mut st, mut rx) = state_with_bus();
-    let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
-    st.set_ownership(Arc::clone(&registry));
+    /// b8ke ext r8 F5: a delayed attach whose observed generation predates a
+    /// generation advance is refused typed (SESSION_RESERVED) — the
+    /// crashed-recovery re-claim carries the request's fence, so the stale
+    /// attach can no longer recreate the runtime past the advance (pre-r8 the
+    /// claim was hard-wired None and the recreation proceeded).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_generation_crashed_attach_is_refused_typed_no_recreation() {
+        let _guard = ENV_LOCK.lock().await;
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
 
-    configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
-    let thread_id = create_real_fake_session(&st, &mut rx).await;
-    wait_for_self_heal(&st, &mut rx, &thread_id).await;
-    configure_fake_codex_cmd("{}");
+        configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
+        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        configure_fake_codex_cmd("{}");
 
-    // Advance the coordinator generation past the attach's observation: a
-    // handoff begin + fail bumps the record while the runtime stays live.
-    let before = registry.observe(PROVIDER, &thread_id);
-    let freshell_ownership::BeginOutcome::Granted { generation: ho_gen } = registry.begin_handoff(
-        PROVIDER,
-        &thread_id,
-        freshell_ownership::RuntimeOwnerKind::Terminal,
-        "op-r8-bump",
-        None,
-        "test",
-        freshell_ownership::now_epoch_ms(),
-    ) else {
-        panic!("expected the bump handoff granted")
-    };
-    // The bump handoff's unwind restores the prior (or vacates a
-    // from-vacant key) — either way the RECORD's generation advanced.
-    let _ = registry.fail(PROVIDER, &thread_id, "op-r8-bump", ho_gen, true);
-    let after = registry.observe(PROVIDER, &thread_id);
-    assert!(
-        after.generation > before.generation,
-        "the record's generation advanced: {} -> {}",
-        before.generation,
-        after.generation
-    );
+        // Advance the coordinator generation past the attach's observation: a
+        // handoff begin + fail bumps the record while the runtime stays live.
+        let before = registry.observe(PROVIDER, &thread_id);
+        let freshell_ownership::BeginOutcome::Granted { generation: ho_gen } = registry
+            .begin_handoff(
+                PROVIDER,
+                &thread_id,
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "op-r8-bump",
+                None,
+                "test",
+                freshell_ownership::now_epoch_ms(),
+            )
+        else {
+            panic!("expected the bump handoff granted")
+        };
+        // The bump handoff's unwind restores the prior (or vacates a
+        // from-vacant key) — either way the RECORD's generation advanced.
+        let _ = registry.fail(PROVIDER, &thread_id, "op-r8-bump", ho_gen, true);
+        let after = registry.observe(PROVIDER, &thread_id);
+        assert!(
+            after.generation > before.generation,
+            "the record's generation advanced: {} -> {}",
+            before.generation,
+            after.generation
+        );
 
-    // Mark the session crashed so the attach runs the recovery re-claim.
-    {
-        let sessions = st.sessions.lock().await;
-        sessions
-            .get(&thread_id)
-            .expect("the session row")
-            .exited
-            .store(true, Ordering::SeqCst);
+        // Mark the session crashed so the attach runs the recovery re-claim.
+        {
+            let sessions = st.sessions.lock().await;
+            sessions
+                .get(&thread_id)
+                .expect("the session row")
+                .exited
+                .store(true, Ordering::SeqCst);
+        }
+
+        // THE STALE ATTACH: observed generation is the PRE-advance value —
+        // typed refusal (SESSION_RESERVED), never a recreation.
+        st.handle_attach(FreshAgentAttach {
+            observed_epoch: Some(before.epoch),
+            observed_generation: Some(before.generation),
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread_id.clone(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+            resume_session_id: None,
+            session_ref: None,
+        })
+        .await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv())
+                .await
+                .expect("a frame within budget")
+                .map(|raw| serde_json::from_str(&raw).expect("json frame"))
+                .expect("the bus stays open");
+            if frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == json!("freshAgent.error")
+                && frame["event"]["code"] == json!("SESSION_RESERVED")
+            {
+                break;
+            }
+            assert!(
+                frame["type"] != "freshAgent.session.materialized",
+                "the stale attach must never recreate: {frame}"
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the stale attach never answered typed: {frame}"
+            );
+        }
     }
 
-    // THE STALE ATTACH: observed generation is the PRE-advance value —
-    // typed refusal (SESSION_RESERVED), never a recreation.
-    st.handle_attach(FreshAgentAttach {
-        observed_epoch: Some(before.epoch),
-        observed_generation: Some(before.generation),
-        provider: freshell_protocol::AgentProvider::Codex,
-        session_id: thread_id.clone(),
-        session_type: freshell_protocol::SessionType::Freshcodex,
-        cwd: None,
-        resume_session_id: None,
-        session_ref: None,
-    })
-    .await;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-    loop {
-        let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv())
-            .await
-            .expect("a frame within budget")
-            .map(|raw| serde_json::from_str(&raw).expect("json frame"))
-            .expect("the bus stays open");
-        if frame["type"] == "freshAgent.event"
-            && frame["event"]["type"] == json!("freshAgent.error")
-            && frame["event"]["code"] == json!("SESSION_RESERVED")
+    /// b8ke ext r8 F5: a send carrying a stale observed generation against a
+    /// crashed session is refused typed (SESSION_RESERVED) — FreshAgentSend's
+    /// new additive pair fences the recovery re-claim on every route through
+    /// ensure_session_alive.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_generation_send_against_a_crashed_session_is_refused_typed() {
+        let _guard = ENV_LOCK.lock().await;
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+
+        configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
+        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        configure_fake_codex_cmd("{}");
+
+        // Advance the generation past the send's observation.
+        let before = registry.observe(PROVIDER, &thread_id);
+        let freshell_ownership::BeginOutcome::Granted { generation: ho_gen } = registry
+            .begin_handoff(
+                PROVIDER,
+                &thread_id,
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "op-r8-bump-send",
+                None,
+                "test",
+                freshell_ownership::now_epoch_ms(),
+            )
+        else {
+            panic!("expected the bump handoff granted")
+        };
+        let _ = registry.fail(PROVIDER, &thread_id, "op-r8-bump-send", ho_gen, true);
+
+        // Mark the session crashed so the send runs the recovery re-claim.
         {
-            break;
+            let sessions = st.sessions.lock().await;
+            sessions
+                .get(&thread_id)
+                .expect("the session row")
+                .exited
+                .store(true, Ordering::SeqCst);
+        }
+
+        // THE STALE SEND: typed refusal, never a recreation.
+        st.handle_send(FreshAgentSend {
+            request_id: Some("req-r8-stale-send".to_string()),
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread_id.clone(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            text: "delayed".to_string(),
+            images: None,
+            cwd: None,
+            settings: None,
+            observed_epoch: Some(before.epoch),
+            observed_generation: Some(before.generation),
+        })
+        .await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv())
+                .await
+                .expect("a frame within budget")
+                .map(|raw| serde_json::from_str(&raw).expect("json frame"))
+                .expect("the bus stays open");
+            if frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == json!("freshAgent.error")
+                && frame["event"]["code"] == json!("SESSION_RESERVED")
+            {
+                break;
+            }
+            assert!(
+                frame["type"] != "freshAgent.session.materialized",
+                "the stale send must never recreate: {frame}"
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the stale send never answered typed: {frame}"
+            );
+        }
+    }
+
+    /// b8ke ext r8 F5: the None path (compact/fork — wire messages carry no
+    /// pair) is typed-safe: a fence-less recreation is refused when the key is
+    /// non-Vacant (mid-Handoff), never a silent recreation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fenceless_compact_against_a_mid_handoff_key_is_refused_typed() {
+        let _guard = ENV_LOCK.lock().await;
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+
+        configure_fake_codex_cmd("{}");
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
+
+        // The key moves to Handoff (a lifecycle transition owns the session).
+        let freshell_ownership::BeginOutcome::Granted { .. } = registry.begin_handoff(
+            PROVIDER,
+            &thread_id,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-r8-handoff-held",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) else {
+            panic!("expected the handoff granted")
+        };
+        // Mark the session crashed so the compact runs the recovery re-claim.
+        {
+            let sessions = st.sessions.lock().await;
+            sessions
+                .get(&thread_id)
+                .expect("the session row")
+                .exited
+                .store(true, Ordering::SeqCst);
+        }
+
+        // THE FENCE-LESS COMPACT against the mid-Handoff key: typed refusal.
+        st.handle_compact(FreshAgentCompact {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread_id.clone(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+            instructions: None,
+        })
+        .await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv())
+                .await
+                .expect("a frame within budget")
+                .map(|raw| serde_json::from_str(&raw).expect("json frame"))
+                .expect("the bus stays open");
+            if frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == json!("freshAgent.error")
+                && frame["event"]["code"] == json!("SESSION_RESERVED")
+            {
+                break;
+            }
+            assert!(
+                frame["type"] != "freshAgent.session.materialized",
+                "the fence-less compact must never recreate mid-handoff: {frame}"
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the fence-less compact never answered typed: {frame}"
+            );
         }
         assert!(
-            frame["type"] != "freshAgent.session.materialized",
-            "the stale attach must never recreate: {frame}"
-        );
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the stale attach never answered typed: {frame}"
+            matches!(
+                registry.observe(PROVIDER, &thread_id).state,
+                freshell_ownership::OwnershipState::Handoff { .. }
+            ),
+            "the Handoff record is untouched by the refused compact"
         );
     }
-}
 
-/// b8ke ext r8 F5: a send carrying a stale observed generation against a
-/// crashed session is refused typed (SESSION_RESERVED) — FreshAgentSend's
-/// new additive pair fences the recovery re-claim on every route through
-/// ensure_session_alive.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_stale_generation_send_against_a_crashed_session_is_refused_typed() {
-    let _guard = ENV_LOCK.lock().await;
-    let (mut st, mut rx) = state_with_bus();
-    let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
-    st.set_ownership(Arc::clone(&registry));
+    /// b8ke ext r8 F5: a half-sent observed pair on a send is the typed
+    /// invalid-fence refusal — never a silent legacy downgrade.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_half_fenced_send_is_refused_typed() {
+        let _guard = ENV_LOCK.lock().await;
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
 
-    configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
-    let thread_id = create_real_fake_session(&st, &mut rx).await;
-    wait_for_self_heal(&st, &mut rx, &thread_id).await;
-    configure_fake_codex_cmd("{}");
+        configure_fake_codex_cmd("{}");
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
 
-    // Advance the generation past the send's observation.
-    let before = registry.observe(PROVIDER, &thread_id);
-    let freshell_ownership::BeginOutcome::Granted { generation: ho_gen } = registry.begin_handoff(
-        PROVIDER,
-        &thread_id,
-        freshell_ownership::RuntimeOwnerKind::Terminal,
-        "op-r8-bump-send",
-        None,
-        "test",
-        freshell_ownership::now_epoch_ms(),
-    ) else {
-        panic!("expected the bump handoff granted")
-    };
-    let _ = registry.fail(PROVIDER, &thread_id, "op-r8-bump-send", ho_gen, true);
-
-    // Mark the session crashed so the send runs the recovery re-claim.
-    {
-        let sessions = st.sessions.lock().await;
-        sessions
-            .get(&thread_id)
-            .expect("the session row")
-            .exited
-            .store(true, Ordering::SeqCst);
-    }
-
-    // THE STALE SEND: typed refusal, never a recreation.
-    st.handle_send(FreshAgentSend {
-        request_id: Some("req-r8-stale-send".to_string()),
-        provider: freshell_protocol::AgentProvider::Codex,
-        session_id: thread_id.clone(),
-        session_type: freshell_protocol::SessionType::Freshcodex,
-        text: "delayed".to_string(),
-        images: None,
-        cwd: None,
-        settings: None,
-        observed_epoch: Some(before.epoch),
-        observed_generation: Some(before.generation),
-    })
-    .await;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-    loop {
-        let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv())
-            .await
-            .expect("a frame within budget")
-            .map(|raw| serde_json::from_str(&raw).expect("json frame"))
-            .expect("the bus stays open");
-        if frame["type"] == "freshAgent.event"
-            && frame["event"]["type"] == json!("freshAgent.error")
-            && frame["event"]["code"] == json!("SESSION_RESERVED")
-        {
-            break;
+        st.handle_send(FreshAgentSend {
+            request_id: Some("req-r8-half".to_string()),
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread_id.clone(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            text: "half".to_string(),
+            images: None,
+            cwd: None,
+            settings: None,
+            observed_epoch: Some(7),
+            observed_generation: None,
+        })
+        .await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv())
+                .await
+                .expect("a frame within budget")
+                .map(|raw| serde_json::from_str(&raw).expect("json frame"))
+                .expect("the bus stays open");
+            if frame["type"] == "error"
+                && frame["message"]
+                    .as_str()
+                    .is_some_and(|m| m.starts_with("INVALID_FENCE"))
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the half-fenced send never answered INVALID_FENCE: {frame}"
+            );
         }
-        assert!(
-            frame["type"] != "freshAgent.session.materialized",
-            "the stale send must never recreate: {frame}"
-        );
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the stale send never answered typed: {frame}"
-        );
     }
-}
-
-/// b8ke ext r8 F5: the None path (compact/fork — wire messages carry no
-/// pair) is typed-safe: a fence-less recreation is refused when the key is
-/// non-Vacant (mid-Handoff), never a silent recreation.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_fenceless_compact_against_a_mid_handoff_key_is_refused_typed() {
-    let _guard = ENV_LOCK.lock().await;
-    let (mut st, mut rx) = state_with_bus();
-    let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
-    st.set_ownership(Arc::clone(&registry));
-
-    configure_fake_codex_cmd("{}");
-    let thread_id = create_real_fake_session(&st, &mut rx).await;
-
-    // The key moves to Handoff (a lifecycle transition owns the session).
-    let freshell_ownership::BeginOutcome::Granted { .. } = registry.begin_handoff(
-        PROVIDER,
-        &thread_id,
-        freshell_ownership::RuntimeOwnerKind::Terminal,
-        "op-r8-handoff-held",
-        None,
-        "test",
-        freshell_ownership::now_epoch_ms(),
-    ) else {
-        panic!("expected the handoff granted")
-    };
-    // Mark the session crashed so the compact runs the recovery re-claim.
-    {
-        let sessions = st.sessions.lock().await;
-        sessions
-            .get(&thread_id)
-            .expect("the session row")
-            .exited
-            .store(true, Ordering::SeqCst);
-    }
-
-    // THE FENCE-LESS COMPACT against the mid-Handoff key: typed refusal.
-    st.handle_compact(FreshAgentCompact {
-        provider: freshell_protocol::AgentProvider::Codex,
-        session_id: thread_id.clone(),
-        session_type: freshell_protocol::SessionType::Freshcodex,
-        cwd: None,
-        instructions: None,
-    })
-    .await;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-    loop {
-        let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv())
-            .await
-            .expect("a frame within budget")
-            .map(|raw| serde_json::from_str(&raw).expect("json frame"))
-            .expect("the bus stays open");
-        if frame["type"] == "freshAgent.event"
-            && frame["event"]["type"] == json!("freshAgent.error")
-            && frame["event"]["code"] == json!("SESSION_RESERVED")
-        {
-            break;
-        }
-        assert!(
-            frame["type"] != "freshAgent.session.materialized",
-            "the fence-less compact must never recreate mid-handoff: {frame}"
-        );
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the fence-less compact never answered typed: {frame}"
-        );
-    }
-    assert!(
-        matches!(
-            registry.observe(PROVIDER, &thread_id).state,
-            freshell_ownership::OwnershipState::Handoff { .. }
-        ),
-        "the Handoff record is untouched by the refused compact"
-    );
-}
-
-/// b8ke ext r8 F5: a half-sent observed pair on a send is the typed
-/// invalid-fence refusal — never a silent legacy downgrade.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_half_fenced_send_is_refused_typed() {
-    let _guard = ENV_LOCK.lock().await;
-    let (mut st, mut rx) = state_with_bus();
-    let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
-    st.set_ownership(Arc::clone(&registry));
-
-    configure_fake_codex_cmd("{}");
-    let thread_id = create_real_fake_session(&st, &mut rx).await;
-
-    st.handle_send(FreshAgentSend {
-        request_id: Some("req-r8-half".to_string()),
-        provider: freshell_protocol::AgentProvider::Codex,
-        session_id: thread_id.clone(),
-        session_type: freshell_protocol::SessionType::Freshcodex,
-        text: "half".to_string(),
-        images: None,
-        cwd: None,
-        settings: None,
-        observed_epoch: Some(7),
-        observed_generation: None,
-    })
-    .await;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-    loop {
-        let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv())
-            .await
-            .expect("a frame within budget")
-            .map(|raw| serde_json::from_str(&raw).expect("json frame"))
-            .expect("the bus stays open");
-        if frame["type"] == "error"
-            && frame["message"]
-                .as_str()
-                .is_some_and(|m| m.starts_with("INVALID_FENCE"))
-        {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the half-fenced send never answered INVALID_FENCE: {frame}"
-        );
-    }
-}
 }
