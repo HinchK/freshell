@@ -29,16 +29,14 @@
  * other suites; the PERSISTENCE and SUPPRESSION behavior exercised is
  * entirely production code.
  *
- * Rust-only: registers under `rust-chromium` + RUST_ONLY_SPECS (owns a
- * RustServer directly, the e2eServerKind seam not used). CLOUD-SKIPPED with
- * justification (see playwright.cloud.config.ts): the Cloud Run image
- * builds WITHOUT git metadata, so both the Rust bake and the Vite define
- * are "unknown" there and the compare is inert BY DESIGN — this spec can
- * only pass on a lane where at least the client bake is a real sha.
+ * Rust-only: runs in the application Chromium project (owns a
+ * RustServer directly rather than the shared server fixture). The Cloud Run
+ * image receives the validated build-time commit input shared by Vite and
+ * Rust, so this same-artifact convergence proof runs in the cloud lane too.
  */
-import { test, expect } from '../helpers/fixtures.js'
+import { createFreshE2eBrowserContext, test, expect } from '../helpers/fixtures.js'
 import { RustServer, ensureRustServerBuilt } from '../helpers/rust-server.js'
-import type { TestServerInfo } from '../helpers/test-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 
 const MISMATCHED_BUILD_ID = 'f'.repeat(40)
@@ -46,7 +44,7 @@ const SENTINEL = 'freshell.server-build-reload'
 
 test.describe('server build mismatch reload (rust)', () => {
   let server: RustServer | undefined
-  let info: TestServerInfo
+  let info: E2eServerInfo
 
   test.beforeAll(async () => {
     test.setTimeout(600_000) // first release build of freshell-server can take minutes
@@ -60,7 +58,7 @@ test.describe('server build mismatch reload (rust)', () => {
   })
 
   test('mismatched ready buildId reloads exactly once and converges', async ({ browser }) => {
-    const context = await browser.newContext({ serviceWorkers: 'block' })
+    const { context } = await createFreshE2eBrowserContext(browser, info, { serviceWorkers: 'block' })
     const page = await context.newPage()
     await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
     const harness = new TestHarness(page)
@@ -92,7 +90,7 @@ test.describe('server build mismatch reload (rust)', () => {
     // The real post-reload ready must MATCH: in normal e2e runs the harness
     // guarantees same-HEAD artifacts — global setup fresh-builds both sides
     // (test/e2e-browser/global-setup.ts runs `npm run build:client && npm run
-    // build:server` at run start) and `ensureRustServerBuilt` restamps the
+    // build:rust` at run start) and `ensureRustServerBuilt` restamps the
     // Rust binary on HEAD moves — so the real `ready.buildId` equals the
     // client's baked `__FRESHELL_BUILD_ID__` and the production match path
     // MUST have cleared the sentinel. A failure here means the real ready
@@ -109,7 +107,7 @@ test.describe('server build mismatch reload (rust)', () => {
   })
 
   test('sentinel persists across a real navigation', async ({ browser }) => {
-    const context = await browser.newContext({ serviceWorkers: 'block' })
+    const { context } = await createFreshE2eBrowserContext(browser, info, { serviceWorkers: 'block' })
     const page = await context.newPage()
     await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
     const harness = new TestHarness(page)
@@ -144,7 +142,7 @@ test.describe('server build mismatch reload (rust)', () => {
   })
 
   test('a seeded sentinel suppresses a repeat mismatch (no reload)', async ({ browser }) => {
-    const context = await browser.newContext({ serviceWorkers: 'block' })
+    const { context } = await createFreshE2eBrowserContext(browser, info, { serviceWorkers: 'block' })
     const page = await context.newPage()
     await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
     const harness = new TestHarness(page)

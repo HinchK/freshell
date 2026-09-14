@@ -3,7 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import WebSocket from 'ws'
-import { test, expect } from '../helpers/fixtures.js'
+import { createFreshE2eBrowserContext, test, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle } from '../helpers/external-target.js'
 import { RustServer } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
@@ -29,7 +29,6 @@ import { WS_PROTOCOL_VERSION } from '../../../shared/ws-version.js'
  * `crates/freshell-ws/tests/codex_candidate_inert.rs` (the accept-and-ignore
  * contract).
  *
- * Rust-only (`playwright.config.ts` registers this under `rust-chromium`).
  */
 
 const __filename = fileURLToPath(import.meta.url)
@@ -312,9 +311,7 @@ test.describe('Codex status completeness (Rust only)', () => {
 
   test('restartAbrupt mid-codex-turn: restored pane seeds busy from the rollout, then completes with identity', async ({
     page,
-    e2eServerKind,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-restart-'))
     // Dual-role: the codex terminal lane boots a `codex app-server` sidecar
     // first; a terminal-only fake dies on it (PTY_SPAWN_FAILED).
@@ -415,10 +412,8 @@ test.describe('Codex status completeness (Rust only)', () => {
 
   test('two concurrent servers keep independent codex status streams', async ({
     page,
-    e2eServerKind,
     browser,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-twin-'))
     // Dual-role (see note at site one): the codex lane boots an app-server
     // sidecar first; the BEL fake must cover only the terminal branch.
@@ -458,7 +453,7 @@ test.describe('Codex status completeness (Rust only)', () => {
         const terminalA = await openCliPaneAndGetTerminalId(page, harnessA, tabA!, /Codex/i, 'codex')
 
         // Server B: second browser context, its own codex pane + turn.
-        contextB = await browser.newContext()
+        contextB = (await createFreshE2eBrowserContext(browser, infoB)).context
         const pageB = await contextB.newPage()
         const harnessB = await bootAndConnect(pageB, infoB)
         await expect(pageB.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })

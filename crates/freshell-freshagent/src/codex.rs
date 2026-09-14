@@ -109,6 +109,20 @@ const DEAD_THREADS_CAP: usize = 256;
 /// requirement, so only a LONG silence with a turn in flight flags `stuck`.
 const DEFAULT_CODEX_QUIET_WINDOW_MS: u64 = 600_000;
 
+/// Shared ownership-bearing state for one Codex notification consumer.
+///
+/// Keeping these handles together makes the consumer's concurrency contract
+/// explicit: every lifecycle path must give the reducer, quiet-deadman, compact
+/// guard, and emission barrier for the same thread to the same task.
+struct CodexConsumerRuntime {
+    thread_id: String,
+    active_turn: Arc<StdMutex<Option<String>>>,
+    quiet_deadman: Arc<StdMutex<QuietDeadman>>,
+    compact_in_flight: Arc<AtomicBool>,
+    compact_turn_id: Arc<StdMutex<Option<String>>>,
+    event_emission_gate: Arc<TokioMutex<()>>,
+}
+
 /// Seed the quiet window from `FRESHELL_FRESHCODEX_QUIET_WINDOW_MS` (positive integer
 /// milliseconds; missing or unparseable falls back to [`DEFAULT_CODEX_QUIET_WINDOW_MS`]).
 fn codex_quiet_window_ms_from_env() -> u64 {
@@ -284,6 +298,11 @@ struct CodexSession {
     /// rollback busy gate). Rollback-vs-rollback additionally single-flights on
     /// `rollback_in_flight`, acquired FIRST (never the reverse order).
     turn_lock: Arc<TokioMutex<()>>,
+    /// Serializes notification-consumer emission with a `freshAgent.send` acceptance.
+    /// Codex can send `turn/completed` immediately after the `turn/start` response;
+    /// the request-correlated accepted frame must reach the client first so its
+    /// submitted-turn identity is available before completion state is folded.
+    event_emission_gate: Arc<TokioMutex<()>>,
     /// The notification-consumer task (aborted on shutdown/kill).
     consumer: tokio::task::JoinHandle<()>,
     /// Signals the exit-watcher to gracefully tear the sidecar down (a REQUESTED
@@ -1307,14 +1326,18 @@ impl FreshCodexState {
         // only its delivery to the consumer is deferred.
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
+        let event_emission_gate = Arc::new(TokioMutex::new(()));
         let (created_tx, created_rx) = oneshot::channel();
         let consumer = self.spawn_consumer_after(
             notifs,
-            thread_id.clone(),
-            active_turn.clone(),
-            quiet_deadman.clone(),
-            compact_in_flight.clone(),
-            compact_turn_id.clone(),
+            CodexConsumerRuntime {
+                thread_id: thread_id.clone(),
+                active_turn: active_turn.clone(),
+                quiet_deadman: quiet_deadman.clone(),
+                compact_in_flight: compact_in_flight.clone(),
+                compact_turn_id: compact_turn_id.clone(),
+                event_emission_gate: event_emission_gate.clone(),
+            },
             Some(created_rx),
         );
 
@@ -1348,6 +1371,7 @@ impl FreshCodexState {
                 compact_turn_id,
                 history_mode,
                 turn_lock: Arc::new(TokioMutex::new(())),
+                event_emission_gate,
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -1650,11 +1674,13 @@ impl FreshCodexState {
                     s.client.clone(),
                     s.active_turn.clone(),
                     s.turn_lock.clone(),
+                    s.event_emission_gate.clone(),
                     s.quiet_deadman.clone(),
                 )
             })
         };
-        let Some((client, active_turn, turn_lock, quiet_deadman)) = looked_up else {
+        let Some((client, active_turn, turn_lock, event_emission_gate, quiet_deadman)) = looked_up
+        else {
             self.send_error(&request_id, "SESSION_NOT_FOUND", "codex session not found");
             return;
         };
@@ -1743,6 +1769,12 @@ impl FreshCodexState {
             sandbox_policy: sandbox.as_deref().map(sandbox_policy_value),
             approval_policy: permission_mode.as_deref().map(|p| json!(p)),
         };
+
+        // The app-server can write a terminal notification immediately after its
+        // turn/start response. Hold the session-local emission gate from before that
+        // RPC through the accepted broadcast below, so the client first receives the
+        // request-correlated submittedTurnId and then the completion-derived frames.
+        let _event_emission = event_emission_gate.lock().await;
 
         let submitted_turn_id = match client.start_turn(params).await {
             Ok(started) => {
@@ -3512,14 +3544,18 @@ impl FreshCodexState {
         let quiet_deadman = QuietDeadman::new_shared();
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
+        let event_emission_gate = Arc::new(TokioMutex::new(()));
         let exited = Arc::new(AtomicBool::new(false));
         let consumer = self.spawn_consumer(
             notifs,
-            session_id.to_string(),
-            active_turn.clone(),
-            quiet_deadman.clone(),
-            compact_in_flight.clone(),
-            compact_turn_id.clone(),
+            CodexConsumerRuntime {
+                thread_id: session_id.to_string(),
+                active_turn: active_turn.clone(),
+                quiet_deadman: quiet_deadman.clone(),
+                compact_in_flight: compact_in_flight.clone(),
+                compact_turn_id: compact_turn_id.clone(),
+                event_emission_gate: event_emission_gate.clone(),
+            },
         );
         let (kill_tx, kill_rx) = oneshot::channel();
         let watcher = spawn_exit_watcher(
@@ -3559,6 +3595,7 @@ impl FreshCodexState {
                     // missing/unparseable meta stamps legacy).
                     history_mode: read_rollout_history_mode(session_id),
                     turn_lock: Arc::new(TokioMutex::new(())),
+                    event_emission_gate,
                     consumer,
                     kill_tx: Some(kill_tx),
                     watcher,
@@ -3686,14 +3723,18 @@ impl FreshCodexState {
         let quiet_deadman = QuietDeadman::new_shared();
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
+        let event_emission_gate = Arc::new(TokioMutex::new(()));
         let exited = Arc::new(AtomicBool::new(false));
         let consumer = self.spawn_consumer(
             notifs,
-            new_thread_id.clone(),
-            active_turn.clone(),
-            quiet_deadman.clone(),
-            compact_in_flight.clone(),
-            compact_turn_id.clone(),
+            CodexConsumerRuntime {
+                thread_id: new_thread_id.clone(),
+                active_turn: active_turn.clone(),
+                quiet_deadman: quiet_deadman.clone(),
+                compact_in_flight: compact_in_flight.clone(),
+                compact_turn_id: compact_turn_id.clone(),
+                event_emission_gate: event_emission_gate.clone(),
+            },
         );
         let (kill_tx, kill_rx) = oneshot::channel();
         let watcher = spawn_exit_watcher(
@@ -3724,6 +3765,7 @@ impl FreshCodexState {
                     compact_turn_id,
                     history_mode: Some(HistoryMode::Paginated),
                     turn_lock: Arc::new(TokioMutex::new(())),
+                    event_emission_gate,
                     consumer,
                     kill_tx: Some(kill_tx),
                     watcher,
@@ -3946,24 +3988,12 @@ impl FreshCodexState {
     fn spawn_consumer(
         &self,
         notifs: tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
-        thread_id: String,
-        active_turn: Arc<StdMutex<Option<String>>>,
-        quiet_deadman: Arc<StdMutex<QuietDeadman>>,
-        compact_in_flight: Arc<AtomicBool>,
-        compact_turn_id: Arc<StdMutex<Option<String>>>,
+        runtime: CodexConsumerRuntime,
     ) -> tokio::task::JoinHandle<()> {
-        self.spawn_consumer_after(
-            notifs,
-            thread_id,
-            active_turn,
-            quiet_deadman,
-            compact_in_flight,
-            compact_turn_id,
-            None,
-        )
+        self.spawn_consumer_after(notifs, runtime, None)
     }
 
-    /// Like [`Self::spawn_consumer`], but if `gate` is given, the consumer's first
+    /// Like [`Self::spawn_consumer`], but if `created_gate` is given, the consumer's first
     /// `notifs.recv()` waits for it to fire before consuming anything -- see
     /// [`Self::finish_create`]'s ordering-fix doc for why this exists. The unbounded
     /// `notifs` channel buffers whatever arrives while gated; nothing is lost, only its
@@ -3972,29 +4002,58 @@ impl FreshCodexState {
     /// sender resolves its receiver immediately with `Err`, which this ignores) --
     /// callers must still fire it on every path, but a bug that forgets to can never
     /// wedge the consumer forever.
-    #[allow(clippy::too_many_arguments)]
     fn spawn_consumer_after(
         &self,
         mut notifs: tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
-        thread_id: String,
-        active_turn: Arc<StdMutex<Option<String>>>,
-        quiet_deadman: Arc<StdMutex<QuietDeadman>>,
-        compact_in_flight: Arc<AtomicBool>,
-        compact_turn_id: Arc<StdMutex<Option<String>>>,
-        gate: Option<oneshot::Receiver<()>>,
+        runtime: CodexConsumerRuntime,
+        created_gate: Option<oneshot::Receiver<()>>,
     ) -> tokio::task::JoinHandle<()> {
+        let CodexConsumerRuntime {
+            thread_id,
+            active_turn,
+            quiet_deadman,
+            compact_in_flight,
+            compact_turn_id,
+            event_emission_gate,
+        } = runtime;
         let broadcast_tx = self.broadcast_tx.clone();
         // The deadman feed needs the state handle (window config + waiter spawn); a
         // clone is all-Arc, cheap, and adds no lifecycle coupling (the state is the
         // server-global `FreshCodexState`, alive for the process's whole life anyway).
         let state = self.clone();
         tokio::spawn(async move {
-            if let Some(gate) = gate {
+            if let Some(gate) = created_gate {
                 let _ = gate.await;
             }
             state.clear_controls(&thread_id).await;
             let mut subscription = CodexSubscription::new(thread_id.clone());
             while let Some(notification) = notifs.recv().await {
+                // `turn/started` has no wire output, but establishes state that later
+                // notifications depend on (notably the compact turn's ownership id).
+                // Let it fold while a send holds the emission barrier; otherwise the
+                // compact's queued start can land only AFTER a newer send's direct
+                // active-turn update, and its delayed completion can retire the wrong
+                // turn. Every notification capable of emitting a wire frame stays
+                // behind the barrier below.
+                if matches!(&notification, CodexNotification::TurnStarted(_)) {
+                    let events = reduce_notification(
+                        &mut subscription,
+                        notification,
+                        &active_turn,
+                        &quiet_deadman,
+                        &state,
+                        &compact_in_flight,
+                        &compact_turn_id,
+                    );
+                    debug_assert!(events.is_empty(), "turn/started must not emit wire frames");
+                    continue;
+                }
+
+                // Lock around the whole notification fold, not each individual frame:
+                // a completed turn emits snapshot then chime as one ordered unit. This
+                // also ensures an immediate completion cannot retire a just-started
+                // turn before handle_send has recorded its returned turn id.
+                let _emission = event_emission_gate.lock().await;
                 if state
                     .consume_control_notification(&thread_id, &notification)
                     .await
@@ -4741,14 +4800,18 @@ impl FreshCodexState {
         let quiet_deadman = QuietDeadman::new_shared();
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
+        let event_emission_gate = Arc::new(TokioMutex::new(()));
         let exited = Arc::new(AtomicBool::new(false));
         let consumer = self.spawn_consumer(
             notifs,
-            thread_id.to_string(),
-            active_turn.clone(),
-            quiet_deadman.clone(),
-            compact_in_flight.clone(),
-            compact_turn_id.clone(),
+            CodexConsumerRuntime {
+                thread_id: thread_id.to_string(),
+                active_turn: active_turn.clone(),
+                quiet_deadman: quiet_deadman.clone(),
+                compact_in_flight: compact_in_flight.clone(),
+                compact_turn_id: compact_turn_id.clone(),
+                event_emission_gate: event_emission_gate.clone(),
+            },
         );
         let (kill_tx, kill_rx) = oneshot::channel();
         let watcher = spawn_exit_watcher(
@@ -4775,6 +4838,7 @@ impl FreshCodexState {
                 compact_turn_id: compact_turn_id.clone(),
                 history_mode,
                 turn_lock: Arc::new(TokioMutex::new(())),
+                event_emission_gate,
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -4843,6 +4907,7 @@ impl FreshCodexState {
                 // This fixture models a thread freshell started (paginated).
                 history_mode: Some(HistoryMode::Paginated),
                 turn_lock: Arc::new(TokioMutex::new(())),
+                event_emission_gate: Arc::new(TokioMutex::new(())),
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -5809,10 +5874,13 @@ fn disarm_codex_quiet(
 /// compact's start before any later send's). A `turn/completed` carrying a
 /// DIFFERENT id (a DELAYED PRIOR-turn completion can land inside the
 /// armed-clear-pending window — the probed sequence emits `thread/status:idle`
-/// BEFORE that stale completion) NEVER clears the window, and neither does a
-/// completion arriving with no id captured yet. The quiet-deadman disarm in that
-/// arm is keyed the same way: it rides the ACTIVE turn's retirement, so a stale
-/// completion that retires nothing leaves the still-in-flight turn's window armed.
+/// BEFORE that stale completion) NEVER clears the window; nor does a completion
+/// arriving before a compact ownership id has been captured. An ID-less completion
+/// that follows a newer active turn and a captured compact owner is the one FIFO-safe exception: it
+/// retires only the compact marker, never the active turn or its outward completion
+/// state. The quiet-deadman disarm in that arm is keyed to the ACTIVE turn's
+/// retirement, so a stale completion that retires no active turn leaves the
+/// still-in-flight turn's window armed.
 fn reduce_notification(
     subscription: &mut CodexSubscription,
     notification: CodexNotification,
@@ -5876,20 +5944,30 @@ fn reduce_notification(
             // while it was still running (the rollback gate then observed
             // false||false and admitted a mid-turn thread/revert that
             // force-interrupts the newer turn). A completion carrying NO id can
-            // never retire anything (fail-closed).
+            // never retire the active turn (fail-closed); the compact marker has
+            // its narrower FIFO-safe ownership exception below.
             if event.thread_id == subscription.session_id() {
                 // Scoped: the `active_turn` guard must be dropped BEFORE the
                 // quiet-deadman disarm below (the file-wide lock order is
                 // `quiet_deadman` outer / `active_turn` inner — never lock
                 // `quiet_deadman` while holding `active_turn`).
-                let retired = {
+                let (retired, superseded_by_active_turn, active_turn_id) = {
                     let mut active = active_turn.lock().expect("active_turn mutex");
+                    // A delayed compact completion can arrive after a newer send
+                    // installed its own active id. It may retire its compact-window
+                    // ownership below, but it cannot truthfully publish this
+                    // session as idle or complete: the client has no completion turn
+                    // id with which to reject such a stale event.
+                    let superseded_by_active_turn = active
+                        .as_deref()
+                        .is_some_and(|active_id| event.turn_id.as_deref() != Some(active_id));
                     let retired = event.turn_id.as_deref().is_some()
                         && active.as_deref() == event.turn_id.as_deref();
+                    let active_turn_id = active.clone();
                     if retired {
                         *active = None;
                     }
-                    retired
+                    (retired, superseded_by_active_turn, active_turn_id)
                 };
                 // Delta-r1 F2 + ep1-r3 F4 (completion-id OWNERSHIP): the compact
                 // window ends HERE — but ONLY on the `turn/completed` whose params
@@ -5900,11 +5978,27 @@ fn reduce_notification(
                 // `thread/status:idle` and the compact's own `turn/started`) and a
                 // completion while no id is captured yet BOTH leave the window
                 // armed: the compact's own completion never landed, so the
-                // pre-start/post-RPC rollback window stays closed.
+                // pre-start/post-RPC rollback window stays closed. The sole
+                // exception is the documented ID-less completion after a newer
+                // active turn supersedes an already-captured compact owner.
                 let mut owned_turn_id = compact_turn_id.lock().expect("compact_turn_id mutex");
+                // The accepted app-server shape permits an ID-less completion.
+                // With a newer tracked turn distinct from the compact owner, the
+                // FIFO notification stream makes that completion the compact's:
+                // it cannot retire the newer active turn or publish completion
+                // state for it, but it must release the compact's separate busy
+                // marker. Without this inference the marker stays armed forever
+                // after the newer turn later completes.
+                let idless_superseded_compact_completion = compact_in_flight.load(Ordering::SeqCst)
+                    && event.turn_id.is_none()
+                    && superseded_by_active_turn
+                    && owned_turn_id
+                        .as_deref()
+                        .is_some_and(|owned_id| active_turn_id.as_deref() != Some(owned_id));
                 if compact_in_flight.load(Ordering::SeqCst)
                     && owned_turn_id.is_some()
-                    && event.turn_id.as_deref() == owned_turn_id.as_deref()
+                    && (event.turn_id.as_deref() == owned_turn_id.as_deref()
+                        || idless_superseded_compact_completion)
                 {
                     compact_in_flight.store(false, Ordering::SeqCst);
                     *owned_turn_id = None;
@@ -5919,6 +6013,20 @@ fn reduce_notification(
                 if retired {
                     disarm_codex_quiet(quiet_deadman, subscription.session_id(), "turn_complete");
                 }
+
+                // Preserve the subscription's per-session completion bookkeeping
+                // (including its monotonic clock) even when its normal idle/chime
+                // output is stale. The outward replacement keeps the client busy
+                // until the active turn's OWN completion arrives.
+                let completion_events = subscription.on_turn_completed(&event, now_ms());
+                if superseded_by_active_turn {
+                    return vec![CodexAdapterEvent::StatusSnapshot {
+                        session_id: subscription.session_id().to_string(),
+                        status: CodexStatus::Running,
+                        revision: None,
+                    }];
+                }
+                return completion_events;
             }
             subscription.on_turn_completed(&event, now_ms())
         }
@@ -5926,7 +6034,18 @@ fn reduce_notification(
             if let Some(turn_id) = &event.turn_id {
                 subscription.set_active_turn(turn_id.clone());
                 if event.thread_id == subscription.session_id() {
-                    *active_turn.lock().expect("active_turn mutex") = Some(turn_id.clone());
+                    // `handle_send` records the provider-returned turn id before its
+                    // matching `turn/started` notification necessarily reaches this
+                    // consumer. Treat that direct record as authoritative over a
+                    // different, delayed start notification (the compact lifecycle
+                    // can produce exactly that overlap); the matching start remains
+                    // an idempotent refresh, and an empty tracker still adopts an
+                    // externally observed start.
+                    let mut active = active_turn.lock().expect("active_turn mutex");
+                    if active.as_deref().is_none_or(|id| id == turn_id) {
+                        *active = Some(turn_id.clone());
+                    }
+                    drop(active);
                     // ep1-r3 F4: capture the compact turn's OWNERSHIP id — the FIRST
                     // turn/started observed while the compact window is armed with
                     // no id captured (provider FIFO: the compact was submitted
@@ -6895,6 +7014,7 @@ pub(crate) mod tests {
                 // These fixtures model threads freshell started (paginated).
                 history_mode: Some(HistoryMode::Paginated),
                 turn_lock: Arc::new(TokioMutex::new(())),
+                event_emission_gate: Arc::new(TokioMutex::new(())),
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -6933,13 +7053,17 @@ pub(crate) mod tests {
         let quiet_deadman = QuietDeadman::new_shared();
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
+        let event_emission_gate = Arc::new(TokioMutex::new(()));
         let consumer = state.spawn_consumer(
             notifs,
-            thread_id.to_string(),
-            active_turn.clone(),
-            quiet_deadman.clone(),
-            compact_in_flight.clone(),
-            compact_turn_id.clone(),
+            CodexConsumerRuntime {
+                thread_id: thread_id.to_string(),
+                active_turn: active_turn.clone(),
+                quiet_deadman: quiet_deadman.clone(),
+                compact_in_flight: compact_in_flight.clone(),
+                compact_turn_id: compact_turn_id.clone(),
+                event_emission_gate: event_emission_gate.clone(),
+            },
         );
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
@@ -6968,6 +7092,7 @@ pub(crate) mod tests {
                 // These fixtures model threads freshell started (paginated).
                 history_mode: Some(HistoryMode::Paginated),
                 turn_lock: Arc::new(TokioMutex::new(())),
+                event_emission_gate,
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -7966,6 +8091,7 @@ pub(crate) mod tests {
                 compact_turn_id: Arc::new(StdMutex::new(None)),
                 history_mode: Some(HistoryMode::Paginated),
                 turn_lock: Arc::new(TokioMutex::new(())),
+                event_emission_gate: Arc::new(TokioMutex::new(())),
                 consumer,
                 kill_tx: None,
                 watcher,
@@ -8572,6 +8698,44 @@ pub(crate) mod tests {
         }
     }
 
+    /// Await the session's next status snapshot, preserving its status so a
+    /// regression can distinguish a stale completion's truthful `running`
+    /// correction from a false idle assertion.
+    async fn await_next_status_snapshot(
+        wire: &mut tokio::sync::broadcast::Receiver<String>,
+        thread_id: &str,
+    ) -> Value {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "the expected status snapshot never flowed"
+            );
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, wire.recv()).await else {
+                continue;
+            };
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["sessionId"] == thread_id
+                && frame["event"]["type"] == "freshAgent.session.snapshot"
+            {
+                return frame;
+            }
+        }
+    }
+
+    /// No further frame may follow a completion-derived snapshot when this
+    /// helper is used: a stale compact completion must not ring while a newer
+    /// turn is running, and a real completion must ring exactly once.
+    async fn assert_wire_quiet(wire: &mut tokio::sync::broadcast::Receiver<String>) {
+        let received =
+            tokio::time::timeout(std::time::Duration::from_millis(100), wire.recv()).await;
+        assert!(
+            received.is_err(),
+            "unexpected extra wire frame: {received:?}"
+        );
+    }
+
     /// Insert a live, IDLE fake codex session whose notification consumer is the REAL
     /// one ([`FreshCodexState::spawn_consumer`]), returning the scripted server end of
     /// the channel plus a fresh bus receiver.
@@ -8636,6 +8800,105 @@ pub(crate) mod tests {
             json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
         );
         let _ = peer.expect_notification().await; // initialized
+    }
+
+    /// A `turn/start` reply and its terminal notification can arrive back-to-back: the
+    /// app-server writes the RPC reply, then immediately writes `turn/completed` on the
+    /// same socket. The request-correlated acceptance frame MUST nevertheless reach the
+    /// browser first, so its `submittedTurnId` is available when the snapshot/chime is
+    /// folded. Repeat the exact no-slack delivery window enough times to exercise the
+    /// independent RPC waiter and notification-consumer tasks on the multi-thread runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn handle_send_always_broadcasts_accepted_before_an_immediate_completion_snapshot_and_chime(
+    ) {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+        let (st, mut rx) = state_with_bus();
+        let thread_id = "thread-send-accepted-order";
+
+        insert_fake_session_with_real_consumer(
+            &st,
+            thread_id,
+            client,
+            Arc::new(StdMutex::new(None)),
+            notifs,
+            spawn_sleeper(),
+            "codex-sidecar-test-send-accepted-order",
+        )
+        .await;
+
+        for attempt in 0..30 {
+            let mut send = send_msg(thread_id, "hi");
+            send.request_id = Some(format!("send-accepted-order-{attempt}"));
+            let driver = {
+                let st = st.clone();
+                tokio::spawn(async move { st.handle_send(send).await })
+            };
+
+            if attempt == 0 {
+                answer_initialize(&peer).await;
+            }
+            let (turn_request_id, method, _params) = peer.expect_request().await;
+            assert_eq!(method, "turn/start");
+
+            // Deliberately enqueue the completion immediately after the success response,
+            // with no yield between the two writes. This is the production race boundary.
+            peer.respond(
+                &turn_request_id,
+                json!({ "turn": { "id": format!("turn-{attempt}") } }),
+            );
+            peer.emit_notification(
+                "turn/completed",
+                json!({
+                    "threadId": thread_id,
+                    "turn": { "id": format!("turn-{attempt}"), "status": "completed" },
+                }),
+            );
+            driver.await.expect("send driver completes");
+
+            let mut frames = Vec::new();
+            let mut saw_accepted = false;
+            let mut saw_complete = false;
+            loop {
+                let raw = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("turn frames arrive within budget")
+                    .expect("broadcast bus remains open");
+                let frame: Value = serde_json::from_str(&raw).unwrap();
+                saw_accepted |= frame["type"] == "freshAgent.send.accepted";
+                saw_complete |= frame["type"] == "freshAgent.event"
+                    && frame["event"]["type"] == "freshAgent.turn.complete";
+                frames.push(frame);
+                if saw_accepted && saw_complete {
+                    break;
+                }
+            }
+
+            let accepted = frames
+                .iter()
+                .position(|frame| frame["type"] == "freshAgent.send.accepted")
+                .expect("turn acceptance frame");
+            let snapshot = frames
+                .iter()
+                .position(|frame| {
+                    frame["type"] == "freshAgent.event"
+                        && frame["event"]["type"] == "freshAgent.session.snapshot"
+                        && frame["event"]["status"] == "idle"
+                })
+                .expect("completion-derived idle snapshot");
+            let complete = frames
+                .iter()
+                .position(|frame| {
+                    frame["type"] == "freshAgent.event"
+                        && frame["event"]["type"] == "freshAgent.turn.complete"
+                })
+                .expect("completion chime");
+            assert!(
+                accepted < snapshot && snapshot < complete,
+                "attempt {attempt}: accepted must precede its completion snapshot and chime: {frames:?}"
+            );
+        }
     }
 
     /// Drive the PROBED real-0.147.0 post-compact notification sequence (plan Task 4,
@@ -9030,15 +9293,25 @@ pub(crate) mod tests {
         peer.respond(&turn_req, json!({ "turn": { "id": "turn-new-9" } }));
         send_driver.await.expect("send task");
 
-        // The compact's OWN delayed completion lands NOW: clears the compact
-        // window (ownership match) — and MUST leave the newer send's
-        // `active_turn` untouched. The rollback gate stays BUSY on it.
+        // The compact's OWN delayed completion lands NOW: it clears the compact
+        // window (ownership match) but MUST leave the newer send's `active_turn`
+        // untouched. Because the client has only a session-scoped status/chime
+        // channel (no completion turn id), this stale completion must correct it
+        // to RUNNING and must never ring; an idle snapshot/chime would falsely
+        // make the newer turn look complete.
         drain_wire(&mut wire);
         peer.emit_notification(
             "turn/completed",
             json!({ "threadId": "thread-cnewer", "turn": { "id": "turn-c-1", "status": "completed" } }),
         );
-        await_next_idle_snapshot(&mut wire, "thread-cnewer").await;
+        let stale_completion_snapshot =
+            await_next_status_snapshot(&mut wire, "thread-cnewer").await;
+        assert_eq!(
+            stale_completion_snapshot["event"]["status"],
+            json!("running"),
+            "the compact completion is stale against the newer active turn"
+        );
+        assert_wire_quiet(&mut wire).await;
         let (sink, captured) = capturing_sink();
         let rollback_driver = {
             let st = st.clone();
@@ -9063,13 +9336,21 @@ pub(crate) mod tests {
             "ep2-r4: the compact's completion never reaches past its own window — the newer turn still owns the gate"
         );
 
-        // The newer turn's OWN completion releases the gate exactly here.
-        drain_wire(&mut wire);
+        // The newer turn's OWN completion releases the gate exactly here: the
+        // first idle snapshot and only chime in this overlap belong to it.
         peer.emit_notification(
             "turn/completed",
             json!({ "threadId": "thread-cnewer", "turn": { "id": "turn-new-9", "status": "completed" } }),
         );
         await_next_idle_snapshot(&mut wire, "thread-cnewer").await;
+        let next = tokio::time::timeout(std::time::Duration::from_secs(5), wire.recv())
+            .await
+            .expect("the newer completion chime arrived")
+            .expect("wire remains open");
+        let next: Value = serde_json::from_str(&next).unwrap();
+        assert_eq!(next["sessionId"], json!("thread-cnewer"));
+        assert_eq!(next["event"]["type"], json!("freshAgent.turn.complete"));
+        assert_wire_quiet(&mut wire).await;
         let (sink, captured) = capturing_sink();
         let rollback_driver = {
             let st = st.clone();
@@ -9098,6 +9379,120 @@ pub(crate) mod tests {
             captured_frames(&captured)[0]["event"]["code"],
             json!("NOTHING_TO_UNDO"),
             "the newer turn's own completion released the gate"
+        );
+    }
+
+    /// An accepted `turn/completed` shape need only carry `threadId`; a delayed
+    /// compact completion can therefore arrive without the compact's turn id
+    /// after a newer send has installed its own active turn. It must not publish
+    /// idle or a positive completion for that newer turn, and it must retire the
+    /// compact window so the newer turn's own matching completion can reopen the
+    /// rollback gate.
+    #[tokio::test]
+    async fn an_idless_compact_completion_inside_a_newer_turns_window_stays_busy_and_retires_the_compact(
+    ) {
+        let (st, _rx_boot) = state_with_bus();
+        let (peer, mut wire) = insert_idle_compact_session(&st, "thread-cnewer-idless").await;
+
+        peer.emit_notification(
+            "thread/status/changed",
+            json!({ "threadId": "thread-cnewer-idless", "status": { "type": "idle" } }),
+        );
+
+        let compact_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-cnewer-idless")).await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (compact_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        peer.respond(&compact_id, json!({}));
+        compact_driver.await.expect("compact task");
+        peer.emit_notification(
+            "turn/started",
+            json!({ "threadId": "thread-cnewer-idless", "turn": { "id": "turn-c-idless" } }),
+        );
+
+        let send_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_send(FreshAgentSend {
+                    request_id: Some("req-cnewer-idless".to_string()),
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    session_id: "thread-cnewer-idless".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    text: "fresh submission".to_string(),
+                    images: None,
+                    cwd: None,
+                    settings: None,
+                })
+                .await;
+            })
+        };
+        let (turn_req, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        peer.respond(&turn_req, json!({ "turn": { "id": "turn-new-idless" } }));
+        send_driver.await.expect("send task");
+
+        drain_wire(&mut wire);
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-cnewer-idless", "turn": { "status": "completed" } }),
+        );
+        let stale_completion_snapshot =
+            await_next_status_snapshot(&mut wire, "thread-cnewer-idless").await;
+        assert_eq!(
+            stale_completion_snapshot["event"]["status"],
+            json!("running"),
+            "an id-less completion cannot claim the newer active turn is idle"
+        );
+        assert_wire_quiet(&mut wire).await;
+
+        let (active_turn, compact_in_flight, compact_turn_id) = {
+            let sessions = st.sessions.lock().await;
+            let session = sessions
+                .get("thread-cnewer-idless")
+                .expect("session remains registered");
+            (
+                session.active_turn.clone(),
+                session.compact_in_flight.clone(),
+                session.compact_turn_id.clone(),
+            )
+        };
+        assert_eq!(
+            active_turn.lock().expect("active_turn mutex").as_deref(),
+            Some("turn-new-idless"),
+            "the newer turn remains the active owner"
+        );
+        assert!(
+            !compact_in_flight.load(Ordering::SeqCst),
+            "the delayed id-less completion retires the already superseded compact window"
+        );
+        assert!(
+            compact_turn_id
+                .lock()
+                .expect("compact_turn_id mutex")
+                .is_none(),
+            "retiring the compact also clears its ownership id"
+        );
+
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-cnewer-idless", "turn": { "id": "turn-new-idless", "status": "completed" } }),
+        );
+        await_next_idle_snapshot(&mut wire, "thread-cnewer-idless").await;
+        let chime = tokio::time::timeout(std::time::Duration::from_secs(5), wire.recv())
+            .await
+            .expect("the newer completion chime arrived")
+            .expect("wire remains open");
+        let chime: Value = serde_json::from_str(&chime).unwrap();
+        assert_eq!(chime["event"]["type"], json!("freshAgent.turn.complete"));
+        assert_wire_quiet(&mut wire).await;
+        assert!(
+            active_turn.lock().expect("active_turn mutex").is_none(),
+            "the newer matching completion retires the active turn"
         );
     }
 

@@ -39,7 +39,24 @@ docker build -f docker/cloud-run/Dockerfile -t "$IMAGE_TAG" . || {
 }
 echo "PASS: docker build succeeded"
 
-# Check 5: Run auth smoke test in container
+# Check 5: The Vitest lane behaviorally builds isolated Rust build-script
+# fixtures. Verify the assembled Cloud test image provides a runnable Cargo
+# toolchain to its configured (non-root) runtime user; a source-text check
+# would not catch a broken copied toolchain or PATH.
+echo "Checking Cargo is runnable in the Cloud test image..."
+CARGO_OUTPUT=$(docker run --rm --entrypoint cargo "$IMAGE_TAG" --version 2>&1) || {
+  echo "FAIL: cargo is not runnable in the Cloud test image"
+  echo "$CARGO_OUTPUT"
+  exit 1
+}
+if ! echo "$CARGO_OUTPUT" | grep -q '^cargo [0-9]'; then
+  echo "FAIL: cargo --version did not report a Cargo version"
+  echo "$CARGO_OUTPUT"
+  exit 1
+fi
+echo "PASS: Cargo is runnable in the Cloud test image"
+
+# Check 6: Run auth smoke test in container
 echo "Running auth smoke test in container..."
 RUN_OUTPUT=$(docker run --rm "$IMAGE_TAG" --project=chromium test/e2e-browser/specs/auth.spec.ts --reporter=line 2>&1) || {
   echo "FAIL: docker run failed"
@@ -54,7 +71,7 @@ if ! echo "$RUN_OUTPUT" | grep -q "6 passed"; then
 fi
 echo "PASS: auth smoke test passed (6 passed)"
 
-# Check 6: Sharding works
+# Check 7: Sharding works
 echo "Testing shard 1 of 2..."
 SHARD1_OUTPUT=$(docker run --rm -e CLOUD_RUN_TASK_INDEX=0 -e CLOUD_RUN_TASK_COUNT=2 "$IMAGE_TAG" --project=chromium test/e2e-browser/specs/auth.spec.ts --reporter=line 2>&1) || {
   echo "FAIL: shard 1 run failed"

@@ -11,9 +11,8 @@
 //      newline, the numeric exit code passed through in a 200 (never a 500),
 //      and the exact 400 `command is required`.
 //
-// Both tests drive the server directly (REST, no browser page — the
-// freshagent-settings-resume-rust.spec.ts direct-drive precedent). Rust-only:
-// registered in RUST_ONLY_SPECS + the rust-chromium project's testMatch.
+// Both tests drive an owned Rust server directly (REST, no browser page — the
+// freshagent-settings-resume-rust.spec.ts direct-drive precedent).
 //
 // Donor (precedent, not copied code): the REST-with-token pattern from
 // agent-checkpoint-rewind.spec.ts (:299-303).
@@ -26,12 +25,11 @@ import { RustServer } from '../helpers/rust-server.js'
 
 test.describe('fresh-agent extras routes (rust)', () => {
   // ── AGENT-13 (kata ekc6): GET /api/fresh-agent/diff ──────────────────────
-  test('diff: 200 unified diff over the session repo, exact 400/500 error contracts', async ({ e2eServerKind }) => {
+  test('diff: 200 unified diff over the session repo, exact 400/500 error contracts', async () => {
     // 6-minute timeout covers RustServer.start()'s synchronous cold
     // `cargo build --release` on the first local run (the terminal-escape-key
     // spec precedent; the cloud lane prebuilds and never compiles).
     test.setTimeout(360_000)
-    expect(e2eServerKind).toBe('rust')
     // Hoisted cleanup handles: every statement after the mkdtemp runs inside
     // the try so a mid-setup throw cannot leak the tmpdir.
     let sharedRoot: string | null = null
@@ -90,12 +88,11 @@ test.describe('fresh-agent extras routes (rust)', () => {
   })
 
   // ── AGENT-13 (kata ekc6): POST /api/fresh-agent/exec ─────────────────────
-  test('exec: stdout+stderr fold, exit-code passthrough in a 200, exact 400 for a missing command', async ({ e2eServerKind }) => {
+  test('exec: stdout+stderr fold, exit-code passthrough in a 200, exact 400 for a missing command', async () => {
     // 6-minute timeout covers RustServer.start()'s synchronous cold
     // `cargo build --release` on the first local run (the terminal-escape-key
     // spec precedent; the cloud lane prebuilds and never compiles).
     test.setTimeout(360_000)
-    expect(e2eServerKind).toBe('rust')
     let sharedRoot: string | null = null
     let server: RustServer | null = null
     try {

@@ -1,13 +1,12 @@
 import fs from 'fs/promises'
 import path from 'path'
-import type { Page } from '@playwright/test'
-import { test, expect } from '../helpers/fixtures.js'
+import type { BrowserContext, Page } from '@playwright/test'
+import { createFreshE2ePage, test, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle } from '../helpers/external-target.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { installRecoveryOfferAutoDeclineOnContext } from '../helpers/recovery-offer.js'
 
 /**
- * SESSION-05 — project colors on History project headers (matrix leg).
  *
  * Acceptance text (docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md):
  * "Choose a project color in one browser, assert the History project header
@@ -18,11 +17,8 @@ import { installRecoveryOfferAutoDeclineOnContext } from '../helpers/recovery-of
  * PUT /api/project-colors → config `projectColors` → `sessions.changed`
  * broadcast → every open context refetches `/api/session-directory` whose
  * page now carries `projectColors` → the client's group overlay recolors
- * the History header swatch. Runs against BOTH server kinds via the
- * HARNESS-02 seam (`e2eServerKind`); legacy is a true parity control.
  *
  * Seeds reuse the trimmed Claude-JSONL shape from
- * session-directory-matrix.spec.ts (the upstream corpus builder HARNESS-04
  * is not required — two single-file projects suffice for the color claim).
  */
 
@@ -158,9 +154,8 @@ async function pickProjectColor(page: Page, projectPath: string, hex: string): P
 test.describe('SESSION-05 project colors (History project headers)', () => {
   test.setTimeout(120_000)
 
-  test('color set in one browser renders in two contexts, persists across reload and restart, and leaves other projects unchanged', async ({ browser, page, e2eServerKind }) => {
+  test('color set in one browser renders in two contexts, persists across reload and restart, and leaves other projects unchanged', async ({ browser }) => {
     const server = await createE2eServerHandle(process.env, {
-      kind: e2eServerKind,
       construct: {
         setupHome: async (homeDir) => {
           const projectsDir = path.join(homeDir, '.claude', 'projects')
@@ -189,16 +184,21 @@ test.describe('SESSION-05 project colors (History project headers)', () => {
         },
       },
     })
-    const info = await server.start()
-
-    const contextB = await browser.newContext()
-    // RESTORE-01: manual contexts bypass the fixtures' `context` override —
-    // adopt the shared recovery auto-decline watcher directly (the default
-    // `page` fixture's context is covered automatically).
-    installRecoveryOfferAutoDeclineOnContext(contextB)
-    const pageB = await contextB.newPage()
-
+    let contextA: BrowserContext | undefined
+    let contextB: BrowserContext | undefined
     try {
+      const info = await server.start()
+      const ownedA = await createFreshE2ePage(browser, info)
+      contextA = ownedA.context
+      const { page } = ownedA
+      const ownedB = await createFreshE2ePage(browser, info)
+      contextB = ownedB.context
+      const { page: pageB } = ownedB
+      // RESTORE-01: manual contexts bypass the fixtures' `context` override —
+      // adopt the shared recovery auto-decline watcher directly.
+      installRecoveryOfferAutoDeclineOnContext(contextA)
+      installRecoveryOfferAutoDeclineOnContext(contextB)
+
       // --- Context A + Context B both open, both on the History (Projects)
       // view, BEFORE any color is set: both swatches show the default. ---
       const harnessA = await bootFreshPage(page, info)
@@ -246,7 +246,7 @@ test.describe('SESSION-05 project colors (History project headers)', () => {
 
       // --- Full server restart, SAME isolated home: still there. ---
       if (!server.restart) {
-        throw new Error(`${e2eServerKind} E2eServerHandle does not implement restart()`)
+        throw new Error('Owned Rust E2eServerHandle does not implement restart()')
       }
       await server.restart()
       await expect(async () => {
@@ -267,7 +267,8 @@ test.describe('SESSION-05 project colors (History project headers)', () => {
       await expect(headerSwatch(pageB, ALPHA_PROJECT)).toHaveCSS('background-color', PICKED_COLOR_RGB)
       await expect(headerSwatch(pageB, BETA_PROJECT)).toHaveCSS('background-color', DEFAULT_COLOR_RGB)
     } finally {
-      await contextB.close().catch(() => {})
+      await contextA?.close().catch(() => {})
+      await contextB?.close().catch(() => {})
       await server.stop().catch(() => {})
     }
   })

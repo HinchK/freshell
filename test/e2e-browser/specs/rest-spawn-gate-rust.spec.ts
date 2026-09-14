@@ -17,7 +17,8 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import os from 'node:os'
 import WebSocket from 'ws'
-import { RustServer, type TestServerInfo } from '../helpers/rust-server.js'
+import { RustServer } from '../helpers/rust-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-version.js'
 
 const BURST_SIZE = 16
@@ -25,6 +26,24 @@ const BURST_SIZE = 16
 test.setTimeout(300_000)
 
 type Frame = Record<string, unknown> & { type: string }
+
+type CreatedTerminalTab = {
+  tabId: string
+  paneId: string
+  terminalId: string
+}
+
+function requireCreatedTerminalTab(body: unknown, requestIndex: number): CreatedTerminalTab {
+  const data = (body as { data?: unknown } | null)?.data as Partial<CreatedTerminalTab> | undefined
+  if (
+    typeof data?.tabId !== 'string'
+    || typeof data.paneId !== 'string'
+    || typeof data.terminalId !== 'string'
+  ) {
+    throw new Error(`POST /api/tabs burst request ${requestIndex} returned an unrecognized create envelope: ${JSON.stringify(body)}`)
+  }
+  return { tabId: data.tabId, paneId: data.paneId, terminalId: data.terminalId }
+}
 
 /** Raw synthetic client (copied per per-spec-ownership from
  *  create-protection-isolation-rust.spec.ts; itself copied from
@@ -53,7 +72,7 @@ class SyntheticClient {
     })
   }
 
-  static async connect(info: TestServerInfo): Promise<SyntheticClient> {
+  static async connect(info: E2eServerInfo): Promise<SyntheticClient> {
     const ws = new WebSocket(info.wsUrl)
     await new Promise<void>((resolve, reject) => {
       ws.once('open', () => resolve())
@@ -151,13 +170,22 @@ test('REST create burst is gate-bounded, drains fully, and WS stays responsive',
     expect(health.ok).toBe(true)
 
     const responses = await Promise.all(burst)
+    const createdTabs: CreatedTerminalTab[] = []
     for (const [i, res] of responses.entries()) {
       expect(res.status, `POST /api/tabs burst request ${i}`).toBe(200)
+      createdTabs.push(requireCreatedTerminalTab(await res.json(), i))
     }
 
-    // Every pane materialized (FIFO drain — nothing dropped). Envelope is
-    // ok_json's {status:'ok', data:{panes:[...]}} (terminal_tabs.rs list_panes);
-    // an unrecognized shape fails LOUDLY rather than counting 0 panes.
+    // Every response owns a distinct tab, pane, and terminal. The concurrent
+    // order is intentionally unspecified, but a 200 create must never lose
+    // or alias another burst member.
+    expect(new Set(createdTabs.map(({ tabId }) => tabId)).size).toBe(BURST_SIZE)
+    expect(new Set(createdTabs.map(({ paneId }) => paneId)).size).toBe(BURST_SIZE)
+    expect(new Set(createdTabs.map(({ terminalId }) => terminalId)).size).toBe(BURST_SIZE)
+
+    // The unqualified endpoint intentionally lists only the active tab's
+    // leaves. A burst creates sixteen one-pane tabs, so verify that one
+    // active row here and interrogate every tab explicitly below.
     const panesRes = await fetch(`${info.baseUrl}/api/panes`, {
       headers: { 'x-auth-token': info.token },
     })
@@ -170,7 +198,63 @@ test('REST create burst is gate-bounded, drains fully, and WS stays responsive',
           JSON.stringify(panesBody).slice(0, 500)}`,
       )
     }
-    expect(panes.length).toBeGreaterThanOrEqual(BURST_SIZE)
+    expect(panes).toHaveLength(1)
+
+    const tabsRes = await fetch(`${info.baseUrl}/api/tabs`, {
+      headers: { 'x-auth-token': info.token },
+    })
+    expect(tabsRes.status).toBe(200)
+    const tabsBody = await tabsRes.json() as {
+      data?: { tabs?: Array<{ id?: unknown }>; activeTabId?: unknown }
+    }
+    const tabs = tabsBody.data?.tabs
+    const activeTabId = tabsBody.data?.activeTabId
+    if (!Array.isArray(tabs) || typeof activeTabId !== 'string') {
+      throw new Error(`Unrecognized GET /api/tabs envelope: ${JSON.stringify(tabsBody).slice(0, 500)}`)
+    }
+    expect(tabs).toHaveLength(BURST_SIZE)
+    expect(new Set(tabs.map((tab) => tab.id)).size).toBe(BURST_SIZE)
+    expect(new Set(tabs.map((tab) => tab.id))).toEqual(new Set(createdTabs.map(({ tabId }) => tabId)))
+    expect(createdTabs.some(({ tabId }) => tabId === activeTabId)).toBe(true)
+
+    const activeCreatedTab = createdTabs.find(({ tabId }) => tabId === activeTabId)
+    expect(activeCreatedTab).toBeDefined()
+    expect(panes[0]).toMatchObject({
+      id: activeCreatedTab!.paneId,
+      terminalId: activeCreatedTab!.terminalId,
+    })
+
+    const snapshotRes = await fetch(`${info.baseUrl}/api/layout/snapshot`, {
+      headers: { 'x-auth-token': info.token },
+    })
+    expect(snapshotRes.status).toBe(200)
+    const snapshotBody = await snapshotRes.json() as {
+      data?: { tabs?: Array<{ id?: unknown }>; layouts?: Record<string, unknown> }
+    }
+    const snapshotTabs = snapshotBody.data?.tabs
+    const layouts = snapshotBody.data?.layouts
+    if (!Array.isArray(snapshotTabs) || !layouts || typeof layouts !== 'object') {
+      throw new Error(`Unrecognized GET /api/layout/snapshot envelope: ${JSON.stringify(snapshotBody).slice(0, 500)}`)
+    }
+    expect(snapshotTabs).toHaveLength(BURST_SIZE)
+    expect(new Set(snapshotTabs.map((tab) => tab.id))).toEqual(new Set(createdTabs.map(({ tabId }) => tabId)))
+    expect(Object.keys(layouts)).toHaveLength(BURST_SIZE)
+    expect(new Set(Object.keys(layouts))).toEqual(new Set(createdTabs.map(({ tabId }) => tabId)))
+
+    for (const created of createdTabs) {
+      const perTabPanesRes = await fetch(`${info.baseUrl}/api/panes?tabId=${encodeURIComponent(created.tabId)}`, {
+        headers: { 'x-auth-token': info.token },
+      })
+      expect(perTabPanesRes.status, `GET /api/panes for ${created.tabId}`).toBe(200)
+      const perTabPanesBody = await perTabPanesRes.json() as { data?: { panes?: unknown } }
+      const perTabPanes = perTabPanesBody.data?.panes
+      if (!Array.isArray(perTabPanes)) {
+        throw new Error(`Unrecognized GET /api/panes?tabId envelope: ${JSON.stringify(perTabPanesBody).slice(0, 500)}`)
+      }
+      expect(perTabPanes, `one leaf for ${created.tabId}`).toEqual([
+        expect.objectContaining({ id: created.paneId, terminalId: created.terminalId }),
+      ])
+    }
 
     // Bounded concurrency observed: the burst QUEUED through the gate
     // (non-vacuous: with concurrency 1 and 16 near-simultaneous creates,

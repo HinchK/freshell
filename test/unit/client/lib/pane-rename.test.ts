@@ -1,82 +1,258 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+import { renamePaneAfterMirrorReady } from '@/lib/pane-rename'
 
-// Repo-standard hoisted logger double: every test gets a no-op logger; only
-// the retry test asserts on the calls.
-const logSpies = vi.hoisted(() => ({
-  debug: vi.fn(),
-  info: vi.fn(),
-  warn: vi.fn(),
-  error: vi.fn(),
-}))
+const mirrorWithoutPane = { status: 'ok', data: { panes: [] } }
+const mirrorWithPane = { status: 'ok', data: { panes: [{ id: 'pane-1' }] } }
+const renameOk = { status: 'ok', data: { paneId: 'pane-1', tabId: 'tab-1' }, message: 'pane renamed' }
 
-vi.mock('@/lib/client-logger', () => ({
-  createLogger: () => logSpies,
-}))
+function options(overrides: Partial<Parameters<typeof renamePaneAfterMirrorReady>[3]> = {}) {
+  let now = 0
+  const signal = new AbortController().signal
+  return {
+    signal,
+    get: vi.fn().mockResolvedValue(mirrorWithPane),
+    patch: vi.fn().mockResolvedValue(renameOk),
+    sleep: vi.fn(async (ms: number) => {
+      now += ms
+    }),
+    now: () => now,
+    ...overrides,
+  }
+}
 
-import { renamePaneWithMirrorRetry } from '@/lib/pane-rename'
-
-const patchOk = () => Promise.resolve({ status: 'ok', data: { paneId: 'pane-1', tabId: 'tab-1' }, message: 'pane renamed' } as object) as never
-const patchNotFound = () => Promise.resolve({ status: 'ok', message: 'pane not found' } as object) as never
-
-describe('renamePaneWithMirrorRetry', () => {
-  beforeEach(() => {
-    vi.clearAllMocks()
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
   })
+  return { promise, resolve, reject }
+}
 
-  it('succeeds on the first attempt without sleeping', async () => {
-    const patch = vi.fn().mockImplementation(patchOk)
-    const sleep = vi.fn().mockResolvedValue(undefined)
-    const result = await renamePaneWithMirrorRetry('pane-1', 'Ops desk', { patch, sleep })
-    expect(result).toEqual({ ok: true, response: expect.objectContaining({ message: 'pane renamed' }) })
-    expect(patch).toHaveBeenCalledTimes(1)
-    expect(patch).toHaveBeenCalledWith('/api/panes/pane-1', { name: 'Ops desk' })
-    expect(sleep).not.toHaveBeenCalled()
-  })
+describe('renamePaneAfterMirrorReady', () => {
+  it('waits for a positive receipt beyond the former 1.4s window before making one rename PATCH', async () => {
+    const get = vi.fn()
+      .mockResolvedValueOnce(mirrorWithoutPane)
+      .mockResolvedValueOnce(mirrorWithoutPane)
+      .mockResolvedValueOnce(mirrorWithoutPane)
+      .mockResolvedValueOnce(mirrorWithoutPane)
+      .mockResolvedValueOnce(mirrorWithoutPane)
+      .mockResolvedValueOnce(mirrorWithoutPane)
+      .mockResolvedValueOnce(mirrorWithoutPane)
+      .mockResolvedValueOnce(mirrorWithoutPane)
+      .mockResolvedValue(mirrorWithPane)
+    const opts = options({ get })
 
-  it('retries the transient pane-not-found no-op until the mirror lands', async () => {
-    const patch = vi.fn().mockImplementationOnce(patchNotFound).mockImplementation(patchOk)
-    const sleep = vi.fn().mockResolvedValue(undefined)
-    const result = await renamePaneWithMirrorRetry('pane-1', 'Ops desk', { patch, sleep, retryDelaysMs: [5, 10, 20] })
+    const result = await renamePaneAfterMirrorReady('tab-1', 'pane-1', 'Ops desk', opts)
+
     expect(result.ok).toBe(true)
-    expect(patch).toHaveBeenCalledTimes(2)
-    expect(sleep).toHaveBeenCalledTimes(1)
-    expect(sleep).toHaveBeenCalledWith(5)
-    // Review M2: a retried attempt must be observable in the field. Exactly one
-    // debug event, emitted before/at the sleep, carrying the retry evidence.
-    expect(logSpies.debug).toHaveBeenCalledTimes(1)
-    expect(logSpies.debug).toHaveBeenCalledWith(
-      expect.stringContaining('pane-not-found'),
-      { paneId: 'pane-1', attempt: 1, delayMs: 5 },
-    )
-    expect(logSpies.debug.mock.invocationCallOrder[0])
-      .toBeLessThanOrEqual(sleep.mock.invocationCallOrder[0])
+    expect(get).toHaveBeenCalledTimes(9)
+    expect(opts.sleep).toHaveBeenCalledTimes(8)
+    expect(opts.sleep.mock.calls.map(([delay]) => delay)).toEqual([200, 200, 200, 200, 200, 200, 200, 200])
+    expect(opts.patch).toHaveBeenCalledTimes(1)
+    const mirrorSignal = get.mock.calls[0]?.[1]?.signal
+    expect(mirrorSignal).toBeInstanceOf(AbortSignal)
+    expect(mirrorSignal).not.toBe(opts.signal)
+    expect(opts.patch).toHaveBeenCalledWith('/api/panes/pane-1', { name: 'Ops desk' }, { signal: opts.signal })
   })
 
-  it('gives up after the retry budget with the last pane-not-found message', async () => {
-    const patch = vi.fn().mockImplementation(patchNotFound)
-    const sleep = vi.fn().mockResolvedValue(undefined)
-    const result = await renamePaneWithMirrorRetry('pane-1', 'Ops desk', { patch, sleep, retryDelaysMs: [5, 10, 20] })
+  it('surfaces pane-not-found promptly after a positive exact pane receipt without a second PATCH', async () => {
+    const opts = options({
+      patch: vi.fn().mockResolvedValue({ status: 'ok', message: 'pane not found' }),
+    })
+
+    const result = await renamePaneAfterMirrorReady('tab-1', 'pane-1', 'Ops desk', opts)
+
     expect(result).toEqual({ ok: false, message: 'pane not found' })
-    expect(patch).toHaveBeenCalledTimes(4)
+    expect(opts.get).toHaveBeenCalledTimes(1)
+    expect(opts.patch).toHaveBeenCalledTimes(1)
+    expect(opts.sleep).not.toHaveBeenCalled()
   })
 
-  it('does not retry a non-retryable mismatch message', async () => {
-    const patch = vi.fn().mockResolvedValue({ status: 'ok', message: 'name too long' })
-    const sleep = vi.fn().mockResolvedValue(undefined)
-    const result = await renamePaneWithMirrorRetry('pane-1', 'Ops desk', { patch, sleep })
-    expect(result).toEqual({ ok: false, message: 'name too long' })
-    expect(patch).toHaveBeenCalledTimes(1)
-    expect(sleep).not.toHaveBeenCalled()
+  it('surfaces ordinary rename responses and HTTP failures without polling or retrying the PATCH', async () => {
+    const ordinary = options({
+      patch: vi.fn().mockResolvedValue({ status: 'ok', message: 'name too long' }),
+    })
+
+    await expect(renamePaneAfterMirrorReady('tab-1', 'pane-1', 'Ops desk', ordinary))
+      .resolves.toEqual({ ok: false, message: 'name too long' })
+    expect(ordinary.patch).toHaveBeenCalledTimes(1)
+    expect(ordinary.sleep).not.toHaveBeenCalled()
+
+    const rejected = options({ patch: vi.fn().mockRejectedValue(new Error('network down')) })
+    await expect(renamePaneAfterMirrorReady('tab-1', 'pane-1', 'Ops desk', rejected))
+      .rejects.toThrow('network down')
+    expect(rejected.patch).toHaveBeenCalledTimes(1)
+
+    const mirrorRejected = options({ get: vi.fn().mockRejectedValue(new Error('mirror unavailable')) })
+    await expect(renamePaneAfterMirrorReady('tab-1', 'pane-1', 'Ops desk', mirrorRejected))
+      .rejects.toThrow('mirror unavailable')
+    expect(mirrorRejected.patch).not.toHaveBeenCalled()
   })
 
-  it('falls back to the generic message when the response carries none', async () => {
-    const patch = vi.fn().mockResolvedValue(undefined)
-    const result = await renamePaneWithMirrorRetry('pane-1', 'Ops desk', { patch, sleep: vi.fn() })
-    expect(result).toEqual({ ok: false, message: 'Failed to rename pane' })
+  it('reports a missing pane after the bounded mirror-readiness deadline without PATCHing', async () => {
+    const opts = options({
+      get: vi.fn().mockResolvedValue(mirrorWithoutPane),
+      deadlineMs: 600,
+      pollIntervalMs: 200,
+    })
+
+    await expect(renamePaneAfterMirrorReady('tab-1', 'pane-1', 'Ops desk', opts))
+      .resolves.toEqual({ ok: false, message: 'pane not found' })
+    expect(opts.get).toHaveBeenCalledTimes(4)
+    expect(opts.sleep).toHaveBeenCalledTimes(3)
+    expect(opts.patch).not.toHaveBeenCalled()
   })
 
-  it('propagates patch rejections (caller surfaces them)', async () => {
-    const patch = vi.fn().mockRejectedValue(new Error('network down'))
-    await expect(renamePaneWithMirrorRetry('pane-1', 'Ops desk', { patch, sleep: vi.fn() })).rejects.toThrow('network down')
+  it('does not accept a matching mirror receipt that settles after the logical deadline before its timer dispatches', async () => {
+    let logicalNow = 0
+    const pendingGet = deferred<typeof mirrorWithPane>()
+    const get = vi.fn(() => pendingGet.promise)
+    const patch = vi.fn().mockResolvedValue(renameOk)
+    const result = renamePaneAfterMirrorReady('tab-1', 'pane-1', 'Ops desk', options({
+      get,
+      patch,
+      now: () => logicalNow,
+      deadlineMs: 600,
+    }))
+
+    await Promise.resolve()
+    expect(get).toHaveBeenCalledTimes(1)
+
+    // Advance the injected clock without dispatching the browser timeout.
+    logicalNow = 601
+    pendingGet.resolve(mirrorWithPane)
+
+    await expect(result).resolves.toEqual({ ok: false, message: 'pane not found' })
+    expect(patch).not.toHaveBeenCalled()
+  })
+
+  it('returns pane not found at the default deadline when the first mirror GET never settles', async () => {
+    vi.useFakeTimers()
+    try {
+      let receivedSignal: AbortSignal | undefined
+      const get = vi.fn((_: string, { signal }: { signal: AbortSignal }) => {
+        receivedSignal = signal
+        return new Promise<typeof mirrorWithoutPane>(() => {})
+      })
+      const patch = vi.fn().mockResolvedValue(renameOk)
+      const result = renamePaneAfterMirrorReady('tab-1', 'pane-1', 'Ops desk', options({ get, patch }))
+
+      await vi.advanceTimersByTimeAsync(5_001)
+
+      await expect(result).resolves.toEqual({ ok: false, message: 'pane not found' })
+      expect(receivedSignal?.aborted).toBe(true)
+      expect(patch).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('disarms the mirror deadline after an exact receipt so an in-flight PATCH can complete', async () => {
+    vi.useFakeTimers()
+    try {
+      const pendingPatch = deferred<typeof renameOk>()
+      const patch = vi.fn((_: string, __: unknown, { signal }: { signal: AbortSignal }) => {
+        expect(signal.aborted).toBe(false)
+        return pendingPatch.promise
+      })
+      const caller = new AbortController()
+      const result = renamePaneAfterMirrorReady('tab-1', 'pane-1', 'Ops desk', options({
+        signal: caller.signal,
+        patch,
+      }))
+
+      await vi.advanceTimersByTimeAsync(0)
+      expect(patch).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(5_001)
+      expect(caller.signal.aborted).toBe(false)
+
+      pendingPatch.resolve(renameOk)
+      await expect(result).resolves.toEqual({ ok: true, response: renameOk })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('cancels an in-flight mirror GET without issuing later requests or a PATCH', async () => {
+    vi.useFakeTimers()
+    try {
+      const caller = new AbortController()
+      const pendingGet = deferred<typeof mirrorWithPane>()
+      let receivedSignal: AbortSignal | undefined
+      const get = vi.fn((_: string, { signal }: { signal: AbortSignal }) => {
+        receivedSignal = signal
+        return pendingGet.promise
+      })
+      const patch = vi.fn().mockResolvedValue(renameOk)
+      const result = renamePaneAfterMirrorReady('tab-1', 'pane-1', 'Ops desk', options({
+        signal: caller.signal,
+        get,
+        patch,
+      }))
+
+      caller.abort()
+      await expect(result).rejects.toMatchObject({ name: 'AbortError' })
+      expect(receivedSignal?.aborted).toBe(true)
+
+      pendingGet.resolve(mirrorWithPane)
+      await vi.advanceTimersByTimeAsync(250)
+      expect(get).toHaveBeenCalledTimes(1)
+      expect(patch).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('cancels an in-flight PATCH with the caller signal and cannot later return success', async () => {
+    vi.useFakeTimers()
+    try {
+      const caller = new AbortController()
+      const pendingPatch = deferred<typeof renameOk>()
+      let receivedSignal: AbortSignal | undefined
+      const patch = vi.fn((_: string, __: unknown, { signal }: { signal: AbortSignal }) => {
+        receivedSignal = signal
+        return pendingPatch.promise
+      })
+      const result = renamePaneAfterMirrorReady('tab-1', 'pane-1', 'Ops desk', options({
+        signal: caller.signal,
+        patch,
+      }))
+
+      await vi.advanceTimersByTimeAsync(0)
+      expect(patch).toHaveBeenCalledTimes(1)
+      caller.abort()
+      await expect(result).rejects.toMatchObject({ name: 'AbortError' })
+      expect(receivedSignal).toBe(caller.signal)
+      expect(receivedSignal?.aborted).toBe(true)
+
+      pendingPatch.resolve(renameOk)
+      await vi.advanceTimersByTimeAsync(250)
+      expect(patch).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('stops the mirror wait on abort before issuing a PATCH', async () => {
+    const controller = new AbortController()
+    const sleep = vi.fn((_: number, signal: AbortSignal) => new Promise<void>((_, reject) => {
+      signal.addEventListener('abort', () => {
+        const error = new Error('The operation was aborted')
+        error.name = 'AbortError'
+        reject(error)
+      }, { once: true })
+    }))
+    const opts = options({ signal: controller.signal, get: vi.fn().mockResolvedValue(mirrorWithoutPane), sleep })
+    const result = renamePaneAfterMirrorReady('tab-1', 'pane-1', 'Ops desk', opts)
+
+    await Promise.resolve()
+    controller.abort()
+
+    await expect(result).rejects.toMatchObject({ name: 'AbortError' })
+    expect(opts.get).toHaveBeenCalledWith('/api/panes?tabId=tab-1', { signal: expect.any(AbortSignal) })
+    expect(opts.get.mock.calls[0]?.[1]?.signal.aborted).toBe(true)
+    expect(opts.patch).not.toHaveBeenCalled()
   })
 })

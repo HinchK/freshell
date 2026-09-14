@@ -23,17 +23,15 @@
  * Rust-only: the auto-resume orchestrator lives in the Rust server
  * (crates/freshell-ws/src/auto_resume.rs); owns one RustServer per test rig
  * (ephemeral loopback port — NEVER 3001/3002). Registered ONLY under
- * `rust-chromium` and testIgnore'd on every match-all project (see
- * playwright.config.ts's RUST_ONLY_SPECS).
  */
-import { test, expect } from '../helpers/fixtures.js'
+import { createFreshE2ePage, test, expect } from '../helpers/fixtures.js'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import * as os from 'node:os'
 import { fileURLToPath } from 'node:url'
-import type { Page } from '@playwright/test'
+import type { Browser, BrowserContext, Page } from '@playwright/test'
 import { RustServer, ensureRustServerBuilt } from '../helpers/rust-server.js'
-import type { TestServerInfo } from '../helpers/test-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 
@@ -138,7 +136,7 @@ interface Rig {
   root: string
   argvLog: string
   server: RustServer
-  info: TestServerInfo
+  info: E2eServerInfo
 }
 
 async function bootRig(prefix: string, behaviorEnv: Record<string, string>): Promise<Rig> {
@@ -165,8 +163,34 @@ async function teardownRig(rig: Rig | undefined): Promise<void> {
   if (rig?.root) await fs.rm(rig.root, { recursive: true, force: true }).catch(() => {})
 }
 
+interface RigPage {
+  rig: Rig
+  context: BrowserContext
+  page: Page
+}
+
+async function bootRigPage(
+  browser: Browser,
+  prefix: string,
+  behaviorEnv: Record<string, string>,
+): Promise<RigPage> {
+  const rig = await bootRig(prefix, behaviorEnv)
+  try {
+    const { context, page } = await createFreshE2ePage(browser, rig.info)
+    return { rig, context, page }
+  } catch (error) {
+    await teardownRig(rig)
+    throw error
+  }
+}
+
+async function teardownRigPage(rigPage: RigPage | undefined): Promise<void> {
+  await rigPage?.context.close().catch(() => {})
+  await teardownRig(rigPage?.rig)
+}
+
 /** Connect, ensure a live shell terminal, then create a claude pane via the UI. */
-async function createClaudePane(page: Page, info: TestServerInfo): Promise<TestHarness> {
+async function createClaudePane(page: Page, info: E2eServerInfo): Promise<TestHarness> {
   const harness = await connect(page, info)
   await selectShellIfPickerShowing(page)
   await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
@@ -193,13 +217,13 @@ test.describe('agent crash auto-resume (rust only)', () => {
     ensureRustServerBuilt()
   })
 
-  test('crash → bounded auto-resume with --resume <same id> and a visible notice', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('crash → bounded auto-resume with --resume <same id> and a visible notice', async ({ browser }) => {
     test.setTimeout(240_000)
-    let rig: Rig | undefined
+    let rigPage: RigPage | undefined
     try {
       // FAKE_CRASH_MODE=once: invocation 1 crashes (exit 1), invocation 2 survives.
-      rig = await bootRig('once', { FAKE_CRASH_MODE: 'once' })
+      rigPage = await bootRigPage(browser, 'once', { FAKE_CRASH_MODE: 'once' })
+      const { rig, page } = rigPage
       await createClaudePane(page, rig.info)
 
       // The session id the server minted for invocation 1: the WS/picker
@@ -245,17 +269,17 @@ test.describe('agent crash auto-resume (rust only)', () => {
         expect(claude.content.terminalId).toBeTruthy()
       }).toPass({ timeout: 30_000 })
     } finally {
-      await teardownRig(rig)
+      await teardownRigPage(rigPage)
     }
   })
 
-  test('instantly re-crashing CLI exhausts retries and settles with a loud banner', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('instantly re-crashing CLI exhausts retries and settles with a loud banner', async ({ browser }) => {
     test.setTimeout(240_000)
-    let rig: Rig | undefined
+    let rigPage: RigPage | undefined
     try {
       // FAKE_CRASH_MODE=always: every invocation exits 1 immediately.
-      rig = await bootRig('always', { FAKE_CRASH_MODE: 'always' })
+      rigPage = await bootRigPage(browser, 'always', { FAKE_CRASH_MODE: 'always' })
+      const { rig, page } = rigPage
       await createClaudePane(page, rig.info)
 
       // Converge to EXACTLY 3 invocations (1 original + 2 retries)...
@@ -272,17 +296,17 @@ test.describe('agent crash auto-resume (rust only)', () => {
       await expect(alert).toBeVisible({ timeout: 15_000 })
       await expect(page.getByRole('button', { name: 'Relaunch claude session' })).toBeVisible()
     } finally {
-      await teardownRig(rig)
+      await teardownRigPage(rigPage)
     }
   })
 
-  test('clean exit (code 0) neither resumes nor alarms', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('clean exit (code 0) neither resumes nor alarms', async ({ browser }) => {
     test.setTimeout(240_000)
-    let rig: Rig | undefined
+    let rigPage: RigPage | undefined
     try {
       // FAKE_CRASH_MODE=clean: prints then exits 0.
-      rig = await bootRig('clean', { FAKE_CRASH_MODE: 'clean' })
+      rigPage = await bootRigPage(browser, 'clean', { FAKE_CRASH_MODE: 'clean' })
+      const { rig, page } = rigPage
       await createClaudePane(page, rig.info)
 
       // The single clean-exit invocation lands...
@@ -297,21 +321,21 @@ test.describe('agent crash auto-resume (rust only)', () => {
       await expect(page.getByRole('alert')).toHaveCount(0)
       await expect(autoResumeNotice(page)).toHaveCount(0)
     } finally {
-      await teardownRig(rig)
+      await teardownRigPage(rigPage)
     }
   })
 
-  test('Relaunch button drives a resume with the same session id', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('Relaunch button drives a resume with the same session id', async ({ browser }) => {
     test.setTimeout(240_000)
-    let rig: Rig | undefined
+    let rigPage: RigPage | undefined
     try {
       // FAKE_CRASH_UNTIL=3 and NO FAKE_CRASH_MODE: invocations 1..3 crash
       // (exit 1) and invocation 4 SURVIVES as a long-running process — the
       // fixture's FAKE_CRASH_UNTIL branch takes precedence over the mode
       // checks, so the 'clean' default can never exit-0 the surviving
       // invocation and vacuously satisfy the liveness assertions below.
-      rig = await bootRig('until3', { FAKE_CRASH_UNTIL: '3' })
+      rigPage = await bootRigPage(browser, 'until3', { FAKE_CRASH_UNTIL: '3' })
+      const { rig, page } = rigPage
       await createClaudePane(page, rig.info)
 
       // The session id minted for invocation 1 (see test 1).
@@ -358,16 +382,16 @@ test.describe('agent crash auto-resume (rust only)', () => {
       await expect(page.getByRole('alert')).toHaveCount(0)
       await expect(recoveringNotice(page)).toHaveCount(0)
     } finally {
-      await teardownRig(rig)
+      await teardownRigPage(rigPage)
     }
   })
 
-  test('a persistent crash trace survives reload and is dismissible', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('a persistent crash trace survives reload and is dismissible', async ({ browser }) => {
     test.setTimeout(240_000)
-    let rig: Rig | undefined
+    let rigPage: RigPage | undefined
     try {
-      rig = await bootRig('trace', { FAKE_CRASH_MODE: 'once' })
+      rigPage = await bootRigPage(browser, 'trace', { FAKE_CRASH_MODE: 'once' })
+      const { rig, page } = rigPage
       await createClaudePane(page, rig.info)
 
       const trace = page.getByTestId('crash-trace')
@@ -388,16 +412,15 @@ test.describe('agent crash auto-resume (rust only)', () => {
       await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
       await expect(page.getByTestId('crash-trace')).toHaveCount(0)
     } finally {
-      await teardownRig(rig)
+      await teardownRigPage(rigPage)
     }
   })
 
-  test('a flap loop trips the circuit breaker: settles with the crashed-N-times banner', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('a flap loop trips the circuit breaker: settles with the crashed-N-times banner', async ({ browser }) => {
     test.setTimeout(240_000)
-    let rig: Rig | undefined
+    let rigPage: RigPage | undefined
     try {
-      rig = await bootRig('flap', {
+      rigPage = await bootRigPage(browser, 'flap', {
         FAKE_CRASH_MODE: 'always',
         FAKE_CRASH_LIVE_MS: '1000',
         FRESHELL_AUTO_RESUME_DELAYS_MS: '100,200',
@@ -408,6 +431,7 @@ test.describe('agent crash auto-resume (rust only)', () => {
         FRESHELL_RESPAWN_LIVENESS_WINDOW_MS: '500',
         FRESHELL_AUTO_RESUME_MAX_CYCLES: '3',
       })
+      const { rig, page } = rigPage
       await createClaudePane(page, rig.info)
 
       const alert = page.getByRole('alert').filter({ hasText: 'claude crashed 3 times — auto-resume paused' })
@@ -421,14 +445,13 @@ test.describe('agent crash auto-resume (rust only)', () => {
       expect((await readArgvLog(rig.argvLog)).length, 'breaker must stay open').toBe(4)
       await expect(page.getByRole('button', { name: 'Relaunch claude session' })).toBeVisible()
     } finally {
-      await teardownRig(rig)
+      await teardownRigPage(rigPage)
     }
   })
 
-  test('cancel clears the recovering notice immediately and no respawn happens', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('cancel clears the recovering notice immediately and no respawn happens', async ({ browser }) => {
     test.setTimeout(240_000)
-    let rig: Rig | undefined
+    let rigPage: RigPage | undefined
     try {
       // Long backoff = a wide window where the OLD behavior would have lied
       // for 30s (znhn#3) and no window at all for the alert bar (znhn#6).
@@ -437,11 +460,12 @@ test.describe('agent crash auto-resume (rust only)', () => {
       // lands early in the 8s backoff (observed: a crash mid-choreography
       // pushed the click past the first backoff, so attempt 1 had already
       // respawned before the cancel could land).
-      rig = await bootRig('cancel', {
+      rigPage = await bootRigPage(browser, 'cancel', {
         FAKE_CRASH_MODE: 'always',
         FAKE_CRASH_LIVE_MS: '5000',
         FRESHELL_AUTO_RESUME_DELAYS_MS: '8000,8000',
       })
+      const { rig, page } = rigPage
       await createClaudePane(page, rig.info)
 
       await expect(recoveringNotice(page)).toBeVisible({ timeout: 30_000 })
@@ -456,7 +480,7 @@ test.describe('agent crash auto-resume (rust only)', () => {
       await page.waitForTimeout(10_000)
       expect((await readArgvLog(rig.argvLog)).length, 'cancel must abort the planned respawn').toBe(1)
     } finally {
-      await teardownRig(rig)
+      await teardownRigPage(rigPage)
     }
   })
 })

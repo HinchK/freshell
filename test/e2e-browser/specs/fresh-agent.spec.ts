@@ -27,6 +27,28 @@ async function enableClaudeAndCodex(page: any) {
   })
 }
 
+async function previewFreshclaudeDefaults(page: any) {
+  await page.waitForFunction(() => {
+    return window.__FRESHELL_TEST_HARNESS__?.getState()?.settings?.loaded === true
+  })
+  await page.evaluate(() => {
+    window.__FRESHELL_TEST_HARNESS__?.dispatch({
+      type: 'settings/previewServerSettingsPatch',
+      payload: {
+        freshAgent: {
+          enabled: true,
+          providers: {
+            freshclaude: {
+              modelSelection: { kind: 'exact', modelId: 'opus[1m]' },
+              effort: 'high',
+            },
+          },
+        },
+      },
+    })
+  })
+}
+
 async function getActiveLeaf(harness: any) {
   const tabId = await harness.getActiveTabId()
   expect(tabId).toBeTruthy()
@@ -235,7 +257,6 @@ async function expectFreshAgentSubmitButtonContrasted(
 
 /** Convert the active leaf terminal pane into a freshclaude pane carrying the
  * strip-relevant wiring: a canonical (UUID) durable session id chain so the
- * restore machinery never trips the "legacy name" restore error, and the
  * static default model ('opus[1m]') so the chip label is deterministic.
  * Network effects are suppressed BEFORE the conversion so the attach effect
  * records instead of sending; the REST snapshot is served by
@@ -265,6 +286,7 @@ async function installFreshclaudeStripPane(page: any, sessionId: string) {
           status: 'idle',
           initialCwd: '/home/user/code/freshell',
           model: 'opus[1m]',
+          effort: 'high',
           settingsDismissed: true,
         },
       },
@@ -288,7 +310,7 @@ async function stubFreshclaudeThread(page: any, sessionId: string, turns: unknow
         status: 'idle',
         summary: '',
         capabilities: { send: true, interrupt: true, approvals: true, questions: true, fork: false },
-        settings: { model: 'opus[1m]', permissionMode: 'default', plugins: [] },
+        settings: { model: 'opus[1m]', permissionMode: 'default', effort: 'high', plugins: [] },
         tokenUsage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, costUsd: 0 },
         pendingApprovals: [],
         pendingQuestions: [],
@@ -837,6 +859,12 @@ test.describe('Fresh Agent', () => {
   test('freshclaude settings use FreshAgent model defaults and create payload', async ({ freshellPage: _freshellPage, page, harness, terminal }) => {
     await terminal.waitForTerminal()
     await enableClaudeAndCodex(page)
+    await previewFreshclaudeDefaults(page)
+    const settings = await harness.getSettings()
+    expect(settings?.freshAgent?.providers?.freshclaude).toMatchObject({
+      modelSelection: { kind: 'exact', modelId: 'opus[1m]' },
+      effort: 'high',
+    })
 
     await harness.clearSentWsMessages()
     const picker = await openPanePicker(page)
@@ -887,21 +915,6 @@ test.describe('Fresh Agent', () => {
       return settings?.freshAgent?.providers?.freshcodex?.style ?? null
     }).toBe('serif')
 
-    await page.route('**/api/fresh-agent/diff*', async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify({
-          diff: [
-            'diff --git a/src/index.css b/src/index.css',
-            '@@ -1,3 +1,3 @@',
-            '-.old { color: blue; }',
-            '+.fresh-agent-style-serif { color: #1d1a16; }',
-            ' context line',
-          ].join('\n'),
-        }),
-      })
-    })
     await page.route('**/api/fresh-agent/threads/freshcodex/codex/style-thread*', async (route) => {
       await route.fulfill({
         status: 200,
@@ -1037,7 +1050,12 @@ test.describe('Fresh Agent', () => {
     await expect(freshcodexRoot.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'true')
     await freshcodexRoot.getByRole('button', { name: 'Thinking' }).press('Enter')
     await expect(freshcodexRoot.getByText('private style reasoning starts collapsed')).toBeVisible()
-    await freshcodexRoot.getByRole('button', { name: /Diff: src\/index\.css/ }).click()
+    // This style test consumes the diff metadata already present in the
+    // routed snapshot. Full Rust diff loading is covered separately.
+    const diffPanel = freshcodexRoot.locator('.fresh-agent-diff-panel').first()
+    await expect(diffPanel).toBeVisible()
+    await expect(diffPanel.locator('.fresh-agent-file-diff').first()).toContainText('src/index.css')
+    await expect(diffPanel.locator('.fresh-agent-file-diff').first()).toContainText('modified')
     const transcriptFont = await transcript.evaluate((node) => getComputedStyle(node).fontFamily)
     expect(transcriptFont.toLowerCase()).toContain('georgia')
     const rootFont = await freshcodexRoot.evaluate((node) => getComputedStyle(node).fontFamily)
@@ -1054,7 +1072,7 @@ test.describe('Fresh Agent', () => {
     const questionBackground = await freshcodexRoot.locator('.fresh-agent-question-card').first()
       .evaluate((node) => getComputedStyle(node).backgroundColor)
     expect(questionBackground).toBe('rgb(251, 250, 247)')
-    const diffBackground = await freshcodexRoot.locator('.fresh-agent-diff-panel').first()
+    const diffBackground = await diffPanel
       .evaluate((node) => getComputedStyle(node).backgroundColor)
     expect(diffBackground).toBe('rgb(251, 250, 247)')
     const composerButtonFont = await freshcodexRoot.locator('.fresh-agent-composer-action').first()
@@ -1558,7 +1576,7 @@ test.describe('Fresh Agent', () => {
     expect(ratio).toBeLessThan(1.35)
   })
 
-  test('browser user can create and resume Freshcodex with worktree, review, and fork metadata in the shared pane', async ({ freshellPage, page, harness, terminal, serverInfo }) => {
+  test('browser user renders Freshcodex worktree, review, and fork metadata from a thread snapshot', async ({ freshellPage, page, harness, terminal, serverInfo }) => {
     await terminal.waitForTerminal()
     await enableClaudeAndCodex(page)
 
@@ -1640,14 +1658,35 @@ test.describe('Fresh Agent', () => {
     await expect(page.getByText('pending')).toBeVisible()
     await expect(page.getByText('thread-parent-1')).toBeVisible()
 
+    // The routed snapshot is visual-only, but the persisted-layout contract is
+    // still meaningful: retain the durable reference and never persist the
+    // ephemeral live session id. Reload/reconciliation belongs to the
+    // Rust-backed fake-Codex coverage, where this reference is real server
+    // state rather than a route-only fixture.
     await page.evaluate(() => {
       window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
     })
-    await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
-    await harness.waitForHarness()
-    await harness.waitForConnection()
-    await expect(page.getByText('Codex transcript')).toBeVisible()
-    await expect(page.getByText(/feature\/fresh-agent/)).toBeVisible()
+    const persistedFreshcodex = await page.evaluate(({ currentTabId, currentPaneId }) => {
+      const raw = localStorage.getItem('freshell.layout.v3')
+      if (!raw) throw new Error('Missing persisted layout after freshcodex flush')
+      const layout = JSON.parse(raw)
+      const findPane = (node: any): any => {
+        if (node?.type === 'leaf' && node.id === currentPaneId) return node.content
+        for (const child of node?.children ?? []) {
+          const found = findPane(child)
+          if (found) return found
+        }
+        return undefined
+      }
+      const content = findPane(layout.panes?.layouts?.[currentTabId])
+      if (!content) throw new Error('Persisted freshcodex pane is missing')
+      return {
+        sessionRef: content.sessionRef,
+        hasSessionId: Object.prototype.hasOwnProperty.call(content, 'sessionId'),
+      }
+    }, { currentTabId: tabId, currentPaneId: activePaneId })
+    expect(persistedFreshcodex.sessionRef).toEqual({ provider: 'codex', sessionId: 'thread-codex' })
+    expect(persistedFreshcodex.hasSessionId).toBe(false)
   })
 })
 

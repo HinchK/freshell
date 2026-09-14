@@ -606,6 +606,57 @@ export class RawWsClient {
   }
 
   /**
+   * Wait for either a requested JSON message or the peer's terminal event.
+   *
+   * A raw protocol assertion must not treat an abnormal TCP end as an
+   * application close merely because it happened while waiting for a message.
+   * This keeps the first terminal wire outcome available to the caller.
+   */
+  async waitForJsonMessageOrTerminal<T = any>(
+    type: string,
+    timeoutMs: number,
+  ): Promise<
+    | { kind: 'message'; message: T }
+    | { kind: 'terminal'; terminal: 'peer-close'; close: { code: number; reason: string } }
+    | { kind: 'terminal'; terminal: 'tcp-end' | 'local-abort' | 'error' }
+  > {
+    const fromIndex = this.received.length
+    const deadline = Date.now() + timeoutMs
+    for (;;) {
+      for (const frame of this.received.slice(fromIndex)) {
+        if (frame.opcode === WS_OPCODE.CLOSE && this._peerClose) {
+          return {
+            kind: 'terminal',
+            terminal: 'peer-close',
+            close: { code: this._peerClose.code, reason: this._peerClose.reason },
+          }
+        }
+        if (frame.opcode !== WS_OPCODE.TEXT) continue
+        try {
+          const message = JSON.parse(frame.payload.toString('utf8')) as { type?: unknown }
+          if (message.type === type) return { kind: 'message', message: message as T }
+        } catch {
+          // Non-JSON frames cannot satisfy a JSON message wait.
+        }
+      }
+      if (this._peerClose) {
+        return {
+          kind: 'terminal',
+          terminal: 'peer-close',
+          close: { code: this._peerClose.code, reason: this._peerClose.reason },
+        }
+      }
+      if (this._peerEnded) return { kind: 'terminal', terminal: 'tcp-end' }
+      if (this._socketError) return { kind: 'terminal', terminal: 'error' }
+      if (this._destroyed) return { kind: 'terminal', terminal: 'local-abort' }
+      if (Date.now() >= deadline) {
+        throw new Error(`RawWsClient: timed out after ${timeoutMs}ms waiting for json message type=${JSON.stringify(type)} or terminal event`)
+      }
+      await new Promise((r) => setTimeout(r, 25))
+    }
+  }
+
+  /**
    * Resolve after `durationMs` with the frames received during the window
    * ([] while reads are paused — the delayed-receive assertion primitive).
    */

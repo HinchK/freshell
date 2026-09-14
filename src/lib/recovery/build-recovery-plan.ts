@@ -13,10 +13,13 @@ function terminalContent(p: {
   shell: string | null
   cwd: string | null
   sessionRef: { provider: string; sessionId: string } | null
+  createRequestId?: string
 }): PaneContent {
   return {
     kind: 'terminal',
-    createRequestId: nanoid(), // re-minted by restoreLayout normalization; required by the type
+    // Same-machine bootstrap carries a valid snapshot key; cross-device and
+    // ledger-only recovery deliberately mint a new key.
+    createRequestId: p.createRequestId ?? nanoid(),
     status: 'creating',
     ...(p.mode ? { mode: p.mode } : {}),
     ...(p.shell ? { shell: p.shell } : {}),
@@ -69,8 +72,16 @@ export function isRestorablePane(p: RecoveryPane): boolean {
   return p.ledgerState !== 'closed'
 }
 
-function paneContent(p: RecoveryPane): PaneContent {
-  if (p.kind === 'terminal') return terminalContent(p)
+function snapshotCreateRequestId(p: RecoveryPane, preserve: boolean): string | undefined {
+  const createRequestId = p.payload.createRequestId
+  return preserve && typeof createRequestId === 'string' && createRequestId
+    ? createRequestId
+    : undefined
+}
+
+function paneContent(p: RecoveryPane, preserveSnapshotCreateRequestId = false): PaneContent {
+  const createRequestId = snapshotCreateRequestId(p, preserveSnapshotCreateRequestId)
+  if (p.kind === 'terminal') return terminalContent({ ...p, createRequestId })
   if (p.kind === 'editor') {
     // EditorPaneContent.content is required (paneTypes.ts:116-130) but snapshots never
     // capture buffer text - recreate with an empty buffer (data fact, D6)
@@ -91,18 +102,24 @@ function paneContent(p: RecoveryPane): PaneContent {
     // regardless, as defense in depth). A LIVE fresh-agent pane rides the
     // same branch: the top-level ref is the live session's identity, so the
     // restored pane's create adopts it server-side (never a respawn).
-    const { restoreError: _restoreError, sessionRef: _snapshotSessionRef, ...payload } = p.payload
+    const {
+      createRequestId: _snapshotCreateRequestId,
+      restoreError: _restoreError,
+      sessionRef: _snapshotSessionRef,
+      ...payload
+    } = p.payload
     return {
       ...payload,
       kind: 'fresh-agent',
+      createRequestId: createRequestId ?? nanoid(),
       ...(p.sessionRef ? { sessionRef: p.sessionRef } : {}),
     } as PaneContent
   }
   return { ...p.payload, kind: p.kind } as PaneContent
 }
 
-function leaf(content: PaneContent): PaneNode {
-  return { type: 'leaf', id: nanoid(), content }
+function leaf(content: PaneContent, paneId?: string): PaneNode {
+  return { type: 'leaf', id: paneId ?? nanoid(), content }
 }
 
 // D6: no split geometry in snapshots - right-leaning binary chain of even splits
@@ -125,12 +142,33 @@ export interface RecoveryTabPlan {
    * paneId→terminalId targets, armed into `terminal-restore` on accept
    * (RecoveryOfferPanel) and consumed by TerminalView's lifecycle BEFORE it
    * would dispatch a terminal.create. Keyed by the leaf's PANE ID (not
-   * createRequestId): restoreLayout normalization re-mints terminal
-   * createRequestIds but preserves pane node ids, so this key identity holds
-   * from plan to mount. A pane with no entry creates exactly as before
+   * createRequestId): same-machine bootstrap preserves valid snapshot
+   * createRequestIds while cross-device and ledger-only recovery remint; pane
+   * node ids still provide the stable plan-to-mount identity. A pane with no
+   * entry creates exactly as before
    * (dead panes resume/fresh per the existing rules).
    */
   liveTerminalReattach?: Array<{ paneId: string; terminalId: string }>
+}
+
+export interface BuildRecoveryPlanOptions {
+  /**
+   * Machine bootstrap replaces the local cache with this same machine's
+   * durable workspace. Preserve its tab and pane ids so reload does not break
+   * references or turn every existing tab into a newly-created one. The
+   * opt-in keeps the user-invoked cross-device recovery offer's deliberate
+   * reminting behavior unchanged.
+   */
+  preserveIdsForMachine?: string
+}
+
+function preservedTabId(tabKey: string, machineId: string): string {
+  const prefix = `${machineId}:`
+  const tabId = tabKey.startsWith(prefix) ? tabKey.slice(prefix.length) : ''
+  if (!tabId) {
+    throw new Error(`Recovery tab key ${tabKey} does not belong to machine ${machineId}`)
+  }
+  return tabId
 }
 
 /**
@@ -216,7 +254,9 @@ function freshAgentEntryContent(e: LedgerOnlyEntry): PaneContent {
     // resolveFreshAgentRuntimeProvider(sessionType)); for genuine rows both
     // derivations agree, the resolution just makes the invariant explicit.
     provider: resolveFreshAgentRuntimeProvider(sessionType) ?? (e.provider as FreshAgentRuntimeProvider),
-    createRequestId: nanoid(), // re-minted by restoreLayout normalization; required by the type
+    // Ledger-only rows describe newly reconstructed panes, so their request
+    // identity is always minted rather than borrowed from durable state.
+    createRequestId: nanoid(),
     status: 'creating',
     ...(e.cwd ? { initialCwd: e.cwd } : {}),
     // Focused-ep1 Finding B: the row's recorded settings ride the resume so a
@@ -301,7 +341,10 @@ export function countRecoverablePanes(inv: RecoveryInventory): number {
   return device + joined
 }
 
-export function buildRecoveryPlan(inv: RecoveryInventory): RecoveryTabPlan[] {
+export function buildRecoveryPlan(
+  inv: RecoveryInventory,
+  options: BuildRecoveryPlanOptions = {},
+): RecoveryTabPlan[] {
   // The layout join MUST happen at plan time: restoreLayout no-ops when the
   // tab's layout already exists (panesSlice.ts restoreLayout), so the accept
   // loop (one dispatch per plan) can never graft a row on afterwards. Joined
@@ -323,8 +366,8 @@ export function buildRecoveryPlan(inv: RecoveryInventory): RecoveryTabPlan[] {
       const leaves: PaneNode[] = []
       const liveTerminalReattach: Array<{ paneId: string; terminalId: string }> = []
       for (const p of t.panes.filter(isRestorablePane)) {
-        const content = paneContent(p)
-        const node = leaf(content)
+        const content = paneContent(p, Boolean(options.preserveIdsForMachine))
+        const node = leaf(content, options.preserveIdsForMachine ? p.paneId : undefined)
         const target = liveReattachTarget(p, content, node.id)
         if (target) liveTerminalReattach.push(target)
         leaves.push(node)
@@ -352,7 +395,9 @@ export function buildRecoveryPlan(inv: RecoveryInventory): RecoveryTabPlan[] {
     })
     .filter(({ leaves }) => leaves.length > 0)
     .map(({ tab: t, leaves, liveTerminalReattach }) => ({
-      tabId: nanoid(),
+      tabId: options.preserveIdsForMachine
+        ? preservedTabId(t.tabKey, options.preserveIdsForMachine)
+        : nanoid(),
       title: t.tabName || 'Recovered',
       sourceTabKey: t.tabKey,
       layout: chain(leaves),

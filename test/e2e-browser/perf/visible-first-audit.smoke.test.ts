@@ -18,5 +18,5 @@ describe('visible-first audit smoke', () => {
 
     const parsed = VisibleFirstAuditSchema.parse(JSON.parse(await readFile(outputPath, 'utf8')))
     expect(parsed.scenarios).toHaveLength(1)
-  })
+  }, 360_000) // Includes a cold release build of the owned Rust server.
 })

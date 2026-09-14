@@ -1,6 +1,7 @@
 //! Compile-time build-provenance stamp for `freshell-ws`: bakes the git
-//! commit SHA into `FRESHELL_WS_BUILD_COMMIT` so the WS handshake's `ready`
-//! can stamp `ready.buildId` (client-side stale-bundle auto-reload).
+//! validated `FRESHELL_BUILD_COMMIT` input (or the checkout SHA) into
+//! `FRESHELL_WS_BUILD_COMMIT` so the WS handshake's `ready` can stamp
+//! `ready.buildId` (client-side stale-bundle auto-reload).
 //! Build provenance is BUILD-scoped, not boot-scoped, so it deliberately
 //! does NOT ride on `WsState` (whose contents are boot-scoped ids/state
 //! injected by `freshell-server`). The full worktree-aware rationale for
@@ -8,17 +9,37 @@
 //! this copy performs the SAME resolved-HEAD/ref/packed-refs watching so a
 //! cached rebuild re-stamps when HEAD moves; both crates compile in the
 //! same workspace build, so their baked commits agree. Never fails the
-//! build over a missing/unavailable `git` (falls back to `"unknown"`).
+//! build over a missing/unavailable `git` (falls back to `"unknown"` unless
+//! the validated build input is present).
 
 use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    let commit = git_head_commit().unwrap_or_else(|| "unknown".to_string());
+    let commit = build_commit_override()
+        .or_else(git_head_commit)
+        .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=FRESHELL_WS_BUILD_COMMIT={commit}");
+    println!("cargo:rerun-if-env-changed=FRESHELL_BUILD_COMMIT");
     for path in rerun_paths() {
         println!("cargo:rerun-if-changed={}", path.display());
     }
+}
+
+/// The Cloud Build provenance input is intentionally stricter than a generic
+/// string: only a full lowercase Git object id may replace checkout discovery.
+/// Invalid values preserve the ordinary git -> `"unknown"` fallback.
+fn build_commit_override() -> Option<String> {
+    std::env::var("FRESHELL_BUILD_COMMIT")
+        .ok()
+        .filter(|value| is_lowercase_commit(value))
+}
+
+fn is_lowercase_commit(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// `git rev-parse HEAD`, trimmed. `None` on any failure (git not on `PATH`,

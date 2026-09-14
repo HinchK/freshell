@@ -1,14 +1,18 @@
 import fs from 'fs/promises'
 import path from 'path'
 import type { Browser, BrowserContext, Page } from '@playwright/test'
-import { test, expect } from '../helpers/fixtures.js'
+import { createE2eBrowserContext, test, expect } from '../helpers/fixtures.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { installRecoveryOfferAutoDeclineOnContext } from '../helpers/recovery-offer.js'
 
-// RESTORE-01: manual contexts bypass the fixtures' built-in `context`
-// override, so they adopt the shared recovery auto-decline watcher directly
-// (docs/plans/df1/RESTORE-01.md). No-op unless a recoverable offer is made.
-async function newClientContext(browser: Browser): Promise<BrowserContext> {
-  const context = await browser.newContext()
+// This spec uses same-device pages, so its manual context selects the test's
+// fixture-owned machine before the first navigation.
+async function newClientContext(
+  browser: Browser,
+  serverInfo: E2eServerInfo,
+  e2eMachineId: string,
+): Promise<BrowserContext> {
+  const context = await createE2eBrowserContext(browser, serverInfo, e2eMachineId)
   installRecoveryOfferAutoDeclineOnContext(context)
   return context
 }
@@ -191,10 +195,71 @@ async function activateTab(page: Page, tabId: string): Promise<void> {
   await page.waitForFunction((id) => window.__FRESHELL_TEST_HARNESS__?.getState()?.tabs?.activeTabId === id, tabId, { timeout: 10_000 })
 }
 
+type ReceivedWsFrame = Record<string, unknown> & { type?: string }
+
+function captureReceivedWsFrames(page: Page) {
+  type Waiter = {
+    predicate: (frame: ReceivedWsFrame) => boolean
+    resolve: (frame: ReceivedWsFrame) => void
+  }
+
+  const frames: ReceivedWsFrame[] = []
+  const waiters = new Set<Waiter>()
+  page.on('websocket', (ws) => {
+    ws.on('framereceived', (ev) => {
+      const payload = typeof ev.payload === 'string' ? ev.payload : ev.payload.toString('utf8')
+      let frame: ReceivedWsFrame
+      try {
+        const parsed = JSON.parse(payload)
+        if (!parsed || typeof parsed !== 'object') return
+        frame = parsed as ReceivedWsFrame
+      } catch {
+        return
+      }
+      frames.push(frame)
+      for (const waiter of [...waiters]) {
+        if (waiter.predicate(frame)) waiter.resolve(frame)
+      }
+    })
+  })
+
+  return {
+    frames,
+    clear() {
+      frames.length = 0
+    },
+    waitForFrame(
+      predicate: (frame: ReceivedWsFrame) => boolean,
+      description: string,
+      timeoutMs: number,
+    ): Promise<ReceivedWsFrame> {
+      const existing = frames.find(predicate)
+      if (existing) return Promise.resolve(existing)
+
+      return new Promise((resolve, reject) => {
+        let timeout: ReturnType<typeof setTimeout>
+        const waiter: Waiter = {
+          predicate,
+          resolve: (frame) => {
+            clearTimeout(timeout)
+            waiters.delete(waiter)
+            resolve(frame)
+          },
+        }
+        timeout = setTimeout(() => {
+          waiters.delete(waiter)
+          reject(new Error(`Timed out waiting for ${description}; received frames: ${JSON.stringify(frames)}`))
+        }, timeoutMs)
+        waiters.add(waiter)
+      })
+    },
+  }
+}
+
 test.describe('Multi-Client', () => {
-  test('two browser tabs share the same server', async ({ browser, serverInfo }) => {
+  test('two browser tabs share the same server', async ({ browser, serverInfo, e2eMachineId }) => {
     // Open two pages to the same server
-    const context = await newClientContext(browser)
+    const context = await newClientContext(browser, serverInfo, e2eMachineId)
     const page1 = await context.newPage()
     const page2 = await context.newPage()
 
@@ -208,8 +273,8 @@ test.describe('Multi-Client', () => {
     await context.close()
   })
 
-  test('terminal output appears in both clients', async ({ browser, serverInfo }) => {
-    const context = await newClientContext(browser)
+  test('terminal output appears in both clients', async ({ browser, serverInfo, e2eMachineId }) => {
+    const context = await newClientContext(browser, serverInfo, e2eMachineId)
     const page1 = await context.newPage()
 
     await page1.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
@@ -234,8 +299,8 @@ test.describe('Multi-Client', () => {
     await context.close()
   })
 
-  test('reconnecting second viewer keeps page 1 PTY size stable and both pages keep shared output', async ({ browser, serverInfo }) => {
-    const context = await newClientContext(browser)
+  test('reconnecting second viewer keeps page 1 PTY size stable and both pages keep shared output', async ({ browser, serverInfo, e2eMachineId }) => {
+    const context = await newClientContext(browser, serverInfo, e2eMachineId)
     const page1 = await context.newPage()
     await page1.setViewportSize({ width: 1500, height: 980 })
 
@@ -253,6 +318,7 @@ test.describe('Multi-Client', () => {
     await waitForReady(page2)
     const sharedTabId = await waitForTabWithTerminalId(page2, terminalId!)
     await activateTab(page2, sharedTabId)
+    const receivedFrames = captureReceivedWsFrames(page2)
 
     await executeCommand(page1, 'echo "__MULTI_CLIENT_READY__"')
     await waitForTerminalText(page1, '__MULTI_CLIENT_READY__', terminalId!)
@@ -261,6 +327,7 @@ test.describe('Multi-Client', () => {
     await executeCommand(page1, 'printf "__PTY_SIZE_BEFORE__:%s\\n" "$(stty size)"')
     const beforeSize = await waitForMarkedPtySize(page1, '__PTY_SIZE_BEFORE__', terminalId!)
 
+    receivedFrames.clear()
     await page2.evaluate(() => {
       window.__FRESHELL_TEST_HARNESS__?.clearSentWsMessages?.()
       window.__FRESHELL_TEST_HARNESS__?.forceDisconnect()
@@ -268,6 +335,23 @@ test.describe('Multi-Client', () => {
 
     await waitForReady(page2)
     await waitForTerminalText(page2, '__MULTI_CLIENT_READY__', terminalId!)
+
+    await page2.waitForFunction(() => {
+      const sent = window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
+      return sent.some((msg: any) => msg?.type === 'pane.reconcile.request' && typeof msg?.reconcileId === 'string')
+    }, {}, { timeout: 20_000 })
+    const reconnectReconcileId = await page2.evaluate(() => {
+      const sent = window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
+      const request = [...sent].reverse().find((msg: any) =>
+        msg?.type === 'pane.reconcile.request' && typeof msg?.reconcileId === 'string') as { reconcileId: string } | undefined
+      return request?.reconcileId ?? null
+    })
+    expect(reconnectReconcileId).toBeTruthy()
+    await receivedFrames.waitForFrame(
+      (frame) => frame.type === 'pane.reconcile.result' && frame.reconcileId === reconnectReconcileId,
+      `pane.reconcile.result for reconnect ${reconnectReconcileId}`,
+      20_000,
+    )
 
     // Wait for page2 to have re-attached to the terminal after the forced
     // disconnect, then assert on what actually got sent.
@@ -309,10 +393,11 @@ test.describe('Multi-Client', () => {
     // documented contract) pass on either path. So the specific intent value
     // within that set is an internal implementation choice, not the behavior
     // this test is meant to guard. What DOES matter, and is still asserted:
-    // page2 issued a BOUNDED 1..2 re-attaches for this terminal (not zero --
-    // a silently dropped reconnect -- and not a runaway retry storm; the 2
-    // covers the reconnect attach plus at most one designed pane.reconcile
-    // fold re-fire via the reconcileEpoch bump, detailed below), using a
+    // page2 issued a BOUNDED 1..3 re-attaches for this terminal (not zero --
+    // a silently dropped reconnect -- and not a runaway retry storm). The
+    // three deliberate sources are TerminalView's reconnect handler, the
+    // reconcile-pending lifecycle re-run, and the reconcile attach verdict's
+    // reconcileEpoch re-fire. Each is a distinct attach generation using a
     // reconnect-shaped intent from the accepted set above.
     await page2.waitForFunction((id) => {
       const sent = window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
@@ -323,7 +408,7 @@ test.describe('Multi-Client', () => {
       )
     }, terminalId!, { timeout: 20_000 })
 
-    const reconnectAttachMessages = await page2.evaluate((id) => {
+    const collectReconnectAttachMessages = () => page2.evaluate((id) => {
       const sent = window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
       return sent.filter((msg: any) =>
         msg?.type === 'terminal.attach'
@@ -331,20 +416,33 @@ test.describe('Multi-Client', () => {
         && (msg?.intent === 'transport_reconnect' || msg?.intent === 'viewport_hydrate' || msg?.intent === 'keepalive_delta')
       )
     }, terminalId!)
-    // Under paneReconcileV1 (the adopted client) a reconnect has TWO
-    // legitimate attach sources for a live pane: (1) TerminalView's own
-    // reconnect/reveal path, and (2) the pane.reconcile `attach` verdict
-    // fold, which bumps `reconcileEpoch` and deliberately re-fires the
-    // attach effect so the pane converges on server truth even when the
-    // client's own bookkeeping is wrong (the A1 epoch-bump design pin in
-    // `panesSlice.reconcile.test.ts`: "every fold bumps reconcileEpoch").
-    // The pre-reconcile client had only source (1), which is what the old
-    // `toHaveLength(1)` encoded. The behavior this test actually guards is
-    // unchanged and still asserted: the reconnect was not silently dropped
-    // (>= 1), and there is no runaway retry storm (<= 2 -- exactly the two
-    // named sources, nothing unbounded).
+    const waitForAttachReadies = (attachRequestIds: string[]) => Promise.all(attachRequestIds.map((attachRequestId) => receivedFrames.waitForFrame(
+      (frame) => (
+        frame.type === 'terminal.attach.ready'
+        && frame.terminalId === terminalId
+        && frame.attachRequestId === attachRequestId
+      ),
+      `terminal.attach.ready for reconnect attach ${attachRequestId}`,
+      20_000,
+    )))
+
+    let reconnectAttachMessages = await collectReconnectAttachMessages()
+    let reconnectAttachRequestIds = reconnectAttachMessages.map((message: any) => message.attachRequestId)
+    expect(reconnectAttachRequestIds.every((requestId) => typeof requestId === 'string' && requestId.length > 0)).toBe(true)
+    expect(new Set(reconnectAttachRequestIds).size).toBe(reconnectAttachRequestIds.length)
+    await waitForAttachReadies(reconnectAttachRequestIds)
+
+    // A lifecycle re-run can be scheduled while an earlier attach is
+    // settling, so close the observation window only after the resulting
+    // generation(s) have their own ready receipts too. This remains bounded:
+    // the contract below rejects a fourth attach.
+    reconnectAttachMessages = await collectReconnectAttachMessages()
+    reconnectAttachRequestIds = reconnectAttachMessages.map((message: any) => message.attachRequestId)
+    expect(reconnectAttachRequestIds.every((requestId) => typeof requestId === 'string' && requestId.length > 0)).toBe(true)
+    expect(new Set(reconnectAttachRequestIds).size).toBe(reconnectAttachRequestIds.length)
+    await waitForAttachReadies(reconnectAttachRequestIds)
     expect(reconnectAttachMessages.length).toBeGreaterThanOrEqual(1)
-    expect(reconnectAttachMessages.length).toBeLessThanOrEqual(2)
+    expect(reconnectAttachMessages.length).toBeLessThanOrEqual(3)
 
     await executeCommand(page1, 'printf "__PTY_SIZE_AFTER__:%s\\n" "$(stty size)"')
     const afterSize = await waitForMarkedPtySize(page1, '__PTY_SIZE_AFTER__', terminalId!)
@@ -370,9 +468,9 @@ test.describe('Multi-Client', () => {
   // (replay-only), and the reveal heals geometry with a terminal.resize
   // whose dims the kernel then confirms via stty.
   // ------------------------------------------------------------------
-  test('reload-restored background tab stays geometry-neutral until reveal heals it with a resize', async ({ browser, serverInfo }) => {
+  test('reload-restored background tab stays geometry-neutral until reveal heals it with a resize', async ({ browser, serverInfo, e2eMachineId }) => {
     test.setTimeout(120_000)
-    const context = await newClientContext(browser)
+    const context = await newClientContext(browser, serverInfo, e2eMachineId)
     const page = await context.newPage()
 
     await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
@@ -525,8 +623,8 @@ test.describe('Multi-Client', () => {
     await context.close()
   })
 
-  test('settings change broadcasts to other clients', async ({ browser, serverInfo }) => {
-    const context = await newClientContext(browser)
+  test('settings change broadcasts to other clients', async ({ browser, serverInfo, e2eMachineId }) => {
+    const context = await newClientContext(browser, serverInfo, e2eMachineId)
     const page1 = await context.newPage()
     const page2 = await context.newPage()
 
@@ -580,8 +678,8 @@ test.describe('Multi-Client', () => {
     await context.close()
   })
 
-  test('server handles many concurrent connections', async ({ browser, serverInfo }) => {
-    const context = await newClientContext(browser)
+  test('server handles many concurrent connections', async ({ browser, serverInfo, e2eMachineId }) => {
+    const context = await newClientContext(browser, serverInfo, e2eMachineId)
     const pages = []
 
     // Open 5 pages
@@ -602,7 +700,7 @@ test.describe('Multi-Client', () => {
     await context.close()
   })
 
-  test('mode replay-sync: fresh surface restores mouse tracking + alt buffer after reload, and claims surfaceReset', async ({ browser, serverInfo }) => {
+  test('mode replay-sync: fresh surface restores mouse tracking + alt buffer after reload, and claims surfaceReset', async ({ browser, serverInfo, e2eMachineId }) => {
     // Regression coverage: an app arms DEC private modes ONCE at startup;
     // the retained replay window does not carry those bytes back, so a
     // freshly-constructed surface (page reload) used to rehydrate contents
@@ -610,19 +708,10 @@ test.describe('Multi-Client', () => {
     // mode projection and answers surfaceReset attaches with ONE
     // terminal.modes.sync preamble (ready < sync < replay).
     test.setTimeout(120_000)
-    const context = await newClientContext(browser)
+    const context = await newClientContext(browser, serverInfo, e2eMachineId)
     const page = await context.newPage()
     await page.setViewportSize({ width: 1400, height: 900 })
-    const syncFrames: Array<{ data: string }> = []
-    page.on('websocket', (ws) => {
-      ws.on('framereceived', (ev) => {
-        const payload = typeof ev.payload === 'string' ? ev.payload : ev.payload.toString('utf8')
-        try {
-          const msg = JSON.parse(payload)
-          if (msg?.type === 'terminal.modes.sync' && typeof msg?.data === 'string') syncFrames.push(msg)
-        } catch { /* ignore */ }
-      })
-    })
+    const receivedFrames = captureReceivedWsFrames(page)
     await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
     await waitForReady(page)
     await ensureTerminalReady(page)
@@ -643,6 +732,7 @@ test.describe('Multi-Client', () => {
     await waitForTerminalText(page, '__MODE_SYNC_MARK__', terminalId!)
 
     // Reload: fresh xterm surface, full rehydrate via surfaceReset attach.
+    receivedFrames.clear()
     await page.reload({ waitUntil: 'domcontentloaded' })
     await waitForReady(page)
     await page.waitForFunction(() => {
@@ -676,6 +766,10 @@ test.describe('Multi-Client', () => {
     ).toBeGreaterThanOrEqual(1)
     expect(claimed.every((m) => m.sinceSeq === 0),
       `every fresh claim must force a full hydrate (sinceSeq 0); got: ${JSON.stringify(reloadAttaches)}`).toBe(true)
+    const claimedAttachRequestIds = new Set(claimed
+      .map((attach) => attach.attachRequestId)
+      .filter((attachRequestId): attachRequestId is string => typeof attachRequestId === 'string'))
+    expect(claimedAttachRequestIds.size).toBeGreaterThanOrEqual(1)
 
     // The sync preamble must have RE-ARMED the modes on the fresh surface —
     // and the mechanism is asserted at the wire level, not only by outcome:
@@ -685,11 +779,37 @@ test.describe('Multi-Client', () => {
       const modes = window.__FRESHELL_TEST_HARNESS__?.getTerminalModes?.(id)
       return modes?.mouseTrackingMode === 'any' && modes?.bufferType === 'alternate'
     }, terminalId, { timeout: 45_000 })
+    await receivedFrames.waitForFrame(
+      (frame) => (
+        frame.type === 'terminal.modes.sync'
+        && frame.terminalId === terminalId
+        && typeof frame.attachRequestId === 'string'
+        && claimedAttachRequestIds.has(frame.attachRequestId)
+        && typeof frame.data === 'string'
+      ),
+      'terminal.modes.sync for a claimed post-reload surface-reset attach',
+      45_000,
+    )
+    const syncFrames = receivedFrames.frames.filter((frame): frame is ReceivedWsFrame & {
+      terminalId: string
+      attachRequestId: string
+      data: string
+    } => (
+      frame.type === 'terminal.modes.sync'
+      && frame.terminalId === terminalId
+      && typeof frame.attachRequestId === 'string'
+      && claimedAttachRequestIds.has(frame.attachRequestId)
+      && typeof frame.data === 'string'
+    ))
     expect(
       syncFrames.length,
       'a fresh-reload attach must receive at least one terminal.modes.sync frame',
     ).toBeGreaterThanOrEqual(1)
-    expect(syncFrames.every((f) => f.data.includes('\u001b[?1003h') && f.data.includes('\u001b[?1049h'))).toBe(true)
+    expect(syncFrames.every((frame) => (
+      frame.data.includes('\u001b[?1003h')
+      && frame.data.includes('\u001b[?1006h')
+      && frame.data.includes('\u001b[?1049h')
+    ))).toBe(true)
 
     // Consumption: once hydration of the marker attach completed, a later
     // transport-level reconnect must NOT re-claim (stuck markers would force
@@ -724,7 +844,7 @@ test.describe('Multi-Client', () => {
     await context.close()
   })
 
-  test('mode replay-sync: sync preamble is ordered before replay and excludes ?1004 (junk-focus hazard)', async ({ browser, serverInfo }) => {
+  test('mode replay-sync: sync preamble is ordered before replay and excludes ?1004 (junk-focus hazard)', async ({ browser, serverInfo, e2eMachineId }) => {
     // xterm 6.0.0 fires onRequestSendFocus on EVERY ?1004 arm, and
     // _reportFocus immediately emits ESC[I/ESC[O on a focused surface — so a
     // sync preamble replaying ?1004h would deterministically inject junk
@@ -739,7 +859,7 @@ test.describe('Multi-Client', () => {
     // attach), then observe the live ws frames: exactly one modes.sync frame,
     // it precedes every replay frame, its data contains ?2004h, never 1004.
     test.setTimeout(120_000)
-    const context = await newClientContext(browser)
+    const context = await newClientContext(browser, serverInfo, e2eMachineId)
     const page = await context.newPage()
 
     const syncFrames: Array<{ data: string; attachRequestId: string }> = []
@@ -822,7 +942,7 @@ test.describe('Multi-Client', () => {
     await context.close()
   })
 
-  test('mode replay-sync: replay no longer injects phantom xterm focus reports (kata 9gy8)', async ({ browser, serverInfo }) => {
+  test('mode replay-sync: replay no longer injects phantom xterm focus reports (kata 9gy8)', async ({ browser, serverInfo, e2eMachineId }) => {
     // Kata 9gy8 wire proof. xterm 6.0.0 re-fires the app's ?1004 focus-report
     // switch on EVERY ?1004h parse — including when the arming byte is inside
     // a replayed history chunk (page reload here) — and _reportFocus
@@ -834,7 +954,7 @@ test.describe('Multi-Client', () => {
     // arm byte still sets sendFocusMode on the fresh surface (asserted via
     // the harness modes accessor) — the mode is re-armed, the report is not.
     test.setTimeout(120_000)
-    const context = await newClientContext(browser)
+    const context = await newClientContext(browser, serverInfo, e2eMachineId)
     const page = await context.newPage()
     await page.setViewportSize({ width: 1400, height: 900 })
     await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
@@ -912,8 +1032,8 @@ test.describe('Multi-Client', () => {
     await context.close()
   })
 
-  test('client disconnect is handled gracefully', async ({ browser, serverInfo }) => {
-    const context = await newClientContext(browser)
+  test('client disconnect is handled gracefully', async ({ browser, serverInfo, e2eMachineId }) => {
+    const context = await newClientContext(browser, serverInfo, e2eMachineId)
     const page1 = await context.newPage()
     const page2 = await context.newPage()
 

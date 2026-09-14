@@ -5,7 +5,7 @@ import { test as base, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle } from '../helpers/external-target.js'
 
 /**
- * RENAME SCOPE CONTRACT (b5fb) -- cross-server parity leg.
+ * RENAME SCOPE CONTRACT (b5fb) -- Rust acceptance leg.
  *
  * Pins the naming-ownership contract documented in
  * docs/development/rename-scope-contract.md: pane labels belong to panes,
@@ -18,20 +18,15 @@ import { createE2eServerHandle } from '../helpers/external-target.js'
  * the durable provider-native session title. The reviewed "Reset to provider
  * title" flow clears an explicit override and reveals that provider title.
  *
- * The client is SHARED by both backends, so this spec runs on
- * `rust-chromium` AND `legacy-chromium`: the legacy run is the parity
- * control proving the Node server obeys the same scope contract as the
- * production Rust server.
- *
  * Each test drives a REAL UI journey (or the automation REST surface, where
  * the scenario is about automation) on its OWN dedicated seeded claude
  * session, then asserts BOTH the converging surface (pane header / tab
  * label) AND the invariant one (the sidebar row keeps the provider title).
  * Sessions are resumed by a sidebar click, spawning the fake `claude` CLI
- * (`CLAUDE_CMD` override -- restore-matrix.spec.ts precedent, works on both
- * server kinds). `GOOGLE_GENERATIVE_AI_API_KEY` is force-blanked so neither
- * server's auto-name pass can reach a real Gemini: with no key, both servers'
- * sweeps settle sessions on the first-message heuristic (so the seeded
+ * (`CLAUDE_CMD` override -- restore-matrix.spec.ts precedent).
+ * `GOOGLE_GENERATIVE_AI_API_KEY` is force-blanked so the server's auto-name
+ * pass cannot reach a real Gemini: with no key, its sweep settles sessions
+ * on the first-message heuristic (so the seeded
  * provider-native title below is deterministic), and every EXPLICIT session
  * rename writes the finalized `user` ladder rung which the sweeps never
  * clobber.
@@ -140,16 +135,15 @@ const test = base.extend<Record<never, never>, { sharedRootDir: string }>({
     await use(root)
     await fs.rm(root, { recursive: true, force: true }).catch(() => {})
   }, { scope: 'worker' }],
-  testServer: [async ({ e2eServerKind, sharedRootDir }, use) => {
+  testServer: [async ({ sharedRootDir }, use) => {
     const fakeClaudePath = await installFakeClaudeCli(path.join(sharedRootDir, 'bin'))
     const server = await createE2eServerHandle(process.env, {
-      kind: e2eServerKind,
       construct: {
         env: {
           CLAUDE_CMD: fakeClaudePath,
           // Never let a host-environment key enable either server's AI
           // branch: this spec's convergence must be deterministic (and
-          // live-Gemini-free) on both kinds.
+          // live-Gemini-free) on the Rust baseline.
           GOOGLE_GENERATIVE_AI_API_KEY: '',
         },
         setupHome: async (homeDir) => {
@@ -195,7 +189,7 @@ function visiblePaneHeader(page: import('@playwright/test').Page) {
 }
 
 /** Sidebar-click resume of a dedicated seeded session (the WS create path,
- * which registers the terminal's session identity on both server kinds). */
+ * which registers the terminal's session identity). */
 async function resumeSeededSession(
   page: import('@playwright/test').Page,
   harness: import('../helpers/test-harness.js').TestHarness,
@@ -286,12 +280,12 @@ test.describe('Title sync convergence', () => {
 
     // The server-side layout mirror is client-pushed (`ui.layout.sync`,
     // 200 ms trailing debounce, layoutMirrorMiddleware.ts) — until it lands,
-    // BOTH servers answer a rename of the not-yet-mirrored pane with the
-    // Node-parity no-op 200 `{message:'pane not found'}` (router.ts:1411 /
-    // rename_pane lib.rs:1516-1521) and skip the broadcast entirely. That
+    // The Rust server answers a rename of the not-yet-mirrored pane with the
+    // no-op 200 `{message:'pane not found'}` (rename_pane lib.rs:1516-1521)
+    // and skips the broadcast entirely. That
     // miss is a real automation-contract outcome, not a convergence failure,
     // so arrange like a real automation client: target a pane the server
-    // actually lists (GET /api/panes on both kinds).
+    // actually lists (GET /api/panes).
     await expect.poll(async () => {
       const listRes = await page.request.get(`${serverInfo.baseUrl}/api/panes?tabId=${encodeURIComponent(tabId)}`, {
         headers: { 'x-auth-token': serverInfo.token },

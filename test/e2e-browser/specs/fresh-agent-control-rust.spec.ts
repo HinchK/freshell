@@ -52,7 +52,6 @@
  *      })
  *      process.stdin.resume()
  *   2. FRESHELL_FAKE_NOOP=1 npx playwright test --config test/e2e-browser/playwright.config.ts \
- *        --project=rust-chromium fresh-agent-control-rust -g "Allow"
  *   Expected: the approval-allow test fails — the approval card never renders
  *   (timeout waiting for role=alert "Permission request for Bash"), proving
  *   the assertion chain is not vacuous. (Recorded in the Task-8 report; with
@@ -75,8 +74,8 @@ import { test, expect } from '../helpers/fixtures.js'
 import {
   RustServer,
   GEMINI_STRIP_ENV_PREFIXES,
-  type TestServerInfo,
 } from '../helpers/rust-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js';
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-version.js'
@@ -334,7 +333,7 @@ async function bootWall(
     stripEnvPrefixes?: string[]
     setupHome?: (homeDir: string) => Promise<void>
   } = {},
-): Promise<{ server: RustServer; info: TestServerInfo; harness: TestHarness }> {
+): Promise<{ server: RustServer; info: E2eServerInfo; harness: TestHarness }> {
   const server = new RustServer({
     env: options.env,
     stripEnvPrefixes: options.stripEnvPrefixes,
@@ -429,7 +428,7 @@ async function waitForStdinFrame(
 
 /** Direct REST snapshot read — the route every card renders from. */
 async function fetchSnapshot(
-  info: TestServerInfo,
+  info: E2eServerInfo,
   sessionType: string,
   provider: string,
   threadId: string,
@@ -542,7 +541,7 @@ async function bootClaudeLane(
   extraEnv: Record<string, string> = {},
 ): Promise<{
   server: RustServer
-  info: TestServerInfo
+  info: E2eServerInfo
   harness: TestHarness
   sharedRoot: string
   projectDir: string
@@ -626,8 +625,7 @@ async function raisePermissionAndAssertNoDecisions(
 test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
   test.setTimeout(180_000)
 
-  test('approval: Allow writes the exact permission.respond, never before the click', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('approval: Allow writes the exact permission.respond, never before the click', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -657,8 +655,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
     }
   })
 
-  test('approval: Deny writes the deny decision, no success completion, pane stays usable', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('approval: Deny writes the deny decision, no success completion, pane stays usable', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -750,8 +747,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
     }
   })
 
-  test('approval: survives page reload mid-pending (exactly one restored card), Allow still works', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('approval: survives page reload mid-pending (exactly one restored card), Allow still works', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -794,8 +790,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
     }
   })
 
-  test('approval cancellation: composer Stop removes the card with zero fabricated decisions', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('approval cancellation: composer Stop removes the card with zero fabricated decisions', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -824,8 +819,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
     }
   })
 
-  test('Always Allow answers the second raise without a click', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('Always Allow answers the second raise without a click', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -864,8 +858,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
     }
   })
 
-  test('questions: single-choice, multi-select, and Other answers keyed by question text', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('questions: single-choice, multi-select, and Other answers keyed by question text', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -933,8 +926,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
     }
   })
 
-  test('compact: /compact instructions land on the same session; compacting shows; context retained', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('compact: /compact instructions land on the same session; compacting shows; context retained', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -1006,8 +998,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
     }
   })
 
-  test('capability gate: /fork is not offered for claude', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('capability gate: /fork is not offered for claude', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -1030,8 +1021,8 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
     }
   })
-  test('per-send settings reach the claude sidecar before the send (freshclaude)', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+
+  test('per-send settings reach the claude sidecar before the send (freshclaude)', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -1049,7 +1040,6 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
         .toBe('acceptEdits')
 
       await sendComposerText(page, 'settings probe')
-
       // Canonical machinery: the settings-bearing send routes through
       // configure_for_send, which writes a `configure` frame and awaits the
       // sidecar's ack BEFORE the user message frame — the stdin audit proves
@@ -1064,6 +1054,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
         (f) => f?.type === 'send' && f?.text === 'settings probe',
         'send frame for "settings probe"',
       )
+
       const frames = readStdinFrames(lane.stdinLog)
       const configureIdx = frames.findIndex(
         (f) => f?.type === 'configure' && f?.settings?.permissionMode === 'acceptEdits',
@@ -1101,8 +1092,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
 test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
   test.setTimeout(240_000)
 
-  test('kilroy lifecycle: create/send/approval/question/reload/cancel on the KILROY_ENABLED gate', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('kilroy lifecycle: create/send/approval/question/reload/cancel on the KILROY_ENABLED gate', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'kilroy', { KILROY_ENABLED: '1' })
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -1200,8 +1190,7 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
     }
   })
 
-  test('kilroy crash mid-turn + restart recover the SAME durable session, never a fabricated completion', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('kilroy crash mid-turn + restart recover the SAME durable session, never a fabricated completion', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'kilroy', { KILROY_ENABLED: '1' })
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -1300,14 +1289,11 @@ function projectSlugOf(cwd: string): string {
 /** Boot a freshcodex pane against the behavior-driven fake codex app-server. */
 async function bootCodexLane(
   page: Page,
-  // Per-test behavior knobs merged INTO FAKE_CODEX_APP_SERVER_BEHAVIOR
-  // (e.g. turnCompleteDelayMs to wedge a mid-flight turn).
   behavior: Record<string, unknown> = {},
-  // Per-test server env (e.g. FRESHELL_FRESHCODEX_QUIET_WINDOW_MS).
   extraEnv: Record<string, string> = {},
 ): Promise<{
   server: RustServer
-  info: TestServerInfo
+  info: E2eServerInfo
   harness: TestHarness
   sharedRoot: string
   projectDir: string
@@ -1382,18 +1368,78 @@ const CODEX_FORK_LIFECYCLE_METHODS = new Set([
   'thread/resume',
 ])
 
-/** Send one freshcodex turn and wait until its snapshot rows render. */
+/**
+ * Send one freshcodex turn only after the browser accepts it, then wait for
+ * the provider's durable idle snapshot. A durable snapshot from the previous
+ * turn is not permission to assume a newly clicked composer submit left the
+ * browser: FreshAgentView intentionally queues submits while its own outgoing
+ * reservation is still being reconciled.
+ */
 async function sendCodexTurnAndWaitRows(
   page: Page,
+  info: E2eServerInfo,
+  harness: TestHarness,
   expectedRowCount: number,
   text: string,
 ): Promise<void> {
+  const sentBefore = await harness.getSentWsMessages()
+  const matchingSendsBefore = (sentBefore as any[]).filter(
+    (message) => message?.type === 'freshAgent.send'
+      && message?.provider === 'codex'
+      && message?.sessionId === 'thread-new-1'
+      && message?.text === text,
+  ).length
   await sendComposerText(page, text)
+  await expect
+    .poll(
+      async () => (await harness.getSentWsMessages() as any[]).filter(
+        (message) => message?.type === 'freshAgent.send'
+          && message?.provider === 'codex'
+          && message?.sessionId === 'thread-new-1'
+          && message?.text === text,
+      ).length,
+      {
+        timeout: 30_000,
+        message: `the browser did not dispatch the Codex send for "${text}"`,
+      },
+    )
+    .toBe(matchingSendsBefore + 1)
   const paneRoot = page.locator('[data-context="fresh-agent"]').last()
   await expect(
     paneRoot.locator('article[data-turn-index]'),
     `${expectedRowCount} snapshot rows after "${text}"`,
   ).toHaveCount(expectedRowCount, { timeout: 30_000 })
+  // The pane layout starts idle and can paint rows before the provider has
+  // completed its turn. The Rust snapshot is the authoritative provider state;
+  // require both the expected durable rows and an idle status before the next
+  // send, compact, or fork action.
+  await expect
+    .poll(
+      async () => {
+        const snapshot = await fetchSnapshot(info, 'freshcodex', 'codex', 'thread-new-1')
+        return {
+          rows: snapshot?.turns?.length ?? 0,
+          status: snapshot?.status ?? null,
+        }
+      },
+      {
+        timeout: 30_000,
+        message: `timed out waiting for the durable Codex snapshot to settle after "${text}"`,
+      },
+    )
+    .toEqual({ rows: expectedRowCount, status: 'idle' })
+  // Synchronize the next UI action with the same client session status that
+  // releases the outgoing reservation, rather than the independently fetched
+  // provider snapshot alone.
+  await expect
+    .poll(
+      () => readFreshAgentSessionStatus(harness, 'thread-new-1'),
+      {
+        timeout: 30_000,
+        message: `the browser did not settle its Codex session after "${text}"`,
+      },
+    )
+    .toBe('idle')
 }
 
 /** The parent's durable rollout file under the fake's CODEX_HOME. */
@@ -1425,8 +1471,7 @@ async function readRollout(homeDir: string, threadId: string): Promise<string | 
 test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
   test.setTimeout(240_000)
 
-  test('Codex approvals and questions survive reload and send user decisions to the provider', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('Codex approvals and questions survive reload and send user decisions to the provider', async ({ page }) => {
     const lane = await bootCodexLane(page, { serverRequestsByPrompt: {
       'Approve tests': { id: 501, method: 'item/commandExecution/requestApproval', params: { command: 'npm test', reason: 'Run project tests' } },
       'Ask a question': { id: 'question-501', method: 'item/tool/requestUserInput', params: { isBlocking: true, questions: [{ id: 'color', header: 'Color', question: 'Choose a color', options: [{ label: 'Blue', description: 'Use blue' }] }] } },
@@ -1465,12 +1510,143 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
     }
   })
 
-  test('compact: thread/compact/start, never a turn; pane returns usable', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('a real Freshcodex thread persists its durable reference and reloads its snapshot metadata', async ({ page }) => {
     const lane = await bootCodexLane(page)
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
-      await sendCodexTurnAndWaitRows(page, 2, 'codex turn one')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 2, 'durable browser reload turn')
+
+      // The fake app-server's real thread/start plus its recorded snapshot are
+      // the lifecycle precondition the route-only metadata test cannot supply.
+      const beforeReloadLeaf = await paneLeaf(lane.harness, lane.tabId)
+      const threadId = beforeReloadLeaf?.content?.sessionId as string
+      expect(threadId).toBe('thread-new-1')
+      expect(beforeReloadLeaf?.content?.sessionRef).toEqual({ provider: 'codex', sessionId: threadId })
+      const durableSnapshot = await fetchSnapshot(lane.info, 'freshcodex', 'codex', threadId)
+      expect(durableSnapshot?.turns).toHaveLength(2)
+      expect(
+        readCodexOps(lane.opLogPath).filter((op) => op.method === 'thread/start' && op.threadId === threadId),
+        'the thread must have been created by the real fake app-server before persistence',
+      ).toHaveLength(1)
+
+      await flushPersistence(page)
+      const persisted = await page.evaluate(({ tabId, paneId }) => {
+        const raw = localStorage.getItem('freshell.layout.v3')
+        if (!raw) throw new Error('Missing persisted layout after Freshcodex flush')
+        const layout = JSON.parse(raw)
+        const findPane = (node: any): any => {
+          if (node?.type === 'leaf' && node.id === paneId) return node.content
+          for (const child of node?.children ?? []) {
+            const found = findPane(child)
+            if (found) return found
+          }
+          return undefined
+        }
+        const content = findPane(layout.panes?.layouts?.[tabId])
+        if (!content) throw new Error('Persisted Freshcodex pane is missing')
+        return {
+          sessionRef: content.sessionRef,
+          hasSessionId: Object.prototype.hasOwnProperty.call(content, 'sessionId'),
+        }
+      }, { tabId: lane.tabId, paneId: beforeReloadLeaf.id })
+      expect(persisted).toEqual({
+        sessionRef: { provider: 'codex', sessionId: threadId },
+        hasSessionId: false,
+      })
+
+      // This route owns only the visual metadata fixture. It is installed
+      // after the real thread exists, so reload/reconciliation still targets
+      // the same Rust server and durable fake-app-server session above.
+      await page.route(
+        `${lane.info.baseUrl}/api/fresh-agent/threads/freshcodex/codex/${threadId}*`,
+        async (route) => route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            sessionType: 'freshcodex',
+            provider: 'codex',
+            threadId,
+            sessionId: threadId,
+            revision: 7,
+            status: 'idle',
+            summary: 'Freshcodex durable snapshot',
+            capabilities: { send: true, interrupt: true, approvals: false, questions: false, fork: true },
+            tokenUsage: { totalTokens: 42, inputTokens: 10, outputTokens: 32 },
+            worktrees: [{ id: 'wt-1', path: '/tmp/worktree', branch: 'feature/fresh-agent' }],
+            diffs: [{ id: 'diff-1', title: 'README.md' }],
+            childThreads: [{ id: 'child-1', threadId: 'child-thread', origin: 'codex', title: 'Subagent' }],
+            extensions: {
+              codex: {
+                review: { id: 'review-1', status: 'pending' },
+                fork: { parentThreadId: 'thread-parent-1' },
+              },
+            },
+            turns: [{
+              id: 'turn-reload',
+              turnId: 'turn-reload',
+              role: 'assistant',
+              summary: 'Codex durable transcript',
+              items: [{ id: 'item-reload', kind: 'text', text: 'Codex durable transcript' }],
+            }],
+          }),
+        }),
+      )
+
+      await page.reload({ waitUntil: 'domcontentloaded' })
+      const reloadedHarness = new TestHarness(page)
+      await reloadedHarness.waitForHarness()
+      await reloadedHarness.waitForConnection()
+      const reloadedTabId = (await reloadedHarness.getActiveTabId())!
+
+      // The handshake's reconcile inventory and the recovery request must both
+      // name the persisted durable reference. The latter may be attach or a
+      // create-shaped resume, but must never mint an unrelated thread.
+      await expect.poll(async () => {
+        const sent = await reloadedHarness.getSentWsMessages() as any[]
+        return sent.some((message) =>
+          message?.type === 'pane.reconcile.request'
+            && message?.panes?.some((pane: any) =>
+              pane?.kind === 'fresh-agent'
+                && pane?.sessionRef?.provider === 'codex'
+                && pane?.sessionRef?.sessionId === threadId,
+            ),
+        )
+      }, { timeout: 30_000, message: 'reload reconcile inventory must retain the durable Codex reference' }).toBe(true)
+      await expect.poll(async () => {
+        const sent = await reloadedHarness.getSentWsMessages() as any[]
+        return sent.some((message) =>
+          (message?.type === 'freshAgent.attach' || message?.type === 'freshAgent.create')
+            && (message?.sessionId === threadId
+              || message?.resumeSessionId === threadId
+              || message?.sessionRef?.sessionId === threadId),
+        )
+      }, { timeout: 30_000, message: 'reload must attach or resume the persisted Codex thread' }).toBe(true)
+      await expect.poll(async () => (
+        (await paneLeaf(reloadedHarness, reloadedTabId))?.content?.sessionRef?.sessionId ?? null
+      ), { timeout: 30_000 }).toBe(threadId)
+      expect(
+        readCodexOps(lane.opLogPath).filter((op) => op.method === 'thread/start' && op.threadId === threadId),
+        'reload must not create a second Codex thread',
+      ).toHaveLength(1)
+
+      const pane = page.locator('[data-context="fresh-agent"]').last()
+      await expect(pane).toContainText('Codex durable transcript', { timeout: 30_000 })
+      await expect(pane).toContainText('feature/fresh-agent')
+      await expect(pane).toContainText('README.md')
+      await expect(pane).toContainText('review-1')
+      await expect(pane).toContainText('pending')
+      await expect(pane).toContainText('thread-parent-1')
+    } finally {
+      await lane.server.stop().catch(() => {})
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
+  test('compact: thread/compact/start, never a turn; pane returns usable', async ({ page }) => {
+    const lane = await bootCodexLane(page)
+    try {
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 2, 'codex turn one')
 
       // Typed slash gesture → freshAgent.compact → thread/compact/start.
       const paneRoot = page.locator('[data-context="fresh-agent"]').last()
@@ -1496,20 +1672,19 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
 
       // Usable after compact: a follow-up prompt mints exactly the next turn
       // (two recorded turns -> four display rows).
-      await sendCodexTurnAndWaitRows(page, 4, 'codex post-compact turn')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 4, 'codex post-compact turn')
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
     }
   })
 
-  test('fork from tip: fork→archive→(child) unarchive→resume chain; source untouched; pane repoints', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('fork from tip: fork→archive→(child) unarchive→resume chain; source untouched; pane repoints', async ({ page }) => {
     const lane = await bootCodexLane(page)
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
-      await sendCodexTurnAndWaitRows(page, 2, 'codex turn one')
-      await sendCodexTurnAndWaitRows(page, 4, 'codex turn two')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 2, 'codex turn one')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 4, 'codex turn two')
 
       const parentRolloutBefore = await readRollout(lane.info.homeDir, 'thread-new-1')
       expect(parentRolloutBefore, 'the parent rollout must exist').toBeTruthy()
@@ -1578,13 +1753,12 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
     }
   })
 
-  test('per-turn fork: :row-N normalizes to the raw turn id, child diverges at the pin, dual durability', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('per-turn fork: :row-N normalizes to the raw turn id, child diverges at the pin, dual durability', async ({ page }) => {
     const lane = await bootCodexLane(page)
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
-      await sendCodexTurnAndWaitRows(page, 2, 'codex turn one')
-      await sendCodexTurnAndWaitRows(page, 4, 'codex turn two')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 2, 'codex turn one')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 4, 'codex turn two')
 
       // Fork from turn 1's ASSISTANT row (data-turn-index 1, the synthesized
       // split id `turn-1:row-1`) via the turn's real hover affordance.
@@ -1747,13 +1921,11 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
     }
   })
-
   // Wedged-sidecar deadman (r47n): the fake's turnCompleteDelayMs keeps the
   // process alive but the turn/completed broadcast effectively never lands
   // (3.6e6 ms), so the quiet window must surface the stuck state with recovery
   // instead of an eternal spinner.
-  test('wedged sidecar: quiet window surfaces the stuck state with recovery, not an eternal spinner', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('wedged sidecar: quiet window surfaces the stuck state with recovery, not an eternal spinner', async ({ page }) => {
     const lane = await bootCodexLane(
       page,
       { turnCompleteDelayMs: 3_600_000 },
@@ -1812,8 +1984,7 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
     }
   })
 
-  test('long turn within the quiet window completes normally and never shows the stuck state', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('long turn within the quiet window completes normally and never shows the stuck state', async ({ page }) => {
     const lane = await bootCodexLane(
       page,
       { turnCompleteDelayMs: 3_000 },
@@ -1847,13 +2018,12 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
     }
   })
 
-  test('per-send settings alter the turn payload against the Rust server (freshcodex)', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('per-send settings alter the turn payload against the Rust server (freshcodex)', async ({ page }) => {
     const lane = await bootCodexLane(page)
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
       // Turn 1 rides the pane's untouched defaults.
-      await sendCodexTurnAndWaitRows(page, 2, 'codex turn one')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 2, 'codex turn one')
       const threadId = (await paneLeaf(lane.harness, lane.tabId))?.content?.sessionId as string
       expect(threadId, 'the durable codex thread id must be known before turn two').toBeTruthy()
 
@@ -1884,7 +2054,7 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
 
       // Turn 2 must now carry the changed knobs (canonical's codex.rs merges
       // msg.settings over the session baseline before turn/start).
-      await sendCodexTurnAndWaitRows(page, 4, 'codex turn two')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 4, 'codex turn two')
 
       // Ground truth: the fake's recorded-turns file under the lane's isolated
       // CODEX_HOME (<home>/.codex/fake-turns/<threadId>.json). Each recorded
@@ -1917,7 +2087,7 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
 /** Boot a freshopencode pane against the HTTP/SSE fake opencode serve. */
 async function bootOpencodeLane(page: Page): Promise<{
   server: RustServer
-  info: TestServerInfo
+  info: E2eServerInfo
   harness: TestHarness
   sharedRoot: string
   projectDir: string
@@ -1990,8 +2160,7 @@ async function sendOpencodeTurn(
 test.describe('fresh-agent control surfaces — opencode lane (rust)', () => {
   test.setTimeout(240_000)
 
-  test('compact: POST /session/:id/summarize carries {providerID,modelID} exactly', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('compact: POST /session/:id/summarize carries {providerID,modelID} exactly', async ({ page }) => {
     const lane = await bootOpencodeLane(page)
     try {
       const sessionId = await sendOpencodeTurn(page, lane.harness, lane.tabId, 'opencode turn one', 1, lane.auditLogPath)
@@ -2022,8 +2191,7 @@ test.describe('fresh-agent control surfaces — opencode lane (rust)', () => {
     }
   })
 
-  test('fork from tip: child insert + pane repoint; source untouched after parent kill', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('fork from tip: child insert + pane repoint; source untouched after parent kill', async ({ page }) => {
     const lane = await bootOpencodeLane(page)
     try {
       const parentId = await sendOpencodeTurn(page, lane.harness, lane.tabId, 'opencode turn one', 1, lane.auditLogPath)
@@ -2077,8 +2245,7 @@ test.describe('fresh-agent control surfaces — opencode lane (rust)', () => {
     }
   })
 
-  test('per-turn fork: messageID lands; child history stops at the pin; dual durability', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('per-turn fork: messageID lands; child history stops at the pin; dual durability', async ({ page }) => {
     const lane = await bootOpencodeLane(page)
     try {
       const parentId = await sendOpencodeTurn(page, lane.harness, lane.tabId, 'opencode turn one', 1, lane.auditLogPath)

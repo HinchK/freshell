@@ -20,6 +20,8 @@ steps:
       - 'docker/cloud-run/Dockerfile'
       - '-t'
       - '${_IMAGE}'
+      - '--build-arg'
+      - 'FRESHELL_BUILD_COMMIT=${_FRESHELL_BUILD_COMMIT}'
       - '--cache-from'
       - 'type=registry,ref=${_IMAGE}-cache'
       - '--cache-to'
