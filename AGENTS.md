@@ -139,6 +139,7 @@ npm run serve               # Build and run production server
 **On WSL machines, "the desktop app" means the Windows app.** Always build, install, and launch the Windows Electron app (`npm run electron:build:win` + the NSIS installer) — never a Linux AppImage/deb under WSLg. The Windows build must run as a native Windows process (WSL cannot compile `node-pty` for win32); drive it from WSL by rsyncing to a Windows-local dir and running Windows npm via `cmd.exe` — see [docs/development/windows-electron-build.md](docs/development/windows-electron-build.md).
 
 ### Testing
+Pre-push gate: every `git push` runs the cheap local checks (cargo fmt, typecheck, clippy) filtered by what the push changes — see [docs/development/pre-push-gate.md](docs/development/pre-push-gate.md). Bypass: `git push --no-verify`.
 Backend fallback policy: never silently fall back from the configured cloud test backend to local — if the cloud path fails, fix it; a local-backend run may substitute only when the cloud path cannot be fixed AND the user explicitly approves.
 
 ```bash
