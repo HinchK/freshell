@@ -50,6 +50,7 @@ pub mod existence;
 pub mod host_stats_collector;
 pub mod host_stats_interest;
 pub mod identity;
+pub(crate) mod identity_ownership;
 pub mod invariants;
 pub mod opencode_association;
 pub mod opencode_lane;

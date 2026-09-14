@@ -139,6 +139,23 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
         if opencode_claim_refused(state, &located.terminal_id, &located.session_id).await {
             continue;
         }
+        // b8ke ext r11 F1: the learned identity claims and commits
+        // Live{Terminal} under the canonical key through the shared
+        // coordinator (fail-closed: a refusal mutates NO identity home —
+        // parity with the codex adoption tail). Pre-r11 the locator
+        // adoption only updated the identity homes while the real
+        // terminal writer ran with a VACANT canonical key.
+        if !crate::identity_ownership::coordinator_commit_identity(
+            state,
+            "opencode",
+            &located.terminal_id,
+            &located.session_id,
+            None,
+        )
+        .await
+        {
+            continue;
+        }
 
         state.identity.upsert(
             &located.terminal_id,
@@ -469,6 +486,16 @@ mod tests {
             ledger_dir.to_path_buf(),
         )));
         (state, rx)
+    }
+
+    /// b8ke ext r11 F1: wire the shared coordinator into a locator fixture
+    /// (both the WsState and the registry — the commit path reads both).
+    fn wire_ownership(state: &mut WsState) -> StdArc<freshell_ownership::RuntimeOwnershipRegistry> {
+        let ownership = StdArc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        state.registry =
+            freshell_terminal::TerminalRegistry::new().with_ownership(StdArc::clone(&ownership));
+        state.ownership = Some(StdArc::clone(&ownership));
+        ownership
     }
 
     fn unique_temp_dir(label: &str) -> std::path::PathBuf {
@@ -1251,5 +1278,98 @@ mod tests {
         state.registry.kill("t1");
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&ledger_dir);
+    }
+
+    /// b8ke ext r11 F1: the opencode LOCATOR ADOPTION (a canonical ses_ id
+    /// learned after the CLI starts) commits Live{Terminal} under the
+    /// learned canonical key — pre-r11 the drain only updated the identity
+    /// homes while the real terminal writer ran with a VACANT canonical
+    /// key, so a Fresh Agent lifecycle op saw no prior owner.
+    #[tokio::test]
+    async fn opencode_locator_adoption_commits_live_terminal_under_the_learned_key() {
+        let home = unique_temp_dir("r11-adopt");
+        let (mut state, _rx) = state_with_locator(home.clone());
+        let ownership = wire_ownership(&mut state);
+        let db = open_seed_db(&home);
+
+        let spec = freshell_platform::build_spawn_spec(
+            freshell_platform::ShellType::System,
+            freshell_platform::detect::HostOs::Linux,
+            false,
+            Some("/tmp"),
+            &freshell_platform::RealEnv,
+            &freshell_platform::RealFileProbe,
+            &std::collections::BTreeMap::new(),
+            None,
+            None,
+        );
+        state
+            .registry
+            .create(
+                &spec,
+                &std::collections::BTreeMap::new(),
+                "t1".to_string(),
+                "stream-1".to_string(),
+                "opencode",
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("spawn a real shell for the test PTY");
+        state
+            .registry
+            .set_meta("t1", None, None, Some("opencode".to_string()), None);
+
+        maybe_arm(&state, "t1", "opencode", Some("/tmp"), None);
+        note_possible_submit(&state, "t1", "\r");
+
+        insert_session(
+            &db,
+            "ses_r11_adopt",
+            "/tmp",
+            crate::terminal::now_ms(),
+            None,
+            None,
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        for _ in 0..40 {
+            drain_and_associate(&state).await;
+            if state
+                .identity
+                .get("t1")
+                .and_then(|i| i.session_id)
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        assert_eq!(
+            state
+                .identity
+                .get("t1")
+                .and_then(|i| i.session_id)
+                .as_deref(),
+            Some("ses_r11_adopt"),
+            "the locator drain bound the identity"
+        );
+        // THE CONTRACT: the canonical key holds Live{Terminal} naming the
+        // adopting terminal (pre-r11: Vacant).
+        assert!(
+            crate::identity_ownership::holds_live_terminal_owner(
+                &ownership,
+                "opencode",
+                "ses_r11_adopt",
+                "t1"
+            ),
+            "the locator adoption commits Live{{Terminal}} under the learned key — state: {:?}",
+            ownership.observe("opencode", "ses_r11_adopt").state
+        );
+
+        state.registry.kill("t1");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

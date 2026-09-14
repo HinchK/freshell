@@ -396,6 +396,22 @@ async fn rebind_fanout(
     cwd: Option<&str>,
     previous: Option<String>,
 ) {
+    // b8ke ext r11 F1: the signal rebind routes through the shared
+    // coordinator FIRST (fail-closed: a refusal mutates NO identity
+    // home). The first-bind lane commits Live{Terminal} under the
+    // learned id; the live-pane rebind commits the new key AND releases
+    // the superseded old key in the same step.
+    if !crate::identity_ownership::coordinator_commit_identity(
+        state,
+        "opencode",
+        &sig.terminal_id,
+        &sig.session_id,
+        previous.as_deref(),
+    )
+    .await
+    {
+        return;
+    }
     state.identity.upsert(
         &sig.terminal_id,
         Some("opencode"),

@@ -348,6 +348,16 @@ mod tests {
         (state, rx)
     }
 
+    /// b8ke ext r11 F1: wire the shared coordinator into a locator fixture
+    /// (both the WsState and the registry — the commit path reads both).
+    fn wire_ownership(state: &mut WsState) -> StdArc<freshell_ownership::RuntimeOwnershipRegistry> {
+        let ownership = StdArc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        state.registry =
+            freshell_terminal::TerminalRegistry::new().with_ownership(StdArc::clone(&ownership));
+        state.ownership = Some(StdArc::clone(&ownership));
+        ownership
+    }
+
     fn unique_temp_dir(label: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -848,5 +858,208 @@ mod tests {
         state.registry.kill("t1");
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&ledger_dir);
+    }
+
+    /// b8ke ext r11 F1: the codex ADOPTION (a canonical thread id learned
+    /// after the CLI starts — the NORMAL path for fresh codex terminals)
+    /// commits Live{Terminal} under the learned canonical key. Pre-r11 the
+    /// adoption only updated the identity homes while the real terminal
+    /// writer ran with a VACANT canonical key — a Fresh Agent lifecycle op
+    /// saw no prior owner and could not stop-and-confirm-reap it.
+    #[tokio::test]
+    async fn codex_adoption_commits_live_terminal_under_the_learned_key() {
+        const TID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let home = unique_temp_dir("r11-adopt");
+        let (mut state, _rx) = state_with_locator(home.clone());
+        let ownership = wire_ownership(&mut state);
+
+        let spec = freshell_platform::build_spawn_spec(
+            freshell_platform::ShellType::System,
+            freshell_platform::detect::HostOs::Linux,
+            false,
+            Some("/tmp"),
+            &freshell_platform::RealEnv,
+            &freshell_platform::RealFileProbe,
+            &std::collections::BTreeMap::new(),
+            None,
+            None,
+        );
+        state
+            .registry
+            .create(
+                &spec,
+                &std::collections::BTreeMap::new(),
+                "t1".to_string(),
+                "stream-1".to_string(),
+                "codex",
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("spawn a real shell for the test PTY");
+        state
+            .registry
+            .set_meta("t1", None, None, Some("codex".to_string()), None);
+
+        assert!(
+            crate::codex_identity::adopt_codex_identity(
+                &state,
+                crate::codex_identity::CodexAdoption {
+                    terminal_id: "t1",
+                    thread_id: TID,
+                    rollout_path: None,
+                    cwd: Some("/tmp"),
+                },
+            )
+            .await,
+            "the adoption itself succeeds"
+        );
+
+        // THE CONTRACT: the canonical key holds Live{Terminal} naming the
+        // adopting terminal (pre-r11: Vacant).
+        assert!(
+            crate::identity_ownership::holds_live_terminal_owner(&ownership, "codex", TID, "t1"),
+            "the adoption commits Live{{Terminal}} under the learned key — state: {:?}",
+            ownership.observe("codex", TID).state
+        );
+
+        // THE F1 CONTRACT: a Fresh Agent handoff on the canonical key SEES
+        // the prior terminal owner (stop-and-confirm-reap has its target;
+        // pre-r11 it entered from Vacant — no prior runtime to stop).
+        let outcome = ownership.begin_handoff(
+            "codex",
+            TID,
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-r11-handoff",
+            None,
+            "test",
+            crate::terminal::now_ms().max(0) as u64,
+        );
+        match outcome {
+            freshell_ownership::BeginOutcome::Granted { .. } => {
+                match ownership.observe("codex", TID).state {
+                    freshell_ownership::OwnershipState::Handoff {
+                        prior: Some((owner, _)),
+                        ..
+                    } => {
+                        assert_eq!(
+                            owner.kind,
+                            freshell_ownership::RuntimeOwnerKind::Terminal,
+                            "the handoff sees the ADOPTED terminal as its prior"
+                        );
+                        assert_eq!(owner.terminal_id.as_deref(), Some("t1"));
+                    }
+                    other => panic!("the handoff must hold the record: {other:?}"),
+                }
+            }
+            other => panic!("the handoff must grant against the adopted prior: {other:?}"),
+        }
+        // Restore the record for cleanup.
+        let _ = ownership.fail("codex", TID, "op-r11-handoff", 1, false);
+        state.registry.kill("t1");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// b8ke ext r11 F1: the codex fork REBIND moves the coordinator
+    /// authority in the SAME step as the identity move — the fork child's
+    /// canonical key commits Live{Terminal} AND the superseded old key is
+    /// RELEASED (pre-r11 the old key stayed live after the writer moved —
+    /// a stale-live lie).
+    #[tokio::test]
+    async fn codex_rebind_releases_the_old_canonical_key() {
+        const OLD_TID: &str = "11111111-2222-3333-4444-555555555555";
+        const NEW_TID: &str = "99999999-8888-7777-6666-000000000000";
+        let home = unique_temp_dir("r11-rebind");
+        let (mut state, _rx) = state_with_locator(home.clone());
+        let ownership = wire_ownership(&mut state);
+
+        let spec = freshell_platform::build_spawn_spec(
+            freshell_platform::ShellType::System,
+            freshell_platform::detect::HostOs::Linux,
+            false,
+            Some("/tmp"),
+            &freshell_platform::RealEnv,
+            &freshell_platform::RealFileProbe,
+            &std::collections::BTreeMap::new(),
+            None,
+            None,
+        );
+        state
+            .registry
+            .create(
+                &spec,
+                &std::collections::BTreeMap::new(),
+                "t1".to_string(),
+                "stream-1".to_string(),
+                "codex",
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("spawn a real shell for the test PTY");
+        state
+            .registry
+            .set_meta("t1", None, None, Some("codex".to_string()), None);
+
+        // The pane first ADOPTS the old identity (the coordinator commit
+        // rides along).
+        assert!(
+            crate::codex_identity::adopt_codex_identity(
+                &state,
+                crate::codex_identity::CodexAdoption {
+                    terminal_id: "t1",
+                    thread_id: OLD_TID,
+                    rollout_path: None,
+                    cwd: Some("/tmp"),
+                },
+            )
+            .await,
+            "the pre-rebind adoption succeeds"
+        );
+        assert!(crate::identity_ownership::holds_live_terminal_owner(
+            &ownership, "codex", OLD_TID, "t1"
+        ));
+
+        // THE REBIND (the in-TUI fork move): old → new.
+        let rollout = std::path::Path::new(&home).join("fork-rollout.jsonl");
+        std::fs::write(&rollout, "{}\n").expect("write the child rollout path target");
+        assert!(
+            crate::codex_identity::rebind_codex_identity(
+                &state,
+                crate::codex_identity::CodexRebind {
+                    terminal_id: "t1",
+                    old_session_id: OLD_TID,
+                    new_session_id: NEW_TID,
+                    rollout_path: rollout.as_path(),
+                    cwd: Some("/tmp"),
+                },
+            )
+            .await,
+            "the rebind itself succeeds"
+        );
+
+        // THE CONTRACT: the new canonical key is the live owner...
+        assert!(
+            crate::identity_ownership::holds_live_terminal_owner(
+                &ownership, "codex", NEW_TID, "t1"
+            ),
+            "the rebind commits Live{{Terminal}} under the fork child's key — state: {:?}",
+            ownership.observe("codex", NEW_TID).state
+        );
+        // ...and the OLD key left NO stale-live record (released in the
+        // same step — pre-r11 it stayed Live{Terminal} over the moved
+        // writer).
+        assert!(
+            !matches!(
+                ownership.observe("codex", OLD_TID).state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ),
+            "the rebind releases the old canonical key — state: {:?}",
+            ownership.observe("codex", OLD_TID).state
+        );
+        state.registry.kill("t1");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

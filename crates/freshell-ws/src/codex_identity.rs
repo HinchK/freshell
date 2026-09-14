@@ -61,6 +61,24 @@ pub(crate) async fn adopt_codex_identity(state: &WsState, a: CodexAdoption<'_>) 
     if codex_claim_refused(state, a.terminal_id, a.thread_id).await {
         return false;
     }
+    // b8ke ext r11 F1: the learned identity claims and commits
+    // Live{Terminal} under the canonical key through the shared
+    // coordinator (fail-closed: a refusal mutates NO identity home —
+    // the pane keeps its unbound state, and the hit is not consumed by
+    // a false association). Pre-r11 the adoption only updated identity
+    // metadata, the registry, and the pane ledger while the real
+    // terminal writer ran with a VACANT canonical key.
+    if !crate::identity_ownership::coordinator_commit_identity(
+        state,
+        "codex",
+        a.terminal_id,
+        a.thread_id,
+        None,
+    )
+    .await
+    {
+        return false;
+    }
     apply_codex_identity(
         state,
         a.terminal_id,
@@ -106,6 +124,22 @@ pub(crate) async fn rebind_codex_identity(state: &WsState, r: CodexRebind<'_>) -
     // Guard 3 -- shared adoption guards on the claimed id (retired-inclusive
     // bound-elsewhere + freshagent lanes).
     if codex_claim_refused(state, r.terminal_id, r.new_session_id).await {
+        return false;
+    }
+    // b8ke ext r11 F1: the rebind moves the coordinator authority in the
+    // SAME step as the identity move — commit Live{Terminal} under the
+    // fork child's canonical key and RELEASE the superseded old key
+    // (never a stale-live old key after the writer moved). A refusal
+    // mutates nothing.
+    if !crate::identity_ownership::coordinator_commit_identity(
+        state,
+        "codex",
+        r.terminal_id,
+        r.new_session_id,
+        Some(r.old_session_id),
+    )
+    .await
+    {
         return false;
     }
     tracing::info!(terminal_id = %r.terminal_id, old = %r.old_session_id, new = %r.new_session_id,

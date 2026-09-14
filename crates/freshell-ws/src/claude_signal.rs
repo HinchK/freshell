@@ -305,6 +305,23 @@ async fn apply_claude_signal(state: &WsState, sig: &ClaudeSignal) -> SignalDispo
         return SignalDisposition::Acted;
     }
     let previous = current.session_id.clone();
+    // b8ke ext r11 F1: the signal rebind routes through the shared
+    // coordinator FIRST (fail-closed: a refusal mutates NO identity
+    // home — the file is consumed as acted, the next SessionStart
+    // retries). The rebind commits Live{Terminal} under the new
+    // canonical key AND releases the superseded old key in the same
+    // step.
+    if !crate::identity_ownership::coordinator_commit_identity(
+        state,
+        "claude",
+        &sig.terminal_id,
+        &sig.session_id,
+        previous.as_deref(),
+    )
+    .await
+    {
+        return SignalDisposition::Acted;
+    }
     tracing::info!(terminal_id = %sig.terminal_id, new = %sig.session_id,
         source = ?sig.source, "claude_rebind: SessionStart reported a new session id");
     // Same pinned order as the codex tail: identity -> meta -> ledger
