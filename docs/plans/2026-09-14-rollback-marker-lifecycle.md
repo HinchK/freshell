@@ -44,6 +44,7 @@ Implement the agreed restorability-driven lifecycle for the fresh-agent "Rolled 
 - **ESM:** relative imports under `shared/` keep `.js` extensions.
 - **A11y:** every new interactive element is a semantic `<button type="button">` with a discernible aria-label; `npm run lint` (eslint-plugin-jsx-a11y, CI-gated) must pass.
 - **Test coordination:** check `npm run test:status` before any broad run; wait on a foreign holder rather than killing it; label broad runs with `FRESHELL_TEST_SUMMARY`. Focused unit runs use the repo-owned passthrough: `npm run test:vitest -- run <paths>`.
+- **Vitest passthrough rule (validated by executed reproduction):** the coordinator classifies forwarded paths by config ownership. Default-owned paths (`test/unit/client/**`, `test/unit/shared/**`, `test/unit/lib/**`) run under `config/vitest/vitest.config.ts`. Server-owned paths (`test/unit/server/**`, `test/server/**`) REQUIRE the explicit config with the subcommand AFTER it: `npm run test:vitest -- --config config/vitest/vitest.server.config.ts run <paths>`. NEVER mix default-owned and server-owned paths in one invocation — a mixed set falls to the default config, which EXCLUDES `test/unit/server/**`: the server files silently do not run and the command still exits 0 (a false green). Never put a bare leading `run` before an explicit `--config` — the coordinator prepends its own `run` and the stray positional becomes a path filter matching every file with `run` in its path. Evidence: scripts/testing/coordinator-command-matrix.ts:546-557, config/vitest/vitest.config.ts:43, executed reproductions in the load-bearing finder report (§A1).
 - **e2e:** `test/e2e-browser/specs/fresh-agent-rollback-rust.spec.ts` must stay out of `CLOUD_SKIP_SPECS`/`CLOUD_SKIP_TITLES`; every test ≤120s wall; runs require `--project=rust-chromium` (the match-all chromium project ignores RUST_ONLY_SPECS — a filtered-to-nothing run is not coverage). The e2e boots its own ephemeral servers; it never touches the live port-3001 server, which must never be restarted without the user's explicit "APPROVED".
 - **`server/` (legacy TypeScript server) is untouched** by this feature.
 - **docs/index.html needs no change:** the mock depicts no rolled-back section today (verified — zero matches for "rolled back" in the mock), and this is a presentation-lifecycle nuance, not a major feature.
@@ -97,7 +98,8 @@ fn stamp_rollback_snapshot_stamps_restorable_on_all_roles_matching_the_redoable_
     //  - with can_redo = false over the same record, every restorable stamp
     //    flips to false and redoableTurnIds is empty.
     // Build the record with the same helpers the neighboring tests use
-    // (RollbackRecord::default + begin_new_epoch/push_entry patterns at
+    // (RollbackRecord::empty(now_ms) — there is NO Default impl — then
+    // begin_new_epoch/splice_undo_entry/push_entry per the patterns at
     // rollback_record.rs:1151-1183).
 }
 ```
@@ -114,7 +116,7 @@ Rust — extend the per-provider snapshot tests (each already pins the exact `ro
 - `codex.rs` `codex_snapshot_stamps_paginated_capabilities_the_marker_bucket_and_the_revision_floor` (~17412) and `get_snapshot_surfaces_the_durable_rollback_record_and_floors_the_revision` (~17483): bucket turns `restorable == false` (codex is undo-only — collapsed from birth).
 - `snapshot.rs` `claude_locator_surfaces_the_durable_rollback_record` (~643): the REST-surfaced bucket turns `restorable == true`.
 
-Rust — add snapshot reads inside the three real-handler op-sequence tests (the builders are directly callable; use the same call shape the neighboring snapshot tests use):
+Rust — add snapshot reads inside the three real-handler op-sequence tests (call the PUBLIC state getters the neighboring snapshot tests use — NOT the `build_*_json` functions, which are lib-private/file-private: `st.get_opencode_snapshot(thread_id, cwd)` for opencode, `get_claude_snapshot(session_type, thread_id, &record)` (or `pub(crate) build_claude_snapshot_json`) for claude, `st.get_snapshot(thread_id, cwd)` for codex):
 
 - `opencode_ws.rs` `handle_rollback_after_a_resend_starts_a_new_epoch_and_redo_still_works` (~11783): immediately after the second undo's existing record asserts (bucket `[msg_u3,msg_a3,msg_u4,msg_a4]`, epochs `[0,1]`, `can_redo()` true — around ~11818-11840) and BEFORE the redo leg, build the snapshot and assert: msg_u3/msg_a3 `restorable == false`; msg_u4/msg_a4 `restorable == true`; `rollback.redoableTurnIds == ["msg_u4"]`.
 - `claude.rs` `handle_rollback_after_a_resend_re_roots_the_chain_and_redo_restores_the_new_epoch` (~14736): after the second undo's record asserts (entries union [u2,a2]+[uq,aq], epochs `[0,1]` — around ~14828-14884) and BEFORE the redo leg, build the snapshot and assert: u2/a2 `restorable == false`; uq/aq `restorable == true`.
@@ -160,15 +162,15 @@ TS — in `test/unit/shared/fresh-agent-contract.test.ts`, in the `rollback surf
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
-Run: `cargo test -p freshell-freshagent stamp_rollback_snapshot 2>&1 | tail -20`
+Run: `cargo test -p freshell-freshagent stamp_rollback_snapshot`
 
 Expected: FAIL — the new `restorable` assertions fail because `stamp_rollback_snapshot` does not stamp the key (assertions on `turn["restorable"]` mismatch a `Value::Null`/missing key), and the new all-roles test fails for the same reason.
 
-Run: `cargo test -p freshell-freshagent -- claude_snapshot opencode_snapshot codex_snapshot claude_locator 2>&1 | tail -20`
+Run: `cargo test -p freshell-freshagent -- claude_snapshot opencode_snapshot codex_snapshot claude_locator`
 
 Expected: FAIL for the same missing-key reason in the extended provider tests.
 
-Run: `npm run test:vitest -- run test/unit/shared/fresh-agent-contract.test.ts 2>&1 | tail -20`
+Run: `npm run test:vitest -- run test/unit/shared/fresh-agent-contract.test.ts`
 
 Expected: FAIL — `restorable: true` and `restorableTypo` reject against the strict turn schema (undeclared key), i.e. the schema change is missing.
 
@@ -214,15 +216,15 @@ TS — `shared/fresh-agent-contract.ts`, in `FreshAgentTurnSchema` immediately a
 
 - [ ] **Step 4: Run the focused tests**
 
-Run: `cargo test -p freshell-freshagent stamp_rollback_snapshot 2>&1 | tail -5`
+Run: `cargo test -p freshell-freshagent stamp_rollback_snapshot`
 
 Expected: PASS
 
-Run: `cargo test -p freshell-freshagent 2>&1 | tail -5`
+Run: `cargo test -p freshell-freshagent`
 
-Expected: PASS (the full freshell-freshagent crate — this covers every extended provider/builder/handler test; ~2-4 min)
+Expected: PASS (the full freshell-freshagent crate — this covers every extended provider/builder/handler test. WALL CAVEAT: this worktree has NO shared cargo target dir — the FIRST run pays a full cold workspace build; expect tens of minutes, not minutes, and treat a long silent build as normal, not a hang. Subsequent runs are warm.)
 
-Run: `npm run test:vitest -- run test/unit/shared/fresh-agent-contract.test.ts 2>&1 | tail -5`
+Run: `npm run test:vitest -- run test/unit/shared/fresh-agent-contract.test.ts`
 
 Expected: PASS
 
@@ -234,13 +236,17 @@ No structural refactor is expected (one stamping site, one schema key). If the t
 
 Impacted set: the whole `freshell-freshagent` crate (every snapshot builder consumer) plus the shared contract suite plus the client/server snapshot-contract unit tests that strict-parse builder output.
 
-Run: `cargo test -p freshell-freshagent 2>&1 | tail -3` (if not already green in Step 4)
+Run: `cargo test -p freshell-freshagent` (if not already green in Step 4)
 
-Run: `npm run test:vitest -- run test/unit/shared/fresh-agent-contract.test.ts test/unit/server/rust-claude-snapshot-contract.test.ts test/unit/server/fresh-agent/opencode-normalize.test.ts 2>&1 | tail -5`
+Run: `npm run test:vitest -- run test/unit/shared/fresh-agent-contract.test.ts`
 
-Expected: PASS (the golden-fixture byte-identity test is unaffected — the fixture carries no rollback keys)
+Expected: PASS
 
-Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tail -3`
+Run: `npm run test:vitest -- --config config/vitest/vitest.server.config.ts run test/unit/server/rust-claude-snapshot-contract.test.ts test/unit/server/fresh-agent/opencode-normalize.test.ts`
+
+Expected: PASS (the server-config workload — the `run` subcommand goes AFTER the explicit `--config`, which the coordinator forwards verbatim. NEVER merge default-owned and server-owned paths into one `test:vitest` invocation: the coordinator routes mixed sets to the default config, which EXCLUDES `test/unit/server/**` — the server files silently do not run and the command still exits 0, a false green. Also never write the server invocation with a leading bare `run` before the config — the coordinator prepends its own `run` and the stray positional becomes a path filter pulling in every file with `run` in its path. The golden-fixture byte-identity test is unaffected — the fixture carries no rollback keys.)
+
+Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings`
 
 Expected: PASS (fix with `cargo fmt --all` if the new code needs it)
 
@@ -248,7 +254,7 @@ Run: `npm run contract:generate && git status --porcelain port/contract/ crates/
 
 Expected: contract regeneration produces NO diff and the porcelain output is EMPTY (the frozen WS surface is untouched — the Global Constraints explain why). A non-empty result is a stop-and-fix condition.
 
-Run: `npm run typecheck:client 2>&1 | tail -3`
+Run: `npm run typecheck:client`
 
 Expected: PASS
 
@@ -295,11 +301,11 @@ Rework and extend `test/unit/client/components/fresh-agent/FreshAgentView.test.t
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
-Run: `npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx 2>&1 | tail -25`
+Run: `npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx`
 
-Expected: FAIL in the driving cases (3, 5, 6, 7) — current code renders every marker row in one expanded list with no split, no disclosure line, and no per-state headers (case 3 finds no `Toggle rolled-back history` button; case 5 finds the frozen rows already visible; cases 6-7 find no collapsed line). Cases 2 and 4 remain green pre-change BY DESIGN: they pin the restorable-side rendering, which coincidentally matches today's output and must stay green through the change as regression guards.
+Expected: FAIL in the driving cases (2, 3, 5, 6, 7) — case 2 fails because its exact header-text assertion pins the NEW copy (`…; redo to restore.`) against today's `…; kept in history.` header (FreshAgentTranscript.tsx:1156); cases 3 and 5 find no `Toggle rolled-back history` button (and case 5 finds the frozen rows already visible); cases 6-7 find no collapsed line. Case 4 remains green pre-change BY DESIGN (it asserts only the two redo buttons and their clicks, which today's rendering already satisfies for restorable rows) — it is the restorable-side regression guard and must stay green through the change.
 
-Run: `npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx 2>&1 | tail -25`
+Run: `npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx`
 
 Expected: FAIL — the reworked/re-targeted assertions fail for the same reason (e.g. the collapsed-line waits never resolve because current code renders rows expanded).
 
@@ -392,7 +398,7 @@ where `renderMarkerRow` is a local function inside the component (defined just b
 
 - [ ] **Step 4: Run the focused tests**
 
-Run: `npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.test.tsx 2>&1 | tail -10`
+Run: `npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.test.tsx`
 
 Expected: PASS
 
@@ -404,11 +410,11 @@ The row markup is shared via `renderMarkerRow` (no duplication). Verify the comm
 
 Impacted set: every unit suite that renders `FreshAgentTranscript`/`FreshAgentView` with a rollback surface, the shared contract suite (unchanged expectations), plus typecheck and the a11y lint (the new disclosure button).
 
-Run: `npm run test:vitest -- run test/unit/client/components/fresh-agent/ test/unit/shared/fresh-agent-contract.test.ts test/unit/client/lib/fresh-agent-rollback.test.ts test/unit/client/lib/fresh-agent-ws.test.ts 2>&1 | tail -10`
+Run: `npm run test:vitest -- run test/unit/client/components/fresh-agent/ test/unit/shared/fresh-agent-contract.test.ts test/unit/client/lib/fresh-agent-rollback.test.ts test/unit/client/lib/fresh-agent-ws.test.ts`
 
 Expected: PASS
 
-Run: `npm run typecheck:client 2>&1 | tail -3 && npm run lint 2>&1 | tail -3`
+Run: `npm run typecheck:client && npm run lint`
 
 Expected: PASS (the new `<button>` carries `aria-expanded` + `aria-label`; eslint-plugin-jsx-a11y stays green)
 
@@ -562,34 +568,34 @@ Add a sibling test inside the describe (~599), placed after the multi-client con
 
 First build the fresh Rust binary and client for the e2e (the RustServer helper boots `target/release/freshell-server`; build explicitly so a stale binary can't silently test old server code):
 
-Run: `cargo build --release -p freshell-server 2>&1 | tail -3`
+Run: `cargo build --release -p freshell-server`
 
 Expected: PASS (fresh build with Task 1's changes)
 
-Run: `npm run test:e2e:local -- --project=rust-chromium test/e2e-browser/specs/fresh-agent-rollback-rust.spec.ts 2>&1 | tail -15`
+Run: `npm run test:e2e:local -- --project=rust-chromium test/e2e-browser/specs/fresh-agent-rollback-rust.spec.ts`
 
-Expected: PASS — all 9 tests (8 existing + 1 new), each within its 120s override. (First run pays the global-setup dist build + cargo release build; allow ~15-25 min total wall.)
+Expected: PASS — all 9 tests (8 existing + 1 new), each within its 120s override. (First run pays the global-setup dist build + a COLD cargo release build in this worktree — no shared target dir — so allow up to ~45 min total wall; a long silent cargo build is normal, not a hang. Later runs are warm.)
 
-Run: `npm run test:e2e:a11y-gate 2>&1 | tail -5`
+Run: `npm run test:e2e:a11y-gate`
 
-Expected: PASS — all new locators are role/aria-based; no baseline ratchet is expected. If the gate reports a violation, fix the locator per the gate's output rather than weakening it.
+Expected: this command is WARN-mode and always exits 0 — the check is the REPORT, not the exit status. Read the report and confirm the task's NEW assertions add no NEW violations (every new locator is role/aria-based or exact-text). PRE-EXISTING findings are NOT this change's to fix: this spec's two `css-class` findings (the `div.flex.items-start` row locators — deliberately retained for row-selector stability) and the tree's pre-existing baseline-drift violations predate this plan. Do NOT rewrite the pinned row locators and do NOT ratchet the selector baseline.
 
-- [ ] **Step 6: Verify the spec on the configured cloud backend**
-
-Check coordination first: `npm run test:status` — if a foreign holder is active, wait for it rather than killing it.
-
-Run: `npm run test:e2e:cloud -- --project=rust-chromium test/e2e-browser/specs/fresh-agent-rollback-rust.spec.ts 2>&1 | tail -15`
-
-Expected: PASS on the cloud backend (cloud images are commit-addressed — this run must happen AFTER Step 7's commit; run it from the committed tree, expecting the committed HEAD in the runner output). Confirm from the output that all 9 tests ran (a filtered-to-nothing run is not coverage) and the spec is NOT in CLOUD_SKIP_SPECS.
-
-- [ ] **Step 7: Commit the task**
+- [ ] **Step 6: Commit the task**
 
 ```bash
 git add test/e2e-browser/specs/fresh-agent-rollback-rust.spec.ts
 git commit -m "test(e2e): cover the rolled-back marker restorability lifecycle across all state flips"
 ```
 
-(If Step 6's cloud run found a failure, fix it and commit the fix; the commit must precede a re-run.)
+(The commit deliberately PRECEDES the cloud run: cloud images are commit-addressed, and a dirty tree forces the always-rebuild `-dirty` image path — faithful but ~13 minutes slower and the runner output would not show the committed HEAD.)
+
+- [ ] **Step 7: Verify the spec on the configured cloud backend**
+
+Check coordination first: `npm run test:status` — if a foreign holder is active, wait for it rather than killing it.
+
+Run: `npm run test:e2e:cloud -- --project=rust-chromium test/e2e-browser/specs/fresh-agent-rollback-rust.spec.ts`
+
+Expected: PASS on the cloud backend, from the tree at Step 6's commit — the runner output must show the committed HEAD (a `-dirty` image tag means the tree was not committed; stop and fix that, not the tests). Confirm from the output that all 9 tests ran (a filtered-to-nothing run is not coverage) and the spec is NOT in CLOUD_SKIP_SPECS. If the cloud run finds a failure, fix it, commit the fix, and re-run from the committed tree.
 
 ---
 
