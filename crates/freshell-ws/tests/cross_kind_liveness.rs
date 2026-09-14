@@ -4225,6 +4225,175 @@ async fn a_claude_compat_restore_create_commits_live_under_the_ladder_identity()
     }
 }
 
+/// b8ke ext r10 F2: the learned-identity claim's Adopt arm NEVER spawns.
+/// Another device's terminal owner on the ladder-resolved key (established
+/// between the ladder's row-based liveness check and the learned claim —
+/// the coordinator, not the registry, is where it lands) means the restore
+/// create answers the typed reconnect-revive refusal
+/// (SESSION_RESERVED + liveTerminalId), never a second overlapping
+/// `claude --resume` writer. Pre-r10 the Adopt arm proceeded WITHOUT a
+/// ticket and spawned the overlap.
+#[tokio::test]
+async fn a_restore_create_against_a_live_foreign_terminal_owner_never_spawns() {
+    let (url, registry, ws_state, gen1_exit_flag) = spawn_server_with_ladder_claude().await;
+    let mut ws = connect(&url).await;
+
+    // Generation #1: creates the ladder's identity row, then exits (the
+    // flag-driven deterministic exit from the r9 F2 helper).
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-r10-f2-ladder",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": uuid::Uuid::new_v4().to_string() },
+        }),
+    )
+    .await;
+    let created = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "terminal.created" && v["requestId"] == "req-r10-f2-ladder"
+    })
+    .await;
+    let first_terminal = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    let sid = created["sessionRef"]["sessionId"]
+        .as_str()
+        .expect("sid")
+        .to_string();
+    std::fs::write(&gen1_exit_flag, b"go\n").expect("arm the first generation's exit");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let gone = registry
+            .probe(&first_terminal)
+            .map(|row| row.status != freshell_protocol::TerminalRunStatus::Running)
+            .unwrap_or(true);
+        if gone {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first generation never exited"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // The exit's coordinator release must land before the foreign seed.
+    let ownership = ws_state.ownership.as_ref().expect("coordinator wired");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !matches!(
+        ownership.observe("claude", &sid).state,
+        freshell_ownership::OwnershipState::Vacant
+    ) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "generation #1's ownership never released"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // THE FOREIGN OWNER: another device's terminal holds the learned key
+    // (Live{Terminal}, no registry row here — exactly what the claim's
+    // Adopt outcome reports).
+    let freshell_ownership::BeginOutcome::Granted { generation } = ownership.begin_start(
+        "claude",
+        &sid,
+        freshell_ownership::RuntimeOwnerKind::Terminal,
+        "op-r10-f2-foreign-device",
+        None,
+        "foreign-device",
+        freshell_ownership::now_epoch_ms(),
+    ) else {
+        panic!("expected the foreign owner's grant")
+    };
+    assert_eq!(
+        ownership.commit_live(
+            "claude",
+            &sid,
+            "op-r10-f2-foreign-device",
+            generation,
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                terminal_id: Some("term-foreign-device".into()),
+                live_session_key: None,
+                pid: None,
+                ownership_id: None,
+            },
+        ),
+        freshell_ownership::CommitOutcome::Committed
+    );
+
+    // Generation #2: the ladder restore (same createRequestId, no
+    // sessionRef). The ladder's row-based liveness check passes (no
+    // RUNNING row); the learned-identity claim observes the foreign
+    // Live{Terminal} owner → Adopt → NEVER SPAWNS.
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-r10-f2-ladder",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "restore": true,
+        }),
+    )
+    .await;
+    let answer = await_frame(&mut ws, Duration::from_secs(30), |v| {
+        v["requestId"] == json!("req-r10-f2-ladder")
+            && (v["type"] == "terminal.created" || v["type"] == "error")
+    })
+    .await;
+    assert_eq!(
+        answer["type"], "error",
+        "the restore create against a live foreign terminal owner answers the \
+         typed refusal, never a second writer: {answer}"
+    );
+    assert_eq!(answer["code"], json!("SESSION_RESERVED"));
+    assert_eq!(
+        answer["liveTerminalId"],
+        json!("term-foreign-device"),
+        "the refusal names the live terminal the caller reattaches to: {answer}"
+    );
+    assert_eq!(
+        answer["ownerKind"],
+        json!("terminal"),
+        "the typed owner fields ride the refusal: {answer}"
+    );
+    assert!(
+        answer["ownerGeneration"].is_u64(),
+        "the owner generation rides the refusal: {answer}"
+    );
+    // No second writer: no new terminal row was ever registered for the
+    // session, and the foreign owner's record is untouched.
+    assert!(
+        !registry
+            .identity_probe_rows()
+            .iter()
+            .any(|r| r.terminal_id != first_terminal
+                && r.resume_session_id.as_deref() == Some(sid.as_str())),
+        "the restore spawned no second terminal row"
+    );
+    assert!(matches!(
+        ownership.observe("claude", &sid).state,
+        freshell_ownership::OwnershipState::Live { owner, .. }
+            if owner.terminal_id.as_deref() == Some("term-foreign-device")
+    ));
+    // Release the foreign seed (test hygiene).
+    ownership.force_release_for_confirmed_kill(
+        "claude",
+        &sid,
+        &freshell_ownership::ReleaseClaim {
+            operation_id: "op-r10-f2-foreign-device".to_string(),
+            generation,
+            runtime: None,
+        },
+        "test",
+    );
+}
+
 /// [`spawn_server`] with the ladder test's two-phase claude spec.
 async fn spawn_server_with_ladder_claude() -> (
     String,

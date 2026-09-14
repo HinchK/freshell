@@ -3156,6 +3156,13 @@ pub(crate) async fn handle_create(
     // refusal (non-negotiated). Refusals are the frozen D7 frame with the
     // ADDITIVE owner fields (round-1 review: `send_create_error_with_owner`).
     let mut terminal_ownership: Option<TerminalOwnershipClaim> = None;
+    // b8ke ext r10 F2: the wire locator the wire claim above consulted
+    // (None when the create carried no sessionRef). The LEARNED-identity
+    // claim below must NOT re-claim an id the wire claim already covered —
+    // a negotiated create's Adopt outcome follows the WIRE claim's designed
+    // semantics (the lease's BoundElsewhere attach / the D7 refusal), not
+    // the learned claim's fail-closed arm.
+    let mut wire_claim_locator_key: Option<(String, String)> = None;
     // b8ke delta round-2 F2: the terminal start's watchdog machinery —
     // the terminal-id slot (the registered cancellation kills the
     // registry row the moment it exists; the create's own settle gates
@@ -3170,6 +3177,7 @@ pub(crate) async fn handle_create(
     > = None;
     if let Some(locator) = create_session_locator(&create) {
         if state.ownership.is_some() {
+            wire_claim_locator_key = Some((locator.provider.clone(), locator.session_id.clone()));
             let operation_id = format!("term-create-{}", create.request_id);
             let initiator = format!("ws-conn-{conn_id}");
             // b8ke delta review F7: a half-sent observed pair (exactly one
@@ -3828,6 +3836,16 @@ pub(crate) async fn handle_create(
             .map(|sid| SessionLocator {
                 provider: mode.clone(),
                 session_id: sid.to_string(),
+            })
+            // b8ke ext r10 F2: an id the WIRE claim already covered keeps
+            // the wire claim's designed Adopt semantics (the lease's
+            // negotiated attach / the D7 refusal) — the fail-closed Adopt
+            // arm applies only to ids LEARNED after parsing (the prealloc
+            // mint, the P0.4 ladder, the healed mint).
+            .filter(|loc| {
+                wire_claim_locator_key
+                    .as_ref()
+                    .is_none_or(|(p, s)| *p != loc.provider || *s != loc.session_id)
             });
         if let Some(locator) = learned_locator {
             let operation_id = format!("term-create-learned-{}", create.request_id);
@@ -3905,7 +3923,71 @@ pub(crate) async fn handle_create(
                     });
                 }
                 freshell_freshagent::ownership_lane::TerminalLaneClaim::Unwired => {}
-                freshell_freshagent::ownership_lane::TerminalLaneClaim::Adopt => {}
+                freshell_freshagent::ownership_lane::TerminalLaneClaim::Adopt => {
+                    // b8ke ext r10 F2: Adopt is NOT permission to spawn.
+                    // Pre-r10 this arm proceeded WITHOUT a ticket: a live
+                    // terminal owner appearing between the ladder's
+                    // liveness check and this claim (another device's
+                    // terminal establishing the learned session) meant the
+                    // request STILL launched another `claude --resume`
+                    // writer — the settle's late claim eventually killed
+                    // the new terminal, but only after the two writers
+                    // overlapped during spawn/startup. The Adopt arm now
+                    // NEVER spawns: the adopted runtime is this request's
+                    // own session (the coordinator keyed it under the
+                    // learned durable id), so the request answers the typed
+                    // reconnect-revive family — SESSION_RESERVED naming the
+                    // live terminal (`liveTerminalId`), the caller
+                    // reattaches to it instead of dead-ending. A
+                    // foreign/ambiguous observation (the key moved on
+                    // between the Adopt and this read) answers the generic
+                    // typed refusal — fail-closed either way.
+                    let snapshot = state
+                        .ownership
+                        .as_ref()
+                        .map(|ownership| ownership.observe(&locator.provider, &locator.session_id));
+                    let owner_fields = snapshot.as_ref().and_then(
+                        freshell_freshagent::ownership_lane::terminal_owner_fields_from_snapshot,
+                    );
+                    let live_terminal_id = match snapshot.as_ref().map(|s| &s.state) {
+                        Some(freshell_ownership::OwnershipState::Live { owner, .. })
+                            if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal =>
+                        {
+                            owner.terminal_id.clone()
+                        }
+                        _ => None,
+                    };
+                    tracing::warn!(
+                        target: "freshell_ws::terminal",
+                        provider = %locator.provider,
+                        session_id = %locator.session_id,
+                        request_id = %create.request_id,
+                        live_terminal_id = ?live_terminal_id,
+                        "terminal_create_refused: the learned-identity claim ADOPTED a live \
+                         terminal owner — the request never spawns a second writer (kata b8ke \
+                         ext r10 F2)"
+                    );
+                    let reason = match &live_terminal_id {
+                        Some(_) => format!(
+                            "Session {} is already open as a terminal here.",
+                            locator.session_id
+                        ),
+                        None => format!(
+                            "A lifecycle operation is in flight for session {}; retry after it settles.",
+                            locator.session_id
+                        ),
+                    };
+                    let _ = send_create_error_with_owner(
+                        out,
+                        ErrorCode::SessionReserved,
+                        reason,
+                        &create.request_id,
+                        live_terminal_id,
+                        owner_fields.as_ref(),
+                    )
+                    .await;
+                    return false;
+                }
                 freshell_freshagent::ownership_lane::TerminalLaneClaim::Refused(outcome) => {
                     // The learned id is already owned — the typed D7-shaped
                     // refusal (nothing has spawned yet: no teardown owed).
