@@ -4,6 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import net from 'node:net'
 import { spawn, type ChildProcess } from 'node:child_process'
+import { EventEmitter } from 'node:events'
 import { describe, it, expect } from 'vitest'
 import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
 
@@ -31,6 +32,18 @@ interface ShimProcess {
 interface ExitOutcome {
   code: number | null
   signal: NodeJS.Signals | null
+}
+
+function createExitControlledShim(): { shim: ShimProcess; exit: (outcome: ExitOutcome) => void } {
+  const child = new EventEmitter() as unknown as ChildProcess
+  Object.assign(child, { exitCode: null, signalCode: null })
+  const exited = new Promise<ExitOutcome>((resolve) => {
+    child.once('exit', (code, signal) => resolve({ code, signal }))
+  })
+  return {
+    shim: { child, stdout: [], exited },
+    exit: (outcome) => child.emit('exit', outcome.code, outcome.signal),
+  }
 }
 
 async function writeTerminalFake(binDir: string): Promise<string> {
@@ -141,36 +154,124 @@ async function canBindLoopbackPort(port: number): Promise<boolean> {
   })
 }
 
-async function canConnectLoopbackPort(port: number, timeoutMs: number): Promise<boolean> {
+const READINESS_RETRY_INTERVAL_MS = 25
+
+interface ReadinessDependencies {
+  now: () => number
+  connect: (port: number, timeoutMs: number, signal: AbortSignal) => Promise<boolean>
+  pause: (delayMs: number, signal: AbortSignal) => Promise<void>
+}
+
+function pauseForReadiness(delayMs: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve()
+      return
+    }
+    const timer = setTimeout(finish, delayMs)
+    const onAbort = () => finish()
+    function finish() {
+      clearTimeout(timer)
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+async function canConnectLoopbackPort(port: number, timeoutMs: number, signal: AbortSignal): Promise<boolean> {
   return await new Promise((resolve) => {
     const socket = net.createConnection({ host: '127.0.0.1', port })
     let settled = false
     const finish = (connected: boolean) => {
       if (settled) return
       settled = true
+      socket.off('connect', onConnect)
+      socket.off('error', onError)
+      socket.off('timeout', onTimeout)
+      signal.removeEventListener('abort', onAbort)
       socket.destroy()
       resolve(connected)
     }
-    socket.once('connect', () => finish(true))
-    socket.once('error', () => finish(false))
-    socket.setTimeout(timeoutMs, () => finish(false))
+    const onConnect = () => finish(true)
+    const onError = () => finish(false)
+    const onTimeout = () => finish(false)
+    const onAbort = () => finish(false)
+    if (signal.aborted) {
+      finish(false)
+      return
+    }
+    socket.once('connect', onConnect)
+    socket.once('error', onError)
+    socket.setTimeout(timeoutMs, onTimeout)
+    signal.addEventListener('abort', onAbort, { once: true })
   })
 }
 
-async function waitForAppServerReady(shim: ShimProcess, port: number, timeoutMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    const remaining = Math.max(1, deadline - Date.now())
-    const result = await Promise.race([
-      shim.exited.then((outcome) => ({ kind: 'exit' as const, outcome })),
-      canConnectLoopbackPort(port, Math.min(250, remaining)).then((connected) => ({ kind: 'connect' as const, connected })),
-    ])
-    if (result.kind === 'exit') {
-      throw new Error(`dual-role app-server exited before accepting transport connections (${result.outcome.signal ?? result.outcome.code ?? 'unknown'})`)
+function appServerExitedBeforeReadiness(code: number | null, signal: NodeJS.Signals | null): Error {
+  return new Error(`dual-role app-server exited before accepting transport connections (${signal ?? code ?? 'unknown'})`)
+}
+
+async function waitForAppServerReady(
+  shim: Pick<ShimProcess, 'child'>,
+  port: number,
+  timeoutMs: number,
+  dependencies: Partial<ReadinessDependencies> = {},
+): Promise<void> {
+  const now = dependencies.now ?? Date.now
+  const connect = dependencies.connect ?? canConnectLoopbackPort
+  const pause = dependencies.pause ?? pauseForReadiness
+  const deadline = now() + timeoutMs
+  const controller = new AbortController()
+  const { signal } = controller
+  let polling: Promise<void> | undefined
+  let settled = false
+  let removeExitWatcher = () => undefined
+
+  const readiness = new Promise<void>((resolve, reject) => {
+    const settle = (error?: Error) => {
+      if (settled) return
+      settled = true
+      controller.abort()
+      removeExitWatcher()
+      if (error) reject(error)
+      else resolve()
     }
-    if (result.connected) return
+    const onExit = (code: number | null, exitSignal: NodeJS.Signals | null) => settle(appServerExitedBeforeReadiness(code, exitSignal))
+    const onError = (error: Error) => settle(error)
+    removeExitWatcher = () => {
+      shim.child.off('exit', onExit)
+      shim.child.off('error', onError)
+    }
+
+    if (shim.child.exitCode !== null || shim.child.signalCode !== null) {
+      settle(appServerExitedBeforeReadiness(shim.child.exitCode, shim.child.signalCode))
+      return
+    }
+    shim.child.once('exit', onExit)
+    shim.child.once('error', onError)
+
+    polling = (async () => {
+      while (!signal.aborted && now() < deadline) {
+        const remaining = Math.max(1, deadline - now())
+        if (await connect(port, Math.min(250, remaining), signal)) return
+        if (signal.aborted) return
+        await pause(Math.min(READINESS_RETRY_INTERVAL_MS, Math.max(1, deadline - now())), signal)
+      }
+      if (!signal.aborted) {
+        throw new Error(`dual-role app-server did not accept a transport connection within ${timeoutMs}ms`)
+      }
+    })()
+    void polling.then(() => settle(), (error: Error) => settle(error))
+  })
+
+  try {
+    await readiness
+  } finally {
+    controller.abort()
+    removeExitWatcher()
+    await polling?.catch(() => undefined)
   }
-  throw new Error(`dual-role app-server did not accept a transport connection within ${timeoutMs}ms`)
 }
 
 describe('codex-dual-role shim', () => {
@@ -243,6 +344,53 @@ describe('codex-dual-role shim', () => {
     } finally {
       await fs.rm(binDir, { recursive: true, force: true })
     }
+  })
+
+  it('paces refused readiness probes before a later transport success', async () => {
+    const { shim } = createExitControlledShim()
+    let attempts = 0
+    let pauses = 0
+
+    await waitForAppServerReady(shim, 1, 150, {
+      connect: async () => {
+        attempts += 1
+        return attempts === 2
+      },
+      pause: async () => {
+        pauses += 1
+      },
+    })
+
+    expect(attempts).toBe(2)
+    expect(pauses).toBe(1)
+  })
+
+  it('stops the one owned readiness poll when the exact child exits early', async () => {
+    const { shim, exit } = createExitControlledShim()
+    const initialExitListeners = shim.child.listenerCount('exit')
+    let attempts = 0
+    let connectStarted!: () => void
+    const connectStartedPromise = new Promise<void>((resolve) => {
+      connectStarted = resolve
+    })
+
+    const readiness = waitForAppServerReady(shim, 1, 5_000, {
+      connect: async (_port, _timeoutMs, signal) => {
+        attempts += 1
+        connectStarted()
+        return await new Promise<boolean>((resolve) => signal.addEventListener('abort', () => resolve(false), { once: true }))
+      },
+      pause: async () => {
+        throw new Error('readiness poll continued after the child exit')
+      },
+    })
+    await connectStartedPromise
+    exit({ code: 1, signal: null })
+
+    await expect(readiness).rejects.toThrow('exited before accepting transport connections')
+    expect(attempts).toBe(1)
+    expect(initialExitListeners).toBe(1)
+    expect(shim.child.listenerCount('exit')).toBe(0)
   })
 
   it('runs the terminal fake for plain argv', async () => {
@@ -335,7 +483,9 @@ describe('codex-dual-role shim', () => {
     await withCleanup(async () => {
       await waitForAppServerReady(shim, port, 5_000)
 
-      await stopShim(shim)
+      const exit = await stopShim(shim)
+      expect(exit.signal).not.toBe('SIGKILL')
+      expect(shim.child.signalCode).not.toBe('SIGKILL')
       expect(await canBindLoopbackPort(port)).toBe(true)
     }, [
       () => stopShim(shim),
