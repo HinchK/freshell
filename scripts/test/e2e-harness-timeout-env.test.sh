@@ -74,12 +74,14 @@ chmod +x "$STUB_DIR/gcloud" "$STUB_DIR/docker"
 
 echo "=== e2e harness timeout env test ==="
 
-# Check 1: a cloud run's job env file carries the default 45s window.
+# Check 1: a cloud run's job env file carries the default 90s window.
 env PATH="$STUB_DIR:$PATH" bash "$SCRIPT" run --cloud --shards=1 \
   test/e2e-browser/specs/settings.spec.ts >/dev/null 2>&1 || true
 check "run jobs create captured an env-vars file" test -f "$STUB_CAPTURE/env.yaml"
-check "env file sets FRESHELL_E2E_WS_READY_TIMEOUT_MS to 45000 by default" \
-  grep -q 'FRESHELL_E2E_WS_READY_TIMEOUT_MS: "45000"' "$STUB_CAPTURE/env.yaml"
+check "env file sets FRESHELL_E2E_WS_READY_TIMEOUT_MS to 90000 by default" \
+  grep -q 'FRESHELL_E2E_WS_READY_TIMEOUT_MS: "90000"' "$STUB_CAPTURE/env.yaml"
+check "env file carries FRESHELL_E2E_SERVER_VERBOSE: \"1\" (server-log visibility)" \
+  grep -q 'FRESHELL_E2E_SERVER_VERBOSE: "1"' "$STUB_CAPTURE/env.yaml"
 check "env file still carries PLAYWRIGHT_ARGS" \
   grep -q 'PLAYWRIGHT_ARGS' "$STUB_CAPTURE/env.yaml"
 
@@ -91,9 +93,11 @@ env PATH="$STUB_DIR:$PATH" FRESHELL_E2E_WS_READY_TIMEOUT_MS=60000 \
 check "operator override (60000) lands in the env file" \
   grep -q 'FRESHELL_E2E_WS_READY_TIMEOUT_MS: "60000"' "$STUB_CAPTURE/env.yaml"
 
-# Check 3: usage documents the env var.
+# Check 3: usage documents both env vars.
 check "help documents FRESHELL_E2E_WS_READY_TIMEOUT_MS" \
   bash -c "bash '$SCRIPT' help 2>&1 | grep -q 'FRESHELL_E2E_WS_READY_TIMEOUT_MS'"
+check "help documents FRESHELL_E2E_SERVER_VERBOSE" \
+  bash -c "bash '$SCRIPT' help 2>&1 | grep -q 'FRESHELL_E2E_SERVER_VERBOSE'"
 
 # Check 4: the wrapper script itself stays syntactically valid.
 check "e2e-cloud.sh passes bash -n" bash -n "$SCRIPT"

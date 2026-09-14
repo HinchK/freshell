@@ -118,7 +118,17 @@ export const test = base.extend<{
   // `e2eServerKind` (HARNESS-02) picks 'legacy' (a normal TestServer -- behavior
   // identical to before) or 'rust' (an owned RustServer) per Playwright project.
   testServer: [async ({ e2eServerKind }, use) => {
-    const server = await createE2eServerHandle(process.env, { kind: e2eServerKind })
+    const server = await createE2eServerHandle(process.env, {
+      kind: e2eServerKind,
+      // Server-log visibility (kata j90s): the owned TestServer/RustServer
+      // capture stdout/stderr into in-memory buffers unless `verbose` pipes
+      // them to this process's console (test-server.ts). On the cloud lane
+      // (FRESHELL_E2E_SERVER_VERBOSE=1, set by scripts/e2e-cloud.sh) that
+      // forwards the server's structured logs into the container log stream
+      // so a future wedge episode is diagnosable from Cloud Logging. No-op
+      // for external targets (construct is ignored there) and locally.
+      construct: { verbose: process.env.FRESHELL_E2E_SERVER_VERBOSE === '1' },
+    })
     await server.start()
     await use(server)
     await server.stop()
@@ -143,8 +153,12 @@ export const test = base.extend<{
     // Wait for the test harness to be installed
     await harness.waitForHarness()
 
-    // Wait for WebSocket to connect
-    await harness.waitForConnection()
+    // Wait for WebSocket to connect. Self-heal is opted IN here: this is a
+    // fresh-boot wait, and the j90s wedge class (a gVisor I/O stall hanging
+    // a timeout-less boot fetch so the WS never starts) recovers via a fresh
+    // boot chain — waitForConnection performs at most ONE mid-wait reload
+    // when ready has not landed by half the window (kata j90s).
+    await harness.waitForConnection(undefined, { selfHealReload: true })
 
     // If a PanePicker is showing (new tab without auto-created terminal),
     // select a shell to create a terminal. On WSL/Windows the picker shows

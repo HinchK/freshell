@@ -182,7 +182,17 @@ test.describe('Settings', () => {
     ).toBeVisible()
   })
 
-  test('Expand thinking and Expand tools switches persist locally and reset to defaults', async ({ freshellPage, page, harness, serverInfo }) => {
+  test('Expand thinking and Expand tools switches persist locally and reset to defaults',
+    // Cloud-only per-test budget (kata j90s): on the cloud lane the 90s
+    // harness window (FRESHELL_E2E_WS_READY_TIMEOUT_MS, scripts/e2e-cloud.sh)
+    // plus the self-heal reload can legitimately consume up to ~2x the
+    // window before this test's body even starts — more than the default
+    // 60s per-test budget. Locally the env var is unset and the default
+    // budget applies. (The array spread keeps the local call the plain
+    // two-arg test(title, fn) form; a bare object spread is not iterable
+    // in call position.)
+    ...(process.env.FRESHELL_E2E_WS_READY_TIMEOUT_MS ? [{ timeout: 120_000 }] : []),
+    async ({ freshellPage, page, harness, serverInfo }) => {
     await openSettingsSection(page, 'Coding Agents')
 
     // Accessible-name switch locators (each Toggle carries an exact aria-label
@@ -206,10 +216,12 @@ test.describe('Settings', () => {
     expect(parsed.settings?.freshAgent?.expandThinking).toBe(true)
     expect(parsed.settings?.freshAgent?.expandTools).toBe(true)
 
-    // The opt-in persists across reload.
+    // The opt-in persists across reload. Self-heal is safe (and opted in)
+    // on this fresh-boot leg: the state under test lives in localStorage,
+    // which survives a reload by design.
     await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
     await harness.waitForHarness()
-    await harness.waitForConnection()
+    await harness.waitForConnection(undefined, { selfHealReload: true })
     const afterReload = (await harness.getSettings()).freshAgent
     expect(afterReload.expandThinking).toBe(true)
     expect(afterReload.expandTools).toBe(true)
