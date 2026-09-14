@@ -27,6 +27,28 @@ async function enableClaudeAndCodex(page: any) {
   })
 }
 
+async function previewFreshclaudeDefaults(page: any) {
+  await page.waitForFunction(() => {
+    return window.__FRESHELL_TEST_HARNESS__?.getState()?.settings?.loaded === true
+  })
+  await page.evaluate(() => {
+    window.__FRESHELL_TEST_HARNESS__?.dispatch({
+      type: 'settings/previewServerSettingsPatch',
+      payload: {
+        freshAgent: {
+          enabled: true,
+          providers: {
+            freshclaude: {
+              modelSelection: { kind: 'exact', modelId: 'opus[1m]' },
+              effort: 'high',
+            },
+          },
+        },
+      },
+    })
+  })
+}
+
 async function getActiveLeaf(harness: any) {
   const tabId = await harness.getActiveTabId()
   expect(tabId).toBeTruthy()
@@ -837,6 +859,14 @@ test.describe('Fresh Agent', () => {
   test('freshclaude settings use FreshAgent model defaults and create payload', async ({ freshellPage: _freshellPage, page, harness, terminal }) => {
     await terminal.waitForTerminal()
     await enableClaudeAndCodex(page)
+    await previewFreshclaudeDefaults(page)
+    await expect.poll(async () => {
+      const settings = await harness.getSettings()
+      return settings?.freshAgent?.providers?.freshclaude ?? null
+    }).toMatchObject({
+      modelSelection: { kind: 'exact', modelId: 'opus[1m]' },
+      effort: 'high',
+    })
 
     await harness.clearSentWsMessages()
     const picker = await openPanePicker(page)
