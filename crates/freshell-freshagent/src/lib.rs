@@ -3433,6 +3433,72 @@ async fn resume_session_ref_tab(
         );
     };
 
+    // b8ke ext r9 F1: the resume CLAIMS THE COORDINATOR before anything
+    // else touches the session — the REST turn gate requires
+    // Live{FreshAgent}, and pre-r9 this route registered and broadcast its
+    // connected pane with NO claim, so a post-restart resume (the
+    // coordinator vacant) succeeded on the wire while the pane's very first
+    // send-keys was refused SESSION_RESERVED, and a resume against a
+    // terminal/handoff-owned session reported success instead of the typed
+    // owner response (MCP new-tab resume routes here too). Granted holds
+    // the ticket through probe + registration + broadcast and commits at the
+    // end (the materialize path's discipline); Adopt (Live{FreshAgent}
+    // already — the same-pane re-open) proceeds idempotently; a refusal
+    // answers the typed owner response.
+    let resume_op = format!("rest-resume-{durable_id}");
+    let mut resume_ticket = match ownership_lane::begin_lane_claim(
+        &state.ownership,
+        PROVIDER,
+        &durable_id,
+        &resume_op,
+        None,
+        "freshopencode/rest-resume",
+        session_lease::now_epoch_ms(),
+    ) {
+        ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+        ownership_lane::LaneClaim::Unwired => None,
+        ownership_lane::LaneClaim::Adopt => None,
+        ownership_lane::LaneClaim::Refused(outcome) => {
+            // The fresh-agent lane's cross-kind refusal names the ACTUAL
+            // owner kind (OwnedByOtherKind carries the owner — a TERMINAL
+            // owner answers ownerKind "terminal"; the terminal-lane helper
+            // hardcodes the opposite direction, so derive here).
+            let owner_fields = match &outcome {
+                freshell_ownership::BeginOutcome::OwnedByOtherKind { owner, generation } => {
+                    Some(ownership_lane::TerminalOwnerFields {
+                        owner_kind: if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal
+                        {
+                            "terminal"
+                        } else {
+                            "fresh-agent"
+                        },
+                        owner_generation: *generation,
+                        owner_epoch: state
+                            .ownership
+                            .as_ref()
+                            .map(|registry| registry.boot_epoch())
+                            .unwrap_or_default(),
+                    })
+                }
+                _ => ownership_lane::terminal_owner_fields_from_outcome(&state.ownership, &outcome),
+            };
+            tracing::warn!(target: "freshell_freshagent::opencode",
+                provider = PROVIDER, session_id = %durable_id,
+                outcome = ?outcome,
+                "freshagent.opencode.rest_resume_claim_refused: the coordinator refused \
+                 the resume claim — the pane is not resumed"
+            );
+            return fail_json_conflict_with_owner(
+                "SESSION_RESERVED",
+                format!(
+                    "Session {durable_id} is owned by another lifecycle owner; retry after it settles."
+                ),
+                None,
+                owner_fields.as_ref(),
+            );
+        }
+    };
+
     // 4. LEDGER BEFORE PROBE (ordering is load-bearing, review-verified):
     // `get_session` applies the route directory as the `?directory=` query
     // param (serve.rs:634 via `with_route`) and a route-sensitive serve can
@@ -3552,6 +3618,36 @@ async fn resume_session_ref_tab(
         },
     );
     broadcast_tab_create(state, &tab_id, &pane_id, name.as_deref(), &pane_content);
+
+    // b8ke ext r9 F1: the registration is complete — commit
+    // `Live{FreshAgent}` for the resumed durable key (the stamp lands in
+    // the shared map: the kill/exit claim source; OpenCode passes
+    // `pid: None` — the shared serve daemon is never a kill handle, the
+    // OpenCode invariant). A stale/foreign commit means the coordinator
+    // moved on mid-resume — answer the typed conflict, never a success
+    // over a key this pane does not own. The un-claimed shapes (Unwired
+    // — no coordinator; Adopt — an owner already stands) skip the commit
+    // by construction (commit_lane_claim's no-ticket arm is a no-op).
+    if let Err(outcome) = ownership_lane::commit_lane_claim(
+        &state.ownership,
+        &state.ownership_stamps,
+        PROVIDER,
+        &durable_id,
+        &mut resume_ticket,
+        &durable_id,
+        None,
+    ) {
+        tracing::error!(target: "invariant",
+            provider = PROVIDER, session_id = %durable_id,
+            outcome = ?outcome,
+            "freshagent.opencode.rest_resume_commit_stale: the coordinator moved on \
+             while the resume registered"
+        );
+        return fail_json(
+            StatusCode::CONFLICT,
+            "SESSION_RESERVED: session ownership changed during resume".to_string(),
+        );
+    }
 
     ok_json(
         json!({
@@ -6284,6 +6380,172 @@ mod tests {
             json!(1_702_000_000_000i64),
             "a stale serve timestamp never beats the record floor"
         );
+    }
+
+    // ── b8ke ext r9 F1: the resume claims/commits the coordinator ──────────
+
+    /// The resume test fixture: a state with a wired coordinator, a healthy
+    /// fake serve (get_session answers), and an identity sink that has
+    /// recorded the durable session (the post-restart shape).
+    async fn rest_resume_state() -> (
+        FreshAgentState,
+        Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+        Arc<identity_sink::FakeIdentitySink>,
+    ) {
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let st = state().with_ownership(Arc::clone(&registry));
+        let deps = ServeDeps {
+            spawner: Arc::new(NoopSpawner),
+            http: Arc::new(CreateCapableHttp),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        st.set_manager_for_test(manager).await;
+        let fake = Arc::new(identity_sink::FakeIdentitySink::default());
+        fake.settings.lock().unwrap().insert(
+            ("opencode".to_string(), "ses_resume_durable".to_string()),
+            identity_sink::FreshAgentSettings {
+                model: Some("m".to_string()),
+                effort: Some("high".to_string()),
+                cwd: Some("/w".to_string()),
+                ..Default::default()
+            },
+        );
+        fake.recorded
+            .lock()
+            .unwrap()
+            .insert(("opencode".to_string(), "ses_resume_durable".to_string()));
+        st.set_identity_sink(fake.clone());
+        (st, registry, fake)
+    }
+
+    /// b8ke ext r9 F1: a post-restart resume (the coordinator VACANT — the
+    /// pre-restart record is gone) claims and commits Live{FreshAgent}, so
+    /// the pane's FIRST send-keys succeeds (pre-r9 the resume registered
+    /// and broadcast with no claim: the first send-keys was refused
+    /// SESSION_RESERVED).
+    #[tokio::test]
+    async fn a_post_restart_resume_commits_live_and_send_keys_succeeds() {
+        let (st, registry, _fake) = rest_resume_state().await;
+        let resp = resume_session_ref_tab(
+            &st,
+            &json!({ "provider": "opencode", "sessionId": "ses_resume_durable" }),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "the resume succeeds");
+        // THE COMMIT: the coordinator holds Live{FreshAgent}.
+        match registry.observe(PROVIDER, "ses_resume_durable").state {
+            freshell_ownership::OwnershipState::Live { owner, .. } => {
+                assert_eq!(owner.kind, freshell_ownership::RuntimeOwnerKind::FreshAgent);
+            }
+            other => panic!("the resume must commit Live{{FreshAgent}}, got {other:?}"),
+        }
+
+        // THE POST-RESUME TURN: the pane's first send-keys succeeds (the
+        // reviewer-noted lifecycle break: pre-r9 this was 409
+        // SESSION_RESERVED).
+        let pane_id = {
+            let panes = st.panes.lock().expect("panes mutex");
+            panes
+                .keys()
+                .next()
+                .cloned()
+                .expect("the resume registered a pane")
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("x-auth-token", "tok".parse().unwrap());
+        let turn = send_keys(
+            State(st.clone()),
+            Path(pane_id),
+            headers,
+            Json(json!({ "text": "hello", "timeout": 0 })),
+        )
+        .await;
+        assert_eq!(
+            turn.status(),
+            StatusCode::OK,
+            "the post-resume send-keys succeeds (the turn gate sees the committed owner)"
+        );
+    }
+
+    /// b8ke ext r9 F1: a resume against a TERMINAL-owned session answers
+    /// the typed owner response (409 SESSION_RESERVED + ownerKind
+    /// terminal + ownerGeneration), never a success that would fork a
+    /// second writer over the terminal's ownership.
+    #[tokio::test]
+    async fn a_resume_while_a_terminal_owns_answers_the_typed_owner_response() {
+        let (st, registry, _fake) = rest_resume_state().await;
+        // Seed the terminal owner directly (a completed handoff's end state).
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
+            PROVIDER,
+            "ses_resume_durable",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "test-terminal-owner",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("fixture granted")
+        };
+        assert_eq!(
+            registry.commit_live(
+                PROVIDER,
+                "ses_resume_durable",
+                "test-terminal-owner",
+                generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("term-owned".into()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        );
+
+        let resp = resume_session_ref_tab(
+            &st,
+            &json!({ "provider": "opencode", "sessionId": "ses_resume_durable" }),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "the terminal-owned resume answers 409, never success"
+        );
+        let body = resp.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["status"], json!("error"));
+        assert_eq!(value["code"], json!("SESSION_RESERVED"));
+        assert_eq!(
+            value["ownerKind"],
+            json!("terminal"),
+            "the typed owner response names the terminal owner: {value}"
+        );
+        assert!(
+            value["ownerGeneration"].is_u64(),
+            "the typed owner response carries the owner generation: {value}"
+        );
+        // The terminal's record is untouched.
+        assert!(matches!(
+            registry.observe(PROVIDER, "ses_resume_durable").state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ));
     }
 }
 
