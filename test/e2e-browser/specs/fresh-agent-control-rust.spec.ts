@@ -1368,14 +1368,42 @@ const CODEX_FORK_LIFECYCLE_METHODS = new Set([
   'thread/resume',
 ])
 
-/** Send one freshcodex turn and wait for the provider's durable idle snapshot. */
+/**
+ * Send one freshcodex turn only after the browser accepts it, then wait for
+ * the provider's durable idle snapshot. A durable snapshot from the previous
+ * turn is not permission to assume a newly clicked composer submit left the
+ * browser: FreshAgentView intentionally queues submits while its own outgoing
+ * reservation is still being reconciled.
+ */
 async function sendCodexTurnAndWaitRows(
   page: Page,
   info: E2eServerInfo,
+  harness: TestHarness,
   expectedRowCount: number,
   text: string,
 ): Promise<void> {
+  const sentBefore = await harness.getSentWsMessages()
+  const matchingSendsBefore = (sentBefore as any[]).filter(
+    (message) => message?.type === 'freshAgent.send'
+      && message?.provider === 'codex'
+      && message?.sessionId === 'thread-new-1'
+      && message?.text === text,
+  ).length
   await sendComposerText(page, text)
+  await expect
+    .poll(
+      async () => (await harness.getSentWsMessages() as any[]).filter(
+        (message) => message?.type === 'freshAgent.send'
+          && message?.provider === 'codex'
+          && message?.sessionId === 'thread-new-1'
+          && message?.text === text,
+      ).length,
+      {
+        timeout: 30_000,
+        message: `the browser did not dispatch the Codex send for "${text}"`,
+      },
+    )
+    .toBe(matchingSendsBefore + 1)
   const paneRoot = page.locator('[data-context="fresh-agent"]').last()
   await expect(
     paneRoot.locator('article[data-turn-index]'),
@@ -1400,6 +1428,18 @@ async function sendCodexTurnAndWaitRows(
       },
     )
     .toEqual({ rows: expectedRowCount, status: 'idle' })
+  // Synchronize the next UI action with the same client session status that
+  // releases the outgoing reservation, rather than the independently fetched
+  // provider snapshot alone.
+  await expect
+    .poll(
+      () => readFreshAgentSessionStatus(harness, 'thread-new-1'),
+      {
+        timeout: 30_000,
+        message: `the browser did not settle its Codex session after "${text}"`,
+      },
+    )
+    .toBe('idle')
 }
 
 /** The parent's durable rollout file under the fake's CODEX_HOME. */
@@ -1474,7 +1514,7 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
     const lane = await bootCodexLane(page)
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
-      await sendCodexTurnAndWaitRows(page, lane.info, 2, 'codex turn one')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 2, 'codex turn one')
 
       // Typed slash gesture → freshAgent.compact → thread/compact/start.
       const paneRoot = page.locator('[data-context="fresh-agent"]').last()
@@ -1500,7 +1540,7 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
 
       // Usable after compact: a follow-up prompt mints exactly the next turn
       // (two recorded turns -> four display rows).
-      await sendCodexTurnAndWaitRows(page, lane.info, 4, 'codex post-compact turn')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 4, 'codex post-compact turn')
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
@@ -1511,8 +1551,8 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
     const lane = await bootCodexLane(page)
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
-      await sendCodexTurnAndWaitRows(page, lane.info, 2, 'codex turn one')
-      await sendCodexTurnAndWaitRows(page, lane.info, 4, 'codex turn two')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 2, 'codex turn one')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 4, 'codex turn two')
 
       const parentRolloutBefore = await readRollout(lane.info.homeDir, 'thread-new-1')
       expect(parentRolloutBefore, 'the parent rollout must exist').toBeTruthy()
@@ -1585,8 +1625,8 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
     const lane = await bootCodexLane(page)
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
-      await sendCodexTurnAndWaitRows(page, lane.info, 2, 'codex turn one')
-      await sendCodexTurnAndWaitRows(page, lane.info, 4, 'codex turn two')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 2, 'codex turn one')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 4, 'codex turn two')
 
       // Fork from turn 1's ASSISTANT row (data-turn-index 1, the synthesized
       // split id `turn-1:row-1`) via the turn's real hover affordance.
@@ -1851,7 +1891,7 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
       // Turn 1 rides the pane's untouched defaults.
-      await sendCodexTurnAndWaitRows(page, lane.info, 2, 'codex turn one')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 2, 'codex turn one')
       const threadId = (await paneLeaf(lane.harness, lane.tabId))?.content?.sessionId as string
       expect(threadId, 'the durable codex thread id must be known before turn two').toBeTruthy()
 
@@ -1882,7 +1922,7 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
 
       // Turn 2 must now carry the changed knobs (canonical's codex.rs merges
       // msg.settings over the session baseline before turn/start).
-      await sendCodexTurnAndWaitRows(page, lane.info, 4, 'codex turn two')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 4, 'codex turn two')
 
       // Ground truth: the fake's recorded-turns file under the lane's isolated
       // CODEX_HOME (<home>/.codex/fake-turns/<threadId>.json). Each recorded
