@@ -846,6 +846,12 @@ pub struct AttachGuard {
     operation_id: String,
     generation: u64,
     disarmed: std::sync::atomic::AtomicBool,
+    /// b8ke ext r15 F3: the arm instant (wall-clock ms) — the release
+    /// event's REAL measured window duration (pre-r15 it hard-coded 0).
+    armed_at_ms: u64,
+    /// b8ke ext r15 F3: the initiating client/device the guard armed
+    /// under — the release event's initiator (the stable schema's field).
+    initiator: String,
 }
 
 impl AttachGuard {
@@ -872,18 +878,36 @@ impl AttachGuard {
     fn release_window(&self) {
         let mut inner = self.registry.inner.lock().expect("ownership lock poisoned");
         let key = SessionKey::new(&self.provider, &self.session_id);
+        // b8ke ext r15 F3: the release event joins the UNIFORM transition
+        // schema — the record's CURRENT owner at release time (the
+        // identity a blocked lifecycle window pinned), the initiating
+        // client/device, and the REAL measured window duration (pre-r15
+        // the event omitted the kinds, the runtime identity, and the
+        // initiator, and hard-coded the duration to zero).
+        let mut released_from_kind = None;
+        let mut released_runtime_id = None;
+        let mut released_pid = None;
         if let Some(record) = inner.get_mut(&key) {
             record.in_flight_attaches = record.in_flight_attaches.saturating_sub(1);
+            if let OwnershipState::Live { owner, .. } = &record.state {
+                released_from_kind = Some(owner.kind);
+                released_runtime_id = owner.terminal_id.clone();
+                released_pid = owner.pid;
+            }
         }
+        let duration_ms = now_epoch_ms().saturating_sub(self.armed_at_ms);
         tracing::info!(target: "freshell_ownership",
             event = "ownership.attach_guard.released",
             operation_id = %self.operation_id, provider = %self.provider,
-            session_id = %self.session_id,
+            session_id = %self.session_id, initiator = %self.initiator,
+            from_kind = ?released_from_kind,
+            to_kind = ?Option::<RuntimeOwnerKind>::None,
+            runtime_id = ?released_runtime_id, pid = ?released_pid,
             epoch = self.registry.epoch, generation = self.generation,
-            duration_ms = 0u64,
+            duration_ms,
             outcome = "released", failure_reason = "",
-            "the attach guard released — the key's window is closed and \
-             blocked lifecycle operations may retry");
+            "the attach guard released after {duration_ms}ms — the key's window \
+             is closed and blocked lifecycle operations may retry");
     }
 }
 
@@ -1349,11 +1373,25 @@ impl RuntimeOwnershipRegistry {
             }
         }
         record.in_flight_attaches = record.in_flight_attaches.saturating_add(1);
+        // b8ke ext r15 F3: the arm event joins the UNIFORM transition
+        // schema — the LIVE OWNER the guard pins (from_kind + the runtime
+        // identity) is the owner a blocked handoff/stop would name, so
+        // diagnosing a blocked lifecycle window needs it on the record.
+        let (guard_from_kind, guard_runtime_id, guard_pid) = match &record.state {
+            OwnershipState::Live { owner, .. } => {
+                (Some(owner.kind), owner.terminal_id.clone(), owner.pid)
+            }
+            _ => (None, None, None),
+        };
         tracing::info!(target: "freshell_ownership",
             event = "ownership.attach_guard.armed",
             operation_id, provider, session_id, initiator,
+            from_kind = ?guard_from_kind,
+            to_kind = ?Option::<RuntimeOwnerKind>::None,
+            runtime_id = ?guard_runtime_id, pid = ?guard_pid,
             epoch = self.epoch, generation = current_generation,
             in_flight_attaches = record.in_flight_attaches,
+            duration_ms = 0u64,
             outcome = "armed", failure_reason = "",
             "the attach guard is armed — the coordinator covers the attach \
              window; concurrent lifecycle begins answer Blocked");
@@ -1364,6 +1402,8 @@ impl RuntimeOwnershipRegistry {
             operation_id: operation_id.to_string(),
             generation: current_generation,
             disarmed: std::sync::atomic::AtomicBool::new(false),
+            armed_at_ms: now_epoch_ms(),
+            initiator: initiator.to_string(),
         }))
     }
 
@@ -7662,6 +7702,52 @@ mod tests {
             FailOutcome::Released
         ));
 
+        // 17. b8ke ext r15 F3: the attach-guard pair (an armed guard over
+        // a live key, then released) — the claims BLOCK handoff/stop
+        // operations, so their transition records must carry the same
+        // stable schema as every other coordinator transition.
+        let r_attach = Arc::new(RuntimeOwnershipRegistry::new());
+        let BeginOutcome::Granted {
+            generation: g_attach,
+        } = r_attach.begin_start(
+            PROVIDER,
+            "sid-enum-attach",
+            RuntimeOwnerKind::Terminal,
+            "op-enum-attach-live",
+            None,
+            "test",
+            14_000,
+        )
+        else {
+            panic!("expected Granted")
+        };
+        assert!(matches!(
+            r_attach.commit_live(
+                PROVIDER,
+                "sid-enum-attach",
+                "op-enum-attach-live",
+                g_attach,
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("t-enum-attach".into()),
+                    live_session_key: None,
+                    pid: Some(4242),
+                    ownership_id: None,
+                },
+            ),
+            CommitOutcome::Committed
+        ));
+        let AttachGuardOutcome::Armed(guard) = r_attach.begin_attach_guard(
+            PROVIDER,
+            "sid-enum-attach",
+            "op-enum-attach",
+            Some(g_attach),
+            "test-attach",
+        ) else {
+            panic!("expected Armed")
+        };
+        drop(guard);
+
         // ── the ENUMERATION: every captured transition event carries the
         // complete stable schema. A missing field anywhere fails.
         let events = capture.events();
@@ -7694,6 +7780,8 @@ mod tests {
             "ownership.live.rekey_live",
             "ownership.start.recovery_started",
             "ownership.start.failed",
+            "ownership.attach_guard.armed",
+            "ownership.attach_guard.released",
         ];
         let mut covered: Vec<&str> = Vec::new();
         for event in &events {
@@ -7724,6 +7812,75 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    /// b8ke ext r15 F3: the attach-guard release event's duration is
+    /// the REAL measured window — the guard's held wall-clock time
+    /// between arm and release (pre-r15 the event hard-coded 0).
+    #[test]
+    fn the_attach_guard_release_duration_is_the_real_window() {
+        let r = Arc::new(RuntimeOwnershipRegistry::new());
+        let capture = EventCapture::default();
+        let _guard = capture.install();
+
+        let BeginOutcome::Granted { generation } = r.begin_start(
+            PROVIDER,
+            "sid-attach-dur",
+            RuntimeOwnerKind::Terminal,
+            "op-attach-dur",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("expected Granted")
+        };
+        assert!(matches!(
+            r.commit_live(
+                PROVIDER,
+                "sid-attach-dur",
+                "op-attach-dur",
+                generation,
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("t-attach-dur".into()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            CommitOutcome::Committed
+        ));
+        let AttachGuardOutcome::Armed(guard) = r.begin_attach_guard(
+            PROVIDER,
+            "sid-attach-dur",
+            "op-attach-dur-guard",
+            Some(generation),
+            "test-attach",
+        ) else {
+            panic!("expected Armed")
+        };
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        drop(guard);
+
+        let release = capture
+            .events()
+            .into_iter()
+            .find(|event| event.event.as_deref() == Some("ownership.attach_guard.released"))
+            .expect("the release event");
+        let duration = release
+            .values
+            .get("duration_ms")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or_else(|| {
+                panic!(
+                    "duration_ms present with a value — got {:?}",
+                    release.values
+                )
+            });
+        assert!(
+            duration >= 50,
+            "the release duration is the REAL measured window (>= the 60ms hold), got {duration}"
+        );
     }
 
     /// b8ke ext r6 F5: the live handoff-begin's duration is the PRIOR
