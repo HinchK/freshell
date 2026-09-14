@@ -114,6 +114,8 @@ In `src/components/fresh-agent/FreshAgentTranscript.tsx`, replace the comment bl
 
 (Replacing the old comment `Hoisted thinking rows: thinking is NEVER hidden behind the strip's tool disclosure...` and the old hoist `{thinkingRows.map(renderThinkingRow)}`. `tools` is already computed at `:584` via `activityTools(displayRows)`.)
 
+Also update two comments that would otherwise misdescribe the new contract: (a) the `expandThinking` prop doc at `:901` — replace `/** "Expand thinking": thinking rows' starting state (they always render). */` with `/** "Expand thinking": thinking rows' starting state. */`; (b) in `test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx` around `:2522` (inside `keeps liveness pinned to the last non-caption row...`), replace the parenthetical `(The hoisted thinking row renders its own 'Thinking' label alongside the reel — scope the query to the reel's status element so the text nodes can't collide.)` with `(While this tool-bearing line is collapsed there is no hoisted Thinking row; the reel's status element carries the only 'Thinking' text — scope the query to it so the text nodes can't collide if the strip is ever expanded.)`. No assertion changes.
+
 - [ ] **Step 4: Run the focused test**
 
 Run: `npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx --config config/vitest/vitest.config.ts -t "collapses an interleaved thinking-and-tool line"`
@@ -356,7 +358,7 @@ Add this test inside `test.describe('expansion defaults and settings')` right af
 
 Run: `npm run test:e2e:chromium -- test/e2e-browser/specs/fresh-agent.spec.ts --grep "collapses an interleaved thinking-and-tool line"`
 
-Expected: PASS — the production behavior landed in Task 1 makes this green; this step adds the e2e-layer pin. To see the intended red, optionally run it once against the pre-change code (`git stash` is forbidden — instead `git worktree add` a scratch at `base_ref` or temporarily revert the Task 1 commit): before Task 1 the run fails at `toHaveCount(0)` because two hoisted `Thinking` disclosures stack below the summary. Contingency: if Playwright reports a missing browser, run `npx playwright install chromium` once before retrying.
+Expected: PASS — the production behavior landed in Task 1 makes this green; this step adds the e2e-layer pin. To see the intended red, optionally run it once against the pre-change code from a scratch worktree at `base_ref` (`git worktree add` a scratch, never stash or revert run commits): before Task 1 the run fails at `toHaveCount(0)` because two hoisted `Thinking` disclosures stack below the summary. Contingency: if Playwright reports a missing browser, run `npx playwright install chromium` once before retrying.
 
 - [ ] **Step 3: Rework the four stale e2e pins (no production changes)**
 
@@ -566,6 +568,12 @@ Run: `npm run test:e2e:chromium -- test/e2e-browser/specs/settings.spec.ts --gre
 
 Expected: PASS (persistence-only asserts; unaffected by copy).
 
+Then on the configured backend (cloud — required because this task changes the settings UI source after Task 2's cloud gate):
+
+Run: `npm run test:e2e:cloud -- test/e2e-browser/specs/settings.spec.ts`
+
+Expected: PASS (may pay a one-time content-addressed image build at this new commit). If the cloud path fails, fix it or stop and report — never silently fall back to local.
+
 - [ ] **Step 7: Commit the task**
 
 ```bash
@@ -580,3 +588,4 @@ git commit -m "fix(settings): refresh Expand thinking copy for gated thinking ro
 - **User-visible outcome:** a fresh-agent transcript line that used tools shows, while collapsed, exactly one row — `thought · N tools used` — no matter how many thinking rows it contains or how they interleave with tool uses. Proven end-to-end by the new interleaved e2e test and the reworked compact-default e2e test.
 - **Boundary:** thinking-only lines keep hoisted Thinking disclosures (pinned unchanged by existing unit tests `renders a live thinking row disclosure while streaming with the strip collapsed`, `renders a thinking-only turn as an activity strip (never dropped)`, `expansion is per-mount state, never re-synced from props`, and the thinking-only tail cases).
 - **Regression safety:** the full fresh-agent unit directory and the full fresh-agent e2e spec run green in Tasks 1-2 — locally for iteration, plus the configured cloud backend (`npm run test:e2e:cloud -- test/e2e-browser/specs/fresh-agent.spec.ts`) for PR readiness; the final full-suite gate (coordinated `npm test`) runs once after the last task/review fix per the-usual Stage 4.
+- **PR-readiness gate:** before requesting user approval to land, both affected specs pass on the configured cloud backend at the final tree: `npm run test:e2e:cloud -- test/e2e-browser/specs/fresh-agent.spec.ts test/e2e-browser/specs/settings.spec.ts`. Task 2's cloud result sits at Task 2's HEAD; this final run re-establishes the configured-backend evidence at the exact tree that would be filed.
