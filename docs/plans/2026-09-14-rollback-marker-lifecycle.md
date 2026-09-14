@@ -37,13 +37,13 @@ Implement the agreed restorability-driven lifecycle for the fresh-agent "Rolled 
 ## Global Constraints
 
 - **Worktree/branch:** all work happens in `/home/dan/code/freshell/.worktrees/rollback-marker-lifecycle` on branch `the-usual/rollback-marker-lifecycle` (base `e46020b4d21d30ba54032c30b56111b8c93b7c76` = `origin/main`). Never commit to `main`; never push to `origin/main`; no PR without explicit user approval. Committer identity comes from the repo/global git config — never override it and never write `dan@danshapiro.com` into git config or commits.
-- **Contract-surface fact (evidence-cited; supersedes the generic workflow reading):** the fresh-agent snapshot schema lives in `shared/fresh-agent-contract.ts` (a REST payload, strict-parsed client-side at `src/lib/api.ts:487`), NOT in `shared/ws-protocol.ts`. The frozen WS contract generator (`port/contract/generate-ws-contract.ts`) reads only `shared/ws-protocol.ts`; `FreshAgentTurnSchema`/`FreshAgentSnapshotSchema` are absent from the committed `port/contract` bundle, and the snapshot never rides a WS frame (`freshAgent.event.event` is opaque). Precedent: commit `7b0c0ea9b` added the snapshot-level `redoableTurnIds` key with zero `port/contract/`, `crates/freshell-protocol`, or `ws-protocol.ts` changes. THEREFORE this feature expects NO `shared/ws-protocol.ts` edit, NO `port/contract/*.json` diff, NO `crates/freshell-protocol` change, and NO protocol version bump. Task 1 still runs `npm run contract:generate` once as verification and requires `git status --porcelain port/contract/` to stay EMPTY; a non-empty result means the frozen surface was touched by mistake — stop and fix before committing. (The repo's full frozen-contract checklist applies only if a WS frame type ever changes, which this feature does not do.)
+- **Frozen-contract constraint compliance (evidence-cited):** the User Request's frozen-contract workflow governs changes that touch the WS-frozen surface. The fresh-agent snapshot schema lives in `shared/fresh-agent-contract.ts` (a REST payload, strict-parsed client-side at `src/lib/api.ts:487`), NOT in `shared/ws-protocol.ts`: the generator (`port/contract/generate-ws-contract.ts`) reads only `shared/ws-protocol.ts`, `FreshAgentTurnSchema`/`FreshAgentSnapshotSchema` are absent from the committed `port/contract` bundle, and the snapshot never rides a WS frame (`freshAgent.event.event` is opaque; the client fetches snapshots over REST). Precedent: commit `7b0c0ea9b` added the snapshot-level `redoableTurnIds` key with zero `port/contract/`, `crates/freshell-protocol`, or `ws-protocol.ts` changes. For THIS change, compliance is executed as follows: the workflow's verification leg runs in Task 1 Step 6 — `npm run contract:generate` is executed and `git status --porcelain port/contract/ crates/freshell-protocol/ shared/ws-protocol.ts` must come back EMPTY; the "commit regenerated `port/contract/*.json` in the same commit" clause is satisfied vacuously because regeneration produces no diff (there is nothing to commit). There is no `shared/ws-protocol.ts` edit for a REST-snapshot key — a gratuitous WS edit would be churn against the freeze tests, not compliance. A non-empty verification result means the frozen surface was touched by mistake — stop and fix before committing. The full checklist (ws-protocol.ts edit → contract:generate → `crates/freshell-protocol` inventory arrays/counts → commit regenerated artifacts) becomes mandatory only if a WS frame type changes, which this feature does not do.
 - **Critical lockstep:** the Rust stamp and the `shared/fresh-agent-contract.ts` schema key MUST land in the same commit (Task 1) — the client strict-parses snapshots, so a server stamping an undeclared key would make every new-server snapshot fail client-side.
 - **TDD:** Red-Green-Refactor per task. Never weaken, skip, or delete tests to make verification pass. The only justified Red exception in this plan is Task 3's e2e additions (coverage of behavior whose Red was proven at unit level in Task 2) — record it in the implementer report as the plan directs.
 - **Rust gates:** `cargo fmt --all --check` (fix with `cargo fmt --all`); `cargo clippy --workspace --all-targets -- -D warnings`; toolchain 1.96.0.
 - **ESM:** relative imports under `shared/` keep `.js` extensions.
 - **A11y:** every new interactive element is a semantic `<button type="button">` with a discernible aria-label; `npm run lint` (eslint-plugin-jsx-a11y, CI-gated) must pass.
-- **Test coordination:** check `npm run test:status` before any broad run; wait on a foreign holder rather than killing it; label broad runs with `FRESHELL_TEST_SUMMARY`. Focused unit runs use the repo-owned passthrough: `npm run test:vitest -- run <paths>`.
+- **Test coordination (applies to every broad run this plan triggers):** check `npm run test:status` before any broad run; wait on a foreign holder rather than killing it; label every broad run with `FRESHELL_TEST_SUMMARY` (e.g. the end-of-execution gate in the Verification summary and Task 3 Step 7's cloud e2e run both carry `FRESHELL_TEST_SUMMARY='the-usual: rollback-marker-lifecycle <purpose>'`). Focused unit runs use the repo-owned passthrough: `npm run test:vitest -- run <paths>`.
 - **Vitest passthrough rule (validated by executed reproduction):** the coordinator classifies forwarded paths by config ownership. Default-owned paths (`test/unit/client/**`, `test/unit/shared/**`, `test/unit/lib/**`) run under `config/vitest/vitest.config.ts`. Server-owned paths (`test/unit/server/**`, `test/server/**`) REQUIRE the explicit config with the subcommand AFTER it: `npm run test:vitest -- --config config/vitest/vitest.server.config.ts run <paths>`. NEVER mix default-owned and server-owned paths in one invocation — a mixed set falls to the default config, which EXCLUDES `test/unit/server/**`: the server files silently do not run and the command still exits 0 (a false green). Never put a bare leading `run` before an explicit `--config` — the coordinator prepends its own `run` and the stray positional becomes a path filter matching every file with `run` in its path. Evidence: scripts/testing/coordinator-command-matrix.ts:546-557, config/vitest/vitest.config.ts:43, executed reproductions in the load-bearing finder report (§A1).
 - **e2e:** `test/e2e-browser/specs/fresh-agent-rollback-rust.spec.ts` must stay out of `CLOUD_SKIP_SPECS`/`CLOUD_SKIP_TITLES`; every test ≤120s wall; runs require `--project=rust-chromium` (the match-all chromium project ignores RUST_ONLY_SPECS — a filtered-to-nothing run is not coverage). The e2e boots its own ephemeral servers; it never touches the live port-3001 server, which must never be restarted without the user's explicit "APPROVED".
 - **`server/` (legacy TypeScript server) is untouched** by this feature.
@@ -70,7 +70,7 @@ Supporting exploration evidence (file:line citations for every claim above) live
 
 **Interfaces:**
 - Consumes: `RollbackRecord.entries[*].epoch` vs `RollbackRecord.current_epoch` (rollback_record.rs:131-176), and the provider-adjudicated `can_redo` parameter already received by `stamp_rollback_snapshot` (claude's `claude_can_redo_now` tip recheck arrives through it — claude_snapshot.rs:1022-1033).
-- Produces: per-turn `restorable: true|false` on every record-sourced `rolledBackTurns` row (all roles); record-less fallback rows (lib.rs:1604-1609) keep carrying NO `restorable` key (absent ⇒ not restorable, the older-server tolerance). Later tasks consume `turn.restorable === true` client-side.
+- Produces: per-turn `restorable: true|false` on every server-produced `rolledBackTurns` row (all roles): true/false from the record-based stamper, and explicit `false` on the record-less opencode fallback bucket rows (`lib.rs:1604-1609` — a new server speaks authoritatively; it never serves a maybe-restorable marker without adjudicating it). An ABSENT key remains exclusively the older-server tolerance (absent ⇒ not restorable). Later tasks consume `turn.restorable === true` client-side.
 
 - [ ] **Step 1: Write the failing tests (Rust + TS)**
 
@@ -110,7 +110,7 @@ Rust — extend the per-provider snapshot tests (each already pins the exact `ro
 - `claude_snapshot.rs` `claude_snapshot_a_moved_original_tip_forces_can_redo_false` (~2118): u2/a2 `restorable == false` even though the STORED bit is true — this is the regression pin for the provider-adjudicated-param rule.
 - `claude_snapshot.rs` `claude_snapshot_the_bucket_is_the_entries_union_across_epochs` (~2162): frozen o1/o2 `restorable == false`; current-epoch u2/a2 `restorable == true`.
 - `claude_snapshot.rs` `claude_snapshot_destroyed_redo_keeps_the_marked_bucket` (~2206): `restorable == false`.
-- `lib.rs` `opencode_snapshot_filters_turns_to_the_active_prefix_and_marks_the_tail` (~4081): the record-LESS fallback bucket turns carry NO `restorable` key (`turn.get("restorable").is_none()`).
+- `lib.rs` `opencode_snapshot_filters_turns_to_the_active_prefix_and_marks_the_tail` (~4081): the record-LESS fallback bucket turns carry `restorable == json!(false)` (the fallback path stamps an explicit false — an out-of-band revert is never restorable, and an absent key stays reserved for older-server payloads).
 - `lib.rs` `opencode_snapshot_stamps_capabilities_and_the_ledger_marker_bucket` (~4202), `opencode_snapshot_undone_depth_counts_user_steps_not_entries` (~4248), `get_opencode_snapshot_surfaces_the_durable_rollback_record` (~4299): bucket turns `restorable == true`.
 - `lib.rs` `opencode_snapshot_destroyed_redo_keeps_the_marked_bucket_alive` (~4277): `restorable == false` (the collapsed-history server truth).
 - `codex.rs` `codex_snapshot_stamps_paginated_capabilities_the_marker_bucket_and_the_revision_floor` (~17412) and `get_snapshot_surfaces_the_durable_rollback_record_and_floors_the_revision` (~17483): bucket turns `restorable == false` (codex is undo-only — collapsed from birth).
@@ -168,7 +168,7 @@ Expected: FAIL — the new `restorable` assertions fail because `stamp_rollback_
 
 Run: `cargo test -p freshell-freshagent -- claude_snapshot opencode_snapshot codex_snapshot claude_locator`
 
-Expected: FAIL for the same missing-key reason in the extended provider tests.
+Expected: FAIL for the same missing-key reason in the extended provider tests. (Multiple positional filters after `--` are OR'd name filters — verified empirically on this host's toolchain 1.96.0 by the load-bearing finder with a scratch crate; see reports/load-bearing-finder.md §A2. A filter that matches nothing exits 0 with "0 tests", so a typo'd filter would surface HERE as an unexpected pass — treat any "0 tests" or unexpected-pass result at this step as a stop-and-fix condition, never as the intended Red.)
 
 Run: `npm run test:vitest -- run test/unit/shared/fresh-agent-contract.test.ts`
 
@@ -203,13 +203,15 @@ Rust — `crates/freshell-freshagent/src/rollback_record.rs`, in `stamp_rollback
 
 Also extend the function's doc comment (~518-536) with one line noting the read-time `restorable` stamp beside the existing `rolledBack` bullet, and leave `redoable_turn_ids` (577-594) untouched (minimal diff; the user-row invariant holds by construction).
 
+Rust — also stamp the record-less fallback bucket: in `crates/freshell-freshagent/src/lib.rs`, `build_opencode_snapshot_json`'s record-less fallback turn projection (the per-turn `rolledBack` stamp at ~1539, bucket insert at ~1604-1609), stamp `t["restorable"] = json!(false)` beside the existing `rolledBack` stamp. An out-of-band revert the ledger never observed can never be restorable, and the new server must not leave the key ambiguous — an absent key stays reserved exclusively for older-server payloads.
+
 TS — `shared/fresh-agent-contract.ts`, in `FreshAgentTurnSchema` immediately after the `rolledBack` key (line 200):
 
 ```ts
   // Rolled-back section lifecycle: server-stamped per rolledBackTurns marker
   // row — true only while the step is still restorable (current rollback
-  // chain, redo available). Absent (an older server, or the record-less
-  // out-of-band fallback bucket) ⇒ not restorable ⇒ collapsed history
+  // chain, redo available); always false for out-of-band fallback markers.
+  // Absent (an older-server payload) ⇒ not restorable ⇒ collapsed history
   // presentation. Never stamped on live turns[].
   restorable: z.boolean().optional(),
 ```
@@ -593,7 +595,7 @@ git commit -m "test(e2e): cover the rolled-back marker restorability lifecycle a
 
 Check coordination first: `npm run test:status` — if a foreign holder is active, wait for it rather than killing it.
 
-Run: `npm run test:e2e:cloud -- --project=rust-chromium test/e2e-browser/specs/fresh-agent-rollback-rust.spec.ts`
+Run: `FRESHELL_TEST_SUMMARY='the-usual: rollback-marker-lifecycle cloud e2e verification' npm run test:e2e:cloud -- --project=rust-chromium test/e2e-browser/specs/fresh-agent-rollback-rust.spec.ts`
 
 Expected: PASS on the cloud backend, from the tree at Step 6's commit — the runner output must show the committed HEAD (a `-dirty` image tag means the tree was not committed; stop and fix that, not the tests). Confirm from the output that all 9 tests ran (a filtered-to-nothing run is not coverage) and the spec is NOT in CLOUD_SKIP_SPECS. If the cloud run finds a failure, fix it, commit the fix, and re-run from the committed tree.
 
@@ -608,7 +610,7 @@ Expected: PASS on the cloud backend, from the tree at Step 6's commit — the ru
 5. `npm run contract:generate` produces NO diff in `port/contract/`, `crates/freshell-protocol/`, `shared/ws-protocol.ts` (Task 1 — the frozen WS surface is untouched by design).
 6. `npm run test:e2e:local -- --project=rust-chromium test/e2e-browser/specs/fresh-agent-rollback-rust.spec.ts` — all 9 tests green (Task 3).
 7. `npm run test:e2e:cloud -- --project=rust-chromium test/e2e-browser/specs/fresh-agent-rollback-rust.spec.ts` — green on the configured cloud backend (Task 3).
-8. End-of-execution full-suite gate: `npm test` (coordinated) — green at final HEAD.
+8. End-of-execution full-suite gate — green at final HEAD, run with the coordinated-test procedure: first `npm run test:status` (wait on any foreign holder rather than killing it), then `FRESHELL_TEST_SUMMARY='the-usual: rollback-marker-lifecycle end-of-execution full-suite gate' npm test`. Record the gate entry (time, HEAD, exact command, result) in the execution progress ledger.
 
 ## Out-of-scope (explicitly not built)
 
