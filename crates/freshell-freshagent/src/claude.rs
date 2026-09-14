@@ -4659,6 +4659,21 @@ impl FreshClaudeState {
             ));
             return;
         };
+        // b8ke ext r13 F3: the rollback's observed generation fence —
+        // the wire carries no pair, so the server threads what it
+        // deterministically knows: the session's CURRENT owner generation,
+        // observed at ENTRY and re-validated by the claim under the
+        // coordinator lock. Any generation advance across the handler's
+        // awaits (the turn lock, the parked/retried spawn work) is the
+        // typed stale refusal — a DELAYED rollback can never replace a
+        // writer that moved on.
+        let rollback_fence = self.ownership.as_ref().map(|ownership| {
+            let snap = ownership.observe(PROVIDER, &durable_id);
+            freshell_ownership::ObservedFence {
+                epoch: ownership.boot_epoch(),
+                generation: snap.generation,
+            }
+        });
         // Held for the REST of this handler. in_turn is set by handle_send UNDER
         // this same lock BEFORE the sidecar write (the check-then-set window is
         // closed): observed false here means no op is in flight. Focused ep1-r1
@@ -4701,7 +4716,7 @@ impl FreshClaudeState {
         let granted_ticket = match self.begin_lane_claim_at(
             &durable_id,
             &rollback_lease_id,
-            None,
+            rollback_fence,
             "freshclaude/rollback",
         ) {
             crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
@@ -4738,6 +4753,46 @@ impl FreshClaudeState {
         // kind-appropriate identity (pid unknown until the spawn returns —
         // the same evidence shape the codex spawn hook rearms with the
         // real pid).
+        // b8ke ext r13 F3: the Adopt arm holds REAL authority across the
+        // replace window — the ext-r12 attach guard arms on the live
+        // incumbent's key and is held through the kill + respawn +
+        // register + rekey (this handler's scope), so a handoff or stop
+        // begin inside the window answers the typed Blocked outcome and
+        // can NEVER start a terminal beside the replacement (pre-r13 the
+        // Adopt arm proceeded with NO claim, and the rekey's verify was
+        // the only — post-overlap — defense).
+        let mut rollback_adopt_guard: Option<freshell_ownership::AttachGuard> = None;
+        if granted_ticket.is_none() && self.ownership.is_some() {
+            let resolved = self.resolve_ownership_key(&durable_id);
+            let snap = self.ownership_snapshot(PROVIDER, &resolved);
+            match crate::ownership_lane::arm_attach_guard(
+                &self.ownership,
+                PROVIDER,
+                &resolved,
+                &format!("rollback-adopt-{rollback_lease_id}"),
+                Some(snap.generation),
+                "freshclaude/rollback-adopt",
+            ) {
+                crate::ownership_lane::LaneAttachGuard::Armed(guard) => {
+                    rollback_adopt_guard = Some(guard);
+                }
+                crate::ownership_lane::LaneAttachGuard::Unwired => {}
+                crate::ownership_lane::LaneAttachGuard::Refused => {
+                    tracing::warn!(target: "freshell_freshagent::claude",
+                        session_id = %durable_id,
+                        "fresh_agent_rollback_refused: the Adopt arm's attach guard \
+                         refused to arm (the key entered a transition) — the rollback \
+                         aborts typed, nothing is killed or spawned"
+                    );
+                    reply_sink(rollback_error_frame(
+                        &op,
+                        "SESSION_RESERVED",
+                        "Another resume for this session is in flight",
+                    ));
+                    return;
+                }
+            }
+        }
         let mut own_ticket = granted_ticket;
         if own_ticket.is_some() {
             _start_cancellation = Some(
@@ -12585,6 +12640,209 @@ rl.on('line', (line) => {
             "a snapshot on the superseded id reports the canonical record — \
              never a false Vacant over the live re-keyed runtime"
         );
+    }
+
+    /// b8ke ext r13 F3: the rollback's replace window holds REAL
+    /// authority. The rollback is parked INSIDE its respawn (the fake
+    /// sidecar's deferred create answer) while the Adopt-path attach guard
+    /// is armed, and a handoff BEGIN is attempted in the window: it answers
+    /// the typed Blocked outcome — no terminal can start beside the
+    /// replacement (pre-r13 the Adopt arm held NO claim, so the racing
+    /// handoff granted and the overlapping writers ran until the rekey's
+    /// verify rejected).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_handoff_during_the_rollback_replace_window_is_blocked_typed() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install_with_knobs(Some(3_000), false);
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+
+        // A LIVE owner under the OLD durable id — the Adopt shape the
+        // rollback's claim observes.
+        st.handle_create(dedup_create_msg("req-r13-f3-window"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "req-r13-f3-window").await;
+        let map_key = created["sessionId"].as_str().unwrap().to_string();
+        let old_dur = FRESH_CREATE_DURABLE_ID;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if matches!(
+                registry.observe("claude", old_dur).state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the create's adoption never committed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // A rollback the sidecar can service (the transcript + record).
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        write_rollback_transcript(home.path(), old_dur, &two_turn_transcript());
+
+        // Truncate the spawn log: the FIXTURE's create already logged a
+        // spawn — only the ROLLBACK's respawn line is the park proof.
+        if let Ok(log) = std::env::var("FRESHELL_TEST_CLAUDE_SPAWN_LOG") {
+            let _ = std::fs::write(&log, "");
+        }
+        // Drive the rollback in a task; the deferred create answer parks
+        // it INSIDE the respawn window (the guard is armed).
+        let st_for_task = st.clone();
+        let op = rollback_op(&map_key, "req-r13-f3-window", RollbackDirection::Undo);
+        let (sink, captured) = capturing_sink();
+        let task = tokio::spawn(async move {
+            st_for_task.handle_rollback(op, sink).await;
+        });
+        // Park proof: the fake sidecar logged the spawn (inside the
+        // window; the create ANSWER is deferred 3s).
+        {
+            let spawn_log = std::env::var("FRESHELL_TEST_CLAUDE_SPAWN_LOG")
+                .map(std::path::PathBuf::from)
+                .ok();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let spawned = spawn_log
+                    .as_ref()
+                    .map(|p| {
+                        std::fs::read_to_string(p)
+                            .map(|s| !s.is_empty())
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if spawned {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the rollback never reached its respawn window"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+
+        // THE CONTRACT: a handoff BEGIN inside the rollback's replace
+        // window answers the typed Blocked outcome.
+        match registry.begin_handoff(
+            "claude",
+            old_dur,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-r13-f3-racing-handoff",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) {
+            freshell_ownership::BeginOutcome::Blocked {
+                state,
+                retry_after_ms,
+            } => {
+                assert!(retry_after_ms > 0);
+                assert!(
+                    matches!(state, freshell_ownership::OwnershipState::Live { .. }),
+                    "the blocked state names the still-Live key: {state:?}"
+                );
+            }
+            other => panic!(
+                "a handoff begin inside the rollback window must answer Blocked — got {other:?}"
+            ),
+        }
+        // No terminal ever started beside the replacement.
+        let _ = task.await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        drop(captured);
+    }
+
+    /// b8ke ext r13 F3: the rollback carries an observed generation fence —
+    /// the server threads the session's CURRENT owner generation (observed
+    /// at entry) into the claim, so a DELAYED rollback whose generation
+    /// went stale across the handler's awaits is refused typed (pre-r13 the
+    /// claim carried NO fence and a stale rollback replaced a writer that
+    /// moved on).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_generation_rollback_is_refused_typed() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+
+        st.handle_create(dedup_create_msg("req-r13-f3-stale"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "req-r13-f3-stale").await;
+        let map_key = created["sessionId"].as_str().unwrap().to_string();
+        let old_dur = FRESH_CREATE_DURABLE_ID;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if matches!(
+                registry.observe("claude", old_dur).state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "never committed Live"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        write_rollback_transcript(home.path(), old_dur, &two_turn_transcript());
+
+        // Hold the session's TURN LOCK: the rollback observes the fence at
+        // entry, then parks at the turn-lock await.
+        let turn_lock = {
+            let sessions = st.sessions.lock().await;
+            sessions
+                .get(&map_key)
+                .expect("the live session")
+                .turn_lock
+                .clone()
+        };
+        let _park = turn_lock.lock().await;
+
+        let st_for_task = st.clone();
+        let op = rollback_op(&map_key, "req-r13-f3-stale", RollbackDirection::Undo);
+        let (sink, captured) = capturing_sink();
+        let task = tokio::spawn(async move {
+            st_for_task.handle_rollback(op, sink).await;
+        });
+        // Let the task observe the fence and park at the turn lock.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // The generation ADVANCES while the rollback is parked: a handoff
+        // begin + fail-restore bumps the record's generation.
+        let freshell_ownership::BeginOutcome::Granted { .. } = registry.begin_handoff(
+            "claude",
+            old_dur,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-r13-f3-bump",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) else {
+            panic!("the generation-bump handoff must grant")
+        };
+        let _ = registry.fail("claude", old_dur, "op-r13-f3-bump", 2, true);
+
+        // Release the park: the rollback's claim re-validates the entry
+        // fence against the ADVANCED generation → typed stale refusal.
+        drop(_park);
+        let _ = task.await;
+        let frames = captured_json(&captured);
+        assert!(
+            frames.iter().any(|f| {
+                f["type"] == "freshAgent.event"
+                    && f["event"]["type"] == json!("freshAgent.error")
+                    && f["event"]["code"] == json!("SESSION_RESERVED")
+            }),
+            "the stale-generation rollback must answer the typed refusal: {frames:?}"
+        );
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
     }
 
     /// b8ke focused episode-2 round-3 F1: the NORMAL live-rollback path —
