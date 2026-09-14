@@ -14,7 +14,7 @@ Fresh-agent transcript collapsed activity line: a single collapsed line reading 
 - Repo rules: dedicated worktree branch from origin/main; red/green/refactor TDD; unit + e2e coverage; no direct pushes to main; stop before PR creation without explicit user approval.
 
 ### Accepted tradeoffs and residuals
-- None stated.
+- The request's "thought - 4 tools used" quotes the collapsed line visible in the user's screenshot; that rendered line is the existing `thought · N tools used` summary (middle-dot separator, singular "1 tool used" / plural "N tools used"). The hyphen in the request is a plain-text transcription of the middle dot — the run keeps the existing format unchanged and does not alter separators, wording, or count semantics.
 
 **Goal:** In fresh-agent transcripts, a tool-bearing activity line that is collapsed renders exactly one row — the existing `thought · N tools used` summary — with every thinking row (however many, wherever interleaved) hidden behind the strip's expand toggle instead of stacked below it as separate "Thinking" disclosures.
 
@@ -29,7 +29,7 @@ Fresh-agent transcript collapsed activity line: a single collapsed line reading 
 - **The expanded state is unchanged**: thinking rows, tool rows, and captions render inline in item order inside `fresh-agent-activity-details`.
 - **A11y contracts are preserved**: `div[role="region"][aria-label="Activity strip"]`, `button[aria-label="Toggle activity details"]`, `button[aria-label="Thinking"][aria-expanded]`, `span[role="status"]` reel, `aria-label="running"`/`"error"`, `pre[data-tool-input]`/`pre[data-tool-output]`, `.fresh-agent-thinking-body`, and all `data-testid` hooks stay exactly as they are. No new interactive elements without accessible names.
 - **Scope rule**: preserve pre-existing code and behavior unless satisfying the User Request requires changing them. The 2026-09-12 plan doc (`docs/plans/2026-09-12-freshagent-expand-toggles.md`) is historical — never edit it; this plan supersedes its D1 clause for tool-bearing lines.
-- **Test coordination**: focused vitest runs via the repo-owned path `npm run test:vitest -- run <path> --config config/vitest/vitest.config.ts` need no coordinator; broad/full-suite runs go through the coordinator (`npm test`) or `scripts/base-gate.sh`. E2e: `npm run test:e2e:chromium -- test/e2e-browser/specs/fresh-agent.spec.ts [--grep "..."]` (local backend; `FRESHELL_E2E_BACKEND` is unset → local default). Every e2e spec changed here must pass on the configured backend before any PR.
+- **Test coordination**: focused vitest runs via the repo-owned path `npm run test:vitest -- run <path> --config config/vitest/vitest.config.ts` need no coordinator; broad/full-suite runs go through the coordinator (`npm test`) or `scripts/base-gate.sh`. E2e: focused local iteration uses `npm run test:e2e:chromium -- test/e2e-browser/specs/fresh-agent.spec.ts [--grep "..."]`. The configured e2e backend is CLOUD (`FRESHELL_E2E_BACKEND=cloud` is exported in `~/.bashrc`; non-login shells hide it). Per repo rules, the affected spec must pass on the configured cloud backend before any PR: `npm run test:e2e:cloud -- test/e2e-browser/specs/fresh-agent.spec.ts` (the first cloud run per new commit may pay a one-time image build). If the cloud path fails, fix it or stop and report — never silently fall back to local.
 - **Process safety**: never restart the self-hosted server; never run broad kill patterns. All work stays inside the worktree `/home/dan/code/freshell/.worktrees/collapsed-thought-strip` on branch `the-usual/collapsed-thought-strip` (base_ref `e46020b4d21d30ba54032c30b56111b8c93b7c76`).
 - **Style**: no comments added to code unless they explain a non-obvious contract (this repo comments liberally in the fresh-agent components — match that local style where the existing comment block at the change site must be rewritten because its contract changes).
 
@@ -294,7 +294,7 @@ The impact set also includes every other fresh-agent component test (ItemCard, S
 
 Run: `npm run test:vitest -- run test/unit/client/components/fresh-agent/ --config config/vitest/vitest.config.ts`
 
-Expected: PASS (every test file in the directory, including all 99 tests in the transcript file). If a test not listed above fails, examine whether it pinned hoisted rows on a tool-bearing line while collapsed (rework it per the same pattern) or whether the production change over-hid thinking-only lines (fix the production change — the boundary is `tools.length === 0`).
+Expected: PASS (every test file in the directory, including all 100 tests in the transcript file — 99 existing + the 1 new interleaved test). If a test not listed above fails, examine whether it pinned hoisted rows on a tool-bearing line while collapsed (rework it per the same pattern) or whether the production change over-hid thinking-only lines (fix the production change — the boundary is `tools.length === 0`).
 
 - [ ] **Step 7: Commit the task**
 
@@ -483,11 +483,17 @@ No refactor — test-only edits matching existing helper/locator idioms.
 
 - [ ] **Step 6: Run impacted-test verification**
 
-The changed render path affects every e2e spec that mounts a fresh-agent transcript. The full fresh-agent spec is the impacted set (it is cloud-eligible — not in `CLOUD_SKIP_SPECS`; the configured backend is local):
+The changed render path affects every e2e spec that mounts a fresh-agent transcript. The full fresh-agent spec is the impacted set (it is cloud-eligible — not in `CLOUD_SKIP_SPECS`). First locally:
 
 Run: `npm run test:e2e:chromium -- test/e2e-browser/specs/fresh-agent.spec.ts`
 
 Expected: PASS (whole spec, all tests). `thinking text renders lighter than the final answer across sans, serif, and mono styles` must pass UNCHANGED (its `ensureThinkingExpanded` already expands the strip before clicking Thinking).
+
+Then on the configured backend (cloud — required for PR readiness per repo rules):
+
+Run: `npm run test:e2e:cloud -- test/e2e-browser/specs/fresh-agent.spec.ts`
+
+Expected: PASS (the first cloud run at a new commit may pay a one-time content-addressed image build). If the cloud path fails, fix it or stop and report — never silently fall back to local.
 
 - [ ] **Step 7: Commit the task**
 
@@ -516,7 +522,7 @@ No automated test asserts this copy (it is prose inside a `SettingsRow` descript
 
 Run: `grep -rn "always present in fresh-agent" src/ test/ docs/index.html`
 
-Expected: exactly 3 matches — `CodingAgentsSettings.tsx:160` (thinking copy), `CodingAgentsSettings.tsx:172` (Expand tools copy — NOT changed by this task), `docs/index.html:1061`. After Step 3, only the two Expand-tools copies remain with "always present".
+Expected: exactly 4 matches — `CodingAgentsSettings.tsx:160` (thinking copy), `CodingAgentsSettings.tsx:172` (Expand tools copy — NOT changed by this task), `docs/index.html:1061` (thinking copy, mock), `docs/index.html:1067` (Expand tools copy, mock — NOT changed). After Step 3, exactly 2 remain: the two Expand-tools copies (`CodingAgentsSettings.tsx:172` and `docs/index.html:1067`).
 
 - [ ] **Step 3: Update the copy**
 
@@ -573,4 +579,4 @@ git commit -m "fix(settings): refresh Expand thinking copy for gated thinking ro
 
 - **User-visible outcome:** a fresh-agent transcript line that used tools shows, while collapsed, exactly one row — `thought · N tools used` — no matter how many thinking rows it contains or how they interleave with tool uses. Proven end-to-end by the new interleaved e2e test and the reworked compact-default e2e test.
 - **Boundary:** thinking-only lines keep hoisted Thinking disclosures (pinned unchanged by existing unit tests `renders a live thinking row disclosure while streaming with the strip collapsed`, `renders a thinking-only turn as an activity strip (never dropped)`, `expansion is per-mount state, never re-synced from props`, and the thinking-only tail cases).
-- **Regression safety:** the full fresh-agent unit directory and the full fresh-agent e2e spec run green in Tasks 1-2; the final full-suite gate (coordinated `npm test`) runs once after the last task/review fix per the-usual Stage 4.
+- **Regression safety:** the full fresh-agent unit directory and the full fresh-agent e2e spec run green in Tasks 1-2 — locally for iteration, plus the configured cloud backend (`npm run test:e2e:cloud -- test/e2e-browser/specs/fresh-agent.spec.ts`) for PR readiness; the final full-suite gate (coordinated `npm test`) runs once after the last task/review fix per the-usual Stage 4.
