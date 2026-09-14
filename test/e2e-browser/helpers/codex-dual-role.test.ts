@@ -5,7 +5,7 @@ import path from 'node:path'
 import net from 'node:net'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { describe, it, expect } from 'vitest'
-import { FAKE_CODEX_APP_SERVER, installDualRoleCodexCli } from '../fixtures/codex-dual-role'
+import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
 
 /**
  * Behavioral pinning for the dual-role codex shim installed by e2e specs.
@@ -85,14 +85,6 @@ function directChildPids(pid: number): number[] {
   return raw === '' ? [] : raw.split(/\s+/).map(Number)
 }
 
-function hasExactCmdline(pid: number, script: string): boolean {
-  try {
-    return fsSync.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').includes(script)
-  } catch {
-    return false
-  }
-}
-
 async function freeLoopbackPort(): Promise<number> {
   return await new Promise((resolve, reject) => {
     const server = net.createServer()
@@ -103,6 +95,36 @@ async function freeLoopbackPort(): Promise<number> {
       server.close((error) => error ? reject(error) : resolve(port))
     })
   })
+}
+
+async function withCleanup<T>(body: () => Promise<T>, cleanupSteps: Array<() => Promise<void>>): Promise<T> {
+  let result: T | undefined
+  let primaryError: unknown
+  try {
+    result = await body()
+  } catch (error) {
+    primaryError = error
+  }
+
+  const cleanupErrors: unknown[] = []
+  for (const cleanup of cleanupSteps) {
+    try {
+      await cleanup()
+    } catch (error) {
+      cleanupErrors.push(error)
+    }
+  }
+
+  if (primaryError !== undefined) {
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError([primaryError, ...cleanupErrors], 'dual-role test and cleanup both failed')
+    }
+    throw primaryError
+  }
+  if (cleanupErrors.length > 0) {
+    throw new AggregateError(cleanupErrors, 'dual-role cleanup failed')
+  }
+  return result as T
 }
 
 async function canBindLoopbackPort(port: number): Promise<boolean> {
@@ -116,6 +138,38 @@ async function canBindLoopbackPort(port: number): Promise<boolean> {
 }
 
 describe('codex-dual-role shim', () => {
+  it('preserves the test failure while attempting every cleanup step', async () => {
+    const primary = new Error('primary test failure')
+    const firstCleanup = new Error('first cleanup failure')
+    const secondCleanup = new Error('second cleanup failure')
+    const attempted: string[] = []
+    let thrown: unknown
+
+    try {
+      await withCleanup(
+        async () => {
+          throw primary
+        },
+        [
+          async () => {
+            attempted.push('first')
+            throw firstCleanup
+          },
+          async () => {
+            attempted.push('second')
+            throw secondCleanup
+          },
+        ],
+      )
+    } catch (error) {
+      thrown = error
+    }
+
+    expect(attempted).toEqual(['first', 'second'])
+    expect(thrown).toBeInstanceOf(AggregateError)
+    expect((thrown as AggregateError).errors).toEqual([primary, firstCleanup, secondCleanup])
+  })
+
   it('runs the terminal fake for plain argv', async () => {
     const binDir = await fs.mkdtemp(path.join(os.tmpdir(), 'dual-role-'))
     try {
@@ -136,7 +190,7 @@ describe('codex-dual-role shim', () => {
   it('routes `app-server` argv to the fake app-server, which keeps listening (the sidecar contract)', async () => {
     const binDir = await fs.mkdtemp(path.join(os.tmpdir(), 'dual-role-'))
     let shim: ShimProcess | undefined
-    try {
+    await withCleanup(async () => {
       const terminalSrc = await writeTerminalFake(binDir)
       const bin = await installDualRoleCodexCli(binDir, terminalSrc)
 
@@ -148,10 +202,10 @@ describe('codex-dual-role shim', () => {
       // And it never confused itself for the terminal fake.
       await new Promise((r) => setTimeout(r, 100))
       expect(shim.stdout.join('')).not.toContain(TERMINAL_MARKER)
-    } finally {
-      if (shim) await stopShim(shim)
-      await fs.rm(binDir, { recursive: true, force: true })
-    }
+    }, [
+      async () => { if (shim) await stopShim(shim) },
+      () => fs.rm(binDir, { recursive: true, force: true }),
+    ])
   }, 30_000)
 
   it('passes terminalEnv through to the terminal role only', async () => {
@@ -182,7 +236,7 @@ describe('codex-dual-role shim', () => {
     // in the FIXture's transitive meaning.
     const binDir = await fs.mkdtemp(path.join(os.tmpdir(), 'dual-role-'))
     let shim: ShimProcess | undefined
-    try {
+    await withCleanup(async () => {
       const terminalSrc = await writeTerminalFake(binDir)
       const bin = await installDualRoleCodexCli(binDir, terminalSrc)
 
@@ -191,41 +245,50 @@ describe('codex-dual-role shim', () => {
       // Terminal fake must NOT have run.
       expect(shim.stdout.join('')).not.toContain(TERMINAL_MARKER)
       expect(code).toBeNull()
-    } finally {
-      if (shim) await stopShim(shim)
-      await fs.rm(binDir, { recursive: true, force: true })
-    }
+    }, [
+      async () => { if (shim) await stopShim(shim) },
+      () => fs.rm(binDir, { recursive: true, force: true }),
+    ])
   }, 30_000)
 
-  it.skipIf(process.platform !== 'linux')('reaps the captured app-server child before releasing its exact listener port', async () => {
+  it('releases its direct app-server listener after bounded graceful cleanup', async () => {
     const binDir = await fs.mkdtemp(path.join(os.tmpdir(), 'dual-role-reap-'))
     const terminalSrc = await writeTerminalFake(binDir)
     const bin = await installDualRoleCodexCli(binDir, terminalSrc)
     const port = await freeLoopbackPort()
     const shim = spawnShim(bin, ['-c', 'features.apps=false', 'app-server', '--listen', `ws://127.0.0.1:${port}`])
-    let sidecarPid: number | undefined
 
-    try {
+    await withCleanup(async () => {
       await waitUntil(5_000, () => {
-        const candidates = directChildPids(shim.child.pid ?? -1)
-        sidecarPid = candidates.find((pid) => hasExactCmdline(pid, FAKE_CODEX_APP_SERVER))
-        return sidecarPid !== undefined
+        return shim.child.exitCode === null
       })
       await waitUntil(5_000, async () => !(await canBindLoopbackPort(port)))
 
-      shim.child.kill('SIGTERM')
-      expect(await didExit(shim, 2_000)).toBe(true)
+      await stopShim(shim)
       expect(await canBindLoopbackPort(port)).toBe(true)
-    } finally {
-      if (sidecarPid !== undefined && hasExactCmdline(sidecarPid, FAKE_CODEX_APP_SERVER)) {
-        process.kill(sidecarPid, 'SIGKILL')
-        await waitUntil(5_000, () => !hasExactCmdline(sidecarPid!, FAKE_CODEX_APP_SERVER))
-      }
-      await fs.rm(binDir, { recursive: true, force: true })
-    }
+    }, [
+      () => stopShim(shim),
+      () => fs.rm(binDir, { recursive: true, force: true }),
+    ])
   }, 30_000)
 
-  it.skipIf(process.platform !== 'linux')('escalates cleanup when the captured app-server rejects SIGTERM', async () => {
+  it.skipIf(process.platform !== 'linux')('runs the app-server in the shim process instead of an extra child', async () => {
+    const binDir = await fs.mkdtemp(path.join(os.tmpdir(), 'dual-role-direct-'))
+    const terminalSrc = await writeTerminalFake(binDir)
+    const bin = await installDualRoleCodexCli(binDir, terminalSrc)
+    const port = await freeLoopbackPort()
+    const shim = spawnShim(bin, ['-c', 'features.apps=false', 'app-server', '--listen', `ws://127.0.0.1:${port}`])
+
+    await withCleanup(async () => {
+      await waitUntil(5_000, async () => !(await canBindLoopbackPort(port)))
+      expect(directChildPids(shim.child.pid ?? -1)).toEqual([])
+    }, [
+      () => stopShim(shim),
+      () => fs.rm(binDir, { recursive: true, force: true }),
+    ])
+  }, 30_000)
+
+  it.skipIf(process.platform === 'win32')('escalates cleanup when the direct app-server rejects SIGTERM', async () => {
     const binDir = await fs.mkdtemp(path.join(os.tmpdir(), 'dual-role-escalate-'))
     const terminalSrc = await writeTerminalFake(binDir)
     const bin = await installDualRoleCodexCli(binDir, terminalSrc)
@@ -235,30 +298,19 @@ describe('codex-dual-role shim', () => {
       ['-c', 'features.apps=false', 'app-server', '--listen', `ws://127.0.0.1:${port}`],
       { ...process.env, FAKE_CODEX_APP_SERVER_IGNORE_SIGTERM: '1' },
     )
-    let sidecarPid: number | undefined
 
-    try {
+    await withCleanup(async () => {
       await waitUntil(5_000, () => {
-        const candidates = directChildPids(shim.child.pid ?? -1)
-        sidecarPid = candidates.find((pid) => hasExactCmdline(pid, FAKE_CODEX_APP_SERVER))
-        return sidecarPid !== undefined
+        return shim.child.exitCode === null
       })
       await waitUntil(5_000, async () => !(await canBindLoopbackPort(port)))
 
-      shim.child.kill('SIGTERM')
-      expect(await didExit(shim, 2_500)).toBe(true)
+      await stopShim(shim)
       expect(await canBindLoopbackPort(port)).toBe(true)
-    } finally {
-      if (!(await didExit(shim, 20)) && shim.child.pid !== undefined) {
-        shim.child.kill('SIGKILL')
-        await didExit(shim, 2_000)
-      }
-      if (sidecarPid !== undefined && hasExactCmdline(sidecarPid, FAKE_CODEX_APP_SERVER)) {
-        process.kill(sidecarPid, 'SIGKILL')
-        await waitUntil(5_000, () => !hasExactCmdline(sidecarPid!, FAKE_CODEX_APP_SERVER))
-      }
-      await fs.rm(binDir, { recursive: true, force: true })
-    }
+    }, [
+      () => stopShim(shim),
+      () => fs.rm(binDir, { recursive: true, force: true }),
+    ])
   }, 30_000)
 })
 

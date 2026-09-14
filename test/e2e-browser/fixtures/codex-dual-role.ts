@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -33,64 +33,22 @@ export async function installDualRoleCodexCli(
   await fs.mkdir(binDir, { recursive: true })
   const target = path.join(binDir, 'codex')
   const terminalEnvExtra = JSON.stringify(terminalEnv ?? {})
+  const fakeAppServerUrl = pathToFileURL(FAKE_CODEX_APP_SERVER).href
   const script = `#!/usr/bin/env node
-const { spawn } = require('node:child_process')
+const { spawnSync } = require('node:child_process')
 const argv = process.argv.slice(2)
-const appServer = argv.includes('app-server')
-const target = appServer ? ${JSON.stringify(FAKE_CODEX_APP_SERVER)} : ${JSON.stringify(terminalSource)}
-const childEnv = appServer ? process.env : { ...process.env, ...${terminalEnvExtra} }
-const child = spawn(process.execPath, [target, ...argv], { stdio: 'inherit', env: childEnv })
-let stopping = false
-let killTimer
-
-function stopChild(signal) {
-  if (stopping) return
-  stopping = true
-  if (child.exitCode !== null) return
-  // The shim owns this exact ChildProcess. Forwarding only to it is portable
-  // and cannot accidentally signal the parent Vitest process or a sibling
-  // fixture, unlike a process-group signal.
-  try {
-    child.kill(signal)
-  } catch {
-    return
-  }
-  killTimer = setTimeout(() => {
-    if (child.exitCode === null) {
-      try {
-        child.kill('SIGKILL')
-      } catch {
-        // The exact child exited between the observation and the escalation.
-      }
-    }
-  }, 1_000)
-  killTimer.unref()
+if (argv.includes('app-server')) {
+  // Load the ESM fixture into this process rather than creating a wrapper
+  // plus sidecar child. The caller therefore owns one direct process on every
+  // platform; forceful Windows termination cannot orphan an inner listener.
+  void import(${JSON.stringify(fakeAppServerUrl)}).catch((error) => {
+    console.error(error)
+    process.exitCode = 1
+  })
+} else {
+  const result = spawnSync(process.execPath, [${JSON.stringify(terminalSource)}, ...argv], { stdio: 'inherit', env: { ...process.env, ...${terminalEnvExtra} } })
+  process.exit(result.status ?? 1)
 }
-
-function clearSignalHandlers() {
-  if (killTimer) clearTimeout(killTimer)
-  process.off('SIGTERM', onSigterm)
-  process.off('SIGINT', onSigint)
-  process.off('SIGHUP', onSighup)
-}
-
-function onSigterm() { stopChild('SIGTERM') }
-function onSigint() { stopChild('SIGINT') }
-function onSighup() { stopChild('SIGHUP') }
-
-process.once('SIGTERM', onSigterm)
-process.once('SIGINT', onSigint)
-process.once('SIGHUP', onSighup)
-
-child.once('error', () => {
-  clearSignalHandlers()
-  process.exitCode = 1
-})
-
-child.once('exit', (code) => {
-  clearSignalHandlers()
-  process.exitCode = code ?? 1
-})
 `
   await fs.writeFile(target, script, 'utf8')
   await fs.chmod(target, 0o755)
