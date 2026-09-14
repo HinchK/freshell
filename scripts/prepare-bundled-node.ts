@@ -172,6 +172,26 @@ export function getStagingPaths(): {
   return { nativeModulesDir, nodePtyTarget, bundledNodeDir }
 }
 
+/**
+ * Build the package.json staged for `npm ci --omit=dev`: strips "//" comment
+ * keys (newer npm versions reject them as invalid package names) and drops
+ * the root scripts section, whose lifecycle hooks are repo dev tooling that
+ * cannot run in the staging dir — npm ci executes them there, and their
+ * script files do not exist outside the checkout.
+ */
+export function buildStagingPackageJson(pkgRaw: string): string {
+  const pkg = JSON.parse(pkgRaw)
+  for (const section of ['dependencies', 'devDependencies']) {
+    if (pkg[section]) {
+      for (const key of Object.keys(pkg[section])) {
+        if (key.startsWith('//')) delete pkg[section][key]
+      }
+    }
+  }
+  delete pkg.scripts
+  return JSON.stringify(pkg, null, 2)
+}
+
 function resolvePackageRoot(packageName: string): string {
   const localPackageRoot = path.join(PROJECT_ROOT, 'node_modules', packageName)
   if (existsSync(path.join(localPackageRoot, 'package.json'))) {
@@ -423,18 +443,15 @@ async function main(): Promise<void> {
   removePath(stagingDir)
   mkdirSync(stagingDir, { recursive: true })
 
-  // Copy package.json to staging, stripping comment entries (keys starting
-  // with "//") that newer npm versions reject as invalid package names.
-  const pkgRaw = readFileSync(path.join(PROJECT_ROOT, 'package.json'), 'utf8')
-  const pkg = JSON.parse(pkgRaw)
-  for (const section of ['dependencies', 'devDependencies']) {
-    if (pkg[section]) {
-      for (const key of Object.keys(pkg[section])) {
-        if (key.startsWith('//')) delete pkg[section][key]
-      }
-    }
-  }
-  writeFileSync(path.join(stagingDir, 'package.json'), JSON.stringify(pkg, null, 2))
+  // Copy package.json to staging: buildStagingPackageJson strips "//"
+  // comment keys and the root scripts section (repo dev tooling whose
+  // lifecycle hooks cannot run in the staging dir).
+  writeFileSync(
+    path.join(stagingDir, 'package.json'),
+    buildStagingPackageJson(
+      readFileSync(path.join(PROJECT_ROOT, 'package.json'), 'utf8')
+    )
+  )
   if (existsSync(path.join(PROJECT_ROOT, 'package-lock.json'))) {
     cpSync(
       path.join(PROJECT_ROOT, 'package-lock.json'),

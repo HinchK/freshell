@@ -62,8 +62,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Copy package manifests first for npm ci layer caching.
+# Copy package manifests first for npm ci layer caching. The postinstall hook
+# (scripts/install-hooks.mjs) must also be present wherever npm ci runs: it
+# no-ops safely outside a git repo, but npm fails the whole install if the
+# file itself is missing. Copying only the hook file keeps the npm ci layer
+# cache keyed on the manifests and this one rarely-touched script.
 COPY package.json package-lock.json ./
+COPY scripts/install-hooks.mjs ./scripts/
 
 # Install all dependencies (including devDependencies for Playwright + tsc).
 RUN npm ci
