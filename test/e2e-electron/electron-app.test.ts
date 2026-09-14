@@ -161,7 +161,10 @@ function requireRemoteServerInfo(): E2eServerInfo {
 
 async function startRemoteServer(): Promise<E2eServerInfo> {
   if (remoteServer) throw new Error('Electron remote-server fixture is already running')
-  remoteServer = new RustServer({ expectedBuildCommit: requireElectronE2eBuildId() })
+  remoteServer = new RustServer({
+    expectedBuildCommit: requireElectronE2eBuildId(),
+    expectedBuildDirty: false,
+  })
   remoteServerInfo = await remoteServer.start()
   expect(remoteServerInfo.port).not.toBe(3001)
   return remoteServerInfo
@@ -222,7 +225,10 @@ test.describe('Renderer crash recovery', () => {
   })
 
   test('recovers the main Freshell UI after the renderer process crashes', async () => {
-    server = new RustServer({ expectedBuildCommit: requireElectronE2eBuildId() })
+    server = new RustServer({
+      expectedBuildCommit: requireElectronE2eBuildId(),
+      expectedBuildDirty: false,
+    })
     serverInfo = await server.start()
     tmpHome = createTempHome({
       serverMode: 'remote',

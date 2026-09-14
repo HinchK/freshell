@@ -2,7 +2,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { ensureRustServerBuilt, resolveRustServerBin, rustServerBinSha256 } from './rust-server.js'
+import { assertExpectedRustProvenance, ensureRustServerBuilt, resolveRustServerBin, rustServerBinSha256 } from './rust-server.js'
 
 describe('resolveRustServerBin (fail-closed override, :2015)', () => {
   const buildHead = () => '/BUILT/head/freshell-server' // sentinel: never used on the override paths
@@ -38,6 +38,26 @@ describe('resolveRustServerBin (fail-closed override, :2015)', () => {
   })
   it('falls back to the built HEAD binary when the override is UNSET', () => {
     expect(resolveRustServerBin({}, buildHead)).toEqual({ bin: '/BUILT/head/freshell-server', source: 'built' })
+  })
+})
+
+describe('assertExpectedRustProvenance', () => {
+  const exactHead = 'a'.repeat(40)
+
+  it('rejects a dirty server receipt even when its commit matches exactly', () => {
+    expect(() => assertExpectedRustProvenance(
+      { runtime: 'rust', commit: exactHead, buildDirty: true },
+      exactHead,
+      false,
+    )).toThrow(/clean build/i)
+  })
+
+  it('accepts the exact clean Rust receipt', () => {
+    expect(() => assertExpectedRustProvenance(
+      { runtime: 'rust', commit: exactHead, buildDirty: false },
+      exactHead,
+      false,
+    )).not.toThrow()
   })
 })
 

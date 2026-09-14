@@ -18,6 +18,23 @@ export function rustArtifactPath(
   return path.join(root, 'target', 'release', platform === 'win32' ? 'freshell-server.exe' : 'freshell-server')
 }
 
+/**
+ * Electron E2E owns its Rust artifact: generic browser E2E may deliberately
+ * select a prebuilt binary, but this launcher must run the release artifact it
+ * just rebuilt in this exact clean checkout.
+ */
+export function electronE2eEnvironment(
+  inheritedEnv: NodeJS.ProcessEnv,
+  buildId: string,
+  rustArtifact: string,
+): NodeJS.ProcessEnv {
+  return {
+    ...inheritedEnv,
+    FRESHELL_ELECTRON_E2E_BUILD_ID: buildId,
+    FRESHELL_E2E_RUST_SERVER_BIN: rustArtifact,
+  }
+}
+
 export function clientArtifactContainsBuildId(clientDir: string, buildId: string): boolean {
   const pending = [clientDir]
   while (pending.length > 0) {
@@ -108,10 +125,11 @@ export function playwrightExitResult(result: { status: number | null; signal: No
 
 export function main(argv: string[] = process.argv.slice(2)): number | NodeJS.Signals {
   const buildId = runElectronE2ePreflight()
+  const rustArtifact = rustArtifactPath(PROJECT_ROOT)
   const playwright = path.join(PROJECT_ROOT, 'node_modules', '@playwright', 'test', 'cli.js')
   const result = spawnSync(process.execPath, [playwright, 'test', '--config', 'test/e2e-electron/playwright.electron.config.ts', ...argv], {
     cwd: PROJECT_ROOT,
-    env: { ...process.env, FRESHELL_ELECTRON_E2E_BUILD_ID: buildId },
+    env: electronE2eEnvironment(process.env, buildId, rustArtifact),
     stdio: 'inherit',
     windowsHide: true,
   })

@@ -180,6 +180,27 @@ export function assertRustServerInfo(value: unknown): void {
   }
 }
 
+/** Verify optional fixture-specific build provenance after Rust runtime identity. */
+export function assertExpectedRustProvenance(
+  value: unknown,
+  expectedBuildCommit?: string,
+  expectedBuildDirty?: boolean,
+): void {
+  assertRustServerInfo(value)
+  const info = value as Record<string, unknown>
+  if (expectedBuildCommit !== undefined && info.commit !== expectedBuildCommit) {
+    throw new Error(
+      `Rust server fixture build commit mismatch: expected ${expectedBuildCommit}, received ${String(info.commit)}`,
+    )
+  }
+  if (expectedBuildDirty !== undefined && info.buildDirty !== expectedBuildDirty) {
+    const expectation = expectedBuildDirty ? 'dirty build' : 'clean build (buildDirty: false)'
+    throw new Error(
+      `Rust server fixture build cleanliness mismatch: expected ${expectation}, received ${String(info.buildDirty)}`,
+    )
+  }
+}
+
 
 /**
  * Recursively enumerate the live descendant PIDs of `pid` (children,
@@ -284,6 +305,8 @@ export interface RustServerOptions {
   portPicker?: () => Promise<number>
   /** Refuse to boot when the authenticated server provenance differs. */
   expectedBuildCommit?: string
+  /** Refuse to boot when the authenticated server build cleanliness differs. */
+  expectedBuildDirty?: boolean
 }
 
 /**
@@ -370,15 +393,11 @@ export class RustServer implements E2eServerHandle {
           )
         }
         const identityBody = await identity.json().catch(() => null)
-        assertRustServerInfo(identityBody)
-        if (this.options.expectedBuildCommit) {
-          const actualCommit = (identityBody as { commit?: unknown }).commit
-          if (actualCommit !== this.options.expectedBuildCommit) {
-            throw new Error(
-              `Rust server fixture build commit mismatch: expected ${this.options.expectedBuildCommit}, received ${String(actualCommit)}`,
-            )
-          }
-        }
+        assertExpectedRustProvenance(
+          identityBody,
+          this.options.expectedBuildCommit,
+          this.options.expectedBuildDirty,
+        )
         return info
       } catch (error) {
         lastError = error

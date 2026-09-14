@@ -225,6 +225,7 @@ test.describe('Electron app-bound Rust server', () => {
       })
       const foreignInfo = await waitForHealth(foreignPort, foreignToken)
       expect(foreignInfo.commit).toBe(expectedBuildId)
+      expect(foreignInfo.buildDirty).toBe(false)
 
       // In development Electron loads the chooser from Vite. Start only that
       // fixture here; the Rust server serves the main client from disk.
@@ -260,6 +261,7 @@ test.describe('Electron app-bound Rust server', () => {
       const appInfo = await waitForHealth(appPort, appToken)
       expect(appInfo.runtime).toBe('rust')
       expect(appInfo.commit).toBe(expectedBuildId)
+      expect(appInfo.buildDirty).toBe(false)
 
       await closeElectronGracefully(app)
       await waitForCapturedChildExit(electronProcess)

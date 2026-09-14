@@ -4,6 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import {
   clientArtifactContainsBuildId,
+  electronE2eEnvironment,
   playwrightExitResult,
   resolveExactElectronE2eHead,
   rustArtifactPath,
@@ -47,5 +48,18 @@ describe('Electron E2E client preflight', () => {
   it('uses the release Rust artifact for the Electron E2E provenance contract', () => {
     expect(rustArtifactPath('/repo', 'linux')).toBe('/repo/target/release/freshell-server')
     expect(rustArtifactPath('/repo', 'win32')).toBe('/repo/target/release/freshell-server.exe')
+  })
+
+  it('overrides a hostile inherited Rust binary path with the exact preflight artifact', () => {
+    const env = electronE2eEnvironment(
+      { FRESHELL_E2E_RUST_SERVER_BIN: '/other-worktree/target/release/freshell-server', KEEP_ME: 'yes' },
+      'a'.repeat(40),
+      '/repo/target/release/freshell-server',
+    )
+    expect(env).toMatchObject({
+      FRESHELL_ELECTRON_E2E_BUILD_ID: 'a'.repeat(40),
+      FRESHELL_E2E_RUST_SERVER_BIN: '/repo/target/release/freshell-server',
+      KEEP_ME: 'yes',
+    })
   })
 })
