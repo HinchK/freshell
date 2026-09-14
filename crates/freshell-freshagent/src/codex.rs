@@ -71,7 +71,7 @@ use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCompact, FreshAgentCreate,
     FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent, FreshAgentFork, FreshAgentForked,
     FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled, FreshAgentSend,
-    FreshAgentSessionMaterialized, ServerMessage, SessionLocator,
+    FreshAgentSessionMaterialized, ServerMessage, SessionLocator, SessionRuntimeOwner,
 };
 use freshell_terminal::FrameSink;
 
@@ -1234,18 +1234,17 @@ impl FreshCodexState {
             // Task 12 (D8 for fresh agents): claim the per-sessionRef lease BEFORE any
             // spawn -- exactly one in-flight resume (and one live rollout writer) per
             // thread. ALWAYS ON (never capability-gated).
-            // Fast-path ADOPT (V1): the thread is already live -- answer created
-            // naming it, spawn nothing (base checked only the dead-thread negative
-            // cache here, never the live sessions map).
-            if self.has_live_session(&resume_session_id).await {
-                // D8 (focused-ep1-r4 Finding 1): the adopt re-parks/re-stamps
-                // the CURRENT connection's provenance — recovery plans mint
-                // NEW tabIds, so the incumbent must not keep the old tab's
-                // attribution.
-                self.adopt_live_create(&request_id, &resume_session_id, provenance.clone())
-                    .await;
-                return;
-            }
+            // b8ke ext r10 F1: the map-hit fast path moved BEHIND the fence +
+            // coordinator claim (the Claude path's round-3 F2 shape). Pre-r10
+            // the already-live fast path ran BEFORE wire_fence and
+            // begin_lane_claim_at: during a handoff the OLD codex session
+            // stays live in the map until teardown, so a delayed
+            // freshAgent.create entered the branch, ignored its
+            // stale/malformed observed generation, rewrote the durable
+            // binding/provenance, and broadcast freshAgent.created for the
+            // runtime being handed off. The Adopt/Unwired/Granted arms below
+            // resolve the map hit COORDINATED (adopt proceeds idempotently;
+            // refusals answer typed) before any durable write or broadcast.
             // kata b8ke Task 3: the coordinator claim comes FIRST — before
             // the provider lease — so the cross-kind authority decides
             // atomically (no check-then-act window the terminal-lane probe
@@ -1273,11 +1272,101 @@ impl FreshCodexState {
                 claim_fence,
                 &Self::initiator_for(provenance.as_ref(), "freshcodex/create-resume"),
             ) {
-                crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
-                crate::ownership_lane::LaneClaim::Unwired => None,
+                crate::ownership_lane::LaneClaim::Granted(ticket) => {
+                    // b8ke ext r10 F1 (the Claude path's delta round-3 F2 +
+                    // e3r1 F3 shape): Granted-from-Vacant with a LIVE in-map
+                    // runtime is the unowned-runtime shape — adopt it, spawn
+                    // nothing, and COMMIT the adopted runtime as the
+                    // authoritative Live owner (the ticket's drop would
+                    // otherwise restore Vacant while the runtime keeps
+                    // running, licensing a SECOND writer).
+                    if self.has_live_session(&resume_session_id).await {
+                        // The codex sessions map is keyed BY the session id.
+                        // The adopted runtime's sidecar pid (R2-1's recorded
+                        // identity; None for test fixtures without a child).
+                        let adopted_pid = self
+                            .sessions
+                            .lock()
+                            .await
+                            .get(&resume_session_id)
+                            .and_then(|sess| sess.sidecar_pid);
+                        let adopted_map_key = resume_session_id.clone();
+                        let mut adopt_ticket = Some(ticket);
+                        match self.commit_lane_claim_at(
+                            &mut adopt_ticket,
+                            &resume_session_id,
+                            &adopted_map_key,
+                            adopted_pid,
+                        ) {
+                            Ok(()) => {
+                                self.broadcast(&ServerMessage::SessionRuntimeOwner(
+                                    SessionRuntimeOwner {
+                                        provider: PROVIDER.to_string(),
+                                        session_id: resume_session_id.clone(),
+                                        epoch: self
+                                            .ownership
+                                            .as_ref()
+                                            .map(|r| r.boot_epoch())
+                                            .unwrap_or(0),
+                                        generation: self
+                                            .ownership
+                                            .as_ref()
+                                            .map(|r| {
+                                                r.observe(PROVIDER, &resume_session_id).generation
+                                            })
+                                            .unwrap_or(0),
+                                        owner_kind: "fresh-agent".into(),
+                                        previous_kind: None,
+                                        terminal_id: None,
+                                        operation_id: format!("adopt-{request_id}"),
+                                        transition: "handoff-committed".into(),
+                                        reason: None,
+                                        fenced: None,
+                                        alias_of: None,
+                                    },
+                                ));
+                            }
+                            Err(outcome) => {
+                                tracing::warn!(target: "freshell_freshagent::codex",
+                                    session_id = %resume_session_id, request_id = %request_id,
+                                    outcome = ?outcome,
+                                    "fresh_agent_create_adopt_commit_stale: the coordinator \
+                                     moved on while the live-runtime adopt committed — the \
+                                     create is refused (never a live writer left unowned)"
+                                );
+                                self.fail_create(
+                                    &request_id,
+                                    "STALE_CLAIM",
+                                    "ownership moved on while adopting the live session; refresh and retry",
+                                );
+                                return;
+                            }
+                        }
+                        // D8 (focused-ep1-r4 Finding 1): the adopt re-parks/re-stamps
+                        // the CURRENT connection's provenance — recovery plans mint
+                        // NEW tabIds, so the incumbent must not keep the old tab's
+                        // attribution.
+                        self.adopt_live_create(&request_id, &resume_session_id, provenance.clone())
+                            .await;
+                        return;
+                    }
+                    Some(ticket)
+                }
+                crate::ownership_lane::LaneClaim::Unwired => {
+                    // The unwired lane's map fast path (V1 behavior): a live
+                    // session adopts, spawn nothing. With no coordinator
+                    // there is no fence to consult.
+                    if self.has_live_session(&resume_session_id).await {
+                        self.adopt_live_create(&request_id, &resume_session_id, provenance.clone())
+                            .await;
+                        return;
+                    }
+                    None
+                }
                 crate::ownership_lane::LaneClaim::Adopt => {
-                    // A same-kind live runtime the map fast-path missed —
-                    // adopt it, spawn nothing.
+                    // A same-kind live runtime the coordinator names —
+                    // adopt it, spawn nothing (the COORDINATED map-hit:
+                    // the claim already verified the key's state).
                     self.adopt_live_create(&request_id, &resume_session_id, provenance.clone())
                         .await;
                     return;
@@ -20018,5 +20107,201 @@ pub(crate) mod tests {
                 "the half-fenced send never answered INVALID_FENCE: {frame}"
             );
         }
+    }
+
+    /// b8ke ext r10 F1: a delayed freshAgent.create (resume) arriving
+    /// MID-HANDOFF for an IN-MAP codex session is refused typed — no
+    /// durable binding rewrite, no created broadcast for the runtime being
+    /// handed off. Pre-r10 the already-live fast path ran BEFORE the fence
+    /// and the coordinator claim, so the delayed create adopted the
+    /// mid-teardown session (rewriting the binding/provenance and
+    /// broadcasting created) while the handoff owned the key.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delayed_resume_create_mid_handoff_for_an_in_map_session_is_refused_typed() {
+        let _guard = ENV_LOCK.lock().await;
+        let (mut st, mut rx, fake) = state_with_sink();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+
+        configure_fake_codex_cmd("{}");
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, &thread_id).state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ),
+            "fixture: the create committed Live{{FreshAgent}}"
+        );
+        let bindings_before = fake.bindings.lock().unwrap().len();
+
+        // The key moves to Handoff (the old codex session stays LIVE in the
+        // map until the handoff's teardown lands).
+        let freshell_ownership::BeginOutcome::Granted { .. } = registry.begin_handoff(
+            PROVIDER,
+            &thread_id,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-r10-handoff-held",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) else {
+            panic!("expected the handoff granted")
+        };
+
+        // THE DELAYED CREATE: a resume naming the mid-handoff thread, its
+        // observed generation left at the legacy None pair (the delayed
+        // sender never refreshed its fence). Pre-r10 the map-hit fast path
+        // adopted without consulting the coordinator.
+        st.handle_create(
+            FreshAgentCreate {
+                observed_epoch: None,
+                observed_generation: None,
+                request_id: "req-r10-f1-delayed".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                provider: Some(freshell_protocol::AgentProvider::Codex),
+                cwd: None,
+                legacy_restore_context: None,
+                resume_session_id: Some(thread_id.clone()),
+                session_ref: None,
+                model: None,
+                model_selection: None,
+                permission_mode: None,
+                sandbox: None,
+                effort: None,
+                plugins: None,
+                tab_id: None,
+            },
+            None,
+        )
+        .await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv())
+                .await
+                .expect("a frame within budget")
+                .map(|raw| serde_json::from_str(&raw).expect("json frame"))
+                .expect("the bus stays open");
+            if frame["type"] == "freshAgent.create.failed"
+                && frame["requestId"] == json!("req-r10-f1-delayed")
+            {
+                assert_eq!(
+                    frame["code"],
+                    json!("SESSION_RESERVED"),
+                    "the delayed mid-handoff create answers the typed refusal: {frame}"
+                );
+                break;
+            }
+            assert!(
+                frame["type"] != "freshAgent.created"
+                    || frame["requestId"] != json!("req-r10-f1-delayed"),
+                "the delayed mid-handoff create must never broadcast created: {frame}"
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the delayed mid-handoff create never answered typed: {frame}"
+            );
+        }
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, &thread_id).state,
+                freshell_ownership::OwnershipState::Handoff { .. }
+            ),
+            "the Handoff record is untouched by the refused create"
+        );
+        assert_eq!(
+            fake.bindings.lock().unwrap().len(),
+            bindings_before,
+            "the refused create rewrote no durable binding"
+        );
+    }
+
+    /// b8ke ext r10 F1: the STALE observed generation is honored on the
+    /// already-live resume path — a resume-create naming a live session
+    /// with a stale fence pair answers the typed refusal, never the
+    /// map-hit adopt's created broadcast (the fast path ran before the
+    /// fence pre-r10, so the stale pair was silently ignored).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_fence_resume_create_for_a_live_session_is_refused_typed() {
+        let _guard = ENV_LOCK.lock().await;
+        let (mut st, mut rx, fake) = state_with_sink();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+
+        configure_fake_codex_cmd("{}");
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
+        let bindings_before = fake.bindings.lock().unwrap().len();
+        let stale_generation = 0u64;
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, &thread_id).state,
+                freshell_ownership::OwnershipState::Live { generation, .. } if generation > stale_generation
+            ),
+            "fixture: the live session's generation advanced past the stale pair"
+        );
+
+        // THE STALE-FENCED RESUME CREATE: same-kind Live owner + an older
+        // observed generation — the fence discipline refuses typed.
+        st.handle_create(
+            FreshAgentCreate {
+                observed_epoch: Some(registry.boot_epoch()),
+                observed_generation: Some(stale_generation),
+                request_id: "req-r10-f1-stale".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                provider: Some(freshell_protocol::AgentProvider::Codex),
+                cwd: None,
+                legacy_restore_context: None,
+                resume_session_id: Some(thread_id.clone()),
+                session_ref: None,
+                model: None,
+                model_selection: None,
+                permission_mode: None,
+                sandbox: None,
+                effort: None,
+                plugins: None,
+                tab_id: None,
+            },
+            None,
+        )
+        .await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv())
+                .await
+                .expect("a frame within budget")
+                .map(|raw| serde_json::from_str(&raw).expect("json frame"))
+                .expect("the bus stays open");
+            if frame["type"] == "freshAgent.create.failed"
+                && frame["requestId"] == json!("req-r10-f1-stale")
+            {
+                assert_eq!(
+                    frame["code"],
+                    json!("SESSION_RESERVED"),
+                    "the stale-fenced resume answers the typed refusal: {frame}"
+                );
+                break;
+            }
+            assert!(
+                frame["type"] != "freshAgent.created"
+                    || frame["requestId"] != json!("req-r10-f1-stale"),
+                "the stale-fenced resume must never broadcast created: {frame}"
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the stale-fenced resume never answered typed: {frame}"
+            );
+        }
+        assert_eq!(
+            fake.bindings.lock().unwrap().len(),
+            bindings_before,
+            "the refused resume rewrote no durable binding"
+        );
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, &thread_id).state,
+                freshell_ownership::OwnershipState::Live { owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+            ),
+            "the live session's owner record is untouched"
+        );
     }
 }
