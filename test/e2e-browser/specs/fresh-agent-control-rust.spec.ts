@@ -1510,6 +1510,138 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
     }
   })
 
+  test('a real Freshcodex thread persists its durable reference and reloads its snapshot metadata', async ({ page }) => {
+    const lane = await bootCodexLane(page)
+    try {
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      await sendCodexTurnAndWaitRows(page, lane.info, lane.harness, 2, 'durable browser reload turn')
+
+      // The fake app-server's real thread/start plus its recorded snapshot are
+      // the lifecycle precondition the route-only metadata test cannot supply.
+      const beforeReloadLeaf = await paneLeaf(lane.harness, lane.tabId)
+      const threadId = beforeReloadLeaf?.content?.sessionId as string
+      expect(threadId).toBe('thread-new-1')
+      expect(beforeReloadLeaf?.content?.sessionRef).toEqual({ provider: 'codex', sessionId: threadId })
+      const durableSnapshot = await fetchSnapshot(lane.info, 'freshcodex', 'codex', threadId)
+      expect(durableSnapshot?.turns).toHaveLength(2)
+      expect(
+        readCodexOps(lane.opLogPath).filter((op) => op.method === 'thread/start' && op.threadId === threadId),
+        'the thread must have been created by the real fake app-server before persistence',
+      ).toHaveLength(1)
+
+      await flushPersistence(page)
+      const persisted = await page.evaluate(({ tabId, paneId }) => {
+        const raw = localStorage.getItem('freshell.layout.v3')
+        if (!raw) throw new Error('Missing persisted layout after Freshcodex flush')
+        const layout = JSON.parse(raw)
+        const findPane = (node: any): any => {
+          if (node?.type === 'leaf' && node.id === paneId) return node.content
+          for (const child of node?.children ?? []) {
+            const found = findPane(child)
+            if (found) return found
+          }
+          return undefined
+        }
+        const content = findPane(layout.panes?.layouts?.[tabId])
+        if (!content) throw new Error('Persisted Freshcodex pane is missing')
+        return {
+          sessionRef: content.sessionRef,
+          hasSessionId: Object.prototype.hasOwnProperty.call(content, 'sessionId'),
+        }
+      }, { tabId: lane.tabId, paneId: beforeReloadLeaf.id })
+      expect(persisted).toEqual({
+        sessionRef: { provider: 'codex', sessionId: threadId },
+        hasSessionId: false,
+      })
+
+      // This route owns only the visual metadata fixture. It is installed
+      // after the real thread exists, so reload/reconciliation still targets
+      // the same Rust server and durable fake-app-server session above.
+      await page.route(
+        `${lane.info.baseUrl}/api/fresh-agent/threads/freshcodex/codex/${threadId}*`,
+        async (route) => route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            sessionType: 'freshcodex',
+            provider: 'codex',
+            threadId,
+            sessionId: threadId,
+            revision: 7,
+            status: 'idle',
+            summary: 'Freshcodex durable snapshot',
+            capabilities: { send: true, interrupt: true, approvals: false, questions: false, fork: true },
+            tokenUsage: { totalTokens: 42, inputTokens: 10, outputTokens: 32 },
+            worktrees: [{ id: 'wt-1', path: '/tmp/worktree', branch: 'feature/fresh-agent' }],
+            diffs: [{ id: 'diff-1', title: 'README.md' }],
+            childThreads: [{ id: 'child-1', threadId: 'child-thread', origin: 'codex', title: 'Subagent' }],
+            extensions: {
+              codex: {
+                review: { id: 'review-1', status: 'pending' },
+                fork: { parentThreadId: 'thread-parent-1' },
+              },
+            },
+            turns: [{
+              id: 'turn-reload',
+              turnId: 'turn-reload',
+              role: 'assistant',
+              summary: 'Codex durable transcript',
+              items: [{ id: 'item-reload', kind: 'text', text: 'Codex durable transcript' }],
+            }],
+          }),
+        }),
+      )
+
+      await page.reload({ waitUntil: 'domcontentloaded' })
+      const reloadedHarness = new TestHarness(page)
+      await reloadedHarness.waitForHarness()
+      await reloadedHarness.waitForConnection()
+      const reloadedTabId = (await reloadedHarness.getActiveTabId())!
+
+      // The handshake's reconcile inventory and the recovery request must both
+      // name the persisted durable reference. The latter may be attach or a
+      // create-shaped resume, but must never mint an unrelated thread.
+      await expect.poll(async () => {
+        const sent = await reloadedHarness.getSentWsMessages() as any[]
+        return sent.some((message) =>
+          message?.type === 'pane.reconcile.request'
+            && message?.panes?.some((pane: any) =>
+              pane?.kind === 'fresh-agent'
+                && pane?.sessionRef?.provider === 'codex'
+                && pane?.sessionRef?.sessionId === threadId,
+            ),
+        )
+      }, { timeout: 30_000, message: 'reload reconcile inventory must retain the durable Codex reference' }).toBe(true)
+      await expect.poll(async () => {
+        const sent = await reloadedHarness.getSentWsMessages() as any[]
+        return sent.some((message) =>
+          (message?.type === 'freshAgent.attach' || message?.type === 'freshAgent.create')
+            && (message?.sessionId === threadId
+              || message?.resumeSessionId === threadId
+              || message?.sessionRef?.sessionId === threadId),
+        )
+      }, { timeout: 30_000, message: 'reload must attach or resume the persisted Codex thread' }).toBe(true)
+      await expect.poll(async () => (
+        (await paneLeaf(reloadedHarness, reloadedTabId))?.content?.sessionRef?.sessionId ?? null
+      ), { timeout: 30_000 }).toBe(threadId)
+      expect(
+        readCodexOps(lane.opLogPath).filter((op) => op.method === 'thread/start' && op.threadId === threadId),
+        'reload must not create a second Codex thread',
+      ).toHaveLength(1)
+
+      const pane = page.locator('[data-context="fresh-agent"]').last()
+      await expect(pane).toContainText('Codex durable transcript', { timeout: 30_000 })
+      await expect(pane).toContainText('feature/fresh-agent')
+      await expect(pane).toContainText('README.md')
+      await expect(pane).toContainText('review-1')
+      await expect(pane).toContainText('pending')
+      await expect(pane).toContainText('thread-parent-1')
+    } finally {
+      await lane.server.stop().catch(() => {})
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
   test('compact: thread/compact/start, never a turn; pane returns usable', async ({ page }) => {
     const lane = await bootCodexLane(page)
     try {

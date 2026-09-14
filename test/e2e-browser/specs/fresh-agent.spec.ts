@@ -1,6 +1,5 @@
 import { test, expect } from '../helpers/fixtures.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
-import { TestHarness } from '../helpers/test-harness.js'
 
 // The browser-preferences persist path debounces localStorage writes by
 // 500ms; wait past it before reading the blob.
@@ -1581,9 +1580,7 @@ test.describe('Fresh Agent', () => {
     await terminal.waitForTerminal()
     await enableClaudeAndCodex(page)
 
-    let snapshotGetCount = 0
     await page.route(`${serverInfo.baseUrl}/api/fresh-agent/threads/freshcodex/codex/thread-codex*`, async (route) => {
-      snapshotGetCount += 1
       await route.fulfill({
         status: 200,
         contentType: 'application/json',
@@ -1661,9 +1658,11 @@ test.describe('Fresh Agent', () => {
     await expect(page.getByText('pending')).toBeVisible()
     await expect(page.getByText('thread-parent-1')).toBeVisible()
 
-    // Persist the pane's durable reference, then exercise a fresh browser
-    // session against the same Rust fixture. Re-query the harness and locators
-    // after navigation so this is a resume proof, not stale-page evidence.
+    // The routed snapshot is visual-only, but the persisted-layout contract is
+    // still meaningful: retain the durable reference and never persist the
+    // ephemeral live session id. Reload/reconciliation belongs to the
+    // Rust-backed fake-Codex coverage, where this reference is real server
+    // state rather than a route-only fixture.
     await page.evaluate(() => {
       window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
     })
@@ -1688,38 +1687,6 @@ test.describe('Fresh Agent', () => {
     }, { currentTabId: tabId, currentPaneId: activePaneId })
     expect(persistedFreshcodex.sessionRef).toEqual({ provider: 'codex', sessionId: 'thread-codex' })
     expect(persistedFreshcodex.hasSessionId).toBe(false)
-    const snapshotGetsBeforeReload = snapshotGetCount
-    expect(snapshotGetsBeforeReload).toBeGreaterThan(0)
-
-    // This test owns a routed transcript, not a real Codex sidecar. Make the
-    // suppression survive the new document so its persisted sessionRef is
-    // exercised without trying to resume the synthetic thread on the fixture.
-    await page.addInitScript(() => {
-      ;(window as typeof window & { __FRESHELL_SUPPRESS_ALL_FRESH_AGENT_NETWORK_EFFECTS__?: boolean })
-        .__FRESHELL_SUPPRESS_ALL_FRESH_AGENT_NETWORK_EFFECTS__ = true
-    })
-    await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
-    const reloadedHarness = new TestHarness(page)
-    await reloadedHarness.waitForHarness()
-    await reloadedHarness.waitForConnection()
-    expect(await page.evaluate(() => (
-      window.__FRESHELL_TEST_HARNESS__?.isAllFreshAgentNetworkEffectsSuppressed?.()
-    ))).toBe(true)
-    await expect.poll(() => snapshotGetCount, { timeout: 10_000 }).toBeGreaterThan(snapshotGetsBeforeReload)
-    await expect.poll(async () => (
-      (await reloadedHarness.getSentWsMessages()).filter((message: any) => message?.type === 'freshAgent.create')
-    ), { timeout: 10_000 }).toHaveLength(1)
-    const suppressedCreates = (await reloadedHarness.getSentWsMessages()).filter(
-      (message: any) => message?.type === 'freshAgent.create',
-    ) as any[]
-    expect(suppressedCreates[0]).toMatchObject({
-      sessionType: 'freshcodex',
-      provider: 'codex',
-      sessionRef: { provider: 'codex', sessionId: 'thread-codex' },
-    })
-    await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible()
-    await expect(page.getByText('Codex transcript')).toBeVisible()
-    await expect(page.getByText(/feature\/fresh-agent/)).toBeVisible()
   })
 })
 
