@@ -61,6 +61,11 @@ fail() {
 }
 
 if [ "$run_rust" = 1 ]; then
+  # cargo can live in ~/.cargo/bin, which stripped-environment hook contexts
+  # (ssh, agents, IDEs, cron) don't always carry on PATH.
+  if ! command -v cargo >/dev/null 2>&1 && [ -d "$HOME/.cargo/bin" ]; then
+    PATH="$HOME/.cargo/bin:$PATH"
+  fi
   if command -v cargo >/dev/null 2>&1; then
     echo "pre-push: rust gate — cargo fmt --all --check" >&2
     cargo fmt --all --check || fail "cargo fmt --all --check"
@@ -68,16 +73,25 @@ if [ "$run_rust" = 1 ]; then
     cargo clippy --workspace --exclude freshell-tauri --all-targets -- -D warnings \
       || fail "cargo clippy --workspace --all-targets -- -D warnings"
   else
-    echo "pre-push: cargo not found — SKIPPING rust gate (install rustup to enforce)" >&2
+    echo "pre-push: cargo not on PATH (~/.cargo/bin tried) — SKIPPING rust gate" >&2
   fi
 fi
 
 if [ "$run_ts" = 1 ]; then
-  if command -v npm >/dev/null 2>&1 && [ -e node_modules/.bin/tsc ]; then
-    echo "pre-push: ts gate — npm run typecheck" >&2
-    npm run --silent typecheck || fail "npm run typecheck"
+  if [ ! -e node_modules/.bin/tsc ]; then
+    echo "pre-push: node_modules missing (no tsc) — SKIPPING typecheck (npm install to enforce)" >&2
   else
-    echo "pre-push: tsc not available (no node_modules?) — SKIPPING typecheck (npm install to enforce)" >&2
+    # npm (and node) can live in nvm, which stripped-environment hook contexts
+    # (ssh, agents, IDEs, cron) don't always load — source the loader if absent.
+    if ! command -v npm >/dev/null 2>&1; then
+      [ -s "$HOME/.nvm/nvm.sh" ] && \. "$HOME/.nvm/nvm.sh" >/dev/null 2>&1
+    fi
+    if command -v npm >/dev/null 2>&1; then
+      echo "pre-push: ts gate — npm run typecheck" >&2
+      npm run --silent typecheck || fail "npm run typecheck"
+    else
+      echo "pre-push: npm not on PATH (nvm loader tried) — SKIPPING typecheck" >&2
+    fi
   fi
 fi
 
