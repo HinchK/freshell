@@ -184,6 +184,13 @@ export async function cleanupElectronFixture(options: ElectronFixtureCleanupDeps
     } catch (error) {
       gracefulCloseFailed = true
       appendFailure(failures, 'closing Electron', error)
+    }
+
+    // Playwright's close promise resolving is not an exit receipt for the
+    // launch-owned child. The handle is exact (rather than a PID lookup), so
+    // this is a bounded no-op after a normal exit and TERM→KILL containment
+    // only when that same captured process still reports live.
+    if (options.electronProcess) {
       try {
         await stopExactCapturedProcess(options.electronProcess, forceCloseTimeoutMs, sleep)
       } catch (containmentError) {

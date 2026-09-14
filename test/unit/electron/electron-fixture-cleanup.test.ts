@@ -78,6 +78,45 @@ describe('cleanupElectronFixture', () => {
     expect(order).toEqual(['app.close', 'server.stop-and-verify', 'home.remove'])
   })
 
+  it('contains the exact captured Electron child when app.close resolves but the child remains live', async () => {
+    const order: string[] = []
+    const electronProcess = {
+      exitCode: null,
+      signalCode: null as NodeJS.Signals | null,
+      kill: vi.fn((signal: NodeJS.Signals) => {
+        order.push(`electron.${signal}`)
+        electronProcess.signalCode = signal
+        return true
+      }),
+    }
+
+    await expect(cleanupElectronFixture({
+      app: {
+        close: async () => {
+          order.push('app.close')
+        },
+      },
+      electronProcess,
+      stopServer: async (context) => {
+        expect(context).toEqual({ gracefulCloseFailed: false })
+        order.push('server.stop-and-verify')
+      },
+      removeHome: async () => {
+        order.push('home.remove')
+      },
+      forceCloseTimeoutMs: 1,
+      sleep: async () => {},
+    })).resolves.toBeUndefined()
+
+    expect(order).toEqual([
+      'app.close',
+      'electron.SIGTERM',
+      'server.stop-and-verify',
+      'home.remove',
+    ])
+    expect(electronProcess.kill).toHaveBeenCalledExactlyOnceWith('SIGTERM')
+  })
+
   it('contains a hung graceful close, still proves/removes fixture resources, and preserves the failure', async () => {
     const close = deferred()
     const order: string[] = []
