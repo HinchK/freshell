@@ -47,6 +47,7 @@ const configDir = path.join(os.homedir(), '.freshell')
 const mainProcessLogger = createElectronMainLogger({ configDir })
 
 const ELECTRON_TEST_DISCOVERY_CANDIDATE = 'FRESHELL_ELECTRON_TEST_DISCOVERY_CANDIDATE'
+const ELECTRON_TEST_CHOOSER_PORT = 'FRESHELL_ELECTRON_TEST_CHOOSER_PORT'
 
 /**
  * Electron E2E disables the normal local-port sweep so its process can never
@@ -640,7 +641,9 @@ async function main(): Promise<void> {
     chooserWebContentsId = chooserWin.webContents.id
 
     if (isDev) {
-      await chooserWin.loadURL('http://localhost:5175')
+      const chooserPort = process.env[ELECTRON_TEST_CHOOSER_PORT] ?? '5175'
+      if (!/^\d+$/.test(chooserPort)) throw new Error(`${ELECTRON_TEST_CHOOSER_PORT} must be a port number`)
+      await chooserWin.loadURL(`http://localhost:${chooserPort}`)
     } else {
       const packagedChooser = path.join(process.resourcesPath, 'launch-chooser', 'index.html')
       const unpackagedChooser = path.join(app.getAppPath(), 'dist', 'launch-chooser', 'index.html')

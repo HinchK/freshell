@@ -131,4 +131,25 @@ describe('cleanupElectronFixture', () => {
     await expectCleanupFailure(cleanupElectronFixture(deps), /closing Electron/i)
     expect(order).toEqual(['server.stop-and-verify', 'home.remove'])
   })
+
+  it('contains the exact Electron child after app.close rejects and still cleans server and HOME', async () => {
+    const order: string[] = []
+    const child = {
+      exitCode: null,
+      signalCode: null as NodeJS.Signals | null,
+      kill: vi.fn((signal: NodeJS.Signals) => {
+        order.push(`child.${signal}`)
+        child.signalCode = signal
+        return true
+      }),
+    }
+    await expectCleanupFailure(cleanupElectronFixture({
+      app: { close: async () => { throw new Error('Playwright transport lost') } },
+      electronProcess: child,
+      stopServer: async () => { order.push('server') },
+      removeHome: async () => { order.push('home') },
+      sleep: async () => {},
+    }), /Playwright transport lost/i)
+    expect(order).toEqual(['child.SIGTERM', 'server', 'home'])
+  })
 })

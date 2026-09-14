@@ -30,6 +30,7 @@ export function resolveExactElectronE2eHead(
   root = PROJECT_ROOT,
   inheritedBuildCommit = process.env.FRESHELL_BUILD_COMMIT,
   resolveHead: (cwd: string) => string = (cwd) => execFileSync('git', ['rev-parse', 'HEAD'], { cwd, encoding: 'utf8' }).trim(),
+  resolveDirty: (cwd: string) => string = (cwd) => execFileSync('git', ['status', '--porcelain', '--untracked-files=all'], { cwd, encoding: 'utf8' }),
 ): string {
   const buildId = resolveHead(root)
   if (!/^[0-9a-f]{40}$/.test(buildId)) {
@@ -37,6 +38,9 @@ export function resolveExactElectronE2eHead(
   }
   if (inheritedBuildCommit !== undefined) {
     throw new Error(`Electron E2E rejects inherited FRESHELL_BUILD_COMMIT ${inheritedBuildCommit}; it pins checkout HEAD ${buildId} itself`)
+  }
+  if (resolveDirty(root).trim() !== '') {
+    throw new Error('Electron E2E requires a clean checkout; commit or remove tracked/untracked changes first')
   }
   return buildId
 }

@@ -131,24 +131,14 @@ export async function cleanupElectronFixture(options: ElectronFixtureCleanupDeps
 
   if (options.app) {
     try {
-      try {
-        await closeElectronGracefully(options.app, gracefulCloseTimeoutMs, sleep)
-      } catch (error) {
-        const timedOut = error instanceof Error && /graceful Electron shutdown timed out/.test(error.message)
-        if (!timedOut) throw error
-        appendFailure(
-          failures,
-          'closing Electron',
-          error,
-        )
-        try {
-          await stopExactCapturedProcess(options.electronProcess, forceCloseTimeoutMs, sleep)
-        } catch (error) {
-          appendFailure(failures, 'containing the captured Electron process', error)
-        }
-      }
+      await closeElectronGracefully(options.app, gracefulCloseTimeoutMs, sleep)
     } catch (error) {
       appendFailure(failures, 'closing Electron', error)
+      try {
+        await stopExactCapturedProcess(options.electronProcess, forceCloseTimeoutMs, sleep)
+      } catch (containmentError) {
+        appendFailure(failures, 'containing the captured Electron process', containmentError)
+      }
     }
   }
 

@@ -15,6 +15,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { cleanupElectronFixture, closeElectronGracefully, stopExactCapturedProcess } from './electron-fixture-cleanup.js'
 import { isolatedElectronHomeEnv } from './fixture-home-env.js'
+import { launchChooserViteArgs } from './launch-chooser-vite.js'
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, '..', '..')
 const VITE_ROOT = path.join(PROJECT_ROOT, 'node_modules')
@@ -109,11 +110,9 @@ async function waitForWindowUrl(
   throw new Error(`Timed out waiting for Electron window matching ${pattern}`)
 }
 
-function startLaunchChooserDevServer(): ChildProcess {
+function startLaunchChooserDevServer(port: number): ChildProcess {
   return spawn(process.execPath, [
-    path.join(VITE_ROOT, 'vite/bin/vite.js'),
-    '--config',
-    path.join(PROJECT_ROOT, 'config/vite/vite.launch-chooser.config.ts'),
+    ...launchChooserViteArgs(VITE_ROOT, PROJECT_ROOT, port),
   ], {
     cwd: PROJECT_ROOT,
     env: {
@@ -121,6 +120,26 @@ function startLaunchChooserDevServer(): ChildProcess {
       NODE_PATH: path.join(PROJECT_ROOT, 'node_modules'),
     },
     stdio: 'ignore',
+  })
+}
+
+async function waitForCapturedViteReady(child: ChildProcess, port: number): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    let output = ''
+    const timer = setTimeout(() => reject(new Error(`captured chooser Vite did not become ready on ${port}`)), 30_000)
+    const finish = (error?: Error) => {
+      clearTimeout(timer)
+      child.stdout?.off('data', onData)
+      child.off('exit', onExit)
+      error ? reject(error) : resolve()
+    }
+    const onData = (chunk: Buffer) => {
+      output += chunk.toString()
+      if (output.includes(`http://localhost:${port}/`)) finish()
+    }
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => finish(new Error(`captured chooser Vite exited before ready (${code ?? signal ?? 'unknown'})`))
+    child.stdout?.on('data', onData)
+    child.once('exit', onExit)
   })
 }
 
@@ -195,6 +214,7 @@ test.describe('Electron app-bound Rust server', () => {
     const expectedBuildId = requireElectronE2eBuildId()
 
     const appPort = await findFreePort()
+    const chooserPort = await findFreePort()
     let foreignPort = await findFreePort()
     while (foreignPort === appPort) foreignPort = await findFreePort()
 
@@ -244,8 +264,8 @@ test.describe('Electron app-bound Rust server', () => {
 
       // In development Electron loads the chooser from Vite. Start only that
       // fixture here; the Rust server serves the main client from disk.
-      chooserDevServer = startLaunchChooserDevServer()
-      await waitForHttp('http://localhost:5175')
+      chooserDevServer = startLaunchChooserDevServer(chooserPort)
+      await waitForCapturedViteReady(chooserDevServer, chooserPort)
 
       app = await electron.launch({
         args: [PROJECT_ROOT],
@@ -253,6 +273,7 @@ test.describe('Electron app-bound Rust server', () => {
         env: {
           ...isolatedElectronHomeEnv(process.env, appHome),
           ELECTRON_DEV: '1',
+          FRESHELL_ELECTRON_TEST_CHOOSER_PORT: String(chooserPort),
           FRESHELL_ELECTRON_TEST_NO_LOCAL_DISCOVERY: '1',
           NODE_PATH: path.join(PROJECT_ROOT, 'node_modules'),
         },

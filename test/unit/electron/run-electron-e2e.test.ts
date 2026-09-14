@@ -30,9 +30,12 @@ describe('Electron E2E client preflight', () => {
 
   it('pins builds to checkout HEAD and rejects a conflicting inherited override', () => {
     const head = 'a'.repeat(40)
-    expect(resolveExactElectronE2eHead('/repo', undefined, () => head)).toBe(head)
-    expect(() => resolveExactElectronE2eHead('/repo', head, () => head)).toThrow(/rejects inherited FRESHELL_BUILD_COMMIT/i)
-    expect(() => resolveExactElectronE2eHead('/repo', 'b'.repeat(40), () => head)).toThrow(/rejects inherited FRESHELL_BUILD_COMMIT/i)
+    expect(resolveExactElectronE2eHead('/repo', undefined, () => head, () => '')).toBe(head)
+    expect(() => resolveExactElectronE2eHead('/repo', head, () => head, () => '')).toThrow(/rejects inherited FRESHELL_BUILD_COMMIT/i)
+    expect(() => resolveExactElectronE2eHead('/repo', 'b'.repeat(40), () => head, () => '')).toThrow(/rejects inherited FRESHELL_BUILD_COMMIT/i)
+    expect(() => resolveExactElectronE2eHead('/repo', undefined, () => head, () => ' M tracked.ts')).toThrow(/clean checkout/i)
+    expect(() => resolveExactElectronE2eHead('/repo', undefined, () => head, () => '?? untracked.ts')).toThrow(/clean checkout/i)
+    expect(resolveExactElectronE2eHead('/repo', undefined, () => head, () => '')).toBe(head)
   })
 
   it('preserves a Playwright child signal instead of collapsing it into exit 1', () => {
