@@ -1232,6 +1232,17 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
         }
     }
     let resume_notice = rest_outcome.notice;
+    // b8ke ext r7 F2: the TYPED fresh-substitution record — the requested
+    // session was DEFINITIVELY missing and a replacement was started (the
+    // new session id rides the paneContent's sessionRef when the provider
+    // mints one). The pane always knows it got a new session, never a
+    // silent swap.
+    let session_substitution = rest_outcome.stale_session_id.map(|requested| {
+        json!({
+            "reason": "SESSION_MISSING_RESUMED_FRESH",
+            "requestedSessionId": requested,
+        })
+    });
 
     // Fresh-claude preallocation (kata hbsa): WS parity. The WS door's
     // fresh-claude special case (freshell-ws/src/terminal.rs, LIVE-PATH LAW
@@ -1498,6 +1509,32 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
         });
     let mut session_ref_lease: Option<RestSessionRefLease> = None;
     let under_handoff_ticket = handoff.is_some();
+    // b8ke ext r7 F2: the claim locator includes the LEARNED identity —
+    // the REST prealloc mint / gate-healed mint / restore-ladder id (the
+    // body-only guard_locator is None for these). The DOOR claim uses it
+    // so coordinator authority is retained THROUGH the spawn (pre-r7 the
+    // learned locator only fed the late claim: the
+    // ownership-check-through-spawn interval sat outside the coordinator
+    // and a concurrent handoff on the learned key granted from Vacant
+    // mid-spawn).
+    let learned_claim_locator = guard_locator.clone().or_else(|| {
+        resume_session_id
+            .as_deref()
+            .filter(|sid| {
+                // Only DURABLE session ids claim: the mints and ladder
+                // resolutions are canonical by construction; the filter
+                // keeps an implausible legacy resume id (which the
+                // guard_locator's own plausibility gate already rejected)
+                // from claiming a junk key.
+                !sid.is_empty()
+                    && is_session_provider_mode(&mode)
+                    && plausible_resume_session_id(&mode, sid)
+            })
+            .map(|sid| SessionLocator {
+                provider: mode.clone(),
+                session_id: sid.to_string(),
+            })
+    });
     // Round-3 review I-1: the token's guard-visible spawn watch — the settle
     // publishes the spawned terminal into it (see the under-ticket surface
     // below); the runner's HandoffGuard holds a clone across the await so
@@ -1515,7 +1552,7 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
     // terminal (refusal with `liveTerminalId`, or the attach-shaped
     // BoundElsewhere refusal).
     let mut ownership_claim: Option<RestOwnershipClaim> = None;
-    if let Some(locator) = guard_locator.clone() {
+    if let Some(locator) = learned_claim_locator.clone() {
         let operation_id = handoff
             .map(|t| t.operation_id.clone())
             .unwrap_or_else(|| format!("rest-create-{create_request_id}"));
@@ -1748,31 +1785,6 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
     // detached, an aborted create is FULLY BOOKKEPT — never a
     // half-initialized orphan. (The WS door solves the same hazard by
     // spawning its settled restore create: `spawn_gated_restore_create`.)
-    // b8ke ext r6 F1: the LEARNED identity joins the late claim's locator —
-    // the REST prealloc mint / gate-healed mint / restore-ladder id is
-    // resolved AFTER request parsing, so the body-only guard_locator is
-    // None for these and the late claim (the commit authority) must carry
-    // the learned durable id: pre-r6 these live REST terminal sessions
-    // never committed Live{Terminal}, and a direct handoff entered from
-    // Vacant to start a second writer on the same durable session.
-    let learned_claim_locator = guard_locator.clone().or_else(|| {
-        resume_session_id
-            .as_deref()
-            .filter(|sid| {
-                // Only DURABLE session ids claim: the mints and ladder
-                // resolutions are canonical by construction; the filter
-                // keeps an implausible legacy resume id (which the
-                // guard_locator's own plausibility gate already rejected)
-                // from claiming a junk key.
-                !sid.is_empty()
-                    && is_session_provider_mode(&mode)
-                    && plausible_resume_session_id(&mode, sid)
-            })
-            .map(|sid| SessionLocator {
-                provider: mode.clone(),
-                session_id: sid.to_string(),
-            })
-    });
     let inputs = GatedSettleInputs {
         state: state.clone(),
         body: body.clone(),
@@ -1784,6 +1796,7 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
         resume_session_id,
         launch_intent,
         resume_notice,
+        session_substitution,
         accepted_session_ref,
         claude_fresh_prealloc,
         pane_identity: state.pane_identity.clone(),
@@ -1844,6 +1857,11 @@ struct GatedSettleInputs {
     /// Door 3: the operator-visible stale-resume notice when the gate fired,
     /// injected into the returned `paneContent` as `reconcileNotice`.
     resume_notice: Option<String>,
+    /// b8ke ext r7 F2: the TYPED fresh-substitution record for the returned
+    /// `paneContent` (`sessionSubstitution: { reason, requestedSessionId }`)
+    /// — Some only when the resume gate stamped a definitively-missing
+    /// requested session.
+    session_substitution: Option<serde_json::Value>,
     accepted_session_ref: Option<SessionLocator>,
     /// Fresh-claude preallocation (kata hbsa): `true` iff THIS create minted
     /// its own `--session-id` (the [`freshell_platform::should_preallocate_fresh_claude`]
@@ -1911,6 +1929,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         mut resume_session_id,
         launch_intent,
         resume_notice,
+        session_substitution,
         accepted_session_ref,
         claude_fresh_prealloc,
         pane_identity,
@@ -2753,6 +2772,11 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
     // pane content, never dropped.)
     if let Some(notice) = &resume_notice {
         pane_content["reconcileNotice"] = json!(notice);
+    }
+    // b8ke ext r7 F2: the typed substitution record — additive on the
+    // paneContent.
+    if let Some(substitution) = &session_substitution {
+        pane_content["sessionSubstitution"] = substitution.clone();
     }
     // `paneContent` sessionRef/resumeSessionId, still mutually exclusive like
     // `router.ts:762-771` -- but with the EDEV-07 upgrade over legacy: a legacy
@@ -7936,6 +7960,106 @@ if (args.includes('app-server')) {{
 
         // Cleanup: reap the surviving replacement PTY.
         registry.kill(&tid);
+    }
+
+    /// b8ke ext r7 F2: a REST resume to a DEFINITIVELY MISSING session is
+    /// TYPED and explicit — the returned paneContent carries the typed
+    /// substitution record (SESSION_MISSING_RESUMED_FRESH + the missing id)
+    /// and the minted sessionRef (pre-r7 only the prose reconcileNotice —
+    /// a silent swap).
+    #[tokio::test]
+    async fn a_rest_resume_to_a_missing_session_answers_the_typed_substitution() {
+        use freshell_platform::resume_gate::ResumeExistence;
+        let _ = isolate_amplifier_home();
+        let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let registry =
+            freshell_terminal::TerminalRegistry::new().with_ownership(Arc::clone(&ownership));
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let state = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx))
+            .with_terminal_registry(registry.clone())
+            .with_cli_commands(Arc::new(vec![claude_prealloc_recording_cli_spec(
+                &unique_argv_file("rest-r7-typed"),
+            )]))
+            .with_ownership(Arc::clone(&ownership))
+            .with_resume_probe(probe_answering(ResumeExistence::Absent, true));
+        let tmp = std::env::temp_dir();
+
+        // A canonical-UUID claude id that was never on disk. The paneContent
+        // rides the broadcast ui.command frame (the HTTP body carries only
+        // {tabId, paneId, terminalId}) — subscribe BEFORE the POST.
+        let missing_sid = uuid::Uuid::new_v4().to_string();
+        let mut frames = state.broadcast_tx.subscribe();
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": tmp.to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": missing_sid },
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the REST resume-to-missing create must succeed: {body}"
+        );
+        let pane_content = loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), frames.recv())
+                .await
+                .expect("a broadcast frame within budget")
+                .expect("the broadcast channel stays open");
+            let value: serde_json::Value =
+                serde_json::from_str(&frame).expect("the broadcast frame is JSON");
+            if value["command"] == "tab.create" {
+                break value["payload"]["paneContent"].clone();
+            }
+        };
+
+        // THE TYPED SUBSTITUTION: the paneContent names the missing session
+        // and the fresh-substitution reason, and carries the minted
+        // sessionRef (pre-r7: no typed record).
+        assert_eq!(
+            pane_content["sessionSubstitution"]["reason"],
+            json!("SESSION_MISSING_RESUMED_FRESH"),
+            "the typed substitution reason — paneContent: {pane_content}"
+        );
+        assert_eq!(
+            pane_content["sessionSubstitution"]["requestedSessionId"],
+            json!(missing_sid),
+            "the typed record names the missing requested session: {pane_content}"
+        );
+        let mint = pane_content["sessionRef"]["sessionId"]
+            .as_str()
+            .expect("the minted sessionRef")
+            .to_string();
+        assert_ne!(mint, missing_sid);
+
+        // The minted session commits Live{Terminal} (the learned locator
+        // claims at the DOOR pre-spawn now).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if matches!(
+                ownership.observe("claude", &mint).state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the substituted REST session never committed Live — state: {:?}",
+                ownership.observe("claude", &mint).state
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // Cleanup: reap the spawned terminal.
+        let terminal_id = body["data"]["terminalId"]
+            .as_str()
+            .expect("terminalId")
+            .to_string();
+        registry.kill(&terminal_id);
     }
 
     /// b8ke ext r6 F1: a fresh-claude PREALLOCATION create through the REST

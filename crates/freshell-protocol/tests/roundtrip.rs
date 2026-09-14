@@ -573,12 +573,34 @@ fn terminal_created_notice_is_optional_and_additive() {
         restore_error: None,
         session_ref: None,
         notice: None,
+        session_substitution: None,
     };
     let json = serde_json::to_value(ServerMessage::TerminalCreated(created.clone())).unwrap();
     assert!(json.get("notice").is_none());
+    // b8ke ext r7 F2: the typed substitution record is optional/additive —
+    // absent means the key is omitted (wire-compatible with the frozen
+    // client); present serializes verbatim.
+    assert!(json.get("sessionSubstitution").is_none());
+    let created_clone_for_notice = created.clone();
+    let substituted = TerminalCreated {
+        session_substitution: Some(TerminalSessionSubstitution {
+            reason: "SESSION_MISSING_RESUMED_FRESH".into(),
+            requested_session_id: Some("missing-1".into()),
+        }),
+        ..created
+    };
+    let json = serde_json::to_value(ServerMessage::TerminalCreated(substituted)).unwrap();
+    assert_eq!(
+        json["sessionSubstitution"]["reason"],
+        json!("SESSION_MISSING_RESUMED_FRESH")
+    );
+    assert_eq!(
+        json["sessionSubstitution"]["requestedSessionId"],
+        json!("missing-1")
+    );
 
     // Present => serialized verbatim.
-    let mut with_notice = created;
+    let mut with_notice = created_clone_for_notice;
     with_notice.notice = Some(
         "Saved amplifier session X could not be found on disk — started a fresh session instead."
             .to_string(),

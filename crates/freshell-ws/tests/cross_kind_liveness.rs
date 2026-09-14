@@ -458,6 +458,25 @@ async fn build_ws_state(
     freshell_terminal::TerminalRegistry,
     freshell_freshagent::FreshAgentState,
 ) {
+    build_ws_state_with_probe(
+        cli_commands,
+        std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+    )
+    .await
+}
+
+/// b8ke ext r7 F2: [`build_ws_state`] with a caller-chosen session-existence
+/// probe — the resume-gate tests need a probe that answers Absent (the
+/// default NoIndexProbe answers Unknown for every known provider, so the
+/// gate never fires in this rig).
+async fn build_ws_state_with_probe(
+    cli_commands: Vec<freshell_platform::CliCommandSpec>,
+    probe: std::sync::Arc<dyn freshell_ws::existence::SessionExistenceProbe>,
+) -> (
+    WsState,
+    freshell_terminal::TerminalRegistry,
+    freshell_freshagent::FreshAgentState,
+) {
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let settings =
@@ -556,7 +575,7 @@ async fn build_ws_state(
         opencode_locator: None,
         codex_locator: None,
         activity: None,
-        session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+        session_existence: probe,
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
         ownership: Some(Arc::clone(&ownership)),
@@ -4201,4 +4220,212 @@ async fn spawn_server_with_ladder_claude() -> (String, freshell_terminal::Termin
         let _ = axum::serve(listener, router).await;
     });
     (format!("ws://{addr}/ws"), registry, state)
+}
+
+// ── b8ke ext r7 F2: the resume path's coordinator authority + typed substitution ──
+
+/// b8ke ext r7 F2: a probe answering DEFINITIVELY ABSENT for claude (the
+/// resume gate's SpawnFresh precondition — the zero-turn carve-out is
+/// skipped by ever_observed=true so a missing session STAMPS).
+struct AbsentClaudeProbe;
+impl freshell_ws::existence::SessionExistenceProbe for AbsentClaudeProbe {
+    fn exists(
+        &self,
+        provider: &str,
+        _session_id: &str,
+    ) -> freshell_ws::existence::SessionExistence {
+        if provider == "claude" {
+            freshell_ws::existence::SessionExistence::Absent
+        } else {
+            freshell_ws::existence::SessionExistence::Unknown
+        }
+    }
+    fn ever_observed(&self, _provider: &str, _session_id: &str) -> bool {
+        // true skips the zero-turn carve-out: the gate STAMPS.
+        true
+    }
+}
+
+/// b8ke ext r7 F2: a resume to a DEFINITIVELY MISSING session is TYPED and
+/// explicit — the created frame carries the typed substitution record
+/// (SESSION_MISSING_RESUMED_FRESH + the missing id) and the minted
+/// sessionRef (pre-r7 the swap was silent: only the prose notice).
+#[tokio::test]
+async fn a_resume_to_a_missing_session_answers_the_typed_substitution_record() {
+    let (state, _registry, _fresh_agent_state) = build_ws_state_with_probe(
+        vec![sleeper_cli_spec("claude")],
+        std::sync::Arc::new(AbsentClaudeProbe),
+    )
+    .await;
+    let url = {
+        let router = freshell_ws::router(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral loopback port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        format!("ws://{addr}/ws")
+    };
+    let mut ws = connect(&url).await;
+    // A canonical-UUID claude id that was never on disk (the gate's
+    // definitively-missing shape).
+    let missing_sid = uuid::Uuid::new_v4().to_string();
+
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-r7-f2-typed",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": missing_sid },
+        }),
+    )
+    .await;
+    let created = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "terminal.created" && v["requestId"] == "req-r7-f2-typed"
+    })
+    .await;
+
+    // THE TYPED SUBSTITUTION: the frame names the missing session and the
+    // fresh-substitution reason (pre-r7: no typed record — a silent swap).
+    assert_eq!(
+        created["sessionSubstitution"]["reason"],
+        json!("SESSION_MISSING_RESUMED_FRESH"),
+        "the typed substitution reason — frame: {created:?}"
+    );
+    assert_eq!(
+        created["sessionSubstitution"]["requestedSessionId"],
+        json!(missing_sid),
+        "the typed record names the missing requested session: {created:?}"
+    );
+    // The new session id rides the frame's sessionRef (the mint).
+    let mint = created["sessionRef"]["sessionId"]
+        .as_str()
+        .expect("the minted sessionRef")
+        .to_string();
+    assert_ne!(mint, missing_sid);
+
+    // The minted session commits Live{Terminal} (the ext r6 F1 discipline).
+    let ownership = state.ownership.as_ref().expect("coordinator wired");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if matches!(
+            ownership.observe("claude", &mint).state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the substituted session never committed Live — state: {:?}",
+            ownership.observe("claude", &mint).state
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // Cleanup: reap the spawned terminal.
+    let tid = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    state.registry.kill(&tid);
+}
+
+/// b8ke ext r7 F2: the spawn interval holds a coordinator claim — a create
+/// whose durable id was LEARNED after request parsing (the resume gate's
+/// healed mint) claims BEFORE the spawn and the SAME ticket commits at the
+/// settle: the Live record's ownership id is the PRE-SPAWN learned claim's
+/// operation ("term-create-learned-…"), never the late claim's
+/// ("term-create-late-…" — the pre-r7 shape, where the stamping dropped
+/// the stale claim and the mint spawned unclaimed, the
+/// ownership-check-through-spawn interval outside the coordinator and a
+/// concurrent handoff on the mint free to grant from Vacant mid-spawn).
+#[tokio::test]
+async fn the_learned_identity_spawn_interval_holds_a_coordinator_claim() {
+    let (state, _registry, _fresh_agent_state) = build_ws_state_with_probe(
+        vec![sleeper_cli_spec("claude")],
+        std::sync::Arc::new(AbsentClaudeProbe),
+    )
+    .await;
+    let url = {
+        let router = freshell_ws::router(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral loopback port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        format!("ws://{addr}/ws")
+    };
+    let mut ws = connect(&url).await;
+    let missing_sid = uuid::Uuid::new_v4().to_string();
+
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-r7-f2-parked",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": missing_sid },
+        }),
+    )
+    .await;
+    let created = await_frame(&mut ws, Duration::from_secs(30), |v| {
+        v["type"] == "terminal.created" && v["requestId"] == "req-r7-f2-parked"
+    })
+    .await;
+    let mint = created["sessionRef"]["sessionId"]
+        .as_str()
+        .expect("the minted sessionRef")
+        .to_string();
+    assert_ne!(mint, missing_sid);
+
+    // THE CONTRACT: the committed Live record's ownership id is the
+    // PRE-SPAWN learned claim's operation — the claim was held through
+    // the spawn await to the final commit (pre-r7 the stamping dropped the
+    // claim and the settle's late claim minted "term-create-late-…",
+    // leaving the spawn interval outside the coordinator).
+    let ownership = state.ownership.as_ref().expect("coordinator wired");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let snap = ownership.observe("claude", &mint);
+        if matches!(snap.state, freshell_ownership::OwnershipState::Live { .. }) {
+            match snap.state {
+                freshell_ownership::OwnershipState::Live { ref owner, .. } => {
+                    assert_eq!(
+                        owner.ownership_id.as_deref(),
+                        Some("term-create-learned-req-r7-f2-parked"),
+                        "the Live commit rode the PRE-SPAWN learned claim's \
+                         ticket (the late claim is the backstop, never the \
+                         committer)"
+                    );
+                }
+                _ => unreachable!("checked Live above"),
+            }
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the create's mint never committed Live — state: {:?}",
+            snap.state
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // A concurrent lifecycle operation against the still-held claim was
+    // refused while it was Starting — the provenance above plus the
+    // committed generation being the learned claim's grant (never a
+    // re-claim) is the held-authority proof.
+    // Cleanup: reap the spawned terminal.
+    let tid = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    state.registry.kill(&tid);
 }

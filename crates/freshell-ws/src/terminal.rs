@@ -2955,6 +2955,7 @@ pub(crate) async fn handle_create(
                     notice: None,
                     restore_error: None,
                     session_ref: state.identity.session_ref_for(&existing),
+                    session_substitution: None,
                 });
                 // An adoption IS a successful create for this requestId:
                 // settle the server-wide dedupe entry exactly like the main
@@ -3275,6 +3276,7 @@ pub(crate) async fn handle_create(
                                 .identity
                                 .session_ref_for(&terminal_id)
                                 .or(Some(locator)),
+                            session_substitution: None,
                         });
                         // Attaching to the winner IS a successful create for
                         // this requestId: settle the dedupe entry exactly
@@ -3630,6 +3632,10 @@ pub(crate) async fn handle_create(
     // be validated), before the amplifier ensure_session re-stub (which
     // would resurrect the stale dir).
     let mut resume_fallback_notice: Option<String> = None;
+    // b8ke ext r7 F2: the definitively-missing requested session (the gate's
+    // SpawnFresh verdict) — the typed substitution record on the created
+    // frame names it; `None` when the gate did not fire.
+    let mut resume_gate_missing_session: Option<String> = None;
     let resume_gate_carry = match prepared_resume_gate {
         Some(carry) => Some(carry),
         None if resume_id_from_wire => Some(
@@ -3656,8 +3662,172 @@ pub(crate) async fn handle_create(
             // (the create proceeds under the freshly-minted id, which claims
             // nothing — the lifecycle-audit rule for mints).
             session_ref_lease = None;
+            resume_gate_missing_session = carry.stale_session_id.clone();
             drop(terminal_ownership.take());
             resume_fallback_notice = carry.notice;
+        }
+    }
+
+    // b8ke ext r7 F2: the LEARNED-identity PRE-SPAWN claim. Every
+    // resume/create path retains coordinator authority through the spawn:
+    // the pre-spawn claim covers only the wire locator (identities known
+    // at request parse), so a create whose durable id was LEARNED after
+    // parsing — the fresh-claude/amplifier prealloc mint, the claude P0.4
+    // restore ladder, and the resume gate's healed mint (the stamping
+    // guard above just dropped the stale key's claim) — would spawn with
+    // NO claim and only claim at the settle: the
+    // ownership-check-through-spawn interval sat OUTSIDE the coordinator
+    // (a concurrent handoff on the learned key granted from Vacant and
+    // started a second writer mid-spawn). The learned id claims HERE —
+    // BEFORE the spawn, held through the spawn await, committed at the
+    // settle (the same discipline the fresh-agent create paths have; the
+    // ext r6 F1 late claim becomes the no-op backstop it was meant to
+    // be).
+    if terminal_ownership.is_none() && state.ownership.is_some() {
+        let learned_locator = resume_session_id
+            .as_deref()
+            .filter(|sid| !sid.is_empty() && mode != "shell")
+            .map(|sid| SessionLocator {
+                provider: mode.clone(),
+                session_id: sid.to_string(),
+            });
+        if let Some(locator) = learned_locator {
+            let operation_id = format!("term-create-learned-{}", create.request_id);
+            let initiator = format!("ws-conn-{conn_id}");
+            match freshell_freshagent::ownership_lane::begin_terminal_lane_claim(
+                &state.ownership,
+                &locator.provider,
+                &locator.session_id,
+                &operation_id,
+                // No observed fence: the create holds no prior observation
+                // for the learned id (it did not come from the wire).
+                None,
+                &initiator,
+                now_ms().max(0) as u64,
+            ) {
+                freshell_freshagent::ownership_lane::TerminalLaneClaim::Granted(ticket) => {
+                    // The same watchdog machinery as the wire claim: the
+                    // tid slot's cancellation kills the row the moment it
+                    // exists; the partial runtime arms the evidence a
+                    // sweep needs during the async spawn work.
+                    let registry = state.registry.clone();
+                    let tid_slot = Arc::clone(&terminal_start_tid_slot);
+                    let cancel: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                        if let Some(tid) = tid_slot
+                            .lock()
+                            .expect("terminal start tid slot lock")
+                            .clone()
+                        {
+                            tracing::warn!(target: "freshell_ws::terminal",
+                                terminal_id = %tid,
+                                event = "ownership.start.cancel_signal",
+                                "the watchdog's start cancellation kills the spawned \
+                                 terminal's registry row");
+                            registry.kill(&tid);
+                        }
+                    });
+                    let mut registration_ticket = Some(ticket);
+                    _terminal_start_cancellation = Some(
+                        freshell_freshagent::ownership_lane::register_start_cancellation_for_ticket(
+                            &state.ownership,
+                            &locator.provider,
+                            &locator.session_id,
+                            &registration_ticket,
+                            cancel,
+                        ),
+                    );
+                    if let Some(ownership) = state.ownership.as_ref() {
+                        let ticket_ref_for_partial = registration_ticket
+                            .as_ref()
+                            .expect("the ticket is present on the Granted arm");
+                        ownership.register_partial_runtime(
+                            &locator.provider,
+                            &locator.session_id,
+                            ticket_ref_for_partial.operation_id(),
+                            ticket_ref_for_partial.generation(),
+                            freshell_ownership::OwnerIdentity {
+                                kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                                terminal_id: terminal_start_tid_slot
+                                    .lock()
+                                    .expect("terminal start tid slot lock")
+                                    .clone(),
+                                live_session_key: None,
+                                pid: None,
+                                ownership_id: None,
+                            },
+                        );
+                    }
+                    let ticket = registration_ticket
+                        .take()
+                        .expect("the ticket is present on the Granted arm");
+                    terminal_ownership = Some(TerminalOwnershipClaim {
+                        ticket,
+                        registry: state.registry.clone(),
+                        locator,
+                    });
+                }
+                freshell_freshagent::ownership_lane::TerminalLaneClaim::Unwired => {}
+                freshell_freshagent::ownership_lane::TerminalLaneClaim::Adopt => {}
+                freshell_freshagent::ownership_lane::TerminalLaneClaim::Refused(outcome) => {
+                    // The learned id is already owned — the typed D7-shaped
+                    // refusal (nothing has spawned yet: no teardown owed).
+                    tracing::warn!(
+                        target: "freshell_ws::terminal",
+                        provider = %locator.provider,
+                        session_id = %locator.session_id,
+                        request_id = %create.request_id,
+                        outcome = ?outcome,
+                        "terminal_create_refused: the ownership coordinator refused the \
+                         learned-identity claim (kata b8ke ext r7 F2)"
+                    );
+                    let owner_fields =
+                        freshell_freshagent::ownership_lane::terminal_owner_fields_from_outcome(
+                            &state.ownership,
+                            &outcome,
+                        );
+                    match &outcome {
+                        freshell_ownership::BeginOutcome::OwnedByOtherKind { owner, .. } => {
+                            let reason = format!(
+                                "Session {} is open as a different kind of runtime here.",
+                                locator.session_id
+                            );
+                            if let Some(fields) = owner_fields.as_ref() {
+                                let _ = send_create_error_with_owner(
+                                    out,
+                                    ErrorCode::SessionReserved,
+                                    reason,
+                                    &create.request_id,
+                                    owner.terminal_id.clone(),
+                                    Some(fields),
+                                )
+                                .await;
+                            } else {
+                                send_create_error(
+                                    out,
+                                    ErrorCode::SessionReserved,
+                                    reason,
+                                    &create.request_id,
+                                )
+                                .await;
+                            }
+                        }
+                        _ => {
+                            let reason = format!(
+                                "A lifecycle operation is in flight for session {}; retry after it settles.",
+                                locator.session_id
+                            );
+                            send_create_error(
+                                out,
+                                ErrorCode::SessionReserved,
+                                reason,
+                                &create.request_id,
+                            )
+                            .await;
+                        }
+                    }
+                    return false;
+                }
+            }
         }
     }
 
@@ -4773,6 +4943,16 @@ pub(crate) async fn handle_create(
         // The canonical create-time identity, from the SAME registry every other
         // identity-stamped frame reads (shell creates have no entry -> `None`).
         session_ref: state.identity.session_ref_for(&terminal_id_for_meta),
+        // b8ke ext r7 F2: the TYPED fresh-substitution record — the gate
+        // stamped a definitively-missing requested session (the new session
+        // id rides sessionRef when the provider mints one). Never a silent
+        // swap.
+        session_substitution: resume_gate_missing_session.map(|requested| {
+            freshell_protocol::TerminalSessionSubstitution {
+                reason: "SESSION_MISSING_RESUMED_FRESH".to_string(),
+                requested_session_id: Some(requested),
+            }
+        }),
     });
     // Record the settled create (server-wide requestId dedupe) and forward
     // the frame to any cross-connection waiters — AFTER the origin reply's
