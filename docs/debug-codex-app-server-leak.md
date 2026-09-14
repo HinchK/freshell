@@ -1,5 +1,7 @@
 # Codex Sidecar Lifecycle Architecture Brief
 
+> **Historical Node-server architecture brief (September 2026).** This document records investigation of the retired Node server. Its paths, lifecycle descriptions, and commands are historical; current server work belongs under `crates/`, and the standalone TypeScript CLI lives in `tools/freshell-cli/`.
+
 Worktree: `.worktrees/debug-codex-app-server-leak` (branch `debug/codex-app-server-leak`).
 
 ## Goal
