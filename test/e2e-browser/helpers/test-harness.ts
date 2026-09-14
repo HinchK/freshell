@@ -2,6 +2,39 @@ import type { Page } from '@playwright/test'
 import type { PerfAuditSnapshot } from '@/lib/perf-audit-bridge'
 import type { TerminalWriteEvent } from '@/lib/test-harness'
 
+/** Default waitForConnection window (ms) used when neither an explicit
+ * per-call timeout nor FRESHELL_E2E_WS_READY_TIMEOUT_MS applies. 30s
+ * preserves the historical REAL window: the old code passed 15s, but as
+ * the predicate's argument (never bound), so the real window was
+ * Playwright's 30s default. Binding 15s for real would have narrowed every
+ * no-arg call site from 30s to 16s and risked new cold-start flakes. */
+export const DEFAULT_WS_READY_TIMEOUT_MS = 30_000
+
+/**
+ * Resolve the effective waitForConnection window.
+ *
+ * Precedence: an explicit per-call timeout wins; otherwise the
+ * FRESHELL_E2E_WS_READY_TIMEOUT_MS env var scales the window (the cloud e2e
+ * lane sets it — see scripts/e2e-cloud.sh); otherwise the 30s default that
+ * preserves the historical real window. Cloud cold starts can need more:
+ * the client's 10s ready watchdog (CONNECTION_TIMEOUT_MS,
+ * src/lib/ws-client.ts) force-closes a slow handshake and reconnects with
+ * jittered 1→2→4s backoff, and the observed j90s flake exceeded a real 30s
+ * window. Empty, non-numeric, or non-positive env values fall back to the
+ * default — a malformed override must never poison the harness wait.
+ */
+export function resolveWsReadyTimeoutMs(
+  explicitMs: number | undefined,
+  env: Record<string, string | undefined> = process.env,
+): number {
+  if (explicitMs !== undefined) return explicitMs
+  const raw = env.FRESHELL_E2E_WS_READY_TIMEOUT_MS
+  if (raw === undefined || raw === '') return DEFAULT_WS_READY_TIMEOUT_MS
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_WS_READY_TIMEOUT_MS
+  return parsed
+}
+
 /**
  * Helpers for interacting with the Freshell test harness from Playwright tests.
  */
@@ -16,8 +49,19 @@ export class TestHarness {
     )
   }
 
-  /** Wait for WebSocket connection to reach 'ready' state */
-  async waitForConnection(timeoutMs = 15_000): Promise<void> {
+  /**
+   * Wait for WebSocket connection to reach 'ready' state.
+   *
+   * The timeout is passed as waitForFunction's OPTIONS (third argument).
+   * The historical two-arg call bound the timeout object to the
+   * predicate's argument, so every explicit window was decorative and the
+   * real wait was Playwright's 30s default (empirically confirmed — see
+   * the j90s load-bearing ledger, LB-1). The resolved window keeps +1s
+   * slack, so the no-arg default lands at 31s — preserving (by 1s of
+   * harmless widening) the real 30s window local runs always had.
+   */
+  async waitForConnection(timeoutMs?: number): Promise<void> {
+    const resolvedTimeoutMs = resolveWsReadyTimeoutMs(timeoutMs)
     await this.page.waitForFunction(
       () => {
         const harness = window.__FRESHELL_TEST_HARNESS__
@@ -25,7 +69,8 @@ export class TestHarness {
         const reduxStatus = harness.getState()?.connection?.status
         return harness.getWsReadyState() === 'ready' && reduxStatus === 'ready'
       },
-      { timeout: timeoutMs + 1000 },
+      undefined,
+      { timeout: resolvedTimeoutMs + 1000 },
     )
   }
 
