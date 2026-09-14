@@ -3508,19 +3508,76 @@ async fn resume_session_ref_tab(
     // end (the materialize path's discipline); Adopt (Live{FreshAgent}
     // already — the same-pane re-open) proceeds idempotently; a refusal
     // answers the typed owner response.
-    let resume_op = format!("rest-resume-{durable_id}");
+    // b8ke ext r13 F4: the resume's observed generation fence — the server
+    // deterministically knows the pane's last-committed owner generation
+    // (the retained ownership stamp under the canonical id) and threads it
+    // into the claim: a DELAYED resume whose recorded generation went
+    // stale against the coordinator's advanced generation answers the
+    // typed stale refusal (pre-r13 the claim carried None always, so a
+    // stale request could claim the canonical session after its
+    // generation advanced and later became vacant — recreating ownership
+    // the stale-generation requirement says must be rejected).
+    let resume_fence = ownership_lane::peek_retained_stamp(&state.ownership_stamps, &durable_id)
+        .map(|stamp| freshell_ownership::ObservedFence {
+            epoch: stamp.epoch,
+            generation: stamp.generation,
+        });
+    // b8ke ext r13 F5: the operation id is PER-REQUEST (pane id + nonce)
+    // — concurrent same-pane resumes are SEPARATE operations, never
+    // reentrant parts of one (pre-r13 the shared pane-id-only id let the
+    // coordinator's same-operation continuation arm grant both requests,
+    // and either ticket's drop released the shared Starting claim while
+    // the other ran; the loser's conflict also landed only AFTER it had
+    // inserted and broadcast its tab and panes).
+    let resume_op = format!("rest-resume-{durable_id}-{}", uuid::Uuid::new_v4().simple());
+    // b8ke ext r13 F6: the Adopt arm's held authority — the ext-r12
+    // attach guard, held across the probe + registration + broadcast
+    // (this function's scope).
+    let mut resume_adopt_guard: Option<freshell_ownership::AttachGuard> = None;
     let mut resume_ticket = match ownership_lane::begin_lane_claim(
         &state.ownership,
         PROVIDER,
         &durable_id,
         &resume_op,
-        None,
+        resume_fence,
         "freshopencode/rest-resume",
         session_lease::now_epoch_ms(),
     ) {
         ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
         ownership_lane::LaneClaim::Unwired => None,
-        ownership_lane::LaneClaim::Adopt => None,
+        // b8ke ext r13 F6: the Adopt arm (a live same-kind owner — the
+        // same-pane re-open) proceeds ONLY under HELD authority (pre-r13
+        // the arm proceeded with NO claim: a handoff could commit while
+        // the stale request installed the pane).
+        ownership_lane::LaneClaim::Adopt => {
+            match ownership_lane::arm_attach_guard(
+                &state.ownership,
+                PROVIDER,
+                &durable_id,
+                &format!("{resume_op}-adopt"),
+                None,
+                "freshopencode/rest-resume-adopt",
+            ) {
+                ownership_lane::LaneAttachGuard::Armed(guard) => {
+                    resume_adopt_guard = Some(guard);
+                    None
+                }
+                ownership_lane::LaneAttachGuard::Unwired => None,
+                ownership_lane::LaneAttachGuard::Refused => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        provider = PROVIDER, session_id = %durable_id,
+                        "freshagent.opencode.rest_resume_adopt_guard_refused: the key \
+                         entered a transition — the resume aborts typed, nothing is \
+                         registered or broadcast"
+                    );
+                    return fail_json(
+                        StatusCode::CONFLICT,
+                        "SESSION_RESERVED: another lifecycle operation owns this session"
+                            .to_string(),
+                    );
+                }
+            }
+        }
         ownership_lane::LaneClaim::Refused(outcome) => {
             // The fresh-agent lane's cross-kind refusal names the ACTUAL
             // owner kind (OwnedByOtherKind carries the owner — a TERMINAL
@@ -3706,6 +3763,13 @@ async fn resume_session_ref_tab(
             "freshagent.opencode.rest_resume_commit_stale: the coordinator moved on \
              while the resume registered"
         );
+        // b8ke ext r13 F5: the stale arm must NOT leave authoritative
+        // layout state for an operation reported as failed — the tab the
+        // registration created is CLOSED (deterministically; the
+        // per-request operation id already makes the loser refuse at the
+        // CLAIM before any layout mutation — this is the belt-and-braces
+        // for the commit-stale corner).
+        state.layout.close_tab(&tab_id);
         return fail_json(
             StatusCode::CONFLICT,
             "SESSION_RESERVED: session ownership changed during resume".to_string(),
@@ -6485,6 +6549,364 @@ mod tests {
             .insert(("opencode".to_string(), "ses_resume_durable".to_string()));
         st.set_identity_sink(fake.clone());
         (st, registry, fake)
+    }
+
+    // ── b8ke ext r13 F4/F5/F6: the REST/MCP resume's authority ──────────────
+
+    /// The F4/F5/F6 fixture: a resumed durable session whose FIRST resume
+    /// committed Live{FreshAgent} and parked the retained ownership stamp
+    /// (the pane's recorded owner generation).
+    async fn resumed_live_state() -> (
+        FreshAgentState,
+        Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+        String,
+    ) {
+        let (st, registry, _fake) = rest_resume_state().await;
+        let durable_id = "ses_resume_durable".to_string();
+        let resp = resume_session_ref_tab(
+            &st,
+            &json!({ "provider": "opencode", "sessionId": durable_id }),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "the fixture resume succeeds");
+        assert!(matches!(
+            registry.observe(PROVIDER, &durable_id).state,
+            freshell_ownership::OwnershipState::Live { owner, .. }
+                if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+        ));
+        (st, registry, durable_id)
+    }
+
+    /// b8ke ext r13 F4: the resume threads the pane's RECORDED owner
+    /// generation (the retained stamp) as the claim's observed fence — a
+    /// delayed resume whose recorded generation is stale against the
+    /// coordinator's ADVANCED generation answers the typed stale refusal
+    /// (pre-r13 the claim carried None always, so the stale request
+    /// re-adopted the moved-on session and installed its pane).
+    #[tokio::test]
+    async fn a_stale_recorded_generation_resume_is_refused_typed() {
+        let (st, registry, durable_id) = resumed_live_state().await;
+        assert!(
+            ownership_lane::peek_retained_stamp(&st.ownership_stamps, &durable_id).is_some(),
+            "fixture: the first resume parked the retained stamp"
+        );
+
+        // The generation ADVANCES past the recorded stamp: a handoff begin
+        // bumps the record and the fail-restore keeps the advanced
+        // generation in the restored Live state.
+        let freshell_ownership::BeginOutcome::Granted { .. } = registry.begin_handoff(
+            PROVIDER,
+            &durable_id,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-r13-f4-bump",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) else {
+            panic!("the generation-bump handoff must grant")
+        };
+        let _ = registry.fail(PROVIDER, &durable_id, "op-r13-f4-bump", 2, true);
+
+        // THE STALE RESUME: the stamp's fence is older than the advanced
+        // generation → the typed stale refusal, nothing registered.
+        let panes_before = st.panes.lock().expect("panes mutex").len();
+        let resp = resume_session_ref_tab(
+            &st,
+            &json!({ "provider": "opencode", "sessionId": durable_id }),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "the stale-generation resume answers the typed refusal"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["status"], json!("error"));
+        assert_eq!(value["code"], json!("SESSION_RESERVED"));
+        assert_eq!(
+            st.panes.lock().expect("panes mutex").len(),
+            panes_before,
+            "the refused resume registered no pane"
+        );
+    }
+
+    /// b8ke ext r13 F5: concurrent same-pane resumes are SEPARATE
+    /// operations. With the first resume in flight (parked in its probe),
+    /// the second's claim answers Blocked — it refuses BEFORE any layout
+    /// mutation or broadcast (pre-r13 the SHARED pane-id-only operation id
+    /// made the second a reentrant part of the first: the continuation arm
+    /// granted it, both registered tabs, and the loser's conflict landed
+    /// only after it had inserted and broadcast its layout).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_same_session_resumes_are_separate_operations() {
+        let (mut st, registry, durable_id) = resumed_live_state().await;
+        // Reset the key to Vacant so BOTH requests claim from scratch
+        // (the concurrent in-flight shape the shared id broke).
+        match registry.observe(PROVIDER, &durable_id).state {
+            freshell_ownership::OwnershipState::Live {
+                owner, generation, ..
+            } => {
+                let _ = registry.release(
+                    PROVIDER,
+                    &durable_id,
+                    &freshell_ownership::ReleaseClaim {
+                        operation_id: owner.ownership_id.clone().unwrap_or_default(),
+                        generation,
+                        runtime: Some(owner.clone()),
+                    },
+                    "test",
+                );
+            }
+            other => panic!("fixture: expected the committed live owner, got {other:?}"),
+        }
+        // A parking probe: the FIRST resume's get_session parks until
+        // released (the deterministic in-flight window).
+        let park = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let park_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let release = Arc::clone(&release);
+            let park_count = Arc::clone(&park_count);
+            struct ParkingGetSessionHttp {
+                release: Arc<tokio::sync::Notify>,
+                park_count: Arc<std::sync::atomic::AtomicUsize>,
+            }
+            impl ServeHttp for ParkingGetSessionHttp {
+                fn request<'a>(
+                    &'a self,
+                    _req: ServeHttpRequest,
+                ) -> std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                            + Send
+                            + 'a,
+                    >,
+                > {
+                    let release = Arc::clone(&self.release);
+                    let park_count = Arc::clone(&self.park_count);
+                    let release = Arc::clone(&release);
+                    let park_count = Arc::clone(&park_count);
+                    Box::pin(async move {
+                        // Park ONLY the session probe (the resume's
+                        // get_session); the serve's health checks answer
+                        // instantly.
+                        let is_session_probe = _req.url.contains("/session")
+                            && matches!(_req.method, freshell_opencode::serve::HttpMethod::Get);
+                        if is_session_probe {
+                            park_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            release.notified().await;
+                        }
+                        Ok(ServeHttpResponse::new(
+                            200,
+                            serde_json::to_vec(&serde_json::json!({ "id": "ses_resume_durable" }))
+                                .unwrap(),
+                        ))
+                    })
+                }
+            }
+            let deps = ServeDeps {
+                spawner: Arc::new(NoopSpawner),
+                http: Arc::new(ParkingGetSessionHttp {
+                    release,
+                    park_count,
+                }),
+                ports: Arc::new(FakeAllocator),
+                events: Arc::new(NoopEventSource),
+            };
+            let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+            manager
+                .ensure_started()
+                .await
+                .expect("healthy fake serve starts");
+            st.set_manager_for_test(manager).await;
+        }
+
+        let st1 = st.clone();
+        let durable1 = durable_id.clone();
+        let first = tokio::spawn(async move {
+            resume_session_ref_tab(
+                &st1,
+                &json!({ "provider": "opencode", "sessionId": durable1 }),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        });
+        // Park proof: the first resume's probe parked.
+        {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            while park_count.load(std::sync::atomic::Ordering::SeqCst) < 1 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the first resume never parked"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+
+        // THE SECOND RESUME (in flight against the first): a SEPARATE
+        // operation — the claim answers Blocked and it refuses BEFORE any
+        // layout mutation (no second tab/pane registered).
+        let panes_before = st.panes.lock().expect("panes mutex").len();
+        let second = resume_session_ref_tab(
+            &st,
+            &json!({ "provider": "opencode", "sessionId": durable_id }),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            second.status(),
+            StatusCode::CONFLICT,
+            "the concurrent same-session resume refuses typed"
+        );
+        assert_eq!(
+            st.panes.lock().expect("panes mutex").len(),
+            panes_before,
+            "the loser refused BEFORE any layout mutation"
+        );
+
+        // Release + complete: the FIRST resume succeeds (its tab is the
+        // only one).
+        release.notify_one();
+        let first_resp = first.await.expect("the first resume completes");
+        assert_eq!(first_resp.status(), StatusCode::OK);
+        assert_eq!(
+            st.panes.lock().expect("panes mutex").len(),
+            panes_before + 1,
+            "exactly the winner's pane registered"
+        );
+        let _ = park;
+    }
+
+    /// b8ke ext r13 F6: the Adopt arm (a live same-kind owner — the
+    /// same-pane re-open) proceeds ONLY under the ext-r12 attach guard:
+    /// a handoff BEGIN during the resume's registration window answers
+    /// the typed Blocked outcome (pre-r13 the arm proceeded with NO
+    /// claim, so the handoff committed while the stale request installed
+    /// its pane).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_handoff_during_the_resume_adopt_window_is_blocked_typed() {
+        let (mut st, registry, durable_id) = resumed_live_state().await;
+        // A parking probe: the Adopt-path resume parks inside its window.
+        let release = Arc::new(tokio::sync::Notify::new());
+        let park_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let release = Arc::clone(&release);
+            let park_count = Arc::clone(&park_count);
+            struct ParkingGetSessionHttp {
+                release: Arc<tokio::sync::Notify>,
+                park_count: Arc<std::sync::atomic::AtomicUsize>,
+            }
+            impl ServeHttp for ParkingGetSessionHttp {
+                fn request<'a>(
+                    &'a self,
+                    _req: ServeHttpRequest,
+                ) -> std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                            + Send
+                            + 'a,
+                    >,
+                > {
+                    let release = Arc::clone(&self.release);
+                    let park_count = Arc::clone(&self.park_count);
+                    let release = Arc::clone(&release);
+                    let park_count = Arc::clone(&park_count);
+                    Box::pin(async move {
+                        let is_session_probe = _req.url.contains("/session")
+                            && matches!(_req.method, freshell_opencode::serve::HttpMethod::Get);
+                        if is_session_probe {
+                            park_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            release.notified().await;
+                        }
+                        Ok(ServeHttpResponse::new(
+                            200,
+                            serde_json::to_vec(&serde_json::json!({ "id": "ses_resume_durable" }))
+                                .unwrap(),
+                        ))
+                    })
+                }
+            }
+            let deps = ServeDeps {
+                spawner: Arc::new(NoopSpawner),
+                http: Arc::new(ParkingGetSessionHttp {
+                    release,
+                    park_count,
+                }),
+                ports: Arc::new(FakeAllocator),
+                events: Arc::new(NoopEventSource),
+            };
+            let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+            manager
+                .ensure_started()
+                .await
+                .expect("healthy fake serve starts");
+            st.set_manager_for_test(manager).await;
+        }
+
+        // The Adopt-path resume (the key holds Live{FreshAgent}).
+        let st1 = st.clone();
+        let durable1 = durable_id.clone();
+        let resume = tokio::spawn(async move {
+            resume_session_ref_tab(
+                &st1,
+                &json!({ "provider": "opencode", "sessionId": durable1 }),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        });
+        {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            while park_count.load(std::sync::atomic::Ordering::SeqCst) < 1 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the adopt-path resume never parked in its window"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+
+        // THE CONTRACT: a handoff BEGIN inside the resume's window answers
+        // Blocked typed.
+        match registry.begin_handoff(
+            PROVIDER,
+            &durable_id,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-r13-f6-racing-handoff",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) {
+            freshell_ownership::BeginOutcome::Blocked { retry_after_ms, .. } => {
+                assert!(retry_after_ms > 0);
+            }
+            other => panic!(
+                "a handoff begin inside the resume's Adopt window must answer Blocked — got {other:?}"
+            ),
+        }
+        // No terminal ever started beside the incumbent.
+        release.notify_one();
+        let resp = resume.await.expect("the resume completes");
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     /// b8ke ext r9 F1: a post-restart resume (the coordinator VACANT — the
