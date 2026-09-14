@@ -11839,6 +11839,44 @@ mod tests {
             "only the redo-capable chain state reset; the NEW chain is redoable"
         );
 
+        // The snapshot truth at the two-epoch boundary (the DIRECT builder, the
+        // same crate-callable shape the neighboring compact test asserts through):
+        // per-marker restorability is record-stamped — the frozen epoch-0 rows
+        // are never restorable; the new epoch's are, exactly the redo gate set.
+        let snap = crate::build_opencode_snapshot_json(
+            "ses_real",
+            &json!({ "id": "ses_real", "time": { "updated": 5 } }),
+            &json!([]),
+            Some(&record),
+        );
+        let bucket = snap["rolledBackTurns"].as_array().expect("bucket");
+        assert_eq!(bucket.len(), 4);
+        assert_eq!(bucket[0]["turnId"], json!("msg_u3"));
+        assert_eq!(
+            bucket[0]["restorable"],
+            json!(false),
+            "frozen epoch-0 USER marker"
+        );
+        assert_eq!(bucket[1]["turnId"], json!("msg_a3"));
+        assert_eq!(
+            bucket[1]["restorable"],
+            json!(false),
+            "frozen epoch-0 ASSISTANT marker — ALL roles are stamped"
+        );
+        assert_eq!(bucket[2]["turnId"], json!("msg_u4"));
+        assert_eq!(
+            bucket[2]["restorable"],
+            json!(true),
+            "current-epoch USER marker"
+        );
+        assert_eq!(bucket[3]["turnId"], json!("msg_a4"));
+        assert_eq!(
+            bucket[3]["restorable"],
+            json!(true),
+            "current-epoch ASSISTANT marker — ALL roles are stamped"
+        );
+        assert_eq!(snap["rollback"]["redoableTurnIds"], json!(["msg_u4"]));
+
         // One redo step restores EXACTLY the new epoch's tail — never the frozen rows.
         let (sink3, captured3) = capturing_sink();
         let mut op = undo_op("ses_real", "rb-16c");

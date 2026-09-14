@@ -132,6 +132,39 @@ describe('rollback surface (kata 1wxv)', () => {
     })
     expect(parsed.success).toBe(true)
   })
+  it('a bucket turn may carry restorable', () => {
+    const parsed = FreshAgentTurnSchema.safeParse({
+      id: 't1', turnId: 't1', summary: 's', items: [{ id: 'i1', kind: 'text', text: 'hi' }], rolledBack: true, restorable: true,
+    })
+    expect(parsed.success).toBe(true)
+    expect(parsed.data?.restorable).toBe(true)
+  })
+  it('restorable is optional on turns (older servers omit it)', () => {
+    const parsed = FreshAgentTurnSchema.safeParse({
+      id: 't1', turnId: 't1', summary: 's', items: [{ id: 'i1', kind: 'text', text: 'hi' }], rolledBack: true,
+    })
+    expect(parsed.success).toBe(true)
+    expect(parsed.data?.restorable).toBeUndefined()
+  })
+  it('snapshot round-trips restorable-stamped rolledBackTurns', () => {
+    const parsed = FreshAgentSnapshotSchema.safeParse({
+      sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_1',
+      revision: 3, status: 'idle',
+      capabilities: { send: true, interrupt: true, approvals: false, questions: false, fork: true, undo: true, redo: true },
+      tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      turns: [],
+      rolledBackTurns: [{ id: 't2', turnId: 't2', summary: 'gone', items: [], rolledBack: true, restorable: true }],
+      rollback: { canRedo: true, undoneDepth: 1, redoableTurnIds: ['t2'] },
+      extensions: {},
+    })
+    expect(parsed.success).toBe(true)
+    expect(parsed.data?.rolledBackTurns?.[0]?.restorable).toBe(true)
+  })
+  it('a turn with an undeclared restorableTypo key rejects (turn stays strict)', () => {
+    expect(FreshAgentTurnSchema.safeParse({
+      id: 't1', turnId: 't1', summary: 's', items: [{ id: 'i1', kind: 'text', text: 'hi' }], rolledBack: true, restorableTypo: true,
+    }).success).toBe(false)
+  })
   it('snapshot accepts rolledBackTurns + the inline rollback block', () => {
     const turn = { id: 't2', turnId: 't2', summary: 'gone', items: [], rolledBack: true }
     const parsed = FreshAgentSnapshotSchema.safeParse({

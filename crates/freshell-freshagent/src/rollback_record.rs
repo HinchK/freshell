@@ -520,8 +520,9 @@ pub fn rollback_broadcast_frame(
 ///
 /// - the marker bucket (the r3 `entries` UNION — frozen prior-epoch markers
 ///   first, then the current epoch's recorded slice — each turn stamped
-///   `rolledBack:true` at READ time, never stored; durable even after native
-///   provider deletion, satisfying decision 6's "persist marked"),
+///   `rolledBack:true` AND the read-time restorability `restorable` at READ
+///   time, never stored; durable even after native provider deletion,
+///   satisfying decision 6's "persist marked"),
 /// - the `rollback{canRedo, undoneDepth}` block — `undoneDepth` is the
 ///   USER-role step count of the bucket (r3 finding 5: the same step count the
 ///   client's `Rolled back (N)` label shows), NEVER `entries.len()`,
@@ -543,10 +544,20 @@ pub(crate) fn stamp_rollback_snapshot(
     let bucket: Vec<Value> = record
         .entries
         .iter()
-        .flat_map(|e| e.removed_turns.iter())
-        .map(|t| {
+        .flat_map(|e| {
+            // Per-marker restorability (rolled-back section lifecycle): a
+            // marker is restorable iff redo is available (the provider-
+            // adjudicated `can_redo` param — claude rechecks the chain tip
+            // through it) AND its entry belongs to the CURRENT epoch (frozen
+            // prior-epoch markers are never restorable). The exact per-turn
+            // generalization of `redoable_turn_ids`, stamped on ALL roles.
+            let restorable = can_redo && e.epoch == record.current_epoch;
+            e.removed_turns.iter().map(move |t| (t, restorable))
+        })
+        .map(|(t, restorable)| {
             let mut t = t.clone();
             t["rolledBack"] = json!(true);
+            t["restorable"] = json!(restorable);
             t
         })
         .collect();
@@ -1174,6 +1185,36 @@ mod tests {
         record.set_can_redo(true, 71);
         let mut snapshot = json!({ "revision": 7 });
         stamp_rollback_snapshot(&mut snapshot, 7, &record, true);
+        let bucket = snapshot["rolledBackTurns"].as_array().expect("bucket");
+        assert_eq!(
+            bucket.len(),
+            4,
+            "the union bucket: frozen epoch then current"
+        );
+        assert_eq!(bucket[0]["turnId"], json!("t4"));
+        assert_eq!(
+            bucket[0]["restorable"],
+            json!(false),
+            "frozen prior-epoch marker (user row) is never restorable"
+        );
+        assert_eq!(bucket[1]["turnId"], json!("a4"));
+        assert_eq!(
+            bucket[1]["restorable"],
+            json!(false),
+            "frozen prior-epoch marker (assistant row) — ALL roles are stamped"
+        );
+        assert_eq!(bucket[2]["turnId"], json!("n1"));
+        assert_eq!(
+            bucket[2]["restorable"],
+            json!(true),
+            "current-epoch marker (user row) is restorable"
+        );
+        assert_eq!(bucket[3]["turnId"], json!("b1"));
+        assert_eq!(
+            bucket[3]["restorable"],
+            json!(true),
+            "current-epoch marker (assistant row) — ALL roles are stamped"
+        );
         assert_eq!(
             snapshot["rollback"]["redoableTurnIds"],
             json!(["n1"]),
@@ -1204,6 +1245,11 @@ mod tests {
             snapshot["rollback"]["redoableTurnIds"],
             json!([]),
             "canRedo:false ⇒ no marker is redoable, even in the current epoch"
+        );
+        let bucket = snapshot["rolledBackTurns"].as_array().expect("bucket");
+        assert!(
+            bucket.iter().all(|t| t["restorable"] == json!(false)),
+            "canRedo:false ⇒ every bucket row reads not-restorable (the collapsed-history truth)"
         );
     }
 
@@ -1294,6 +1340,18 @@ mod tests {
         assert!(record.entries[0].removed_turns[0]
             .get("rolledBack")
             .is_none());
+        assert!(
+            bucket.iter().all(|t| t["restorable"] == json!(true)),
+            "restorable:true is stamped AT READ on every bucket row (single current \
+             epoch, can_redo) — the stored turn JSON stays untouched"
+        );
+        // The STORED entry JSON must not carry the read-time restorable stamp either.
+        assert!(record.entries[0].removed_turns[0]
+            .get("restorable")
+            .is_none());
+        assert!(record.entries[0].removed_turns[1]
+            .get("restorable")
+            .is_none());
         assert_eq!(
             snapshot["rollback"],
             json!({ "canRedo": true, "undoneDepth": 1, "redoableTurnIds": ["u2"] }),
@@ -1313,6 +1371,99 @@ mod tests {
             "the strict-contract key stays OPTIONAL — an empty union inserts nothing"
         );
         assert!(snapshot.get("rollback").is_none());
+    }
+
+    /// Rollback-marker lifecycle: the read-time `restorable` stamp is the
+    /// per-turn generalization of `redoable_turn_ids` — stamped on ALL roles,
+    /// true exactly when redo is available (the provider-adjudicated param)
+    /// AND the entry belongs to the current epoch.
+    #[test]
+    fn stamp_rollback_snapshot_stamps_restorable_on_all_roles_matching_the_redoable_rule() {
+        // Two-epoch record: frozen entry [o1(user), o2(assistant)] at epoch 0,
+        // current entry [u2(user), a2(assistant)] at current_epoch. can_redo = true.
+        let mut record = RollbackRecord::empty(50);
+        record.splice_undo_entry(
+            RollbackEntry {
+                removed_turns: vec![marker_turn("o1", "user"), marker_turn("o2", "assistant")],
+                prompt_text: "old prompt".into(),
+                at_ms: 60,
+                epoch: 0,
+            },
+            60,
+        );
+        record.destroy_redo(61); // the resend destroyed the old epoch's redo
+        record.redo_destroyed = false; // the redo fields now describe the new chain
+        record.begin_new_epoch();
+        record.splice_undo_entry(
+            RollbackEntry {
+                removed_turns: vec![marker_turn("u2", "user"), marker_turn("a2", "assistant")],
+                prompt_text: "prompt two".into(),
+                at_ms: 70,
+                epoch: 1,
+            },
+            70,
+        );
+        record.set_can_redo(true, 71);
+
+        let mut snapshot = json!({ "revision": 7 });
+        stamp_rollback_snapshot(&mut snapshot, 7, &record, true);
+        let bucket = snapshot["rolledBackTurns"].as_array().expect("bucket");
+        let ids: Vec<&str> = bucket.iter().filter_map(|t| t["turnId"].as_str()).collect();
+        assert_eq!(ids, vec!["o1", "o2", "u2", "a2"]);
+        assert_eq!(
+            bucket[0]["restorable"],
+            json!(false),
+            "frozen prior-epoch USER row"
+        );
+        assert_eq!(
+            bucket[1]["restorable"],
+            json!(false),
+            "frozen prior-epoch ASSISTANT row — ALL roles are stamped, not just user rows"
+        );
+        assert_eq!(
+            bucket[2]["restorable"],
+            json!(true),
+            "current-epoch USER row"
+        );
+        assert_eq!(
+            bucket[3]["restorable"],
+            json!(true),
+            "current-epoch ASSISTANT row — ALL roles are stamped, not just user rows"
+        );
+        // Invariant: the user-role rows with restorable:true are EXACTLY
+        // redoableTurnIds (a user row is restorable <=> it is a member of the
+        // redo gate set).
+        let redoable: Vec<&str> = snapshot["rollback"]["redoableTurnIds"]
+            .as_array()
+            .expect("redoableTurnIds")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        for turn in bucket {
+            let restorable_user_step =
+                turn["role"] == json!("user") && turn["restorable"] == json!(true);
+            let id = turn["turnId"].as_str().expect("turnId");
+            assert_eq!(
+                restorable_user_step,
+                redoable.contains(&id),
+                "user rows restorable <=> redoableTurnIds membership ({id})"
+            );
+        }
+
+        // can_redo = false over the SAME record: every restorable stamp flips
+        // to false and the redoable set is empty.
+        let mut snapshot = json!({ "revision": 7 });
+        stamp_rollback_snapshot(&mut snapshot, 7, &record, false);
+        let bucket = snapshot["rolledBackTurns"].as_array().expect("bucket");
+        assert!(
+            bucket.iter().all(|t| t["restorable"] == json!(false)),
+            "canRedo:false ⇒ every marker is not restorable, on every role"
+        );
+        assert_eq!(
+            snapshot["rollback"]["redoableTurnIds"],
+            json!([]),
+            "the gate set empties with the stamps"
+        );
     }
 
     #[tokio::test]

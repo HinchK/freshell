@@ -2945,6 +2945,11 @@ export function FreshAgentView({
               rolledBackTurns={snapshot?.rolledBackTurns ?? []}
               canRedo={canRedoNow}
               redoableTurnIds={snapshot?.rollback?.redoableTurnIds}
+              // Conversation identity for the disclosure's conversation scoping.
+              // Codex snapshots carry NO sessionId (codex.rs stamps threadId
+              // only) — fall back to threadId so a codex pane re-collapses the
+              // history line across conversation switches too.
+              sessionId={snapshot?.sessionId ?? snapshot?.threadId}
               agentLabel={descriptor?.label}
               expandThinking={globalExpandThinking}
               expandTools={globalExpandTools}

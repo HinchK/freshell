@@ -2102,6 +2102,8 @@ mod tests {
             "the marker bucket is the ledger entries union"
         );
         assert!(bucket.iter().all(|t| t["rolledBack"] == json!(true)));
+        assert_eq!(bucket[0]["restorable"], json!(true), "u2 is restorable");
+        assert_eq!(bucket[1]["restorable"], json!(true), "a2 is restorable");
         assert_eq!(
             snap["rollback"],
             json!({ "canRedo": true, "undoneDepth": 1, "redoableTurnIds": ["u2"] }),
@@ -2134,7 +2136,19 @@ mod tests {
             json!({ "canRedo": false, "undoneDepth": 1, "redoableTurnIds": [] }),
             "the chain-root tip is re-READ at snapshot time — no device shows a redo Task 4 would refuse"
         );
-        assert_eq!(snap["rolledBackTurns"].as_array().expect("bucket").len(), 2);
+        let bucket = snap["rolledBackTurns"].as_array().expect("bucket");
+        assert_eq!(bucket.len(), 2);
+        assert_eq!(
+            bucket[0]["restorable"],
+            json!(false),
+            "u2 reads not-restorable even though the STORED bit is true — restorability \
+             follows the provider-adjudicated canRedo param (the tip recheck)"
+        );
+        assert_eq!(
+            bucket[1]["restorable"],
+            json!(false),
+            "a2 reads not-restorable for the same reason"
+        );
     }
 
     #[tokio::test]
@@ -2195,6 +2209,26 @@ mod tests {
         );
         assert!(bucket.iter().all(|t| t["rolledBack"] == json!(true)));
         assert_eq!(
+            bucket[0]["restorable"],
+            json!(false),
+            "o1 — frozen prior-epoch marker"
+        );
+        assert_eq!(
+            bucket[1]["restorable"],
+            json!(false),
+            "o2 — frozen prior-epoch marker (assistant row too)"
+        );
+        assert_eq!(
+            bucket[2]["restorable"],
+            json!(true),
+            "u2 — current-epoch marker"
+        );
+        assert_eq!(
+            bucket[3]["restorable"],
+            json!(true),
+            "a2 — current-epoch marker (assistant row too)"
+        );
+        assert_eq!(
             snap["rollback"],
             json!({ "canRedo": true, "undoneDepth": 2, "redoableTurnIds": ["u2"] }),
             "undoneDepth counts USER turns across the whole union (o1, u2); F6: the frozen \
@@ -2211,7 +2245,14 @@ mod tests {
         let snap =
             build_claude_snapshot_json("freshclaude", &cur, &prefix_after_undo(), 7, Some(&record));
         std::env::remove_var("CLAUDE_CONFIG_DIR");
-        assert_eq!(snap["rolledBackTurns"].as_array().expect("bucket").len(), 2);
+        let bucket = snap["rolledBackTurns"].as_array().expect("bucket");
+        assert_eq!(bucket.len(), 2);
+        assert_eq!(
+            bucket[0]["restorable"],
+            json!(false),
+            "u2 — destroyed redo ⇒ collapsed history, never restorable"
+        );
+        assert_eq!(bucket[1]["restorable"], json!(false), "a2 — same");
         assert_eq!(
             snap["rollback"],
             json!({ "canRedo": false, "undoneDepth": 1, "redoableTurnIds": [] })

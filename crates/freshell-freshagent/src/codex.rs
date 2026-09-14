@@ -12866,6 +12866,34 @@ pub(crate) mod tests {
             !record.redo_destroyed,
             "the new epoch cleared only the redo chain state"
         );
+
+        // The snapshot truth at the tail — the DIRECT builder (the same
+        // file-private call the neighboring snapshot tests use): the live
+        // route's `thread/read` cannot be serviced by this single-task test.
+        // Codex is undo-only, so EVERY bucket turn reads restorable:false —
+        // collapsed from birth — and canRedo stays false.
+        let snap = build_codex_snapshot_json(
+            "thr-f8",
+            &codex_raw_thread_updated_at_7(),
+            false,
+            Some(HistoryMode::Paginated),
+            Some(&record),
+            false,
+        )
+        .expect("snapshot builds");
+        assert!(
+            snap["rolledBackTurns"]
+                .as_array()
+                .expect("bucket")
+                .iter()
+                .all(|t| t["restorable"] == json!(false)),
+            "codex can never be restorable — every marker row, every epoch"
+        );
+        assert_eq!(
+            snap["rollback"]["canRedo"],
+            json!(false),
+            "codex is undo-only — the snapshot never advertises a redo"
+        );
     }
 
     #[tokio::test]
@@ -17430,6 +17458,11 @@ pub(crate) mod tests {
         let bucket = snap["rolledBackTurns"].as_array().expect("bucket");
         assert_eq!(bucket.len(), 1);
         assert_eq!(bucket[0]["rolledBack"], json!(true));
+        assert_eq!(
+            bucket[0]["restorable"],
+            json!(false),
+            "codex is undo-only — its markers are collapsed-from-birth (never restorable)"
+        );
         assert_eq!(bucket[0]["turnId"], json!("turn-9"));
         assert_eq!(
             snap["revision"],
@@ -17530,6 +17563,11 @@ pub(crate) mod tests {
         );
         assert_eq!(snapshot["rolledBackTurns"][0]["turnId"], json!("turn-9"));
         assert_eq!(snapshot["rolledBackTurns"][0]["rolledBack"], json!(true));
+        assert_eq!(
+            snapshot["rolledBackTurns"][0]["restorable"],
+            json!(false),
+            "codex is undo-only — never restorable over the live route either"
+        );
         assert_eq!(
             snapshot["revision"],
             json!(100),

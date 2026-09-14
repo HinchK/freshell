@@ -7511,7 +7511,7 @@ describe('/undo + /redo dispatch (kata 1wxv)', () => {
       rolledBackTurns: [
         { id: 'u8', turnId: 'u8', role: 'user', summary: 'frozen marker', items: [{ id: 'u8-i', kind: 'text', text: 'frozen marker' }], rolledBack: true },
         { id: 'a8', turnId: 'a8', role: 'assistant', summary: 'frozen answer', items: [{ id: 'a8-i', kind: 'text', text: 'frozen answer' }], rolledBack: true },
-        { id: 'u9', turnId: 'u9', role: 'user', summary: 'current marker', items: [{ id: 'u9-i', kind: 'text', text: 'current marker' }], rolledBack: true },
+        { id: 'u9', turnId: 'u9', role: 'user', summary: 'current marker', items: [{ id: 'u9-i', kind: 'text', text: 'current marker' }], rolledBack: true, restorable: true },
       ],
       rollback: { canRedo: true, undoneDepth: 2, redoableTurnIds: ['u9'] },
     }))
@@ -7521,12 +7521,21 @@ describe('/undo + /redo dispatch (kata 1wxv)', () => {
         <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
       </Provider>,
     )
-    await waitFor(() => expect(screen.getByText('frozen marker')).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText('current marker')).toBeInTheDocument())
 
     const section = screen.getByRole('region', { name: 'Rolled back turns' })
     const buttons = Array.from(section.querySelectorAll('button[aria-label="Redo to here"]'))
     expect(buttons).toHaveLength(1)
     expect(buttons[0].closest('div.flex.items-start')?.textContent).toContain('current marker')
+    // The frozen pair is historical: the quiet line counts its ONE user step…
+    const historyLine = within(section).getByRole('button', { name: /Toggle rolled-back history/ })
+    expect(historyLine).toHaveTextContent('Rolled back (1) — kept in history')
+    expect(within(section).queryByText('frozen marker')).toBeNull()
+    // …and reveals the frozen rows (with no redo button) on demand.
+    fireEvent.click(historyLine)
+    const frozenRow = screen.getByText('frozen marker').closest('div.flex.items-start')
+    expect(frozenRow).not.toBeNull()
+    expect(frozenRow?.querySelector('button[aria-label="Redo to here"]')).toBeNull()
   })
 
   it('delta-r1 F6 legacy: a rollback block WITHOUT redoableTurnIds offers no per-marker redo', async () => {
@@ -7540,10 +7549,132 @@ describe('/undo + /redo dispatch (kata 1wxv)', () => {
         <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
       </Provider>,
     )
-    await waitFor(() => expect(screen.getByText('rolled prompt')).toBeInTheDocument())
+    // Legacy shape: no restorable stamps ⇒ the marker is born behind the line.
+    await waitFor(() => expect(screen.getByRole('button', { name: /Toggle rolled-back history/ })).toBeInTheDocument())
 
     const section = screen.getByRole('region', { name: 'Rolled back turns' })
     expect(section.querySelectorAll('button[aria-label="Redo to here"]')).toHaveLength(0)
+    fireEvent.click(screen.getByRole('button', { name: /Toggle rolled-back history/ }))
+    expect(screen.getByText('rolled prompt')).toBeInTheDocument()
+    expect(section.querySelectorAll('button[aria-label="Redo to here"]')).toHaveLength(0)
+  })
+
+  it('a freshcodex pane renders its markers collapsed from birth (undo-only provider)', async () => {
+    // codex is undo-only: the server stamps restorable:false from the moment of
+    // its undo, so the marker section is born collapsed behind the history line.
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'Codex rolled marker',
+      capabilities: { send: true, interrupt: true, fork: true, undo: true, redo: false },
+      rollback: { canRedo: false, undoneDepth: 1 },
+      rolledBackTurns: [
+        { id: 'u9', turnId: 'u9', role: 'user', summary: 'codex rolled prompt', items: [{ id: 'u9-i', kind: 'text', text: 'codex rolled prompt' }], rolledBack: true, restorable: false },
+      ],
+      turns: [],
+    })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-collapsed-codex',
+        sessionId: 'thread-collapsed-codex',
+        status: 'idle',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByRole('button', { name: /Toggle rolled-back history/ })).toBeInTheDocument())
+
+    const section = screen.getByRole('region', { name: 'Rolled back turns' })
+    const historyLine = within(section).getByRole('button', { name: /Toggle rolled-back history/ })
+    expect(historyLine).toHaveTextContent('Rolled back (1) — kept in history')
+    expect(historyLine).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.queryByRole('button', { name: 'Redo to here' })).toBeNull()
+
+    fireEvent.click(historyLine)
+    expect(screen.getByText('codex rolled prompt')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Redo to here' })).toBeNull()
+  })
+
+  it('a freshcodex pane re-collapses the disclosure across conversation switches (threadId-keyed: codex snapshots carry no sessionId)', async () => {
+    // The delta-review hazard: the Rust codex snapshot builder stamps threadId
+    // but NEVER sessionId (codex.rs build_codex_snapshot_json), so the view
+    // must fall back to threadId for the disclosure's conversation keying —
+    // otherwise a second codex conversation in the same pane inherits the
+    // first one's expanded history line instead of collapsing from birth.
+    const codexSnapshotWith = (threadId: string, prompt: string) => ({
+      status: 'idle' as const,
+      summary: prompt,
+      threadId,
+      capabilities: { send: true, interrupt: true, fork: true, undo: true, redo: false },
+      rollback: { canRedo: false, undoneDepth: 1 },
+      rolledBackTurns: [
+        { id: `${threadId}-u`, turnId: `${threadId}-u`, role: 'user', summary: prompt, items: [{ id: `${threadId}-u-i`, kind: 'text' as const, text: prompt }], rolledBack: true, restorable: false },
+      ],
+      turns: [],
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(codexSnapshotWith('thread-a', 'codex prompt one'))
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-codex-switch',
+        sessionId: 'thread-a',
+        status: 'idle',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByRole('button', { name: /Toggle rolled-back history/ })).toBeInTheDocument())
+
+    // Expand conversation A's history line.
+    fireEvent.click(screen.getByRole('button', { name: /Toggle rolled-back history/ }))
+    expect(screen.getByText('codex prompt one')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Toggle rolled-back history/ })).toHaveAttribute('aria-expanded', 'true')
+
+    // Start a NEW conversation in the SAME pane: the pane content re-keys to
+    // thread-b and the (mocked) snapshot now describes conversation B.
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(codexSnapshotWith('thread-b', 'codex prompt two'))
+    act(() => {
+      store.dispatch(updatePaneContent({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-codex-switch',
+          sessionId: 'thread-b',
+          status: 'idle',
+        },
+      }))
+    })
+
+    // The disclosure re-collapses for the new conversation — codex markers are
+    // collapsed from birth, and an expanded toggle never leaks across the
+    // conversation switch (against the pre-fix code the key stays null and
+    // aria-expanded would never return to 'false').
+    await waitFor(() => expect(screen.getByRole('button', { name: /Toggle rolled-back history/ })).toHaveAttribute('aria-expanded', 'false'))
+    expect(screen.queryByText('codex prompt one')).toBeNull()
+    expect(screen.queryByText('codex prompt two')).toBeNull()
+    // Expanding reveals conversation B's own row.
+    fireEvent.click(screen.getByRole('button', { name: /Toggle rolled-back history/ }))
+    expect(screen.getByText('codex prompt two')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Toggle rolled-back history/ })).toHaveAttribute('aria-expanded', 'true')
   })
 
   it('typed /redo on a freshcodex pane hits the composer RESERVED seam: pinned codex notice, NEVER a send (r3 correction 8)', async () => {
