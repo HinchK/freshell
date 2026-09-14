@@ -12,6 +12,7 @@ import {
   type ResourceSnapshot,
   type SnapshotDiff,
 } from '../helpers/leak-metrics.js'
+import { RustServer } from '../helpers/rust-server.js'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-version.js'
 
 /**
@@ -347,41 +348,60 @@ test.describe('HARNESS-12 leak/resource measurements', () => {
 
   test('stop leaves no owned process behind and frees the listening port', async ({ testServer }, testInfo) => {
     test.skip(externalTargetConfigured(), 'leak metrics require an owned server (external target is not ours)')
-    const pid = testServer.info.pid
-    const port = testServer.info.port
+    // This is deliberately NOT the worker-scoped `testServer`: subsequent
+    // specs in the same Cloud worker use that fixture to register a machine
+    // and connect. The destructive lifecycle proof owns a separate ephemeral
+    // RustServer, leaving the framework-owned server alive.
+    const sharedPid = testServer.info.pid
+    const owned = new RustServer()
+    await owned.start()
+    const pid = owned.info.pid
+    const port = owned.info.port
     const beforeStop = captureResourceSnapshot([pid])
 
-    await testServer.stop()
+    try {
+      await owned.stop()
 
-    await expect
-      .poll(
-        () => {
-          try {
-            process.kill(pid, 0)
-            return true
-          } catch {
-            return false
-          }
-        },
-        { timeout: 10_000, intervals: [100, 250] },
-      )
-      .toBe(false)
-    // The port is gone host-wide (nobody — not just our pid — still LISTENs on it).
-    expect(captureHostListeningPorts()).not.toContain(port)
+      await expect
+        .poll(
+          () => {
+            try {
+              process.kill(pid, 0)
+              return true
+            } catch {
+              return false
+            }
+          },
+          { timeout: 10_000, intervals: [100, 250] },
+        )
+        .toBe(false)
+      // The port is gone host-wide (nobody — not just our pid — still LISTENs on it).
+      expect(captureHostListeningPorts()).not.toContain(port)
+      // The worker fixture remains its original live server; the following
+      // test and multirow-tabs in this same worker exercise registration and
+      // browser connection against this exact handle.
+      expect(testServer.info.pid).toBe(sharedPid)
 
-    await attachArtifact(testInfo, 'leak-metrics-stop-snapshot', beforeStop, {
-      capturedAt: new Date().toISOString(),
-      rootPids: [pid],
-      processCount: 0,
-      totalRssBytes: 0,
-      totalFdCount: 0,
-      totalThreads: 0,
-      totalSocketQueue: { rxBytes: 0, txBytes: 0 },
-      listeningPorts: [],
-      processes: [],
-    }, null)
-    // The worker fixture's own teardown calls stop() a second time — both
-    // owned fixtures tolerate that (verified by inspection in the HARNESS-12
-    // plan, assumption 5).
+      await attachArtifact(testInfo, 'leak-metrics-stop-snapshot', beforeStop, {
+        capturedAt: new Date().toISOString(),
+        rootPids: [pid],
+        processCount: 0,
+        totalRssBytes: 0,
+        totalFdCount: 0,
+        totalThreads: 0,
+        totalSocketQueue: { rxBytes: 0, txBytes: 0 },
+        listeningPorts: [],
+        processes: [],
+      }, null)
+    } finally {
+      await owned.stop().catch(() => {})
+    }
+  })
+
+  test('the shared worker server still registers a machine and connects after the owned stop check', async ({ freshellPage, harness, testServer }) => {
+    const sharedPid = testServer.info.pid
+    await expect(freshellPage.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+    await harness.waitForConnection()
+    expect(testServer.info.pid).toBe(sharedPid)
   })
 })

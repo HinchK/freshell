@@ -364,48 +364,6 @@ async function createFreshclaudePane(page: Page, harness: TestHarness, cwd: stri
   // never assert error-free UI chrome for freshclaude.
 }
 
-/**
- * Close→required-offer guard (teardown-lag pin): poll
- * `GET /api/recovery/inventory` with a PROBE clientInstanceId until the last
- * closed context's records resolve as recoverable, so a later boot that
- * REQUIRES the offer can never race WS-teardown lag. Uses a STANDALONE
- * APIRequestContext — NOT `page.request` (its handle dies with the page's
- * browser context) and NOT a navigated page (a booted page would register as
- * a tracked tabs.sync client and entangle the very inventory it polls); the
- * probe is a plain auth'd GET that never opens a WS socket, so it leaves no
- * connected-state of its own. Disposed after use.
- */
-async function waitForRecoverable(
-  info: E2eServerInfo,
-  { timeoutMs = 30_000 }: { timeoutMs?: number } = {},
-): Promise<void> {
-  const req = await request.newContext({
-    baseURL: info.baseUrl,
-    extraHTTPHeaders: { 'x-auth-token': info.token },
-  })
-  try {
-    const deadline = Date.now() + timeoutMs
-    let lastPayload: unknown
-    while (Date.now() < deadline) {
-      const res = await req
-        .get('/api/recovery/inventory?clientInstanceId=freshell-test-probe&bootAgoMs=0')
-        .catch(() => null)
-      if (res?.ok()) {
-        const body = (await res.json().catch(() => null)) as { recoverable?: unknown } | null
-        lastPayload = body
-        if (body?.recoverable === true) return
-      }
-      await new Promise((r) => setTimeout(r, 500))
-    }
-    throw new Error(
-      `waitForRecoverable: inventory never reported recoverable=true within ${timeoutMs}ms; `
-      + `last payload: ${JSON.stringify(lastPayload)}`,
-    )
-  } finally {
-    await req.dispose()
-  }
-}
-
 test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
   // Scenarios share ONE owned server and build on each other's durable state
   // (snapshots, ledger rows, a still-running PTY) — strict ordering required.
@@ -548,22 +506,21 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
   }
 
   /**
-   * Open a FRESH context (empty storage) and REQUIRE the recovery offer —
-   * one context, one hard `toBeVisible` assertion (the brief's contract).
-   * No retry loop: with service workers blocked (above) the only known cause
-   * of transient offer suppression is gone, and a retry here would quietly
-   * absorb exactly the flaky-offer regression class this feature already
-   * exhibited once. If the offer ever goes flaky again, this MUST fail loud.
+   * Open empty browser storage for an already registered machine. Rust owns
+   * that machine's workspace, so bootstrap restores it directly and the
+   * retired generic cross-machine offer must never mount.
    */
-  async function openFreshContextWithOffer(
+  async function openSameMachineContext(
     browser: import('@playwright/test').Browser,
+    machineId: string,
     label: string,
+    options = FRESH_CONTEXT_OPTIONS,
   ): Promise<{ ctx: BrowserContext; page: Page; harness: TestHarness }> {
-    const ctx = await createFreshContext(browser)
+    const ctx = await createE2eBrowserContext(browser, info, machineId, options)
     const page = await ctx.newPage()
     traceInventoryFailures(page, label)
     const harness = await connect(page, info)
-    await expect(page.getByTestId('recovery-offer-panel')).toBeVisible({ timeout: 15_000 })
+    await expect(page.getByTestId('recovery-offer-panel')).toHaveCount(0)
     return { ctx, page, harness }
   }
 
@@ -689,48 +646,38 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     await expect(pageB.getByTestId('recovery-offer-panel')).toHaveCount(0)
 
     await ctxB.close()
-    // Guard (R2a): scenario 2's ctxC boot REQUIRES the offer — wait until B's
-    // closed records resolve as recoverable so teardown lag cannot starve it.
-    await waitForRecoverable(info)
   })
 
-  test('scenario 2: decline path — panel closes, no recovered tabs added', async ({ browser }) => {
+  test('scenario 2: a separately registered machine remains isolated and never mounts a generic recovery offer', async ({ browser }) => {
     test.setTimeout(120_000)
 
-    // Fresh context C against the same server (recoverable state still exists
-    // from scenario 1 — context B's accepted layout also pushed snapshots).
-    const { ctx: ctxC, page: pageC, harness: harnessC } = await openFreshContextWithOffer(browser, 'contextC')
-
-    const panelC = pageC.getByTestId('recovery-offer-panel')
-    await expect(panelC).toBeVisible()
-    await pageC.getByTestId('recovery-decline').click()
-    await expect(panelC).toHaveCount(0)
-
-    // No recovered tabs: only the auto-created default tab remains — settle
-    // first so a straggling (wrongful) recovery could have landed.
+    // Context C receives a brand-new server-managed machine identity before
+    // boot. It must not inherit scenario 1's machine workspace, and it must
+    // not resurrect the retired generic cross-machine recovery UI.
+    const ctxC = await createFreshContext(browser)
+    const pageC = await ctxC.newPage()
+    const harnessC = await connect(pageC, info)
+    await expect(pageC.getByTestId('recovery-offer-panel')).toHaveCount(0)
     await expect(async () => {
       expect(await harnessC.getTabCount()).toBe(1)
     }).toPass({ timeout: 10_000 })
-    await pageC.waitForTimeout(1_500)
-    expect(await harnessC.getTabCount()).toBe(1)
 
     await ctxC.close()
-    // Guard (R2a): scenario 3's ctxD boot REQUIRES the offer.
-    await waitForRecoverable(info)
   })
 
   test('scenario 3: no-restart browser loss — live panes restore by REATTACH to the still-running terminals (focused-episode-6 round 5)', async ({ browser }) => {
     test.setTimeout(240_000)
 
     // ---- Context D against the SAME still-running server (no restart) ----
-    // The offer MODAL (role="dialog" + overlay) appears first — D's storage is
-    // empty and recoverable state exists — and would intercept all pointer
-    // events. Clear it BEFORE any pane interaction (this dismissal lives only
-    // in D's localStorage; context E below is a different fresh context).
-    const { ctx: ctxD, page: pageD } = await openFreshContextWithOffer(browser, 'contextD')
-    const panelD = pageD.getByTestId('recovery-offer-panel')
-    await pageD.getByTestId('recovery-decline').click()
-    await expect(panelD).toHaveCount(0)
+    // D receives a server-managed machine identity. The app starts directly
+    // in that machine's workspace; generic cross-machine recovery is not a
+    // supported UI path.
+    const ownedD = await createFreshE2eBrowserContext(browser, info, FRESH_CONTEXT_OPTIONS)
+    const ctxD = ownedD.context
+    const machineD = ownedD.machine
+    const pageD = await ctxD.newPage()
+    await connect(pageD, info)
+    await expect(pageD.getByTestId('recovery-offer-panel')).toHaveCount(0)
 
     await selectShellIfPickerShowing(pageD)
     await expect(pageD.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
@@ -790,33 +737,11 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     // PTY and D's claude CLI keep running (registry-owned, not
     // connection-owned), so BOTH panes verdict LIVE. ----
     await ctxD.close()
-    // Guard (R2a): the server's inventory must see the recoverable substance
-    // before E boots (the poller is the transition guard, not an assertion).
-    await waitForRecoverable(info)
 
-    // ---- Context E (fresh storage): the offer lists AND counts BOTH panes —
-    // live panes are restorable (focused-episode-6 round 5, Finding F1): the
-    // shell claims liveness through its snapshot's liveTerminal.terminalId
-    // (Finding F2 — before it, an unidentified shell ALWAYS read live:false
-    // and restored as a duplicate), the claude pane through its durable
-    // session ref. Accepting reattaches both IN THEIR TAB — never a second
-    // spawn on top of the still-running sessions. ----
-    const ctxE: BrowserContext = await createFreshContext(browser)
-    const pageE = await ctxE.newPage()
-    traceInventoryFailures(pageE, 'contextE')
-    await connect(pageE, info)
-
-    const panelE = pageE.getByTestId('recovery-offer-panel')
-    await expect(panelE).toBeVisible({ timeout: 15_000 })
-    await expect(
-      pageE.getByRole('heading', { name: /restore 2 panes from server memory/i }),
-    ).toBeVisible()
-    await expect(panelE.getByRole('listitem')).toHaveCount(2)
-    await expect(pageE.getByTestId('recovery-live-note')).toBeVisible()
-    await expect(pageE.getByTestId('recovery-live-note')).toHaveText(/reattach/)
-
-    await pageE.getByTestId('recovery-accept').click()
-    await expect(panelE).toHaveCount(0)
+    // ---- Context E: empty browser storage for D's registered machine.
+    // Machine-scoped bootstrap restores both live panes and reattaches them;
+    // it never asks the user through the legacy generic offer. ----
+    const { ctx: ctxE, page: pageE } = await openSameMachineContext(browser, machineD.id, 'contextE')
 
     // The accept ran: the tab is restored with both panes visible.
     await expect(pageE.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
@@ -875,34 +800,20 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     await ctxE.close()
   })
 
-  test('scenario 4: small-viewport boots offer the full dialog and the decline control is tappable', async ({ browser }) => {
+  test('scenario 4: small-viewport same-machine bootstrap restores a dense workspace without a generic offer', async ({ browser }) => {
     test.setTimeout(240_000)
 
     // ---- Populating context: record a 40-shell-tab layout ----
-    // 40 records overflow the dialog's 80vh-capped list budget on an 844px
-    // viewport (measured ~24px/record ⇒ ~950px of content vs a ~525px list
-    // budget); the plan's 20 records measure ~500px and fit UNDER the cap,
-    // which made scrollHeight === clientHeight with AND without the
-    // containment classes — a non-discriminating assertion.
-    // A boot offer MODALLY intercepts the "New shell tab" clicks below — the
-    // canonical full serial run has recoverable state from scenarios 1–3,
-    // while an isolated `-g "scenario 4"` run against a fresh server/home has
-    // none. Branch on the boot inventory RESPONSE PAYLOAD (captured BEFORE
-    // navigation), never on visibility timing: offer render latency of >10s
-    // has been observed, so a short visibility probe would race a delayed
-    // modal into a false "no offer" read.
-    const ctxP = await createFreshContext(browser)
+    // Registered machines bootstrap their own workspace directly. The dense
+    // layout is still useful coverage on a phone viewport; the old generic
+    // dialog containment contract is intentionally retired.
+    const ownedP = await createFreshE2eBrowserContext(browser, info, FRESH_CONTEXT_OPTIONS)
+    const ctxP = ownedP.context
+    const machineP = ownedP.machine
     const pageP = await ctxP.newPage()
     traceInventoryFailures(pageP, 'scenario4-populating')
-    const inventoryResponsePromise = pageP.waitForResponse((r) => r.url().includes('/api/recovery/inventory'))
     const harnessP = await connect(pageP, info)
-    const inventoryBody = (await (await inventoryResponsePromise).json().catch(() => null)) as { recoverable?: unknown } | null
-    if (inventoryBody?.recoverable === true) {
-      const bootPanel = pageP.getByTestId('recovery-offer-panel')
-      await expect(bootPanel).toBeVisible({ timeout: 30_000 })
-      await pageP.getByTestId('recovery-decline').click()
-      await expect(bootPanel).toHaveCount(0)
-    }
+    await expect(pageP.getByTestId('recovery-offer-panel')).toHaveCount(0)
 
     // 40 shell tabs via the tab strip (idiom donor: automation-layout-rust.spec.ts:143
     // — TabBar.tsx:535 `addTab({mode:'shell'})`; multirow-tabs.spec.ts's
@@ -929,49 +840,17 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
 
     // ---- Lose the populating browser WITHOUT a server restart ----
     await ctxP.close()
-    // Guard (R2a): the phone boot below REQUIRES the 40-tab offer.
-    await waitForRecoverable(info)
 
-    // ---- Phone-viewport context: the offer must contain itself + scroll ----
-    const ctxPhone = await createFreshContext(browser, {
+    // ---- Phone-viewport context: the same registered machine restores its
+    // own workspace automatically and must not mount a generic offer. ----
+    const { ctx: ctxPhone, page: pagePhone, harness: harnessPhone } = await openSameMachineContext(browser, machineP.id, 'scenario4-phone', {
       serviceWorkers: 'block',
       viewport: { width: 390, height: 844 },
     })
-    const pagePhone = await ctxPhone.newPage()
-    traceInventoryFailures(pagePhone, 'scenario4-phone')
-    await connect(pagePhone, info)
-
-    const panel = pagePhone.getByTestId('recovery-offer-panel')
-    await expect(panel).toBeVisible({ timeout: 30_000 })
-
-    // R1 containment: the dialog's rendered box never escapes the 390x844
-    // viewport (the phone incident: the dialog filled the screen and cropped
-    // the decline button off-viewport).
-    const box = await panel.boundingBox()
-    expect(box, 'recovery dialog must have a layout box').not.toBeNull()
-    expect(box!.x).toBeGreaterThanOrEqual(0)
-    expect(box!.y).toBeGreaterThanOrEqual(0)
-    expect(box!.x + box!.width).toBeLessThanOrEqual(390)
-    expect(box!.y + box!.height).toBeLessThanOrEqual(844)
-
-    // R1 internal scroll: the records list is the sole scroll region
-    // (RecoveryOfferPanel's <ul>) and provably overflows its own box with a
-    // 40-record inventory.
-    const recordsList = panel.locator('ul').first()
-    const listMetrics = await recordsList.evaluate((el) => ({
-      scrollHeight: el.scrollHeight,
-      clientHeight: el.clientHeight,
-    }))
-    expect(
-      listMetrics.scrollHeight,
-      'records list must scroll internally with a 40-record inventory',
-    ).toBeGreaterThan(listMetrics.clientHeight)
-
-    // R1/R3 phone proof: Playwright's click does the full actionability sweep
-    // (attached, visible, stable, receives events) — "Not now" really is one
-    // tap away on the phone-sized screen.
-    await pagePhone.getByTestId('recovery-decline').click()
-    await expect(panel).toHaveCount(0)
+    await expect(async () => {
+      expect(await harnessPhone.getTabCount()).toBe(41)
+    }).toPass({ timeout: 30_000 })
+    await expect(pagePhone.getByTestId('recovery-offer-panel')).toHaveCount(0)
 
     await ctxPhone.close()
   })
@@ -1001,11 +880,11 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     const snapshotsRoot = path.join(capturedHome, '.freshell', 'tabs-snapshots')
     await fs.rm(snapshotsRoot, { recursive: true, force: true })
 
-    // 2. Context L boots against the wiped store — NO offer (nothing is
-    //    recoverable) — then gains a shell pane and a claude CLI pane in one
-    //    tab. Plain connect, NOT openFreshContextWithOffer (which REQUIRES a
-    //    panel).
-    const ctxL: BrowserContext = await createFreshContext(browser)
+    // 2. Context L boots against the wiped store on a fresh server-managed
+    //    machine, then gains a shell pane and a claude CLI pane in one tab.
+    const ownedL = await createFreshE2eBrowserContext(browser, info, FRESH_CONTEXT_OPTIONS)
+    const ctxL = ownedL.context
+    const machineL = ownedL.machine
     const pageL = await ctxL.newPage()
     traceInventoryFailures(pageL, 'early-loss-L')
     const harnessL = await connect(pageL, info)
@@ -1064,7 +943,6 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     //    new pane surviving (we deliberately never wait for one — the F1
     //    shape). The server (and both PTYs) keep running.
     await ctxL.close()
-    await waitForRecoverable(info)
 
     // 6. Deterministic shaping: remove every retained generation referencing
     //    the pane (within-cadence loss made exact); the surviving keepsake
@@ -1117,26 +995,10 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
       await probe.dispose()
     }
 
-    // 8. Context E (fresh storage = new machine): the offer lists AND counts
-    //    BOTH panes (the snapshotted live shell + the ledgerOnly live claude
-    //    row), the live note explains the reattach, and accepting puts both
-    //    back IN THEIR TAB on their ORIGINAL terminals — never a respawn.
-    const ctxE: BrowserContext = await createFreshContext(browser)
-    const pageE = await ctxE.newPage()
-    traceInventoryFailures(pageE, 'early-loss-E')
-    await connect(pageE, info)
-
-    const panelE = pageE.getByTestId('recovery-offer-panel')
-    await expect(panelE).toBeVisible({ timeout: 15_000 })
-    await expect(
-      pageE.getByRole('heading', { name: /restore 2 panes from server memory/i }),
-    ).toBeVisible()
-    await expect(panelE.getByRole('listitem')).toHaveCount(2)
-    await expect(pageE.getByTestId('recovery-live-note')).toBeVisible()
-    await expect(pageE.getByTestId('recovery-live-note')).toHaveText(/reattach/)
-
-    await pageE.getByTestId('recovery-accept').click()
-    await expect(panelE).toHaveCount(0)
+    // 8. Empty browser storage for L's same registered machine automatically
+    //    restores the shell plus ledger-only live claude row and reattaches
+    //    both to their original terminals — never a respawn.
+    const { ctx: ctxE, page: pageE } = await openSameMachineContext(browser, machineL.id, 'early-loss-E')
     await expect(pageE.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
 
     await expect(async () => {
@@ -1204,7 +1066,9 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     // 2. Context A: boot shell pane, then SPLIT a claude CLI pane beside it
     //    (the shell sibling keeps the tab alive, so closePane — not closeTab
     //    — fires, and no closed-tab record is written).
-    const ctxA: BrowserContext = await createFreshContext(browser)
+    const ownedA = await createFreshE2eBrowserContext(browser, info, FRESH_CONTEXT_OPTIONS)
+    const ctxA = ownedA.context
+    const machineA = ownedA.machine
     const pageA = await ctxA.newPage()
     const harnessA = await connect(pageA, info)
     await selectShellIfPickerShowing(pageA)
@@ -1355,22 +1219,15 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
       await probe.dispose()
     }
 
-    // 11. Offer assertion: the shell tab survived in the evidence, so the
-    //     offer is REQUIRED; the closed pane's line would render
-    //     "{tabName}: claude — {markerDir}" and must appear on NO line.
-    const { ctx: ctxB, page: pageB, harness: harnessB } = await openFreshContextWithOffer(browser, 'detach-window-exclusion')
-    const panel = pageB.getByTestId('recovery-offer-panel')
-    await expect(panel.getByRole('listitem').first()).toBeVisible({ timeout: 15_000 })
-    await expect(
-      panel.locator('ul li', { hasText: /: claude — \S*detach-close-cli-/ }),
-    ).toHaveCount(0)
+    // 11. Same-machine bootstrap restores the surviving shell directly while
+    //     the close-covered pane remains absent; no generic offer is mounted.
+    const { ctx: ctxB, page: pageB, harness: harnessB } = await openSameMachineContext(browser, machineA.id, 'detach-window-exclusion')
 
-    // 12. Accept: the surviving shell restores (anti-vacuity), and NO leaf
+    // 12. The surviving shell restores (anti-vacuity), and NO leaf
     //     anywhere carries the closed session — the pane the user closed
     //     stays closed. The shell respawn is expected (it verdicts dead after
     //     the SIGKILL); the claude session must never reappear in ANY form.
     const argvCountAtAccept = (await readArgvLog(argLog)).length
-    await pageB.getByTestId('recovery-accept').click()
     await expect(pageB.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
     await expect(async () => {
       const layout = await harnessB.getPaneLayout(await harnessB.getActiveTabId())
@@ -1434,7 +1291,9 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
 
     // 2. Context A: boot shell pane, then SPLIT a claude CLI pane beside it
     //    (same producer shape as scenario 7).
-    const ctxA: BrowserContext = await createFreshContext(browser)
+    const ownedA = await createFreshE2eBrowserContext(browser, info, FRESH_CONTEXT_OPTIONS)
+    const ctxA = ownedA.context
+    const machineA = ownedA.machine
     const pageA = await ctxA.newPage()
     traceInventoryFailures(pageA, 'reattach-lapse-A')
     const harnessA = await connect(pageA, info)
@@ -1618,7 +1477,6 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     //     keep running) and BEFORE any snapshot containing the reopened pane
     //     survives.
     await ctxA.close()
-    await waitForRecoverable(info)
 
     // 11. Deterministic shaping: remove every retained generation referencing
     //     ANY of the pane's identities across BOTH its epochs (old AND new
@@ -1675,18 +1533,9 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
       await probe.dispose()
     }
 
-    // 13. The offer names the reattach (the live note); ACCEPTING puts the
-    //     pane back on the ORIGINAL terminal — never a second process.
-    const { ctx: ctxE, page: pageE } = await openFreshContextWithOffer(browser, 'reattach-lapse-E')
-    const panelE = pageE.getByTestId('recovery-offer-panel')
-    await expect(panelE.getByRole('listitem').first()).toBeVisible({ timeout: 15_000 })
-    await expect(
-      panelE.locator('ul li', { hasText: /: claude — \S*reattach-lapse-cli-/ }),
-    ).toHaveCount(1)
-    await expect(pageE.getByTestId('recovery-live-note')).toBeVisible()
-
-    await pageE.getByTestId('recovery-accept').click()
-    await expect(panelE).toHaveCount(0)
+    // 13. Same-machine bootstrap reattaches the row to the ORIGINAL terminal
+    //     without routing through a generic offer.
+    const { ctx: ctxE, page: pageE } = await openSameMachineContext(browser, machineA.id, 'reattach-lapse-E')
     await expect(pageE.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
     await expect(async () => {
       const ePanes = await pageE.evaluate(() => {
@@ -1761,7 +1610,9 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     await fs.rm(path.join(capturedHome, '.freshell', 'tabs-snapshots'), { recursive: true, force: true })
 
     // 2. Context A: boot shell pane, then SPLIT a freshclaude pane beside it.
-    const ctxA: BrowserContext = await createFreshContext(browser)
+    const ownedA = await createFreshE2eBrowserContext(browser, info, FRESH_CONTEXT_OPTIONS)
+    const ctxA = ownedA.context
+    const machineA = ownedA.machine
     const pageA = await ctxA.newPage()
     const harnessA = await connect(pageA, info)
     await selectShellIfPickerShowing(pageA)
@@ -1906,27 +1757,14 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
       await req.dispose()
     }
 
-    // 9. Offer assertion: the shell tab survived in the evidence, so the
-    //    offer is REQUIRED; the panel lines render "{tabName}: {mode} — {cwd}",
-    //    and the killed pane's freshclaude line (marker cwd) must appear on NO
-    //    line.
-    const { ctx: ctxB, page: pageB, harness: harnessB } = await openFreshContextWithOffer(browser, 'kill-window-exclusion')
-    const panel = pageB.getByTestId('recovery-offer-panel')
-    // The killed pane's line would render "{tabName}: freshclaude — {cwd}"
-    // with the marker cwd. Do NOT match the bare marker string: the surviving
-    // shell pane's line carries the tab NAME from the last pushed generation,
-    // which legitimately derives from the killed pane's cwd while that pane
-    // was active (the anti-vacuity shell offer MUST render). Only the
-    // freshclaude-mode line with the marker CWD names the killed pane.
-    await expect(
-      panel.locator('ul li', { hasText: /: freshclaude — \S*kill-window-freshclaude-/ }),
-    ).toHaveCount(0)
+    // 9. The same registered machine restores its surviving shell directly;
+    //    the killed pane remains absent and no generic offer is mounted.
+    const { ctx: ctxB, page: pageB, harness: harnessB } = await openSameMachineContext(browser, machineA.id, 'kill-window-exclusion')
 
-    // 10. Accept: the surviving shell restores (anti-vacuity), and NO leaf
+    // 10. The surviving shell restores (anti-vacuity), and NO leaf
     //     anywhere carries the killed session — the pane the user closed
     //     stays closed. (Layout scan has a soft budget: the restore runs
     //     through the plan rebuild, not instantly.)
-    await pageB.getByTestId('recovery-accept').click()
     await expect(pageB.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
     await expect(async () => {
       const layout = await harnessB.getPaneLayout(await harnessB.getActiveTabId())
@@ -1983,7 +1821,9 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     // 2. Context A: boot shell pane, then SPLIT a freshclaude pane beside it
     //    (NEVER close a tab's only pane — that collapses to closeTab, whose
     //    closed-tab record would re-reference the row forever).
-    const ctxA: BrowserContext = await createFreshContext(browser)
+    const ownedA = await createFreshE2eBrowserContext(browser, info, FRESH_CONTEXT_OPTIONS)
+    const ctxA = ownedA.context
+    const machineA = ownedA.machine
     const pageA = await ctxA.newPage()
     const harnessA = await connect(pageA, info)
     await selectShellIfPickerShowing(pageA)
@@ -2093,10 +1933,8 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
       }
     }).toPass({ timeout: 120_000 })
 
-    // 10. Close context A, then the file's close→restart discipline parity
-    //     (recoverable guard, restart, reassign info).
+    // 10. Close context A, then restart before same-machine bootstrap.
     await ctxA.close()
-    await waitForRecoverable(info)
     info = await server.restart()
 
     // 11. RED/GREEN inventory assertion via a STANDALONE probe BEFORE any
@@ -2124,13 +1962,9 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
       await req.dispose()
     }
 
-    // 12. Offer assertion: the panel's ledgerOnly lines carry the row's cwd
-    //     ("{tabName}: {mode} — {cwd}"), so the marker cwd discriminates. The
-    //     re-based union still holds the surviving shell tab, so
-    //     recoverable stays true and the offer is REQUIRED.
-    const { ctx: ctxB, page: pageB } = await openFreshContextWithOffer(browser, 'junk-exclusion')
-    const panel = pageB.getByTestId('recovery-offer-panel')
-    await expect(panel.locator('ul li', { hasText: 'junk-freshclaude-' })).toHaveCount(0)
+    // 12. Same-machine bootstrap restores the surviving layout without a
+    //     generic offer; the stale row remains excluded by the probe above.
+    const { ctx: ctxB, page: pageB } = await openSameMachineContext(browser, machineA.id, 'junk-exclusion')
 
     // Do NOT click accept on the junk account alone: with the bucket empty of
     // this row there is no junk tab to form (Task 4 separately pins that

@@ -342,8 +342,15 @@ test.describe('Sidebar Click Resume', () => {
         const newTabTerminal = page.locator(`[data-context="terminal"][data-tab-id="${newTabId}"]`)
         await expect(newTabTerminal.locator('.xterm').first()).toBeVisible({ timeout: 20_000 })
 
-        const terminalId: string | undefined = (await harness.getPaneLayout(newTabId!))?.content?.terminalId
-        expect(terminalId).toBeTruthy()
+        // Sidebar resume creates the tab before the terminal-created fold
+        // reaches its layout. Poll the exact new tab rather than taking one
+        // immediate snapshot after the xterm node appears.
+        const terminalId = await expect.poll(async () => {
+          const terminal = (await harness.getPaneLayout(newTabId!))?.content?.terminalId
+          return typeof terminal === 'string' && terminal.length > 0 ? terminal : null
+        }, { timeout: 20_000 }).not.toBeNull().then(async () => {
+          return (await harness.getPaneLayout(newTabId!))!.content.terminalId as string
+        })
 
         await expect.poll(async () => {
           const buffer = await harness.getTerminalBuffer(terminalId)
