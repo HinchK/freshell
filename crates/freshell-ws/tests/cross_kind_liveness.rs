@@ -3121,6 +3121,81 @@ async fn race_snapshot_paused_after_lookup_cannot_resurrect_during_handoff() {
     h.ws_state.registry.kill(&terminal_id);
 }
 
+/// b8ke ext r18 F1 (c): the TERMINAL kill's commit-to-Vacant broadcasts
+/// the same release frame — a negotiated create commits Live{Terminal},
+/// the kill commits the incremented Vacant generation, and the
+/// session.runtimeOwner released frame (vacant owner + the new
+/// generation/epoch) arrives on the bus the connected panes fold from
+/// (pre-r18 the commit broadcast nothing, so a recreate of the same
+/// session carried the stale observed generation and was fenced).
+#[tokio::test]
+async fn the_terminal_kill_broadcasts_the_release_frame() {
+    let (url, _registry, ws_state) = spawn_server().await;
+    let mut ws = connect(&url).await;
+    let ownership = ws_state.ownership.clone().expect("coordinator wired");
+    let sid = uuid::Uuid::new_v4().to_string();
+
+    // A negotiated terminal create — the session commits Live{Terminal}.
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-r18-f1-term-kill",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+    let created = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "terminal.created" && v["requestId"] == "req-r18-f1-term-kill"
+    })
+    .await;
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    let live = ownership.observe("claude", &sid);
+    assert!(
+        matches!(live.state, freshell_ownership::OwnershipState::Live { .. }),
+        "fixture: the create committed Live{{Terminal}}"
+    );
+
+    // THE KILL.
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.kill",
+            "requestId": "req-r18-f1-term-kill-kill",
+            "terminalId": terminal_id,
+        }),
+    )
+    .await;
+    let _ = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "terminal.killed" && v["requestId"] == "req-r18-f1-term-kill-kill"
+    })
+    .await;
+
+    // THE RELEASE FRAME: the vacant owner + the INCREMENTED generation.
+    let release = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "session.runtimeOwner"
+            && v["sessionId"] == json!(sid)
+            && v["transition"] == json!("released")
+    })
+    .await;
+    assert_eq!(release["ownerKind"], json!("vacant"), "{release}");
+    assert!(
+        release["generation"].as_u64().unwrap() > live.generation,
+        "the release carries the INCREMENTED generation: {release}"
+    );
+    assert_eq!(release["epoch"], json!(ownership.boot_epoch()), "{release}");
+    assert!(matches!(
+        ownership.observe("claude", &sid).state,
+        freshell_ownership::OwnershipState::Vacant
+    ));
+}
+
 /// R1b (b8ke ext r17 F2): the MANDATED capture-then-park interleaving the
 /// pre-lookup seam could not express — the GET CAPTURES its live-runtime
 /// reference, parks at the AFTER-CAPTURE seam, the fresh→terminal handoff

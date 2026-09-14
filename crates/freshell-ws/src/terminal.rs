@@ -7734,7 +7734,16 @@ fn commit_terminal_stop(state: &WsState, stop_commit: &mut Option<(String, Strin
             outcome = ?outcome,
             "terminal_kill_stop_commit_foreign: the stop state moved on before the reap"
         );
+        return;
     }
+    // b8ke ext r18 F1: a SUCCESSFUL commit-to-Vacant BROADCASTS the
+    // release frame (the established identity_ownership vacant-release
+    // machinery) — connected panes and the kill → immediate recreate
+    // sequence converge on the vacant owner and the NEW generation
+    // (pre-r18 the commit changed the coordinator with no broadcast, so
+    // a recreate carrying the stale observed generation was fenced and
+    // the client kept retrying the stale pair).
+    crate::identity_ownership::broadcast_vacant_frame(state, &provider, &session_id, &operation_id);
 }
 
 /// kata b8ke Task 4 review F1: the granted stop's CLEAN-failure rollback —

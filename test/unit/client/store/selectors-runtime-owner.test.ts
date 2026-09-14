@@ -593,6 +593,29 @@ describe('b8ke ext F1: rekey alias chains resolve to the canonical key', () => {
       sessionRef: { provider: 'claude', sessionId: 'old-id' },
     })).toEqual({ epoch: 9, generation: 7 })
   })
+
+  it('a released-vacant stop frame refreshes the fence the next lifecycle request carries (b8ke ext r18 F1)', () => {
+    // The kill → immediate recreate "Restart sidecar" sequence: the pane's
+    // stored owner record still names the LIVE owner at generation 4, then
+    // the server's release frame (broadcast on the successful stop
+    // commit) folds over it — the pane's observed fence becomes the
+    // post-stop (epoch, generation) pair, so the recreate's
+    // freshAgent.create carries the CURRENT generation and succeeds on
+    // the first try (pre-r18 the server never sent the frame, so the
+    // fence stayed stale and the recreate was fenced as a stale pair).
+    const afterStop = ownersState([
+      { provider: 'codex', sessionId: 'sid-restart', ownerKind: 'vacant', generation: 5, epoch: 5, transition: 'released' },
+    ])
+    const pane = {
+      paneKind: 'fresh-agent' as const,
+      provider: 'codex',
+      sessionRef: { provider: 'codex', sessionId: 'sid-restart' },
+    }
+    expect(selectPaneOwnerFence(afterStop, pane)).toEqual({ epoch: 5, generation: 5 })
+    // And the pane is NOT divergent against the vacant record (it can
+    // issue the lifecycle start immediately).
+    expect(selectPaneOwnerDivergence(afterStop, pane)).toBeNull()
+  })
 })
 
 describe('deriveTerminalOwnerConvergence (b8ke ext r11 F2)', () => {

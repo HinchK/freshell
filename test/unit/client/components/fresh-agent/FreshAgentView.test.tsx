@@ -6,6 +6,7 @@ import panesReducer from '@/store/panesSlice'
 import settingsReducer, { previewServerSettingsPatch, updateSettingsLocal } from '@/store/settingsSlice'
 import sessionsReducer, { applySessionsPatch, applyContextUsageExtras } from '@/store/sessionsSlice'
 import freshAgentReducer, { applyRuntimeOwner, sessionInit, setSessionStatus, markSessionLost } from '@/store/freshAgentSlice'
+import { selectPaneOwnerFence } from '@/store/selectors/runtimeOwner'
 import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import { FreshAgentView, IDLE_INCOMPLETE_MAX_RETRIES, locatorMatchesPane } from '@/components/fresh-agent/FreshAgentView'
@@ -6760,6 +6761,71 @@ describe('freshcodex wedged-sidecar notice', () => {
     expect(alert).toHaveTextContent(/appears stuck/i)
     expect(screen.getByRole('button', { name: /restart sidecar and resume session/i })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /start new conversation/i })).toBeInTheDocument()
+  })
+
+  it('the restart-sidecar sequence converges on the kill release frame (b8ke ext r18 F1)', async () => {
+    // The full kill → immediate recreate sequence: the click kills (with the
+    // PRE-STOP observed pair), the server's release frame (broadcast on the
+    // successful stop commit) folds into the runtimeOwners store, and the
+    // re-minted pane's create-resume carries the RELEASE frame's refreshed
+    // generation — the first try succeeds (pre-r18 the server never sent the
+    // frame, so the recreate repeated the stale pair until reconnection).
+    const { store } = renderFocusPane({ sessionId: 'thread-stuck-1', status: 'running' })
+    // The pane's pre-stop owner record (the live owner the kill observes).
+    act(() => {
+      store.dispatch(applyRuntimeOwner({
+        type: 'session.runtimeOwner',
+        provider: 'codex',
+        sessionId: 'thread-stuck-1',
+        epoch: 3,
+        generation: 4,
+        ownerKind: 'fresh-agent',
+        operationId: 'create-r18',
+        transition: 'handoff-committed',
+      }))
+    })
+    dispatchStuck(store)
+    await screen.findByRole('alert')
+    const preStop = selectPaneOwnerFence(store.getState(), {
+      provider: 'codex',
+      sessionRef: { provider: 'codex', sessionId: 'thread-stuck-1' },
+    })
+    expect(preStop).toEqual({ epoch: 3, generation: 4 })
+    fireEvent.click(screen.getByRole('button', { name: /restart sidecar and resume session/i }))
+    // The KILL frame carries the pre-stop observed pair (every lifecycle
+    // producer's contract).
+    await waitFor(() => {
+      const kills = wsMock.send.mock.calls
+        .map(([msg]: [any]) => msg)
+        .filter((msg: any) => msg?.type === 'freshAgent.kill')
+      expect(kills).toHaveLength(1)
+      expect(kills[0].observedEpoch).toBe(3)
+      expect(kills[0].observedGeneration).toBe(4)
+    })
+    // The server broadcast the release on the successful stop commit (the
+    // WS layer folds it into the store — here driven directly).
+    act(() => {
+      store.dispatch(applyRuntimeOwner({
+        type: 'session.runtimeOwner',
+        provider: 'codex',
+        sessionId: 'thread-stuck-1',
+        epoch: 3,
+        generation: 5,
+        ownerKind: 'vacant',
+        operationId: 'stop-r18',
+        transition: 'released',
+      }))
+    })
+    // The re-minted pane's create-resume derives its observed fence from
+    // selectPaneOwnerFence at send time — the REFRESHED record now
+    // carries the release generation, so the recreate's frame would carry
+    // (epoch 3, generation 5) and succeed on the FIRST try (pre-r18 the
+    // frame never arrived, so the fence stayed at the stale live pair
+    // and the recreate repeated it until reconnection).
+    expect(selectPaneOwnerFence(store.getState(), {
+      provider: 'codex',
+      sessionRef: { provider: 'codex', sessionId: 'thread-stuck-1' },
+    })).toEqual({ epoch: 3, generation: 5 })
   })
 
   it('Restart sidecar kills the wedged session then re-mints a creating pane on the canonical resume id', async () => {

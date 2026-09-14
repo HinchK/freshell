@@ -4085,7 +4085,21 @@ impl FreshCodexState {
                              during the awaited close — NOT restored (never a dead runtime \
                              recorded Live); the key ends Vacant"
                         );
-                        let _ = registry.commit_stop(PROVIDER, &session_id, &op_id, generation);
+                        let outcome =
+                            registry.commit_stop(PROVIDER, &session_id, &op_id, generation);
+                        // b8ke ext r18 F1: the successful commit-to-Vacant
+                        // BROADCASTS the release frame (every commit site,
+                        // not only the main kill arm).
+                        if matches!(outcome, freshell_ownership::CommitOutcome::Committed) {
+                            if let Some(frame) = crate::ownership_lane::released_owner_frame(
+                                &self.ownership,
+                                PROVIDER,
+                                &session_id,
+                                &op_id,
+                            ) {
+                                self.broadcast(&frame);
+                            }
+                        }
                     }
                 }
             }
@@ -4128,13 +4142,29 @@ impl FreshCodexState {
             stop_generation,
             stop_op_id.as_deref(),
         ) {
-            let _ = crate::ownership_lane::commit_fresh_agent_stop(
+            let outcome = crate::ownership_lane::commit_fresh_agent_stop(
                 registry,
                 PROVIDER,
                 &session_id,
                 op_id,
                 generation,
             );
+            // b8ke ext r18 F1: a SUCCESSFUL commit-to-Vacant BROADCASTS the
+            // release frame — connected panes (and the kill → immediate
+            // recreate "Restart sidecar" sequence) converge on the vacant
+            // owner and the NEW generation (pre-r18 the commit changed the
+            // coordinator with no broadcast, so the recreate carried the
+            // stale observed generation and the fence refused it).
+            if matches!(outcome, freshell_ownership::CommitOutcome::Committed) {
+                if let Some(frame) = crate::ownership_lane::released_owner_frame(
+                    &self.ownership,
+                    PROVIDER,
+                    &session_id,
+                    op_id,
+                ) {
+                    self.broadcast(&frame);
+                }
+            }
         }
 
         // Explicit kill evicts this session's requestId dedup cache entries (mirrors
@@ -20393,6 +20423,125 @@ pub(crate) mod tests {
 
         let _ = rx.try_recv();
         let _ = generation;
+    }
+
+    /// b8ke ext r18 F1: a SUCCESSFUL explicit kill commits the
+    /// coordinator to the incremented Vacant generation AND broadcasts the
+    /// `session.runtimeOwner` release frame — the vacant owner plus the
+    /// NEW (epoch, generation) pair. The kill → immediate recreate
+    /// "Restart sidecar" sequence derives its observed fence from the
+    /// frame and succeeds on the FIRST try (pre-r18 the commit broadcast
+    /// NOTHING: connected panes retained the old live owner/generation,
+    /// the recreate carried the stale pair, the server correctly fenced
+    /// it, and the client kept retrying the stale request).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_explicit_kill_broadcasts_the_release_and_the_recreate_converges() {
+        let _guard = ENV_LOCK.lock().await;
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+
+        configure_fake_codex_cmd("{}");
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
+        let live = registry.observe(PROVIDER, &thread_id);
+        assert!(
+            matches!(live.state, freshell_ownership::OwnershipState::Live { .. }),
+            "fixture: the create committed Live{{FreshAgent}}"
+        );
+        // Consume the create-time frames so the kill's frames are isolated.
+        while rx.try_recv().is_ok() {}
+
+        // THE KILL.
+        st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread_id.clone(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+
+        // THE RELEASE FRAME (b8ke ext r18 F1): the vacant owner + the NEW
+        // generation, on the same bus the connected panes fold from. Red
+        // today: no frame ever arrives (the commit broadcast nothing).
+        let release = {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                let frame: Value =
+                    match tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv()).await
+                    {
+                        Ok(Ok(raw)) => serde_json::from_str(&raw).expect("json frame"),
+                        _ => panic!("the kill never broadcast the release frame"),
+                    };
+                if frame["type"] == "session.runtimeOwner"
+                    && frame["sessionId"] == json!(thread_id)
+                    && frame["transition"] == json!("released")
+                {
+                    break frame;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the kill never broadcast the release frame — last: {frame}"
+                );
+            }
+        };
+        assert_eq!(release["ownerKind"], json!("vacant"), "{release}");
+        assert!(
+            release["generation"].as_u64().unwrap() > live.generation,
+            "the release carries the INCREMENTED generation: {release}"
+        );
+        assert_eq!(release["epoch"], json!(registry.boot_epoch()), "{release}");
+
+        // (a) THE RESTART-SIDECAR SEQUENCE: the recreate derives its
+        // observed fence from the release frame — the create-resume with
+        // the RELEASE frame's generation succeeds on the FIRST try.
+        let observed_generation = release["generation"].as_u64().unwrap();
+        let epoch = release["epoch"].as_u64().unwrap();
+        let mut create = create_msg("req-r18-f1-recreate");
+        create.session_ref = Some(freshell_protocol::SessionLocator {
+            provider: PROVIDER.to_string(),
+            session_id: thread_id.clone(),
+        });
+        create.observed_epoch = Some(epoch);
+        create.observed_generation = Some(observed_generation);
+        st.handle_create(create, None).await;
+        let recreated = {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                let frame: Value =
+                    match tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv()).await
+                    {
+                        Ok(Ok(raw)) => serde_json::from_str(&raw).expect("json frame"),
+                        _ => panic!("the recreate never answered"),
+                    };
+                if (frame["type"] == "freshAgent.created"
+                    || frame["type"] == "freshAgent.create.failed")
+                    && frame["requestId"] == json!("req-r18-f1-recreate")
+                {
+                    break frame;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the recreate never answered — last: {frame}"
+                );
+            }
+        };
+        assert_eq!(
+            recreated["type"], "freshAgent.created",
+            "the kill → immediate recreate converges on the FIRST try: {recreated}"
+        );
+        assert_eq!(recreated["sessionId"], json!(thread_id), "{recreated}");
+        // Cleanup: kill the recreated session.
+        st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread_id,
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
     }
 
     /// b8ke ext r10 F1: a delayed freshAgent.create (resume) arriving

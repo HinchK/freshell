@@ -1030,6 +1030,44 @@ pub mod ownership_lane {
         }
     }
 
+    /// b8ke ext r18 F1: the RELEASED owner frame — the vacant owner state
+    /// plus the post-stop (epoch, generation) pair a connected client
+    /// refreshes its observed fence from. Emitted by every SUCCESSFUL
+    /// commit-to-Vacant stop/kill site (the fresh-agent explicit kills and
+    /// the terminal stop path): pre-r18 the commit changed the
+    /// coordinator to the incremented Vacant generation with NO
+    /// broadcast, so connected panes retained the old live owner and
+    /// generation — the kill → immediate recreate "Restart sidecar"
+    /// sequence carried the stale observed generation, the server
+    /// correctly fenced it, and the client neither received nor derived
+    /// the new vacant generation (retries repeated the stale request
+    /// until reconnection; other devices kept displaying the former
+    /// owner). `None` when the coordinator is unwired (nothing to fold).
+    pub fn released_owner_frame(
+        registry: &Option<Arc<RuntimeOwnershipRegistry>>,
+        provider: &str,
+        session_id: &str,
+        operation_id: &str,
+    ) -> Option<freshell_protocol::ServerMessage> {
+        let registry = registry.as_ref()?;
+        Some(freshell_protocol::ServerMessage::SessionRuntimeOwner(
+            freshell_protocol::SessionRuntimeOwner {
+                provider: provider.to_string(),
+                session_id: session_id.to_string(),
+                epoch: registry.boot_epoch(),
+                generation: registry.observe(provider, session_id).generation,
+                owner_kind: "vacant".into(),
+                previous_kind: None,
+                terminal_id: None,
+                operation_id: operation_id.to_string(),
+                transition: "released".into(),
+                reason: None,
+                fenced: None,
+                alias_of: None,
+            },
+        ))
+    }
+
     pub fn terminal_owner_fields_from_outcome(
         registry: &Option<Arc<RuntimeOwnershipRegistry>>,
         outcome: &BeginOutcome,

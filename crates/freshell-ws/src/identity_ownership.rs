@@ -517,7 +517,12 @@ fn rebind_release_old_key(
 /// terminal-owner frame on a released key left old-key Fresh Agent panes
 /// presenting the divergence card with a direct-attach action long after
 /// the writer moved).
-fn broadcast_vacant_frame(state: &WsState, provider: &str, session_id: &str, operation_id: &str) {
+pub(crate) fn broadcast_vacant_frame(
+    state: &WsState,
+    provider: &str,
+    session_id: &str,
+    operation_id: &str,
+) {
     let Some(ownership) = state.ownership.as_ref() else {
         return;
     };

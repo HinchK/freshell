@@ -2771,8 +2771,27 @@ impl FreshOpencodeState {
                                          exited during the awaited close — NOT restored; the \
                                          key ends Vacant"
                                     );
-                                    let _ =
+                                    let outcome =
                                         registry.commit_stop(PROVIDER, &key, &op_id, generation);
+                                    // b8ke ext r18 F1: the successful
+                                    // commit-to-Vacant BROADCASTS the
+                                    // release frame (every commit site, not
+                                    // only the main kill arm).
+                                    if matches!(
+                                        outcome,
+                                        freshell_ownership::CommitOutcome::Committed
+                                    ) {
+                                        if let Some(frame) =
+                                            crate::ownership_lane::released_owner_frame(
+                                                &self.fresh_agent.ownership,
+                                                PROVIDER,
+                                                &key,
+                                                &op_id,
+                                            )
+                                        {
+                                            self.broadcast(&frame);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2966,9 +2985,24 @@ impl FreshOpencodeState {
             stop_op_id.as_deref(),
             stop_key.as_deref(),
         ) {
-            let _ = crate::ownership_lane::commit_fresh_agent_stop(
+            let outcome = crate::ownership_lane::commit_fresh_agent_stop(
                 registry, PROVIDER, key, op_id, generation,
             );
+            // b8ke ext r18 F1: a SUCCESSFUL commit-to-Vacant BROADCASTS
+            // the release frame — connected panes and the kill →
+            // immediate recreate sequence converge on the vacant owner
+            // and the NEW generation (the shared `opencode serve`
+            // daemon is untouched — the OpenCode invariant).
+            if matches!(outcome, freshell_ownership::CommitOutcome::Committed) {
+                if let Some(frame) = crate::ownership_lane::released_owner_frame(
+                    &self.fresh_agent.ownership,
+                    PROVIDER,
+                    key,
+                    op_id,
+                ) {
+                    self.broadcast(&frame);
+                }
+            }
         }
 
         // `adapter.ts kill()` is unconditional (`return true` even for an
