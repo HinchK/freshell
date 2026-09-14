@@ -1047,7 +1047,6 @@ impl AutoResumeDriver for WsAutoResumeDriver {
                                 freshell_freshagent::ownership_lane::TerminalLaneClaim::Granted(
                                     ticket,
                                 ) => {
-                                    eprintln!("DIAG: re-claim GRANTED");
                                     *pending_slot.lock().expect("pending ownership lock") =
                                         Some(PendingOwnershipClaim {
                                             locator: locator.clone(),
@@ -1065,7 +1064,6 @@ impl AutoResumeDriver for WsAutoResumeDriver {
                                 freshell_freshagent::ownership_lane::TerminalLaneClaim::Refused(
                                     outcome,
                                 ) => {
-                                    eprintln!("DIAG: re-claim REFUSED {outcome:?}");
                                     tracing::warn!(target: "freshell_ws::auto_resume",
                                         provider = %provider, session_id = %session_id,
                                         create_request_id = %create_request_id,
