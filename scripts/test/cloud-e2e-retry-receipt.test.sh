@@ -19,7 +19,7 @@ printf 'unrelated successful retry trace\n' > "$UNRELATED_TRACE"
 
 cat > "$REPORT" <<JSON
 {
-  "stats": { "expected": 1 },
+  "stats": { "expected": 0, "skipped": 0, "unexpected": 0, "flaky": 1 },
   "suites": [{
     "title": "retry fixture",
     "specs": [{
@@ -28,6 +28,7 @@ cat > "$REPORT" <<JSON
       "line": 42,
       "tests": [{
         "projectName": "chromium",
+        "status": "flaky",
         "results": [
           {
             "status": "failed",
@@ -136,18 +137,48 @@ for incomplete_report in \
   fi
 done
 
+printf '%s' '{"stats":{"expected":1,"skipped":0,"unexpected":0,"flaky":0},"suites":[]}' > "$WORK/truncated-report.json"
+if CLOUD_RUN_EXECUTION=retry-receipt-probe CLOUD_RUN_TASK_INDEX=2 CLOUD_RUN_TASK_COUNT=4 \
+  node "$RECEIPT" "$WORK/truncated-report.json" >/dev/null 2>&1; then
+  echo "FAIL: report statistics that contradict serialized tests were accepted"
+  exit 1
+fi
+
+cat > "$WORK/outcomes-report.json" <<'JSON'
+{
+  "stats": { "expected": 1, "skipped": 1, "unexpected": 1, "flaky": 1 },
+  "suites": [{ "specs": [{
+    "title": "all Playwright outcomes",
+    "tests": [
+      { "projectName": "chromium", "status": "expected", "results": [{ "status": "passed", "retry": 0, "attachments": [] }] },
+      { "projectName": "chromium", "status": "skipped", "results": [] },
+      { "projectName": "chromium", "status": "unexpected", "results": [{ "status": "failed", "retry": 0, "attachments": [] }] },
+      { "projectName": "chromium", "status": "flaky", "results": [{ "status": "failed", "retry": 0, "attachments": [] }, { "status": "passed", "retry": 1, "attachments": [] }] }
+    ]
+  }]}]
+}
+JSON
+OUTCOMES_OUT="$WORK/outcomes-receipt.jsonl"
+CLOUD_RUN_EXECUTION=outcomes-probe CLOUD_RUN_TASK_INDEX=0 CLOUD_RUN_TASK_COUNT=1 \
+  node "$RECEIPT" "$WORK/outcomes-report.json" > "$OUTCOMES_OUT"
+if ! jq -e 'select(.event == "e2e_playwright_task_complete") | .recoveredRetryCount == 1' "$OUTCOMES_OUT" >/dev/null; then
+  echo "FAIL: a realistic Playwright pass/skipped/unexpected/flaky report was not accepted"
+  cat "$OUTCOMES_OUT"
+  exit 1
+fi
+
 MULTI_FIRST_TRACE="$WORK/multi-first-failure.zip"
 MULTI_LATER_TRACE="$WORK/multi-later-attempt.zip"
 printf 'first failed attempt trace\n' > "$MULTI_FIRST_TRACE"
 printf 'later attempt trace that must not be paired\n' > "$MULTI_LATER_TRACE"
 cat > "$WORK/multi-report.json" <<JSON
 {
-  "stats": { "expected": 1 },
+  "stats": { "expected": 0, "skipped": 0, "unexpected": 0, "flaky": 1 },
   "suites": [{ "specs": [{
     "title": "fails twice then recovers",
     "file": "test/e2e-browser/specs/multi-retry.spec.ts",
     "line": 7,
-    "tests": [{ "projectName": "chromium", "results": [
+    "tests": [{ "projectName": "chromium", "status": "flaky", "results": [
       { "status": "failed", "retry": 0, "errors": [{ "stack": "first failure" }], "attachments": [{ "name": "trace", "contentType": "application/zip", "path": "$MULTI_FIRST_TRACE" }] },
       { "status": "failed", "retry": 1, "errors": [{ "stack": "later failure" }], "attachments": [{ "name": "trace", "contentType": "application/zip", "path": "$MULTI_LATER_TRACE" }] },
       { "status": "passed", "retry": 2, "attachments": [] }
@@ -177,7 +208,7 @@ cmp -s "$MULTI_FIRST_TRACE" "$WORK/multi-reconstructed.zip" || {
 
 NO_TRACE_REPORT="$WORK/no-trace-report.json"
 cat > "$NO_TRACE_REPORT" <<'JSON'
-{"stats":{"expected":1},"suites":[{"specs":[{"title":"recovers without a retained trace","tests":[{"projectName":"chromium","results":[{"status":"failed","retry":0,"errors":[{"stack":"failure without trace"}],"attachments":[]},{"status":"passed","retry":1,"attachments":[]}]}]}]}]}
+{"stats":{"expected":0,"skipped":0,"unexpected":0,"flaky":1},"suites":[{"specs":[{"title":"recovers without a retained trace","tests":[{"projectName":"chromium","status":"flaky","results":[{"status":"failed","retry":0,"errors":[{"stack":"failure without trace"}],"attachments":[]},{"status":"passed","retry":1,"attachments":[]}]}]}]}]}
 JSON
 NO_TRACE_OUT="$WORK/no-trace-receipt.jsonl"
 CLOUD_RUN_EXECUTION=no-trace-probe CLOUD_RUN_TASK_INDEX=0 CLOUD_RUN_TASK_COUNT=1 \
@@ -215,6 +246,10 @@ cat > "$BIN/npx" <<'NPX'
 #!/usr/bin/env bash
 set -euo pipefail
 if [ "$1" = "playwright" ] && [ "$2" = "test" ]; then
+  if [[ " $* " == *" --list "* ]]; then
+    printf '  [chromium] › retry-fixture.spec.ts:42:9 › recovers on the first retry\n'
+    exit 0
+  fi
   if [ -n "${FRESHELL_CLOUD_RETRY_REPORT_PATH:-}" ]; then
     cp "$STUB_RETRY_REPORT" "$FRESHELL_CLOUD_RETRY_REPORT_PATH"
   fi
@@ -238,5 +273,37 @@ if PATH="$BIN:$PATH" STUB_RETRY_REPORT="$WORK/malformed-report.json" CLOUD_RUN_E
   echo "FAIL: entrypoint accepted a structurally incomplete JSON report after a successful Playwright process"
   exit 1
 fi
+
+for incomplete_entrypoint_report in \
+  "$WORK/truncated-report.json" \
+  <(printf '%s' '{"stats":{"expected":1,"skipped":0,"unexpected":0,"flaky":0},"suites":[{"specs":[{"tests":[{"projectName":"chromium","status":"expected","results":[]}]}]}]}'); do
+  if PATH="$BIN:$PATH" STUB_RETRY_REPORT="$incomplete_entrypoint_report" CLOUD_RUN_EXECUTION=entrypoint-probe CLOUD_RUN_TASK_INDEX=0 CLOUD_RUN_TASK_COUNT=1 \
+    "$ROOT/docker/cloud-run/entrypoint.sh" --project=chromium >/dev/null 2>&1; then
+    echo "FAIL: entrypoint accepted Playwright report accounting that contradicted serialized tests/results"
+    exit 1
+  fi
+done
+
+cat > "$WORK/passing-report.json" <<'JSON'
+{"stats":{"expected":1,"skipped":0,"unexpected":0,"flaky":0},"suites":[{"specs":[{"tests":[{"projectName":"chromium","status":"expected","results":[{"status":"passed","retry":0,"attachments":[]}]}]}]}]}
+JSON
+EMPTY_SHARD_OUT=""
+for task_index in 0 1; do
+  EMPTY_SHARD_OUT+="$(PATH="$BIN:$PATH" STUB_RETRY_REPORT="$WORK/passing-report.json" CLOUD_RUN_EXECUTION=empty-shard-probe CLOUD_RUN_TASK_INDEX="$task_index" CLOUD_RUN_TASK_COUNT=2 \
+    "$ROOT/docker/cloud-run/entrypoint.sh" --project=chromium 2>&1)"$'\n'
+done
+if [ "$(grep -c '"event":"e2e_playwright_task_complete"' <<< "$EMPTY_SHARD_OUT")" -ne 2 ] \
+  || ! grep -q '"taskIndex":0,"taskCount":2,"recoveredRetryCount":0' <<< "$EMPTY_SHARD_OUT" \
+  || ! grep -q '"taskIndex":1,"taskCount":2,"recoveredRetryCount":0' <<< "$EMPTY_SHARD_OUT"; then
+  echo "FAIL: a one-spec/two-shard entrypoint run did not emit one zero-retry receipt for every task"
+  echo "$EMPTY_SHARD_OUT"
+  exit 1
+fi
+printf '%s\n' "$EMPTY_SHARD_OUT" | jq -R 'fromjson? | select(.event == "e2e_playwright_task_complete") | {jsonPayload: .}' | jq -s . \
+  | node "$ROOT/scripts/e2e-cloud-structured-receipts.mjs" empty-shard-probe 2 >/dev/null || {
+    echo "FAIL: the outer receipt parser did not accept the actual entrypoint's one-spec/two-shard completion receipts"
+    echo "$EMPTY_SHARD_OUT"
+    exit 1
+  }
 
 echo "PASS: successful retry retains first-attempt stack and trace in durable JSONL chunks"

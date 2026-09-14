@@ -28,6 +28,7 @@ if (completions.length !== expectedTaskCount) {
 }
 
 const taskIndexes = new Set()
+const recoveredRetryCountByTask = new Map()
 let recoveredRetryCount = 0
 for (const completion of completions) {
   if (completion.execution !== execution || completion.taskCount !== expectedTaskCount
@@ -37,6 +38,7 @@ for (const completion of completions) {
   }
   if (taskIndexes.has(completion.taskIndex)) throw new Error(`duplicate task completion receipt for task ${completion.taskIndex}`)
   taskIndexes.add(completion.taskIndex)
+  recoveredRetryCountByTask.set(completion.taskIndex, completion.recoveredRetryCount)
   recoveredRetryCount += completion.recoveredRetryCount
 }
 
@@ -44,10 +46,7 @@ for (let taskIndex = 0; taskIndex < expectedTaskCount; taskIndex += 1) {
   if (!taskIndexes.has(taskIndex)) throw new Error(`missing task completion receipt for task ${taskIndex}`)
 }
 
-if (retryEvidence.length !== recoveredRetryCount) {
-  throw new Error(`completion receipts report ${recoveredRetryCount} recovered retry/retries but found ${retryEvidence.length} evidence record(s)`)
-}
-
+const retryEvidenceCountByTask = new Map()
 for (const evidence of retryEvidence) {
   if (evidence.execution !== execution || evidence.taskCount !== expectedTaskCount
     || !Number.isInteger(evidence.taskIndex) || evidence.taskIndex < 0 || evidence.taskIndex >= expectedTaskCount
@@ -56,6 +55,15 @@ for (const evidence of retryEvidence) {
     || !evidence.trace || typeof evidence.trace !== 'object'
     || evidence.trace.traceAttempt !== evidence.failureAttempt) {
     throw new Error('retry evidence has invalid task identity or failure/trace association')
+  }
+  retryEvidenceCountByTask.set(evidence.taskIndex, (retryEvidenceCountByTask.get(evidence.taskIndex) ?? 0) + 1)
+}
+
+for (let taskIndex = 0; taskIndex < expectedTaskCount; taskIndex += 1) {
+  const expectedEvidenceCount = recoveredRetryCountByTask.get(taskIndex)
+  const actualEvidenceCount = retryEvidenceCountByTask.get(taskIndex) ?? 0
+  if (actualEvidenceCount !== expectedEvidenceCount) {
+    throw new Error(`task ${taskIndex} completion reports ${expectedEvidenceCount} recovered retry/retries but found ${actualEvidenceCount} evidence record(s)`)
   }
 }
 

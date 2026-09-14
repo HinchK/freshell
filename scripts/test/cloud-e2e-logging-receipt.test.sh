@@ -55,6 +55,19 @@ if ! grep -q 'logging read.*exec-json-receipt.*jsonPayload.event.*--format=json'
   cat "$WORK/capture/gcloud.args"; exit 1
 fi
 
+records_empty_shards='[
+ {"jsonPayload":{"event":"e2e_playwright_task_complete","execution":"exec-json-receipt","taskIndex":0,"taskCount":4,"recoveredRetryCount":0}},
+ {"jsonPayload":{"event":"e2e_playwright_task_complete","execution":"exec-json-receipt","taskIndex":1,"taskCount":4,"recoveredRetryCount":0}},
+ {"jsonPayload":{"event":"e2e_playwright_task_complete","execution":"exec-json-receipt","taskIndex":2,"taskCount":4,"recoveredRetryCount":0}},
+ {"jsonPayload":{"event":"e2e_playwright_task_complete","execution":"exec-json-receipt","taskIndex":3,"taskCount":4,"recoveredRetryCount":0}}
+]'
+EMPTY_SHARDS_OUT="$(env PATH="$WORK/bin:$PATH" STUB_CAPTURE="$WORK/capture" STUB_LOGGING_JSON="$records_empty_shards" STUB_SUCCEEDED=4 GCLOUD_IDENT=stub@example.invalid "$SCRIPT" run --cloud --shards=4 2>&1)" || {
+  echo "FAIL: a narrow multi-task run with empty shards did not accept one zero-retry receipt for each task"; echo "$EMPTY_SHARDS_OUT"; exit 1
+}
+if ! grep -q "All tasks completed successfully" <<< "$EMPTY_SHARDS_OUT"; then
+  echo "FAIL: complete zero-retry receipts from empty shards did not allow success"; echo "$EMPTY_SHARDS_OUT"; exit 1
+fi
+
 records_retry='[
  {"jsonPayload":{"event":"e2e_playwright_task_complete","execution":"exec-json-receipt","taskIndex":0,"taskCount":2,"recoveredRetryCount":0}},
  {"jsonPayload":{"event":"e2e_playwright_retry_evidence","execution":"exec-json-receipt","taskIndex":1,"taskCount":2,"failureAttempt":0,"error":{"stack":"first failure"},"trace":{"traceAttempt":0,"retained":false}}},

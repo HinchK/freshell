@@ -109,6 +109,19 @@ run_playwright_with_retry_receipt() {
   return "$status"
 }
 
+emit_empty_shard_retry_receipt() {
+  # An empty assignment is still a successful Cloud Run task. Route its
+  # zero-test report through the same exporter so the outer runner can account
+  # for every task without a special receipt format.
+  printf '%s\n' '{"stats":{"expected":0,"skipped":0,"unexpected":0,"flaky":0},"suites":[]}' > "$RETRY_REPORT_PATH"
+  if ! node scripts/e2e-cloud-retry-receipt.mjs "$RETRY_REPORT_PATH"; then
+    log_json error e2e_retry_evidence_export_failed "Could not retain the empty-shard Playwright completion receipt before task exit."
+    rm -f "$RETRY_REPORT_PATH"
+    return 70
+  fi
+  rm -f "$RETRY_REPORT_PATH"
+}
+
 # ---------------------------------------------------------------------------
 # Parse args: separate flags from spec-path filters, intercept --dry-run.
 # ---------------------------------------------------------------------------
@@ -269,10 +282,12 @@ for spec in $MY_SPECS; do
   echo "  ${spec}  (${DURATIONS[$spec]:-$DEFAULT_DURATION}s)"
 done
 
-# 7. If this shard got no specs, exit cleanly (nothing to run).
+# 7. If this shard got no specs, export its zero-test completion receipt and
+# exit cleanly. The outer runner requires exactly one receipt per Cloud task.
 if [ -z "$MY_SPECS" ]; then
-  echo "[e2e-entrypoint] No specs assigned to this shard. Exiting."
-  exit 0
+  echo "[e2e-entrypoint] No specs assigned to this shard. Exporting zero-test receipt."
+  emit_empty_shard_retry_receipt
+  exit $?
 fi
 
 # 8. Run this shard's specs as explicit file paths (avoids Playwright's

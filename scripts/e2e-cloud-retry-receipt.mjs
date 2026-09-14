@@ -12,6 +12,7 @@ import { readFileSync } from 'node:fs'
 const MAX_TRACE_BYTES = 8 * 1024 * 1024
 const TRACE_CHUNK_BYTES = 120 * 1024
 const MAX_ERROR_TEXT_BYTES = 64 * 1024
+const PLAYWRIGHT_OUTCOMES = ['expected', 'skipped', 'unexpected', 'flaky']
 
 const [reportPath] = process.argv.slice(2)
 
@@ -56,14 +57,30 @@ function errorEvidence(result) {
 
 function validateReport(candidate) {
   if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) throw new Error('Playwright JSON report must be an object')
-  if (!candidate.stats || typeof candidate.stats !== 'object' || !Number.isInteger(candidate.stats.expected) || candidate.stats.expected < 0) {
-    throw new Error('Playwright JSON report is missing valid stats.expected')
+  if (!candidate.stats || typeof candidate.stats !== 'object') {
+    throw new Error('Playwright JSON report is missing stats')
   }
-  validateSuites(candidate.suites, 'report.suites')
+  for (const outcome of PLAYWRIGHT_OUTCOMES) {
+    if (!Number.isInteger(candidate.stats[outcome]) || candidate.stats[outcome] < 0) {
+      throw new Error(`Playwright JSON report is missing valid stats.${outcome}`)
+    }
+  }
+
+  const tests = validateSuites(candidate.suites, 'report.suites')
+  const serializedStats = Object.fromEntries(PLAYWRIGHT_OUTCOMES.map((outcome) => [outcome, 0]))
+  for (const test of tests) {
+    serializedStats[test.status] += 1
+  }
+  for (const outcome of PLAYWRIGHT_OUTCOMES) {
+    if (candidate.stats[outcome] !== serializedStats[outcome]) {
+      throw new Error(`Playwright JSON report stats.${outcome} does not match serialized test outcomes`)
+    }
+  }
 }
 
 function validateSuites(suites, location) {
   if (!Array.isArray(suites)) throw new Error(`${location} must be an array`)
+  const tests = []
   suites.forEach((suite, suiteIndex) => {
     const suiteLocation = `${location}[${suiteIndex}]`
     if (!suite || typeof suite !== 'object' || Array.isArray(suite)) throw new Error(`${suiteLocation} must be an object`)
@@ -77,6 +94,12 @@ function validateSuites(suites, location) {
         if (!test || typeof test !== 'object' || Array.isArray(test) || !Array.isArray(test.results)) {
           throw new Error(`${suiteLocation}.specs[${specIndex}].tests[${testIndex}].results must be an array`)
         }
+        if (!PLAYWRIGHT_OUTCOMES.includes(test.status)) {
+          throw new Error(`${suiteLocation}.specs[${specIndex}].tests[${testIndex}].status is not a Playwright test outcome`)
+        }
+        if (test.status !== 'skipped' && test.results.length === 0) {
+          throw new Error(`${suiteLocation}.specs[${specIndex}].tests[${testIndex}] has no serialized test results`)
+        }
         test.results.forEach((result, resultIndex) => {
           if (!result || typeof result !== 'object' || Array.isArray(result) || typeof result.status !== 'string' || !Number.isInteger(result.retry)) {
             throw new Error(`${suiteLocation}.specs[${specIndex}].tests[${testIndex}].results[${resultIndex}] is invalid`)
@@ -85,10 +108,12 @@ function validateSuites(suites, location) {
             throw new Error(`${suiteLocation}.specs[${specIndex}].tests[${testIndex}].results[${resultIndex}].attachments must be an array`)
           }
         })
+        tests.push(test)
       })
     })
-    validateSuites(suite.suites ?? [], `${suiteLocation}.suites`)
+    tests.push(...validateSuites(suite.suites ?? [], `${suiteLocation}.suites`))
   })
+  return tests
 }
 
 function specsIn(suites) {
