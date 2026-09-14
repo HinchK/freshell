@@ -2603,12 +2603,91 @@ impl TerminalRegistry {
         let Some(ownership) = self.ownership.as_ref() else {
             return freshell_ownership::CommitOutcome::Committed;
         };
+        // b8ke ext r9 F2: the commit verifies the spawned PTY is STILL
+        // RUNNING at commit time — a fast-failing exact resume can exit
+        // during the asynchronous binding and registration work BEFORE
+        // this commit, and its natural-exit callback (finding no retained
+        // claim yet) releases NOTHING; pre-r9 the dead terminal was then
+        // recorded Live{Terminal}. The retained-claim lock is the ordering
+        // point for the whole commit: the exit path flips the row's status
+        // FIRST (under the registry's inner lock) and takes/releases the
+        // retained claim second, so whichever observes first wins — the
+        // commit under this lock either sees the still-Running row (it
+        // commits and inserts; the exit callback's take then finds the
+        // claim and releases it) or sees the already-Exited row and
+        // fails typed (a dead runtime NEVER records Live). The nesting is
+        // safe: no code path takes the registry's inner lock and then this
+        // lock, so claims→inner can never invert.
+        let mut claims = self
+            .session_ref_ownership
+            .lock()
+            .expect("session-ref ownership lock");
+        if !self.is_pty_running(terminal_id) {
+            tracing::error!(target: "freshell_terminal",
+                terminal_id = %terminal_id,
+                provider = %locator.provider,
+                session_id = %locator.session_id,
+                operation_id = %operation_id,
+                "session_ref_ownership_commit_refused_dead_pty: the PTY exited \
+                 before the commit — a dead runtime is never recorded Live; the \
+                 natural-exit path owns the release");
+            return freshell_ownership::CommitOutcome::ForeignOperation;
+        }
         let pid = self.pid_of(terminal_id);
         let owner = freshell_ownership::OwnerIdentity {
             kind: freshell_ownership::RuntimeOwnerKind::Terminal,
             terminal_id: Some(terminal_id.to_string()),
             live_session_key: None,
             pid,
+            ownership_id: Some(operation_id.to_string()),
+        };
+        let outcome = ownership.commit_live(
+            &locator.provider,
+            &locator.session_id,
+            operation_id,
+            generation,
+            owner,
+        );
+        if matches!(outcome, freshell_ownership::CommitOutcome::Committed) {
+            claims.insert(
+                session_ref_key(locator),
+                RetainedSessionRefOwnership {
+                    locator: locator.clone(),
+                    terminal_id: terminal_id.to_string(),
+                    operation_id: operation_id.to_string(),
+                    generation,
+                    pid,
+                },
+            );
+        }
+        outcome
+    }
+
+    /// TEST FIXTURE ONLY (b8ke ext r9 F2): stamp a coordinator
+    /// `Live{Terminal}` owner AND the retained claim for a terminal whose
+    /// registry row is ALREADY GONE — the mid-kill-race shape (the commit
+    /// landed while the row was alive; the reaper consumed the row before
+    /// the kill observed it). Pre-r9 the public
+    /// `commit_session_ref_ownership` could construct this shape because it
+    /// verified nothing; it now refuses a dead/gone PTY typed, so the
+    /// wedge-test fixtures seed the state directly. Never call from
+    /// production code.
+    #[doc(hidden)]
+    pub fn seed_live_session_ref_ownership_for_test(
+        &self,
+        locator: &freshell_protocol::SessionLocator,
+        operation_id: &str,
+        generation: u64,
+        terminal_id: &str,
+    ) -> freshell_ownership::CommitOutcome {
+        let Some(ownership) = self.ownership.as_ref() else {
+            return freshell_ownership::CommitOutcome::Committed;
+        };
+        let owner = freshell_ownership::OwnerIdentity {
+            kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+            terminal_id: Some(terminal_id.to_string()),
+            live_session_key: None,
+            pid: None,
             ownership_id: Some(operation_id.to_string()),
         };
         let outcome = ownership.commit_live(
@@ -2629,7 +2708,7 @@ impl TerminalRegistry {
                         terminal_id: terminal_id.to_string(),
                         operation_id: operation_id.to_string(),
                         generation,
-                        pid,
+                        pid: None,
                     },
                 );
         }

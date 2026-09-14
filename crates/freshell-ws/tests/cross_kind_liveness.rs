@@ -3901,9 +3901,16 @@ async fn race_coordinator_cancellation_and_sidecar_crash_leave_consistent_state(
 /// replacement generation must STAY alive long enough for the Live-commit
 /// observation (an instantly-exiting replacement would have its exit
 /// watcher release the claim before the test can observe it).
-fn exiting_then_sleeper_cli_spec(name: &str) -> freshell_platform::CliCommandSpec {
+fn exiting_then_sleeper_cli_spec(
+    name: &str,
+) -> (freshell_platform::CliCommandSpec, std::path::PathBuf) {
     let marker = std::env::temp_dir().join(format!(
         "freshell-cross-kind-ladder-marker-{name}-{}-{}.marker",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let exit_flag = std::env::temp_dir().join(format!(
+        "freshell-cross-kind-ladder-exit-{name}-{}-{}.flag",
         std::process::id(),
         uuid::Uuid::new_v4().simple()
     ));
@@ -3912,15 +3919,20 @@ fn exiting_then_sleeper_cli_spec(name: &str) -> freshell_platform::CliCommandSpe
         std::process::id(),
         uuid::Uuid::new_v4().simple()
     ));
-    // The FIRST invocation DELAYS its exit (1s) past the settle's
-    // ownership commit: the natural-exit release consumes the retained
-    // claim exactly once, and an instant death would race the commit
-    // (the release finds an empty claim map and the record strands Live —
-    // a PRE-EXISTING exit-release/commit race for fast-dying terminals,
-    // outside this test's contract).
+    // b8ke ext r9 F2: the FIRST generation survives until the TEST
+    // touches the exit flag — a deterministic, marker-driven exit that
+    // replaces the pre-r9 fixed 1s sleep (which existed to dodge the
+    // exit-before-commit race the commit-time liveness check now
+    // handles: whichever observes first wins; a dead runtime is never
+    // recorded Live). The create is observed committed
+    // (terminal.created), the flag lands, the generation exits
+    // naturally (the row is RETAINED for the ladder's rung-1 read);
+    // every LATER invocation SLEEPS — the replacement generation must
+    // STAY alive long enough for the Live-commit observation.
     let script = format!(
-        "#!/bin/sh\nif [ -e \"{marker}\" ]; then exec sleep 300; fi\nsleep 1\n: > \"{marker}\"\nexit 1\n",
-        marker = marker.display()
+        "#!/bin/sh\nif [ -e \"{marker}\" ]; then exec sleep 300; fi\nwhile [ ! -e \"{exit_flag}\" ]; do sleep 0.05; done\n: > \"{marker}\"\nexit 1\n",
+        marker = marker.display(),
+        exit_flag = exit_flag.display()
     );
     std::fs::write(&script_path, script).expect("write ladder script");
     #[cfg(unix)]
@@ -3930,22 +3942,25 @@ fn exiting_then_sleeper_cli_spec(name: &str) -> freshell_platform::CliCommandSpe
         perms.set_mode(0o755);
         std::fs::set_permissions(&script_path, perms).expect("chmod ladder script");
     }
-    freshell_platform::CliCommandSpec {
-        name: name.to_string(),
-        label: format!("{name}-label"),
-        env_var: None,
-        default_cmd: script_path.to_string_lossy().to_string(),
-        base_args: vec![],
-        base_env: std::collections::BTreeMap::new(),
-        resume_args: Some(vec!["--resume".to_string(), "{{sessionId}}".to_string()]),
-        create_session_args: Some(vec![
-            "--session-id".to_string(),
-            "{{sessionId}}".to_string(),
-        ]),
-        model_args: None,
-        sandbox_args: None,
-        permission_mode_args: None,
-    }
+    (
+        freshell_platform::CliCommandSpec {
+            name: name.to_string(),
+            label: format!("{name}-label"),
+            env_var: None,
+            default_cmd: script_path.to_string_lossy().to_string(),
+            base_args: vec![],
+            base_env: std::collections::BTreeMap::new(),
+            resume_args: Some(vec!["--resume".to_string(), "{{sessionId}}".to_string()]),
+            create_session_args: Some(vec![
+                "--session-id".to_string(),
+                "{{sessionId}}".to_string(),
+            ]),
+            model_args: None,
+            sandbox_args: None,
+            permission_mode_args: None,
+        },
+        exit_flag,
+    )
 }
 
 /// b8ke ext r6 F1: a fresh-Claude PREALLOCATION create (the server mints
@@ -4058,7 +4073,7 @@ async fn a_fresh_claude_prealloc_create_commits_live_and_a_direct_handoff_sees_t
 #[tokio::test]
 async fn a_claude_compat_restore_create_commits_live_under_the_ladder_identity() {
     let sid = format!("ladder-sid-{}", uuid::Uuid::new_v4());
-    let (url, registry, ws_state) = spawn_server_with_ladder_claude().await;
+    let (url, registry, ws_state, gen1_exit_flag) = spawn_server_with_ladder_claude().await;
     let mut ws = connect(&url).await;
 
     // Generation #1: a sessionRef-bearing claude create whose row EXITS
@@ -4084,6 +4099,10 @@ async fn a_claude_compat_restore_create_commits_live_under_the_ladder_identity()
         .as_str()
         .expect("terminalId")
         .to_string();
+    // The commit landed (the created frame is emitted after the settle's
+    // commit) — NOW the generation may exit: arm the flag and wait for
+    // the natural exit (the row is retained, not killed).
+    std::fs::write(&gen1_exit_flag, b"go\n").expect("arm the first generation's exit");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let gone = registry
@@ -4207,10 +4226,14 @@ async fn a_claude_compat_restore_create_commits_live_under_the_ladder_identity()
 }
 
 /// [`spawn_server`] with the ladder test's two-phase claude spec.
-async fn spawn_server_with_ladder_claude() -> (String, freshell_terminal::TerminalRegistry, WsState)
-{
-    let (state, registry, _fresh_agent_state) =
-        build_ws_state(vec![exiting_then_sleeper_cli_spec("claude")]).await;
+async fn spawn_server_with_ladder_claude() -> (
+    String,
+    freshell_terminal::TerminalRegistry,
+    WsState,
+    std::path::PathBuf,
+) {
+    let (spec, exit_flag) = exiting_then_sleeper_cli_spec("claude");
+    let (state, registry, _fresh_agent_state) = build_ws_state(vec![spec]).await;
     let router = freshell_ws::router(state.clone());
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -4219,7 +4242,7 @@ async fn spawn_server_with_ladder_claude() -> (String, freshell_terminal::Termin
     tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
-    (format!("ws://{addr}/ws"), registry, state)
+    (format!("ws://{addr}/ws"), registry, state, exit_flag)
 }
 
 // ── b8ke ext r7 F2: the resume path's coordinator authority + typed substitution ──
@@ -4714,4 +4737,216 @@ async fn a_current_attach_succeeds_and_restamps() {
         "the current attach never disturbed the Live record"
     );
     ws_state.registry.kill(&terminal_id);
+}
+
+// ── b8ke ext r9 F2: the commit verifies the PTY is alive at commit time ─────
+
+/// An instantly-dying claude spec (the fast-failing exact-resume shape —
+/// exits before the settle's binding/registration work can finish).
+fn instant_death_cli_spec(name: &str) -> freshell_platform::CliCommandSpec {
+    let script_path = std::env::temp_dir().join(format!(
+        "freshell-cross-kind-instant-death-{name}-{}-{}.sh",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(&script_path, "#!/bin/sh\nexit 1\n").expect("write instant-death script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod instant-death script");
+    }
+    freshell_platform::CliCommandSpec {
+        name: name.to_string(),
+        label: format!("{name}-label"),
+        env_var: None,
+        default_cmd: script_path.to_string_lossy().to_string(),
+        base_args: vec![],
+        base_env: std::collections::BTreeMap::new(),
+        resume_args: Some(vec!["--resume".to_string(), "{{sessionId}}".to_string()]),
+        create_session_args: Some(vec![
+            "--session-id".to_string(),
+            "{{sessionId}}".to_string(),
+        ]),
+        model_args: None,
+        sandbox_args: None,
+        permission_mode_args: None,
+    }
+}
+
+/// b8ke ext r9 F2: a terminal whose process EXITS BEFORE THE COMMIT is
+/// NEVER recorded Live{Terminal} — the commit-time liveness check
+/// synchronizes the interleaving under the retained-claim lock
+/// (whichever observes first wins; the exit path releases or the commit
+/// fails typed). The sessionRef-bearing create that instantly dies answers
+/// the typed create failure (never a phantom Live), the key never holds a
+/// dead runtime, and a handoff into the key enters from Vacant (no phantom
+/// prior to stop) — pre-r9 the dead terminal WAS recorded Live and the
+/// natural-exit callback released nothing.
+#[tokio::test]
+async fn an_instantly_exiting_terminal_is_never_recorded_live() {
+    let (state, registry, _fresh_agent_state) =
+        build_ws_state(vec![instant_death_cli_spec("claude")]).await;
+    let url = {
+        let router = freshell_ws::router(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral loopback port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        format!("ws://{addr}/ws")
+    };
+    let mut ws = connect(&url).await;
+    let sid = uuid::Uuid::new_v4().to_string();
+
+    // The create: the CLI dies instantly — the PTY exits before/during
+    // the settle's asynchronous binding work. The commit either saw the
+    // exit (typed failure) or committed BEFORE the exit (the exit
+    // callback then finds the retained claim and releases); BOTH paths
+    // end with the key never holding a dead runtime.
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-r9-f2-dead",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+    // Bounded wait for the create's settle to finish either way (the
+    // created frame or the typed error), then the exit callback's release.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let snap = state
+            .ownership
+            .as_ref()
+            .expect("coordinator wired")
+            .observe("claude", &sid);
+        // A Live owner with a DEAD PTY is the F2 defect. Everything else
+        // is acceptable on both race sides: Vacant (the commit refused
+        // typed / the exit released) or, transiently, Live{Terminal}
+        // whose PTY still runs (the exit hasn't landed). Once the row
+        // is gone/Exited AND the coordinator still says Live{Terminal}
+        // — that's the phantom.
+        // Row status by identity-registry join: the row is dead-or-gone when
+        // no RUNNING row carries the session as its resume id.
+        let row_dead_or_gone = !registry.identity_probe_rows().iter().any(|r| {
+            r.resume_session_id.as_deref() == Some(sid.as_str())
+                && r.status == freshell_protocol::TerminalRunStatus::Running
+        });
+        let live_terminal = matches!(
+            snap.state,
+            freshell_ownership::OwnershipState::Live {
+                owner: ref o, ..
+            } if o.kind == freshell_ownership::RuntimeOwnerKind::Terminal
+        );
+        if row_dead_or_gone {
+            if live_terminal {
+                // The exit landed; the coordinator must release within
+                // the watcher's settle quantum — give the callback a
+                // bounded window, then fail.
+                let release_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                while matches!(
+                    state
+                        .ownership
+                        .as_ref()
+                        .expect("coordinator wired")
+                        .observe("claude", &sid)
+                        .state,
+                    freshell_ownership::OwnershipState::Live { .. }
+                ) {
+                    assert!(
+                        tokio::time::Instant::now() < release_deadline,
+                        "the DEAD terminal is recorded Live(Terminal) — the commit verified nothing"
+                    );
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                break;
+            }
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the create never settled: {:?}",
+            snap.state
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // THE CONTRACT: after everything settles, the key NEVER holds
+    // Live{Terminal} over the dead runtime.
+    let snap = state
+        .ownership
+        .as_ref()
+        .expect("coordinator wired")
+        .observe("claude", &sid);
+    assert!(
+        !matches!(
+            snap.state,
+            freshell_ownership::OwnershipState::Live {
+                owner: ref o, ..
+            } if o.kind == freshell_ownership::RuntimeOwnerKind::Terminal
+        ),
+        "an instantly-dying terminal is never recorded Live — {:?}",
+        snap.state
+    );
+}
+
+/// b8ke ext r9 F2: the same at the COMMIT API level — a terminal that
+/// exits before commit_session_ref_ownership is called answers the TYPED
+/// refusal (never Committed), so a handoff into a fast-failing resume
+/// target returns the typed resume failure instead of a dead-target
+/// success.
+#[tokio::test]
+async fn a_dead_pty_commit_is_refused_typed() {
+    let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+    let registry =
+        freshell_terminal::TerminalRegistry::new().with_ownership(Arc::clone(&ownership));
+    let locator = freshell_protocol::SessionLocator {
+        provider: "claude".to_string(),
+        session_id: "ses-r9-dead".to_string(),
+    };
+    let freshell_ownership::BeginOutcome::Granted { generation } = ownership.begin_start(
+        "claude",
+        "ses-r9-dead",
+        freshell_ownership::RuntimeOwnerKind::Terminal,
+        "op-r9-dead",
+        None,
+        "test",
+        1_000,
+    ) else {
+        panic!("expected Granted")
+    };
+    // A headless row that is ALREADY Exited (the fast-fail shape).
+    registry.register_headless(freshell_terminal::registry::HeadlessTerminal {
+        terminal_id: "t-r9-dead".to_string(),
+        stream_id: "s-r9".to_string(),
+        mode: "claude".to_string(),
+        resume_session_id: Some("ses-r9-dead".to_string()),
+        create_request_id: None,
+        created_at: None,
+    });
+    assert!(registry.is_pty_running("t-r9-dead"));
+    registry.finish_pty_exit("t-r9-dead", 1);
+    assert!(!registry.is_pty_running("t-r9-dead"));
+    // THE TYPED REFUSAL: the dead-PTY commit fails typed, never records
+    // Live.
+    assert_eq!(
+        registry.commit_session_ref_ownership(&locator, "op-r9-dead", generation, "t-r9-dead"),
+        freshell_ownership::CommitOutcome::ForeignOperation,
+        "a dead PTY's commit is refused typed"
+    );
+    assert!(
+        !matches!(
+            ownership.observe("claude", "ses-r9-dead").state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ),
+        "the dead runtime was never recorded Live"
+    );
 }

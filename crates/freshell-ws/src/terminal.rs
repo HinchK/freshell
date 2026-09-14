@@ -8595,8 +8595,12 @@ mod terminal_kill_stop_wedge_tests {
             provider: KILL_PROVIDER.to_string(),
             session_id: KILL_SESSION.to_string(),
         };
+        // b8ke ext r9 F2: the public commit now verifies the PTY is alive
+        // (a dead/gone runtime is never recorded Live), so the fixture
+        // seeds the mid-kill-race shape (Live owner + retained claim, row
+        // already reaped) directly.
         assert!(matches!(
-            registry.commit_session_ref_ownership(
+            registry.seed_live_session_ref_ownership_for_test(
                 &locator,
                 "op-commit-1",
                 generation,
