@@ -89,16 +89,7 @@ export default defineConfig({
   globalTeardown: undefined,
   forbidOnly: true,
   retries: 2,
-  // kata j90s: run specs SEQUENTIALLY per cloud task. Rationale: variance
-  // reduction — with two workers on a 2-vCPU task, sibling bursts feed the
-  // client's 10s ready-watchdog amplifier (slow-but-alive handshakes
-  // force-closed and retried). The j90s flake itself turned out to be
-  // contention-INdependent (rare ~40-60s zero-CPU gVisor I/O wedges — see
-  // docs/plans/2026-09-14-j90s-harness-flake.md amendment and the j90s
-  // stall investigation); sequential execution still removes the sibling
-  // variance class for every spec, and the lane stays far faster than
-  // local (~4-6 min vs ~28 min for the full suite).
-  workers: 1,
+  workers: 2,
   reporter: [['line'], ['html', { open: 'never' }]],
   grepInvert: CLOUD_SKIP_TITLES,
   projects: (baseConfig.projects ?? [])

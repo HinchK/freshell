@@ -75,7 +75,9 @@ chmod +x "$STUB_DIR/gcloud" "$STUB_DIR/docker"
 echo "=== e2e harness timeout env test ==="
 
 # Check 1: a cloud run's job env file carries the default 90s window.
-env PATH="$STUB_DIR:$PATH" bash "$SCRIPT" run --cloud --shards=1 \
+# env -u keeps the leg hermetic: an ambient FRESHELL_E2E_WS_READY_TIMEOUT_MS
+# (operator override) must neither satisfy nor break the default assertion.
+env -u FRESHELL_E2E_WS_READY_TIMEOUT_MS PATH="$STUB_DIR:$PATH" bash "$SCRIPT" run --cloud --shards=1 \
   test/e2e-browser/specs/settings.spec.ts >/dev/null 2>&1 || true
 check "run jobs create captured an env-vars file" test -f "$STUB_CAPTURE/env.yaml"
 check "env file sets FRESHELL_E2E_WS_READY_TIMEOUT_MS to 90000 by default" \
