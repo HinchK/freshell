@@ -157,13 +157,13 @@ export async function renamePaneAfterMirrorReady(
       throwIfAborted(signal)
       const mirror = await awaitWithAbort(opts.get(mirrorPath, { signal: mirrorSignal }), mirrorSignal)
       throwIfAborted(signal)
+      const remainingMs = deadlineAt - now()
+      if (remainingMs <= 0) return { ok: false, message: MIRROR_NOT_FOUND_MESSAGE }
       if (hasExactPaneReceipt(mirror, paneId)) {
         stopMirrorDeadline()
         break
       }
 
-      const remainingMs = deadlineAt - now()
-      if (remainingMs <= 0) return { ok: false, message: MIRROR_NOT_FOUND_MESSAGE }
       await awaitWithAbort(sleep(Math.min(pollIntervalMs, remainingMs), mirrorSignal), mirrorSignal)
     }
   } catch (error) {

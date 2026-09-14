@@ -105,6 +105,29 @@ describe('renamePaneAfterMirrorReady', () => {
     expect(opts.patch).not.toHaveBeenCalled()
   })
 
+  it('does not accept a matching mirror receipt that settles after the logical deadline before its timer dispatches', async () => {
+    let logicalNow = 0
+    const pendingGet = deferred<typeof mirrorWithPane>()
+    const get = vi.fn(() => pendingGet.promise)
+    const patch = vi.fn().mockResolvedValue(renameOk)
+    const result = renamePaneAfterMirrorReady('tab-1', 'pane-1', 'Ops desk', options({
+      get,
+      patch,
+      now: () => logicalNow,
+      deadlineMs: 600,
+    }))
+
+    await Promise.resolve()
+    expect(get).toHaveBeenCalledTimes(1)
+
+    // Advance the injected clock without dispatching the browser timeout.
+    logicalNow = 601
+    pendingGet.resolve(mirrorWithPane)
+
+    await expect(result).resolves.toEqual({ ok: false, message: 'pane not found' })
+    expect(patch).not.toHaveBeenCalled()
+  })
+
   it('returns pane not found at the default deadline when the first mirror GET never settles', async () => {
     vi.useFakeTimers()
     try {
