@@ -2,7 +2,7 @@
 //! docs/plans/2026-07-22-continuity-safety-trio.md). Split out of `tabs.rs` to
 //! keep that module under the port/AGENTS.md:81 1,000-line-per-file limit.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
@@ -649,13 +649,46 @@ fn union_of_newest_per_client(
             }
         }
     }
-    let mut records: Vec<Value> = by_key.into_values().map(|(rec, _)| rec).collect();
-    records.sort_by_key(|r| {
-        r.get("tabKey")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string()
+    // FIRST-SEEN emission (the tab-order regression fix): the client pushes
+    // each generation's records in its tab-strip order, so a tab's union
+    // POSITION is its slot in the NEWEST source that knows it — the most
+    // recent view of the user's strip — while its CONTENT stays the per-key
+    // dedupe-rank winner chosen above (unchanged semantics). Sources are
+    // ranked newest-first by the same tuple `label_src` uses, so HashMap
+    // iteration order never decides user-visible record order (the
+    // determinism the old `sort_by_key(tabKey)` existed to provide).
+    // sort_by_cached_key — NOT sort_by_key — because the ranking tuple
+    // includes snapshot_generation_id, which canonicalizes, serializes, and
+    // hashes the WHOLE generation document (potentially ~1 MiB):
+    // sort_by_cached_key evaluates it at most once per source; sort_by_key
+    // would re-evaluate it O(n log n) times.
+    let mut sources: Vec<(&String, &(i64, PathBuf, Value))> = newest.iter().collect();
+    sources.sort_by_cached_key(|(client, gen)| {
+        let snap: &Value = &gen.2;
+        std::cmp::Reverse((
+            captured_at(snap),
+            generation_rank(snap).0,
+            (*client).clone(),
+            snapshot_generation_id(snap),
+        ))
     });
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut records: Vec<Value> = Vec::new();
+    for (_, (_, _, snap)) in &sources {
+        for rec in snap
+            .get("records")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let tab_key = rec.get("tabKey").and_then(Value::as_str).unwrap_or("");
+            if seen.insert(tab_key) {
+                if let Some((winner, _)) = by_key.get(tab_key) {
+                    records.push(winner.clone());
+                }
+            }
+        }
+    }
     Some((records, max_captured, max_rev, label_src))
 }
 
