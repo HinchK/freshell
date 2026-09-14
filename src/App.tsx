@@ -67,7 +67,9 @@ import {
 } from '@/store/machineIdentitySlice'
 import type { Machine } from '@/lib/machine-identity'
 import {
+  consumeActiveMachineSelectionMark,
   getSuggestedMachineLabel,
+  markActiveMachineSelection,
   persistSelectedMachineId,
   resolveMachineIdentity,
 } from '@/lib/machine-identity'
@@ -555,12 +557,17 @@ export default function App() {
   }, [])
 
   const selectMachineFromChooser = useCallback(async (machine: Machine) => {
+    // An ACTIVE choice: arm the one-shot marker so the next boot's restore
+    // knows the local layout may be a foreign machine's cache (the
+    // non-recoverable-inventory clear must still apply after the reload).
+    markActiveMachineSelection()
     persistSelectedMachineId(machine.id)
     restartAfterMachineSelection()
   }, [restartAfterMachineSelection])
 
   const addMachineFromChooser = useCallback(async (label: string) => {
     const machine = await createMachine(label)
+    markActiveMachineSelection()
     persistSelectedMachineId(machine.id)
     restartAfterMachineSelection()
   }, [restartAfterMachineSelection])
@@ -828,7 +835,12 @@ export default function App() {
             deviceId: resolution.machine.id,
             deviceLabel: resolution.machine.label,
           }))
-          await restoreMachineWorkspace(appStore, resolution.machine.id)
+          await restoreMachineWorkspace(appStore, resolution.machine.id, {
+            // Consume the chooser's one-shot marker: an ACTIVE machine choice
+            // keeps the non-recoverable clear (foreign cache); a natural
+            // reload of a remembered selection keeps the rehydrated layout.
+            activeSelection: consumeActiveMachineSelectionMark(),
+          })
           if (cancelled) return false
           dispatch(setMachineReady({ machine: resolution.machine, mode: 'server-managed' }))
           return true
