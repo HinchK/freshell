@@ -1002,6 +1002,13 @@ struct HandoffSpawnWatchInner {
     /// engages (the deterministic signal that the settle REACHED the
     /// reviewer's window before the test aborts).
     parked_before_publish: std::sync::atomic::AtomicBool,
+    /// b8ke ext r13 F7: the published terminal's recorded PID — captured
+    /// at PUBLICATION (while the registry row exists), so an abort
+    /// cleanup's reap confirmation can use the PID's OS-level death as
+    /// the evidence (the registry removes a row BEFORE its blocking PTY
+    /// kill completes, so the ROW's absence is NOT death proof — the
+    /// recurring row-absence shortcut).
+    published_pid: std::sync::Mutex<Option<u32>>,
 }
 
 impl HandoffSpawnWatch {
@@ -1023,6 +1030,7 @@ impl HandoffSpawnWatch {
                 pause_before_publish,
                 settle_wait_budget_ms: std::sync::atomic::AtomicU64::new(60_000),
                 parked_before_publish: std::sync::atomic::AtomicBool::new(false),
+                published_pid: std::sync::Mutex::new(None),
             }),
         }
     }
@@ -1038,8 +1046,17 @@ impl HandoffSpawnWatch {
     }
 
     /// The settle's publication point: the terminal exists and will be kept.
-    fn publish(&self, terminal_id: &str) {
+    /// b8ke ext r13 F7: also records the PID (captured while the row
+    /// exists — the cleanup's confirmed-reap evidence).
+    fn publish(&self, terminal_id: &str, pid: Option<u32>) {
         *self.inner.terminal_id.lock().expect("spawn watch lock") = Some(terminal_id.to_string());
+        *self.inner.published_pid.lock().expect("spawn watch lock") = pid;
+    }
+
+    /// b8ke ext r13 F7: the published terminal's recorded PID (the
+    /// confirmed-reap evidence for the abort cleanup).
+    pub(crate) fn published_pid(&self) -> Option<u32> {
+        *self.inner.published_pid.lock().expect("spawn watch lock")
     }
 
     /// The id the settle published, if any — the abort cleanup's reap
@@ -2848,7 +2865,9 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                 // reviewer flagged (an abort here leaves the cleanup's
                 // settle-wait unsettled; the fail-closed path fences).
                 watch.pause_if_armed_before_publish().await;
-                watch.publish(&terminal_id);
+                // b8ke ext r13 F7: capture the PID at publication (while
+                // the row exists) — the cleanup's confirmed-reap evidence.
+                watch.publish(&terminal_id, registry.pid_of(&terminal_id));
                 watch.pause_if_armed().await;
             }
             surfaced_owner_identity = Some(freshell_ownership::OwnerIdentity {

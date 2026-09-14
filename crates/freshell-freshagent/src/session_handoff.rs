@@ -2325,13 +2325,17 @@ impl SessionHandoffRunner {
             // an unsettled spawn means the target's state is unconfirmed).
             watch.wait_settled_unbounded().await;
             if let Some(terminal_id) = watch.published_terminal() {
-                if registry.kill(&terminal_id) {
-                    let _ = tokio::time::timeout(
-                        std::time::Duration::from_millis(reap_timeout_ms),
-                        await_terminal_dead(&registry, &terminal_id),
-                    )
-                    .await;
-                }
+                // b8ke ext r13 F7: the watch's RECORDED PID (captured at
+                // publication) is the death evidence — the row's absence
+                // is not.
+                let recorded_pid = watch.published_pid();
+                let _ = kill_and_confirm_terminal_pid(
+                    &registry,
+                    &terminal_id,
+                    recorded_pid,
+                    reap_timeout_ms,
+                )
+                .await;
             }
             // The registry sessionRef sweep backstop (the cleanup arm's
             // same provider-matched join — an opaque-id collision across
@@ -2339,11 +2343,12 @@ impl SessionHandoffRunner {
             for entry in registry.directory() {
                 if entry.mode == provider.as_str()
                     && entry.resume_session_id.as_deref() == Some(session_id.as_str())
-                    && registry.kill(&entry.terminal_id)
                 {
-                    let _ = tokio::time::timeout(
-                        std::time::Duration::from_millis(reap_timeout_ms),
-                        await_terminal_dead(&registry, &entry.terminal_id),
+                    let _ = kill_and_confirm_terminal_pid(
+                        &registry,
+                        &entry.terminal_id,
+                        registry.pid_of(&entry.terminal_id),
+                        reap_timeout_ms,
                     )
                     .await;
                 }
@@ -2580,13 +2585,12 @@ impl SessionHandoffRunner {
 
     /// Registry kill + bounded confirmed death (the runner's reap shape).
     async fn kill_and_confirm_terminal(&self, terminal_id: &str) {
-        if self.registry.kill(terminal_id) {
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_millis(self.reap_timeout_ms),
-                await_terminal_dead(&self.registry, terminal_id),
-            )
-            .await;
-        }
+        // b8ke ext r13 F7: the recorded-PID OS-level death is the
+        // confirmation — never the row's absence (a concurrent kill
+        // removes the row before its blocking PTY kill completes).
+        let _ =
+            kill_and_confirm_terminal_pid(&self.registry, terminal_id, None, self.reap_timeout_ms)
+                .await;
     }
 
     /// Stop the prior runtime and await the CONFIRMED reap (bounded by
@@ -3650,6 +3654,51 @@ impl TransitionLog<'_> {
 async fn await_terminal_dead(registry: &freshell_terminal::TerminalRegistry, terminal_id: &str) {
     while !registry.terminal_is_dead(terminal_id) {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// b8ke ext r13 F7: kill a terminal and confirm its death by the
+/// RECORDED-PID OS-level probe — the registry removes a row BEFORE its
+/// blocking PTY kill completes, so the ROW's absence (or its Exited
+/// status flip) is NOT death proof: a concurrent kill can leave the PID
+/// alive while `terminal_is_dead` already reports true. The recorded PID
+/// (captured while the row existed — the spawn watch's publication, or
+/// pid_of before the kill) is the evidence (the ext-r7 F5 discipline).
+/// `None` (no pid handle ever recorded): the legacy row-based poll. The
+/// bounded wait returns `false` on timeout — the caller treats an
+/// unconfirmed reap per its fail-closed discipline, never as Confirmed.
+async fn kill_and_confirm_terminal_pid(
+    registry: &freshell_terminal::TerminalRegistry,
+    terminal_id: &str,
+    recorded_pid: Option<u32>,
+    reap_timeout_ms: u64,
+) -> bool {
+    let pid = recorded_pid.or_else(|| registry.pid_of(terminal_id));
+    if !registry.kill(terminal_id) && pid.is_none() {
+        // No row AND no pid evidence: nothing to probe — the legacy
+        // absent-row answer (a pre-recorded terminal this cleanup never
+        // saw publish).
+        return true;
+    }
+    match pid {
+        Some(pid) => {
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_millis(reap_timeout_ms), async {
+                    while freshell_terminal::registry::pid_alive(pid) {
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    }
+                })
+                .await;
+            !freshell_terminal::registry::pid_alive(pid)
+        }
+        None => {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(reap_timeout_ms),
+                await_terminal_dead(registry, terminal_id),
+            )
+            .await;
+            registry.terminal_is_dead(terminal_id)
+        }
     }
 }
 

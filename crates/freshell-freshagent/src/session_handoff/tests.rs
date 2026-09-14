@@ -26,7 +26,10 @@ use freshell_protocol::{
     SessionType,
 };
 
-use super::{HandoffHandle, HandoffRequest, HandoffTestHooks, SessionHandoffRunner};
+use super::{
+    kill_and_confirm_terminal_pid, HandoffHandle, HandoffRequest, HandoffTestHooks,
+    SessionHandoffRunner,
+};
 
 /// Serializes the tests in this file: they mutate process-global env vars
 /// (`FRESHELL_CLAUDE_SIDECAR` / `FRESHELL_CLAUDE_NODE` /
@@ -3492,6 +3495,50 @@ async fn a_post_clear_user_initiated_handoff_proceeds_fresh() {
         other => panic!("expected the committed terminal owner, got {other:?}"),
     }
     rig.registry.kill(&terminal_id);
+}
+
+/// b8ke ext r13 F7: the row-removed-but-pid-alive window reports
+/// UNCONFIRMED, not Confirmed. The registry removes a row BEFORE its
+/// blocking PTY kill completes, so a concurrent kill can leave the target
+/// PID alive while the row-based poll already reports dead — the
+/// recorded-PID OS-level probe is the death evidence (the ext-r7 F5
+/// discipline). The deterministic shape: a terminal id with NO registry
+/// row (a concurrent kill removed it) whose RECORDED pid is a live
+/// external process — the OLD row-based confirmation answered Confirmed
+/// instantly; the recorded-PID confirmation answers unconfirmed.
+#[tokio::test]
+async fn the_row_removed_but_pid_alive_window_reports_unconfirmed() {
+    let registry = freshell_terminal::TerminalRegistry::new();
+    // A live process this cleanup never owned a row for (the concurrent
+    // kill's window): the recorded pid.
+    let mut child = std::process::Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .expect("spawn the external live process");
+    let live_pid = child.id();
+    assert!(
+        freshell_terminal::registry::pid_alive(live_pid),
+        "fixture: the external pid is alive"
+    );
+
+    // THE CONTRACT: the row-absent + pid-alive window is UNCONFIRMED
+    // (pre-r13 the row-based poll answered Confirmed — the row's
+    // absence was treated as exit proof).
+    let confirmed =
+        kill_and_confirm_terminal_pid(&registry, "ghost-row-removed-tid", Some(live_pid), 200)
+            .await;
+    assert!(
+        !confirmed,
+        "the row-removed-but-pid-alive window must NOT report Confirmed"
+    );
+    assert!(
+        freshell_terminal::registry::pid_alive(live_pid),
+        "the pid still lives"
+    );
+
+    // Cleanup: reap the external child.
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// 3j. b8ke focused round-3 review R3-3: the DELAYED platform-limited
