@@ -261,7 +261,7 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
   async function createOwnedPage(
     browser: import('@playwright/test').Browser,
   ) {
-    const owned = await createFreshE2ePage(browser, info)
+    const owned = await createFreshE2ePage(browser, info, FRESH_CONTEXT_OPTIONS)
     ownedContexts.add(owned.context)
     return owned
   }
