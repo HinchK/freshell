@@ -4624,6 +4624,175 @@ async fn the_learned_identity_spawn_interval_holds_a_coordinator_claim() {
 
 // ── b8ke ext r8 F2: terminal.attach participates in the coordinator ─────────
 
+/// b8ke ext r13 F1: the terminal create's Adopt arm proceeds ONLY under
+/// HELD authority. The create is parked INSIDE its coordinator window
+/// (after the Adopt arm's attach guard arms) and a handoff BEGIN is
+/// attempted in the window: it answers the typed Blocked outcome — the
+/// handoff can NEVER begin and commit inside the create's spawn window
+/// (pre-r13 the Adopt arm proceeded with NO ticket or guard, so the
+/// racing handoff GRANTED and could commit around the in-flight create).
+#[tokio::test]
+async fn a_handoff_during_the_adopt_create_window_answers_blocked_typed() {
+    let (url, registry, ws_state) = spawn_server().await;
+    let mut ws = connect(&url).await;
+    let ownership = ws_state.ownership.clone().expect("coordinator wired");
+    let sid = uuid::Uuid::new_v4().to_string();
+
+    // Terminal #1: the negotiated create commits Live{Terminal}(t1) — the
+    // incumbent the second create's claim will Adopt.
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-r13-f1-incumbent",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+    let created = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "terminal.created" && v["requestId"] == "req-r13-f1-incumbent"
+    })
+    .await;
+    let incumbent = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !matches!(
+        ownership.observe("claude", &sid).state,
+        freshell_ownership::OwnershipState::Live { .. }
+    ) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never committed Live"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Park create #2 INSIDE its held-authority window.
+    let parked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    {
+        let parked = std::sync::Arc::clone(&parked);
+        let release = std::sync::Arc::clone(&release);
+        registry.set_terminal_create_postclaim_pause_for_tests(std::sync::Arc::new(
+            move |request_id: &str| {
+                let parked = std::sync::Arc::clone(&parked);
+                let release = std::sync::Arc::clone(&release);
+                let request_id = request_id.to_string();
+                Box::pin(async move {
+                    if request_id == "req-r13-f1-second" {
+                        parked.store(true, std::sync::atomic::Ordering::Release);
+                        release.notified().await;
+                    }
+                })
+            },
+        ));
+    }
+
+    // Create #2 for the SAME session: the wire claim Adopts the live
+    // incumbent → the ext-r13 guard arms → the create parks in its window.
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-r13-f1-second",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+    {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !parked.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the create never reached its window"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    // THE CONTRACT: a handoff BEGIN inside the create's window answers the
+    // typed Blocked outcome — never Granted (pre-r13 the Adopt arm held NO
+    // authority, so the racing handoff granted).
+    match ownership.begin_handoff(
+        "claude",
+        &sid,
+        freshell_ownership::RuntimeOwnerKind::FreshAgent,
+        "op-r13-f1-racing-handoff",
+        None,
+        "test",
+        freshell_ownership::now_epoch_ms(),
+    ) {
+        freshell_ownership::BeginOutcome::Blocked {
+            state,
+            retry_after_ms,
+        } => {
+            assert!(
+                matches!(state, freshell_ownership::OwnershipState::Live { .. }),
+                "the blocked state names the still-Live key: {state:?}"
+            );
+            assert!(retry_after_ms > 0);
+        }
+        other => panic!(
+            "a handoff begin inside the Adopt-create window must answer Blocked — got {other:?}"
+        ),
+    }
+
+    // Release the park: create #2 completes its window. The incumbent still
+    // lives, so the create either loses the late claim (error) OR attaches
+    // to the LIVE incumbent (the negotiated BoundElsewhere multi-device
+    // reuse — the created frame names the INCUMBENT's terminal id) — NEVER
+    // a second writer and never a reaped-terminal attach.
+    release.notify_one();
+    let answer = await_frame(&mut ws, Duration::from_secs(30), |v| {
+        v["requestId"] == "req-r13-f1-second"
+            && (v["type"] == "terminal.created" || v["type"] == "error")
+    })
+    .await;
+    if answer["type"] == "terminal.created" {
+        assert_eq!(
+            answer["terminalId"],
+            json!(incumbent),
+            "the create may only ATTACH to the live incumbent — never a second writer: {answer}"
+        );
+    }
+    // No second terminal row for the session was ever registered.
+    assert_eq!(
+        registry
+            .identity_probe_rows()
+            .iter()
+            .filter(|r| r.resume_session_id.as_deref() == Some(sid.as_str()))
+            .count(),
+        1,
+        "exactly the incumbent row exists — no second writer"
+    );
+
+    // THE WINDOW CLOSED: a handoff begin now proceeds.
+    match ownership.begin_handoff(
+        "claude",
+        &sid,
+        freshell_ownership::RuntimeOwnerKind::FreshAgent,
+        "op-r13-f1-after-window",
+        None,
+        "test",
+        freshell_ownership::now_epoch_ms(),
+    ) {
+        freshell_ownership::BeginOutcome::Granted { .. } => {}
+        other => panic!("the handoff must proceed after the create window closed: {other:?}"),
+    }
+    // Cleanup: restore the record + reap.
+    let _ = ownership.fail("claude", &sid, "op-r13-f1-after-window", 3, false);
+    registry.kill(&incumbent);
+    registry.clear_terminal_create_postclaim_pause_for_tests();
+}
+
 /// b8ke ext r12 F2: the attach holds a REAL claim across its window. The
 /// attach is parked INSIDE its coordinator window (after the guard arms,
 /// before the restamp/attach completes) and a handoff BEGIN is attempted

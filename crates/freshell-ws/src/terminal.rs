@@ -3282,6 +3282,16 @@ pub(crate) async fn handle_create(
     // refusal (non-negotiated). Refusals are the frozen D7 frame with the
     // ADDITIVE owner fields (round-1 review: `send_create_error_with_owner`).
     let mut terminal_ownership: Option<TerminalOwnershipClaim> = None;
+    // b8ke ext r13 F1: the wire claim's Adopt arm proceeds ONLY under HELD
+    // authority — the ext-r12 attach guard arms on the live incumbent's
+    // key (an atomic check-then-count under the coordinator lock) and is
+    // held through the create's spawn + register + settle/commit, so a
+    // handoff or stop can NEVER begin and commit inside the create's
+    // window (pre-r13 the Adopt arm proceeded with NO ticket or guard:
+    // the incumbent terminating or a handoff starting after the check let
+    // the request attach to a terminal being reaped or briefly create
+    // another writer before the late claim failed).
+    let mut wire_adopt_guard: Option<freshell_ownership::AttachGuard> = None;
     // b8ke ext r10 F2: the wire locator the wire claim above consulted
     // (None when the create carried no sessionRef). The LEARNED-identity
     // claim below must NOT re-claim an id the wire claim already covered —
@@ -3415,8 +3425,82 @@ pub(crate) async fn handle_create(
                         locator,
                     });
                 }
-                freshell_freshagent::ownership_lane::TerminalLaneClaim::Unwired
-                | freshell_freshagent::ownership_lane::TerminalLaneClaim::Adopt => {}
+                freshell_freshagent::ownership_lane::TerminalLaneClaim::Unwired => {}
+                freshell_freshagent::ownership_lane::TerminalLaneClaim::Adopt => {
+                    // b8ke ext r13 F1: Adopt is NOT permission to proceed
+                    // unguarded — the adopted runtime is this lane's
+                    // session (the coordinator keyed it under the wire
+                    // locator), and the create proceeds ONLY under the
+                    // held attach guard (the ext-r10 F2 discipline: verify,
+                    // then hold authority). A guard refusal (the incumbent
+                    // entered a transition, or the observed fence is
+                    // stale) answers the typed refusal and NOTHING spawns.
+                    let ownership_ref = state.ownership.as_ref().expect("claimed above");
+                    let observed_generation = observed.map(|fence| fence.generation);
+                    match ownership_ref.begin_attach_guard(
+                        &locator.provider,
+                        &locator.session_id,
+                        &format!("create-adopt-{}", create.request_id),
+                        observed_generation,
+                        "ws-terminal-create/adopt",
+                    ) {
+                        freshell_ownership::AttachGuardOutcome::Armed(guard) => {
+                            wire_adopt_guard = Some(*guard);
+                        }
+                        freshell_ownership::AttachGuardOutcome::Refused {
+                            state: refused_state,
+                            generation,
+                        } => {
+                            tracing::warn!(
+                                target: "freshell_ws::terminal",
+                                provider = %locator.provider,
+                                session_id = %locator.session_id,
+                                request_id = %create.request_id,
+                                state = ?refused_state,
+                                "terminal_create_refused: the Adopt arm's attach guard \
+                                 refused to arm (a lifecycle transition owns the key) — \
+                                 the create aborts typed, nothing spawns"
+                            );
+                            let _ = send_create_error(
+                                out,
+                                ErrorCode::SessionReserved,
+                                "A lifecycle operation is in flight for this session; retry after it settles."
+                                    .to_string(),
+                                &create.request_id,
+                            )
+                            .await;
+                            return false;
+                        }
+                        freshell_ownership::AttachGuardOutcome::StaleGeneration {
+                            current_epoch,
+                            current_generation,
+                        } => {
+                            tracing::warn!(
+                                target: "freshell_ws::terminal",
+                                provider = %locator.provider,
+                                session_id = %locator.session_id,
+                                request_id = %create.request_id,
+                                observed_generation = ?observed_generation,
+                                current_epoch, current_generation,
+                                "terminal_create_refused: the Adopt arm's attach guard \
+                                 refused to arm (the observed generation is stale) — \
+                                 the create aborts typed, nothing spawns"
+                            );
+                            let _ = send_create_error(
+                                out,
+                                ErrorCode::SessionReserved,
+                                format!(
+                                    "Session ownership moved on (stale observed generation); \
+                                     refresh and retry. (session {})",
+                                    locator.session_id
+                                ),
+                                &create.request_id,
+                            )
+                            .await;
+                            return false;
+                        }
+                    }
+                }
                 freshell_freshagent::ownership_lane::TerminalLaneClaim::Refused(outcome) => {
                     tracing::warn!(
                         target: "freshell_ws::terminal",
@@ -3485,6 +3569,14 @@ pub(crate) async fn handle_create(
                 }
             }
         }
+    }
+    // b8ke ext r13 F1 test seam: park the create INSIDE its held-authority
+    // window (right after the wire claim / the Adopt arm's guard arms,
+    // BEFORE the resume gate and the spawn) — the deterministic-race tests
+    // prove a concurrent handoff begin answers the typed Blocked outcome.
+    // No-op in production.
+    if let Some(pause) = state.registry.terminal_create_postclaim_pause_hook() {
+        pause(&create.request_id).await;
     }
 
     // Council rule 7 (D8 two-writers closure): per-sessionRef single-flight,

@@ -676,6 +676,10 @@ pub struct TerminalRegistry {
     /// [`Self::set_terminal_attach_pause_for_tests`]). Never set in
     /// production.
     terminal_attach_pause: Arc<std::sync::RwLock<Option<TerminalCreatePauseHook>>>,
+    /// b8ke ext r13 F1: the create POST-CLAIM park seam (see
+    /// [`Self::set_terminal_create_postclaim_pause_for_tests`]). Never set
+    /// in production.
+    terminal_create_postclaim_pause: Arc<std::sync::RwLock<Option<TerminalCreatePauseHook>>>,
 }
 
 /// The retained coordinator claim for one sessionRef-owning terminal (kata
@@ -840,6 +844,7 @@ impl TerminalRegistry {
             session_ref_ownership: Arc::new(Mutex::new(HashMap::new())),
             terminal_create_pause: Arc::new(std::sync::RwLock::new(None)),
             terminal_attach_pause: Arc::new(std::sync::RwLock::new(None)),
+            terminal_create_postclaim_pause: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -915,6 +920,35 @@ impl TerminalRegistry {
             .terminal_attach_pause
             .write()
             .expect("terminal attach pause lock") = None;
+    }
+
+    /// b8ke ext r13 F1: install the terminal-create POST-CLAIM pause hook —
+    /// the deterministic-race tests park the create handler AFTER the
+    /// coordinator claim (inside its held-authority window) to prove a
+    /// concurrent handoff begin answers the typed Blocked outcome. Interior-
+    /// shared like the create seam. Never set in production.
+    pub fn set_terminal_create_postclaim_pause_for_tests(&self, hook: TerminalCreatePauseHook) {
+        *self
+            .terminal_create_postclaim_pause
+            .write()
+            .expect("terminal create postclaim pause lock") = Some(hook);
+    }
+
+    /// b8ke ext r13 F1: clear the post-claim create pause hook.
+    pub fn clear_terminal_create_postclaim_pause_for_tests(&self) {
+        *self
+            .terminal_create_postclaim_pause
+            .write()
+            .expect("terminal create postclaim pause lock") = None;
+    }
+
+    /// b8ke ext r13 F1: the clone-out read of the post-claim create pause
+    /// hook.
+    pub fn terminal_create_postclaim_pause_hook(&self) -> Option<TerminalCreatePauseHook> {
+        self.terminal_create_postclaim_pause
+            .read()
+            .expect("terminal create postclaim pause lock")
+            .clone()
     }
 
     /// b8ke ext r12 F2: the clone-out read of the attach pause hook (the

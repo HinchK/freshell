@@ -1631,6 +1631,12 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
     // terminal (refusal with `liveTerminalId`, or the attach-shaped
     // BoundElsewhere refusal).
     let mut ownership_claim: Option<RestOwnershipClaim> = None;
+    // b8ke ext r13 F1: the REST claim's Adopt arm proceeds ONLY under HELD
+    // authority — the ext-r12 attach guard arms on the live incumbent's key
+    // and is held through the REST spawn + register + settle, so a handoff or
+    // stop can NEVER begin and commit inside the create's window (pre-r13
+    // the Adopt arm proceeded with NO ticket or guard).
+    let mut rest_adopt_guard: Option<freshell_ownership::AttachGuard> = None;
     if let Some(locator) = learned_claim_locator.clone() {
         let operation_id = handoff
             .map(|t| t.operation_id.clone())
@@ -1668,8 +1674,61 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
             crate::ownership_lane::TerminalLaneClaim::Granted(ticket) => {
                 ownership_claim = Some(RestOwnershipClaim { ticket, locator });
             }
-            crate::ownership_lane::TerminalLaneClaim::Unwired
-            | crate::ownership_lane::TerminalLaneClaim::Adopt => {}
+            crate::ownership_lane::TerminalLaneClaim::Unwired => {}
+            crate::ownership_lane::TerminalLaneClaim::Adopt => {
+                // b8ke ext r13 F1: Adopt is NOT permission to proceed
+                // unguarded — the create proceeds ONLY under the held
+                // attach guard (the ext-r10 F2 discipline). A guard
+                // refusal (the incumbent entered a transition, or the
+                // observed fence is stale) answers the typed refusal and
+                // NOTHING spawns.
+                let ownership_ref = state.ownership.as_ref().expect("claimed above");
+                let observed_generation = observed.map(|fence| fence.generation);
+                match ownership_ref.begin_attach_guard(
+                    &locator.provider,
+                    &locator.session_id,
+                    &format!("rest-create-adopt-{create_request_id}"),
+                    observed_generation,
+                    "rest-terminal-create/adopt",
+                ) {
+                    freshell_ownership::AttachGuardOutcome::Armed(guard) => {
+                        rest_adopt_guard = Some(*guard);
+                    }
+                    freshell_ownership::AttachGuardOutcome::Refused { .. } => {
+                        tracing::warn!(target: "freshell_freshagent::terminal_tabs",
+                            provider = %locator.provider, session_id = %locator.session_id,
+                            pane_id = %pane_id,
+                            "spawn_refused: the Adopt arm's attach guard refused to arm \
+                             (a lifecycle transition owns the key) — the create aborts \
+                             typed, nothing spawns"
+                        );
+                        return Err(crate::fail_json_code(
+                            StatusCode::CONFLICT,
+                            "SESSION_RESERVED",
+                            "A lifecycle operation is in flight for this session; retry after it settles"
+                                .to_string(),
+                        ));
+                    }
+                    freshell_ownership::AttachGuardOutcome::StaleGeneration { .. } => {
+                        tracing::warn!(target: "freshell_freshagent::terminal_tabs",
+                            provider = %locator.provider, session_id = %locator.session_id,
+                            pane_id = %pane_id,
+                            "spawn_refused: the Adopt arm's attach guard refused to arm \
+                             (the observed generation is stale) — the create aborts \
+                             typed, nothing spawns"
+                        );
+                        return Err(crate::fail_json_code(
+                            StatusCode::CONFLICT,
+                            "SESSION_RESERVED",
+                            format!(
+                                "Session ownership moved on (stale observed generation); \
+                                 refresh and retry. (session {})",
+                                locator.session_id
+                            ),
+                        ));
+                    }
+                }
+            }
             crate::ownership_lane::TerminalLaneClaim::Refused(outcome) => {
                 tracing::warn!(
                     target: "freshell_freshagent::terminal_tabs",
