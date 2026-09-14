@@ -977,6 +977,23 @@ impl FreshOpencodeState {
             } => (Some(*generation), Some(owner.clone())),
             _ => (None, None),
         };
+        // b8ke ext r15 F1: the request fence is parsed BEFORE ANY
+        // ownership mutation — the map-hit/Vacant compatibility claim
+        // below carries it, and a half-sent (or stale) pair must refuse
+        // with NOTHING mutated (pre-r15 the claim ran first with None:
+        // a stale request reclaimed a since-vacated key, and a half-sent
+        // create mutated ownership before the INVALID_FENCE refusal).
+        let create_fence =
+            match crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation) {
+                Ok(fence) => fence,
+                Err(err) => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                    session_id = %durable_id, request_id = %request_id, code = err.code(),
+                    "fresh_agent_create_refused: the observed fence is half-sent (invalid)");
+                    self.fail_create(&request_id, err.code(), err.message());
+                    return;
+                }
+            };
         // b8ke delta round-3 F2: an in-memory hit still CONSULTS the
         // coordinator — a delayed create-resume during a Handoff must be
         // blocked or typed, never a silent reuse of a runtime the handoff
@@ -1004,10 +1021,13 @@ impl FreshOpencodeState {
                 // proceeds — never reused unowned.
                 freshell_ownership::OwnershipState::Vacant => {
                     let adopt_op = format!("adopt-{}", uuid::Uuid::new_v4());
+                    // b8ke ext r15 F1: the compatibility claim is FENCED
+                    // with the request's observed pair — a stale
+                    // generation can never reclaim a since-vacated key.
                     match self.begin_lane_claim_at(
                         &durable_id,
                         &adopt_op,
-                        None,
+                        create_fence,
                         "freshopencode/map-hit-adopt",
                     ) {
                         crate::ownership_lane::LaneClaim::Granted(ticket) => {
@@ -1070,20 +1090,6 @@ impl FreshOpencodeState {
                 _ => {}
             }
         }
-        // b8ke delta review F7: a half-sent observed pair (exactly one of
-        // epoch/generation) is the typed invalid-fence refusal — never a
-        // silently downgraded legacy request.
-        let create_fence =
-            match crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation) {
-                Ok(fence) => fence,
-                Err(err) => {
-                    tracing::warn!(target: "freshell_freshagent::opencode",
-                    session_id = %durable_id, request_id = %request_id, code = err.code(),
-                    "fresh_agent_create_refused: the observed fence is half-sent (invalid)");
-                    self.fail_create(&request_id, err.code(), err.message());
-                    return;
-                }
-            };
         let session_arc = match existing {
             Some(session_arc) => session_arc,
             None => match self
@@ -4398,10 +4404,15 @@ impl FreshOpencodeState {
                     }
                     .unwrap_or_else(|| msg.session_id.clone());
                     let adopt_op = format!("adopt-{}", uuid::Uuid::new_v4());
+                    // b8ke ext r15 F1: the attach's compatibility claim is
+                    // FENCED with the request's observed pair (parsed at
+                    // handler entry, before any ownership mutation) — a
+                    // stale generation can never reclaim a since-vacated
+                    // key.
                     match self.begin_lane_claim_at(
                         &durable,
                         &adopt_op,
-                        None,
+                        attach_fence,
                         "freshopencode/map-hit-adopt",
                     ) {
                         crate::ownership_lane::LaneClaim::Granted(ticket) => {
@@ -9463,6 +9474,228 @@ mod tests {
     /// (default settings — `load_settings` answers `None`) must STILL re-stamp
     /// the row's provenance to the CURRENT connection: the provenance refresh,
     /// not the settings write, is the point of the resume refresh.
+    // ── b8ke ext r15 F1: the map-hit/Vacant compatibility claims are FENCED ──
+
+    /// The F1 fixture: a live in-map session row over a coordinator key the
+    /// test controls (wired ownership + the session row).
+    async fn fenced_state_with_map_row(
+        durable_id: &str,
+    ) -> (
+        FreshOpencodeState,
+        tokio::sync::broadcast::Receiver<String>,
+        Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, killed) = started_manager().await;
+        let _ = &killed;
+        fresh_agent.set_manager_for_test(manager).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let mut st = FreshOpencodeState::new(fresh_agent);
+        st.set_ownership(Arc::clone(&registry));
+        st.sessions.lock().await.insert(
+            durable_id.to_string(),
+            Arc::new(TokioMutex::new(OpencodeSession::new(
+                durable_id.to_string(),
+                None,
+                None,
+                None,
+            ))),
+        );
+        (st, rx, registry)
+    }
+
+    /// Seed Live{FreshAgent} under the durable id, then COMPLETE A NEWER
+    /// STOP: the key ends VACANT at the ADVANCED generation (G+1) — the
+    /// since-vacated shape a stale reconnect request must never reclaim.
+    async fn seed_live_then_stop_to_vacant(
+        registry: &Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+        durable_id: &str,
+    ) -> u64 {
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
+            PROVIDER,
+            durable_id,
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-f15-seed",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("seed granted")
+        };
+        assert_eq!(
+            registry.commit_live(
+                PROVIDER,
+                durable_id,
+                "op-f15-seed",
+                generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some(durable_id.to_string()),
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        );
+        let stale_fence = freshell_ownership::ObservedFence {
+            epoch: registry.boot_epoch(),
+            generation,
+        };
+        let freshell_ownership::StopOutcome::Granted {
+            generation: stop_gen,
+        } = registry.begin_stop(
+            PROVIDER,
+            durable_id,
+            "op-f15-newer-stop",
+            &freshell_ownership::StopClaim {
+                expected_kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                expected_runtime: None,
+                observed: stale_fence,
+            },
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        )
+        else {
+            panic!("the newer stop must begin")
+        };
+        assert_eq!(
+            registry.commit_stop(PROVIDER, durable_id, "op-f15-newer-stop", stop_gen),
+            freshell_ownership::CommitOutcome::Committed
+        );
+        assert!(matches!(
+            registry.observe(PROVIDER, durable_id).state,
+            freshell_ownership::OwnershipState::Vacant
+        ));
+        generation
+    }
+
+    /// b8ke ext r15 F1 (a): a STALE-observed-generation create hitting a
+    /// since-vacated in-memory map entry CANNOT reclaim ownership. The
+    /// delayed request carries the OLD generation (G) while the key sits
+    /// Vacant at the advanced generation (G+1) — generation arithmetic must
+    /// refuse the claim (pre-r15 the map-hit compatibility claim passed
+    /// None, so the stale request GRANTED from Vacant and re-committed
+    /// Live{FreshAgent} — stale reconnect traffic reclaiming the global
+    /// owner and blocking or redirecting a subsequent terminal lifecycle
+    /// operation).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_fence_map_hit_resume_cannot_reclaim_vacated_ownership() {
+        let durable_id = "ses_r15_f1_stale";
+        let (st, mut rx, registry) = fenced_state_with_map_row(durable_id).await;
+        let stale_generation = seed_live_then_stop_to_vacant(&registry, durable_id).await;
+
+        // THE STALE REQUEST: the resume-create names the in-map durable id
+        // with the OLD observed generation.
+        let mut create = create_msg("req-r15-f1-stale");
+        create.session_ref = Some(freshell_protocol::SessionLocator {
+            provider: "opencode".to_string(),
+            session_id: durable_id.to_string(),
+        });
+        create.observed_epoch = Some(registry.boot_epoch());
+        create.observed_generation = Some(stale_generation);
+        st.handle_create(create, None).await;
+
+        // THE CONTRACT: the failure answers AND the key is NOT reclaimed.
+        let frame: serde_json::Value = serde_json::from_str(
+            &tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a frame within budget")
+                .expect("the bus stays open"),
+        )
+        .expect("json frame");
+        assert_eq!(frame["type"], "freshAgent.create.failed", "{frame}");
+        let snap = registry.observe(PROVIDER, durable_id);
+        assert!(
+            !matches!(snap.state, freshell_ownership::OwnershipState::Live { .. }),
+            "the stale request reclaimed NOTHING — state: {:?}",
+            snap.state
+        );
+    }
+
+    /// b8ke ext r15 F1 (b): an INVALID_FENCE create (a half-sent observed
+    /// pair) mutates NOTHING. Pre-r15 the map-hit compatibility block
+    /// claimed + committed Live{FreshAgent} BEFORE the fence parse refused,
+    /// so ownership (state AND generation) had already moved by the time
+    /// the INVALID_FENCE failure returned.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_invalid_fence_map_hit_create_mutates_no_ownership() {
+        let durable_id = "ses_r15_f1_invalid";
+        let (st, mut rx, registry) = fenced_state_with_map_row(durable_id).await;
+        let before = registry.observe(PROVIDER, durable_id);
+
+        // THE HALF-SENT REQUEST: exactly one of the pair present.
+        let mut create = create_msg("req-r15-f1-invalid");
+        create.session_ref = Some(freshell_protocol::SessionLocator {
+            provider: "opencode".to_string(),
+            session_id: durable_id.to_string(),
+        });
+        create.observed_epoch = Some(registry.boot_epoch());
+        create.observed_generation = None;
+        st.handle_create(create, None).await;
+
+        let frame: serde_json::Value = serde_json::from_str(
+            &tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a frame within budget")
+                .expect("the bus stays open"),
+        )
+        .expect("json frame");
+        assert_eq!(frame["type"], "freshAgent.create.failed", "{frame}");
+        assert!(
+            frame["code"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("INVALID_FENCE"),
+            "the typed invalid-fence refusal: {frame}"
+        );
+        let after = registry.observe(PROVIDER, durable_id);
+        assert_eq!(
+            before.state, after.state,
+            "the INVALID_FENCE create mutated NO ownership state"
+        );
+        assert_eq!(
+            before.generation, after.generation,
+            "the INVALID_FENCE create advanced NO generation"
+        );
+    }
+
+    /// b8ke ext r15 F1: the ATTACH counterpart — a stale-observed-generation
+    /// attach over a since-vacated in-memory map entry cannot reclaim
+    /// ownership either (the attach's map-hit adopt claim was the same
+    /// unfenced None).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_fence_map_hit_attach_cannot_reclaim_vacated_ownership() {
+        let durable_id = "ses_r15_f1_stale_attach";
+        let (st, mut rx, registry) = fenced_state_with_map_row(durable_id).await;
+        let stale_generation = seed_live_then_stop_to_vacant(&registry, durable_id).await;
+
+        let mut attach = attach_msg(durable_id);
+        attach.observed_epoch = Some(registry.boot_epoch());
+        attach.observed_generation = Some(stale_generation);
+        st.handle_attach(attach).await;
+
+        let frame: serde_json::Value = serde_json::from_str(
+            &tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a frame within budget")
+                .expect("the bus stays open"),
+        )
+        .expect("json frame");
+        assert!(
+            frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == json!("freshAgent.error"),
+            "the typed error answers: {frame}"
+        );
+        let snap = registry.observe(PROVIDER, durable_id);
+        assert!(
+            !matches!(snap.state, freshell_ownership::OwnershipState::Live { .. }),
+            "the stale attach reclaimed NOTHING — state: {:?}",
+            snap.state
+        );
+    }
+
     #[tokio::test]
     async fn create_resume_with_a_lineage_only_row_still_restamps_the_current_connections_provenance(
     ) {
