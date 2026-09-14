@@ -662,3 +662,52 @@ describe('deriveTerminalOwnerConvergence (b8ke ext r11 F2)', () => {
     expect(deriveTerminalOwnerConvergence(undefined, undefined)).toBeNull()
   })
 })
+
+describe('b8ke ext r14 F3: the VACANT released frame clears an old-key pane', () => {
+  function stateWithFrame(record: Partial<SessionRuntimeOwnerMessage>): RootState {
+    const frame: SessionRuntimeOwnerMessage = {
+      type: 'session.runtimeOwner',
+      epoch: 5,
+      generation: 4,
+      ownerKind: 'terminal',
+      operationId: 'rebind-1',
+      transition: 'released',
+      ...record,
+    } as SessionRuntimeOwnerMessage
+    const freshAgent = freshAgentReducer(undefined, applyRuntimeOwner(frame))
+    return { freshAgent } as unknown as RootState
+  }
+
+  it('an old-key fresh-agent pane clears its divergence on the VACANT released frame (no attach action)', () => {
+    // The old key first shows the terminal owner (the divergence the
+    // pane presents mid-rebind).
+    const before = stateWithFrame({
+      provider: 'codex',
+      sessionId: 'old-key',
+      ownerKind: 'terminal',
+      terminalId: 't-mover',
+      generation: 4,
+      transition: 'handoff-committed',
+    })
+    const pane = {
+      paneKind: 'fresh-agent' as const,
+      provider: 'codex',
+      sessionRef: { provider: 'codex', sessionId: 'old-key' },
+    }
+    expect(selectPaneOwnerDivergence(before, pane)).not.toBeNull()
+
+    // THE VACANT RELEASED FRAME (the ext-r14 server shape for a rebind's
+    // superseded key): ownerKind "vacant", NO terminal id — the pane's
+    // divergence CLEARS (no "opened as CLI elsewhere" card, no
+    // direct-attach action pointing at a terminal that moved on).
+    const after = stateWithFrame({
+      provider: 'codex',
+      sessionId: 'old-key',
+      ownerKind: 'vacant',
+      terminalId: undefined,
+      generation: 5,
+      transition: 'released',
+    })
+    expect(selectPaneOwnerDivergence(after, pane)).toBeNull()
+  })
+})
