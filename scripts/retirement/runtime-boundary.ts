@@ -76,6 +76,7 @@ export const NON_BACKEND_LISTENER_PATHS = [
   'scripts/proofs/browser-freeze-lifecycle-probe.ts',
   'scripts/proofs/browser-process-suspend-probe.ts',
   'electron/port-check.ts',
+  'test/e2e-electron/owned-server-teardown.ts',
   'test/e2e-browser/helpers/server-fixture-support.ts',
   'examples/extensions/live-counter/server.js',
   'examples/extensions/status-dashboard/server.js',

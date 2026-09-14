@@ -508,6 +508,12 @@
       "listener": "assertion-only"
     },
     {
+      "id": "listener-electron-owned-server-teardown-probe",
+      "path": "test/e2e-electron/owned-server-teardown.ts",
+      "role": "non-backend-listener",
+      "listener": "non-backend"
+    },
+    {
       "id": "assertion-test-electron-checkout-free-runtime",
       "path": "test/integration/electron/checkout-free-runtime.test.ts",
       "role": "test-listener-assertion",
