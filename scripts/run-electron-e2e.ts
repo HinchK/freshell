@@ -2,11 +2,10 @@
 
 /** Build the Electron E2E client from this checkout before launching it. */
 
-import { spawnSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { computeClientBuildId } from '../config/vite/build-id.js'
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url))
 const PROJECT_ROOT = path.resolve(SCRIPT_DIR, '..')
@@ -27,15 +26,29 @@ export function clientArtifactContainsBuildId(clientDir: string, buildId: string
   return false
 }
 
-export function runElectronE2ePreflight(root = PROJECT_ROOT): string {
-  const buildId = computeClientBuildId(root)
+export function resolveExactElectronE2eHead(
+  root = PROJECT_ROOT,
+  inheritedBuildCommit = process.env.FRESHELL_BUILD_COMMIT,
+  resolveHead: (cwd: string) => string = (cwd) => execFileSync('git', ['rev-parse', 'HEAD'], { cwd, encoding: 'utf8' }).trim(),
+): string {
+  const buildId = resolveHead(root)
   if (!/^[0-9a-f]{40}$/.test(buildId)) {
-    throw new Error(`Electron E2E requires a verifiable checkout build id, received ${buildId}`)
+    throw new Error(`Electron E2E requires a verifiable checkout HEAD, received ${buildId}`)
   }
+  if (inheritedBuildCommit !== undefined) {
+    throw new Error(`Electron E2E rejects inherited FRESHELL_BUILD_COMMIT ${inheritedBuildCommit}; it pins checkout HEAD ${buildId} itself`)
+  }
+  return buildId
+}
+
+export function runElectronE2ePreflight(root = PROJECT_ROOT): string {
+  const buildId = resolveExactElectronE2eHead(root)
+  const buildEnv = { ...process.env, FRESHELL_BUILD_COMMIT: buildId }
 
   const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
   const result = spawnSync(npm, ['run', 'build:client'], {
     cwd: root,
+    env: buildEnv,
     stdio: 'inherit',
     windowsHide: true,
   })
@@ -48,6 +61,7 @@ export function runElectronE2ePreflight(root = PROJECT_ROOT): string {
   // freshly stamped client rather than a stale compiled main process.
   const electronBuild = spawnSync(npm, ['run', 'build:electron'], {
     cwd: root,
+    env: buildEnv,
     stdio: 'inherit',
     windowsHide: true,
   })
@@ -57,6 +71,7 @@ export function runElectronE2ePreflight(root = PROJECT_ROOT): string {
 
   const rustBuild = spawnSync('cargo', ['build', '-p', 'freshell-server', '--locked'], {
     cwd: root,
+    env: buildEnv,
     stdio: 'inherit',
     windowsHide: true,
   })
@@ -71,7 +86,11 @@ export function runElectronE2ePreflight(root = PROJECT_ROOT): string {
   return buildId
 }
 
-export function main(argv: string[] = process.argv.slice(2)): number {
+export function playwrightExitResult(result: { status: number | null; signal: NodeJS.Signals | null }): number | NodeJS.Signals {
+  return result.signal ?? result.status ?? 1
+}
+
+export function main(argv: string[] = process.argv.slice(2)): number | NodeJS.Signals {
   const buildId = runElectronE2ePreflight()
   const playwright = path.join(PROJECT_ROOT, 'node_modules', '@playwright', 'test', 'cli.js')
   const result = spawnSync(process.execPath, [playwright, 'test', '--config', 'test/e2e-electron/playwright.electron.config.ts', ...argv], {
@@ -80,12 +99,14 @@ export function main(argv: string[] = process.argv.slice(2)): number {
     stdio: 'inherit',
     windowsHide: true,
   })
-  return result.status ?? 1
+  return playwrightExitResult(result)
 }
 
 if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
   try {
-    process.exitCode = main()
+    const result = main()
+    if (typeof result === 'string') process.kill(process.pid, result)
+    else process.exitCode = result
   } catch (error) {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`)
     process.exitCode = 1

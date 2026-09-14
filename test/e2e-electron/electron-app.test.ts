@@ -19,6 +19,7 @@ import { cleanupElectronFixture, closeElectronGracefully } from './electron-fixt
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, '..', '..')
 const electronProcesses = new WeakMap<ElectronApplication, ChildProcess>()
+const electronStdout = new WeakMap<ElectronApplication, string[]>()
 
 function requireElectronE2eBuildId(): string {
   const buildId = process.env.FRESHELL_ELECTRON_E2E_BUILD_ID
@@ -69,6 +70,11 @@ async function launchApp(
   // Capture the launch-owned process once. Cleanup may only signal this exact
   // child if Playwright's graceful close has already timed out.
   electronProcesses.set(app, app.process())
+  const stdout: string[] = []
+  electronStdout.set(app, stdout)
+  app.process().stdout?.on('data', (data: Buffer) => {
+    stdout.push(data.toString())
+  })
 
   if (captureOutput) {
     app.process().stdout?.on('data', (data: Buffer) => {
@@ -458,6 +464,19 @@ test.describe('Launch chooser', () => {
     // This is the chooser-restart lifecycle contract. It must gracefully
     // quit within the fixture budget before exact owned server teardown.
     await expect(closeElectronGracefully(app)).resolves.toBeUndefined()
+    const lifecycle = electronStdout.get(app)?.join('').split('\n')
+      .flatMap((line) => {
+        try { return [JSON.parse(line) as { event?: string; startupGeneration?: number }] } catch { return [] }
+      }) ?? []
+    for (const event of [
+      'electron_before_quit',
+      'electron_server_stop_started',
+      'electron_server_stop_settled',
+      'electron_continue_quit',
+      'electron_will_quit',
+    ]) {
+      expect(lifecycle).toContainEqual(expect.objectContaining({ event, startupGeneration: 2 }))
+    }
     app = undefined
     await expect(stopRemoteServer()).resolves.toBeUndefined()
     fs.rmSync(tmpHome, { recursive: true, force: true })

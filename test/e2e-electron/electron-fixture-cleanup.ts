@@ -13,6 +13,7 @@ export interface ElectronFixtureApplication {
 
 export interface OwnedElectronProcess {
   exitCode: number | null
+  signalCode: NodeJS.Signals | null
   kill(signal: NodeJS.Signals): boolean
 }
 
@@ -63,7 +64,8 @@ async function terminateExactElectronProcess(
   timeoutMs: number,
   sleep: (ms: number) => Promise<void>,
 ): Promise<void> {
-  if (!process || process.exitCode !== null) return
+  const hasExited = () => process.exitCode !== null || process.signalCode !== null
+  if (!process || hasExited()) return
 
   let sentTerm = false
   try {
@@ -71,13 +73,13 @@ async function terminateExactElectronProcess(
   } catch (error) {
     throw new Error('sending SIGTERM to the captured Electron process failed', { cause: error })
   }
-  if (!sentTerm && process.exitCode === null) {
+  if (!sentTerm && !hasExited()) {
     throw new Error('the captured Electron process rejected SIGTERM')
   }
 
   const exitedAfterTerm = await settleWithin(
     (async () => {
-      while (process.exitCode === null) await sleep(25)
+      while (!hasExited()) await sleep(25)
     })(),
     timeoutMs,
     sleep,
@@ -86,7 +88,7 @@ async function terminateExactElectronProcess(
 
   try {
     const sentKill = process.kill('SIGKILL')
-    if (!sentKill && process.exitCode === null) {
+    if (!sentKill && !hasExited()) {
       throw new Error('the captured Electron process rejected SIGKILL')
     }
   } catch (error) {
@@ -95,7 +97,7 @@ async function terminateExactElectronProcess(
 
   const exitedAfterKill = await settleWithin(
     (async () => {
-      while (process.exitCode === null) await sleep(25)
+      while (!hasExited()) await sleep(25)
     })(),
     timeoutMs,
     sleep,

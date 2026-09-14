@@ -52,9 +52,10 @@ describe('cleanupElectronFixture', () => {
     const order: string[] = []
     const electronProcess = {
       exitCode: null,
+      signalCode: null as NodeJS.Signals | null,
       kill: vi.fn((signal: NodeJS.Signals) => {
         order.push(`electron.${signal}`)
-        electronProcess.exitCode = 0
+        electronProcess.signalCode = signal
         return true
       }),
     }
@@ -72,6 +73,32 @@ describe('cleanupElectronFixture', () => {
 
     expect(order).toEqual(['electron.SIGTERM', 'server.stop-and-verify', 'home.remove'])
     expect(electronProcess.kill).toHaveBeenCalledWith('SIGTERM')
+  })
+
+  it('escalates only the captured child when SIGTERM does not exit it, then recognizes SIGKILL signal exit', async () => {
+    const close = deferred()
+    const electronProcess = {
+      exitCode: null,
+      signalCode: null as NodeJS.Signals | null,
+      kill: vi.fn((signal: NodeJS.Signals) => {
+        if (signal === 'SIGKILL') electronProcess.signalCode = 'SIGKILL'
+        return true
+      }),
+    }
+    const stopServer = vi.fn().mockResolvedValue(undefined)
+
+    await expectCleanupFailure(cleanupElectronFixture({
+      app: { close: () => close.promise },
+      electronProcess,
+      stopServer,
+      gracefulCloseTimeoutMs: 1,
+      forceCloseTimeoutMs: 1,
+      sleep: async () => {},
+    }), /graceful Electron shutdown timed out/i)
+
+    expect(electronProcess.kill).toHaveBeenNthCalledWith(1, 'SIGTERM')
+    expect(electronProcess.kill).toHaveBeenNthCalledWith(2, 'SIGKILL')
+    expect(stopServer).toHaveBeenCalledOnce()
   })
 
   it('retains a graceful-close failure while continuing exact-server and HOME cleanup', async () => {

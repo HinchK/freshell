@@ -13,6 +13,7 @@ import fsp from 'node:fs/promises'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
+import { cleanupElectronFixture, closeElectronGracefully } from './electron-fixture-cleanup.js'
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, '..', '..')
 const VITE_ROOT = path.join(PROJECT_ROOT, 'node_modules')
@@ -164,6 +165,23 @@ async function waitForPidGone(pid: number): Promise<void> {
   throw new Error(`PID ${pid} remained alive after its owner exited`)
 }
 
+async function isPortFree(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const listener = http.createServer()
+    listener.once('error', () => resolve(false))
+    listener.listen(port, '127.0.0.1', () => listener.close(() => resolve(true)))
+  })
+}
+
+async function waitForCapturedChildExit(child: ChildProcess, timeoutMs = 15_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (child.exitCode !== null || child.signalCode !== null) return
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
+  throw new Error(`captured Electron PID ${child.pid ?? 'unknown'} remained alive after graceful close`)
+}
+
 async function stopCapturedChild(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return
   await new Promise<void>((resolve) => {
@@ -193,7 +211,6 @@ test.describe('Electron app-bound Rust server', () => {
   })
 
   test('authenticates Rust server-info and stops only its exact child', async () => {
-    test.skip(process.platform === 'win32', 'The exact /proc executable assertion is Linux-only.')
     expect(fs.existsSync(RUST_BINARY)).toBe(true)
     expect(fs.existsSync(CLIENT_DIR)).toBe(true)
     const expectedBuildId = requireElectronE2eBuildId()
@@ -230,6 +247,7 @@ test.describe('Electron app-bound Rust server', () => {
     let foreign: ChildProcess | undefined
     let chooserDevServer: ChildProcess | undefined
     let appServerPid: number | undefined
+    let electronProcess: ChildProcess | undefined
     try {
       foreign = spawn(RUST_BINARY, [], {
         cwd: foreignConfigDir,
@@ -261,6 +279,7 @@ test.describe('Electron app-bound Rust server', () => {
           NODE_PATH: path.join(PROJECT_ROOT, 'node_modules'),
         },
       })
+      electronProcess = app.process()
       const mainPage = await app.firstWindow()
       await mainPage.waitForLoadState('domcontentloaded')
       const chooser = mainPage.getByRole('heading', { name: 'Choose Freshell server' })
@@ -272,14 +291,18 @@ test.describe('Electron app-bound Rust server', () => {
 
       const electronPid = app.process().pid
       if (electronPid === undefined) throw new Error('Electron process did not expose a PID')
-      appServerPid = await waitForOwnedChild(electronPid, RUST_BINARY)
+      if (process.platform !== 'win32') {
+        appServerPid = await waitForOwnedChild(electronPid, RUST_BINARY)
+      }
       const appInfo = await waitForHealth(appPort, appToken)
       expect(appInfo.runtime).toBe('rust')
       expect(appInfo.commit).toBe(expectedBuildId)
 
-      await app.close()
+      await closeElectronGracefully(app)
+      await waitForCapturedChildExit(electronProcess)
       app = undefined
-      await waitForPidGone(appServerPid)
+      if (appServerPid !== undefined) await waitForPidGone(appServerPid)
+      expect(await isPortFree(appPort)).toBe(true)
 
       // The same-path foreign Rust server must remain available after the app
       // closes. Cleanup below stops it through its captured ChildProcess.
@@ -292,11 +315,34 @@ test.describe('Electron app-bound Rust server', () => {
         }
       }).toBe(true)
     } finally {
-      if (app) await app.close().catch(() => {})
-      if (chooserDevServer) await stopCapturedChild(chooserDevServer).catch(() => {})
-      if (foreign) await stopCapturedChild(foreign).catch(() => {})
-      await fsp.rm(appHome, { recursive: true, force: true })
-      await fsp.rm(foreignHome, { recursive: true, force: true })
+      const failures: Error[] = []
+      try {
+        await cleanupElectronFixture({
+          app,
+          electronProcess,
+          stopServer: async () => {
+            if (appServerPid !== undefined) await waitForPidGone(appServerPid)
+            if (!await isPortFree(appPort)) throw new Error(`Electron app-owned Rust port ${appPort} is still bound`)
+          },
+          removeHome: () => fsp.rm(appHome, { recursive: true, force: true }),
+        })
+      } catch (error) {
+        failures.push(error as Error)
+      }
+      for (const [name, child] of [['chooser', chooserDevServer], ['foreign Rust server', foreign]] as const) {
+        if (!child) continue
+        try {
+          await stopCapturedChild(child)
+        } catch (error) {
+          failures.push(new Error(`app-bound fixture cleanup failed while stopping ${name}`, { cause: error }))
+        }
+      }
+      try {
+        await fsp.rm(foreignHome, { recursive: true, force: true })
+      } catch (error) {
+        failures.push(new Error('app-bound fixture cleanup failed while removing foreign HOME', { cause: error }))
+      }
+      if (failures.length > 0) throw new AggregateError(failures, 'app-bound Electron fixture cleanup failed')
     }
   })
 })
