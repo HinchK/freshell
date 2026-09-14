@@ -22,6 +22,7 @@ import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
  */
 
 const TERMINAL_MARKER = 'DUAL_ROLE_TERMINAL_RAN'
+const SKIP_UNIX_SHIM_ON_WINDOWS = process.platform === 'win32'
 
 interface ShimProcess {
   child: ChildProcess
@@ -351,18 +352,24 @@ describe('codex-dual-role shim', () => {
   it('paces refused readiness probes before a later transport success', async () => {
     const { shim } = createReadinessControlledShim()
     const events: string[] = []
+    const pauseDelays: number[] = []
+    let now = 0
 
     await waitForAppServerReady(shim, 1, 150, {
+      now: () => now,
       connect: async () => {
         events.push('connect')
         return events.filter((event) => event === 'connect').length === 2
       },
       pause: async (delayMs) => {
-        events.push(`pause:${delayMs}`)
+        events.push('pause')
+        pauseDelays.push(delayMs)
+        now += delayMs
       },
     })
 
-    expect(events).toEqual(['connect', `pause:${READINESS_RETRY_INTERVAL_MS}`, 'connect'])
+    expect(events).toEqual(['connect', 'pause', 'connect'])
+    expect(pauseDelays).toEqual([READINESS_RETRY_INTERVAL_MS])
   })
 
   it('stops the one owned readiness poll when the exact child exits early', async () => {
@@ -467,7 +474,9 @@ describe('codex-dual-role shim', () => {
     expect(shim.child.listenerCount('error')).toBe(initialErrorListeners)
   })
 
-  it('runs the terminal fake for plain argv', async () => {
+  // The installed fixture is an extensionless Unix shebang. Keep the process
+  // lifecycle seams above portable; only actual shim execution is Unix-only.
+  it.skipIf(SKIP_UNIX_SHIM_ON_WINDOWS)('runs the terminal fake for plain argv', async () => {
     const binDir = await fs.mkdtemp(path.join(os.tmpdir(), 'dual-role-'))
     try {
       const terminalSrc = await writeTerminalFake(binDir)
@@ -483,7 +492,7 @@ describe('codex-dual-role shim', () => {
     }
   }, 30_000)
 
-  it('routes `app-server` argv to the fake app-server, which keeps listening (the sidecar contract)', async () => {
+  it.skipIf(SKIP_UNIX_SHIM_ON_WINDOWS)('routes `app-server` argv to the fake app-server, which keeps listening (the sidecar contract)', async () => {
     const binDir = await fs.mkdtemp(path.join(os.tmpdir(), 'dual-role-'))
     let shim: ShimProcess | undefined
     await withCleanup(async () => {
@@ -504,7 +513,7 @@ describe('codex-dual-role shim', () => {
     ])
   }, 30_000)
 
-  it('passes terminalEnv through to the terminal role only', async () => {
+  it.skipIf(SKIP_UNIX_SHIM_ON_WINDOWS)('passes terminalEnv through to the terminal role only', async () => {
     const binDir = await fs.mkdtemp(path.join(os.tmpdir(), 'dual-role-'))
     try {
       const terminalSrc = path.join(binDir, 'terminal-src.mjs')
@@ -525,7 +534,7 @@ describe('codex-dual-role shim', () => {
     }
   }, 30_000)
 
-  it('a terminal-only fake at CODEX_CMD exits 0 instantly under sidecar argv (the pathology this shim fixes)', async () => {
+  it.skipIf(SKIP_UNIX_SHIM_ON_WINDOWS)('a terminal-only fake at CODEX_CMD exits 0 instantly under sidecar argv (the pathology this shim fixes)', async () => {
     // Contrast test: documents the failure this helper prevents. If the
     // shared app-server fake stops working, the previous test fails; if the
     // dispatch breaks toward the terminal role, this one catches regression
@@ -547,7 +556,7 @@ describe('codex-dual-role shim', () => {
     ])
   }, 30_000)
 
-  it('releases its direct app-server listener after bounded graceful cleanup', async () => {
+  it.skipIf(SKIP_UNIX_SHIM_ON_WINDOWS)('releases its direct app-server listener after bounded graceful cleanup', async () => {
     const binDir = await fs.mkdtemp(path.join(os.tmpdir(), 'dual-role-reap-'))
     const terminalSrc = await writeTerminalFake(binDir)
     const bin = await installDualRoleCodexCli(binDir, terminalSrc)
@@ -568,7 +577,7 @@ describe('codex-dual-role shim', () => {
     ])
   }, 30_000)
 
-  it.skipIf(process.platform !== 'linux')('runs the app-server in the shim process instead of an extra child', async () => {
+  it.skipIf(SKIP_UNIX_SHIM_ON_WINDOWS || process.platform !== 'linux')('runs the app-server in the shim process instead of an extra child', async () => {
     const binDir = await fs.mkdtemp(path.join(os.tmpdir(), 'dual-role-direct-'))
     const terminalSrc = await writeTerminalFake(binDir)
     const bin = await installDualRoleCodexCli(binDir, terminalSrc)
