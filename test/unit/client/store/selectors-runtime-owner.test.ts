@@ -3,6 +3,7 @@ import freshAgentReducer, { applyRuntimeOwner, type RuntimeOwnerRecord } from '@
 import {
   canonicalPaneSession,
   derivePaneOwnerDivergence,
+  deriveTerminalOwnerConvergence,
   isLifecycleStartSuperseded,
   selectOwnerFence,
   selectPaneOwnerDivergence,
@@ -591,5 +592,73 @@ describe('b8ke ext F1: rekey alias chains resolve to the canonical key', () => {
       provider: 'claude',
       sessionRef: { provider: 'claude', sessionId: 'old-id' },
     })).toEqual({ epoch: 9, generation: 7 })
+  })
+})
+
+describe('deriveTerminalOwnerConvergence (b8ke ext r11 F2)', () => {
+  const committedTerminalOwner = (overrides: Partial<RuntimeOwnerRecord> = {}): RuntimeOwnerRecord => ({
+    provider: 'codex',
+    sessionId: 'sid-conv',
+    epoch: 5,
+    generation: 9,
+    ownerKind: 'terminal',
+    terminalId: 't-new-owner',
+    operationId: 'handoff-1',
+    transition: 'handoff-committed',
+    ...overrides,
+  })
+
+  it('marks a committed same-kind owner with a DIFFERENT terminal id than the dead/absent pane terminal', () => {
+    expect(deriveTerminalOwnerConvergence(committedTerminalOwner(), undefined)).toEqual({
+      ownerKind: 'terminal',
+      transition: 'handoff-committed',
+      terminalId: 't-new-owner',
+      generation: 9,
+      sameKindTerminal: true,
+    })
+    expect(deriveTerminalOwnerConvergence(committedTerminalOwner(), 't-dead-prior')).toEqual({
+      ownerKind: 'terminal',
+      transition: 'handoff-committed',
+      terminalId: 't-new-owner',
+      generation: 9,
+      sameKindTerminal: true,
+    })
+  })
+
+  it('returns null when the owner IS the pane\'s own terminal (idempotent same-mode attachment)', () => {
+    expect(deriveTerminalOwnerConvergence(committedTerminalOwner(), 't-new-owner')).toBeNull()
+  })
+
+  it('returns null for an in-progress handoff (the same-kind-transition blocking stays on the divergence path)', () => {
+    expect(deriveTerminalOwnerConvergence(
+      committedTerminalOwner({ transition: 'handoff-started' }),
+      undefined,
+    )).toBeNull()
+  })
+
+  it('returns null for a fenced record (the typed recovery state owns the pane)', () => {
+    expect(deriveTerminalOwnerConvergence(
+      committedTerminalOwner({ fenced: true }),
+      undefined,
+    )).toBeNull()
+  })
+
+  it('returns null for a fresh-agent owner (the cross-kind card flow is untouched)', () => {
+    expect(deriveTerminalOwnerConvergence(
+      committedTerminalOwner({ ownerKind: 'fresh-agent', terminalId: undefined }),
+      undefined,
+    )).toBeNull()
+  })
+
+  it('returns null for a vacant record or a terminal owner with no terminal id', () => {
+    expect(deriveTerminalOwnerConvergence(
+      committedTerminalOwner({ ownerKind: 'vacant', terminalId: undefined }),
+      undefined,
+    )).toBeNull()
+    expect(deriveTerminalOwnerConvergence(
+      committedTerminalOwner({ terminalId: undefined }),
+      undefined,
+    )).toBeNull()
+    expect(deriveTerminalOwnerConvergence(undefined, undefined)).toBeNull()
   })
 })

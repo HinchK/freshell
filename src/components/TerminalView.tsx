@@ -34,6 +34,7 @@ import { buildReconcileRequestForPanes, foldVerdicts } from '@/lib/pane-reconcil
 import type { PaneReconcileRequest } from '@shared/ws-protocol'
 import {
   derivePaneOwnerDivergence,
+  deriveTerminalOwnerConvergence,
   resolveCanonicalPaneSession,
   selectPaneOwnerFence,
   selectSessionRuntimeOwner,
@@ -809,6 +810,71 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const freshAgentOwnerDivergence = derivePaneOwnerDivergence(terminalRuntimeOwner, 'terminal')
   const freshAgentOwnerDivergenceRef = useRef(freshAgentOwnerDivergence)
   freshAgentOwnerDivergenceRef.current = freshAgentOwnerDivergence
+
+  // b8ke ext r11 F2: the SAME-KIND TERMINAL convergence — a handoff
+  // committed a NEW terminal owner for this pane's canonical session while
+  // this pane's own runtime is dead or absent (the prior-reap exited it
+  // and the exit cleared the stored terminal id). Pre-r11 the committed
+  // broadcast produced NOTHING here: the same-kind early-return is null,
+  // so a terminal pane on another device stayed exited after a
+  // Fresh Agent → CLI handoff with no automatic attachment. The gate is
+  // the pane's OWN terminal: dead/absent converges (adopt-and-attach the
+  // authoritative runtime); still-RUNNING never steals the pane off its
+  // live terminal. The cross-kind divergence owns the pane when a
+  // fresh-agent runtime holds the session instead.
+  // The gate is the pane's DEAD state (status exited — the exit cleared
+  // the stored terminal id): a CREATING pane legitimately holds no terminal
+  // id yet and the ordinary lifecycle flow owns it; a RUNNING pane is never
+  // stolen off its own live terminal.
+  const ownTerminalDeadOrAbsent = isTerminal && terminalContent?.status === 'exited'
+  const terminalOwnerConvergence = ownTerminalDeadOrAbsent
+    && freshAgentOwnerDivergence === null
+    ? deriveTerminalOwnerConvergence(terminalRuntimeOwner, terminalContent?.terminalId)
+    : null
+  const terminalOwnerConvergenceRef = useRef(terminalOwnerConvergence)
+  terminalOwnerConvergenceRef.current = terminalOwnerConvergence
+  const terminalConvergenceAdoptedRef = useRef<string | null>(null)
+
+  // b8ke ext r11 F2: the convergence effect — the committed same-kind
+  // owner broadcast drives the pane onto the new authoritative terminal.
+  // The dependencies carry the OWNER GENERATION and the owner TERMINAL ID
+  // (the reviewer's exact lifecycle-effect gap: pre-r11 the broadcast
+  // changed neither the pane's terminal id nor any lifecycle dep, so a
+  // terminal pane on another device stayed exited). One adoption per
+  // owner terminal id: the fold points the pane at the live terminal
+  // (terminalId + status running + the reconcileEpoch bump — the
+  // lifecycle effect's ONLY re-fire signal), which re-fires the attach
+  // branch onto the new runtime. If the adopted handle dies in the race,
+  // the ordinary INVALID_TERMINAL_ID reconnect owns the recovery — never
+  // a loop.
+  const terminalOwnerConvergenceTarget = terminalOwnerConvergence?.terminalId
+  const terminalOwnerConvergenceGeneration = terminalOwnerConvergence?.generation
+  useEffect(() => {
+    if (!isTerminal) return
+    if (!terminalOwnerConvergenceTarget) return
+    if (terminalConvergenceAdoptedRef.current === terminalOwnerConvergenceTarget) return
+    terminalConvergenceAdoptedRef.current = terminalOwnerConvergenceTarget
+    log.info('converging onto the committed same-kind terminal owner', {
+      paneId,
+      terminalId: terminalOwnerConvergenceTarget,
+      ownerGeneration: terminalOwnerConvergenceGeneration,
+    })
+    dispatch(applyReattachToLiveTerminal({
+      tabId,
+      paneId,
+      terminalId: terminalOwnerConvergenceTarget,
+    }))
+  }, [
+    isTerminal,
+    paneId,
+    tabId,
+    dispatch,
+    // The owner generation + terminal id ARE the trigger: a NEW committed
+    // owner (a fresh generation naming a fresh terminal) re-converges the
+    // pane; a same-id re-broadcast never double-adopts.
+    terminalOwnerConvergenceTarget,
+    terminalOwnerConvergenceGeneration,
+  ])
 
   // Register live terminal text reader for Stream Deck previews (classic tile style)
   useTerminalTextRegistration(terminalContent?.terminalId, termRef)

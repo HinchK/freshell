@@ -40,6 +40,14 @@ export type PaneOwnerDivergence = {
   terminalId?: string
   generation: number
   /**
+   * b8ke ext r11 F2: present on the SAME-KIND TERMINAL convergence shape —
+   * the canonical session's committed owner is a DIFFERENT (live) terminal
+   * than the pane's own (dead/absent) one. Distinct from every cross-kind
+   * divergence: the pane converges by ADOPTING the owner's terminal id
+   * (the same-mode multi-device attachment), never by converting kinds.
+   */
+  sameKindTerminal?: true
+  /**
    * b8ke R3-5: present when the record is FENCED (no live writer exists —
    * the ownerKind names the fenced prior). Present for BOTH pane kinds:
    * every pane holding the sessionRef shows the typed recovery state, not
@@ -219,6 +227,47 @@ export function derivePaneOwnerDivergence(
     transition: record.transition,
     ...(record.terminalId !== undefined ? { terminalId: record.terminalId } : {}),
     generation: record.generation,
+  }
+}
+
+/**
+ * b8ke ext r11 F2: the SAME-KIND TERMINAL convergence — a handoff
+ * committed a NEW same-kind terminal owner for the canonical session, and
+ * this terminal pane's own runtime is dead or absent (the handoff's
+ * prior-reap exited it; the exit cleared the stored terminal id). The
+ * committed-owner broadcast previously produced NOTHING for such a pane:
+ * derivePaneOwnerDivergence's same-kind early-return is null, so the pane
+ * stayed exited with no attachment to the new authoritative runtime.
+ *
+ * Returns the convergence target (the new owner's terminal id) when the
+ * pane should adopt-and-attach; null when it must not:
+ * - no record, a fenced record, or an in-progress handoff (the R5-3
+ *   transition-blocking discipline stays on the existing divergence path —
+ *   attachments stay blocked until the transition settles);
+ * - a fresh-agent owner (the cross-kind card flow owns that pane);
+ * - the owner IS the pane's own terminal (idempotent — same-mode
+ *   multi-device attachment already covered it).
+ *
+ * The pane's own-terminal gate (dead/absent) is the CALLER's: a pane whose
+ * own terminal is still RUNNING must never be stolen off it.
+ */
+export function deriveTerminalOwnerConvergence(
+  record: RuntimeOwnerRecord | undefined,
+  paneTerminalId: string | undefined,
+): PaneOwnerDivergence | null {
+  if (!record) return null
+  if (record.fenced) return null
+  if (record.transition === 'handoff-started') return null
+  if (record.ownerKind !== 'terminal') return null
+  const ownerTerminalId = record.terminalId
+  if (!ownerTerminalId) return null
+  if (paneTerminalId !== undefined && ownerTerminalId === paneTerminalId) return null
+  return {
+    ownerKind: 'terminal',
+    transition: record.transition,
+    terminalId: ownerTerminalId,
+    generation: record.generation,
+    sameKindTerminal: true,
   }
 }
 

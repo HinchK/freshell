@@ -3717,6 +3717,90 @@ describe('TerminalView lifecycle updates', () => {
       ).toBeNull()
     })
 
+    it('b8ke ext r11 F2: a dead terminal pane converges onto a committed same-kind terminal owner', async () => {
+      // The pane's own runtime is DEAD (the Fresh Agent → CLI handoff's
+      // prior-reap exited it; the exit cleared the stored terminal id) —
+      // a terminal pane on ANOTHER device holding the same sessionRef.
+      // Pre-r11 the committed-owner broadcast produced NOTHING: the
+      // same-kind early-return is null and the lifecycle effect had no
+      // owner-generation/owner-terminal deps, so the pane stayed exited.
+      const { store } = setupTypedPane({
+        content: {
+          status: 'exited',
+          terminalId: undefined,
+          sessionRef: { provider: 'codex', sessionId: TYPED_SESSION_ID },
+        },
+      })
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+      })
+
+      // THE COMMITTED OWNER BROADCAST: a NEW terminal owns the canonical
+      // session (generation 12, a terminal id this pane never held).
+      act(() => {
+        store.dispatch(applyRuntimeOwner(runtimeOwnerFrame({
+          generation: 12,
+          terminalId: 't-new-authoritative',
+          ownerKind: 'terminal',
+          transition: 'handoff-committed',
+        })))
+      })
+
+      // THE CONVERGENCE: the pane adopts the authoritative terminal id and
+      // re-fires into the attach branch (the fold sets terminalId +
+      // status running + the reconcileEpoch bump).
+      await waitFor(() => {
+        const leaf = store.getState().panes.layouts['tab-b8ke']
+        expect(leaf?.type === 'leaf' && leaf.content.kind === 'terminal'
+          ? leaf.content.terminalId : undefined).toBe('t-new-authoritative')
+      })
+      await waitFor(() => {
+        const leaf = store.getState().panes.layouts['tab-b8ke']
+        expect(leaf?.type === 'leaf' && leaf.content.kind === 'terminal'
+          ? leaf.content.status : undefined).toBe('running')
+      })
+      // The attach was DRIVEN onto the new runtime (the same-mode
+      // multi-device attachment the convergence requires).
+      await waitFor(() => {
+        const attach = sentMessages().find((msg) => msg?.type === 'terminal.attach'
+          && msg.terminalId === 't-new-authoritative')
+        expect(attach).toBeTruthy()
+      })
+    })
+
+    it('b8ke ext r11 F2: a still-RUNNING pane is never stolen off its own terminal by a committed same-kind owner', async () => {
+      const { store } = setupTypedPane({
+        content: {
+          status: 'running',
+          terminalId: 't-mine-still-live',
+          sessionRef: { provider: 'codex', sessionId: TYPED_SESSION_ID },
+        },
+      })
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+      })
+
+      act(() => {
+        store.dispatch(applyRuntimeOwner(runtimeOwnerFrame({
+          generation: 12,
+          terminalId: 't-other-device',
+          ownerKind: 'terminal',
+          transition: 'handoff-committed',
+        })))
+      })
+
+      // No adoption: the pane keeps its own live terminal.
+      const leaf = store.getState().panes.layouts['tab-b8ke']
+      const content = leaf?.type === 'leaf' ? leaf.content : undefined
+      expect(content?.kind === 'terminal' ? content.terminalId : undefined)
+        .toBe('t-mine-still-live')
+      expect(sentMessages().some((msg) => msg?.type === 'terminal.attach'
+        && msg.terminalId === 't-other-device')).toBe(false)
+    })
+
+
     it('a terminal pane whose session is fresh-agent-owned renders the recovery card with a direct open action', async () => {
       const { store } = setupTypedPane({
         content: {
