@@ -3497,6 +3497,55 @@ async fn a_post_clear_user_initiated_handoff_proceeds_fresh() {
     rig.registry.kill(&terminal_id);
 }
 
+/// b8ke ext r16 F1: the settle-then-reap confirmation PROPAGATES the
+/// kill-and-confirm result — a concurrent kill that already removed the
+/// registry row while the recorded PID stays alive (beyond the reap
+/// timeout) must NOT answer Confirmed (pre-r16 the boolean was discarded
+/// and the answer was unconditionally Confirmed, so the watcher released
+/// the ownership fence and another writer could start beside the
+/// abandoned target). The unconfirmed outcome keeps the typed fence +
+/// watcher regime armed (ReapAnswer::Lost → the R2-1 fence + the
+/// replacement watcher).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_spawn_settle_reconfirmation_does_not_confirm_a_live_recorded_pid() {
+    let _guard = ENV_LOCK.lock().await;
+    let rig = build_rig(None);
+    // A live process this cleanup never owned a row for (the concurrent
+    // kill's shape): the watch's RECORDED pid.
+    let mut child = std::process::Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .expect("spawn the external live process");
+    let live_pid = child.id();
+    assert!(
+        freshell_terminal::registry::pid_alive(live_pid),
+        "fixture: the external pid is alive"
+    );
+
+    let watch = crate::terminal_tabs::HandoffSpawnWatch::new_with_before_publish(None, None);
+    watch.publish_and_settle_for_test("t-ghost-row-removed", Some(live_pid));
+
+    let runner = std::sync::Arc::clone(&rig.runner);
+    let answer = runner
+        .spawn_settle_reconfirmation("claude", "ses-r16-f1-ghost", watch)
+        .await;
+
+    // THE CONTRACT: the live recorded pid is NOT a confirmed death — the
+    // answer must keep the fence + watcher regime armed (Lost), never
+    // Confirmed.
+    assert!(
+        matches!(answer, crate::session_handoff::ReapAnswer::Lost),
+        "a live recorded pid must NOT answer Confirmed — got {answer:?}"
+    );
+    assert!(
+        freshell_terminal::registry::pid_alive(live_pid),
+        "the pid still lives (the fixture never died)"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// b8ke ext r13 F7: the row-removed-but-pid-alive window reports
 /// UNCONFIRMED, not Confirmed. The registry removes a row BEFORE its
 /// blocking PTY kill completes, so a concurrent kill can leave the target

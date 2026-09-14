@@ -1035,6 +1035,17 @@ impl HandoffSpawnWatch {
         }
     }
 
+    /// TEST SEAM (b8ke ext r16 F1): publish a terminal + its recorded PID
+    /// and mark the settle finished — the crafted-watch shape the
+    /// reconfirmation tests drive (an external live pid over a registry
+    /// row a concurrent kill already removed). Never call from production
+    /// code.
+    #[doc(hidden)]
+    pub fn publish_and_settle_for_test(&self, terminal_id: &str, pid: Option<u32>) {
+        self.publish(terminal_id, pid);
+        self.settle_finished();
+    }
+
     /// TEST KNOB (b8ke ext r10 F3): shrink the cleanup's bounded
     /// settle-wait budget so the timeout's fail-closed path is
     /// deterministic. Never call from production code.

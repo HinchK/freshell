@@ -222,6 +222,7 @@ impl std::fmt::Debug for StopResult {
 /// cannot confirm the descendant tree (R2-3: fences, never releases);
 /// `Lost` — the confirmation future itself failed (R2-1: fences with the
 /// typed WatcherFailed reason and spawns the replacement probe).
+#[derive(Debug)]
 pub(crate) enum ReapAnswer {
     Confirmed,
     PlatformLimited,
@@ -2324,18 +2325,31 @@ impl SessionHandoffRunner {
             // HOLD until the spawn settles — publishes or dies (unbounded:
             // an unsettled spawn means the target's state is unconfirmed).
             watch.wait_settled_unbounded().await;
+            // b8ke ext r16 F1: the confirmation boolean PROPAGATES —
+            // Confirmed only when every reaped target's death was
+            // actually confirmed (the recorded PID's OS-level death). An
+            // unconfirmed outcome answers Lost, keeping the typed fence +
+            // the replacement-watcher regime armed (pre-r16 the boolean
+            // was discarded and the answer was unconditionally Confirmed,
+            // so a concurrent kill that removed the row while the
+            // recorded PID stayed alive released the fence and licensed
+            // another writer beside the abandoned target).
+            let mut all_confirmed = true;
             if let Some(terminal_id) = watch.published_terminal() {
                 // b8ke ext r13 F7: the watch's RECORDED PID (captured at
                 // publication) is the death evidence — the row's absence
                 // is not.
                 let recorded_pid = watch.published_pid();
-                let _ = kill_and_confirm_terminal_pid(
+                if !kill_and_confirm_terminal_pid(
                     &registry,
                     &terminal_id,
                     recorded_pid,
                     reap_timeout_ms,
                 )
-                .await;
+                .await
+                {
+                    all_confirmed = false;
+                }
             }
             // The registry sessionRef sweep backstop (the cleanup arm's
             // same provider-matched join — an opaque-id collision across
@@ -2343,17 +2357,28 @@ impl SessionHandoffRunner {
             for entry in registry.directory() {
                 if entry.mode == provider.as_str()
                     && entry.resume_session_id.as_deref() == Some(session_id.as_str())
-                {
-                    let _ = kill_and_confirm_terminal_pid(
+                    && !kill_and_confirm_terminal_pid(
                         &registry,
                         &entry.terminal_id,
                         registry.pid_of(&entry.terminal_id),
                         reap_timeout_ms,
                     )
-                    .await;
+                    .await
+                {
+                    all_confirmed = false;
                 }
             }
-            ReapAnswer::Confirmed
+            if all_confirmed {
+                ReapAnswer::Confirmed
+            } else {
+                tracing::error!(target: "invariant",
+                    provider = %provider, session_id = %session_id,
+                    "spawn_settle_reconfirmation_unconfirmed: the recorded target \
+                     PID outlived the reap budget — the fence STAYS (the typed \
+                     WatcherFailed regime + the replacement watcher own the resolution)"
+                );
+                ReapAnswer::Lost
+            }
         }
     }
 
