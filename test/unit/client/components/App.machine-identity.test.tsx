@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import App from '@/App'
@@ -13,7 +13,12 @@ import terminalMetaReducer from '@/store/terminalMetaSlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import machineIdentityReducer from '@/store/machineIdentitySlice'
 import { networkReducer } from '@/store/networkSlice'
-import { MACHINE_ID_STORAGE_KEY, type Machine } from '@/lib/machine-identity'
+import {
+  MACHINE_ID_STORAGE_KEY,
+  consumeActiveMachineSelectionMark,
+  markActiveMachineSelection,
+  type Machine,
+} from '@/lib/machine-identity'
 import {
   composeResolvedSettings,
   createDefaultServerSettings,
@@ -150,6 +155,7 @@ function createStore() {
 describe('App machine identity bootstrap', () => {
   beforeEach(() => {
     localStorage.clear()
+    sessionStorage.clear()
     cleanup()
     vi.clearAllMocks()
     mocks.onMessage.mockReturnValue(() => {})
@@ -174,6 +180,7 @@ describe('App machine identity bootstrap', () => {
   afterEach(() => {
     cleanup()
     localStorage.clear()
+    sessionStorage.clear()
   })
 
   it('holds hello and tab sync behind the explicit chooser for a fresh browser with existing machines', async () => {
@@ -188,6 +195,19 @@ describe('App machine identity bootstrap', () => {
     expect(mocks.startTabRegistrySync).not.toHaveBeenCalled()
     expect(mocks.setHelloExtensionProvider).not.toHaveBeenCalled()
     expect(mocks.connect).not.toHaveBeenCalled()
+
+    // The pick handler arms the one-shot active-selection marker. jsdom's
+    // reload is a navigation no-op that logs "Not implemented" via
+    // console.error, so allow that one notice for this test; without the
+    // arming, a chooser-picked machine would lose the non-recoverable clear
+    // on the reload it triggers and keep a foreign machine's stale cache.
+    ;(globalThis as unknown as { __ALLOW_CONSOLE_ERROR__?: boolean }).__ALLOW_CONSOLE_ERROR__ = true
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: new RegExp(`Use ${MACHINE.label}`) }))
+    })
+    expect(mocks.restoreMachineWorkspace).not.toHaveBeenCalled()
+    expect(consumeActiveMachineSelectionMark()).toBe(true)
+    expect(localStorage.getItem(MACHINE_ID_STORAGE_KEY)).toBe(MACHINE.id)
   })
 
   it('does not auto-create a machine after its bootstrap is cancelled', async () => {
@@ -223,6 +243,8 @@ describe('App machine identity bootstrap', () => {
     // natural reload (no active chooser pick) must keep a non-recoverable
     // local layout — the reload-wipe fix's core wiring.
     expect(mocks.restoreMachineWorkspace).toHaveBeenCalledWith(store, MACHINE.id, { activeSelection: false })
+    // The marker was consumed (one-shot): nothing stays armed for later boots.
+    expect(consumeActiveMachineSelectionMark()).toBe(false)
     expect(mocks.restoreMachineWorkspace.mock.invocationCallOrder[0]).toBeLessThan(
       mocks.startTabRegistrySync.mock.invocationCallOrder[0],
     )
@@ -236,5 +258,27 @@ describe('App machine identity bootstrap', () => {
       deviceId: MACHINE.id,
       clientInstanceId: 'window-identity-test',
     })
+  })
+
+  it('re-arms the active-selection marker when the restore fails, so the retry still treats the machine as actively chosen', async () => {
+    // The transient-failure path: an armed marker (a chooser pick booted
+    // into a failing inventory request) must be re-armed on the restore
+    // error — otherwise the app's reload action would retry with
+    // activeSelection:false and keep a foreign machine's stale local cache
+    // over the machine the user just chose.
+    markActiveMachineSelection()
+    localStorage.setItem(MACHINE_ID_STORAGE_KEY, MACHINE.id)
+    mocks.getMachines.mockResolvedValue([MACHINE])
+    mocks.restoreMachineWorkspace.mockRejectedValueOnce(new Error('inventory unavailable'))
+    const store = createStore()
+
+    render(<Provider store={store}><App /></Provider>)
+
+    await waitFor(() => expect(mocks.restoreMachineWorkspace).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(store.getState().machineIdentity?.status).toBe('error'))
+    expect(mocks.startTabRegistrySync).not.toHaveBeenCalled()
+    // Re-armed for the retry — consumed exactly once by the next boot.
+    expect(consumeActiveMachineSelectionMark()).toBe(true)
+    expect(consumeActiveMachineSelectionMark()).toBe(false)
   })
 })

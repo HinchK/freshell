@@ -835,12 +835,20 @@ export default function App() {
             deviceId: resolution.machine.id,
             deviceLabel: resolution.machine.label,
           }))
-          await restoreMachineWorkspace(appStore, resolution.machine.id, {
-            // Consume the chooser's one-shot marker: an ACTIVE machine choice
-            // keeps the non-recoverable clear (foreign cache); a natural
-            // reload of a remembered selection keeps the rehydrated layout.
-            activeSelection: consumeActiveMachineSelectionMark(),
-          })
+          // Consume the chooser's one-shot marker: an ACTIVE machine choice
+          // keeps the non-recoverable clear (foreign cache); a natural
+          // reload of a remembered selection keeps the rehydrated layout.
+          // If the restore fails (e.g. a transient inventory request), the
+          // app offers a reload — re-arm the marker so the RETRY still knows
+          // the machine was actively chosen and never falls back to the
+          // keep-local path over a foreign machine's stale cache.
+          const activeSelection = consumeActiveMachineSelectionMark()
+          try {
+            await restoreMachineWorkspace(appStore, resolution.machine.id, { activeSelection })
+          } catch (restoreError) {
+            if (activeSelection) markActiveMachineSelection()
+            throw restoreError
+          }
           if (cancelled) return false
           dispatch(setMachineReady({ machine: resolution.machine, mode: 'server-managed' }))
           return true
