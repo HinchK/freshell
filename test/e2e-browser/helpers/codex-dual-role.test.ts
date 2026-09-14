@@ -25,7 +25,12 @@ const TERMINAL_MARKER = 'DUAL_ROLE_TERMINAL_RAN'
 interface ShimProcess {
   child: ChildProcess
   stdout: string[]
-  exited: Promise<number | null>
+  exited: Promise<ExitOutcome>
+}
+
+interface ExitOutcome {
+  code: number | null
+  signal: NodeJS.Signals | null
 }
 
 async function writeTerminalFake(binDir: string): Promise<string> {
@@ -37,47 +42,46 @@ async function writeTerminalFake(binDir: string): Promise<string> {
 function spawnShim(binPath: string, args: string[], env?: NodeJS.ProcessEnv): ShimProcess {
   const stdout: string[] = []
   const child = spawn(binPath, args, { stdio: ['ignore', 'pipe', 'pipe'], env })
-  const exited = new Promise<number | null>((resolve) => child.once('exit', resolve))
+  const exited = new Promise<ExitOutcome>((resolve, reject) => {
+    child.once('error', reject)
+    child.once('exit', (code, signal) => resolve({ code, signal }))
+  })
   child.stdout?.on('data', (d) => stdout.push(String(d)))
   return { child, stdout, exited }
 }
 
-async function waitExit(shim: ShimProcess, timeoutMs: number): Promise<number | null> {
-  return await new Promise((resolve) => {
-    const timer = setTimeout(() => resolve(null), timeoutMs)
-    void shim.exited.then((code) => {
+async function waitExit(shim: ShimProcess, timeoutMs: number): Promise<ExitOutcome | undefined> {
+  return await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => resolve(undefined), timeoutMs)
+    void shim.exited.then((outcome) => {
       clearTimeout(timer)
-      resolve(code)
+      resolve(outcome)
+    }, (error) => {
+      clearTimeout(timer)
+      reject(error)
     })
   })
 }
 
-async function didExit(shim: ShimProcess, timeoutMs: number): Promise<boolean> {
-  return await new Promise((resolve) => {
-    const timer = setTimeout(() => resolve(false), timeoutMs)
-    void shim.exited.then(() => {
-      clearTimeout(timer)
-      resolve(true)
-    })
-  })
-}
+async function stopShim(shim: ShimProcess): Promise<ExitOutcome> {
+  if (shim.child.exitCode !== null || shim.child.signalCode !== null) {
+    return await shim.exited
+  }
+  const pid = shim.child.pid ?? 'unknown'
+  if (!shim.child.kill('SIGTERM')) {
+    throw new Error(`dual-role shim PID ${pid} could not receive SIGTERM`)
+  }
+  const gracefulExit = await waitExit(shim, 2_500)
+  if (gracefulExit) return gracefulExit
 
-async function stopShim(shim: ShimProcess): Promise<void> {
-  if (shim.child.exitCode !== null || shim.child.signalCode !== null) return
-  try {
-    shim.child.kill('SIGTERM')
-  } catch {
-    return
+  if (!shim.child.kill('SIGKILL')) {
+    throw new Error(`dual-role shim PID ${pid} could not receive SIGKILL`)
   }
-  if (await didExit(shim, 2_500)) return
-  try {
-    shim.child.kill('SIGKILL')
-  } catch {
-    return
+  const forcedExit = await waitExit(shim, 2_500)
+  if (!forcedExit) {
+    throw new Error(`dual-role shim PID ${pid} did not exit after SIGKILL`)
   }
-  if (!(await didExit(shim, 2_500))) {
-    throw new Error(`dual-role shim PID ${shim.child.pid ?? 'unknown'} did not exit after SIGKILL`)
-  }
+  return forcedExit
 }
 
 function directChildPids(pid: number): number[] {
@@ -137,6 +141,38 @@ async function canBindLoopbackPort(port: number): Promise<boolean> {
   })
 }
 
+async function canConnectLoopbackPort(port: number, timeoutMs: number): Promise<boolean> {
+  return await new Promise((resolve) => {
+    const socket = net.createConnection({ host: '127.0.0.1', port })
+    let settled = false
+    const finish = (connected: boolean) => {
+      if (settled) return
+      settled = true
+      socket.destroy()
+      resolve(connected)
+    }
+    socket.once('connect', () => finish(true))
+    socket.once('error', () => finish(false))
+    socket.setTimeout(timeoutMs, () => finish(false))
+  })
+}
+
+async function waitForAppServerReady(shim: ShimProcess, port: number, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const remaining = Math.max(1, deadline - Date.now())
+    const result = await Promise.race([
+      shim.exited.then((outcome) => ({ kind: 'exit' as const, outcome })),
+      canConnectLoopbackPort(port, Math.min(250, remaining)).then((connected) => ({ kind: 'connect' as const, connected })),
+    ])
+    if (result.kind === 'exit') {
+      throw new Error(`dual-role app-server exited before accepting transport connections (${result.outcome.signal ?? result.outcome.code ?? 'unknown'})`)
+    }
+    if (result.connected) return
+  }
+  throw new Error(`dual-role app-server did not accept a transport connection within ${timeoutMs}ms`)
+}
+
 describe('codex-dual-role shim', () => {
   it('preserves the test failure while attempting every cleanup step', async () => {
     const primary = new Error('primary test failure')
@@ -170,6 +206,45 @@ describe('codex-dual-role shim', () => {
     expect((thrown as AggregateError).errors).toEqual([primary, firstCleanup, secondCleanup])
   })
 
+  it('surfaces cleanup failures after a successful test body and still attempts every step', async () => {
+    const firstCleanup = new Error('first cleanup failure')
+    const secondCleanup = new Error('second cleanup failure')
+    const attempted: string[] = []
+    let thrown: unknown
+
+    try {
+      await withCleanup(
+        async () => 'body result',
+        [
+          async () => {
+            attempted.push('first')
+            throw firstCleanup
+          },
+          async () => {
+            attempted.push('second')
+            throw secondCleanup
+          },
+        ],
+      )
+    } catch (error) {
+      thrown = error
+    }
+
+    expect(attempted).toEqual(['first', 'second'])
+    expect(thrown).toBeInstanceOf(AggregateError)
+    expect((thrown as AggregateError).errors).toEqual([firstCleanup, secondCleanup])
+  })
+
+  it('rejects lifecycle waits when spawning the shim itself fails', async () => {
+    const binDir = await fs.mkdtemp(path.join(os.tmpdir(), 'dual-role-spawn-error-'))
+    try {
+      const shim = spawnShim(path.join(binDir, 'missing-codex'), [])
+      await expect(waitExit(shim, 1_000)).rejects.toThrow()
+    } finally {
+      await fs.rm(binDir, { recursive: true, force: true })
+    }
+  })
+
   it('runs the terminal fake for plain argv', async () => {
     const binDir = await fs.mkdtemp(path.join(os.tmpdir(), 'dual-role-'))
     try {
@@ -178,9 +253,8 @@ describe('codex-dual-role shim', () => {
       expect(bin).toBe(path.join(binDir, 'codex'))
 
       const shim = spawnShim(bin, [])
-      const code = await waitExit(shim, 10_000)
-      expect(code).not.toBeNull()
-      expect(code).toBe(0)
+      const exit = await waitExit(shim, 10_000)
+      expect(exit?.code).toBe(0)
       await waitUntil(2_000, () => shim.stdout.join('').includes(TERMINAL_MARKER))
     } finally {
       await fs.rm(binDir, { recursive: true, force: true })
@@ -198,7 +272,7 @@ describe('codex-dual-role shim', () => {
       // A listening sidecar survives its whole lifetime — it does NOT exit 0
       // instantly the way a terminal-only fake does when stdin is /dev/null.
       const earlyExit = await waitExit(shim, 3_000)
-      expect(earlyExit).toBeNull()
+      expect(earlyExit).toBeUndefined()
       // And it never confused itself for the terminal fake.
       await new Promise((r) => setTimeout(r, 100))
       expect(shim.stdout.join('')).not.toContain(TERMINAL_MARKER)
@@ -221,8 +295,8 @@ describe('codex-dual-role shim', () => {
         DUAL_ROLE_TEST_ENV: 'env-carry-1',
       })
       const shim = spawnShim(bin, [])
-      const code = await waitExit(shim, 10_000)
-      expect(code).toBe(0)
+      const exit = await waitExit(shim, 10_000)
+      expect(exit?.code).toBe(0)
       await waitUntil(2_000, () => shim.stdout.join('').includes('env=env-carry-1'))
     } finally {
       await fs.rm(binDir, { recursive: true, force: true })
@@ -241,10 +315,10 @@ describe('codex-dual-role shim', () => {
       const bin = await installDualRoleCodexCli(binDir, terminalSrc)
 
       shim = spawnShim(bin, ['-c', 'features.apps=false', 'app-server', '--listen', 'ws://127.0.0.1:0'])
-      const code = await waitExit(shim, 10_000)
+      const exit = await waitExit(shim, 10_000)
       // Terminal fake must NOT have run.
       expect(shim.stdout.join('')).not.toContain(TERMINAL_MARKER)
-      expect(code).toBeNull()
+      expect(exit).toBeUndefined()
     }, [
       async () => { if (shim) await stopShim(shim) },
       () => fs.rm(binDir, { recursive: true, force: true }),
@@ -259,10 +333,7 @@ describe('codex-dual-role shim', () => {
     const shim = spawnShim(bin, ['-c', 'features.apps=false', 'app-server', '--listen', `ws://127.0.0.1:${port}`])
 
     await withCleanup(async () => {
-      await waitUntil(5_000, () => {
-        return shim.child.exitCode === null
-      })
-      await waitUntil(5_000, async () => !(await canBindLoopbackPort(port)))
+      await waitForAppServerReady(shim, port, 5_000)
 
       await stopShim(shim)
       expect(await canBindLoopbackPort(port)).toBe(true)
@@ -280,7 +351,7 @@ describe('codex-dual-role shim', () => {
     const shim = spawnShim(bin, ['-c', 'features.apps=false', 'app-server', '--listen', `ws://127.0.0.1:${port}`])
 
     await withCleanup(async () => {
-      await waitUntil(5_000, async () => !(await canBindLoopbackPort(port)))
+      await waitForAppServerReady(shim, port, 5_000)
       expect(directChildPids(shim.child.pid ?? -1)).toEqual([])
     }, [
       () => stopShim(shim),
@@ -300,12 +371,11 @@ describe('codex-dual-role shim', () => {
     )
 
     await withCleanup(async () => {
-      await waitUntil(5_000, () => {
-        return shim.child.exitCode === null
-      })
-      await waitUntil(5_000, async () => !(await canBindLoopbackPort(port)))
+      await waitForAppServerReady(shim, port, 5_000)
 
-      await stopShim(shim)
+      const exit = await stopShim(shim)
+      expect(exit.signal).toBe('SIGKILL')
+      expect(shim.child.signalCode).toBe('SIGKILL')
       expect(await canBindLoopbackPort(port)).toBe(true)
     }, [
       () => stopShim(shim),
