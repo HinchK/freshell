@@ -120,7 +120,7 @@ Rust — add snapshot reads inside the three real-handler op-sequence tests, eac
 
 - `opencode_ws.rs` `handle_rollback_after_a_resend_starts_a_new_epoch_and_redo_still_works` (~11783): immediately after the second undo's existing record asserts (the test already loads `let record = st_sink.load_rollback(PROVIDER, "ses_real").expect("record")` and asserts bucket `[msg_u3,msg_a3,msg_u4,msg_a4]`, epochs `[0,1]`, `can_redo()` true — around ~11818-11840) and BEFORE the redo leg, mirror the neighboring `compact_retires_redo_...` test's direct call (~8599): `crate::build_opencode_snapshot_json("ses_real", &json!({ "id": "ses_real", "time": { "updated": 5 } }), &json!([]), Some(&record))` — the builder is crate-callable and the neighboring test in this very file asserts `snap["rollback"]` through it. Assert: the epoch-0 rows msg_u3/msg_a3 carry `restorable == json!(false)`; the epoch-1 rows msg_u4/msg_a4 carry `restorable == json!(true)`; `snap["rollback"]["redoableTurnIds"] == json!(["msg_u4"])`.
 - `claude.rs` `handle_rollback_after_a_resend_re_roots_the_chain_and_redo_restores_the_new_epoch` (~14736): after the second undo's record asserts (entries union [u2,a2]+[uq,aq], epochs `[0,1]` — around ~14828-14884) and BEFORE the redo leg, call `crate::claude_snapshot::get_claude_snapshot(<session_type>, <thread_id>, Some(&record)).await` (`pub(crate) async fn`, claude_snapshot.rs:1117 — the test's staged `CLAUDE_CONFIG_DIR` transcripts make `locate_transcript` resolve) and assert: u2/a2 `restorable == false`; uq/aq `restorable == true`.
-- `codex.rs` `handle_rollback_undo_send_undo_undo_freezes_epoch_zero_and_orders_the_new_epoch_ascending` (~12764): at the test's tail (after the existing entries asserts ~12853-12868), call `st.get_snapshot(<thread_id>, <cwd>).await` (`pub async fn`, codex.rs:4127 — the neighboring snapshot test's exact call) and assert: EVERY bucket turn `restorable == false` and `rollback.canRedo == false` (codex can never be restorable).
+- `codex.rs` `handle_rollback_undo_send_undo_undo_freezes_epoch_zero_and_orders_the_new_epoch_ascending` (~12764): at the test's tail (after the existing entries asserts ~12853-12868), mirror the `codex_snapshot_stamps_paginated_capabilities_the_marker_bucket_and_the_revision_floor` test's DIRECT `build_codex_snapshot_json` call (~17412, same-file `mod tests` so the file-private builder is callable) with this test's loaded record, and assert: EVERY bucket turn `restorable == false` and `rollback.canRedo == false` (codex can never be restorable). Do NOT call `st.get_snapshot(...).await` inline in this test — it sends `thread/read` to the fake sidecar and awaits a response this single-task test cannot service (the neighboring snapshot test at ~17502-17520 spawns the call and services `peer` concurrently; this handler test has no background responder, so an inline await would hang the gate).
 
 TS — in `test/unit/shared/fresh-agent-contract.test.ts`, in the `rollback surface (kata 1wxv)` describe block (~115-179), add alongside the existing `rolledBack` legs (~129-134; follow the block's inline-literal fixture style seen at 129-146):
 
@@ -271,16 +271,17 @@ git commit -m "feat(fresh-agent): stamp per-marker restorable on the rollback sn
 
 **Files:**
 - Modify: `src/components/fresh-agent/FreshAgentTranscript.tsx` (props/state ~891-955; the rolled-back section render ~1153-1182)
+- Modify: `src/components/fresh-agent/FreshAgentView.tsx:2945` (ONE line: pass `sessionId={snapshot?.sessionId}` to the transcript — the disclosure state is conversation-scoped; without it the toggle would leak across a same-pane conversation switch, since PaneContainer keys the view by paneId only and `startNewConversation` clears the snapshot without remounting)
 - Test: `test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx` (rolled-back describe block ~2596-2707)
 - Test: `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx` (rollback dispatch describe ~7507-7546; plus one NEW codex test)
-- No changes to `FreshAgentView.tsx` (the snapshot flows to the transcript untouched — verified) or `src/lib/fresh-agent-rollback.ts` (pinned copy stays verbatim).
+- No changes to `src/lib/fresh-agent-rollback.ts` (pinned copy stays verbatim).
 
 **Interfaces:**
-- Consumes: Task 1's per-turn `restorable?: boolean | undefined` on `FreshAgentTurn` (absent ⇒ historical).
+- Consumes: Task 1's per-turn `restorable?: boolean | undefined` on `FreshAgentTurn` (absent ⇒ historical); the pane's current session id (`FreshAgentView` already holds it on the snapshot — `snapshot?.sessionId`).
 - Produces (pinned presentation contract consumed by Task 3's e2e):
   - Region: the existing `<section aria-label="Rolled back turns">` renders whenever the bucket is non-empty, in BOTH presentations.
   - Expanded group (restorable rows): header copy `Rolled back ({restorableUserSteps}) — gone from the conversation; redo to restore.`; row markup unchanged (`div.flex.items-start` class, "rolled back" badge, summary text); per-row redo button gate unchanged (`canRedo && onRedoToTurn && role === 'user' && redoableTurnIdSet?.has(...)`).
-  - Historical group: a semantic `<button type="button">` disclosure line — visible text `Rolled back ({historicalUserSteps}) — kept in history`, `aria-expanded={historyExpanded}`, `aria-label="Toggle rolled-back history"`, `ChevronRight` rotating 90° when expanded (repo disclosure idiom, `FreshAgentItemCard.tsx:64-114`); expanded body reveals the historical rows with the same row markup and NO redo button. Default `historyExpanded = false`. Non-dismissible.
+  - Historical group: a semantic `<button type="button">` disclosure line — visible text `Rolled back ({historicalUserSteps}) — kept in history`, `aria-expanded={historyExpanded}`, `aria-label="Toggle rolled-back history"`, `ChevronRight` rotating 90° when expanded (repo disclosure idiom, `FreshAgentItemCard.tsx:64-114`); expanded body reveals the historical rows with the same row markup and NO redo button. Default collapsed; NON-dismissible; conversation-scoped — the toggle state resets to collapsed whenever the pane's session id changes (a new conversation in the same pane, or a session restore, starts collapsed; within one conversation the user's expansion persists).
   - Counts are user-role step counts per group; the all-time union count is NEVER rendered.
 
 - [ ] **Step 1: Write the failing tests**
@@ -300,6 +301,7 @@ Rework and extend `test/unit/client/components/fresh-agent/FreshAgentView.test.t
 8. Rework `the view passes the snapshot redoableTurnIds through to the marker section (frozen markers hidden, current-epoch marker enabled)` (~7507-7529): in the `rollbackCapableSnapshot` fixture, stamp ONLY the current-epoch marker row (u9, `current marker`) `restorable: true`, leave the frozen u8/a8 rows unstamped. Replace the `screen.getByText('frozen marker')` visibility wait with a wait on `'current marker'` visible. Assert: exactly 1 `Redo to here` button in the row containing `'current marker'`; the disclosure line `Rolled back (1) — kept in history` is present; clicking it reveals `'frozen marker'` with no button.
 9. Rework `legacy: a rollback block WITHOUT redoableTurnIds offers no per-marker redo` (~7531-7546): no `restorable` anywhere in the fixture. Re-target the `'rolled prompt'` wait: the collapsed history line renders; after expanding it, `'rolled prompt'` is visible; zero `Redo to here` buttons; region still present.
 10. NEW `a freshcodex pane renders its markers collapsed from birth (undo-only provider)`: a codex snapshot with `capabilities: { undo: true, redo: false }`, `rollback: { canRedo: false, undoneDepth: 1 }`, and one marker row stamped `restorable: false` (the server's codex shape from Task 1). Assert: the collapsed history line renders with `Rolled back (1) — kept in history`; zero `Redo to here` buttons; expanding reveals the row. (Model the harness on the existing freshcodex view test at ~7779-7813.)
+11. NEW `the disclosure toggle resets when the pane switches conversations (same component, new session)`: render the transcript with `sessionId='ses-a'` and historical markers; expand the disclosure (rows visible). Re-render with `sessionId='ses-b'` and different historical markers (same component instance — no unmount). Assert: the disclosure is collapsed again (`aria-expanded: false`, rows hidden); toggling works per conversation. This is the leak regression pin — PaneContainer keys the view by `paneId` only and `startNewConversation` swaps the snapshot without remounting the transcript.
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
@@ -315,13 +317,24 @@ Expected: FAIL — the reworked/re-targeted assertions fail for the same reason 
 
 In `src/components/fresh-agent/FreshAgentTranscript.tsx`:
 
-(a) Beside the existing local states (~946-949) add:
+(a) Add the optional prop `sessionId?: string` to `FreshAgentTranscriptProps` (the conversation identity the disclosure state scopes to), and beside the existing local states (~946-949) add the conversation-scoped toggle:
 
 ```tsx
   // Rolled-back section lifecycle: historical (non-restorable) markers render
-  // behind a quiet disclosure line; the toggle is ephemeral view state (like
-  // atBottom/sheetTurn) — placement itself is a pure function of the snapshot.
-  const [historyExpanded, setHistoryExpanded] = useState(false)
+  // behind a quiet disclosure line. The toggle is ephemeral view state SCOPED
+  // TO THE CONVERSATION — a different sessionId (a new conversation started
+  // in the same pane, or a session restore) re-collapses it, so the
+  // disclosure never leaks across conversations. Pure derivation, no effect,
+  // no timer; placement itself is a pure function of the snapshot.
+  const [historyToggle, setHistoryToggle] = useState<{ sessionId: string | null; expanded: boolean }>({ sessionId: null, expanded: false })
+  const historyExpanded = historyToggle.sessionId === (sessionId ?? null) ? historyToggle.expanded : false
+  const toggleHistory = () => setHistoryToggle({ sessionId: sessionId ?? null, expanded: !historyExpanded })
+```
+
+In `src/components/fresh-agent/FreshAgentView.tsx` (~2945), pass the conversation identity through — the ONE-LINE view change this task makes:
+
+```tsx
+              sessionId={snapshot?.sessionId}
 ```
 
 (b) After the `redoableTurnIdSet` memo (~951-955) add the split and counts:
@@ -355,7 +368,7 @@ In `src/components/fresh-agent/FreshAgentTranscript.tsx`:
               <div>
                 <button
                   type="button"
-                  onClick={() => setHistoryExpanded((value) => !value)}
+                  onClick={() => toggleHistory()}
                   className="flex w-full items-center gap-2 rounded px-1 py-0.5 text-left text-xs font-medium text-muted-foreground transition-colors hover:bg-accent/50"
                   aria-expanded={historyExpanded}
                   aria-label="Toggle rolled-back history"
