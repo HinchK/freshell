@@ -1018,10 +1018,6 @@ impl AutoResumeDriver for WsAutoResumeDriver {
                                  (fail-closed)"
                             );
                         } else {
-                            eprintln!(
-                                "DIAG: re-claiming, key state = {:?}",
-                                ownership.observe(&provider, &session_id).state
-                            );
                             match freshell_freshagent::ownership_lane::begin_terminal_lane_claim(
                                 &state.ownership,
                                 &provider,
