@@ -45,6 +45,12 @@ pub struct HandoffTestHooks {
     /// abort-test hold). The runner embeds this into the `HandoffSpawnWatch`
     /// it hands the settle.
     pub pause_in_target_spawn: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// b8ke ext r10 F3: park the under-ticket terminal-target settle
+    /// BEFORE its publication point — the reviewer's exact pre-publication
+    /// abort window (the cleanup's bounded settle-wait times out with
+    /// nothing published). The runner embeds this into the
+    /// `HandoffSpawnWatch` it hands the settle.
+    pub pause_in_target_spawn_before_publish: Option<std::sync::Arc<tokio::sync::Notify>>,
     /// The runner deposits the terminal-target spawn watch here at
     /// `start_target` entry, so a test can observe the settle's publication
     /// deterministically.
@@ -109,6 +115,7 @@ impl Default for HandoffTestHooks {
             pause_after_enter: None,
             pause_after_terminal_prior_kill: None,
             pause_in_target_spawn: None,
+            pause_in_target_spawn_before_publish: None,
             spawn_watch_slot: std::sync::Mutex::new(None),
             force_reap_timeout: std::sync::atomic::AtomicBool::new(false),
             force_reap_timeout_fenced: std::sync::atomic::AtomicBool::new(false),
@@ -1044,10 +1051,13 @@ impl SessionHandoffRunner {
         // reap) the terminal it publishes.
         let mut target_spawn_watch = None;
         if req.target_kind == RuntimeOwnerKind::Terminal {
-            let watch = crate::terminal_tabs::HandoffSpawnWatch::new(
+            let watch = crate::terminal_tabs::HandoffSpawnWatch::new_with_before_publish(
                 self.test_hooks
                     .as_ref()
                     .and_then(|hooks| hooks.pause_in_target_spawn.clone()),
+                self.test_hooks
+                    .as_ref()
+                    .and_then(|hooks| hooks.pause_in_target_spawn_before_publish.clone()),
             );
             if let Some(hooks) = self.test_hooks.as_ref() {
                 *hooks.spawn_watch_slot.lock().expect("spawn watch slot") = Some(watch.clone());
@@ -2241,6 +2251,7 @@ impl SessionHandoffRunner {
             generation,
             target_kind,
             target,
+            spawn_watch,
             ..
         } = payload;
         let probe_target = target.clone().unwrap_or_else(|| OwnerIdentity {
@@ -2251,7 +2262,28 @@ impl SessionHandoffRunner {
             ownership_id: None,
         });
         let cleanup_req = self.cleanup_request(provider, session_id, *target_kind);
-        let confirmation = self.prior_death_reconfirmation(provider, session_id, &probe_target);
+        // b8ke ext r10 F3: when the abort left a DETACHED TERMINAL SPAWN
+        // unsettled (the pre-publication window — the cleanup's bounded
+        // settle-wait timed out, so the outcome fenced Unconfirmed), the
+        // confirmation is the SETTLE-THEN-REAP future: await the spawn's
+        // settle (unbounded — the key holds until the spawn publishes or
+        // dies), reap the terminal it published (plus the registry
+        // sessionRef sweep's provider-matched rows), and only the
+        // confirmed death releases the fence. The identity-probing
+        // `prior_death_reconfirmation` cannot resolve this shape (a
+        // pre-publication terminal target has NO terminal id to probe —
+        // its fail-closed loop would hold the fence forever while the
+        // late-published spawn ran on unowned).
+        let confirmation: std::pin::Pin<Box<dyn std::future::Future<Output = ReapAnswer> + Send>> =
+            if target.is_none() && spawn_watch.is_some() {
+                Box::pin(self.spawn_settle_reconfirmation(
+                    provider,
+                    session_id,
+                    spawn_watch.clone().expect("checked Some"),
+                ))
+            } else {
+                Box::pin(self.prior_death_reconfirmation(provider, session_id, &probe_target))
+            };
         self.spawn_reap_confirmation_watcher(
             &cleanup_req,
             operation_id,
@@ -2261,6 +2293,57 @@ impl SessionHandoffRunner {
             "RUNNER_ABORTED",
             confirmation,
         );
+    }
+
+    /// b8ke ext r10 F3: the SETTLE-THEN-REAP confirmation for an aborted
+    /// handoff's detached, unsettled terminal spawn — the fail-closed
+    /// timeout arm's resolution future. Awaits the spawn's settle, reaps
+    /// whatever it published (the published terminal + the registry
+    /// sessionRef sweep's provider-matched rows), and answers Confirmed
+    /// once the published terminal is dead (or the settle finished with
+    /// nothing published — the spawn died pre-publication). Never
+    /// answers while a published terminal may still run: the fence holds
+    /// until the late-published spawn is killed.
+    fn spawn_settle_reconfirmation(
+        self: &Arc<Self>,
+        provider: &str,
+        session_id: &str,
+        watch: crate::terminal_tabs::HandoffSpawnWatch,
+    ) -> impl std::future::Future<Output = ReapAnswer> + Send + 'static {
+        let registry = self.registry.clone();
+        let reap_timeout_ms = self.reap_timeout_ms;
+        let provider = provider.to_string();
+        let session_id = session_id.to_string();
+        async move {
+            // HOLD until the spawn settles — publishes or dies (unbounded:
+            // an unsettled spawn means the target's state is unconfirmed).
+            watch.wait_settled_unbounded().await;
+            if let Some(terminal_id) = watch.published_terminal() {
+                if registry.kill(&terminal_id) {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(reap_timeout_ms),
+                        await_terminal_dead(&registry, &terminal_id),
+                    )
+                    .await;
+                }
+            }
+            // The registry sessionRef sweep backstop (the cleanup arm's
+            // same provider-matched join — an opaque-id collision across
+            // providers must never abort an unrelated terminal).
+            for entry in registry.directory() {
+                if entry.mode == provider.as_str()
+                    && entry.resume_session_id.as_deref() == Some(session_id.as_str())
+                    && registry.kill(&entry.terminal_id)
+                {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(reap_timeout_ms),
+                        await_terminal_dead(&registry, &entry.terminal_id),
+                    )
+                    .await;
+                }
+            }
+            ReapAnswer::Confirmed
+        }
     }
 
     /// Round-3 review I-1: the abort/panic cleanup's target half — reap the
@@ -2355,7 +2438,28 @@ impl SessionHandoffRunner {
             }
         }
         if let Some(watch) = spawn_watch.as_ref() {
-            watch.wait_settled().await;
+            // b8ke ext r10 F3: the bounded settle-wait's result is
+            // CONSUMED — an UNSETTLED spawn means the target's state is
+            // UNCONFIRMED, and the cleanup FAILS CLOSED: the key fences
+            // typed (never release-and-hope) and the replacement
+            // confirmation watcher owns the resolution — it awaits the
+            // spawn's settle (publishes or dies), reaps the terminal it
+            // published, and only a confirmed death releases the fence.
+            // Pre-r10 the timeout was discarded: the cleanup saw no
+            // published terminal, classified NothingToDo, and RELEASED —
+            // the detached spawn could then publish a live unowned writer.
+            if !watch.wait_settled().await {
+                tracing::error!(target: "freshell_ownership",
+                    operation_id = %operation_id, provider = %provider,
+                    session_id = %session_id,
+                    event = "ownership.handoff.abort_target_spawn_settle_unsettle",
+                    "the aborted handoff's detached terminal spawn never settled within \
+                     the cleanup budget — the target's state is unconfirmed; the key \
+                     fences typed (never release-and-hope); the replacement confirmation \
+                     watcher awaits the spawn's settle and reaps what it publishes"
+                );
+                return UncommittedTargetOutcome::Unconfirmed;
+            }
             if let Some(terminal_id) = watch.published_terminal() {
                 self.kill_and_confirm_terminal(&terminal_id).await;
             }

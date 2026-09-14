@@ -988,18 +988,53 @@ struct HandoffSpawnWatchInner {
     /// publication, before the result surfaces — the deterministic
     /// abort-inside-the-window hold.
     pause_before_surface: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// b8ke ext r10 F3 test seam: park the settle BEFORE the publication
+    /// point — the reviewer's exact pre-publication abort window (the
+    /// cleanup's settle wait times out while the spawn has not yet
+    /// published). `None` in production.
+    pause_before_publish: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// b8ke ext r10 F3: the cleanup's bounded settle-wait budget in ms
+    /// (default 60s). A test-visible knob so the timeout's fail-closed
+    /// path is exercisable without wall-clock waits; production never
+    /// touches it.
+    settle_wait_budget_ms: std::sync::atomic::AtomicU64,
+    /// b8ke ext r10 F3 test proof: set the moment the pre-publication park
+    /// engages (the deterministic signal that the settle REACHED the
+    /// reviewer's window before the test aborts).
+    parked_before_publish: std::sync::atomic::AtomicBool,
 }
 
 impl HandoffSpawnWatch {
     pub(crate) fn new(pause_before_surface: Option<std::sync::Arc<tokio::sync::Notify>>) -> Self {
+        Self::new_with_before_publish(pause_before_surface, None)
+    }
+
+    /// [`Self::new`] plus the pre-publication test seam (b8ke ext r10 F3).
+    pub(crate) fn new_with_before_publish(
+        pause_before_surface: Option<std::sync::Arc<tokio::sync::Notify>>,
+        pause_before_publish: Option<std::sync::Arc<tokio::sync::Notify>>,
+    ) -> Self {
         Self {
             inner: std::sync::Arc::new(HandoffSpawnWatchInner {
                 terminal_id: std::sync::Mutex::new(None),
                 settled: std::sync::atomic::AtomicBool::new(false),
                 settled_notify: tokio::sync::Notify::new(),
                 pause_before_surface,
+                pause_before_publish,
+                settle_wait_budget_ms: std::sync::atomic::AtomicU64::new(60_000),
+                parked_before_publish: std::sync::atomic::AtomicBool::new(false),
             }),
         }
+    }
+
+    /// TEST KNOB (b8ke ext r10 F3): shrink the cleanup's bounded
+    /// settle-wait budget so the timeout's fail-closed path is
+    /// deterministic. Never call from production code.
+    #[doc(hidden)]
+    pub fn set_settle_wait_budget_ms(&self, ms: u64) {
+        self.inner
+            .settle_wait_budget_ms
+            .store(ms, std::sync::atomic::Ordering::Release);
     }
 
     /// The settle's publication point: the terminal exists and will be kept.
@@ -1024,6 +1059,26 @@ impl HandoffSpawnWatch {
         }
     }
 
+    /// b8ke ext r10 F3: park the settle BEFORE the publication point when
+    /// the pre-publication seam is armed (the reviewer's exact window).
+    pub(crate) async fn pause_if_armed_before_publish(&self) {
+        if let Some(pause) = self.inner.pause_before_publish.as_ref() {
+            self.inner
+                .parked_before_publish
+                .store(true, std::sync::atomic::Ordering::Release);
+            let _ = pause.notified().await;
+        }
+    }
+
+    /// b8ke ext r10 F3 test proof: whether the pre-publication park has
+    /// engaged (the settle reached the window).
+    #[doc(hidden)]
+    pub fn parked_before_publish(&self) -> bool {
+        self.inner
+            .parked_before_publish
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// The settle finished — wake any cleanup waiter. `notify_one` stores a
     /// permit when no waiter is registered yet, so a cleanup that checks
     /// `settled` then awaits still observes the finish.
@@ -1034,11 +1089,39 @@ impl HandoffSpawnWatch {
         self.inner.settled_notify.notify_one();
     }
 
-    /// Resolve once the settle finished. Generously bounded: a settle that
-    /// somehow outlives the bound still leaves the caller the registry
-    /// sessionRef sweep as its backstop (the terminal itself stays
-    /// findable by its sessionRef row).
-    pub(crate) async fn wait_settled(&self) {
+    /// Resolve once the settle finished, bounded by the watch's budget.
+    /// b8ke ext r10 F3: the timeout result is NO LONGER DISCARDED — the
+    /// caller learns whether the settle actually finished. `true` = the
+    /// settle finished (or already had); `false` = the budget elapsed
+    /// with the spawn still unsettled (pre-r10 the caller then saw no
+    /// published terminal, classified NothingToDo, and RELEASED — the
+    /// detached spawn could publish a live unowned writer afterwards).
+    pub(crate) async fn wait_settled(&self) -> bool {
+        if self
+            .inner
+            .settled
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return true;
+        }
+        let budget_ms = self
+            .inner
+            .settle_wait_budget_ms
+            .load(std::sync::atomic::Ordering::Acquire);
+        tokio::time::timeout(
+            std::time::Duration::from_millis(budget_ms),
+            self.inner.settled_notify.notified(),
+        )
+        .await
+        .is_ok()
+    }
+
+    /// b8ke ext r10 F3: park until the settle finishes — NO budget. The
+    /// fence's replacement confirmation watcher uses this: an unsettled
+    /// spawn means the target's state is unconfirmed, and the key HOLDS
+    /// until the spawn settles (publishes or dies) and the published
+    /// terminal is reaped — never release-and-hope.
+    pub(crate) async fn wait_settled_unbounded(&self) {
         if self
             .inner
             .settled
@@ -1046,11 +1129,7 @@ impl HandoffSpawnWatch {
         {
             return;
         }
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            self.inner.settled_notify.notified(),
-        )
-        .await;
+        self.inner.settled_notify.notified().await;
     }
 }
 
@@ -2705,6 +2784,11 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             // earlier failure path tore its own child down, so this is
             // the single publication point.)
             if let Some(watch) = handoff_spawn_watch.as_ref() {
+                // b8ke ext r10 F3: the PRE-PUBLICATION park runs before the
+                // terminal id lands in the watch — the exact window the
+                // reviewer flagged (an abort here leaves the cleanup's
+                // settle-wait unsettled; the fail-closed path fences).
+                watch.pause_if_armed_before_publish().await;
                 watch.publish(&terminal_id);
                 watch.pause_if_armed().await;
             }

@@ -4308,6 +4308,132 @@ async fn handoff_abort_during_target_spawn_reaps_the_uncommitted_terminal() {
     await_pid_dead(prior_pid).await;
 }
 
+/// 5e'. b8ke ext r10 F3: an abort landing while the detached terminal
+/// spawn is parked in PRE-PUBLICATION work (the reviewer's exact window —
+/// nothing published, the cleanup's bounded settle-wait times out) FAILS
+/// CLOSED: the key fences typed (never release-and-hope over the
+/// unsettled spawn), and the fence's replacement confirmation watcher
+/// awaits the spawn's settle, reaps the terminal it publishes, and only
+/// the confirmed death releases the key. Pre-r10 the timeout was
+/// discarded — the cleanup classified NothingToDo and VACATED while the
+/// spawn still ran, and the late-published spawn could survive as a live
+/// unowned writer.
+#[tokio::test]
+async fn handoff_abort_during_pre_publication_spawn_fences_until_the_spawn_settles() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let pre_publish_park = Arc::new(tokio::sync::Notify::new());
+    let hooks = Arc::new(HandoffTestHooks {
+        pause_in_target_spawn_before_publish: Some(Arc::clone(&pre_publish_park)),
+        ..HandoffTestHooks::default()
+    });
+    let rig = build_rig(Some(Arc::clone(&hooks)));
+    establish_fresh_claude_owner(&rig, &sid).await;
+    let prior_pid = env.sidecar_pid_for(&sid).expect("the prior sidecar's pid");
+
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+
+    // Park proof: the runner deposited its spawn watch, the settle REACHED
+    // the pre-publication park (the flag), and NOTHING is published yet.
+    let watch = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(watch) = hooks.spawn_watch_slot.lock().unwrap().clone() {
+                if watch.parked_before_publish() {
+                    break watch;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the settle never reached the pre-publication park"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    assert!(
+        watch.published_terminal().is_none(),
+        "nothing is published while parked pre-publication"
+    );
+    // Shrink the cleanup's bounded settle-wait so the timeout path runs
+    // deterministically (the test knob; production keeps 60s).
+    watch.set_settle_wait_budget_ms(200);
+
+    // ABORT inside the target-spawn await (the runner is parked awaiting
+    // the settle).
+    handle.abort();
+    let _ = handle.task.await;
+
+    // FAIL-CLOSED: after the settle-wait budget elapses the key FENCES
+    // typed — it is NEVER vacated while the detached spawn is unsettled
+    // (pre-r10 the discarded timeout classified NothingToDo and vacated).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let state = rig.ownership.observe("claude", &sid).state;
+        match state {
+            OwnershipState::Fenced { .. } => break,
+            OwnershipState::Handoff { .. } => {
+                // The deferred cleanup may still be inside its settle-wait
+                // budget — keep waiting for the timeout arm.
+            }
+            other => panic!(
+                "the unsettled spawn's cleanup must hold/fence the key — \
+                 never {other:?} while the spawn still runs"
+            ),
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the cleanup never fenced the key for the unsettled spawn — \
+             state: {:?}",
+            rig.ownership.observe("claude", &sid).state
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Release the settle: it publishes the terminal and finishes — the
+    // fence's confirmation watcher reaps the late-published spawn.
+    pre_publish_park.notify_one();
+    let published = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(terminal_id) = watch.published_terminal() {
+                break terminal_id;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the released settle never published its terminal"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+
+    // The late-published spawn is KILLED (never a live unowned writer).
+    await_cond("the late-published spawn must be reaped", || {
+        rig.registry.terminal_is_dead(&published)
+    })
+    .await;
+    assert!(
+        !rig.registry
+            .directory()
+            .into_iter()
+            .any(|entry| entry.resume_session_id.as_deref() == Some(sid.as_str())),
+        "no terminal may own {sid} after the watcher reaps the late-published spawn"
+    );
+
+    // The confirmed death releases the fence — the key reopens.
+    await_cond("the watcher-resolved key must reopen", || {
+        matches!(
+            rig.ownership.observe("claude", &sid).state,
+            OwnershipState::Vacant
+        )
+    })
+    .await;
+    await_pid_dead(prior_pid).await;
+}
+
 /// 5f. Cancellation kill filter (b8ke delta review F6): the abort
 /// cleanup's sessionRef backstop sweep must match the handoff's PROVIDER
 /// (the registry join: `mode == provider`) in addition to the session id —
