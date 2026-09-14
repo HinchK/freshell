@@ -157,7 +157,7 @@ export default function CodingAgentsSettings({
       >
         <SettingsRow
           label="Expand thinking"
-          description="Thinking rows are always present in fresh-agent panes; this sets whether they start expanded. Expanding or collapsing in a pane is temporary and never saved."
+          description="Thinking rows render under thinking-only lines and inside expanded activity lines; this sets whether they start expanded. Expanding or collapsing in a pane is temporary and never saved."
         >
           <Toggle
             checked={settings.freshAgent?.expandThinking ?? false}

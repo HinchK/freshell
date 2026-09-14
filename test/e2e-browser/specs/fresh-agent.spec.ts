@@ -1028,16 +1028,15 @@ test.describe('Fresh Agent', () => {
     // point). Activate both toggles by keyboard Enter instead: focus +
     // keypress targets the element, not the point, so the overlay cannot
     // intercept the activation.
-    // Compact default: the strip mounts COLLAPSED. The hoisted thinking row
-    // renders its disclosure WITHOUT expanding the strip — press Thinking
-    // and assert its body, then expand the strip so the tool-block font
-    // probe below has its element.
+    // Compact default: the strip mounts COLLAPSED; on this tool-bearing
+    // line the thinking row is gated behind the strip toggle — expand the
+    // strip first, then press Thinking for the reasoning-body probe below.
     await expect(freshcodexRoot.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'false')
     await expect(freshcodexRoot.getByText('private style reasoning starts collapsed')).toHaveCount(0)
-    await freshcodexRoot.getByRole('button', { name: 'Thinking' }).press('Enter')
-    await expect(freshcodexRoot.getByText('private style reasoning starts collapsed')).toBeVisible()
     await freshcodexRoot.getByRole('button', { name: 'Toggle activity details' }).press('Enter')
     await expect(freshcodexRoot.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'true')
+    await freshcodexRoot.getByRole('button', { name: 'Thinking' }).press('Enter')
+    await expect(freshcodexRoot.getByText('private style reasoning starts collapsed')).toBeVisible()
     await freshcodexRoot.getByRole('button', { name: /Diff: src\/index\.css/ }).click()
     const transcriptFont = await transcript.evaluate((node) => getComputedStyle(node).fontFamily)
     expect(transcriptFont.toLowerCase()).toContain('georgia')
@@ -1722,41 +1721,71 @@ test.describe('expansion defaults and settings', () => {
     },
   ]
 
-  test('mounts the activity strip compact by default and never hides the Thinking disclosure', async ({ freshellPage: _freshellPage, page, terminal }) => {
+  test('collapses an interleaved thinking-and-tool line to the single summary', async ({ freshellPage: _freshellPage, page, terminal }) => {
+    const interleavedTurns = [
+      { id: 'turn-user', turnId: 'turn-user', role: 'user', summary: 'run the checks',
+        items: [{ id: 'item-user', kind: 'text', text: 'run the checks' }] },
+      {
+        id: 'turn-mixed', turnId: 'turn-mixed', role: 'assistant', summary: 'thought and read',
+        items: [
+          { id: 'think-1', kind: 'thinking', text: 'first stretch of reasoning' },
+          { id: 'tool-1', kind: 'tool_use', toolUseId: 'c-1', name: 'Read', input: { file_path: 'src/a.ts' } },
+          { id: 'result-1', kind: 'tool_result', toolUseId: 'c-1', content: 'ok', isError: false },
+          { id: 'think-2', kind: 'thinking', text: 'second stretch of reasoning' },
+          { id: 'tool-2', kind: 'tool_use', toolUseId: 'c-2', name: 'Read', input: { file_path: 'src/b.ts' } },
+          { id: 'result-2', kind: 'tool_result', toolUseId: 'c-2', content: 'ok', isError: false },
+        ],
+      },
+    ]
+    await seedCollapsePane(page, terminal, 'interleaved-thought-thread', interleavedTurns)
+    const pane = page.locator('[data-context="fresh-agent"]').last()
+    await expect(pane).toBeVisible({ timeout: 10_000 })
+    const strip = pane.getByRole('region', { name: 'Activity strip' }).first()
+    // The interleaved line collapses to ONE row: the summary alone, with
+    // both thinking stretches absorbed into the 'thought' segment.
+    await expect(strip.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'false')
+    await expect(strip).toContainText('thought · 2 tools used')
+    await expect(strip.getByRole('button', { name: 'Thinking' })).toHaveCount(0)
+    // Expanding the strip reveals BOTH thinking rows (kept separate by the
+    // intervening tools) alongside the two tool rows.
+    await strip.getByRole('button', { name: 'Toggle activity details' }).click()
+    await expect(strip.getByRole('button', { name: 'Thinking' })).toHaveCount(2)
+    await expect(strip.getByRole('button', { name: 'Read tool call' })).toHaveCount(2)
+  })
+
+  test('mounts the activity strip compact by default and gates the Thinking disclosure behind the strip toggle', async ({ freshellPage: _freshellPage, page, terminal }) => {
     await seedCollapsePane(page, terminal, 'compact-defaults-thread', mixedThinkingToolTurns)
     const pane = page.locator('[data-context="fresh-agent"]').last()
     await expect(pane).toBeVisible({ timeout: 10_000 })
     const strip = pane.getByRole('region', { name: 'Activity strip' }).first()
-    // Compact default (Expand tools off): the strip mounts COLLAPSED with the
-    // settled summary.
     await expect(strip.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'false')
     await expect(strip).toContainText('thought · 1 tool used')
-    // Hoisted: the Thinking disclosure is ALREADY visible without expanding
-    // the strip — thinking rows are never hidden in any state.
+    // Collapsed tool-bearing line: the summary is the strip's ONLY row —
+    // no hoisted Thinking disclosure.
+    await expect(strip.getByRole('button', { name: 'Thinking' })).toHaveCount(0)
+    await expect(strip.getByText('weighing which files to read first')).toHaveCount(0)
+    // Expanding the strip reveals the thinking row and the tool row.
+    await strip.getByRole('button', { name: 'Toggle activity details' }).click()
     const thinking = strip.getByRole('button', { name: 'Thinking' })
     await expect(thinking).toBeVisible()
-    await expect(strip.getByText('weighing which files to read first')).toHaveCount(0)
-    // Click Thinking → the body opens while the strip stays compact.
+    await expect(strip.getByRole('button', { name: 'Read tool call' })).toHaveCount(1)
+    // Click Thinking → the body opens inside the expanded strip.
     await thinking.click()
     await expect(strip.locator('.fresh-agent-thinking-body', { hasText: 'weighing which files to read first' })).toBeVisible()
-    // Expanding the strip reveals the tool row; the thinking row stays
-    // visible AND its user-opened body REMAINS expanded (the thinking-row
-    // expansion is independent of the strip's tool disclosure). The tool row
-    // mounts as its own collapsed disclosure under the compact default —
-    // expand it and assert its raw input via the pre, strict-mode-safe (the
-    // expanded tool block renders the path as both preview span and pre
-    // body).
-    await strip.getByRole('button', { name: 'Toggle activity details' }).click()
-    await expect(strip.getByRole('button', { name: 'Read tool call' })).toHaveCount(1)
-    await expect(strip.locator('.fresh-agent-thinking-body', { hasText: 'weighing which files to read first' })).toBeVisible()
+    // The tool block mounts as its own collapsed disclosure under the
+    // compact default — expand it and assert its raw input via the pre,
+    // strict-mode-safe (the expanded tool block renders the path as both
+    // preview span and pre body).
     await strip.getByRole('button', { name: 'Read tool call' }).click()
     await expect(pane.locator('pre[data-tool-input]').filter({ hasText: 'src/a.ts' })).toBeVisible()
-    await expect(strip.getByRole('button', { name: 'Thinking' })).toBeVisible()
-    // Collapse again: the summary returns, the Thinking trigger survives, and
-    // the user-opened thinking body is STILL expanded.
+    // Collapse again: the summary returns and the Thinking trigger hides
+    // with it; re-expanding shows the user-opened body STILL open (the
+    // per-row override survives the strip toggle in the never-unmounted
+    // strip).
     await strip.getByRole('button', { name: 'Toggle activity details' }).click()
     await expect(strip).toContainText('thought · 1 tool used')
-    await expect(strip.getByRole('button', { name: 'Thinking' })).toBeVisible()
+    await expect(strip.getByRole('button', { name: 'Thinking' })).toHaveCount(0)
+    await strip.getByRole('button', { name: 'Toggle activity details' }).click()
     await expect(strip.locator('.fresh-agent-thinking-body', { hasText: 'weighing which files to read first' })).toBeVisible()
   })
 
@@ -1766,8 +1795,8 @@ test.describe('expansion defaults and settings', () => {
     await expect(pane).toBeVisible({ timeout: 10_000 })
     const strip = pane.getByRole('region', { name: 'Activity strip' }).first()
     await expect(strip.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'false')
-    // Thinking never disappears in any state.
-    await expect(strip.getByRole('button', { name: 'Thinking' })).toBeVisible()
+    // Collapsed tool-bearing line: no hoisted Thinking disclosure.
+    await expect(strip.getByRole('button', { name: 'Thinking' })).toHaveCount(0)
 
     // Flip "Expand tools" on in the real Settings UI. (Opening Settings
     // unmounts the pane tree — App.tsx:1788-1796 — so the pane reflects the
@@ -1798,8 +1827,8 @@ test.describe('expansion defaults and settings', () => {
     // Thinking trigger still present in the expanded state.
     await expect(stripAfter.getByRole('button', { name: 'Thinking' })).toBeVisible()
 
-    // Flip it back off: the next remount starts compact again, and the
-    // Thinking trigger never disappears.
+    // Flip it back off: the next remount starts compact again —
+    // the Thinking disclosure stays gated behind the compact strip.
     await page.getByRole('button', { name: 'Settings (Ctrl+B ,)' }).click()
     await page.getByRole('tab', { name: /^Coding Agents$/i }).click()
     await expandToolsSwitch.click()
@@ -1810,18 +1839,18 @@ test.describe('expansion defaults and settings', () => {
     const stripOff = paneOff.getByRole('region', { name: 'Activity strip' }).first()
     await expect(stripOff.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'false')
     await expect(stripOff).toContainText('thought · 1 tool used')
-    await expect(stripOff.getByRole('button', { name: 'Thinking' })).toBeVisible()
+    await expect(stripOff.getByRole('button', { name: 'Thinking' })).toHaveCount(0)
   })
 
-  test('the Expand thinking setting starts thinking rows expanded with the strip still compact', async ({ freshellPage: _freshellPage, page, terminal }) => {
+  test('the Expand thinking setting starts thinking rows expanded inside an expanded strip', async ({ freshellPage: _freshellPage, page, terminal }) => {
     await seedCollapsePane(page, terminal, 'expand-thinking-thread', mixedThinkingToolTurns)
     const pane = page.locator('[data-context="fresh-agent"]').last()
     await expect(pane).toBeVisible({ timeout: 10_000 })
     const strip = pane.getByRole('region', { name: 'Activity strip' }).first()
-    // Compact mount: the Thinking disclosure renders collapsed.
-    const thinking = strip.getByRole('button', { name: 'Thinking' })
-    await expect(thinking).toBeVisible()
-    await expect(thinking).toHaveAttribute('aria-expanded', 'false')
+    // Compact mount: the tool-bearing line collapses to the single summary —
+    // the Thinking disclosure is gated behind the strip toggle.
+    await expect(strip.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'false')
+    await expect(strip.getByRole('button', { name: 'Thinking' })).toHaveCount(0)
     await expect(strip.getByText('weighing which files to read first')).toHaveCount(0)
 
     // Flip "Expand thinking" on in the real Settings UI (exact-name settings
@@ -1838,11 +1867,11 @@ test.describe('expansion defaults and settings', () => {
     const paneAfter = page.locator('[data-context="fresh-agent"]').last()
     await expect(paneAfter).toBeVisible({ timeout: 10_000 })
     const stripAfter = paneAfter.getByRole('region', { name: 'Activity strip' }).first()
-    // Thinking rows START expanded (body visible with no click) while the
-    // strip itself stays compact.
     await expect(stripAfter.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'false')
-    const thinkingAfter = stripAfter.getByRole('button', { name: 'Thinking' })
-    await expect(thinkingAfter).toHaveAttribute('aria-expanded', 'true')
+    await expect(stripAfter.getByRole('button', { name: 'Thinking' })).toHaveCount(0)
+    // Expanding the strip: the thinking row starts with its body ALREADY
+    // open (the setting set the row's start state) — no Thinking click.
+    await stripAfter.getByRole('button', { name: 'Toggle activity details' }).click()
     await expect(stripAfter.locator('.fresh-agent-thinking-body', { hasText: 'weighing which files to read first' })).toBeVisible()
 
     // Flip it back off: the next remount starts the rows collapsed again.
@@ -1854,8 +1883,9 @@ test.describe('expansion defaults and settings', () => {
     const paneOff = page.locator('[data-context="fresh-agent"]').last()
     await expect(paneOff).toBeVisible({ timeout: 10_000 })
     const stripOff = paneOff.getByRole('region', { name: 'Activity strip' }).first()
+    await expect(stripOff.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'false')
+    await stripOff.getByRole('button', { name: 'Toggle activity details' }).click()
     const thinkingOff = stripOff.getByRole('button', { name: 'Thinking' })
-    await expect(thinkingOff).toBeVisible()
     await expect(thinkingOff).toHaveAttribute('aria-expanded', 'false')
     await expect(stripOff.getByText('weighing which files to read first')).toHaveCount(0)
   })
@@ -2006,10 +2036,9 @@ test.describe('foldable echo captions', () => {
   test('authored prose never folds', async ({ freshellPage: _freshellPage, page, harness, terminal }) => {
     // Real codex authored shape: a turn whose reasoning item carries a
     // provider-written summary (`summaryKind: 'authored'`) plus a command item.
-    // The prose lives in the always-rendered reasoning row (hoisted — its
-    // disclosure is visible while the strip stays compact); what THIS spec
-    // pins is the fold boundary: the authored turn keeps its own line and
-    // contributes no caption — painted or stashed — anywhere.
+    // The prose lives in the reasoning row inside the strip's expansion;
+    // what THIS spec pins is the fold boundary: the authored turn keeps its
+    // own line and contributes no caption — painted or stashed — anywhere.
     const proseTurn = {
       id: 'turn-prose', turnId: 'turn-prose', role: 'assistant',
       summary: 'Pausing to plan the next step', summaryKind: 'authored',
@@ -2032,10 +2061,11 @@ test.describe('foldable echo captions', () => {
     ])
     await expect(pane.getByRole('region', { name: 'Activity strip' })).toHaveCount(2, { timeout: 10_000 })
     await expect(pane.getByTestId('fresh-agent-tail-caption')).toHaveCount(0)
-    // Hoisted thinking rows: stripTwo's reasoning disclosure is visible
-    // WITHOUT expanding the strip under hoisting — only the Thinking press
-    // is needed; expand it and assert the prose.
+    // stripTwo's reasoning row is gated behind the strip toggle on its
+    // tool-bearing line — expand the strip first, then press Thinking and
+    // assert the prose.
     const stripTwo = pane.getByRole('region', { name: 'Activity strip' }).nth(1)
+    await stripTwo.getByRole('button', { name: 'Toggle activity details' }).click()
     const thinking = stripTwo.getByRole('button', { name: 'Thinking' })
     await expect(thinking).toBeVisible()
     await thinking.click()

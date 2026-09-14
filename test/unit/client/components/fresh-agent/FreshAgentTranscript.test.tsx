@@ -234,17 +234,53 @@ describe('FreshAgentTranscript', () => {
     )
 
     expect(screen.getByRole('region', { name: 'Activity strip' })).toHaveTextContent('thought · 1 tool used')
-    // Hoisted: the Thinking trigger is visible WITHOUT expanding the strip —
-    // the collapsed strip already carries the expandable thinking row.
-    const thinking = screen.getByRole('button', { name: 'Thinking' })
-    expect(thinking).toBeInTheDocument()
+    // Collapsed tool-bearing line: the summary is the strip's ONLY row —
+    // the thinking is absorbed into the 'thought' segment, with no hoisted
+    // disclosure.
+    expect(screen.queryByRole('button', { name: 'Thinking' })).not.toBeInTheDocument()
     expect(screen.queryByText('the race is in the close handler')).not.toBeInTheDocument()
-    fireEvent.click(thinking)
-    expect(screen.getAllByText('the race is in the close handler').length).toBeGreaterThanOrEqual(1)
-    // Expanding the strip reveals the tool rows (tool detail stays gated
-    // behind the strip's own disclosure).
+    // Expanding the strip reveals the thinking row AND the tool row.
     fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Thinking' }))
+    expect(screen.getAllByText('the race is in the close handler').length).toBeGreaterThanOrEqual(1)
     expect(screen.getByRole('button', { name: 'Bash tool call' })).toBeInTheDocument()
+  })
+
+  it('collapses an interleaved thinking-and-tool line to the single summary', () => {
+    render(
+      <FreshAgentTranscript
+        turns={[
+          {
+            id: 'turn-1',
+            role: 'assistant',
+            summary: 'thought and ran',
+            items: [
+              { id: 'think-1', kind: 'thinking', text: 'first stretch of reasoning' },
+              { id: 'tool-1', kind: 'tool_use', toolUseId: 'call-1', name: 'Bash', input: { command: 'npm test' } },
+              { id: 'result-1', kind: 'tool_result', toolUseId: 'call-1', content: 'ok', isError: false },
+              { id: 'think-2', kind: 'thinking', text: 'second stretch of reasoning' },
+              { id: 'tool-2', kind: 'tool_use', toolUseId: 'call-2', name: 'Read', input: { file_path: 'src/a.ts' } },
+              { id: 'result-2', kind: 'tool_result', toolUseId: 'call-2', content: 'ok', isError: false },
+            ],
+          },
+        ]}
+      />,
+    )
+
+    const strip = screen.getByRole('region', { name: 'Activity strip' })
+    expect(strip).toHaveTextContent('thought · 2 tools used')
+    // The collapsed tool-bearing line is the summary ALONE: both thinking
+    // stretches are absorbed into the 'thought' segment — no hoisted
+    // disclosures, no visible thinking text.
+    expect(screen.queryByRole('button', { name: 'Thinking' })).not.toBeInTheDocument()
+    expect(screen.queryByText('first stretch of reasoning')).not.toBeInTheDocument()
+    expect(screen.queryByText('second stretch of reasoning')).not.toBeInTheDocument()
+    // Expanding the strip reveals BOTH thinking rows (kept separate by the
+    // intervening tool rows) plus the two tool rows, in item order.
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+    expect(screen.getAllByRole('button', { name: 'Thinking' })).toHaveLength(2)
+    expect(screen.getByRole('button', { name: 'Bash tool call' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Read tool call' })).toBeInTheDocument()
   })
 
   it('starts the strip expanded when expandTools is true', () => {
@@ -288,41 +324,48 @@ describe('FreshAgentTranscript', () => {
       ],
     }
 
-    it('renders thinking rows regardless of the expandThinking setting and of strip expansion', () => {
+    it('gates thinking rows behind the strip toggle on tool-bearing lines', () => {
       const first = render(<FreshAgentTranscript turns={[mixedTurn]} />)
-      // Compact mount (expandTools unset): the Thinking trigger is visible
-      // while the strip is collapsed, and the body stays gated behind the
-      // click.
+      // Compact mount (expandTools unset): the single summary line only.
       expect(screen.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'false')
+      expect(screen.queryByRole('button', { name: 'Thinking' })).not.toBeInTheDocument()
+      // Expanding the strip reveals the thinking row; the body stays gated
+      // behind its own click.
+      fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
       const thinking = screen.getByRole('button', { name: 'Thinking' })
-      expect(thinking).toBeInTheDocument()
       expect(screen.queryByText('the race is in the close handler')).not.toBeInTheDocument()
       fireEvent.click(thinking)
       expect(screen.getAllByText('the race is in the close handler').length).toBeGreaterThanOrEqual(1)
-      // The trigger survives strip expansion — thinking rows render in BOTH
-      // strip states.
+      // Collapse the strip: the thinking row hides behind the single
+      // summary line again.
       fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
-      expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Thinking' })).not.toBeInTheDocument()
       first.unmount()
 
-      // The row renders identically with expandThinking on: the setting
-      // changes only the initial body state, never the row's presence.
+      // Same line with expandThinking on: the setting governs the row's
+      // starting body state inside the expanded strip, never its presence.
       render(<FreshAgentTranscript expandThinking turns={[mixedTurn]} />)
-      expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()
       expect(screen.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'false')
+      expect(screen.queryByRole('button', { name: 'Thinking' })).not.toBeInTheDocument()
+      fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+      expect(screen.getAllByText('the race is in the close handler').length).toBeGreaterThanOrEqual(1)
     })
 
     it('starts thinking rows expanded when expandThinking is true', () => {
       const { container } = render(<FreshAgentTranscript expandThinking turns={[mixedTurn]} />)
-      // The strip itself stays compact; the thinking body is visible at
-      // mount with no click.
+      // Compact mount: the thinking row is not rendered at all.
       expect(screen.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'false')
+      expect(screen.queryByRole('button', { name: 'Thinking' })).not.toBeInTheDocument()
+      // Expanding the strip: the thinking body is ALREADY open — the
+      // setting set the row's start state at its mount.
+      fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
       expect(container.querySelector('.fresh-agent-thinking-body')).toBeTruthy()
       expect(screen.getAllByText('the race is in the close handler').length).toBeGreaterThanOrEqual(1)
     })
 
     it('starts thinking rows collapsed by default', () => {
       const { container } = render(<FreshAgentTranscript turns={[mixedTurn]} />)
+      fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
       const thinking = screen.getByRole('button', { name: 'Thinking' })
       expect(thinking).toHaveAttribute('aria-expanded', 'false')
       expect(container.querySelector('.fresh-agent-thinking-body')).toBeNull()
@@ -331,32 +374,32 @@ describe('FreshAgentTranscript', () => {
 
     it('a user-expanded thinking row stays expanded across the tool-disclosure toggle', () => {
       render(<FreshAgentTranscript turns={[mixedTurn]} />)
-      // Defaults off: expand the thinking body by hand while the strip is
-      // collapsed.
+      // Defaults off: expand the strip, then open the thinking body by hand.
+      fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
       fireEvent.click(screen.getByRole('button', { name: 'Thinking' }))
       expect(screen.getAllByText('the race is in the close handler').length).toBeGreaterThanOrEqual(1)
-      // Expand the strip for tool detail: the thinking body must STILL be
-      // visible (the row's expansion is independent of the strip's).
-      fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
-      expect(screen.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'true')
-      expect(screen.getAllByText('the race is in the close handler').length).toBeGreaterThanOrEqual(1)
-      // Collapse the strip again: the thinking body is STILL visible.
+      // Collapse the strip: the row hides behind the single summary line.
       fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
       expect(screen.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'false')
+      expect(screen.queryByRole('button', { name: 'Thinking' })).not.toBeInTheDocument()
+      // Re-expand: the row's user-opened body is STILL open (the per-row
+      // override survives the strip toggle in the never-unmounted strip).
+      fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+      expect(screen.getByRole('button', { name: 'Thinking' })).toHaveAttribute('aria-expanded', 'true')
       expect(screen.getAllByText('the race is in the close handler').length).toBeGreaterThanOrEqual(1)
     })
 
     it('a user-collapsed thinking row stays collapsed across the tool-disclosure toggle with expandThinking on', () => {
       render(<FreshAgentTranscript expandThinking turns={[mixedTurn]} />)
-      // "Expand thinking" on: the body mounts visible; the user collapses it.
+      // "Expand thinking" on: expanding the strip shows the body ALREADY
+      // open (the setting set the row's start state); the user collapses it.
+      fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
       expect(screen.getAllByText('the race is in the close handler').length).toBeGreaterThanOrEqual(1)
       fireEvent.click(screen.getByRole('button', { name: 'Thinking' }))
       expect(screen.queryByText('the race is in the close handler')).not.toBeInTheDocument()
-      // Toggle the strip twice (expanded branch and back): the body stays
-      // hidden — the setting never re-asserts itself mid-session.
+      // Toggle the strip (collapsed and back): the body stays hidden — the
+      // setting never re-asserts itself mid-session.
       fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
-      expect(screen.getByRole('button', { name: 'Thinking' })).toHaveAttribute('aria-expanded', 'false')
-      expect(screen.queryByText('the race is in the close handler')).not.toBeInTheDocument()
       fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
       expect(screen.getByRole('button', { name: 'Thinking' })).toHaveAttribute('aria-expanded', 'false')
       expect(screen.queryByText('the race is in the close handler')).not.toBeInTheDocument()
@@ -366,11 +409,11 @@ describe('FreshAgentTranscript', () => {
       render(<FreshAgentTranscript turns={[mixedTurn]} />)
       expect(screen.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'false')
       expect(screen.getByRole('region', { name: 'Activity strip' })).toHaveTextContent('thought · 1 tool used')
-      // Tool rows and captions render only when the strip is expanded;
-      // thinking rows are present even while collapsed.
+      // Tool rows, captions, and — on this tool-bearing line — thinking
+      // rows render only when the strip is expanded.
       expect(screen.queryByRole('button', { name: 'Bash tool call' })).not.toBeInTheDocument()
       expect(screen.queryByTestId('fresh-agent-activity-caption')).not.toBeInTheDocument()
-      expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Thinking' })).not.toBeInTheDocument()
     })
 
     it('expansion is per-mount state, never re-synced from props', () => {
@@ -422,21 +465,22 @@ describe('FreshAgentTranscript', () => {
     it('the expanded state swaps the summary for detail behind the persistent toggle', () => {
       render(<FreshAgentTranscript turns={[mixedTurn]} />)
       const strip = screen.getByRole('region', { name: 'Activity strip' })
-      // Collapsed: the settled summary is the strip's one line.
+      // Collapsed: the settled summary is the strip's one line, and it is
+      // the ONLY row (no hoisted thinking disclosure on a tool-bearing
+      // line).
       expect(strip).toHaveTextContent('thought · 1 tool used')
-      expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Thinking' })).not.toBeInTheDocument()
       // Expand: the toggle row persists and the summary text is REPLACED by
-      // the detail rows.
+      // the detail rows — including the thinking row.
       fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
       expect(screen.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'true')
       expect(strip).not.toHaveTextContent('1 tool used')
       expect(screen.getByRole('button', { name: 'Bash tool call' })).toBeInTheDocument()
-      // Thinking rows are present in BOTH states.
       expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()
-      // Collapse: the summary returns; the thinking row survives the cycle.
+      // Collapse: the summary returns and the thinking row hides again.
       fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
       expect(strip).toHaveTextContent('thought · 1 tool used')
-      expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Thinking' })).not.toBeInTheDocument()
     })
 
     it('renders a live thinking row disclosure while streaming with the strip collapsed', () => {
@@ -2519,10 +2563,11 @@ describe('FreshAgentTranscript', () => {
         )
         // Streaming: one merged line; the strip stays live on the merged
         // THINKING row — the spinner and the 'Thinking' reel survive even
-        // though the line's final row is the stashed caption. (The hoisted
-        // thinking row renders its own 'Thinking' label alongside the reel —
-        // scope the query to the reel's status element so the text nodes
-        // can't collide.)
+        // though the line's final row is the stashed caption. (While this
+        // tool-bearing line is collapsed there is no hoisted Thinking row;
+        // the reel's status element carries the only 'Thinking' text —
+        // scope the query to it so the text nodes can't collide if the
+        // strip is ever expanded.)
         expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
         expect(screen.getByLabelText('running')).toBeInTheDocument()
         expect(within(screen.getByRole('status')).getByText('Thinking')).toBeInTheDocument()

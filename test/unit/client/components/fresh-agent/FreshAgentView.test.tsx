@@ -777,7 +777,7 @@ describe('FreshAgentView', () => {
     expect(timecodeEl.textContent).toMatch(/^\d{1,2}:\d{2}\s?(AM|PM)$/i)
   })
 
-  it('mounts thinking rows and a collapsed strip by default', async () => {
+  it('mounts a collapsed strip by default and gates thinking rows behind the strip toggle', async () => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
       status: 'idle',
@@ -821,16 +821,17 @@ describe('FreshAgentView', () => {
       expect(screen.getByText('thought · 1 tool used')).toBeInTheDocument()
     })
     expect(screen.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'false')
-    // Thinking rows always render: the trigger is visible at the compact
-    // mount, with its body gated behind the click.
-    const thinking = screen.getByRole('button', { name: 'Thinking' })
-    expect(thinking).toBeInTheDocument()
-    expect(thinking).toHaveAttribute('aria-expanded', 'false')
+    // Compact defaults: a tool-bearing line collapses to the single summary
+    // line — no hoisted Thinking trigger while the strip is collapsed.
+    expect(screen.queryByRole('button', { name: 'Thinking' })).not.toBeInTheDocument()
     expect(screen.queryByText('default-visible thinking')).not.toBeInTheDocument()
-    // Expanding the strip reveals the tool row; the block itself starts
-    // collapsed (expandTools governs the strip's starting state, not the
-    // per-block in-pane toggles) and opens on its own click.
+    // Expanding the strip reveals the thinking row and the tool row; the
+    // block itself starts collapsed (expandTools governs the strip's
+    // starting state, not the per-block in-pane toggles) and opens on its
+    // own click.
     fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+    expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()
+    expect(screen.queryByText('default-visible thinking')).not.toBeInTheDocument()
     const toolButton = screen.getByRole('button', { name: 'Bash tool call' })
     expect(toolButton).toBeInTheDocument()
     fireEvent.click(toolButton)
