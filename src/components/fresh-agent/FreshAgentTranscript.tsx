@@ -920,6 +920,11 @@ export type FreshAgentTranscriptProps = {
    * offers the affordance: frozen prior-epoch markers are NOT redoable (providers
    * only restore the current epoch's tail). */
   redoableTurnIds?: readonly string[]
+  /** The conversation the rolled-back history disclosure scopes to. A different
+   * session id (a new conversation started in the same pane, or a session
+   * restore) re-collapses the disclosure — the toggle never leaks across
+   * conversations. Omitted in isolation/tests (the state keys on null). */
+  sessionId?: string
 }
 
 export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, FreshAgentTranscriptProps>(function FreshAgentTranscript({
@@ -941,18 +946,41 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
   canRedo = false,
   onRedoToTurn,
   redoableTurnIds,
+  sessionId,
 }, ref) {
   const scrollerRef = useRef<HTMLDivElement | null>(null)
   const [atBottom, setAtBottom] = useState(true)
   const [newMessages, setNewMessages] = useState(0)
   const [sheetTurn, setSheetTurn] = useState<FreshAgentTurn | null>(null)
   const [glomTarget, setGlomTarget] = useState<{ index: number; text: string } | null>(null)
+  // Rolled-back section lifecycle: historical (non-restorable) markers render
+  // behind a quiet disclosure line. The toggle is ephemeral view state SCOPED
+  // TO THE CONVERSATION — a different sessionId (a new conversation started
+  // in the same pane, or a session restore) re-collapses it, so the
+  // disclosure never leaks across conversations. Pure derivation, no effect,
+  // no timer; placement itself is a pure function of the snapshot.
+  const [historyToggle, setHistoryToggle] = useState<{ sessionId: string | null; expanded: boolean }>({ sessionId: null, expanded: false })
+  const historyExpanded = historyToggle.sessionId === (sessionId ?? null) ? historyToggle.expanded : false
+  const toggleHistory = () => setHistoryToggle({ sessionId: sessionId ?? null, expanded: !historyExpanded })
   const coarsePointer = useCoarsePointer()
   // F6: the per-marker redo gate set — membership-tested per user marker row.
   const redoableTurnIdSet = useMemo(
     () => (redoableTurnIds ? new Set(redoableTurnIds) : null),
     [redoableTurnIds],
   )
+  // Restorable markers (server-stamped flag) keep the expanded section with
+  // redo affordances; everything else — redo destroyed by a submission, frozen
+  // prior chains, codex from birth, older servers without the flag — renders
+  // behind the collapsed history line. Counts are USER-role steps per group;
+  // the all-time union is never presented as live state.
+  const restorableMarkers = rolledBackTurns.filter((t) => t.restorable === true)
+  const historicalMarkers = rolledBackTurns.filter((t) => t.restorable !== true)
+  // r2/r3: each count is rollback STEPS (user-role marker groups), not raw
+  // marker rows — one undone turn-step contributes a user row AND an assistant
+  // row. This is exactly the user-step count the server's rollback.undoneDepth
+  // computes (r3 correction 5): same bucket, same rule, never entries.len().
+  const restorableSteps = restorableMarkers.filter((t) => t.role === 'user').length
+  const historicalSteps = historicalMarkers.filter((t) => t.role === 'user').length
   const resolvedShowTimecodes = showTimecodes ?? showModel
   const displayTurns = useMemo(() => (
     coalesceSyntheticToolResultTurns(turns)
@@ -1100,6 +1128,30 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
     recomputeGlom()
   }, [recomputeGlom, transcriptSignature])
 
+  // Shared row markup for BOTH rolled-back presentations (the e2e locates rows
+  // via div.flex.items-start). The redo button branch is gated on the row's
+  // restorable group IN ADDITION to the unchanged server-authored redo gate —
+  // historical rows never offer the affordance.
+  const renderMarkerRow = (turn: FreshAgentTurn, index: number, restorable: boolean) => (
+    <div key={`${getFreshAgentDisplayTurnKey(turn)}:${index}`} className="flex items-start justify-between gap-2 rounded px-1 py-1">
+      <div className="min-w-0">
+        <span className="mr-2 inline-block rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">rolled back</span>
+        <span className="text-sm text-muted-foreground">{turn.summary || turnPlainText(turn)}</span>
+      </div>
+      {restorable && canRedo && onRedoToTurn && turn.role === 'user' && redoableTurnIdSet?.has(turn.turnId ?? turn.id) ? (
+        <button
+          type="button"
+          onClick={() => onRedoToTurn(turn.turnId ?? turn.id)}
+          className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+          aria-label="Redo to here"
+          title={`Restore this turn and the rolled-back turns before it (“${turn.summary.slice(0, 60)}”)`}
+        >
+          <Redo2 className="h-3 w-3" />
+        </button>
+      ) : null}
+    </div>
+  )
+
   return (
     <div className="relative min-h-0 flex-1">
       <div
@@ -1152,32 +1204,31 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
           </div>        ) : null}
         {rolledBackTurns.length > 0 ? (
           <section aria-label="Rolled back turns" className="mx-2 mt-2 rounded-md border border-dashed border-border/60 bg-muted/30 p-2 opacity-80">
-            <p className="px-1 pb-1 text-xs font-medium text-muted-foreground">
-              Rolled back ({rolledBackTurns.filter((t) => t.role === 'user').length}) — gone from the conversation; kept in history.
-              {/* r2/r3: the count is rollback STEPS (user-role marker groups), not raw marker rows —
-                  one undone turn-step contributes a user row AND an assistant row. This is exactly
-                  the user-step count the server's rollback.undoneDepth computes (r3 correction 5):
-                  same bucket, same rule, never entries.len(). */}
-            </p>
-            {rolledBackTurns.map((turn, index) => (
-              <div key={`${getFreshAgentDisplayTurnKey(turn)}:${index}`} className="flex items-start justify-between gap-2 rounded px-1 py-1">
-                <div className="min-w-0">
-                  <span className="mr-2 inline-block rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">rolled back</span>
-                  <span className="text-sm text-muted-foreground">{turn.summary || turnPlainText(turn)}</span>
-                </div>
-                {canRedo && onRedoToTurn && turn.role === 'user' && redoableTurnIdSet?.has(turn.turnId ?? turn.id) ? (
-                  <button
-                    type="button"
-                    onClick={() => onRedoToTurn(turn.turnId ?? turn.id)}
-                    className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-                    aria-label="Redo to here"
-                    title={`Restore this turn and the rolled-back turns before it (“${turn.summary.slice(0, 60)}”)`}
-                  >
-                    <Redo2 className="h-3 w-3" />
-                  </button>
-                ) : null}
+            {restorableMarkers.length > 0 ? (
+              <>
+                <p className="px-1 pb-1 text-xs font-medium text-muted-foreground">
+                  Rolled back ({restorableSteps}) — gone from the conversation; redo to restore.
+                </p>
+                {restorableMarkers.map((turn, index) => renderMarkerRow(turn, index, true))}
+              </>
+            ) : null}
+            {historicalMarkers.length > 0 ? (
+              <div>
+                <button
+                  type="button"
+                  onClick={() => toggleHistory()}
+                  className="flex w-full items-center gap-2 rounded px-1 py-0.5 text-left text-xs font-medium text-muted-foreground transition-colors hover:bg-accent/50"
+                  aria-expanded={historyExpanded}
+                  aria-label="Toggle rolled-back history"
+                >
+                  <ChevronRight className={cn('h-3 w-3 shrink-0 transition-transform', historyExpanded && 'rotate-90')} aria-hidden="true" />
+                  Rolled back ({historicalSteps}) — kept in history
+                </button>
+                {historyExpanded
+                  ? historicalMarkers.map((turn, index) => renderMarkerRow(turn, index, false))
+                  : null}
               </div>
-            ))}
+            ) : null}
           </section>
         ) : null}
       </div>

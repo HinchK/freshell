@@ -2945,6 +2945,7 @@ export function FreshAgentView({
               rolledBackTurns={snapshot?.rolledBackTurns ?? []}
               canRedo={canRedoNow}
               redoableTurnIds={snapshot?.rollback?.redoableTurnIds}
+              sessionId={snapshot?.sessionId}
               agentLabel={descriptor?.label}
               expandThinking={globalExpandThinking}
               expandTools={globalExpandTools}

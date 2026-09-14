@@ -2596,13 +2596,17 @@ describe('FreshAgentTranscript', () => {
 describe('rolled-back section (kata 1wxv decision 6)', () => {
   afterEach(() => cleanup())
 
-  function markerTurns(): FreshAgentTurn[] {
+  function markerTurns(restorable?: boolean): FreshAgentTurn[] {
     // Two undone STEPS = four marker ROWS (a user row and an assistant row each).
+    // `restorable` omitted ⇒ the older-server payload shape (no key ⇒ all
+    // markers historical); passed ⇒ the server-stamped shape (true while the
+    // step is still restorable, false once redo is destroyed).
+    const stamp = restorable === undefined ? {} : { restorable }
     return [
-      { id: 'u2', turnId: 'u2', role: 'user', summary: 'second prompt', items: [{ id: 'u2-i1', kind: 'text', text: 'second prompt' }], rolledBack: true },
-      { id: 'a2', turnId: 'a2', role: 'assistant', summary: 'second answer', items: [{ id: 'a2-i1', kind: 'text', text: 'second answer' }], rolledBack: true },
-      { id: 'u3', turnId: 'u3', role: 'user', summary: 'third prompt', items: [{ id: 'u3-i1', kind: 'text', text: 'third prompt' }], rolledBack: true },
-      { id: 'a3', turnId: 'a3', role: 'assistant', summary: 'third answer', items: [{ id: 'a3-i1', kind: 'text', text: 'third answer' }], rolledBack: true },
+      { id: 'u2', turnId: 'u2', role: 'user', summary: 'second prompt', items: [{ id: 'u2-i1', kind: 'text', text: 'second prompt' }], rolledBack: true, ...stamp },
+      { id: 'a2', turnId: 'a2', role: 'assistant', summary: 'second answer', items: [{ id: 'a2-i1', kind: 'text', text: 'second answer' }], rolledBack: true, ...stamp },
+      { id: 'u3', turnId: 'u3', role: 'user', summary: 'third prompt', items: [{ id: 'u3-i1', kind: 'text', text: 'third prompt' }], rolledBack: true, ...stamp },
+      { id: 'a3', turnId: 'a3', role: 'assistant', summary: 'third answer', items: [{ id: 'a3-i1', kind: 'text', text: 'third answer' }], rolledBack: true, ...stamp },
     ]
   }
 
@@ -2618,18 +2622,44 @@ describe('rolled-back section (kata 1wxv decision 6)', () => {
     expect(screen.queryByRole('region', { name: 'Rolled back turns' })).toBeNull()
   })
 
-  it('renders the marker rows with the USER-STEP count label (r3 correction 5)', () => {
-    // The label matches the server's rollback.undoneDepth: steps (user-role marker
-    // groups), never the raw marker-row count (4) and never entries.len().
+  it('renders restorable marker rows expanded with the USER-STEP count label (r3 correction 5)', () => {
+    // The label matches the server's rollback.undoneDepth: steps (user-role
+    // marker groups), never the raw marker-row count (4) and never entries.len().
+    render(<FreshAgentTranscript turns={[]} rolledBackTurns={markerTurns(true)} />)
+
+    const section = screen.getByRole('region', { name: 'Rolled back turns' })
+    expect(screen.getByText('Rolled back (2) — gone from the conversation; redo to restore.')).toBeInTheDocument()
+    expect(section).not.toHaveTextContent('Rolled back (4)')
+    expect(within(section).getByText('second prompt')).toBeInTheDocument()
+    expect(within(section).getByText('second answer')).toBeInTheDocument()
+    expect(within(section).getByText('third prompt')).toBeInTheDocument()
+    expect(within(section).getByText('third answer')).toBeInTheDocument()
+    // No historical rows ⇒ no disclosure line at all.
+    expect(screen.queryByRole('button', { name: 'Toggle rolled-back history' })).toBeNull()
+  })
+
+  it('collapses non-restorable markers behind the history line with the historical step count', () => {
+    // Older-server shape: no `restorable` key anywhere ⇒ every marker is
+    // historical ⇒ nothing renders expanded; the quiet line is the only surface.
     render(<FreshAgentTranscript turns={[]} rolledBackTurns={markerTurns()} />)
 
     const section = screen.getByRole('region', { name: 'Rolled back turns' })
-    expect(section).toHaveTextContent('Rolled back (2)')
-    expect(section).not.toHaveTextContent('Rolled back (4)')
-    expect(section).toHaveTextContent('second prompt')
-    expect(section).toHaveTextContent('second answer')
-    expect(section).toHaveTextContent('third prompt')
-    expect(section).toHaveTextContent('third answer')
+    const toggle = within(section).getByRole('button', { name: 'Toggle rolled-back history' })
+    expect(toggle).toHaveAttribute('aria-expanded', 'false')
+    expect(toggle).toHaveTextContent('Rolled back (2) — kept in history')
+    expect(screen.queryByText('second prompt')).toBeNull()
+    expect(screen.queryByText('second answer')).toBeNull()
+    expect(screen.queryByText('third prompt')).toBeNull()
+    expect(screen.queryByText('third answer')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Redo to here' })).toBeNull()
+
+    fireEvent.click(toggle)
+    expect(toggle).toHaveAttribute('aria-expanded', 'true')
+    expect(within(section).getByText('second prompt')).toBeInTheDocument()
+    expect(within(section).getByText('second answer')).toBeInTheDocument()
+    expect(within(section).getByText('third prompt')).toBeInTheDocument()
+    expect(within(section).getByText('third answer')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Redo to here' })).toBeNull()
   })
 
   it('per-row Redo to here fires onRedoToTurn only on redoable user rows when canRedo', () => {
@@ -2637,7 +2667,7 @@ describe('rolled-back section (kata 1wxv decision 6)', () => {
     render(
       <FreshAgentTranscript
         turns={[]}
-        rolledBackTurns={markerTurns()}
+        rolledBackTurns={markerTurns(true)}
         canRedo
         redoableTurnIds={['u2', 'u3']}
         onRedoToTurn={onRedoToTurn}
@@ -2654,14 +2684,18 @@ describe('rolled-back section (kata 1wxv decision 6)', () => {
   })
 
   it('delta-r1 F6: frozen prior-epoch markers (absent from redoableTurnIds) expose NO Redo to here', () => {
-    // undo → send destroys redo → a NEW epoch's undos land behind the frozen ones:
-    // the marker union is [frozen u2/a2 rows, current u3/a3 rows] — only the current
-    // epoch's tail is restorable, so only ITS user rows carry the affordance.
+    // undo → send destroys redo → a NEW epoch's undos land behind the frozen
+    // ones: the union is [frozen u2/a2 rows (no restorable stamp), current
+    // u3/a3 rows (restorable)] — only the current epoch's tail renders
+    // expanded with its redo affordance; the frozen pair collapses behind
+    // the history line.
     const onRedoToTurn = vi.fn()
+    const frozenRows = markerTurns().slice(0, 2)
+    const currentRows = markerTurns(true).slice(2)
     render(
       <FreshAgentTranscript
         turns={[]}
-        rolledBackTurns={markerTurns()}
+        rolledBackTurns={[...frozenRows, ...currentRows]}
         canRedo
         redoableTurnIds={['u3']}
         onRedoToTurn={onRedoToTurn}
@@ -2669,11 +2703,24 @@ describe('rolled-back section (kata 1wxv decision 6)', () => {
     )
 
     expect(screen.getByRole('region', { name: 'Rolled back turns' })).toBeInTheDocument()
+    expect(screen.getByText('Rolled back (1) — gone from the conversation; redo to restore.')).toBeInTheDocument()
+    expect(screen.getByText('Rolled back (1) — kept in history')).toBeInTheDocument()
+    // The all-time union count (2 steps) is never presented as live state.
+    expect(screen.queryByText(/Rolled back \(2\)/)).toBeNull()
     const redoButtons = screen.getAllByRole('button', { name: 'Redo to here' })
     expect(redoButtons).toHaveLength(1)
     fireEvent.click(redoButtons[0])
     expect(onRedoToTurn).toHaveBeenCalledWith('u3')
     expect(onRedoToTurn).toHaveBeenCalledTimes(1)
+    // The frozen rows stay hidden behind the collapsed line until toggled…
+    expect(screen.queryByText('second prompt')).toBeNull()
+    expect(screen.queryByText('second answer')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle rolled-back history' }))
+    expect(screen.getByText('second prompt')).toBeInTheDocument()
+    expect(screen.getByText('second answer')).toBeInTheDocument()
+    // …and they never grow a redo button (still exactly one, on the current row).
+    expect(screen.getAllByRole('button', { name: 'Redo to here' })).toHaveLength(1)
+    expect(screen.getByText('second prompt').closest('div.flex.items-start')?.querySelector('button[aria-label="Redo to here"]')).toBeNull()
   })
 
   it('delta-r1 F6 legacy harmlessness: an absent redoableTurnIds (legacy server surface) exposes NO per-marker redo, even with canRedo', () => {
@@ -2686,22 +2733,76 @@ describe('rolled-back section (kata 1wxv decision 6)', () => {
       />,
     )
 
-    expect(screen.getByRole('region', { name: 'Rolled back turns' })).toBeInTheDocument()
+    // A legacy server also omits `restorable` ⇒ the whole bucket is historical
+    // ⇒ the collapsed line is the only surface; expanding reveals the rows.
+    const section = screen.getByRole('region', { name: 'Rolled back turns' })
+    const toggle = within(section).getByRole('button', { name: 'Toggle rolled-back history' })
+    expect(toggle).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.queryByRole('button', { name: 'Redo to here' })).toBeNull()
+    fireEvent.click(toggle)
+    expect(within(section).getByText('second prompt')).toBeInTheDocument()
+    expect(within(section).getByText('third answer')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Redo to here' })).toBeNull()
   })
 
   it('exposes no Redo to here affordance when canRedo is false', () => {
+    // The realistic server shape when a new submission destroys redo: the
+    // markers are stamped restorable:false ⇒ born collapsed behind the line.
     render(
       <FreshAgentTranscript
         turns={[]}
-        rolledBackTurns={markerTurns()}
+        rolledBackTurns={markerTurns(false)}
         canRedo={false}
         redoableTurnIds={['u2', 'u3']}
         onRedoToTurn={vi.fn()}
       />,
     )
 
-    expect(screen.getByRole('region', { name: 'Rolled back turns' })).toBeInTheDocument()
+    const section = screen.getByRole('region', { name: 'Rolled back turns' })
+    const toggle = within(section).getByRole('button', { name: 'Toggle rolled-back history' })
+    expect(toggle).toHaveTextContent('Rolled back (2) — kept in history')
     expect(screen.queryByRole('button', { name: 'Redo to here' })).toBeNull()
+    fireEvent.click(toggle)
+    expect(within(section).getByText('second prompt')).toBeInTheDocument()
+    expect(within(section).getByText('third answer')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Redo to here' })).toBeNull()
+  })
+
+  it('the disclosure toggle resets when the pane switches conversations (same component, new session)', () => {
+    // Leak regression pin: PaneContainer keys the view by paneId only and
+    // startNewConversation swaps the snapshot WITHOUT remounting the transcript,
+    // so the toggle must re-collapse on a session id change by itself.
+    const historyA: FreshAgentTurn[] = [
+      { id: 'u2', turnId: 'u2', role: 'user', summary: 'conversation a marker', items: [{ id: 'u2-i1', kind: 'text', text: 'conversation a marker' }], rolledBack: true },
+    ]
+    const historyB: FreshAgentTurn[] = [
+      { id: 'v2', turnId: 'v2', role: 'user', summary: 'conversation b marker', items: [{ id: 'v2-i1', kind: 'text', text: 'conversation b marker' }], rolledBack: true },
+    ]
+    const { rerender } = render(
+      <FreshAgentTranscript sessionId="ses-a" turns={[]} rolledBackTurns={historyA} />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle rolled-back history' }))
+    expect(screen.getByText('conversation a marker')).toBeInTheDocument()
+
+    // Same component instance, NEW conversation: collapsed again, no leak.
+    rerender(<FreshAgentTranscript sessionId="ses-b" turns={[]} rolledBackTurns={historyB} />)
+    const toggleB = screen.getByRole('button', { name: 'Toggle rolled-back history' })
+    expect(toggleB).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.queryByText('conversation a marker')).toBeNull()
+    expect(screen.queryByText('conversation b marker')).toBeNull()
+
+    // Toggling works per conversation, and within one conversation the
+    // expansion survives a snapshot refresh (same session id, new markers).
+    fireEvent.click(toggleB)
+    expect(screen.getByText('conversation b marker')).toBeInTheDocument()
+    rerender(
+      <FreshAgentTranscript
+        sessionId="ses-b"
+        turns={[]}
+        rolledBackTurns={[...historyB, { id: 'v3', turnId: 'v3', role: 'user', summary: 'conversation b second marker', items: [{ id: 'v3-i1', kind: 'text', text: 'conversation b second marker' }], rolledBack: true }]}
+      />,
+    )
+    expect(screen.getByRole('button', { name: 'Toggle rolled-back history' })).toHaveAttribute('aria-expanded', 'true')
+    expect(screen.getByText('conversation b second marker')).toBeInTheDocument()
   })
 })
