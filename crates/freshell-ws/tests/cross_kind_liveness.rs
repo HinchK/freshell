@@ -3121,6 +3121,117 @@ async fn race_snapshot_paused_after_lookup_cannot_resurrect_during_handoff() {
     h.ws_state.registry.kill(&terminal_id);
 }
 
+/// R1b (b8ke ext r17 F2): the MANDATED capture-then-park interleaving the
+/// pre-lookup seam could not express — the GET CAPTURES its live-runtime
+/// reference, parks at the AFTER-CAPTURE seam, the fresh→terminal handoff
+/// COMPLETES while the GET holds the stale capture, then the GET resumes.
+/// The resumed path must answer the typed 409 derived from the CURRENT
+/// coordinator state (the terminal owner) — never a 200 served from the
+/// stale capture (pre-r17 the tracked arm served its capture blind, with
+/// no re-check and no seam to even drive the interleaving).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn race_snapshot_parked_after_capture_answers_typed_after_handoff() {
+    let _guard = ENV_LOCK.lock().await;
+    let codex_fake = DualRoleCodexFake::install();
+    let mut h = spawn_merged_server().await;
+    let sid = format!("r1b-{}", uuid::Uuid::new_v4());
+    establish_freshcodex_session(&mut h, &sid).await;
+    let watermark = codex_fake.thread_op_rows().len();
+
+    // Install the AFTER-CAPTURE pause: the GET parks holding its already-
+    // captured live-runtime reference.
+    let entered = Arc::new(AtomicBool::new(false));
+    let entered_for_hook = Arc::clone(&entered);
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let release_rx = std::sync::Mutex::new(Some(release_rx));
+    h.ws_state
+        .fresh_codex
+        .set_snapshot_pause_after_capture_for_tests(Arc::new(move |_thread_id: &str| {
+            let entered = Arc::clone(&entered_for_hook);
+            let release_rx = release_rx.lock().expect("release rx lock").take();
+            Box::pin(async move {
+                entered.store(true, Ordering::SeqCst);
+                if let Some(release_rx) = release_rx {
+                    let _ = release_rx.await;
+                }
+            })
+        }));
+    let base_url = h.base_url.clone();
+    let sid_for_get = sid.clone();
+    let get_task = tokio::spawn(async move {
+        http_get_json(
+            &base_url,
+            &format!("/api/fresh-agent/threads/freshcodex/codex/{sid_for_get}"),
+        )
+        .await
+    });
+    await_flag(&entered, "the snapshot GET must park AFTER its capture").await;
+
+    // Begin the fresh→terminal handoff and let it COMPLETE while the GET
+    // is parked holding the stale capture.
+    let resp = http_post_json(
+        &h.base_url,
+        "/api/sessions/handoff",
+        &handoff_post_body(&sid, "race-r1b"),
+    )
+    .await;
+    assert_eq!(resp.0, 200, "{}", resp.1);
+    assert_eq!(resp.1["ok"], json!(true), "{}", resp.1);
+    await_ownership(
+        &h,
+        &sid,
+        |state| {
+            matches!(
+                state,
+                freshell_ownership::OwnershipState::Live { owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal
+            )
+        },
+        "the handoff must commit Live{Terminal} while the GET holds the stale capture",
+    )
+    .await;
+
+    // Release the parked snapshot: the resumed path answers the TYPED 409
+    // derived from the CURRENT state — the terminal owner — never a 200
+    // from the stale capture.
+    let _ = release_tx.send(());
+    let (status, body) = get_task.await.expect("get task");
+    assert_eq!(
+        status, 409,
+        "the resumed stale-capture GET must answer the typed refusal: {body}"
+    );
+    assert_eq!(body["code"], json!("RESTORE_UNAVAILABLE"), "{body}");
+    assert_eq!(body["ownerKind"], json!("terminal"), "{body}");
+    assert!(
+        body["ownerGeneration"].as_u64().is_some(),
+        "the typed refusal names the owner generation: {body}"
+    );
+    // No sidecar spawn/resume was triggered by the stale GET.
+    assert_eq!(
+        codex_fake.thread_op_rows().len(),
+        watermark,
+        "no thread op may land after the watermark: {:?}",
+        codex_fake.thread_op_rows()
+    );
+    assert_eq!(ledger_resumes_for(&codex_fake, &sid), 1);
+
+    // The terminal stays the sole owner.
+    let terminal_id = resp.1["owner"]["terminalId"].as_str().unwrap().to_string();
+    assert_eq!(
+        live_pty_count_for_session(&h.ws_state.registry, "codex", &sid),
+        1,
+        "the exact terminal session is the sole live writer"
+    );
+    assert!(
+        !h.ws_state.fresh_codex.has_live_session(&sid).await,
+        "the old sidecar session is gone — the terminal is the one writer"
+    );
+    h.ws_state
+        .fresh_codex
+        .clear_snapshot_pause_after_capture_for_tests();
+    h.ws_state.registry.kill(&terminal_id);
+}
+
 /// R2: pause terminal creation after its keyed-create precheck, attempt the
 /// fresh-agent attach, then release both. One winner; the loser gets the
 /// typed owner/handoff result. The terminal-create pause is the same

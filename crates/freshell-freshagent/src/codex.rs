@@ -240,6 +240,12 @@ pub struct FreshCodexState {
     /// test registers its `notified()` future BEFORE any `notify_waiters()`
     /// — never notify before the waiter registered (lost-notification hang).
     snapshot_pause: Arc<StdMutex<Option<SnapshotPauseHook>>>,
+    /// b8ke ext r17 F2: the AFTER-CAPTURE snapshot-GET pause seam — fires
+    /// AFTER the tracked live-runtime lookup has captured its reference
+    /// (the mandated capture-then-park interleaving); the resumed path
+    /// RE-CHECKS the coordinator before serving (the captured reference is
+    /// stale by definition). `None` in production.
+    snapshot_pause_after_capture: Arc<StdMutex<Option<SnapshotPauseHook>>>,
     controls: controls::ControlRegistry,
 }
 
@@ -515,6 +521,7 @@ impl FreshCodexState {
             codex_quiet_window_ms: Arc::new(AtomicU64::new(codex_quiet_window_ms_from_env())),
             rollback_in_flight: crate::InFlightRegistry::new(),
             snapshot_pause: Arc::new(StdMutex::new(None)),
+            snapshot_pause_after_capture: Arc::new(StdMutex::new(None)),
             controls: Default::default(),
         }
     }
@@ -544,6 +551,26 @@ impl FreshCodexState {
     /// cleanup between scenarios).
     pub fn clear_snapshot_pause_for_tests(&self) {
         *self.snapshot_pause.lock().expect("snapshot pause lock") = None;
+    }
+
+    /// b8ke ext r17 F2: install the AFTER-CAPTURE snapshot-GET pause hook
+    /// — the GET parks AFTER the tracked live-runtime lookup has captured
+    /// its reference (the deterministic-race interleaving: capture → park
+    /// → handoff completes → resume). Interior-shared like the pre-lookup
+    /// seam; never set in production.
+    pub fn set_snapshot_pause_after_capture_for_tests(&self, hook: SnapshotPauseHook) {
+        *self
+            .snapshot_pause_after_capture
+            .lock()
+            .expect("snapshot after-capture pause lock") = Some(hook);
+    }
+
+    /// b8ke ext r17 F2: clear the after-capture pause hook.
+    pub fn clear_snapshot_pause_after_capture_for_tests(&self) {
+        *self
+            .snapshot_pause_after_capture
+            .lock()
+            .expect("snapshot after-capture pause lock") = None;
     }
 
     /// Wire the cross-kind terminal-liveness probe (Task 13b; called by `main.rs`
@@ -5799,13 +5826,64 @@ impl FreshCodexState {
         if let Some(hook) = pause_hook {
             hook(thread_id).await;
         }
-        // Tracked: serve from the live runtime (unchanged behavior).
+        // Tracked: the live map lookup — the CAPTURE. b8ke ext r17 F2:
+        // the AFTER-CAPTURE seam (below) parks the GET HERE, holding the
+        // already-captured reference (the mandated capture-then-park
+        // interleaving — the pre-lookup seam above could not express it:
+        // both R1 and the queued-snapshot races let the handoff finish
+        // before any lookup). The resumed path RE-CHECKS the coordinator
+        // — the captured reference is stale by definition, so the answer
+        // derives from the CURRENT state (the same typed arms the
+        // untracked path applies), never a blind reuse of the capture.
         if let Some(resumed) = self.live_resumed_session(thread_id).await {
+            // The hook is cloned out of the interior-shared cell in its
+            // own statement (an `if let` scrutinee temporary would hold
+            // the cell's lock across the await — not Send); `None` in
+            // production.
+            let after_capture_hook = self
+                .snapshot_pause_after_capture
+                .lock()
+                .expect("snapshot after-capture pause lock")
+                .clone();
+            if let Some(hook) = after_capture_hook {
+                hook(thread_id).await;
+            }
             let active_turn_present = resumed
                 .active_turn
                 .lock()
                 .expect("active_turn mutex")
                 .is_some();
+            // THE RESUMED RE-CHECK: derive from the CURRENT coordinator
+            // state. A same-kind live fresh-agent owner (or an
+            // unwired/vacant key — the local map is the truth for a
+            // tracked session the coordinator cannot contradict) serves
+            // the capture; a foreign owner or an in-flight transition
+            // answers the TYPED result, never a stale 200.
+            let ownership = self.ownership_snapshot(PROVIDER, thread_id);
+            match &ownership.state {
+                freshell_ownership::OwnershipState::Live {
+                    owner, generation, ..
+                } if owner.kind != freshell_ownership::RuntimeOwnerKind::FreshAgent => {
+                    return Err(CodexSnapshotError::ReservedByOwner {
+                        owner_kind: owner.kind,
+                        generation: *generation,
+                    });
+                }
+                freshell_ownership::OwnershipState::Handoff { generation, .. }
+                | freshell_ownership::OwnershipState::Starting { generation, .. }
+                | freshell_ownership::OwnershipState::Stopping { generation, .. }
+                | freshell_ownership::OwnershipState::Fenced { generation, .. } => {
+                    return Err(CodexSnapshotError::HandoffInProgress {
+                        generation: *generation,
+                    });
+                }
+                // Live{FreshAgent} (this writer), Vacant/Aliased (the
+                // coordinator cannot contradict the local map), or an
+                // unwired registry (the snapshot's Vacant default):
+                // serve the captured reference (the pre-existing
+                // behavior).
+                _ => {}
+            }
             return Ok((resumed.client, active_turn_present));
         }
         // Untracked: SIDE-EFFECT-FREE contract (kata b8ke; round-2 review —
