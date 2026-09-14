@@ -203,7 +203,16 @@ fn parse_server_frame(bytes: &[u8]) -> Option<(u8, &[u8], usize)> {
     if bytes.len() < 2 {
         return None;
     }
-    let opcode = bytes[0] & 0x0f;
+    let first = bytes[0];
+    let opcode = first & 0x0f;
+    if opcode == 0x8 {
+        assert_ne!(first & 0x80, 0, "server close frame must set FIN");
+        assert_eq!(first & 0x70, 0, "server close frame must not set RSV bits");
+        assert!(
+            bytes[1] & 0x7f <= 125,
+            "server close frame payload must be at most 125 bytes"
+        );
+    }
     assert_eq!(bytes[1] & 0x80, 0, "server frames must not be masked");
     let (payload_len, header_len) = match bytes[1] & 0x7f {
         short @ 0..=125 => (short as usize, 2usize),
@@ -226,8 +235,38 @@ fn parse_server_frame(bytes: &[u8]) -> Option<(u8, &[u8], usize)> {
         }
         _ => unreachable!("WebSocket payload length is seven bits"),
     };
+    if opcode == 0x8 {
+        assert_ne!(
+            payload_len, 1,
+            "server close payload must be empty or include a code"
+        );
+    }
     let end = header_len.checked_add(payload_len)?;
     (bytes.len() >= end).then_some((opcode, &bytes[header_len..end], end))
+}
+
+#[test]
+#[should_panic(expected = "server close frame must set FIN")]
+fn origin_close_parser_rejects_fragmented_close() {
+    let _ = parse_server_frame(&[0x08, 0x02, 0x0f, 0xab]);
+}
+
+#[test]
+#[should_panic(expected = "server close frame must not set RSV bits")]
+fn origin_close_parser_rejects_rsv_close() {
+    let _ = parse_server_frame(&[0xc8, 0x02, 0x0f, 0xab]);
+}
+
+#[test]
+#[should_panic(expected = "server close frame payload must be at most 125 bytes")]
+fn origin_close_parser_rejects_extended_length() {
+    let _ = parse_server_frame(&[0x88, 126]);
+}
+
+#[test]
+#[should_panic(expected = "server close payload must be empty or include a code")]
+fn origin_close_parser_rejects_one_byte_payload() {
+    let _ = parse_server_frame(&[0x88, 0x01, 0x00]);
 }
 
 /// A client may write its hello as soon as it has emitted the upgrade request,
@@ -247,14 +286,14 @@ async fn pipelined_origin_rejection_close(addr: &str, origin: &str) -> (u16, Str
         "GET /ws HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\nOrigin: {origin}\r\n\r\n",
         generate_key(),
     );
+    let hello_frame = masked_client_text_frame(hello.as_bytes());
+    let mut pipelined_request = Vec::with_capacity(request.len() + hello_frame.len());
+    pipelined_request.extend_from_slice(request.as_bytes());
+    pipelined_request.extend_from_slice(&hello_frame);
     stream
-        .write_all(request.as_bytes())
+        .write_all(&pipelined_request)
         .await
-        .expect("write upgrade request");
-    stream
-        .write_all(&masked_client_text_frame(hello.as_bytes()))
-        .await
-        .expect("pipeline hello behind upgrade request");
+        .expect("write upgrade request and pipelined hello together");
     stream.flush().await.expect("flush pipelined client bytes");
 
     tokio::time::timeout(Duration::from_secs(3), async {
