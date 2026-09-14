@@ -6141,3 +6141,49 @@ fn close_verdicts_apply_only_with_close_evidence() {
     );
     assert!(panes[1]["sessionRef"].is_null());
 }
+
+#[test]
+fn device_tabs_preserve_the_union_record_order() {
+    // The client's workspace restore rebuilds its tab strip from
+    // device.tabs IN ORDER (restoreMachineWorkspace -> buildRecoveryPlan),
+    // so the inventory must never re-order the union's records. The union
+    // owns the strip-order fix; this pins the inventory's pass-through.
+    // Two tab records in the union's record array, in a non-alphabetical
+    // order: k2 first, k1 second (union_doc_with_tab_key builds one-record
+    // docs, so build the two-record doc with json! directly, mirroring
+    // union_doc's shape).
+    let doc = json!({
+        "deviceId": "dev",
+        "deviceLabel": "Dev",
+        "capturedAt": 1000,
+        "snapshotRevision": 1,
+        "records": [
+            {
+                "tabKey": "k2", "tabId": "k2", "tabName": "Second", "status": "open",
+                "revision": 10, "updatedAt": 10, "createdAt": 10,
+                "titleSetByUser": false, "paneCount": 1,
+                "panes": [{ "paneId": "p-late", "kind": "editor",
+                            "payload": { "filePath": "/tmp/late.md" } }]
+            },
+            {
+                "tabKey": "k1", "tabId": "k1", "tabName": "First", "status": "open",
+                "revision": 10, "updatedAt": 10, "createdAt": 10,
+                "titleSetByUser": false, "paneCount": 1,
+                "panes": [{ "paneId": "p-early", "kind": "editor",
+                            "payload": { "filePath": "/tmp/early.md" } }]
+            }
+        ]
+    });
+    let union = DeviceUnion {
+        device_id: "dev".to_string(),
+        union_doc: doc,
+    };
+    let out = build_inventory(vec![union], vec![], no_live(), &no_evidence(), &no_closes());
+    let keys: Vec<&str> = out["device"]["tabs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["tabKey"].as_str())
+        .collect();
+    assert_eq!(keys, vec!["k2", "k1"]);
+}
