@@ -72,15 +72,18 @@ describe('Electron E2E client preflight', () => {
     })
   })
 
-  it('removes inherited Cargo artifact routing for the build and Electron child', () => {
+  it('removes case-insensitive inherited Cargo artifact routing for the build and Electron child', () => {
     const inherited = {
       CARGO_TARGET_DIR: '/other-worktree/target',
-      CARGO_BUILD_TARGET: 'aarch64-unknown-linux-gnu',
+      cargo_target_dir: '/other-worktree/lowercase-target',
+      Cargo_Build_Target: 'aarch64-pc-windows-msvc',
       KEEP_ME: 'yes',
+      CARGO_TARGET_DIR_EXTRA: 'must-not-be-removed',
     }
     expect(electronE2eBuildEnvironment(inherited, 'a'.repeat(40))).toEqual({
       FRESHELL_BUILD_COMMIT: 'a'.repeat(40),
       KEEP_ME: 'yes',
+      CARGO_TARGET_DIR_EXTRA: 'must-not-be-removed',
     })
     expect(electronE2eEnvironment(
       inherited,
@@ -90,6 +93,7 @@ describe('Electron E2E client preflight', () => {
       FRESHELL_ELECTRON_E2E_BUILD_ID: 'a'.repeat(40),
       FRESHELL_E2E_RUST_SERVER_BIN: '/repo/target/release/freshell-server',
       KEEP_ME: 'yes',
+      CARGO_TARGET_DIR_EXTRA: 'must-not-be-removed',
     })
   })
 })

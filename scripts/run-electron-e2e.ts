@@ -9,6 +9,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url))
 const PROJECT_ROOT = path.resolve(SCRIPT_DIR, '..')
+const CARGO_ARTIFACT_ROUTING_KEYS = new Set(['CARGO_TARGET_DIR', 'CARGO_BUILD_TARGET'])
 
 /** The target platform determines the Rust executable's filename. */
 export function rustArtifactName(platform: NodeJS.Platform = process.platform): string {
@@ -26,8 +27,11 @@ export function rustArtifactPath(
 /** Keep Cargo's output at the artifact path Electron E2E will verify and run. */
 function withoutCargoArtifactRouting(inheritedEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env = { ...inheritedEnv }
-  delete env.CARGO_TARGET_DIR
-  delete env.CARGO_BUILD_TARGET
+  for (const key of Object.keys(env)) {
+    if (CARGO_ARTIFACT_ROUTING_KEYS.has(key.toUpperCase())) {
+      delete env[key]
+    }
+  }
   return env
 }
 
