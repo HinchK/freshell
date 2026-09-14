@@ -4,6 +4,20 @@ import {
   stopOwnedServerAndVerify,
 } from '../../e2e-electron/owned-server-teardown.js'
 
+async function expectAggregateCause(operation: Promise<void>, pattern: RegExp): Promise<void> {
+  try {
+    await operation
+    throw new Error('expected teardown to fail')
+  } catch (error) {
+    expect(error).toBeInstanceOf(AggregateError)
+    const messages = (error as AggregateError).errors.flatMap((failure) => [
+      String(failure),
+      String((failure as Error & { cause?: unknown }).cause),
+    ])
+    expect(messages.some((message) => pattern.test(message))).toBe(true)
+  }
+}
+
 describe('stopOwnedServerAndVerify', () => {
   it('surfaces a stop failure after still checking the exact owned PID and port', async () => {
     const stop = vi.fn().mockRejectedValue(new Error('SIGTERM failed'))
@@ -58,7 +72,6 @@ describe('stopOwnedServerAndVerify', () => {
 
     expect(order).toEqual(['ownership', 'signal:SIGTERM'])
     expect(proveOwnership).toHaveBeenCalledWith({ pid: 4242, port: 4243 })
-    expect(waitForPidGone).toHaveBeenCalledWith(4242)
     expect(isPortFree).toHaveBeenCalledWith(4243)
   })
 
@@ -82,7 +95,134 @@ describe('stopOwnedServerAndVerify', () => {
     ).rejects.toThrow(/forced owned server teardown failed/i)
 
     expect(process.signal).not.toHaveBeenCalled()
-    expect(waitForPidGone).toHaveBeenCalledWith(4242)
     expect(isPortFree).toHaveBeenCalledWith(4243)
+  })
+
+  it('does not SIGKILL a PID reused after TERM when its original Rust ownership disappears', async () => {
+    let identity: 'owned' | 'reused' = 'owned'
+    const process = {
+      pid: 4242,
+      isAlive: vi.fn(() => true),
+      signal: vi.fn((signal: NodeJS.Signals) => {
+        if (signal === 'SIGTERM') identity = 'reused'
+        return true
+      }),
+    }
+    const proveOwnership = vi.fn(async () => {
+      if (identity !== 'owned') throw new Error('PID start identity changed after TERM')
+    })
+    const waitForPidGone = vi.fn().mockResolvedValue(false)
+    const isPortFree = vi.fn().mockResolvedValue(false)
+
+    await expectAggregateCause(
+      forceStopExactOwnedServerAndVerify(
+        process,
+        { pid: 4242, port: 4243 },
+        {
+          proveOwnership,
+          waitForPidGone,
+          isPortFree,
+          sleep: async () => { await new Promise((resolve) => setTimeout(resolve, 1)) },
+        },
+        1,
+      ),
+      /ownership/i,
+    )
+
+    expect(process.signal).toHaveBeenCalledWith('SIGTERM')
+    expect(process.signal).not.toHaveBeenCalledWith('SIGKILL')
+    expect(proveOwnership.mock.calls.length).toBeGreaterThanOrEqual(2)
+  })
+
+  it('reproves a TERM-resistant Rust child before SIGKILL and observes its exit', async () => {
+    let alive = true
+    const process = {
+      pid: 4242,
+      isAlive: vi.fn(() => alive),
+      signal: vi.fn((signal: NodeJS.Signals) => {
+        if (signal === 'SIGKILL') alive = false
+        return true
+      }),
+    }
+    const proveOwnership = vi.fn().mockResolvedValue(undefined)
+    const waitForPidGone = vi.fn(async () => !alive)
+    const isPortFree = vi.fn(async () => !alive)
+
+    await expect(
+      forceStopExactOwnedServerAndVerify(
+        process,
+        { pid: 4242, port: 4243 },
+        { proveOwnership, waitForPidGone, isPortFree, sleep: async () => { await new Promise((resolve) => setTimeout(resolve, 1)) } },
+        1,
+      ),
+    ).resolves.toBeUndefined()
+
+    expect(process.signal).toHaveBeenNthCalledWith(1, 'SIGTERM')
+    expect(process.signal).toHaveBeenNthCalledWith(2, 'SIGKILL')
+    expect(proveOwnership.mock.calls.length).toBeGreaterThanOrEqual(2)
+  })
+
+  it('bounds no-progress polling, escalates once, and leaves no detached polling after a resistant child', async () => {
+    let aliveChecks = 0
+    let alive = true
+    const process = {
+      pid: 4242,
+      isAlive: vi.fn(() => {
+        aliveChecks += 1
+        // The old Date.now-only loop waited for this artificial process exit
+        // instead of honoring its poll budget. The bounded helper must KILL.
+        if (aliveChecks > 10) alive = false
+        return alive
+      }),
+      signal: vi.fn((signal: NodeJS.Signals) => {
+        if (signal === 'SIGKILL') alive = false
+        return true
+      }),
+    }
+    const proveOwnership = vi.fn().mockResolvedValue(undefined)
+    const waitForPidGone = vi.fn(async () => !alive)
+    const isPortFree = vi.fn(async () => !alive)
+    const sleep = vi.fn(async () => {})
+
+    await expect(
+      forceStopExactOwnedServerAndVerify(
+        process,
+        { pid: 4242, port: 4243 },
+        { proveOwnership, waitForPidGone, isPortFree, sleep },
+        1,
+      ),
+    ).resolves.toBeUndefined()
+
+    expect(process.signal).toHaveBeenNthCalledWith(1, 'SIGTERM')
+    expect(process.signal).toHaveBeenNthCalledWith(2, 'SIGKILL')
+    const checksAtReturn = process.isAlive.mock.calls.length
+    await Promise.resolve()
+    expect(process.isAlive).toHaveBeenCalledTimes(checksAtReturn)
+    expect(sleep).toHaveBeenCalledTimes(2)
+  })
+
+  it('aggregates a rejected exact signal and never starts a detached escalation', async () => {
+    const process = {
+      pid: 4242,
+      isAlive: vi.fn(() => true),
+      signal: vi.fn(() => { throw new Error('TERM denied') }),
+    }
+    const proveOwnership = vi.fn().mockResolvedValue(undefined)
+    const waitForPidGone = vi.fn().mockResolvedValue(false)
+    const isPortFree = vi.fn().mockResolvedValue(false)
+
+    await expectAggregateCause(
+      forceStopExactOwnedServerAndVerify(
+        process,
+        { pid: 4242, port: 4243 },
+        { proveOwnership, waitForPidGone, isPortFree, sleep: async () => {} },
+        1,
+      ),
+      /TERM denied/i,
+    )
+
+    expect(process.signal).toHaveBeenCalledTimes(1)
+    await Promise.resolve()
+    expect(process.signal).toHaveBeenCalledTimes(1)
   })
 })

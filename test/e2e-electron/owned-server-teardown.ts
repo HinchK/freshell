@@ -3,6 +3,8 @@ import net from 'node:net'
 export interface OwnedServerReceipt {
   pid: number
   port: number
+  /** Stable platform identity captured with the PID when the fixture starts. */
+  identity?: string
 }
 
 export interface OwnedServerHandle {
@@ -94,18 +96,67 @@ export async function verifyOwnedServerStopped(
   }
 }
 
+type ExactProcessState = { state: 'gone' | 'owned' | 'unproven'; error?: unknown }
+
+async function observeExactProcess(
+  process: ExactOwnedServerProcess,
+  receipt: OwnedServerReceipt,
+  probes: ForcedOwnedServerTeardownProbes,
+): Promise<ExactProcessState> {
+  if (!process.isAlive()) return { state: 'gone' }
+  try {
+    await probes.proveOwnership(receipt)
+    return { state: 'owned' }
+  } catch (error) {
+    // A natural exit between the liveness probe and /proc/handle inspection is
+    // success, not a reason to keep a numeric PID in forced containment.
+    if (!process.isAlive()) return { state: 'gone' }
+    return { state: 'unproven', error }
+  }
+}
+
 async function waitForExactProcessExit(
   process: ExactOwnedServerProcess,
+  receipt: OwnedServerReceipt,
+  probes: ForcedOwnedServerTeardownProbes,
   timeoutMs: number,
-  sleep: (ms: number) => Promise<void>,
-): Promise<boolean> {
+): Promise<ExactProcessState> {
   const deadline = Date.now() + timeoutMs
-  while (process.isAlive()) {
+  const maxPolls = Math.max(1, Math.ceil(timeoutMs / 25) + 1)
+  for (let poll = 0; poll < maxPolls; poll += 1) {
+    const observed = await observeExactProcess(process, receipt, probes)
+    if (observed.state !== 'owned') return observed
     const remaining = deadline - Date.now()
-    if (remaining <= 0) return false
-    await sleep(Math.min(25, remaining))
+    if (remaining <= 0) return { state: 'owned' }
+    await probes.sleep(Math.min(25, remaining))
   }
-  return true
+  return observeExactProcess(process, receipt, probes)
+}
+
+async function verifyForcedOwnedServerStopped(
+  process: ExactOwnedServerProcess,
+  receipt: OwnedServerReceipt,
+  probes: ForcedOwnedServerTeardownProbes,
+): Promise<void> {
+  const failures: Error[] = []
+  const observed = await observeExactProcess(process, receipt, probes)
+  if (observed.state === 'owned') {
+    failures.push(new Error(`owned server PID ${receipt.pid} is still alive after forced teardown`))
+  } else if (observed.state === 'unproven') {
+    appendFailure(failures, `could not verify original identity of server PID ${receipt.pid} after forced teardown`, observed.error)
+  }
+
+  try {
+    if (!await probes.isPortFree(receipt.port)) {
+      failures.push(new Error(`owned server port ${receipt.port} is still bound after forced teardown`))
+    }
+  } catch (error) {
+    appendFailure(failures, `could not verify owned server port ${receipt.port} was released`, error)
+  }
+
+  if (failures.length > 0) {
+    throw new AggregateError(failures, `forced owned server teardown verification failed for PID ${receipt.pid}, port ${receipt.port}`)
+  }
 }
 
 /**
@@ -119,42 +170,47 @@ export async function forceStopExactOwnedServerAndVerify(
   timeoutMs = 5_000,
 ): Promise<void> {
   const failures: Error[] = []
-  let ownershipProved = false
-
-  try {
-    if (process.pid !== receipt.pid) {
-      throw new Error(`captured process PID ${process.pid} does not match receipt PID ${receipt.pid}`)
+  if (process.pid !== receipt.pid) {
+    failures.push(new Error(`captured process PID ${process.pid} does not match receipt PID ${receipt.pid}`))
+  } else {
+    const initial = await observeExactProcess(process, receipt, probes)
+    if (initial.state === 'unproven') {
+      appendFailure(failures, `could not prove ownership of server PID ${receipt.pid}`, initial.error)
+    } else if (initial.state === 'owned') {
+      try {
+        const sentTerm = process.signal('SIGTERM')
+        if (!sentTerm && process.isAlive()) {
+          throw new Error(`owned server PID ${receipt.pid} rejected SIGTERM`)
+        }
+        const afterTerm = await waitForExactProcessExit(process, receipt, probes, timeoutMs)
+        if (afterTerm.state === 'unproven') {
+          throw new Error(`ownership of server PID ${receipt.pid} changed after SIGTERM`, { cause: afterTerm.error })
+        }
+        if (afterTerm.state === 'owned') {
+          // PID liveness alone is insufficient: prove the same fixture child
+          // again immediately before escalation so PID reuse can never receive
+          // an unproven SIGKILL.
+          await probes.proveOwnership(receipt)
+          const sentKill = process.signal('SIGKILL')
+          if (!sentKill && process.isAlive()) {
+            throw new Error(`owned server PID ${receipt.pid} rejected SIGKILL`)
+          }
+          const afterKill = await waitForExactProcessExit(process, receipt, probes, timeoutMs)
+          if (afterKill.state === 'unproven') {
+            throw new Error(`ownership of server PID ${receipt.pid} changed after SIGKILL`, { cause: afterKill.error })
+          }
+          if (afterKill.state === 'owned') {
+            throw new Error(`owned server PID ${receipt.pid} did not exit within ${timeoutMs}ms after SIGKILL`)
+          }
+        }
+      } catch (error) {
+        appendFailure(failures, `force-stopping owned server PID ${receipt.pid}`, error)
+      }
     }
-    if (process.isAlive()) {
-      await probes.proveOwnership(receipt)
-      ownershipProved = true
-    }
-  } catch (error) {
-    appendFailure(failures, `could not prove ownership of server PID ${receipt.pid}`, error)
   }
 
-  if (ownershipProved) {
-    try {
-      const sentTerm = process.signal('SIGTERM')
-      if (!sentTerm && process.isAlive()) {
-        throw new Error(`owned server PID ${receipt.pid} rejected SIGTERM`)
-      }
-      if (!(await waitForExactProcessExit(process, timeoutMs, probes.sleep))) {
-        const sentKill = process.signal('SIGKILL')
-        if (!sentKill && process.isAlive()) {
-          throw new Error(`owned server PID ${receipt.pid} rejected SIGKILL`)
-        }
-        if (!(await waitForExactProcessExit(process, timeoutMs, probes.sleep))) {
-          throw new Error(`owned server PID ${receipt.pid} did not exit within ${timeoutMs}ms after SIGKILL`)
-        }
-      }
-    } catch (error) {
-      appendFailure(failures, `force-stopping owned server PID ${receipt.pid}`, error)
-    }
-  }
-
   try {
-    await verifyOwnedServerStopped(receipt, probes)
+    await verifyForcedOwnedServerStopped(process, receipt, probes)
   } catch (error) {
     appendFailure(failures, `verifying forced teardown of owned server PID ${receipt.pid}`, error)
   }

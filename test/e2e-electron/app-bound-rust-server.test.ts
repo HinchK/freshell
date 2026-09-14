@@ -169,6 +169,43 @@ function splitNulSeparatedFile(filePath: string): string[] {
   return fs.readFileSync(filePath).toString('utf8').split('\0').filter(Boolean)
 }
 
+/**
+ * A PID alone is not stable across a forced-stop wait. Pair it with the
+ * kernel-assigned process creation identity and re-read it before every
+ * signal so a recycled numeric PID can never receive fixture cleanup.
+ */
+function processIdentity(pid: number): string {
+  if (!Number.isInteger(pid) || pid <= 0) throw new Error(`invalid fixture PID ${pid}`)
+  if (process.platform === 'win32') {
+    const result = spawnSync(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks`,
+      ],
+      { encoding: 'utf8', windowsHide: true },
+    ) as { status: number | null; stdout: string }
+    const ticks = result.stdout.trim()
+    if (result.status !== 0 || !/^\d+$/.test(ticks)) {
+      throw new Error(`could not read creation identity for fixture PID ${pid}`)
+    }
+    return `windows-start:${ticks}`
+  }
+
+  const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8')
+  const closeName = stat.lastIndexOf(')')
+  const fields = stat.slice(closeName + 1).trim().split(/\s+/)
+  // /proc/<pid>/stat begins with fields 3 onward after the closing name;
+  // starttime is field 22, therefore index 19 in this suffix.
+  const startTime = fields[19]
+  if (closeName < 0 || !/^\d+$/.test(startTime ?? '')) {
+    throw new Error(`could not read creation identity for fixture PID ${pid}`)
+  }
+  return `linux-start:${startTime}`
+}
+
 function listeningPidsForFixturePort(port: number): number[] {
   if (process.platform === 'win32') {
     const result = spawnSync('netstat', ['-ano', '-p', 'tcp'], {
@@ -219,6 +256,9 @@ async function proveAppBoundRustOwnership(
     token: string
   },
 ): Promise<void> {
+  if (!receipt.identity || processIdentity(receipt.pid) !== receipt.identity) {
+    throw new Error(`captured Rust PID ${receipt.pid} no longer has its recorded process identity`)
+  }
   const response = await fetch(`http://127.0.0.1:${receipt.port}/api/server-info`, {
     headers: { 'x-auth-token': options.token },
     signal: AbortSignal.timeout(2_000),
@@ -385,7 +425,7 @@ test.describe('Electron app-bound Rust server', () => {
         process.platform === 'win32'
           ? await waitForFixturePortOwner(appPort)
           : await waitForOwnedChild(electronPid, RUST_BINARY)
-      appServerReceipt = { pid: appServerPid, port: appPort }
+      appServerReceipt = { pid: appServerPid, port: appPort, identity: processIdentity(appServerPid) }
 
       await closeElectronGracefully(app)
       await waitForCapturedChildExit(electronProcess)
