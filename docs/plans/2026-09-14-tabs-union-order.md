@@ -201,17 +201,17 @@ test.describe('machine workspace restore keeps tab order', () => {
     await harness.waitForHarness()
     await harness.waitForConnection()
 
-    // The first-boot auto-create (App.tsx:1871-1876: machine ready + 0
-    // tabs) leaves one shell tab; remove it so the pushed strip holds
-    // EXACTLY the three deterministic tabs below (its nanoid tabKey would
-    // otherwise make the restored order nondeterministic).
+    // The first-boot auto-create (App.tsx:1871-1876) fires on EVERY render
+    // where a ready machine has ZERO tabs — so the auto tab must be removed
+    // LAST, never first: removing it before adding ours would expose an
+    // empty strip for one render and deterministically inject a fresh
+    // random-id shell tab. Capture its id now; add our three tabs (strip
+    // 1 -> 4); then remove the auto tab (strip 4 -> 3) so the strip never
+    // passes through zero.
     await harness.waitForTabCount(1, 30_000)
     const bootState: any = await harness.getState()
     const autoTabId: string = bootState?.tabs?.tabs?.[0]?.id
     expect(autoTabId, 'the auto-created first tab exists before our tabs').toBeTruthy()
-    await page.evaluate((tabId: string) => {
-      window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'tabs/removeTab', payload: tabId })
-    }, autoTabId)
 
     // Three tabs with explicit ids, created in an order that differs from
     // tabKey sort. Editor panes: no PTY spawn, and the recovery plan
@@ -237,7 +237,11 @@ test.describe('machine workspace restore keeps tab order', () => {
         })
       }, tab)
     }
-    await harness.waitForTabCount(3, 30_000) // the removal precedes the adds in program order
+    await harness.waitForTabCount(4, 30_000) // three explicit tabs + the auto tab
+    await page.evaluate((tabId: string) => {
+      window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'tabs/removeTab', payload: tabId })
+    }, autoTabId)
+    await harness.waitForTabCount(3, 30_000)
 
     // Durable-persist wait: the client's NEWEST generation on disk holds
     // exactly the three tab ids before we reload.
@@ -261,7 +265,7 @@ test.describe('machine workspace restore keeps tab order', () => {
 })
 ```
 
-Implementation notes: verify `TestHarness.waitForTabCount`'s exact semantics in `helpers/test-harness.ts` while implementing (it must poll-until, not assert-once); the removal dispatch precedes the adds in program order, so the strip settles at exactly 3. Register in `test/e2e-browser/playwright.config.ts`. In the `RUST_ONLY_SPECS` array (after the `/freshagent-live-model-convergence-rust\.spec\.ts$/` entry):
+Implementation notes: verify `TestHarness.waitForTabCount`'s exact semantics in `helpers/test-harness.ts` while implementing (it must poll-until, not assert-once). The ordering is load-bearing: the auto tab's removal comes AFTER the three adds so the strip never renders at zero tabs (App.tsx:1871-1876 re-fires `addTab` on every zero-tab render with a ready machine). Register in `test/e2e-browser/playwright.config.ts`. In the `RUST_ONLY_SPECS` array (after the `/freshagent-live-model-convergence-rust\.spec\.ts$/` entry):
 
 ```typescript
   // MACHINE-TAB-ORDER (the-usual/tabs-union-order): reload-through-restore
@@ -401,7 +405,7 @@ with:
 
 Run: `cargo test -p freshell-ws --lib tabs_persist`
 
-Expected: FAIL — `union_preserves_the_newest_sources_pushed_record_order` receives `["dev:k1", "dev:k2", "dev:k3"]`; `union_positions_keys_by_first_seen_source_and_content_by_dedupe_rank` receives `["dev:x", "dev:y", "dev:z", "dev:w"]` sorted by tabKey (`dev:w`, `dev:x`, `dev:y`, `dev:z`); the flipped bundle test receives `["dev:x", "dev:y"]`. All three fail because the tabKey sort still governs, not for setup/syntax reasons.
+Expected: FAIL — `union_preserves_the_newest_sources_pushed_record_order` receives `["dev:k1", "dev:k2", "dev:k3"]`; `union_positions_keys_by_first_seen_source_and_content_by_dedupe_rank` receives the tabKey-sorted `["dev:w", "dev:x", "dev:y", "dev:z"]`; the flipped bundle test receives `["dev:x", "dev:y"]`. All three fail because the tabKey sort still governs, not for setup/syntax reasons.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -428,17 +432,19 @@ with:
     // ranked newest-first by the same tuple `label_src` uses, so HashMap
     // iteration order never decides user-visible record order (the
     // determinism the old `sort_by_key(tabKey)` existed to provide).
+    // sort_by_key computes the ranking tuple ONCE per source — required,
+    // not a nicety: snapshot_generation_id canonicalizes, serializes, and
+    // hashes the WHOLE generation document, which a comparator would
+    // otherwise redo for both operands on every comparison.
     let mut sources: Vec<(&String, &(i64, PathBuf, Value))> = newest.iter().collect();
-    sources.sort_by(|a, b| {
-        let key = |s: &(&String, &(i64, PathBuf, Value))| {
-            (
-                captured_at(&s.1.2),
-                generation_rank(&s.1.2).0,
-                s.0.clone(),
-                snapshot_generation_id(&s.1.2),
-            )
-        };
-        key(b).cmp(&key(a))
+    sources.sort_by_key(|(client, gen)| {
+        let snap: &Value = &gen.2;
+        std::cmp::Reverse((
+            captured_at(snap),
+            generation_rank(snap).0,
+            (*client).clone(),
+            snapshot_generation_id(snap),
+        ))
     });
     let mut seen: HashSet<&str> = HashSet::new();
     let mut records: Vec<Value> = Vec::new();
@@ -687,11 +693,10 @@ None.
 
 - [ ] **Step 5: Run impacted-test verification**
 
-The touched test files are self-contained client unit suites; run them together (the Step 3 command) plus lint on the touched files:
+The touched test files are self-contained client unit suites; the focused vitest run IS the verification (eslint's flat config, `eslint.config.js`, covers only `src/**` — a direct eslint invocation on `test/` files applies no rules and proves nothing):
 
 ```bash
 npm run test:vitest -- run test/unit/client/lib/machine-workspace.test.ts test/unit/client/lib/recovery/build-recovery-plan.test.ts
-npx eslint test/unit/client/lib/machine-workspace.test.ts test/unit/client/lib/recovery/build-recovery-plan.test.ts
 ```
 
 Expected: PASS.
