@@ -1901,8 +1901,26 @@ impl SessionHandoffRunner {
             operation_id,
             generation,
             prior,
+            target_kind,
+            target,
             ..
         } = &payload;
+        // b8ke ext r8 F6: the unconfirmed TARGET's identity — the runtime
+        // whose death the fence awaits (the spawn's returned identity when
+        // start_target returned, else the resumed session's kind+key — the
+        // SAME probe identity the R5-1 replacement watcher uses). The
+        // abort fences name it (the normal failure paths already do);
+        // pre-r8 they defaulted to the Handoff record's already-reaped
+        // SOURCE (or vacant on a from-vacant handoff), so snapshots, logs,
+        // broadcasts, and typed responses named a dead runtime while the
+        // potentially live TARGET went unnamed.
+        let fence_target = target.clone().unwrap_or_else(|| OwnerIdentity {
+            kind: *target_kind,
+            terminal_id: None,
+            live_session_key: Some(session_id.clone()),
+            pid: None,
+            ownership_id: None,
+        });
         let target_outcome = self.abort_reap_uncommitted_target(&payload).await;
         let confirmed_live = match prior.as_ref() {
             Some((owner, _)) => {
@@ -1935,12 +1953,13 @@ impl SessionHandoffRunner {
                         // descendant tree is unverifiable on this platform —
                         // fence typed (a new writer can never start against
                         // the unconfirmable target), never plain Vacant.
-                        let fenced = self.ownership.fence_unconfirmed_handoff(
+                        let fenced = self.ownership.fence_unconfirmed_handoff_with_prior(
                             provider,
                             session_id,
                             operation_id,
                             *generation,
                             freshell_ownership::FenceReason::PlatformLimited,
+                            Some((fence_target.clone(), *generation)),
                         );
                         tracing::error!(target: "freshell_ownership",
                             event = "ownership.handoff.abort_fenced_platform_limited",
@@ -1961,12 +1980,13 @@ impl SessionHandoffRunner {
                         // uncommitted target's recorded identity and only
                         // a confirmed death releases the fence; without it
                         // the key blocked until a server restart.
-                        let fenced = self.ownership.fence_unconfirmed_handoff(
+                        let fenced = self.ownership.fence_unconfirmed_handoff_with_prior(
                             provider,
                             session_id,
                             operation_id,
                             *generation,
                             freshell_ownership::FenceReason::WatcherFailed,
+                            Some((fence_target.clone(), *generation)),
                         );
                         tracing::error!(target: "freshell_ownership",
                             event = "ownership.handoff.abort_fenced_unconfirmed_target",
@@ -2007,12 +2027,13 @@ impl SessionHandoffRunner {
                         // acknowledged force-clear): the target's teardown
                         // confirmed the direct child's exit but cannot
                         // verify the descendant tree on this platform.
-                        let fenced = self.ownership.fence_unconfirmed_handoff(
+                        let fenced = self.ownership.fence_unconfirmed_handoff_with_prior(
                             provider,
                             session_id,
                             operation_id,
                             *generation,
                             freshell_ownership::FenceReason::PlatformLimited,
+                            Some((fence_target.clone(), *generation)),
                         );
                         tracing::error!(target: "freshell_ownership",
                             event = "ownership.handoff.abort_fenced_platform_limited",
@@ -2029,12 +2050,13 @@ impl SessionHandoffRunner {
                         // the bounded probe re-issues the target's lane
                         // kill-and-confirm and only a confirmed death
                         // releases the fence. Never a watcher-less fence.
-                        let fenced = self.ownership.fence_unconfirmed_handoff(
+                        let fenced = self.ownership.fence_unconfirmed_handoff_with_prior(
                             provider,
                             session_id,
                             operation_id,
                             *generation,
                             freshell_ownership::FenceReason::WatcherFailed,
+                            Some((fence_target.clone(), *generation)),
                         );
                         tracing::error!(target: "freshell_ownership",
                             event = "ownership.handoff.abort_fenced_unconfirmed_target",

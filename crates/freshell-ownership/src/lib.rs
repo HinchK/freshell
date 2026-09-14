@@ -2088,7 +2088,10 @@ impl RuntimeOwnershipRegistry {
         };
         match record.state.clone() {
             OwnershipState::Live {
-                owner, generation, ..
+                owner,
+                generation,
+                since_ms: live_since_ms,
+                ..
             } => {
                 let identity_mismatch = claim.expected_kind != owner.kind
                     || claim
@@ -2129,6 +2132,12 @@ impl RuntimeOwnershipRegistry {
                         state: record.state.clone(),
                     };
                 }
+                // b8ke ext r8 F3: the prior owner's REAL tenure —
+                // computed BEFORE the state replacement (the r6
+                // handoff-begin class: reading the just-replaced Stopping
+                // state's own timestamp reported ~zero instead of the
+                // Live era's tenure).
+                let prior_tenure_ms = now_ms.saturating_sub(live_since_ms);
                 record.generation += 1;
                 record.state = OwnershipState::Stopping {
                     owner: Some(owner.clone()),
@@ -2153,9 +2162,7 @@ impl RuntimeOwnershipRegistry {
                     to_kind = ?claim.expected_kind,
                     runtime_id = ?owner.terminal_id, pid = ?owner.pid,
                     epoch = self.epoch, generation = record.generation,
-                    duration_ms = now_epoch_ms().saturating_sub(
-                        record.state.since_ms().unwrap_or(now_epoch_ms()),
-                    ),
+                    duration_ms = prior_tenure_ms,
                     outcome = "granted", failure_reason = "");
                 StopOutcome::Granted {
                     generation: record.generation,
@@ -7440,6 +7447,7 @@ mod tests {
                     && e.values.get("session_id").map(String::as_str) == Some("sid-tenure")
             })
             .expect("the handoff begin event fires");
+        let _ = begin;
         let duration: u64 = begin
             .values
             .get("duration_ms")
@@ -7448,6 +7456,81 @@ mod tests {
         assert!(
             duration >= 10_000,
             "the live handoff-begin duration is the prior's REAL tenure — \
+             got {duration} ({:?})",
+            begin.values
+        );
+    }
+
+    /// b8ke ext r8 F3: the granted stop.begin's duration is the PRIOR
+    /// RUNTIME'S REAL TENURE — computed before the state replacement
+    /// (pre-r8 the log read the just-replaced Stopping state's own
+    /// timestamp, so the tenure reported ~zero / the test-clock delta
+    /// instead of the Live era's age).
+    #[test]
+    fn the_granted_stop_begin_duration_is_the_prior_tenure() {
+        let r = RuntimeOwnershipRegistry::new();
+        let capture = EventCapture::default();
+        let _guard = capture.install();
+
+        let BeginOutcome::Granted { generation } = r.begin_start(
+            PROVIDER,
+            "sid-stop-tenure",
+            RuntimeOwnerKind::Terminal,
+            "op-stop-tenure",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("expected Granted")
+        };
+        assert!(matches!(
+            r.commit_live(
+                PROVIDER,
+                "sid-stop-tenure",
+                "op-stop-tenure",
+                generation,
+                live_terminal_owner(),
+            ),
+            CommitOutcome::Committed
+        ));
+        // The stop begin carries a now_ms 10s past the commit: the prior's
+        // tenure is at least 10s by construction (pre-r8 the log read the
+        // replaced Stopping state's own timestamp).
+        let begin_now = now_epoch_ms() + 10_000;
+        let claim = StopClaim {
+            expected_kind: RuntimeOwnerKind::Terminal,
+            expected_runtime: Some(live_terminal_owner()),
+            observed: ObservedFence {
+                epoch: r.boot_epoch(),
+                generation,
+            },
+        };
+        let StopOutcome::Granted { .. } = r.begin_stop(
+            PROVIDER,
+            "sid-stop-tenure",
+            "ho-stop",
+            &claim,
+            "test",
+            begin_now,
+        ) else {
+            panic!("expected the stop granted")
+        };
+        let begin = capture
+            .events()
+            .into_iter()
+            .find(|e| {
+                e.event.as_deref() == Some("ownership.stop.begin")
+                    && e.values.get("session_id").map(String::as_str) == Some("sid-stop-tenure")
+            })
+            .expect("the stop begin event fires");
+        let duration: u64 = begin
+            .values
+            .get("duration_ms")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        assert!(
+            duration >= 10_000,
+            "the granted stop.begin duration is the prior's REAL tenure — \
              got {duration} ({:?})",
             begin.values
         );

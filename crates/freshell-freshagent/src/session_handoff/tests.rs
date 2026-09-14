@@ -4767,23 +4767,29 @@ async fn an_aborted_from_vacant_platform_limited_target_fences_typed_and_recover
 
     // R5-1: the fence is TYPED PlatformLimited (pre-fix: the folded
     // WatcherFailed the force-clear can never release).
+    // b8ke ext r8 F6: the fence names the unconfirmed TARGET (the
+    // resumed session's identity — pre-r8 it defaulted to the Handoff
+    // record's prior: vacant on a from-vacant handoff, naming nothing
+    // while the potentially live target went unnamed).
     let snap = rig.ownership.observe("claude", &sid);
     assert!(
         matches!(
-            snap.state,
+            &snap.state,
             OwnershipState::Fenced {
                 reason: FenceReason::PlatformLimited,
-                prior: None,
+                prior: Some((owner, _)),
                 ..
-            }
+            } if owner.kind == RuntimeOwnerKind::FreshAgent
+                && owner.live_session_key.as_deref() == Some(sid.as_str())
         ),
         "the aborted from-vacant handoff's PlatformLimited target must fence \
-         TYPED PlatformLimited with no prior, got {:?}",
+         TYPED PlatformLimited naming the TARGET, got {:?}",
         snap.state
     );
 
     // R5-2: the fence transition BROADCASTS — fenced marker + typed
-    // reason + the no-prior fence's vacant ownerKind (pre-fix: no frame).
+    // reason + the TARGET's ownerKind (pre-fix: no frame; pre-r8 the
+    // frame said vacant).
     let frames = await_owner_frames(&mut rig.rx, &["handoff-failed"]).await;
     let failed = runtime_owner_frame(&frames, "handoff-failed");
     assert_eq!(
@@ -4794,8 +4800,8 @@ async fn an_aborted_from_vacant_platform_limited_target_fences_typed_and_recover
     assert_eq!(failed["reason"], json!("platform-limited"));
     assert_eq!(
         failed["ownerKind"],
-        json!("vacant"),
-        "a no-prior fence names the vacant prior: {failed}"
+        json!("fresh-agent"),
+        "the abort-cleanup fence names the unconfirmed TARGET's kind: {failed}"
     );
 
     // THE R5-1 recovery: the r4 acknowledged force-clear releases the
@@ -4923,10 +4929,17 @@ async fn an_aborted_from_vacant_unconfirmed_target_fences_with_a_replacement_wat
 
     // The fence is typed (never plain Vacant, never Reaped) — and R5-2:
     // the fence transition is BROADCAST with the marker + reason.
+    // b8ke ext r8 F6: the fence names the unconfirmed TARGET (the
+    // resumed session's identity — pre-r8 the from-vacant fence said
+    // vacant while the target went unnamed).
     await_cond("the unconfirmed target must fence the key", || {
         matches!(
-            rig.ownership.observe("claude", &sid).state,
-            OwnershipState::Fenced { prior: None, .. }
+            &rig.ownership.observe("claude", &sid).state,
+            OwnershipState::Fenced {
+                prior: Some((owner, _)),
+                ..
+            } if owner.kind == RuntimeOwnerKind::FreshAgent
+                && owner.live_session_key.as_deref() == Some(sid.as_str())
         )
     })
     .await;
@@ -4934,7 +4947,7 @@ async fn an_aborted_from_vacant_unconfirmed_target_fences_with_a_replacement_wat
     let failed = runtime_owner_frame(&frames, "handoff-failed");
     assert_eq!(failed["fenced"], json!(true), "the fence frame: {failed}");
     assert_eq!(failed["reason"], json!("watcher-failed"));
-    assert_eq!(failed["ownerKind"], json!("vacant"));
+    assert_eq!(failed["ownerKind"], json!("fresh-agent"));
 
     // THE R5-1 replacement watcher: its bounded probe re-issues the
     // recorded-identity kill-and-confirm — the lingering grandchild is
