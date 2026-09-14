@@ -34,15 +34,17 @@ interface ExitOutcome {
   signal: NodeJS.Signals | null
 }
 
-function createExitControlledShim(): { shim: ShimProcess; exit: (outcome: ExitOutcome) => void } {
+function createReadinessControlledShim(): {
+  shim: Pick<ShimProcess, 'child'>
+  exit: (outcome: ExitOutcome) => void
+  fail: (error: Error) => void
+} {
   const child = new EventEmitter() as unknown as ChildProcess
   Object.assign(child, { exitCode: null, signalCode: null })
-  const exited = new Promise<ExitOutcome>((resolve) => {
-    child.once('exit', (code, signal) => resolve({ code, signal }))
-  })
   return {
-    shim: { child, stdout: [], exited },
+    shim: { child },
     exit: (outcome) => child.emit('exit', outcome.code, outcome.signal),
+    fail: (error) => child.emit('error', error),
   }
 }
 
@@ -114,7 +116,7 @@ async function freeLoopbackPort(): Promise<number> {
   })
 }
 
-async function withCleanup<T>(body: () => Promise<T>, cleanupSteps: Array<() => Promise<void>>): Promise<T> {
+async function withCleanup<T>(body: () => Promise<T>, cleanupSteps: Array<() => Promise<unknown>>): Promise<T> {
   let result: T | undefined
   let primaryError: unknown
   try {
@@ -347,28 +349,28 @@ describe('codex-dual-role shim', () => {
   })
 
   it('paces refused readiness probes before a later transport success', async () => {
-    const { shim } = createExitControlledShim()
-    let attempts = 0
-    let pauses = 0
+    const { shim } = createReadinessControlledShim()
+    const events: string[] = []
 
     await waitForAppServerReady(shim, 1, 150, {
       connect: async () => {
-        attempts += 1
-        return attempts === 2
+        events.push('connect')
+        return events.filter((event) => event === 'connect').length === 2
       },
-      pause: async () => {
-        pauses += 1
+      pause: async (delayMs) => {
+        events.push(`pause:${delayMs}`)
       },
     })
 
-    expect(attempts).toBe(2)
-    expect(pauses).toBe(1)
+    expect(events).toEqual(['connect', `pause:${READINESS_RETRY_INTERVAL_MS}`, 'connect'])
   })
 
   it('stops the one owned readiness poll when the exact child exits early', async () => {
-    const { shim, exit } = createExitControlledShim()
+    const { shim, exit } = createReadinessControlledShim()
     const initialExitListeners = shim.child.listenerCount('exit')
+    const initialErrorListeners = shim.child.listenerCount('error')
     let attempts = 0
+    let pauses = 0
     let connectStarted!: () => void
     const connectStartedPromise = new Promise<void>((resolve) => {
       connectStarted = resolve
@@ -381,16 +383,88 @@ describe('codex-dual-role shim', () => {
         return await new Promise<boolean>((resolve) => signal.addEventListener('abort', () => resolve(false), { once: true }))
       },
       pause: async () => {
-        throw new Error('readiness poll continued after the child exit')
+        pauses += 1
       },
     })
     await connectStartedPromise
+    expect(shim.child.listenerCount('exit')).toBe(initialExitListeners + 1)
+    expect(shim.child.listenerCount('error')).toBe(initialErrorListeners + 1)
     exit({ code: 1, signal: null })
 
     await expect(readiness).rejects.toThrow('exited before accepting transport connections')
+    await Promise.resolve()
     expect(attempts).toBe(1)
-    expect(initialExitListeners).toBe(1)
-    expect(shim.child.listenerCount('exit')).toBe(0)
+    expect(pauses).toBe(0)
+    expect(shim.child.listenerCount('exit')).toBe(initialExitListeners)
+    expect(shim.child.listenerCount('error')).toBe(initialErrorListeners)
+  })
+
+  it('removes its owned exit and error watchers after successful readiness', async () => {
+    const { shim } = createReadinessControlledShim()
+    const initialExitListeners = shim.child.listenerCount('exit')
+    const initialErrorListeners = shim.child.listenerCount('error')
+    let connectCalls = 0
+    let pauseCalls = 0
+    let finishConnect!: (connected: boolean) => void
+    const connectPending = new Promise<boolean>((resolve) => {
+      finishConnect = resolve
+    })
+
+    const readiness = waitForAppServerReady(shim, 1, 5_000, {
+      connect: async () => {
+        connectCalls += 1
+        return await connectPending
+      },
+      pause: async () => {
+        pauseCalls += 1
+      },
+    })
+    await Promise.resolve()
+    expect(shim.child.listenerCount('exit')).toBe(initialExitListeners + 1)
+    expect(shim.child.listenerCount('error')).toBe(initialErrorListeners + 1)
+
+    finishConnect(true)
+    await readiness
+    await Promise.resolve()
+    expect(connectCalls).toBe(1)
+    expect(pauseCalls).toBe(0)
+    expect(shim.child.listenerCount('exit')).toBe(initialExitListeners)
+    expect(shim.child.listenerCount('error')).toBe(initialErrorListeners)
+  })
+
+  it('removes its owned exit and error watchers after an exact child error', async () => {
+    const { shim, fail } = createReadinessControlledShim()
+    const initialExitListeners = shim.child.listenerCount('exit')
+    const initialErrorListeners = shim.child.listenerCount('error')
+    let connectCalls = 0
+    let pauseCalls = 0
+    let connectStarted!: () => void
+    const connectStartedPromise = new Promise<void>((resolve) => {
+      connectStarted = resolve
+    })
+
+    const readiness = waitForAppServerReady(shim, 1, 5_000, {
+      connect: async (_port, _timeoutMs, signal) => {
+        connectCalls += 1
+        connectStarted()
+        return await new Promise<boolean>((resolve) => signal.addEventListener('abort', () => resolve(false), { once: true }))
+      },
+      pause: async () => {
+        pauseCalls += 1
+      },
+    })
+    await connectStartedPromise
+    expect(shim.child.listenerCount('exit')).toBe(initialExitListeners + 1)
+    expect(shim.child.listenerCount('error')).toBe(initialErrorListeners + 1)
+
+    const expected = new Error('exact child spawn failure')
+    fail(expected)
+    await expect(readiness).rejects.toBe(expected)
+    await Promise.resolve()
+    expect(connectCalls).toBe(1)
+    expect(pauseCalls).toBe(0)
+    expect(shim.child.listenerCount('exit')).toBe(initialExitListeners)
+    expect(shim.child.listenerCount('error')).toBe(initialErrorListeners)
   })
 
   it('runs the terminal fake for plain argv', async () => {
@@ -484,8 +558,9 @@ describe('codex-dual-role shim', () => {
       await waitForAppServerReady(shim, port, 5_000)
 
       const exit = await stopShim(shim)
-      expect(exit.signal).not.toBe('SIGKILL')
-      expect(shim.child.signalCode).not.toBe('SIGKILL')
+      expect(exit).toEqual({ code: 0, signal: null })
+      expect(shim.child.exitCode).toBe(0)
+      expect(shim.child.signalCode).toBeNull()
       expect(await canBindLoopbackPort(port)).toBe(true)
     }, [
       () => stopShim(shim),
