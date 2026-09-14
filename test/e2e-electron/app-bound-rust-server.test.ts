@@ -20,6 +20,7 @@ import {
 } from './electron-fixture-cleanup.js'
 import { cleanupOwnedFixtureHome } from './owned-fixture-home.js'
 import { withBoundedFixtureRequest } from './bounded-fixture-request.js'
+import { parseNetstatListeningPidsForPort } from './netstat-listener-parser.js'
 import { parseSsListeningPidsForPort } from './ss-listener-parser.js'
 import { isolatedElectronHomeEnv } from './fixture-home-env.js'
 import { launchChooserViteArgs, waitForCapturedViteReady } from './launch-chooser-vite.js'
@@ -261,14 +262,7 @@ function listeningPidsForFixturePort(port: number, context?: OwnershipProofConte
   if (process.platform === 'win32') {
     const result = runBoundedOwnershipCommand('netstat', ['-ano', '-p', 'tcp'], context)
     if (result.status !== 0) throw new Error(`could not inspect the exact fixture port ${port} with netstat`)
-    return result.stdout.split(/\r?\n/).flatMap((line) => {
-      const fields = line.trim().split(/\s+/)
-      if (fields.length < 5 || fields[0].toUpperCase() !== 'TCP') return []
-      const localAddress = fields[1]
-      if (!localAddress.endsWith(`:${port}`)) return []
-      const pid = Number.parseInt(fields.at(-1) ?? '', 10)
-      return Number.isInteger(pid) && pid > 0 ? [pid] : []
-    })
+    return parseNetstatListeningPidsForPort(result.stdout, port)
   }
 
   const result = runBoundedOwnershipCommand('ss', ['-ltnp'], context)
