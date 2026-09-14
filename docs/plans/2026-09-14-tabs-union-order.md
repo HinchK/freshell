@@ -24,7 +24,7 @@ Fix the tab-order regression on restart/refresh via the server-side fix: make th
 
 **Architecture:** One behavioral change in `union_of_newest_per_client` (crates/freshell-ws/src/tabs_persist.rs:583-660): the per-tabKey dedupe-rank winner semantics stay EXACTLY as-is, but records are emitted in FIRST-SEEN order across deterministically ranked sources (each client's newest generation, ranked newest-first by the same tuple `label_src` uses — `(capturedAt, snapshotRevision, clientInstanceId, generationId)` descending; within a source, the pushed record array order, which the client builds from its tab strip in `tabRegistrySync.ts buildRecords`). A tab's POSITION is its slot in the newest source that knows it; a tab's CONTENT is still the existing dedupe-rank winner. Downstream consumers are already order-preserving and were verified order-sensitive in exactly one place: `build_inventory` maps union records to `device.tabs` in order (recovery_inventory.rs:697-702), and the client's `restoreMachineWorkspace`/`buildRecoveryPlan` dispatch `addTab` in that order. The `tabs.sync.snapshot` replies on BOTH servers re-sort by `updatedAt` and are unaffected; the recovery `contentId` sorts its substance lines before hashing and is order-independent; no on-disk generation file, digest, or bundle name is computed from union output.
 
-**Tech Stack:** Rust workspace (`cargo test -p freshell-ws`, `-p freshell-server`), Vitest client unit tests (`npm run test:vitest --`), Playwright rust-chromium e2e (`scripts/e2e-cloud.sh run --local --project=rust-chromium`).
+**Tech Stack:** Rust workspace (`cargo test -p freshell-ws`, `-p freshell-server`), Vitest client unit tests (`npm run test:vitest --`), Playwright e2e (`scripts/e2e-cloud.sh run --local <spec-path>`; post-#699 there is a single rust-only e2e surface — the default `chromium` project).
 
 ## Global Constraints
 
@@ -32,7 +32,7 @@ Fix the tab-order regression on restart/refresh via the server-side fix: make th
 - **Determinism (explicit user constraint):** same union inputs must produce the same output order. Source ranking is a total order (tuple above); within one source the on-disk record array order is fixed.
 - **Rust gates:** `cargo fmt --all --check` and `cargo clippy --workspace --exclude freshell-tauri --all-targets -- -D warnings` must pass before each Rust commit.
 - **Vitest:** repo-owned path only — `npm run test:vitest -- run <paths>` (never raw `npx vitest`). Client-side pins in this plan are green contract pins (the bug is server-fed order, so they pass at base by design); they protect the client's order-preservation contract.
-- **E2e:** rust-only specs run LOCALLY — `bash scripts/e2e-cloud.sh run --local --project=rust-chromium <spec-path>` (the cloud lane skips the rust-chromium project by design, `playwright.cloud.config.ts:54`). The spec must be registered in BOTH `RUST_ONLY_SPECS` (so the default `chromium` project ignores it) and the `rust-chromium` project's `testMatch` in `test/e2e-browser/playwright.config.ts`.
+- **E2e:** the e2e lane runs LOCALLY per spec — `bash scripts/e2e-cloud.sh run --local <spec-path>` (the default `chromium` project picks up every spec except `continuity-smoke`; no project flag needed). AMENDED 2026-09-14 post-#699 (Node-server retirement): the old `RUST_ONLY_SPECS`/`rust-chromium`-project registration requirement is OBSOLETE — the retired registration commit was dropped during the user-directed rebase onto f9aac2746, and the spec runs under the default `chromium` project with no registration.
 - **Test coordinator:** the end-of-execution full-suite gate (`npm test`) is a coordinated run. In non-login shells, `~/.bashrc` is not sourced: export `FRESHELL_VITEST_BACKEND=cloud` and `GCLOUD_IDENT=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com` explicitly on every cloud-lane invocation from this agent (machine identity fix recorded in run-state).
 - **No PR creation.** Commit locally on `the-usual/tabs-union-order`.
 - **No client restore-path redesign:** `src/lib/machine-workspace.ts` and `src/App.tsx` are not modified by this plan.
@@ -42,7 +42,7 @@ Fix the tab-order regression on restart/refresh via the server-side fix: make th
 
 - The client pushes `records` in exact strip order (`src/store/tabRegistrySync.ts:200` `buildRecords` iterates `state.tabs.tabs`); the Rust WS ingestion (`validate_tabs_push` → `replace_client_snapshot` → `persist_generation`) persists the array verbatim; tabKeys are unique within one push.
 - Only ONE order-sensitive consumer chain exists: union records → `build_inventory` `device.tabs` (in order) → `buildRecoveryPlan` (order-preserving, `src/lib/recovery/build-recovery-plan.ts:313`) → `restoreMachineWorkspace`'s `addTab` loop (`src/lib/machine-workspace.ts:65-75`).
-- The recovery inventory EXCLUDES the requester's own clientInstanceId generations (`select_foreign_recent_generation_ids`, A15/A16) — so a reload restores pre-reload tabs only when the reloaded page has a NEW clientInstanceId (sessionStorage cleared or new tab). The e2e below forces exactly that.
+- The recovery inventory EXCLUDES the requester's own clientInstanceId generations (`select_foreign_recent_generation_ids`, A15/A16) — so a reload restores pre-reload tabs only when the reloaded page has a NEW clientInstanceId (sessionStorage cleared or new tab). The e2e below forces exactly that. AMENDED 2026-09-14 post-#699: `restoreMachineWorkspace` now passes a reserved `machine-bootstrap:<clientInstanceId>` exclusion key (the server cannot match it, so the page's OWN last durable snapshot is included too), and a NON-recoverable inventory on a non-active-choice boot now KEEPS the rehydrated local layout (the reload-wipe fix). Neither change affects this run's path: our durable generations make the inventory recoverable, and recoverable always replaces — the order the union feeds is still the contract under test. The spec's sessionStorage clear is now belt-and-suspenders rather than load-bearing.
 - One existing test pins the current tabKey sort incidentally: `union_by_ids_resolves_exact_generation_files_when_digests_repeat_across_clients` (`tabs_persist_tests.rs:1013-1019`).
 - Machine resolution on reload: the auto-created machine id is persisted to localStorage (`machine-identity.ts persistSelectedMachineId`), so the reloaded page resolves `'selected'` and runs `restoreMachineWorkspace` before the WS starts.
 
@@ -52,7 +52,7 @@ Fix the tab-order regression on restart/refresh via the server-side fix: make th
 
 **Files:**
 - Create: `test/e2e-browser/specs/machine-tab-order-rust.spec.ts`
-- Modify: `test/e2e-browser/playwright.config.ts` (`RUST_ONLY_SPECS` array ~:187; `rust-chromium` project `testMatch` ~:430)
+- ~~Modify: `test/e2e-browser/playwright.config.ts`~~ (OBSOLETE post-#699: no registration lists exist anymore; see the Global Constraints amendment.)
 
 **Interfaces:**
 - Consumes: `RustServer` + `ensureRustServerBuilt` from `helpers/rust-server.js` (per-test owned server — the 45-spec rust-only convention; donor recipe: `recover-my-panes-rust.spec.ts:496-524`), `TestHarness` from `helpers/test-harness.js` (incl. `waitForTabCount`), the generation-file fs-poll idiom (donor: `recover-my-panes-rust.spec.ts:452-494`), Redux dispatch seam `window.__FRESHELL_TEST_HARNESS__?.dispatch` (precedent: `remote-tab-linkage-rust.spec.ts:257`).
@@ -265,28 +265,18 @@ test.describe('machine workspace restore keeps tab order', () => {
 })
 ```
 
-Implementation notes: verify `TestHarness.waitForTabCount`'s exact semantics in `helpers/test-harness.ts` while implementing (it must poll-until, not assert-once). The ordering is load-bearing: the auto tab's removal comes AFTER the three adds so the strip never renders at zero tabs (App.tsx:1871-1876 re-fires `addTab` on every zero-tab render with a ready machine). Register in `test/e2e-browser/playwright.config.ts`. In the `RUST_ONLY_SPECS` array (after the `/freshagent-live-model-convergence-rust\.spec\.ts$/` entry):
-
-```typescript
-  // MACHINE-TAB-ORDER (the-usual/tabs-union-order): reload-through-restore
-  // keeps the tab strip order. Rust-only: drives the REAL /api/machines +
-  // /api/recovery/inventory (the machine-identity workspace restore path);
-  // the legacy Node server implements neither API.
-  /machine-tab-order-rust\.spec\.ts$/,
-```
-
-And the same regex plus comment inside the `rust-chromium` project's `testMatch` array.
+Implementation notes: verify `TestHarness.waitForTabCount`'s exact semantics in `helpers/test-harness.ts` while implementing (it must poll-until, not assert-once). The ordering is load-bearing: the auto tab's removal comes AFTER the three adds so the strip never renders at zero tabs (App.tsx:1889-1894 re-fires `addTab` on every zero-tab render with a ready machine). AMENDED 2026-09-14 post-#699 rebase: NO playwright.config.ts registration exists anymore — the single rust-only e2e world runs this spec under the default `chromium` project automatically; Task 1's deliverable is the spec file alone (the originally-planned registration hunks were dropped during the rebase onto f9aac2746).
 
 - [ ] **Step 2: Run the spec and verify the intended failure**
 
-Run: `bash scripts/e2e-cloud.sh run --local --project=rust-chromium test/e2e-browser/specs/machine-tab-order-rust.spec.ts`
+Run: `bash scripts/e2e-cloud.sh run --local test/e2e-browser/specs/machine-tab-order-rust.spec.ts`
 
 Expected: FAIL — the final `expect.poll` receives `['Apple', 'Mango', 'Zebra']` (the tabKey-sorted permutation) against expected `['Mango', 'Apple', 'Zebra']`. This is the regression, observed end to end. If the spec fails ANY OTHER way (zero tabs restored, a machine-chooser dialog visible, a timeout before three titles exist, the durable-persist wait timing out), the restore-path assumptions are wrong: STOP and investigate rather than adjusting the spec — record the surprise in the progress ledger and surface it to the coordinator (it would falsify this plan's verified-ground-truth section).
 
 - [ ] **Step 3: Commit the task**
 
 ```bash
-git add test/e2e-browser/specs/machine-tab-order-rust.spec.ts test/e2e-browser/playwright.config.ts
+git add test/e2e-browser/specs/machine-tab-order-rust.spec.ts
 git commit -m "test(e2e): pin tab strip order across a reload-through-restore (red)"
 ```
 
@@ -536,7 +526,7 @@ cargo test -p freshell-ws --test ui_layout_sync
 cargo test -p freshell-ws --test sessions_prefs
 cargo fmt --all --check
 cargo clippy --workspace --exclude freshell-tauri --all-targets -- -D warnings
-bash scripts/e2e-cloud.sh run --local --project=rust-chromium test/e2e-browser/specs/machine-tab-order-rust.spec.ts
+bash scripts/e2e-cloud.sh run --local test/e2e-browser/specs/machine-tab-order-rust.spec.ts
 ```
 
 Expected: all cargo suites PASS (including `ui_layout_sync`/`sessions_prefs`, which explorer analysis says never touch the union — they prove it); fmt/clippy clean; the e2e from Task 1 now PASSES (received order `['Mango', 'Apple', 'Zebra']`).
@@ -638,8 +628,10 @@ git commit -m "test(recovery-inventory): pin device.tabs to the union record ord
 - Test: `test/unit/client/lib/recovery/build-recovery-plan.test.ts` (add one test)
 
 **Interfaces:**
-- Consumes: `restoreMachineWorkspace` (src/lib/machine-workspace.ts:47), `buildRecoveryPlan` (src/lib/recovery/build-recovery-plan.ts:304).
+- Consumes: `restoreMachineWorkspace` (src/lib/machine-workspace.ts — post-#699 it takes an optional third `options` argument and passes a `machine-bootstrap:` exclusion id; the mock-based pin below is unaffected: it mocks `getRecoveryInventory` wholesale and uses a RECOVERABLE inventory, whose path still replaces local state in the new semantics), `buildRecoveryPlan` (src/lib/recovery/build-recovery-plan.ts — post-#699 it takes an optional options bag; the pin below calls it single-argument).
 - Produces: none (tests only; the client behavior is already order-preserving — these pins make sure no future client-side re-sort can reintroduce the regression silently).
+
+AMENDED 2026-09-14 post-#699 rebase: #699 expanded BOTH target test files (+372 and +100 lines — reload-keep coverage etc.) and changed their helper shapes. The Step-1/Step-2 code below is a pre-implementation draft: the implementer transcribes its ASSERTIONS faithfully (the multi-tab order contracts) but adapts helper usage (e.g. `inventoryFor`, the `pane`/`inv` fixtures) to the CURRENT file shapes, reusing whatever fixture builders now exist rather than duplicating stale ones. The assertions' substance — inventory order consumed verbatim — is the contract under test.
 
 - [ ] **Step 1: Add the machine-workspace order test**
 

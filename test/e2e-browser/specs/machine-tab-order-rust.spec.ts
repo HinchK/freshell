@@ -122,8 +122,10 @@ async function waitForNewestGenerationTabs(
 }
 
 test.describe('machine workspace restore keeps tab order', () => {
-  test('a reload restores the tab strip in the pushed strip order', async ({ browser, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('a reload restores the tab strip in the pushed strip order', async ({ browser }) => {
+    // Post-#699 (Node-server retirement) there is a single rust-only e2e
+    // surface: this spec owns its RustServer directly and runs under the
+    // default chromium project — no e2eServerKind guard to assert.
     test.setTimeout(240_000)
 
     const ctx: BrowserContext = await browser.newContext({ serviceWorkers: 'block' })
