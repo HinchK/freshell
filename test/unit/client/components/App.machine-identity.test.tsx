@@ -272,25 +272,54 @@ describe('App machine identity bootstrap', () => {
     })
   })
 
-  it('keeps the active-selection marker armed when the restore fails, so the retry still treats the machine as actively chosen', async () => {
-    // The transient-failure path: an armed marker (a chooser pick booted
-    // into a failing inventory request) must STAY armed on the restore
-    // error — the boot peeked before the request and consumes only after
-    // success, so the app's reload action retries with activeSelection
-    // again and never keeps a foreign machine's stale local cache over
-    // the machine the user just chose. The same holds for a manual reload
-    // while the restore is in flight: the marker dies with the document,
-    // not with the request.
+  it('peeks before the restore and consumes only after success — the marker stays armed through an in-flight reload', async () => {
+    // The protocol's ORDERING pin, discriminated against the
+    // consume-before-await implementation: while the restore (and its
+    // inventory request) is IN FLIGHT the marker must still be ARMED — a
+    // manual reload here carries the active-choice state into the next
+    // boot. Only a SUCCESSFUL restore consumes it (a later natural reload
+    // boots with activeSelection:false).
     markActiveMachineSelection()
     localStorage.setItem(MACHINE_ID_STORAGE_KEY, MACHINE.id)
     mocks.getMachines.mockResolvedValue([MACHINE])
-    mocks.restoreMachineWorkspace.mockRejectedValueOnce(new Error('inventory unavailable'))
+    let resolveRestore: ((value: { restoredTabs: number }) => void) | undefined
+    mocks.restoreMachineWorkspace.mockImplementationOnce(
+      () => new Promise<{ restoredTabs: number }>((resolve) => { resolveRestore = resolve }),
+    )
+    const store = createStore()
+
+    render(<Provider store={store}><App /></Provider>)
+
+    // In flight: called with the peeked value, marker still armed.
+    await waitFor(() => expect(mocks.restoreMachineWorkspace).toHaveBeenCalledTimes(1))
+    expect(mocks.restoreMachineWorkspace).toHaveBeenCalledWith(store, MACHINE.id, { activeSelection: true })
+    expect(peekActiveMachineSelectionMark()).toBe(true)
+
+    // Success consumes the marker.
+    await act(async () => { resolveRestore?.({ restoredTabs: 1 }) })
+    await waitFor(() => expect(mocks.startTabRegistrySync).toHaveBeenCalledTimes(1))
+    expect(peekActiveMachineSelectionMark()).toBe(false)
+  })
+
+  it('keeps the marker armed when the restore fails, so the retry still treats the machine as actively chosen', async () => {
+    // The failure path, pinned through the same in-flight ordering: the
+    // failing boot never consumes the marker, so the app's reload action
+    // retries with activeSelection again and never keeps a foreign
+    // machine's stale local cache over the machine the user just chose.
+    markActiveMachineSelection()
+    localStorage.setItem(MACHINE_ID_STORAGE_KEY, MACHINE.id)
+    mocks.getMachines.mockResolvedValue([MACHINE])
+    let rejectRestore: ((reason: unknown) => void) | undefined
+    mocks.restoreMachineWorkspace.mockImplementationOnce(
+      () => new Promise<{ restoredTabs: number }>((_, reject) => { rejectRestore = reject }),
+    )
     const store = createStore()
 
     render(<Provider store={store}><App /></Provider>)
 
     await waitFor(() => expect(mocks.restoreMachineWorkspace).toHaveBeenCalledTimes(1))
-    expect(mocks.restoreMachineWorkspace).toHaveBeenCalledWith(store, MACHINE.id, { activeSelection: true })
+    expect(peekActiveMachineSelectionMark()).toBe(true)
+    await act(async () => { rejectRestore?.(new Error('inventory unavailable')) })
     await waitFor(() => expect(store.getState().machineIdentity?.status).toBe('error'))
     expect(mocks.startTabRegistrySync).not.toHaveBeenCalled()
     // Still armed for the retry — the failing boot never consumed it.
