@@ -238,6 +238,32 @@ describe('RawWsClient — codec + handshake', () => {
     })
   })
 
+  it('fails closed on a peer TCP end and disposes without recording a continuation', async () => {
+    fixture = await EchoWsFixture.start()
+    const client = await connect()
+    const outcome = client.waitForJsonMessageOrTerminal('ready', 5000)
+    client.sendText('drop')
+
+    await expect(outcome).resolves.toEqual({ kind: 'terminal', terminal: 'tcp-end' })
+    const framesAtTerminal = client.receivedFrames.length
+    await client.dispose()
+    expect(client.destroyed).toBe(true)
+    expect(client.receivedFrames).toHaveLength(framesAtTerminal)
+  })
+
+  it('fails closed on a peer socket reset and disposes without recording a continuation', async () => {
+    fixture = await EchoWsFixture.start()
+    const client = await connect()
+    const outcome = client.waitForJsonMessageOrTerminal('ready', 5000)
+    client.sendText('reset')
+
+    await expect(outcome).resolves.toEqual({ kind: 'terminal', terminal: 'error' })
+    const framesAtTerminal = client.receivedFrames.length
+    await client.dispose()
+    expect(client.destroyed).toBe(true)
+    expect(client.receivedFrames).toHaveLength(framesAtTerminal)
+  })
+
   it('encodes 64-bit payload lengths (>64KiB) correctly (echo proof)', async () => {
     fixture = await EchoWsFixture.start()
     const client = await connect()
