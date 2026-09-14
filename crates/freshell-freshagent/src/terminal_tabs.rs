@@ -1781,12 +1781,26 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                         }
                         (StatusCode::CONFLICT, Json(body)).into_response()
                     }
-                    freshell_ownership::BeginOutcome::StaleGeneration { .. } => {
-                        fail_json(
-                            StatusCode::CONFLICT,
-                            "Session ownership moved on (stale observed generation); refresh and retry."
-                                .to_string(),
-                        )
+                    freshell_ownership::BeginOutcome::StaleGeneration {
+                        current_epoch,
+                        current_generation,
+                    } => {
+                        // b8ke ext r15 F2: the stale-generation refusal
+                        // rides the shared typed-code envelope
+                        // (`fail_json_code`, the established pattern this
+                        // file uses for every typed ownership error) so
+                        // REST/MCP callers distinguish stale ownership
+                        // from other failures — plus the additive
+                        // ownerEpoch/ownerGeneration pair the caller
+                        // refreshes its fence from.
+                        let mut stale_body = json!({
+                            "status": "error",
+                            "code": "SESSION_RESERVED",
+                            "message": "Session ownership moved on (stale observed generation); refresh and retry.",
+                        });
+                        stale_body["ownerEpoch"] = json!(current_epoch);
+                        stale_body["ownerGeneration"] = json!(current_generation);
+                        (StatusCode::CONFLICT, Json(stale_body)).into_response()
                     }
                     _ => unreachable!("the refused arms are exhaustive above"),
                 });

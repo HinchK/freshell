@@ -1451,6 +1451,15 @@ async fn respawn_with_a_stale_observed_fence_cannot_recreate_ownership() {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     let msg = body["message"].as_str().unwrap();
     assert!(msg.contains("stale observed generation"), "{body}");
+    // b8ke ext r15 F2: the machine-readable ownership code rides the
+    // envelope — REST/MCP callers distinguish stale ownership from other
+    // failures (pre-r15 the stale refusal used the bare {status,message}
+    // fail_json shape with NO code).
+    assert_eq!(
+        body["code"],
+        json!("SESSION_RESERVED"),
+        "the stale-generation refusal carries the typed ownership code: {body}"
+    );
     // The current owner is untouched.
     let snap = ownership.observe("claude", sid);
     assert!(matches!(
