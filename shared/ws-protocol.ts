@@ -528,6 +528,12 @@ export const TerminalAttachSchema = z.object({
    * attribution advances to the attach's true tab and assertion time under
    * the existing full-triple advance rule. Additive optional. */
   tabId: z.string().min(1).optional(),
+  /** b8ke ext r8 F2: the attach's observed ownership fence —
+   *  terminal.attach participates in the coordinator (a queued
+   *  cross-device attach is generation-fenced server-side). Additive
+   *  optional. */
+  observedEpoch: z.number().int().nonnegative().optional(),
+  observedGeneration: z.number().int().nonnegative().optional(),
   intent: TerminalAttachIntentSchema,
   priority: TerminalAttachPrioritySchema.optional(),
   cols: z.number().int().min(2).max(1000),

@@ -375,6 +375,15 @@ pub struct TerminalAttach {
     /// Additive optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab_id: Option<String>,
+    /// b8ke ext r8 F2: the attach's observed ownership fence — terminal
+    /// .attach participates in the coordinator (a queued cross-device
+    /// attach is generation-fenced: an in-Handoff/in-transition key answers
+    /// the typed refusal, a stale generation answers typed, a current
+    /// attach restamps under the held claim). Additive optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

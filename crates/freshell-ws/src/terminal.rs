@@ -1062,6 +1062,144 @@ async fn handle_client_text(
         }
         ClientMessage::TerminalAttach(attach) => {
             if terminal_dims_in_range(attach.cols, attach.rows) {
+                // b8ke ext r8 F2: terminal.attach participates in the
+                // coordinator — the attach's observed (epoch, generation)
+                // fence is consulted BEFORE the durable restamp: a queued
+                // cross-device attach landing while the canonical session is
+                // in Handoff (or any in-flight transition / fence) answers
+                // the typed refusal with NO restamp (pre-r8 the handler
+                // wrote the durable pane reattachment record and restamped
+                // the old terminal without consulting the coordinator at
+                // all), a stale generation answers typed, and a current
+                // attach proceeds and restamps under the held claim.
+                if let Some(session_ref) = state.identity.session_ref_for(&attach.terminal_id) {
+                    // A half-sent observed pair is the typed invalid-fence
+                    // refusal (the F7 discipline — never a silent legacy
+                    // downgrade).
+                    let observed = match freshell_freshagent::ownership_lane::wire_fence(
+                        attach.observed_epoch,
+                        attach.observed_generation,
+                    ) {
+                        Ok(fence) => fence,
+                        Err(err) => {
+                            tracing::warn!(
+                                target: "freshell_ws::terminal",
+                                terminal_id = %attach.terminal_id,
+                                session_id = %session_ref.session_id,
+                                code = err.code(),
+                                "terminal_attach_refused: the observed fence is half-sent (invalid)"
+                            );
+                            return send(
+                                ws_tx,
+                                &ServerMessage::Error(ErrorMsg {
+                                    owner_kind: None,
+                                    owner_generation: None,
+                                    owner_epoch: None,
+                                    code: ErrorCode::InvalidCreateRequest,
+                                    message: err.message().to_string(),
+                                    timestamp: crate::now_iso(),
+                                    actual_session_ref: None,
+                                    expected_session_ref: None,
+                                    request_id: None,
+                                    retry_after_ms: None,
+                                    terminal_exit_code: None,
+                                    terminal_id: Some(attach.terminal_id.clone()),
+                                    live_terminal_id: None,
+                                }),
+                            )
+                            .await;
+                        }
+                    };
+                    let snap = state.ownership.as_ref().map(|ownership| {
+                        ownership.observe(&session_ref.provider, &session_ref.session_id)
+                    });
+                    if let Some(snap) = snap {
+                        let refused_reason = match &snap.state {
+                            // An in-flight lifecycle transition owns the
+                            // session — the queued attach answers the typed
+                            // refusal (the fresh-agent attach gate family),
+                            // nothing restamps.
+                            freshell_ownership::OwnershipState::Handoff { .. }
+                            | freshell_ownership::OwnershipState::Starting { .. }
+                            | freshell_ownership::OwnershipState::Stopping { .. }
+                            |                             freshell_ownership::OwnershipState::Fenced { .. } => Some(
+                                "A lifecycle operation is in flight for this session; retry after it settles"
+                                    .to_string(),
+                            ),
+                            _ => None,
+                        };
+                        if let Some(reason) = refused_reason {
+                            tracing::warn!(
+                                target: "freshell_ws::terminal",
+                                terminal_id = %attach.terminal_id,
+                                session_id = %session_ref.session_id,
+                                state = ?snap.state,
+                                "terminal_attach_refused: a lifecycle transition owns this \
+                                 session — the queued attach answers typed, nothing restamps"
+                            );
+                            return send(
+                                ws_tx,
+                                &ServerMessage::Error(ErrorMsg {
+                                    owner_kind: None,
+                                    owner_generation: Some(snap.generation),
+                                    owner_epoch: Some(snap.epoch),
+                                    code: ErrorCode::SessionReserved,
+                                    message: reason,
+                                    timestamp: crate::now_iso(),
+                                    actual_session_ref: None,
+                                    expected_session_ref: None,
+                                    request_id: None,
+                                    retry_after_ms: None,
+                                    terminal_exit_code: None,
+                                    terminal_id: Some(attach.terminal_id.clone()),
+                                    live_terminal_id: None,
+                                }),
+                            )
+                            .await;
+                        }
+                        // A fenced observation: a stale generation answers
+                        // typed (the delayed cross-device attach), a current
+                        // one proceeds and restamps under the held claim.
+                        if let Some(fence) = observed {
+                            if fence.epoch != snap.epoch || fence.generation < snap.generation {
+                                tracing::warn!(
+                                    target: "freshell_ws::terminal",
+                                    terminal_id = %attach.terminal_id,
+                                    session_id = %session_ref.session_id,
+                                    observed_epoch = fence.epoch,
+                                    observed_generation = fence.generation,
+                                    current_epoch = snap.epoch,
+                                    current_generation = snap.generation,
+                                    "terminal_attach_refused: the observed fence is stale — \
+                                     the queued attach answers typed, nothing restamps"
+                                );
+                                return send(
+                                    ws_tx,
+                                    &ServerMessage::Error(ErrorMsg {
+                                        owner_kind: None,
+                                        owner_generation: Some(snap.generation),
+                                        owner_epoch: Some(snap.epoch),
+                                        code: ErrorCode::SessionReserved,
+                                        message: format!(
+                                            "Session ownership moved on (stale observed \
+                                             generation); refresh and retry. (session {})",
+                                            session_ref.session_id
+                                        ),
+                                        timestamp: crate::now_iso(),
+                                        actual_session_ref: None,
+                                        expected_session_ref: None,
+                                        request_id: None,
+                                        retry_after_ms: None,
+                                        terminal_exit_code: None,
+                                        terminal_id: Some(attach.terminal_id.clone()),
+                                        live_terminal_id: None,
+                                    }),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                }
                 // Delta-r7-round-2 (Finding F3) — the attach-carried pane
                 // identity restamps the terminal's Bound ledger row BEFORE
                 // the attach is observable (the kill lane's

@@ -3077,6 +3077,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       sinceSeq,
       attachRequestId,
       priority: opts?.priority ?? 'foreground',
+      // b8ke ext r8 F2: the attach carries the pane's observed ownership
+      // fence — terminal.attach participates in the coordinator (a queued
+      // cross-device attach is generation-fenced server-side).
+      ownerFence: selectPaneOwnerFence(appStore.getState(), contentRef.current ?? {}) ?? undefined,
       ...(opts?.maxReplayBytes ? { maxReplayBytes: opts.maxReplayBytes } : {}),
       ...(claimSurfaceReset ? { surfaceReset: true } : {}),
     }))

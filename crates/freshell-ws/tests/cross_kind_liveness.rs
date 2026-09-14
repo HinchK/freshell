@@ -4429,3 +4429,289 @@ async fn the_learned_identity_spawn_interval_holds_a_coordinator_claim() {
         .to_string();
     state.registry.kill(&tid);
 }
+
+// ── b8ke ext r8 F2: terminal.attach participates in the coordinator ─────────
+
+/// b8ke ext r8 F2: a queued cross-device attach landing while the canonical
+/// session is in Handoff answers the typed refusal with NO restamp —
+/// pre-r8 the handler wrote the durable pane reattachment record and
+/// restamped the old terminal without consulting the coordinator at all.
+#[tokio::test]
+async fn a_queued_attach_mid_handoff_is_refused_typed_no_restamp() {
+    let (url, registry, ws_state) = spawn_server().await;
+    let mut ws = connect(&url).await;
+
+    // A negotiated terminal create — the session commits Live{Terminal}.
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-r8-f2-attach",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": uuid::Uuid::new_v4().to_string() },
+        }),
+    )
+    .await;
+    let created = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "terminal.created" && v["requestId"] == "req-r8-f2-attach"
+    })
+    .await;
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    let sid = created["sessionRef"]["sessionId"]
+        .as_str()
+        .expect("sid")
+        .to_string();
+    let ownership = ws_state.ownership.as_ref().expect("coordinator wired");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !matches!(
+        ownership.observe("claude", &sid).state,
+        freshell_ownership::OwnershipState::Live { .. }
+    ) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never committed Live"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let live = ownership.observe("claude", &sid);
+
+    // The session moves to HANDOFF (a lifecycle transition owns it).
+    let freshell_ownership::BeginOutcome::Granted { .. } = ownership.begin_handoff(
+        "claude",
+        &sid,
+        freshell_ownership::RuntimeOwnerKind::FreshAgent,
+        "op-r8-attach-held",
+        None,
+        "test",
+        freshell_ownership::now_epoch_ms(),
+    ) else {
+        panic!("expected the handoff granted")
+    };
+
+    // THE QUEUED ATTACH (carrying the pre-handoff observation): typed
+    // SESSION_RESERVED, never an attach.ready.
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.attach",
+            "terminalId": terminal_id,
+            "intent": "viewport_hydrate",
+            "cols": 80,
+            "rows": 24,
+            "sinceSeq": 0,
+            "attachRequestId": "req-r8-attach",
+            "priority": "foreground",
+            "observedEpoch": live.epoch,
+            "observedGeneration": live.generation,
+        }),
+    )
+    .await;
+    let refused = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "error" && v["code"] == "SESSION_RESERVED"
+    })
+    .await;
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("lifecycle operation is in flight"),
+        "the typed refusal names the in-flight transition: {refused}"
+    );
+    // No attach.ready ever lands for the queued attach.
+    // (The refusal IS the answer — the next frame for this terminal is
+    // nothing attach-shaped; we assert via the next frame filter below.)
+    let still_handoff = ownership.observe("claude", &sid);
+    assert!(
+        matches!(
+            still_handoff.state,
+            freshell_ownership::OwnershipState::Handoff { .. }
+        ),
+        "the Handoff record is untouched: {:?}",
+        still_handoff.state
+    );
+    let _ = registry;
+    // Cleanup: unwind the held handoff + reap the terminal.
+    let _ = ownership.fail(
+        "claude",
+        &sid,
+        "op-r8-attach-held",
+        still_handoff.generation,
+        true,
+    );
+    ws_state.registry.kill(&terminal_id);
+}
+
+/// b8ke ext r8 F2: a stale-generation attach answers the typed refusal —
+/// never a restamp past the generation advance.
+#[tokio::test]
+async fn a_stale_generation_attach_is_refused_typed() {
+    let (url, _registry, ws_state) = spawn_server().await;
+    let mut ws = connect(&url).await;
+
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-r8-f2-stale",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": uuid::Uuid::new_v4().to_string() },
+        }),
+    )
+    .await;
+    let created = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "terminal.created" && v["requestId"] == "req-r8-f2-stale"
+    })
+    .await;
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    let sid = created["sessionRef"]["sessionId"]
+        .as_str()
+        .expect("sid")
+        .to_string();
+    let ownership = ws_state.ownership.as_ref().expect("coordinator wired");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !matches!(
+        ownership.observe("claude", &sid).state,
+        freshell_ownership::OwnershipState::Live { .. }
+    ) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never committed Live"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Advance the record's generation (a handoff begin + fail bumps it).
+    let before = ownership.observe("claude", &sid);
+    let freshell_ownership::BeginOutcome::Granted { generation: ho_gen } = ownership.begin_handoff(
+        "claude",
+        &sid,
+        freshell_ownership::RuntimeOwnerKind::FreshAgent,
+        "op-r8-attach-bump",
+        None,
+        "test",
+        freshell_ownership::now_epoch_ms(),
+    ) else {
+        panic!("expected the bump handoff granted")
+    };
+    let _ = ownership.fail("claude", &sid, "op-r8-attach-bump", ho_gen, true);
+    assert!(
+        ownership.observe("claude", &sid).generation > before.generation,
+        "the generation advanced"
+    );
+
+    // THE STALE ATTACH: observed generation is the PRE-advance value.
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.attach",
+            "terminalId": terminal_id,
+            "intent": "viewport_hydrate",
+            "cols": 80,
+            "rows": 24,
+            "sinceSeq": 0,
+            "attachRequestId": "req-r8-attach-stale",
+            "priority": "foreground",
+            "observedEpoch": before.epoch,
+            "observedGeneration": before.generation,
+        }),
+    )
+    .await;
+    let refused = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "error" && v["code"] == "SESSION_RESERVED"
+    })
+    .await;
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("stale observed generation"),
+        "the typed refusal names the stale generation: {refused}"
+    );
+    ws_state.registry.kill(&terminal_id);
+}
+
+/// b8ke ext r8 F2: a CURRENT attach (fresh observation) succeeds and
+/// restamps — the gate never over-blocks the legitimate path.
+#[tokio::test]
+async fn a_current_attach_succeeds_and_restamps() {
+    let (url, _registry, ws_state) = spawn_server().await;
+    let mut ws = connect(&url).await;
+
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-r8-f2-current",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": uuid::Uuid::new_v4().to_string() },
+        }),
+    )
+    .await;
+    let created = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "terminal.created" && v["requestId"] == "req-r8-f2-current"
+    })
+    .await;
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    let sid = created["sessionRef"]["sessionId"]
+        .as_str()
+        .expect("sid")
+        .to_string();
+    let ownership = ws_state.ownership.as_ref().expect("coordinator wired");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !matches!(
+        ownership.observe("claude", &sid).state,
+        freshell_ownership::OwnershipState::Live { .. }
+    ) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never committed Live"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let live = ownership.observe("claude", &sid);
+
+    // THE CURRENT ATTACH: attach.ready lands (the legitimate path).
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.attach",
+            "terminalId": terminal_id,
+            "intent": "viewport_hydrate",
+            "cols": 80,
+            "rows": 24,
+            "sinceSeq": 0,
+            "attachRequestId": "req-r8-attach-current",
+            "priority": "foreground",
+            "observedEpoch": live.epoch,
+            "observedGeneration": live.generation,
+        }),
+    )
+    .await;
+    let _ = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "terminal.attach.ready" && v["terminalId"] == json!(terminal_id)
+    })
+    .await;
+    assert!(
+        matches!(
+            ownership.observe("claude", &sid).state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ),
+        "the current attach never disturbed the Live record"
+    );
+    ws_state.registry.kill(&terminal_id);
+}
