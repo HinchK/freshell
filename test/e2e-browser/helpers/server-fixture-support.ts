@@ -74,6 +74,58 @@ export async function findFreePort(probe: () => Promise<number> = probeEphemeral
   throw new Error('findFreePort: no not-recently-issued port after 20 probes')
 }
 
+/**
+ * Prove that a fixture port is available without retaining a listener.
+ * This is deliberately a test-fixture transport seam, not application
+ * server behavior.
+ */
+export async function canBindLoopbackPort(port: number): Promise<boolean> {
+  return await new Promise((resolve) => {
+    const server = net.createServer()
+    server.once('error', () => resolve(false))
+    server.listen(port, '127.0.0.1', () => {
+      server.close(() => resolve(true))
+    })
+  })
+}
+
+/**
+ * Make one bounded loopback transport probe and always release its socket.
+ * An outer abort owns cancellation for readiness and teardown tests.
+ */
+export async function canConnectLoopbackPort(
+  port: number,
+  timeoutMs: number,
+  signal: AbortSignal,
+): Promise<boolean> {
+  return await new Promise((resolve) => {
+    const socket = net.createConnection({ host: '127.0.0.1', port })
+    let settled = false
+    const finish = (connected: boolean) => {
+      if (settled) return
+      settled = true
+      socket.off('connect', onConnect)
+      socket.off('error', onError)
+      socket.off('timeout', onTimeout)
+      signal.removeEventListener('abort', onAbort)
+      socket.destroy()
+      resolve(connected)
+    }
+    const onConnect = () => finish(true)
+    const onError = () => finish(false)
+    const onTimeout = () => finish(false)
+    const onAbort = () => finish(false)
+    if (signal.aborted) {
+      finish(false)
+      return
+    }
+    socket.once('connect', onConnect)
+    socket.once('error', onError)
+    socket.setTimeout(timeoutMs, onTimeout)
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
 function probeEphemeralPort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const server = net.createServer()

@@ -330,6 +330,29 @@ describe('runtime boundary analyzer', () => {
     ])
   })
 
+  it('allows a test to consume the exact fixture transport helper without allowing an adjacent listener', async () => {
+    const root = await createSyntheticRoot(
+      [{
+        id: 'listener-server-fixture-support',
+        path: 'test/e2e-browser/helpers/server-fixture-support.ts',
+        role: 'non-backend-listener',
+        listener: 'non-backend',
+      }],
+      {
+        'test/e2e-browser/helpers/server-fixture-support.ts': "require('node:net').createServer().listen(0)\n",
+        'test/e2e-browser/helpers/codex-dual-role.test.ts': "import { findFreePort } from './server-fixture-support.js'\nvoid findFreePort\n",
+        'test/e2e-browser/helpers/rogue-listener.test.ts': "require('node:http').createServer().listen(0)\n",
+      },
+    )
+
+    const result = await analyzeRuntimeBoundary(root)
+
+    expect(result.manifestDrift).toEqual([])
+    expect(result.unexpectedNodeBackend).toEqual([
+      'test/e2e-browser/helpers/rogue-listener.test.ts',
+    ])
+  })
+
   it('rejects an unlisted Node listener in a supported extension example', async () => {
     const root = await createSyntheticRoot(
       [],

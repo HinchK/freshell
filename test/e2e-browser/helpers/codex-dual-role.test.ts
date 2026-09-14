@@ -2,11 +2,15 @@ import fs from 'node:fs/promises'
 import fsSync from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import net from 'node:net'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { describe, it, expect } from 'vitest'
 import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
+import {
+  canBindLoopbackPort,
+  canConnectLoopbackPort,
+  findFreePort,
+} from './server-fixture-support.js'
 
 /**
  * Behavioral pinning for the dual-role codex shim installed by e2e specs.
@@ -105,18 +109,6 @@ function directChildPids(pid: number): number[] {
   return raw === '' ? [] : raw.split(/\s+/).map(Number)
 }
 
-async function freeLoopbackPort(): Promise<number> {
-  return await new Promise((resolve, reject) => {
-    const server = net.createServer()
-    server.once('error', reject)
-    server.listen(0, '127.0.0.1', () => {
-      const address = server.address()
-      const port = typeof address === 'object' && address ? address.port : 0
-      server.close((error) => error ? reject(error) : resolve(port))
-    })
-  })
-}
-
 async function withCleanup<T>(body: () => Promise<T>, cleanupSteps: Array<() => Promise<unknown>>): Promise<T> {
   let result: T | undefined
   let primaryError: unknown
@@ -147,16 +139,6 @@ async function withCleanup<T>(body: () => Promise<T>, cleanupSteps: Array<() => 
   return result as T
 }
 
-async function canBindLoopbackPort(port: number): Promise<boolean> {
-  return await new Promise((resolve) => {
-    const server = net.createServer()
-    server.once('error', () => resolve(false))
-    server.listen(port, '127.0.0.1', () => {
-      server.close(() => resolve(true))
-    })
-  })
-}
-
 const READINESS_RETRY_INTERVAL_MS = 25
 
 interface ReadinessDependencies {
@@ -178,35 +160,6 @@ function pauseForReadiness(delayMs: number, signal: AbortSignal): Promise<void> 
       signal.removeEventListener('abort', onAbort)
       resolve()
     }
-    signal.addEventListener('abort', onAbort, { once: true })
-  })
-}
-
-async function canConnectLoopbackPort(port: number, timeoutMs: number, signal: AbortSignal): Promise<boolean> {
-  return await new Promise((resolve) => {
-    const socket = net.createConnection({ host: '127.0.0.1', port })
-    let settled = false
-    const finish = (connected: boolean) => {
-      if (settled) return
-      settled = true
-      socket.off('connect', onConnect)
-      socket.off('error', onError)
-      socket.off('timeout', onTimeout)
-      signal.removeEventListener('abort', onAbort)
-      socket.destroy()
-      resolve(connected)
-    }
-    const onConnect = () => finish(true)
-    const onError = () => finish(false)
-    const onTimeout = () => finish(false)
-    const onAbort = () => finish(false)
-    if (signal.aborted) {
-      finish(false)
-      return
-    }
-    socket.once('connect', onConnect)
-    socket.once('error', onError)
-    socket.setTimeout(timeoutMs, onTimeout)
     signal.addEventListener('abort', onAbort, { once: true })
   })
 }
@@ -560,7 +513,7 @@ describe('codex-dual-role shim', () => {
     const binDir = await fs.mkdtemp(path.join(os.tmpdir(), 'dual-role-reap-'))
     const terminalSrc = await writeTerminalFake(binDir)
     const bin = await installDualRoleCodexCli(binDir, terminalSrc)
-    const port = await freeLoopbackPort()
+    const port = await findFreePort()
     const shim = spawnShim(bin, ['-c', 'features.apps=false', 'app-server', '--listen', `ws://127.0.0.1:${port}`])
 
     await withCleanup(async () => {
@@ -581,7 +534,7 @@ describe('codex-dual-role shim', () => {
     const binDir = await fs.mkdtemp(path.join(os.tmpdir(), 'dual-role-direct-'))
     const terminalSrc = await writeTerminalFake(binDir)
     const bin = await installDualRoleCodexCli(binDir, terminalSrc)
-    const port = await freeLoopbackPort()
+    const port = await findFreePort()
     const shim = spawnShim(bin, ['-c', 'features.apps=false', 'app-server', '--listen', `ws://127.0.0.1:${port}`])
 
     await withCleanup(async () => {
@@ -597,7 +550,7 @@ describe('codex-dual-role shim', () => {
     const binDir = await fs.mkdtemp(path.join(os.tmpdir(), 'dual-role-escalate-'))
     const terminalSrc = await writeTerminalFake(binDir)
     const bin = await installDualRoleCodexCli(binDir, terminalSrc)
-    const port = await freeLoopbackPort()
+    const port = await findFreePort()
     const shim = spawnShim(
       bin,
       ['-c', 'features.apps=false', 'app-server', '--listen', `ws://127.0.0.1:${port}`],
