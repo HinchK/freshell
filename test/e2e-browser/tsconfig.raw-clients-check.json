@@ -10,6 +10,7 @@
     "helpers/raw-clients.ts",
     "helpers/raw-clients.test.ts",
     "helpers/echo-ws-fixture.ts",
-    "specs/harness-05-raw-clients.spec.ts"
+    "specs/harness-05-raw-clients.spec.ts",
+    "specs/safe03-origin-matrix.spec.ts"
   ]
 }

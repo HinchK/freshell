@@ -213,6 +213,31 @@ describe('RawWsClient — codec + handshake', () => {
     expect(echo.payload.equals(payload)).toBe(true)
   })
 
+  it('returns a matching JSON message before a terminal WebSocket event', async () => {
+    fixture = await EchoWsFixture.start()
+    const client = await connect()
+    const outcome = client.waitForJsonMessageOrTerminal<{ type: string; value: string }>('ready', 5000)
+    client.sendJson({ type: 'ready', value: 'fixture' })
+
+    await expect(outcome).resolves.toEqual({
+      kind: 'message',
+      message: { type: 'ready', value: 'fixture' },
+    })
+  })
+
+  it('returns an exact close event instead of waiting for a matching JSON message', async () => {
+    fixture = await EchoWsFixture.start()
+    const client = await connect()
+    const outcome = client.waitForJsonMessageOrTerminal('ready', 5000)
+    client.sendText('close:4000:fixture-bye')
+
+    await expect(outcome).resolves.toEqual({
+      kind: 'terminal',
+      terminal: 'peer-close',
+      close: { code: 4000, reason: 'fixture-bye' },
+    })
+  })
+
   it('encodes 64-bit payload lengths (>64KiB) correctly (echo proof)', async () => {
     fixture = await EchoWsFixture.start()
     const client = await connect()

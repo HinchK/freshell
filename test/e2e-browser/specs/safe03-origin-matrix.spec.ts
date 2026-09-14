@@ -1,7 +1,7 @@
-import WebSocket from 'ws'
 import { test, expect } from '../helpers/fixtures.js'
 import { RustServer } from '../helpers/rust-server.js'
 import type { E2eServerHandle } from '../helpers/external-target.js'
+import { RawWsClient } from '../helpers/raw-clients.js'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 
 /**
@@ -55,48 +55,29 @@ async function bootWithAllowedOrigins(
 type OriginOutcome = 'ready' | { closeCode: number; closeReason: string }
 
 /**
- * Open a raw WS connection with an explicit (or absent) `Origin` header,
- * send a well-formed `hello` with a VALID token immediately, and observe
- * whether the very first inbound frame is `ready` (allowed through) or a
- * `close` (rejected before session state).
+ * Open a raw WS connection with an explicit (or absent) `Origin` header and
+ * send a well-formed `hello` with a VALID token immediately. The raw client
+ * records the actual peer close frame, rather than translating a TCP end into
+ * a synthetic `1006` close code as a convenience client library would.
  */
-function connectWithOrigin(wsUrl: string, token: string, origin: string | undefined): Promise<OriginOutcome> {
-  return new Promise((resolve, reject) => {
-    const options = origin !== undefined ? { headers: { Origin: origin } } : undefined
-    const ws = new WebSocket(wsUrl, options)
-    const timeout = setTimeout(() => {
-      ws.removeAllListeners()
-      ws.terminate()
-      reject(new Error('Timed out waiting for origin-policy outcome'))
-    }, 10_000)
-
-    ws.on('open', () => {
-      ws.send(JSON.stringify({ type: 'hello', token, protocolVersion: WS_PROTOCOL_VERSION }))
-    })
-
-    ws.on('message', (raw) => {
-      const message = JSON.parse(String(raw))
-      if (message?.type === 'ready') {
-        clearTimeout(timeout)
-        ws.removeAllListeners()
-        ws.close()
-        resolve('ready')
-      }
-      // Any other message type (e.g. an `error` frame accompanying the
-      // reject) is not itself conclusive -- wait for the close event below.
-    })
-
-    ws.on('close', (code, reasonBuf) => {
-      clearTimeout(timeout)
-      ws.removeAllListeners()
-      resolve({ closeCode: code, closeReason: String(reasonBuf) })
-    })
-
-    ws.on('error', (err) => {
-      clearTimeout(timeout)
-      reject(err)
-    })
-  })
+async function connectWithOrigin(wsUrl: string, token: string, origin: string | undefined): Promise<OriginOutcome> {
+  const client = await RawWsClient.connect(wsUrl, origin === undefined ? undefined : { headers: { Origin: origin } })
+  try {
+    // Start observing before hello can cause an immediate server response.
+    const outcome = client.waitForJsonMessageOrTerminal('ready', 10_000)
+    client.hello(token, WS_PROTOCOL_VERSION)
+    const observed = await outcome
+    if (observed.kind === 'message') {
+      await client.closeGracefully()
+      return 'ready'
+    }
+    if (observed.terminal !== 'peer-close') {
+      throw new Error(`Origin-policy connection ended without a close frame: ${observed.terminal}`)
+    }
+    return { closeCode: observed.close.code, closeReason: observed.close.reason }
+  } finally {
+    await client.dispose()
+  }
 }
 
 const ALLOW_LISTED_REMOTE_ORIGIN = 'https://trusted.example'
