@@ -15,7 +15,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { cleanupElectronFixture, closeElectronGracefully, stopExactCapturedProcess } from './electron-fixture-cleanup.js'
 import { isolatedElectronHomeEnv } from './fixture-home-env.js'
-import { launchChooserViteArgs } from './launch-chooser-vite.js'
+import { launchChooserViteArgs, waitForCapturedViteReady } from './launch-chooser-vite.js'
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, '..', '..')
 const VITE_ROOT = path.join(PROJECT_ROOT, 'node_modules')
@@ -74,22 +74,6 @@ async function waitForHealth(port: number, token: string): Promise<Record<string
   throw new Error(`Timed out waiting for Rust server: ${String(lastError)}`)
 }
 
-async function waitForHttp(url: string): Promise<void> {
-  const deadline = Date.now() + 30_000
-  let lastError: unknown
-  while (Date.now() < deadline) {
-    try {
-      const response = await fetch(url)
-      if (response.ok) return
-      lastError = new Error(`HTTP ${response.status}`)
-    } catch (error) {
-      lastError = error
-    }
-    await new Promise((resolve) => setTimeout(resolve, 100))
-  }
-  throw new Error(`Timed out waiting for ${url}: ${String(lastError)}`)
-}
-
 async function waitForWindowUrl(
   app: ElectronApplication,
   pattern: RegExp,
@@ -119,27 +103,9 @@ function startLaunchChooserDevServer(port: number): ChildProcess {
       ...process.env,
       NODE_PATH: path.join(PROJECT_ROOT, 'node_modules'),
     },
-    stdio: 'ignore',
-  })
-}
-
-async function waitForCapturedViteReady(child: ChildProcess, port: number): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    let output = ''
-    const timer = setTimeout(() => reject(new Error(`captured chooser Vite did not become ready on ${port}`)), 30_000)
-    const finish = (error?: Error) => {
-      clearTimeout(timer)
-      child.stdout?.off('data', onData)
-      child.off('exit', onExit)
-      error ? reject(error) : resolve()
-    }
-    const onData = (chunk: Buffer) => {
-      output += chunk.toString()
-      if (output.includes(`http://localhost:${port}/`)) finish()
-    }
-    const onExit = (code: number | null, signal: NodeJS.Signals | null) => finish(new Error(`captured chooser Vite exited before ready (${code ?? signal ?? 'unknown'})`))
-    child.stdout?.on('data', onData)
-    child.once('exit', onExit)
+    // Readiness is proved from this exact process's Vite output; do not use
+    // a generic HTTP probe that a foreign process could satisfy.
+    stdio: ['ignore', 'pipe', 'pipe'],
   })
 }
 
