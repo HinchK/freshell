@@ -660,13 +660,14 @@ function FreshAgentActivityStrip({
               settledText={running ? undefined : settledSummary(displayRows)}
             />
           </div>
-          {/* Hoisted thinking rows: thinking is NEVER hidden behind the
-            * strip's tool disclosure. While collapsed, every thinking row —
-            * including LIVE rows mid-stream — renders its own expandable
-            * disclosure under the summary; the reel keeps its status slot.
-            * Tool rows and echo captions render only when expanded (their
-            * anchoring belongs to the tool supersession flow). */}
-          {thinkingRows.map(renderThinkingRow)}
+          {/* Hoisted thinking rows: on a thinking-only line, every thinking
+            * row — including LIVE rows mid-stream — renders its own
+            * expandable disclosure under the summary. On a line that used
+            * tools, the collapsed view is the single summary line alone:
+            * the 'thought' segment carries the thinking, and the rows are
+            * reachable by expanding the strip's tool disclosure (where
+            * they render in item order). */}
+          {tools.length === 0 ? thinkingRows.map(renderThinkingRow) : null}
         </>
       ) : (
         <div className="fresh-agent-activity-details">
@@ -898,7 +899,7 @@ export type FreshAgentTranscriptProps = {
   canFork?: boolean
   agentLabel?: string
   showModel?: boolean
-  /** "Expand thinking": thinking rows' starting state (they always render). */
+  /** "Expand thinking": thinking rows' starting state. */
   expandThinking?: boolean
   /** "Expand tools": the activity strip's starting state. */
   expandTools?: boolean
