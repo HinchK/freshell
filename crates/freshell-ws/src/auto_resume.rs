@@ -1018,18 +1018,36 @@ impl AutoResumeDriver for WsAutoResumeDriver {
                                  (fail-closed)"
                             );
                         } else {
+                            eprintln!(
+                                "DIAG: re-claiming, key state = {:?}",
+                                ownership.observe(&provider, &session_id).state
+                            );
                             match freshell_freshagent::ownership_lane::begin_terminal_lane_claim(
                                 &state.ownership,
                                 &provider,
                                 &session_id,
                                 &format!("auto-resume-{create_request_id}"),
-                                None,
+                                // b8ke ext r14 F4: the retry carries the
+                                // SAME observed fence as the first claim
+                                // (the crash event's dead-generation pair)
+                                // — a newer stop/handoff advancing the
+                                // generation and returning the key to
+                                // Vacant during the polling interval is
+                                // rejected by generation arithmetic (the
+                                // stale crash request can never claim the
+                                // NEW generation and respawn what the
+                                // newer operation deliberately stopped;
+                                // pre-r14 the retry passed None, so the
+                                // old request claimed whatever generation
+                                // the key reached).
+                                observed,
                                 "auto-resume/adopt-reclaim",
                                 crate::terminal::now_ms().max(0) as u64,
                             ) {
                                 freshell_freshagent::ownership_lane::TerminalLaneClaim::Granted(
                                     ticket,
                                 ) => {
+                                    eprintln!("DIAG: re-claim GRANTED");
                                     *pending_slot.lock().expect("pending ownership lock") =
                                         Some(PendingOwnershipClaim {
                                             locator: locator.clone(),
@@ -1047,6 +1065,7 @@ impl AutoResumeDriver for WsAutoResumeDriver {
                                 freshell_freshagent::ownership_lane::TerminalLaneClaim::Refused(
                                     outcome,
                                 ) => {
+                                    eprintln!("DIAG: re-claim REFUSED {outcome:?}");
                                     tracing::warn!(target: "freshell_ws::auto_resume",
                                         provider = %provider, session_id = %session_id,
                                         create_request_id = %create_request_id,
@@ -3228,5 +3247,143 @@ mod tests {
             .expect("pending ownership lock")
             .is_none());
         state.registry.kill("t-incumbent-live");
+    }
+
+    /// b8ke ext r14 F4: the delayed Adopt/release retry carries the SAME
+    /// observed fence as the crash event — a NEWER STOP that advances the
+    /// generation and returns the key to Vacant during the polling
+    /// interval rejects the stale crash request by generation arithmetic:
+    /// the retry is REFUSED TYPED and NOTHING respawns (pre-r14 the retry
+    /// passed None, so the old crash request claimed the NEW generation
+    /// and respawned the session the newer operation deliberately
+    /// stopped).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_crash_recovery_retry_after_a_newer_stop_is_refused_typed() {
+        let (state, ownership) = ownership_state();
+        let driver = std::sync::Arc::new(WsAutoResumeDriver {
+            state: state.clone(),
+            pending_ownership: Default::default(),
+            pending_attach_guard: Default::default(),
+        });
+        let sid = "ses-r14-f4-stale-retry".to_string();
+        spawn_real_shell_row(&state, "t-crashed", "claude");
+        // The coordinator record seeded DIRECTLY (no retained registry
+        // claim): the crashed row's kill finds NO claim to release, so
+        // the key STAYS LIVE while the row dies — the exact trailing-
+        // release window the Adopt resolution waits in.
+        let freshell_ownership::BeginOutcome::Granted { generation } = ownership.begin_start(
+            "claude",
+            &sid,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-crashed-owner",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("fixture granted")
+        };
+        assert_eq!(
+            ownership.commit_live(
+                "claude",
+                &sid,
+                "op-crashed-owner",
+                generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("t-crashed".into()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        );
+        // The crash shape: the row dies (its un-claimed release trails).
+        state.registry.kill("t-crashed");
+        assert!(
+            matches!(
+                ownership.observe("claude", &sid).state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ),
+            "fixture: the key stays Live over the dead row (the trailing-release window)"
+        );
+        // The crash event's observed fence: the dead generation's pair.
+        let crash_fence = freshell_ownership::ObservedFence {
+            epoch: ownership.boot_epoch(),
+            generation,
+        };
+
+        // The claim ADOPTS the live record over the dead row and enters
+        // the release-wait.
+        let claim_driver = std::sync::Arc::clone(&driver);
+        let claim_sid = sid.clone();
+        let claim = tokio::spawn(async move {
+            claim_driver
+                .claim_session("claude", &claim_sid, "req-r14-f4", Some(crash_fence))
+                .await
+        });
+
+        // Let the claim ADOPT and enter its release-wait BEFORE the
+        // newer stop (the wait polls every 10ms; 100ms is ample).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // THE NEWER STOP during the polling interval: it advances the
+        // generation (G+1) and returns the key to Vacant — the session
+        // is DELIBERATELY stopped.
+        let freshell_ownership::StopOutcome::Granted {
+            generation: stop_gen,
+        } = ownership.begin_stop(
+            "claude",
+            &sid,
+            "op-newer-stop",
+            &freshell_ownership::StopClaim {
+                expected_kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                expected_runtime: Some(freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("t-crashed".into()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: None,
+                }),
+                observed: crash_fence,
+            },
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        )
+        else {
+            panic!("the newer stop must begin")
+        };
+        assert_eq!(
+            ownership.commit_stop("claude", &sid, "op-newer-stop", stop_gen),
+            freshell_ownership::CommitOutcome::Committed
+        );
+        assert!(matches!(
+            ownership.observe("claude", &sid).state,
+            freshell_ownership::OwnershipState::Vacant
+        ));
+
+        // THE STALE RETRY: the crash request's re-claim carries the OLD
+        // fence (generation G) against the key's NEW generation (G+1) —
+        // REFUSED TYPED, no respawn, no ticket.
+        let claimed = claim.await.expect("the claim resolves");
+        assert!(
+            !claimed,
+            "the stale crash-recovery retry is refused typed — no respawn"
+        );
+        assert!(
+            driver
+                .pending_ownership
+                .lock()
+                .expect("pending ownership lock")
+                .is_none(),
+            "no ticket parked for the stale retry"
+        );
+        assert!(
+            matches!(
+                ownership.observe("claude", &sid).state,
+                freshell_ownership::OwnershipState::Vacant
+            ),
+            "the newer stop's Vacant verdict stands"
+        );
     }
 }
