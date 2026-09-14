@@ -223,12 +223,18 @@ export async function runPaneSessionHandoff(
     return false
   }
 
-  // b8ke focused round-4 R4-4: the acknowledged PlatformLimited
-  // force-clear's TYPED answer — the fence cleared, NO handoff ran, no
-  // owner is committed. The server never auto-re-enters handoff from the
-  // force-release path; the caller retries explicitly: this operator
-  // action's single gesture covers clear-then-reopen, re-issuing the
-  // handoff ONCE as the fresh no-prior sequence (the prior is Vacant).
+  // b8ke focused round-4 R4-4 + ext r12 F1: the acknowledged
+  // PlatformLimited force-clear's TYPED answer — the fence cleared, NO
+  // handoff ran, no owner is committed. The clear STOPS AT THE CLEAR:
+  // acknowledgment covers clearing the fence, NOT starting a writer over
+  // the acknowledged-risk tree (on non-Linux the Claude descendant reaper
+  // is a no-op, so a surviving provider CLI may still be writing the
+  // session — an automatic retry would start the new owner over it). The
+  // server never auto-re-enters handoff from the force-release path and
+  // the clear response carries no retry instruction; the cleared banner
+  // surfaces the state with an EXPLICIT user action to re-initiate the
+  // handoff (which then goes through the coordinator fresh, as any new
+  // request would — the prior is Vacant).
   if (handoff.ok === true && 'cleared' in handoff) {
     log.info({
       event: 'session_handoff_platform_limited_force_cleared',
@@ -238,7 +244,17 @@ export async function runPaneSessionHandoff(
       paneId,
       generation: handoff.generation,
     })
-    return runPaneSessionHandoff(appStore, { tabId, paneId, expected })
+    appStore.dispatch(setPaneHandoffError({
+      tabId,
+      paneId,
+      error: {
+        code: 'HANDOFF_FORCE_CLEARED',
+        message: 'The platform-limited fence was cleared (unverified descendant processes are the acknowledged risk). No reopen has run — start it again when ready.',
+        retryable: true,
+        generation: handoff.generation,
+      },
+    }))
+    return false
   }
 
   if (!handoff.ok) {

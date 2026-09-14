@@ -140,3 +140,60 @@ describe('b8ke ext F1: the direct handoff navigates the rekey alias chain', () =
       .toEqual({ provider: 'claude', sessionId: NEW_SESSION_ID })
   })
 })
+
+describe('b8ke ext r12 F1: the acknowledged force-clear STOPS at the clear', () => {
+  beforeEach(() => {
+    requestSessionHandoffMock.mockReset()
+  })
+
+  it('performs NO handoff request after the clear and surfaces the cleared state', async () => {
+    const store = buildStore()
+    seedRekeyedPane(store)
+    // The first call answers the acknowledged clear; a SECOND call (the
+    // pre-fix auto-retry) would answer a committed handoff — the call
+    // count is the red/green observable.
+    requestSessionHandoffMock
+      .mockResolvedValueOnce({
+        ok: true,
+        cleared: 'platform-limited-fence',
+        operationId: 'clear-1',
+        generation: 5,
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        operationId: 'ho-auto-retry',
+        generation: 6,
+        owner: { kind: 'terminal', terminalId: 't-auto', mode: 'claude' },
+      })
+
+    const result = await runPaneSessionHandoff(store, {
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      acknowledgePlatformLimitedRisk: true,
+    })
+    expect(result).toBe(false)
+
+    // THE CLEAR-THEN-STOP CONTRACT: exactly ONE request (the clear
+    // itself) — pre-fix the client auto-retried the handoff after the
+    // clear, starting a writer over the acknowledged-risk tree.
+    expect(requestSessionHandoffMock).toHaveBeenCalledTimes(1)
+    expect(requestSessionHandoffMock).toHaveBeenCalledWith(expect.objectContaining({
+      acknowledgePlatformLimitedRisk: true,
+    }))
+
+    // The cleared state is SURFACED (the banner's explicit user action
+    // re-initiates the handoff; no automatic retry ever runs).
+    const leaf = store.getState().panes.layouts['tab-1'] as Extract<
+      import('@/store/paneTypes').PaneNode,
+      { type: 'leaf' }
+    >
+    expect(leaf.content).toMatchObject({
+      kind: 'fresh-agent',
+      handoffError: {
+        code: 'HANDOFF_FORCE_CLEARED',
+        retryable: true,
+        generation: 5,
+      },
+    })
+  })
+})

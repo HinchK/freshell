@@ -3399,9 +3399,81 @@ async fn a_platform_limited_fence_recovers_only_through_the_acknowledged_force_c
         "the force-clear path must not re-enter handoff: {frames:?}"
     );
 
-    // (c) A subsequent EXPLICIT handoff proceeds as a fresh no-prior
-    // sequence — the key is Vacant, so the runner starts the terminal
-    // target fresh from the durable session and commits it.
+    // b8ke ext r12 F1: THE CLEAR STOPS AT THE CLEAR — the typed clear
+    // answer carries NO retry semantics (no owner, no handoff chain): the
+    // server never re-enters handoff from the force-clear path, and the
+    // recovery ends HERE (the client surfaces the cleared state; an
+    // explicit user action re-initiates the handoff as any NEW request —
+    // see a_post_clear_user_initiated_handoff_proceeds_fresh below).
+    let cleared_response_keys: Vec<String> = cleared
+        .as_object()
+        .expect("the typed clear is a JSON object")
+        .keys()
+        .cloned()
+        .collect();
+    assert!(
+        !cleared_response_keys.iter().any(|k| k.contains("retry")),
+        "the typed clear carries no retry instruction: {cleared}"
+    );
+    assert!(
+        cleared.get("owner").is_none() && cleared.get("ok").is_some(),
+        "the typed clear is NOT a handoff success — no owner is committed: {cleared}"
+    );
+
+    // The limitation was recorded honestly: the force-clear's log names
+    // the platform limitation and the operator's acknowledgment (the
+    // registry's own force_released line + the runner's acknowledgment
+    // line; the behavioral outcome above is the proof — no log capture is
+    // needed here).
+}
+
+/// b8ke ext r12 F1 (c): the re-initiated handoff — a SEPARATE, explicit
+/// user request after the clear (never an automatic clear-then-start
+/// chain) — proceeds through the coordinator FRESH, as any new request
+/// would: the key is Vacant, so the runner starts the terminal target
+/// fresh from the durable session and commits it.
+#[tokio::test]
+async fn a_post_clear_user_initiated_handoff_proceeds_fresh() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let rig = build_rig_with_options(None, None, None, 8_000, None, true);
+    establish_fresh_claude_owner(&rig, &sid).await;
+
+    // Fence PlatformLimited (the 3i shape).
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let result = handle.completion.await.expect("runner completed");
+    assert_eq!(result["error"]["code"], json!("PLATFORM_LIMITED"));
+    let snap = rig.ownership.observe("claude", &sid);
+    assert!(matches!(
+        snap.state,
+        OwnershipState::Fenced {
+            reason: FenceReason::PlatformLimited,
+            ..
+        }
+    ));
+
+    // The acknowledged clear (the operator action) — the recovery STOPS
+    // here.
+    let mut clear_req = handoff_req_terminal("claude", &sid, "claude");
+    clear_req.acknowledge_platform_limited_risk = true;
+    clear_req.observed_epoch = Some(snap.epoch);
+    clear_req.observed_generation = Some(snap.generation);
+    let clear = rig.runner.spawn_handoff(clear_req);
+    let cleared = clear.completion.await.expect("force-clear completed");
+    assert_eq!(cleared["ok"], json!(true));
+    assert_eq!(cleared["cleared"], json!("platform-limited-fence"));
+    assert!(matches!(
+        rig.ownership.observe("claude", &sid).state,
+        OwnershipState::Vacant
+    ));
+
+    // THE USER-INITIATED RE-INITIATION: a brand-new handoff request (the
+    // explicit affordance's action; nothing chained it) — the coordinator
+    // treats it as any fresh request from the now-Vacant key.
     let retry = rig
         .runner
         .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
@@ -3409,7 +3481,7 @@ async fn a_platform_limited_fence_recovers_only_through_the_acknowledged_force_c
     assert_eq!(
         retried["ok"],
         json!(true),
-        "the post-clear explicit handoff must proceed: {retried}"
+        "the post-clear user-initiated handoff must proceed: {retried}"
     );
     let terminal_id = retried["owner"]["terminalId"].as_str().unwrap().to_string();
     match rig.ownership.observe("claude", &sid).state {
@@ -3420,12 +3492,6 @@ async fn a_platform_limited_fence_recovers_only_through_the_acknowledged_force_c
         other => panic!("expected the committed terminal owner, got {other:?}"),
     }
     rig.registry.kill(&terminal_id);
-
-    // The limitation was recorded honestly: the force-clear's log names
-    // the platform limitation and the operator's acknowledgment (the
-    // registry's own force_released line + the runner's acknowledgment
-    // line; the behavioral outcome above is the proof — no log capture is
-    // needed here).
 }
 
 /// 3j. b8ke focused round-3 review R3-3: the DELAYED platform-limited

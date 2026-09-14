@@ -695,9 +695,15 @@ impl SessionHandoffRunner {
                             None,
                         );
                         // The typed clear — the force-clear's own answer.
-                        // NOT a handoff success: no owner is committed
-                        // and the caller must retry the handoff
-                        // explicitly (the fresh no-prior sequence).
+                        // NOT a handoff success: no owner is committed.
+                        // b8ke ext r12 F1: the clear STOPS AT THE CLEAR —
+                        // the answer carries NO retry instruction
+                        // (acknowledgment covers clearing the fence, not
+                        // starting a writer over the acknowledged-risk
+                        // tree); the client surfaces the cleared state
+                        // with an explicit user action to re-initiate the
+                        // handoff, which then goes through the coordinator
+                        // fresh (the no-prior sequence).
                         return json!({
                             "ok": true,
                             "cleared": cleared_label,

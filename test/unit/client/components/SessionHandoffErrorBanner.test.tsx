@@ -118,3 +118,32 @@ describe('SessionHandoffErrorBanner (kata b8ke R4-4 force-clear action)', () => 
     })
   })
 })
+
+describe('b8ke ext r12 F1: the cleared state presents the explicit re-initiation affordance', () => {
+  it('renders HANDOFF_FORCE_CLEARED with the Start-again action and NO force-clear button', () => {
+    render(
+      <SessionHandoffErrorBanner
+        error={errorWith({
+          code: 'HANDOFF_FORCE_CLEARED',
+          message: 'The platform-limited fence was cleared.',
+          retryable: true,
+          generation: 5,
+        })}
+        appStore={store}
+        tabId="tab-1"
+        paneId="pane-1"
+      />,
+    )
+    const banner = screen.getByRole('alert')
+    expect(banner).toHaveTextContent(/fence was cleared/i)
+    // THE EXPLICIT AFFORDANCE: the user action that re-initiates the
+    // handoff (which then goes through the coordinator fresh).
+    expect(
+      screen.getByRole('button', { name: 'Start the reopen again now that the fence is cleared' }),
+    ).toBeDefined()
+    expect(screen.getByRole('button', { name: /start the reopen again/i })).toBeDefined()
+    // No force-clear action on the CLEARED state (the fence is gone).
+    expect(screen.queryByRole('button', { name: /force clear/i })).toBeNull()
+  })
+})
+

@@ -767,10 +767,13 @@ export const SessionHandoffResultSchema = z.union([
     generation: z.number().int().nonnegative(),
     owner: SessionHandoffOwnerSchema,
   }),
-  // b8ke focused round-4 R4-4: the acknowledged PlatformLimited
-  // force-clear's TYPED answer — the fence was cleared (key Vacant) but
-  // NO handoff ran and no owner is committed; the caller retries the
-  // handoff explicitly as a fresh no-prior sequence.
+  // b8ke focused round-4 R4-4 + ext r12 F1: the acknowledged
+  // PlatformLimited force-clear's TYPED answer — the fence was cleared
+  // (key Vacant) but NO handoff ran and no owner is committed. The answer
+  // carries NO retry instruction: the clear STOPS at the clear (the
+  // client surfaces the cleared state with an explicit user action to
+  // re-initiate the handoff, which then goes through the coordinator
+  // fresh, as any new request would).
   z.object({
     ok: z.literal(true),
     /** b8ke e3r4 F2 (the DESIGN RECONCILIATION): the cleared label is

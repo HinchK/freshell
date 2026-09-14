@@ -17,10 +17,14 @@ import { runPaneSessionHandoff, SESSION_HANDOFF_RETRY_BACKOFF_MS } from '@/lib/s
  * operator force-clear action — "Force clear" sends the handoff request
  * with the `acknowledgePlatformLimitedRisk` acknowledgment: the server
  * clears the fence (recording the unverified-descendant limitation) and
- * answers the typed clear; this client then retries the handoff
- * explicitly as the fresh no-prior sequence. An ordinary Retry never
- * clears the fence (the server answers the typed PLATFORM_LIMITED_FENCED
- * refusal).
+ * answers the typed clear. b8ke ext r12 F1: the clear STOPS AT THE CLEAR —
+ * acknowledgment covers clearing the fence, not starting a writer over the
+ * acknowledged-risk tree, so the client performs NO handoff request after
+ * the clear; the cleared banner (HANDOFF_FORCE_CLEARED) surfaces the state
+ * with the explicit "Start reopen again" action, and only THAT user action
+ * re-initiates the handoff (which goes through the coordinator fresh, as
+ * any new request would). An ordinary Retry never clears the fence (the
+ * server answers the typed PLATFORM_LIMITED_FENCED refusal).
  */
 export function SessionHandoffErrorBanner({ error, appStore, tabId, paneId }: {
   error: HandoffError
@@ -61,6 +65,12 @@ export function SessionHandoffErrorBanner({ error, appStore, tabId, paneId }: {
   // fenced state and probe-based retry guidance).
   const platformLimited = error.code === 'PLATFORM_LIMITED'
     || error.code === 'PLATFORM_LIMITED_FENCED'
+
+  // b8ke ext r12 F1: the acknowledged force-clear's STOPPED state — the
+  // fence cleared, no reopen ran. The explicit re-initiation affordance
+  // ("Start reopen again") is the ONLY next step; no automatic retry ever
+  // runs from the clear.
+  const forceCleared = error.code === 'HANDOFF_FORCE_CLEARED'
 
   if (!error.retryable) {
     return (
@@ -107,7 +117,9 @@ export function SessionHandoffErrorBanner({ error, appStore, tabId, paneId }: {
         <button
           type="button"
           className="shrink-0 rounded border border-border/70 px-2 py-1 text-xs disabled:opacity-60"
-          aria-label="Retry reopening this session"
+          aria-label={forceCleared
+            ? 'Start the reopen again now that the fence is cleared'
+            : 'Retry reopening this session'}
           disabled={retryArmed}
           onClick={() => {
             if (retryTimerRef.current !== null) return
@@ -119,7 +131,7 @@ export function SessionHandoffErrorBanner({ error, appStore, tabId, paneId }: {
             }, SESSION_HANDOFF_RETRY_BACKOFF_MS)
           }}
         >
-          Retry
+          {forceCleared ? 'Start reopen again' : 'Retry'}
         </button>
       </div>
     </div>
