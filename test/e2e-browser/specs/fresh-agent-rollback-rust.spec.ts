@@ -689,6 +689,22 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
       expect((await snap())?.rollback?.canRedo).toBe(false)
       expect(((await snap())?.rolledBackTurns ?? []).length).toBeGreaterThan(0)
+
+      // Lifecycle: the send destroyed redo — every marker is historical now, so
+      // the UI must show the single collapsed history line (2 user steps:
+      // 'prompt one' + 'prompt two') with no redo affordances; expanding
+      // reveals the frozen rows.
+      const historyToggle = page.getByRole('button', { name: 'Toggle rolled-back history' })
+      await expect(historyToggle).toBeVisible({ timeout: 15_000 })
+      await expect(historyToggle).toHaveText(/Rolled back \(2\) — kept in history/)
+      await expect(page.getByRole('button', { name: 'Redo to here' })).toHaveCount(0)
+      await historyToggle.click()
+      // Scope the row asserts to the region: the session title ('prompt one')
+      // also renders in the sidebar row + pane header, so a page-wide exact
+      // text match is 3-way ambiguous here.
+      const historySection = page.getByRole('region', { name: 'Rolled back turns' })
+      await expect(historySection.getByText('prompt one', { exact: true })).toBeVisible()
+      await expect(historySection.getByText('prompt two', { exact: true })).toBeVisible()
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
@@ -738,11 +754,24 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
       expect(bucketIds.indexOf(epoch0MarkerId)).toBeGreaterThanOrEqual(0)
       expect(bucketIds.indexOf(epoch1MarkerId)).toBeGreaterThan(bucketIds.indexOf(epoch0MarkerId))
 
-      // UI: the frozen marker row offers NO affordance; the current-epoch one does.
-      const frozenRow = section().locator('div.flex.items-start', { has: page.getByText('prompt three', { exact: true }) })
+      // UI (lifecycle): the expanded section renders ONLY the current
+      // (restorable) epoch — header counts restorable steps; the frozen
+      // epoch-0 step lives behind the collapsed history line counting
+      // historical steps. Both surfaces read "Rolled back (1)" here —
+      // assert by exact text / role, never a bare text match.
+      await expect(section().getByText('Rolled back (1) — gone from the conversation; redo to restore.')).toBeVisible({ timeout: 15_000 })
+      const historyToggle = section().getByRole('button', { name: 'Toggle rolled-back history' })
+      await expect(historyToggle).toBeVisible()
+      await expect(historyToggle).toHaveText(/Rolled back \(1\) — kept in history/)
       const currentRow = section().locator('div.flex.items-start', { has: page.getByText('prompt three edited', { exact: true }) })
       await expect(currentRow.getByRole('button', { name: 'Redo to here' })).toHaveCount(1, { timeout: 15_000 })
+      // The frozen row is NOT rendered until the disclosure opens.
+      await expect(page.getByText('prompt three', { exact: true })).toHaveCount(0)
+      await historyToggle.click()
+      const frozenRow = section().locator('div.flex.items-start', { has: page.getByText('prompt three', { exact: true }) })
+      await expect(frozenRow).toBeVisible()
       await expect(frozenRow.getByRole('button', { name: 'Redo to here' })).toHaveCount(0)
+      // The restorable epoch keeps exactly its one affordance overall.
       await expect(section().getByRole('button', { name: 'Redo to here' })).toHaveCount(1)
     } finally {
       await lane.server.stop().catch(() => {})
@@ -846,6 +875,26 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
         ),
         'no freshAgent.send (turn/start) carried the typed /redo to the codex provider',
       ).toBe(false)
+
+      // Codex is undo-only — its markers are never restorable, so the section
+      // renders as the collapsed history line from the moment of the undo.
+      const undoneSnap = await snap()
+      const undoneUserSummaries = ((undoneSnap.rolledBackTurns ?? []) as any[])
+        .filter((t) => t.role === 'user')
+        .map((t) => t.summary)
+      expect(undoneUserSummaries).toHaveLength(2) // both turns reverted (empty-prefix)
+      const historyToggle = page.getByRole('button', { name: 'Toggle rolled-back history' })
+      await expect(historyToggle).toBeVisible({ timeout: 15_000 })
+      await expect(historyToggle).toHaveText(/Rolled back \(2\) — kept in history/)
+      await expect(page.getByRole('button', { name: 'Redo to here' })).toHaveCount(0)
+      await historyToggle.click()
+      // Scope the row asserts to the region: the session title ('codex turn
+      // one') also renders in the sidebar row + pane header, so a page-wide
+      // exact text match is 3-way ambiguous here.
+      const historySection = page.getByRole('region', { name: 'Rolled back turns' })
+      for (const summary of undoneUserSummaries) {
+        await expect(historySection.getByText(summary, { exact: true })).toBeVisible()
+      }
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
@@ -1041,6 +1090,54 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
         .map((t) => t.turnId)
       expect(afterReload.rollback).toEqual({ canRedo: true, undoneDepth: 1, redoableTurnIds: reloadedUserMarkerIds })
       expect(afterReload.rolledBackTurns).toHaveLength(2)
+    } finally {
+      await lane.server.stop().catch(() => {})
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
+  test('opencode: non-restorable convergence — after a send destroys redo, the collapsed history line survives reload identically (lifecycle)', async ({ page, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    const lane = await bootOpencodeLane(page)
+    try {
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      await sendOpencodeTurn(page, lane.harness, lane.tabId, 'prompt one', 1, lane.auditLogPath)
+      const sessionId = await sendOpencodeTurn(page, lane.harness, lane.tabId, 'prompt two', 2, lane.auditLogPath)
+      const snap = (): Promise<any | null> => fetchSnapshot(lane.info, 'freshopencode', 'opencode', sessionId)
+
+      await waitForRollbackCapability(page)
+      await typeSlash(page, '/undo')
+      await expect.poll(async () => userRows(await snap()), { timeout: 15_000 }).toBe(1)
+      // Restorable state: the expanded section renders with its redo affordance.
+      await expect(page.getByText('Rolled back (1) — gone from the conversation; redo to restore.')).toBeVisible({ timeout: 15_000 })
+      await expect(page.getByRole('button', { name: 'Redo to here' })).toHaveCount(1)
+
+      // The send destroys redo — the marker becomes historical and the UI
+      // collapses to the single history line.
+      await sendComposerText(page, 'prompt three')
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      await expect.poll(async () => (await snap())?.rollback?.canRedo, { timeout: 15_000 }).toBe(false)
+      const historyToggle = page.getByRole('button', { name: 'Toggle rolled-back history' })
+      await expect(historyToggle).toBeVisible({ timeout: 15_000 })
+      await expect(historyToggle).toHaveText(/Rolled back \(1\) — kept in history/)
+      await expect(page.getByRole('button', { name: 'Redo to here' })).toHaveCount(0)
+
+      // Reload: the collapsed state re-derives identically from the durable
+      // snapshot — pure presentation, no per-client dismissal state.
+      await page.reload({ waitUntil: 'domcontentloaded' })
+      const harness2 = new TestHarness(page)
+      await harness2.waitForHarness()
+      await harness2.waitForConnection()
+      const reloadedToggle = page.getByRole('button', { name: 'Toggle rolled-back history' })
+      await expect(reloadedToggle).toBeVisible({ timeout: 15_000 })
+      await expect(reloadedToggle).toHaveText(/Rolled back \(1\) — kept in history/)
+      await expect(reloadedToggle).toHaveAttribute('aria-expanded', 'false')
+      await expect(page.getByRole('button', { name: 'Redo to here' })).toHaveCount(0)
+      await reloadedToggle.click()
+      await expect(page.getByText('prompt two', { exact: true })).toBeVisible()
+      const afterReload = await snap()
+      expect(afterReload.rollback?.canRedo).toBe(false)
+      expect(((afterReload.rolledBackTurns ?? []) as any[]).filter((t) => t.role === 'user')).toHaveLength(1)
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
