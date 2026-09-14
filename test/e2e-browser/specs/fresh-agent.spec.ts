@@ -1581,7 +1581,9 @@ test.describe('Fresh Agent', () => {
     await terminal.waitForTerminal()
     await enableClaudeAndCodex(page)
 
+    let snapshotGetCount = 0
     await page.route(`${serverInfo.baseUrl}/api/fresh-agent/threads/freshcodex/codex/thread-codex*`, async (route) => {
+      snapshotGetCount += 1
       await route.fulfill({
         status: 200,
         contentType: 'application/json',
@@ -1665,10 +1667,56 @@ test.describe('Fresh Agent', () => {
     await page.evaluate(() => {
       window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
     })
+    const persistedFreshcodex = await page.evaluate(({ currentTabId, currentPaneId }) => {
+      const raw = localStorage.getItem('freshell.layout.v3')
+      if (!raw) throw new Error('Missing persisted layout after freshcodex flush')
+      const layout = JSON.parse(raw)
+      const findPane = (node: any): any => {
+        if (node?.type === 'leaf' && node.id === currentPaneId) return node.content
+        for (const child of node?.children ?? []) {
+          const found = findPane(child)
+          if (found) return found
+        }
+        return undefined
+      }
+      const content = findPane(layout.panes?.layouts?.[currentTabId])
+      if (!content) throw new Error('Persisted freshcodex pane is missing')
+      return {
+        sessionRef: content.sessionRef,
+        hasSessionId: Object.prototype.hasOwnProperty.call(content, 'sessionId'),
+      }
+    }, { currentTabId: tabId, currentPaneId: activePaneId })
+    expect(persistedFreshcodex.sessionRef).toEqual({ provider: 'codex', sessionId: 'thread-codex' })
+    expect(persistedFreshcodex.hasSessionId).toBe(false)
+    const snapshotGetsBeforeReload = snapshotGetCount
+    expect(snapshotGetsBeforeReload).toBeGreaterThan(0)
+
+    // This test owns a routed transcript, not a real Codex sidecar. Make the
+    // suppression survive the new document so its persisted sessionRef is
+    // exercised without trying to resume the synthetic thread on the fixture.
+    await page.addInitScript(() => {
+      ;(window as typeof window & { __FRESHELL_SUPPRESS_ALL_FRESH_AGENT_NETWORK_EFFECTS__?: boolean })
+        .__FRESHELL_SUPPRESS_ALL_FRESH_AGENT_NETWORK_EFFECTS__ = true
+    })
     await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
     const reloadedHarness = new TestHarness(page)
     await reloadedHarness.waitForHarness()
     await reloadedHarness.waitForConnection()
+    expect(await page.evaluate(() => (
+      window.__FRESHELL_TEST_HARNESS__?.isAllFreshAgentNetworkEffectsSuppressed?.()
+    ))).toBe(true)
+    await expect.poll(() => snapshotGetCount, { timeout: 10_000 }).toBeGreaterThan(snapshotGetsBeforeReload)
+    await expect.poll(async () => (
+      (await reloadedHarness.getSentWsMessages()).filter((message: any) => message?.type === 'freshAgent.create')
+    ), { timeout: 10_000 }).toHaveLength(1)
+    const suppressedCreates = (await reloadedHarness.getSentWsMessages()).filter(
+      (message: any) => message?.type === 'freshAgent.create',
+    ) as any[]
+    expect(suppressedCreates[0]).toMatchObject({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      sessionRef: { provider: 'codex', sessionId: 'thread-codex' },
+    })
     await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible()
     await expect(page.getByText('Codex transcript')).toBeVisible()
     await expect(page.getByText(/feature\/fresh-agent/)).toBeVisible()
