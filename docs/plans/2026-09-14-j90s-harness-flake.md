@@ -20,9 +20,9 @@
 - The fix is expected to be proportionate (harness connection tolerance/readiness on the cloud lane), not a broad rewrite — the kata evidence points at harness-connection timing, not the settings feature.
 - Sizing the real flake rate (the kata's direction 3) is in scope only as far as it shapes the fix; absence of a perfect historical rate estimate is acceptable if the mechanism fix is well-evidenced.
 
-**Goal:** The cloud e2e lane stops flaking `settings.spec.ts:185` (and every other harness-connected spec) on cold-start connection timing, by (a) fixing `waitForConnection`'s timeout-binding bug — the `{timeout}` object currently binds to the predicate's *argument*, so the real window is Playwright's 30s default, not the intended 16s — and (b) making that now-real window environment-scalable, with 45s on the cloud lane so it survives the client's 10s ready-watchdog close/reconnect cycles. Local defaults stay unchanged.
+**Goal:** The cloud e2e lane stops flaking `settings.spec.ts:185` (and every other harness-connected spec) on cold-start connection timing, by (a) fixing `waitForConnection`'s timeout-binding bug — the `{timeout}` object currently binds to the predicate's *argument*, so the real window is Playwright's 30s default, not the intended 16s — and (b) making that now-real window environment-scalable, with 45s on the cloud lane so it survives the client's 10s ready-watchdog close/reconnect cycles. Local no-arg call sites keep their historical real ~30s window: the new default binds 30s (+1s slack), preserving actual behavior rather than narrowing it to the never-effective 16s.
 
-**Architecture:** Three small, sequenced pieces. (1) `test/e2e-browser/helpers/test-harness.ts` gains a pure, unit-tested resolver (`resolveWsReadyTimeoutMs`) — explicit per-call timeout wins, then a new `FRESHELL_E2E_WS_READY_TIMEOUT_MS` env var, then the unchanged 15s default — and `waitForConnection` routes its window through it, called in the correct three-argument shape `waitForFunction(fn, undefined, { timeout })` so the timeout actually binds (load-bearing finding LB-1: the historical two-arg call made every explicit window decorative; the real window was Playwright's 30s default). (2) `scripts/e2e-cloud.sh` writes that env var (default 45000 ms, operator-overridable) into every cloud e2e job's env-vars file and documents it in its usage text. (3) A hermetic bash test (new `scripts/test/e2e-harness-timeout-env.test.sh`, following the proven stubbed-gcloud pattern from `scripts/test/cloud-run-wrapper.test.sh`) captures the generated env file and pins the default, the override, and the docs; the kata's own failing invocation (`fresh-agent.spec.ts` + `settings.spec.ts` on the cloud backend) is re-run as acceptance evidence.
+**Architecture:** Three small, sequenced pieces. (1) `test/e2e-browser/helpers/test-harness.ts` gains a pure, unit-tested resolver (`resolveWsReadyTimeoutMs`) — explicit per-call timeout wins, then a new `FRESHELL_E2E_WS_READY_TIMEOUT_MS` env var, then a 30s default that preserves the historical real window (the never-effective 15s would have narrowed local behavior from 30s to 16s and risked new cold-start flakes) — and `waitForConnection` routes its window through it, called in the correct three-argument shape `waitForFunction(fn, undefined, { timeout })` so the timeout actually binds (load-bearing finding LB-1: the historical two-arg call made every explicit window decorative; the real window was Playwright's 30s default). (2) `scripts/e2e-cloud.sh` writes that env var (default 45000 ms, operator-overridable) into every cloud e2e job's env-vars file and documents it in its usage text. (3) A hermetic bash test (new `scripts/test/e2e-harness-timeout-env.test.sh`, following the proven stubbed-gcloud pattern from `scripts/test/cloud-run-wrapper.test.sh`) captures the generated env file and pins the default, the override, and the docs; the kata's own failing invocation (`fresh-agent.spec.ts` + `settings.spec.ts` on the cloud backend) is re-run as acceptance evidence.
 
 **Tech Stack:** TypeScript + Playwright helper classes (e2e harness), Vitest (helper unit tests via `test/e2e-browser/vitest.config.ts` / `npm run test:e2e:helpers`), Bash (cloud lane wrapper `scripts/e2e-cloud.sh`, Cloud Run Jobs env-vars YAML), Google Cloud Run e2e backend.
 
@@ -48,7 +48,7 @@
 
 **Interfaces:**
 - Consumes: `Page.waitForFunction(fn, options)` (`@playwright/test`); `process.env.FRESHELL_E2E_WS_READY_TIMEOUT_MS` (new, defined by Task 2's cloud wiring; absent locally).
-- Produces: `export const DEFAULT_WS_READY_TIMEOUT_MS = 15_000`; `export function resolveWsReadyTimeoutMs(explicitMs: number | undefined, env?: Record<string, string | undefined>): number`; `TestHarness.waitForConnection(timeoutMs?: number)` (signature changes from defaulted `timeoutMs = 15_000` to optional `timeoutMs?: number` — strictly parameter-widening, so no call site can break). Of the 186 call sites: 179 pass no argument, six pass `30_000` in restart/recovery specs (`reconnect-revive-rust.spec.ts:705`, `amplifier-lane-resilience-rust.spec.ts:407`, `freshopencode-restart-recovery.spec.ts:420`, `opencode-restart-recovery.spec.ts:538,1117`, `codex-status-completeness-rust.spec.ts:373`), and one passes `20_000` (`test/e2e-browser/specs/terminal-lifecycle.spec.ts:280`). With the binding fixed, the six 30s sites get a real 31s window (≥ today's real 30s — no regression possible) and the 20s site a real 21s (its forced-reconnect scenario resolves in ~1-2s).
+- Produces: `export const DEFAULT_WS_READY_TIMEOUT_MS = 30_000`; `export function resolveWsReadyTimeoutMs(explicitMs: number | undefined, env?: Record<string, string | undefined>): number`; `TestHarness.waitForConnection(timeoutMs?: number)` (signature changes from defaulted `timeoutMs = 15_000` to optional `timeoutMs?: number` — strictly parameter-widening, so no call site can break). The 30s default preserves the historical REAL window (Playwright's default, since the old 15s never bound); the never-effective 15s would have narrowed every no-arg call site from a real 30s to 16s. Of the 186 call sites: 179 pass no argument (real window stays ~30s: 31s with slack — no narrowing), six pass `30_000` in restart/recovery specs (`reconnect-revive-rust.spec.ts:705`, `amplifier-lane-resilience-rust.spec.ts:407`, `freshopencode-restart-recovery.spec.ts:420`, `opencode-restart-recovery.spec.ts:538,1117`, `codex-status-completeness-rust.spec.ts:373`) and get a real 31s window (≥ today's real 30s — no regression possible), and one passes `20_000` (`test/e2e-browser/specs/terminal-lifecycle.spec.ts:280`, a forced-reconnect scenario resolving in ~1-2s — honoring its intended 21s window).
 
 Workspace prep (once, before the Red step): from the worktree root run `npm ci --no-audit --no-fund` (expected: clean install; node-pty compiles via node-gyp; postinstall wires the shared pre-push gate).
 
@@ -92,17 +92,17 @@ afterEach(() => {
 })
 
 describe('resolveWsReadyTimeoutMs', () => {
-  it('defaults to the in-code 15s window when the env var is unset', () => {
+  it('defaults to the 30s window that preserves the historical real window when the env var is unset', () => {
     expect(resolveWsReadyTimeoutMs(undefined, {})).toBe(DEFAULT_WS_READY_TIMEOUT_MS)
-    expect(DEFAULT_WS_READY_TIMEOUT_MS).toBe(15_000)
+    expect(DEFAULT_WS_READY_TIMEOUT_MS).toBe(30_000)
   })
 
   it('uses the env value when set and no explicit timeout is given', () => {
-    expect(resolveWsReadyTimeoutMs(undefined, { [ENV_VAR]: '30000' })).toBe(30_000)
+    expect(resolveWsReadyTimeoutMs(undefined, { [ENV_VAR]: '45000' })).toBe(45_000)
   })
 
   it('lets an explicit per-call timeout win over the env value', () => {
-    expect(resolveWsReadyTimeoutMs(20_000, { [ENV_VAR]: '30000' })).toBe(20_000)
+    expect(resolveWsReadyTimeoutMs(20_000, { [ENV_VAR]: '45000' })).toBe(20_000)
   })
 
   it('falls back to the default for empty, non-numeric, or non-positive env values', () => {
@@ -152,21 +152,25 @@ In `test/e2e-browser/helpers/test-harness.ts`, add above the `TestHarness` class
 
 ```ts
 /** Default waitForConnection window (ms) used when neither an explicit
- * per-call timeout nor FRESHELL_E2E_WS_READY_TIMEOUT_MS applies. */
-export const DEFAULT_WS_READY_TIMEOUT_MS = 15_000
+ * per-call timeout nor FRESHELL_E2E_WS_READY_TIMEOUT_MS applies. 30s
+ * preserves the historical REAL window: the old code passed 15s, but as
+ * the predicate's argument (never bound), so the real window was
+ * Playwright's 30s default. Binding 15s for real would have narrowed every
+ * no-arg call site from 30s to 16s and risked new cold-start flakes. */
+export const DEFAULT_WS_READY_TIMEOUT_MS = 30_000
 
 /**
  * Resolve the effective waitForConnection window.
  *
  * Precedence: an explicit per-call timeout wins; otherwise the
  * FRESHELL_E2E_WS_READY_TIMEOUT_MS env var scales the window (the cloud e2e
- * lane sets it — see scripts/e2e-cloud.sh); otherwise the 15s default.
- * Cloud cold starts can need more than that: the client's 10s ready
- * watchdog (CONNECTION_TIMEOUT_MS, src/lib/ws-client.ts) force-closes a
- * slow handshake and reconnects with jittered 1→2→4s backoff, and the
- * observed j90s flake exceeded a real 30s window. Empty, non-numeric, or
- * non-positive env values fall back to the default — a malformed override
- * must never poison the harness wait.
+ * lane sets it — see scripts/e2e-cloud.sh); otherwise the 30s default that
+ * preserves the historical real window. Cloud cold starts can need more:
+ * the client's 10s ready watchdog (CONNECTION_TIMEOUT_MS,
+ * src/lib/ws-client.ts) force-closes a slow handshake and reconnects with
+ * jittered 1→2→4s backoff, and the observed j90s flake exceeded a real 30s
+ * window. Empty, non-numeric, or non-positive env values fall back to the
+ * default — a malformed override must never poison the harness wait.
  */
 export function resolveWsReadyTimeoutMs(
   explicitMs: number | undefined,
@@ -192,7 +196,8 @@ Then change `waitForConnection` (keep the predicate body byte-identical; note th
    * predicate's argument, so every explicit window was decorative and the
    * real wait was Playwright's 30s default (empirically confirmed — see
    * the j90s load-bearing ledger, LB-1). The resolved window keeps +1s
-   * slack, preserving the original intent.
+   * slack, so the no-arg default lands at 31s — preserving (by 1s of
+   * harmless widening) the real 30s window local runs always had.
    */
   async waitForConnection(timeoutMs?: number): Promise<void> {
     const resolvedTimeoutMs = resolveWsReadyTimeoutMs(timeoutMs)
@@ -238,7 +243,7 @@ git commit -m "test(e2e): make TestHarness.waitForConnection window env-scalable
 
 ---
 
-### Task 2: Cloud lane sets and documents the 30s harness window
+### Task 2: Cloud lane sets and documents the 45s harness window
 
 **Files:**
 - Modify: `scripts/e2e-cloud.sh:486-504` (env-vars file emission) and the usage/env-var documentation block near lines 173-178
@@ -366,7 +371,7 @@ exit 1
 
 Run: `bash scripts/test/e2e-harness-timeout-env.test.sh`
 
-Expected: FAIL — Check 1's second assertion fails because the generated env file does not yet contain `FRESHELL_E2E_WS_READY_TIMEOUT_MS` (the cloud-lane wiring is absent), and Check 3 fails because usage does not document it. (Check 1's first assertion and Check 4 pass already — the file mechanism and script syntax exist; that is expected and is not the missing behavior.)
+Expected: FAIL — three of the suite's six assertions fail on the missing behavior: Check 1's default assertion (env file has no `FRESHELL_E2E_WS_READY_TIMEOUT_MS`), Check 2's override assertion (same absence, so the 60000 grep fails), and Check 3 (usage does not document the var). Check 1's first and third assertions and Check 4 pass already — the file mechanism and script syntax exist; that is expected and is not the missing behavior.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -406,17 +411,17 @@ No refactor: the emission is one line in the single place that owns per-run job 
 
 - [ ] **Step 6: Run impacted-test verification**
 
-The change touches `scripts/e2e-cloud.sh`, exercised by the existing wrapper suite `scripts/test/cloud-run-wrapper.test.sh` (its stubbed cloud path asserts on the same `run jobs create` flags and env file). The suite also contains one real local-Playwright pass-through check — Playwright browsers live in the shared `~/.cache/ms-playwright`, so it runs in the worktree after Task 1's `npm ci`.
+The change touches `scripts/e2e-cloud.sh`, exercised by the existing wrapper suite `scripts/test/cloud-run-wrapper.test.sh` (its stubbed cloud path asserts on the same `run jobs create` flags and env file). The suite also contains one real local-Playwright pass-through check — Playwright browsers live in the shared `~/.cache/ms-playwright`, so it runs in the worktree after Task 1's `npm ci`. NOTE: the suite's local-Playwright check triggers `test/e2e-browser/global-setup.ts`, which rebuilds `dist/` — run this suite ONLY inside the worktree, NEVER from the main checkout (the main checkout's `dist/client` is served live by the production Rust server on port 3001; rebuilding or validating there is prohibited without explicit user approval, and it would also validate the wrong tree).
 
-Run: `bash scripts/test/cloud-run-wrapper.test.sh`
+Run (from the worktree root): `bash scripts/test/cloud-run-wrapper.test.sh`
 
-Expected: PASS. If an environment dependency of the real local-Playwright check fails for reasons unrelated to this change (missing browser binary, port conflict), record the exact failure and evidence in the implementer report, then verify that specific check from the main checkout (which has the established environment) — the change itself is a one-line YAML emission plus docs.
+Expected: PASS. If an environment dependency of the real local-Playwright check fails for reasons unrelated to this change (missing browser binary, port conflict), record the exact failure and evidence in the implementer report and STOP — do not work around it by validating from the main checkout; the orchestrator decides how to proceed. The change itself is a one-line YAML emission plus docs.
 
 - [ ] **Step 7: Commit the task**
 
 ```bash
 git add scripts/e2e-cloud.sh scripts/test/e2e-harness-timeout-env.test.sh
-git commit -m "test(e2e): give cloud lane a 30s harness WS-ready window via job env (j90s)"
+git commit -m "test(e2e): give cloud lane a 45s harness WS-ready window via job env (j90s)"
 ```
 
 ---
@@ -440,15 +445,18 @@ Expected: clean tree (the cloud image must be commit-addressed, not `-dirty`), H
 
 This mirrors the PR #772 final-tree gate that caught the flake (both specs, same backend). First run may pay one image build for the new commit (~7-13 min); the run itself is minutes after that.
 
-Run (unpiped — a `| tee` pipeline would report `tee`'s exit code and hide a failed run, load-bearing LB-4):
+Run (unpiped — a `| tee` pipeline would report `tee`'s exit code and hide a failed run, load-bearing LB-4; the captured exit code is asserted at the end so the block itself fails when the run fails):
 
 ```bash
 export FRESHELL_E2E_BACKEND=cloud
-npm run test:e2e:cloud -- test/e2e-browser/specs/fresh-agent.spec.ts test/e2e-browser/specs/settings.spec.ts > /home/dan/code/freshell/.worktrees/.the-usual-logs/j90s-harness-flake/reports/task3-cloud-e2e.log 2>&1
-echo "exit=$?"; tail -40 /home/dan/code/freshell/.worktrees/.the-usual-logs/j90s-harness-flake/reports/task3-cloud-e2e.log
+LOG=/home/dan/code/freshell/.worktrees/.the-usual-logs/j90s-harness-flake/reports/task3-cloud-e2e.log
+npm run test:e2e:cloud -- test/e2e-browser/specs/fresh-agent.spec.ts test/e2e-browser/specs/settings.spec.ts > "$LOG" 2>&1
+cloud_exit=$?
+echo "exit=$cloud_exit"; tail -40 "$LOG"
+test "$cloud_exit" -eq 0
 ```
 
-Expected: `exit=0`; all tests passed, 0 failed; the line reporter shows no `flaky` annotation on the `Expand thinking and Expand tools switches persist locally and reset to defaults` test (attempt-1 pass). Record `exit=` and the passed/failed counts (with the full log path) in the task report.
+Expected: `exit=0` and the final `test` succeeds; all tests passed, 0 failed; the line reporter shows no `flaky` annotation on the `Expand thinking and Expand tools switches persist locally and reset to defaults` test (attempt-1 pass). Record `exit=` and the passed/failed counts (with the full log path) in the task report.
 
 - [ ] **Step 3: Run the repo full-suite gate at the final HEAD**
 
@@ -492,6 +500,7 @@ No commit is produced by a passing verification-only task (evidence lives in the
 ## Notes on scope decisions (evidence-based)
 
 - **The central correction (load-bearing LB-1/LB-2, empirically double-confirmed):** the historical two-arg `page.waitForFunction(fn, {timeout})` call binds the timeout object to the predicate's ARGUMENT — every explicit window in `waitForConnection`/`waitForHarness` was decorative, and the real window was Playwright's 30s default (probes: finder + coordinator, Playwright 1.58.2; two-arg `{timeout: 500}` threw at 30.0s, three-arg at 0.5s). The PR #772 attempt-1 failure therefore exceeded a real 30s window, so the cloud default is 45s (three watchdog cycles at ~11-17s each), not 30s.
+- **The in-code default becomes 30s, not the historical 15s** (plan-review round 1, Major): binding the never-effective 15s for real would have NARROWED every no-arg call site's real window from 30s to 16s — the exact new-cold-start-flake risk this plan refuses elsewhere. The 30s default (31s with slack) preserves the actual behavior local runs have always had; only the cloud lane widens (45s) via the env var.
 - **Server readiness is not the problem** (kata direction 2 dismissed): the worker-scoped `TestServer` fixture health-gates `/api/health` (30s, 200ms poll) before any navigation; the flaky wait is the post-reload `waitForConnection` inside the test budget. No new readiness signal is needed.
 - **`waitForHarness` is deliberately untouched**: its `{timeout: 15_000}` is also decorative (real window: Playwright's 30s default). Fixing its binding would SHORTEN the real window to 16s and risk new cold-start flakes for zero demonstrated benefit — it has never flaked. Recorded as a follow-up suggestion, not scope.
 - **Raw two-arg `page.waitForFunction(fn, {timeout})` sites in five specs** (`cfg04-legacy-browser-seed`, `session-13-first-chat-exclusions`, `tabs-client-retire`, `multi-client`, `reconnection`) share the decorative shape; their real 30s windows exceed their intended 15-20s and none flake. Out of scope for the same reason.
