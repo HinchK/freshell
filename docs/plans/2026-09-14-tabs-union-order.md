@@ -55,8 +55,10 @@ Fix the tab-order regression on restart/refresh via the server-side fix: make th
 - Modify: `test/e2e-browser/playwright.config.ts` (`RUST_ONLY_SPECS` array ~:187; `rust-chromium` project `testMatch` ~:430)
 
 **Interfaces:**
-- Consumes: existing e2e fixtures (`helpers/fixtures.js` → `page`, `serverInfo`, `harness`), `TestHarness.waitForHarness/waitForConnection/getState/getSentWsMessages`, the real e2e Rust server's `/api/machines` + `/api/recovery/inventory`, Redux dispatch seam `window.__FRESHELL_TEST_HARNESS__?.dispatch` (precedent: `remote-tab-linkage-rust.spec.ts:257`, `pane-activity-indicator.spec.ts`).
+- Consumes: `RustServer` + `ensureRustServerBuilt` from `helpers/rust-server.js` (per-test owned server — the 45-spec rust-only convention; donor recipe: `recover-my-panes-rust.spec.ts:496-524`), `TestHarness` from `helpers/test-harness.js` (incl. `waitForTabCount`), the generation-file fs-poll idiom (donor: `recover-my-panes-rust.spec.ts:452-494`), Redux dispatch seam `window.__FRESHELL_TEST_HARNESS__?.dispatch` (precedent: `remote-tab-linkage-rust.spec.ts:257`).
 - Produces: the spec `machine-tab-order-rust.spec.ts` (consumed by Task 2's impacted-test step).
+
+**Why the owned server, the Tab-1 removal, and the fs-poll wait (load-bearing findings LB1-LB3):** the fixtures' rust `testServer` is a worker-scoped SHARED server (fixtures.ts:120-125) — earlier rust specs in the same worker would leave machines/generations behind and a fresh context would hit the machine chooser instead of the auto-create path, so this spec OWNS a fresh `RustServer` (fresh temp HOME ⇒ empty machines store ⇒ deterministic auto-create). The first boot auto-creates a "Tab 1" shell tab (App.tsx:1871-1876: machine ready + 0 tabs) whose nanoid tabKey would make any restored order nondeterministic — the spec removes it before adding its three explicit-id tabs. And seeing a sent `tabs.sync.push` does NOT prove the server persisted the generation (persist happens in `spawn_blocking` after receipt; no received-frame log) — the wait polls the generation FILES on disk instead (the donor spec's exact idiom).
 
 - [ ] **Step 1: Write the failing e2e test**
 
@@ -64,6 +66,15 @@ Create `test/e2e-browser/specs/machine-tab-order-rust.spec.ts`:
 
 ```typescript
 import { test, expect } from '../helpers/fixtures.js'
+import * as fs from 'node:fs/promises'
+import * as path from 'node:path'
+import * as os from 'node:os'
+import { fileURLToPath } from 'node:url'
+import type { BrowserContext, Page } from '@playwright/test'
+import { RustServer, ensureRustServerBuilt } from '../helpers/rust-server.js'
+import { TestHarness } from '../helpers/test-harness.js'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 /**
  * MACHINE-TAB-ORDER (the-usual/tabs-union-order): the tab strip's ORDER must
@@ -90,13 +101,117 @@ import { test, expect } from '../helpers/fixtures.js'
  * and `build_inventory` rebuilds `device.tabs` from them. The machine id
  * itself lives in localStorage and survives the reload, so resolution is
  * 'selected' (not the chooser) and the restore path runs before the WS.
+ *
+ * Owns a RustServer directly (ephemeral loopback port, fresh temp HOME ⇒
+ * empty machines store ⇒ deterministic machine auto-create; the fixtures'
+ * shared rust testServer carries other specs' machines/generations).
+ * Service workers blocked per the recover-my-panes PWA note: the SW's
+ * controllerchange reload races the boot inventory fetch.
  */
+let server: RustServer | null = null
+let info: { baseUrl: string; token: string } | null = null
+let capturedHome = ''
+
+test.beforeAll(async () => {
+  test.setTimeout(600_000) // first release build of freshell-server can take minutes
+  ensureRustServerBuilt()
+  server = new RustServer({
+    setupHome: async (homeDir: string) => {
+      capturedHome = homeDir
+    },
+  })
+  info = await server.start()
+})
+
+test.afterAll(async () => {
+  await server?.stop().catch(() => {})
+})
+
+/**
+ * Wait until the NEWEST persisted tabs-snapshot generation for the given
+ * client carries EXACTLY the expected tab ids — copied and adapted from
+ * recover-my-panes-rust.spec.ts's waitForNewestGenerationRecordCount
+ * (same fs-poll idiom; snapshot pushes fire on ready + every 5s, so the
+ * generation files lag the UI by seconds). Reading the files proves the
+ * server DURABLY persisted the strip before the reload (a sent
+ * tabs.sync.push frame does not).
+ */
+async function waitForNewestGenerationTabs(
+  clientInstanceId: string,
+  expectedTabIds: string[],
+  timeoutMs = 30_000,
+): Promise<void> {
+  const snapshotsDir = path.join(capturedHome, '.freshell', 'tabs-snapshots')
+  const deadline = Date.now() + timeoutMs
+  let lastObserved = 'none'
+  while (Date.now() < deadline) {
+    const devices = await fs.readdir(snapshotsDir).catch(() => [] as string[])
+    for (const device of devices) {
+      const deviceDir = path.join(snapshotsDir, device)
+      const files = (await fs.readdir(deviceDir).catch(() => [] as string[]))
+        .filter((f) => f.endsWith('.json'))
+      let newest: { revision: number; capturedAt: number; tabIds: string[] } | null = null
+      for (const f of files) {
+        const raw = await fs.readFile(path.join(deviceDir, f), 'utf8').catch(() => '')
+        let doc: any = null
+        try {
+          doc = JSON.parse(raw)
+        } catch {
+          continue
+        }
+        if (doc?.clientInstanceId !== clientInstanceId) continue
+        const revision = Number(doc?.snapshotRevision ?? 0)
+        const capturedAt = Number(doc?.capturedAt ?? 0)
+        const tabIds: string[] = Array.isArray(doc?.records)
+          ? doc.records.map((r: any) => r?.tabId).filter((id: any) => typeof id === 'string')
+          : []
+        if (!newest || revision > newest.revision
+          || (revision === newest.revision && capturedAt > newest.capturedAt)) {
+          newest = { revision, capturedAt, tabIds }
+        }
+      }
+      if (newest) {
+        lastObserved = JSON.stringify(newest.tabIds)
+        const sortedSeen = [...newest.tabIds].sort()
+        const sortedWant = [...expectedTabIds].sort()
+        if (sortedSeen.length === sortedWant.length
+          && sortedSeen.every((id, i) => id === sortedWant[i])) {
+          return
+        }
+      }
+    }
+    await new Promise((r) => setTimeout(r, 500))
+  }
+  throw new Error(
+    `Newest persisted generation for client ${clientInstanceId} never held exactly `
+    + `[${expectedTabIds.join(', ')}] within ${timeoutMs}ms (last observed: ${lastObserved})`,
+  )
+}
+
 test.describe('machine workspace restore keeps tab order', () => {
-  test('a reload restores the tab strip in the pushed strip order', async ({ page, serverInfo, harness }) => {
+  test('a reload restores the tab strip in the pushed strip order', async ({ browser, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    test.setTimeout(240_000)
+
+    const ctx: BrowserContext = await browser.newContext({ serviceWorkers: 'block' })
+    const page: Page = await ctx.newPage()
     await page.addInitScript(() => { sessionStorage.clear() })
-    await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+    await page.goto(`${info!.baseUrl}/?token=${info!.token}&e2e=1`)
+    const harness = new TestHarness(page)
     await harness.waitForHarness()
     await harness.waitForConnection()
+
+    // The first-boot auto-create (App.tsx:1871-1876: machine ready + 0
+    // tabs) leaves one shell tab; remove it so the pushed strip holds
+    // EXACTLY the three deterministic tabs below (its nanoid tabKey would
+    // otherwise make the restored order nondeterministic).
+    await harness.waitForTabCount(1, 30_000)
+    const bootState: any = await harness.getState()
+    const autoTabId: string = bootState?.tabs?.tabs?.[0]?.id
+    expect(autoTabId, 'the auto-created first tab exists before our tabs').toBeTruthy()
+    await page.evaluate((tabId: string) => {
+      window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'tabs/removeTab', payload: tabId })
+    }, autoTabId)
 
     // Three tabs with explicit ids, created in an order that differs from
     // tabKey sort. Editor panes: no PTY spawn, and the recovery plan
@@ -122,34 +237,31 @@ test.describe('machine workspace restore keeps tab order', () => {
         })
       }, tab)
     }
+    await harness.waitForTabCount(3, 30_000) // the removal precedes the adds in program order
 
-    // Wait until the server holds a tabs-registry generation carrying all
-    // three tabKeys: tabs.sync.push fires on the lifecycle change (with a
-    // 5s interval fallback), and persist_generation writes it durably.
-    await expect.poll(async () => {
-      const sent = await harness.getSentWsMessages()
-      return sent.some((m: any) =>
-        m?.type === 'tabs.sync.push'
-        && ['tab-mango', 'tab-apple', 'tab-zebra'].every((id) =>
-          JSON.stringify(m?.records ?? []).includes(id)))
-    }, { timeout: 20_000 }).toBe(true)
+    // Durable-persist wait: the client's NEWEST generation on disk holds
+    // exactly the three tab ids before we reload.
+    const clientInstanceId = await page.evaluate(() =>
+      window.sessionStorage.getItem('freshell.tabs.client-instance-id.v1'))
+    expect(clientInstanceId, 'the page claimed a tabs-registry clientInstanceId').toBeTruthy()
+    await waitForNewestGenerationTabs(clientInstanceId!, ['tab-mango', 'tab-apple', 'tab-zebra'])
 
     await page.reload({ waitUntil: 'domcontentloaded' })
     await harness.waitForHarness()
     await harness.waitForConnection()
 
     // The restore replaced the local strip before the WS connected; wait
-    // for all three tabs and pin the exact order. Before the union fix the
+    // for the three tabs and pin the exact order. Before the union fix the
     // received order is the tabKey sort ['Apple', 'Mango', 'Zebra'].
     await expect.poll(async () => {
-      const state = await harness.getState()
+      const state: any = await harness.getState()
       return (state?.tabs?.tabs ?? []).map((t: any) => t.title)
     }, { timeout: 20_000 }).toEqual(['Mango', 'Apple', 'Zebra'])
   })
 })
 ```
 
-Register in `test/e2e-browser/playwright.config.ts`. In the `RUST_ONLY_SPECS` array (after the `/freshagent-live-model-convergence-rust\.spec\.ts$/` entry):
+Implementation notes: verify `TestHarness.waitForTabCount`'s exact semantics in `helpers/test-harness.ts` while implementing (it must poll-until, not assert-once); the removal dispatch precedes the adds in program order, so the strip settles at exactly 3. Register in `test/e2e-browser/playwright.config.ts`. In the `RUST_ONLY_SPECS` array (after the `/freshagent-live-model-convergence-rust\.spec\.ts$/` entry):
 
 ```typescript
   // MACHINE-TAB-ORDER (the-usual/tabs-union-order): reload-through-restore
@@ -165,7 +277,7 @@ And the same regex plus comment inside the `rust-chromium` project's `testMatch`
 
 Run: `bash scripts/e2e-cloud.sh run --local --project=rust-chromium test/e2e-browser/specs/machine-tab-order-rust.spec.ts`
 
-Expected: FAIL — the final `expect.poll` receives `['Apple', 'Mango', 'Zebra']` (the tabKey-sorted permutation) against expected `['Mango', 'Apple', 'Zebra']`. This is the regression, observed end to end. If the spec fails ANY OTHER way (zero tabs restored, a machine-chooser dialog visible, a timeout before three titles exist), the restore-path assumptions are wrong: STOP and investigate rather than adjusting the spec — record the surprise in the progress ledger and surface it to the coordinator (it would falsify this plan's verified-ground-truth section).
+Expected: FAIL — the final `expect.poll` receives `['Apple', 'Mango', 'Zebra']` (the tabKey-sorted permutation) against expected `['Mango', 'Apple', 'Zebra']`. This is the regression, observed end to end. If the spec fails ANY OTHER way (zero tabs restored, a machine-chooser dialog visible, a timeout before three titles exist, the durable-persist wait timing out), the restore-path assumptions are wrong: STOP and investigate rather than adjusting the spec — record the surprise in the progress ledger and surface it to the coordinator (it would falsify this plan's verified-ground-truth section).
 
 - [ ] **Step 3: Commit the task**
 
