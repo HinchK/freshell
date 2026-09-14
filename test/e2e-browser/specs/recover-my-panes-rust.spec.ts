@@ -1,108 +1,20 @@
 /**
- * B3/P1.9 recover-my-panes — the campaign's first browser-loss recovery e2e
- * (docs/plans/2026-07-26-recover-my-panes.md, Task 8).
+ * Rust browser-loss recovery for server-managed machines.
  *
- * Scenario 1 (accept path): a browser with a claude CLI pane + a browser pane
- * is LOST (context closed), the server restarts, and a fresh browser profile
- * for that same server-owned machine automatically recreates the panes,
- * resumes the dead claude session (`--resume <sessionId>` argv proof +
- * the fake CLI's scrollback marker), recreates the mixed-kind browser pane,
- * and a same-browser reload never re-offers (localStorage now has a layout).
+ * Scenarios 1–4 cover the user-facing contract: a registered machine
+ * bootstraps its own workspace after a browser loss (recreating dead sessions
+ * or reattaching live terminals), a separately registered machine starts with
+ * only its own default picker leaf, and the retired generic cross-machine
+ * recovery offer never mounts. Scenario 2 also proves that the new machine
+ * receives none of machine A's session, browser URL, pane IDs, or content.
  *
- * Scenario 2 (decline path): a fresh context declines — the panel closes and
- * no recovered tabs are added.
- *
- * Scenario 3 (no-restart browser loss, live REATTACH): the browser is lost
- * WITHOUT a server restart, so D's shell PTY and claude PTY both stay
- * Running (registry-owned) and both panes verdict LIVE. Live panes are
- * restorable (focused-episode-6 round 5, F1): the offer lists and counts
- * BOTH under the reattach live note, and accepting puts the panes back IN
- * THEIR TAB by reattaching to the still-running terminals — the recovered
- * panes own D's ORIGINAL terminal ids, and NEVER spawn a second process on
- * top of the still-running ones (argv-log proof: no fresh claude spawn past
- * the watermark, never `--resume <sessionIdD>`).
- *
- * Scenario 4 (phone containment, R1/R3): a populating context records a
- * 40-shell-tab layout and is lost WITHOUT a server restart; a fresh
- * 390x844-viewport context is then offered the layout — the dialog must fit
- * the viewport (bounding box), the records list must scroll internally
- * (`scrollHeight > clientHeight`), and the decline control must be tappable
- * (Playwright actionability IS the user-level phone proof). The inventory
- * must OVERFLOW the dialog's 80vh-capped list budget (~525px at 844px tall,
- * ~24px/record) to exercise containment at all — 20 records measure ~500px
- * and fit under the cap, making every scroll/bounding assertion vacuous
- * (identical metrics with and without the containment classes). Every
- * close→required-offer transition without a restart is preceded by the
- * file-local `waitForRecoverable` probe-poll guard (R2a) so WS-teardown lag
- * can never starve a later boot's required offer.
- *
- * Scenario 5 (stale never-open ledger row pin, D8): a freshclaude pane is
- * created, proven snapshot-open, then closed OUTSIDE the judgment's grace
- * window (a 15s gate) via the PLAIN pane-X — the pane row is left
- * unreferenced by the newest-per-client union (and, since the retire-on-kill
- * repair, additionally retired Closed at the kill). After a server restart
- * the recovery inventory's ledgerOnly bucket (and the offer built from it)
- * must NOT offer that row. First pinned RED against the pre-judgment blanket
- * bucket; the parent-relative judgment
- * (docs/plans/2026-09-02-restore-open-sessions-only.md, Task 3) turned it
- * GREEN.
- *
- * Kill-window pin (delta-review round 5, "retire-on-kill"): a freshclaude
- * pane is created and closed PROMPTLY (inside the 7s creation-race grace
- * window — the immediate post-close evidence cannot distinguish "never
- * snapshotted" from "just closed"), the browser is lost and the server is
- * SIGKILLed. The explicit freshAgent.kill retires the pane's ledger row
- * Closed, so the inventory never offers it and accepting the offer never
- * recreates it. Pinned RED pre-repair: the kill left the row Bound, and
- * inside the grace window the parent-relative judgment kept it.
- *
- * Scenario 6 (delta-round-7, F1 — the early-loss variant of scenario 3): the
- * browser is lost WITHOUT a server restart AND before any snapshot containing
- * the live claude pane survives (deterministic post-loss evidence shaping).
- * No union pane can then reference the pane's binding row, so the row reaches
- * the offer ONLY through the ledgerOnly pipeline — which pre-fix categorically
- * excluded live rows (recovery_inventory.rs's !is_live filter), losing a
- * genuinely-open session. Post-fix the live, attributed, placement-valid,
- * not-close-covered row is offered (probe pin: `live:true` + the still-running
- * terminal id), and accepting REATTACHES it to its ORIGINAL terminal (argv-log
- * anti-respawn proof), never spawns a second process.
- *
- * Scenario 7 (delta-round-7, F2 — the terminal-detach kill-window twin): a
- * claude CLI pane is created and closed PROMPTLY via the PLAIN pane-X inside
- * the grace window. The close DETACHES (the session survives — FEATURE), the
- * ledger row stays Bound, and the durable pane-close record keyed by the
- * pane's createRequestId lands BEFORE/ALONGSIDE the detach; after browser
- * loss + server SIGKILL (the terminal dies; the row reads non-live) the
- * close-covered row is never offered or restored. Pre-fix nothing durable
- * recorded the pane close (terminalDetachMiddleware only detached), so the
- * still-Bound row was admitted and the offer recreated a pane the user had
- * explicitly closed.
- *
- * Scenario 8 (delta-r7-round-2, F3 — close → sidebar reattach → early loss):
- * a claude CLI pane is created beside the shell and closed via the PLAIN
- * pane-X (the non-retiring close record stands, keyed by the OLD pane's
- * createRequestId), then REOPENED through the sidebar session list in split
- * mode — the new pane mints a NEW createRequestId and attaches to the SAME
- * still-running terminal, and the attach-carried pane identity re-stamps the
- * Bound row (new createRequestId, advanced attribution). The browser is then
- * lost WITHOUT a server restart and before any snapshot containing the
- * reopened pane survives (deterministic shaping): the row reaches the offer
- * ONLY through the ledgerOnly pipeline and MUST be offered again (the old
- * pane's close record covers only the old pane), live, with the original
- * terminal id for the reattach arm; accepting reattaches it (never a
- * respawn). Pre-fix the row kept the old close-covered createRequestId AND
- * the close record's live-terminal arm keyed it, so the genuinely re-opened
- * session was suppressed from the offer.
+ * Later scenarios retain route-level `GET /api/recovery/inventory` probes for
+ * ledger admission, close, and reattach behavior. They do not reinstate the
+ * removed generic recovery UI.
  *
  * Fixture shapes (fake CLI, config seeding, shell-picker choreography) are
- * COPIED from pane-ledger-restart-rust.spec.ts per this suite's
- * per-spec-ownership convention. The freshclaude helpers
- * (findFreshAgentLeaf, createFreshclaudePane) are COPIED from
- * hidden-pane-rebind-rust.spec.ts under the same convention.
- *
- * Rust-only: drives `GET /api/recovery/inventory` and owns a RustServer
- * directly (ephemeral loopback port — NEVER 3001/3002). The application
- * Chromium lane is Rust-only and selects this spec by default.
+ * copied from pane-ledger-restart-rust.spec.ts. This spec owns a RustServer on
+ * an ephemeral loopback port and never contacts port 3001.
  */
 import {
   createE2eBrowserContext,
@@ -486,15 +398,9 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
   })
 
   /**
-   * SERVICE WORKERS ARE BLOCKED in every context this spec opens (the
-   * perf harness precedent, perf/create-audit-context.ts:18): the production
-   * client registers /sw.js and RELOADS on `controllerchange` (pwa.ts:24-34).
-   * On a FRESH context that reload races App mount, aborting in-flight boot
-   * fetches (observed: the recovery-inventory fetch dying with
-   * net::ERR_ABORTED) — and the panel's fetch is deliberately one-shot
-   * best-effort (RecoveryOfferPanel.tsx: on fetch failure, stay quiet), so a
-   * lost race means no offer for that boot. Blocking the SW removes the
-   * reload entirely; recovery behavior itself never depends on the SW.
+   * Service workers are blocked in every fresh context. The production client
+   * reloads on `controllerchange`; blocking it removes that unrelated boot
+   * race so these scenarios observe only server-managed machine bootstrap.
    */
   const FRESH_CONTEXT_OPTIONS = { serviceWorkers: 'block' as const }
 
@@ -524,8 +430,9 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     return { ctx, page, harness }
   }
 
-  // Scenario 1's claude session — scenario 2/3 reason about the same log.
+  // Scenario 1 creates these identities; scenario 2 must prove it inherited none.
   let sessionIdA = ''
+  let paneIdsA: string[] = []
 
   test('scenario 1: lose the browser, restart the server, same-machine bootstrap recreates panes and reload never offers recovery', async ({ browser }) => {
     test.setTimeout(240_000)
@@ -535,7 +442,7 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     const ctxA: BrowserContext = ownedA.context
     const machineA = ownedA.machine
     const pageA = await ctxA.newPage()
-    await connect(pageA, info)
+    const harnessA = await connect(pageA, info)
     await selectShellIfPickerShowing(pageA)
     await expect(pageA.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
 
@@ -565,6 +472,15 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     // A snapshot generation containing BOTH panes exists on disk (pushes fire
     // on ready + every 5s).
     await waitForSnapshotContaining([sessionIdA, 'example.com'])
+    await expect(async () => {
+      const layoutA = await harnessA.getPaneLayout(await harnessA.getActiveTabId())
+      const leavesA = leavesOfLayout(layoutA)
+      expect(leavesA).toHaveLength(3)
+      expect(leavesA.some((leaf) => leaf.content?.sessionRef?.sessionId === sessionIdA)).toBe(true)
+      expect(leavesA.some((leaf) => leaf.content?.kind === 'browser' && leaf.content?.url === 'https://example.com')).toBe(true)
+      paneIdsA = leavesA.map((leaf) => leaf.id)
+      expect(paneIdsA.every(Boolean)).toBe(true)
+    }).toPass({ timeout: 30_000 })
 
     // ---- The "lost browser" + server restart ----
     await ctxA.close()
@@ -660,7 +576,22 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     await expect(pageC.getByTestId('recovery-offer-panel')).toHaveCount(0)
     await expect(async () => {
       expect(await harnessC.getTabCount()).toBe(1)
+      const layoutC = await harnessC.getPaneLayout(await harnessC.getActiveTabId())
+      const leavesC = leavesOfLayout(layoutC)
+
+      // A newly registered machine starts from the ordinary one-tab, one-picker
+      // default. It must never receive A's split terminal/browser workspace.
+      expect(layoutC?.type).toBe('leaf')
+      expect(leavesC).toHaveLength(1)
+      expect(leavesC[0]?.content).toMatchObject({ kind: 'picker' })
+
+      const layoutCJson = JSON.stringify(layoutC)
+      expect(layoutCJson).not.toContain(sessionIdA)
+      expect(layoutCJson).not.toContain('example.com')
+      expect(leavesC.some((leaf) => paneIdsA.includes(leaf.id))).toBe(false)
+      expect(leavesC.some((leaf) => leaf.content?.sessionRef?.sessionId === sessionIdA)).toBe(false)
     }).toPass({ timeout: 10_000 })
+    await expect(pageC.locator('iframe[src*="example.com"]')).toHaveCount(0)
 
     await ctxC.close()
   })

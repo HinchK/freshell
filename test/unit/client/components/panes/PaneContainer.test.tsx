@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
-import { configureStore } from '@reduxjs/toolkit'
+import { configureStore, type Middleware } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import PaneContainer from '@/components/panes/PaneContainer'
 import panesReducer, { resetPaneForReconcileCreate } from '@/store/panesSlice'
@@ -142,9 +142,11 @@ vi.mock('@/lib/ws-client', () => ({
 
 vi.mock('@/lib/api', () => ({
   api: {
-    get: (path: string) => mockApiGet(path),
+    get: (path: string, options?: unknown) => options === undefined ? mockApiGet(path) : mockApiGet(path, options),
     post: (path: string, body: unknown) => mockApiPost(path, body),
-    patch: (path: string, body: unknown) => mockApiPatch(path, body),
+    patch: (path: string, body: unknown, options?: unknown) => options === undefined
+      ? mockApiPatch(path, body)
+      : mockApiPatch(path, body, options),
   },
   getFreshAgentThreadSnapshot: vi.fn().mockResolvedValue({
     status: 'idle',
@@ -368,7 +370,12 @@ function createStore(
   initialConnectionState: Partial<ConnectionState> = {},
   initialSessionsState: Partial<SessionsState> = {},
   initialFreshAgentState: Partial<FreshAgentState> = {},
+  actionLog?: unknown[],
 ) {
+  const recordAction: Middleware = () => (next) => (action) => {
+    actionLog?.push(action)
+    return next(action)
+  }
   return configureStore({
     reducer: {
       panes: panesReducer,
@@ -387,7 +394,7 @@ function createStore(
         serializableCheck: {
           ignoredPaths: ['sessions.expandedProjects'],
         },
-      }).concat(terminalDetachMiddleware),
+      }).concat(terminalDetachMiddleware, recordAction),
     preloadedState: {
       panes: {
         layouts: {},
@@ -465,7 +472,7 @@ describe('PaneContainer', () => {
     saveServerSettingsPatchSpy.mockClear()
     cancelCreateSpy.mockClear()
     cancelWsCreateSpy.mockClear()
-    mockApiGet.mockResolvedValue({ directories: [] })
+    mockApiGet.mockResolvedValue({ data: { panes: [{ id: 'pane-1' }] }, directories: [] })
     mockApiPost.mockResolvedValue({ valid: true, resolvedPath: '/resolved/path' })
     mockApiPatch.mockResolvedValue({})
     // Mock fetch for EditorPane's /api/terminals call
@@ -843,7 +850,11 @@ describe('PaneContainer', () => {
       fireEvent.blur(renameInput)
 
       await waitFor(() => {
-        expect(mockApiPatch).toHaveBeenCalledWith('/api/panes/pane-1', { name: 'Ops desk' })
+        expect(mockApiPatch).toHaveBeenCalledWith(
+          '/api/panes/pane-1',
+          { name: 'Ops desk' },
+          { signal: expect.any(AbortSignal) },
+        )
       })
       await waitFor(() => {
         expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).toBe('Ops desk')
@@ -882,7 +893,11 @@ describe('PaneContainer', () => {
       fireEvent.blur(renameInput)
 
       await waitFor(() => {
-        expect(mockApiPatch).toHaveBeenCalledWith('/api/panes/pane-1', { name: 'Ops desk' })
+        expect(mockApiPatch).toHaveBeenCalledWith(
+          '/api/panes/pane-1',
+          { name: 'Ops desk' },
+          { signal: expect.any(AbortSignal) },
+        )
       })
       await waitFor(() => {
         expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).toBe('Ops desk')
@@ -891,13 +906,7 @@ describe('PaneContainer', () => {
     })
 
     it('keeps the rename editor open and does not update local titles when the server reports pane not found in a 200 response', async () => {
-      mockApiPatch.mockResolvedValueOnce({
-        status: 'ok',
-        message: 'pane not found',
-      }).mockResolvedValue({
-        status: 'ok',
-        message: 'pane not found',
-      })
+      mockApiPatch.mockResolvedValueOnce({ status: 'ok', message: 'pane not found' })
 
       const leafNode: PaneNode = {
         type: 'leaf',
@@ -923,21 +932,26 @@ describe('PaneContainer', () => {
       fireEvent.blur(renameInput)
 
       await waitFor(() => {
-        expect(mockApiPatch).toHaveBeenCalledWith('/api/panes/pane-1', { name: 'Ops desk' })
+        expect(mockApiPatch).toHaveBeenCalledWith(
+          '/api/panes/pane-1',
+          { name: 'Ops desk' },
+          { signal: expect.any(AbortSignal) },
+        )
       })
       await waitFor(() => {
         expect(screen.getByRole('alert')).toHaveTextContent('pane not found')
-      }, { timeout: 5_000 })
-      expect(mockApiPatch).toHaveBeenCalledTimes(4)
+      })
+      expect(mockApiPatch).toHaveBeenCalledTimes(1)
       expect(await screen.findByLabelText('Rename pane')).toHaveValue('Ops desk')
       expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).toBe('Shell')
       expect(store.getState().tabs.tabs[0].title).toBe('Tab 1')
     })
 
-    it('retries the rename when the pane is not yet mirrored and commits once it lands', async () => {
-      mockApiPatch
-        .mockResolvedValueOnce({ status: 'ok', message: 'pane not found' })
-        .mockResolvedValueOnce({
+    it('waits for the exact pane receipt before making one successful rename PATCH', async () => {
+      mockApiGet
+        .mockResolvedValueOnce({ data: { panes: [] } })
+        .mockResolvedValueOnce({ data: { panes: [{ id: 'pane-1' }] } })
+      mockApiPatch.mockResolvedValueOnce({
           status: 'ok',
           data: { tabId: 'tab-1', paneId: 'pane-1', tabRenamed: true },
           message: 'pane renamed',
@@ -963,9 +977,14 @@ describe('PaneContainer', () => {
 
       await waitFor(() => {
         expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).toBe('Ops desk')
-      }, { timeout: 5_000 })
-      expect(mockApiPatch).toHaveBeenCalledTimes(2)
-      expect(mockApiPatch).toHaveBeenNthCalledWith(2, '/api/panes/pane-1', { name: 'Ops desk' })
+      })
+      expect(mockApiGet).toHaveBeenCalledTimes(2)
+      expect(mockApiPatch).toHaveBeenCalledTimes(1)
+      expect(mockApiPatch).toHaveBeenCalledWith(
+        '/api/panes/pane-1',
+        { name: 'Ops desk' },
+        { signal: expect.any(AbortSignal) },
+      )
       expect(screen.queryByRole('alert')).not.toBeInTheDocument()
     })
 
@@ -996,7 +1015,11 @@ describe('PaneContainer', () => {
       fireEvent.blur(renameInput)
 
       await waitFor(() => {
-        expect(mockApiPatch).toHaveBeenCalledWith('/api/panes/pane-1', { name: 'x'.repeat(600) })
+        expect(mockApiPatch).toHaveBeenCalledWith(
+          '/api/panes/pane-1',
+          { name: 'x'.repeat(600) },
+          { signal: expect.any(AbortSignal) },
+        )
       })
       expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).toBe('Shell')
       expect(store.getState().tabs.tabs[0].title).toBe('Tab 1')
@@ -1029,11 +1052,95 @@ describe('PaneContainer', () => {
       fireEvent.blur(renameInput)
 
       await waitFor(() => {
-        expect(mockApiPatch).toHaveBeenCalledWith('/api/panes/pane-1', { name: 'x'.repeat(600) })
+        expect(mockApiPatch).toHaveBeenCalledWith(
+          '/api/panes/pane-1',
+          { name: 'x'.repeat(600) },
+          { signal: expect.any(AbortSignal) },
+        )
       })
       expect(await screen.findByLabelText('Rename pane')).toHaveValue('x'.repeat(600))
       expect(screen.getByRole('alert')).toHaveTextContent('name must be 500 characters or fewer')
       expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).toBe('Shell')
+    })
+
+    it('cancels a pending mirror wait when the container unmounts without a later PATCH, title update, or alert', async () => {
+      mockApiGet.mockResolvedValue({ data: { panes: [] } })
+      const leafNode: PaneNode = {
+        type: 'leaf',
+        id: 'pane-1',
+        content: createTerminalContent({ terminalId: 'term-1' }),
+      }
+      const actions: unknown[] = []
+      const store = createStore(
+        {
+          layouts: { 'tab-1': leafNode },
+          activePane: { 'tab-1': 'pane-1' },
+          paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
+          renameRequestTabId: 'tab-1',
+          renameRequestPaneId: 'pane-1',
+        },
+        {}, {}, {}, actions,
+      )
+      const rendered = renderWithStore(<PaneContainer tabId="tab-1" node={leafNode} />, store)
+
+      const renameInput = await screen.findByLabelText('Rename pane')
+      fireEvent.change(renameInput, { target: { value: 'Ops desk' } })
+      fireEvent.blur(renameInput)
+      await waitFor(() => {
+        expect(mockApiGet).toHaveBeenCalledWith(
+          '/api/panes?tabId=tab-1',
+          { signal: expect.any(AbortSignal) },
+        )
+      })
+
+      rendered.unmount()
+      await Promise.resolve()
+      await Promise.resolve()
+
+      expect(mockApiPatch).not.toHaveBeenCalled()
+      expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).not.toBe('Ops desk')
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+      expect(actions).not.toContainEqual(expect.objectContaining({ type: 'panes/updatePaneTitle' }))
+    })
+
+    it('cancels a pending mirror wait when its target pane closes without a later PATCH or title update', async () => {
+      mockApiGet.mockResolvedValue({ data: { panes: [] } })
+      const rootNode: PaneNode = {
+        type: 'split',
+        id: 'split-1',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          { type: 'leaf', id: 'pane-1', content: createTerminalContent({ terminalId: 'term-1' }) },
+          { type: 'leaf', id: 'pane-2', content: createTerminalContent({ terminalId: 'term-2' }) },
+        ],
+      }
+      const actions: unknown[] = []
+      const store = createStore(
+        {
+          layouts: { 'tab-1': rootNode },
+          activePane: { 'tab-1': 'pane-1' },
+          paneTitles: { 'tab-1': { 'pane-1': 'Shell', 'pane-2': 'Other' } },
+          renameRequestTabId: 'tab-1',
+          renameRequestPaneId: 'pane-1',
+        },
+        {}, {}, {}, actions,
+      )
+      renderWithStore(<PaneContainer tabId="tab-1" node={rootNode} />, store)
+
+      const renameInput = await screen.findByLabelText('Rename pane')
+      fireEvent.change(renameInput, { target: { value: 'Ops desk' } })
+      fireEvent.blur(renameInput)
+      await waitFor(() => expect(mockApiGet).toHaveBeenCalled())
+
+      fireEvent.click(screen.getAllByTitle('Close pane')[0])
+      await Promise.resolve()
+      await Promise.resolve()
+
+      expect(mockApiPatch).not.toHaveBeenCalled()
+      expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).not.toBe('Ops desk')
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+      expect(actions).not.toContainEqual(expect.objectContaining({ type: 'panes/updatePaneTitle' }))
     })
   })
 

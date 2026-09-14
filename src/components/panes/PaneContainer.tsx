@@ -17,7 +17,7 @@ import { isFreshAgentProviderName, getFreshAgentProviderConfig } from '@/lib/fre
 import { getFreshAgentLabel, normalizeFreshAgentEffort, normalizeFreshAgentModel, resolveFreshAgentPaneCreateEffort, resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { clearDraft } from '@/lib/draft-store'
 import { getTerminalActions } from '@/lib/pane-action-registry'
-import { renamePaneWithMirrorRetry } from '@/lib/pane-rename'
+import { renamePaneAfterMirrorReady } from '@/lib/pane-rename'
 import { buildPaneRefreshTarget } from '@/lib/pane-utils'
 import { cn } from '@/lib/utils'
 import { withChunkErrorRecovery } from '@/lib/import-retry'
@@ -250,6 +250,11 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   const [renamingPaneId, setRenamingPaneId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
   const [renameError, setRenameError] = useState<string | null>(null)
+  const renameAbortRef = useRef<{ paneId: string; controller: AbortController } | null>(null)
+
+  useEffect(() => () => {
+    renameAbortRef.current?.controller.abort()
+  }, [])
 
   // Listen for rename requests from Redux (context menu trigger)
   const renameRequestTabId = useAppSelector((s) => s.panes.renameRequestTabId)
@@ -295,11 +300,17 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       return
     }
     if (node.type !== 'leaf') return
+    renameAbortRef.current?.controller.abort()
+    const controller = new AbortController()
+    renameAbortRef.current = { paneId, controller }
     void (async () => {
       try {
-        const result = await renamePaneWithMirrorRetry(paneId, trimmed, {
-          patch: (path, body) => api.patch(path, body),
+        const result = await renamePaneAfterMirrorReady(tabId, paneId, trimmed, {
+          signal: controller.signal,
+          get: (path, options) => api.get(path, options),
+          patch: (path, body, options) => api.patch(path, body, options),
         })
+        if (controller.signal.aborted) return
         if (!result.ok) {
           setRenameError(result.message)
           return
@@ -309,10 +320,15 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         setRenamingPaneId(null)
         setRenameValue('')
       } catch (error: any) {
+        if (controller.signal.aborted) return
         const message = typeof error?.message === 'string' && error.message
           ? error.message
           : 'Failed to rename pane'
         setRenameError(message)
+      } finally {
+        if (renameAbortRef.current?.controller === controller) {
+          renameAbortRef.current = null
+        }
       }
     })()
   }, [dispatch, tabId, renamingPaneId, renameValue, node])
@@ -325,6 +341,9 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   }, [])
 
   const handleClose = useCallback((paneId: string, content: PaneContent) => {
+    if (renameAbortRef.current?.paneId === paneId) {
+      renameAbortRef.current.controller.abort()
+    }
     // Terminal detach is handled by terminalDetachMiddleware, which reconciles
     // dropped terminal references on the resulting layout change.
     if (content.kind === 'fresh-agent') {
