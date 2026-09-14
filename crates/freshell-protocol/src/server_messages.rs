@@ -1233,29 +1233,6 @@ pub struct TerminalCreated {
     pub restore_error: Option<TerminalRestoreError>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<SessionLocator>,
-    /// b8ke ext r7 F2: the TYPED fresh-substitution record — set when the
-    /// REQUESTED session was definitively missing and a NEW session was
-    /// minted (or the spawn ran identity-less). The pane always knows it
-    /// got a new session, never a silent swap: `reason` is the typed code
-    /// (SESSION_MISSING_RESUMED_FRESH), `requested_session_id` names the
-    /// missing id the caller asked for, and the new session id rides the
-    /// frame's `sessionRef` (when the provider mints one). Additive.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_substitution: Option<TerminalSessionSubstitution>,
-}
-
-/// b8ke ext r7 F2: the typed fresh-substitution record on
-/// [`TerminalCreated`] — the requested session was DEFINITIVELY missing
-/// (the resume gate's SpawnFresh verdict) and a replacement was started
-/// instead. The caller is never left with a silent swap.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TerminalSessionSubstitution {
-    /// The typed reason code — `SESSION_MISSING_RESUMED_FRESH`.
-    pub reason: String,
-    /// The requested (missing) session id, when the request carried one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub requested_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

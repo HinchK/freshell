@@ -3717,6 +3717,60 @@ describe('TerminalView lifecycle updates', () => {
       ).toBeNull()
     })
 
+    it('b8ke ext r16 F3: a SESSION_MISSING refusal renders the typed missing state with the explicit start-fresh action', async () => {
+      const { store } = setupTypedPane()
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+        expect(createCalls()).toHaveLength(1)
+      })
+
+      // The typed missing refusal: the durable session is definitively
+      // gone — nothing was started (pre-r16 the server auto-substituted a
+      // replacement session).
+      act(() => {
+        messageHandler!({
+          type: 'error',
+          code: 'SESSION_MISSING',
+          message: `The durable session ${TYPED_SESSION_ID} is gone. No replacement was started — start a fresh conversation explicitly if you want a new session.`,
+          requestId: 'req-b8ke',
+          timestamp: new Date().toISOString(),
+        })
+      })
+
+      // THE TYPED MISSING CARD: the recoverable missing state + the
+      // explicit start-fresh action (the ONLY new-session path) + NO
+      // retry action (retrying the resume cannot bring the session back).
+      const card = await screen.findByTestId('terminal-launch-failure-card')
+      expect(card).toHaveAttribute('role', 'alert')
+      expect(card).toHaveTextContent(/is gone/i)
+      expect(
+        within(card).queryByRole('button', { name: 'Retry launch' }),
+      ).toBeNull()
+      const startFresh = within(card).getByRole('button', {
+        name: 'Start a fresh conversation (a new session — the old one is gone)',
+      })
+      expect(startFresh).toBeInTheDocument()
+
+      // THE OPERATOR-INITIATED FRESH START: the click clears the stale
+      // sessionRef (a genuinely new identity-less conversation) and
+      // re-fires the lifecycle into a fresh create.
+      fireEvent.click(startFresh)
+      await waitFor(() => {
+        expect(createCalls()).toHaveLength(2)
+      })
+      expect(createCalls()[1]).toMatchObject({
+        requestId: 'req-b8ke',
+      })
+      expect(createCalls()[1].sessionRef).toBeUndefined()
+      const leaf = store.getState().panes.layouts['tab-b8ke']
+      expect(
+        leaf?.type === 'leaf' && leaf.content.kind === 'terminal'
+          ? leaf.content.sessionRef
+          : undefined,
+      ).toBeUndefined()
+    })
+
     it('b8ke ext r11 F2: a dead terminal pane converges onto a committed same-kind terminal owner', async () => {
       // The pane's own runtime is DEAD (the Fresh Agent → CLI handoff's
       // prior-reap exited it; the exit cleared the stored terminal id) —

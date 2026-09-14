@@ -92,7 +92,7 @@ export type { CrashTrace }
  */
 export type LaunchFailure = {
   code: 'SESSION_RESERVED' | 'RESTORE_UNAVAILABLE' | 'HANDOFF_IN_PROGRESS' | 'REAP_TIMEOUT'
-    | 'TARGET_SPAWN_FAILED' | 'STALE_GENERATION' | 'LAUNCH_FAILED'
+    | 'TARGET_SPAWN_FAILED' | 'STALE_GENERATION' | 'LAUNCH_FAILED' | 'SESSION_MISSING'
   message: string
   retryable: boolean
   ownerKind?: 'terminal' | 'fresh-agent'

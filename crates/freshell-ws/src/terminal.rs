@@ -2942,10 +2942,9 @@ pub(crate) struct PreparedLaunch {
 
 /// Outcome of the wire-resume disk-existence gate, carried from wherever the
 /// gate ran (off-permit in prepare_launch for codex; on-permit in
-/// handle_create for everything else) to the single place that emits the
-/// operator notice and releases the D8 stale-ref lease.
+/// handle_create for everything else) to the single place that answers the
+/// typed SESSION_MISSING refusal and releases the D8 stale-ref lease.
 pub(crate) struct ResumeGateCarry {
-    pub notice: Option<String>,
     pub stale_session_id: Option<String>,
 }
 
@@ -2991,7 +2990,6 @@ async fn gate_wire_resume(
     };
     if candidate_is_live {
         return ResumeGateCarry {
-            notice: None,
             stale_session_id: None,
         };
     }
@@ -3023,7 +3021,8 @@ async fn gate_wire_resume(
         tracing::warn!(
             mode = %mode,
             stale_session_id = %stale,
-            "resume validation: cached session missing on disk; spawning fresh"
+            "resume validation: cached session missing on disk; the create \
+             answers the typed SESSION_MISSING refusal (no substitution)"
         );
         // Don't retry the stale id forever. Same blocking-pool
         // discipline as every other pane-ledger write in this file
@@ -3035,7 +3034,6 @@ async fn gate_wire_resume(
             spawn_blocking_in_span(move || ledger.retire_missing(&retire_mode, &stale_id)).await;
     }
     ResumeGateCarry {
-        notice: outcome.notice,
         stale_session_id: outcome.stale_session_id,
     }
 }
@@ -3219,7 +3217,6 @@ pub(crate) async fn handle_create(
                     notice: None,
                     restore_error: None,
                     session_ref: state.identity.session_ref_for(&existing),
-                    session_substitution: None,
                 });
                 // An adoption IS a successful create for this requestId:
                 // settle the server-wide dedupe entry exactly like the main
@@ -3642,7 +3639,6 @@ pub(crate) async fn handle_create(
                                 .identity
                                 .session_ref_for(&terminal_id)
                                 .or(Some(locator)),
-                            session_substitution: None,
                         });
                         // Attaching to the winner IS a successful create for
                         // this requestId: settle the dedupe entry exactly
@@ -3997,11 +3993,6 @@ pub(crate) async fn handle_create(
     // claude P0.4 ladder (ladder-resolved ids are wire-originated and must
     // be validated), before the amplifier ensure_session re-stub (which
     // would resurrect the stale dir).
-    let mut resume_fallback_notice: Option<String> = None;
-    // b8ke ext r7 F2: the definitively-missing requested session (the gate's
-    // SpawnFresh verdict) — the typed substitution record on the created
-    // frame names it; `None` when the gate did not fire.
-    let mut resume_gate_missing_session: Option<String> = None;
     let resume_gate_carry = match prepared_resume_gate {
         Some(carry) => Some(carry),
         None if resume_id_from_wire => Some(
@@ -4017,20 +4008,36 @@ pub(crate) async fn handle_create(
         None => None,
     };
     if let Some(carry) = resume_gate_carry {
-        if carry.stale_session_id.is_some() {
-            // Stale-ref stamping guard: this create no longer creates the
-            // wire sessionRef's session, so a D8 lease claimed for the
-            // STALE ref must be RELEASED, never completed (completing it
-            // would bind stale-ref->terminal in the registry binding map).
-            // Dropping the armed guard runs fail_session_ref_claim.
-            // kata b8ke Task 4: the coordinator claim follows the same
-            // discipline — dropping the ticket fails the `Starting` claim
-            // (the create proceeds under the freshly-minted id, which claims
-            // nothing — the lifecycle-audit rule for mints).
-            session_ref_lease = None;
-            resume_gate_missing_session = carry.stale_session_id.clone();
+        if let Some(stale) = carry.stale_session_id.as_deref() {
+            // b8ke ext r16 F3: a DEFINITIVELY MISSING exact-resume target
+            // no longer auto-substitutes a replacement session (the
+            // request's non-goal is unqualified — "do not start blank
+            // sessions when exact resume fails"; no recovery path changes
+            // the session id). The lease + coordinator claim unwind (a D8
+            // lease claimed for the STALE ref must be RELEASED, never
+            // completed; the ticket's typed fail), then the create answers
+            // the TYPED SESSION_MISSING refusal — nothing was started,
+            // and the only fresh-start path is the explicit operator
+            // action on the pane's typed missing card.
+            drop(session_ref_lease.take());
             drop(terminal_ownership.take());
-            resume_fallback_notice = carry.notice;
+            tracing::warn!(target: "freshell_ws::terminal",
+                mode = %mode, session_id = %stale,
+                request_id = %create.request_id,
+                "terminal_create_refused: the requested durable session is \
+                 definitively missing — the typed SESSION_MISSING refusal, \
+                 never an automatic fresh substitution"
+            );
+            return send_create_error(
+                out,
+                ErrorCode::SessionMissing,
+                format!(
+                    "The durable session {stale} is gone. No replacement was started — \
+                     start a fresh conversation explicitly if you want a new session."
+                ),
+                &create.request_id,
+            )
+            .await;
         }
     }
 
@@ -5376,23 +5383,11 @@ pub(crate) async fn handle_create(
         clear_codex_durability: None,
         // Echo the resolved cwd (`record.cwd`) when the shell spec carries one.
         cwd: spec.cwd.clone(),
-        // Resume-validation door 1: the operator-visible stale-resume notice
-        // (Some only when the gate fired above).
-        notice: resume_fallback_notice,
+        notice: None,
         restore_error: None,
         // The canonical create-time identity, from the SAME registry every other
         // identity-stamped frame reads (shell creates have no entry -> `None`).
         session_ref: state.identity.session_ref_for(&terminal_id_for_meta),
-        // b8ke ext r7 F2: the TYPED fresh-substitution record — the gate
-        // stamped a definitively-missing requested session (the new session
-        // id rides sessionRef when the provider mints one). Never a silent
-        // swap.
-        session_substitution: resume_gate_missing_session.map(|requested| {
-            freshell_protocol::TerminalSessionSubstitution {
-                reason: "SESSION_MISSING_RESUMED_FRESH".to_string(),
-                requested_session_id: Some(requested),
-            }
-        }),
     });
     // Record the settled create (server-wide requestId dedupe) and forward
     // the frame to any cross-connection waiters — AFTER the origin reply's

@@ -993,7 +993,6 @@ mod tests {
             notice: None,
             restore_error: None,
             session_ref: None,
-            session_substitution: None,
         })
     }
 }

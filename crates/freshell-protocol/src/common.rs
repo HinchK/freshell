@@ -105,6 +105,12 @@ pub enum ErrorCode {
     /// never send the request.
     #[serde(rename = "RECONCILE_NOT_NEGOTIATED")]
     ReconcileNotNegotiated,
+    /// b8ke ext r16 F3: the exact-resume target was DEFINITIVELY missing
+    /// (the resume gate's SpawnFresh verdict) — the create REFUSES with
+    /// this typed code and NOTHING was started (the operator-initiated
+    /// fresh start is the only new-session path, never an automatic
+    /// substitution).
+    SessionMissing,
 }
 
 /// The frozen sessionRef-naming refusal text for the legacy `resumeSessionId`

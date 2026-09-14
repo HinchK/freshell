@@ -5099,6 +5099,29 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         }
 
         if (msg.type === 'error' && msg.requestId === reqId) {
+          // b8ke ext r16 F3: the TYPED missing-session refusal — the
+          // durable session is gone, NOTHING was started (no automatic
+          // substitution). The pane lands the typed recoverable missing
+          // state; the card's explicit "Start fresh" action is the ONLY
+          // new-session path (operator-initiated, clearly a new
+          // conversation — never a resume).
+          if (msg.code === 'SESSION_MISSING') {
+            launchAttemptRef.current = null
+            clearRateLimitRetry()
+            setIsAttaching(false)
+            dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
+            updateContent({
+              status: 'error',
+              streamId: undefined,
+              launchFailure: {
+                code: 'SESSION_MISSING',
+                message: msg.message || `The durable session is gone. No replacement was started.`,
+                retryable: false,
+              },
+            })
+            writeLocalXtermNotice(term, `\r\n[Resume failed] ${msg.message || msg.code}\r\n`)
+            return
+          }
           // D7-refusal revival (reconnect-revive Task 7): the create was
           // refused because the session is STILL RUNNING under the named
           // terminal — reattach the pane to it instead of dead-ending on
@@ -5815,6 +5838,22 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     dispatch(applyReattachToLiveTerminal({ tabId, paneId, terminalId }))
   }
 
+  // b8ke ext r16 F3: the typed missing state's explicit START-FRESH
+  // action — the ONLY new-session path (operator-initiated, clearly a NEW
+  // conversation, never a resume). The stale sessionRef is cleared (a
+  // fresh create spawns identity-less) and the reconcileEpoch bump
+  // re-fires the lifecycle effect into a genuinely new create.
+  const startFreshConversation = () => {
+    dispatch(resetPaneForReconcileCreate({
+      tabId,
+      paneId,
+      // 'fresh' clears sessionRef/resumeSessionId/codexDurability — a
+      // genuinely new identity-less conversation.
+      intent: 'fresh',
+      reason: 'session_missing',
+    }))
+  }
+
   return (
     <div
       ref={wrapperRef}
@@ -5898,6 +5937,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           onAttach={typedLaunchFailure.terminalId !== undefined ? attachToNamedTerminal : undefined}
           onOpenFresh={typedLaunchFailure.ownerKind === 'fresh-agent' && terminalContent.sessionRef
             ? openAsFreshAgentHere
+            : undefined}
+          onStartFresh={typedLaunchFailure.code === 'SESSION_MISSING'
+            ? startFreshConversation
             : undefined}
         />
       ) : null}

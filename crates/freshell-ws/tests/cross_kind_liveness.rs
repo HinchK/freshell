@@ -4438,12 +4438,15 @@ impl freshell_ws::existence::SessionExistenceProbe for AbsentClaudeProbe {
     }
 }
 
-/// b8ke ext r7 F2: a resume to a DEFINITIVELY MISSING session is TYPED and
-/// explicit — the created frame carries the typed substitution record
-/// (SESSION_MISSING_RESUMED_FRESH + the missing id) and the minted
-/// sessionRef (pre-r7 the swap was silent: only the prose notice).
+/// b8ke ext r16 F3: a resume to a DEFINITIVELY MISSING session is the
+/// TYPED SESSION_MISSING refusal — nothing was started, no session id
+/// changed, and the frame carries NO substitution record (pre-r16 the
+/// create auto-substituted a replacement session and recorded
+/// SESSION_MISSING_RESUMED_FRESH — the request's non-goal forbids blank
+/// sessions on exact-resume failure). The separate operator-initiated
+/// fresh start (a NEW create with NO sessionRef) is the ONLY fresh path.
 #[tokio::test]
-async fn a_resume_to_a_missing_session_answers_the_typed_substitution_record() {
+async fn a_resume_to_a_missing_session_answers_the_typed_missing_refusal() {
     let (state, _registry, _fresh_agent_state) = build_ws_state_with_probe(
         vec![sleeper_cli_spec("claude")],
         std::sync::Arc::new(AbsentClaudeProbe),
@@ -4469,7 +4472,7 @@ async fn a_resume_to_a_missing_session_answers_the_typed_substitution_record() {
         &mut ws,
         &json!({
             "type": "terminal.create",
-            "requestId": "req-r7-f2-typed",
+            "requestId": "req-r16-f3-missing",
             "mode": "claude",
             "shell": "system",
             "cwd": std::env::temp_dir().to_string_lossy(),
@@ -4477,48 +4480,58 @@ async fn a_resume_to_a_missing_session_answers_the_typed_substitution_record() {
         }),
     )
     .await;
-    let created = await_frame(&mut ws, Duration::from_secs(10), |v| {
-        v["type"] == "terminal.created" && v["requestId"] == "req-r7-f2-typed"
+
+    // THE TYPED REFUSAL: the create fails SESSION_MISSING — never a
+    // terminal.created, never a substitution record (pre-r16 the create
+    // answered created with a NEW session id).
+    let refused = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        (v["type"] == "error" || v["type"] == "terminal.created")
+            && v["requestId"] == "req-r16-f3-missing"
     })
     .await;
+    assert_eq!(
+        refused["type"], "error",
+        "the missing-session resume answers the typed refusal, never created: {refused:?}"
+    );
+    assert_eq!(refused["code"], json!("SESSION_MISSING"), "{refused:?}");
+    assert!(
+        refused.get("sessionSubstitution").is_none(),
+        "the wire no longer carries any substitution record: {refused:?}"
+    );
+    // No terminal was spawned for the refusal.
+    let ownership = state.ownership.as_ref().expect("coordinator wired");
+    assert!(
+        matches!(
+            ownership.observe("claude", &missing_sid).state,
+            freshell_ownership::OwnershipState::Vacant
+        ),
+        "nothing was started for the missing session"
+    );
 
-    // THE TYPED SUBSTITUTION: the frame names the missing session and the
-    // fresh-substitution reason (pre-r7: no typed record — a silent swap).
-    assert_eq!(
-        created["sessionSubstitution"]["reason"],
-        json!("SESSION_MISSING_RESUMED_FRESH"),
-        "the typed substitution reason — frame: {created:?}"
-    );
-    assert_eq!(
-        created["sessionSubstitution"]["requestedSessionId"],
-        json!(missing_sid),
-        "the typed record names the missing requested session: {created:?}"
-    );
-    // The new session id rides the frame's sessionRef (the mint).
+    // THE OPERATOR-INITIATED FRESH START — the ONLY new-session path: a
+    // brand-new create with NO sessionRef (clearly a new conversation,
+    // never a resume). It succeeds and mints its OWN session.
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-r16-f3-fresh",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+        }),
+    )
+    .await;
+    let created = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "terminal.created" && v["requestId"] == "req-r16-f3-fresh"
+    })
+    .await;
     let mint = created["sessionRef"]["sessionId"]
         .as_str()
-        .expect("the minted sessionRef")
+        .expect("the fresh create mints its own sessionRef")
         .to_string();
     assert_ne!(mint, missing_sid);
-
-    // The minted session commits Live{Terminal} (the ext r6 F1 discipline).
-    let ownership = state.ownership.as_ref().expect("coordinator wired");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        if matches!(
-            ownership.observe("claude", &mint).state,
-            freshell_ownership::OwnershipState::Live { .. }
-        ) {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the substituted session never committed Live — state: {:?}",
-            ownership.observe("claude", &mint).state
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    // Cleanup: reap the spawned terminal.
+    // Cleanup: reap the fresh terminal.
     let tid = created["terminalId"]
         .as_str()
         .expect("terminalId")
@@ -4554,8 +4567,11 @@ async fn the_learned_identity_spawn_interval_holds_a_coordinator_claim() {
         format!("ws://{addr}/ws")
     };
     let mut ws = connect(&url).await;
-    let missing_sid = uuid::Uuid::new_v4().to_string();
 
+    // b8ke ext r16 F3: the learned-identity fixture is the FRESH-claude
+    // PREALLOC mint (no sessionRef — the pre-r16 missing-resume mint path
+    // this test used now answers the typed SESSION_MISSING refusal
+    // instead of substituting a replacement session).
     send_json(
         &mut ws,
         &json!({
@@ -4564,7 +4580,6 @@ async fn the_learned_identity_spawn_interval_holds_a_coordinator_claim() {
             "mode": "claude",
             "shell": "system",
             "cwd": std::env::temp_dir().to_string_lossy(),
-            "sessionRef": { "provider": "claude", "sessionId": missing_sid },
         }),
     )
     .await;
@@ -4576,7 +4591,6 @@ async fn the_learned_identity_spawn_interval_holds_a_coordinator_claim() {
         .as_str()
         .expect("the minted sessionRef")
         .to_string();
-    assert_ne!(mint, missing_sid);
 
     // THE CONTRACT: the committed Live record's ownership id is the
     // PRE-SPAWN learned claim's operation — the claim was held through
