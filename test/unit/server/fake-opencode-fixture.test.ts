@@ -81,10 +81,25 @@ beforeAll(async () => {
   await waitForServer(port)
 }, 30_000)
 
-afterAll(() => {
-  server?.kill('SIGTERM')
+afterAll(async () => {
+  // Await the fixture's exit before removing scratch: the SIGTERMed process
+  // can still be writing under it, and an immediate rmSync then races with
+  // ENOTEMPTY (observed ~1 in 3 runs locally and in cloud shards).
+  const dying = server
   server = undefined
-  fs.rmSync(scratch, { recursive: true, force: true })
+  if (dying) {
+    dying.kill('SIGTERM')
+    if (dying.exitCode === null) {
+      await new Promise<void>((resolve) => {
+        const killTimer = setTimeout(() => dying.kill('SIGKILL'), 3000)
+        dying.once('exit', () => {
+          clearTimeout(killTimer)
+          resolve()
+        })
+      })
+    }
+  }
+  fs.rmSync(scratch, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
 })
 
 describe('fake-opencode fixture fork sequence parity (ep3-r1 F3)', () => {
