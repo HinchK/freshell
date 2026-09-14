@@ -5650,8 +5650,13 @@ impl FreshCodexState {
             Ok(resolved) => resolved,
             // kata b8ke Task 5: an untracked session serves the EMPTY
             // snapshot read-only — never a cold-start spawn.
-            Err(CodexSnapshotError::UntrackedReadonly) => {
-                return Ok(self.empty_readonly_snapshot(thread_id));
+            Err(CodexSnapshotError::UntrackedReadonly { ownership }) => {
+                // b8ke ext r17 F3: the response derives from the ONE
+                // observation captured at the decision — no second look
+                // (pre-r17 a start/handoff beginning between the two
+                // observations returned 200 "vacant" paired to the active
+                // transition's generation, the impossible half-state).
+                return Ok(self.empty_readonly_snapshot(thread_id, &ownership));
             }
             Err(other) => return Err(other),
         };
@@ -5810,13 +5815,17 @@ impl FreshCodexState {
         let ownership = self.ownership_snapshot(PROVIDER, thread_id);
         match ownership.state {
             freshell_ownership::OwnershipState::Vacant => {
-                Err(CodexSnapshotError::UntrackedReadonly)
+                Err(CodexSnapshotError::UntrackedReadonly {
+                    ownership: ownership.clone(),
+                })
             }
             // An aliased (re-keyed) key has no writer under THIS id — the
             // canonical record lives under the resolved key; this snapshot
             // path answers the same untracked-vacant truth.
             freshell_ownership::OwnershipState::Aliased { .. } => {
-                Err(CodexSnapshotError::UntrackedReadonly)
+                Err(CodexSnapshotError::UntrackedReadonly {
+                    ownership: ownership.clone(),
+                })
             }
             freshell_ownership::OwnershipState::Live {
                 owner, generation, ..
@@ -5845,8 +5854,11 @@ impl FreshCodexState {
     /// client schema's permissive per-provider bag — `ownerKind: "vacant"`
     /// with the coordinator's epoch/generation). No runtime was consulted;
     /// no runtime was created.
-    pub(crate) fn empty_readonly_snapshot(&self, thread_id: &str) -> Value {
-        let ownership = self.ownership_snapshot(PROVIDER, thread_id);
+    pub(crate) fn empty_readonly_snapshot(
+        &self,
+        thread_id: &str,
+        ownership: &freshell_ownership::OwnershipSnapshot,
+    ) -> Value {
         let mut snapshot =
             build_codex_snapshot_json(thread_id, &json!({}), false, None, None, false)
                 .expect("the empty raw payload always normalizes");
@@ -6626,7 +6638,13 @@ pub enum CodexSnapshotError {
     /// resume belongs ONLY to the explicit lifecycle commands
     /// (`freshAgent.create`/`freshAgent.attach` with `sessionRef`,
     /// generation-fenced).
-    UntrackedReadonly,
+    UntrackedReadonly {
+        /// b8ke ext r17 F3: the ONE coordinator observation that chose the
+        /// untracked-vacant answer — the caller's empty snapshot derives
+        /// from THIS observation (opencode parity), never a second look
+        /// that could pair a mid-transition generation with "vacant".
+        ownership: freshell_ownership::OwnershipSnapshot,
+    },
     /// kata b8ke Task 5: a live runtime owner this GET cannot serve locally
     /// (a terminal PTY, or a fresh-agent runtime outside this process's live
     /// map). Typed refusal — never a spawn on top of an owner.
@@ -6645,7 +6663,7 @@ impl std::fmt::Display for CodexSnapshotError {
             CodexSnapshotError::NotFound => write!(f, "codex thread not found"),
             CodexSnapshotError::AppServer(err) => write!(f, "{err}"),
             CodexSnapshotError::Protocol(message) => write!(f, "{message}"),
-            CodexSnapshotError::UntrackedReadonly => {
+            CodexSnapshotError::UntrackedReadonly { .. } => {
                 write!(f, "codex thread untracked (read-only empty snapshot)")
             }
             CodexSnapshotError::ReservedByOwner { owner_kind, .. } => write!(
@@ -20242,6 +20260,61 @@ pub(crate) mod tests {
             freshell_ownership::OwnershipState::Live { owner, .. }
                 if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal
         ));
+    }
+
+    /// b8ke ext r17 F3: the untracked empty snapshot derives from the
+    /// ONE decision-time coordinator observation — a start/handoff that
+    /// begins AFTER the untracked-vacant decision is simply not in the
+    /// response (a later request sees it). Pre-r17 the path re-observed
+    /// while unconditionally stamping "vacant", so a transition beginning
+    /// between the two observations returned the impossible half-state:
+    /// 200 "vacant" paired to the active transition's generation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_untracked_empty_snapshot_derives_from_the_decision_time_observation() {
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+
+        // THE DECISION-TIME OBSERVATION: the key is Vacant at generation 0.
+        let captured = st.ownership_snapshot(PROVIDER, "ses-r17-f3-untracked");
+        assert_eq!(captured.state, freshell_ownership::OwnershipState::Vacant);
+        assert_eq!(captured.generation, 0);
+
+        // A TRANSITION BEGINS between the decision and the response build
+        // (the exact double-observation interleaving the finding flags).
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
+            PROVIDER,
+            "ses-r17-f3-untracked",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-r17-f3-interleave",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("fixture granted")
+        };
+        assert!(matches!(
+            registry.observe(PROVIDER, "ses-r17-f3-untracked").state,
+            freshell_ownership::OwnershipState::Starting { .. }
+        ));
+
+        // THE CONTRACT: the response carries the DECISION-TIME pair —
+        // ownerKind "vacant" with generation 0 — never the transition's
+        // generation (the pre-r17 half-state).
+        let snapshot = st.empty_readonly_snapshot("ses-r17-f3-untracked", &captured);
+        assert_eq!(
+            snapshot["extensions"]["codex"]["ownerKind"],
+            json!("vacant")
+        );
+        assert_eq!(
+            snapshot["extensions"]["codex"]["ownerGeneration"],
+            json!(captured.generation),
+            "the generation is the DECISION-TIME observation, not the \
+             mid-transition registry state: {snapshot}"
+        );
+
+        let _ = rx.try_recv();
+        let _ = generation;
     }
 
     /// b8ke ext r10 F1: a delayed freshAgent.create (resume) arriving

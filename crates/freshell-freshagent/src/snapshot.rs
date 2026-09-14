@@ -154,8 +154,8 @@ async fn get_snapshot(
             // `Ok` (the empty snapshot), so this arm is unreachable today —
             // but the route's contract for it stays the same 200 empty
             // snapshot if it ever propagates.
-            Err(CodexSnapshotError::UntrackedReadonly) => {
-                Json(state.codex.empty_readonly_snapshot(&thread_id)).into_response()
+            Err(CodexSnapshotError::UntrackedReadonly { ownership }) => {
+                Json(state.codex.empty_readonly_snapshot(&thread_id, &ownership)).into_response()
             }
         },
         ("freshopencode", "opencode") => {
