@@ -9469,11 +9469,6 @@ mod tests {
         );
     }
 
-    /// Focused-ep1 Finding A (branch 2 — settings-None skip): a
-    /// connection-scoped create-resume whose ledger row is LINEAGE-ONLY
-    /// (default settings — `load_settings` answers `None`) must STILL re-stamp
-    /// the row's provenance to the CURRENT connection: the provenance refresh,
-    /// not the settings write, is the point of the resume refresh.
     // ── b8ke ext r15 F1: the map-hit/Vacant compatibility claims are FENCED ──
 
     /// The F1 fixture: a live in-map session row over a coordinator key the
@@ -9696,6 +9691,11 @@ mod tests {
         );
     }
 
+    /// Focused-ep1 Finding A (branch 2 — settings-None skip): a
+    /// connection-scoped create-resume whose ledger row is LINEAGE-ONLY
+    /// (default settings — `load_settings` answers `None`) must STILL re-stamp
+    /// the row's provenance to the CURRENT connection: the provenance refresh,
+    /// not the settings write, is the point of the resume refresh.
     #[tokio::test]
     async fn create_resume_with_a_lineage_only_row_still_restamps_the_current_connections_provenance(
     ) {
