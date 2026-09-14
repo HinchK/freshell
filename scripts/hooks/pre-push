@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Freshell pre-push gate — the cheap local checks (cargo fmt, tsc typecheck,
+# cargo clippy), filtered by what the push actually changes.
+# See docs/development/pre-push-gate.md.
+#
+# Bypass (emergencies only): git push --no-verify
+# Disable for one push:       FRESHELL_PREPUSH=0 git push ...
+# Debug routing (run nothing): FRESHELL_PREPUSH_DEBUG=1 git push --dry-run ...
+set -u
+
+if [ "${FRESHELL_PREPUSH:-1}" = "0" ]; then
+  echo "pre-push: FRESHELL_PREPUSH=0 — gate disabled for this push" >&2
+  exit 0
+fi
+
+ZERO=0000000000000000000000000000000000000000
+changed=""
+full_gate=0
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  # Branch deletion — nothing to check.
+  [ "$local_sha" = "$ZERO" ] && continue
+  if [ "$remote_sha" = "$ZERO" ]; then
+    # New branch: diff against its merge base with origin/main.
+    base=$(git merge-base "$local_sha" origin/main 2>/dev/null) || { full_gate=1; continue; }
+  else
+    base="$remote_sha"
+  fi
+  chunk=$(git diff --name-only "$base" "$local_sha" 2>/dev/null) || full_gate=1
+  if [ -n "$chunk" ]; then
+    changed="${changed}${chunk}
+"
+  fi
+done
+
+run_rust=0
+run_ts=0
+if [ "$full_gate" = 1 ]; then
+  run_rust=1
+  run_ts=1
+elif [ -n "$changed" ]; then
+  printf '%s' "$changed" | grep -Eq '\.rs$|Cargo\.(toml|lock)$|rust-toolchain' && run_rust=1
+  printf '%s' "$changed" | grep -Eq '\.(ts|tsx)$|package(-lock)?\.json$|tsconfig' && run_ts=1
+fi
+
+if [ "${FRESHELL_PREPUSH_DEBUG:-0}" = "1" ]; then
+  echo "pre-push[debug]: full_gate=$full_gate run_rust=$run_rust run_ts=$run_ts" >&2
+  printf '%s' "$changed" | sed 's/^/  changed: /' >&2
+  exit 0
+fi
+
+if [ "$run_rust" = 0 ] && [ "$run_ts" = 0 ]; then
+  [ -n "$changed" ] && echo "pre-push: no rust/ts files changed — skipping checks" >&2
+  exit 0
+fi
+
+fail() {
+  echo "pre-push: FAILED — $1" >&2
+  echo "pre-push: fix and push again, or bypass with: git push --no-verify" >&2
+  exit 1
+}
+
+if [ "$run_rust" = 1 ]; then
+  if command -v cargo >/dev/null 2>&1; then
+    echo "pre-push: rust gate — cargo fmt --all --check" >&2
+    cargo fmt --all --check || fail "cargo fmt --all --check"
+    echo "pre-push: rust gate — cargo clippy --workspace (a few minutes warm; longer cold)" >&2
+    cargo clippy --workspace --exclude freshell-tauri --all-targets -- -D warnings \
+      || fail "cargo clippy --workspace --all-targets -- -D warnings"
+  else
+    echo "pre-push: cargo not found — SKIPPING rust gate (install rustup to enforce)" >&2
+  fi
+fi
+
+if [ "$run_ts" = 1 ]; then
+  if command -v npm >/dev/null 2>&1 && [ -e node_modules/.bin/tsc ]; then
+    echo "pre-push: ts gate — npm run typecheck" >&2
+    npm run --silent typecheck || fail "npm run typecheck"
+  else
+    echo "pre-push: tsc not available (no node_modules?) — SKIPPING typecheck (npm install to enforce)" >&2
+  fi
+fi
+
+echo "pre-push: OK" >&2
+exit 0

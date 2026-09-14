@@ -19,6 +19,7 @@
     "typecheck:client": "tsc -p tsconfig.json --noEmit",
     "typecheck:server": "tsc -p tsconfig.server.json --noEmit",
     "prebuild": "tsx scripts/prebuild-guard.ts",
+    "postinstall": "node scripts/install-hooks.mjs",
     "build": "npm run typecheck:client && npm run build:client && npm run build:server",
     "build:client": "vite build --config config/vite/vite.config.ts",
     "build:server": "tsc -p tsconfig.server.json && node scripts/bake-server-build-id.mjs",
