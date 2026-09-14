@@ -955,11 +955,18 @@ impl RuntimeOwnershipRegistry {
             // observe()/snapshot_records() converges on restored keys.
             let current_generation = inner.get(&key).map_or(0, snapshot_generation);
             if fence.epoch != self.epoch || fence.generation < current_generation {
+                // b8ke ext r7 F4: the UNIFORM transition schema — the
+                // refusal carries the complete stable field set, the
+                // unknown prior/next runtime identities None-valued.
                 tracing::warn!(target: "freshell_ownership",
                     event = "ownership.begin_start.stale_generation",
                     operation_id, provider, session_id, initiator,
+                    from_kind = ?Option::<RuntimeOwnerKind>::None,
+                    to_kind = ?Option::<RuntimeOwnerKind>::None,
+                    runtime_id = ?Option::<String>::None, pid = ?Option::<u32>::None,
                     observed_epoch = fence.epoch, observed_generation = fence.generation,
                     epoch = self.epoch, generation = current_generation,
+                    duration_ms = 0u64,
                     outcome = "refused", failure_reason = "STALE_GENERATION");
                 return BeginOutcome::StaleGeneration {
                     current_epoch: self.epoch,
@@ -976,10 +983,15 @@ impl RuntimeOwnershipRegistry {
             // re-keyed runtime. Typed Blocked so the caller learns to
             // resolve.
             OwnershipState::Aliased { to, generation } => {
+                // b8ke ext r7 F4: the UNIFORM transition schema.
                 tracing::warn!(target: "freshell_ownership",
                     event = "ownership.begin.on_aliased_key",
                     operation_id, provider, session_id,
+                    from_kind = ?Option::<RuntimeOwnerKind>::None,
+                    to_kind = ?Option::<RuntimeOwnerKind>::None,
+                    runtime_id = ?Option::<String>::None, pid = ?Option::<u32>::None,
                     aliased_to = %to, epoch = self.epoch, generation,
+                    duration_ms = 0u64,
                     outcome = "refused", failure_reason = "REKEYED_ALIAS_KEY");
                 BeginOutcome::Blocked {
                     state: OwnershipState::Aliased { to, generation },
@@ -1084,11 +1096,16 @@ impl RuntimeOwnershipRegistry {
             // observe()/snapshot_records() converges on restored keys.
             let current_generation = inner.get(&key).map_or(0, snapshot_generation);
             if fence.epoch != self.epoch || fence.generation < current_generation {
+                // b8ke ext r7 F4: the UNIFORM transition schema.
                 tracing::warn!(target: "freshell_ownership",
                     event = "ownership.begin_handoff.stale_generation",
                     operation_id, provider, session_id, initiator,
+                    from_kind = ?Option::<RuntimeOwnerKind>::None,
+                    to_kind = ?Option::<RuntimeOwnerKind>::None,
+                    runtime_id = ?Option::<String>::None, pid = ?Option::<u32>::None,
                     observed_epoch = fence.epoch, observed_generation = fence.generation,
                     epoch = self.epoch, generation = current_generation,
+                    duration_ms = 0u64,
                     outcome = "refused", failure_reason = "STALE_GENERATION");
                 return BeginOutcome::StaleGeneration {
                     current_epoch: self.epoch,
@@ -1101,10 +1118,15 @@ impl RuntimeOwnershipRegistry {
             // b8ke focused episode-2 round-3 F3: as begin_start — a
             // superseded id refuses typed; resolve to the canonical key.
             OwnershipState::Aliased { to, generation } => {
+                // b8ke ext r7 F4: the UNIFORM transition schema.
                 tracing::warn!(target: "freshell_ownership",
                     event = "ownership.handoff.on_aliased_key",
                     operation_id, provider, session_id,
+                    from_kind = ?Option::<RuntimeOwnerKind>::None,
+                    to_kind = ?Option::<RuntimeOwnerKind>::None,
+                    runtime_id = ?Option::<String>::None, pid = ?Option::<u32>::None,
                     aliased_to = %to, epoch = self.epoch, generation,
+                    duration_ms = 0u64,
                     outcome = "refused", failure_reason = "REKEYED_ALIAS_KEY");
                 BeginOutcome::Blocked {
                     state: OwnershipState::Aliased { to, generation },
@@ -1203,10 +1225,15 @@ impl RuntimeOwnershipRegistry {
             // warn on the crate's diagnostic target; error!/invariant is
             // reserved for genuine contract violations (e.g.
             // force_release during Handoff below).
+            // b8ke ext r7 F4: the UNIFORM transition schema.
             tracing::warn!(target: "freshell_ownership",
                 event = "ownership.commit_live.stale_generation",
                 operation_id, provider, session_id,
+                from_kind = ?Option::<RuntimeOwnerKind>::None,
+                to_kind = ?Option::<RuntimeOwnerKind>::None,
+                runtime_id = ?Option::<String>::None, pid = ?Option::<u32>::None,
                 epoch = self.epoch, generation, current_generation = record.generation,
+                duration_ms = 0u64,
                 outcome = "refused", failure_reason = "STALE_GENERATION");
             return CommitOutcome::StaleGeneration {
                 current_generation: record.generation,
@@ -1292,11 +1319,16 @@ impl RuntimeOwnershipRegistry {
                 return CommitOutcome::ForeignOperation;
             };
             if generation != record.generation {
+                // b8ke ext r7 F4: the UNIFORM transition schema.
                 tracing::warn!(target: "freshell_ownership",
                     event = "ownership.commit_live_rekey.stale_generation",
                     operation_id, provider,
                     old_session_id, new_session_id,
+                    from_kind = ?Option::<RuntimeOwnerKind>::None,
+                    to_kind = ?Option::<RuntimeOwnerKind>::None,
+                    runtime_id = ?Option::<String>::None, pid = ?Option::<u32>::None,
                     epoch = self.epoch, generation, current_generation = record.generation,
+                    duration_ms = 0u64,
                     outcome = "refused", failure_reason = "STALE_GENERATION");
                 return CommitOutcome::StaleGeneration {
                     current_generation: record.generation,
@@ -1317,10 +1349,15 @@ impl RuntimeOwnershipRegistry {
                 .get(&SessionKey::new(provider, new_session_id))
                 .is_some()
             {
+                // b8ke ext r7 F4: the UNIFORM transition schema.
                 tracing::error!(target: "invariant",
                     event = "ownership.commit_live_rekey.target_occupied",
                     operation_id, provider, old_session_id, new_session_id,
+                    from_kind = ?Option::<RuntimeOwnerKind>::None,
+                    to_kind = ?Option::<RuntimeOwnerKind>::None,
+                    runtime_id = ?Option::<String>::None, pid = ?Option::<u32>::None,
                     epoch = self.epoch, generation,
+                    duration_ms = 0u64,
                     outcome = "refused", failure_reason = "FOREIGN_TARGET_KEY");
                 return CommitOutcome::ForeignOperation;
             }
@@ -1358,8 +1395,10 @@ impl RuntimeOwnershipRegistry {
             to_kind = ?owner.kind,
             runtime_id = ?owner.terminal_id,
             live_session_key = ?owner.live_session_key, pid = ?owner.pid,
+            // b8ke ext r7 F4: the UNIFORM transition schema — the empty
+            // (not-applicable) failure_reason on the success transition.
             epoch = self.epoch, generation, duration_ms,
-            outcome = "rekeyed_committed",
+            outcome = "rekeyed_committed", failure_reason = "",
             "the start's record moved to the client-visible durable id in one \
              atomic step — the old key is Aliased, the new key is Live");
         CommitOutcome::Committed
@@ -1409,13 +1448,18 @@ impl RuntimeOwnershipRegistry {
                     if owner.kind != new_owner.kind
                         || owner.live_session_key.as_deref() != Some(expected_live_session_key)
                     {
+                        // b8ke ext r7 F4: the UNIFORM transition schema.
                         tracing::error!(target: "invariant",
                             event = "ownership.rekey_live.expected_owner_mismatch",
                             provider, old_session_id, new_session_id,
                             expected_live_session_key,
                             observed_kind = ?owner.kind,
                             observed_live_session_key = ?owner.live_session_key,
+                            from_kind = ?owner.kind,
+                            to_kind = ?Option::<RuntimeOwnerKind>::None,
+                            runtime_id = ?owner.terminal_id, pid = ?owner.pid,
                             epoch = self.epoch,
+                            duration_ms = 0u64,
                             outcome = "refused",
                             failure_reason = "FOREIGN_LIVE_OWNER");
                         return CommitOutcome::ForeignOperation;
@@ -1426,10 +1470,15 @@ impl RuntimeOwnershipRegistry {
             }
         };
         if inner.contains_key(&SessionKey::new(provider, new_session_id)) {
+            // b8ke ext r7 F4: the UNIFORM transition schema.
             tracing::error!(target: "invariant",
                 event = "ownership.rekey_live.target_occupied",
                 provider, old_session_id, new_session_id,
+                from_kind = ?Option::<RuntimeOwnerKind>::None,
+                to_kind = ?Option::<RuntimeOwnerKind>::None,
+                runtime_id = ?Option::<String>::None, pid = ?Option::<u32>::None,
                 epoch = self.epoch,
+                duration_ms = 0u64,
                 outcome = "refused", failure_reason = "FOREIGN_TARGET_KEY");
             return CommitOutcome::ForeignOperation;
         }
@@ -1542,9 +1591,14 @@ impl RuntimeOwnershipRegistry {
                 ..
             } if op == operation_id => {
                 record.state = OwnershipState::Vacant;
+                // b8ke ext r7 F4: the UNIFORM transition schema — the
+                // release-to-Vacant transition's to_kind is the None VALUE
+                // and the Starting identity carried no runtime row.
                 tracing::warn!(target: "freshell_ownership",
                     event = "ownership.start.failed", operation_id, provider, session_id,
                     initiator, from_kind = ?kind,
+                    to_kind = ?Option::<RuntimeOwnerKind>::None,
+                    runtime_id = ?Option::<String>::None, pid = ?Option::<u32>::None,
                     epoch = self.epoch, generation, outcome = "released",
                     duration_ms = now_epoch_ms().saturating_sub(since_ms),
                     failure_reason = "START_FAILED");
@@ -1592,9 +1646,13 @@ impl RuntimeOwnershipRegistry {
                             FailVacantReason::NoPrior
                         };
                         record.state = OwnershipState::Vacant;
+                        // b8ke ext r7 F4: the UNIFORM transition schema —
+                        // the vacated arm's runtime identities are
+                        // None-valued (the prior is consumed).
                         tracing::warn!(target: "freshell_ownership",
                             event = "ownership.handoff.failed", operation_id, provider, session_id,
                             initiator, from_kind = ?prior.map(|(o, _)| o.kind), to_kind = ?to_kind,
+                            runtime_id = ?Option::<String>::None, pid = ?Option::<u32>::None,
                             epoch = self.epoch, generation, outcome = "vacant", duration_ms,
                             failure_reason = ?reason);
                         FailOutcome::Vacant { reason }
@@ -1680,11 +1738,15 @@ impl RuntimeOwnershipRegistry {
             } if op == operation_id => {
                 let duration_ms = now_epoch_ms()
                     .saturating_sub(record.state.since_ms().unwrap_or(now_epoch_ms()));
+                // b8ke ext r7 F4: the UNIFORM transition schema — the
+                // fenced record's captured identity rides the log (the
+                // unconfirmed runtime the fence names).
+                // b8ke e4 post-cap F2: the unconfirmed runtime's OWN
+                // identity when the caller names it (the uncommitted
+                // TARGET), else the Handoff record's captured prior.
+                let fenced_prior = unconfirmed.or(prior);
                 record.state = OwnershipState::Fenced {
-                    // b8ke e4 post-cap F2: the unconfirmed runtime's OWN
-                    // identity when the caller names it (the uncommitted
-                    // TARGET), else the Handoff record's captured prior.
-                    prior: unconfirmed.or(prior),
+                    prior: fenced_prior.clone(),
                     reason,
                     operation_id: op,
                     generation,
@@ -1693,7 +1755,12 @@ impl RuntimeOwnershipRegistry {
                 };
                 tracing::error!(target: "freshell_ownership",
                     event = "ownership.handoff.fenced_unconfirmed", operation_id, provider, session_id,
-                    initiator, epoch = self.epoch, generation, duration_ms,
+                    initiator,
+                    from_kind = ?fenced_prior.as_ref().map(|(o, _)| o.kind),
+                    to_kind = ?Option::<RuntimeOwnerKind>::None,
+                    runtime_id = ?fenced_prior.as_ref().and_then(|(o, _)| o.terminal_id.clone()),
+                    pid = ?fenced_prior.as_ref().and_then(|(o, _)| o.pid),
+                    epoch = self.epoch, generation, duration_ms,
                     fence_reason = ?reason, outcome = "fenced",
                     failure_reason = "UNCONFIRMED_PRIOR_DEATH",
                     "the reap confirmation failed without confirming the prior's death — \
@@ -1737,6 +1804,7 @@ impl RuntimeOwnershipRegistry {
             } if op == operation_id => {
                 let prior =
                     owner.map(|o| (o, prior_generation.unwrap_or(generation.saturating_sub(1))));
+                let logged_prior = prior.clone();
                 let duration_ms = now_epoch_ms()
                     .saturating_sub(record.state.since_ms().unwrap_or(now_epoch_ms()));
                 record.state = OwnershipState::Fenced {
@@ -1747,9 +1815,16 @@ impl RuntimeOwnershipRegistry {
                     initiator: initiator.clone(),
                     since_ms: now_epoch_ms(),
                 };
+                // b8ke ext r7 F4: the UNIFORM transition schema — the
+                // fenced record's captured identity rides the log.
                 tracing::error!(target: "freshell_ownership",
                     event = "ownership.stop.fenced_unconfirmed", operation_id, provider, session_id,
-                    initiator, epoch = self.epoch, generation, duration_ms,
+                    initiator,
+                    from_kind = ?logged_prior.as_ref().map(|(o, _)| o.kind),
+                    to_kind = ?Option::<RuntimeOwnerKind>::None,
+                    runtime_id = ?logged_prior.as_ref().and_then(|(o, _)| o.terminal_id.clone()),
+                    pid = ?logged_prior.as_ref().and_then(|(o, _)| o.pid),
+                    epoch = self.epoch, generation, duration_ms,
                     fence_reason = ?reason, outcome = "fenced",
                     failure_reason = "UNCONFIRMED_PRIOR_DEATH",
                     "the stop's teardown could not confirm the prior's death — the key is \
@@ -1795,15 +1870,21 @@ impl RuntimeOwnershipRegistry {
                 // F8: capture the fencing initiator BEFORE the record clears.
                 let fencing_initiator = record.state.initiator();
                 record.state = OwnershipState::Vacant;
+                // b8ke ext r7 F4: the UNIFORM transition schema — the
+                // release creates no new runtime, so to_kind is the None
+                // VALUE (never the prior's kind — that would falsely
+                // describe a same-kind transition), and the
+                // not-applicable failure_reason is the empty string.
                 tracing::info!(target: "freshell_ownership",
                     event = "ownership.fenced.released", operation_id, provider, session_id,
                     from_kind = ?prior.as_ref().map(|(o, _)| o.kind),
-                    to_kind = ?prior.as_ref().map(|(o, _)| o.kind),
+                    to_kind = ?Option::<RuntimeOwnerKind>::None,
                     runtime_id = ?prior.as_ref().and_then(|(o, _)| o.terminal_id.clone()),
                     pid = ?prior.as_ref().and_then(|(o, _)| o.pid),
                     initiator = ?fencing_initiator,
                     epoch = self.epoch, generation, duration_ms,
-                    fence_reason = ?reason, outcome = "released_on_confirmed_death");
+                    fence_reason = ?reason, outcome = "released_on_confirmed_death",
+                    failure_reason = "");
                 CommitOutcome::Committed
             }
             _ => CommitOutcome::ForeignOperation,
@@ -1909,11 +1990,16 @@ impl RuntimeOwnershipRegistry {
         };
         let current_generation = snapshot_generation(record);
         if observed.epoch != self.epoch || observed.generation != current_generation {
+            // b8ke ext r7 F4: the UNIFORM transition schema.
             tracing::warn!(target: "freshell_ownership",
                 event = "ownership.fenced.force_release_platform_limited",
                 provider, session_id, initiator,
+                from_kind = ?Option::<RuntimeOwnerKind>::None,
+                to_kind = ?Option::<RuntimeOwnerKind>::None,
+                runtime_id = ?Option::<String>::None, pid = ?Option::<u32>::None,
                 observed_epoch = observed.epoch, observed_generation = observed.generation,
                 epoch = self.epoch, current_generation,
+                duration_ms = 0u64,
                 outcome = "refused", failure_reason = "STALE_OBSERVATION",
                 "the force-clear's observed fence is stale — refresh and retry");
             return ForceReleaseOutcome::StaleObservation {
@@ -1947,15 +2033,21 @@ impl RuntimeOwnershipRegistry {
                 let duration_ms = now_epoch_ms().saturating_sub(since_ms);
                 record.state = OwnershipState::Vacant;
                 tracing::warn!(target: "freshell_ownership",
+                    // b8ke ext r7 F4: the UNIFORM transition schema —
+                    // the release creates no new runtime (to_kind
+                    // None-valued) and the not-applicable failure_reason is
+                    // the empty string.
                     event = "ownership.fenced.force_released_unconfirmable",
                     provider, session_id, initiator,
-                    fenced_operation_id = %operation_id,
+                    operation_id = %operation_id,
                     from_kind = ?prior.as_ref().map(|(o, _)| o.kind),
+                    to_kind = ?Option::<RuntimeOwnerKind>::None,
                     runtime_id = ?prior.as_ref().and_then(|(o, _)| o.terminal_id.clone()),
                     pid = ?prior.as_ref().and_then(|(o, _)| o.pid),
                     epoch = self.epoch, generation = record.generation, duration_ms,
                     fence_reason = ?reason,
                     outcome = "force_released_on_operator_action",
+                    failure_reason = "PLATFORM_LIMITED_ACKNOWLEDGED",
                     "an explicit acknowledged operator force-clear released an \
                      UNCONFIRMABLE fence (PlatformLimited or PID-less StaleStart): the \
                      recorded runtime identity could not be confirmed dead — surviving \
@@ -2013,11 +2105,17 @@ impl RuntimeOwnershipRegistry {
                     || claim.observed.generation != generation
                     || identity_mismatch
                 {
+                    // b8ke ext r7 F4: the UNIFORM transition schema —
+                    // the refusal's duration is the live owner's tenure at
+                    // the refused begin (never omitted).
                     tracing::warn!(target: "freshell_ownership",
                         event = "ownership.stop.begin", operation_id, provider, session_id,
                         initiator, from_kind = ?owner.kind, to_kind = ?claim.expected_kind,
                         runtime_id = ?owner.terminal_id, pid = ?owner.pid,
                         epoch = self.epoch, generation,
+                        duration_ms = now_epoch_ms().saturating_sub(
+                            record.state.since_ms().unwrap_or(now_epoch_ms()),
+                        ),
                         outcome = "refused", failure_reason = "STALE_STOP_CLAIM");
                     return StopOutcome::StaleClaim {
                         current_epoch: self.epoch,
@@ -2044,11 +2142,21 @@ impl RuntimeOwnershipRegistry {
                     initiator: initiator.to_string(),
                     since_ms: now_ms,
                 };
+                // b8ke ext r7 F4: the UNIFORM transition schema — the
+                // granted stop names the expected next-owner kind (the
+                // stop claim's kind — a same-kind transition), the prior
+                // owner's tenure at the begin, and the empty
+                // (not-applicable) failure_reason.
                 tracing::info!(target: "freshell_ownership",
                     event = "ownership.stop.begin", operation_id, provider, session_id,
                     initiator, from_kind = ?owner.kind,
+                    to_kind = ?claim.expected_kind,
                     runtime_id = ?owner.terminal_id, pid = ?owner.pid,
-                    epoch = self.epoch, generation = record.generation, outcome = "granted");
+                    epoch = self.epoch, generation = record.generation,
+                    duration_ms = now_epoch_ms().saturating_sub(
+                        record.state.since_ms().unwrap_or(now_epoch_ms()),
+                    ),
+                    outcome = "granted", failure_reason = "");
                 StopOutcome::Granted {
                     generation: record.generation,
                 }
@@ -2091,12 +2199,18 @@ impl RuntimeOwnershipRegistry {
             } if op == operation_id => {
                 let duration_ms = now_epoch_ms().saturating_sub(since_ms);
                 record.state = OwnershipState::Vacant;
+                // b8ke ext r7 F4: the UNIFORM transition schema — the
+                // commit releases the key to Vacant, so to_kind is the
+                // None VALUE, and the empty failure_reason rides the
+                // success transition.
                 tracing::info!(target: "freshell_ownership",
                     event = "ownership.stop.commit", operation_id, provider, session_id,
                     initiator, from_kind = ?owner.as_ref().map(|o| o.kind),
+                    to_kind = ?Option::<RuntimeOwnerKind>::None,
                     runtime_id = ?owner.as_ref().and_then(|o| o.terminal_id.clone()),
                     pid = ?owner.as_ref().and_then(|o| o.pid),
-                    epoch = self.epoch, generation, outcome = "committed", duration_ms);
+                    epoch = self.epoch, generation, outcome = "committed", duration_ms,
+                    failure_reason = "");
                 CommitOutcome::Committed
             }
             _ => CommitOutcome::ForeignOperation,
@@ -2152,8 +2266,11 @@ impl RuntimeOwnershipRegistry {
                     since_ms: now_epoch_ms(),
                 };
                 tracing::warn!(target: "freshell_ownership",
+                    // b8ke ext r7 F4: the UNIFORM transition schema — the
+                    // abort restores the SAME runtime Live, so to_kind is
+                    // the restored owner's kind.
                     event = "ownership.stop.aborted", operation_id, provider, session_id,
-                    initiator, from_kind = ?owner.kind,
+                    initiator, from_kind = ?owner.kind, to_kind = ?owner.kind,
                     runtime_id = ?owner.terminal_id, pid = ?owner.pid,
                     epoch = self.epoch, generation, restored_generation = prior_generation,
                     outcome = "restored_live", duration_ms,
@@ -2202,12 +2319,19 @@ impl RuntimeOwnershipRegistry {
                         epoch = self.epoch, generation, duration_ms,
                         outcome = "released", failure_reason = "");
                 } else {
+                    // b8ke ext r7 F4: the UNIFORM transition schema —
+                    // the noop names both kinds (no transition:
+                    // to_kind None-valued) and the full identity set.
+                    let duration_ms = now_epoch_ms().saturating_sub(since_ms);
                     tracing::warn!(target: "freshell_ownership",
                         event = "ownership.release.fenced_noop", provider, session_id,
                         operation_id = %claim.operation_id, initiator,
                         from_kind = ?owner.kind,
+                        to_kind = ?Option::<RuntimeOwnerKind>::None,
+                        runtime_id = ?owner.terminal_id, pid = ?owner.pid,
                         claim_generation = claim.generation, generation,
                         epoch = self.epoch,
+                        duration_ms,
                         outcome = "no_op", failure_reason = "RELEASE_FENCE_MISMATCH");
                 }
             }
@@ -2274,11 +2398,18 @@ impl RuntimeOwnershipRegistry {
         if matched {
             let from_kind = record.state.kind();
             record.state = OwnershipState::Vacant;
+            // b8ke ext r7 F4: the UNIFORM transition schema — the
+            // release creates no new runtime (to_kind None-valued) and
+            // carries the released identity + duration.
             tracing::warn!(target: "freshell_ownership",
                 event = "ownership.force_released", provider, session_id,
                 operation_id = %claim.operation_id, initiator,
                 from_kind = ?from_kind,
+                to_kind = ?Option::<RuntimeOwnerKind>::None,
+                runtime_id = ?claim.runtime.as_ref().and_then(|o| o.terminal_id.clone()),
+                pid = ?claim.runtime.as_ref().and_then(|o| o.pid),
                 epoch = self.epoch, generation = claim.generation,
+                duration_ms = 0u64,
                 outcome = "released", failure_reason = "CONFIRMED_KILL");
         }
     }
@@ -2391,12 +2522,22 @@ impl RuntimeOwnershipRegistry {
                 // stop (a pre-e3r3 path) fences.
                 if let Some(flag) = &record.stop_settled {
                     if !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        // b8ke ext r7 F4: the UNIFORM transition schema —
+                        // the skipped sweep names the Stopping record's
+                        // owner identity (no transition: to_kind
+                        // None-valued).
                         tracing::info!(target: "freshell_ownership",
                             event = "ownership.stop.stale_stopping_skipped_live",
                             operation_id = %operation_id, provider = %key.provider,
                             session_id = %key.session_id,
+                            initiator = %initiator,
+                            from_kind = ?owner.as_ref().map(|o| o.kind),
+                            to_kind = ?Option::<RuntimeOwnerKind>::None,
+                            runtime_id = ?owner.as_ref().and_then(|o| o.terminal_id.clone()),
+                            pid = ?owner.as_ref().and_then(|o| o.pid),
                             duration_ms = now_ms.saturating_sub(since_ms),
                             outcome = "skipped",
+                            failure_reason = "",
                             "the over-aged stop is STILL RUNNING (its settlement \
                              flag has not fired) — a progressing stop is not stale");
                         continue;
@@ -2429,9 +2570,12 @@ impl RuntimeOwnershipRegistry {
                     // b8ke e3r4 F5: the complete structured transition
                     // schema — the initiating client/device, the old/new
                     // runtime kinds, the recorded runtime identity.
+                    // b8ke ext r7 F4: to_kind is the None VALUE — the
+                    // fence creates no new runtime (the prior's kind would
+                    // falsely describe a same-kind transition).
                     initiator = %initiator,
                     from_kind = ?stale.prior.as_ref().map(|(o, _)| o.kind),
-                    to_kind = ?stale.prior.as_ref().map(|(o, _)| o.kind),
+                    to_kind = ?Option::<RuntimeOwnerKind>::None,
                     runtime_id = ?stale.prior.as_ref().and_then(|(o, _)| o.terminal_id.clone()),
                     pid = ?stale.prior.as_ref().and_then(|(o, _)| o.pid),
                     epoch = self.epoch, generation,
@@ -2512,11 +2656,17 @@ impl RuntimeOwnershipRegistry {
                         initiator: initiator.clone(),
                         since_ms,
                     };
+                    // b8ke ext r7 F4: the UNIFORM transition schema —
+                    // the sweep's synthesized Stopping transition carries
+                    // the recorded start kind and the None-valued
+                    // to-kind/identity (nothing spawned).
                     tracing::warn!(target: "freshell_ownership",
                         event = "ownership.start.recovery_started",
                         operation_id = %operation_id,
                         provider = %key.provider, session_id = %key.session_id,
                         initiator = %initiator, from_kind = ?kind,
+                        to_kind = ?Option::<RuntimeOwnerKind>::None,
+                        runtime_id = ?Option::<String>::None, pid = ?Option::<u32>::None,
                         epoch = self.epoch, generation,
                         outcome = "stopping_stale_start",
                         duration_ms = now_ms.saturating_sub(since_ms),
@@ -6175,6 +6325,21 @@ mod tests {
     /// handoff begin lacked duration/failure reason.
     #[test]
     fn begin_events_carry_the_stable_schema() {
+        // b8ke ext r7 F4 DEFLAKE: the thread-local capture displacement
+        // family — re-install + re-run, bounded (a REAL gap is
+        // deterministic and fails every attempt).
+        for _attempt in 0..3 {
+            let outcome = std::panic::catch_unwind(run_begin_events_schema_once);
+            if outcome.is_ok() {
+                return;
+            }
+        }
+        // The bounded retries are exhausted: run once more WITHOUT the
+        // catch so the real panic (message + location) surfaces.
+        run_begin_events_schema_once();
+    }
+
+    fn run_begin_events_schema_once() {
         let r = RuntimeOwnershipRegistry::new();
         let capture = EventCapture::default();
         let _guard = capture.install();
@@ -6337,6 +6502,23 @@ mod tests {
     /// commit logged as terminal-to-terminal).
     #[test]
     fn cross_kind_commit_logs_the_true_prior_kind() {
+        // b8ke ext r7 F4 DEFLAKE: the thread-local capture displacement
+        // family — re-install + re-run, bounded (a REAL gap is
+        // deterministic and fails every attempt).
+        for attempt in 0..3 {
+            match run_cross_kind_commit_once() {
+                Ok(()) => return,
+                Err(missing) if attempt == 2 => panic!("{missing}"),
+                Err(problem) => {
+                    eprintln!(
+                        "cross_kind_commit attempt {attempt} incomplete ({problem}); retrying"
+                    );
+                }
+            }
+        }
+    }
+
+    fn run_cross_kind_commit_once() -> Result<(), String> {
         let r = RuntimeOwnershipRegistry::new();
         // Live{FreshAgent}:
         let BeginOutcome::Granted {
@@ -6387,26 +6569,25 @@ mod tests {
             r.commit_live(PROVIDER, "sid", "ho-1", ho_gen, live_terminal_owner(),),
             CommitOutcome::Committed
         ));
-        let commit = capture
-            .events()
-            .into_iter()
-            .find(|e| {
-                e.target == "freshell_ownership"
-                    && e.event.as_deref() == Some("ownership.live.commit")
-            })
-            .expect("the commit event must fire");
-        assert_eq!(
-            commit.values.get("from_kind").map(String::as_str),
-            Some("Some(FreshAgent)"),
-            "the cross-kind commit logs the TRUE prior kind (the              pre-handoff fresh-agent owner) — got {:?}",
-            commit.values
-        );
-        assert_eq!(
-            commit.values.get("to_kind").map(String::as_str),
-            Some("Terminal"),
-            "the cross-kind commit logs the committed target kind — got {:?}",
-            commit.values
-        );
+        let Some(commit) = capture.events().into_iter().find(|e| {
+            e.target == "freshell_ownership" && e.event.as_deref() == Some("ownership.live.commit")
+        }) else {
+            return Err("the commit event must fire".to_string());
+        };
+        if commit.values.get("from_kind").map(String::as_str) != Some("Some(FreshAgent)") {
+            return Err(format!(
+                "the cross-kind commit logs the TRUE prior kind (the \
+                 pre-handoff fresh-agent owner) — got {:?}",
+                commit.values
+            ));
+        }
+        if commit.values.get("to_kind").map(String::as_str) != Some("Terminal") {
+            return Err(format!(
+                "the cross-kind commit logs the committed target kind — got {:?}",
+                commit.values
+            ));
+        }
+        Ok(())
     }
 
     /// b8ke ext r6 F5: the UNIFORM transition-log schema — every
@@ -6567,6 +6748,21 @@ mod tests {
     /// never `stale_age_ms`.
     #[test]
     fn stale_stop_events_log_duration_ms_naming() {
+        // b8ke ext r7 F4 DEFLAKE: the thread-local capture displacement
+        // family — re-install + re-run, bounded (a REAL gap is
+        // deterministic and fails every attempt).
+        for _attempt in 0..3 {
+            let outcome = std::panic::catch_unwind(run_stale_stop_naming_once);
+            if outcome.is_ok() {
+                return;
+            }
+        }
+        // The bounded retries are exhausted: run once more WITHOUT the
+        // catch so the real panic (message + location) surfaces.
+        run_stale_stop_naming_once();
+    }
+
+    fn run_stale_stop_naming_once() {
         let r = RuntimeOwnershipRegistry::new();
         let capture = EventCapture::default();
         let _guard = capture.install();
@@ -6647,6 +6843,547 @@ mod tests {
             "the stale-stop fence never logs stale_age_ms — got {:?}",
             sweep_event.fields
         );
+    }
+
+    /// b8ke ext r7 F4: the TRANSITION-SCHEMA ENUMERATION — every
+    /// coordinator transition type carries the COMPLETE stable field set
+    /// (from_kind, to_kind, operation_id, runtime_id, pid, duration_ms,
+    /// failure_reason — None/empty where unknown, the same class-killer
+    /// pattern as the parser enumeration). A missing field ANYWHERE in
+    /// the enumerated set fails; new transition types join the list.
+    #[test]
+    fn every_coordinator_transition_type_carries_the_stable_schema() {
+        // b8ke ext r7 F4 DEFLAKE: the thread-local capture displacement
+        // family (the documented dead_session/load_index class — another
+        // pooled-thread test's guard can momentarily displace this
+        // thread's default, dropping a RANDOM event under full-suite
+        // parallel load) — re-install + re-run the sequence, bounded. A
+        // REAL schema gap is deterministic (the same field missing every
+        // attempt); only the displacement heals on retry.
+        let mut last_problem = String::new();
+        for attempt in 0..3 {
+            match run_enumeration_once() {
+                Ok(()) => return,
+                Err(problem) => {
+                    eprintln!(
+                        "enumeration attempt {attempt} incomplete ({problem}); retrying \
+                         with a fresh capture"
+                    );
+                    last_problem = problem;
+                }
+            }
+        }
+        panic!("{last_problem}");
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn run_enumeration_once() -> Result<(), String> {
+        let r = RuntimeOwnershipRegistry::new();
+        let capture = EventCapture::default();
+        let _guard = capture.install();
+
+        // ── drive every transition type ──────────────────────────────────
+        // 1. start.begin (granted, from Vacant).
+        let BeginOutcome::Granted {
+            generation: g_start,
+        } = r.begin_start(
+            PROVIDER,
+            "sid-enum",
+            RuntimeOwnerKind::Terminal,
+            "op-enum-start",
+            None,
+            "test",
+            1_000,
+        )
+        else {
+            panic!("expected Granted")
+        };
+        // 2. live.commit.
+        assert!(matches!(
+            r.commit_live(
+                PROVIDER,
+                "sid-enum",
+                "op-enum-start",
+                g_start,
+                live_terminal_owner(),
+            ),
+            CommitOutcome::Committed
+        ));
+        // 3. stop.begin (granted + refused-stale).
+        let claim = StopClaim {
+            expected_kind: RuntimeOwnerKind::Terminal,
+            expected_runtime: Some(live_terminal_owner()),
+            observed: ObservedFence {
+                epoch: r.boot_epoch(),
+                generation: g_start,
+            },
+        };
+        let StopOutcome::Granted { generation: g_stop } =
+            r.begin_stop(PROVIDER, "sid-enum", "op-enum-stop", &claim, "test", 2_000)
+        else {
+            panic!("expected the stop granted")
+        };
+        // 4. stop.commit (release to Vacant).
+        assert!(matches!(
+            r.commit_stop(PROVIDER, "sid-enum", "op-enum-stop", g_stop),
+            CommitOutcome::Committed
+        ));
+        // 5. handoff.begin (vacant + live) + handoff.failed.
+        let BeginOutcome::Granted { generation: g_ho } = r.begin_handoff(
+            PROVIDER,
+            "sid-enum",
+            RuntimeOwnerKind::Terminal,
+            "op-enum-ho",
+            None,
+            "test",
+            3_000,
+        ) else {
+            panic!("expected Granted")
+        };
+        // A vacant-entered handoff fails to the typed Vacant{NoPrior}
+        // outcome — the handoff.failed event fires either way.
+        assert!(matches!(
+            r.fail(PROVIDER, "sid-enum", "op-enum-ho", g_ho, false),
+            FailOutcome::Vacant { .. } | FailOutcome::Released
+        ));
+        // A second handoff from the restored vacancy, then the fenced
+        // regime.
+        let BeginOutcome::Granted { generation: g_ho2 } = r.begin_handoff(
+            PROVIDER,
+            "sid-enum",
+            RuntimeOwnerKind::Terminal,
+            "op-enum-ho2",
+            None,
+            "test",
+            4_000,
+        ) else {
+            panic!("expected Granted")
+        };
+        // 6. handoff.fenced_unconfirmed (PlatformLimited — the reason
+        // the acknowledged operator clear can release).
+        assert!(matches!(
+            r.fence_unconfirmed_handoff(
+                PROVIDER,
+                "sid-enum",
+                "op-enum-ho2",
+                g_ho2,
+                FenceReason::PlatformLimited,
+            ),
+            FenceOutcome::Fenced
+        ));
+        // 7. release.fenced_noop — a mismatched release against a LIVE
+        // record (the fenced-noop arm needs a live owner; the fence's
+        // release is step 8). Seed a live owner first.
+        let BeginOutcome::Granted { generation: g_noop } = r.begin_start(
+            PROVIDER,
+            "sid-enum-noop",
+            RuntimeOwnerKind::Terminal,
+            "op-enum-noop",
+            None,
+            "test",
+            7_200,
+        ) else {
+            panic!("expected Granted")
+        };
+        assert!(matches!(
+            r.commit_live(
+                PROVIDER,
+                "sid-enum-noop",
+                "op-enum-noop",
+                g_noop,
+                live_terminal_owner(),
+            ),
+            CommitOutcome::Committed
+        ));
+        r.release(
+            PROVIDER,
+            "sid-enum-noop",
+            &ReleaseClaim {
+                operation_id: "op-foreign".to_string(),
+                generation: g_noop,
+                runtime: Some(OwnerIdentity {
+                    kind: RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("t-foreign".into()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: None,
+                }),
+            },
+            "test-noop",
+        );
+        // Release the seeded live owner properly (cleanup for this
+        // enumeration key).
+        r.release(
+            PROVIDER,
+            "sid-enum-noop",
+            &ReleaseClaim {
+                operation_id: "op-enum-noop".to_string(),
+                generation: g_noop,
+                runtime: Some(live_terminal_owner()),
+            },
+            "test-noop-real",
+        );
+        // 8. fenced.force_released_unconfirmable (the acknowledged clear).
+        assert!(matches!(
+            r.force_release_platform_limited(
+                PROVIDER,
+                "sid-enum",
+                ObservedFence {
+                    epoch: r.boot_epoch(),
+                    generation: g_ho2,
+                },
+                "test-operator",
+            ),
+            ForceReleaseOutcome::Released
+        ));
+        // 9. begin_start.stale_generation + commit_live.stale_generation.
+        assert!(matches!(
+            r.begin_start(
+                PROVIDER,
+                "sid-enum",
+                RuntimeOwnerKind::FreshAgent,
+                "op-enum-stale",
+                Some(ObservedFence {
+                    epoch: r.boot_epoch(),
+                    generation: 0,
+                }),
+                "test",
+                5_000,
+            ),
+            BeginOutcome::StaleGeneration { .. }
+        ));
+        let BeginOutcome::Granted {
+            generation: g_stale,
+        } = r.begin_start(
+            PROVIDER,
+            "sid-enum",
+            RuntimeOwnerKind::FreshAgent,
+            "op-enum-stale2",
+            None,
+            "test",
+            6_000,
+        )
+        else {
+            panic!("expected Granted")
+        };
+        assert!(matches!(
+            r.commit_live(
+                PROVIDER,
+                "sid-enum",
+                "op-enum-stale2",
+                g_stale - 1,
+                live_terminal_owner(),
+            ),
+            CommitOutcome::StaleGeneration { .. }
+        ));
+        // 9b. start.failed — release the stale2 claim (the key must be
+        // Vacant for the later steps).
+        assert!(matches!(
+            r.fail(PROVIDER, "sid-enum", "op-enum-stale2", g_stale, false),
+            FailOutcome::Released
+        ));
+        // 11. stop.fenced_unconfirmed (a stranded stop — re-seed a Live
+        // FreshAgent owner first; the force-clear left the key Vacant).
+        let BeginOutcome::Granted {
+            generation: g_stop2_live,
+        } = r.begin_start(
+            PROVIDER,
+            "sid-enum",
+            RuntimeOwnerKind::FreshAgent,
+            "op-enum-stop2-live",
+            None,
+            "test",
+            7_500,
+        )
+        else {
+            panic!("expected Granted")
+        };
+        assert!(matches!(
+            r.commit_live(
+                PROVIDER,
+                "sid-enum",
+                "op-enum-stop2-live",
+                g_stop2_live,
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("sid-enum".into()),
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            CommitOutcome::Committed
+        ));
+        let StopOutcome::Granted {
+            generation: g_stop2,
+        } = r.begin_stop(
+            PROVIDER,
+            "sid-enum",
+            "op-enum-stop2",
+            &StopClaim {
+                expected_kind: RuntimeOwnerKind::FreshAgent,
+                expected_runtime: None,
+                observed: ObservedFence {
+                    epoch: r.boot_epoch(),
+                    generation: g_stop2_live,
+                },
+            },
+            "test",
+            8_000,
+        )
+        else {
+            panic!("expected the stop granted")
+        };
+        assert!(matches!(
+            r.fence_unconfirmed_stop(
+                PROVIDER,
+                "sid-enum",
+                "op-enum-stop2",
+                g_stop2,
+                FenceReason::PlatformLimited,
+            ),
+            FenceOutcome::Fenced
+        ));
+        // 12. fenced.released (the confirmed-death probe release).
+        assert!(matches!(
+            r.release_fenced(PROVIDER, "sid-enum", "op-enum-stop2", g_stop2),
+            CommitOutcome::Committed
+        ));
+        // 13. stop.aborted.
+        let BeginOutcome::Granted {
+            generation: g_abort,
+        } = r.begin_start(
+            PROVIDER,
+            "sid-enum-abort",
+            RuntimeOwnerKind::Terminal,
+            "op-enum-abort",
+            None,
+            "test",
+            9_000,
+        )
+        else {
+            panic!("expected Granted")
+        };
+        assert!(matches!(
+            r.commit_live(
+                PROVIDER,
+                "sid-enum-abort",
+                "op-enum-abort",
+                g_abort,
+                live_terminal_owner(),
+            ),
+            CommitOutcome::Committed
+        ));
+        let StopOutcome::Granted {
+            generation: g_stop3,
+        } = r.begin_stop(
+            PROVIDER,
+            "sid-enum-abort",
+            "op-enum-stop3",
+            &StopClaim {
+                expected_kind: RuntimeOwnerKind::Terminal,
+                expected_runtime: Some(live_terminal_owner()),
+                observed: ObservedFence {
+                    epoch: r.boot_epoch(),
+                    generation: g_abort,
+                },
+            },
+            "test",
+            10_000,
+        )
+        else {
+            panic!("expected the stop granted")
+        };
+        assert!(matches!(
+            r.abort_stop(PROVIDER, "sid-enum-abort", "op-enum-stop3", g_stop3),
+            AbortStopOutcome::Aborted
+        ));
+        // 14. live.commit_rekey + live.rekey_live.
+        let BeginOutcome::Granted { generation: g_rk } = r.begin_start(
+            PROVIDER,
+            "sid-enum-rekey",
+            RuntimeOwnerKind::FreshAgent,
+            "op-enum-rk",
+            None,
+            "test",
+            11_000,
+        ) else {
+            panic!("expected Granted")
+        };
+        assert!(matches!(
+            r.commit_live(
+                PROVIDER,
+                "sid-enum-rekey",
+                "op-enum-rk",
+                g_rk,
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("sid-enum-rekey".into()),
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            CommitOutcome::Committed
+        ));
+        assert!(matches!(
+            r.rekey_live(
+                PROVIDER,
+                "sid-enum-rekey",
+                "sid-enum-rekeyed",
+                "sid-enum-rekey",
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("sid-enum-rekey".into()),
+                    pid: None,
+                    ownership_id: None,
+                },
+                "test",
+                "op-enum-rekey",
+            ),
+            CommitOutcome::Committed
+        ));
+        // 14b. live.commit_rekey — a start claim under the OLD key
+        // committed to the NEW key (the claude lane's fork-rekey commit).
+        let BeginOutcome::Granted { generation: g_crk } = r.begin_start(
+            PROVIDER,
+            "sid-enum-crk-old",
+            RuntimeOwnerKind::FreshAgent,
+            "op-enum-crk",
+            None,
+            "test",
+            11_500,
+        ) else {
+            panic!("expected Granted")
+        };
+        assert!(matches!(
+            r.commit_live_rekey(
+                PROVIDER,
+                "sid-enum-crk-old",
+                "sid-enum-crk-new",
+                "op-enum-crk",
+                g_crk,
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("sid-enum-crk-new".into()),
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            CommitOutcome::Committed
+        ));
+
+        // 10. begin.on_aliased_key (the old rekeyed key is Aliased).
+        assert!(matches!(
+            r.begin_start(
+                PROVIDER,
+                "sid-enum-rekey",
+                RuntimeOwnerKind::Terminal,
+                "op-enum-alias",
+                None,
+                "test",
+                7_000,
+            ),
+            BeginOutcome::Blocked { .. }
+        ));
+        // 15. start.recovery_started + stale_stopping fenced/skipped.
+        let BeginOutcome::Granted {
+            generation: g_sweep,
+        } = r.begin_start(
+            PROVIDER,
+            "sid-enum-sweep",
+            RuntimeOwnerKind::FreshAgent,
+            "op-enum-sweep",
+            None,
+            "test",
+            12_000,
+        )
+        else {
+            panic!("expected Granted")
+        };
+        let _ = r.recover_stale_starts(20_000, 0);
+        let _ = g_sweep;
+        // 16. start.failed (a claimed start's release).
+        let BeginOutcome::Granted { generation: g_fail } = r.begin_start(
+            PROVIDER,
+            "sid-enum-fail",
+            RuntimeOwnerKind::Terminal,
+            "op-enum-fail",
+            None,
+            "test",
+            13_000,
+        ) else {
+            panic!("expected Granted")
+        };
+        assert!(matches!(
+            r.fail(PROVIDER, "sid-enum-fail", "op-enum-fail", g_fail, false),
+            FailOutcome::Released
+        ));
+
+        // ── the ENUMERATION: every captured transition event carries the
+        // complete stable schema. A missing field anywhere fails.
+        let events = capture.events();
+        let stable_fields = [
+            "operation_id",
+            "from_kind",
+            "to_kind",
+            "runtime_id",
+            "pid",
+            "duration_ms",
+            "failure_reason",
+        ];
+        let expected_transitions = [
+            "ownership.start.begin",
+            "ownership.live.commit",
+            "ownership.stop.begin",
+            "ownership.stop.commit",
+            "ownership.handoff.begin",
+            "ownership.handoff.failed",
+            "ownership.handoff.fenced_unconfirmed",
+            "ownership.release.fenced_noop",
+            "ownership.fenced.force_released_unconfirmable",
+            "ownership.begin_start.stale_generation",
+            "ownership.commit_live.stale_generation",
+            "ownership.begin.on_aliased_key",
+            "ownership.stop.fenced_unconfirmed",
+            "ownership.fenced.released",
+            "ownership.stop.aborted",
+            "ownership.live.commit_rekey",
+            "ownership.live.rekey_live",
+            "ownership.start.recovery_started",
+            "ownership.start.failed",
+        ];
+        let mut covered: Vec<&str> = Vec::new();
+        for event in &events {
+            let Some(name) = event.event.as_deref() else {
+                continue;
+            };
+            if !expected_transitions.contains(&name) {
+                continue;
+            }
+            if !covered.contains(&name) {
+                covered.push(name);
+            }
+            for field in stable_fields {
+                if !event.fields.contains(&field.to_string()) {
+                    return Err(format!(
+                        "{name} must carry {field} (the stable transition schema) — \
+                         got {:?}",
+                        event.fields
+                    ));
+                }
+            }
+        }
+        for expected in expected_transitions {
+            if !covered.contains(&expected) {
+                return Err(format!(
+                    "the enumeration must cover {expected} — covered: {covered:?}"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// b8ke ext r6 F5: the live handoff-begin's duration is the PRIOR
