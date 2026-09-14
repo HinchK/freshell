@@ -385,6 +385,46 @@ fn union_positions_keys_by_first_seen_source_and_content_by_dedupe_rank() {
 }
 ```
 
+And add the tie-break determinism test (RED at base — the explicit `Multi-client unions must remain deterministic` constraint made checkable):
+
+```rust
+#[test]
+fn union_source_order_is_deterministic_when_captured_at_and_revision_tie() {
+    // Determinism made CHECKABLE, not probabilistic: both clients push at
+    // the same capturedAt and revision, so the source ranking falls through
+    // to clientInstanceId ("clientA" < "clientB") — a total order that
+    // HashMap iteration must never decide. The write order below is
+    // deliberately reversed (B's file created before A's) to also prove the
+    // union normalizes file-scan order through its input ranking. Expected
+    // first-seen order: clientA's [dev:z1, dev:a2], then clientB's [dev:m3].
+    let dir = tempfile::tempdir().unwrap();
+    put(
+        dir.path(),
+        "dev",
+        "clientB",
+        1,
+        1000,
+        vec![open_record("dev:m3", "M3", 10)],
+    );
+    put(
+        dir.path(),
+        "dev",
+        "clientA",
+        1,
+        1000,
+        vec![open_record("dev:z1", "Z1", 10), open_record("dev:a2", "A2", 10)],
+    );
+    let out = union(dir.path(), "dev").unwrap();
+    let keys: Vec<&str> = out["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["tabKey"].as_str())
+        .collect();
+    assert_eq!(keys, vec!["dev:z1", "dev:a2", "dev:m3"]);
+}
+```
+
 And flip the one incidental order pin in `union_by_ids_resolves_exact_generation_files_when_digests_repeat_across_clients` (~:1013-1019) — replace:
 
 ```rust
@@ -405,7 +445,7 @@ with:
 
 Run: `cargo test -p freshell-ws --lib tabs_persist`
 
-Expected: FAIL — `union_preserves_the_newest_sources_pushed_record_order` receives `["dev:k1", "dev:k2", "dev:k3"]`; `union_positions_keys_by_first_seen_source_and_content_by_dedupe_rank` receives the tabKey-sorted `["dev:w", "dev:x", "dev:y", "dev:z"]`; the flipped bundle test receives `["dev:x", "dev:y"]`. All three fail because the tabKey sort still governs, not for setup/syntax reasons.
+Expected: FAIL — `union_preserves_the_newest_sources_pushed_record_order` receives `["dev:k1", "dev:k2", "dev:k3"]`; `union_positions_keys_by_first_seen_source_and_content_by_dedupe_rank` receives the tabKey-sorted `["dev:w", "dev:x", "dev:y", "dev:z"]`; `union_source_order_is_deterministic_when_captured_at_and_revision_tie` receives the tabKey-sorted `["dev:a2", "dev:m3", "dev:z1"]`; the flipped bundle test receives `["dev:x", "dev:y"]`. All four fail because the tabKey sort still governs, not for setup/syntax reasons.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -432,12 +472,13 @@ with:
     // ranked newest-first by the same tuple `label_src` uses, so HashMap
     // iteration order never decides user-visible record order (the
     // determinism the old `sort_by_key(tabKey)` existed to provide).
-    // sort_by_key computes the ranking tuple ONCE per source — required,
-    // not a nicety: snapshot_generation_id canonicalizes, serializes, and
-    // hashes the WHOLE generation document, which a comparator would
-    // otherwise redo for both operands on every comparison.
+    // sort_by_cached_key — NOT sort_by_key — because the ranking tuple
+    // includes snapshot_generation_id, which canonicalizes, serializes, and
+    // hashes the WHOLE generation document (potentially ~1 MiB):
+    // sort_by_cached_key evaluates it at most once per source; sort_by_key
+    // would re-evaluate it O(n log n) times.
     let mut sources: Vec<(&String, &(i64, PathBuf, Value))> = newest.iter().collect();
-    sources.sort_by_key(|(client, gen)| {
+    sources.sort_by_cached_key(|(client, gen)| {
         let snap: &Value = &gen.2;
         std::cmp::Reverse((
             captured_at(snap),
@@ -471,43 +512,11 @@ Keep the surrounding code (label_src selection, the `by_key` rank loop) byte-ide
 
 Run: `cargo test -p freshell-ws --lib tabs_persist`
 
-Expected: PASS (the two new tests, the flipped bundle test, and every existing tabs_persist test).
+Expected: PASS (the three new tests, the flipped bundle test, and every existing tabs_persist test).
 
 - [ ] **Step 5: Refactor while green**
 
-Add the determinism pin (green before and after; protects the new emission's core guarantee):
-
-```rust
-#[test]
-fn union_record_order_is_independent_of_file_scan_order() {
-    // Same generations written in reverse creation order must union to the
-    // SAME record order: the first-seen rule ranks SOURCES, never files or
-    // scan order (the determinism contract of the user request).
-    let build = |reverse: bool| {
-        let dir = tempfile::tempdir().unwrap();
-        let a = vec![open_record("dev:x", "X", 10), open_record("dev:y", "Y-old", 10)];
-        let b = vec![
-            open_record("dev:z", "Z", 10),
-            open_record("dev:y", "Y-new", 5000),
-            open_record("dev:w", "W", 10),
-        ];
-        let mut writes: Vec<(&str, i64, Vec<Value>)> = vec![
-            ("clientA", 2000, a),
-            ("clientB", 1000, b),
-        ];
-        if reverse {
-            writes.reverse();
-        }
-        for (client, captured, recs) in writes {
-            put(dir.path(), "dev", client, 1, captured, recs);
-        }
-        union(dir.path(), "dev").unwrap()
-    };
-    assert_eq!(build(false), build(true));
-}
-```
-
-No other refactor: the change is already minimal and sits inside the existing function.
+No other refactor: the change is already minimal and sits inside the existing function. (The determinism coverage is the tie-break test added in Step 1 — a controlled tie on `(capturedAt, snapshotRevision)` resolved by `clientInstanceId`, with the write order deliberately reversed; it makes the determinism constraint checkable instead of probabilistic.)
 
 - [ ] **Step 6: Run impacted-test verification**
 
