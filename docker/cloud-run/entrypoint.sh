@@ -81,6 +81,34 @@ SPECS_DIR="test/e2e-browser/specs"
 DURATIONS_FILE="docker/cloud-run/test-durations.txt"
 DEFAULT_DURATION=30
 
+# Cloud Run deletes a task's filesystem on exit. Preserve the first failed
+# attempt of a recovered retry in Cloud Logging before that can happen. The
+# cloud config writes a JSON report only when this task-scoped path is set.
+RETRY_REPORT_PATH="/tmp/freshell-e2e-retry-report-task-${TASK_INDEX}.json"
+
+run_playwright_with_retry_receipt() {
+  rm -f "$RETRY_REPORT_PATH"
+
+  local status=0
+  if FRESHELL_CLOUD_RETRY_REPORT_PATH="$RETRY_REPORT_PATH" \
+    npx playwright test --config "$CONFIG" "$@"; then
+    status=0
+  else
+    status=$?
+  fi
+
+  # A missing or unreadable report would recreate the observability gap. Fail
+  # closed even when Playwright recovered, rather than printing a misleading
+  # green Cloud receipt with no first-attempt evidence.
+  if ! node scripts/e2e-cloud-retry-receipt.mjs "$RETRY_REPORT_PATH"; then
+    log_json error e2e_retry_evidence_export_failed "Could not retain Playwright retry evidence before task exit."
+    rm -f "$RETRY_REPORT_PATH"
+    return 70
+  fi
+  rm -f "$RETRY_REPORT_PATH"
+  return "$status"
+}
+
 # ---------------------------------------------------------------------------
 # Parse args: separate flags from spec-path filters, intercept --dry-run.
 # ---------------------------------------------------------------------------
@@ -124,7 +152,8 @@ if [ "$TASK_COUNT" -eq 1 ]; then
   fi
   echo "[e2e-entrypoint] Running all tests (single task)"
   echo "[e2e-entrypoint] Playwright args: ${FLAGS[*]-} ${SPEC_FILTERS[*]-}"
-  exec npx playwright test --config "$CONFIG" "${FLAGS[@]}" "${SPEC_FILTERS[@]}"
+  run_playwright_with_retry_receipt "${FLAGS[@]}" "${SPEC_FILTERS[@]}"
+  exit $?
 fi
 
 # ---------------------------------------------------------------------------
@@ -256,4 +285,4 @@ done
 echo "[e2e-entrypoint] Playwright flags: ${FLAGS[*]-}"
 echo "[e2e-entrypoint] Exec: npx playwright test --config ${CONFIG} ${FLAGS[*]-} ${MY_SPEC_PATHS[*]}"
 
-exec npx playwright test --config "$CONFIG" "${FLAGS[@]}" "${MY_SPEC_PATHS[@]}"
+run_playwright_with_retry_receipt "${FLAGS[@]}" "${MY_SPEC_PATHS[@]}"

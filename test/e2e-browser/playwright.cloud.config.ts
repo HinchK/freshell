@@ -74,6 +74,11 @@ const CLOUD_SKIP_TITLES = [
   /new JS asset after the click/,
 ]
 
+// The Cloud Run entrypoint sets this per task. The JSON report is consumed
+// before the container exits so recovered retries can be retained in Cloud
+// Logging instead of disappearing with the task filesystem.
+const retryEvidenceReportPath = process.env.FRESHELL_CLOUD_RETRY_REPORT_PATH
+
 export default defineConfig({
   ...baseConfig,
   globalSetup: undefined,
@@ -81,7 +86,11 @@ export default defineConfig({
   forbidOnly: true,
   retries: 2,
   workers: 2,
-  reporter: [['line'], ['html', { open: 'never' }]],
+  reporter: [
+    ['line'],
+    ['html', { open: 'never' }],
+    ...(retryEvidenceReportPath ? [['json', { outputFile: retryEvidenceReportPath }]] : []),
+  ],
   grepInvert: CLOUD_SKIP_TITLES,
   projects: (baseConfig.projects ?? [])
     .filter(

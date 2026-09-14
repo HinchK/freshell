@@ -589,8 +589,20 @@ cmd_run() {
   local log_output
   log_output=$(gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" 2>/dev/null || true)
 
-  # Print full log output from ALL shards.
-  echo "$log_output"
+  # Print logs from every shard. Retry traces are retained as bounded base64
+  # JSONL chunks in Cloud Logging; redact their bytes here so a successful
+  # retry's terminal receipt remains readable while retaining the immutable
+  # artifact id and first-attempt stack in the underlying logs.
+  local display_log_output
+  display_log_output=$(printf '%s\n' "$log_output" | sed -E \
+    '/"event":"e2e_playwright_retry_trace_chunk"/ s/("data":")[^"]*/\1<retained-in-cloud-logging>/' )
+  echo "$display_log_output"
+
+  local retry_evidence_count
+  retry_evidence_count=$(printf '%s\n' "$log_output" | grep -c '"event":"e2e_playwright_retry_evidence"' || true)
+  if [ "$retry_evidence_count" -gt 0 ]; then
+    echo "[e2e-cloud] Recovered Playwright retry evidence retained in Cloud Logging (${retry_evidence_count} case(s)); see the e2e_playwright_retry_evidence artifact id(s) above."
+  fi
 
   # Extract and display a per-shard summary from the Playwright output.
   # Each shard's entrypoint prints "Shard X/Y assignment" and Playwright's
@@ -640,6 +652,15 @@ cmd_run() {
   # ran zero tests).
   if [ "$succeeded" != "$shards" ]; then
     echo "[e2e-cloud] ERROR: expected $shards succeeded task(s), got $succeeded."
+    exit 1
+  fi
+
+  # Playwright retries are useful diagnostics, but a task that passes only on
+  # retry is not a zero-flake release receipt. The structured evidence above
+  # names the exact first failure and durable trace artifact before failing the
+  # wrapper; retry policy itself remains unchanged.
+  if [ "$retry_evidence_count" -gt 0 ]; then
+    echo "[e2e-cloud] ERROR: recovered Playwright retry evidence prevents a zero-flake cloud receipt."
     exit 1
   fi
 
