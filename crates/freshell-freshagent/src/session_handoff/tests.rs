@@ -3384,8 +3384,14 @@ async fn a_platform_limited_fence_recovers_only_through_the_acknowledged_force_c
         "the typed clear is NOT a handoff success — no owner is committed"
     );
     match rig.ownership.observe("claude", &sid).state {
-        OwnershipState::Vacant => {}
-        other => panic!("the force-clear must leave the key Vacant, got {other:?}"),
+        // b8ke ext r16 F4: the force-clear lands in the TYPED
+        // cleared-unverified state — never plain Vacant (the clear is
+        // not permission to start a writer over the unverified tree).
+        OwnershipState::Fenced {
+            reason: FenceReason::ClearedUnverified,
+            ..
+        } => {}
+        other => panic!("the force-clear must leave the key cleared-unverified, got {other:?}"),
     }
     // No handoff-started frame rode the clear (no handoff ran), and the
     // cleared state was broadcast for cross-device convergence.
@@ -3430,13 +3436,16 @@ async fn a_platform_limited_fence_recovers_only_through_the_acknowledged_force_c
     // needed here).
 }
 
-/// b8ke ext r12 F1 (c): the re-initiated handoff — a SEPARATE, explicit
-/// user request after the clear (never an automatic clear-then-start
-/// chain) — proceeds through the coordinator FRESH, as any new request
-/// would: the key is Vacant, so the runner starts the terminal target
-/// fresh from the durable session and commits it.
-#[tokio::test]
-async fn a_post_clear_user_initiated_handoff_proceeds_fresh() {
+/// b8ke ext r16 F4: the acknowledged PlatformLimited clear lands in the
+/// TYPED cleared-unverified state (never plain Vacant). The
+/// banner-initiated "Start reopen again" handoff proceeds BECAUSE it
+/// carries the acknowledged-risk arm (the acknowledgment recorded at the
+/// START); a NAIVE unacknowledged handoff on the cleared-unverified key
+/// refuses typed (pre-r16 the clear landed plain-Vacant, so a good-faith
+/// user following the offered recovery could start a second writer
+/// beside a surviving descendant without any acknowledgment).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_cleared_unverified_state_requires_the_acknowledged_start() {
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
     let _env = FakeSidecarEnv::install();
@@ -3444,23 +3453,13 @@ async fn a_post_clear_user_initiated_handoff_proceeds_fresh() {
     let rig = build_rig_with_options(None, None, None, 8_000, None, true);
     establish_fresh_claude_owner(&rig, &sid).await;
 
-    // Fence PlatformLimited (the 3i shape).
+    // Fence PlatformLimited (the 3i shape) and take the acknowledged clear.
     let handle = rig
         .runner
         .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
     let result = handle.completion.await.expect("runner completed");
     assert_eq!(result["error"]["code"], json!("PLATFORM_LIMITED"));
     let snap = rig.ownership.observe("claude", &sid);
-    assert!(matches!(
-        snap.state,
-        OwnershipState::Fenced {
-            reason: FenceReason::PlatformLimited,
-            ..
-        }
-    ));
-
-    // The acknowledged clear (the operator action) — the recovery STOPS
-    // here.
     let mut clear_req = handoff_req_terminal("claude", &sid, "claude");
     clear_req.acknowledge_platform_limited_risk = true;
     clear_req.observed_epoch = Some(snap.epoch);
@@ -3469,22 +3468,50 @@ async fn a_post_clear_user_initiated_handoff_proceeds_fresh() {
     let cleared = clear.completion.await.expect("force-clear completed");
     assert_eq!(cleared["ok"], json!(true));
     assert_eq!(cleared["cleared"], json!("platform-limited-fence"));
+    // THE TYPED LANDING: cleared-unverified, never plain Vacant.
     assert!(matches!(
         rig.ownership.observe("claude", &sid).state,
-        OwnershipState::Vacant
+        OwnershipState::Fenced {
+            reason: FenceReason::ClearedUnverified,
+            ..
+        }
     ));
 
-    // THE USER-INITIATED RE-INITIATION: a brand-new handoff request (the
-    // explicit affordance's action; nothing chained it) — the coordinator
-    // treats it as any fresh request from the now-Vacant key.
-    let retry = rig
+    // THE NAIVE HANDOFF (no acknowledgment): typed refusal — the clear is
+    // not permission to start a writer over the unverified tree.
+    let naive = rig
         .runner
         .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
-    let retried = retry.completion.await.expect("retry completed");
+    let naive_result = naive.completion.await.expect("naive completed");
+    assert_eq!(
+        naive_result["error"]["code"],
+        json!("CLEARED_UNVERIFIED_FENCED"),
+        "the naive handoff on the cleared-unverified key refuses typed: {naive_result}"
+    );
+    assert!(matches!(
+        rig.ownership.observe("claude", &sid).state,
+        OwnershipState::Fenced {
+            reason: FenceReason::ClearedUnverified,
+            ..
+        }
+    ));
+
+    // THE BANNER-INITIATED START (acknowledged): the handoff proceeds —
+    // the acknowledgment attaches to the START and vacates the state.
+    let clear_snap = rig.ownership.observe("claude", &sid);
+    let mut ack_req = handoff_req_terminal("claude", &sid, "claude");
+    ack_req.acknowledge_platform_limited_risk = true;
+    ack_req.observed_epoch = Some(clear_snap.epoch);
+    ack_req.observed_generation = Some(clear_snap.generation);
+    let retry = rig.runner.spawn_handoff(ack_req);
+    let retried = retry
+        .completion
+        .await
+        .expect("acknowledged retry completed");
     assert_eq!(
         retried["ok"],
         json!(true),
-        "the post-clear user-initiated handoff must proceed: {retried}"
+        "the acknowledged start-again handoff proceeds: {retried}"
     );
     let terminal_id = retried["owner"]["terminalId"].as_str().unwrap().to_string();
     match rig.ownership.observe("claude", &sid).state {
@@ -3497,7 +3524,7 @@ async fn a_post_clear_user_initiated_handoff_proceeds_fresh() {
     rig.registry.kill(&terminal_id);
 }
 
-/// b8ke ext r16 F1: the settle-then-reap confirmation PROPAGATES the
+/// b8ke ext r16 F1: the settle-then-reap confirmation PROPAGATES/// b8ke ext r16 F1: the settle-then-reap confirmation PROPAGATES the
 /// kill-and-confirm result — a concurrent kill that already removed the
 /// registry row while the recorded PID stays alive (beyond the reap
 /// timeout) must NOT answer Confirmed (pre-r16 the boolean was discarded
@@ -5113,9 +5140,13 @@ async fn an_aborted_from_vacant_platform_limited_target_fences_typed_and_recover
     assert!(
         matches!(
             rig.ownership.observe("claude", &sid).state,
-            OwnershipState::Vacant
+            OwnershipState::Fenced {
+                reason: FenceReason::ClearedUnverified,
+                ..
+            }
         ),
-        "the force-cleared key is Vacant"
+        "the force-cleared key sits in the TYPED cleared-unverified state \
+         (b8ke ext r16 F4 — never plain Vacant)"
     );
     std::env::remove_var("CLAUDE_CONFIG_DIR");
     let _ = std::fs::remove_dir_all(&store_dir);

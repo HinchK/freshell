@@ -512,6 +512,124 @@ impl SessionHandoffRunner {
             // session, the unverified descendants being the operator's
             // acknowledged risk).
             BeginOutcome::Blocked {
+                state:
+                    freshell_ownership::OwnershipState::Fenced {
+                        reason: freshell_ownership::FenceReason::ClearedUnverified,
+                        prior,
+                        ..
+                    },
+                ..
+            } => {
+                // b8ke ext r16 F4: the acknowledged PlatformLimited
+                // force-clear landed in the TYPED cleared-unverified
+                // state (never plain Vacant) — a lifecycle start here
+                // requires the acknowledged-risk arm, and the
+                // acknowledgment is recorded at THE START (the dangerous
+                // new-writer step), not the clear. Without the flag: the
+                // typed refusal; with it: the acknowledged start vacates
+                // the state and THIS handoff proceeds fresh (the
+                // no-prior sequence).
+                let generation = self
+                    .ownership
+                    .observe(&req.provider, &req.session_id)
+                    .generation;
+                if !req.acknowledge_platform_limited_risk {
+                    tracing::warn!(target: "freshell_ownership",
+                        event = "ownership.handoff.cleared_unverified_refused",
+                        operation_id = %operation_id, provider = %req.provider,
+                        session_id = %req.session_id,
+                        from_kind = ?prior.as_ref().map(|(o, _)| o.kind),
+                        to_kind = ?Option::<RuntimeOwnerKind>::None,
+                        epoch = self.ownership.boot_epoch(), generation,
+                        outcome = "refused", failure_reason = "CLEARED_UNVERIFIED_FENCED",
+                        "an unacknowledged start on the cleared-unverified key is \
+                         refused typed — the prior writer's descendant tree was never \
+                         confirmed dead; retry with acknowledgePlatformLimitedRisk: true \
+                         (the pane's start-again action carries it)");
+                    return typed_failure(
+                        "CLEARED_UNVERIFIED_FENCED",
+                        "the session sits in the cleared-unverified state: the prior \
+                         runtime's descendant processes were never confirmed dead. The \
+                         prior clear is not permission to start a writer — retry with the \
+                         acknowledged risk (acknowledgePlatformLimitedRisk: true; the pane's \
+                         start-again action carries it).",
+                        true,
+                        generation,
+                    );
+                }
+                // THE ACKNOWLEDGED START: the current observed pair is
+                // required (the operator acknowledges the state they are
+                // looking at).
+                let Some(observed) = observed else {
+                    return typed_failure(
+                        "CLEARED_UNVERIFIED_FENCED",
+                        "the acknowledged start requires the current observed \
+                         (epoch, generation) fence pair; refresh and retry",
+                        true,
+                        generation,
+                    );
+                };
+                match self.ownership.acknowledge_cleared_unverified(
+                    &req.provider,
+                    &req.session_id,
+                    observed,
+                    &operation_id,
+                    &initiator,
+                ) {
+                    freshell_ownership::ForceReleaseOutcome::Released => {
+                        tracing::info!(target: "freshell_ownership",
+                            event = "ownership.handoff.cleared_unverified_acknowledged_start",
+                            operation_id = %operation_id, provider = %req.provider,
+                            session_id = %req.session_id,
+                            epoch = self.ownership.boot_epoch(), generation,
+                            outcome = "acknowledged_start_proceeds", failure_reason = "",
+                            "the operator's acknowledged-risk start vacated the \
+                             cleared-unverified state — the handoff proceeds fresh");
+                        // Re-enter: the record is now Vacant, the fresh
+                        // no-prior sequence runs.
+                        let freshell_ownership::BeginOutcome::Granted { generation } =
+                            self.ownership.begin_handoff(
+                                &req.provider,
+                                &req.session_id,
+                                req.target_kind,
+                                &operation_id,
+                                None,
+                                &initiator,
+                                crate::session_lease::now_epoch_ms(),
+                            )
+                        else {
+                            panic!("the acknowledged start must grant from the vacated state");
+                        };
+                        generation
+                    }
+                    freshell_ownership::ForceReleaseOutcome::StaleObservation {
+                        current_generation,
+                        ..
+                    } => {
+                        return typed_failure(
+                            "STALE_GENERATION",
+                            "observed ownership fence is stale; refresh and retry",
+                            false,
+                            current_generation,
+                        )
+                    }
+                    freshell_ownership::ForceReleaseOutcome::NotPlatformLimited { state } => {
+                        tracing::warn!(target: "freshell_ownership",
+                            event = "ownership.handoff.cleared_unverified_acknowledge_moved_on",
+                            operation_id = %operation_id, provider = %req.provider,
+                            session_id = %req.session_id, state = ?state,
+                            "the acknowledged start found the key moved on");
+                        return typed_failure(
+                            "SESSION_FENCED",
+                            "the session's recovery state moved on; retry with a fresh \
+                             observation",
+                            true,
+                            generation,
+                        );
+                    }
+                }
+            }
+            BeginOutcome::Blocked {
                 // b8ke delta round-3 F5: the acknowledged operator
                 // force-clear accepts BOTH unconfirmable fence reasons —
                 // the coordinator's own force_release API takes

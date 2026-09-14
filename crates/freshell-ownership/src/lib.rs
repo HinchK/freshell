@@ -396,6 +396,17 @@ pub enum FenceReason {
     /// confirmation is IMPOSSIBLE on this platform, so nothing clears the
     /// fence within this boot epoch (the documented tradeoff).
     PlatformLimited,
+    /// b8ke ext r16 F4: the acknowledged PlatformLimited force-clear
+    /// landed HERE (pre-r16 it landed in plain Vacant, so a good-faith
+    /// user following the offered recovery could start a second writer
+    /// beside a surviving descendant). The state truthfully encodes the
+    /// unverified prior writer; a lifecycle start on it refuses typed
+    /// unless it carries the acknowledged-risk arm
+    /// ([`RuntimeOwnershipRegistry::acknowledge_cleared_unverified`] —
+    /// the operator's explicit start-again clears it, recording the
+    /// acknowledgment at the START); confirmed death (the existing
+    /// watchers) also clears it.
+    ClearedUnverified,
     /// b8ke delta round-2 F2: the stale-Starting watchdog could not confirm
     /// the start operation's death (a blocked/hung start, an unregistered
     /// settle, or an unconfirmable partial reap). The fence's recovery
@@ -425,6 +436,7 @@ impl FenceReason {
         match self {
             FenceReason::WatcherFailed => "watcher-failed",
             FenceReason::PlatformLimited => "platform-limited",
+            FenceReason::ClearedUnverified => "cleared-unverified",
             FenceReason::StaleStop => "stale-stop",
             FenceReason::StaleStart => "stale-start",
         }
@@ -2384,7 +2396,26 @@ impl RuntimeOwnershipRegistry {
                 // acknowledged
                 // risk — never a silent licensing.
                 let duration_ms = now_epoch_ms().saturating_sub(since_ms);
-                record.state = OwnershipState::Vacant;
+                // b8ke ext r16 F4: the acknowledged clear lands in the
+                // TYPED cleared-unverified state — never plain Vacant
+                // (pre-r16 the plain-Vacant landing let a good-faith user
+                // following the offered recovery start a second writer
+                // beside a surviving descendant: the acknowledgment
+                // belongs on the dangerous new-writer START, not the
+                // harmless clear). The state truthfully encodes the
+                // unverified prior writer; a lifecycle start on it
+                // refuses typed unless it carries the acknowledged-risk
+                // arm; confirmed death (the existing watchers) also
+                // clears it.
+                let cleared_prior = prior.clone();
+                record.state = OwnershipState::Fenced {
+                    reason: FenceReason::ClearedUnverified,
+                    prior: cleared_prior,
+                    operation_id: operation_id.to_string(),
+                    generation: record.generation,
+                    initiator: initiator.to_string(),
+                    since_ms: now_epoch_ms(),
+                };
                 tracing::warn!(target: "freshell_ownership",
                     // b8ke ext r7 F4: the UNIFORM transition schema —
                     // the release creates no new runtime (to_kind
@@ -2402,10 +2433,11 @@ impl RuntimeOwnershipRegistry {
                     outcome = "force_released_on_operator_action",
                     failure_reason = "PLATFORM_LIMITED_ACKNOWLEDGED",
                     "an explicit acknowledged operator force-clear released an \
-                     UNCONFIRMABLE fence (PlatformLimited or PID-less StaleStart): the \
-                     recorded runtime identity could not be confirmed dead — surviving \
-                     processes are the operator's acknowledged risk, recorded honestly, \
-                     never a confirmed reap");
+                     UNCONFIRMABLE fence (PlatformLimited or PID-less StaleStart) into \
+                     the TYPED cleared-unverified state — the recorded runtime identity \
+                     could not be confirmed dead, so a new lifecycle start still requires \
+                     the acknowledged-risk arm; surviving processes are the operator's \
+                     acknowledged risk, recorded honestly, never a confirmed reap");
                 ForceReleaseOutcome::Released
             }
             state => ForceReleaseOutcome::NotPlatformLimited { state },
@@ -3009,6 +3041,87 @@ impl RuntimeOwnershipRegistry {
     /// max age) then aborts the operation, awaits its settle, kills the
     /// registered partial runtime if any, and finishes with `commit_stop`
     /// → `Vacant` + the typed `ownership.start.recovered` failure log.
+    /// b8ke ext r16 F4: the acknowledged START on a
+    /// `Fenced{ClearedUnverified}` key — the operator's explicit
+    /// start-again carries the acknowledged-risk arm and THIS call moves
+    /// the record to plain Vacant, recording the acknowledgment in the
+    /// transition log AT THE START (the acknowledgment attaches to the
+    /// dangerous new-writer step, not the harmless clear). The current
+    /// observed pair is required (the operator acknowledges the state
+    /// they are looking at); any other state answers the typed
+    /// `NotPlatformLimited` refusal.
+    pub fn acknowledge_cleared_unverified(
+        &self,
+        provider: &str,
+        session_id: &str,
+        observed: ObservedFence,
+        operation_id: &str,
+        initiator: &str,
+    ) -> ForceReleaseOutcome {
+        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let key = SessionKey::new(provider, session_id);
+        let Some(record) = inner.get_mut(&key) else {
+            return ForceReleaseOutcome::NotPlatformLimited {
+                state: OwnershipState::Vacant,
+            };
+        };
+        let current_generation = snapshot_generation(record);
+        if observed.epoch != self.epoch || observed.generation != current_generation {
+            tracing::warn!(target: "freshell_ownership",
+                event = "ownership.fenced.acknowledge_cleared_unverified.stale_observation",
+                operation_id, provider, session_id, initiator,
+                from_kind = ?Option::<RuntimeOwnerKind>::None,
+                to_kind = ?Option::<RuntimeOwnerKind>::None,
+                runtime_id = ?Option::<String>::None, pid = ?Option::<u32>::None,
+                observed_epoch = observed.epoch, observed_generation = observed.generation,
+                epoch = self.epoch, generation = current_generation,
+                duration_ms = 0u64,
+                outcome = "refused", failure_reason = "STALE_OBSERVATION",
+                "the acknowledged start observed a stale fence pair — refresh and retry");
+            return ForceReleaseOutcome::StaleObservation {
+                current_epoch: self.epoch,
+                current_generation,
+            };
+        }
+        match record.state.clone() {
+            OwnershipState::Fenced {
+                reason: reason @ FenceReason::ClearedUnverified,
+                prior,
+                operation_id: fencing_operation_id,
+                since_ms,
+                ..
+            } => {
+                let duration_ms = now_epoch_ms().saturating_sub(since_ms);
+                let unverified_kind = prior.as_ref().map(|(o, _)| o.kind);
+                let unverified_id = prior.as_ref().and_then(|(o, _)| o.terminal_id.clone());
+                let unverified_pid = prior.as_ref().and_then(|(o, _)| o.pid);
+                record.state = OwnershipState::Vacant;
+                // b8ke ext r7 F4: the UNIFORM transition schema — the
+                // acknowledgment STARTS a new writer only after this call,
+                // so to_kind is None-valued here and the acknowledgment
+                // is the recorded failure_reason context.
+                tracing::warn!(target: "freshell_ownership",
+                    event = "ownership.fenced.acknowledged_start_cleared_unverified",
+                    provider, session_id, initiator,
+                    operation_id,
+                    from_kind = ?unverified_kind,
+                    to_kind = ?Option::<RuntimeOwnerKind>::None,
+                    runtime_id = ?unverified_id, pid = ?unverified_pid,
+                    epoch = self.epoch, generation = record.generation, duration_ms,
+                    fence_reason = ?reason,
+                    outcome = "acknowledged_start_vacated",
+                    failure_reason = "UNVERIFIED_PRIOR_ACKNOWLEDGED",
+                    "the operator's acknowledged-risk start vacated the \
+                     cleared-unverified state — the prior writer's descendant tree \
+                     was NEVER confirmed dead; the operator accepted the risk of \
+                     surviving processes");
+                let _ = &fencing_operation_id;
+                ForceReleaseOutcome::Released
+            }
+            state => ForceReleaseOutcome::NotPlatformLimited { state },
+        }
+    }
+
     pub fn recover_stale_starts(&self, now_ms: u64, max_age_ms: u64) -> Vec<RecoveredStart> {
         let mut inner = self.inner.lock().expect("ownership lock poisoned");
         let mut recovered = Vec::new();
@@ -5564,17 +5677,57 @@ mod tests {
             ),
             ForceReleaseOutcome::Released
         );
-        assert_eq!(r.observe(PROVIDER, "sid").state, OwnershipState::Vacant);
+        // b8ke ext r16 F4: the acknowledged clear lands in the TYPED
+        // cleared-unverified state — never plain Vacant (pre-r16 a naive
+        // post-clear start could begin a second writer beside a surviving
+        // descendant).
+        assert!(matches!(
+            r.observe(PROVIDER, "sid").state,
+            OwnershipState::Fenced {
+                reason: FenceReason::ClearedUnverified,
+                ..
+            }
+        ));
         assert_eq!(r.observe(PROVIDER, "sid").generation, g);
+        // A NAIVE start on the cleared-unverified key is BLOCKED typed —
+        // the acknowledged-risk arm is required.
         assert!(matches!(
             r.begin_start(
                 PROVIDER,
                 "sid",
                 RuntimeOwnerKind::Terminal,
-                "post-force-create",
+                "post-force-create-naive",
                 None,
                 "test",
                 8,
+            ),
+            BeginOutcome::Blocked { .. }
+        ));
+        // THE ACKNOWLEDGED START vacates the state to plain Vacant — the
+        // operator's explicit risk acceptance recorded at the START.
+        assert!(matches!(
+            r.acknowledge_cleared_unverified(
+                PROVIDER,
+                "sid",
+                ObservedFence {
+                    epoch: r.boot_epoch(),
+                    generation: g
+                },
+                "op-ack-start",
+                "operator-start-again",
+            ),
+            ForceReleaseOutcome::Released
+        ));
+        assert_eq!(r.observe(PROVIDER, "sid").state, OwnershipState::Vacant);
+        assert!(matches!(
+            r.begin_start(
+                PROVIDER,
+                "sid",
+                RuntimeOwnerKind::Terminal,
+                "post-ack-start",
+                None,
+                "test",
+                9,
             ),
             BeginOutcome::Granted { .. }
         ));
@@ -7403,7 +7556,11 @@ mod tests {
             },
             "test-noop-real",
         );
-        // 8. fenced.force_released_unconfirmable (the acknowledged clear).
+        // 8. fenced.force_released_unconfirmable (the acknowledged clear —
+        // b8ke ext r16 F4: lands in the TYPED cleared-unverified state,
+        // never plain Vacant) + the acknowledged START that vacates it (the
+        // operator's risk acceptance recorded at the START; also covers
+        // fenced.acknowledged_start_cleared_unverified).
         assert!(matches!(
             r.force_release_platform_limited(
                 PROVIDER,
@@ -7413,6 +7570,26 @@ mod tests {
                     generation: g_ho2,
                 },
                 "test-operator",
+            ),
+            ForceReleaseOutcome::Released
+        ));
+        assert!(matches!(
+            r.observe(PROVIDER, "sid-enum").state,
+            OwnershipState::Fenced {
+                reason: FenceReason::ClearedUnverified,
+                ..
+            }
+        ));
+        assert!(matches!(
+            r.acknowledge_cleared_unverified(
+                PROVIDER,
+                "sid-enum",
+                ObservedFence {
+                    epoch: r.boot_epoch(),
+                    generation: g_ho2,
+                },
+                "op-enum-ack",
+                "test-operator-start-again",
             ),
             ForceReleaseOutcome::Released
         ));
@@ -7707,6 +7884,8 @@ mod tests {
         // operations, so their transition records must carry the same
         // stable schema as every other coordinator transition.
         let r_attach = Arc::new(RuntimeOwnershipRegistry::new());
+        // 18. b8ke ext r16 F4: the cleared-unverified pair's registry.
+        let r_cu = Arc::new(RuntimeOwnershipRegistry::new());
         let BeginOutcome::Granted {
             generation: g_attach,
         } = r_attach.begin_start(
@@ -7748,6 +7927,112 @@ mod tests {
         };
         drop(guard);
 
+        // 18. b8ke ext r16 F4: the cleared-unverified pair — the
+        // acknowledged PlatformLimited force-clear lands in the typed
+        // state (never plain Vacant), and the operator's acknowledged
+        // START vacates it (the stale-observation refusal arm is also
+        // driven: the same API with a stale pair first).
+        let BeginOutcome::Granted { generation: g_cu } = r_cu.begin_start(
+            PROVIDER,
+            "sid-enum-cleared-unverified",
+            RuntimeOwnerKind::FreshAgent,
+            "op-enum-cu-live",
+            None,
+            "test",
+            15_000,
+        ) else {
+            panic!("expected Granted")
+        };
+        assert!(matches!(
+            r_cu.commit_live(
+                PROVIDER,
+                "sid-enum-cleared-unverified",
+                "op-enum-cu-live",
+                g_cu,
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("sid-enum-cleared-unverified".into()),
+                    pid: Some(5555),
+                    ownership_id: None,
+                },
+            ),
+            CommitOutcome::Committed
+        ));
+        // The PlatformLimited fence, taken directly through
+        // fence_unconfirmed_handoff (the stop's PlatformLimited outcome
+        // needs the platform-limited teardown seam; the fence shape is
+        // identical). The fence requires the in-flight Handoff record —
+        // enter it first.
+        let BeginOutcome::Granted {
+            generation: g_cu_ho,
+        } = r_cu.begin_handoff(
+            PROVIDER,
+            "sid-enum-cleared-unverified",
+            RuntimeOwnerKind::Terminal,
+            "op-enum-cu-fence",
+            None,
+            "test",
+            15_500,
+        )
+        else {
+            panic!("expected the cu handoff granted")
+        };
+        assert!(matches!(
+            r_cu.fence_unconfirmed_handoff(
+                PROVIDER,
+                "sid-enum-cleared-unverified",
+                "op-enum-cu-fence",
+                g_cu_ho,
+                FenceReason::PlatformLimited,
+            ),
+            FenceOutcome::Fenced
+        ));
+        let cu_fence_generation = r_cu
+            .observe(PROVIDER, "sid-enum-cleared-unverified")
+            .generation;
+        // The acknowledged clear lands typed.
+        assert!(matches!(
+            r_cu.force_release_platform_limited(
+                PROVIDER,
+                "sid-enum-cleared-unverified",
+                ObservedFence {
+                    epoch: r_cu.boot_epoch(),
+                    generation: cu_fence_generation,
+                },
+                "operator",
+            ),
+            ForceReleaseOutcome::Released
+        ));
+        // The stale-observation refusal arm (a stale pair first).
+        assert!(matches!(
+            r_cu.acknowledge_cleared_unverified(
+                PROVIDER,
+                "sid-enum-cleared-unverified",
+                ObservedFence {
+                    epoch: r_cu.boot_epoch(),
+                    generation: cu_fence_generation.saturating_sub(1),
+                },
+                "op-enum-cu-ack",
+                "operator",
+            ),
+            ForceReleaseOutcome::StaleObservation { .. }
+        ));
+        // THE ACKNOWLEDGED START vacates the typed state.
+        assert!(matches!(
+            r_cu.acknowledge_cleared_unverified(
+                PROVIDER,
+                "sid-enum-cleared-unverified",
+                ObservedFence {
+                    epoch: r_cu.boot_epoch(),
+                    generation: cu_fence_generation,
+                },
+                "op-enum-cu-ack",
+                "operator-start-again",
+            ),
+            ForceReleaseOutcome::Released
+        ));
+
         // ── the ENUMERATION: every captured transition event carries the
         // complete stable schema. A missing field anywhere fails.
         let events = capture.events();
@@ -7782,6 +8067,8 @@ mod tests {
             "ownership.start.failed",
             "ownership.attach_guard.armed",
             "ownership.attach_guard.released",
+            "ownership.fenced.acknowledged_start_cleared_unverified",
+            "ownership.fenced.acknowledge_cleared_unverified.stale_observation",
         ];
         let mut covered: Vec<&str> = Vec::new();
         for event in &events {

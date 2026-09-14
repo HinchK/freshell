@@ -127,7 +127,17 @@ export function SessionHandoffErrorBanner({ error, appStore, tabId, paneId }: {
             retryTimerRef.current = setTimeout(() => {
               retryTimerRef.current = null
               setRetryArmed(false)
-              void runPaneSessionHandoff(appStore, { tabId, paneId })
+              void runPaneSessionHandoff(appStore, {
+                tabId,
+                paneId,
+                // b8ke ext r16 F4: the cleared state's start-again action
+                // CARRIES THE ACKNOWLEDGMENT — the clear landed in the
+                // typed cleared-unverified state (never plain Vacant), and
+                // the acknowledged-risk arm is what licenses the new
+                // writer's START (the server records the acknowledgment
+                // at the START; an unacknowledged start is refused typed).
+                ...(forceCleared ? { acknowledgePlatformLimitedRisk: true } : {}),
+              })
             }, SESSION_HANDOFF_RETRY_BACKOFF_MS)
           }}
         >

@@ -120,6 +120,44 @@ describe('SessionHandoffErrorBanner (kata b8ke R4-4 force-clear action)', () => 
 })
 
 describe('b8ke ext r12 F1: the cleared state presents the explicit re-initiation affordance', () => {
+  afterEach(() => {
+    cleanup()
+  })
+
+  it('the cleared-state Start-again action carries the acknowledged-risk arm (b8ke ext r16 F4)', async () => {
+    const user = userEvent.setup()
+    render(
+      <SessionHandoffErrorBanner
+        error={errorWith({
+          code: 'HANDOFF_FORCE_CLEARED',
+          message: 'The platform-limited fence was cleared.',
+          retryable: true,
+          generation: 5,
+        })}
+        appStore={store}
+        tabId="tab-1"
+        paneId="pane-1"
+      />,
+    )
+    const startAgain = screen.getByRole('button', {
+      name: 'Start the reopen again now that the fence is cleared',
+    })
+    await user.click(startAgain)
+    // The action re-initiates with the ACKNOWLEDGED-RISK arm (the cleared
+    // state is not permission to start a writer — the acknowledgment at
+    // the START is).
+    await waitFor(() => {
+      expect(runPaneSessionHandoffMock).toHaveBeenCalledWith(
+        store,
+        expect.objectContaining({
+          tabId: 'tab-1',
+          paneId: 'pane-1',
+          acknowledgePlatformLimitedRisk: true,
+        }),
+      )
+    })
+  })
+
   it('renders HANDOFF_FORCE_CLEARED with the Start-again action and NO force-clear button', () => {
     render(
       <SessionHandoffErrorBanner
