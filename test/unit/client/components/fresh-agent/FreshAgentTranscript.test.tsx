@@ -2635,7 +2635,7 @@ describe('rolled-back section (kata 1wxv decision 6)', () => {
     expect(within(section).getByText('third prompt')).toBeInTheDocument()
     expect(within(section).getByText('third answer')).toBeInTheDocument()
     // No historical rows ⇒ no disclosure line at all.
-    expect(screen.queryByRole('button', { name: 'Toggle rolled-back history' })).toBeNull()
+    expect(screen.queryByRole('button', { name: /Toggle rolled-back history/ })).toBeNull()
   })
 
   it('collapses non-restorable markers behind the history line with the historical step count', () => {
@@ -2644,7 +2644,7 @@ describe('rolled-back section (kata 1wxv decision 6)', () => {
     render(<FreshAgentTranscript turns={[]} rolledBackTurns={markerTurns()} />)
 
     const section = screen.getByRole('region', { name: 'Rolled back turns' })
-    const toggle = within(section).getByRole('button', { name: 'Toggle rolled-back history' })
+    const toggle = within(section).getByRole('button', { name: /Toggle rolled-back history/ })
     expect(toggle).toHaveAttribute('aria-expanded', 'false')
     expect(toggle).toHaveTextContent('Rolled back (2) — kept in history')
     expect(screen.queryByText('second prompt')).toBeNull()
@@ -2715,7 +2715,7 @@ describe('rolled-back section (kata 1wxv decision 6)', () => {
     // The frozen rows stay hidden behind the collapsed line until toggled…
     expect(screen.queryByText('second prompt')).toBeNull()
     expect(screen.queryByText('second answer')).toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: 'Toggle rolled-back history' }))
+    fireEvent.click(screen.getByRole('button', { name: /Toggle rolled-back history/ }))
     expect(screen.getByText('second prompt')).toBeInTheDocument()
     expect(screen.getByText('second answer')).toBeInTheDocument()
     // …and they never grow a redo button (still exactly one, on the current row).
@@ -2736,7 +2736,7 @@ describe('rolled-back section (kata 1wxv decision 6)', () => {
     // A legacy server also omits `restorable` ⇒ the whole bucket is historical
     // ⇒ the collapsed line is the only surface; expanding reveals the rows.
     const section = screen.getByRole('region', { name: 'Rolled back turns' })
-    const toggle = within(section).getByRole('button', { name: 'Toggle rolled-back history' })
+    const toggle = within(section).getByRole('button', { name: /Toggle rolled-back history/ })
     expect(toggle).toHaveAttribute('aria-expanded', 'false')
     expect(screen.queryByRole('button', { name: 'Redo to here' })).toBeNull()
     fireEvent.click(toggle)
@@ -2759,7 +2759,7 @@ describe('rolled-back section (kata 1wxv decision 6)', () => {
     )
 
     const section = screen.getByRole('region', { name: 'Rolled back turns' })
-    const toggle = within(section).getByRole('button', { name: 'Toggle rolled-back history' })
+    const toggle = within(section).getByRole('button', { name: /Toggle rolled-back history/ })
     expect(toggle).toHaveTextContent('Rolled back (2) — kept in history')
     expect(screen.queryByRole('button', { name: 'Redo to here' })).toBeNull()
     fireEvent.click(toggle)
@@ -2781,12 +2781,12 @@ describe('rolled-back section (kata 1wxv decision 6)', () => {
     const { rerender } = render(
       <FreshAgentTranscript sessionId="ses-a" turns={[]} rolledBackTurns={historyA} />,
     )
-    fireEvent.click(screen.getByRole('button', { name: 'Toggle rolled-back history' }))
+    fireEvent.click(screen.getByRole('button', { name: /Toggle rolled-back history/ }))
     expect(screen.getByText('conversation a marker')).toBeInTheDocument()
 
     // Same component instance, NEW conversation: collapsed again, no leak.
     rerender(<FreshAgentTranscript sessionId="ses-b" turns={[]} rolledBackTurns={historyB} />)
-    const toggleB = screen.getByRole('button', { name: 'Toggle rolled-back history' })
+    const toggleB = screen.getByRole('button', { name: /Toggle rolled-back history/ })
     expect(toggleB).toHaveAttribute('aria-expanded', 'false')
     expect(screen.queryByText('conversation a marker')).toBeNull()
     expect(screen.queryByText('conversation b marker')).toBeNull()
@@ -2802,7 +2802,7 @@ describe('rolled-back section (kata 1wxv decision 6)', () => {
         rolledBackTurns={[...historyB, { id: 'v3', turnId: 'v3', role: 'user', summary: 'conversation b second marker', items: [{ id: 'v3-i1', kind: 'text', text: 'conversation b second marker' }], rolledBack: true }]}
       />,
     )
-    expect(screen.getByRole('button', { name: 'Toggle rolled-back history' })).toHaveAttribute('aria-expanded', 'true')
+    expect(screen.getByRole('button', { name: /Toggle rolled-back history/ })).toHaveAttribute('aria-expanded', 'true')
     expect(screen.getByText('conversation b second marker')).toBeInTheDocument()
   })
 })

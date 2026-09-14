@@ -977,8 +977,10 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
   const historicalMarkers = rolledBackTurns.filter((t) => t.restorable !== true)
   // r2/r3: each count is rollback STEPS (user-role marker groups), not raw
   // marker rows — one undone turn-step contributes a user row AND an assistant
-  // row. This is exactly the user-step count the server's rollback.undoneDepth
-  // computes (r3 correction 5): same bucket, same rule, never entries.len().
+  // row. Each group applies the same user-step rule the server's
+  // rollback.undoneDepth computes (r3 correction 5) to its OWN bucket, and
+  // restorableSteps + historicalSteps sums to undoneDepth — neither group's
+  // count alone equals the union count.
   const restorableSteps = restorableMarkers.filter((t) => t.role === 'user').length
   const historicalSteps = historicalMarkers.filter((t) => t.role === 'user').length
   const resolvedShowTimecodes = showTimecodes ?? showModel
@@ -1219,7 +1221,7 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
                   onClick={() => toggleHistory()}
                   className="flex w-full items-center gap-2 rounded px-1 py-0.5 text-left text-xs font-medium text-muted-foreground transition-colors hover:bg-accent/50"
                   aria-expanded={historyExpanded}
-                  aria-label="Toggle rolled-back history"
+                  aria-label={`Rolled back (${historicalSteps}) — kept in history — Toggle rolled-back history`}
                 >
                   <ChevronRight className={cn('h-3 w-3 shrink-0 transition-transform', historyExpanded && 'rotate-90')} aria-hidden="true" />
                   Rolled back ({historicalSteps}) — kept in history
