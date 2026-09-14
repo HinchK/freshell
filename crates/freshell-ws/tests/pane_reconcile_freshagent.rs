@@ -772,8 +772,9 @@ use tracing::{Event, Subscriber};
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::Layer;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct CapturedEvent {
+    level: tracing::Level,
     message: String,
     /// The event's OWN fields only (all dead-session log fields are recorded
     /// on the event; no span merge needed).
@@ -820,6 +821,7 @@ where
             .lock()
             .expect("capture lock")
             .push(CapturedEvent {
+                level: *event.metadata().level(),
                 message: visitor.message,
                 fields: visitor.fields,
             });
@@ -906,6 +908,7 @@ async fn dead_session_verdict_is_warn_logged_with_claimed_identity() {
         1,
         "exactly one dead_session WARN per dead verdict; got {hits:?}"
     );
+    assert_eq!(hits[0].level, tracing::Level::WARN);
     let fields = &hits[0].fields;
     assert!(
         fields
