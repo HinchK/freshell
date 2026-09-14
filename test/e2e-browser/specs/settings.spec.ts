@@ -185,9 +185,10 @@ test.describe('Settings', () => {
   test('Expand thinking and Expand tools switches persist locally and reset to defaults',
     // Cloud-only per-test budget (kata j90s): on the cloud lane the 90s
     // harness window (FRESHELL_E2E_WS_READY_TIMEOUT_MS, scripts/e2e-cloud.sh)
-    // plus the self-heal reload can legitimately consume up to ~2x the
-    // window before this test's body even starts — more than the default
-    // 60s per-test budget. Locally the env var is unset and the default
+    // plus the self-heal reload can legitimately consume up to ~1.5x the
+    // window (phase 1 + reload + phase 2) before this test's body even
+    // starts — more than the default 60s per-test budget. Locally the env
+    // var is unset and the default
     // budget applies. (The array spread keeps the local call the plain
     // two-arg test(title, fn) form; a bare object spread is not iterable
     // in call position.)
