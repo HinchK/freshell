@@ -1,3 +1,9 @@
+export interface FixtureRequestTimeout {
+  cancel(): void
+}
+
+export type CreateFixtureRequestTimeout = (callback: () => void, ms: number) => FixtureRequestTimeout
+
 export interface BoundedFixtureRequestOptions {
   /** Per-request ceiling, further bounded by `deadline` when supplied. */
   timeoutMs?: number
@@ -6,9 +12,16 @@ export interface BoundedFixtureRequestOptions {
   /** Cancellation owned by the surrounding fixture operation. */
   signal?: AbortSignal
   fetchImpl?: typeof fetch
+  /** Injectable only to prove timeout ownership without scheduler sleeps. */
+  createTimeout?: CreateFixtureRequestTimeout
 }
 
 const DEFAULT_FIXTURE_REQUEST_TIMEOUT_MS = 1_000
+
+const defaultCreateTimeout: CreateFixtureRequestTimeout = (callback, ms) => {
+  const timer = setTimeout(callback, ms)
+  return { cancel: () => clearTimeout(timer) }
+}
 
 /**
  * Keep an HTTP request and its response consumption within the fixture's
@@ -31,13 +44,13 @@ export async function withBoundedFixtureRequest<T>(
   const timeoutError = new Error(`fixture request timed out after ${timeoutMs}ms`)
   const abortFromOuterSignal = () => controller.abort(options.signal?.reason)
   options.signal?.addEventListener('abort', abortFromOuterSignal, { once: true })
-  const timeout = setTimeout(() => controller.abort(timeoutError), timeoutMs)
+  const timeout = (options.createTimeout ?? defaultCreateTimeout)(() => controller.abort(timeoutError), timeoutMs)
 
   try {
     const response = await (options.fetchImpl ?? fetch)(input, { ...init, signal: controller.signal })
     return await consume(response)
   } finally {
-    clearTimeout(timeout)
+    timeout.cancel()
     options.signal?.removeEventListener('abort', abortFromOuterSignal)
   }
 }
