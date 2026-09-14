@@ -3717,6 +3717,65 @@ describe('TerminalView lifecycle updates', () => {
       ).toBeNull()
     })
 
+    it('b8ke ext r16 F5: the open-as-fresh-agent action resolves the retired pre-rekey key to the canonical key', async () => {
+      const CANONICAL_ID = '77777777-8888-4999-aaaa-bbbbbbbbbbbb'
+      const { store } = setupTypedPane()
+      // The pane holds the RETIRED pre-rekey reference; the runtime-owners
+      // map carries the alias mirror (the server's rekey mirror frame —
+      // the same chain the owner selection resolves through).
+      act(() => {
+        store.dispatch(applyRuntimeOwner({
+          type: 'session.runtimeOwner',
+          provider: 'codex',
+          sessionId: TYPED_SESSION_ID,
+          epoch: 3,
+          generation: 2,
+          ownerKind: 'fresh-agent',
+          operationId: 'rekey-16-f5',
+          transition: 'handoff-committed',
+          aliasOf: CANONICAL_ID,
+        }))
+        store.dispatch(applyRuntimeOwner({
+          type: 'session.runtimeOwner',
+          provider: 'codex',
+          sessionId: CANONICAL_ID,
+          epoch: 3,
+          generation: 2,
+          ownerKind: 'fresh-agent',
+          operationId: 'rekey-16-f5',
+          transition: 'handoff-committed',
+        }))
+      })
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+      })
+
+      // The fresh-agent owner on the pane's canonical chain surfaces the
+      // CROSS-KIND DIVERGENCE card — the "opened as CLI elsewhere" state
+      // whose direct-attach action is THIS finding's target.
+      const card = await screen.findByTestId('terminal-owner-divergence-card')
+      expect(card).toHaveAttribute('role', 'alert')
+      fireEvent.click(within(card).getByRole('button', { name: 'Open as Fresh Agent here' }))
+
+      // THE CONTRACT: the pane's content converts to the fresh-agent
+      // pane under the CANONICAL key — the lifecycle start carries the
+      // resolved canonical sessionId (pre-r16 the raw retired key went
+      // to the start and the coordinator refused REKEYED_ALIAS_KEY).
+      await waitFor(() => {
+        const leaf = store.getState().panes.layouts['tab-b8ke']
+        expect(leaf?.type === 'leaf' ? leaf.content.kind : undefined).toBe('fresh-agent')
+      })
+      const leaf = store.getState().panes.layouts['tab-b8ke']
+      if (leaf?.type === 'leaf' && leaf.content.kind === 'fresh-agent') {
+        // The converted pane's sessionRef carries the CANONICAL key (the
+        // retired pre-rekey key must never reach the lifecycle start).
+        expect(leaf.content.sessionRef?.sessionId).toBe(CANONICAL_ID)
+      } else {
+        throw new Error('the pane did not convert')
+      }
+    })
+
     it('b8ke ext r16 F3: a SESSION_MISSING refusal renders the typed missing state with the explicit start-fresh action', async () => {
       const { store } = setupTypedPane()
 

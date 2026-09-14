@@ -5801,12 +5801,22 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     const sessionType = freshSessionTypeForPaneFlavor(tab, terminalContent)
     if (!sessionType) return
     const providerSettings = appStore.getState().settings.settings.freshAgent?.providers?.[sessionType]
+    // b8ke ext r16 F5: the action resolves the CANONICAL key through the
+    // alias chain (the same resolver the owner selection uses) before
+    // issuing the lifecycle start — a cross-device pane retaining the
+    // pre-rekey reference would otherwise start the lifecycle on the
+    // retired key, which the coordinator refuses with REKEYED_ALIAS_KEY
+    // (the direct-attach action could never attach to the canonical owner
+    // it just displayed).
+    const state = appStore.getState()
+    const canonical = resolveCanonicalPaneSession(state, terminalContent)
+    const sessionId = canonical?.sessionId ?? sessionRef.sessionId
     dispatch(updatePaneContent({
       tabId,
       paneId,
       content: buildResumeContent({
         sessionType,
-        sessionId: sessionRef.sessionId,
+        sessionId,
         cwd: terminalContent.initialCwd,
         ...(providerSettings ? { freshAgentProviderSettings: providerSettings } : {}),
       }),
