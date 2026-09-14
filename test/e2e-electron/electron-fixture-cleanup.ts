@@ -59,13 +59,15 @@ export async function closeElectronGracefully(
   }
 }
 
-async function terminateExactElectronProcess(
+/** Stop and prove only a process handle captured by this fixture. */
+export async function stopExactCapturedProcess(
   process: OwnedElectronProcess | undefined,
   timeoutMs: number,
   sleep: (ms: number) => Promise<void>,
 ): Promise<void> {
+  if (!process) throw new Error('no captured process is available for exact-child containment')
   const hasExited = () => process.exitCode !== null || process.signalCode !== null
-  if (!process || hasExited()) return
+  if (hasExited()) return
 
   let sentTerm = false
   try {
@@ -140,7 +142,7 @@ export async function cleanupElectronFixture(options: ElectronFixtureCleanupDeps
           error,
         )
         try {
-          await terminateExactElectronProcess(options.electronProcess, forceCloseTimeoutMs, sleep)
+          await stopExactCapturedProcess(options.electronProcess, forceCloseTimeoutMs, sleep)
         } catch (error) {
           appendFailure(failures, 'containing the captured Electron process', error)
         }

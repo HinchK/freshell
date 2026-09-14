@@ -13,7 +13,8 @@ import fsp from 'node:fs/promises'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
-import { cleanupElectronFixture, closeElectronGracefully } from './electron-fixture-cleanup.js'
+import { cleanupElectronFixture, closeElectronGracefully, stopExactCapturedProcess } from './electron-fixture-cleanup.js'
+import { isolatedElectronHomeEnv } from './fixture-home-env.js'
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, '..', '..')
 const VITE_ROOT = path.join(PROJECT_ROOT, 'node_modules')
@@ -182,28 +183,6 @@ async function waitForCapturedChildExit(child: ChildProcess, timeoutMs = 15_000)
   throw new Error(`captured Electron PID ${child.pid ?? 'unknown'} remained alive after graceful close`)
 }
 
-async function stopCapturedChild(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return
-  await new Promise<void>((resolve) => {
-    let settled = false
-    const finish = () => {
-      if (settled) return
-      settled = true
-      resolve()
-    }
-    child.once('close', finish)
-    child.once('error', finish)
-    child.kill('SIGTERM')
-    const timer = setTimeout(() => {
-      if (settled) return
-      child.kill('SIGKILL')
-      setTimeout(finish, 5_000)
-    }, 5_000)
-    child.once('close', () => clearTimeout(timer))
-    child.once('error', () => clearTimeout(timer))
-  })
-}
-
 test.describe('Electron app-bound Rust server', () => {
   test('resolves the launch chooser from this checkout', () => {
     expect(VITE_ROOT).toBe(path.join(PROJECT_ROOT, 'node_modules'))
@@ -272,8 +251,7 @@ test.describe('Electron app-bound Rust server', () => {
         args: [PROJECT_ROOT],
         cwd: PROJECT_ROOT,
         env: {
-          ...process.env,
-          HOME: appHome,
+          ...isolatedElectronHomeEnv(process.env, appHome),
           ELECTRON_DEV: '1',
           FRESHELL_ELECTRON_TEST_NO_LOCAL_DISCOVERY: '1',
           NODE_PATH: path.join(PROJECT_ROOT, 'node_modules'),
@@ -329,10 +307,16 @@ test.describe('Electron app-bound Rust server', () => {
       } catch (error) {
         failures.push(error as Error)
       }
-      for (const [name, child] of [['chooser', chooserDevServer], ['foreign Rust server', foreign]] as const) {
+      for (const [name, child, port] of [
+        ['chooser', chooserDevServer, undefined],
+        ['foreign Rust server', foreign, foreignPort],
+      ] as const) {
         if (!child) continue
         try {
-          await stopCapturedChild(child)
+          await stopExactCapturedProcess(child, 5_000, (ms) => new Promise((resolve) => setTimeout(resolve, ms)))
+          if (port !== undefined && !await isPortFree(port)) {
+            throw new Error(`captured ${name} port ${port} is still bound`)
+          }
         } catch (error) {
           failures.push(new Error(`app-bound fixture cleanup failed while stopping ${name}`, { cause: error }))
         }

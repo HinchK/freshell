@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import {
   closeElectronGracefully,
   cleanupElectronFixture,
+  stopExactCapturedProcess,
   type ElectronFixtureCleanupDeps,
 } from '../../e2e-electron/electron-fixture-cleanup.js'
 
@@ -99,6 +100,24 @@ describe('cleanupElectronFixture', () => {
     expect(electronProcess.kill).toHaveBeenNthCalledWith(1, 'SIGTERM')
     expect(electronProcess.kill).toHaveBeenNthCalledWith(2, 'SIGKILL')
     expect(stopServer).toHaveBeenCalledOnce()
+  })
+
+  it('fails containment when the exact captured child resists both signals', async () => {
+    const child = {
+      exitCode: null,
+      signalCode: null as NodeJS.Signals | null,
+      kill: vi.fn(() => true),
+    }
+
+    await expect(stopExactCapturedProcess(child, 1, async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })).rejects.toThrow(/did not exit/i)
+    expect(child.kill).toHaveBeenNthCalledWith(1, 'SIGTERM')
+    expect(child.kill).toHaveBeenNthCalledWith(2, 'SIGKILL')
+  })
+
+  it('reports a missing captured process as containment evidence, not a TypeError', async () => {
+    await expect(stopExactCapturedProcess(undefined, 1, async () => {})).rejects.toThrow(/no captured process/i)
   })
 
   it('retains a graceful-close failure while continuing exact-server and HOME cleanup', async () => {

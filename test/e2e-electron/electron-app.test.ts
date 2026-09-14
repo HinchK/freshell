@@ -16,6 +16,7 @@ import type { E2eServerInfo } from '../e2e-browser/helpers/server-fixture-suppor
 import type { LaunchServerCandidate } from '../../electron/types.js'
 import { stopOwnedServerAndVerify } from './owned-server-teardown.js'
 import { cleanupElectronFixture, closeElectronGracefully } from './electron-fixture-cleanup.js'
+import { isolatedElectronHomeEnv } from './fixture-home-env.js'
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, '..', '..')
 const electronProcesses = new WeakMap<ElectronApplication, ChildProcess>()
@@ -54,8 +55,7 @@ async function launchApp(
   const app = await electron.launch({
     args: [PROJECT_ROOT],
     env: {
-      ...process.env,
-      HOME: tmpHome,
+      ...isolatedElectronHomeEnv(process.env, tmpHome),
       NODE_PATH: path.join(PROJECT_ROOT, 'node_modules'),
       // The Electron launch chooser normally probes local development ports,
       // including :3001. E2E supplies an explicit owned target instead.
