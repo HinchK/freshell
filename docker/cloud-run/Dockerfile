@@ -112,17 +112,24 @@ RUN scripts/verify-container-layout.sh --fixture /app --runtime-root
 
 ENV FRESHELL_E2E_RUST_SERVER_BIN=/app/target/release/freshell-server
 
-# COPY preserves checkout permissions; use an explicit mode because a private
-# checkout can otherwise bake a 0700 script that USER node cannot read.
+# COPY's requested mode can still be narrowed by rootless build/ACL metadata.
+# Normalize the copied artifact in the image layer so the final unprivileged
+# runtime does not inherit host checkout permissions.
 COPY --chmod=755 docker/cloud-run/entrypoint.sh /usr/local/bin/e2e-entrypoint.sh
+RUN chmod 755 /usr/local/bin/e2e-entrypoint.sh \
+    && chown root:root /usr/local/bin/e2e-entrypoint.sh
 
 # The browser test harness needs an unprivileged user for permission checks.
 RUN chown -R node:node /app
 USER node
 
-# Verify that the runtime user can execute and read the shell entrypoint.
-RUN test -x /usr/local/bin/e2e-entrypoint.sh \
-    && bash -n /usr/local/bin/e2e-entrypoint.sh
+# Verify the final runtime user can read, syntax-check, and execute the exact
+# entrypoint artifact. `--dry-run` exits before Playwright and exercises the
+# image's configured ENTRYPOINT behavior without running a test workload.
+RUN test -r /usr/local/bin/e2e-entrypoint.sh \
+    && test -x /usr/local/bin/e2e-entrypoint.sh \
+    && bash -n /usr/local/bin/e2e-entrypoint.sh \
+    && /usr/local/bin/e2e-entrypoint.sh --dry-run
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
   CMD test -x /app/target/release/freshell-server \
