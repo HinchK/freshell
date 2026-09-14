@@ -167,21 +167,44 @@ async fn recover_stale_start(
                     // closed.
                     None => false,
                     Some(tid) => {
+                        // b8ke ext r16 F2: confirm by the RECORDED PID —
+                        // row-absence is NEVER confirmed death.
+                        // `TerminalRegistry::kill_internal` removes the
+                        // row BEFORE its blocking PTY kill completes, so
+                        // a concurrent kill can make the row-based
+                        // `terminal_is_dead` poll report dead while the
+                        // recorded process still lives (pre-r16 that
+                        // shortcut let the watchdog commit the session
+                        // to plain Vacant over a live process). The
+                        // pid is captured BEFORE the kill (the row
+                        // removal would erase it), falling back to the
+                        // partial's registered pid; an undeterminable
+                        // pid (neither source) stays UNCONFIRMED — the
+                        // typed fence stays.
+                        let row_pid = registry.pid_of(tid);
+                        let recorded_pid = partial.pid.or(row_pid);
                         // Best-effort kill (a no-op for an already-dead
-                        // row), then the bounded dead-poll — the
-                        // registry's own row-state truth, not the
-                        // kill's return alone.
+                        // row).
                         let _ = registry.kill(tid);
-                        let deadline =
-                            tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-                        loop {
-                            if registry.terminal_is_dead(tid) {
-                                break true;
+                        match recorded_pid {
+                            Some(pid) => {
+                                // The recorded PID's OS-level death is
+                                // the evidence — the bounded poll.
+                                let deadline =
+                                    tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+                                loop {
+                                    if !freshell_terminal::registry::pid_alive(pid) {
+                                        break true;
+                                    }
+                                    if tokio::time::Instant::now() >= deadline {
+                                        break false;
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                                }
                             }
-                            if tokio::time::Instant::now() >= deadline {
-                                break false;
-                            }
-                            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                            // No pid handle anywhere: the runtime's
+                            // death is UNDETERMINABLE — fail closed.
+                            None => false,
                         }
                     }
                 }
@@ -4717,9 +4740,30 @@ mod stale_start_watchdog_tests {
             &own_ticket,
             cancel,
         );
-        // The partial runtime: a TERMINAL identity for a terminal id with
-        // no registry row — the watchdog's kill is a no-op and the
-        // dead-poll confirms (a provably-dead runtime).
+        // The partial runtime: a TERMINAL identity whose RECORDED PID is
+        // genuinely DEAD (b8ke ext r16 F2: row-absence is never confirmed
+        // death — the old shape registered a row-less terminal id with no
+        // pid and treated the absent row as a provably-dead runtime, the
+        // exact shortcut F2 removes). The recorded pid's OS-level
+        // disappearance is the evidence.
+        let mut short_lived = std::process::Command::new("sleep")
+            .arg("0.05")
+            .spawn()
+            .expect("spawn the short-lived process");
+        let dead_pid = short_lived.id();
+        // Reap the child (a zombie's pid lingers until waited) — then
+        // the pid is genuinely gone.
+        let _ = short_lived.wait();
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while freshell_terminal::registry::pid_alive(dead_pid) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fixture: the short-lived process never died"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
         states.0.register_partial_runtime(
             "claude",
             "sid-stale",
@@ -4729,7 +4773,7 @@ mod stale_start_watchdog_tests {
                 kind: freshell_ownership::RuntimeOwnerKind::Terminal,
                 terminal_id: Some("t-never-existed".into()),
                 live_session_key: None,
-                pid: None,
+                pid: Some(dead_pid),
                 ownership_id: None,
             },
         );
@@ -4760,6 +4804,101 @@ mod stale_start_watchdog_tests {
             OwnershipState::Vacant,
             "the settled operation + confirmed-dead partial vacate the key"
         );
+    }
+
+    /// b8ke ext r16 F2: the row-removed-but-pid-alive shape must NOT
+    /// vacate. `TerminalRegistry::kill_internal` removes the registry row
+    /// BEFORE its blocking PTY kill completes, so a concurrent kill can
+    /// make the row-based `terminal_is_dead` poll report dead while the
+    /// recorded process still lives — the watchdog must confirm by the
+    /// RECORDED PID (captured before any row removal can erase it), and
+    /// only a confirmed PID death vacates (pre-r16 the row's absence was
+    /// treated as confirmed death, so the watchdog could commit the
+    /// session to plain Vacant while the old process remained alive).
+    #[tokio::test]
+    async fn a_row_removed_but_live_recorded_pid_stale_start_does_not_vacate() {
+        let states = watchdog_states();
+        let generation = begin_stale_start(&states.0, "op-r16-f2-live-pid").await;
+        let own_ticket = Some(freshell_ownership::OperationTicket::new(
+            Arc::clone(&states.0),
+            "claude",
+            "sid-stale",
+            "op-r16-f2-live-pid",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            generation,
+            "test",
+        ));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel = {
+            let cancelled = Arc::clone(&cancelled);
+            Arc::new(move || cancelled.store(true, Ordering::SeqCst)) as Arc<dyn Fn() + Send + Sync>
+        };
+        let guard = freshell_freshagent::ownership_lane::register_start_cancellation_for_ticket(
+            &Some(Arc::clone(&states.0)),
+            "claude",
+            "sid-stale",
+            &own_ticket,
+            cancel,
+        );
+        // THE CONCURRENT-KILL SHAPE: the partial's recorded PID is a LIVE
+        // external process whose registry row is already GONE (a
+        // concurrent kill_internal removed it).
+        let mut live_child = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn the external live process");
+        let live_pid = live_child.id();
+        assert!(
+            freshell_terminal::registry::pid_alive(live_pid),
+            "fixture: the recorded pid is alive"
+        );
+        states.0.register_partial_runtime(
+            "claude",
+            "sid-stale",
+            "op-r16-f2-live-pid",
+            generation,
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                terminal_id: Some("t-row-removed".into()),
+                live_session_key: None,
+                pid: Some(live_pid),
+                ownership_id: None,
+            },
+        );
+        // The operation COMPLETES (the settle fires) — only the runtime
+        // confirmation decides.
+        drop(guard);
+
+        let recs = states.0.recover_stale_starts(0, 0);
+        assert_eq!(recs.len(), 1);
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        recover_stale_start(
+            &states.0,
+            &states.1,
+            states.2.clone(),
+            states.3.clone(),
+            states.4.clone(),
+            recs.into_iter().next().unwrap(),
+            std::time::Duration::from_secs(5),
+            &tx,
+        )
+        .await;
+
+        // THE CONTRACT: the LIVE recorded pid is not a confirmed death —
+        // the key fences typed StaleStart, NEVER plain Vacant.
+        assert!(
+            matches!(
+                states.0.observe("claude", "sid-stale").state,
+                OwnershipState::Fenced {
+                    reason: FenceReason::StaleStart,
+                    ..
+                }
+            ),
+            "the live recorded pid must NOT vacate — got {:?}",
+            states.0.observe("claude", "sid-stale").state
+        );
+        let _ = live_child.kill();
+        let _ = live_child.wait();
     }
 
     /// A registered start whose settle NEVER fires (the operation is still
