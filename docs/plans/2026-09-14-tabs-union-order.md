@@ -58,7 +58,7 @@ Fix the tab-order regression on restart/refresh via the server-side fix: make th
 - Consumes: `RustServer` + `ensureRustServerBuilt` from `helpers/rust-server.js` (per-test owned server — the 45-spec rust-only convention; donor recipe: `recover-my-panes-rust.spec.ts:496-524`), `TestHarness` from `helpers/test-harness.js` (incl. `waitForTabCount`), the generation-file fs-poll idiom (donor: `recover-my-panes-rust.spec.ts:452-494`), Redux dispatch seam `window.__FRESHELL_TEST_HARNESS__?.dispatch` (precedent: `remote-tab-linkage-rust.spec.ts:257`).
 - Produces: the spec `machine-tab-order-rust.spec.ts` (consumed by Task 2's impacted-test step).
 
-**Why the owned server, the Tab-1 removal, and the fs-poll wait (load-bearing findings LB1-LB3):** the fixtures' rust `testServer` is a worker-scoped SHARED server (fixtures.ts:120-125) — earlier rust specs in the same worker would leave machines/generations behind and a fresh context would hit the machine chooser instead of the auto-create path, so this spec OWNS a fresh `RustServer` (fresh temp HOME ⇒ empty machines store ⇒ deterministic auto-create). The first boot auto-creates a "Tab 1" shell tab (App.tsx:1871-1876: machine ready + 0 tabs) whose nanoid tabKey would make any restored order nondeterministic — the spec removes it before adding its three explicit-id tabs. And seeing a sent `tabs.sync.push` does NOT prove the server persisted the generation (persist happens in `spawn_blocking` after receipt; no received-frame log) — the wait polls the generation FILES on disk instead (the donor spec's exact idiom).
+**Why the owned server, the Tab-1 removal, and the fs-poll wait (load-bearing findings LB1-LB3):** the fixtures' rust `testServer` is a worker-scoped SHARED server (fixtures.ts:120-125) — earlier rust specs in the same worker would leave machines/generations behind and a fresh context would hit the machine chooser instead of the auto-create path, so this spec OWNS a fresh `RustServer` (fresh temp HOME ⇒ empty machines store ⇒ deterministic auto-create). The first boot auto-creates a "Tab 1" shell tab (App.tsx:1871-1876: machine ready + 0 tabs) whose nanoid tabKey would make any restored order nondeterministic — the spec adds its three explicit-id tabs FIRST and removes the auto tab LAST, so the strip never renders at zero (the auto-create effect re-fires on every zero-tab render). And seeing a sent `tabs.sync.push` does NOT prove the server persisted the generation (persist happens in `spawn_blocking` after receipt; no received-frame log) — the wait polls the generation FILES on disk instead (the donor spec's exact idiom).
 
 - [ ] **Step 1: Write the failing e2e test**
 
@@ -392,11 +392,14 @@ And add the tie-break determinism test (RED at base — the explicit `Multi-clie
 fn union_source_order_is_deterministic_when_captured_at_and_revision_tie() {
     // Determinism made CHECKABLE, not probabilistic: both clients push at
     // the same capturedAt and revision, so the source ranking falls through
-    // to clientInstanceId ("clientA" < "clientB") — a total order that
-    // HashMap iteration must never decide. The write order below is
-    // deliberately reversed (B's file created before A's) to also prove the
-    // union normalizes file-scan order through its input ranking. Expected
-    // first-seen order: clientA's [dev:z1, dev:a2], then clientB's [dev:m3].
+    // to clientInstanceId — DESCENDING, because the ranking tuple is the
+    // same one `label_src` takes the max of: the tie resolves to the
+    // LARGER client id ("clientB" before "clientA"), keeping sources[0]
+    // equal to the label source. A total order HashMap iteration must
+    // never decide. The write order below is deliberately reversed (B's
+    // file created before A's) to also prove the union normalizes
+    // file-scan order through its input ranking. Expected first-seen
+    // order: clientB's [dev:m3], then clientA's [dev:z1, dev:a2].
     let dir = tempfile::tempdir().unwrap();
     put(
         dir.path(),
@@ -421,7 +424,7 @@ fn union_source_order_is_deterministic_when_captured_at_and_revision_tie() {
         .iter()
         .filter_map(|r| r["tabKey"].as_str())
         .collect();
-    assert_eq!(keys, vec!["dev:z1", "dev:a2", "dev:m3"]);
+    assert_eq!(keys, vec!["dev:m3", "dev:z1", "dev:a2"]);
 }
 ```
 
@@ -719,6 +722,6 @@ git commit -m "test(client): pin machine-workspace restore and recovery-plan tab
 
 ## Verification summary (whole plan)
 
-- RED evidence: Task 1 e2e fails at base with the tabKey-sorted strip; Task 2's two new union tests and one flipped pin fail for the missing order-preservation.
+- RED evidence: Task 1 e2e fails at base with the tabKey-sorted strip; Task 2's three new union tests and one flipped pin fail for the missing order-preservation.
 - GREEN evidence: all focused suites, the e2e, fmt/clippy, and the client pins pass; the end-of-execution full-suite gate (`npm test`, coordinated) passes at final HEAD.
 - The user-visible contract: after a restart/refresh that triggers a restore, the strip order is the pre-restart order.
