@@ -9,6 +9,7 @@ import {
   getSelectedMachineId,
   getSuggestedMachineLabel,
   markActiveMachineSelection,
+  peekActiveMachineSelectionMark,
   persistSelectedMachineId,
   resolveMachineIdentity,
   type Machine,
@@ -194,6 +195,21 @@ describe('active machine selection marker (reload-safety)', () => {
     expect(consumeActiveMachineSelectionMark()).toBe(true)
     // A later natural reload never inherits the consumed marker.
     expect(consumeActiveMachineSelectionMark()).toBe(false)
+  })
+
+  it('peek reads without consuming — the boot peek-before/consume-after-success protocol', () => {
+    markActiveMachineSelection()
+
+    // PEEK: read armed without clearing (the pre-restore read).
+    expect(peekActiveMachineSelectionMark()).toBe(true)
+    expect(peekActiveMachineSelectionMark()).toBe(true)
+    // Still armed: an in-flight reload, failure, or cancellation between the
+    // peek and the consume leaves the marker for the retry boot.
+    expect(sessionStorage.getItem('freshell.machine.active-selection')).toBe('1')
+
+    // CONSUME after success: cleared exactly once.
+    expect(consumeActiveMachineSelectionMark()).toBe(true)
+    expect(peekActiveMachineSelectionMark()).toBe(false)
   })
 
   it('arms in sessionStorage (per-tab, survives the chooser reload lane) — never localStorage', () => {

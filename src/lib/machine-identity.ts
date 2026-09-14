@@ -77,6 +77,21 @@ export function markActiveMachineSelection(storage = safeSessionStorage()): void
   }
 }
 
+/**
+ * Read the marker WITHOUT consuming it. The boot's restore peeks before the
+ * (asynchronous) inventory request and consumes only after a SUCCESSFUL
+ * restore — so an in-flight reload (the document dying mid-restore) leaves
+ * the marker armed and the next boot still treats the machine as actively
+ * chosen, never falling back to the keep-local path over a foreign cache.
+ */
+export function peekActiveMachineSelectionMark(storage = safeSessionStorage()): boolean {
+  try {
+    return storage?.getItem(ACTIVE_MACHINE_SELECTION_STORAGE_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
 export function consumeActiveMachineSelectionMark(storage = safeSessionStorage()): boolean {
   try {
     const armed = storage?.getItem(ACTIVE_MACHINE_SELECTION_STORAGE_KEY) === '1'

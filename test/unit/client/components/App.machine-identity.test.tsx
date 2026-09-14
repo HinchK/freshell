@@ -17,6 +17,7 @@ import {
   MACHINE_ID_STORAGE_KEY,
   consumeActiveMachineSelectionMark,
   markActiveMachineSelection,
+  peekActiveMachineSelectionMark,
   type Machine,
 } from '@/lib/machine-identity'
 import {
@@ -206,8 +207,18 @@ describe('App machine identity bootstrap', () => {
       fireEvent.click(screen.getByRole('button', { name: new RegExp(`Use ${MACHINE.label}`) }))
     })
     expect(mocks.restoreMachineWorkspace).not.toHaveBeenCalled()
-    expect(consumeActiveMachineSelectionMark()).toBe(true)
+    expect(peekActiveMachineSelectionMark()).toBe(true)
     expect(localStorage.getItem(MACHINE_ID_STORAGE_KEY)).toBe(MACHINE.id)
+
+    // The ADD handler arms the marker too: a machine created through the
+    // chooser is just as active a choice as a picked existing one.
+    sessionStorage.clear()
+    mocks.createMachine.mockResolvedValue({ ...MACHINE, id: 'machine-added', label: 'ADDED' })
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Add this machine' }))
+    })
+    expect(peekActiveMachineSelectionMark()).toBe(true)
+    expect(localStorage.getItem(MACHINE_ID_STORAGE_KEY)).toBe('machine-added')
   })
 
   it('does not auto-create a machine after its bootstrap is cancelled', async () => {
@@ -243,7 +254,8 @@ describe('App machine identity bootstrap', () => {
     // natural reload (no active chooser pick) must keep a non-recoverable
     // local layout — the reload-wipe fix's core wiring.
     expect(mocks.restoreMachineWorkspace).toHaveBeenCalledWith(store, MACHINE.id, { activeSelection: false })
-    // The marker was consumed (one-shot): nothing stays armed for later boots.
+    // The boot PEEKED the (unarmed) marker and CONSUMED after the successful
+    // restore: nothing stays armed for later boots.
     expect(consumeActiveMachineSelectionMark()).toBe(false)
     expect(mocks.restoreMachineWorkspace.mock.invocationCallOrder[0]).toBeLessThan(
       mocks.startTabRegistrySync.mock.invocationCallOrder[0],
@@ -260,12 +272,15 @@ describe('App machine identity bootstrap', () => {
     })
   })
 
-  it('re-arms the active-selection marker when the restore fails, so the retry still treats the machine as actively chosen', async () => {
+  it('keeps the active-selection marker armed when the restore fails, so the retry still treats the machine as actively chosen', async () => {
     // The transient-failure path: an armed marker (a chooser pick booted
-    // into a failing inventory request) must be re-armed on the restore
-    // error — otherwise the app's reload action would retry with
-    // activeSelection:false and keep a foreign machine's stale local cache
-    // over the machine the user just chose.
+    // into a failing inventory request) must STAY armed on the restore
+    // error — the boot peeked before the request and consumes only after
+    // success, so the app's reload action retries with activeSelection
+    // again and never keeps a foreign machine's stale local cache over
+    // the machine the user just chose. The same holds for a manual reload
+    // while the restore is in flight: the marker dies with the document,
+    // not with the request.
     markActiveMachineSelection()
     localStorage.setItem(MACHINE_ID_STORAGE_KEY, MACHINE.id)
     mocks.getMachines.mockResolvedValue([MACHINE])
@@ -275,10 +290,10 @@ describe('App machine identity bootstrap', () => {
     render(<Provider store={store}><App /></Provider>)
 
     await waitFor(() => expect(mocks.restoreMachineWorkspace).toHaveBeenCalledTimes(1))
+    expect(mocks.restoreMachineWorkspace).toHaveBeenCalledWith(store, MACHINE.id, { activeSelection: true })
     await waitFor(() => expect(store.getState().machineIdentity?.status).toBe('error'))
     expect(mocks.startTabRegistrySync).not.toHaveBeenCalled()
-    // Re-armed for the retry — consumed exactly once by the next boot.
-    expect(consumeActiveMachineSelectionMark()).toBe(true)
-    expect(consumeActiveMachineSelectionMark()).toBe(false)
+    // Still armed for the retry — the failing boot never consumed it.
+    expect(peekActiveMachineSelectionMark()).toBe(true)
   })
 })

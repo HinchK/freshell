@@ -71,6 +71,7 @@ import {
   getSuggestedMachineLabel,
   markActiveMachineSelection,
   persistSelectedMachineId,
+  peekActiveMachineSelectionMark,
   resolveMachineIdentity,
 } from '@/lib/machine-identity'
 import { restoreMachineWorkspace } from '@/lib/machine-workspace'
@@ -835,20 +836,17 @@ export default function App() {
             deviceId: resolution.machine.id,
             deviceLabel: resolution.machine.label,
           }))
-          // Consume the chooser's one-shot marker: an ACTIVE machine choice
-          // keeps the non-recoverable clear (foreign cache); a natural
-          // reload of a remembered selection keeps the rehydrated layout.
-          // If the restore fails (e.g. a transient inventory request), the
-          // app offers a reload — re-arm the marker so the RETRY still knows
-          // the machine was actively chosen and never falls back to the
-          // keep-local path over a foreign machine's stale cache.
-          const activeSelection = consumeActiveMachineSelectionMark()
-          try {
-            await restoreMachineWorkspace(appStore, resolution.machine.id, { activeSelection })
-          } catch (restoreError) {
-            if (activeSelection) markActiveMachineSelection()
-            throw restoreError
-          }
+          // The chooser's one-shot marker: an ACTIVE machine choice keeps the
+          // non-recoverable clear (foreign cache); a natural reload of a
+          // remembered selection keeps the rehydrated layout. PEEK before the
+          // (async) inventory request and CONSUME only after a successful
+          // restore — a failure, cancellation, or in-flight manual reload
+          // leaves the marker armed, so the retry always knows the machine
+          // was actively chosen and never keeps a foreign machine's stale
+          // local cache over the user's choice.
+          const activeSelection = peekActiveMachineSelectionMark()
+          await restoreMachineWorkspace(appStore, resolution.machine.id, { activeSelection })
+          consumeActiveMachineSelectionMark()
           if (cancelled) return false
           dispatch(setMachineReady({ machine: resolution.machine, mode: 'server-managed' }))
           return true
