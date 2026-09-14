@@ -10,6 +10,9 @@ import type { TerminalHelper } from '../helpers/terminal-helpers.js'
 const execFileAsync = promisify(execFile)
 const ACTIVE_PROBE_MS = 300
 const STOPPED_PROBE_MS = 2_500
+// Leave a small allowance for signal delivery and scheduler handoff while
+// still requiring nearly the entire requested suspension window.
+const MINIMUM_STOPPED_GAP_MS = STOPPED_PROBE_MS - 250
 const RESUMED_PROBE_MS = 500
 const STOPPED_OUTPUT_DELAY_MS = 1_000
 const STOPPED_OUTPUT_LINE_COUNT = 240
@@ -25,6 +28,11 @@ type StopProbeSnapshot = {
   maxTimerGapMs: number
   maxRafGapMs: number
   messageTypes: Record<string, number>
+}
+
+type StopResumeProbe = {
+  snapshot: () => StopProbeSnapshot
+  checkpointStopWindow: () => void
 }
 
 type ReceivedWsFrame = {
@@ -189,8 +197,19 @@ async function installStopProbe(page: Page): Promise<void> {
     }
 
     ;(window as Window & {
-      __FRESHELL_STOP_RESUME_PROBE__?: { snapshot: () => StopProbeSnapshot }
+      __FRESHELL_STOP_RESUME_PROBE__?: StopResumeProbe
     }).__FRESHELL_STOP_RESUME_PROBE__ = {
+      // Reset the gap clocks immediately before SIGSTOP. A post-SIGCONT
+      // snapshot necessarily permits some new animation frames, so its frame
+      // count cannot distinguish a real pause from normal resumption. The
+      // elapsed timer/rAF gap can.
+      checkpointStopWindow: () => {
+        const now = performance.now()
+        state.lastTimerAt = now
+        state.lastRafAt = now
+        state.maxTimerGapMs = 0
+        state.maxRafGapMs = 0
+      },
       snapshot: () => ({
         timerTicks: state.timerTicks,
         rafTicks: state.rafTicks,
@@ -210,13 +229,40 @@ async function installStopProbe(page: Page): Promise<void> {
 async function stopProbeSnapshot(page: Page): Promise<StopProbeSnapshot> {
   return page.evaluate(() => {
     const probe = (window as Window & {
-      __FRESHELL_STOP_RESUME_PROBE__?: { snapshot: () => StopProbeSnapshot }
+      __FRESHELL_STOP_RESUME_PROBE__?: StopResumeProbe
     }).__FRESHELL_STOP_RESUME_PROBE__
     if (!probe) {
       throw new Error('Stop/resume probe was not installed')
     }
     return probe.snapshot()
   })
+}
+
+async function checkpointStopWindow(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const probe = (window as Window & {
+      __FRESHELL_STOP_RESUME_PROBE__?: StopResumeProbe
+    }).__FRESHELL_STOP_RESUME_PROBE__
+    if (!probe) {
+      throw new Error('Stop/resume probe was not installed')
+    }
+    probe.checkpointStopWindow()
+  })
+}
+
+async function waitForStopWindowEvidence(page: Page): Promise<StopProbeSnapshot> {
+  let observed: StopProbeSnapshot | null = null
+  await expect.poll(async () => {
+    const snapshot = await stopProbeSnapshot(page)
+    observed = snapshot
+    return snapshot.maxTimerGapMs >= MINIMUM_STOPPED_GAP_MS
+      && snapshot.maxRafGapMs >= MINIMUM_STOPPED_GAP_MS
+  }, { timeout: 5_000 }).toBe(true)
+
+  if (!observed) {
+    throw new Error('Stop-window evidence poll completed without a probe snapshot')
+  }
+  return observed
 }
 
 function deltaSnapshots(before: StopProbeSnapshot, after: StopProbeSnapshot): StopProbeSnapshot {
@@ -427,6 +473,7 @@ test.describe('terminal background freeze catch-up', () => {
       const scheduledMarkerObservedAt = Date.now()
       const beforeStop = await stopProbeSnapshot(page)
       const wsFrameBaseline = receivedWsFrames.length
+      await checkpointStopWindow(page)
       const stopStartedAt = Date.now()
       expect(stopStartedAt - scheduledMarkerObservedAt).toBeLessThan(STOPPED_OUTPUT_DELAY_MS)
       signalPids([...stoppedPids].sort((a, b) => b - a), 'SIGSTOP')
@@ -435,15 +482,18 @@ test.describe('terminal background freeze catch-up', () => {
       const stopEndedAt = Date.now()
       const stoppedDurationMs = stopEndedAt - stopStartedAt
       expect(stoppedDurationMs).toBeGreaterThan(STOPPED_OUTPUT_DELAY_MS)
-      const afterResumeImmediate = await stopProbeSnapshot(page)
+      const afterResumeImmediate = await waitForStopWindowEvidence(page)
       const stoppedDelta = deltaSnapshots(beforeStop, afterResumeImmediate)
       await waitForFile(startedMarkerPath)
       const outputStartedAt = JSON.parse(await fs.readFile(startedMarkerPath, 'utf8')).startedAt as number
       expect(outputStartedAt).toBeGreaterThanOrEqual(stopStartedAt)
       expect(outputStartedAt).toBeLessThanOrEqual(stopEndedAt)
 
-      expect(stoppedDelta.timerTicks).toBeLessThan(5)
-      expect(stoppedDelta.rafTicks).toBeLessThan(5)
+      // This fails if the renderer keeps running through the stop window.
+      // It intentionally does not constrain tick counts after SIGCONT: the
+      // snapshot itself resumes the renderer and may validly observe frames.
+      expect(afterResumeImmediate.maxTimerGapMs).toBeGreaterThanOrEqual(MINIMUM_STOPPED_GAP_MS)
+      expect(afterResumeImmediate.maxRafGapMs).toBeGreaterThanOrEqual(MINIMUM_STOPPED_GAP_MS)
 
       await terminal.waitForOutput(finalLine, { terminalId, timeout: 30_000 })
       await page.waitForTimeout(RESUMED_PROBE_MS)
@@ -476,6 +526,9 @@ test.describe('terminal background freeze catch-up', () => {
         stoppedPids,
         stoppedDurationMs,
         stoppedOutputDelayMs: STOPPED_OUTPUT_DELAY_MS,
+        minimumStoppedGapMs: MINIMUM_STOPPED_GAP_MS,
+        stopWindowTimerGapMs: afterResumeImmediate.maxTimerGapMs,
+        stopWindowRafGapMs: afterResumeImmediate.maxRafGapMs,
         scheduledToStopMs: stopStartedAt - scheduledMarkerObservedAt,
         outputStartedAt,
         outputStartedAfterStopMs: outputStartedAt - stopStartedAt,
