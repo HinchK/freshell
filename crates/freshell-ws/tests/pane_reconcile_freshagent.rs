@@ -876,6 +876,12 @@ async fn dead_session_verdict_is_warn_logged_with_claimed_identity() {
     // scheduling quantum. Bounded-poll the capture instead of asserting
     // immediately so the test is resilient to that lag without masking a
     // genuinely missing log (a 5s budget on a current-thread runtime).
+    // The poll waits only for the FIRST hit — never for an exact count — so a
+    // scheduling-starved wakeup cannot hang the loop into the timeout when the
+    // capture already holds the expected WARN; the exactly-one contract is
+    // asserted below with the full evidence printed (the 2026-09-14 evening
+    // gate flakes hit exactly this hang: the poll's `len() == 1` wait burned
+    // the whole 5s budget and the Elapsed masked the real capture state).
     let hits = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let hits: Vec<CapturedEvent> = {
@@ -886,7 +892,7 @@ async fn dead_session_verdict_is_warn_logged_with_claimed_identity() {
                     .cloned()
                     .collect()
             };
-            if hits.len() == 1 {
+            if !hits.is_empty() {
                 return hits;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
