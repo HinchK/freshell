@@ -128,7 +128,7 @@ No refactor: the change is one render expression plus its contract comment. Veri
 
 Eight tests in this file pinned hoisted `Thinking` buttons on tool-bearing lines while collapsed; they now fail and must be reworked to pin the new behavior (all use the `mixedTurn` fixture `[thinking, tool_use Bash]` except the first). Rework each to the code below (same file, same describe block order):
 
-1. `folds thinking into the activity strip with tools` — replace the body after the summary assert with:
+1. `folds thinking into the activity strip with tools` — replace everything from the first assert (`expect(screen.getByRole('region', { name: 'Activity strip' })).toHaveTextContent(...)`) through the end of the test with:
 
 ```tsx
     expect(screen.getByRole('region', { name: 'Activity strip' })).toHaveTextContent('thought · 1 tool used')
@@ -235,7 +235,7 @@ Eight tests in this file pinned hoisted `Thinking` buttons on tool-bearing lines
       expect(screen.queryByText('the race is in the close handler')).not.toBeInTheDocument()
 ```
 
-7. `mounts the strip collapsed by default (expandTools unset)` — replace the trailing comment+assert (`// Tool rows and captions render only when the strip is expanded; thinking rows are present even while collapsed.` + `expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()`) with:
+7. `mounts the strip collapsed by default (expandTools unset)` — replace the trailing comment and its three asserts (from `// Tool rows and captions render only when the strip is expanded; thinking rows are present even while collapsed.` through `expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()`) with:
 
 ```tsx
       // Tool rows, captions, and — on this tool-bearing line — thinking
@@ -268,7 +268,7 @@ Eight tests in this file pinned hoisted `Thinking` buttons on tool-bearing lines
       expect(screen.queryByRole('button', { name: 'Thinking' })).not.toBeInTheDocument()
 ```
 
-Also rework `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx:780-838` — rename `mounts thinking rows and a collapsed strip by default` to `mounts a collapsed strip by default and gates thinking rows behind the strip toggle` and replace the middle section (from the `// Thinking rows always render:` comment through the strip-expand) with:
+Also rework `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx:780-838` — rename `mounts thinking rows and a collapsed strip by default` to `mounts a collapsed strip by default and gates thinking rows behind the strip toggle` and replace everything from the `// Thinking rows always render:` comment through the end of the test with:
 
 ```tsx
     // Compact defaults: a tool-bearing line collapses to the single summary
@@ -360,7 +360,7 @@ Expected: PASS — the production behavior landed in Task 1 makes this green; th
 
 - [ ] **Step 3: Rework the four stale e2e pins (no production changes)**
 
-1. `mounts the activity strip compact by default and never hides the Thinking disclosure` → rename to `mounts the activity strip compact by default and gates the Thinking disclosure behind the strip toggle`; replace the body between the compact-mount asserts and the end with:
+1. `mounts the activity strip compact by default and never hides the Thinking disclosure` → rename to `mounts the activity strip compact by default and gates the Thinking disclosure behind the strip toggle`; replace everything after the `const strip = pane.getByRole('region', { name: 'Activity strip' }).first()` line with:
 
 ```ts
     await expect(strip.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'false')
@@ -403,7 +403,7 @@ Expected: PASS — the production behavior landed in Task 1 makes this green; th
 
 Keep the expanded-state assert (`stripAfter` Thinking visible). Replace the final block's last line (`await expect(stripOff.getByRole('button', { name: 'Thinking' })).toBeVisible()`) with `await expect(stripOff.getByRole('button', { name: 'Thinking' })).toHaveCount(0)` and update its trailing comment ("the Thinking trigger never disappears") to "// the Thinking disclosure stays gated behind the compact strip".
 
-3. `the Expand thinking setting starts thinking rows expanded with the strip still compact` → rename to `the Expand thinking setting starts thinking rows expanded inside an expanded strip`; rework the body: the initial compact-mount block becomes:
+3. `the Expand thinking setting starts thinking rows expanded with the strip still compact` → rename to `the Expand thinking setting starts thinking rows expanded inside an expanded strip`; rework the body: replace the `// Compact mount: the Thinking disclosure renders collapsed.` comment and its three asserts (`const thinking` declaration, `toBeVisible`, `aria-expanded` check, and the body-count check) with:
 
 ```ts
     // Compact mount: the tool-bearing line collapses to the single summary —
@@ -434,7 +434,7 @@ After flipping the setting back off and remounting (`stripOff`), replace the fin
     await expect(stripOff.getByText('weighing which files to read first')).toHaveCount(0)
 ```
 
-4. `authored prose never folds`: replace the hoisted-press block (from the `// Hoisted thinking rows: stripTwo's reasoning disclosure...` comment through the prose assert) with:
+4. `authored prose never folds`: replace the entire block from the `// Hoisted thinking rows: stripTwo's reasoning disclosure is visible` comment through the final `await expect(pane.getByTestId('fresh-agent-activity-caption')).toHaveCount(0)` with:
 
 ```ts
     // stripTwo's reasoning row is gated behind the strip toggle on its
@@ -448,6 +448,8 @@ After flipping the setting back off and remounting (`stripOff`), replace the fin
     await expect(stripTwo.getByText('Pausing to plan the next step').first()).toBeVisible()
     await expect(pane.getByTestId('fresh-agent-activity-caption')).toHaveCount(0)
 ```
+
+Also update that test's opening doc comment (spec `:2007-2012`): replace `The prose lives in the always-rendered reasoning row (hoisted — its disclosure is visible while the strip stays compact);` with `The prose lives in the reasoning row inside the strip's expansion;` — the old sentence describes the superseded hoisting contract.
 
 5. Style test (`style setting persists per Fresh Agent pane type and applies serif rendering`), the freshcodex compact block around `:1031-1040`: re-order so the strip expands before the Thinking press:
 
@@ -469,7 +471,7 @@ After flipping the setting back off and remounting (`stripOff`), replace the fin
 
 Run: `npm run test:e2e:chromium -- test/e2e-browser/specs/fresh-agent.spec.ts --grep "expansion defaults and settings"`
 
-Expected: PASS (4 reworked + 1 new test in that describe).
+Expected: PASS (this describe runs 5 tests: 3 reworked + 1 new interleaved + 1 unchanged `temporary in-pane expansion never writes settings and reverts on remount` test).
 
 Run: `npm run test:e2e:chromium -- test/e2e-browser/specs/fresh-agent.spec.ts --grep "authored prose never folds"`
 
