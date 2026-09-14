@@ -2647,6 +2647,12 @@ describe('rolled-back section (kata 1wxv decision 6)', () => {
     const toggle = within(section).getByRole('button', { name: /Toggle rolled-back history/ })
     expect(toggle).toHaveAttribute('aria-expanded', 'false')
     expect(toggle).toHaveTextContent('Rolled back (2) — kept in history')
+    // Label-in-name (WCAG 2.5.3): the ACCESSIBLE NAME must contain the visible
+    // label — a speech-input user saying "Rolled back two kept in history" has
+    // to reach this control. Querying by the visible-label portion of the name
+    // is the red/green pin for the aria-label repair: a bare action-only
+    // aria-label ("Toggle rolled-back history") would fail this query.
+    expect(within(section).getByRole('button', { name: /Rolled back \(2\) — kept in history/ })).toBe(toggle)
     expect(screen.queryByText('second prompt')).toBeNull()
     expect(screen.queryByText('second answer')).toBeNull()
     expect(screen.queryByText('third prompt')).toBeNull()
