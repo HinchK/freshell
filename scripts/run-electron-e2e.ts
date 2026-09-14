@@ -18,6 +18,24 @@ export function rustArtifactPath(
   return path.join(root, 'target', 'release', platform === 'win32' ? 'freshell-server.exe' : 'freshell-server')
 }
 
+/** Keep Cargo's output at the artifact path Electron E2E will verify and run. */
+function withoutCargoArtifactRouting(inheritedEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env = { ...inheritedEnv }
+  delete env.CARGO_TARGET_DIR
+  delete env.CARGO_BUILD_TARGET
+  return env
+}
+
+export function electronE2eBuildEnvironment(
+  inheritedEnv: NodeJS.ProcessEnv,
+  buildId: string,
+): NodeJS.ProcessEnv {
+  return {
+    ...withoutCargoArtifactRouting(inheritedEnv),
+    FRESHELL_BUILD_COMMIT: buildId,
+  }
+}
+
 /**
  * Electron E2E owns its Rust artifact: generic browser E2E may deliberately
  * select a prebuilt binary, but this launcher must run the release artifact it
@@ -29,7 +47,7 @@ export function electronE2eEnvironment(
   rustArtifact: string,
 ): NodeJS.ProcessEnv {
   return {
-    ...inheritedEnv,
+    ...withoutCargoArtifactRouting(inheritedEnv),
     FRESHELL_ELECTRON_E2E_BUILD_ID: buildId,
     FRESHELL_E2E_RUST_SERVER_BIN: rustArtifact,
   }
@@ -72,7 +90,7 @@ export function resolveExactElectronE2eHead(
 
 export function runElectronE2ePreflight(root = PROJECT_ROOT): string {
   const buildId = resolveExactElectronE2eHead(root)
-  const buildEnv = { ...process.env, FRESHELL_BUILD_COMMIT: buildId }
+  const buildEnv = electronE2eBuildEnvironment(process.env, buildId)
 
   const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
   const result = spawnSync(npm, ['run', 'build:client'], {

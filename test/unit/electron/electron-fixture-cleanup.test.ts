@@ -50,8 +50,8 @@ describe('cleanupElectronFixture', () => {
         return true
       }),
     }
-    await stopExactCapturedProcess(child, 5_000, async () => {}, createTimeout)
-    expect(cancel).toHaveBeenCalledTimes(2)
+    await stopExactCapturedProcess(child, 5_000, async () => {})
+    expect(cancel).toHaveBeenCalledOnce()
   })
 
   it('closes Electron before proving the owned Rust server and removing HOME', async () => {
@@ -133,6 +133,29 @@ describe('cleanupElectronFixture', () => {
     })).rejects.toThrow(/did not exit/i)
     expect(child.kill).toHaveBeenNthCalledWith(1, 'SIGTERM')
     expect(child.kill).toHaveBeenNthCalledWith(2, 'SIGKILL')
+  })
+
+  it('stops polling after resistant-child containment fails', async () => {
+    const child = {
+      exitCode: null,
+      signalCode: null as NodeJS.Signals | null,
+      kill: vi.fn(() => true),
+    }
+    let activeTimers = 0
+    const sleep = vi.fn((ms: number) => new Promise<void>((resolve) => {
+      activeTimers += 1
+      setTimeout(() => {
+        activeTimers -= 1
+        resolve()
+      }, Math.min(ms, 1))
+    }))
+
+    await expect(stopExactCapturedProcess(child, 1, sleep)).rejects.toThrow(/did not exit/i)
+    const pollsAtReturn = sleep.mock.calls.length
+    expect(activeTimers).toBe(0)
+    await new Promise((resolve) => setTimeout(resolve, 15))
+    expect(activeTimers).toBe(0)
+    expect(sleep).toHaveBeenCalledTimes(pollsAtReturn)
   })
 
   it('reports a missing captured process as containment evidence, not a TypeError', async () => {

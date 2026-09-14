@@ -73,6 +73,26 @@ async function settleWithin(
   }
 }
 
+/**
+ * Poll an exact captured child within one bounded call stack. Unlike a raced
+ * background loop, every sleep is awaited before this helper returns.
+ */
+async function waitForCapturedProcessExit(
+  hasExited: () => boolean,
+  timeoutMs: number,
+  sleep: (ms: number) => Promise<void>,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  const maxPolls = Math.max(1, Math.ceil(timeoutMs / 25) + 1)
+  for (let poll = 0; poll < maxPolls; poll += 1) {
+    if (hasExited()) return true
+    const remainingMs = deadline - Date.now()
+    if (remainingMs <= 0) return false
+    await sleep(Math.min(25, remainingMs))
+  }
+  return hasExited()
+}
+
 /** The product-facing graceful-quit contract used by chooser lifecycle E2E. */
 export async function closeElectronGracefully(
   app: ElectronFixtureApplication,
@@ -89,7 +109,6 @@ export async function stopExactCapturedProcess(
   process: OwnedElectronProcess | undefined,
   timeoutMs: number,
   sleep: (ms: number) => Promise<void>,
-  createTimeout: CreateCancellableTimeout = defaultCreateTimeout,
 ): Promise<void> {
   if (!process) throw new Error('no captured process is available for exact-child containment')
   const hasExited = () => process.exitCode !== null || process.signalCode !== null
@@ -105,14 +124,7 @@ export async function stopExactCapturedProcess(
     throw new Error('the captured Electron process rejected SIGTERM')
   }
 
-  const exitedAfterTerm = await settleWithin(
-    (async () => {
-      while (!hasExited()) await sleep(25)
-    })(),
-    timeoutMs,
-    createTimeout,
-  )
-  if (exitedAfterTerm === 'settled') return
+  if (await waitForCapturedProcessExit(hasExited, timeoutMs, sleep)) return
 
   try {
     const sentKill = process.kill('SIGKILL')
@@ -123,14 +135,7 @@ export async function stopExactCapturedProcess(
     throw new Error('sending SIGKILL to the captured Electron process failed', { cause: error })
   }
 
-  const exitedAfterKill = await settleWithin(
-    (async () => {
-      while (!hasExited()) await sleep(25)
-    })(),
-    timeoutMs,
-    createTimeout,
-  )
-  if (exitedAfterKill === 'timed-out') {
+  if (!await waitForCapturedProcessExit(hasExited, timeoutMs, sleep)) {
     throw new Error(`captured Electron process did not exit within ${timeoutMs}ms after SIGKILL`)
   }
 }
@@ -162,7 +167,7 @@ export async function cleanupElectronFixture(options: ElectronFixtureCleanupDeps
     } catch (error) {
       appendFailure(failures, 'closing Electron', error)
       try {
-        await stopExactCapturedProcess(options.electronProcess, forceCloseTimeoutMs, sleep, createTimeout)
+        await stopExactCapturedProcess(options.electronProcess, forceCloseTimeoutMs, sleep)
       } catch (containmentError) {
         appendFailure(failures, 'containing the captured Electron process', containmentError)
       }

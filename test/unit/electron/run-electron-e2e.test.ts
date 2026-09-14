@@ -4,6 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import {
   clientArtifactContainsBuildId,
+  electronE2eBuildEnvironment,
   electronE2eEnvironment,
   playwrightExitResult,
   resolveExactElectronE2eHead,
@@ -57,6 +58,27 @@ describe('Electron E2E client preflight', () => {
       '/repo/target/release/freshell-server',
     )
     expect(env).toMatchObject({
+      FRESHELL_ELECTRON_E2E_BUILD_ID: 'a'.repeat(40),
+      FRESHELL_E2E_RUST_SERVER_BIN: '/repo/target/release/freshell-server',
+      KEEP_ME: 'yes',
+    })
+  })
+
+  it('removes inherited Cargo artifact routing for the build and Electron child', () => {
+    const inherited = {
+      CARGO_TARGET_DIR: '/other-worktree/target',
+      CARGO_BUILD_TARGET: 'aarch64-unknown-linux-gnu',
+      KEEP_ME: 'yes',
+    }
+    expect(electronE2eBuildEnvironment(inherited, 'a'.repeat(40))).toEqual({
+      FRESHELL_BUILD_COMMIT: 'a'.repeat(40),
+      KEEP_ME: 'yes',
+    })
+    expect(electronE2eEnvironment(
+      inherited,
+      'a'.repeat(40),
+      '/repo/target/release/freshell-server',
+    )).toEqual({
       FRESHELL_ELECTRON_E2E_BUILD_ID: 'a'.repeat(40),
       FRESHELL_E2E_RUST_SERVER_BIN: '/repo/target/release/freshell-server',
       KEEP_ME: 'yes',
