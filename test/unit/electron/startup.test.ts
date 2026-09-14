@@ -175,13 +175,13 @@ describe('runStartup', () => {
       await expect(runStartup(ctx)).rejects.toThrow('resourcesPath is required')
     })
 
-    it('uses the debug Rust server in dev mode', async () => {
+    it('uses the release Rust server in dev mode', async () => {
       const ctx = createDefaultContext({ isDev: true })
       const result = await runStartup(ctx)
 
       expect(ctx.serverSpawner.start).toHaveBeenCalledTimes(1)
       const startArgs = (ctx.serverSpawner.start as ReturnType<typeof vi.fn>).mock.calls[0][0]
-      expect(norm(startArgs.resources.serverBinary)).toMatch(/target\/debug\/freshell-server$/)
+      expect(norm(startArgs.resources.serverBinary)).toMatch(/target\/release\/freshell-server$/)
       if (result.type === 'main') {
         expect(result.serverUrl).toBe('http://localhost:3001')
       }

@@ -6,6 +6,7 @@ import {
   clientArtifactContainsBuildId,
   playwrightExitResult,
   resolveExactElectronE2eHead,
+  rustArtifactPath,
 } from '../../../scripts/run-electron-e2e.js'
 
 const temporaryPaths: string[] = []
@@ -41,5 +42,10 @@ describe('Electron E2E client preflight', () => {
   it('preserves a Playwright child signal instead of collapsing it into exit 1', () => {
     expect(playwrightExitResult({ status: null, signal: 'SIGTERM' })).toBe('SIGTERM')
     expect(playwrightExitResult({ status: 2, signal: null })).toBe(2)
+  })
+
+  it('uses the release Rust artifact for the Electron E2E provenance contract', () => {
+    expect(rustArtifactPath('/repo', 'linux')).toBe('/repo/target/release/freshell-server')
+    expect(rustArtifactPath('/repo', 'win32')).toBe('/repo/target/release/freshell-server.exe')
   })
 })

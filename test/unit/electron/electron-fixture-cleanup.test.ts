@@ -31,8 +31,27 @@ describe('cleanupElectronFixture', () => {
     await expect(closeElectronGracefully(
       { close: () => close.promise },
       1,
-      async () => {},
     )).rejects.toThrow(/graceful Electron shutdown timed out/i)
+  })
+
+  it('cancels timeout handles after graceful close and exact-child containment settle', async () => {
+    const never = deferred()
+    const cancel = vi.fn()
+    const createTimeout = vi.fn(() => ({ promise: never.promise, cancel }))
+
+    await closeElectronGracefully({ close: async () => {} }, 20_000, createTimeout)
+    expect(cancel).toHaveBeenCalledOnce()
+
+    const child = {
+      exitCode: null,
+      signalCode: null as NodeJS.Signals | null,
+      kill: vi.fn((signal: NodeJS.Signals) => {
+        child.signalCode = signal
+        return true
+      }),
+    }
+    await stopExactCapturedProcess(child, 5_000, async () => {}, createTimeout)
+    expect(cancel).toHaveBeenCalledTimes(2)
   })
 
   it('closes Electron before proving the owned Rust server and removing HOME', async () => {
@@ -94,7 +113,7 @@ describe('cleanupElectronFixture', () => {
       stopServer,
       gracefulCloseTimeoutMs: 1,
       forceCloseTimeoutMs: 1,
-      sleep: async () => {},
+      sleep: async () => { await new Promise((resolve) => setTimeout(resolve, 0)) },
     }), /graceful Electron shutdown timed out/i)
 
     expect(electronProcess.kill).toHaveBeenNthCalledWith(1, 'SIGTERM')

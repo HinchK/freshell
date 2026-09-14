@@ -17,6 +17,13 @@ export interface OwnedElectronProcess {
   kill(signal: NodeJS.Signals): boolean
 }
 
+export interface CancellableTimeout {
+  promise: Promise<void>
+  cancel(): void
+}
+
+export type CreateCancellableTimeout = (ms: number) => CancellableTimeout
+
 export interface ElectronFixtureCleanupDeps {
   app?: ElectronFixtureApplication
   electronProcess?: OwnedElectronProcess
@@ -26,12 +33,25 @@ export interface ElectronFixtureCleanupDeps {
   gracefulCloseTimeoutMs?: number
   forceCloseTimeoutMs?: number
   sleep?: (ms: number) => Promise<void>
+  createTimeout?: CreateCancellableTimeout
 }
 
 const DEFAULT_GRACEFUL_CLOSE_TIMEOUT_MS = 20_000
 const DEFAULT_FORCE_CLOSE_TIMEOUT_MS = 5_000
 
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+
+const defaultCreateTimeout: CreateCancellableTimeout = (ms) => {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  return {
+    promise: new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, ms)
+    }),
+    cancel: () => {
+      if (timer !== undefined) clearTimeout(timer)
+    },
+  }
+}
 
 function appendFailure(failures: Error[], step: string, error: unknown): void {
   failures.push(new Error(`Electron fixture cleanup failed while ${step}`, { cause: error }))
@@ -40,21 +60,26 @@ function appendFailure(failures: Error[], step: string, error: unknown): void {
 async function settleWithin(
   operation: Promise<void>,
   timeoutMs: number,
-  sleep: (ms: number) => Promise<void>,
+  createTimeout: CreateCancellableTimeout = defaultCreateTimeout,
 ): Promise<'settled' | 'timed-out'> {
-  return Promise.race([
-    operation.then(() => 'settled' as const),
-    sleep(timeoutMs).then(() => 'timed-out' as const),
-  ])
+  const timeout = createTimeout(timeoutMs)
+  try {
+    return await Promise.race([
+      operation.then(() => 'settled' as const),
+      timeout.promise.then(() => 'timed-out' as const),
+    ])
+  } finally {
+    timeout.cancel()
+  }
 }
 
 /** The product-facing graceful-quit contract used by chooser lifecycle E2E. */
 export async function closeElectronGracefully(
   app: ElectronFixtureApplication,
   timeoutMs = DEFAULT_GRACEFUL_CLOSE_TIMEOUT_MS,
-  sleep: (ms: number) => Promise<void> = defaultSleep,
+  createTimeout: CreateCancellableTimeout = defaultCreateTimeout,
 ): Promise<void> {
-  if (await settleWithin(app.close(), timeoutMs, sleep) === 'timed-out') {
+  if (await settleWithin(app.close(), timeoutMs, createTimeout) === 'timed-out') {
     throw new Error(`graceful Electron shutdown timed out after ${timeoutMs}ms`)
   }
 }
@@ -64,6 +89,7 @@ export async function stopExactCapturedProcess(
   process: OwnedElectronProcess | undefined,
   timeoutMs: number,
   sleep: (ms: number) => Promise<void>,
+  createTimeout: CreateCancellableTimeout = defaultCreateTimeout,
 ): Promise<void> {
   if (!process) throw new Error('no captured process is available for exact-child containment')
   const hasExited = () => process.exitCode !== null || process.signalCode !== null
@@ -84,7 +110,7 @@ export async function stopExactCapturedProcess(
       while (!hasExited()) await sleep(25)
     })(),
     timeoutMs,
-    sleep,
+    createTimeout,
   )
   if (exitedAfterTerm === 'settled') return
 
@@ -102,7 +128,7 @@ export async function stopExactCapturedProcess(
       while (!hasExited()) await sleep(25)
     })(),
     timeoutMs,
-    sleep,
+    createTimeout,
   )
   if (exitedAfterKill === 'timed-out') {
     throw new Error(`captured Electron process did not exit within ${timeoutMs}ms after SIGKILL`)
@@ -118,6 +144,7 @@ export async function stopExactCapturedProcess(
 export async function cleanupElectronFixture(options: ElectronFixtureCleanupDeps): Promise<void> {
   const failures: Error[] = []
   const sleep = options.sleep ?? defaultSleep
+  const createTimeout = options.createTimeout ?? defaultCreateTimeout
   const gracefulCloseTimeoutMs = options.gracefulCloseTimeoutMs ?? DEFAULT_GRACEFUL_CLOSE_TIMEOUT_MS
   const forceCloseTimeoutMs = options.forceCloseTimeoutMs ?? DEFAULT_FORCE_CLOSE_TIMEOUT_MS
 
@@ -131,11 +158,11 @@ export async function cleanupElectronFixture(options: ElectronFixtureCleanupDeps
 
   if (options.app) {
     try {
-      await closeElectronGracefully(options.app, gracefulCloseTimeoutMs, sleep)
+      await closeElectronGracefully(options.app, gracefulCloseTimeoutMs, createTimeout)
     } catch (error) {
       appendFailure(failures, 'closing Electron', error)
       try {
-        await stopExactCapturedProcess(options.electronProcess, forceCloseTimeoutMs, sleep)
+        await stopExactCapturedProcess(options.electronProcess, forceCloseTimeoutMs, sleep, createTimeout)
       } catch (containmentError) {
         appendFailure(failures, 'containing the captured Electron process', containmentError)
       }

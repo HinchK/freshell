@@ -83,9 +83,9 @@ describe('Electron Rust app-bound startup', () => {
       } else if (phase === 'run build:tools') {
         mkdirSync(path.dirname(resources.mcpEntry), { recursive: true })
         writeFileSync(resources.mcpEntry, 'export {}')
-      } else if (phase === 'run build:rust:debug') {
+      } else if (phase === 'run build:rust') {
         mkdirSync(path.dirname(resources.serverBinary), { recursive: true })
-        writeFileSync(resources.serverBinary, 'rust debug binary')
+        writeFileSync(resources.serverBinary, 'rust release binary')
       }
     })
 
@@ -103,7 +103,7 @@ describe('Electron Rust app-bound startup', () => {
         ['run', 'prebuild'],
         ['run', 'build:client'],
         ['run', 'build:tools'],
-        ['run', 'build:rust:debug'],
+        ['run', 'build:rust'],
       ])
       expect(existsSync(resources.serverBinary)).toBe(true)
       expect(existsSync(resources.clientIndex)).toBe(true)
@@ -135,7 +135,7 @@ describe('Electron Rust app-bound startup', () => {
     })
   })
 
-  it('uses the debug Rust binary in development and starts the app-bound URL', async () => {
+  it('uses the release Rust binary in development and starts the app-bound URL', async () => {
     const ctx = context({ isDev: true, resourcesPath: undefined })
     const result = await runStartup(ctx)
     expect(result.type).toBe('main')
@@ -143,7 +143,7 @@ describe('Electron Rust app-bound startup', () => {
       port: 4321,
       authToken: 'test-token',
       resources: expect.objectContaining({
-        serverBinary: expect.stringMatching(/target[\\/]debug[\\/]freshell-server$/),
+        serverBinary: expect.stringMatching(/target[\\/]release[\\/]freshell-server$/),
       }),
     }))
     if (result.type === 'main') expect(result.serverUrl).toBe('http://localhost:4321')

@@ -34,9 +34,9 @@ describe('Electron development prerequisite process spawning', () => {
           mkdirSync(path.dirname(resources.mcpEntry), { recursive: true })
           writeFileSync(resources.mcpEntry, 'export {}')
           break
-        case 'run build:rust:debug':
+        case 'run build:rust':
           mkdirSync(path.dirname(resources.serverBinary), { recursive: true })
-          writeFileSync(resources.serverBinary, 'rust debug binary')
+          writeFileSync(resources.serverBinary, 'rust release binary')
           break
       }
 
@@ -57,7 +57,7 @@ describe('Electron development prerequisite process spawning', () => {
         ['run', 'prebuild'],
         ['run', 'build:client'],
         ['run', 'build:tools'],
-        ['run', 'build:rust:debug'],
+        ['run', 'build:rust'],
       ])
     } finally {
       rmSync(projectRoot, { recursive: true, force: true })
@@ -102,9 +102,9 @@ describe('Electron development prerequisite process spawning', () => {
           mkdirSync(path.dirname(resources.mcpEntry), { recursive: true })
           writeFileSync(resources.mcpEntry, 'export {}')
           break
-        case 'run build:rust:debug':
+        case 'run build:rust':
           mkdirSync(path.dirname(resources.serverBinary), { recursive: true })
-          writeFileSync(resources.serverBinary, 'rust debug binary')
+          writeFileSync(resources.serverBinary, 'rust release binary')
           break
       }
 

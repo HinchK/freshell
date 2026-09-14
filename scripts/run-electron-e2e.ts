@@ -10,6 +10,14 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url))
 const PROJECT_ROOT = path.resolve(SCRIPT_DIR, '..')
 
+/** Electron E2E runs every Rust fixture against this one freshly built profile. */
+export function rustArtifactPath(
+  root = PROJECT_ROOT,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  return path.join(root, 'target', 'release', platform === 'win32' ? 'freshell-server.exe' : 'freshell-server')
+}
+
 export function clientArtifactContainsBuildId(clientDir: string, buildId: string): boolean {
   const pending = [clientDir]
   while (pending.length > 0) {
@@ -73,7 +81,7 @@ export function runElectronE2ePreflight(root = PROJECT_ROOT): string {
     throw new Error(`Electron E2E launcher preflight failed (exit ${electronBuild.status ?? electronBuild.signal ?? 'unknown'})`)
   }
 
-  const rustBuild = spawnSync('cargo', ['build', '-p', 'freshell-server', '--locked'], {
+  const rustBuild = spawnSync('cargo', ['build', '--release', '-p', 'freshell-server', '--locked'], {
     cwd: root,
     env: buildEnv,
     stdio: 'inherit',
@@ -81,6 +89,10 @@ export function runElectronE2ePreflight(root = PROJECT_ROOT): string {
   })
   if (rustBuild.status !== 0) {
     throw new Error(`Electron E2E Rust preflight failed (exit ${rustBuild.status ?? rustBuild.signal ?? 'unknown'})`)
+  }
+  const rustArtifact = rustArtifactPath(root)
+  if (!fs.existsSync(rustArtifact)) {
+    throw new Error(`Electron E2E Rust preflight completed but release artifact is missing: ${rustArtifact}`)
   }
 
   const clientDir = path.join(root, 'dist', 'client')

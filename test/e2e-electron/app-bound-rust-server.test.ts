@@ -16,10 +16,11 @@ import path from 'node:path'
 import { cleanupElectronFixture, closeElectronGracefully, stopExactCapturedProcess } from './electron-fixture-cleanup.js'
 import { isolatedElectronHomeEnv } from './fixture-home-env.js'
 import { launchChooserViteArgs, waitForCapturedViteReady } from './launch-chooser-vite.js'
+import { allocateDistinctFixturePorts } from './fixture-ports.js'
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, '..', '..')
 const VITE_ROOT = path.join(PROJECT_ROOT, 'node_modules')
-const RUST_BINARY = path.join(PROJECT_ROOT, 'target', 'debug', process.platform === 'win32'
+const RUST_BINARY = path.join(PROJECT_ROOT, 'target', 'release', process.platform === 'win32'
   ? 'freshell-server.exe'
   : 'freshell-server')
 const CLIENT_DIR = path.join(PROJECT_ROOT, 'dist', 'client')
@@ -179,10 +180,7 @@ test.describe('Electron app-bound Rust server', () => {
     expect(fs.existsSync(CLIENT_DIR)).toBe(true)
     const expectedBuildId = requireElectronE2eBuildId()
 
-    const appPort = await findFreePort()
-    const chooserPort = await findFreePort()
-    let foreignPort = await findFreePort()
-    while (foreignPort === appPort) foreignPort = await findFreePort()
+    const [appPort, chooserPort, foreignPort] = await allocateDistinctFixturePorts(3, findFreePort)
 
     const appHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-electron-rust-'))
     const foreignHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-electron-foreign-'))

@@ -222,7 +222,7 @@ test.describe('Renderer crash recovery', () => {
   })
 
   test('recovers the main Freshell UI after the renderer process crashes', async () => {
-    server = new RustServer()
+    server = new RustServer({ expectedBuildCommit: requireElectronE2eBuildId() })
     serverInfo = await server.start()
     tmpHome = createTempHome({
       serverMode: 'remote',

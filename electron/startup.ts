@@ -84,7 +84,9 @@ export function resolveDesktopRuntimeResources(
       ?? process.env.npm_node_execpath
       ?? process.execPath
     return {
-      serverBinary: path.join(repoRoot, 'target', 'debug', executable),
+      // Electron's dev and E2E paths share the release artifact contract so
+      // startup provenance always refers to the binary preflight rebuilt.
+      serverBinary: path.join(repoRoot, 'target', 'release', executable),
       clientDir: path.join(repoRoot, 'dist', 'client'),
       claudeNodeBinary: sidecarNodeRuntime,
       claudeSidecarEntry: process.env.FRESHELL_CLAUDE_SIDECAR

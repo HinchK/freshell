@@ -59,7 +59,7 @@ export function buildElectronDevPrerequisitePhases(
     { command: npm, args: ['run', 'prebuild'] },
     { command: npm, args: ['run', 'build:client'] },
     { command: npm, args: ['run', 'build:tools'] },
-    { command: npm, args: ['run', 'build:rust:debug'] },
+    { command: npm, args: ['run', 'build:rust'] },
   ]
 }
 
@@ -72,7 +72,7 @@ export function resolveElectronDevPrerequisitePaths(
   const clientDir = path.join(root, 'dist', 'client')
 
   return {
-    serverBinary: path.join(root, 'target', 'debug', executable),
+    serverBinary: path.join(root, 'target', 'release', executable),
     clientDir,
     clientIndex: path.join(clientDir, 'index.html'),
     mcpEntry: path.join(root, 'dist', 'tools', 'freshell-mcp', 'server.js'),
@@ -137,7 +137,7 @@ export function runElectronDevPrerequisites({
   }
 
   const requiredOutputs: Array<[string, string]> = [
-    ['debug Rust server', paths.serverBinary],
+    ['release Rust server', paths.serverBinary],
     ['static client', paths.clientIndex],
     ['MCP tool bundle', paths.mcpEntry],
   ]
