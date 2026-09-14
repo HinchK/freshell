@@ -421,6 +421,20 @@ cmd_run() {
   done
   pw_args=("${normalized[@]}")
 
+  # The container entrypoint treats --dry-run as a diagnostic-only request: it
+  # calculates and prints shard assignments, then exits before Playwright runs.
+  # Such a task has no completion/retry receipt by design, so keep Cloud Run's
+  # task-success checks below but do not reconcile execution receipts that
+  # truthfully do not exist. Scan the normalized array so split-form flags and
+  # PLAYWRIGHT_ARGS serialization have one authoritative representation.
+  local playwright_dry_run=false
+  for arg in "${pw_args[@]}"; do
+    if [ "$arg" = "--dry-run" ]; then
+      playwright_dry_run=true
+      break
+    fi
+  done
+
   # Resolve backend: explicit flags override env var; env var defaults to local.
   if $cloud_mode; then
     local_mode=false
@@ -631,20 +645,24 @@ cmd_run() {
     return 1
   }
 
-  local structured_retry_receipts
-  if ! structured_retry_receipts=$(query_structured_retry_receipts); then
-    exit 1
-  fi
+  local retry_evidence_count=0
+  if $playwright_dry_run; then
+    echo "[e2e-cloud] Skipping structured retry-receipt reconciliation for --dry-run (no Playwright task executed)."
+  else
+    local structured_retry_receipts
+    if ! structured_retry_receipts=$(query_structured_retry_receipts); then
+      exit 1
+    fi
 
-  local retry_evidence_count
-  retry_evidence_count=$(jq -r '.recoveredRetryCount' <<< "$structured_retry_receipts")
-  if ! [[ "$retry_evidence_count" =~ ^[0-9]+$ ]]; then
-    echo "[e2e-cloud] ERROR: structured retry receipt returned an invalid recoveredRetryCount." >&2
-    exit 1
-  fi
-  if [ "$retry_evidence_count" -gt 0 ]; then
-    echo "[e2e-cloud] Recovered Playwright retry evidence retained in Cloud Logging (${retry_evidence_count} case(s)):"
-    jq -c '.retryEvidence[] | {taskIndex, failureAttempt, test, error, trace}' <<< "$structured_retry_receipts"
+    retry_evidence_count=$(jq -r '.recoveredRetryCount' <<< "$structured_retry_receipts")
+    if ! [[ "$retry_evidence_count" =~ ^[0-9]+$ ]]; then
+      echo "[e2e-cloud] ERROR: structured retry receipt returned an invalid recoveredRetryCount." >&2
+      exit 1
+    fi
+    if [ "$retry_evidence_count" -gt 0 ]; then
+      echo "[e2e-cloud] Recovered Playwright retry evidence retained in Cloud Logging (${retry_evidence_count} case(s)):"
+      jq -c '.retryEvidence[] | {taskIndex, failureAttempt, test, error, trace}' <<< "$structured_retry_receipts"
+    fi
   fi
 
   # Extract and display a per-shard summary from the Playwright output.
