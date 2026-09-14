@@ -860,10 +860,8 @@ test.describe('Fresh Agent', () => {
     await terminal.waitForTerminal()
     await enableClaudeAndCodex(page)
     await previewFreshclaudeDefaults(page)
-    await expect.poll(async () => {
-      const settings = await harness.getSettings()
-      return settings?.freshAgent?.providers?.freshclaude ?? null
-    }).toMatchObject({
+    const settings = await harness.getSettings()
+    expect(settings?.freshAgent?.providers?.freshclaude).toMatchObject({
       modelSelection: { kind: 'exact', modelId: 'opus[1m]' },
       effort: 'high',
     })
