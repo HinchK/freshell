@@ -219,7 +219,10 @@ describe('App machine identity bootstrap', () => {
     render(<Provider store={store}><App /></Provider>)
 
     await waitFor(() => expect(mocks.startTabRegistrySync).toHaveBeenCalledTimes(1))
-    expect(mocks.restoreMachineWorkspace).toHaveBeenCalledWith(store, MACHINE.id)
+    // The remembered-selection boot passes the consumed one-shot marker: a
+    // natural reload (no active chooser pick) must keep a non-recoverable
+    // local layout — the reload-wipe fix's core wiring.
+    expect(mocks.restoreMachineWorkspace).toHaveBeenCalledWith(store, MACHINE.id, { activeSelection: false })
     expect(mocks.restoreMachineWorkspace.mock.invocationCallOrder[0]).toBeLessThan(
       mocks.startTabRegistrySync.mock.invocationCallOrder[0],
     )
