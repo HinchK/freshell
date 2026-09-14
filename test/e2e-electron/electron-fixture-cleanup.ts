@@ -167,6 +167,7 @@ export async function cleanupElectronFixture(options: ElectronFixtureCleanupDeps
   const gracefulCloseTimeoutMs = options.gracefulCloseTimeoutMs ?? DEFAULT_GRACEFUL_CLOSE_TIMEOUT_MS
   const forceCloseTimeoutMs = options.forceCloseTimeoutMs ?? DEFAULT_FORCE_CLOSE_TIMEOUT_MS
   let gracefulCloseFailed = false
+  let electronContainmentSucceeded = true
   let serverTeardownSucceeded = true
 
   if (options.restoreOpenExternal) {
@@ -186,6 +187,7 @@ export async function cleanupElectronFixture(options: ElectronFixtureCleanupDeps
       try {
         await stopExactCapturedProcess(options.electronProcess, forceCloseTimeoutMs, sleep)
       } catch (containmentError) {
+        electronContainmentSucceeded = false
         appendFailure(failures, 'containing the captured Electron process', containmentError)
       }
     }
@@ -200,7 +202,9 @@ export async function cleanupElectronFixture(options: ElectronFixtureCleanupDeps
     }
   }
 
-  if (options.removeHome && serverTeardownSucceeded) {
+  // Do not delete the profile beneath either a surviving app-bound Rust child
+  // or a captured Electron process whose exact containment was not proven.
+  if (options.removeHome && electronContainmentSucceeded && serverTeardownSucceeded) {
     try {
       await options.removeHome()
     } catch (error) {
