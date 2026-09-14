@@ -19,6 +19,7 @@ import {
   stopExactCapturedProcess,
 } from './electron-fixture-cleanup.js'
 import { cleanupOwnedFixtureHome } from './owned-fixture-home.js'
+import { withBoundedFixtureRequest } from './bounded-fixture-request.js'
 import { parseSsListeningPidsForPort } from './ss-listener-parser.js'
 import { isolatedElectronHomeEnv } from './fixture-home-env.js'
 import { launchChooserViteArgs, waitForCapturedViteReady } from './launch-chooser-vite.js'
@@ -73,17 +74,24 @@ async function waitForHealth(port: number, token: string): Promise<Record<string
   let lastError: unknown
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(`http://127.0.0.1:${port}/api/server-info`, {
-        headers: { 'x-auth-token': token },
-      })
-      if (response.ok) {
-        const info = (await response.json()) as Record<string, unknown>
+      const result = await withBoundedFixtureRequest(
+        `http://127.0.0.1:${port}/api/server-info`,
+        { headers: { 'x-auth-token': token } },
+        { deadline },
+        async (response) => ({
+          ok: response.ok,
+          status: response.status,
+          info: response.ok ? ((await response.json()) as Record<string, unknown>) : undefined,
+        }),
+      )
+      if (result.ok && result.info) {
+        const info = result.info
         if (info.runtime === 'rust' && typeof info.commit === 'string' && info.commit.length > 0) {
           return info
         }
         lastError = new Error('server-info did not contain Rust build provenance')
       } else {
-        lastError = new Error(`server-info returned ${response.status}`)
+        lastError = new Error(`server-info returned ${result.status}`)
       }
     } catch (error) {
       lastError = error
@@ -293,13 +301,16 @@ async function proveAppBoundRustOwnership(
   if (!receipt.identity || processIdentity(receipt.pid, context) !== receipt.identity) {
     throw new Error(`captured Rust PID ${receipt.pid} no longer has its recorded process identity`)
   }
-  const response = await fetch(`http://127.0.0.1:${receipt.port}/api/server-info`, {
-    headers: { 'x-auth-token': options.token },
-    signal: context.signal,
-  })
+  const serverInfo = await withBoundedFixtureRequest(
+    `http://127.0.0.1:${receipt.port}/api/server-info`,
+    { headers: { 'x-auth-token': options.token } },
+    { deadline: context.deadline, signal: context.signal },
+    async (response) => {
+      if (!response.ok) throw new Error(`fixture Rust server-info returned ${response.status} during ownership proof`)
+      return (await response.json()) as Record<string, unknown>
+    },
+  )
   assertOwnershipProofActive(context)
-  if (!response.ok) throw new Error(`fixture Rust server-info returned ${response.status} during ownership proof`)
-  const serverInfo = (await response.json()) as Record<string, unknown>
   if (serverInfo.runtime !== 'rust') throw new Error('fixture port did not serve the expected Rust runtime')
 
   const listeners = listeningPidsForFixturePort(receipt.port, context)
@@ -480,8 +491,12 @@ test.describe('Electron app-bound Rust server', () => {
       await expect
         .poll(async () => {
           try {
-            const response = await fetch(`http://127.0.0.1:${foreignPort}/api/health`)
-            return response.ok
+            return await withBoundedFixtureRequest(
+              `http://127.0.0.1:${foreignPort}/api/health`,
+              undefined,
+              {},
+              (response) => response.ok,
+            )
           } catch {
             return false
           }
