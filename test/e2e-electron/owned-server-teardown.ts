@@ -23,14 +23,25 @@ export interface ExactOwnedServerProcess {
   signal(signal: NodeJS.Signals): boolean
 }
 
+export interface OwnershipProofContext {
+  /** Cancels I/O when this one ownership observation reaches its deadline. */
+  signal: AbortSignal
+  /** Absolute deadline (milliseconds since epoch) for the cooperative probe. */
+  deadline: number
+}
+
 export interface ForcedOwnedServerTeardownProbes extends OwnedServerTeardownProbes {
   /**
    * Proves that the PID is still this fixture's Rust child immediately before
    * any signal is sent. A failed proof deliberately prevents signaling it.
    */
-  proveOwnership(receipt: OwnedServerReceipt): Promise<void>
+  proveOwnership(receipt: OwnedServerReceipt, context: OwnershipProofContext): Promise<void>
   sleep(ms: number): Promise<void>
+  /** Bounds each cooperative ownership observation, including external I/O. */
+  ownershipProofTimeoutMs?: number
 }
+
+const DEFAULT_OWNERSHIP_PROOF_TIMEOUT_MS = 2_000
 
 function isPidAlive(pid: number): boolean {
   try {
@@ -98,6 +109,40 @@ export async function verifyOwnedServerStopped(
 
 type ExactProcessState = { state: 'gone' | 'owned' | 'unproven'; error?: unknown }
 
+async function proveOwnershipWithinBudget(
+  receipt: OwnedServerReceipt,
+  probes: ForcedOwnedServerTeardownProbes,
+): Promise<void> {
+  const timeoutMs = probes.ownershipProofTimeoutMs ?? DEFAULT_OWNERSHIP_PROOF_TIMEOUT_MS
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new Error(`ownership proof timeout must be a positive finite duration, received ${timeoutMs}`)
+  }
+
+  const controller = new AbortController()
+  const deadline = Date.now() + timeoutMs
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeoutError = new Error(`ownership proof timed out after ${timeoutMs}ms`)
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      controller.abort(timeoutError)
+      reject(timeoutError)
+    }, timeoutMs)
+  })
+  const proof = Promise.resolve().then(() => probes.proveOwnership(receipt, {
+    signal: controller.signal,
+    deadline,
+  }))
+
+  try {
+    await Promise.race([proof, timeout])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+    // Cooperative probes receive an abort on every exit path, so a future
+    // operation cannot outlive this observation's ownership decision.
+    if (!controller.signal.aborted) controller.abort()
+  }
+}
+
 async function observeExactProcess(
   process: ExactOwnedServerProcess,
   receipt: OwnedServerReceipt,
@@ -105,7 +150,7 @@ async function observeExactProcess(
 ): Promise<ExactProcessState> {
   if (!process.isAlive()) return { state: 'gone' }
   try {
-    await probes.proveOwnership(receipt)
+    await proveOwnershipWithinBudget(receipt, probes)
     return { state: 'owned' }
   } catch (error) {
     // A natural exit between the liveness probe and /proc/handle inspection is
@@ -190,7 +235,7 @@ export async function forceStopExactOwnedServerAndVerify(
           // PID liveness alone is insufficient: prove the same fixture child
           // again immediately before escalation so PID reuse can never receive
           // an unproven SIGKILL.
-          await probes.proveOwnership(receipt)
+          await proveOwnershipWithinBudget(receipt, probes)
           const sentKill = process.signal('SIGKILL')
           if (!sentKill && process.isAlive()) {
             throw new Error(`owned server PID ${receipt.pid} rejected SIGKILL`)

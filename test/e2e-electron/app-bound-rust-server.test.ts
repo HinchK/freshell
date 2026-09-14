@@ -26,6 +26,7 @@ import {
   isPortFree,
   verifyOwnedServerStopped,
   waitForPidGone,
+  type OwnershipProofContext,
   type OwnedServerReceipt,
 } from './owned-server-teardown.js'
 
@@ -38,6 +39,7 @@ const RUST_BINARY = path.join(
   process.platform === 'win32' ? 'freshell-server.exe' : 'freshell-server',
 )
 const CLIENT_DIR = path.join(PROJECT_ROOT, 'dist', 'client')
+const OWNERSHIP_COMMAND_TIMEOUT_MS = 1_000
 
 function requireElectronE2eBuildId(): string {
   const buildId = process.env.FRESHELL_ELECTRON_E2E_BUILD_ID
@@ -174,10 +176,38 @@ function splitNulSeparatedFile(filePath: string): string[] {
  * kernel-assigned process creation identity and re-read it before every
  * signal so a recycled numeric PID can never receive fixture cleanup.
  */
-function processIdentity(pid: number): string {
+function assertOwnershipProofActive(context?: OwnershipProofContext): void {
+  if (!context) return
+  if (context.signal.aborted) throw context.signal.reason
+  if (Date.now() >= context.deadline) throw new Error('ownership proof deadline expired')
+}
+
+function runBoundedOwnershipCommand(
+  command: string,
+  args: string[],
+  context?: OwnershipProofContext,
+): { status: number | null; stdout: string } {
+  assertOwnershipProofActive(context)
+  const remainingMs = context ? context.deadline - Date.now() : OWNERSHIP_COMMAND_TIMEOUT_MS
+  const timeout = Math.min(OWNERSHIP_COMMAND_TIMEOUT_MS, remainingMs)
+  if (timeout <= 0) throw new Error('ownership proof deadline expired before external command')
+  const result = spawnSync(command, args, {
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout,
+    killSignal: 'SIGKILL',
+  }) as { status: number | null; stdout: string; error?: Error }
+  if (result.error || result.status === null) {
+    throw new Error(`ownership command ${command} did not settle within ${timeout}ms`, { cause: result.error })
+  }
+  assertOwnershipProofActive(context)
+  return result
+}
+
+function processIdentity(pid: number, context?: OwnershipProofContext): string {
   if (!Number.isInteger(pid) || pid <= 0) throw new Error(`invalid fixture PID ${pid}`)
   if (process.platform === 'win32') {
-    const result = spawnSync(
+    const result = runBoundedOwnershipCommand(
       'powershell.exe',
       [
         '-NoProfile',
@@ -185,8 +215,8 @@ function processIdentity(pid: number): string {
         '-Command',
         `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks`,
       ],
-      { encoding: 'utf8', windowsHide: true },
-    ) as { status: number | null; stdout: string }
+      context,
+    )
     const ticks = result.stdout.trim()
     if (result.status !== 0 || !/^\d+$/.test(ticks)) {
       throw new Error(`could not read creation identity for fixture PID ${pid}`)
@@ -206,11 +236,9 @@ function processIdentity(pid: number): string {
   return `linux-start:${startTime}`
 }
 
-function listeningPidsForFixturePort(port: number): number[] {
+function listeningPidsForFixturePort(port: number, context?: OwnershipProofContext): number[] {
   if (process.platform === 'win32') {
-    const result = spawnSync('netstat', ['-ano', '-p', 'tcp'], {
-      encoding: 'utf8',
-    }) as { status: number | null; stdout: string }
+    const result = runBoundedOwnershipCommand('netstat', ['-ano', '-p', 'tcp'], context)
     if (result.status !== 0) throw new Error(`could not inspect the exact fixture port ${port} with netstat`)
     return result.stdout.split(/\r?\n/).flatMap((line) => {
       const fields = line.trim().split(/\s+/)
@@ -222,10 +250,7 @@ function listeningPidsForFixturePort(port: number): number[] {
     })
   }
 
-  const result = spawnSync('ss', ['-ltnp'], { encoding: 'utf8' }) as {
-    status: number | null
-    stdout: string
-  }
+  const result = runBoundedOwnershipCommand('ss', ['-ltnp'], context)
   if (result.status !== 0) throw new Error(`could not inspect the exact fixture port ${port} with ss`)
   const portPattern = new RegExp(`(?:127\\.0\\.0\\.1|\\[::1\\]):${port}(?:\\s|$)`)
   const pids = new Set<number>()
@@ -255,24 +280,32 @@ async function proveAppBoundRustOwnership(
     clientDir: string
     token: string
   },
+  context: OwnershipProofContext,
 ): Promise<void> {
-  if (!receipt.identity || processIdentity(receipt.pid) !== receipt.identity) {
+  assertOwnershipProofActive(context)
+  if (!receipt.identity || processIdentity(receipt.pid, context) !== receipt.identity) {
     throw new Error(`captured Rust PID ${receipt.pid} no longer has its recorded process identity`)
   }
   const response = await fetch(`http://127.0.0.1:${receipt.port}/api/server-info`, {
     headers: { 'x-auth-token': options.token },
-    signal: AbortSignal.timeout(2_000),
+    signal: context.signal,
   })
+  assertOwnershipProofActive(context)
   if (!response.ok) throw new Error(`fixture Rust server-info returned ${response.status} during ownership proof`)
   const serverInfo = (await response.json()) as Record<string, unknown>
   if (serverInfo.runtime !== 'rust') throw new Error('fixture port did not serve the expected Rust runtime')
 
-  const listeners = listeningPidsForFixturePort(receipt.port)
+  const listeners = listeningPidsForFixturePort(receipt.port, context)
   if (listeners.length !== 1 || listeners[0] !== receipt.pid) {
     throw new Error(`fixture port ${receipt.port} is not exclusively owned by captured Rust PID ${receipt.pid}`)
   }
 
-  if (process.platform === 'win32') return
+  if (process.platform === 'win32') {
+    if (processIdentity(receipt.pid, context) !== receipt.identity) {
+      throw new Error(`captured Rust PID ${receipt.pid} changed identity during ownership proof`)
+    }
+    return
+  }
 
   const executable = executablePath(receipt.pid)
   if (!executable || !sameResolvedPath(executable, options.binary)) {
@@ -305,6 +338,9 @@ async function proveAppBoundRustOwnership(
     environment.get('FRESHELL_CLIENT_DIR') !== options.clientDir
   ) {
     throw new Error(`captured Rust PID ${receipt.pid} does not have the fixture port, HOME, and client environment`)
+  }
+  if (processIdentity(receipt.pid, context) !== receipt.identity) {
+    throw new Error(`captured Rust PID ${receipt.pid} changed identity during ownership proof`)
   }
 }
 
@@ -458,14 +494,14 @@ test.describe('Electron app-bound Rust server', () => {
             }
             if (gracefulCloseFailed) {
               await forceStopExactOwnedServerAndVerify(exactPidProcess(appServerReceipt.pid), appServerReceipt, {
-                proveOwnership: (receipt) =>
+                proveOwnership: (receipt, context) =>
                   proveAppBoundRustOwnership(receipt, {
                     binary: RUST_BINARY,
                     configDir: appConfigDir,
                     home: appHome,
                     clientDir: CLIENT_DIR,
                     token: appToken,
-                  }),
+                  }, context),
                 waitForPidGone,
                 isPortFree,
                 sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
