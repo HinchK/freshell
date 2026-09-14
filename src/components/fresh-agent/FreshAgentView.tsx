@@ -1190,12 +1190,18 @@ export function FreshAgentView({
   const sendFreshAgentSendFrame = useCallback((requestId: string, text: string, cwd?: string) => {
     const current = paneContentRef.current
     if (!current.sessionId) return
+    // b8ke ext r8 F5: the send is a lifecycle producer — it carries the
+    // observed (epoch, generation) fence so a queued send landing after a
+    // crash + generation advance is typed-refused server-side, never an
+    // unfenced recreation.
+    const fence = selectPaneOwnerFence(appStore.getState(), current)
     sendFreshAgentMessage({
       type: 'freshAgent.send',
       requestId,
       sessionId: current.sessionId,
       sessionType: current.sessionType,
       provider: current.provider,
+      ...(fence ? { observedEpoch: fence.epoch, observedGeneration: fence.generation } : {}),
       ...(cwd ? { cwd } : {}),
       text,
       settings: {

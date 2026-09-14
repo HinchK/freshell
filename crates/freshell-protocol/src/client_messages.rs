@@ -799,6 +799,14 @@ pub struct FreshAgentSend {
     pub request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub settings: Option<FreshAgentSendSettings>,
+    /// b8ke ext r8 F5: the delayed-request fence (additive; the pair
+    /// rides the coordinator's generation discipline so a queued send
+    /// landing after a crash + generation advance is typed-refused, never
+    /// an unfenced recreation).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_epoch: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

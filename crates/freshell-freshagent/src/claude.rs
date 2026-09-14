@@ -10107,6 +10107,8 @@ rl.on('line', (line) => {
             images: None,
             request_id: None,
             settings: None,
+            observed_epoch: None,
+            observed_generation: None,
         }
     }
 

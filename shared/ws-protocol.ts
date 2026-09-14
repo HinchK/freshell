@@ -816,6 +816,11 @@ export const FreshAgentSendSchema = z.object({
   sessionId: z.string().min(1),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
+  /** b8ke ext r8 F5: the send's delayed-request fence (crashed-session
+   *  recovery re-claims carry it, so a stale queued send is typed-refused,
+   *  never an unfenced recreation). */
+  observedEpoch: z.number().int().nonnegative().optional(),
+  observedGeneration: z.number().int().nonnegative().optional(),
   cwd: z.string().optional(),
   text: z.string().min(1),
   settings: z.object({

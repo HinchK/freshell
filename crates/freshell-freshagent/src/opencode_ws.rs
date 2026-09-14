@@ -5840,6 +5840,8 @@ mod tests {
             images: None,
             request_id: Some(format!("req-{text}")),
             settings: None,
+            observed_epoch: None,
+            observed_generation: None,
         }
     }
 

@@ -5485,6 +5485,8 @@ async fn opencode_handoff_stop_aborts_the_active_turn_through_the_manager_before
             images: None,
             request_id: Some(format!("handoff-active-send-{}", uuid::Uuid::new_v4())),
             settings: None,
+            observed_epoch: None,
+            observed_generation: None,
         })
         .await;
     env.await_audit_row(Duration::from_secs(20), |r| {
@@ -5619,6 +5621,8 @@ async fn opencode_handoff_stop_aborts_a_daemon_turn_left_running_by_a_finished_l
             images: None,
             request_id: Some(format!("handoff-idletimeout-send-{}", uuid::Uuid::new_v4())),
             settings: None,
+            observed_epoch: None,
+            observed_generation: None,
         })
         .await;
     env.await_audit_row(Duration::from_secs(20), |r| {
