@@ -113,6 +113,7 @@
         "perf:audit:compare",
         "perf:audit:gate",
         "perf:audit:visible-first",
+        "postinstall",
         "prebuild",
         "predev",
         "predev:server",
@@ -226,6 +227,11 @@
       "id": "scripts-launch",
       "path": "scripts/launch.sh",
       "role": "rust-launcher"
+    },
+    {
+      "id": "scripts-hook-pre-push",
+      "path": "scripts/hooks/pre-push",
+      "role": "developer-hook"
     },
     {
       "id": "listener-browser-visibility-probe",
