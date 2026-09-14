@@ -1653,7 +1653,7 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
     // and is held through the REST spawn + register + settle, so a handoff or
     // stop can NEVER begin and commit inside the create's window (pre-r13
     // the Adopt arm proceeded with NO ticket or guard).
-    let mut rest_adopt_guard: Option<freshell_ownership::AttachGuard> = None;
+    let mut _rest_adopt_guard: Option<freshell_ownership::AttachGuard> = None;
     if let Some(locator) = learned_claim_locator.clone() {
         let operation_id = handoff
             .map(|t| t.operation_id.clone())
@@ -1709,7 +1709,7 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                     "rest-terminal-create/adopt",
                 ) {
                     freshell_ownership::AttachGuardOutcome::Armed(guard) => {
-                        rest_adopt_guard = Some(*guard);
+                        _rest_adopt_guard = Some(*guard);
                     }
                     freshell_ownership::AttachGuardOutcome::Refused { .. } => {
                         tracing::warn!(target: "freshell_freshagent::terminal_tabs",

@@ -4761,7 +4761,7 @@ impl FreshClaudeState {
         // can NEVER start a terminal beside the replacement (pre-r13 the
         // Adopt arm proceeded with NO claim, and the rekey's verify was
         // the only — post-overlap — defense).
-        let mut rollback_adopt_guard: Option<freshell_ownership::AttachGuard> = None;
+        let mut _rollback_adopt_guard: Option<freshell_ownership::AttachGuard> = None;
         if granted_ticket.is_none() && self.ownership.is_some() {
             let resolved = self.resolve_ownership_key(&durable_id);
             let snap = self.ownership_snapshot(PROVIDER, &resolved);
@@ -4774,7 +4774,7 @@ impl FreshClaudeState {
                 "freshclaude/rollback-adopt",
             ) {
                 crate::ownership_lane::LaneAttachGuard::Armed(guard) => {
-                    rollback_adopt_guard = Some(guard);
+                    _rollback_adopt_guard = Some(guard);
                 }
                 crate::ownership_lane::LaneAttachGuard::Unwired => {}
                 crate::ownership_lane::LaneAttachGuard::Refused => {

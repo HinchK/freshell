@@ -3533,7 +3533,7 @@ async fn resume_session_ref_tab(
     // b8ke ext r13 F6: the Adopt arm's held authority — the ext-r12
     // attach guard, held across the probe + registration + broadcast
     // (this function's scope).
-    let mut resume_adopt_guard: Option<freshell_ownership::AttachGuard> = None;
+    let mut _resume_adopt_guard: Option<freshell_ownership::AttachGuard> = None;
     let mut resume_ticket = match ownership_lane::begin_lane_claim(
         &state.ownership,
         PROVIDER,
@@ -3559,7 +3559,7 @@ async fn resume_session_ref_tab(
                 "freshopencode/rest-resume-adopt",
             ) {
                 ownership_lane::LaneAttachGuard::Armed(guard) => {
-                    resume_adopt_guard = Some(guard);
+                    _resume_adopt_guard = Some(guard);
                     None
                 }
                 ownership_lane::LaneAttachGuard::Unwired => None,
@@ -6650,14 +6650,14 @@ mod tests {
     /// only after it had inserted and broadcast its layout).
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_same_session_resumes_are_separate_operations() {
-        let (mut st, registry, durable_id) = resumed_live_state().await;
+        let (st, registry, durable_id) = resumed_live_state().await;
         // Reset the key to Vacant so BOTH requests claim from scratch
         // (the concurrent in-flight shape the shared id broke).
         match registry.observe(PROVIDER, &durable_id).state {
             freshell_ownership::OwnershipState::Live {
                 owner, generation, ..
             } => {
-                let _ = registry.release(
+                registry.release(
                     PROVIDER,
                     &durable_id,
                     &freshell_ownership::ReleaseClaim {
@@ -6802,7 +6802,7 @@ mod tests {
     /// its pane).
     #[tokio::test(flavor = "multi_thread")]
     async fn a_handoff_during_the_resume_adopt_window_is_blocked_typed() {
-        let (mut st, registry, durable_id) = resumed_live_state().await;
+        let (st, registry, durable_id) = resumed_live_state().await;
         // A parking probe: the Adopt-path resume parks inside its window.
         let release = Arc::new(tokio::sync::Notify::new());
         let park_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));

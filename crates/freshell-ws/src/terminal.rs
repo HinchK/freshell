@@ -3291,7 +3291,7 @@ pub(crate) async fn handle_create(
     // the incumbent terminating or a handoff starting after the check let
     // the request attach to a terminal being reaped or briefly create
     // another writer before the late claim failed).
-    let mut wire_adopt_guard: Option<freshell_ownership::AttachGuard> = None;
+    let mut _wire_adopt_guard: Option<freshell_ownership::AttachGuard> = None;
     // b8ke ext r10 F2: the wire locator the wire claim above consulted
     // (None when the create carried no sessionRef). The LEARNED-identity
     // claim below must NOT re-claim an id the wire claim already covered —
@@ -3435,7 +3435,9 @@ pub(crate) async fn handle_create(
                     // then hold authority). A guard refusal (the incumbent
                     // entered a transition, or the observed fence is
                     // stale) answers the typed refusal and NOTHING spawns.
-                    let ownership_ref = state.ownership.as_ref().expect("claimed above");
+                    let Some(ownership_ref) = state.ownership.as_ref() else {
+                        unreachable!("the wire claim ran under a wired coordinator");
+                    };
                     let observed_generation = observed.map(|fence| fence.generation);
                     match ownership_ref.begin_attach_guard(
                         &locator.provider,
@@ -3445,7 +3447,7 @@ pub(crate) async fn handle_create(
                         "ws-terminal-create/adopt",
                     ) {
                         freshell_ownership::AttachGuardOutcome::Armed(guard) => {
-                            wire_adopt_guard = Some(*guard);
+                            _wire_adopt_guard = Some(*guard);
                         }
                         freshell_ownership::AttachGuardOutcome::Refused {
                             state: refused_state,
