@@ -1,5 +1,6 @@
 import { test, expect } from '../helpers/fixtures.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { TestHarness } from '../helpers/test-harness.js'
 
 // The browser-preferences persist path debounces localStorage writes by
 // 500ms; wait past it before reading the blob.
@@ -1658,6 +1659,19 @@ test.describe('Fresh Agent', () => {
     await expect(page.getByText('pending')).toBeVisible()
     await expect(page.getByText('thread-parent-1')).toBeVisible()
 
+    // Persist the pane's durable reference, then exercise a fresh browser
+    // session against the same Rust fixture. Re-query the harness and locators
+    // after navigation so this is a resume proof, not stale-page evidence.
+    await page.evaluate(() => {
+      window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
+    })
+    await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+    const reloadedHarness = new TestHarness(page)
+    await reloadedHarness.waitForHarness()
+    await reloadedHarness.waitForConnection()
+    await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible()
+    await expect(page.getByText('Codex transcript')).toBeVisible()
+    await expect(page.getByText(/feature\/fresh-agent/)).toBeVisible()
   })
 })
 
