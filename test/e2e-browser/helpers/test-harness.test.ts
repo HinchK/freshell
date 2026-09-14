@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { Page } from '@playwright/test'
 import {
   DEFAULT_WS_READY_TIMEOUT_MS,
@@ -27,6 +27,14 @@ function fakePage() {
   }
   return { page: page as unknown as Page, calls }
 }
+
+// beforeEach: clear the ambient var (set by scripts/e2e-cloud.sh on the
+// cloud lane) so every test starts from the default state, even in -t
+// filtered runs that skip the earlier tests whose afterEach would
+// otherwise clean it first.
+beforeEach(() => {
+  delete process.env[ENV_VAR]
+})
 
 afterEach(() => {
   delete process.env[ENV_VAR]

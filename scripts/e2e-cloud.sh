@@ -173,6 +173,10 @@ Environment:
   FRESHELL_E2E_BACKEND  "local" (default) or "cloud"
   FRESHELL_GCP_JOB      Cloud Run job-name prefix (default: freshell-e2e)
   FRESHELL_GCP_ACCOUNT  GCP account override pinned on every gcloud call (optional)
+  FRESHELL_E2E_WS_READY_TIMEOUT_MS  Cloud-lane TestHarness.waitForConnection
+                                    window in ms (default 45000; overrides
+                                    the 30s in-code default). Set per-run
+                                    job env on `run --cloud`.
 
 Identity (cloud lanes only — details: docs/development/gcloud-robot.md):
   Cloud subcommands resolve a gcloud identity lazily, in this order:
@@ -501,6 +505,17 @@ cmd_run() {
   else
     echo 'PLAYWRIGHT_ARGS: ""' > "$RUN_ENV_FILE"
   fi
+
+  # Cloud-lane WS-ready tolerance (kata j90s). The client's 10s ready
+  # watchdog (CONNECTION_TIMEOUT_MS in src/lib/ws-client.ts) force-closes a
+  # cold-start-slowed handshake and reconnects with jittered 1→2→4s
+  # backoff; each missed cycle costs ~11-17s, and the observed j90s flake
+  # (PR #772 gate, 2026-09-14) exceeded a real 30s window (the explicit
+  # windows were decorative — see test-harness.ts). 45s covers three full
+  # watchdog cycles while the 60s per-test Playwright budget still bounds
+  # the pathological tail. Override by exporting
+  # FRESHELL_E2E_WS_READY_TIMEOUT_MS (ms) before this script.
+  echo "FRESHELL_E2E_WS_READY_TIMEOUT_MS: \"${FRESHELL_E2E_WS_READY_TIMEOUT_MS:-45000}\"" >> "$RUN_ENV_FILE"
 
   # Create THIS run's own unique job (see unique_job_name). Create-only: a
   # name collision would mean the job is not unique to this run, so fail
