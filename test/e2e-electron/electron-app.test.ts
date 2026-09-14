@@ -7,6 +7,7 @@
  */
 
 import { test, expect, _electron as electron, type ElectronApplication, type Page } from '@playwright/test'
+import type { ChildProcess } from 'node:child_process'
 import path from 'path'
 import fs from 'fs'
 import os from 'os'
@@ -14,8 +15,18 @@ import { RustServer } from '../e2e-browser/helpers/rust-server.js'
 import type { E2eServerInfo } from '../e2e-browser/helpers/server-fixture-support.js'
 import type { LaunchServerCandidate } from '../../electron/types.js'
 import { stopOwnedServerAndVerify } from './owned-server-teardown.js'
+import { cleanupElectronFixture, closeElectronGracefully } from './electron-fixture-cleanup.js'
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, '..', '..')
+const electronProcesses = new WeakMap<ElectronApplication, ChildProcess>()
+
+function requireElectronE2eBuildId(): string {
+  const buildId = process.env.FRESHELL_ELECTRON_E2E_BUILD_ID
+  if (!buildId || !/^[0-9a-f]{40}$/.test(buildId)) {
+    throw new Error('Electron E2E requires the exact-client-build preflight; run npm run test:e2e:electron')
+  }
+  return buildId
+}
 
 function createTempHome(desktopConfig?: Record<string, unknown>): string {
   const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-e2e-'))
@@ -48,12 +59,16 @@ async function launchApp(
       // The Electron launch chooser normally probes local development ports,
       // including :3001. E2E supplies an explicit owned target instead.
       FRESHELL_ELECTRON_TEST_NO_LOCAL_DISCOVERY: '1',
+      FRESHELL_ELECTRON_TEST_LIFECYCLE_STDOUT: '1',
       FRESHELL_ELECTRON_TEST_DISCOVERY_CANDIDATE: discoveryCandidate
         ? JSON.stringify(discoveryCandidate)
         : undefined,
     },
     cwd: PROJECT_ROOT,
   })
+  // Capture the launch-owned process once. Cleanup may only signal this exact
+  // child if Playwright's graceful close has already timed out.
+  electronProcesses.set(app, app.process())
 
   if (captureOutput) {
     app.process().stdout?.on('data', (data: Buffer) => {
@@ -140,7 +155,7 @@ function requireRemoteServerInfo(): E2eServerInfo {
 
 async function startRemoteServer(): Promise<E2eServerInfo> {
   if (remoteServer) throw new Error('Electron remote-server fixture is already running')
-  remoteServer = new RustServer()
+  remoteServer = new RustServer({ expectedBuildCommit: requireElectronE2eBuildId() })
   remoteServerInfo = await remoteServer.start()
   expect(remoteServerInfo.port).not.toBe(3001)
   return remoteServerInfo
@@ -158,56 +173,6 @@ async function stopRemoteServer(): Promise<void> {
     throw new Error('Electron remote-server fixture stopped without an owned PID/port receipt')
   }
   await stopOwnedServerAndVerify(server, serverInfo)
-}
-
-function appendCleanupFailure(failures: Error[], step: string, error: unknown): void {
-  failures.push(new Error(`Electron fixture cleanup failed while ${step}`, { cause: error }))
-}
-
-async function cleanupElectronFixture(options: {
-  app?: ElectronApplication
-  restoreOpenExternal?: boolean
-  stopServer?: () => Promise<void>
-  tmpHome?: string
-}): Promise<void> {
-  const failures: Error[] = []
-
-  // App shutdown must precede server shutdown so renderer/browser teardown
-  // cannot race the fixture's exact PID/port proof.
-  if (options.app && options.restoreOpenExternal) {
-    try {
-      await options.app.evaluate(() => {
-        ;(globalThis as any).__restoreOpenExternal?.()
-      })
-    } catch (error) {
-      appendCleanupFailure(failures, 'restoring shell.openExternal', error)
-    }
-  }
-  if (options.app) {
-    try {
-      await options.app.close()
-    } catch (error) {
-      appendCleanupFailure(failures, 'closing Electron', error)
-    }
-  }
-  if (options.stopServer) {
-    try {
-      await options.stopServer()
-    } catch (error) {
-      appendCleanupFailure(failures, 'stopping the owned Rust server', error)
-    }
-  }
-  if (options.tmpHome) {
-    try {
-      fs.rmSync(options.tmpHome, { recursive: true, force: true })
-    } catch (error) {
-      appendCleanupFailure(failures, 'removing the temporary HOME', error)
-    }
-  }
-
-  if (failures.length > 0) {
-    throw new AggregateError(failures, 'Electron fixture cleanup failed')
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -231,7 +196,14 @@ test.describe('Renderer crash recovery', () => {
     tmpHome = undefined
     await cleanupElectronFixture({
       app: appToClose,
-      restoreOpenExternal: true,
+      electronProcess: appToClose ? electronProcesses.get(appToClose) : undefined,
+      restoreOpenExternal: appToClose
+        ? async () => {
+          await appToClose.evaluate(() => {
+            ;(globalThis as any).__restoreOpenExternal?.()
+          })
+        }
+        : undefined,
       stopServer: serverToStop && infoToVerify
         ? () => stopOwnedServerAndVerify(serverToStop, infoToVerify)
         : serverToStop
@@ -239,7 +211,7 @@ test.describe('Renderer crash recovery', () => {
             throw new Error('renderer-recovery fixture stopped without an owned PID/port receipt')
           })
           : undefined,
-      tmpHome: homeToRemove,
+      removeHome: homeToRemove ? async () => { fs.rmSync(homeToRemove, { recursive: true, force: true }) } : undefined,
     })
   })
 
@@ -341,7 +313,12 @@ test.describe('Wizard flow', () => {
     const homeToRemove = tmpHome
     app = undefined
     tmpHome = undefined
-    await cleanupElectronFixture({ app: appToClose, stopServer: stopRemoteServer, tmpHome: homeToRemove })
+    await cleanupElectronFixture({
+      app: appToClose,
+      electronProcess: appToClose ? electronProcesses.get(appToClose) : undefined,
+      stopServer: stopRemoteServer,
+      removeHome: homeToRemove ? async () => { fs.rmSync(homeToRemove, { recursive: true, force: true }) } : undefined,
+    })
   })
 
   test('shows wizard on first launch and completes setup', async () => {
@@ -429,7 +406,12 @@ test.describe('Launch chooser', () => {
     const homeToRemove = tmpHome
     app = undefined
     tmpHome = undefined
-    await cleanupElectronFixture({ app: appToClose, stopServer: stopRemoteServer, tmpHome: homeToRemove })
+    await cleanupElectronFixture({
+      app: appToClose,
+      electronProcess: appToClose ? electronProcesses.get(appToClose) : undefined,
+      stopServer: stopRemoteServer,
+      removeHome: homeToRemove ? async () => { fs.rmSync(homeToRemove, { recursive: true, force: true }) } : undefined,
+    })
   })
 
   test('shows launch chooser when alwaysAskOnLaunch is true', async () => {
@@ -472,6 +454,14 @@ test.describe('Launch chooser', () => {
     await mainPage.waitForLoadState('domcontentloaded')
 
     await expect(mainPage).toHaveURL(new RegExp(`^${escapeRegExp(serverInfo.baseUrl)}(?:[/?#]|$)`))
+
+    // This is the chooser-restart lifecycle contract. It must gracefully
+    // quit within the fixture budget before exact owned server teardown.
+    await expect(closeElectronGracefully(app)).resolves.toBeUndefined()
+    app = undefined
+    await expect(stopRemoteServer()).resolves.toBeUndefined()
+    fs.rmSync(tmpHome, { recursive: true, force: true })
+    expect(fs.existsSync(tmpHome)).toBe(false)
   })
 })
 
@@ -493,7 +483,12 @@ test.describe('Main window with remote server', () => {
     const homeToRemove = tmpHome
     app = undefined
     tmpHome = undefined
-    await cleanupElectronFixture({ app: appToClose, stopServer: stopRemoteServer, tmpHome: homeToRemove })
+    await cleanupElectronFixture({
+      app: appToClose,
+      electronProcess: appToClose ? electronProcesses.get(appToClose) : undefined,
+      stopServer: stopRemoteServer,
+      removeHome: homeToRemove ? async () => { fs.rmSync(homeToRemove, { recursive: true, force: true }) } : undefined,
+    })
   })
 
   test('loads authenticated Freshell UI', async () => {

@@ -1,0 +1,88 @@
+import { describe, expect, it, vi } from 'vitest'
+import {
+  closeElectronGracefully,
+  cleanupElectronFixture,
+  type ElectronFixtureCleanupDeps,
+} from '../../e2e-electron/electron-fixture-cleanup.js'
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void
+  const promise = new Promise<void>((done) => { resolve = done })
+  return { promise, resolve }
+}
+
+async function expectCleanupFailure(operation: Promise<void>, pattern: RegExp): Promise<void> {
+  try {
+    await operation
+    throw new Error('expected fixture cleanup to fail')
+  } catch (error) {
+    expect(error).toBeInstanceOf(AggregateError)
+    expect((error as AggregateError).errors.some((failure) => {
+      const cause = (failure as Error & { cause?: unknown }).cause
+      return pattern.test(String(failure)) || pattern.test(String(cause))
+    })).toBe(true)
+  }
+}
+
+describe('cleanupElectronFixture', () => {
+  it('rejects a hung graceful-close contract within its explicit budget', async () => {
+    const close = deferred()
+    await expect(closeElectronGracefully(
+      { close: () => close.promise },
+      1,
+      async () => {},
+    )).rejects.toThrow(/graceful Electron shutdown timed out/i)
+  })
+
+  it('closes Electron before proving the owned Rust server and removing HOME', async () => {
+    const order: string[] = []
+    const deps: ElectronFixtureCleanupDeps = {
+      app: { close: vi.fn(async () => { order.push('app.close') }) },
+      stopServer: vi.fn(async () => { order.push('server.stop-and-verify') }),
+      removeHome: vi.fn(async () => { order.push('home.remove') }),
+    }
+
+    await expect(cleanupElectronFixture(deps)).resolves.toBeUndefined()
+
+    expect(order).toEqual(['app.close', 'server.stop-and-verify', 'home.remove'])
+  })
+
+  it('contains a hung graceful close, still proves/removes fixture resources, and preserves the failure', async () => {
+    const close = deferred()
+    const order: string[] = []
+    const electronProcess = {
+      exitCode: null,
+      kill: vi.fn((signal: NodeJS.Signals) => {
+        order.push(`electron.${signal}`)
+        electronProcess.exitCode = 0
+        return true
+      }),
+    }
+    const deps: ElectronFixtureCleanupDeps = {
+      app: { close: vi.fn(() => close.promise) },
+      electronProcess,
+      stopServer: vi.fn(async () => { order.push('server.stop-and-verify') }),
+      removeHome: vi.fn(async () => { order.push('home.remove') }),
+      gracefulCloseTimeoutMs: 1,
+      forceCloseTimeoutMs: 1,
+      sleep: async () => {},
+    }
+
+    await expectCleanupFailure(cleanupElectronFixture(deps), /graceful Electron shutdown timed out/i)
+
+    expect(order).toEqual(['electron.SIGTERM', 'server.stop-and-verify', 'home.remove'])
+    expect(electronProcess.kill).toHaveBeenCalledWith('SIGTERM')
+  })
+
+  it('retains a graceful-close failure while continuing exact-server and HOME cleanup', async () => {
+    const order: string[] = []
+    const deps: ElectronFixtureCleanupDeps = {
+      app: { close: vi.fn(async () => { throw new Error('close protocol failed') }) },
+      stopServer: vi.fn(async () => { order.push('server.stop-and-verify') }),
+      removeHome: vi.fn(async () => { order.push('home.remove') }),
+    }
+
+    await expectCleanupFailure(cleanupElectronFixture(deps), /closing Electron/i)
+    expect(order).toEqual(['server.stop-and-verify', 'home.remove'])
+  })
+})

@@ -282,6 +282,8 @@ export interface RustServerOptions {
    * Default: findFreePort. restart paths intentionally reuse the prior port.
    */
   portPicker?: () => Promise<number>
+  /** Refuse to boot when the authenticated server provenance differs. */
+  expectedBuildCommit?: string
 }
 
 /**
@@ -367,7 +369,16 @@ export class RustServer implements E2eServerHandle {
             `bind race: foreign server answered health on port ${port} (server-info ${identity.status})`,
           )
         }
-        assertRustServerInfo(await identity.json().catch(() => null))
+        const identityBody = await identity.json().catch(() => null)
+        assertRustServerInfo(identityBody)
+        if (this.options.expectedBuildCommit) {
+          const actualCommit = (identityBody as { commit?: unknown }).commit
+          if (actualCommit !== this.options.expectedBuildCommit) {
+            throw new Error(
+              `Rust server fixture build commit mismatch: expected ${this.options.expectedBuildCommit}, received ${String(actualCommit)}`,
+            )
+          }
+        }
         return info
       } catch (error) {
         lastError = error

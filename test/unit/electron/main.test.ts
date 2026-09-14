@@ -125,6 +125,24 @@ describe('initMainProcess', () => {
     expect(deps.stopServer).toHaveBeenCalledTimes(1)
   })
 
+  it('emits the generation-scoped graceful-quit lifecycle sequence', async () => {
+    const log = vi.fn()
+    deps.lifecycleLogger = { log }
+    deps.startupGeneration = 2
+    await initMainProcess(deps)
+
+    const beforeQuit = app.listeners('before-quit')[0] as (event: { preventDefault: () => void }) => void
+    beforeQuit({ preventDefault: vi.fn() })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(log.mock.calls.map(([entry]) => entry)).toEqual([
+      expect.objectContaining({ event: 'electron_before_quit', startupGeneration: 2 }),
+      expect.objectContaining({ event: 'electron_server_stop_started', startupGeneration: 2 }),
+      expect.objectContaining({ event: 'electron_server_stop_settled', startupGeneration: 2 }),
+      expect.objectContaining({ event: 'electron_continue_quit', startupGeneration: 2 }),
+    ])
+  })
+
   it('resumes quitting when server cleanup rejects', async () => {
     ;(deps.stopServer as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('stop failed'))
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})

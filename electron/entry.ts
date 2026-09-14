@@ -264,16 +264,19 @@ let wizardPhase = true
  * once at the top of main().
  */
 let pendingForcedLaunch: ForcedLaunch | undefined
+let startupGeneration = 0
 
 async function main(): Promise<void> {
   // Wait for Electron to be ready before creating any BrowserWindow or using
   // Electron APIs that require the app to be initialized.
   await app.whenReady()
+  const currentStartupGeneration = ++startupGeneration
   mainProcessLogger.log({
-    severity: 'info',
+    severity: 'info' as const,
     event: 'electron_main_started',
     appVersion: app.getVersion(),
     isDev,
+    startupGeneration: currentStartupGeneration,
   })
 
   // Consolidated window-all-closed handler: during the wizard phase we keep
@@ -712,6 +715,8 @@ async function main(): Promise<void> {
     },
     minimizeToTray: desktopConfig.minimizeToTray,
     platform: process.platform,
+    lifecycleLogger: mainProcessLogger,
+    startupGeneration: currentStartupGeneration,
   })
 }
 
@@ -720,6 +725,16 @@ async function main(): Promise<void> {
 // will-quit independently, and without this guard the process exits before
 // main() can re-run to create the main window.
 app.on('will-quit', (e) => {
+  const lifecycleEntry = {
+    severity: 'info' as const,
+    event: 'electron_will_quit',
+    startupGeneration,
+    wizardPhase,
+  }
+  mainProcessLogger.log(lifecycleEntry)
+  if (process.env.FRESHELL_ELECTRON_TEST_LIFECYCLE_STDOUT === '1') {
+    console.log(JSON.stringify({ component: 'electron-main', ...lifecycleEntry }))
+  }
   if (wizardPhase) {
     e.preventDefault()
   }

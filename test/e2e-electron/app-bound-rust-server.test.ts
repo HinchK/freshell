@@ -21,6 +21,14 @@ const RUST_BINARY = path.join(PROJECT_ROOT, 'target', 'debug', process.platform 
   : 'freshell-server')
 const CLIENT_DIR = path.join(PROJECT_ROOT, 'dist', 'client')
 
+function requireElectronE2eBuildId(): string {
+  const buildId = process.env.FRESHELL_ELECTRON_E2E_BUILD_ID
+  if (!buildId || !/^[0-9a-f]{40}$/.test(buildId)) {
+    throw new Error('Electron E2E requires the exact-client-build preflight; run npm run test:e2e:electron')
+  }
+  return buildId
+}
+
 async function findFreePort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const server = http.createServer()
@@ -188,6 +196,7 @@ test.describe('Electron app-bound Rust server', () => {
     test.skip(process.platform === 'win32', 'The exact /proc executable assertion is Linux-only.')
     expect(fs.existsSync(RUST_BINARY)).toBe(true)
     expect(fs.existsSync(CLIENT_DIR)).toBe(true)
+    const expectedBuildId = requireElectronE2eBuildId()
 
     const appPort = await findFreePort()
     let foreignPort = await findFreePort()
@@ -233,7 +242,8 @@ test.describe('Electron app-bound Rust server', () => {
         },
         stdio: 'ignore',
       })
-      await waitForHealth(foreignPort, foreignToken)
+      const foreignInfo = await waitForHealth(foreignPort, foreignToken)
+      expect(foreignInfo.commit).toBe(expectedBuildId)
 
       // In development Electron loads the chooser from Vite. Start only that
       // fixture here; the Rust server serves the main client from disk.
@@ -265,7 +275,7 @@ test.describe('Electron app-bound Rust server', () => {
       appServerPid = await waitForOwnedChild(electronPid, RUST_BINARY)
       const appInfo = await waitForHealth(appPort, appToken)
       expect(appInfo.runtime).toBe('rust')
-      expect(appInfo.commit).toEqual(expect.any(String))
+      expect(appInfo.commit).toBe(expectedBuildId)
 
       await app.close()
       app = undefined
