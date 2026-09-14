@@ -46,14 +46,20 @@ a native Windows process. **Do not** build over the `\\wsl.localhost\...` UNC
 path (slow and fragile over 9p). Instead, copy the working tree to a
 Windows-local path and run Windows' own npm against it via interop.
 
-1. Copy the worktree to a Windows-local dir, excluding regenerable/platform dirs:
+1. Copy the working tree to a Windows-local dir, excluding regenerable/platform dirs:
 
    ```bash
    rsync -rlt --delete --no-perms --no-owner --no-group \
      --exclude='.git' --exclude='node_modules/' --exclude='dist/' \
      --exclude='release/' --exclude='bundled-node/' --exclude='server-node-modules/' \
+     --exclude='target/' --exclude='.worktrees/' \
      ./ "/mnt/c/Users/<you>/AppData/Local/Temp/freshell-electron-build/"
    ```
+
+   `target/` and `.worktrees/` matter when copying from the **main checkout**:
+   it holds multi-GB Rust build artifacts and every sibling worktree, and
+   copying those over 9p stalls the sync indefinitely. They are harmless to
+   exclude when copying from a linked worktree.
 
 2. Run Windows npm in that dir via `cmd.exe`. Always `cd /d` to a real Windows
    path first — `cmd.exe` launched from WSL inherits the UNC cwd and will warn
@@ -63,10 +69,19 @@ Windows-local path and run Windows' own npm against it via interop.
    cmd.exe /c 'cd /d C:\Users\<you>\AppData\Local\Temp\freshell-electron-build && set "CI=true" && set "PORT=39517" && npm install && npm run electron:build:win'
    ```
 
-   - `PORT=<unused>` is belt-and-suspenders for the `prebuild` guard. (It
-     normally auto-skips here because the copied `.git` is a worktree pointer,
-     so `isLinkedWorktreeCheckout` is true — but WSL2 forwards `localhost`, so a
-     live dev server on the default port is otherwise visible to the guard.)
+   - The `prebuild` guard refuses to build over a live server, and it probes
+     the configured port from the build dir — on Windows. If any Freshell
+     server is listening there (for example the user's own running desktop
+     app), the guard sees it and blocks the build, and `PORT=<unused>` may
+     not reach it through npm script shells. The rsync excludes `.git`, so
+     arm the guard's linked-worktree skip by writing a synthetic pointer
+     file into the build dir before the npm step:
+
+     ```bash
+     echo 'gitdir: /home/<you>/code/freshell/.git/worktrees/electron-build' \
+       > "/mnt/c/Users/<you>/AppData/Local/Temp/freshell-electron-build/.git"
+     ```
+
    - Reusing a previous build dir keeps its warm Windows `node_modules` (with the
      already-compiled win32 `node-pty`), making `npm install` a fast no-op.
 

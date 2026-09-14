@@ -14,8 +14,11 @@ FROM node:24-slim
 
 WORKDIR /app
 
-# Install dependencies first (layer cache)
+# Install dependencies first (layer cache). scripts/install-hooks.mjs must be
+# present: the postinstall hook no-ops safely without git, but npm fails the
+# install if the file itself is missing.
 COPY package.json package-lock.json ./
+COPY scripts/install-hooks.mjs ./scripts/
 RUN npm ci --ignore-scripts 2>/dev/null; exit 0
 RUN npm ci
 

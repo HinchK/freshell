@@ -121,6 +121,50 @@ describe('prepare-bundled-node helpers', () => {
     })
   })
 
+  describe('buildStagingPackageJson', () => {
+    it('strips the root scripts section so npm ci cannot run repo lifecycle hooks in staging', async () => {
+      const { buildStagingPackageJson } = await import(
+        '../../../scripts/prepare-bundled-node.js'
+      )
+      const staged = JSON.parse(
+        buildStagingPackageJson(
+          JSON.stringify({
+            name: 'freshell',
+            version: '0.7.5',
+            scripts: {
+              postinstall: 'node scripts/install-hooks.mjs',
+              build: 'vite build',
+            },
+            dependencies: { express: '^4.18.0' },
+            devDependencies: { vitest: '^1.0.0' },
+          })
+        )
+      )
+      expect(staged.scripts).toBeUndefined()
+      expect(staged.name).toBe('freshell')
+      expect(staged.version).toBe('0.7.5')
+      expect(staged.dependencies).toEqual({ express: '^4.18.0' })
+      expect(staged.devDependencies).toEqual({ vitest: '^1.0.0' })
+    })
+
+    it('still strips // comment keys from dependency sections', async () => {
+      const { buildStagingPackageJson } = await import(
+        '../../../scripts/prepare-bundled-node.js'
+      )
+      const staged = JSON.parse(
+        buildStagingPackageJson(
+          JSON.stringify({
+            name: 'freshell',
+            dependencies: { '//comment-key': '1', express: '^4.18.0' },
+            devDependencies: { '//another': '2', vitest: '^1.0.0' },
+          })
+        )
+      )
+      expect(staged.dependencies).toEqual({ express: '^4.18.0' })
+      expect(staged.devDependencies).toEqual({ vitest: '^1.0.0' })
+    })
+  })
+
   describe('electron-builder resource paths', () => {
     it('uses electron-builder os directory names', async () => {
       const { getElectronBuilderOs } = await import(
