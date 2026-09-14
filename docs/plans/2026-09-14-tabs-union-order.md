@@ -519,9 +519,9 @@ Run all of:
 
 ```bash
 cargo test -p freshell-ws --lib tabs
-cargo test -p freshell-server --lib recovery_inventory
-cargo test -p freshell-server --lib tabs_snapshots
-cargo test -p freshell-server --lib machines
+cargo test -p freshell-server --bins recovery_inventory
+cargo test -p freshell-server --bins tabs_snapshots
+cargo test -p freshell-server --bins machines
 cargo test -p freshell-ws --test ui_layout_sync
 cargo test -p freshell-ws --test sessions_prefs
 cargo fmt --all --check
@@ -600,7 +600,7 @@ GREEN is required at first run — if this test is red, `build_inventory` re-ord
 
 - [ ] **Step 2: Run the focused test**
 
-Run: `cargo test -p freshell-server --lib recovery_inventory`
+Run: `cargo test -p freshell-server --bins recovery_inventory`
 
 Expected: PASS (the new test plus every existing one).
 
@@ -610,7 +610,7 @@ None — test-only addition.
 
 - [ ] **Step 4: Run impacted-test verification**
 
-Run: `cargo test -p freshell-server --lib recovery_inventory && cargo fmt --all --check && cargo clippy --workspace --exclude freshell-tauri --all-targets -- -D warnings`
+Run: `cargo test -p freshell-server --bins recovery_inventory && cargo fmt --all --check && cargo clippy --workspace --exclude freshell-tauri --all-targets -- -D warnings`
 
 Expected: PASS.
 
