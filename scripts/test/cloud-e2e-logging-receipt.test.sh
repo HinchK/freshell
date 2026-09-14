@@ -22,6 +22,11 @@ case "$*" in
   *"run jobs execute"*) echo "Execution [exec-json-receipt] has successfully completed." ;;
   *"executions logs read"*) echo "  4 passed (12.3s)" ;;
   *"logging read"*)
+    case "$*" in
+      *'labels."run.googleapis.com/execution_name"'*) echo "obsolete execution label" >&2; exit 9 ;;
+      *'labels.execution_name="exec-json-receipt"'*) ;;
+      *) echo "missing Cloud Run Jobs execution label" >&2; exit 9 ;;
+    esac
     if [ "${STUB_LOGGING_FAIL:-0}" = 1 ]; then echo "logging unavailable" >&2; exit 7; fi
     count_file="$STUB_CAPTURE/logging.count"
     count="$(cat "$count_file" 2>/dev/null || echo 0)"; count=$((count + 1)); echo "$count" > "$count_file"
@@ -50,7 +55,8 @@ fi
 if [ "$(cat "$WORK/capture/logging.count")" -lt 2 ]; then
   echo "FAIL: wrapper did not retry delayed Cloud Logging receipt ingestion"; cat "$WORK/capture/gcloud.args"; exit 1
 fi
-if ! grep -q 'logging read.*exec-json-receipt.*jsonPayload.event.*--format=json' "$WORK/capture/gcloud.args"; then
+if ! grep -q 'logging read.*labels.execution_name="exec-json-receipt".*jsonPayload.event.*--format=json' "$WORK/capture/gcloud.args" \
+  || grep -q 'run.googleapis.com/execution_name' "$WORK/capture/gcloud.args"; then
   echo "FAIL: wrapper did not issue a structured jsonPayload Cloud Logging query scoped to its execution"
   cat "$WORK/capture/gcloud.args"; exit 1
 fi

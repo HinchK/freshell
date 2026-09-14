@@ -611,7 +611,7 @@ cmd_run() {
   # A query/read/parser failure is never evidence of zero retries.
   query_structured_retry_receipts() {
     local query attempt raw parsed parser_error
-    query="resource.type=\"cloud_run_job\" AND labels.\"run.googleapis.com/execution_name\"=\"${execution_id}\" AND (jsonPayload.event=\"e2e_playwright_task_complete\" OR jsonPayload.event=\"e2e_playwright_retry_evidence\")"
+    query="resource.type=\"cloud_run_job\" AND labels.execution_name=\"${execution_id}\" AND (jsonPayload.event=\"e2e_playwright_task_complete\" OR jsonPayload.event=\"e2e_playwright_retry_evidence\")"
     for attempt in 1 2 3 4 5; do
       if raw=$(gcloud logging read "$query" $(account_flag) --project="$GCP_PROJECT" --format=json --limit=1000 2>&1); then
         if parsed=$(printf '%s' "$raw" | node "$ROOT/scripts/e2e-cloud-structured-receipts.mjs" "$execution_id" "$shards" 2>&1); then
