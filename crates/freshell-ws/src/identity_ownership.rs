@@ -182,11 +182,10 @@ pub(crate) async fn coordinator_commit_identity(
                         generation: *generation,
                         runtime: Some(owner.clone()),
                     };
-                    let released = ownership.release(provider, old_session_id, &claim, initiator);
+                    ownership.release(provider, old_session_id, &claim, initiator);
                     tracing::info!(target: "freshell_ws::identity_ownership",
                         provider = %provider, old_session_id = %old_session_id,
                         new_session_id = %session_id, terminal_id = %terminal_id,
-                        released = ?released,
                         "identity_rebind_old_key_released: the superseded canonical \\
                          key released in the same step as the move"
                     );
