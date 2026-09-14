@@ -24,7 +24,7 @@ Unit/integration vitest, e2e, electron, the real-transport clippy lanes. Those s
 - Bypass (emergencies only): `git push --no-verify`
 - Disable for one push: `FRESHELL_PREPUSH=0 git push ...`
 - See routing without running checks: `FRESHELL_PREPUSH_DEBUG=1 git push --dry-run ...`
-- If `cargo` or `tsc` is unavailable, that lane is skipped with a warning (not a failure).
+- If a lane's tooling is unavailable it is skipped with an accurate warning (not a failure). The hook self-heals stripped-environment contexts (ssh/agents/IDEs/cron): it sources `~/.nvm/nvm.sh` when `npm` is missing from PATH, and adds `~/.cargo/bin` when `cargo` is missing.
 
 ## Setup
 
