@@ -19,6 +19,7 @@ import {
   stopExactCapturedProcess,
 } from './electron-fixture-cleanup.js'
 import { cleanupOwnedFixtureHome } from './owned-fixture-home.js'
+import { parseSsListeningPidsForPort } from './ss-listener-parser.js'
 import { isolatedElectronHomeEnv } from './fixture-home-env.js'
 import { launchChooserViteArgs, waitForCapturedViteReady } from './launch-chooser-vite.js'
 import { allocateDistinctFixturePorts } from './fixture-ports.js'
@@ -264,13 +265,7 @@ function listeningPidsForFixturePort(port: number, context?: OwnershipProofConte
 
   const result = runBoundedOwnershipCommand('ss', ['-ltnp'], context)
   if (result.status !== 0) throw new Error(`could not inspect the exact fixture port ${port} with ss`)
-  const portPattern = new RegExp(`(?:127\\.0\\.0\\.1|\\[::1\\]):${port}(?:\\s|$)`)
-  const pids = new Set<number>()
-  for (const line of result.stdout.split('\n')) {
-    if (!portPattern.test(line)) continue
-    for (const match of line.matchAll(/pid=(\d+)/g)) pids.add(Number.parseInt(match[1], 10))
-  }
-  return [...pids]
+  return parseSsListeningPidsForPort(result.stdout, port)
 }
 
 async function waitForFixturePortOwner(port: number): Promise<number> {
