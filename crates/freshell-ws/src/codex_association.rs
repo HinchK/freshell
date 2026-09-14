@@ -273,6 +273,7 @@ mod tests {
     use crate::terminal::now_ms;
     use crate::WsState;
     use freshell_sessions::codex_locator::CodexLocator;
+    use serde_json::json;
     use std::sync::Arc as StdArc;
 
     fn state_with_locator(
@@ -1060,6 +1061,299 @@ mod tests {
             ownership.observe("codex", OLD_TID).state
         );
         state.registry.kill("t1");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// b8ke ext r14 F1: a durable-binding FAILURE unwinds the held
+    /// authority — NO committed owner. The adoption's ledger write fails
+    /// (a ledger root that is a FILE: every write errors) — the adoption
+    /// returns false and the canonical key stays non-Live (pre-r14 the
+    /// owner committed FIRST, so the key was Live{Terminal} over a
+    /// terminal whose durable binding never landed).
+    #[tokio::test]
+    async fn a_binding_failure_leaves_no_committed_owner() {
+        const TID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let home = unique_temp_dir("r14-f1-bindfail");
+        let (mut state, _rx) = state_with_locator(home.clone());
+        let ownership = wire_ownership(&mut state);
+        // A ledger rooted at a READ-ONLY directory: every durable row
+        // write errors (EACCES).
+        let ledger_dir = unique_temp_dir("r14-f1-bindfail-ledger");
+        std::fs::create_dir_all(&ledger_dir).expect("the ledger root dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&ledger_dir).unwrap().permissions();
+            perms.set_mode(0o555);
+            std::fs::set_permissions(&ledger_dir, perms).expect("read-only ledger root");
+        }
+        state.pane_ledger = std::sync::Arc::new(crate::pane_ledger::PaneLedger::new(Some(
+            ledger_dir.clone(),
+        )));
+
+        let spec = freshell_platform::build_spawn_spec(
+            freshell_platform::ShellType::System,
+            freshell_platform::detect::HostOs::Linux,
+            false,
+            Some("/tmp"),
+            &freshell_platform::RealEnv,
+            &freshell_platform::RealFileProbe,
+            &std::collections::BTreeMap::new(),
+            None,
+            None,
+        );
+        state
+            .registry
+            .create(
+                &spec,
+                &std::collections::BTreeMap::new(),
+                "t1".to_string(),
+                "stream-1".to_string(),
+                "codex",
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("spawn a real shell for the test PTY");
+        state
+            .registry
+            .set_meta("t1", None, None, Some("codex".to_string()), None);
+
+        let adopted = crate::codex_identity::adopt_codex_identity(
+            &state,
+            crate::codex_identity::CodexAdoption {
+                terminal_id: "t1",
+                thread_id: TID,
+                rollout_path: None,
+                cwd: Some("/tmp"),
+            },
+        )
+        .await;
+
+        // THE CONTRACT: the binding write failed → the adoption FAILED and
+        // the canonical key holds NO committed owner.
+        assert!(!adopted, "the adoption fails on a binding failure");
+        assert!(
+            !matches!(
+                ownership.observe("codex", TID).state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ),
+            "a binding failure leaves NO committed owner — state: {:?}",
+            ownership.observe("codex", TID).state
+        );
+        state.registry.kill("t1");
+        let _ = std::fs::remove_dir_all(&home);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&ledger_dir).unwrap().permissions();
+            perms.set_mode(0o755);
+            let _ = std::fs::set_permissions(&ledger_dir, perms);
+        }
+        let _ = std::fs::remove_dir_all(&ledger_dir);
+    }
+
+    /// b8ke ext r14 F2: the rebind is the ATOMIC coordinator move. After
+    /// the rebind: the OLD key is ALIASED to the new key (the one-lock-
+    /// scope move's signature — pre-r14 the old key was observed and
+    /// released under a SECOND lock, leaving a both-Live interval), the
+    /// registry's retained-claim map holds EXACTLY ONE claim (the new
+    /// key's — pre-r14 the old claim stayed beside the new one, and the
+    /// kill/exit path's unordered selection could pick the stale old
+    /// claim and strand the new key Live), and after the terminal dies
+    /// BOTH keys reach non-Live regardless of iteration order.
+    #[tokio::test]
+    async fn the_rebind_is_atomic_one_scope_one_claim_both_keys_settle() {
+        const OLD_TID: &str = "11111111-2222-3333-4444-555555555555";
+        const NEW_TID: &str = "99999999-8888-7777-6666-000000000000";
+        let home = unique_temp_dir("r14-f2-atomic");
+        let (mut state, mut rx) = state_with_locator(home.clone());
+        let ownership = wire_ownership(&mut state);
+
+        let spec = freshell_platform::build_spawn_spec(
+            freshell_platform::ShellType::System,
+            freshell_platform::detect::HostOs::Linux,
+            false,
+            Some("/tmp"),
+            &freshell_platform::RealEnv,
+            &freshell_platform::RealFileProbe,
+            &std::collections::BTreeMap::new(),
+            None,
+            None,
+        );
+        state
+            .registry
+            .create(
+                &spec,
+                &std::collections::BTreeMap::new(),
+                "t1".to_string(),
+                "stream-1".to_string(),
+                "codex",
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("spawn a real shell for the test PTY");
+        state
+            .registry
+            .set_meta("t1", None, None, Some("codex".to_string()), None);
+
+        // Consume the pre-rebind frames so the rebind's owner frames are
+        // isolated.
+        while rx.try_recv().is_ok() {}
+
+        // The pre-rebind adoption (the old key's owner + retained claim).
+        assert!(
+            crate::codex_identity::adopt_codex_identity(
+                &state,
+                crate::codex_identity::CodexAdoption {
+                    terminal_id: "t1",
+                    thread_id: OLD_TID,
+                    rollout_path: None,
+                    cwd: Some("/tmp"),
+                },
+            )
+            .await,
+            "the pre-rebind adoption succeeds"
+        );
+
+        // THE REBIND.
+        let rollout = std::path::Path::new(&home).join("fork-rollout.jsonl");
+        std::fs::write(&rollout, "{}\n").expect("write the child rollout path target");
+        assert!(
+            crate::codex_identity::rebind_codex_identity(
+                &state,
+                crate::codex_identity::CodexRebind {
+                    terminal_id: "t1",
+                    old_session_id: OLD_TID,
+                    new_session_id: NEW_TID,
+                    rollout_path: rollout.as_path(),
+                    cwd: Some("/tmp"),
+                },
+            )
+            .await,
+            "the rebind itself succeeds"
+        );
+
+        // (1) THE ONE-SCOPE MOVE's signature: the old key is ALIASED to the
+        // new key (pre-r14: the old key was separately released to a
+        // plain Vacant — and both keys briefly named the writer).
+        match ownership.observe("codex", OLD_TID).state {
+            freshell_ownership::OwnershipState::Aliased { to, .. } => {
+                assert_eq!(to, NEW_TID, "the alias names the new canonical key");
+            }
+            other => panic!(
+                "the old key must be Aliased to the new key after the atomic rebind — got {other:?}"
+            ),
+        }
+        assert!(matches!(
+            ownership.observe("codex", NEW_TID).state,
+            freshell_ownership::OwnershipState::Live { owner, .. }
+                if owner.terminal_id.as_deref() == Some("t1")
+        ));
+
+        // (1b) b8ke ext r14 F3: the broadcast pair — the NEW key's
+        // handoff-committed frame (ownerKind terminal + the terminal id)
+        // and the OLD key's released frame in the VACANT shape
+        // (ownerKind "vacant", NO terminal id) — the shape the client's
+        // convergence clears on (pre-r14 the released frame carried
+        // ownerKind "terminal" + the terminal id, so old-key Fresh Agent
+        // panes kept presenting "opened as CLI elsewhere" with a
+        // direct-attach action pointing at a terminal that had moved on).
+        {
+            let mut new_key_frame: Option<serde_json::Value> = None;
+            let mut old_key_frame: Option<serde_json::Value> = None;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while (new_key_frame.is_none() || old_key_frame.is_none())
+                && std::time::Instant::now() < deadline
+            {
+                while let Ok(raw) = rx.try_recv() {
+                    let frame: serde_json::Value = serde_json::from_str(&raw).expect("json frame");
+                    if frame["type"] != "session.runtimeOwner" {
+                        continue;
+                    }
+                    if frame["sessionId"] == json!(NEW_TID) {
+                        new_key_frame = Some(frame.clone());
+                    }
+                    if frame["sessionId"] == json!(OLD_TID) {
+                        old_key_frame = Some(frame.clone());
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let new_key_frame =
+                new_key_frame.expect("the rebind broadcast the new key's owner frame");
+            assert_eq!(new_key_frame["ownerKind"], json!("terminal"));
+            assert_eq!(new_key_frame["terminalId"], json!("t1"));
+            assert_eq!(new_key_frame["transition"], json!("handoff-committed"));
+            let old_key_frame =
+                old_key_frame.expect("the rebind broadcast the old key's release frame");
+            assert_eq!(
+                old_key_frame["ownerKind"],
+                json!("vacant"),
+                "the old key's released frame carries the VACANT owner shape: {old_key_frame}"
+            );
+            assert!(
+                old_key_frame.get("terminalId").is_none(),
+                "the VACANT release frame carries NO terminal id: {old_key_frame}"
+            );
+            assert_eq!(old_key_frame["transition"], json!("released"));
+        }
+
+        // (2) EXACTLY ONE retained claim (the new key's) — the rebind
+        // rekeyed the registry's claim map (pre-r14 the old claim stayed
+        // beside the new one and the unordered kill/exit selection could
+        // strand the new key).
+        let new_claim = state.registry.retained_ownership_claim_by_locator(
+            &freshell_protocol::SessionLocator {
+                provider: "codex".to_string(),
+                session_id: NEW_TID.to_string(),
+            },
+        );
+        assert!(new_claim.is_some(), "the new key's retained claim exists");
+        assert_eq!(
+            new_claim.as_ref().map(|c| c.terminal_id.as_str()),
+            Some("t1")
+        );
+        let old_claim = state.registry.retained_ownership_claim_by_locator(
+            &freshell_protocol::SessionLocator {
+                provider: "codex".to_string(),
+                session_id: OLD_TID.to_string(),
+            },
+        );
+        assert!(
+            old_claim.is_none(),
+            "the rebind REMOVED the old key's retained claim (one claim for one terminal)"
+        );
+
+        // (3) THE TERMINAL DIES: both keys settle non-Live regardless of
+        // any iteration order (the new key's claim releases; the old key
+        // is already Aliased).
+        state.registry.kill("t1");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let new_live = matches!(
+                ownership.observe("codex", NEW_TID).state,
+                freshell_ownership::OwnershipState::Live { .. }
+            );
+            if !new_live {
+                break;
+            }
+            assert!(
+                deadline > std::time::Instant::now(),
+                "the new key never settled after the terminal died — stranded Live"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            !matches!(
+                ownership.observe("codex", OLD_TID).state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ),
+            "the old key never names the dead writer"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 }

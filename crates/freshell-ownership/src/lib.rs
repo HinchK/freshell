@@ -1204,6 +1204,109 @@ impl RuntimeOwnershipRegistry {
     /// durable restamp, leaving the delayed attach persisting stale
     /// old-runtime binding, answering from the superseded runtime, or
     /// restarting a torn-down SSE bridge).
+    /// b8ke ext r14 F2: the identity REBIND's atomic coordinator move —
+    /// ONE lock scope, mirroring [`Self::rekey_live`]'s machinery for a
+    /// TERMINAL incumbent whose writer moved to a NEW canonical key:
+    /// (1) the NEW key's `Starting{operation_id, generation}` claim (the
+    ///     rebind's held ticket) commits `Live{owner, generation}`;
+    /// (2) the OLD key's `Live{Terminal, expected_terminal_id}` record
+    ///     becomes `Aliased{to: new}` (the monotone generation bumped, so
+    ///     old-key fences see the advance and old-key panes resolve the
+    ///     canonical chain).
+    /// Any mismatch (the new key's claim is stale/foreign, the old key is
+    /// not Live under THIS terminal) is the typed refusal and NOTHING
+    /// moves — never the interval where BOTH keys name the writer.
+    #[allow(clippy::too_many_arguments)] // the rekey field set (the ids + the claim + the expected identity)
+    pub fn commit_live_rekey_from_terminal(
+        &self,
+        provider: &str,
+        new_session_id: &str,
+        operation_id: &str,
+        generation: u64,
+        old_session_id: &str,
+        expected_terminal_id: &str,
+        owner: OwnerIdentity,
+        initiator: &str,
+    ) -> CommitOutcome {
+        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let new_key = SessionKey::new(provider, new_session_id);
+        // (1) The new key's Starting claim must be ours.
+        match inner.get(&new_key).map(|r| r.state.clone()) {
+            Some(OwnershipState::Starting {
+                operation_id: starting_op,
+                generation: starting_gen,
+                ..
+            }) if starting_op == operation_id && starting_gen == generation => {}
+            _ => {
+                tracing::error!(target: "invariant",
+                    event = "ownership.commit_live_rekey_from_terminal.new_claim_mismatch",
+                    operation_id = %operation_id, provider, initiator,
+                    old_session_id, new_session_id,
+                    expected_terminal_id = %expected_terminal_id,
+                    epoch = self.epoch, generation,
+                    outcome = "refused", failure_reason = "FOREIGN_NEW_CLAIM",
+                    "the rebind's new-key Starting claim is stale or foreign — \
+                     nothing moves");
+                return CommitOutcome::ForeignOperation;
+            }
+        }
+        // (2) The old key must be Live under THIS terminal.
+        let old_key = SessionKey::new(provider, old_session_id);
+        let old_generation = match inner.get(&old_key).map(|r| r.state.clone()) {
+            Some(OwnershipState::Live {
+                owner: old_owner,
+                generation,
+                ..
+            }) if old_owner.kind == RuntimeOwnerKind::Terminal
+                && old_owner.terminal_id.as_deref() == Some(expected_terminal_id) =>
+            {
+                generation
+            }
+            _ => {
+                tracing::error!(target: "invariant",
+                    event = "ownership.commit_live_rekey_from_terminal.old_owner_mismatch",
+                    operation_id = %operation_id, provider, initiator,
+                    old_session_id, new_session_id,
+                    expected_terminal_id = %expected_terminal_id,
+                    epoch = self.epoch, generation,
+                    outcome = "refused", failure_reason = "FOREIGN_OLD_OWNER",
+                    "the rebind's old key is not Live under this terminal — \
+                     nothing moves");
+                return CommitOutcome::ForeignOperation;
+            }
+        };
+        // THE MOVE (one lock scope): new Starting → Live; old Live →
+        // Aliased{to: new} with the monotone generation bumped.
+        if let Some(record) = inner.get_mut(&new_key) {
+            record.state = OwnershipState::Live {
+                owner: owner.clone(),
+                generation,
+                since_ms: now_epoch_ms(),
+            };
+        }
+        let aliased_generation = old_generation + 1;
+        if let Some(record) = inner.get_mut(&old_key) {
+            record.generation = aliased_generation;
+            record.state = OwnershipState::Aliased {
+                to: new_session_id.to_string(),
+                generation: aliased_generation,
+            };
+        }
+        tracing::info!(target: "freshell_ownership",
+            event = "ownership.live.rekey_from_terminal", operation_id, provider,
+            old_session_id, new_session_id, initiator,
+            from_kind = ?RuntimeOwnerKind::Terminal,
+            to_kind = ?RuntimeOwnerKind::Terminal,
+            runtime_id = ?owner.terminal_id, pid = ?owner.pid,
+            epoch = self.epoch, generation, aliased_generation,
+            duration_ms = 0u64,
+            outcome = "rekeyed_committed", failure_reason = "",
+            "the identity rebind moved the terminal owner old→new in ONE \
+             coordinator lock scope — no interval where both keys name the \
+             writer");
+        CommitOutcome::Committed
+    }
+
     pub fn begin_attach_guard(
         self: &Arc<Self>,
         provider: &str,

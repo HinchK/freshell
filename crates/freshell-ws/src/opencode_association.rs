@@ -139,13 +139,18 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
         if opencode_claim_refused(state, &located.terminal_id, &located.session_id).await {
             continue;
         }
-        // b8ke ext r11 F1: the learned identity claims and commits
-        // Live{Terminal} under the canonical key through the shared
-        // coordinator (fail-closed: a refusal mutates NO identity home —
-        // parity with the codex adoption tail). Pre-r11 the locator
-        // adoption only updated the identity homes while the real
-        // terminal writer ran with a VACANT canonical key.
-        if !crate::identity_ownership::coordinator_commit_identity(
+        // b8ke ext r14 F1: the learned identity's coordinator authority is
+        // acquired FIRST (fail-closed: a refusal mutates NO identity home —
+        // parity with the codex adoption tail) and held across the identity
+        // homes' writes; the owner commits + broadcasts only AFTER the
+        // registry/metadata/durable-binding updates all landed (pre-r14 the
+        // commit+broadcast preceded the writes — a handoff could acquire the
+        // supposedly-complete owner and reap it while this sweep kept
+        // writing stale bindings, and a binding failure could not unwind
+        // the committed owner). Pre-r11 the locator adoption only updated
+        // the identity homes while the real terminal writer ran with a
+        // VACANT canonical key.
+        let Some(authority) = crate::identity_ownership::coordinator_begin_identity(
             state,
             "opencode",
             &located.terminal_id,
@@ -153,9 +158,9 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
             None,
         )
         .await
-        {
+        else {
             continue;
-        }
+        };
 
         state.identity.upsert(
             &located.terminal_id,
@@ -176,7 +181,7 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
         // deleted. Registry-truth cwd, same as the in-memory binds above.
         // Awaited (drain_and_associate is async; the helper spawn_blockings
         // the fsync off this sweep task — V1.md).
-        crate::pane_ledger::ledger_resolve_identity(
+        let binding_ok = crate::pane_ledger::ledger_resolve_identity(
             state,
             &located.terminal_id,
             "opencode",
@@ -198,6 +203,21 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
         if let Some(hub) = &state.activity {
             hub.bind_opencode_session(&located.terminal_id, &located.session_id);
         }
+        if !binding_ok {
+            // The durable binding write failed — unwind the held
+            // authority (NO committed owner, no broadcast).
+            crate::identity_ownership::coordinator_fail_identity(authority);
+            continue;
+        }
+        crate::identity_ownership::coordinator_commit_identity(
+            state,
+            authority,
+            "opencode",
+            &located.terminal_id,
+            &located.session_id,
+            None,
+        )
+        .await;
     }
 }
 

@@ -61,14 +61,14 @@ pub(crate) async fn adopt_codex_identity(state: &WsState, a: CodexAdoption<'_>) 
     if codex_claim_refused(state, a.terminal_id, a.thread_id).await {
         return false;
     }
-    // b8ke ext r11 F1: the learned identity claims and commits
-    // Live{Terminal} under the canonical key through the shared
-    // coordinator (fail-closed: a refusal mutates NO identity home —
-    // the pane keeps its unbound state, and the hit is not consumed by
-    // a false association). Pre-r11 the adoption only updated identity
-    // metadata, the registry, and the pane ledger while the real
-    // terminal writer ran with a VACANT canonical key.
-    if !crate::identity_ownership::coordinator_commit_identity(
+    // b8ke ext r14 F1: the authority is acquired FIRST and held across
+    // the identity homes' writes; the owner commits + broadcasts only
+    // AFTER the registry/metadata/durable-binding updates all landed
+    // (pre-r14 the commit+broadcast preceded the writes: a handoff could
+    // acquire the supposedly-complete owner, reap it, and install another
+    // writer while this task kept writing stale bindings, and a durable
+    // write failure could not unwind the committed owner).
+    let Some(authority) = crate::identity_ownership::coordinator_begin_identity(
         state,
         "codex",
         a.terminal_id,
@@ -76,10 +76,10 @@ pub(crate) async fn adopt_codex_identity(state: &WsState, a: CodexAdoption<'_>) 
         None,
     )
     .await
-    {
+    else {
         return false;
-    }
-    apply_codex_identity(
+    };
+    let applied = apply_codex_identity(
         state,
         a.terminal_id,
         a.thread_id,
@@ -88,7 +88,21 @@ pub(crate) async fn adopt_codex_identity(state: &WsState, a: CodexAdoption<'_>) 
         None,
     )
     .await;
-    true
+    if !applied {
+        // The binding write failed: unwind the held authority — NO
+        // committed owner, no broadcast.
+        crate::identity_ownership::coordinator_fail_identity(authority);
+        return false;
+    }
+    crate::identity_ownership::coordinator_commit_identity(
+        state,
+        authority,
+        "codex",
+        a.terminal_id,
+        a.thread_id,
+        None,
+    )
+    .await
 }
 
 /// Move a live pane's codex identity to a fork child. Guards: (1) the pane is
@@ -126,12 +140,15 @@ pub(crate) async fn rebind_codex_identity(state: &WsState, r: CodexRebind<'_>) -
     if codex_claim_refused(state, r.terminal_id, r.new_session_id).await {
         return false;
     }
-    // b8ke ext r11 F1: the rebind moves the coordinator authority in the
-    // SAME step as the identity move — commit Live{Terminal} under the
-    // fork child's canonical key and RELEASE the superseded old key
-    // (never a stale-live old key after the writer moved). A refusal
-    // mutates nothing.
-    if !crate::identity_ownership::coordinator_commit_identity(
+    // b8ke ext r14 F1/F2: the rebind's authority is acquired FIRST (the
+    // new key's claim + the OLD key's guard — a stop/handoff on the old
+    // key mid-rebind answers Blocked typed) and held across the identity
+    // homes' writes; the commit is the ATOMIC coordinator move (the new
+    // key commits Live while the old key's Live record becomes Aliased in
+    // ONE lock scope, the registry's retained claim rekeyed in the same
+    // step — never the interval where both keys name the writer). A
+    // refusal mutates nothing.
+    let Some(authority) = crate::identity_ownership::coordinator_begin_identity(
         state,
         "codex",
         r.terminal_id,
@@ -139,12 +156,12 @@ pub(crate) async fn rebind_codex_identity(state: &WsState, r: CodexRebind<'_>) -
         Some(r.old_session_id),
     )
     .await
-    {
+    else {
         return false;
-    }
+    };
     tracing::info!(terminal_id = %r.terminal_id, old = %r.old_session_id, new = %r.new_session_id,
         "codex_rebind: in-TUI fork detected; moving pane identity");
-    apply_codex_identity(
+    let applied = apply_codex_identity(
         state,
         r.terminal_id,
         r.new_session_id,
@@ -153,7 +170,21 @@ pub(crate) async fn rebind_codex_identity(state: &WsState, r: CodexRebind<'_>) -
         Some(r.old_session_id),
     )
     .await;
-    true
+    if !applied {
+        // The binding write failed: unwind the held authority — NO
+        // committed owner, no broadcast, no key move.
+        crate::identity_ownership::coordinator_fail_identity(authority);
+        return false;
+    }
+    crate::identity_ownership::coordinator_commit_identity(
+        state,
+        authority,
+        "codex",
+        r.terminal_id,
+        r.new_session_id,
+        Some(r.old_session_id),
+    )
+    .await
 }
 
 /// Shared hijack/misbind guards for BOTH adoption and rebind. `thread_id` is
@@ -224,7 +255,7 @@ async fn apply_codex_identity(
     rollout_path: Option<&std::path::Path>,
     cwd: Option<&str>,
     previous_session_id: Option<&str>,
-) {
+) -> bool {
     // Both identity homes -- different consumers (see opencode_association.rs:135-148).
     state
         .identity
@@ -240,7 +271,9 @@ async fn apply_codex_identity(
     // awaited before the broadcast (fsync-before-announce). On a rebind the
     // marker is long gone (a no-op delete) and the write supersedes the old
     // bound row (new bound row FIRST, then retire old).
-    crate::pane_ledger::ledger_resolve_identity(state, terminal_id, "codex", thread_id, cwd).await;
+    let binding_ok =
+        crate::pane_ledger::ledger_resolve_identity(state, terminal_id, "codex", thread_id, cwd)
+            .await;
     broadcast_terminal_session_associated(
         state,
         "codex",
@@ -258,6 +291,7 @@ async fn apply_codex_identity(
             hub.attach_codex_rollout(terminal_id, thread_id, path);
         }
     }
+    binding_ok
 }
 
 /// Fan `terminal.session.associated` + a `terminal.meta.updated` upsert to

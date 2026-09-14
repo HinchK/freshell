@@ -396,12 +396,14 @@ async fn rebind_fanout(
     cwd: Option<&str>,
     previous: Option<String>,
 ) {
-    // b8ke ext r11 F1: the signal rebind routes through the shared
-    // coordinator FIRST (fail-closed: a refusal mutates NO identity
-    // home). The first-bind lane commits Live{Terminal} under the
-    // learned id; the live-pane rebind commits the new key AND releases
-    // the superseded old key in the same step.
-    if !crate::identity_ownership::coordinator_commit_identity(
+    // b8ke ext r14 F1/F2: the signal rebind acquires its coordinator
+    // authority FIRST (fail-closed: a refusal mutates NO identity home)
+    // and holds it across the identity homes' writes; the commit is the
+    // ATOMIC move (the new key commits Live while the old key's Live
+    // record becomes Aliased in ONE lock scope, the retained claim
+    // rekeyed — never both keys naming the writer). A binding failure
+    // unwinds the held authority with NO committed owner.
+    let Some(authority) = crate::identity_ownership::coordinator_begin_identity(
         state,
         "opencode",
         &sig.terminal_id,
@@ -409,9 +411,9 @@ async fn rebind_fanout(
         previous.as_deref(),
     )
     .await
-    {
+    else {
         return;
-    }
+    };
     state.identity.upsert(
         &sig.terminal_id,
         Some("opencode"),
@@ -435,7 +437,7 @@ async fn rebind_fanout(
         "opencode",
         Some(&sig.session_id),
     );
-    crate::pane_ledger::ledger_resolve_identity(
+    let binding_ok = crate::pane_ledger::ledger_resolve_identity(
         state,
         &sig.terminal_id,
         "opencode",
@@ -449,7 +451,7 @@ async fn rebind_fanout(
         &sig.terminal_id,
         &sig.session_id,
         cwd.map(str::to_string),
-        previous,
+        previous.clone(),
     );
     // Task 10: feed the identity proof into the activity hub — the in-TUI
     // session-switch (and first-bind) signal rebinds the tracker's owned
@@ -459,6 +461,21 @@ async fn rebind_fanout(
     if let Some(hub) = &state.activity {
         hub.bind_opencode_session(&sig.terminal_id, &sig.session_id);
     }
+    if !binding_ok {
+        // The durable binding write failed — unwind the held authority
+        // (NO committed owner, no broadcast).
+        crate::identity_ownership::coordinator_fail_identity(authority);
+        return;
+    }
+    crate::identity_ownership::coordinator_commit_identity(
+        state,
+        authority,
+        "opencode",
+        &sig.terminal_id,
+        &sig.session_id,
+        previous.as_deref(),
+    )
+    .await;
 }
 
 /// Outcome of applying one signal: `Acted` (rebind done), `Retain` (might

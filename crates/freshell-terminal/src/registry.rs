@@ -2785,6 +2785,118 @@ impl TerminalRegistry {
         outcome
     }
 
+    /// b8ke ext r14 F2: the identity REBIND's commit — the ext-r9 F2
+    /// liveness contract plus the atomic coordinator move
+    /// ([`freshell_ownership::RuntimeOwnershipRegistry::commit_live_rekey_from_terminal`]:
+    /// the new key's Starting claim commits Live while the OLD key's
+    /// Live{Terminal} record becomes Aliased — ONE coordinator lock scope,
+    /// never the interval where both keys name the writer) and the
+    /// RETAINED CLAIM REKEY in one registry lock scope: the old key's
+    /// retained claim is REMOVED as the new key's is inserted, so the
+    /// kill/exit selection can never pick a stale old claim. The old
+    /// claim is returned to the caller (the release of the old key is the
+    /// caller's broadcast decision, not a second registry step).
+    pub fn commit_session_ref_ownership_rekey(
+        &self,
+        old_locator: &freshell_protocol::SessionLocator,
+        new_locator: &freshell_protocol::SessionLocator,
+        operation_id: &str,
+        generation: u64,
+        terminal_id: &str,
+    ) -> (
+        freshell_ownership::CommitOutcome,
+        Option<RetainedSessionRefOwnership>,
+    ) {
+        let Some(ownership) = self.ownership.as_ref() else {
+            return (freshell_ownership::CommitOutcome::Committed, None);
+        };
+        // The ext-r9 F2 commit-time liveness check: a dead/gone PTY never
+        // records Live (the association lanes gate on a Running row, so
+        // this passes).
+        if !self.is_pty_running(terminal_id) {
+            tracing::error!(target: "freshell_terminal",
+                terminal_id = %terminal_id,
+                provider = %new_locator.provider,
+                session_id = %new_locator.session_id,
+                operation_id = %operation_id,
+                "session_ref_ownership_rekey_refused_dead_pty: the PTY exited \
+                 before the rebind commit — a dead runtime is never recorded \
+                 Live; the rebind mutates nothing");
+            return (freshell_ownership::CommitOutcome::ForeignOperation, None);
+        }
+        let pid = self.pid_of(terminal_id);
+        let owner = freshell_ownership::OwnerIdentity {
+            kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+            terminal_id: Some(terminal_id.to_string()),
+            live_session_key: None,
+            pid,
+            ownership_id: Some(operation_id.to_string()),
+        };
+        let outcome = ownership.commit_live_rekey_from_terminal(
+            &new_locator.provider,
+            &new_locator.session_id,
+            operation_id,
+            generation,
+            &old_locator.session_id,
+            terminal_id,
+            owner,
+            "ws-identity-association/rebind",
+        );
+        if !matches!(outcome, freshell_ownership::CommitOutcome::Committed) {
+            return (outcome, None);
+        }
+        // The retained-claim rekey: remove the old claim + insert the new
+        // — ONE registry lock scope (the map never holds both after the
+        // step).
+        let removed_old = {
+            let mut claims = self
+                .session_ref_ownership
+                .lock()
+                .expect("session-ref ownership lock");
+            let removed_old = claims.remove(&session_ref_key(old_locator));
+            claims.insert(
+                session_ref_key(new_locator),
+                RetainedSessionRefOwnership {
+                    locator: new_locator.clone(),
+                    terminal_id: terminal_id.to_string(),
+                    operation_id: operation_id.to_string(),
+                    generation,
+                    pid,
+                },
+            );
+            removed_old
+        };
+        (outcome, removed_old)
+    }
+
+    /// b8ke ext r14 F2 (test probe): the retained ownership claim a
+    /// locator holds, if any — the rebind's claim-rekey assertions read
+    /// the map without depending on HashMap iteration order.
+    pub fn retained_ownership_claim_by_locator(
+        &self,
+        locator: &freshell_protocol::SessionLocator,
+    ) -> Option<RetainedSessionRefOwnership> {
+        self.session_ref_ownership
+            .lock()
+            .expect("session-ref ownership lock")
+            .get(&session_ref_key(locator))
+            .cloned()
+    }
+
+    /// b8ke ext r14 F2: remove a locator's retained ownership claim — the
+    /// rebind's old-key half of the retained-claim rekey (the kill/exit
+    /// selection must never find a superseded claim beside its
+    /// replacement). Returns the removed claim, if any.
+    pub fn remove_retained_session_ref_claim(
+        &self,
+        locator: &freshell_protocol::SessionLocator,
+    ) -> Option<RetainedSessionRefOwnership> {
+        self.session_ref_ownership
+            .lock()
+            .expect("session-ref ownership lock")
+            .remove(&session_ref_key(locator))
+    }
+
     /// The last-known coordinator `(epoch, generation)` a terminal committed
     /// under (kata b8ke Task 4) — the auto-resume crash event's observed
     /// fence pair. `None` when the terminal never committed ownership (a
@@ -2832,19 +2944,31 @@ impl TerminalRegistry {
     /// release paths' lookup). Only an entry whose terminal id matches is
     /// taken — a newer owner's retained entry (same locator key, replaced at
     /// its commit) is never taken by an older terminal's death.
-    fn take_retained_ownership_claim_for_terminal(
+    fn take_retained_ownership_claims_for_terminal(
         &self,
         terminal_id: &str,
-    ) -> Option<RetainedSessionRefOwnership> {
+    ) -> Vec<RetainedSessionRefOwnership> {
+        // b8ke ext r14 F2: take EVERY claim this terminal holds — the
+        // kill/exit owns the TERMINAL, so each of its retained claims
+        // releases its key (a rebind's superseded old claim beside its new
+        // one must never leave the new key stranded by unordered
+        // HashMap selection). Pre-r14 this took exactly ONE matching
+        // claim: a rebind-left pair let the iteration order pick the
+        // stale old claim, releasing the already-vacant old key while the
+        // authoritative new key stayed Live after the terminal died.
         let mut claims = self
             .session_ref_ownership
             .lock()
             .expect("session-ref ownership lock");
-        let key = claims
+        let matching: Vec<String> = claims
             .iter()
-            .find(|(_, claim)| claim.terminal_id == terminal_id)
-            .map(|(key, _)| key.clone())?;
-        claims.remove(&key)
+            .filter(|(_, claim)| claim.terminal_id == terminal_id)
+            .map(|(key, _)| key.clone())
+            .collect();
+        matching
+            .into_iter()
+            .filter_map(|key| claims.remove(&key))
+            .collect()
     }
 
     /// The failed-handoff restore's claim repair (kata b8ke whole-branch
@@ -2886,19 +3010,22 @@ impl TerminalRegistry {
         let Some(ownership) = self.ownership.as_ref() else {
             return;
         };
-        let Some(claim) = self.take_retained_ownership_claim_for_terminal(terminal_id) else {
-            return;
-        };
-        ownership.release(
-            &claim.locator.provider,
-            &claim.locator.session_id,
-            &freshell_ownership::ReleaseClaim {
-                operation_id: claim.operation_id.clone(),
-                generation: claim.generation,
-                runtime: Some(retained_runtime_identity(&claim)),
-            },
-            initiator,
-        );
+        // b8ke ext r14 F2: EVERY retained claim this terminal held
+        // releases its key — a mismatched (already-moved/vacant) key
+        // no-ops per the release-claim discipline, so taking all is
+        // always safe and never strands a key by selection order.
+        for claim in self.take_retained_ownership_claims_for_terminal(terminal_id) {
+            ownership.release(
+                &claim.locator.provider,
+                &claim.locator.session_id,
+                &freshell_ownership::ReleaseClaim {
+                    operation_id: claim.operation_id.clone(),
+                    generation: claim.generation,
+                    runtime: Some(retained_runtime_identity(&claim)),
+                },
+                initiator,
+            );
+        }
     }
 
     /// The terminalId a completed claim bound this sessionRef to

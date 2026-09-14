@@ -4567,7 +4567,7 @@ pub(crate) async fn ledger_resolve_identity(
     provider: &str,
     session_id: &str,
     cwd: Option<&str>,
-) {
+) -> bool {
     let ledger = std::sync::Arc::clone(&state.pane_ledger);
     let provider_owned = provider.to_string();
     let session_id_owned = session_id.to_string();
@@ -4609,7 +4609,12 @@ pub(crate) async fn ledger_resolve_identity(
     })
     .await
     .unwrap_or_else(|join_err| Err(std::io::Error::other(join_err)));
+    let ok = result.is_ok();
     surface_write_failure(state, terminal_id, result);
+    // b8ke ext r14 F1: the durable-binding write's outcome — the identity
+    // association lanes unwind their held coordinator authority on `false`
+    // (a binding failure leaves NO committed owner).
+    ok
 }
 
 /// The inverse of [`encode_segment`], used by the construction-time scan to

@@ -305,13 +305,13 @@ async fn apply_claude_signal(state: &WsState, sig: &ClaudeSignal) -> SignalDispo
         return SignalDisposition::Acted;
     }
     let previous = current.session_id.clone();
-    // b8ke ext r11 F1: the signal rebind routes through the shared
-    // coordinator FIRST (fail-closed: a refusal mutates NO identity
-    // home — the file is consumed as acted, the next SessionStart
-    // retries). The rebind commits Live{Terminal} under the new
-    // canonical key AND releases the superseded old key in the same
-    // step.
-    if !crate::identity_ownership::coordinator_commit_identity(
+    // b8ke ext r14 F1/F2: the signal rebind acquires its coordinator
+    // authority FIRST (fail-closed: a refusal mutates NO identity home —
+    // the file is consumed as acted, the next SessionStart retries) and
+    // holds it across the identity homes' writes; the commit is the
+    // atomic move (new Live + old Aliased in ONE lock scope, the retained
+    // claim rekeyed — never both keys naming the writer).
+    let Some(authority) = crate::identity_ownership::coordinator_begin_identity(
         state,
         "claude",
         &sig.terminal_id,
@@ -319,9 +319,9 @@ async fn apply_claude_signal(state: &WsState, sig: &ClaudeSignal) -> SignalDispo
         previous.as_deref(),
     )
     .await
-    {
+    else {
         return SignalDisposition::Acted;
-    }
+    };
     tracing::info!(terminal_id = %sig.terminal_id, new = %sig.session_id,
         source = ?sig.source, "claude_rebind: SessionStart reported a new session id");
     // Same pinned order as the codex tail: identity -> meta -> ledger
@@ -346,7 +346,7 @@ async fn apply_claude_signal(state: &WsState, sig: &ClaudeSignal) -> SignalDispo
     if let Some(hub) = state.activity.as_ref() {
         hub.bind_claude_session(&sig.terminal_id, &sig.session_id);
     }
-    crate::pane_ledger::ledger_resolve_identity(
+    let binding_ok = crate::pane_ledger::ledger_resolve_identity(
         state,
         &sig.terminal_id,
         "claude",
@@ -360,8 +360,23 @@ async fn apply_claude_signal(state: &WsState, sig: &ClaudeSignal) -> SignalDispo
         &sig.terminal_id,
         &sig.session_id,
         current.cwd.clone(),
-        previous,
+        previous.clone(),
     );
+    if !binding_ok {
+        // b8ke ext r14 F1: the durable binding write failed — unwind the
+        // held authority (NO committed owner, no broadcast).
+        crate::identity_ownership::coordinator_fail_identity(authority);
+        return SignalDisposition::Acted;
+    }
+    crate::identity_ownership::coordinator_commit_identity(
+        state,
+        authority,
+        "claude",
+        &sig.terminal_id,
+        &sig.session_id,
+        previous.as_deref(),
+    )
+    .await;
     SignalDisposition::Acted
 }
 
