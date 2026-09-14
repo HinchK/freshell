@@ -18,6 +18,7 @@ import {
   closeElectronGracefully,
   stopExactCapturedProcess,
 } from './electron-fixture-cleanup.js'
+import { cleanupOwnedFixtureHome } from './owned-fixture-home.js'
 import { isolatedElectronHomeEnv } from './fixture-home-env.js'
 import { launchChooserViteArgs, waitForCapturedViteReady } from './launch-chooser-vite.js'
 import { allocateDistinctFixturePorts } from './fixture-ports.js'
@@ -157,6 +158,17 @@ async function waitForCapturedChildExit(child: ChildProcess, timeoutMs = 15_000)
     await new Promise((resolve) => setTimeout(resolve, 50))
   }
   throw new Error(`captured Electron PID ${child.pid ?? 'unknown'} remained alive after graceful close`)
+}
+
+async function stopCapturedFixtureProcess(
+  name: string,
+  child: ChildProcess,
+  port?: number,
+): Promise<void> {
+  await stopExactCapturedProcess(child, 5_000, (ms) => new Promise((resolve) => setTimeout(resolve, ms)))
+  if (port !== undefined && !(await isPortFree(port))) {
+    throw new Error(`captured ${name} port ${port} is still bound`)
+  }
 }
 
 function sameResolvedPath(actual: string, expected: string): boolean {
@@ -515,24 +527,30 @@ test.describe('Electron app-bound Rust server', () => {
       } catch (error) {
         failures.push(error as Error)
       }
-      for (const [name, child, port] of [
-        ['chooser', chooserDevServer, undefined],
-        ['foreign Rust server', foreign, foreignPort],
-      ] as const) {
-        if (!child) continue
+      if (chooserDevServer) {
         try {
-          await stopExactCapturedProcess(child, 5_000, (ms) => new Promise((resolve) => setTimeout(resolve, ms)))
-          if (port !== undefined && !(await isPortFree(port))) {
-            throw new Error(`captured ${name} port ${port} is still bound`)
-          }
+          await stopCapturedFixtureProcess('chooser', chooserDevServer)
         } catch (error) {
-          failures.push(new Error(`app-bound fixture cleanup failed while stopping ${name}`, { cause: error }))
+          failures.push(new Error('app-bound fixture cleanup failed while stopping chooser', { cause: error }))
         }
       }
-      try {
-        await fsp.rm(foreignHome, { recursive: true, force: true })
-      } catch (error) {
-        failures.push(new Error('app-bound fixture cleanup failed while removing foreign HOME', { cause: error }))
+
+      if (foreign) {
+        try {
+          await cleanupOwnedFixtureHome({
+            containOwner: () => stopCapturedFixtureProcess('foreign Rust server', foreign, foreignPort),
+            removeHome: () => fsp.rm(foreignHome, { recursive: true, force: true }),
+          })
+        } catch (error) {
+          failures.push(new Error('app-bound fixture cleanup failed while containing foreign Rust server and removing HOME', { cause: error }))
+        }
+      } else {
+        // No foreign child was captured, so no process can still own this HOME.
+        try {
+          await fsp.rm(foreignHome, { recursive: true, force: true })
+        } catch (error) {
+          failures.push(new Error('app-bound fixture cleanup failed while removing foreign HOME', { cause: error }))
+        }
       }
       if (failures.length > 0) throw new AggregateError(failures, 'app-bound Electron fixture cleanup failed')
     }
