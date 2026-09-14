@@ -20,9 +20,14 @@ if (!reportPath) {
 }
 
 const report = JSON.parse(readFileSync(reportPath, 'utf8'))
-const execution = process.env.CLOUD_RUN_EXECUTION ?? 'unknown-execution'
+const execution = process.env.CLOUD_RUN_EXECUTION
 const taskIndex = Number.parseInt(process.env.CLOUD_RUN_TASK_INDEX ?? '0', 10)
 const taskCount = Number.parseInt(process.env.CLOUD_RUN_TASK_COUNT ?? '1', 10)
+
+if (!execution) throw new Error('CLOUD_RUN_EXECUTION is required for a durable retry receipt')
+if (!Number.isInteger(taskIndex) || !Number.isInteger(taskCount) || taskCount < 1 || taskIndex < 0 || taskIndex >= taskCount) {
+  throw new Error('Cloud Run task identity is invalid')
+}
 
 function emit(entry) {
   process.stdout.write(`${JSON.stringify(entry)}\n`)
@@ -49,6 +54,43 @@ function errorEvidence(result) {
   }
 }
 
+function validateReport(candidate) {
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) throw new Error('Playwright JSON report must be an object')
+  if (!candidate.stats || typeof candidate.stats !== 'object' || !Number.isInteger(candidate.stats.expected) || candidate.stats.expected < 0) {
+    throw new Error('Playwright JSON report is missing valid stats.expected')
+  }
+  validateSuites(candidate.suites, 'report.suites')
+}
+
+function validateSuites(suites, location) {
+  if (!Array.isArray(suites)) throw new Error(`${location} must be an array`)
+  suites.forEach((suite, suiteIndex) => {
+    const suiteLocation = `${location}[${suiteIndex}]`
+    if (!suite || typeof suite !== 'object' || Array.isArray(suite)) throw new Error(`${suiteLocation} must be an object`)
+    if (!Array.isArray(suite.specs)) throw new Error(`${suiteLocation}.specs must be an array`)
+    if (suite.suites !== undefined && !Array.isArray(suite.suites)) throw new Error(`${suiteLocation}.suites must be an array`)
+    suite.specs.forEach((spec, specIndex) => {
+      if (!spec || typeof spec !== 'object' || Array.isArray(spec) || !Array.isArray(spec.tests)) {
+        throw new Error(`${suiteLocation}.specs[${specIndex}].tests must be an array`)
+      }
+      spec.tests.forEach((test, testIndex) => {
+        if (!test || typeof test !== 'object' || Array.isArray(test) || !Array.isArray(test.results)) {
+          throw new Error(`${suiteLocation}.specs[${specIndex}].tests[${testIndex}].results must be an array`)
+        }
+        test.results.forEach((result, resultIndex) => {
+          if (!result || typeof result !== 'object' || Array.isArray(result) || typeof result.status !== 'string' || !Number.isInteger(result.retry)) {
+            throw new Error(`${suiteLocation}.specs[${specIndex}].tests[${testIndex}].results[${resultIndex}] is invalid`)
+          }
+          if (result.attachments !== undefined && !Array.isArray(result.attachments)) {
+            throw new Error(`${suiteLocation}.specs[${specIndex}].tests[${testIndex}].results[${resultIndex}].attachments must be an array`)
+          }
+        })
+      })
+    })
+    validateSuites(suite.suites ?? [], `${suiteLocation}.suites`)
+  })
+}
+
 function specsIn(suites) {
   return suites.flatMap((suite) => [
     ...(suite.specs ?? []),
@@ -56,10 +98,10 @@ function specsIn(suites) {
   ])
 }
 
-function traceAttachments(results) {
-  return results.flatMap((result) => (result.attachments ?? []).filter((attachment) => (
-    attachment.name === 'trace' || attachment.contentType === 'application/zip'
-  )))
+function traceAttachmentFor(result) {
+  return (result.attachments ?? []).find((attachment) => (
+    attachment?.name === 'trace' && attachment.contentType === 'application/zip'
+  ))
 }
 
 function artifactIdFor({ spec, test, attempt, traceIndex }) {
@@ -69,7 +111,7 @@ function artifactIdFor({ spec, test, attempt, traceIndex }) {
 
 function emitTrace({ attachment, artifactId }) {
   if (!attachment.path) {
-    return { storage: 'cloud-logging-jsonl-chunks', artifactId, retained: false, reason: 'reporter attachment has no file path' }
+    return { storage: 'cloud-logging-jsonl-chunks', artifactId, retained: false, reason: 'Trace attachment for the failed attempt has no file path.' }
   }
 
   let trace
@@ -80,7 +122,7 @@ function emitTrace({ attachment, artifactId }) {
       storage: 'cloud-logging-jsonl-chunks',
       artifactId,
       retained: false,
-      reason: `could not read retry trace: ${error instanceof Error ? error.message : String(error)}`,
+      reason: `Could not read trace for the failed attempt: ${error instanceof Error ? error.message : String(error)}`,
     }
   }
 
@@ -91,7 +133,7 @@ function emitTrace({ attachment, artifactId }) {
       retained: false,
       bytes: trace.length,
       maxBytes: MAX_TRACE_BYTES,
-      reason: 'retry trace exceeds bounded Cloud Logging retention limit',
+      reason: 'Trace for the failed attempt exceeds the bounded Cloud Logging retention limit.',
     }
   }
 
@@ -124,24 +166,29 @@ function emitTrace({ attachment, artifactId }) {
   }
 }
 
-for (const spec of specsIn(report.suites ?? [])) {
+validateReport(report)
+
+let recoveredRetryCount = 0
+for (const spec of specsIn(report.suites)) {
   for (const test of spec.tests ?? []) {
     const results = test.results ?? []
     const firstFailure = results.find((result) => result.status === 'failed' || result.status === 'timedOut')
     const recovered = firstFailure && results.some((result) => result.status === 'passed' && result.retry > firstFailure.retry)
     if (!recovered) continue
 
-    const traces = traceAttachments(results)
-    const trace = traces.length > 0
+    recoveredRetryCount += 1
+    const attachment = traceAttachmentFor(firstFailure)
+    const trace = attachment
       ? emitTrace({
-        attachment: traces[0],
+        attachment,
         artifactId: artifactIdFor({ spec, test, attempt: firstFailure.retry, traceIndex: 0 }),
       })
       : {
         storage: 'cloud-logging-jsonl-chunks',
         retained: false,
-        reason: 'Playwright report contained no trace attachment for the recovered retry',
+        reason: 'No trace attachment was retained for the failed attempt.',
       }
+    trace.traceAttempt = firstFailure.retry
 
     emit({
       severity: 'WARNING',
@@ -150,6 +197,7 @@ for (const spec of specsIn(report.suites ?? [])) {
       taskIndex,
       taskCount,
       attempt: firstFailure.retry,
+      failureAttempt: firstFailure.retry,
       test: {
         file: spec.file ?? '',
         line: spec.line ?? 0,
@@ -161,3 +209,12 @@ for (const spec of specsIn(report.suites ?? [])) {
     })
   }
 }
+
+emit({
+  severity: 'INFO',
+  event: 'e2e_playwright_task_complete',
+  execution,
+  taskIndex,
+  taskCount,
+  recoveredRetryCount,
+})

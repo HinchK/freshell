@@ -86,6 +86,12 @@ export default defineConfig({
   forbidOnly: true,
   retries: 2,
   workers: 2,
+  use: {
+    ...baseConfig.use,
+    // Keep the first failed attempt's trace, even when a later retry passes.
+    // The Cloud receipt associates evidence only with that failed attempt.
+    trace: 'retain-on-first-failure',
+  },
   reporter: [
     ['line'],
     ['html', { open: 'never' }],

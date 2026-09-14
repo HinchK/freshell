@@ -587,7 +587,13 @@ cmd_run() {
   # per-shard summary, even when some shards fail.
   echo "[e2e-cloud] Fetching logs..."
   local log_output
-  log_output=$(gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" 2>/dev/null || true)
+  if ! log_output=$(gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" 2>&1); then
+    # This human formatter exposes textPayload only. It remains useful for
+    # display, but never decides whether retry evidence exists; that decision
+    # comes from the required jsonPayload query below.
+    echo "[e2e-cloud] WARNING: could not read display logs: $log_output" >&2
+    log_output=""
+  fi
 
   # Print logs from every shard. Retry traces are retained as bounded base64
   # JSONL chunks in Cloud Logging; redact their bytes here so a successful
@@ -598,10 +604,47 @@ cmd_run() {
     '/"event":"e2e_playwright_retry_trace_chunk"/ s/("data":")[^"]*/\1<retained-in-cloud-logging>/' )
   echo "$display_log_output"
 
+  # Cloud Run turns structured stdout JSON into jsonPayload, which the human
+  # `executions logs read` formatter deliberately does not print. Fetch the
+  # machine-readable entries directly, wait through bounded Cloud Logging
+  # ingestion lag, and require one exact completion receipt from every task.
+  # A query/read/parser failure is never evidence of zero retries.
+  query_structured_retry_receipts() {
+    local query attempt raw parsed parser_error
+    query="resource.type=\"cloud_run_job\" AND labels.\"run.googleapis.com/execution_name\"=\"${execution_id}\" AND (jsonPayload.event=\"e2e_playwright_task_complete\" OR jsonPayload.event=\"e2e_playwright_retry_evidence\")"
+    for attempt in 1 2 3 4 5; do
+      if raw=$(gcloud logging read "$query" $(account_flag) --project="$GCP_PROJECT" --format=json --limit=1000 2>&1); then
+        if parsed=$(printf '%s' "$raw" | node "$ROOT/scripts/e2e-cloud-structured-receipts.mjs" "$execution_id" "$shards" 2>&1); then
+          printf '%s\n' "$parsed"
+          return 0
+        fi
+        parser_error="$parsed"
+      else
+        parser_error="$raw"
+      fi
+      if [ "$attempt" -lt 5 ]; then
+        echo "[e2e-cloud] Waiting for complete structured retry receipts (attempt ${attempt}/5): $parser_error" >&2
+        sleep 3
+      fi
+    done
+    echo "[e2e-cloud] ERROR: could not retrieve complete structured retry receipts: $parser_error" >&2
+    return 1
+  }
+
+  local structured_retry_receipts
+  if ! structured_retry_receipts=$(query_structured_retry_receipts); then
+    exit 1
+  fi
+
   local retry_evidence_count
-  retry_evidence_count=$(printf '%s\n' "$log_output" | grep -c '"event":"e2e_playwright_retry_evidence"' || true)
+  retry_evidence_count=$(jq -r '.recoveredRetryCount' <<< "$structured_retry_receipts")
+  if ! [[ "$retry_evidence_count" =~ ^[0-9]+$ ]]; then
+    echo "[e2e-cloud] ERROR: structured retry receipt returned an invalid recoveredRetryCount." >&2
+    exit 1
+  fi
   if [ "$retry_evidence_count" -gt 0 ]; then
-    echo "[e2e-cloud] Recovered Playwright retry evidence retained in Cloud Logging (${retry_evidence_count} case(s)); see the e2e_playwright_retry_evidence artifact id(s) above."
+    echo "[e2e-cloud] Recovered Playwright retry evidence retained in Cloud Logging (${retry_evidence_count} case(s)):"
+    jq -c '.retryEvidence[] | {taskIndex, failureAttempt, test, error, trace}' <<< "$structured_retry_receipts"
   fi
 
   # Extract and display a per-shard summary from the Playwright output.
