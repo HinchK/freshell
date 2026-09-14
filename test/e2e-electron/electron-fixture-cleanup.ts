@@ -2,8 +2,9 @@
  * Failure-preserving Electron fixture cleanup.
  *
  * A stuck Playwright graceful close must never prevent the fixture from
- * stopping and proving its exact owned Rust server, or from removing its
- * temporary HOME. The exact Electron child is supplied by the launch helper;
+ * stopping and proving its exact owned Rust server. Temporary HOME is removed
+ * only after server teardown succeeds, so a surviving Rust child never runs
+ * against deleted fixture state. The exact Electron child is supplied by the launch helper;
  * this module never searches for or signals a process by name, port, or group.
  */
 
@@ -24,11 +25,16 @@ export interface CancellableTimeout {
 
 export type CreateCancellableTimeout = (ms: number) => CancellableTimeout
 
+export interface ElectronFixtureServerCleanupContext {
+  /** The app's graceful shutdown rejected or timed out before teardown. */
+  gracefulCloseFailed: boolean
+}
+
 export interface ElectronFixtureCleanupDeps {
   app?: ElectronFixtureApplication
   electronProcess?: OwnedElectronProcess
   restoreOpenExternal?: () => Promise<void>
-  stopServer?: () => Promise<void>
+  stopServer?: (context: ElectronFixtureServerCleanupContext) => Promise<void>
   removeHome?: () => Promise<void>
   gracefulCloseTimeoutMs?: number
   forceCloseTimeoutMs?: number
@@ -54,7 +60,11 @@ const defaultCreateTimeout: CreateCancellableTimeout = (ms) => {
 }
 
 function appendFailure(failures: Error[], step: string, error: unknown): void {
-  failures.push(new Error(`Electron fixture cleanup failed while ${step}`, { cause: error }))
+  failures.push(
+    new Error(`Electron fixture cleanup failed while ${step}`, {
+      cause: error,
+    }),
+  )
 }
 
 async function settleWithin(
@@ -99,7 +109,7 @@ export async function closeElectronGracefully(
   timeoutMs = DEFAULT_GRACEFUL_CLOSE_TIMEOUT_MS,
   createTimeout: CreateCancellableTimeout = defaultCreateTimeout,
 ): Promise<void> {
-  if (await settleWithin(app.close(), timeoutMs, createTimeout) === 'timed-out') {
+  if ((await settleWithin(app.close(), timeoutMs, createTimeout)) === 'timed-out') {
     throw new Error(`graceful Electron shutdown timed out after ${timeoutMs}ms`)
   }
 }
@@ -118,7 +128,9 @@ export async function stopExactCapturedProcess(
   try {
     sentTerm = process.kill('SIGTERM')
   } catch (error) {
-    throw new Error('sending SIGTERM to the captured Electron process failed', { cause: error })
+    throw new Error('sending SIGTERM to the captured Electron process failed', {
+      cause: error,
+    })
   }
   if (!sentTerm && !hasExited()) {
     throw new Error('the captured Electron process rejected SIGTERM')
@@ -132,10 +144,12 @@ export async function stopExactCapturedProcess(
       throw new Error('the captured Electron process rejected SIGKILL')
     }
   } catch (error) {
-    throw new Error('sending SIGKILL to the captured Electron process failed', { cause: error })
+    throw new Error('sending SIGKILL to the captured Electron process failed', {
+      cause: error,
+    })
   }
 
-  if (!await waitForCapturedProcessExit(hasExited, timeoutMs, sleep)) {
+  if (!(await waitForCapturedProcessExit(hasExited, timeoutMs, sleep))) {
     throw new Error(`captured Electron process did not exit within ${timeoutMs}ms after SIGKILL`)
   }
 }
@@ -152,6 +166,8 @@ export async function cleanupElectronFixture(options: ElectronFixtureCleanupDeps
   const createTimeout = options.createTimeout ?? defaultCreateTimeout
   const gracefulCloseTimeoutMs = options.gracefulCloseTimeoutMs ?? DEFAULT_GRACEFUL_CLOSE_TIMEOUT_MS
   const forceCloseTimeoutMs = options.forceCloseTimeoutMs ?? DEFAULT_FORCE_CLOSE_TIMEOUT_MS
+  let gracefulCloseFailed = false
+  let serverTeardownSucceeded = true
 
   if (options.restoreOpenExternal) {
     try {
@@ -165,6 +181,7 @@ export async function cleanupElectronFixture(options: ElectronFixtureCleanupDeps
     try {
       await closeElectronGracefully(options.app, gracefulCloseTimeoutMs, createTimeout)
     } catch (error) {
+      gracefulCloseFailed = true
       appendFailure(failures, 'closing Electron', error)
       try {
         await stopExactCapturedProcess(options.electronProcess, forceCloseTimeoutMs, sleep)
@@ -176,13 +193,14 @@ export async function cleanupElectronFixture(options: ElectronFixtureCleanupDeps
 
   if (options.stopServer) {
     try {
-      await options.stopServer()
+      await options.stopServer({ gracefulCloseFailed })
     } catch (error) {
+      serverTeardownSucceeded = false
       appendFailure(failures, 'stopping the owned Rust server', error)
     }
   }
 
-  if (options.removeHome) {
+  if (options.removeHome && serverTeardownSucceeded) {
     try {
       await options.removeHome()
     } catch (error) {

@@ -13,16 +13,30 @@ import fsp from 'node:fs/promises'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
-import { cleanupElectronFixture, closeElectronGracefully, stopExactCapturedProcess } from './electron-fixture-cleanup.js'
+import {
+  cleanupElectronFixture,
+  closeElectronGracefully,
+  stopExactCapturedProcess,
+} from './electron-fixture-cleanup.js'
 import { isolatedElectronHomeEnv } from './fixture-home-env.js'
 import { launchChooserViteArgs, waitForCapturedViteReady } from './launch-chooser-vite.js'
 import { allocateDistinctFixturePorts } from './fixture-ports.js'
+import {
+  forceStopExactOwnedServerAndVerify,
+  isPortFree,
+  verifyOwnedServerStopped,
+  waitForPidGone,
+  type OwnedServerReceipt,
+} from './owned-server-teardown.js'
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, '..', '..')
 const VITE_ROOT = path.join(PROJECT_ROOT, 'node_modules')
-const RUST_BINARY = path.join(PROJECT_ROOT, 'target', 'release', process.platform === 'win32'
-  ? 'freshell-server.exe'
-  : 'freshell-server')
+const RUST_BINARY = path.join(
+  PROJECT_ROOT,
+  'target',
+  'release',
+  process.platform === 'win32' ? 'freshell-server.exe' : 'freshell-server',
+)
 const CLIENT_DIR = path.join(PROJECT_ROOT, 'dist', 'client')
 
 function requireElectronE2eBuildId(): string {
@@ -45,7 +59,7 @@ async function findFreePort(): Promise<number> {
         return
       }
       const port = address.port
-      server.close((error) => error ? reject(error) : resolve(port))
+      server.close((error) => (error ? reject(error) : resolve(port)))
     })
   })
 }
@@ -59,7 +73,7 @@ async function waitForHealth(port: number, token: string): Promise<Record<string
         headers: { 'x-auth-token': token },
       })
       if (response.ok) {
-        const info = await response.json() as Record<string, unknown>
+        const info = (await response.json()) as Record<string, unknown>
         if (info.runtime === 'rust' && typeof info.commit === 'string' && info.commit.length > 0) {
           return info
         }
@@ -75,10 +89,7 @@ async function waitForHealth(port: number, token: string): Promise<Record<string
   throw new Error(`Timed out waiting for Rust server: ${String(lastError)}`)
 }
 
-async function waitForWindowUrl(
-  app: ElectronApplication,
-  pattern: RegExp,
-): Promise<Page> {
+async function waitForWindowUrl(app: ElectronApplication, pattern: RegExp): Promise<Page> {
   const deadline = Date.now() + 30_000
   while (Date.now() < deadline) {
     for (const window of app.windows()) {
@@ -96,9 +107,7 @@ async function waitForWindowUrl(
 }
 
 function startLaunchChooserDevServer(port: number): ChildProcess {
-  return spawn(process.execPath, [
-    ...launchChooserViteArgs(VITE_ROOT, PROJECT_ROOT, port),
-  ], {
+  return spawn(process.execPath, [...launchChooserViteArgs(VITE_ROOT, PROJECT_ROOT, port)], {
     cwd: PROJECT_ROOT,
     env: {
       ...process.env,
@@ -111,9 +120,9 @@ function startLaunchChooserDevServer(port: number): ChildProcess {
 }
 
 function directChildPids(parentPid: number): number[] {
-  const result = spawnSync('ps', [
-    '-o', 'pid=', '--ppid', String(parentPid),
-  ], { encoding: 'utf8' }) as { status: number; stdout: string }
+  const result = spawnSync('ps', ['-o', 'pid=', '--ppid', String(parentPid)], {
+    encoding: 'utf8',
+  }) as { status: number; stdout: string }
   if (result.status !== 0) return []
   return result.stdout
     .split('\n')
@@ -139,27 +148,6 @@ async function waitForOwnedChild(parentPid: number, expectedBinary: string): Pro
   throw new Error(`Timed out waiting for Rust child of Electron PID ${parentPid}`)
 }
 
-async function waitForPidGone(pid: number): Promise<void> {
-  const deadline = Date.now() + 15_000
-  while (Date.now() < deadline) {
-    try {
-      process.kill(pid, 0)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ESRCH') return
-    }
-    await new Promise((resolve) => setTimeout(resolve, 100))
-  }
-  throw new Error(`PID ${pid} remained alive after its owner exited`)
-}
-
-async function isPortFree(port: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    const listener = http.createServer()
-    listener.once('error', () => resolve(false))
-    listener.listen(port, '127.0.0.1', () => listener.close(() => resolve(true)))
-  })
-}
-
 async function waitForCapturedChildExit(child: ChildProcess, timeoutMs = 15_000): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
@@ -167,6 +155,132 @@ async function waitForCapturedChildExit(child: ChildProcess, timeoutMs = 15_000)
     await new Promise((resolve) => setTimeout(resolve, 50))
   }
   throw new Error(`captured Electron PID ${child.pid ?? 'unknown'} remained alive after graceful close`)
+}
+
+function sameResolvedPath(actual: string, expected: string): boolean {
+  try {
+    return fs.realpathSync(actual) === fs.realpathSync(expected)
+  } catch {
+    return false
+  }
+}
+
+function splitNulSeparatedFile(filePath: string): string[] {
+  return fs.readFileSync(filePath).toString('utf8').split('\0').filter(Boolean)
+}
+
+function listeningPidsForFixturePort(port: number): number[] {
+  if (process.platform === 'win32') {
+    const result = spawnSync('netstat', ['-ano', '-p', 'tcp'], {
+      encoding: 'utf8',
+    }) as { status: number | null; stdout: string }
+    if (result.status !== 0) throw new Error(`could not inspect the exact fixture port ${port} with netstat`)
+    return result.stdout.split(/\r?\n/).flatMap((line) => {
+      const fields = line.trim().split(/\s+/)
+      if (fields.length < 5 || fields[0].toUpperCase() !== 'TCP') return []
+      const localAddress = fields[1]
+      if (!localAddress.endsWith(`:${port}`)) return []
+      const pid = Number.parseInt(fields.at(-1) ?? '', 10)
+      return Number.isInteger(pid) && pid > 0 ? [pid] : []
+    })
+  }
+
+  const result = spawnSync('ss', ['-ltnp'], { encoding: 'utf8' }) as {
+    status: number | null
+    stdout: string
+  }
+  if (result.status !== 0) throw new Error(`could not inspect the exact fixture port ${port} with ss`)
+  const portPattern = new RegExp(`(?:127\\.0\\.0\\.1|\\[::1\\]):${port}(?:\\s|$)`)
+  const pids = new Set<number>()
+  for (const line of result.stdout.split('\n')) {
+    if (!portPattern.test(line)) continue
+    for (const match of line.matchAll(/pid=(\d+)/g)) pids.add(Number.parseInt(match[1], 10))
+  }
+  return [...pids]
+}
+
+async function waitForFixturePortOwner(port: number): Promise<number> {
+  const deadline = Date.now() + 15_000
+  while (Date.now() < deadline) {
+    const pids = listeningPidsForFixturePort(port)
+    if (pids.length === 1) return pids[0]
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  throw new Error(`timed out capturing the sole listener on fixture port ${port}`)
+}
+
+async function proveAppBoundRustOwnership(
+  receipt: OwnedServerReceipt,
+  options: {
+    binary: string
+    configDir: string
+    home: string
+    clientDir: string
+    token: string
+  },
+): Promise<void> {
+  const response = await fetch(`http://127.0.0.1:${receipt.port}/api/server-info`, {
+    headers: { 'x-auth-token': options.token },
+    signal: AbortSignal.timeout(2_000),
+  })
+  if (!response.ok) throw new Error(`fixture Rust server-info returned ${response.status} during ownership proof`)
+  const serverInfo = (await response.json()) as Record<string, unknown>
+  if (serverInfo.runtime !== 'rust') throw new Error('fixture port did not serve the expected Rust runtime')
+
+  const listeners = listeningPidsForFixturePort(receipt.port)
+  if (listeners.length !== 1 || listeners[0] !== receipt.pid) {
+    throw new Error(`fixture port ${receipt.port} is not exclusively owned by captured Rust PID ${receipt.pid}`)
+  }
+
+  if (process.platform === 'win32') return
+
+  const executable = executablePath(receipt.pid)
+  if (!executable || !sameResolvedPath(executable, options.binary)) {
+    throw new Error(`captured Rust PID ${receipt.pid} does not run the expected release binary`)
+  }
+  let cwd: string | undefined
+  try {
+    cwd = fs.readlinkSync(`/proc/${receipt.pid}/cwd`)
+  } catch {
+    // The PID may have exited after the exact-port check; let exit and port
+    // verification report that state rather than risking a signal.
+    throw new Error(`could not inspect captured Rust PID ${receipt.pid} working directory`)
+  }
+  if (!sameResolvedPath(cwd, options.configDir)) {
+    throw new Error(`captured Rust PID ${receipt.pid} does not use the fixture config directory`)
+  }
+  const argv = splitNulSeparatedFile(`/proc/${receipt.pid}/cmdline`)
+  if (argv.length !== 1 || !sameResolvedPath(argv[0], options.binary)) {
+    throw new Error(`captured Rust PID ${receipt.pid} does not have the expected release-binary argv`)
+  }
+  const environment = new Map(
+    splitNulSeparatedFile(`/proc/${receipt.pid}/environ`).map((entry) => {
+      const separator = entry.indexOf('=')
+      return [entry.slice(0, separator), entry.slice(separator + 1)]
+    }),
+  )
+  if (
+    environment.get('PORT') !== String(receipt.port) ||
+    environment.get('FRESHELL_HOME') !== options.home ||
+    environment.get('FRESHELL_CLIENT_DIR') !== options.clientDir
+  ) {
+    throw new Error(`captured Rust PID ${receipt.pid} does not have the fixture port, HOME, and client environment`)
+  }
+}
+
+function exactPidProcess(pid: number) {
+  return {
+    pid,
+    isAlive: () => {
+      try {
+        process.kill(pid, 0)
+        return true
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code !== 'ESRCH'
+      }
+    },
+    signal: (signal: NodeJS.Signals) => process.kill(pid, signal),
+  }
 }
 
 test.describe('Electron app-bound Rust server', () => {
@@ -193,23 +307,27 @@ test.describe('Electron app-bound Rust server', () => {
     const foreignToken = `electron-foreign-${Date.now()}`
     await fsp.writeFile(path.join(appConfigDir, '.env'), `AUTH_TOKEN=${appToken}\n`)
     await fsp.writeFile(path.join(foreignConfigDir, '.env'), `AUTH_TOKEN=${foreignToken}\n`)
-    await fsp.writeFile(path.join(appConfigDir, 'desktop.json'), JSON.stringify({
-      serverMode: 'app-bound',
-      port: appPort,
-      knownServers: [],
-      // Force the chooser so this test starts the configured app-bound server
-      // rather than auto-connecting to another developer's local server.
-      alwaysAskOnLaunch: true,
-      globalHotkey: 'CommandOrControl+`',
-      startOnLogin: false,
-      minimizeToTray: true,
-      setupCompleted: true,
-    }))
+    await fsp.writeFile(
+      path.join(appConfigDir, 'desktop.json'),
+      JSON.stringify({
+        serverMode: 'app-bound',
+        port: appPort,
+        knownServers: [],
+        // Force the chooser so this test starts the configured app-bound server
+        // rather than auto-connecting to another developer's local server.
+        alwaysAskOnLaunch: true,
+        globalHotkey: 'CommandOrControl+`',
+        startOnLogin: false,
+        minimizeToTray: true,
+        setupCompleted: true,
+      }),
+    )
 
     let app: ElectronApplication | undefined
     let foreign: ChildProcess | undefined
     let chooserDevServer: ChildProcess | undefined
     let appServerPid: number | undefined
+    let appServerReceipt: OwnedServerReceipt | undefined
     let electronProcess: ChildProcess | undefined
     try {
       foreign = spawn(RUST_BINARY, [], {
@@ -246,48 +364,75 @@ test.describe('Electron app-bound Rust server', () => {
       electronProcess = app.process()
       const mainPage = await app.firstWindow()
       await mainPage.waitForLoadState('domcontentloaded')
-      const chooser = mainPage.getByRole('heading', { name: 'Choose Freshell server' })
+      const chooser = mainPage.getByRole('heading', {
+        name: 'Choose Freshell server',
+      })
       await expect(chooser).toBeVisible({ timeout: 30_000 })
       await mainPage.getByRole('button', { name: 'Start local' }).click()
       const appPage = await waitForWindowUrl(app, new RegExp(`^http://localhost:${appPort}(?:[/?#]|$)`))
       await appPage.waitForLoadState('domcontentloaded')
-      await expect(appPage.locator('text=New Tab').first()).toBeVisible({ timeout: 30_000 })
+      await expect(appPage.locator('text=New Tab').first()).toBeVisible({
+        timeout: 30_000,
+      })
 
       const electronPid = app.process().pid
       if (electronPid === undefined) throw new Error('Electron process did not expose a PID')
-      if (process.platform !== 'win32') {
-        appServerPid = await waitForOwnedChild(electronPid, RUST_BINARY)
-      }
       const appInfo = await waitForHealth(appPort, appToken)
       expect(appInfo.runtime).toBe('rust')
       expect(appInfo.commit).toBe(expectedBuildId)
       expect(appInfo.buildDirty).toBe(false)
+      appServerPid =
+        process.platform === 'win32'
+          ? await waitForFixturePortOwner(appPort)
+          : await waitForOwnedChild(electronPid, RUST_BINARY)
+      appServerReceipt = { pid: appServerPid, port: appPort }
 
       await closeElectronGracefully(app)
       await waitForCapturedChildExit(electronProcess)
       app = undefined
-      if (appServerPid !== undefined) await waitForPidGone(appServerPid)
-      expect(await isPortFree(appPort)).toBe(true)
+      await verifyOwnedServerStopped(appServerReceipt)
 
       // The same-path foreign Rust server must remain available after the app
       // closes. Cleanup below stops it through its captured ChildProcess.
-      await expect.poll(async () => {
-        try {
-          const response = await fetch(`http://127.0.0.1:${foreignPort}/api/health`)
-          return response.ok
-        } catch {
-          return false
-        }
-      }).toBe(true)
+      await expect
+        .poll(async () => {
+          try {
+            const response = await fetch(`http://127.0.0.1:${foreignPort}/api/health`)
+            return response.ok
+          } catch {
+            return false
+          }
+        })
+        .toBe(true)
     } finally {
       const failures: Error[] = []
       try {
         await cleanupElectronFixture({
           app,
           electronProcess,
-          stopServer: async () => {
-            if (appServerPid !== undefined) await waitForPidGone(appServerPid)
-            if (!await isPortFree(appPort)) throw new Error(`Electron app-owned Rust port ${appPort} is still bound`)
+          stopServer: async ({ gracefulCloseFailed }) => {
+            if (!appServerReceipt) {
+              if (!(await isPortFree(appPort)))
+                throw new Error(`Electron app-owned Rust port ${appPort} is still bound without an ownership receipt`)
+              return
+            }
+            if (gracefulCloseFailed) {
+              await forceStopExactOwnedServerAndVerify(exactPidProcess(appServerReceipt.pid), appServerReceipt, {
+                proveOwnership: (receipt) =>
+                  proveAppBoundRustOwnership(receipt, {
+                    binary: RUST_BINARY,
+                    configDir: appConfigDir,
+                    home: appHome,
+                    clientDir: CLIENT_DIR,
+                    token: appToken,
+                  }),
+                waitForPidGone,
+                isPortFree,
+                sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+              })
+              return
+            }
+            await verifyOwnedServerStopped(appServerReceipt)
           },
           removeHome: () => fsp.rm(appHome, { recursive: true, force: true }),
         })
@@ -301,7 +446,7 @@ test.describe('Electron app-bound Rust server', () => {
         if (!child) continue
         try {
           await stopExactCapturedProcess(child, 5_000, (ms) => new Promise((resolve) => setTimeout(resolve, ms)))
-          if (port !== undefined && !await isPortFree(port)) {
+          if (port !== undefined && !(await isPortFree(port))) {
             throw new Error(`captured ${name} port ${port} is still bound`)
           }
         } catch (error) {
