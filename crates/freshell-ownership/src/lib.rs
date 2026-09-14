@@ -525,6 +525,29 @@ pub enum FenceOutcome {
     ForeignOperation,
 }
 
+/// b8ke ext r17 F1: the outcome of the ATOMIC acknowledged start — the
+/// `ClearedUnverified → Handoff` transition in ONE coordinator lock
+/// hold (no Vacant landing, no lock release/reacquire window for a
+/// concurrent request to consume).
+#[derive(Debug)]
+pub enum AcknowledgedStartOutcome {
+    /// The handoff ENTERED atomically: the caller holds the same
+    /// in-flight `Handoff` lease `begin_handoff` grants (the
+    /// generation is the entered record's).
+    Granted { generation: u64 },
+    /// The observed pair is stale (a different epoch, or an older
+    /// generation) — the caller answers the typed stale refusal.
+    StaleObservation {
+        current_epoch: u64,
+        current_generation: u64,
+    },
+    /// The key moved on under the claim (a concurrent lifecycle
+    /// request — acknowledged or otherwise — won the record, or the
+    /// fence already cleared): the caller answers the TYPED conflict
+    /// refusal, NEVER a panic and never a fabricated fallback.
+    LostRace { state: OwnershipState },
+}
+
 /// Outcome of [`RuntimeOwnershipRegistry::force_release_platform_limited`]
 /// (b8ke focused round-3 review R3-4): the typed operator recovery for a
 /// `Fenced{PlatformLimited}` key.
@@ -1417,6 +1440,115 @@ impl RuntimeOwnershipRegistry {
             armed_at_ms: now_epoch_ms(),
             initiator: initiator.to_string(),
         }))
+    }
+
+    /// b8ke ext r17 F1: the ATOMIC acknowledged start — the ONE-lock-hold
+    /// conditional transition `Fenced{ClearedUnverified} → Handoff` with
+    /// the acknowledged-risk arm carried INTO the claim. Pre-r17 the
+    /// acknowledged start was two steps (`acknowledge_cleared_unverified`
+    /// to plain Vacant, then `begin_handoff` reacquiring the lock and
+    /// PANICKING on refusal): a concurrent cross-device lifecycle request
+    /// could claim the vacancy between the calls — including an
+    /// UNACKNOWLEDGED request consuming the opening another client's
+    /// acknowledgment created — and the losing original panicked (its
+    /// caller saw the fallback in-progress lie). Here the record either
+    /// enters Handoff under this claim or the caller answers typed;
+    /// the unverified prior is encoded in the transition log (the
+    /// operator's acknowledgment recorded AT THE START), and the entered
+    /// handoff is the no-prior sequence (the unverified descendants are
+    /// the operator's acknowledged risk — never a reap target).
+    #[allow(clippy::too_many_arguments)] // begin_handoff's field set + the acknowledgment context.
+    pub fn begin_handoff_acknowledged_cleared_unverified(
+        &self,
+        provider: &str,
+        session_id: &str,
+        to_kind: RuntimeOwnerKind,
+        operation_id: &str,
+        observed: ObservedFence,
+        initiator: &str,
+        now_ms: u64,
+    ) -> AcknowledgedStartOutcome {
+        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let key = SessionKey::new(provider, session_id);
+        // The fence check BEFORE the record is read (begin_handoff's
+        // discipline): a stale pair refuses without touching anything.
+        let Some(record) = inner.get_mut(&key) else {
+            return AcknowledgedStartOutcome::LostRace {
+                state: OwnershipState::Vacant,
+            };
+        };
+        let current_generation = snapshot_generation(record);
+        if observed.epoch != self.epoch || observed.generation != current_generation {
+            tracing::warn!(target: "freshell_ownership",
+                event = "ownership.handoff.acknowledged_start.stale_observation",
+                operation_id, provider, session_id, initiator,
+                from_kind = ?Option::<RuntimeOwnerKind>::None,
+                to_kind = ?Some(to_kind),
+                runtime_id = ?Option::<String>::None, pid = ?Option::<u32>::None,
+                observed_epoch = observed.epoch, observed_generation = observed.generation,
+                epoch = self.epoch, generation = current_generation,
+                duration_ms = 0u64,
+                outcome = "refused", failure_reason = "STALE_OBSERVATION",
+                "the acknowledged start observed a stale fence pair — refresh and retry");
+            return AcknowledgedStartOutcome::StaleObservation {
+                current_epoch: self.epoch,
+                current_generation,
+            };
+        }
+        // The conditional transition: ONLY the cleared-unverified state
+        // enters, atomically.
+        match record.state.clone() {
+            OwnershipState::Fenced {
+                reason: reason @ FenceReason::ClearedUnverified,
+                prior,
+                operation_id: fencing_operation_id,
+                since_ms,
+                ..
+            } => {
+                let duration_ms = now_epoch_ms().saturating_sub(since_ms);
+                let unverified_kind = prior.as_ref().map(|(o, _)| o.kind);
+                let unverified_id = prior.as_ref().and_then(|(o, _)| o.terminal_id.clone());
+                let unverified_pid = prior.as_ref().and_then(|(o, _)| o.pid);
+                let unverified_live_key =
+                    prior.as_ref().and_then(|(o, _)| o.live_session_key.clone());
+                // ONE atomic step: the record enters Handoff (prior NONE —
+                // the no-prior sequence; the unverified descendants are the
+                // operator's acknowledged risk, never a reap target).
+                record.generation += 1;
+                record.state = OwnershipState::Handoff {
+                    prior: None,
+                    to_kind,
+                    operation_id: operation_id.to_string(),
+                    generation: record.generation,
+                    initiator: initiator.to_string(),
+                    since_ms: now_ms,
+                };
+                let entered_generation = record.generation;
+                tracing::warn!(target: "freshell_ownership",
+                    event = "ownership.handoff.acknowledged_start.entered",
+                    operation_id, provider, session_id, initiator,
+                    from_kind = ?unverified_kind,
+                    to_kind = ?Some(to_kind),
+                    runtime_id = ?unverified_id, pid = ?unverified_pid,
+                    live_session_key = ?unverified_live_key,
+                    epoch = self.epoch, generation = entered_generation, duration_ms,
+                    fence_reason = ?reason,
+                    fencing_operation_id = %fencing_operation_id,
+                    outcome = "acknowledged_start_entered",
+                    failure_reason = "UNVERIFIED_PRIOR_ACKNOWLEDGED",
+                    "the operator's acknowledged-risk start entered Handoff \
+                     ATOMICALLY over the cleared-unverified state — the prior \
+                     writer's descendant tree was NEVER confirmed dead; the \
+                     operator accepted the risk of surviving processes, and the \
+                     handoff runs the no-prior sequence");
+                AcknowledgedStartOutcome::Granted {
+                    generation: entered_generation,
+                }
+            }
+            // Any other state — a concurrent claim's Handoff, a confirmed
+            // death's Vacant, a foreign fence — is the typed lost race.
+            state => AcknowledgedStartOutcome::LostRace { state },
+        }
     }
 
     #[allow(clippy::too_many_arguments)] // The plan-frozen coordinator surface (Tasks 3-10 consume it).
@@ -8018,19 +8150,111 @@ mod tests {
             ),
             ForceReleaseOutcome::StaleObservation { .. }
         ));
-        // THE ACKNOWLEDGED START vacates the typed state.
+        // THE ACKNOWLEDGED START — b8ke ext r17 F1: the ATOMIC
+        // ClearedUnverified→Handoff claim (one lock hold, the risk carried
+        // into the claim) now drives this key's recovery; the standalone
+        // acknowledge API's event keeps its coverage from the step-8 drive
+        // on the `sid-enum` key.
+        let AcknowledgedStartOutcome::Granted {
+            generation: cu_entered,
+        } = r_cu.begin_handoff_acknowledged_cleared_unverified(
+            PROVIDER,
+            "sid-enum-cleared-unverified",
+            RuntimeOwnerKind::Terminal,
+            "op-enum-cu-ack",
+            ObservedFence {
+                epoch: r_cu.boot_epoch(),
+                generation: cu_fence_generation,
+            },
+            "operator-start-again",
+            17_000,
+        )
+        else {
+            panic!("the cu acknowledged start must grant")
+        };
         assert!(matches!(
-            r_cu.acknowledge_cleared_unverified(
+            r_cu.observe(PROVIDER, "sid-enum-cleared-unverified").state,
+            OwnershipState::Handoff { generation, .. } if generation == cu_entered
+        ));
+        // The stale-observation refusal arm (a fresh cu key, the stale pair).
+        let BeginOutcome::Granted { generation: g_cu2 } = r_cu.begin_start(
+            PROVIDER,
+            "sid-enum-cu-stale-obs",
+            RuntimeOwnerKind::FreshAgent,
+            "op-enum-cu2-live",
+            None,
+            "test",
+            17_500,
+        ) else {
+            panic!("expected Granted")
+        };
+        assert!(matches!(
+            r_cu.commit_live(
                 PROVIDER,
-                "sid-enum-cleared-unverified",
+                "sid-enum-cu-stale-obs",
+                "op-enum-cu2-live",
+                g_cu2,
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("sid-enum-cu-stale-obs".into()),
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            CommitOutcome::Committed
+        ));
+        let BeginOutcome::Granted {
+            generation: g_cu2_fence,
+        } = r_cu.begin_handoff(
+            PROVIDER,
+            "sid-enum-cu-stale-obs",
+            RuntimeOwnerKind::Terminal,
+            "op-enum-cu2-fence",
+            None,
+            "test",
+            17_600,
+        )
+        else {
+            panic!("expected the cu2 handoff granted")
+        };
+        assert!(matches!(
+            r_cu.fence_unconfirmed_handoff(
+                PROVIDER,
+                "sid-enum-cu-stale-obs",
+                "op-enum-cu2-fence",
+                g_cu2_fence,
+                FenceReason::PlatformLimited,
+            ),
+            FenceOutcome::Fenced
+        ));
+        let cu2_fence_generation = r_cu.observe(PROVIDER, "sid-enum-cu-stale-obs").generation;
+        assert!(matches!(
+            r_cu.force_release_platform_limited(
+                PROVIDER,
+                "sid-enum-cu-stale-obs",
                 ObservedFence {
                     epoch: r_cu.boot_epoch(),
-                    generation: cu_fence_generation,
+                    generation: cu2_fence_generation,
                 },
-                "op-enum-cu-ack",
-                "operator-start-again",
+                "operator",
             ),
             ForceReleaseOutcome::Released
+        ));
+        assert!(matches!(
+            r_cu.begin_handoff_acknowledged_cleared_unverified(
+                PROVIDER,
+                "sid-enum-cu-stale-obs",
+                RuntimeOwnerKind::Terminal,
+                "op-enum-cu2-ack",
+                ObservedFence {
+                    epoch: r_cu.boot_epoch(),
+                    generation: cu2_fence_generation.saturating_sub(1),
+                },
+                "operator",
+                17_700,
+            ),
+            AcknowledgedStartOutcome::StaleObservation { .. }
         ));
 
         // ── the ENUMERATION: every captured transition event carries the
@@ -8069,6 +8293,8 @@ mod tests {
             "ownership.attach_guard.released",
             "ownership.fenced.acknowledged_start_cleared_unverified",
             "ownership.fenced.acknowledge_cleared_unverified.stale_observation",
+            "ownership.handoff.acknowledged_start.entered",
+            "ownership.handoff.acknowledged_start.stale_observation",
         ];
         let mut covered: Vec<&str> = Vec::new();
         for event in &events {
@@ -8168,6 +8394,364 @@ mod tests {
             duration >= 50,
             "the release duration is the REAL measured window (>= the 60ms hold), got {duration}"
         );
+    }
+
+    // ── b8ke ext r17 F1: the atomic acknowledged start ────────────────────
+
+    /// The F1 fixture: a key sitting in Fenced{ClearedUnverified} at a
+    /// known generation (the acknowledged-clear landing).
+    fn cleared_unverified_registry() -> (Arc<RuntimeOwnershipRegistry>, String, u64) {
+        let r = Arc::new(RuntimeOwnershipRegistry::new());
+        let sid = "sid-r17-f1".to_string();
+        let BeginOutcome::Granted { generation } = r.begin_start(
+            PROVIDER,
+            &sid,
+            RuntimeOwnerKind::FreshAgent,
+            "op-seed-live",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("seed granted")
+        };
+        assert!(matches!(
+            r.commit_live(
+                PROVIDER,
+                &sid,
+                "op-seed-live",
+                generation,
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some(sid.clone()),
+                    pid: Some(1111),
+                    ownership_id: None,
+                },
+            ),
+            CommitOutcome::Committed
+        ));
+        let BeginOutcome::Granted {
+            generation: fence_gen,
+        } = r.begin_handoff(
+            PROVIDER,
+            &sid,
+            RuntimeOwnerKind::Terminal,
+            "op-seed-fence",
+            None,
+            "test",
+            2_000,
+        )
+        else {
+            panic!("fence granted")
+        };
+        assert!(matches!(
+            r.fence_unconfirmed_handoff(
+                PROVIDER,
+                &sid,
+                "op-seed-fence",
+                fence_gen,
+                FenceReason::PlatformLimited,
+            ),
+            FenceOutcome::Fenced
+        ));
+        let fence_snapshot = r.observe(PROVIDER, &sid);
+        assert!(matches!(
+            r.force_release_platform_limited(
+                PROVIDER,
+                &sid,
+                ObservedFence {
+                    epoch: r.boot_epoch(),
+                    generation: fence_snapshot.generation,
+                },
+                "operator",
+            ),
+            ForceReleaseOutcome::Released
+        ));
+        assert!(matches!(
+            r.observe(PROVIDER, &sid).state,
+            OwnershipState::Fenced {
+                reason: FenceReason::ClearedUnverified,
+                ..
+            }
+        ));
+        let cleared = r.observe(PROVIDER, &sid);
+        (r, sid, cleared.generation)
+    }
+
+    /// b8ke ext r17 F1 (b): the acknowledged start completes ATOMICICALLY —
+    /// `Fenced{ClearedUnverified} → Handoff` in ONE lock hold; the record is
+    /// NEVER plain Vacant, and the entered handoff is the no-prior sequence
+    /// (prior None — the unverified descendants are the operator's
+    /// acknowledged risk, never a reap target).
+    #[test]
+    fn the_acknowledged_start_enters_handoff_atomically_never_vacant() {
+        let (r, sid, cleared_generation) = cleared_unverified_registry();
+        let outcome = r.begin_handoff_acknowledged_cleared_unverified(
+            PROVIDER,
+            &sid,
+            RuntimeOwnerKind::Terminal,
+            "op-ack-start",
+            ObservedFence {
+                epoch: r.boot_epoch(),
+                generation: cleared_generation,
+            },
+            "operator-start-again",
+            3_000,
+        );
+        match outcome {
+            AcknowledgedStartOutcome::Granted { generation } => {
+                assert_eq!(generation, cleared_generation + 1);
+                match r.observe(PROVIDER, &sid).state {
+                    OwnershipState::Handoff {
+                        prior,
+                        to_kind,
+                        operation_id,
+                        generation: entered_gen,
+                        ..
+                    } => {
+                        assert!(prior.is_none(), "the no-prior sequence: {prior:?}");
+                        assert_eq!(to_kind, RuntimeOwnerKind::Terminal);
+                        assert_eq!(operation_id, "op-ack-start");
+                        assert_eq!(entered_gen, cleared_generation + 1);
+                    }
+                    other => {
+                        panic!("the acknowledged start enters Handoff atomically — got {other:?}")
+                    }
+                }
+            }
+            other => panic!("the acknowledged start must grant: {other:?}"),
+        }
+    }
+
+    /// b8ke ext r17 F1 (a)+(c): the concurrent-race property — N threads
+    /// of acknowledged starts, UNACKNOWLEDGED plain begins, and plain
+    /// terminal starts hammer the cleared-unverified key: EXACTLY ONE
+    /// winner, the key is NEVER observed plain Vacant (no two-step
+    /// opening to consume), and every loser answers typed
+    /// (Blocked/Refused/LostRace — never a mid-race Vacant grant).
+    #[test]
+    fn the_acknowledged_start_race_has_exactly_one_winner_never_vacant() {
+        let (r, sid, cleared_generation) = cleared_unverified_registry();
+        let fence = ObservedFence {
+            epoch: r.boot_epoch(),
+            generation: cleared_generation,
+        };
+        let winners = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let vacants = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for i in 0..8u32 {
+            let r = Arc::clone(&r);
+            let sid = sid.clone();
+            let winners = Arc::clone(&winners);
+            let vacants = Arc::clone(&vacants);
+            handles.push(std::thread::spawn(move || {
+                let op = format!("op-race-{i}");
+                match i % 4 {
+                    // The acknowledged start.
+                    0 => {
+                        match r.begin_handoff_acknowledged_cleared_unverified(
+                            PROVIDER,
+                            &sid,
+                            RuntimeOwnerKind::Terminal,
+                            &op,
+                            fence,
+                            "operator-start-again",
+                            4_000,
+                        ) {
+                            AcknowledgedStartOutcome::Granted { .. } => {
+                                winners.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            AcknowledgedStartOutcome::StaleObservation { .. }
+                            | AcknowledgedStartOutcome::LostRace { .. } => {}
+                        }
+                    }
+                    // The UNACKNOWLEDGED plain begins — these must NEVER
+                    // consume the opening (pre-r17 they could claim the
+                    // two-step vacancy).
+                    1 | 2 => {
+                        match r.begin_handoff(
+                            PROVIDER,
+                            &sid,
+                            RuntimeOwnerKind::Terminal,
+                            &op,
+                            None,
+                            "naive-device",
+                            4_000,
+                        ) {
+                            BeginOutcome::Granted { .. } => {
+                                winners.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            BeginOutcome::Blocked { state, .. } => {
+                                if matches!(state, OwnershipState::Vacant) {
+                                    vacants.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    // A plain terminal start.
+                    _ => {
+                        match r.begin_start(
+                            PROVIDER,
+                            &sid,
+                            RuntimeOwnerKind::Terminal,
+                            &op,
+                            None,
+                            "plain-start",
+                            4_000,
+                        ) {
+                            BeginOutcome::Granted { .. } => {
+                                winners.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            BeginOutcome::Blocked { state, .. } => {
+                                if matches!(state, OwnershipState::Vacant) {
+                                    vacants.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                // The key is never observed plain Vacant during the race
+                // (the transition is Fenced→Handoff; a Vacant observation
+                // would prove the pre-r17 two-step window).
+                if matches!(r.observe(PROVIDER, &sid).state, OwnershipState::Vacant) {
+                    // Only legitimate AFTER a single winner entered and its
+                    // commit/fail settled — under the race the winner is
+                    // in-flight (Handoff), so Vacant here is the defect.
+                    // (The threads never commit/fail their tickets, so the
+                    // record stays in its post-begin state.)
+                    vacants.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("race thread");
+        }
+        assert_eq!(
+            winners.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one writer wins the cleared-unverified race"
+        );
+        assert_eq!(
+            vacants.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the key is NEVER plain Vacant during the race — no two-step opening"
+        );
+    }
+
+    /// b8ke ext r17 F1 (a): an UNACKNOWLEDGED hammering start can NEVER
+    /// consume the opening during the acknowledged start — the transition
+    /// is ONE atomic lock hold, so there is no vacancy to claim (pre-r17
+    /// the two-step clear-to-Vacant/re-claim left a real window a
+    /// concurrent unacknowledged request could take, with the losing
+    /// original panicking).
+    #[test]
+    fn an_unacknowledged_hammer_cannot_consume_the_acknowledged_opening() {
+        let (r, sid, cleared_generation) = cleared_unverified_registry();
+        // The spinner: an unacknowledged device hammering plain starts
+        // against the key for the whole duration of the acknowledged start.
+        let spinner_r = Arc::clone(&r);
+        let spinner_sid = sid.clone();
+        let spinner_wins = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let spinner_wins_for_thread = Arc::clone(&spinner_wins);
+        let stop_for_thread = Arc::clone(&stop);
+        let started_for_thread = Arc::clone(&started);
+        let spinner = std::thread::spawn(move || {
+            let mut attempts = 0usize;
+            started_for_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+            while !stop_for_thread.load(std::sync::atomic::Ordering::SeqCst) && attempts < 500_000 {
+                attempts += 1;
+                if let BeginOutcome::Granted { .. } = spinner_r.begin_start(
+                    PROVIDER,
+                    &spinner_sid,
+                    RuntimeOwnerKind::Terminal,
+                    "op-naive-hammer",
+                    None,
+                    "naive-device",
+                    4_000,
+                ) {
+                    spinner_wins_for_thread.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    break;
+                }
+            }
+        });
+
+        // The spinner must be RUNNING before the acknowledged start —
+        // the race is about the window DURING the start, not thread
+        // startup.
+        while !started.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+
+        // THE ACKNOWLEDGED START (with the spinner hammering the same lock).
+        let outcome = r.begin_handoff_acknowledged_cleared_unverified(
+            PROVIDER,
+            &sid,
+            RuntimeOwnerKind::Terminal,
+            "op-ack-start-hammered",
+            ObservedFence {
+                epoch: r.boot_epoch(),
+                generation: cleared_generation,
+            },
+            "operator-start-again",
+            4_500,
+        );
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        spinner.join().expect("spinner thread");
+
+        // EXACTLY the acknowledged start wins; the spinner NEVER consumed
+        // the opening (pre-r17 it granted from the two-step vacancy).
+        assert!(
+            matches!(outcome, AcknowledgedStartOutcome::Granted { .. }),
+            "the acknowledged start wins its own opening: {outcome:?}"
+        );
+        assert_eq!(
+            spinner_wins.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the unacknowledged hammer never consumed the opening"
+        );
+    }
+
+    /// b8ke ext r17 F1 (c): a claim that loses the race answers TYPED —
+    /// the confirmed-death release (Vacant at the SAME generation) makes
+    /// the second acknowledged call a LostRace, never a panic and never a
+    /// fabricated in-progress fallback.
+    #[test]
+    fn the_acknowledged_start_losing_the_race_answers_typed() {
+        let (r, sid, cleared_generation) = cleared_unverified_registry();
+        // The fence clears on confirmed death (the existing watcher path)
+        // at the SAME generation — no state advance, so the still-current
+        // observed pair is valid.
+        assert!(matches!(
+            r.release_fenced(PROVIDER, &sid, "op-seed-fence", cleared_generation),
+            CommitOutcome::Committed
+        ));
+        assert!(matches!(
+            r.observe(PROVIDER, &sid).state,
+            OwnershipState::Vacant
+        ));
+        // The acknowledged start with the still-current pair answers
+        // LostRace{Vacant} — typed, never a panic.
+        match r.begin_handoff_acknowledged_cleared_unverified(
+            PROVIDER,
+            &sid,
+            RuntimeOwnerKind::Terminal,
+            "op-ack-lost",
+            ObservedFence {
+                epoch: r.boot_epoch(),
+                generation: cleared_generation,
+            },
+            "operator-start-again",
+            5_000,
+        ) {
+            AcknowledgedStartOutcome::LostRace { state } => {
+                assert!(matches!(state, OwnershipState::Vacant), "{state:?}");
+            }
+            other => panic!("the lost race must answer LostRace typed — got {other:?}"),
+        }
     }
 
     /// b8ke ext r6 F5: the live handoff-begin's duration is the PRIOR

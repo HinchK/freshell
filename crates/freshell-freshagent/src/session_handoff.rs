@@ -569,40 +569,40 @@ impl SessionHandoffRunner {
                         generation,
                     );
                 };
-                match self.ownership.acknowledge_cleared_unverified(
-                    &req.provider,
-                    &req.session_id,
-                    observed,
-                    &operation_id,
-                    &initiator,
-                ) {
-                    freshell_ownership::ForceReleaseOutcome::Released => {
+                // b8ke ext r17 F1: the acknowledged start is ONE atomic
+                // coordinator transition — `Fenced{ClearedUnverified} →
+                // Handoff` in a single lock hold with the risk carried
+                // INTO the claim (pre-r17 this was two steps — clear to
+                // plain Vacant, then re-enter — whose lock window a
+                // concurrent request could consume, including an
+                // UNACKNOWLEDGED one, and whose re-entry PANICKED on
+                // refusal). A lost race answers the typed conflict
+                // refusal; the entered handoff runs the no-prior sequence.
+                match self
+                    .ownership
+                    .begin_handoff_acknowledged_cleared_unverified(
+                        &req.provider,
+                        &req.session_id,
+                        req.target_kind,
+                        &operation_id,
+                        observed,
+                        &initiator,
+                        now_ms(),
+                    ) {
+                    freshell_ownership::AcknowledgedStartOutcome::Granted {
+                        generation: entered,
+                    } => {
                         tracing::info!(target: "freshell_ownership",
                             event = "ownership.handoff.cleared_unverified_acknowledged_start",
                             operation_id = %operation_id, provider = %req.provider,
                             session_id = %req.session_id,
-                            epoch = self.ownership.boot_epoch(), generation,
+                            epoch = self.ownership.boot_epoch(), generation = entered,
                             outcome = "acknowledged_start_proceeds", failure_reason = "",
-                            "the operator's acknowledged-risk start vacated the \
-                             cleared-unverified state — the handoff proceeds fresh");
-                        // Re-enter: the record is now Vacant, the fresh
-                        // no-prior sequence runs.
-                        let freshell_ownership::BeginOutcome::Granted { generation } =
-                            self.ownership.begin_handoff(
-                                &req.provider,
-                                &req.session_id,
-                                req.target_kind,
-                                &operation_id,
-                                None,
-                                &initiator,
-                                crate::session_lease::now_epoch_ms(),
-                            )
-                        else {
-                            panic!("the acknowledged start must grant from the vacated state");
-                        };
-                        generation
+                            "the operator's acknowledged-risk start entered Handoff \
+                             atomically over the cleared-unverified state");
+                        entered
                     }
-                    freshell_ownership::ForceReleaseOutcome::StaleObservation {
+                    freshell_ownership::AcknowledgedStartOutcome::StaleObservation {
                         current_generation,
                         ..
                     } => {
@@ -613,15 +613,18 @@ impl SessionHandoffRunner {
                             current_generation,
                         )
                     }
-                    freshell_ownership::ForceReleaseOutcome::NotPlatformLimited { state } => {
+                    freshell_ownership::AcknowledgedStartOutcome::LostRace { state } => {
                         tracing::warn!(target: "freshell_ownership",
                             event = "ownership.handoff.cleared_unverified_acknowledge_moved_on",
                             operation_id = %operation_id, provider = %req.provider,
                             session_id = %req.session_id, state = ?state,
-                            "the acknowledged start found the key moved on");
+                            outcome = "refused", failure_reason = "RECOVERY_STATE_MOVED_ON",
+                            "the acknowledged start lost the record — the typed \
+                             conflict refusal, never a panic");
                         return typed_failure(
                             "SESSION_FENCED",
-                            "the session's recovery state moved on; retry with a fresh \
+                            "the session's recovery state moved on (a concurrent \
+                             lifecycle request claimed it); retry with a fresh \
                              observation",
                             true,
                             generation,
