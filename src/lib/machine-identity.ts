@@ -44,6 +44,64 @@ function safeStorage(): Storage | undefined {
   }
 }
 
+const ACTIVE_MACHINE_SELECTION_STORAGE_KEY = 'freshell.machine.active-selection'
+
+function safeSessionStorage(): Storage | undefined {
+  try {
+    if (typeof sessionStorage === 'undefined') return undefined
+    sessionStorage.getItem(ACTIVE_MACHINE_SELECTION_STORAGE_KEY)
+    return sessionStorage
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * bb58 follow-up (reload-safety): the chooser's pick handlers arm this
+ * ONE-SHOT, per-tab marker right before their intentional
+ * `window.location.reload()` bootstrap. The next boot's machine restore
+ * consumes it to tell an ACTIVE machine choice — where the rehydrated local
+ * layout may be a different machine's stale cache, so a non-recoverable
+ * inventory must clear it — apart from a natural reload of a remembered
+ * selection, where the rehydrated layout IS this machine's newest truth and
+ * must survive. sessionStorage (never localStorage) keeps the marker
+ * per-tab: it survives the chooser's reload exactly once and is consumed on
+ * the boot it armed; a later natural reload never inherits it.
+ */
+export function markActiveMachineSelection(storage = safeSessionStorage()): void {
+  try {
+    storage?.setItem(ACTIVE_MACHINE_SELECTION_STORAGE_KEY, '1')
+  } catch {
+    // Best effort: without the marker the next boot takes the conservative
+    // keep-local path, which never destroys data.
+  }
+}
+
+/**
+ * Read the marker WITHOUT consuming it. The boot's restore peeks before the
+ * (asynchronous) inventory request and consumes only after a SUCCESSFUL
+ * restore — so an in-flight reload (the document dying mid-restore) leaves
+ * the marker armed and the next boot still treats the machine as actively
+ * chosen, never falling back to the keep-local path over a foreign cache.
+ */
+export function peekActiveMachineSelectionMark(storage = safeSessionStorage()): boolean {
+  try {
+    return storage?.getItem(ACTIVE_MACHINE_SELECTION_STORAGE_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+export function consumeActiveMachineSelectionMark(storage = safeSessionStorage()): boolean {
+  try {
+    const armed = storage?.getItem(ACTIVE_MACHINE_SELECTION_STORAGE_KEY) === '1'
+    storage?.removeItem(ACTIVE_MACHINE_SELECTION_STORAGE_KEY)
+    return armed
+  } catch {
+    return false
+  }
+}
+
 function nonEmptyString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined
 }

@@ -38,6 +38,18 @@ function assertInventoryIsScopedToMachine(inventory: RecoveryInventory, machineI
   }
 }
 
+export type RestoreMachineWorkspaceOptions = {
+  /**
+   * True when the machine was ACTIVELY chosen this boot (the chooser pick's
+   * one-shot sessionStorage marker). An active choice may be adopting a
+   * different machine over a foreign local cache, so a NON-recoverable
+   * inventory still clears local state (the chosen machine's empty truth
+   * wins). Absent/false — the remembered-selection reload path — keeps the
+   * rehydrated local layout when nothing foreign is recoverable.
+   */
+  activeSelection?: boolean
+}
+
 /**
  * Hydrate the selected machine's durable workspace before the websocket and
  * tabs.sync are allowed to start. The server must honor the additive
@@ -47,6 +59,7 @@ function assertInventoryIsScopedToMachine(inventory: RecoveryInventory, machineI
 export async function restoreMachineWorkspace(
   store: MachineWorkspaceStore,
   machineId: string,
+  options: RestoreMachineWorkspaceOptions = {},
 ): Promise<{ restoredTabs: number }> {
   const inventory = await getRecoveryInventory(
     getCurrentTabRegistryClientInstanceId(),
@@ -56,11 +69,24 @@ export async function restoreMachineWorkspace(
   assertInventoryIsScopedToMachine(inventory, machineId)
   const plans = inventory.recoverable ? buildRecoveryPlan(inventory) : []
 
-  // These are local cache actions, not tab/pane closes. Sync is still gated,
-  // so no blank or mixed-machine snapshot can reach the server mid-replace.
-  store.dispatch(clearTabsForMachine())
-  store.dispatch(clearPanesForMachine())
-  store.dispatch(clearTabRegistryLocalClosed())
+  // bb58dc001 follow-up (reload-safety): the recovery inventory EXCLUDES the
+  // requester's own generations by design (D2 — a live client owns its own
+  // data). When nothing foreign is recoverable and this boot did NOT
+  // actively choose the machine (a natural reload of a remembered
+  // selection), the rehydrated local layout IS this machine's newest truth —
+  // keep it. Destroying it here blanked the workspace on every same-tab
+  // reload, and the destructive persist bypass then wiped the localStorage
+  // cache too. An active choice keeps the clear: a freshly chosen machine
+  // with no durable workspace must still clear a foreign machine's stale
+  // cache. A RECOVERABLE inventory always replaces (the machine's newest
+  // cross-client truth wins on every path).
+  if (inventory.recoverable || options.activeSelection === true) {
+    // These are local cache actions, not tab/pane closes. Sync is still gated,
+    // so no blank or mixed-machine snapshot can reach the server mid-replace.
+    store.dispatch(clearTabsForMachine())
+    store.dispatch(clearPanesForMachine())
+    store.dispatch(clearTabRegistryLocalClosed())
+  }
 
   for (const plan of plans) {
     store.dispatch(addTab({ id: plan.tabId, title: plan.title }))
