@@ -27,8 +27,8 @@ use freshell_protocol::{
 };
 
 use super::{
-    kill_and_confirm_terminal_pid, HandoffHandle, HandoffRequest, HandoffTestHooks,
-    SessionHandoffRunner,
+    kill_and_confirm_terminal_pid, AbortPayload, HandoffHandle, HandoffRequest, HandoffTestHooks,
+    SessionHandoffRunner, UncommittedTargetOutcome,
 };
 
 /// Serializes the tests in this file: they mutate process-global env vars
@@ -3524,7 +3524,65 @@ async fn the_cleared_unverified_state_requires_the_acknowledged_start() {
     rig.registry.kill(&terminal_id);
 }
 
-/// b8ke ext r16 F1: the settle-then-reap confirmation PROPAGATES/// b8ke ext r16 F1: the settle-then-reap confirmation PROPAGATES the
+/// b8ke ext r16 F1: the settle-then-reap confirmation PROPAGATES/// b8ke ext r19 F1: a cancellation after publication where the recorded
+/// PID outlives the reap budget must NOT vacate to plain Vacant — the
+/// unconfirmed kill answers `Unconfirmed` and the abort cleanup's
+/// existing fence + replacement-watcher regime takes over (pre-r19 the
+/// kill wrapper DISCARDED the false and the arm classified NothingToDo,
+/// so a competing lifecycle request could acquire ownership while the
+/// uncommitted terminal writer stayed alive).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_abort_with_a_published_target_pid_outliving_the_reap_budget_fences() {
+    let _guard = ENV_LOCK.lock().await;
+    let rig = build_rig_with_options(None, None, None, 100, None, true);
+    // A live external process the cleanup never owns a row for (the
+    // published-target shape): the watch's RECORDED pid.
+    let mut child = std::process::Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .expect("spawn the external live process");
+    let live_pid = child.id();
+    assert!(
+        freshell_terminal::registry::pid_alive(live_pid),
+        "fixture: the external pid is alive"
+    );
+
+    // The crafted published+settled watch (the r10 F3 seam): publication
+    // recorded the live pid; the settle finished.
+    let watch = crate::terminal_tabs::HandoffSpawnWatch::new_with_before_publish(None, None);
+    watch.publish_and_settle_for_test("t-r19-live-recorded", Some(live_pid));
+
+    // The AbortPayload the guard's Drop would build for a terminal-target
+    // handoff aborted after publication (spawn begun, no returned target).
+    let payload = AbortPayload {
+        provider: "claude".to_string(),
+        session_id: "ses-r19-f1-outlives".to_string(),
+        operation_id: "op-r19-f1-outlives".to_string(),
+        generation: 7,
+        prior: None,
+        target_kind: RuntimeOwnerKind::Terminal,
+        target_spawn_begun: true,
+        target: None,
+        spawn_watch: Some(watch),
+    };
+    let outcome = rig.runner.abort_reap_uncommitted_target(&payload).await;
+
+    // THE CONTRACT: the unconfirmed kill answers Unconfirmed — the fence
+    // regime owns the key, never a plain-Vacant release (red: NothingToDo).
+    assert!(
+        matches!(outcome, UncommittedTargetOutcome::Unconfirmed),
+        "a recorded PID outliving the reap budget must answer Unconfirmed — got {outcome:?}"
+    );
+    assert!(
+        freshell_terminal::registry::pid_alive(live_pid),
+        "the pid still lives (the fixture never died)"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// b8ke ext r16 F1: the settle-then-reap confirmation PROPAGATES
 /// kill-and-confirm result — a concurrent kill that already removed the
 /// registry row while the recorded PID stays alive (beyond the reap
 /// timeout) must NOT answer Confirmed (pre-r16 the boolean was discarded

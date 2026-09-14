@@ -2617,8 +2617,35 @@ impl SessionHandoffRunner {
                 );
                 return UncommittedTargetOutcome::Unconfirmed;
             }
+            // b8ke ext r19 F1: the confirmation result PROPAGATES. The
+            // published arm kills with the WATCH's recorded PID (captured
+            // at publication — the row may already be gone) and an
+            // unconfirmed reap answers `Unconfirmed` (NOT NothingToDo):
+            // ownership is retained/fenced and the existing
+            // reconfirmation/replacement-watcher path starts — a
+            // competing lifecycle request can never acquire the key while
+            // the uncommitted terminal writer stays alive.
+            let mut all_confirmed = true;
             if let Some(terminal_id) = watch.published_terminal() {
-                self.kill_and_confirm_terminal(&terminal_id).await;
+                let recorded_pid = watch.published_pid();
+                if !kill_and_confirm_terminal_pid(
+                    &self.registry,
+                    &terminal_id,
+                    recorded_pid,
+                    self.reap_timeout_ms,
+                )
+                .await
+                {
+                    all_confirmed = false;
+                    tracing::error!(target: "invariant",
+                        terminal_id = %terminal_id,
+                        provider = %provider, session_id = %session_id,
+                        "abort_published_target_reap_unconfirmed: the recorded PID \
+                         outlived the reap budget — the abort answers Unconfirmed (the \
+                         fence + replacement watcher own the resolution), never \
+                         NothingToDo"
+                    );
+                }
             }
             // Backstop: any registry row still holding the canonical
             // sessionRef UNDER THIS HANDOFF'S PROVIDER is an uncommitted
@@ -2630,9 +2657,19 @@ impl SessionHandoffRunner {
             for entry in self.registry.directory() {
                 if entry.mode == provider.as_str()
                     && entry.resume_session_id.as_deref() == Some(session_id.as_str())
+                    && !self.kill_and_confirm_terminal(&entry.terminal_id).await
                 {
-                    self.kill_and_confirm_terminal(&entry.terminal_id).await;
+                    all_confirmed = false;
+                    tracing::error!(target: "invariant",
+                        terminal_id = %entry.terminal_id,
+                        provider = %provider, session_id = %session_id,
+                        "abort_sweep_target_reap_unconfirmed: the row's runtime \
+                         outlived the reap budget — the abort answers Unconfirmed"
+                    );
                 }
+            }
+            if !all_confirmed {
+                return UncommittedTargetOutcome::Unconfirmed;
             }
         }
         if *target_spawn_begun && *target_kind == RuntimeOwnerKind::FreshAgent {
@@ -2730,13 +2767,17 @@ impl SessionHandoffRunner {
     }
 
     /// Registry kill + bounded confirmed death (the runner's reap shape).
-    async fn kill_and_confirm_terminal(&self, terminal_id: &str) {
+    /// b8ke ext r19 F1: the wrapper now RETURNS the typed confirmation —
+    /// no call site can silently discard a timed-out reap as
+    /// success-or-nothing (pre-r19 the bool was dropped, so a
+    /// cancellation after publication with the recorded PID outliving the
+    /// budget classified `NothingToDo` and the cleanup vacated to plain
+    /// Vacant while the uncommitted writer stayed alive).
+    async fn kill_and_confirm_terminal(&self, terminal_id: &str) -> bool {
         // b8ke ext r13 F7: the recorded-PID OS-level death is the
         // confirmation — never the row's absence (a concurrent kill
         // removes the row before its blocking PTY kill completes).
-        let _ =
-            kill_and_confirm_terminal_pid(&self.registry, terminal_id, None, self.reap_timeout_ms)
-                .await;
+        kill_and_confirm_terminal_pid(&self.registry, terminal_id, None, self.reap_timeout_ms).await
     }
 
     /// Stop the prior runtime and await the CONFIRMED reap (bounded by
