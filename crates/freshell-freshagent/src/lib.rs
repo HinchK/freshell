@@ -6516,8 +6516,10 @@ mod tests {
         );
 
         // Release A's parked create: the materialization completes and
-        // commits Live at the minted key with the provisional alias.
-        http.release.notify_waiters();
+        // commits Live at the minted `ses_1` with the provisional alias.
+        // `notify_one` stores its permit even if the waiter has not yet
+        // re-registered after recording its arrival (deterministic wake).
+        http.release.notify_one();
         let a_resp = tokio::time::timeout(std::time::Duration::from_secs(10), drive_a)
             .await
             .expect("drive A completes after the release")

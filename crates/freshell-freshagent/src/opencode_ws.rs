@@ -1528,6 +1528,88 @@ impl FreshOpencodeState {
             // ONE server-wide, and gating would starve the spawn budget on
             // ~50-70s worst-case cold-start holds (see the lib.rs comment for
             // the arithmetic). Revisit if the sidecar ever grows fork fan-out.
+            //
+            // b8ke ext r26 F3: the PRE-MUTATION claim — the placeholder
+            // identity (the pane-scoped id the lane already knows, before
+            // the provider mints anything) holds the in-flight start for
+            // the WHOLE cold-start window, mirroring the REST/MCP lane's
+            // provisional-key discipline. The settle witness registers
+            // with the ticket (the r20 F1 discipline), so the stale-start
+            // sweep skips the live slow cold-start; the cancel closure is
+            // a NO-OP by design — the shared serve daemon is NOT the
+            // per-session writer and must never be killed (OpenCode
+            // invariant). At the mint the SAME ticket rekeys to the
+            // durable id in one atomic step, so the durable key is
+            // coordinator-owned from the moment the id exists — a
+            // claim refusal, cancellation, panic, or shutdown after the
+            // provider mutation can never leave the minted session
+            // outside coordinator ownership and typed recovery, and a
+            // competing lifecycle operation on the placeholder (or a
+            // duplicate first-send) answers the typed conflict BEFORE
+            // any provider mutation.
+            let claim_key = self
+                .fresh_agent
+                .resolve_canonical_session(PROVIDER, &session.placeholder_id);
+            let materialize_op = format!("send-materialize-{}", uuid::Uuid::new_v4());
+            let start_pid_slot = crate::ownership_lane::sidecar_pid_cancel_slot();
+            let mut _start_cancellation: Option<crate::ownership_lane::StartCancellationGuard> =
+                None;
+            let mut own_ticket: Option<freshell_ownership::OperationTicket> = None;
+            match self.begin_lane_claim_at(
+                &claim_key,
+                &materialize_op,
+                None,
+                "freshopencode/send-materialize",
+            ) {
+                crate::ownership_lane::LaneClaim::Granted(ticket) => {
+                    own_ticket = Some(ticket);
+                    _start_cancellation = Some(
+                        crate::ownership_lane::register_start_cancellation_for_ticket(
+                            &self.fresh_agent.ownership,
+                            PROVIDER,
+                            &claim_key,
+                            &own_ticket,
+                            crate::ownership_lane::pid_slot_cancellation(&start_pid_slot),
+                        ),
+                    );
+                }
+                crate::ownership_lane::LaneClaim::Unwired => {}
+                crate::ownership_lane::LaneClaim::Adopt => {
+                    // The placeholder resolves to a LIVE same-kind owner —
+                    // an earlier materialization for this pane completed
+                    // (the key is `Aliased{to: the durable id}` after its
+                    // rekey); the duplicate first-send answers typed.
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        provider = PROVIDER, session_id = %claim_key,
+                        placeholder_id = %session.placeholder_id,
+                        "freshagent.opencode.materialize_claim_refused: the \
+                         placeholder resolves to a live owner; the pane is not \
+                         materialized by this send"
+                    );
+                    self.emit_fresh_agent_error(
+                        &session_id,
+                        "SESSION_RESERVED",
+                        "Another resume for this session is in flight",
+                    );
+                    return;
+                }
+                crate::ownership_lane::LaneClaim::Refused(outcome) => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        provider = PROVIDER, session_id = %claim_key,
+                        placeholder_id = %session.placeholder_id,
+                        outcome = ?outcome,
+                        "freshagent.opencode.materialize_claim_refused: the coordinator \
+                         refused the placeholder's pre-spawn claim; the pane is not \
+                         materialized (kata b8ke ext r26 F3)"
+                    );
+                    self.emit_fresh_agent_error(
+                        &session_id,
+                        "SESSION_RESERVED",
+                        "Another resume for this session is in flight",
+                    );
+                    return;
+                }
+            }
             let created = match manager.create_session(None, None, cwd.as_deref()).await {
                 Ok(created) => created,
                 Err(err) => {
@@ -1541,46 +1623,57 @@ impl FreshOpencodeState {
             };
             let durable_id = created.id;
 
-            // kata b8ke Task 3 (carried finding): the placeholder→durable
-            // materialization MINTS the canonical `ses_*` key — claim
-            // Starting under a ticket NOW, before anything else registers
-            // runtime state for it (a minted id was never observed by
-            // anyone, so no fence is carried). The shared serve daemon is
-            // never a kill target (pid stays `None` — OpenCode invariant).
-            let materialize_op = format!("send-materialize-{durable_id}");
-            let mut own_ticket = match self.begin_lane_claim_at(
-                &durable_id,
-                &materialize_op,
-                None,
-                "freshopencode/send-materialize",
-            ) {
-                crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
-                crate::ownership_lane::LaneClaim::Unwired => None,
-                crate::ownership_lane::LaneClaim::Adopt => {
-                    // A minted `ses_*` id cannot be live under another
-                    // operation — treat the impossible adopt as reserved.
-                    self.emit_fresh_agent_error(
-                        &session_id,
-                        "SESSION_RESERVED",
-                        "Another resume for this session is in flight",
-                    );
-                    return;
+            // b8ke ext r26 F3: the MINT-TIME REKEY — the SAME ticket's
+            // in-flight record moves from the placeholder key to the
+            // minted durable `ses_*` id in ONE atomic step
+            // (`rekey_starting`: the placeholder becomes
+            // `Aliased{to: the durable id}` — the rekey family's
+            // resolution record — and the durable key holds the SAME
+            // operation's `Starting`, witnesses carried; the ticket
+            // survives via `rekey_session_id`, so the registration tail
+            // below lands under the CANONICAL key). The durable key is
+            // coordinator-owned from the moment the id exists: a
+            // competitor that claimed the freshly discoverable session
+            // inside the cold-start window left a record under it and
+            // the rekey REFUSES typed — the pane is NOT registered (the
+            // daemon-side session is abandoned; the shared serve is
+            // never killed — OpenCode invariant), never two writers.
+            if let Some(ticket) = own_ticket.as_mut() {
+                let Some(registry) = self.fresh_agent.ownership.as_ref() else {
+                    unreachable!("a live ticket implies a wired coordinator");
+                };
+                match registry.rekey_starting(
+                    PROVIDER,
+                    ticket.session_id(),
+                    &durable_id,
+                    ticket.operation_id(),
+                    ticket.generation(),
+                ) {
+                    freshell_ownership::CommitOutcome::Committed => {
+                        ticket.rekey_session_id(&durable_id);
+                    }
+                    outcome => {
+                        tracing::error!(target: "invariant",
+                            provider = PROVIDER, session_id = %durable_id,
+                            placeholder_id = %session.placeholder_id,
+                            outcome = ?outcome,
+                            "freshagent.opencode.materialize_rekey_refused: the minted \
+                             session id was claimed by another owner during the \
+                             cold-start window — the pane is not registered (kata b8ke \
+                             ext r26 F3)"
+                        );
+                        self.emit_fresh_agent_error(
+                            &session_id,
+                            "SESSION_RESERVED",
+                            "The minted session id was claimed by another owner during the create",
+                        );
+                        return;
+                    }
                 }
-                crate::ownership_lane::LaneClaim::Refused(outcome) => {
-                    tracing::warn!(target: "freshell_freshagent::opencode",
-                        provider = PROVIDER, session_id = %durable_id,
-                        outcome = ?outcome,
-                        "freshagent.opencode.materialize_claim_refused: the coordinator \
-                         refused the materialization claim; the pane is not materialized"
-                    );
-                    self.emit_fresh_agent_error(
-                        &session_id,
-                        "SESSION_RESERVED",
-                        "Another resume for this session is in flight",
-                    );
-                    return;
-                }
-            };
+            }
+            // The shared `opencode serve` daemon is NOT the per-session writer
+            // and must never be killed — pid stays `None` (OpenCode
+            // invariant): the watchdog has no partial runtime to reap.
             crate::ownership_lane::register_partial_fresh_runtime(
                 &self.fresh_agent.ownership,
                 PROVIDER,
@@ -1675,40 +1768,15 @@ impl FreshOpencodeState {
                 );
                 return;
             }
-            // b8ke ext r23 F1: the placeholder→durable COORDINATOR ALIAS.
-            // The durable key now holds the authoritative owner; the
-            // placeholder identity (the pane's persisted sessionRef — the
-            // `freshopencode-*` id) becomes a resolution alias so a
+            // b8ke ext r23 F1 carried the placeholder→durable COORDINATOR
+            // ALIAS as an explicit `alias_vacant_key` call here; b8ke ext
+            // r26 F3's pre-mint claim makes it inherent — the mint-time
+            // rekey leaves the placeholder key as the resolution alias
+            // (`Aliased{to: the durable id}`), the same record shape, so a
             // placeholder-holding pane (a restored/offline pane or a
             // direct REST caller) resolves to the REAL key through the
-            // canonical chain — a handoff entering on the placeholder
-            // names the actual durable owner as its prior and stops it.
-            // Best-effort on the WS lane (the alias is a resolution hint;
-            // a failure logs and the materialization still succeeds — the
-            // durable key is authoritative regardless): the REST lane's
-            // alias is its own call.
-            if let Some(registry) = self.fresh_agent.ownership.as_ref() {
-                match registry.alias_vacant_key(
-                    PROVIDER,
-                    &session.placeholder_id,
-                    &durable_id,
-                    "freshopencode/send-materialize",
-                ) {
-                    freshell_ownership::CommitOutcome::Committed => {}
-                    other => {
-                        tracing::warn!(target: "freshell_freshagent::opencode",
-                            provider = PROVIDER,
-                            placeholder = %session.placeholder_id,
-                            durable_id = %durable_id,
-                            outcome = ?other,
-                            "freshagent.opencode.materialize_alias_refused: the \
-                             placeholder→durable coordinator alias was refused (the \
-                             durable owner stays authoritative; the placeholder \
-                             identity will not resolve until the next materialization)"
-                        );
-                    }
-                }
-            }
+            // canonical chain exactly as before. When the coordinator is
+            // unwired there is no alias to record.
             durable_id
         };
 
@@ -3635,6 +3703,98 @@ impl FreshOpencodeState {
             .filter(|id| id.starts_with("msg"));
 
         let manager = self.fresh_agent.ensure_manager().await;
+
+        // b8ke ext r26 F3: the fork's PRE-MUTATION claim — the
+        // request-scoped provisional identity (the fork request id the
+        // caller already carries, namespaced so it can never collide with
+        // a provider-minted session id) holds the in-flight start for the
+        // WHOLE fork window, mirroring the REST/MCP lane's
+        // provisional-key discipline. The settle witness registers with
+        // the ticket (the r20 F1 discipline); the cancel closure is a
+        // NO-OP by design — the shared serve daemon is NOT the
+        // per-session writer and must never be killed (OpenCode
+        // invariant). At the mint the SAME ticket rekeys to the child id
+        // in one atomic step, so the child key is coordinator-owned from
+        // the moment the id exists — a claim refusal, cancellation,
+        // panic, or shutdown after the provider mutation can never leave
+        // the minted child outside coordinator ownership and typed
+        // recovery, and a competing lifecycle operation on the
+        // operation identity answers the typed conflict BEFORE any
+        // provider mutation (pre-r26 the claim only happened AFTER
+        // `manager.fork`, leaving the fork window unowned).
+        let fork_request_key = msg
+            .request_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let provisional_id = format!("pending-fork-{fork_request_key}");
+        let claim_key = self
+            .fresh_agent
+            .resolve_canonical_session(PROVIDER, &provisional_id);
+        let fork_op_id = format!("fork-child-{}", uuid::Uuid::new_v4());
+        let start_pid_slot = crate::ownership_lane::sidecar_pid_cancel_slot();
+        let mut _start_cancellation: Option<crate::ownership_lane::StartCancellationGuard> = None;
+        let mut own_ticket: Option<freshell_ownership::OperationTicket> = None;
+        match self.begin_lane_claim_at(
+            &claim_key,
+            &fork_op_id,
+            None,
+            &Self::initiator_for(fork_provenance.as_ref(), "freshopencode/fork"),
+        ) {
+            crate::ownership_lane::LaneClaim::Granted(ticket) => {
+                own_ticket = Some(ticket);
+                _start_cancellation = Some(
+                    crate::ownership_lane::register_start_cancellation_for_ticket(
+                        &self.fresh_agent.ownership,
+                        PROVIDER,
+                        &claim_key,
+                        &own_ticket,
+                        crate::ownership_lane::pid_slot_cancellation(&start_pid_slot),
+                    ),
+                );
+            }
+            crate::ownership_lane::LaneClaim::Unwired => {}
+            crate::ownership_lane::LaneClaim::Adopt => {
+                // The operation identity resolves to a LIVE same-kind owner
+                // — this request id already minted its child (a replayed
+                // fork request); the duplicate answers the typed conflict.
+                tracing::warn!(target: "freshell_freshagent::opencode",
+                    parent_session_id = %msg.session_id, session_id = %claim_key,
+                    "fresh_agent_fork_refused: the fork's operation identity \
+                     resolves to a live owner; the child is not created (kata b8ke \
+                     ext r26 F3)"
+                );
+                reply_sink(event_frame(
+                    &msg.session_id,
+                    json!({
+                        "type": "freshAgent.error",
+                        "sessionId": msg.session_id,
+                        "code": "SESSION_RESERVED",
+                        "message": "Another resume for this session is in flight",
+                    }),
+                ));
+                return;
+            }
+            crate::ownership_lane::LaneClaim::Refused(outcome) => {
+                tracing::warn!(target: "freshell_freshagent::opencode",
+                    parent_session_id = %msg.session_id, session_id = %claim_key,
+                    outcome = ?outcome,
+                    "fresh_agent_fork_refused: the ownership coordinator refused the \
+                     operation-identity claim before the provider mutation (kata b8ke \
+                     ext r26 F3)"
+                );
+                reply_sink(event_frame(
+                    &msg.session_id,
+                    json!({
+                        "type": "freshAgent.error",
+                        "sessionId": msg.session_id,
+                        "code": "SESSION_RESERVED",
+                        "message": "Another resume for this session is in flight",
+                    }),
+                ));
+                return;
+            }
+        }
+
         let child = match manager.fork(&real_id, &route, message_id).await {
             Ok(child) => child,
             Err(err) => {
@@ -3671,58 +3831,64 @@ impl FreshOpencodeState {
             return;
         }
 
+        // b8ke ext r26 F3: the MINT-TIME REKEY — the SAME ticket's
+        // in-flight record moves from the operation identity to the
+        // minted child id in ONE atomic step (`rekey_starting`: the
+        // provisional key becomes `Aliased{to: the child id}` — the rekey
+        // family's resolution record — and the child key holds the SAME
+        // operation's `Starting`, witnesses carried; the ticket survives
+        // via `rekey_session_id`, so the registration tail below lands
+        // under the CANONICAL key). A competitor that claimed the freshly
+        // discoverable child id inside the fork window left a record under
+        // it and the rekey REFUSES typed — the child is NOT registered
+        // (the daemon-side session is abandoned; the shared serve is never
+        // killed — OpenCode invariant), never two writers.
+        if let Some(ticket) = own_ticket.as_mut() {
+            let Some(registry) = self.fresh_agent.ownership.as_ref() else {
+                unreachable!("a live ticket implies a wired coordinator");
+            };
+            match registry.rekey_starting(
+                PROVIDER,
+                ticket.session_id(),
+                &child.id,
+                ticket.operation_id(),
+                ticket.generation(),
+            ) {
+                freshell_ownership::CommitOutcome::Committed => {
+                    ticket.rekey_session_id(&child.id);
+                }
+                outcome => {
+                    tracing::error!(target: "invariant",
+                        provider = PROVIDER, session_id = %child.id,
+                        parent_session_id = %real_id,
+                        outcome = ?outcome,
+                        "freshagent.opencode.fork_rekey_refused: the minted child id \
+                         was claimed by another owner during the fork window — the \
+                         child is not registered (kata b8ke ext r26 F3)"
+                    );
+                    reply_sink(event_frame(
+                        &msg.session_id,
+                        json!({
+                            "type": "freshAgent.error",
+                            "sessionId": msg.session_id,
+                            "code": "SESSION_RESERVED",
+                            "message": "The minted child session id was claimed by another owner during the fork",
+                        }),
+                    ));
+                    return;
+                }
+            }
+        }
+
         // adapter.ts fork:1005-1020 — the child lands in the SAME session map (its
         // placeholder IS its durable id), inherits model/effort from the parent, takes
         // cwd from `child.directory ?? state.cwd`, and gets its own serve-SSE bridge
         // (`bindServeStream(childState)`).
         //
-        // kata b8ke Task 3 (carried finding): fork MINTS a new session id —
-        // claim Starting under a ticket on the NEW child key BEFORE creating
-        // the child runtime (the registration + bridge below). No observed
-        // fence needed (a minted id was never observed); it still goes
-        // through the coordinator.
-        let fork_op_id = format!("fork-child-{}", uuid::Uuid::new_v4());
-        let mut own_ticket = match self.begin_lane_claim_at(
-            &child.id,
-            &fork_op_id,
-            None,
-            &Self::initiator_for(fork_provenance.as_ref(), "freshopencode/fork"),
-        ) {
-            crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
-            crate::ownership_lane::LaneClaim::Unwired => None,
-            crate::ownership_lane::LaneClaim::Adopt => {
-                // Unreachable on a fresh child id in practice — honored by
-                // the same refusal shape.
-                reply_sink(event_frame(
-                    &msg.session_id,
-                    json!({
-                        "type": "freshAgent.error",
-                        "sessionId": msg.session_id,
-                        "code": "SESSION_RESERVED",
-                        "message": "Another resume for this session is in flight",
-                    }),
-                ));
-                return;
-            }
-            crate::ownership_lane::LaneClaim::Refused(outcome) => {
-                tracing::warn!(target: "freshell_freshagent::opencode",
-                    parent_session_id = %msg.session_id, session_id = %child.id,
-                    outcome = ?outcome,
-                    "fresh_agent_fork_refused: the ownership coordinator refused the \
-                     child-key claim (kata b8ke)"
-                );
-                reply_sink(event_frame(
-                    &msg.session_id,
-                    json!({
-                        "type": "freshAgent.error",
-                        "sessionId": msg.session_id,
-                        "code": "SESSION_RESERVED",
-                        "message": "Another resume for this session is in flight",
-                    }),
-                ));
-                return;
-            }
-        };
+        // kata b8ke Task 3 (carried finding): the child registration runs
+        // under the rekeyed ticket's held claim and commits Live at the
+        // minted child key below. No observed fence needed (a minted id
+        // was never observed); it still goes through the coordinator.
         let child_cwd = child
             .directory
             .clone()
@@ -8797,6 +8963,151 @@ mod tests {
         );
     }
 
+    /// b8ke ext r26 F3: the create-GATING http — the POST /session signals
+    /// its arrival from inside the parked future and then waits for the
+    /// test's release (a permit-storing `notify_one` wakes it
+    /// deterministically), holding the first send inside its cold-start
+    /// provider mutation.
+    struct GatedCreateHttp {
+        arrived_tx: tokio::sync::mpsc::UnboundedSender<()>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    impl ServeHttp for GatedCreateHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let is_create = req.url.contains("/session")
+                && !req.url.contains("/message")
+                && !req.url.contains("/abort")
+                && !req.url.contains("/status")
+                && matches!(req.method, freshell_opencode::serve::HttpMethod::Post);
+            if is_create {
+                let arrived_tx = self.arrived_tx.clone();
+                let release = Arc::clone(&self.release);
+                return Box::pin(async move {
+                    let _ = arrived_tx.send(());
+                    release.notified().await;
+                    Ok(ServeHttpResponse::new(
+                        200,
+                        serde_json::to_vec(&json!({
+                            "id": "ses_gated_r26",
+                            "directory": null
+                        }))
+                        .unwrap(),
+                    ))
+                });
+            }
+            Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) })
+        }
+    }
+
+    /// b8ke ext r26 F3: the first send's PRE-MUTATION claim — the
+    /// placeholder identity (the pane-scoped id known before the
+    /// provider mints anything) holds the in-flight start BEFORE
+    /// `manager.create_session` issues its POST, mirroring the REST/MCP
+    /// lane's provisional-key discipline. Pre-r26 the claim only happened
+    /// AFTER the durable id was minted, so a refusal, cancellation,
+    /// panic, or shutdown during the ~50-70s cold-start window left the
+    /// minted session outside coordinator ownership and typed recovery,
+    /// and competing lifecycle operations were never blocked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_first_send_claims_the_placeholder_before_the_provider_mutation() {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx))
+            .with_ownership(Arc::clone(&registry));
+        let (arrived_tx, mut arrived_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: Arc::new(GatedCreateHttp {
+                arrived_tx,
+                release: Arc::clone(&release),
+            }),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        st.handle_create(create_msg("r26-claim"), None).await;
+        let placeholder = "freshopencode-r26-claim";
+
+        let st2 = st.clone();
+        let send =
+            tokio::spawn(async move { st2.handle_send(send_msg(placeholder, "hello")).await });
+        arrived_rx
+            .recv()
+            .await
+            .expect("the first send reaches its provider mutation");
+
+        // THE PRE-MUTATION CLAIM: the placeholder key holds the in-flight
+        // start while the create POST is still open (pre-r26 this was
+        // Vacant — nothing claimed before the mint).
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, placeholder).state,
+                freshell_ownership::OwnershipState::Starting {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    ..
+                }
+            ),
+            "the placeholder holds the in-flight start before the provider \
+             mutation — got {:?}",
+            registry.observe(PROVIDER, placeholder).state
+        );
+        // A competing lifecycle operation on the placeholder is refused
+        // typed — the cold-start window blocks competing starts (pre-r26
+        // a terminal begin GRANTED here: two writers).
+        assert!(matches!(
+            registry.begin_start(
+                PROVIDER,
+                placeholder,
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "op-r26-send-compete",
+                None,
+                "test",
+                crate::session_lease::now_epoch_ms(),
+            ),
+            freshell_ownership::BeginOutcome::Blocked { .. }
+        ));
+
+        // Release the parked create: the mint rekeys the SAME ticket to the
+        // durable id and the materialization commits Live with the
+        // placeholder left as the resolution alias.
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(15), send)
+            .await
+            .expect("the send completes after the release")
+            .expect("the send task joins");
+        assert!(matches!(
+            registry.observe(PROVIDER, "ses_gated_r26").state,
+            freshell_ownership::OwnershipState::Live { owner, .. }
+                if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+        ));
+        assert!(matches!(
+            registry.observe(PROVIDER, placeholder).state,
+            freshell_ownership::OwnershipState::Aliased { to, .. } if to == "ses_gated_r26"
+        ));
+        assert!(
+            st.has_live_session("ses_gated_r26").await,
+            "the materialized session registered"
+        );
+    }
+
     #[tokio::test]
     async fn send_with_changed_settings_refreshes_the_binding() {
         // Same harness; after materialization, send again with
@@ -12739,6 +13050,94 @@ mod tests {
             .insert(id.to_string(), Arc::new(TokioMutex::new(session)));
     }
 
+    /// b8ke ext r26 F3: the fork's PRE-MUTATION claim — the request-scoped
+    /// provisional identity (`pending-fork-<requestId>`) holds the
+    /// in-flight start BEFORE `manager.fork` issues its provider POST, so
+    /// the whole fork window is coordinator-owned (pre-r26 the claim only
+    /// happened AFTER the provider mutation, leaving a refused, panicked,
+    /// or cancelled fork's minted child outside coordinator ownership and
+    /// typed recovery). ForkFakeHttp's gate parks the fork POST for the
+    /// window inspection.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_fork_claims_its_operation_identity_before_the_provider_mutation() {
+        let http = Arc::new(ForkFakeHttp::child_ok());
+        let mut st = fork_state(http.clone()).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        insert_fork_parent(&st, "ses_parent", Some("/parent/cwd"), None, None).await;
+        let gate = Arc::new(tokio::sync::Notify::new());
+        *http.fork_gate.lock().expect("fork gate mutex") = Some(Arc::clone(&gate));
+        let (sink, captured) = capturing_sink();
+
+        let st2 = st.clone();
+        let fork = tokio::spawn(async move {
+            st2.handle_fork(fork_msg("ses_parent", "fork-r26", None), None, sink)
+                .await
+        });
+
+        // THE PRE-MUTATION CLAIM: the request-scoped provisional key holds
+        // the in-flight start while the fork POST is still open (pre-r26
+        // this poll starved — nothing claimed before the mint).
+        let provisional = "pending-fork-fork-r26";
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if matches!(
+                registry.observe(PROVIDER, provisional).state,
+                freshell_ownership::OwnershipState::Starting {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    ..
+                }
+            ) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the fork never claimed its provisional identity before the \
+                 provider mutation (r26 F3)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // A competing lifecycle operation on the provisional key is
+        // refused typed — the fork window blocks competing starts.
+        assert!(matches!(
+            registry.begin_start(
+                PROVIDER,
+                provisional,
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "op-r26-fork-compete",
+                None,
+                "test",
+                crate::session_lease::now_epoch_ms(),
+            ),
+            freshell_ownership::BeginOutcome::Blocked { .. }
+        ));
+
+        // Release the parked fork POST: the minted child rekeys the SAME
+        // ticket, registers, and commits Live at `ses_child` with the
+        // provisional key left as the resolution alias.
+        gate.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(15), fork)
+            .await
+            .expect("the fork completes after the release")
+            .expect("the fork task joins");
+        assert_eq!(http.fork_requests().len(), 1, "exactly one fork POST");
+        assert!(matches!(
+            registry.observe(PROVIDER, "ses_child").state,
+            freshell_ownership::OwnershipState::Live { owner, .. }
+                if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+        ));
+        assert!(matches!(
+            registry.observe(PROVIDER, provisional).state,
+            freshell_ownership::OwnershipState::Aliased { to, .. } if to == "ses_child"
+        ));
+        // The forked reply landed on the requesting sink.
+        assert_eq!(
+            captured.lock().expect("captured mutex").len(),
+            1,
+            "exactly one reply on the requesting sink"
+        );
+    }
+
     #[tokio::test]
     async fn fork_registers_the_child_and_replies_forked_on_the_requesting_sink() {
         let http = Arc::new(ForkFakeHttp::child_ok());
@@ -12873,8 +13272,13 @@ mod tests {
 
         // The mid-fork mover: once the fork parks on the child's binding
         // write, capture the registered child (proving its serve-SSE bridge
-        // is live at the park), then move the coordinator on (the
-        // watchdog's stale-start recovery) and release the park.
+        // is live at the park), then move the coordinator on (b8ke ext
+        // r26 F1/F3: the fork's start is WITNESSED after the rekey — its
+        // settle flag has not fired, so the stale-start sweep correctly
+        // SKIPS it; the watchdog's recovery is driven here through the
+        // registry's own typed fail of the still-open operation, the same
+        // Released transition the sweep's concluded arm produces) and
+        // release the park.
         let sessions = st.sessions.clone();
         let registry_mover = registry.clone();
         let mover = tokio::spawn(async move {
@@ -12889,17 +13293,29 @@ mod tests {
                 .cloned()
                 .expect("the child registered before the park");
             let bridge_was_live = child_arc.lock().await.serve_bridge.is_some();
-            let recovered = registry_mover.recover_stale_starts(u64::MAX, 0);
+            let (held_op, held_generation) =
+                match registry_mover.observe(PROVIDER, "ses_child").state {
+                    freshell_ownership::OwnershipState::Starting {
+                        operation_id,
+                        generation,
+                        ..
+                    } => (operation_id, generation),
+                    other => panic!("expected the rekeyed child start, got {other:?}"),
+                };
+            let fail_outcome =
+                registry_mover.fail(PROVIDER, "ses_child", &held_op, held_generation, false);
             stall.release.send(()).expect("release the stalled write");
-            (child_arc, bridge_was_live, recovered.len())
+            (child_arc, bridge_was_live, fail_outcome)
         });
 
         st.handle_fork(fork_msg("ses_parent", "fork-req-stale", None), None, sink)
             .await;
 
-        let (child_arc, bridge_was_live, recovered_len) =
-            mover.await.expect("mover task completed");
-        assert_eq!(recovered_len, 1, "fixture: the child's start was recovered");
+        let (child_arc, bridge_was_live, fail_outcome) = mover.await.expect("mover task completed");
+        assert!(
+            matches!(fail_outcome, freshell_ownership::FailOutcome::Released),
+            "fixture: the coordinator moved the child's start on (Released)"
+        );
         assert!(
             bridge_was_live,
             "fixture: the child's serve-SSE bridge was live at the park"
