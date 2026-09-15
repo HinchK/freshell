@@ -106,6 +106,30 @@ describe('restoreMachineWorkspace', () => {
     )
   })
 
+  it('derives the bootstrap exclusion id from the REGISTRY client id, not the per-window layout-window id (e3r1 finding 3c pin)', async () => {
+    // The layout envelope key follows the immutable layout-window-id
+    // (window-layout-keys.ts), but the bootstrap exclusion id keeps using
+    // the tab-registry client id so the server can still exclude (or, for
+    // the reserved prefix, include) the window's own tabs-sync snapshot.
+    sessionStorage.setItem('freshell.layout-window-id.v1', 'layout-window-distinct-from-registry-id')
+    const store = createStore()
+    vi.mocked(getRecoveryInventory).mockResolvedValue(inventoryFor(MACHINE_ID))
+
+    await restoreMachineWorkspace(store, MACHINE_ID, { reason: 'absent' })
+
+    expect(getRecoveryInventory).toHaveBeenCalledWith(
+      'machine-bootstrap:client-machine-test',
+      expect.any(Number),
+      { machineId: MACHINE_ID },
+    )
+    expect(getRecoveryInventory).not.toHaveBeenCalledWith(
+      'machine-bootstrap:layout-window-distinct-from-registry-id',
+      expect.any(Number),
+      expect.anything(),
+    )
+    sessionStorage.removeItem('freshell.layout-window-id.v1')
+  })
+
   it('refuses an unscoped foreign recovery response and preserves the current cache', async () => {
     const store = createStore()
     addForeignWorkspace(store)

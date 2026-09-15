@@ -82,7 +82,7 @@ function terminalContent(state: PanesState, tabId: string, paneId: string): Term
 
 // Delta round 3, finding 1: the flush writes THIS window's per-window layout key.
 const WINDOW_ID = 'client-panes-reconcile-tests'
-sessionStorage.setItem('freshell.tabs.client-instance-id.v1', WINDOW_ID)
+sessionStorage.setItem('freshell.layout-window-id.v1', WINDOW_ID)
 
 describe('reconcile reducers', () => {
   it('applyReconcileAttach sets terminalId/status without touching createRequestId', () => {

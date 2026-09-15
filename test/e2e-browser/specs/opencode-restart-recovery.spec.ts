@@ -777,7 +777,7 @@ test.describe('OpenCode restart recovery', () => {
         const harness = window.__FRESHELL_TEST_HARNESS__
         if (!harness) throw new Error('Freshell test harness is not installed')
         harness.dispatch({ type: 'persist/flushNow' })
-        const layoutKey = `freshell.layout.v3.${sessionStorage.getItem('freshell.tabs.client-instance-id.v1')}`
+        const layoutKey = `freshell.layout.v3.${sessionStorage.getItem('freshell.layout-window-id.v1')}`
         const raw = window.localStorage.getItem(layoutKey)
         if (!raw) throw new Error(`Missing persisted layout ${layoutKey}`)
         return raw

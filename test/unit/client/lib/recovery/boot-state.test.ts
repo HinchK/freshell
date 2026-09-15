@@ -13,7 +13,7 @@ const store = (entries: Record<string, string>) => ({ getItem: (k: string) => en
 describe('computeHadPersistedLayout', () => {
   beforeEach(() => {
     localStorage.clear()
-    sessionStorage.setItem('freshell.tabs.client-instance-id.v1', WINDOW_ID)
+    sessionStorage.setItem('freshell.layout-window-id.v1', WINDOW_ID)
   })
 
   it('empty-never: no layout keys at all -> false (offer-eligible)', () => {

@@ -1,6 +1,6 @@
 // Tests for atomic tabs+panes persistence via the per-window layout key
-// (delta round 3, finding 1: freshell.layout.v3.<clientInstanceId>, with
-// freshell.layout.v3 retained as the LEGACY key only).
+// (delta round 3, finding 1 / e3r1 finding 3: freshell.layout.v3.<layoutWindowId>,
+// with freshell.layout.v3 retained as the LEGACY key only).
 import { describe, it, expect, beforeEach } from 'vitest'
 import { LEGACY_LAYOUT_STORAGE_KEY, TABS_STORAGE_KEY, PANES_STORAGE_KEY } from '@/store/storage-keys'
 import { parsePersistedLayoutRaw, migrateV2ToV3 } from '@/store/persistedState'
@@ -11,7 +11,7 @@ const OWN_LAYOUT_KEY = `freshell.layout.v3.${WINDOW_ID}`
 describe('atomic persistence', () => {
   beforeEach(() => {
     localStorage.clear()
-    sessionStorage.setItem('freshell.tabs.client-instance-id.v1', WINDOW_ID)
+    sessionStorage.setItem('freshell.layout-window-id.v1', WINDOW_ID)
   })
 
   describe('layout storage keys', () => {

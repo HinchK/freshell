@@ -16,9 +16,7 @@ import { createLogger } from '@/lib/client-logger'
 import { clearAuthCookie } from '@/lib/auth'
 import {
   LAYOUT_FRESH_AGENT_BACKUP_KEY,
-  LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY,
   LAYOUT_FRESH_AGENT_MIGRATION_ID,
-  LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY,
   LAYOUT_SCHEMA_VERSION,
   PANES_SCHEMA_VERSION,
   hashPersistedLayoutRaw,
@@ -27,15 +25,23 @@ import {
   readRecoverablePersistedLayoutRaw,
 } from './persistedState'
 import { BROWSER_PREFERENCES_STORAGE_KEY } from './storage-keys'
+import { LEGACY_LAYOUT_ADOPTION_MARKER_STORAGE_KEY } from './storage-keys'
+import { STALE_LAYOUT_MS } from '@/lib/recovery/stale-layout-threshold'
 import {
   LEGACY_LAYOUT_STORAGE_KEY,
-  LAYOUT_PRE_MIGRATION_RAW_KEY_PREFIX,
+  LEGACY_LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY,
   LAYOUT_STORAGE_KEY_PREFIX,
+  LAYOUT_PRE_MIGRATION_RAW_KEY_PREFIX,
+  derivedLayoutPreMigrationRawKey,
   getWindowFreshAgentBackupKey,
   getWindowFreshAgentCommitMarkerKey,
   getWindowFreshAgentPendingMarkerKey,
   getWindowLayoutKey,
   getWindowLayoutPreMigrationRawKey,
+  isDerivedLayoutKey,
+  FRESH_AGENT_BACKUP_KEY_SUFFIX,
+  FRESH_AGENT_COMMIT_MARKER_KEY_SUFFIX,
+  FRESH_AGENT_PENDING_MARKER_KEY_SUFFIX,
 } from './window-layout-keys'
 import {
   buildRestoreError,
@@ -317,7 +323,7 @@ function normalizeLayoutNode(node: unknown): unknown {
 // pre-migration truth. One browser window is one JS realm, so one
 // capture per boot is the correct scope; the rewrite ALSO mirrors this
 // raw into the DURABLE per-window pre-migration evidence sidecar
-// (freshell.layout.pre-migration-raw.v1.<clientInstanceId>) because this
+// (freshell.layout.pre-migration-raw.v1.<layoutWindowId>) because this
 // capture is empty
 // again after a reload — see writeMigratedLayoutWithRecovery (e2r4
 // review finding 1).
@@ -509,24 +515,32 @@ function preservePersistedLayout(): PersistedLayoutMigrationResult {
   return migratePersistedLayout()
 }
 
-/** One-time LEGACY adoption (delta round 3, finding 1): when this window's
- * derived per-window layout key is ABSENT but the pre-change origin-wide
- * key exists — the single-window migration path — adopt the legacy
- * envelope as this window's own: a byte-identical copy into the derived
- * key, which the normal preserve/migrate flow below then migrates exactly
- * as today. The legacy key is NEVER deleted: other live pre-change windows
- * may still read it, and new windows without an envelope rebuild via the
- * machine-bootstrap inventory. Adoption runs only when the derived key is
- * absent — a window that already has its own envelope ignores later
- * legacy-key writes from pre-change windows. */
+/** One-shot LEGACY adoption (delta round 3, finding 1; e3r1 finding 2):
+ * when THIS window's derived per-window layout key is ABSENT but the
+ * pre-change origin-wide key exists, adopt the legacy envelope as this
+ * window's own: a byte-identical copy into the derived key, which the
+ * normal preserve/migrate flow below then migrates exactly as today. The
+ * adoption is ONE-SHOT and GLOBAL — the FIRST window to adopt sets the
+ * `freshell.layout.legacy-adopted.v1` marker; every LATER window (fresh
+ * id, no derived key) sees the marker and NEVER adopts, so it classifies
+ * absent and rebuilds via the machine-bootstrap inventory instead of
+ * copying an obsolete envelope (or mis-attributing an unstamped one to a
+ * newly selected machine). The legacy key is NEVER deleted: other live
+ * pre-change windows may still read it. A window that already has its
+ * own envelope ignores later legacy-key writes from pre-change windows. */
 function adoptLegacyLayoutIntoWindowKey(): void {
   const ownKey = getWindowLayoutKey()
   try {
     if (localStorage.getItem(ownKey) !== null) return
     const legacyRaw = localStorage.getItem(LEGACY_LAYOUT_STORAGE_KEY)
     if (legacyRaw === null) return
+    if (localStorage.getItem(LEGACY_LAYOUT_ADOPTION_MARKER_STORAGE_KEY) !== null) return
     localStorage.setItem(ownKey, legacyRaw)
-    log.info('Adopted the legacy layout envelope into this window\u2019s per-window key.')
+    localStorage.setItem(LEGACY_LAYOUT_ADOPTION_MARKER_STORAGE_KEY, JSON.stringify({
+      version: 1,
+      adoptedAt: Date.now(),
+    }))
+    log.info('Adopted the legacy layout envelope into this window\u2019s per-window key (one-shot).')
   } catch (error) {
     warnStructured('layout_legacy_adoption_write_failed', {
       key: ownKey,
@@ -535,8 +549,74 @@ function adoptLegacyLayoutIntoWindowKey(): void {
   }
 }
 
+/** Remove a layout envelope and every side channel attached to its key:
+ * the .bak backup, the fresh-agent centralization channels, and the
+ * pre-migration evidence sidecar (the per-window sidecar for a derived
+ * key, the legacy shared sidecar for the bare legacy key). */
+function removeLayoutEnvelopeAndChannels(envelopeKey: string, layoutWindowId?: string): void {
+  localStorage.removeItem(envelopeKey)
+  localStorage.removeItem(`${envelopeKey}.bak`)
+  localStorage.removeItem(`${envelopeKey}.${FRESH_AGENT_BACKUP_KEY_SUFFIX}`)
+  localStorage.removeItem(`${envelopeKey}.${FRESH_AGENT_COMMIT_MARKER_KEY_SUFFIX}`)
+  localStorage.removeItem(`${envelopeKey}.${FRESH_AGENT_PENDING_MARKER_KEY_SUFFIX}`)
+  localStorage.removeItem(
+    layoutWindowId !== undefined
+      ? derivedLayoutPreMigrationRawKey(layoutWindowId)
+      : LEGACY_LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY,
+  )
+}
+
+/** Stale-threshold prune sweep at migration boot (e3r1 finding 5): fresh
+ * contexts mint new layout-window ids with no close/expiry path, so
+ * closed-window envelopes (and their side channels) would accumulate
+ * unboundedly until quota exhaustion breaks persistence. Enumerate the
+ * layout-prefix keys, parse ONLY envelope-shaped keys (the derived
+ * per-window envelopes and the bare legacy key), and remove those whose
+ * persistedAt is older than STALE_LAYOUT_MS — the same threshold the
+ * health gate uses, which would classify them stale → rebuild anyway. An
+ * envelope whose age cannot be determined (unparseable, or no numeric
+ * persistedAt) is kept: the health gate owns corrupt classification, and
+ * the sweep never destroys evidence it cannot age. Runs BEFORE legacy
+ * adoption so a beyond-threshold legacy envelope is pruned rather than
+ * adopted. */
+function pruneStaleLayoutEnvelopes(): void {
+  try {
+    const now = Date.now()
+    for (const key of Object.keys(localStorage)) {
+      if (!key.startsWith(LAYOUT_STORAGE_KEY_PREFIX)) continue
+      const isLegacyEnvelope = key === LEGACY_LAYOUT_STORAGE_KEY
+      if (!isLegacyEnvelope && !isDerivedLayoutKey(key)) continue
+      const raw = localStorage.getItem(key)
+      if (raw === null) continue
+      let persistedAt: unknown
+      try {
+        persistedAt = (JSON.parse(raw) as { persistedAt?: unknown })?.persistedAt
+      } catch {
+        continue
+      }
+      if (typeof persistedAt !== 'number') continue
+      if (!(now - persistedAt > STALE_LAYOUT_MS)) continue
+      if (isLegacyEnvelope) {
+        removeLayoutEnvelopeAndChannels(key)
+        continue
+      }
+      const layoutWindowId = key.slice(LAYOUT_STORAGE_KEY_PREFIX.length + 1)
+      removeLayoutEnvelopeAndChannels(key, layoutWindowId)
+      warnStructured('layout_stale_envelope_pruned', {
+        key,
+        persistedAt,
+      })
+    }
+  } catch (error) {
+    warnStructured('layout_stale_prune_failed', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+  }
+}
+
 export function runStorageMigration(): void {
   try {
+    pruneStaleLayoutEnvelopes()
     adoptLegacyLayoutIntoWindowKey()
     const currentVersion = readStorageVersion()
     if (currentVersion >= STORAGE_VERSION) {
@@ -564,6 +644,10 @@ export function runStorageMigration(): void {
       [
         AUTH_STORAGE_KEY,
         BROWSER_PREFERENCES_STORAGE_KEY,
+        // The one-shot legacy-adoption marker must survive the wipe, or a
+        // post-wipe fresh window would re-adopt the (also spared) legacy
+        // envelope — un-bounding the migration (e3r1 finding 2).
+        LEGACY_LAYOUT_ADOPTION_MARKER_STORAGE_KEY,
         ...LEGACY_BROWSER_PREFERENCE_KEYS,
       ],
       [

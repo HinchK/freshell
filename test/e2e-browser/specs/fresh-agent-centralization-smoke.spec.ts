@@ -222,7 +222,7 @@ function collectLeaves(node: PaneNode | null | undefined): PaneNode[] {
 
 async function readStoredLayout(page: Page) {
   return page.evaluate(() => {
-    const layoutKey = `freshell.layout.v3.${sessionStorage.getItem('freshell.tabs.client-instance-id.v1')}`
+    const layoutKey = `freshell.layout.v3.${sessionStorage.getItem('freshell.layout-window-id.v1')}`
     return JSON.parse(localStorage.getItem(layoutKey) ?? 'null')
   })
 }

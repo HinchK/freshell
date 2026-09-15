@@ -23,7 +23,7 @@ const OWN_LAYOUT_KEY = `freshell.layout.v3.${WINDOW_ID}`
 describe('persistControl', () => {
   beforeEach(() => {
     localStorage.clear()
-    sessionStorage.setItem('freshell.tabs.client-instance-id.v1', WINDOW_ID)
+    sessionStorage.setItem('freshell.layout-window-id.v1', WINDOW_ID)
     vi.useFakeTimers()
     resetPersistFlushListenersForTests()
     resetPersistedLayoutCacheForTests()

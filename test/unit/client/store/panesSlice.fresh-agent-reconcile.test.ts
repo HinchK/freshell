@@ -100,7 +100,7 @@ async function persistLeafWithContent(
 
 // Delta round 3, finding 1: the flush writes THIS window's per-window layout key.
 const WINDOW_ID = 'client-fa-reconcile-tests'
-sessionStorage.setItem('freshell.tabs.client-instance-id.v1', WINDOW_ID)
+sessionStorage.setItem('freshell.layout-window-id.v1', WINDOW_ID)
 
 describe('fresh-agent reconcile volatile fields', () => {
   const initialState = emptyState()

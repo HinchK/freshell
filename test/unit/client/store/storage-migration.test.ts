@@ -3,9 +3,10 @@ import { parsePersistedLayoutRaw } from '@/store/persistedState'
 import { BROWSER_PREFERENCES_STORAGE_KEY, PANES_STORAGE_KEY, TABS_STORAGE_KEY } from '@/store/storage-keys'
 
 const AUTH_STORAGE_KEY = 'freshell.auth-token'
-// Delta round 3, finding 1: the migration operates on THIS window's
-// per-window layout key; the bare freshell.layout.v3 stays as the LEGACY
-// adoption source (never deleted).
+// Delta round 3, finding 1 / e3r1 findings 3+6: the migration operates on
+// THIS window's per-window layout key (derived from the immutable
+// layout-window-id, sessionStorage freshell.layout-window-id.v1); the bare
+// freshell.layout.v3 stays as the LEGACY adoption source (never deleted).
 const WINDOW_ID = 'client-migration-tests'
 const LAYOUT_STORAGE_KEY = `freshell.layout.v3.${WINDOW_ID}`
 const OWN_SIDECAR_KEY = `freshell.layout.pre-migration-raw.v1.${WINDOW_ID}`
@@ -29,7 +30,7 @@ describe('storage-migration', () => {
   beforeEach(() => {
     localStorage.clear()
     sessionStorage.clear()
-    sessionStorage.setItem('freshell.tabs.client-instance-id.v1', WINDOW_ID)
+    sessionStorage.setItem('freshell.layout-window-id.v1', WINDOW_ID)
     document.cookie = 'freshell-auth=; Max-Age=0; path=/'
   })
 
@@ -470,7 +471,11 @@ describe('storage-migration', () => {
   it('carries the machineId stamp through the every-boot layout rewrite (LB-05)', async () => {
     localStorage.setItem('freshell_version', '5')
     localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify({
-      persistedAt: 1_760_000_000_000,
+      // Real-clock-fresh (e3r1 finding 5): the boot migration's stale
+      // prune sweep removes beyond-STALE_LAYOUT_MS envelopes, and a fixed
+      // 2025 timestamp has drifted past the threshold. The stamp's
+      // survival through the rewrite is the pin; the age is incidental.
+      persistedAt: Date.now(),
       version: 4,
       machineId: 'machine-stamp-1',
       tabs: {

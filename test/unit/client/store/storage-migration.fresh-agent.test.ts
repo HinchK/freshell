@@ -147,7 +147,7 @@ function makeLargeLegacyLayoutRaw(): string {
 describe('storage-migration fresh-agent', () => {
   beforeEach(() => {
     vi.resetModules()
-    sessionStorage.setItem('freshell.tabs.client-instance-id.v1', WINDOW_ID)
+    sessionStorage.setItem('freshell.layout-window-id.v1', WINDOW_ID)
   })
 
   it('does not clear freshell layout storage during the fresh-agent migration', async () => {

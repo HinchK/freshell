@@ -15,6 +15,28 @@ function collectLeafPaneIds(node: PaneNode): string[] {
   ]
 }
 
+/** Defensive leaf-id walk for RAW (unvalidated) incoming layouts: a
+ * malformed split (e.g. missing children) yields no ids instead of
+ * throwing — the full hydrate path never sees such trees (hydratePanes
+ * normalizes first), but the title-only cross-window path reads the
+ * incoming envelope's layouts directly. */
+function collectLeafPaneIdsSafe(node: unknown): string[] {
+  const ids: string[] = []
+  const visit = (candidate: unknown): void => {
+    if (!candidate || typeof candidate !== 'object') return
+    const record = candidate as { type?: unknown; id?: unknown; children?: unknown }
+    if (record.type === 'leaf') {
+      if (typeof record.id === 'string') ids.push(record.id)
+      return
+    }
+    if (record.type === 'split' && Array.isArray(record.children)) {
+      for (const child of record.children) visit(child)
+    }
+  }
+  visit(node)
+  return ids
+}
+
 function filterPaneMetadataByLayout<T>(
   metadata: Record<string, Record<string, T>> | undefined,
   tabId: string,
@@ -148,4 +170,91 @@ export function mergeHydratedPaneMetadata(
   }
 
   return { activePane, paneTitles, paneTitleSetByUser }
+}
+
+/** TITLE-ONLY cross-window reconciliation (e3r1 finding 4): another
+ * window's layout event may never adopt tabs, trees, content, active
+ * panes, or ephemeral pane state — only pane TITLES flow across windows,
+ * under the same recency + user-set rules the full merge's title half
+ * uses (reconcilePaneTitle). Scoped to panes that exist in BOTH envelopes
+ * (local layout AND incoming layout); an incoming side with no title for
+ * a shared pane delivers nothing (the local entry stands verbatim — the
+ * path delivers titles, it never erases them). The incoming base applies
+ * only when the incoming layout is STRICTLY newer (layout persistedAt
+ * meta); unknown-age incoming is never the base. */
+export function mergeCrossWindowPaneTitles(
+  state: PanesState,
+  incoming: Pick<PanesState, 'paneTitles' | 'paneTitleSetByUser'>,
+  incomingLayouts: Record<string, unknown>,
+  meta?: HydratePanesMeta,
+): Pick<PanesState, 'paneTitles' | 'paneTitleSetByUser'> {
+  const paneTitles: Record<string, Record<string, string>> = {}
+  const paneTitleSetByUser: Record<string, Record<string, boolean>> = {}
+
+  const metaPresent =
+    meta !== undefined &&
+    (typeof meta.remoteLayoutPersistedAt === 'number' || typeof meta.localLayoutPersistedAt === 'number')
+  const incomingIsBase = metaPresent
+    ? (meta!.remoteLayoutPersistedAt ?? Number.NEGATIVE_INFINITY) >
+      (meta!.localLayoutPersistedAt ?? Number.NEGATIVE_INFINITY)
+    : false
+
+  for (const [tabId, localLayout] of Object.entries(state.layouts)) {
+    const localPaneIds = collectLeafPaneIds(localLayout)
+    const paneIdSet = new Set(localPaneIds)
+    const incomingLayout = incomingLayouts[tabId]
+    const incomingPaneIdSet = incomingLayout !== undefined && incomingLayout !== null
+      ? new Set(collectLeafPaneIdsSafe(incomingLayout))
+      : undefined
+
+    const localTabTitles = filterPaneMetadataByLayout(state.paneTitles, tabId, paneIdSet)
+    const localTabFlags = filterPaneMetadataByLayout(state.paneTitleSetByUser, tabId, paneIdSet)
+    const incomingTabTitles = incomingPaneIdSet
+      ? filterPaneMetadataByLayout(incoming.paneTitles, tabId, paneIdSet)
+      : undefined
+    const incomingTabFlags = incomingPaneIdSet
+      ? filterPaneMetadataByLayout(incoming.paneTitleSetByUser, tabId, paneIdSet)
+      : undefined
+
+    const nextTabTitles: Record<string, string> = {}
+    const nextTabFlags: Record<string, boolean> = {}
+    for (const paneId of localPaneIds) {
+      const localTitle = localTabTitles?.[paneId]
+      const localFlag = localTabFlags !== undefined && paneId in localTabFlags
+        ? localTabFlags[paneId]
+        : undefined
+      const sharedWithIncoming = incomingPaneIdSet?.has(paneId) ?? false
+      const incomingTitle = sharedWithIncoming ? incomingTabTitles?.[paneId] : undefined
+      const incomingFlag = sharedWithIncoming && incomingTabFlags !== undefined && paneId in incomingTabFlags
+        ? incomingTabFlags[paneId]
+        : undefined
+      if (incomingTitle === undefined) {
+        // No delivery for this pane: the local entry stands verbatim.
+        if (localTitle !== undefined) nextTabTitles[paneId] = localTitle
+        if (localFlag !== undefined) nextTabFlags[paneId] = localFlag
+        continue
+      }
+      const reconciled = reconcilePaneTitle(
+        { title: localTitle, userSet: localFlag },
+        { title: incomingTitle, userSet: incomingFlag },
+        incomingIsBase
+          ? { title: incomingTitle, userSet: incomingFlag }
+          : { title: localTitle, userSet: localFlag },
+      )
+      if (reconciled.title !== undefined) {
+        nextTabTitles[paneId] = reconciled.title
+      }
+      if (localFlag !== undefined || incomingFlag !== undefined || reconciled.userSet) {
+        nextTabFlags[paneId] = !!reconciled.userSet
+      }
+    }
+    if (Object.keys(nextTabTitles).length > 0) {
+      paneTitles[tabId] = nextTabTitles
+    }
+    if (Object.keys(nextTabFlags).length > 0) {
+      paneTitleSetByUser[tabId] = nextTabFlags
+    }
+  }
+
+  return { paneTitles, paneTitleSetByUser }
 }

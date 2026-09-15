@@ -31,12 +31,12 @@ import { PANES_SCHEMA_VERSION } from '../../../../src/store/persistedState'
 import { isWellFormedPaneTree } from '../../../../src/store/paneTreeValidation'
 
 // Delta round 3, finding 1: the flush writes THIS window's per-window layout
-// key (freshell.layout.v3.<clientInstanceId>) and its per-window pre-
+// key (freshell.layout.v3.<layoutWindowId>) and its per-window pre-
 // migration evidence sidecar. Seed a stable window id once per file — the
 // flush resolves the key lazily. The local key constants mirror the
 // per-window shapes.
 const WINDOW_ID = 'client-panes-persistence-tests'
-sessionStorage.setItem('freshell.tabs.client-instance-id.v1', WINDOW_ID)
+sessionStorage.setItem('freshell.layout-window-id.v1', WINDOW_ID)
 const LAYOUT_STORAGE_KEY = `freshell.layout.v3.${WINDOW_ID}`
 const LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY = `freshell.layout.pre-migration-raw.v1.${WINDOW_ID}`
 import {

@@ -172,7 +172,7 @@ test.describe('REST tab persistence (amplifier out-of-enum mode)', () => {
       (window as any).__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
     })
 
-    const layoutBefore = await page.evaluate(() => localStorage.getItem(`freshell.layout.v3.${sessionStorage.getItem('freshell.tabs.client-instance-id.v1')}`))
+    const layoutBefore = await page.evaluate(() => localStorage.getItem(`freshell.layout.v3.${sessionStorage.getItem('freshell.layout-window-id.v1')}`))
     expect(layoutBefore, 'localStorage should hold the persisted layout before reload').toBeTruthy()
     expect(layoutBefore).toContain('amplifier')
 
@@ -185,7 +185,7 @@ test.describe('REST tab persistence (amplifier out-of-enum mode)', () => {
     // governs the client's IN-MEMORY parse/hydrate step, never the write
     // path, so nothing here should ever mutate what was written before the
     // reload.
-    const layoutAfter = await page.evaluate(() => localStorage.getItem(`freshell.layout.v3.${sessionStorage.getItem('freshell.tabs.client-instance-id.v1')}`))
+    const layoutAfter = await page.evaluate(() => localStorage.getItem(`freshell.layout.v3.${sessionStorage.getItem('freshell.layout-window-id.v1')}`))
     expect(layoutAfter, 'localStorage layout must still hold the data after reload (preserved-but-rejected)').toBeTruthy()
     expect(layoutAfter).toContain('amplifier')
 

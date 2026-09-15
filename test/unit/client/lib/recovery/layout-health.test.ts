@@ -10,16 +10,17 @@ import {
 const NOW = 1_760_000_000_000
 const VALID_CLAUDE_SESSION_ID = '11111111-2222-4333-8444-555555555555'
 
-// Delta round 3, finding 1: the layout envelope and the pre-migration
-// evidence sidecar are per-window keys derived from the SAME
-// clientInstanceId the tab-registry sync uses. Every seeding site in this
-// file targets THIS window's keys.
+// Delta round 3, finding 1 (e3r1 finding 3 correction): the layout envelope
+// and the pre-migration evidence sidecar are per-window keys derived from
+// the IMMUTABLE layout-window-id (sessionStorage
+// freshell.layout-window-id.v1). Every seeding site in this file targets
+// THIS window's keys.
 const WINDOW_ID = 'client-health-tests'
 const LAYOUT_STORAGE_KEY = `freshell.layout.v3.${WINDOW_ID}`
 const LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY = `freshell.layout.pre-migration-raw.v1.${WINDOW_ID}`
 
 function seedWindow(): void {
-  sessionStorage.setItem('freshell.tabs.client-instance-id.v1', WINDOW_ID)
+  sessionStorage.setItem('freshell.layout-window-id.v1', WINDOW_ID)
 }
 
 function seedEnvelope(raw: unknown): void {
@@ -514,10 +515,20 @@ describe('classifyPersistedLayoutHealth in the real boot order (migration rewrit
 
   async function classifyAfterRealBoot(): Promise<PersistedLayoutHealthAfterBoot> {
     localStorage.setItem('freshell_version', '5')
-    vi.resetModules()
-    await import('@/store/storage-migration')
-    const { classifyPersistedLayoutHealth: classify } = await import('@/lib/recovery/layout-health')
-    return { classify: (machineId: string) => classify(machineId, { now: NOW }) }
+    // The real boot re-runs the self-executing storage migration, whose
+    // stale-envelope prune sweep (e3r1 finding 5) uses the REAL clock —
+    // freeze it to this file's fixture NOW so the just-persisted envelopes
+    // are not beyond-threshold. Classification below still uses opts.now.
+    vi.useFakeTimers()
+    vi.setSystemTime(NOW)
+    try {
+      vi.resetModules()
+      await import('@/store/storage-migration')
+      const { classifyPersistedLayoutHealth: classify } = await import('@/lib/recovery/layout-health')
+      return { classify: (machineId: string) => classify(machineId, { now: NOW }) }
+    } finally {
+      vi.useRealTimers()
+    }
   }
 
   type PersistedLayoutHealthAfterBoot = { classify: (machineId: string) => ReturnType<typeof classifyPersistedLayoutHealth> }

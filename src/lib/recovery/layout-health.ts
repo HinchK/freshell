@@ -5,6 +5,7 @@ import { getPreMigrationLayoutRaw } from '@/store/storage-migration'
 import { LEGACY_FRESHOPENCODE_DEFAULT_MODEL } from '@/store/paneTypes'
 import { getWindowLayoutKey, getWindowLayoutPreMigrationRawKey } from '@/store/window-layout-keys'
 import { sanitizeRestoreError, sanitizeSessionRef } from '@shared/session-contract'
+import { STALE_LAYOUT_MS } from './stale-layout-threshold'
 
 /** The real TerminalStatus union (src/store/types.ts:1), as a runtime set.
  * The typed Set constructor pins the members to the union at compile time. */
@@ -18,8 +19,9 @@ const TERMINAL_STATUS_SET = new Set<TerminalStatus>([
 
 /** A local layout older than this rebuilds from the server instead of being
  * kept. 7 days is far beyond any terminal lifetime (15-minute default idle
- * timeout), so it only triggers for genuinely abandoned layouts. */
-export const STALE_LAYOUT_MS = 7 * 24 * 60 * 60 * 1000
+ * timeout), so it only triggers for genuinely abandoned layouts. Lives in
+ * the leaf stale-layout-threshold.ts so storage-migration can share it. */
+export { STALE_LAYOUT_MS }
 
 export type PersistedLayoutHealth = 'absent' | 'corrupt' | 'foreign' | 'stale' | 'healthy'
 
@@ -33,7 +35,7 @@ function safeStorage(): Storage | undefined {
 
 /** The durable pre-migration evidence sidecar (e2r4 review finding 1):
  * the OLDEST pre-rewrite raw of THIS window's per-window layout key
- * (freshell.layout.pre-migration-raw.v1.<clientInstanceId> — per-window
+ * (freshell.layout.pre-migration-raw.v1.<layoutWindowId> — per-window
  * since delta round 3, finding 1: two windows migrating concurrently must
  * not cross-contaminate evidence), written by the boot migration's
  * forced-rewrite path only while the key holds no value (oldest evidence

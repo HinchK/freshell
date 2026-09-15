@@ -1,18 +1,19 @@
 import { TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY, TAB_REGISTRY_SNAPSHOT_REVISION_STORAGE_KEY } from './storage-keys'
 
 /**
- * The per-window client id, shared by the tab-registry sync AND the
- * per-window layout keys (delta round 3, finding 1: the layout envelope is
- * keyed `freshell.layout.v3.<clientInstanceId>` from this SAME id source —
- * the sessionStorage key freshell.tabs.client-instance-id.v1). Extracted to
- * a dependency-free leaf so key-derivation modules can resolve the id
- * without importing the registry-sync module graph (cyclic with the
- * self-executing storage migration).
+ * The per-window client id used by the tab-registry sync (the sessionStorage
+ * key freshell.tabs.client-instance-id.v1). Extracted to a dependency-free
+ * leaf so the registry-sync module graph stays importable without cycles.
+ * The per-window LAYOUT keys no longer derive from this id (e3r1 finding
+ * 3): it is MUTABLE — the lease-collision rotation rewrites it — so the
+ * layout envelope is keyed by the immutable layout-window-id instead
+ * (window-layout-keys.ts). The registry id keeps serving the
+ * machine-bootstrap exclusion id and server-side identity.
  *
  * One window is one JS realm; sessionStorage (unlike localStorage) is NOT
  * shared across tabs, which is exactly the per-window scope the id needs.
  * The in-memory fallback keeps the id stable when sessionStorage is
- * unavailable (tests, privacy modes).
+ * unavailable (tests, privacy modes) or when writes fail (quota).
  */
 let inMemoryClientInstanceId = ''
 let inMemorySnapshotRevision = 0
@@ -69,13 +70,17 @@ export function getCurrentTabRegistryClientInstanceId(): string {
   try {
     clientInstanceId = storage?.getItem(TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY) || ''
   } catch {
-    clientInstanceId = inMemoryClientInstanceId
+    clientInstanceId = ''
   }
-  if (!storage) {
+  if (!clientInstanceId && !storage) {
     clientInstanceId = inMemoryClientInstanceId
   }
   if (!clientInstanceId) {
-    return mintTabRegistryClientInstanceId()
+    // getItem succeeded-with-null but the stored write may have failed
+    // (quota-exhausted sessionStorage): mint ONCE per context and keep the
+    // id in memory regardless of write success, so repeated calls return
+    // the same id (e3r1 finding 6).
+    clientInstanceId = inMemoryClientInstanceId || mintTabRegistryClientInstanceId()
   }
   inMemoryClientInstanceId = clientInstanceId
   return clientInstanceId

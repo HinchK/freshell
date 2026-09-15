@@ -1,7 +1,7 @@
 import { z } from 'zod'
 import { mergeLocalSettings, resolveLocalSettings } from '@shared/settings'
 import { getSelectedMachineId } from '@/lib/machine-identity'
-import { hydratePanes } from './panesSlice'
+import { hydratePanes, hydratePaneTitles } from './panesSlice'
 import { setLocalSettings } from './settingsSlice'
 import { setTabRegistryClosedTabRetentionDays } from './tabRegistrySlice'
 import { hydrateTabs } from './tabsSlice'
@@ -34,10 +34,12 @@ const zPersistBroadcastMsg = z.object({
   sourceId: z.string(),
 })
 
-/** Delta round 3, finding 1: the layout subscription observes the per-window
- * key PREFIX (freshell.layout.v3.<clientInstanceId>), not one exact key —
- * events from OTHER windows' keys run the existing incoming-hydrate path.
- * The exact keys below are the layout-independent sidecars. */
+/** Delta round 3, finding 1 + e3r1 finding 4: the layout subscription
+ * observes the per-window key PREFIX (freshell.layout.v3.<layoutWindowId>).
+ * Events for OTHER windows' keys run the TITLE-ONLY reconciliation; events
+ * for THIS window's own key (duplicate tabs sharing the layout-window id)
+ * keep the full incoming-hydrate path. The exact keys below are the
+ * layout-independent sidecars. */
 function isCrossTabSyncStorageKey(key: string): boolean {
   return key === BROWSER_PREFERENCES_STORAGE_KEY
     || key === TAB_RECENCY_STORAGE_KEY
@@ -305,6 +307,41 @@ function dispatchHydrateBrowserPreferencesFromPersisted(
   }
 }
 
+/** TITLE-ONLY reconciliation for ANOTHER window's layout event (e3r1
+ * finding 4): another window's arrangement is that window's business —
+ * the approved divergence tradeoff says arrangements may stay divergent
+ * indefinitely — so its flush may only deliver pane TITLES to panes that
+ * exist in BOTH envelopes, under the Task-7 merge rules (recency via the
+ * layout persistedAt meta, user-set precedence). No hydrateTabs, no
+ * hydratePanes: tab set, order, trees, content, active panes, and
+ * ephemeral pane state (zoom, refresh requests, …) are never adopted. */
+function dispatchHydratePaneTitlesFromPersisted(
+  store: StoreLike,
+  raw: string,
+  localLayoutPersistedAt?: number,
+) {
+  let parsed: ParsedPersistedLayout | null = null
+  try {
+    parsed = parsePersistedLayoutRaw(raw)
+  } catch {
+    parsed = null
+  }
+  if (!parsed) return
+  store.dispatch({
+    ...hydratePaneTitles({
+      paneTitles: parsed.panes.paneTitles,
+      paneTitleSetByUser: parsed.panes.paneTitleSetByUser,
+      layouts: parsed.panes.layouts,
+    }),
+    meta: {
+      skipPersist: true,
+      source: 'cross-tab',
+      localLayoutPersistedAt,
+      remoteLayoutPersistedAt: parsed.persistedAt,
+    },
+  })
+}
+
 function handleIncomingRaw(
   store: StoreLike,
   key: string,
@@ -313,7 +350,15 @@ function handleIncomingRaw(
   localLayoutPersistedAt?: number,
 ) {
   if (isDerivedLayoutKey(key)) {
-    dispatchHydrateLayoutFromPersisted(store, raw, localLayoutPersistedAt)
+    if (key === getWindowLayoutKey()) {
+      // The OWN key: a duplicate tab sharing this window's layout-window
+      // id (or a pre-change window during a deploy transition) wrote this
+      // envelope — same-window envelope replacement, full hydrate.
+      dispatchHydrateLayoutFromPersisted(store, raw, localLayoutPersistedAt)
+    } else {
+      // ANOTHER window's key: title-only.
+      dispatchHydratePaneTitlesFromPersisted(store, raw, localLayoutPersistedAt)
+    }
   } else if (key === BROWSER_PREFERENCES_STORAGE_KEY) {
     dispatchHydrateBrowserPreferencesFromPersisted(store, raw, previousRaw)
   } else if (key === TAB_RECENCY_STORAGE_KEY) {

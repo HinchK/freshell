@@ -287,11 +287,11 @@ test.describe('Remote tab linkage (Rust only)', () => {
         await page.evaluate(() => {
           (window as any).__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
         })
-        const persistedLayout = await page.evaluate(() => localStorage.getItem(`freshell.layout.v3.${sessionStorage.getItem('freshell.tabs.client-instance-id.v1')}`))
+        const persistedLayout = await page.evaluate(() => localStorage.getItem(`freshell.layout.v3.${sessionStorage.getItem('freshell.layout-window-id.v1')}`))
         expect(persistedLayout, 'persisted layout must exist after flush').toBeTruthy()
         expect(
           containsSessionRef(JSON.parse(persistedLayout!), 'amplifier', SEEDED_SESSION_ID),
-          the per-window layout key must contain sessionRef {provider:'amplifier', sessionId:'${SEEDED_SESSION_ID}'}`,
+          `the per-window layout key must contain sessionRef {provider:'amplifier', sessionId:'${SEEDED_SESSION_ID}'}`,
         ).toBe(true)
 
         // ------------------------------------------------------------------

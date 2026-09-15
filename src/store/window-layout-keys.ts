@@ -1,24 +1,36 @@
-import { getCurrentTabRegistryClientInstanceId } from './client-instance-id'
+import { safeSessionStorage } from './client-instance-id'
 import {
+  LAYOUT_WINDOW_ID_STORAGE_KEY,
   LEGACY_LAYOUT_BACKUP_STORAGE_KEY,
   LEGACY_LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY,
   LEGACY_LAYOUT_STORAGE_KEY,
 } from './storage-keys'
 
 /**
- * Per-window layout-key derivation (delta round 3, finding 1).
+ * Per-window layout-key derivation (delta round 3, finding 1; e3r1 finding 3).
  *
  * Every page used to load and write the SAME origin-wide
  * `freshell.layout.v3` key, so once two windows diverged the last flush
  * replaced the only durable copy — refreshing the other window restored
  * the last writer's workspace. The layout envelope is now keyed per
- * window: `freshell.layout.v3.<clientInstanceId>`, derived from the SAME
- * sessionStorage id source the tab-registry sync uses
- * (freshell.tabs.client-instance-id.v1 via getCurrentTabRegistryClientInstanceId
- * — the same getter the machine-bootstrap exclusion id uses,
- * machine-workspace.ts). The bare `freshell.layout.v3` is the LEGACY key
- * only: adopted (byte-identical copy) into a window's derived key on its
- * first post-change boot when the derived key is absent, and NEVER
+ * window: `freshell.layout.v3.<layoutWindowId>`.
+ *
+ * The id is a DEDICATED IMMUTABLE layout-window-id (the sessionStorage key
+ * `freshell.layout-window-id.v1`), minted once per context and NEVER
+ * rotated: the tab-registry client id it used
+ * to be derived from rotates on lease collisions (a duplicated browser tab
+ * claims the copied id), which would strand the duplicate's healthy
+ * envelope on its next refresh (boot → absent → geometry-resetting
+ * rebuild). Duplicated tabs COPY the layout-window-id like any
+ * sessionStorage entry, so they share one envelope — bounded, matching
+ * the pre-upgrade duplicate-tab semantics. The registry client id keeps
+ * serving the tab-registry sync and the machine-bootstrap exclusion id
+ * (machine-workspace.ts), unchanged.
+ *
+ * The bare `freshell.layout.v3` is the LEGACY key only: adopted
+ * (byte-identical copy) into the FIRST window's derived key on its
+ * post-change boot (one-shot, gated by the global
+ * `freshell.layout.legacy-adopted.v1` marker — e3r1 finding 2) and NEVER
  * deleted — other live pre-change windows may still read it.
  *
  * All envelope-attached side channels are per-window key suffixes so two
@@ -29,7 +41,7 @@ import {
  *                                     `<derived>.fresh-agent-centralization-commit`
  *                                     `<derived>.fresh-agent-centralization-pending`
  * - the pre-migration evidence
- *   sidecar:                          `freshell.layout.pre-migration-raw.v1.<clientInstanceId>`
+ *   sidecar:                          `freshell.layout.pre-migration-raw.v1.<layoutWindowId>`
  */
 export const LAYOUT_STORAGE_KEY_PREFIX = 'freshell.layout.v3'
 export const LAYOUT_PRE_MIGRATION_RAW_KEY_PREFIX = 'freshell.layout.pre-migration-raw.v1'
@@ -40,8 +52,8 @@ export const FRESH_AGENT_PENDING_MARKER_KEY_SUFFIX = 'fresh-agent-centralization
 
 // Key suffixes under the layout prefix that are NOT per-window envelope
 // keys: the legacy backup and the legacy fresh-agent centralization
-// channels. Window-derived keys never collide with them (clientInstanceIds
-// are minted `client-…` with no dots).
+// channels. Window-derived keys never collide with them (layoutWindowIds
+// are minted `layout-window-…` with no dots).
 const RESERVED_LAYOUT_KEY_SUFFIXES = new Set([
   'bak',
   FRESH_AGENT_BACKUP_KEY_SUFFIX,
@@ -49,12 +61,12 @@ const RESERVED_LAYOUT_KEY_SUFFIXES = new Set([
   FRESH_AGENT_PENDING_MARKER_KEY_SUFFIX,
 ])
 
-export function derivedLayoutKey(clientInstanceId: string): string {
-  return `${LAYOUT_STORAGE_KEY_PREFIX}.${clientInstanceId}`
+export function derivedLayoutKey(layoutWindowId: string): string {
+  return `${LAYOUT_STORAGE_KEY_PREFIX}.${layoutWindowId}`
 }
 
-export function derivedLayoutPreMigrationRawKey(clientInstanceId: string): string {
-  return `${LAYOUT_PRE_MIGRATION_RAW_KEY_PREFIX}.${clientInstanceId}`
+export function derivedLayoutPreMigrationRawKey(layoutWindowId: string): string {
+  return `${LAYOUT_PRE_MIGRATION_RAW_KEY_PREFIX}.${layoutWindowId}`
 }
 
 /** A per-window layout envelope key (`freshell.layout.v3.<id>`), excluding
@@ -69,11 +81,44 @@ export function isDerivedLayoutKey(key: string): boolean {
   return !RESERVED_LAYOUT_KEY_SUFFIXES.has(suffix)
 }
 
+let inMemoryLayoutWindowId = ''
+
+/** The IMMUTABLE per-window layout-window id: read from sessionStorage,
+ * minted once per context when absent, and cached in memory regardless of
+ * write success (a quota-exhausted sessionStorage must not re-mint per
+ * call — one persistence flush resolves the key repeatedly). Never
+ * rotated by lease collisions; duplicated tabs share the copied
+ * sessionStorage value. */
+export function getLayoutWindowId(): string {
+  const storage = safeSessionStorage()
+  let layoutWindowId = ''
+  try {
+    layoutWindowId = storage?.getItem(LAYOUT_WINDOW_ID_STORAGE_KEY) || ''
+  } catch {
+    layoutWindowId = ''
+  }
+  if (!layoutWindowId) {
+    layoutWindowId = inMemoryLayoutWindowId
+  }
+  if (!layoutWindowId) {
+    layoutWindowId = `layout-window-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`
+    inMemoryLayoutWindowId = layoutWindowId
+    try {
+      storage?.setItem(LAYOUT_WINDOW_ID_STORAGE_KEY, layoutWindowId)
+    } catch {
+      // Keep the per-window in-memory id stable when the write fails.
+    }
+    return layoutWindowId
+  }
+  inMemoryLayoutWindowId = layoutWindowId
+  return layoutWindowId
+}
+
 /** The storage keys of THIS window's layout envelope and its channels.
  * Resolved lazily on every call so tests can seed sessionStorage ids
  * before or after module import; the id itself is stable per window. */
 export function getWindowLayoutKey(): string {
-  return derivedLayoutKey(getCurrentTabRegistryClientInstanceId())
+  return derivedLayoutKey(getLayoutWindowId())
 }
 
 export function getWindowLayoutBackupKey(): string {
@@ -81,7 +126,7 @@ export function getWindowLayoutBackupKey(): string {
 }
 
 export function getWindowLayoutPreMigrationRawKey(): string {
-  return derivedLayoutPreMigrationRawKey(getCurrentTabRegistryClientInstanceId())
+  return derivedLayoutPreMigrationRawKey(getLayoutWindowId())
 }
 
 export function getWindowFreshAgentBackupKey(): string {

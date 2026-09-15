@@ -104,9 +104,9 @@ function makeRecencyStore(preloadedState?: any) {
 }
 
 // Delta round 3, finding 1: the flush writes THIS window's per-window layout
-// key (freshell.layout.v3.<clientInstanceId>).
+// key (freshell.layout.v3.<layoutWindowId>).
 const WINDOW_ID = 'client-tabs-persistence-tests'
-sessionStorage.setItem('freshell.tabs.client-instance-id.v1', WINDOW_ID)
+sessionStorage.setItem('freshell.layout-window-id.v1', WINDOW_ID)
 const LAYOUT_STORAGE_KEY = `freshell.layout.v3.${WINDOW_ID}`
 
 describe('tabs persistence - skipPersist + strip volatile fields', () => {

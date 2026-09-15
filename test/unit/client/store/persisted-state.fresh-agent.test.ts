@@ -18,7 +18,7 @@ const LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY = `${LAYOUT_STORAGE_KEY}.fresh-agent
 const LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY = `${LAYOUT_STORAGE_KEY}.fresh-agent-centralization-commit`
 
 function seedWindow(): void {
-  sessionStorage.setItem('freshell.tabs.client-instance-id.v1', WINDOW_ID)
+  sessionStorage.setItem('freshell.layout-window-id.v1', WINDOW_ID)
 }
 
 function collectLeafContents(node: any, contents: any[] = []): any[] {

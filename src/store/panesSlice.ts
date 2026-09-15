@@ -24,7 +24,7 @@ import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { buildPaneRefreshTarget, paneContentMatchesSessionRef, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
 import { loadPersistedPanes, loadPersistedTabs } from './persistMiddleware.js'
 import { hasPaneTreeShape, isWellFormedPaneTree } from './paneTreeValidation.js'
-import { mergeHydratedPaneMetadata, type HydratePanesMeta } from './hydrate-pane-metadata-merge.js'
+import { mergeHydratedPaneMetadata, mergeCrossWindowPaneTitles, type HydratePanesMeta } from './hydrate-pane-metadata-merge.js'
 import { createLogger } from '@/lib/client-logger'
 import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
 import { sanitizeRestoreError, sanitizeCrashTrace, sanitizeSessionRef, type RestoreError } from '@shared/session-contract'
@@ -2004,6 +2004,27 @@ export const panesSlice = createSlice({
       state.reconcilePendingPanes = {}
     },
 
+    // TITLE-ONLY cross-window hydration (e3r1 finding 4): another window's
+    // layout event applies ONLY the Task-7 pane-title reconciliation to
+    // panes that exist in BOTH envelopes. Trees, content, active panes,
+    // and every ephemeral pane signal (zoom, refresh requests, …) are this
+    // window's own business and stay untouched.
+    hydratePaneTitles: (
+      state,
+      action: PayloadAction<
+        Pick<PanesState, 'paneTitles' | 'paneTitleSetByUser'> & { layouts: Record<string, unknown> }
+      >,
+    ) => {
+      const meta = (action as PayloadAction<
+        Pick<PanesState, 'paneTitles' | 'paneTitleSetByUser'> & { layouts: Record<string, unknown> },
+        string,
+        HydratePanesMeta | undefined
+      >).meta
+      const merged = mergeCrossWindowPaneTitles(state, action.payload, action.payload.layouts, meta)
+      state.paneTitles = merged.paneTitles
+      state.paneTitleSetByUser = merged.paneTitleSetByUser
+    },
+
     updatePaneTitle: (
       state,
       action: PayloadAction<{ tabId: string; paneId: string; title: string; setByUser?: boolean }>
@@ -2635,6 +2656,7 @@ export const {
   markPaneClosing,
   clearPaneClosing,
   hydratePanes,
+  hydratePaneTitles,
   updatePaneTitle,
   updatePaneTitleByTerminalId,
   updatePaneTitleBySessionRef,

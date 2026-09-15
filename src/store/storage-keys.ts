@@ -2,11 +2,16 @@ export const STORAGE_KEYS = {
   // The bare `freshell.layout.v3` family is the LEGACY (pre-per-window)
   // shape: adoption source for a window's first post-change boot, never
   // deleted (other live pre-change windows may still read it). The live
-  // per-window key is `freshell.layout.v3.<clientInstanceId>` — see
-  // window-layout-keys.ts (delta round 3, finding 1).
+  // per-window key is `freshell.layout.v3.<layoutWindowId>` — see
+  // window-layout-keys.ts (delta round 3, finding 1; e3r1 finding 3: the
+  // id is the immutable layout-window-id, not the registry client id).
   legacyLayout: 'freshell.layout.v3',
   legacyLayoutBackup: 'freshell.layout.v3.bak',
   legacyLayoutPreMigrationRaw: 'freshell.layout.pre-migration-raw.v1',
+  // One-shot global marker: the FIRST window to adopt the legacy envelope
+  // sets it; every later fresh window classifies absent and rebuilds from
+  // the inventory instead of adopting (e3r1 finding 2).
+  legacyLayoutAdoptionMarker: 'freshell.layout.legacy-adopted.v1',
   tabs: 'freshell.tabs.v2',
   panes: 'freshell.panes.v2',
   sessionActivity: 'freshell.sessionActivity.v2',
@@ -23,6 +28,7 @@ export const STORAGE_KEYS = {
   machineId: 'freshell.machine-id.v1',
   machineSelections: 'freshell.machine-selections.v1',
   machineSelectionReset: 'freshell.machine-selection-reset.v1',
+  layoutWindowId: 'freshell.layout-window-id.v1',
   tabRegistryClientInstanceId: 'freshell.tabs.client-instance-id.v1',
   tabRegistrySnapshotRevision: 'freshell.tabs.snapshot-revision.v1',
   inputHistory: 'freshell.input-history.v1',
@@ -31,6 +37,8 @@ export const STORAGE_KEYS = {
 export const LEGACY_LAYOUT_STORAGE_KEY = STORAGE_KEYS.legacyLayout
 export const LEGACY_LAYOUT_BACKUP_STORAGE_KEY = STORAGE_KEYS.legacyLayoutBackup
 export const LEGACY_LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY = STORAGE_KEYS.legacyLayoutPreMigrationRaw
+export const LEGACY_LAYOUT_ADOPTION_MARKER_STORAGE_KEY = STORAGE_KEYS.legacyLayoutAdoptionMarker
+export const LAYOUT_WINDOW_ID_STORAGE_KEY = STORAGE_KEYS.layoutWindowId
 export const TABS_STORAGE_KEY = STORAGE_KEYS.tabs
 export const PANES_STORAGE_KEY = STORAGE_KEYS.panes
 export const SESSION_ACTIVITY_STORAGE_KEY = STORAGE_KEYS.sessionActivity
