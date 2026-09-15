@@ -224,11 +224,25 @@ type SessionWindowCommitPayload = {
 // stamping (applyContextUsageExtras) — never from this commit path: committed
 // windows may contain merged/retained rows whose usage is not fresh and must
 // never be re-served as current.
+
+// Per-row client-side fetch stamp the session-title mirror keys on: fresh
+// server rows never carry the field, so every inserted-or-updated row gets
+// the next counter value, while rows the deep-page merge RETAINED arrive as
+// the same objects with their stamps and keep them.
+let sessionRowFetchSeq = 0
+
 function commitWindowPayload(
   window: SessionWindowState,
   payload: SessionWindowCommitPayload,
 ) {
-  window.projects = normalizeProjects(payload.projects)
+  window.projects = normalizeProjects(payload.projects).map((project) => ({
+    ...project,
+    sessions: (project.sessions ?? []).map((row) =>
+      typeof row.fetchSeq === 'number'
+        ? row
+        : { ...row, fetchSeq: ++sessionRowFetchSeq },
+    ),
+  }))
   window.lastLoadedAt = Date.now()
   window.resultVersion = (window.resultVersion ?? 0) + 1
   window.totalSessions = payload.totalSessions

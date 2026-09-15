@@ -67,6 +67,16 @@ describe('sessionsSlice', () => {
 
   let initialState: SessionsState
 
+  // Rows committed through the window-commit reducers carry the client-side
+  // fetch stamp (CodingCliSession.fetchSeq) — exact-equality expectations
+  // over committed windows mirror the field without pinning the value of
+  // the monotonic module counter.
+  const withFetchStamps = (projects: ProjectGroup[]) =>
+    projects.map((project) => ({
+      ...project,
+      sessions: project.sessions.map((session) => ({ ...session, fetchSeq: expect.any(Number) })),
+    }))
+
   beforeEach(() => {
     initialState = {
       projects: [],
@@ -228,7 +238,7 @@ describe('sessionsSlice', () => {
       }))
 
       expect(state.windows.sidebar.projects).toEqual(mockProjects)
-      expect(state.windows.history.projects).toEqual([mockProjects[1]])
+      expect(state.windows.history.projects).toEqual(withFetchStamps([mockProjects[1]]))
       expect(state.projects).toEqual(mockProjects)
     })
   })
@@ -303,7 +313,7 @@ describe('sessionsSlice', () => {
         }),
       )
 
-      expect(state.windows.sidebar.projects).toEqual(replacementProjects)
+      expect(state.windows.sidebar.projects).toEqual(withFetchStamps(replacementProjects))
       expect(state.windows.sidebar.query).toBe('beta')
       expect(state.windows.sidebar.searchTier).toBe('fullText')
       expect(state.windows.sidebar.appliedQuery).toBe('beta')
@@ -311,7 +321,7 @@ describe('sessionsSlice', () => {
       expect(state.windows.sidebar.loading).toBe(false)
       expect(state.windows.sidebar.loadingKind).toBeUndefined()
       expect(state.windows.sidebar.resultVersion).toBe(8)
-      expect(state.projects).toEqual(replacementProjects)
+      expect(state.projects).toEqual(withFetchStamps(replacementProjects))
       expect(state.totalSessions).toBe(1)
     })
 
@@ -1009,12 +1019,12 @@ describe('sessionsSlice', () => {
         searchTier: 'fullText',
       }))
 
-      expect(state.windows.sidebar.projects).toEqual([mockProjects[1]])
+      expect(state.windows.sidebar.projects).toEqual(withFetchStamps([mockProjects[1]]))
       expect(state.windows.sidebar.query).toBe('beta')
       expect(state.windows.sidebar.searchTier).toBe('fullText')
       expect((state.windows.sidebar as any).appliedQuery).toBe('beta')
       expect((state.windows.sidebar as any).appliedSearchTier).toBe('fullText')
-      expect(state.projects).toEqual([mockProjects[1]])
+      expect(state.projects).toEqual(withFetchStamps([mockProjects[1]]))
     })
 
     it('keeps the previous applied search context during a search-to-browse transition until browse data commits', () => {
@@ -1115,7 +1125,7 @@ describe('sessionsSlice', () => {
         preserveLoading: true,
       }))
 
-      expect(state.windows.sidebar.projects).toEqual([mockProjects[1]])
+      expect(state.windows.sidebar.projects).toEqual(withFetchStamps([mockProjects[1]]))
       expect(state.windows.sidebar.query).toBe('')
       expect(state.windows.sidebar.searchTier).toBe('title')
       expect((state.windows.sidebar as any).appliedQuery).toBe('alpha')

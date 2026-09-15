@@ -441,23 +441,17 @@ function findPaneIdByTerminalId(node: PaneNode, terminalId: string): string | un
 }
 
 /**
- * Recursively walk a pane tree to find the leaf pane ID bound to the given
- * provider:sessionId — a fresh-agent pane owning that session, or a terminal
- * pane whose sessionRef points at it. Returns undefined if no match.
+ * Match rule for session-keyed pane-title folds: a fresh-agent pane owning
+ * the given provider:sessionId, or a terminal pane whose sessionRef points
+ * at it.
  */
-function findPaneIdBySessionRef(node: PaneNode, provider: string, sessionId: string): string | undefined {
-  if (node.type === 'leaf') {
-    const content = node.content
-    if (content.kind === 'fresh-agent' && content.provider === provider && content.sessionId === sessionId) {
-      return node.id
-    }
-    if (content.kind === 'terminal' && content.sessionRef?.provider === provider && content.sessionRef?.sessionId === sessionId) {
-      return node.id
-    }
-    return undefined
+function paneContentMatchesSessionRef(content: PaneContent, provider: string, sessionId: string): boolean {
+  if (content.kind === 'fresh-agent' && content.provider === provider && content.sessionId === sessionId) {
+    return true
   }
-  return findPaneIdBySessionRef(node.children[0], provider, sessionId)
-    ?? findPaneIdBySessionRef(node.children[1], provider, sessionId)
+  return content.kind === 'terminal'
+    && content.sessionRef?.provider === provider
+    && content.sessionRef?.sessionId === sessionId
 }
 
 // Helper to find and replace a node (leaf or split) in the tree
@@ -2245,8 +2239,9 @@ export const panesSlice = createSlice({
     ) => {
       const { provider, sessionId, title, setByUser } = action.payload
       for (const tabId of Object.keys(state.layouts)) {
-        const paneId = findPaneIdBySessionRef(state.layouts[tabId], provider, sessionId)
-        if (paneId) {
+        for (const leaf of collectLeaves(state.layouts[tabId])) {
+          if (!paneContentMatchesSessionRef(leaf.content, provider, sessionId)) continue
+          const paneId = leaf.id
           if (setByUser === false && state.paneTitleSetByUser?.[tabId]?.[paneId]) {
             continue
           }
