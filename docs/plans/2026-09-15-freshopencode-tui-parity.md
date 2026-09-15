@@ -258,7 +258,7 @@ Add to `mod tests` in `crates/freshell-freshagent/src/lib.rs` (follow the exact-
 
 ```rust
 #[test]
-fn opencode_item_from_part_reasoning_part_carries_duration_and_optional_title() {
+fn opencode_item_from_part_reasoning_part_carries_duration_without_title() {
     let items = opencode_item_from_part(
         &json!({
             "type": "reasoning", "id": "part_r1", "text": "weighing options",
@@ -287,17 +287,45 @@ fn opencode_item_from_part_reasoning_without_time_has_no_duration() {
 }
 
 #[test]
-fn opencode_item_from_part_reasoning_metadata_title_is_extracted() {
+fn opencode_item_from_part_reasoning_leading_bold_block_becomes_title() {
+    // Mirrors the opencode TUI's reasoningSummary (thinking.ts): a leading bold
+    // block "**Title**" followed by a blank line is disclosure metadata.
     let items = opencode_item_from_part(
         &json!({
-            "type": "reasoning", "id": "part_r3", "text": "planning",
-            "time": { "start": 1000, "end": 4200 },
-            "metadata": { "title": "planning the fix" }
+            "type": "reasoning", "id": "part_r3",
+            "text": "**Planning the fix**\n\nweighing options",
+            "time": { "start": 1000, "end": 4200 }
         }),
         "fallback", Some("assistant"), false,
     );
     assert_eq!(items[0]["durationMs"], json!(3200u64));
-    assert_eq!(items[0]["title"], json!("planning the fix"));
+    assert_eq!(items[0]["title"], json!("Planning the fix"));
+    assert_eq!(items[0]["text"], json!("weighing options"));
+    assert_eq!(items[0]["summary"], json!(["weighing options"]));
+}
+
+#[test]
+fn opencode_item_from_part_reasoning_bold_title_awaiting_body_is_title_only() {
+    // The TUI also treats a complete title still awaiting its body (streaming)
+    // as disclosure metadata: "**Title**" with nothing after it.
+    let items = opencode_item_from_part(
+        &json!({ "type": "reasoning", "id": "part_r4", "text": "**Planning**" }),
+        "fallback", Some("assistant"), false,
+    );
+    assert_eq!(items[0]["title"], json!("Planning"));
+    assert_eq!(items[0]["summary"], json!([]));
+}
+
+#[test]
+fn opencode_item_from_part_reasoning_bold_without_blank_line_is_not_a_title() {
+    // No blank line after the bold block => the TUI regex does not match; the
+    // text stays whole and no title is emitted.
+    let items = opencode_item_from_part(
+        &json!({ "type": "reasoning", "id": "part_r5", "text": "**bold intro** still the same paragraph" }),
+        "fallback", Some("assistant"), false,
+    );
+    assert_eq!(items[0].get("title"), None);
+    assert_eq!(items[0]["text"], json!("**bold intro** still the same paragraph"));
 }
 
 #[test]
@@ -322,8 +350,20 @@ fn opencode_item_from_part_task_tool_part_becomes_task_delegation() {
         "description": "Fix the flaky harness", "subagent": "general", "background": false,
         "childSessionId": "ses_c", "startedAtMs": 1000i64, "endedAtMs": 3000i64,
         "durationMs": 2000u64,
-        "result": "<task id=\"ses_c\" state=\"completed\"><task_result>ok</task_result></task>"
+        // The <task …><task_result>…</task_result></task> envelope is unwrapped:
+        // users see the task-result content, never the internal markup.
+        "result": "ok"
     })]);
+}
+
+#[test]
+fn opencode_task_result_text_unwraps_envelope_and_passes_raw_through() {
+    assert_eq!(
+        opencode_task_result_text("<task id=\"x\" state=\"completed\"><task_result>\n  all green  \n</task_result></task>"),
+        "all green"
+    );
+    assert_eq!(opencode_task_result_text("plain output"), "plain output");
+    assert_eq!(opencode_task_result_text(""), "");
 }
 
 #[test]
@@ -355,9 +395,11 @@ fn opencode_item_from_part_task_tool_part_background_and_custom_subagent() {
 
 #[test]
 fn opencode_item_from_part_retry_part_becomes_retry_item() {
+    // Authoritative serialized shape: NamedError.toObject() => {name, data:{message,…}}
+    // (retry.ts reads error.data.message).
     let items = opencode_item_from_part(
         &json!({ "type": "retry", "id": "part_rr1", "attempt": 2,
-                 "error": { "name": "StreamError", "message": "stream disconnected" } }),
+                 "error": { "name": "APIError", "data": { "message": "stream disconnected" } } }),
         "fallback", Some("assistant"), false,
     );
     assert_eq!(items, vec![json!({
@@ -421,6 +463,21 @@ fn opencode_part_duration_ms(part: &Value) -> Option<u64> {
     (end >= start).then_some((end - start) as u64)
 }
 
+/// Unwrap the opencode task output envelope — `state.output` carries
+/// `<task …><task_result>BODY</task_result></task>` — so users see the task-result
+/// content, never the internal markup. Any other shape passes through raw.
+fn opencode_task_result_text(output: &str) -> String {
+    const OPEN: &str = "<task_result>";
+    const CLOSE: &str = "</task_result>";
+    let (Some(open) = output.find(OPEN)) else { return output.to_string() };
+    let (Some(close) = output.rfind(CLOSE)) else { return output.to_string() };
+    if close > open {
+        output[open + OPEN.len()..close].trim().to_string()
+    } else {
+        output.to_string()
+    }
+}
+
 /// The opencode TUI header: `titlecase(subagent_type ?? "General") + " Task"` (+ " (background)") + " — " + description.
 fn opencode_task_delegation_title(subagent: &str, background: bool, description: &str) -> String {
     let mut chars = subagent.chars();
@@ -454,24 +511,62 @@ pub(crate) fn opencode_child_activity_preview(tool: &str, input: &Value) -> Stri
 }
 ```
 
-3b. In `opencode_item_from_part`, extend the `Some("reasoning")` arm (line ~1293) to append the two optional fields:
+3b. In `opencode_item_from_part`, extend the `Some("reasoning")` arm (line ~1293) to derive duration and the TUI-style title:
 
 ```rust
         Some("reasoning") => {
-            let text = /* existing text extraction */;
-            let segment = /* existing */;
+            let raw = part.get("text").and_then(Value::as_str).unwrap_or("");
+            // The opencode TUI (packages/tui/src/context/thinking.ts reasoningSummary)
+            // treats a leading bold block — "**Title**\n\n<body>" — as disclosure
+            // metadata, styling the header independently of the markdown body.
+            // Mirror that: the title splits off and the body carries the rest.
+            let (title, text) = opencode_reasoning_title_and_body(raw);
+            let segment = if text.is_empty() { vec![] } else { vec![text.clone()] };
             let mut item = json!({ "id": id, "kind": "reasoning", "summary": segment.clone(), "content": segment, "text": text });
             if let Some(duration) = opencode_part_duration_ms(part) {
                 item["durationMs"] = json!(duration);
             }
-            if let Some(title) = part.pointer("/metadata/title").and_then(Value::as_str) {
-                if !title.trim().is_empty() {
-                    item["title"] = json!(title);
-                }
+            if let Some(title) = title {
+                item["title"] = json!(title);
             }
             vec![item]
         }
 ```
+
+with the helper (place near `opencode_part_duration_ms`):
+
+```rust
+/// Mirror of the opencode TUI's `reasoningSummary` (thinking.ts): a leading bold
+/// block `**Title**` followed by a blank line (or end of text — a title still
+/// awaiting its body while streaming) is disclosure metadata; the text after the
+/// blank line is the body. The TUI regex is `/^\*\*([^*\n]+)\*\*(?:\r?\n\r?\n|$)/`.
+fn opencode_reasoning_title_and_body(raw: &str) -> (Option<String>, String) {
+    let content = raw.trim();
+    let Some(rest) = content.strip_prefix("**") else { return (None, content.to_string()) };
+    let Some(close) = rest.find("**") else { return (None, content.to_string()) };
+    let candidate = &rest[..close];
+    if candidate.is_empty() || candidate.contains('\n') || candidate.contains('*') {
+        return (None, content.to_string());
+    }
+    let after = rest[close + 2..].trim_start_matches('\r');
+    // Require end-of-text or a blank line (the TUI's `\r?\n\r?\n`), matching \r\n too.
+    let body = if after.is_empty() {
+        String::new()
+    } else if let Some(stripped) = after.strip_prefix('\n') {
+        let stripped = stripped.trim_start_matches('\r');
+        if stripped.starts_with('\n') {
+            stripped.trim().trim_end().to_string()
+        } else {
+            return (None, content.to_string());
+        }
+    } else {
+        return (None, content.to_string());
+    };
+    (Some(candidate.trim().to_string()), body)
+}
+```
+
+(After implementing, cross-check the helper against the four unit tests above — they encode the TUI's documented cases verbatim.)
 
 3c. In the `Some("tool")` arm (line ~1308), branch on `tool == "task"` BEFORE the existing dynamic_tool mapping, and add the two new part types:
 
@@ -504,17 +599,22 @@ pub(crate) fn opencode_child_activity_preview(tool: &str, input: &Value) -> Stri
                 if let Some(duration) = opencode_part_duration_ms(&json!({ "time": state.get("time").cloned().unwrap_or(Value::Null) })) {
                     item["durationMs"] = json!(duration);
                 }
-                if let Some(output) = state.get("output").and_then(Value::as_str) { item["result"] = json!(output); }
+                if let Some(output) = state.get("output").and_then(Value::as_str) {
+                    item["result"] = json!(opencode_task_result_text(output));
+                }
                 return vec![item];
             }
             // … existing dynamic_tool mapping unchanged …
         }
         Some("retry") => {
             let attempt = part.get("attempt").and_then(Value::as_i64).unwrap_or(1).max(1);
+            // Serialized NamedError shape is {name, data:{message,…}} (retry.ts reads
+            // error.data.message); tolerate legacy {message} and bare-string shapes.
             let error = part.get("error").and_then(|err| {
-                err.get("message").and_then(Value::as_str)
-                    .or_else(|| err.get("name").and_then(Value::as_str))
+                err.pointer("/data/message").and_then(Value::as_str)
+                    .or_else(|| err.get("message").and_then(Value::as_str))
                     .or_else(|| err.as_str())
+                    .or_else(|| err.get("name").and_then(Value::as_str))
             });
             let mut item = json!({ "id": id, "kind": "retry", "attempt": attempt });
             if let Some(error) = error { item["error"] = json!(error); }
@@ -612,7 +712,7 @@ fn opencode_child_activity_rows_cap_at_200() {
 
 1b. End-to-end join test (lib.rs `mod tests`, using the crate's existing fake-serve seam the way `get_opencode_snapshot_returns_a_schema_shaped_snapshot_with_turn_text` at line 3457 drives `get_opencode_snapshot`): the fake serve answers `GET /session/ses_p` + `GET /session/ses_p/message` with the parent (its assistant message contains the Task-2 task tool part with `state.metadata.sessionId = "ses_c"`) and `GET /session/ses_c/message` with the child messages above. Assert `get_opencode_snapshot("ses_p", None)` returns a snapshot whose `task_delegation` item has the three activity rows. Extend the existing fake's routed responses for the child session id (follow the fake's existing message-serving structure).
 
-1c. Live-refresh test (same seam): after building the parent snapshot once (which registers the child link + watcher), dispatch a `message.updated` serve event carrying the CHILD session id (`properties.info.sessionID = "ses_c"`) through the manager's scripted event path, then assert a `freshAgent.session.changed` frame addressed to `ses_p` with reason `opencode-message` reaches the broadcast sink (use the existing `frames_until(&mut rx, |f| is_event(f, "freshAgent.session.changed", …))` helper pattern).
+1c. Live-refresh test (same seam): after `get_opencode_snapshot("ses_p", …)` RETURNS (its `ensure_child_watchers` has synchronously created the child's broadcast receiver before the join fetch — plan-review round 1 Finding 4 makes this ordering load-bearing), dispatch a `message.updated` serve event carrying the CHILD session id (`properties.info.sessionID = "ses_c"`) through the manager's scripted event path, then assert a `freshAgent.session.changed` frame addressed to `ses_p` with reason `opencode-message` reaches the broadcast sink (use the existing `frames_until(&mut rx, |f| is_event(f, "freshAgent.session.changed", …))` helper pattern). Dispatching only after the build returned makes the test deterministic: the receiver exists before the event.
 
 1d. Graceful-degradation tests: when `GET /session/ses_c/message` 404s (child pruned), `get_opencode_snapshot` still succeeds and the `task_delegation` item simply has no `activity` key; when the child fetch errors on transport, the snapshot still succeeds (warn logged).
 
@@ -683,8 +783,12 @@ Call both pieces in `get_opencode_snapshot` (line ~820): replace the final `Ok(b
         // single client-visible snapshot producer, so the join AND the live-refresh
         // registry live here, on FreshAgentState — reachable for every session
         // (live or sidebar-opened durable), re-armed on every build (LB-8).
-        attach_child_activity(&manager, &route, &mut snapshot).await;
+        // ORDER (plan-review round 1, Finding 4): watch FIRST, fetch SECOND. The
+        // subscribe call creates the broadcast receiver synchronously BEFORE the
+        // child-history fetch runs, so a child event racing the fetch is buffered
+        // in the channel instead of lost — a tokio broadcast receiver does not replay.
         self.ensure_child_watchers(&manager, thread_id, &snapshot);
+        attach_child_activity(&manager, &route, &mut snapshot).await;
         Ok(snapshot)
 ```
 
@@ -698,6 +802,10 @@ And the registry + watcher on `FreshAgentState` (lib.rs, near the other shared o
 child_watchers: std::sync::Mutex<std::collections::HashMap<String, String>>,
 
 const OPENCODE_CHILD_ACTIVITY_ROW_CAP: usize = 200;
+/// Idle retire bound for orphaned watchers (plan review round 1, Finding 5):
+/// 2 hours covers realistic long-running delegations and post-"Open session"
+/// child resumes; a quieter child than that rearms on the parent's next build.
+const OPENCODE_CHILD_WATCHER_IDLE_SECS: u64 = 7200;
 
 fn ensure_child_watchers(&self, manager: &OpencodeServeManager, parent_id: &str, snapshot: &Value) {
     for child in opencode_snapshot_child_session_ids(snapshot) {
@@ -705,14 +813,17 @@ fn ensure_child_watchers(&self, manager: &OpencodeServeManager, parent_id: &str,
         if watchers.contains_key(&child) { continue; }
         watchers.insert(child.clone(), parent_id.to_string());
         drop(watchers);
-        let manager = manager.clone_handle_for_watcher(); // however spawn_serve_bridge clones the manager into a task
+        // Subscribe BEFORE spawning (spawn_serve_bridge discipline): the tokio
+        // broadcast receiver is created on THIS line, synchronously, so events
+        // racing the spawned task's startup are buffered, not lost.
+        let rx = manager.subscribe(&child);
         let fresh_agent = self.clone_for_bridge();        // same clone shape spawn_serve_bridge uses for its task
-        let registry = Arc::new(self.child_watchers.clone_for_task_use()); // or restructure: registry as Arc<Mutex<…>> field
+        let registry = self.child_watchers_handle_for_task(); // Arc/clone giving the spawned task removal access
+        let parent_id = parent_id.to_string();
         tokio::spawn(async move {
-            let mut rx = manager.subscribe(&child);
+            let mut rx = rx;
             loop {
-                // 30-minute idle retire bound (LB-8): an orphaned entry never leaks forever.
-                match tokio::time::timeout(Duration::from_secs(1800), rx.recv()).await {
+                match tokio::time::timeout(Duration::from_secs(OPENCODE_CHILD_WATCHER_IDLE_SECS), rx.recv()).await {
                     Err(_elapsed) => break,
                     Ok(Ok(SessionSignal::Event(parsed))) => {
                         if !parsed.kind.starts_with("message.") { continue; }
@@ -732,7 +843,9 @@ fn ensure_child_watchers(&self, manager: &OpencodeServeManager, parent_id: &str,
 fn opencode_snapshot_child_session_ids(snapshot: &Value) -> Vec<String> { /* walk turns[].items[] */ }
 ```
 
-(Adapt the clone/sharing shapes to exactly what `spawn_serve_bridge` (opencode_ws.rs:3258–3305) already does to move a manager + `FreshAgentState` into a spawned task — it solved the identical problem for per-session bridges; if `changed_event`/`event_frame` are private helpers of `opencode_ws`, make them `pub(crate)` in place rather than duplicating them. If the existing `FreshAgentState` cannot be cheaply cloned into tasks, follow the same channel/handle pattern the serve bridge uses. Also cap `opencode_child_activity_rows` output at `OPENCODE_CHILD_ACTIVITY_ROW_CAP` (take the first 200; full detail lives in the child session pane).)
+(Adapt the clone/sharing shapes to exactly what `spawn_serve_bridge` (opencode_ws.rs:3258–3305) already does to move a manager + `FreshAgentState` into a spawned task — it solved the identical problem for per-session bridges; if `changed_event`/`event_frame` are private helpers of `opencode_ws`, make them `pub(crate)` in place rather than duplicating them. Also cap `opencode_child_activity_rows` output at `OPENCODE_CHILD_ACTIVITY_ROW_CAP` (take the first 200; full detail lives in the child session pane).)
+
+Residual recorded from plan-review round 1 (Finding 5): a child session resumed more than `OPENCODE_CHILD_WATCHER_IDLE_SECS` after its last event, while its parent pane receives no parent-driven snapshot builds in that window, shows its next child activity only after the parent's next snapshot build rather than on the child's first event. Accepted — the alternative (unbounded watcher lifetime) leaks; the window is 2 hours; the "Open session" flow itself opens the child pane whose own live view is authoritative.
 
 - [ ] **Step 4: Run the focused tests**
 
@@ -783,6 +896,8 @@ Append to `test/unit/client/components/fresh-agent/FreshAgentItemCard.test.tsx` 
 ```tsx
 import { FreshAgentItemCard, FreshAgentDelegationBlock, FreshAgentOpenSessionContext } from '@/components/fresh-agent/FreshAgentItemCard'
 
+const longTaskResult = Array.from({ length: 30 }, (_, i) => `line ${i + 1}: harness output sample`).join('\n')
+
 const delegationItem = {
   id: 'part_t1', kind: 'task_delegation' as const, status: 'running' as const,
   title: 'General Task — Fix the flaky harness', description: 'Fix the flaky harness',
@@ -792,7 +907,7 @@ const delegationItem = {
     { tool: 'grep', status: 'failed' as const, preview: 'reasoningEffort' },
     { tool: 'read', status: 'running' as const, preview: 'src/index.css' },
   ],
-  result: '<task id="ses_child_1" state="completed"><task_result>all green</task_result></task>',
+  result: longTaskResult,
 }
 
 describe('task_delegation rendering', () => {
@@ -803,15 +918,22 @@ describe('task_delegation rendering', () => {
     expect(screen.getByLabelText('running')).toBeInTheDocument()
   })
 
-  it('renders nested child rows with (failed) suffix on errors', () => {
+  it('renders nested child rows with title-cased tool labels and (failed) on errors', () => {
     render(<FreshAgentDelegationBlock item={delegationItem} />)
+    expect(screen.getByText('Bash')).toBeInTheDocument()
+    expect(screen.getByText('Grep')).toBeInTheDocument()
     expect(screen.getByText(/sed -n 92,112p src\/store\/paneTypes\.ts/)).toBeInTheDocument()
     expect(screen.getByText('(failed)')).toBeInTheDocument()
   })
 
-  it('renders the clamped task result', () => {
+  it('renders the clamped task result: full content in a bounded, scrollable box', () => {
     render(<FreshAgentDelegationBlock item={delegationItem} />)
-    expect(screen.getByTestId('fresh-agent-delegation-result')).toHaveTextContent('all green')
+    const result = screen.getByTestId('fresh-agent-delegation-result')
+    // Content-presence: the LAST line proves the whole result body is carried…
+    expect(result).toHaveTextContent('line 30: harness output sample')
+    // …and the clamp classes prove the box is bounded + scrollable (max-h-24 + overflow).
+    expect(result.className).toContain('max-h-24')
+    expect(result.className).toContain('overflow-y-auto')
   })
 
   it('renders an Open session button that calls the context handler with the child session', () => {
@@ -847,9 +969,9 @@ describe('retry rendering', () => {
 })
 
 describe('delegated_task rendering', () => {
-  it('renders a one-line muted caption', () => {
+  it('renders a one-line muted caption with the title-cased agent', () => {
     render(<FreshAgentItemCard item={{ id: 's1', kind: 'delegated_task', agent: 'general', description: 'Fix the flaky harness' }} />)
-    expect(screen.getByTestId('fresh-agent-delegated-task')).toHaveTextContent('Delegated — general · Fix the flaky harness')
+    expect(screen.getByTestId('fresh-agent-delegated-task')).toHaveTextContent('Delegated — General · Fix the flaky harness')
   })
 })
 
@@ -898,6 +1020,17 @@ export function formatThoughtDuration(ms: number): string {
 export const FreshAgentOpenSessionContext = createContext<(sessionId: string, title?: string) => void>(() => {})
 ```
 
+- Add the display-casing helper (plan-review round 1, Finding 7 — the User Request's output is `↳ Bash …` / `Delegated — General · …`, and opencode title-cases tool labels):
+
+```ts
+/** First-letter uppercase display transform for wire-provided labels. */
+function titleCaseFirst(value: string): string {
+  const trimmed = value.trim()
+  if (!trimmed) return value
+  return trimmed[0].toUpperCase() + trimmed.slice(1)
+}
+```
+
 - Add `FreshAgentDelegationBlock` (status icon per existing tool-block conventions — `Loader2`/`Check`/`X` from lucide-react):
 
 ```tsx
@@ -905,7 +1038,7 @@ export function FreshAgentDelegationBlock({ item }: { item: Extract<FreshAgentTr
   const openSession = useContext(FreshAgentOpenSessionContext)
   const activity = item.activity ?? []
   return (
-    <div className="fresh-agent-delegation-block my-0.5 text-xs" data-status={item.status}>
+    <div className="fresh-agent-delegation-block my-0.5 text-xs" data-testid="fresh-agent-delegation-block" data-status={item.status}>
       <div className="flex min-w-0 items-center gap-2 rounded-r px-2 py-0.5">
         {item.status === 'running' ? <Loader2 className="h-3 w-3 shrink-0 animate-spin" aria-label="running" /> : null}
         {item.status === 'completed' ? <Check className="h-3 w-3 shrink-0 text-green-500" aria-label="complete" /> : null}
@@ -920,7 +1053,7 @@ export function FreshAgentDelegationBlock({ item }: { item: Extract<FreshAgentTr
           {activity.map((row, index) => (
             <div key={`${row.tool}-${index}`} className="flex min-w-0 items-center gap-2 py-0.5 text-muted-foreground" data-testid="fresh-agent-delegation-row">
               <span aria-hidden="true">↳</span>
-              <span className="shrink-0 font-medium">{row.tool}</span>
+              <span className="shrink-0 font-medium">{titleCaseFirst(row.tool)}</span>
               {row.preview ? <span className="truncate font-mono">{row.preview}</span> : null}
               {row.status === 'failed' ? <span className="shrink-0 text-destructive">(failed)</span> : null}
               {row.status === 'running' ? <Loader2 className="h-3 w-3 shrink-0 animate-spin" aria-label="running" /> : null}
@@ -952,7 +1085,7 @@ export function FreshAgentDelegationBlock({ item }: { item: Extract<FreshAgentTr
 }
 ```
 
-- Add the retry row and the delegated-task caption:
+- Add the retry row and the delegated-task caption (caption agent title-cased per Finding 7):
 
 ```tsx
 export function FreshAgentRetryRow({ attempt, error }: { attempt: number; error?: string }) {
@@ -971,7 +1104,7 @@ export function FreshAgentRetryRow({ attempt, error }: { attempt: number; error?
   if (item.kind === 'delegated_task') {
     return (
       <div data-testid="fresh-agent-delegated-task" className="my-0.5 px-2 py-0.5 text-xs italic text-muted-foreground">
-        {`Delegated — ${item.agent ?? 'Task'}${item.description ? ` · ${item.description}` : ''}`}
+        {`Delegated — ${titleCaseFirst(item.agent ?? 'Task')}${item.description ? ` · ${item.description}` : ''}`}
       </div>
     )
   }
@@ -1049,8 +1182,9 @@ describe('task delegation + retry folding', () => {
     // One collapsed line: the SlotReel names the running thing.
     expect(within(strip).getByText('Task')).toBeInTheDocument()
     expect(within(strip).getByText('General Task — Fix the flaky harness')).toBeInTheDocument()
-    // Nothing rendered as a standalone article between assistant messages.
-    expect(within(strip).getAllByTestId('fresh-agent-delegation-block')).toHaveLength(0)
+    // Nothing rendered as a standalone article between assistant messages
+    // (queryAllByTestId — getAllBy* throws on zero matches and cannot assert absence).
+    expect(within(strip).queryAllByTestId('fresh-agent-delegation-block')).toHaveLength(0)
   })
 
   it('expands to the delegation block and the retry row', () => {
@@ -1303,36 +1437,36 @@ git commit -m "feat(client): open-session link on opencode task delegation block
 - Consumes: the existing e2e harness (`TestHarness`, `RustServer`, `installFakeOpencode`, openPanePicker — see `freshopencode-db-history.spec.ts` for the setup pattern), the fake serve's existing `/session/:id`, `/session/:id/message`, `/global/event` SSE implementation, and the wire shapes documented in `.worktrees/.the-usual-logs/freshopencode-tui-parity/reports/plan-exploration.md` §6.
 - Produces: end-to-end proof that a freshopencode pane renders the delegation block, nested child rows, thought durations, retry rows, the child session's delegated-task caption, and that the Open-session link opens the child session pane.
 
-- [ ] **Step 1: Write the failing e2e spec**
+- [ ] **Step 1: Write the failing e2e spec (RED — fixture untouched)**
 
-Model the setup on `freshopencode-db-history.spec.ts` (fake `opencode` binary installed into PATH; freshopencode pane opened via the pane picker). The fake serve gains (fixture changes made in this step):
-
-- Parent session `ses_p` with one assistant message containing:
-  - a `reasoning` part `{ type:'reasoning', text:'planning the fix', time:{ start: <now-4000>, end: <now-600> } }`;
-  - a `task` tool part with `state.status:'completed'`, `state.input:{ description:'Fix the flaky harness', subagent_type:'general' }`, `state.metadata:{ parentSessionId:'ses_p', sessionId:'ses_c', model:{…} }`, `state.output:'<task id="ses_c" state="completed"><task_result>all green</task_result></task>'`, `state.time:{…}`;
-- Child session `ses_c` whose message list contains a user message with a `subtask` part (`{ type:'subtask', agent:'general', description:'Fix the flaky harness' }`) and an assistant message with `bash` tool parts — one `completed` (`sed -n 92,112p src/store/paneTypes.ts`) and one `error` (grep `reasoningEffort`);
-- A `retry` part `{ type:'retry', attempt:2, error:{ name:'StreamError', message:'stream disconnected' } }` in the parent's assistant message;
-- A scripted `message.updated` SSE event on `/global/event` for `ses_c` (prove the parent's strip updates after the child event — the parent pane shows a fresh activity row after the fake sidecar emits it).
+Write ONLY the spec file now; do NOT touch `fake-opencode.cjs` yet (plan-review round 1, Finding 10: the red phase must be reachable, and after Tasks 4–6 the client already renders the new UI — the only missing input is fixture data). Model the setup on `freshopencode-db-history.spec.ts` (fake `opencode` binary installed into PATH; freshopencode pane opened via the pane picker).
 
 The spec (`test/e2e-browser/specs/freshopencode-tui-parity.spec.ts`) asserts, in order:
 
-1. The pane opens and the parent session's transcript folds into a single collapsed activity line (existing `fresh-agent-activity-summary` visible; no standalone delegation article rendered outside the strip while collapsed).
-2. Expanding the strip (`Toggle activity details`) shows: the delegation header `General Task — Fix the flaky harness`, a nested row `↳ bash sed -n 92,112p src/store/paneTypes.ts`, a failed row with `(failed)`, the `Retrying (attempt 2) — stream disconnected` retry row, and the `fresh-agent-delegation-result` body containing `all green`.
-3. The thinking disclosure shows `Thought · 3.` (a seconds-scale duration label; the fixture pins the `time` window so the rendered value is deterministic, e.g. 3400ms → `3.4s`).
-4. Clicking `Open session` opens a pane on the child session `ses_c`, whose transcript shows the muted caption `Delegated — general · Fix the flaky harness` above the child's prompt.
-5. After the fake sidecar emits the scripted child `message.updated` event, the parent pane's expanded delegation block gains the new child activity row (live-refresh of the server-side join).
+1. The pane opens on the parent session `ses_p` and its transcript folds into a single collapsed activity line (existing `fresh-agent-activity-summary` visible; NO standalone delegation article outside the strip while collapsed).
+2. Expanding the strip (`Toggle activity details`) shows: the delegation header `General Task — Fix the flaky harness`, a nested row `↳ Bash sed -n 92,112p src/store/paneTypes.ts` (title-cased tool label), a failed row with `(failed)`, the `Retrying (attempt 2) — stream disconnected` retry row, and the `fresh-agent-delegation-result` body — which the fixture serves as a LONG multi-line result — rendered with a REAL-browser bounded box: `const box = await resultElement.boundingBox(); expect(box!.height).toBeLessThanOrEqual(160)` (the `max-h-24` clamp ≈ 96px + padding; plan-review round 1, Finding 6 makes this assertion protective).
+3. The thinking disclosure shows the settled duration label with the extracted title: `Thought: Planning the fix · 3.4s` (the fixture pins the reasoning part's `time` window to exactly 3400 ms and its leading bold block to the title — matching the Task 5 label formula and the TUI's `reasoningSummary` derivation).
+4. Clicking `Open session` opens a pane on the child session `ses_c`, whose transcript shows the muted caption `Delegated — General · Fix the flaky harness` (title-cased agent) above the child's prompt.
+5. Live refresh of the server-side join: the spec triggers the fake sidecar's scripted child event (see Step 3), and the parent pane's expanded delegation block gains the NEW child activity row that the event's state mutation added.
 
-Use role/aria/query selectors (never CSS classes) per the repo's a11y-first e2e conventions (`getByRole('button', { name: 'Toggle activity details' })`, `getByTestId('fresh-agent-delegation-row')`, …).
+Use role/aria/testid selectors (never CSS classes) per the repo's a11y-first e2e conventions.
 
 - [ ] **Step 2: Run the spec and verify the intended failure**
 
 Run: `npm run test:e2e:chromium -- test/e2e-browser/specs/freshopencode-tui-parity.spec.ts`
 
-Expected: FAIL — the delegation block/rows/retry/caption/duration do not render yet (fixture serves the parts; the client code from Tasks 4–6 must be present — run this task AFTER Task 6 so the failure is fixture/spec-driven only: expected failure mode before the fixture work is `getByTestId('fresh-agent-delegation-block')` timing out; verify the spec fails for the missing rendering, not for harness/setup errors).
+Expected: FAIL for the missing fixture data — the pane renders (the fake sidecar serves `ses_p`'s plain messages) but the delegation block never appears, so the first delegation assertion times out. This is the missing-behavior failure mode, not a harness error: the pane, strip, and testid vocabulary all exist from Tasks 4–6.
 
-- [ ] **Step 3: Land the fixture + spec implementation**
+- [ ] **Step 3: Land the fixture changes (GREEN)**
 
-Implement the fixture data and SSE scripting described in Step 1 (extend `fake-opencode.cjs` following its existing session/message serving structure — read it first; keep all existing scripted behaviors intact so sibling specs stay green), then make the spec pass. If the fake's SSE emitter does not support scripted child-session events yet, add the minimal event injection the existing fake uses for `session.idle` scripting.
+Extend `test/e2e-browser/fixtures/fake-opencode.cjs` (following its existing session/message serving structure; keep all existing scripted behaviors intact so sibling specs stay green):
+
+- Parent session `ses_p` with one assistant message containing:
+  - a `reasoning` part `{ type:'reasoning', text:'**Planning the fix**\n\nweighing options', time:{ start:<pinned>, end:<pinned+3400> } }` (leading-bold title + pinned 3400 ms window);
+  - a `task` tool part with `state.status:'completed'`, `state.input:{ description:'Fix the flaky harness', subagent_type:'general' }`, `state.metadata:{ parentSessionId:'ses_p', sessionId:'ses_c', model:{…} }`, `state.output:'<task id="ses_c" state="completed"><task_result>' + <40 lines of sample output> + '</task_result></task>'` (long content → clamp assertion is meaningful; the server unwraps the envelope), `state.time:{…}`;
+  - a `retry` part `{ type:'retry', attempt:2, error:{ name:'APIError', data:{ message:'stream disconnected' } } }` (authoritative serialized shape).
+- Child session `ses_c` whose message list contains a user message with a `subtask` part (`{ type:'subtask', agent:'general', description:'Fix the flaky harness' }`) and an assistant message with `bash` tool parts — one `completed` (`sed -n 92,112p src/store/paneTypes.ts`) and one `error` (grep `reasoningEffort`);
+- A scripted SSE trigger on `/global/event` for the child that BOTH emits a `message.updated` event carrying `ses_c`'s id AND mutates the fake's served child message state by appending a third `bash` tool part (e.g. `echo live-join-refresh`) — plan-review round 1, Finding 9: the parent watcher responds to the event by triggering a refetch of `/session/:id/message`, so only a fixture whose REST-visible state grows alongside the event makes the "new row appears" assertion pass and prove the live join refresh. If the fake's SSE emitter does not support scripted child-session events yet, add the minimal injection the existing fake uses for `session.idle` scripting.
 
 - [ ] **Step 4: Run the focused spec**
 
