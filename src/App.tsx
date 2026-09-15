@@ -72,6 +72,7 @@ import {
   resolveMachineIdentity,
 } from '@/lib/machine-identity'
 import { restoreMachineWorkspace } from '@/lib/machine-workspace'
+import { backfillPersistedLayoutMachineId, classifyPersistedLayoutHealth } from '@/lib/recovery/layout-health'
 import { buildLocalSettingsPatch } from '@/store/browserPreferencesPersistence'
 import Sidebar, { AppView } from '@/components/Sidebar'
 import TabBar from '@/components/TabBar'
@@ -828,8 +829,23 @@ export default function App() {
             deviceId: resolution.machine.id,
             deviceLabel: resolution.machine.label,
           }))
-          await restoreMachineWorkspace(appStore, resolution.machine.id)
-          if (cancelled) return false
+          // Local-first (Choice B): a healthy local layout IS this window's newest
+          // truth — keep it and skip the inventory entirely. Only an absent,
+          // corrupt, stale, or foreign layout rebuilds from the server.
+          const layoutHealth = classifyPersistedLayoutHealth(resolution.machine.id)
+          // Stamp backfill — classify FIRST, then backfill (AFTER the health gate
+          // reads the envelope). Unstamped is a one-boot transitional state: this
+          // is the only deterministic restamp for a terminal-free healthy layout.
+          // One call site covers both resolution paths — the bootstrap success
+          // path AND a chooser selection (a pick persists the selection and
+          // reloads; the next boot's resolution lands here). Safe on every
+          // classification outcome: absent/corrupt envelopes no-op inside the
+          // helper, and a rebuilt envelope is restamped by its own flush.
+          backfillPersistedLayoutMachineId(resolution.machine.id)
+          if (layoutHealth !== 'healthy') {
+            await restoreMachineWorkspace(appStore, resolution.machine.id, { reason: layoutHealth })
+            if (cancelled) return false
+          }
           dispatch(setMachineReady({ machine: resolution.machine, mode: 'server-managed' }))
           return true
         } catch (err) {

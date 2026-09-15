@@ -47,6 +47,8 @@ const mocks = vi.hoisted(() => ({
   createMachine: vi.fn(),
   fetchSidebarSessionsSnapshot: vi.fn(),
   restoreMachineWorkspace: vi.fn(),
+  classifyPersistedLayoutHealth: vi.fn(),
+  backfillPersistedLayoutMachineId: vi.fn(),
   installCrossTabSync: vi.fn(),
   startTabRegistrySync: vi.fn(),
   setHelloExtensionProvider: vi.fn(),
@@ -77,6 +79,11 @@ vi.mock('@/lib/api', () => ({
 
 vi.mock('@/lib/machine-workspace', () => ({
   restoreMachineWorkspace: (...args: unknown[]) => mocks.restoreMachineWorkspace(...args),
+}))
+
+vi.mock('@/lib/recovery/layout-health', () => ({
+  classifyPersistedLayoutHealth: (...args: unknown[]) => mocks.classifyPersistedLayoutHealth(...args),
+  backfillPersistedLayoutMachineId: (...args: unknown[]) => mocks.backfillPersistedLayoutMachineId(...args),
 }))
 
 vi.mock('@/store/crossTabSync', () => ({
@@ -156,6 +163,8 @@ describe('App machine identity bootstrap', () => {
     mocks.onReconnect.mockReturnValue(() => {})
     mocks.connect.mockResolvedValue(undefined)
     mocks.restoreMachineWorkspace.mockResolvedValue({ restoredTabs: 0 })
+    mocks.classifyPersistedLayoutHealth.mockReturnValue('healthy')
+    mocks.backfillPersistedLayoutMachineId.mockReturnValue(false)
     mocks.installCrossTabSync.mockReturnValue(() => {})
     mocks.startTabRegistrySync.mockReturnValue(() => {})
     mocks.fetchSidebarSessionsSnapshot.mockResolvedValue([])
@@ -212,6 +221,7 @@ describe('App machine identity bootstrap', () => {
   })
 
   it('restores the selected machine before configuring the hello and tab-sync transport', async () => {
+    mocks.classifyPersistedLayoutHealth.mockReturnValue('absent')
     localStorage.setItem(MACHINE_ID_STORAGE_KEY, MACHINE.id)
     mocks.getMachines.mockResolvedValue([MACHINE])
     const store = createStore()
@@ -219,7 +229,7 @@ describe('App machine identity bootstrap', () => {
     render(<Provider store={store}><App /></Provider>)
 
     await waitFor(() => expect(mocks.startTabRegistrySync).toHaveBeenCalledTimes(1))
-    expect(mocks.restoreMachineWorkspace).toHaveBeenCalledWith(store, MACHINE.id)
+    expect(mocks.restoreMachineWorkspace).toHaveBeenCalledWith(store, MACHINE.id, { reason: 'absent' })
     expect(mocks.restoreMachineWorkspace.mock.invocationCallOrder[0]).toBeLessThan(
       mocks.startTabRegistrySync.mock.invocationCallOrder[0],
     )
@@ -234,4 +244,48 @@ describe('App machine identity bootstrap', () => {
       clientInstanceId: 'window-identity-test',
     })
   })
+
+  it('keeps a healthy local workspace: no restore call, backfill stamps, straight to ready', async () => {
+    mocks.classifyPersistedLayoutHealth.mockReturnValue('healthy')
+    localStorage.setItem(MACHINE_ID_STORAGE_KEY, MACHINE.id)
+    mocks.getMachines.mockResolvedValue([MACHINE])
+    const store = createStore()
+
+    render(<Provider store={store}><App /></Provider>)
+
+    await waitFor(() => expect(mocks.startTabRegistrySync).toHaveBeenCalledTimes(1))
+    expect(mocks.restoreMachineWorkspace).not.toHaveBeenCalled()
+    // classify FIRST, then backfill — the gate calls the backfill once with
+    // the resolved machine id (after classification, before any rebuild):
+    expect(mocks.classifyPersistedLayoutHealth).toHaveBeenCalledTimes(1)
+    expect(mocks.classifyPersistedLayoutHealth).toHaveBeenCalledWith(MACHINE.id)
+    expect(mocks.classifyPersistedLayoutHealth.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.backfillPersistedLayoutMachineId.mock.invocationCallOrder[0],
+    )
+    expect(mocks.backfillPersistedLayoutMachineId).toHaveBeenCalledTimes(1)
+    expect(mocks.backfillPersistedLayoutMachineId).toHaveBeenCalledWith(MACHINE.id)
+    expect(store.getState().machineIdentity.status).toBe('ready')
+  })
+
+  it.each(['absent', 'corrupt', 'foreign', 'stale'] as const)(
+    'rebuilds for an unhealthy layout (%s) and passes the health as the reason',
+    async (reason) => {
+      mocks.classifyPersistedLayoutHealth.mockReturnValue(reason)
+      localStorage.setItem(MACHINE_ID_STORAGE_KEY, MACHINE.id)
+      mocks.getMachines.mockResolvedValue([MACHINE])
+      const store = createStore()
+
+      render(<Provider store={store}><App /></Provider>)
+
+      await waitFor(() => expect(mocks.startTabRegistrySync).toHaveBeenCalledTimes(1))
+      expect(mocks.restoreMachineWorkspace).toHaveBeenCalledTimes(1)
+      expect(mocks.restoreMachineWorkspace).toHaveBeenCalledWith(store, MACHINE.id, { reason })
+      // order pin: restore still precedes tab-registry sync on rebuild boots
+      expect(mocks.restoreMachineWorkspace.mock.invocationCallOrder[0]).toBeLessThan(
+        mocks.startTabRegistrySync.mock.invocationCallOrder[0],
+      )
+      expect(mocks.backfillPersistedLayoutMachineId).toHaveBeenCalledTimes(1)
+      expect(mocks.backfillPersistedLayoutMachineId).toHaveBeenCalledWith(MACHINE.id)
+    },
+  )
 })

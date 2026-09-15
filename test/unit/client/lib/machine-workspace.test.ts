@@ -116,4 +116,25 @@ describe('restoreMachineWorkspace', () => {
     expect(store.getState().tabs.tabs).toEqual([])
     expect(store.getState().panes.layouts).toEqual({})
   })
+
+  it.each(['absent', 'corrupt', 'foreign', 'stale'] as const)(
+    'still fetches with the plain client id, clears, and restores when told the boot reason is %s',
+    async (reason) => {
+      const store = createStore()
+      addForeignWorkspace(store)
+      vi.mocked(getRecoveryInventory).mockResolvedValue(inventoryFor(MACHINE_ID))
+
+      const result = await restoreMachineWorkspace(store, MACHINE_ID, { reason })
+
+      expect(getRecoveryInventory).toHaveBeenCalledWith(
+        'client-machine-test',
+        expect.any(Number),
+        { machineId: MACHINE_ID },
+      )
+      expect(result).toEqual({ restoredTabs: 1 })
+      expect(store.getState().tabs.tabs.map((tab) => tab.title)).toEqual(['Recovered workspace'])
+      expect(store.getState().tabs.tabs.map((tab) => tab.id)).not.toContain('foreign-tab')
+      expect(store.getState().panes.layouts['foreign-tab']).toBeUndefined()
+    },
+  )
 })

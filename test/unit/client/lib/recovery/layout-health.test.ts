@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { classifyPersistedLayoutHealth, STALE_LAYOUT_MS } from '@/lib/recovery/layout-health'
+import { backfillPersistedLayoutMachineId, classifyPersistedLayoutHealth, STALE_LAYOUT_MS } from '@/lib/recovery/layout-health'
 import { LAYOUT_STORAGE_KEY, MACHINE_ID_STORAGE_KEY } from '@/store/storage-keys'
 
 const NOW = 1_760_000_000_000
@@ -131,5 +131,40 @@ describe('classifyPersistedLayoutHealth', () => {
     delete envelope.machineId
     seedEnvelope(envelope)
     expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+  })
+})
+
+describe('backfillPersistedLayoutMachineId', () => {
+  beforeEach(() => { localStorage.clear() })
+
+  it('stamps a healthy legacy (unstamped) envelope once machine identity resolves — with NO store action dispatched', () => {
+    // The boot moment the finding pins: identity resolved, persist
+    // middleware not dirty (machine-resolution actions never mark
+    // tabsDirty/panesDirty, persistMiddleware.ts:719-751), so nothing else
+    // would ever restamp a terminal-free healthy layout.
+    const envelope = healthyEnvelope('machine-1')
+    delete envelope.machineId
+    seedEnvelope(envelope)
+    const rawBefore = JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY)!) as Record<string, unknown>
+    expect(backfillPersistedLayoutMachineId('machine-1')).toBe(true)
+    const stamped = JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY)!) as { machineId?: string }
+    expect(stamped.machineId).toBe('machine-1')
+    // everything else is preserved — no layout mutation:
+    expect(stamped.tabs).toEqual(rawBefore.tabs)
+    expect(stamped.panes).toEqual(rawBefore.panes)
+    expect(stamped.persistedAt).toEqual(rawBefore.persistedAt)
+  })
+
+  it('does not rewrite an already-stamped envelope (idempotent — content byte-identical)', () => {
+    seedEnvelope(healthyEnvelope('machine-1'))
+    const before = localStorage.getItem(LAYOUT_STORAGE_KEY)
+    expect(backfillPersistedLayoutMachineId('machine-1')).toBe(false)
+    expect(localStorage.getItem(LAYOUT_STORAGE_KEY)).toBe(before)   // no write at all
+  })
+
+  it('leaves an unparseable envelope alone (no write, no throw)', () => {
+    seedEnvelope('{ not json')
+    expect(backfillPersistedLayoutMachineId('machine-1')).toBe(false)
+    expect(localStorage.getItem(LAYOUT_STORAGE_KEY)).toBe('{ not json')
   })
 })

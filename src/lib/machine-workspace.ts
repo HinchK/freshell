@@ -38,6 +38,13 @@ function assertInventoryIsScopedToMachine(inventory: RecoveryInventory, machineI
   }
 }
 
+export type RestoreMachineWorkspaceReason = 'absent' | 'corrupt' | 'foreign' | 'stale'
+
+export type RestoreMachineWorkspaceOptions = {
+  /** Why this boot is rebuilding instead of keeping the local layout. */
+  reason?: RestoreMachineWorkspaceReason
+}
+
 /**
  * Hydrate the selected machine's durable workspace before the websocket and
  * tabs.sync are allowed to start. The server must honor the additive
@@ -47,6 +54,7 @@ function assertInventoryIsScopedToMachine(inventory: RecoveryInventory, machineI
 export async function restoreMachineWorkspace(
   store: MachineWorkspaceStore,
   machineId: string,
+  _options: RestoreMachineWorkspaceOptions = {},
 ): Promise<{ restoredTabs: number }> {
   const inventory = await getRecoveryInventory(
     getCurrentTabRegistryClientInstanceId(),

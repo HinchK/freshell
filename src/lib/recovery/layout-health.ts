@@ -170,3 +170,54 @@ export function classifyPersistedLayoutHealth(
   if (now - persistedAt > STALE_LAYOUT_MS) return 'stale'
   return 'healthy'
 }
+
+/** One-shot stamp backfill. Machine resolution dispatches no tabs/panes
+ * action, so the persist middleware's dirty flags never fire
+ * (persistMiddleware.ts:534 returns early; :719-751 dirties only tabs/,
+ * panes/, tabRecency/, and turnCompletion changes) — a healthy legacy
+ * (unstamped) envelope could stay unstamped indefinitely (e.g. a
+ * terminal-free layout dispatches nothing on boot). Write the resolved
+ * machine id into the RAW envelope directly: parse only as the gate
+ * (parses AND lacks machineId), mutate the raw object, ONE synchronous
+ * setItem — localStorage writes are all-or-nothing per key, the atomic
+ * equivalent of the server side's temp-file+rename; there is no shared
+ * atomic-write utility in the client to reuse (verified — only prose uses
+ * "atomic" in src/). NO layout mutation (never write the reconstructed
+ * ParsedPersistedLayout back — that would normalize/rewrite fields), no
+ * full reflush, no broadcast, no store dispatch. Idempotent within a
+ * boot: an already-stamped or unparseable envelope writes nothing. */
+export function backfillPersistedLayoutMachineId(
+  resolvedMachineId: string,
+  storage: Storage | undefined = safeStorage(),
+): boolean {
+  if (!resolvedMachineId || !storage) return false
+  let raw: string | null = null
+  try {
+    raw = storage.getItem(LAYOUT_STORAGE_KEY)
+  } catch {
+    return false
+  }
+  if (raw === null) return false
+  let parsed: ParsedPersistedLayout | null = null
+  try {
+    parsed = parsePersistedLayoutRaw(raw)
+  } catch {
+    parsed = null
+  }
+  if (!parsed) return false
+  if (typeof parsed.machineId === 'string' && parsed.machineId) return false
+  let rawEnvelope: { machineId?: string }
+  try {
+    rawEnvelope = JSON.parse(raw)
+  } catch {
+    return false
+  }
+  if (typeof rawEnvelope.machineId === 'string' && rawEnvelope.machineId) return false
+  rawEnvelope.machineId = resolvedMachineId
+  try {
+    storage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(rawEnvelope))
+    return true
+  } catch {
+    return false
+  }
+}
