@@ -40,7 +40,7 @@
 - TypeScript relative imports need `.js` extensions (NodeNext/ESM).
 - No PR creation without explicit user approval; do not push behavior changes to `origin/main`.
 - Focused test commands (delegated, no coordinator gate): `cargo test -p <crate> --locked <selector>`, `npm run test:vitest -- run <file>`, `npm run typecheck`. Broad `npm test`/`check`/`verify` only through the coordinated gate.
-- The meter's three client-required fields (`compactPercent`, `contextTokens`, `compactThresholdTokens`) must be all-present or all-absent per session; the client guard (`src/lib/fresh-agent-context-usage.ts:67-80`) renders muted otherwise. `compactThresholdTokens` must be positive on the wire; `compactPercent` an integer 0–100.
+- The meter's three client-required fields (`compactPercent`, `contextTokens`, `compactThresholdTokens`) must be all-present or all-absent per session; the client guard (`src/lib/fresh-agent-context-usage.ts:67-80`) renders muted otherwise. `compactThresholdTokens` must be positive on the wire; `compactPercent` an integer 0–100; and `modelContextWindow` is positive-optional — NEVER emit 0 or negative (the wire zod is `.positive()` and both page consumers hard-`.parse` at `src/lib/api.ts:646`/`:681` — one violating item rejects the entire session-directory page for ALL providers).
 - Server-side computation mirrors opencode v1.18.31 exactly (evidence: `reports/load-bearing-opencode-overflow-formula.md`): count = `tokens.total || (input + output + cache.read + cache.write)` (fallback omits `reasoning`, upstream's `||` semantics); `usable` returns 0 when `limit.context === 0` (upstream then disables auto-compaction — the meter must stay unknown, not divide by zero). opencode's `compaction.reserved`/`compaction.auto` user-config overrides are NOT visible to the server (accepted residual; the user's config sets neither).
 - Structured logging (`tracing::debug!`/`warn!`) on every degrade/probe-failure path; no secrets/keys in logs.
 
@@ -335,7 +335,7 @@ New file `crates/freshell-sessions/tests/opencode_usage.rs` — mirror the TmpDi
 //! tests/opencode_first_message.rs.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use freshell_sessions::parse::OpencodeProvider;
 use rusqlite::Connection;
@@ -364,7 +364,8 @@ fn create_schema(conn: &Connection) {
          CREATE TABLE message (
             id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
          CREATE TABLE part (
-            id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT);",
+            id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+            time_created INTEGER NOT NULL, time_updated INTEGER, data TEXT);",
     )
     .unwrap();
 }
@@ -386,9 +387,15 @@ fn insert_message(conn: &Connection, id: &str, session_id: &str, time_created: i
 }
 
 fn insert_part(conn: &Connection, id: &str, message_id: &str, session_id: &str, data: &str) {
+    // The real schema stamps parts with time_created (NOT NULL) +
+    // time_updated; the usage SQL orders by time_created. Tests insert in
+    // story order, so a monotonic counter mirrors "later insert = newer
+    // part" (same order the lexicographic ULID ids would give).
+    static PART_TIME: AtomicI64 = AtomicI64::new(1000);
+    let time_created = PART_TIME.fetch_add(1, Ordering::SeqCst);
     conn.execute(
-        "INSERT INTO part VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![id, message_id, session_id, data],
+        "INSERT INTO part VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+        rusqlite::params![id, message_id, session_id, time_created, data],
     )
     .unwrap();
 }
@@ -446,6 +453,27 @@ fn latest_assistant_step_finish_wins_even_with_trailing_user_message() {
     drop(conn);
     let s = list_one(&dir);
     assert_eq!(s.last_usage.as_ref().unwrap().total, Some(215242));
+}
+
+#[test]
+fn in_flight_trailing_step_falls_back_to_previous_finished_step() {
+    // The falsifier (live-DB proven, reports/load-bearing-strategist.md §2):
+    // the newest assistant message is a RUNNING step — step-start/reasoning
+    // parts only, NO step-finish. The meter must read the PREVIOUS finished
+    // step's usage (opencode's `lastFinished`), not degrade to None.
+    let dir = TmpDir::new();
+    let conn = Connection::open(dir.join("opencode.db")).unwrap();
+    create_schema(&conn);
+    insert_session(&conn, "ses_1", "Named", Some(MODEL_JSON));
+    insert_message(&conn, "msg_1", "ses_1", 100, "assistant");
+    insert_part(&conn, "prt_1", "msg_1", "ses_1", r#"{"reason":"stop","type":"step-finish","tokens":{"total":1000,"input":10,"output":20,"cache":{"write":0,"read":970}}}"#);
+    // the RUNNING newest step: assistant message with NO step-finish part
+    insert_message(&conn, "msg_2", "ses_1", 200, "assistant");
+    insert_part(&conn, "prt_2", "msg_2", "ses_1", r#"{"type":"step-start"}"#);
+    insert_part(&conn, "prt_3", "msg_2", "ses_1", r#"{"type":"reasoning","text":"thinking"}"#);
+    drop(conn);
+    let s = list_one(&dir);
+    assert_eq!(s.last_usage.as_ref().unwrap().total, Some(1000));
 }
 
 #[test]
@@ -579,9 +607,21 @@ In-file unit tests in `crates/freshell-sessions/src/parse/opencode.rs` (`mod tes
             opencode_model_composite(r#"{"id":"glm-5.3","providerID":"lunaroute","variant":"default"}"#),
             Some("lunaroute/glm-5.3".to_string())
         );
+        // org/name ids (44% of real sessions, e.g. Kimi-K3) compose verbatim —
+        // the catalog builds the same triple-slash ids from its models-map keys
+        assert_eq!(
+            opencode_model_composite(r#"{"id":"moonshotai/Kimi-K3","providerID":"ms-runpod"}"#),
+            Some("ms-runpod/moonshotai/Kimi-K3".to_string())
+        );
+        // id-side slashes are legal (no id guard; live-verified join contract)
+        assert_eq!(
+            opencode_model_composite(r#"{"id":"a/b","providerID":"p"}"#),
+            Some("p/a/b".to_string())
+        );
         assert_eq!(opencode_model_composite(r#"{"id":"x"}"#), None);          // no providerID
         assert_eq!(opencode_model_composite(r#"not json"#), None);
-        assert_eq!(opencode_model_composite(r#"{"id":"a/b","providerID":"p"}"#), None); // slash guard
+        // provider-side slash stays guarded (mirrors the catalog's provider skip)
+        assert_eq!(opencode_model_composite(r#"{"id":"m","providerID":"p/x"}"#), None);
     }
 ```
 
@@ -689,15 +729,20 @@ pub fn opencode_compact_percent(context_count: i64, usable: i64) -> Option<i64> 
 
 /// Parse the session row's `model` JSON (`{"id","providerID","variant"}`)
 /// into the model-capability catalog's `provider/model` composite id
-/// (`normalize_enabled_model_catalog` joins the same way). Degrades to
-/// `None` on absent/malformed input — the meter stays unknown, the listing
-/// never breaks. Slash-bearing ids are rejected (the composite must stay
-/// unambiguous).
+/// (`normalize_enabled_model_catalog` joins the same way — verbatim
+/// `provider_id + "/" + model_id`). The id may itself contain slashes
+/// (models.dev org/name ids like `moonshotai/Kimi-K3` — 44% of real
+/// sessions; the catalog composes those ids verbatim too), so there is NO
+/// id-side slash guard; the PROVIDER-side guard mirrors the catalog's own
+/// provider-slash skip (catalog.rs:195-200 — such providers never appear in
+/// the catalog, so the composite could never match). Degrades to `None` on
+/// absent/malformed input — the meter stays unknown, the listing never
+/// breaks.
 fn opencode_model_composite(raw: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
     let id = v.get("id")?.as_str()?.trim();
     let provider = v.get("providerID")?.as_str()?.trim();
-    if id.is_empty() || provider.is_empty() || id.contains('/') || provider.contains('/') {
+    if id.is_empty() || provider.is_empty() || provider.contains('/') {
         return None;
     }
     Some(format!("{provider}/{id}"))
@@ -731,26 +776,37 @@ and the SELECT gains `, {model_expr}` after `{marker_expr} AS hasThreeViewsMarke
 4. Bounded usage lookup — the `FIRST_USER_MESSAGE_SQL` discipline verbatim (prepare_cached + query_row + degrade-to-None; pure index searches via `message_session_time_created_id_idx` and `part_message_id_id_idx`):
 
 ```rust
-/// Bounded per-session lookup: the LAST finished assistant step's token
-/// usage — the last assistant message by time, then its last `step-finish`
-/// part (opencode's `lastFinished`). Mirrors [`FIRST_USER_MESSAGE_SQL`]'s
-/// index shape (EXPLAIN QUERY PLAN: index searches, no scans; the same
-/// measured ~0.4 ms/session class). Degrades to `None` on ANY
-/// schema/query error.
+/// Bounded per-session lookup: the NEWEST `step-finish` part's token usage —
+/// opencode's `lastFinished` (the last FINISHED assistant step). An in-flight
+/// newest step must NOT hide the previous step's usage: live-DB verified
+/// (reports/load-bearing-strategist.md §2) that a running session's newest
+/// assistant message carries only step-start/reasoning parts while the newest
+/// step-finish belongs to an earlier message — so the lookup is "newest
+/// step-finish part of the session", not "last message's step-finish".
+/// opencode writes exactly one step-finish part per assistant step message
+/// and parts are created in step order, so the newest such part IS the last
+/// finished step; the role join is belt-and-braces against odd rows.
+/// O(session parts) — measured read-only ~10–25 ms at 1.8–2.2k parts on the
+/// real DB (no `(session_id, time_created)` part index exists and the
+/// read-only DB cannot gain one; this is the floor for a correct query) —
+/// acceptable because it runs only on token-gated re-lists. Degrades to
+/// `None` on ANY schema/query error.
 const LAST_STEP_FINISH_SQL: &str = "\
-    WITH last_assistant AS (\
-        SELECT m.id FROM message m \
-        WHERE m.session_id = ?1 AND json_extract(m.data, '$.role') = 'assistant' \
-        ORDER BY m.time_created DESC, m.id DESC LIMIT 1\
+    WITH last_finished AS (\
+        SELECT p.id AS pid, p.data AS pdata \
+        FROM part p JOIN message m ON m.id = p.message_id \
+        WHERE p.session_id = ?1 \
+          AND json_extract(m.data, '$.role') = 'assistant' \
+          AND json_extract(p.data, '$.type') = 'step-finish' \
+        ORDER BY p.time_created DESC, p.id DESC \
+        LIMIT 1\
     ) \
-    SELECT json_extract(p.data, '$.tokens.total'), \
-           json_extract(p.data, '$.tokens.input'), \
-           json_extract(p.data, '$.tokens.output'), \
-           json_extract(p.data, '$.tokens.cache.read'), \
-           json_extract(p.data, '$.tokens.cache.write') \
-    FROM part p JOIN last_assistant a ON p.message_id = a.id \
-    WHERE json_extract(p.data, '$.type') = 'step-finish' \
-    ORDER BY p.id DESC LIMIT 1";
+    SELECT json_extract(pdata, '$.tokens.total'), \
+           json_extract(pdata, '$.tokens.input'), \
+           json_extract(pdata, '$.tokens.output'), \
+           json_extract(pdata, '$.tokens.cache.read'), \
+           json_extract(pdata, '$.tokens.cache.write') \
+    FROM last_finished";
 
 fn last_step_finish_usage_for_session(conn: &Connection, session_id: &str) -> Option<OpencodeStepUsage> {
     let mut stmt = match conn.prepare_cached(LAST_STEP_FINISH_SQL) {
@@ -844,7 +900,7 @@ git commit -m "feat(sessions): parse opencode session model and last step-finish
 
 In `directory_index.rs`'s in-file test module (`mod tests`, `pub(crate)` — the fixture builders live at `:3802-3866`):
 
-1. Extend the fixture builder `opencode_data_home_with_sessions` so its session schema includes a `model TEXT` column (existing rows unaffected — NULL) and keep its signature; if the builder builds the DB through an internal writable conn helper, expose that conn (or a sibling builder) so tests can seed messages/parts.
+1. Extend the fixture builder `opencode_data_home_with_sessions` so its session schema includes a `model TEXT` column (existing rows unaffected — NULL) and keep its signature; if the builder builds the DB through an internal writable conn helper, expose that conn (or a sibling builder) so tests can seed messages/parts. The fixture `part` table must mirror the real schema's `time_created` (NOT NULL) + `time_updated` columns — the corrected usage SQL orders by `part.time_created` — and the seed helper stamps them monotonically (later insert = newer part).
 2. Add seed helpers next to it (same writable-conn convention as `seed_opencode_user_message` at `:3833-3866`):
 
 ```rust
@@ -858,8 +914,12 @@ In `directory_index.rs`'s in-file test module (`mod tests`, `pub(crate)` — the
             rusqlite::params![session_id],
         )
         .unwrap();
+        // Column list must match the fixture part schema (id, message_id,
+        // session_id, time_created NOT NULL, time_updated, data) — the
+        // corrected usage SQL orders by part.time_created; later inserts
+        // stamp later times.
         conn.execute(
-            "INSERT INTO part VALUES ('prt_usage', 'msg_usage', ?1, ?2)",
+            "INSERT INTO part VALUES ('prt_usage', 'msg_usage', ?1, 900, 900, ?2)",
             rusqlite::params![
                 session_id,
                 format!(r#"{{"reason":"stop","type":"step-finish","tokens":{tokens_json},"cost":0}}"#)
@@ -942,8 +1002,9 @@ In `directory_index.rs`'s in-file test module (`mod tests`, `pub(crate)` — the
 
     #[test]
     fn opencode_zero_context_limit_yields_no_meter() {
-        // limit.context 0 == upstream disables auto-compaction: threshold
-        // and percent stay None even though usage is present.
+        // limit.context 0 == upstream disables auto-compaction: threshold,
+        // percent AND modelContextWindow stay None (the wire zod is
+        // `.positive()` — emitting 0 would reject the whole page parse).
         let (dir, _guard) = opencode_data_home_with_sessions("usage-zero-ctx", vec![("ses_usage", "Named")]);
         set_opencode_session_model(&dir, "ses_usage", OPENCODE_TEST_MODEL);
         seed_opencode_step_finish(
@@ -957,6 +1018,7 @@ In `directory_index.rs`'s in-file test module (`mod tests`, `pub(crate)` — the
         )]);
         let source = OpencodeSource::new(/* builder's data home */).with_model_limit_resolver(resolver);
         let usage = source.scan()[0].token_usage.as_ref().expect("token_usage present");
+        assert_eq!(usage.model_context_window, None);
         assert_eq!(usage.compact_threshold_tokens, None);
         assert_eq!(usage.compact_percent, None);
     }
@@ -1076,7 +1138,10 @@ fn opencode_token_usage(
             Some(limits) => {
                 let usable = crate::parse::opencode_usable_context(&limits);
                 (
-                    Some(limits.context.max(0)),
+                    // NEVER emit 0/negative: the wire zod is `.positive()`
+                    // and one violating item rejects the whole page parse
+                    // (api.ts:646/:681). Zero-context resolves to None here.
+                    (limits.context > 0).then_some(limits.context),
                     (usable > 0).then_some(usable),
                     crate::parse::opencode_compact_percent(count, usable),
                 )
@@ -1176,6 +1241,41 @@ git commit -m "feat(sessions): compute opencode TokenSummary via injected model-
         let cwds = recent_opencode_cwds(&sessions, 2);
         assert_eq!(cwds, vec!["/repo/b".to_string(), "/repo/a".to_string()]);
     }
+
+    #[test]
+    fn resolver_exact_match_wins_then_single_effort_strip() {
+        let snap = snapshot();
+        snap.write().unwrap().insert(
+            "lunaroute/deepseek-4.1-flash".into(),
+            OpencodeModelLimits { context: 1_048_576, input: None, output: Some(262_144) },
+        );
+        snap.write().unwrap().insert(
+            "lunaroute/glm-5.3-vision-background".into(),
+            OpencodeModelLimits { context: 524_288, input: None, output: Some(131_072) },
+        );
+        // exact match wins — never strips
+        let exact = resolve_from_snapshot(&snap, "lunaroute/glm-5.3-vision-background").unwrap();
+        assert_eq!(exact.context, 524_288);
+        // effort-suffixed composite (3+ segments) resolves its base
+        let stripped = resolve_from_snapshot(&snap, "lunaroute/deepseek-4.1-flash/low").unwrap();
+        assert_eq!(stripped.context, 1_048_576);
+        // 2-segment miss stays a miss — never strips
+        assert!(resolve_from_snapshot(&snap, "lunaroute/unknown").is_none());
+        // org/name composites resolve exact too
+        let org_name = resolve_from_snapshot(&snap, "ms-runpod/moonshotai/Kimi-K3");
+        assert_eq!(org_name, None); // not in THIS snapshot; the strip test above covers 3-segment hits
+    }
+
+    #[test]
+    fn upsert_reports_gains_only() {
+        let snap = snapshot();
+        let a = OpencodeModelLimits { context: 1, input: None, output: None };
+        assert!(upsert_limits(&snap, [("m/x".into(), a.clone())].into())); // first fill: gain
+        assert!(!upsert_limits(&snap, [("m/x".into(), a.clone())].into())); // same value: no gain
+        let a2 = OpencodeModelLimits { context: 2, input: None, output: None };
+        assert!(upsert_limits(&snap, [("m/x".into(), a2.clone())].into())); // changed value: gain
+        assert!(upsert_limits(&snap, [("m/y".into(), a2.clone())].into())); // new key: gain
+    }
 ```
 
 (`model_capability`/`minimal_indexed_session` are test helpers — `minimal_indexed_session` builds an `IndexedSession` via the crate's existing test builder conventions; if none is reachable in a bin-crate `mod tests`, construct the struct literally, filling non-relevant fields with `None`/defaults — it has no `Default`, so a small local builder fn is fine.)
@@ -1242,6 +1342,20 @@ git commit -m "feat(sessions): compute opencode TokenSummary via injected model-
         assert!(usage.get("compactThresholdTokens").is_none());
         assert!(usage.get("compactPercent").is_none());
     }
+
+    #[tokio::test]
+    async fn opencode_items_with_zero_context_limits_omit_window_and_meter_fields() {
+        // F1's wire contract: a RESOLVED zero-context limit must NOT emit
+        // modelContextWindow at all (zod `.positive()` — a 0 would reject the
+        // whole page parse at api.ts:646/:681). Same fixture; the resolver
+        // maps the model to {context: 0, input: None, output: None}.
+        // ... mirror the first test's construction with the zero-context resolver ...
+        let usage = &item["tokenUsage"];
+        assert_eq!(usage["inputTokens"], 31);
+        assert!(usage.get("modelContextWindow").is_none());
+        assert!(usage.get("compactThresholdTokens").is_none());
+        assert!(usage.get("compactPercent").is_none());
+    }
 ```
 
 (Adapt the request-building and app-construction helpers to the file's real test scaffolding — the neighboring tests are the authoritative harness shape; keep the JSON assertions byte-exact as written.)
@@ -1292,6 +1406,12 @@ Expected: PASS (comment-only client change) — run it here to catch accidental 
 //! `model id -> limits` into a sync-read snapshot; the resolver closure
 //! handed to `OpencodeSource` reads that snapshot. A cold or failed
 //! refresh keeps the meter unknown — the accepted graceful degradation.
+//! A refresh that GAINS entries marks the opencode provider dirty so the
+//! index re-lists and broadcasts without needing an opencode DB write (a
+//! warm snapshot alone would leave frozen DirectEntry rows meter-muted
+//! until unrelated activity). The resolver lookup is exact-match first
+//! with a single effort-suffix strip (opencode stores the runtime model as
+//! `model/effort`; the catalog keys base models only — live-verified).
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -1329,6 +1449,46 @@ pub(crate) fn merge_catalog(models: Vec<ModelCapability>, into: &mut HashMap<Str
             );
         }
     }
+}
+
+/// Snapshot lookup with the effort-variant fallback (F4): exact composite
+/// match first (`provider/model`); if that misses and the composite has 3+
+/// segments (`provider/model/effort` — opencode stores the runtime model
+/// with the effort suffix; live-verified the catalog keys only base
+/// models), strip ONE trailing segment and retry the base. Two-segment
+/// composites never strip (a stripped one-segment key could never match a
+/// snapshot key anyway — snapshot keys always contain a slash).
+/// Residual (accepted): a `provider/org/name/effort` id whose stripped base
+/// is configured resolves the base's limits — the same model family, the
+/// same base-then-variant resolution order opencode itself uses.
+pub(crate) fn resolve_from_snapshot(snap: &Snapshot, model: &str) -> Option<OpencodeModelLimits> {
+    let map = snap.read().ok()?;
+    if let Some(limits) = map.get(model) {
+        return Some(limits.clone());
+    }
+    if model.matches('/').count() >= 2 {
+        if let Some((base, _)) = model.rsplit_once('/') {
+            return map.get(base).cloned();
+        }
+    }
+    None
+}
+
+/// Upsert `fresh` into the snapshot; `true` when any entry is new or changed
+/// (the F2 re-list nudge signal). A poisoned lock returns false — the next
+/// cycle retries.
+pub(crate) fn upsert_limits(snap: &Snapshot, fresh: HashMap<String, OpencodeModelLimits>) -> bool {
+    let Ok(mut map) = snap.write() else {
+        return false;
+    };
+    let mut gained = false;
+    for (id, limits) in fresh {
+        if map.get(&id) != Some(&limits) {
+            gained = true;
+        }
+        map.insert(id, limits);
+    }
+    gained
 }
 
 /// The distinct cwds of the `window` most recent opencode sessions,
@@ -1372,10 +1532,15 @@ async fn refresh_once(
             Err(e) => tracing::debug!(cwd = %cwd, error = %e, "opencode per-cwd catalog probe failed; keeping previous model limits"),
         }
     }
-    if !fresh.is_empty() {
-        if let Ok(mut map) = snap.write() {
-            map.extend(fresh);
-        }
+    if upsert_limits(snap, fresh) {
+        // F2: the snapshot gained entries (first fill after boot, or a new
+        // model) — nudge a re-list so already-listed opencode rows pick the
+        // limits up without waiting for an unrelated opencode DB write
+        // (DirectEntry rows are change-token/dirty-gated only). The forced
+        // re-list counts as changed and advances the change generation, so
+        // `subscribe_changes` consumers broadcast and idle sessions' meters
+        // light up.
+        session_index.mark_provider_dirty("opencode");
     }
 }
 
@@ -1406,7 +1571,7 @@ pub async fn refresh_loop(
                 .with_model_limit_resolver({
                     let snap = opencode_limits.clone();
                     std::sync::Arc::new(move |model: &str| {
-                        snap.read().ok()?.get(model).cloned()
+                        opencode_limits::resolve_from_snapshot(&snap, model)
                     })
                 }),
             ) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
@@ -1466,6 +1631,8 @@ git commit -m "feat(server): wire opencode model limits into the session-directo
 ## Coverage summary (why no new Playwright spec)
 
 The client needs zero functional changes: the wire chain (`DirItem.tokenUsage` → `contextUsageExtras` → `sessionsSlice.contextUsageByKey` → `guardContextUsageTokenSummary` → `FreshAgentStatusStrip`) is provider-agnostic and already covered by `test/unit/client/components/fresh-agent/FreshAgentStatusStrip.test.tsx`, `FreshAgentView.test.tsx`, and `test/e2e-browser/specs/fresh-agent.spec.ts` (which seeds the session indexer's tokenUsage directly — past the server seam this change modifies). The new behavior is the server data path, whose end-to-end proof is the `session_directory` integration test added in Task 4 (real fixture DB → real parser → real index → real axum router → exact wire JSON), plus the Task 2/3 parser and indexer tests over real-schema fixture DBs. `docs/index.html` shows the meter provider-agnostically and needs no change.
+
+Out-of-scope pre-existing finding (recorded, not addressed — scope rule): `parse/codex.rs:189`/`:234` can emit a non-positive `model_context_window` verbatim (`to_finite_number` filters only non-finiteness, not sign), which would violate the same zod `.positive()` rule today; sampled real rollouts carry 258400 (clean). Suggested follow-up: a one-line sign gate in the codex parser. This plan adds no new violating arm — the opencode arm gates per Task 3.
 
 ## Plan-code status
 
