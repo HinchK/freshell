@@ -377,7 +377,7 @@ test.describe('OpenCode signal-driven rebind (Rust only)', () => {
       const pane1AfterRebind = await findLeafById(tabId!, pane1Id)
       expect(pane1AfterRebind?.content?.status).not.toBe('error')
 
-      // ── Leg 4: reload persistence — freshell.layout.v3 carries the new id.
+      // ── Leg 4: reload persistence — the per-window layout key carries the new id.
       await page.evaluate(() => {
         (window as any).__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
       })
@@ -390,8 +390,8 @@ test.describe('OpenCode signal-driven rebind (Rust only)', () => {
       }, { timeout: 30_000 }).toBe(sesB)
       const persistedRaw: string = await page.evaluate(() => {
         (window as any).__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
-        const raw = window.localStorage.getItem('freshell.layout.v3')
-        if (!raw) throw new Error('Missing persisted layout freshell.layout.v3')
+        const raw = window.localStorage.getItem(`freshell.layout.v3.${sessionStorage.getItem('freshell.tabs.client-instance-id.v1')}`)
+        if (!raw) throw new Error('Missing persisted per-window layout')
         return raw
       })
       const persisted = JSON.parse(persistedRaw)

@@ -17,9 +17,13 @@ import {
 } from '@/store/persistControl'
 import tabsReducer, { addTab, updateTab } from '@/store/tabsSlice'
 
+const WINDOW_ID = 'client-persist-control-tests'
+const OWN_LAYOUT_KEY = `freshell.layout.v3.${WINDOW_ID}`
+
 describe('persistControl', () => {
   beforeEach(() => {
     localStorage.clear()
+    sessionStorage.setItem('freshell.tabs.client-instance-id.v1', WINDOW_ID)
     vi.useFakeTimers()
     resetPersistFlushListenersForTests()
     resetPersistedLayoutCacheForTests()
@@ -48,14 +52,14 @@ describe('persistControl', () => {
     }))
     vi.runAllTimers()
 
-    const baselineRaw = localStorage.getItem('freshell.layout.v3')
+    const baselineRaw = localStorage.getItem(OWN_LAYOUT_KEY)
     store.dispatch(updateTab({ id: 'tab-1', updates: { title: 'Renamed' } }))
 
-    expect(localStorage.getItem('freshell.layout.v3')).toBe(baselineRaw)
+    expect(localStorage.getItem(OWN_LAYOUT_KEY)).toBe(baselineRaw)
 
     store.dispatch(flushPersistedLayoutNow())
 
-    const raw = localStorage.getItem('freshell.layout.v3')
+    const raw = localStorage.getItem(OWN_LAYOUT_KEY)
     expect(raw).not.toBeNull()
     expect(JSON.parse(raw!).tabs.tabs[0].title).toBe('Renamed')
   })

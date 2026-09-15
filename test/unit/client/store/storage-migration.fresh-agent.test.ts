@@ -1,10 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const LAYOUT_KEY = 'freshell.layout.v3'
-const BACKUP_KEY = 'freshell.layout.v3.backup-before-fresh-agent-centralization'
-const MARKER_KEY = 'freshell.layout.v3.fresh-agent-centralization-commit'
-const PENDING_KEY = 'freshell.layout.v3.fresh-agent-centralization-pending'
-const SIDECAR_KEY = 'freshell.layout.pre-migration-raw.v1'
+// Delta round 3, finding 1: the fresh-agent centralization migration's
+// backup/marker/sidecar channels are per-window key suffixes — two windows
+// migrating concurrently must not cross-contaminate recovery state.
+const WINDOW_ID = 'client-fresh-agent-migration'
+const LAYOUT_KEY = `freshell.layout.v3.${WINDOW_ID}`
+const BACKUP_KEY = `freshell.layout.v3.${WINDOW_ID}.backup-before-fresh-agent-centralization`
+const MARKER_KEY = `freshell.layout.v3.${WINDOW_ID}.fresh-agent-centralization-commit`
+const PENDING_KEY = `freshell.layout.v3.${WINDOW_ID}.fresh-agent-centralization-pending`
+const SIDECAR_KEY = `freshell.layout.pre-migration-raw.v1.${WINDOW_ID}`
 const VERSION_KEY = 'freshell_version'
 
 type StorageHooks = {
@@ -143,6 +147,7 @@ function makeLargeLegacyLayoutRaw(): string {
 describe('storage-migration fresh-agent', () => {
   beforeEach(() => {
     vi.resetModules()
+    sessionStorage.setItem('freshell.tabs.client-instance-id.v1', WINDOW_ID)
   })
 
   it('does not clear freshell layout storage during the fresh-agent migration', async () => {

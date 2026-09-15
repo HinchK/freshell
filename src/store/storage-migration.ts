@@ -26,7 +26,17 @@ import {
   parseLayoutFreshAgentCommitMarker,
   readRecoverablePersistedLayoutRaw,
 } from './persistedState'
-import { BROWSER_PREFERENCES_STORAGE_KEY, LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY, LAYOUT_STORAGE_KEY } from './storage-keys'
+import { BROWSER_PREFERENCES_STORAGE_KEY } from './storage-keys'
+import {
+  LEGACY_LAYOUT_STORAGE_KEY,
+  LAYOUT_PRE_MIGRATION_RAW_KEY_PREFIX,
+  LAYOUT_STORAGE_KEY_PREFIX,
+  getWindowFreshAgentBackupKey,
+  getWindowFreshAgentCommitMarkerKey,
+  getWindowFreshAgentPendingMarkerKey,
+  getWindowLayoutKey,
+  getWindowLayoutPreMigrationRawKey,
+} from './window-layout-keys'
 import {
   buildRestoreError,
   migrateLegacyTerminalDurableState,
@@ -64,12 +74,19 @@ function readStorageVersion(): number {
   return Number.isFinite(parsed) ? parsed : 0
 }
 
-function clearFreshellKeysExcept(keep: string[]): void {
+function clearFreshellKeysExcept(keep: string[], keepPrefixes: string[] = []): void {
+  // Delta round 3, finding 1: the layout family and the pre-migration
+  // evidence sidecars are keyed per window, so the version-bump wipe keeps
+  // whole PREFIXES — every window's derived envelope, its .bak and
+  // fresh-agent channels, and its sidecar — plus the legacy keys (the
+  // layout prefix covers the bare legacy key, the legacy .bak, and the
+  // legacy centralization channels; they are never deleted either).
   const keepSet = new Set(keep)
   for (const key of Object.keys(localStorage)) {
-    if ((key.startsWith('freshell.') || key === STORAGE_VERSION_KEY) && !keepSet.has(key)) {
-      localStorage.removeItem(key)
-    }
+    if (!(key.startsWith('freshell.') || key === STORAGE_VERSION_KEY)) continue
+    if (keepSet.has(key)) continue
+    if (keepPrefixes.some((prefix) => key.startsWith(prefix))) continue
+    localStorage.removeItem(key)
   }
 }
 
@@ -139,9 +156,9 @@ function readRestoreError(value: unknown): RestoreError | undefined {
 }
 
 function hasFreshAgentLayoutMigrationMarkerForCurrentRaw(): boolean {
-  const raw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+  const raw = localStorage.getItem(getWindowLayoutKey())
   if (!raw) return false
-  const marker = parseLayoutFreshAgentCommitMarker(localStorage.getItem(LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY))
+  const marker = parseLayoutFreshAgentCommitMarker(localStorage.getItem(getWindowFreshAgentCommitMarkerKey()))
   return marker?.migratedHash === hashPersistedLayoutRaw(raw)
 }
 
@@ -299,8 +316,9 @@ function normalizeLayoutNode(node: unknown): unknown {
 // this boot (marker-guard held) — then the stored raw is its own
 // pre-migration truth. One browser window is one JS realm, so one
 // capture per boot is the correct scope; the rewrite ALSO mirrors this
-// raw into the DURABLE pre-migration evidence sidecar
-// (LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY) because this capture is empty
+// raw into the DURABLE per-window pre-migration evidence sidecar
+// (freshell.layout.pre-migration-raw.v1.<clientInstanceId>) because this
+// capture is empty
 // again after a reload — see writeMigratedLayoutWithRecovery (e2r4
 // review finding 1).
 let preMigrationLayoutRaw: string | null = null
@@ -310,32 +328,36 @@ export function getPreMigrationLayoutRaw(): string | null {
 }
 
 function writeMigratedLayoutWithRecovery(originalRaw: string, migratedRaw: string, expectedCurrentRaw: string): boolean {
+  const layoutKey = getWindowLayoutKey()
+  const backupKey = getWindowFreshAgentBackupKey()
+  const commitMarkerKey = getWindowFreshAgentCommitMarkerKey()
+  const pendingMarkerKey = getWindowFreshAgentPendingMarkerKey()
   try {
-    localStorage.setItem(LAYOUT_FRESH_AGENT_BACKUP_KEY, originalRaw)
+    localStorage.setItem(backupKey, originalRaw)
   } catch (error) {
     warnStructured('fresh_agent_layout_backup_write_failed', {
-      key: LAYOUT_FRESH_AGENT_BACKUP_KEY,
+      key: backupKey,
       error: error instanceof Error ? error.message : String(error),
     })
     return false
   }
 
-  const currentRaw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+  const currentRaw = localStorage.getItem(layoutKey)
   if (currentRaw !== expectedCurrentRaw) {
     try {
-      localStorage.removeItem(LAYOUT_FRESH_AGENT_BACKUP_KEY)
-      localStorage.removeItem(LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY)
-      localStorage.removeItem(LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY)
+      localStorage.removeItem(backupKey)
+      localStorage.removeItem(commitMarkerKey)
+      localStorage.removeItem(pendingMarkerKey)
     } catch (error) {
       warnStructured('fresh_agent_layout_interleaving_cleanup_failed', {
-        backupKey: LAYOUT_FRESH_AGENT_BACKUP_KEY,
-        markerKey: LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY,
-        pendingMarkerKey: LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY,
+        backupKey,
+        markerKey: commitMarkerKey,
+        pendingMarkerKey,
         error: error instanceof Error ? error.message : String(error),
       })
     }
     warnStructured('fresh_agent_layout_interleaving_write_detected', {
-      key: LAYOUT_STORAGE_KEY,
+      key: layoutKey,
     })
     return false
   }
@@ -350,11 +372,11 @@ function writeMigratedLayoutWithRecovery(originalRaw: string, migratedRaw: strin
   })
 
   try {
-    localStorage.removeItem(LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY)
-    localStorage.setItem(LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY, pendingMarkerRaw)
+    localStorage.removeItem(commitMarkerKey)
+    localStorage.setItem(pendingMarkerKey, pendingMarkerRaw)
   } catch (error) {
     warnStructured('fresh_agent_layout_pending_marker_write_failed', {
-      key: LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY,
+      key: pendingMarkerKey,
       error: error instanceof Error ? error.message : String(error),
     })
     return false
@@ -368,34 +390,34 @@ function writeMigratedLayoutWithRecovery(originalRaw: string, migratedRaw: strin
   // original corrupt raw. A failed write only warns; this boot still
   // classifies through the process-local capture.
   try {
-    if (localStorage.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY) === null) {
-      localStorage.setItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY, originalRaw)
+    if (localStorage.getItem(getWindowLayoutPreMigrationRawKey()) === null) {
+      localStorage.setItem(getWindowLayoutPreMigrationRawKey(), originalRaw)
     }
   } catch (error) {
     warnStructured('fresh_agent_layout_evidence_write_failed', {
-      key: LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY,
+      key: getWindowLayoutPreMigrationRawKey(),
       error: error instanceof Error ? error.message : String(error),
     })
   }
 
   preMigrationLayoutRaw = originalRaw
   try {
-    localStorage.setItem(LAYOUT_STORAGE_KEY, migratedRaw)
+    localStorage.setItem(layoutKey, migratedRaw)
   } catch (error) {
     try {
-      localStorage.removeItem(LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY)
+      localStorage.removeItem(pendingMarkerKey)
     } catch {
       // keep the original write failure as the useful signal
     }
     warnStructured('fresh_agent_layout_write_failed', {
-      key: LAYOUT_STORAGE_KEY,
+      key: layoutKey,
       error: error instanceof Error ? error.message : String(error),
     })
     return false
   }
 
   try {
-    localStorage.setItem(LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY, JSON.stringify({
+    localStorage.setItem(commitMarkerKey, JSON.stringify({
       version: 1,
       migration: LAYOUT_FRESH_AGENT_MIGRATION_ID,
       backupKey: LAYOUT_FRESH_AGENT_BACKUP_KEY,
@@ -405,17 +427,17 @@ function writeMigratedLayoutWithRecovery(originalRaw: string, migratedRaw: strin
     }))
   } catch (error) {
     warnStructured('fresh_agent_layout_commit_marker_write_failed', {
-      key: LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY,
+      key: commitMarkerKey,
       error: error instanceof Error ? error.message : String(error),
     })
     return false
   }
 
   try {
-    localStorage.removeItem(LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY)
+    localStorage.removeItem(pendingMarkerKey)
   } catch (error) {
     warnStructured('fresh_agent_layout_pending_marker_cleanup_failed', {
-      key: LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY,
+      key: pendingMarkerKey,
       error: error instanceof Error ? error.message : String(error),
     })
   }
@@ -424,7 +446,7 @@ function writeMigratedLayoutWithRecovery(originalRaw: string, migratedRaw: strin
 }
 
 function migratePersistedLayout(): PersistedLayoutMigrationResult {
-  const expectedCurrentRaw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+  const expectedCurrentRaw = localStorage.getItem(getWindowLayoutKey())
   const raw = readRecoverablePersistedLayoutRaw()
   if (!raw) return 'none'
 
@@ -487,14 +509,41 @@ function preservePersistedLayout(): PersistedLayoutMigrationResult {
   return migratePersistedLayout()
 }
 
+/** One-time LEGACY adoption (delta round 3, finding 1): when this window's
+ * derived per-window layout key is ABSENT but the pre-change origin-wide
+ * key exists — the single-window migration path — adopt the legacy
+ * envelope as this window's own: a byte-identical copy into the derived
+ * key, which the normal preserve/migrate flow below then migrates exactly
+ * as today. The legacy key is NEVER deleted: other live pre-change windows
+ * may still read it, and new windows without an envelope rebuild via the
+ * machine-bootstrap inventory. Adoption runs only when the derived key is
+ * absent — a window that already has its own envelope ignores later
+ * legacy-key writes from pre-change windows. */
+function adoptLegacyLayoutIntoWindowKey(): void {
+  const ownKey = getWindowLayoutKey()
+  try {
+    if (localStorage.getItem(ownKey) !== null) return
+    const legacyRaw = localStorage.getItem(LEGACY_LAYOUT_STORAGE_KEY)
+    if (legacyRaw === null) return
+    localStorage.setItem(ownKey, legacyRaw)
+    log.info('Adopted the legacy layout envelope into this window\u2019s per-window key.')
+  } catch (error) {
+    warnStructured('layout_legacy_adoption_write_failed', {
+      key: ownKey,
+      error: error instanceof Error ? error.message : String(error),
+    })
+  }
+}
+
 export function runStorageMigration(): void {
   try {
+    adoptLegacyLayoutIntoWindowKey()
     const currentVersion = readStorageVersion()
     if (currentVersion >= STORAGE_VERSION) {
       const migratedLayout = preservePersistedLayout()
       if (migratedLayout === 'failed') {
         warnStructured('fresh_agent_layout_migration_aborted', {
-          key: LAYOUT_STORAGE_KEY,
+          key: getWindowLayoutKey(),
         })
       }
       if (migratedLayout === 'migrated') {
@@ -507,19 +556,24 @@ export function runStorageMigration(): void {
     const migratedLayout = preservePersistedLayout()
     if (migratedLayout === 'failed') {
       warnStructured('fresh_agent_layout_migration_aborted', {
-        key: LAYOUT_STORAGE_KEY,
+        key: getWindowLayoutKey(),
       })
       return
     }
-    clearFreshellKeysExcept([
-      AUTH_STORAGE_KEY,
-      BROWSER_PREFERENCES_STORAGE_KEY,
-      LAYOUT_STORAGE_KEY,
-      LAYOUT_FRESH_AGENT_BACKUP_KEY,
-      LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY,
-      LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY,
-      ...LEGACY_BROWSER_PREFERENCE_KEYS,
-    ])
+    clearFreshellKeysExcept(
+      [
+        AUTH_STORAGE_KEY,
+        BROWSER_PREFERENCES_STORAGE_KEY,
+        ...LEGACY_BROWSER_PREFERENCE_KEYS,
+      ],
+      [
+        // Every window's envelope, .bak, fresh-agent channels, and
+        // pre-migration evidence sidecar — plus the never-deleted legacy
+        // shapes of all of them (covered by the same prefixes).
+        LAYOUT_STORAGE_KEY_PREFIX,
+        LAYOUT_PRE_MIGRATION_RAW_KEY_PREFIX,
+      ],
+    )
 
     if (preservedAuthToken) {
       localStorage.setItem(AUTH_STORAGE_KEY, preservedAuthToken)

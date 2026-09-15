@@ -1,9 +1,20 @@
 import { parsePersistedLayoutRaw, type ParsedPersistedLayout } from '@/store/persistedState'
 import { isWellFormedPaneTree } from '@/store/paneTreeValidation'
-import { LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY, LAYOUT_STORAGE_KEY } from '@/store/storage-keys'
+import type { TerminalStatus } from '@/store/types'
 import { getPreMigrationLayoutRaw } from '@/store/storage-migration'
 import { LEGACY_FRESHOPENCODE_DEFAULT_MODEL } from '@/store/paneTypes'
+import { getWindowLayoutKey, getWindowLayoutPreMigrationRawKey } from '@/store/window-layout-keys'
 import { sanitizeRestoreError, sanitizeSessionRef } from '@shared/session-contract'
+
+/** The real TerminalStatus union (src/store/types.ts:1), as a runtime set.
+ * The typed Set constructor pins the members to the union at compile time. */
+const TERMINAL_STATUS_SET = new Set<TerminalStatus>([
+  'creating',
+  'running',
+  'recovering',
+  'exited',
+  'error',
+])
 
 /** A local layout older than this rebuilds from the server instead of being
  * kept. 7 days is far beyond any terminal lifetime (15-minute default idle
@@ -21,14 +32,17 @@ function safeStorage(): Storage | undefined {
 }
 
 /** The durable pre-migration evidence sidecar (e2r4 review finding 1):
- * the OLDEST pre-rewrite `freshell.layout.v3` raw, written by the boot
- * migration's forced-rewrite path only while the key holds no value
- * (oldest evidence wins) and spared by the version-bump wipe. Null when
- * no rewrite ever captured evidence (or the key was consumed below). */
+ * the OLDEST pre-rewrite raw of THIS window's per-window layout key
+ * (freshell.layout.pre-migration-raw.v1.<clientInstanceId> — per-window
+ * since delta round 3, finding 1: two windows migrating concurrently must
+ * not cross-contaminate evidence), written by the boot migration's
+ * forced-rewrite path only while the key holds no value (oldest evidence
+ * wins) and spared by the version-bump wipe. Null when no rewrite ever
+ * captured evidence (or the key was consumed below). */
 function readPreMigrationEvidenceRaw(storage: Storage | undefined): string | null {
   if (!storage) return null
   try {
-    return storage.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)
+    return storage.getItem(getWindowLayoutPreMigrationRawKey())
   } catch {
     return null
   }
@@ -64,7 +78,7 @@ export function resetPreMigrationEvidenceArmForTests(): void {
 function clearPreMigrationLayoutEvidenceKey(storage: Storage | undefined): boolean {
   if (!storage) return false
   try {
-    storage.removeItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)
+    storage.removeItem(getWindowLayoutPreMigrationRawKey())
     return true
   } catch {
     // retention is fail-safe; nothing user-visible to report
@@ -350,6 +364,60 @@ function hasAliasedNodeIds(node: unknown, seenIds: Set<string>): boolean {
   return false
 }
 
+/** Content lifecycle invariants over the PARSED pane trees (delta review
+ * round 3, finding 3): isWellFormedPaneTree only checks
+ * createRequestId/status/mode are STRINGS, so empty createRequestIds,
+ * duplicate createRequestIds across terminal panes, non-union statuses,
+ * and empty modes all passed while the loader silently heals or the server
+ * rejects/dedupes the creates —
+ * - an EMPTY createRequestId: the loader mints a fresh nanoid identity
+ *   (persistMiddleware migratePaneContent `createRequestId || nanoid()`,
+ *   panesSlice normalizePaneContent :79-81), silently losing the pane's
+ *   durable terminal binding; the wire schema would reject it outright
+ *   (TerminalCreateSchema requestId z.string().min(1),
+ *   shared/ws-protocol.ts:468) and the reconcile path answers
+ *   missing_create_request_id invalid (crates/freshell-ws/src/reconcile.rs:245).
+ * - a DUPLICATE createRequestId across terminal panes: the server's
+ *   single-flight create-dedupe ADOPTS the existing live terminal for a
+ *   repeated key (crates/freshell-ws/src/terminal.rs:2884-2933 — "a create
+ *   whose createRequestId already has a live terminal ADOPTS it"), so both
+ *   panes would alias onto ONE PTY, and the reconcile derivation flags
+ *   duplicate_create_request_id within one request (reconcile.rs:56-59).
+ * - a status outside the TerminalStatus union: no loader normalizes pane
+ *   content status (migratePaneContent only heals falsy → 'creating';
+ *   panesSlice normalizePaneContent keeps any string), so an unsupported
+ *   status installs verbatim.
+ * - an EMPTY mode: the load path silently substitutes 'shell'
+ *   (migratePaneContent `mode || 'shell'`), so a mode-wiped CLI pane
+ *   reopens as a shell — identity loss. The valid mode set per the
+ *   protocol is 'shell' | a non-empty provider string (TabMode,
+ *   src/store/types.ts:29; CodingCliProviderSchema z.string().min(1),
+ *   shared/ws-protocol.ts:47) — the wire accepts any string, so the
+ *   enforceable invariant is exactly non-empty. */
+function hasLifecycleInvalidTerminalContent(node: unknown, seenCreateRequestIds: Set<string>): boolean {
+  const n = node as {
+    type?: string
+    content?: { kind?: unknown; createRequestId?: unknown; status?: unknown; mode?: unknown }
+    children?: unknown[]
+  } | null
+  if (!n || typeof n !== 'object') return false
+  if (n.type === 'leaf') {
+    const content = n.content
+    if (!content || typeof content !== 'object' || content.kind !== 'terminal') return false
+    const createRequestId = content.createRequestId
+    if (typeof createRequestId !== 'string' || createRequestId.length === 0) return true
+    if (seenCreateRequestIds.has(createRequestId)) return true
+    seenCreateRequestIds.add(createRequestId)
+    if (typeof content.status !== 'string' || !TERMINAL_STATUS_SET.has(content.status as TerminalStatus)) return true
+    if (typeof content.mode !== 'string' || content.mode.length === 0) return true
+    return false
+  }
+  for (const child of n.children ?? []) {
+    if (hasLifecycleInvalidTerminalContent(child, seenCreateRequestIds)) return true
+  }
+  return false
+}
+
 /** Classify the persisted layout envelope for the machine this boot
  * resolved. Reads only localStorage; no network.
  *
@@ -363,6 +431,10 @@ function hasAliasedNodeIds(node: unknown, seenIds: Set<string>): boolean {
  *             identities are aliased (a duplicate tab id, or a duplicate
  *             or empty node id — split or leaf; legit flushes mint unique
  *             non-empty ids, so aliases are corruption by definition),
+ *             terminal pane content violates the lifecycle invariants
+ *             (an empty or envelope-wide duplicate createRequestId, a
+ *             status outside the TerminalStatus union, or an empty mode —
+ *             see hasLifecycleInvalidTerminalContent),
  *             referential integrity is broken (a layout entry without its
  *             tab, or a tab without its layout entry), or an active
  *             reference is missing/dangling (activeTabId not a parsed tab
@@ -389,7 +461,7 @@ export function classifyPersistedLayoutHealth(
   const now = opts.now ?? Date.now()
   let raw: string | null = null
   try {
-    raw = storage?.getItem(LAYOUT_STORAGE_KEY) ?? null
+    raw = storage?.getItem(getWindowLayoutKey()) ?? null
   } catch {
     return 'absent'
   }
@@ -417,9 +489,11 @@ export function classifyPersistedLayoutHealth(
   // z.unknown while paneTreeValidation only checks typeof id === 'string'
   // — so without this check a corrupt-cache state classifies healthy.
   const seenNodeIds = new Set<string>()
+  const seenTerminalCreateRequestIds = new Set<string>()
   for (const layout of Object.values(parsed.panes?.layouts ?? {})) {
     if (!isWellFormedPaneTree(layout)) return 'corrupt'
     if (hasAliasedNodeIds(layout, seenNodeIds)) return 'corrupt'
+    if (hasLifecycleInvalidTerminalContent(layout, seenTerminalCreateRequestIds)) return 'corrupt'
   }
   // Parse-level salvage drops rows SILENTLY (persistedState.ts salvageTabs
   // :88-102 — one structurally-invalid tab is dropped while the rest parse),
@@ -574,7 +648,7 @@ export function backfillPersistedLayoutMachineId(
   if (!resolvedMachineId || !storage) return false
   let raw: string | null = null
   try {
-    raw = storage.getItem(LAYOUT_STORAGE_KEY)
+    raw = storage.getItem(getWindowLayoutKey())
   } catch {
     return false
   }
@@ -596,7 +670,7 @@ export function backfillPersistedLayoutMachineId(
   if (typeof rawEnvelope.machineId === 'string' && rawEnvelope.machineId) return false
   rawEnvelope.machineId = resolvedMachineId
   try {
-    storage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(rawEnvelope))
+    storage.setItem(getWindowLayoutKey(), JSON.stringify(rawEnvelope))
     return true
   } catch {
     return false

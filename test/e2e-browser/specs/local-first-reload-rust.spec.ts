@@ -173,7 +173,8 @@ test.describe('local-first machine workspace', () => {
 
     // Wait until the registry pushed generations AND the persisted envelope
     // carries the stamp + both tabs (fs-poll generation files under the
-    // server home; localStorage poll for freshell.layout.v3). The page's
+    // server home; localStorage poll for the page's per-window layout key).
+    // The page's
     // clientInstanceId lives in sessionStorage (storage-keys.ts:20 — the
     // natural reload preserves it, which is what makes the
     // `machine-bootstrap:` prefix load-bearing in Scenario 2).
@@ -199,18 +200,22 @@ test.describe('local-first machine workspace', () => {
     // The corruption must land in storage at teardown, AFTER the live
     // page's own persist middleware flushes its healthy in-memory state:
     // the debounced flush and the pagehide/beforeunload flushNow both
-    // rewrite freshell.layout.v3, so corrupting from a live page is always
-    // overwritten before the next boot reads it. Listeners registered here
-    // run AFTER the middleware's own (attached at module init), so the
-    // keys are corrupted last and no further write can precede the next
-    // boot. Both the primary envelope AND the pre-migration backup key must
-    // go: readRecoverablePersistedLayoutRaw (persistedState.ts:523) heals
-    // a primary that does not parse from the backup, which every boot's
-    // migration keeps fresh.
+    // rewrite the page's per-window layout key
+    // (freshell.layout.v3.<clientInstanceId>), so corrupting from a live
+    // page is always overwritten before the next boot reads it. Listeners
+    // registered here run AFTER the middleware's own (attached at module
+    // init), so the keys are corrupted last and no further write can
+    // precede the next boot. Both the primary envelope AND the window's
+    // per-window fresh-agent backup key must go:
+    // readRecoverablePersistedLayoutRaw (persistedState.ts) heals a
+    // primary that does not parse from the backup, which every boot's
+    // migration keeps fresh. The sessionStorage clientInstanceId survives
+    // the reload, so the derived key is stable across it.
     await page.evaluate(() => {
       const corrupt = () => {
-        localStorage.setItem('freshell.layout.v3', '{corrupted-by-e2e')
-        localStorage.setItem('freshell.layout.v3.backup-before-fresh-agent-centralization', '{corrupted-by-e2e')
+        const layoutKey = `freshell.layout.v3.${sessionStorage.getItem('freshell.tabs.client-instance-id.v1')}`
+        localStorage.setItem(layoutKey, '{corrupted-by-e2e')
+        localStorage.setItem(`${layoutKey}.backup-before-fresh-agent-centralization`, '{corrupted-by-e2e')
       }
       window.addEventListener('beforeunload', corrupt)
       window.addEventListener('pagehide', corrupt)
@@ -271,26 +276,33 @@ test.describe('local-first machine workspace', () => {
 
     // page2 sets a NEWER non-user-set pane title and forces an immediate
     // flush (the donor's flushPersistedLayout idiom, multi-client.spec.ts:
-    // 177-185: dispatch 'persist/flushNow'), then poll the shared envelope
-    // until it carries the new title — capturing its persistedAt as tLocal
-    // (page2's local stamp).
+    // 177-185: dispatch 'persist/flushNow'), then poll PAGE2's OWN
+    // per-window envelope (delta round 3: the flush writes page2's key —
+    // under the old shared key this poll read the same bytes page2 just
+    // wrote) until it carries the new title — capturing its persistedAt as
+    // tLocal (page2's local stamp).
     await page2.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.dispatch({
       type: 'panes/updatePaneTitle',
       payload: { tabId: 'tab-mango', paneId: 'tab-mango-pane', title: 'Newer local title', setByUser: false },
     }))
     await page2.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' }))
-    const tLocal = await waitForPersistedEnvelopeTitled(page, 'Newer local title')
+    const tLocal = await waitForPersistedEnvelopeTitled(page2, 'Newer local title')
 
     // Let page1's response settle BEFORE staging: page2's flush fires a
-    // storage event on page1, whose crossTabSync hydrates and schedules its
-    // own debounced reflush — wait that cycle out so the staged write below
-    // is the LAST envelope write.
+    // storage event on page1 (carrying page2's per-window key), whose
+    // crossTabSync hydrates the newer title into page1's Redux state (the
+    // hydrate dispatches are skipPersist, so page1 schedules no reflush of
+    // its own) — wait any cycle out so the staged write below is the LAST
+    // envelope write.
     await page.waitForTimeout(2_000)
 
-    // Stage the STALE remote: from page1, mutate the shared localStorage
+    // Stage the STALE remote: from page1, mutate PAGE2's OWN per-window
     // envelope in place — same JSON, the pane title reverted, persistedAt
-    // 60s OLDER than page2's local stamp. page1's write fires a storage
-    // event on page2 only — the real crossTabSync path hydrates page2 with
+    // 60s OLDER than page2's local stamp (delta round 3, finding 1: the
+    // staging must target page2's own derived key, read from its
+    // sessionStorage clientInstanceId). page1's cross-document write fires
+    // a storage event on page2 carrying page2's own key — the real
+    // crossTabSync prefix subscription hydrates page2 with
     // remoteLayoutPersistedAt < localLayoutPersistedAt.
     // Envelope shape verified against the real writer/reader:
     //  - paneTitles live at panes.paneTitles (persistMiddleware.ts:625-654
@@ -300,17 +312,20 @@ test.describe('local-first machine workspace', () => {
     //    threw — fixed.
     //  - persistedAt is TOP-LEVEL (persistMiddleware.ts:647, read at
     //    persistedState.ts:557).
-    //  - the storage key literal 'freshell.layout.v3' matches
-    //    LAYOUT_STORAGE_KEY (storage-keys.ts:2/:25).
+    //  - the layout key is the page's per-window key
+    //    freshell.layout.v3.<clientInstanceId> (window-layout-keys.ts).
     //  - Task 1's machineId is TOP-LEVEL; the staging touches ONLY the
     //    title and persistedAt, so the stamp (and everything else) is
     //    preserved.
-    await page.evaluate((tLocal) => {
-      const env = JSON.parse(localStorage.getItem('freshell.layout.v3') ?? '{}')
+    const page2ClientInstanceId = await page2.evaluate(() => sessionStorage.getItem('freshell.tabs.client-instance-id.v1'))
+    expect(page2ClientInstanceId, 'page2 has a per-window clientInstanceId in sessionStorage').toBeTruthy()
+    await page.evaluate(([tLocal, clientInstanceId]) => {
+      const layoutKey = `freshell.layout.v3.${clientInstanceId}`
+      const env = JSON.parse(localStorage.getItem(layoutKey) ?? '{}')
       env.panes.paneTitles['tab-mango']['tab-mango-pane'] = 'Stale from page1'
       env.persistedAt = tLocal - 60_000
-      localStorage.setItem('freshell.layout.v3', JSON.stringify(env))
-    }, tLocal)
+      localStorage.setItem(layoutKey, JSON.stringify(env))
+    }, [tLocal, page2ClientInstanceId] as [number, string | null])
 
     // Bounded settle for the storage-event hydration, then ONE hard read (not a
     // poll — a poll could sample before the hydrate lands and false-pass).
@@ -324,7 +339,9 @@ test.describe('local-first machine workspace', () => {
 /** Bounded node-side poll for the persisted envelope to satisfy the
  * predicate: evaluate a plain JSON.parse read each round (no serialized
  * predicate, no `new Function`), assert the predicate in node, keep the
- * poll bounded (10s default) with a clear timeout error. */
+ * poll bounded (10s default) with a clear timeout error. Reads the page's
+ * per-window layout key (freshell.layout.v3.<clientInstanceId>, delta
+ * round 3, finding 1). */
 async function waitForPersistedEnvelope(
   page: Page,
   predicate: (env: Record<string, unknown>) => boolean,
@@ -334,7 +351,8 @@ async function waitForPersistedEnvelope(
   let last: Record<string, unknown> | null = null
   while (Date.now() < deadline) {
     const env = await page.evaluate(() => {
-      try { return JSON.parse(localStorage.getItem('freshell.layout.v3') ?? 'null') } catch { return null }
+      const layoutKey = `freshell.layout.v3.${sessionStorage.getItem('freshell.tabs.client-instance-id.v1')}`
+      try { return JSON.parse(localStorage.getItem(layoutKey) ?? 'null') } catch { return null }
     })
     if (env && predicate(env)) return
     last = env
@@ -346,7 +364,7 @@ async function waitForPersistedEnvelope(
   )
 }
 
-/** Bounded poll until the shared envelope's pane title equals the given
+/** Bounded poll until the page's envelope's pane title equals the given
  * value; resolves the envelope's persistedAt (the writer's stamp — tLocal
  * for the page2 flush this scenario tracks). Node-side predicate over one
  * plain JSON.parse read per round (same shape as waitForPersistedEnvelope). */
@@ -359,7 +377,8 @@ async function waitForPersistedEnvelopeTitled(
   while (Date.now() < deadline) {
     const persistedAt = await page.evaluate((title) => {
       try {
-        const env = JSON.parse(localStorage.getItem('freshell.layout.v3') ?? 'null')
+        const layoutKey = `freshell.layout.v3.${sessionStorage.getItem('freshell.tabs.client-instance-id.v1')}`
+        const env = JSON.parse(localStorage.getItem(layoutKey) ?? 'null')
         if (env?.panes?.paneTitles?.['tab-mango']?.['tab-mango-pane'] === title
           && typeof env.persistedAt === 'number') {
           return env.persistedAt

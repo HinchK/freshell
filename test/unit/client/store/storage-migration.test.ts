@@ -3,7 +3,13 @@ import { parsePersistedLayoutRaw } from '@/store/persistedState'
 import { BROWSER_PREFERENCES_STORAGE_KEY, PANES_STORAGE_KEY, TABS_STORAGE_KEY } from '@/store/storage-keys'
 
 const AUTH_STORAGE_KEY = 'freshell.auth-token'
-const LAYOUT_STORAGE_KEY = 'freshell.layout.v3'
+// Delta round 3, finding 1: the migration operates on THIS window's
+// per-window layout key; the bare freshell.layout.v3 stays as the LEGACY
+// adoption source (never deleted).
+const WINDOW_ID = 'client-migration-tests'
+const LAYOUT_STORAGE_KEY = `freshell.layout.v3.${WINDOW_ID}`
+const OWN_SIDECAR_KEY = `freshell.layout.pre-migration-raw.v1.${WINDOW_ID}`
+const LEGACY_SIDECAR_KEY = 'freshell.layout.pre-migration-raw.v1'
 const VALID_CLAUDE_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
 
 async function importFreshStorageMigration(): Promise<Record<string, unknown>> {
@@ -23,6 +29,7 @@ describe('storage-migration', () => {
   beforeEach(() => {
     localStorage.clear()
     sessionStorage.clear()
+    sessionStorage.setItem('freshell.tabs.client-instance-id.v1', WINDOW_ID)
     document.cookie = 'freshell-auth=; Max-Age=0; path=/'
   })
 
@@ -71,15 +78,19 @@ describe('storage-migration', () => {
     // The sidecar holds the OLDEST pre-rewrite raw the health classifier
     // needs after a reload (clearFreshellKeysExcept wipes every freshell.*
     // key on a version bump); it must sit on the wipe's keep list with the
-    // auth token and browser preferences.
+    // auth token and browser preferences. Delta round 3: the keep-list
+    // entry is the sidecar PREFIX — this window's per-window sidecar AND
+    // the pre-change shared sidecar both survive.
     localStorage.setItem('freshell_version', '2')
     localStorage.setItem(AUTH_STORAGE_KEY, 'token-123')
     localStorage.setItem('freshell.tabs.v1', 'legacy-tabs')
-    localStorage.setItem('freshell.layout.pre-migration-raw.v1', 'original-corrupt-raw')
+    localStorage.setItem(OWN_SIDECAR_KEY, 'original-corrupt-raw')
+    localStorage.setItem(LEGACY_SIDECAR_KEY, 'original-legacy-corrupt-raw')
 
     await importFreshStorageMigration()
 
-    expect(localStorage.getItem('freshell.layout.pre-migration-raw.v1')).toBe('original-corrupt-raw')
+    expect(localStorage.getItem(OWN_SIDECAR_KEY)).toBe('original-corrupt-raw')
+    expect(localStorage.getItem(LEGACY_SIDECAR_KEY)).toBe('original-legacy-corrupt-raw')
     expect(localStorage.getItem('freshell.tabs.v1')).toBeNull()
     expect(localStorage.getItem('freshell_version')).toBe('5')
   })

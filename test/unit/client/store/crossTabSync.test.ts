@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach, vi } from 'vitest'
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 
 import tabsReducer, { hydrateTabs } from '../../../../src/store/tabsSlice'
@@ -19,16 +19,30 @@ import {
   resetBrowserPreferencesFlushListenersForTests,
 } from '../../../../src/store/browserPreferencesPersistence'
 import { broadcastPersistedRaw, resetPersistBroadcastForTests } from '../../../../src/store/persistBroadcast'
-import { BROWSER_PREFERENCES_STORAGE_KEY, LAYOUT_STORAGE_KEY, MACHINE_ID_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY } from '../../../../src/store/storage-keys'
+import { BROWSER_PREFERENCES_STORAGE_KEY, MACHINE_ID_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY } from '../../../../src/store/storage-keys'
 import { resolveLocalSettings } from '@shared/settings'
 import { sessionMetadataKey } from '@/lib/session-metadata'
+
+// Delta round 3, finding 1: layout envelopes are keyed per window
+// (freshell.layout.v3.<clientInstanceId>). Storage events from OTHER
+// windows' keys run the incoming-hydrate path; this window's own key is
+// only ever written by this window.
+const TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY = 'freshell.tabs.client-instance-id.v1'
+const OWN_WINDOW_ID = 'client-crosstab-own'
+const OWN_LAYOUT_KEY = `freshell.layout.v3.${OWN_WINDOW_ID}`
+const REMOTE_LAYOUT_KEY = 'freshell.layout.v3.client-remote-window'
 
 describe('crossTabSync', () => {
   const cleanups: Array<() => void> = []
 
+  beforeEach(() => {
+    sessionStorage.setItem(TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY, OWN_WINDOW_ID)
+  })
+
   afterEach(() => {
     vi.useRealTimers()
     localStorage.clear()
+    sessionStorage.removeItem(TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY)
     vi.restoreAllMocks()
     resetBrowserPreferencesFlushListenersForTests()
     resetPersistFlushListenersForTests()
@@ -66,7 +80,7 @@ describe('crossTabSync', () => {
       tombstones: [],
     })
 
-    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: remoteRaw }))
+    window.dispatchEvent(new StorageEvent('storage', { key: REMOTE_LAYOUT_KEY, newValue: remoteRaw }))
 
     expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['t1', 't2', 't3'])
     expect(store.getState().tabs.activeTabId).toBe('t1')
@@ -120,7 +134,7 @@ describe('crossTabSync', () => {
       tombstones: [],
     })
 
-    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: remoteRaw }))
+    window.dispatchEvent(new StorageEvent('storage', { key: REMOTE_LAYOUT_KEY, newValue: remoteRaw }))
 
     expect(store.getState().panes.layouts['tab-1']?.id).toBe('split-remote')
     expect(store.getState().panes.activePane['tab-1']).toBe('pane-a')
@@ -177,7 +191,7 @@ describe('crossTabSync', () => {
       tombstones: [],
     })
 
-    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: remoteRaw }))
+    window.dispatchEvent(new StorageEvent('storage', { key: REMOTE_LAYOUT_KEY, newValue: remoteRaw }))
 
     const layout = store.getState().panes.layouts['tab-1'] as any
     expect(layout.content.resumeSessionId).toBe('123e4567-e89b-42d3-a456-426614174000')
@@ -249,7 +263,7 @@ describe('crossTabSync', () => {
       tombstones: [],
     })
 
-    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: remoteRaw }))
+    window.dispatchEvent(new StorageEvent('storage', { key: REMOTE_LAYOUT_KEY, newValue: remoteRaw }))
 
     const layout = store.getState().panes.layouts['tab-1'] as any
     expect(layout.content).toMatchObject({
@@ -329,7 +343,7 @@ describe('crossTabSync', () => {
       tombstones: [],
     })
 
-    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: remoteRaw }))
+    window.dispatchEvent(new StorageEvent('storage', { key: REMOTE_LAYOUT_KEY, newValue: remoteRaw }))
 
     const layout = store.getState().panes.layouts['tab-1'] as any
     expect(layout.content.sessionRef).toEqual({
@@ -365,9 +379,9 @@ describe('crossTabSync', () => {
         panes: { version: 6, layouts: {}, activePane: {}, paneTitles: {}, paneTitleSetByUser: {} },
         tombstones: [],
       })
-      window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: raw }))
+      window.dispatchEvent(new StorageEvent('storage', { key: REMOTE_LAYOUT_KEY, newValue: raw }))
 
-      MockBC.instance!.onmessage?.({ data: { type: 'persist', key: LAYOUT_STORAGE_KEY, raw, sourceId: 'other' } })
+      MockBC.instance!.onmessage?.({ data: { type: 'persist', key: REMOTE_LAYOUT_KEY, raw, sourceId: 'other' } })
 
       const hydrateCalls = dispatchSpy.mock.calls
         .map((c) => c[0])
@@ -595,7 +609,7 @@ describe('crossTabSync', () => {
 
     expect(store.getState().tabRecency.paneLastInputAt['pane-1']).toBe(1_740_000_000_000)
     vi.advanceTimersByTime(PERSIST_DEBOUNCE_MS)
-    expect(setItemSpy).not.toHaveBeenCalledWith(LAYOUT_STORAGE_KEY, expect.any(String))
+    expect(setItemSpy).not.toHaveBeenCalledWith(OWN_LAYOUT_KEY, expect.any(String))
     expect(setItemSpy).not.toHaveBeenCalledWith(TAB_RECENCY_STORAGE_KEY, expect.any(String))
   })
 
@@ -690,7 +704,7 @@ describe('crossTabSync', () => {
       'pane-shared': 1_740_000_120_000,
     })
     vi.advanceTimersByTime(PERSIST_DEBOUNCE_MS)
-    expect(setItemSpy).not.toHaveBeenCalledWith(LAYOUT_STORAGE_KEY, expect.any(String))
+    expect(setItemSpy).not.toHaveBeenCalledWith(OWN_LAYOUT_KEY, expect.any(String))
     expect(JSON.parse(localStorage.getItem(TAB_RECENCY_STORAGE_KEY) || '{}')).toEqual({
       version: 1,
       paneLastInputAt: {
@@ -843,7 +857,7 @@ describe('crossTabSync', () => {
     })
 
     cleanups.push(installCrossTabSync(store as any))
-    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: remoteRaw }))
+    window.dispatchEvent(new StorageEvent('storage', { key: REMOTE_LAYOUT_KEY, newValue: remoteRaw }))
 
     // Local terminalId should be preserved
     const content = (store.getState().panes.layouts['tab-1'] as any).content
@@ -903,7 +917,7 @@ describe('crossTabSync', () => {
     })
 
     cleanups.push(installCrossTabSync(store as any))
-    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: remoteRaw }))
+    window.dispatchEvent(new StorageEvent('storage', { key: REMOTE_LAYOUT_KEY, newValue: remoteRaw }))
 
     // Local reconnection state must be preserved — stale remote must not overwrite
     const content = (store.getState().panes.layouts['tab-1'] as any).content
@@ -962,7 +976,7 @@ describe('crossTabSync', () => {
     })
 
     cleanups.push(installCrossTabSync(store as any))
-    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: remoteRaw }))
+    window.dispatchEvent(new StorageEvent('storage', { key: REMOTE_LAYOUT_KEY, newValue: remoteRaw }))
 
     // Exit state should propagate — local should NOT keep stale terminalId
     const content = (store.getState().panes.layouts['tab-1'] as any).content
@@ -1021,7 +1035,7 @@ describe('crossTabSync', () => {
 
     // Should not throw — malformed remote data is ignored and local state wins.
     expect(() => {
-      window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: remoteRaw }))
+      window.dispatchEvent(new StorageEvent('storage', { key: REMOTE_LAYOUT_KEY, newValue: remoteRaw }))
     }).not.toThrow()
 
     expect(store.getState().panes.layouts['tab-1']).toEqual({
@@ -1090,7 +1104,7 @@ describe('crossTabSync', () => {
     })
 
     cleanups.push(installCrossTabSync(store as any))
-    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: remoteRaw }))
+    window.dispatchEvent(new StorageEvent('storage', { key: REMOTE_LAYOUT_KEY, newValue: remoteRaw }))
 
     // Local resumeSessionId must NOT be overwritten by remote
     const content = (store.getState().panes.layouts['tab-1'] as any).content
@@ -1100,7 +1114,11 @@ describe('crossTabSync', () => {
     expect(content.status).toBe('running')
   })
 
-  it('does not permanently dedupe: identical remote payload should hydrate again after a local persisted change', () => {
+  it('does not permanently dedupe: an identical payload hydrates again once the SAME key\u2019s raw changed in between', () => {
+    // Delta round 3: with per-window keys the dedupe map is per storage
+    // key. The pinned property survives in the per-key idiom — this
+    // window's own flush (a different key) can no longer re-arm ANOTHER
+    // window's dedupe entry; only that key's own raw change does.
     const dispatchSpy = vi.fn()
     const storeLike = {
       dispatch: dispatchSpy,
@@ -1115,22 +1133,54 @@ describe('crossTabSync', () => {
       panes: { version: 6, layouts: {}, activePane: {}, paneTitles: {}, paneTitleSetByUser: {} },
       tombstones: [],
     })
-    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: raw1 }))
+    window.dispatchEvent(new StorageEvent('storage', { key: REMOTE_LAYOUT_KEY, newValue: raw1 }))
 
     const raw2 = JSON.stringify({
       version: 3,
-      tabs: { activeTabId: null, tabs: [{ id: 't1', title: 'T1 local change', createdAt: 1 }] },
+      tabs: { activeTabId: null, tabs: [{ id: 't1', title: 'T1 changed remotely', createdAt: 1 }] },
       panes: { version: 6, layouts: {}, activePane: {}, paneTitles: {}, paneTitleSetByUser: {} },
       tombstones: [],
     })
-    broadcastPersistedRaw(LAYOUT_STORAGE_KEY, raw2)
+    window.dispatchEvent(new StorageEvent('storage', { key: REMOTE_LAYOUT_KEY, newValue: raw2 }))
 
-    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: raw1 }))
+    window.dispatchEvent(new StorageEvent('storage', { key: REMOTE_LAYOUT_KEY, newValue: raw1 }))
 
     const hydrateCalls = dispatchSpy.mock.calls
       .map((c) => c[0])
       .filter((a: any) => a?.type === 'tabs/hydrateTabs')
-    expect(hydrateCalls).toHaveLength(2)
+    expect(hydrateCalls).toHaveLength(3)
+  })
+
+  it('marks this window\u2019s own-key broadcast as processed without hydrating (the local flush path)', () => {
+    const dispatchSpy = vi.fn()
+    const storeLike = {
+      dispatch: dispatchSpy,
+      getState: () => ({ tabs: { activeTabId: null }, panes: { activePane: {} } }),
+    }
+
+    cleanups.push(installCrossTabSync(storeLike as any))
+
+    const raw = JSON.stringify({
+      version: 3,
+      tabs: { activeTabId: null, tabs: [{ id: 't1', title: 'T1', createdAt: 1 }] },
+      panes: { version: 6, layouts: {}, activePane: {}, paneTitles: {}, paneTitleSetByUser: {} },
+      tombstones: [],
+    })
+    // persistMiddleware broadcasts the window's own flush; the in-process
+    // listener records the raw in the dedupe map (a later identical
+    // STORAGE event for the same key is deduped) and never hydrates.
+    broadcastPersistedRaw(OWN_LAYOUT_KEY, raw)
+
+    let hydrateCalls = dispatchSpy.mock.calls
+      .map((c) => c[0])
+      .filter((a: any) => a?.type === 'tabs/hydrateTabs')
+    expect(hydrateCalls).toHaveLength(0)
+
+    window.dispatchEvent(new StorageEvent('storage', { key: OWN_LAYOUT_KEY, newValue: raw }))
+    hydrateCalls = dispatchSpy.mock.calls
+      .map((c) => c[0])
+      .filter((a: any) => a?.type === 'tabs/hydrateTabs')
+    expect(hydrateCalls).toHaveLength(0)
   })
 
   it('hydrates both tabs and panes from a single combined layout event', () => {
@@ -1161,7 +1211,7 @@ describe('crossTabSync', () => {
       tombstones: [],
     })
 
-    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: layoutRaw }))
+    window.dispatchEvent(new StorageEvent('storage', { key: REMOTE_LAYOUT_KEY, newValue: layoutRaw }))
 
     // Both tabs and panes should be hydrated from the single combined event
     expect(store.getState().tabs.tabs.map((t: any) => t.id)).toEqual(['t1', 't2'])
@@ -1220,7 +1270,7 @@ describe('crossTabSync', () => {
       paneTitles: {},
     }))
 
-    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify({
+    localStorage.setItem(OWN_LAYOUT_KEY, JSON.stringify({
       version: 3,
       persistedAt: 200,
       tabs: {
@@ -1320,7 +1370,7 @@ describe('crossTabSync', () => {
       tombstones: [],
     })
 
-    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: remoteRaw }))
+    window.dispatchEvent(new StorageEvent('storage', { key: REMOTE_LAYOUT_KEY, newValue: remoteRaw }))
 
     const paneContent = (store.getState().panes.layouts['tab-1'] as any).content
     expect(paneContent).toMatchObject({
@@ -1393,7 +1443,7 @@ describe('crossTabSync', () => {
       paneTitles: {},
     }))
 
-    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify({
+    localStorage.setItem(OWN_LAYOUT_KEY, JSON.stringify({
       version: 3,
       persistedAt: 200,
       tabs: {
@@ -1483,7 +1533,7 @@ describe('crossTabSync', () => {
       tombstones: [],
     })
 
-    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: remoteRaw }))
+    window.dispatchEvent(new StorageEvent('storage', { key: REMOTE_LAYOUT_KEY, newValue: remoteRaw }))
 
     const paneContent = (store.getState().panes.layouts['tab-1'] as any).content
     expect(paneContent).toMatchObject({
@@ -1547,7 +1597,7 @@ describe('crossTabSync', () => {
       paneTitles: {},
     }))
 
-    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify({
+    localStorage.setItem(OWN_LAYOUT_KEY, JSON.stringify({
       version: 3,
       persistedAt: 200,
       tabs: {
@@ -1589,7 +1639,7 @@ describe('crossTabSync', () => {
     cleanups.push(installCrossTabSync(store as any))
 
     window.dispatchEvent(new StorageEvent('storage', {
-      key: LAYOUT_STORAGE_KEY,
+      key: REMOTE_LAYOUT_KEY,
       newValue: JSON.stringify({
         version: 3,
         persistedAt: 150,
@@ -1638,7 +1688,7 @@ describe('crossTabSync', () => {
     })
 
     window.dispatchEvent(new StorageEvent('storage', {
-      key: LAYOUT_STORAGE_KEY,
+      key: REMOTE_LAYOUT_KEY,
       newValue: JSON.stringify({
         version: 3,
         persistedAt: 175,
@@ -1769,7 +1819,7 @@ describe('crossTabSync', () => {
 
     cleanups.push(installCrossTabSync(store as any))
 
-    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: stampedRemoteRaw('machine-1') }))
+    window.dispatchEvent(new StorageEvent('storage', { key: REMOTE_LAYOUT_KEY, newValue: stampedRemoteRaw('machine-1') }))
 
     expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['t1', 't2', 't3'])
     expect(store.getState().panes.layouts['tab-1']?.id).toBe('split-remote')
@@ -1784,7 +1834,7 @@ describe('crossTabSync', () => {
 
     cleanups.push(installCrossTabSync(store as any))
 
-    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: stampedRemoteRaw('machine-OTHER') }))
+    window.dispatchEvent(new StorageEvent('storage', { key: REMOTE_LAYOUT_KEY, newValue: stampedRemoteRaw('machine-OTHER') }))
 
     expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['t1', 't2'])
     expect(store.getState().tabs.activeTabId).toBe('t1')
@@ -1802,7 +1852,7 @@ describe('crossTabSync', () => {
 
     cleanups.push(installCrossTabSync(store as any))
 
-    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: stampedRemoteRaw() }))
+    window.dispatchEvent(new StorageEvent('storage', { key: REMOTE_LAYOUT_KEY, newValue: stampedRemoteRaw() }))
 
     expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['t1', 't2', 't3'])
     expect(store.getState().panes.layouts['tab-1']?.id).toBe('split-remote')
@@ -1816,7 +1866,7 @@ describe('crossTabSync', () => {
 
     cleanups.push(installCrossTabSync(store as any))
 
-    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: stampedRemoteRaw('machine-1') }))
+    window.dispatchEvent(new StorageEvent('storage', { key: REMOTE_LAYOUT_KEY, newValue: stampedRemoteRaw('machine-1') }))
 
     expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['t1', 't2'])
     expect(store.getState().panes.layouts['tab-1']?.id).toBe('pane-local')
@@ -1831,12 +1881,170 @@ describe('crossTabSync', () => {
 
     cleanups.push(installCrossTabSync(store as any))
 
-    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: stampedRemoteRaw('machine-1') }))
+    window.dispatchEvent(new StorageEvent('storage', { key: REMOTE_LAYOUT_KEY, newValue: stampedRemoteRaw('machine-1') }))
     expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['t1', 't2', 't3'])
     expect(store.getState().panes.layouts['tab-1']?.id).toBe('split-remote')
 
-    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: stampedRemoteRaw('machine-OTHER', ['t1', 't2', 't4']) }))
+    window.dispatchEvent(new StorageEvent('storage', { key: REMOTE_LAYOUT_KEY, newValue: stampedRemoteRaw('machine-OTHER', ['t1', 't2', 't4']) }))
     expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['t1', 't2', 't3'])
     expect(store.getState().panes.layouts['tab-1']?.id).toBe('split-remote')
+  })
+
+  // ── Delta round 3, finding 1: the per-window prefix subscription ──
+  //
+  // The storage-event/broadcast subscription must observe the layout-key
+  // PREFIX (freshell.layout.v3.<clientInstanceId>), not one exact key:
+  // events from OTHER windows' per-window keys run the EXISTING
+  // incoming-hydrate path with ALL its guards (machine-stamp guard,
+  // persistedAt recency, pane-title guard).
+  it('hydrates an incoming layout from ANOTHER window\u2019s per-window key (prefix subscription)', () => {
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+    })
+
+    store.dispatch(hydrateTabs({
+      tabs: [{ id: 't1', title: 'T1', createdAt: 1 }],
+      activeTabId: 't1',
+      renameRequestTabId: null,
+    }))
+
+    cleanups.push(installCrossTabSync(store as any))
+
+    const remoteRaw = JSON.stringify({
+      version: 3,
+      tabs: { activeTabId: 't2', tabs: [{ id: 't1', title: 'T1', createdAt: 1 }, { id: 't2', title: 'T2', createdAt: 2 }] },
+      panes: { version: 6, layouts: {}, activePane: {}, paneTitles: {}, paneTitleSetByUser: {} },
+      tombstones: [],
+    })
+
+    window.dispatchEvent(new StorageEvent('storage', { key: 'freshell.layout.v3.client-other-window-9', newValue: remoteRaw }))
+
+    expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['t1', 't2'])
+  })
+
+  it('ignores storage events for reserved layout-family keys (the .bak and the fresh-agent centralization backup/marker keys)', () => {
+    const dispatchSpy = vi.fn()
+    const storeLike = {
+      dispatch: dispatchSpy,
+      getState: () => ({ tabs: { activeTabId: null }, panes: { activePane: {} } }),
+    }
+
+    cleanups.push(installCrossTabSync(storeLike as any))
+
+    const raw = JSON.stringify({
+      version: 3,
+      tabs: { activeTabId: null, tabs: [{ id: 't1', title: 'T1', createdAt: 1 }] },
+      panes: { version: 6, layouts: {}, activePane: {}, paneTitles: {}, paneTitleSetByUser: {} },
+      tombstones: [],
+    })
+    window.dispatchEvent(new StorageEvent('storage', { key: 'freshell.layout.v3.bak', newValue: raw }))
+    window.dispatchEvent(new StorageEvent('storage', { key: 'freshell.layout.v3.backup-before-fresh-agent-centralization', newValue: raw }))
+    window.dispatchEvent(new StorageEvent('storage', { key: `freshell.layout.v3.${OWN_WINDOW_ID}.bak`, newValue: raw }))
+    window.dispatchEvent(new StorageEvent('storage', { key: 'freshell.layout.v3', newValue: raw }))
+
+    const hydrateCalls = dispatchSpy.mock.calls
+      .map((c) => c[0])
+      .filter((a: any) => a?.type === 'tabs/hydrateTabs')
+    expect(hydrateCalls).toHaveLength(0)
+  })
+
+  it('filters own-key writes on the broadcast channel path but keeps marking them processed', () => {
+    const dispatchSpy = vi.fn()
+    const storeLike = {
+      dispatch: dispatchSpy,
+      getState: () => ({ tabs: { activeTabId: null }, panes: { activePane: {} } }),
+    }
+
+    const original = (globalThis as any).BroadcastChannel
+    class MockBC {
+      static instance: MockBC | null = null
+      onmessage: ((ev: any) => void) | null = null
+      constructor(_name: string) {
+        MockBC.instance = this
+      }
+      close() {}
+    }
+    ;(globalThis as any).BroadcastChannel = MockBC
+
+    try {
+      cleanups.push(installCrossTabSync(storeLike as any))
+
+      const raw = JSON.stringify({
+        version: 3,
+        tabs: { activeTabId: null, tabs: [{ id: 't1', title: 'T1', createdAt: 1 }] },
+        panes: { version: 6, layouts: {}, activePane: {}, paneTitles: {}, paneTitleSetByUser: {} },
+        tombstones: [],
+      })
+      // A cross-source broadcast carrying OUR OWN key must not hydrate (the
+      // own key is only ever this window's envelope; production never sees
+      // this shape, the filter is defensive).
+      MockBC.instance!.onmessage?.({ data: { type: 'persist', key: OWN_LAYOUT_KEY, raw, sourceId: 'other-source' } })
+
+      const hydrateCalls = dispatchSpy.mock.calls
+        .map((c) => c[0])
+        .filter((a: any) => a?.type === 'tabs/hydrateTabs')
+      expect(hydrateCalls).toHaveLength(0)
+    } finally {
+      ;(globalThis as any).BroadcastChannel = original
+    }
+  })
+
+  // Delta round 3, finding 2 (belt-and-braces): slices rehydrate at module
+  // init; cross-tab sync installs only at machine-ready. If the window's OWN
+  // envelope raw changed between module-load and install (possible only from
+  // the migration or same-window writers — with per-window keys, cross-window
+  // replacement is impossible), install must process the change as an
+  // incoming hydrate event instead of silently marking it processed.
+  it('hydrates at install when the own envelope was replaced between module-load and sync install', async () => {
+    sessionStorage.setItem(TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY, 'client-stale-install')
+    const ownKey = 'freshell.layout.v3.client-stale-install'
+    const envelopeX = JSON.stringify({
+      persistedAt: 1_000,
+      version: 3,
+      tabs: { activeTabId: 'tab-load-time', tabs: [{ id: 'tab-load-time', title: 'Loaded at module init', createdAt: 1 }] },
+      panes: { version: 6, layouts: {}, activePane: {}, paneTitles: {}, paneTitleSetByUser: {} },
+      tombstones: [],
+    })
+    const envelopeY = JSON.stringify({
+      persistedAt: 2_000,
+      version: 3,
+      tabs: { activeTabId: 'tab-replacement', tabs: [{ id: 'tab-replacement', title: 'Replaced before install', createdAt: 2 }] },
+      panes: { version: 6, layouts: {}, activePane: {}, paneTitles: {}, paneTitleSetByUser: {} },
+      tombstones: [],
+    })
+    localStorage.setItem(ownKey, envelopeX)
+    // The module-init loaders of the pre-change code read the bare legacy
+    // key — seed it too so the RED failure isolates the staleness behavior
+    // (the loaders DID see X) rather than the key naming.
+    localStorage.setItem('freshell.layout.v3', envelopeX)
+
+    vi.resetModules()
+    const { configureStore: freshConfigureStore } = await import('@reduxjs/toolkit')
+    const { default: freshTabsReducer } = await import('@/store/tabsSlice')
+    const { default: freshPanesReducer } = await import('@/store/panesSlice')
+    const { installCrossTabSync: freshInstallCrossTabSync } = await import('@/store/crossTabSync')
+    const { resetPersistFlushListenersForTests: freshResetFlushListeners } = await import('@/store/persistMiddleware')
+    freshResetFlushListeners()
+
+    const store = freshConfigureStore({
+      reducer: { tabs: freshTabsReducer, panes: freshPanesReducer },
+    })
+    // The module-init rehydration loaded X (through whichever key the
+    // CURRENT code reads).
+    expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['tab-load-time'])
+
+    // The envelope is replaced AFTER module-load, BEFORE sync install.
+    localStorage.setItem(ownKey, envelopeY)
+
+    const cleanup = freshInstallCrossTabSync(store as any)
+    cleanups.push(cleanup)
+
+    // NOT silently marked processed: the replacement HYDRATED at install —
+    // the incoming-hydrate path is the existing MERGE (hydrateTabs unions
+    // by tab id with the recency/reconcile guards), so the replacement's
+    // tab lands in state; a silent mark would have left ONLY the loaded X.
+    const tabs = store.getState().tabs.tabs
+    expect(tabs.map((t) => t.id)).toContain('tab-replacement')
+    expect(tabs.find((t) => t.id === 'tab-replacement')?.title).toBe('Replaced before install')
   })
 })

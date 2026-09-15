@@ -3,7 +3,11 @@ import { test, expect } from '../helpers/fixtures.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import type { TestServerInfo } from '../helpers/test-server.js'
 
-const LAYOUT_STORAGE_KEY = 'freshell.layout.v3'
+// Delta round 3, finding 1: the live layout envelope is the page's
+// per-window key (freshell.layout.v3.<clientInstanceId>). The legacy
+// pre-change envelope this spec seeds goes to the LEGACY key — the boot
+// migration adopts it into the window's own key and migrates it there.
+const LEGACY_LAYOUT_STORAGE_KEY = 'freshell.layout.v3'
 const CANONICAL_CLAUDE_SESSION_ID = '11111111-1111-4111-8111-111111111111'
 
 type PaneNode = {
@@ -217,7 +221,10 @@ function collectLeaves(node: PaneNode | null | undefined): PaneNode[] {
 }
 
 async function readStoredLayout(page: Page) {
-  return page.evaluate((key) => JSON.parse(localStorage.getItem(key) ?? 'null'), LAYOUT_STORAGE_KEY)
+  return page.evaluate(() => {
+    const layoutKey = `freshell.layout.v3.${sessionStorage.getItem('freshell.tabs.client-instance-id.v1')}`
+    return JSON.parse(localStorage.getItem(layoutKey) ?? 'null')
+  })
 }
 
 async function sendLegacyLayoutSync(page: Page) {
@@ -375,7 +382,7 @@ test.describe('Fresh-agent centralization smoke', () => {
       ;(window as typeof window & { __FRESHELL_SUPPRESS_ALL_FRESH_AGENT_NETWORK_EFFECTS__?: boolean }).__FRESHELL_SUPPRESS_ALL_FRESH_AGENT_NETWORK_EFFECTS__ = true
       localStorage.setItem('freshell_version', '5')
       localStorage.setItem(key, JSON.stringify(layout))
-    }, { key: LAYOUT_STORAGE_KEY, layout: legacyLayoutPayload() })
+    }, { key: LEGACY_LAYOUT_STORAGE_KEY, layout: legacyLayoutPayload() })
 
     await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
     await harness.waitForHarness()

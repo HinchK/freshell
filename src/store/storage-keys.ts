@@ -1,7 +1,12 @@
 export const STORAGE_KEYS = {
-  layout: 'freshell.layout.v3',
-  layoutBackup: 'freshell.layout.v3.bak',
-  layoutPreMigrationRaw: 'freshell.layout.pre-migration-raw.v1',
+  // The bare `freshell.layout.v3` family is the LEGACY (pre-per-window)
+  // shape: adoption source for a window's first post-change boot, never
+  // deleted (other live pre-change windows may still read it). The live
+  // per-window key is `freshell.layout.v3.<clientInstanceId>` — see
+  // window-layout-keys.ts (delta round 3, finding 1).
+  legacyLayout: 'freshell.layout.v3',
+  legacyLayoutBackup: 'freshell.layout.v3.bak',
+  legacyLayoutPreMigrationRaw: 'freshell.layout.pre-migration-raw.v1',
   tabs: 'freshell.tabs.v2',
   panes: 'freshell.panes.v2',
   sessionActivity: 'freshell.sessionActivity.v2',
@@ -23,9 +28,9 @@ export const STORAGE_KEYS = {
   inputHistory: 'freshell.input-history.v1',
 } as const
 
-export const LAYOUT_STORAGE_KEY = STORAGE_KEYS.layout
-export const LAYOUT_BACKUP_STORAGE_KEY = STORAGE_KEYS.layoutBackup
-export const LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY = STORAGE_KEYS.layoutPreMigrationRaw
+export const LEGACY_LAYOUT_STORAGE_KEY = STORAGE_KEYS.legacyLayout
+export const LEGACY_LAYOUT_BACKUP_STORAGE_KEY = STORAGE_KEYS.legacyLayoutBackup
+export const LEGACY_LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY = STORAGE_KEYS.legacyLayoutPreMigrationRaw
 export const TABS_STORAGE_KEY = STORAGE_KEYS.tabs
 export const PANES_STORAGE_KEY = STORAGE_KEYS.panes
 export const SESSION_ACTIVITY_STORAGE_KEY = STORAGE_KEYS.sessionActivity

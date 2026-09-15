@@ -17,7 +17,7 @@ import { TestHarness } from '../helpers/test-harness.js'
  * through `zPersistedTabsPayload.safeParse(parsed)` and returns `null` for
  * the ENTIRE payload on ANY single tab's schema violation (not a per-tab
  * filter) -- so one out-of-enum `mode` value wipes every tab in the strip,
- * not just its own. `freshell.layout.v3` (the SEPARATE storage key holding
+ * not just its own. The per-window layout key (freshell.layout.v3.<id>, holding
  * the actual pane-content tree) is never touched by this failure, which is
  * exactly the "data preserved but rejected" shape a real incident takes:
  * the bytes are still on disk, but the UI shows nothing.
@@ -172,7 +172,7 @@ test.describe('REST tab persistence (amplifier out-of-enum mode)', () => {
       (window as any).__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
     })
 
-    const layoutBefore = await page.evaluate(() => localStorage.getItem('freshell.layout.v3'))
+    const layoutBefore = await page.evaluate(() => localStorage.getItem(`freshell.layout.v3.${sessionStorage.getItem('freshell.tabs.client-instance-id.v1')}`))
     expect(layoutBefore, 'localStorage should hold the persisted layout before reload').toBeTruthy()
     expect(layoutBefore).toContain('amplifier')
 
@@ -185,7 +185,7 @@ test.describe('REST tab persistence (amplifier out-of-enum mode)', () => {
     // governs the client's IN-MEMORY parse/hydrate step, never the write
     // path, so nothing here should ever mutate what was written before the
     // reload.
-    const layoutAfter = await page.evaluate(() => localStorage.getItem('freshell.layout.v3'))
+    const layoutAfter = await page.evaluate(() => localStorage.getItem(`freshell.layout.v3.${sessionStorage.getItem('freshell.tabs.client-instance-id.v1')}`))
     expect(layoutAfter, 'localStorage layout must still hold the data after reload (preserved-but-rejected)').toBeTruthy()
     expect(layoutAfter).toContain('amplifier')
 
@@ -196,7 +196,7 @@ test.describe('REST tab persistence (amplifier out-of-enum mode)', () => {
     // see commit `260a4d67` ("fix(client): salvage valid persisted tabs
     // instead of nuking whole layout"). A tab carrying an out-of-enum
     // `mode` (or any other salvageable field) no longer poisons the whole
-    // `freshell.layout.v3` payload on reload; the tab strip must still show
+    // per-window layout payload on reload; the tab strip must still show
     // the REST-created tab after the reload above.
     await expect(tabStrip.getByText('amplifier-poison-tab')).toBeVisible({ timeout: 15_000 })
   })

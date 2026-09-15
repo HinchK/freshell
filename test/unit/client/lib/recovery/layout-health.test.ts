@@ -1,15 +1,26 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { backfillPersistedLayoutMachineId, classifyPersistedLayoutHealth, STALE_LAYOUT_MS } from '@/lib/recovery/layout-health'
-import { LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY, LAYOUT_STORAGE_KEY, MACHINE_ID_STORAGE_KEY } from '@/store/storage-keys'
+import { MACHINE_ID_STORAGE_KEY } from '@/store/storage-keys'
 import {
   hashPersistedLayoutRaw,
   LAYOUT_FRESH_AGENT_BACKUP_KEY,
-  LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY,
   LAYOUT_FRESH_AGENT_MIGRATION_ID,
 } from '@/store/persistedState'
 
 const NOW = 1_760_000_000_000
 const VALID_CLAUDE_SESSION_ID = '11111111-2222-4333-8444-555555555555'
+
+// Delta round 3, finding 1: the layout envelope and the pre-migration
+// evidence sidecar are per-window keys derived from the SAME
+// clientInstanceId the tab-registry sync uses. Every seeding site in this
+// file targets THIS window's keys.
+const WINDOW_ID = 'client-health-tests'
+const LAYOUT_STORAGE_KEY = `freshell.layout.v3.${WINDOW_ID}`
+const LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY = `freshell.layout.pre-migration-raw.v1.${WINDOW_ID}`
+
+function seedWindow(): void {
+  sessionStorage.setItem('freshell.tabs.client-instance-id.v1', WINDOW_ID)
+}
 
 function seedEnvelope(raw: unknown): void {
   localStorage.setItem(LAYOUT_STORAGE_KEY, typeof raw === 'string' ? raw : JSON.stringify(raw))
@@ -32,7 +43,7 @@ function healthyEnvelope(machineId: string, persistedAt = NOW): Record<string, u
 }
 
 describe('classifyPersistedLayoutHealth', () => {
-  beforeEach(() => { localStorage.clear() })
+  beforeEach(() => { localStorage.clear(); seedWindow() })
 
   it('returns absent when no layout is persisted', () => {
     expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('absent')
@@ -269,6 +280,97 @@ describe('classifyPersistedLayoutHealth', () => {
     expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
   })
 
+  // Content lifecycle invariants (delta review round 3, finding 3):
+  // isWellFormedPaneTree only checks createRequestId/status/mode are
+  // STRINGS — empty createRequestIds, duplicate createRequestIds across
+  // panes, unsupported status values, and empty modes all passed, so the
+  // loader installed such content and the server later rejected the creates
+  // (TerminalCreateSchema requires requestId min(1),
+  // shared/ws-protocol.ts:468) or deduped duplicate request ids onto ONE
+  // terminal (the single-flight create-dedupe, crates/freshell-ws/src/
+  // terminal.rs:2884-2933: a create whose createRequestId already has a
+  // live terminal ADOPTS it — both panes would alias onto one PTY), or the
+  // loader silently minted a fresh shell/default identity
+  // (persistMiddleware.ts migratePaneContent: createRequestId || nanoid(),
+  // status || 'creating', mode || 'shell'). None of those are recoveries —
+  // the envelope is corrupt and the own-snapshot rebuild must run.
+  it('returns corrupt when a terminal pane content carries an EMPTY createRequestId (the loader would silently mint a fresh terminal identity)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': {
+        type: 'leaf',
+        id: 'pane-a',
+        content: { kind: 'terminal', mode: 'shell', createRequestId: '', status: 'running' },
+      },
+    }
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('returns corrupt when two terminal panes share one createRequestId (the server dedupe would alias both panes onto ONE terminal)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': {
+        type: 'split',
+        id: 'split-1',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          { type: 'leaf', id: 'pane-a', content: { kind: 'terminal', mode: 'shell', createRequestId: 'cr-dup', status: 'running' } },
+          { type: 'leaf', id: 'pane-b', content: { kind: 'terminal', mode: 'claude', createRequestId: 'cr-dup', status: 'running' } },
+        ],
+      },
+    }
+    ;(envelope.panes as { activePane: Record<string, string> }).activePane['tab-a'] = 'pane-a'
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('returns corrupt when a terminal pane status is not a TerminalStatus union member (the loader installs it verbatim)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': {
+        type: 'leaf',
+        id: 'pane-a',
+        content: { kind: 'terminal', mode: 'shell', createRequestId: 'cr-a', status: 'bogus-status' },
+      },
+    }
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('returns corrupt when a terminal pane mode is an empty string (a mode-wiped CLI pane would silently reopen as a shell)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': {
+        type: 'leaf',
+        id: 'pane-a',
+        content: { kind: 'terminal', mode: '', createRequestId: 'cr-a', status: 'running' },
+      },
+    }
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('stays healthy when terminal panes carry distinct non-empty createRequestIds, union-member statuses, and non-empty modes', () => {
+    const envelope = healthyEnvelope('machine-1')
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': {
+        type: 'split',
+        id: 'split-1',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          { type: 'leaf', id: 'pane-a', content: { kind: 'terminal', mode: 'shell', createRequestId: 'cr-1', status: 'running' } },
+          { type: 'leaf', id: 'pane-b', content: { kind: 'terminal', mode: 'claude', createRequestId: 'cr-2', status: 'creating' } },
+        ],
+      },
+    }
+    ;(envelope.panes as { activePane: Record<string, string> }).activePane['tab-a'] = 'pane-a'
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+  })
+
   // Content-salvage classification (delta review round 2, finding 3):
   // parsePersistedLayoutRaw silently strips malformed DURABLE pane-content
   // fields BEFORE tree validation (normalizeTerminalContent destructures
@@ -408,7 +510,7 @@ describe('classifyPersistedLayoutHealth', () => {
 // main.tsx triggers), THEN classify through a fresh classifier instance
 // bound to that same migration module.
 describe('classifyPersistedLayoutHealth in the real boot order (migration rewrite runs first)', () => {
-  beforeEach(() => { localStorage.clear() })
+  beforeEach(() => { localStorage.clear(); seedWindow() })
 
   async function classifyAfterRealBoot(): Promise<PersistedLayoutHealthAfterBoot> {
     localStorage.setItem('freshell_version', '5')
@@ -453,7 +555,10 @@ describe('classifyPersistedLayoutHealth in the real boot order (migration rewrit
     })
     seedEnvelope(envelope)
     const raw = localStorage.getItem(LAYOUT_STORAGE_KEY)!
-    localStorage.setItem(LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY, JSON.stringify({
+    // Delta round 3, finding 1: the marker STORAGE key is this window's
+    // per-window channel suffix; the marker PAYLOAD's backupKey field stays
+    // the migration-identifier constant.
+    localStorage.setItem(`${LAYOUT_STORAGE_KEY}.fresh-agent-centralization-commit`, JSON.stringify({
       version: 1,
       migration: LAYOUT_FRESH_AGENT_MIGRATION_ID,
       backupKey: LAYOUT_FRESH_AGENT_BACKUP_KEY,
@@ -634,7 +739,7 @@ describe('classifyPersistedLayoutHealth in the real boot order (migration rewrit
 // and failed writes; the next boot then still classifies corrupt and
 // rebuilds again.
 describe('pre-migration evidence durable boundary (e2r5 finding 1)', () => {
-  beforeEach(() => { localStorage.clear() })
+  beforeEach(() => { localStorage.clear(); seedWindow() })
 
   async function loadEvidenceModule() {
     const mod = await import('@/lib/recovery/layout-health')
@@ -683,7 +788,7 @@ describe('pre-migration evidence durable boundary (e2r5 finding 1)', () => {
 // nothing and produced no durable product — the pane reopened as a fresh
 // session or with a default model while classifying healthy).
 describe('verified migration exemptions: agent-chat kinds + value sensitivity (e2r2 findings 1-2)', () => {
-  beforeEach(() => { localStorage.clear() })
+  beforeEach(() => { localStorage.clear(); seedWindow() })
 
   const CANONICAL_A = '00000000-0000-4000-8000-000000000121'
   const CANONICAL_B = '00000000-0000-4000-8000-000000000122'
@@ -868,7 +973,7 @@ describe('verified migration exemptions: agent-chat kinds + value sensitivity (e
 // product) yet classified corrupt, forcing a needless rebuild that lost
 // geometry/titles.
 describe('value-level salvage rule + trimmed stale-default exemption (e2r3 findings 1-2)', () => {
-  beforeEach(() => { localStorage.clear() })
+  beforeEach(() => { localStorage.clear(); seedWindow() })
 
   function seedPaneLayout(content: Record<string, unknown>): void {
     const envelope = healthyEnvelope('machine-1')
@@ -921,7 +1026,7 @@ describe('value-level salvage rule + trimmed stale-default exemption (e2r3 findi
 })
 
 describe('backfillPersistedLayoutMachineId', () => {
-  beforeEach(() => { localStorage.clear() })
+  beforeEach(() => { localStorage.clear(); seedWindow() })
 
   it('stamps a healthy legacy (unstamped) envelope once machine identity resolves — with NO store action dispatched', () => {
     // The boot moment the finding pins: identity resolved, persist

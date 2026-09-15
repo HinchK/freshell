@@ -80,6 +80,10 @@ function terminalContent(state: PanesState, tabId: string, paneId: string): Term
   return content
 }
 
+// Delta round 3, finding 1: the flush writes THIS window's per-window layout key.
+const WINDOW_ID = 'client-panes-reconcile-tests'
+sessionStorage.setItem('freshell.tabs.client-instance-id.v1', WINDOW_ID)
+
 describe('reconcile reducers', () => {
   it('applyReconcileAttach sets terminalId/status without touching createRequestId', () => {
     const state = stateWithTerminalPane({ createRequestId: 'cr-keep', terminalId: undefined, status: 'creating' })
@@ -251,7 +255,7 @@ describe('reconcile persistence stripping', () => {
 
     vi.runAllTimers()
 
-    const raw = localStorage.getItem('freshell.layout.v3')
+    const raw = localStorage.getItem(`freshell.layout.v3.${WINDOW_ID}`)
     expect(raw).not.toBeNull()
     const parsed = JSON.parse(raw!)
     const leaf = parsed.panes.layouts[tabId]

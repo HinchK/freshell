@@ -31,7 +31,8 @@ import { TestHarness } from '../helpers/test-harness.js'
  *   2. Tab dedupe: clicking that sidebar row FOCUSES the existing REST tab
  *      (tab count unchanged) -- `findTabIdForSession` joins on the same
  *      extraction (`src/store/tabsSlice.ts:721-763`).
- *   3. Restart durability: the persisted layout (`freshell.layout.v3`)
+ *   3. Restart durability: the persisted per-window layout
+ *      (`freshell.layout.v3.<clientInstanceId>`)
  *      carries the synthesized `sessionRef` (persist-save strips
  *      `resumeSessionId` outright, `persistMiddleware.ts:245-264` -- the
  *      sessionRef is the ONLY key that survives), so after
@@ -286,11 +287,11 @@ test.describe('Remote tab linkage (Rust only)', () => {
         await page.evaluate(() => {
           (window as any).__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
         })
-        const persistedLayout = await page.evaluate(() => localStorage.getItem('freshell.layout.v3'))
+        const persistedLayout = await page.evaluate(() => localStorage.getItem(`freshell.layout.v3.${sessionStorage.getItem('freshell.tabs.client-instance-id.v1')}`))
         expect(persistedLayout, 'persisted layout must exist after flush').toBeTruthy()
         expect(
           containsSessionRef(JSON.parse(persistedLayout!), 'amplifier', SEEDED_SESSION_ID),
-          `freshell.layout.v3 must contain sessionRef {provider:'amplifier', sessionId:'${SEEDED_SESSION_ID}'}`,
+          the per-window layout key must contain sessionRef {provider:'amplifier', sessionId:'${SEEDED_SESSION_ID}'}`,
         ).toBe(true)
 
         // ------------------------------------------------------------------

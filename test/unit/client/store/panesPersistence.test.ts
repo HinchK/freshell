@@ -29,10 +29,16 @@ import {
 } from '../../../../src/store/persistMiddleware'
 import { PANES_SCHEMA_VERSION } from '../../../../src/store/persistedState'
 import { isWellFormedPaneTree } from '../../../../src/store/paneTreeValidation'
-import {
-  LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY,
-  LAYOUT_STORAGE_KEY,
-} from '../../../../src/store/storage-keys'
+
+// Delta round 3, finding 1: the flush writes THIS window's per-window layout
+// key (freshell.layout.v3.<clientInstanceId>) and its per-window pre-
+// migration evidence sidecar. Seed a stable window id once per file — the
+// flush resolves the key lazily. The local key constants mirror the
+// per-window shapes.
+const WINDOW_ID = 'client-panes-persistence-tests'
+sessionStorage.setItem('freshell.tabs.client-instance-id.v1', WINDOW_ID)
+const LAYOUT_STORAGE_KEY = `freshell.layout.v3.${WINDOW_ID}`
+const LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY = `freshell.layout.pre-migration-raw.v1.${WINDOW_ID}`
 import {
   armPreMigrationEvidenceClear,
   resetPreMigrationEvidenceArmForTests,
@@ -85,7 +91,7 @@ describe('Panes Persistence Integration', () => {
 
     // 6. Check localStorage was updated
     vi.runAllTimers()
-    const savedLayout = localStorage.getItem('freshell.layout.v3')
+    const savedLayout = localStorage.getItem(LAYOUT_STORAGE_KEY)
     expect(savedLayout).not.toBeNull()
     const parsedLayout = JSON.parse(savedLayout!)
     expect(parsedLayout.panes.layouts[tabId].type).toBe('split')
@@ -202,7 +208,7 @@ describe('Panes Persistence Integration', () => {
 
     // Verify state was persisted
     vi.runAllTimers()
-    const savedLayout = localStorage.getItem('freshell.layout.v3')
+    const savedLayout = localStorage.getItem(LAYOUT_STORAGE_KEY)
     expect(savedLayout).not.toBeNull()
     expect(JSON.parse(savedLayout!).panes.layouts[tabId].type).toBe('split')
 
@@ -239,7 +245,7 @@ describe('Panes Persistence Integration', () => {
 
     vi.runAllTimers()
 
-    const savedLayout = localStorage.getItem('freshell.layout.v3')
+    const savedLayout = localStorage.getItem(LAYOUT_STORAGE_KEY)
     expect(savedLayout).not.toBeNull()
     const parsedLayout = JSON.parse(savedLayout!)
     const layout = parsedLayout.panes.layouts[tabId]
@@ -356,7 +362,7 @@ describe('Panes Persistence Integration', () => {
 
     vi.runAllTimers()
 
-    const saved = JSON.parse(localStorage.getItem('freshell.layout.v3')!)
+    const saved = JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY)!)
     expect(saved.panes.focusEpochByPaneId).toBeUndefined()
   })
 
@@ -385,7 +391,7 @@ describe('Panes Persistence Integration', () => {
 
     vi.runAllTimers()
 
-    const saved = JSON.parse(localStorage.getItem('freshell.layout.v3')!)
+    const saved = JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY)!)
     expect(saved.panes.refreshRequestsByPane).toBeUndefined()
   })
 
@@ -586,7 +592,7 @@ describe('Panes Persistence Integration', () => {
     vi.runAllTimers()
 
     // The raw persisted bytes carry exactly the bare content.
-    const rawLayout = JSON.parse(localStorage.getItem('freshell.layout.v3')!)
+    const rawLayout = JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY)!)
     expect(rawLayout.panes.layouts[tabId].content).toEqual({ kind: 'host-stats' })
     // Tree-validation round-trip: the persisted leaf must pass the reload gate
     // (a missing isPaneContentShape case silently DROPS the pane on reload).
@@ -628,12 +634,12 @@ describe('Panes Persistence Integration', () => {
     const tabId = store.getState().tabs.tabs[0].id
     store.dispatch(initLayout({ tabId, content: { kind: 'terminal', mode: 'shell' } }))
 
-    expect(localStorage.getItem('freshell.layout.v3')).toBeNull()
+    expect(localStorage.getItem(LAYOUT_STORAGE_KEY)).toBeNull()
 
     Object.defineProperty(document, 'visibilityState', { value: 'hidden', configurable: true })
     document.dispatchEvent(new Event('visibilitychange'))
 
-    expect(localStorage.getItem('freshell.layout.v3')).not.toBeNull()
+    expect(localStorage.getItem(LAYOUT_STORAGE_KEY)).not.toBeNull()
   })
 })
 
@@ -1000,7 +1006,7 @@ describe('version 5 migration (drop claude-chat panes)', () => {
   })
 
   it('migrates legacy agent-chat model and effort fields into selection strategies', () => {
-    localStorage.setItem('freshell.layout.v3', JSON.stringify({
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify({
       version: 3,
       tabs: { tabs: [{ id: 'tab1', title: 'Tab 1' }], activeTabId: 'tab1' },
       panes: {
@@ -1039,7 +1045,7 @@ describe('version 5 migration (drop claude-chat panes)', () => {
   })
 
   it('drops stale legacy Freshopencode pane defaults instead of preserving DeepSeek', () => {
-    localStorage.setItem('freshell.layout.v3', JSON.stringify({
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify({
       version: 3,
       tabs: { tabs: [{ id: 'tab1', title: 'Tab 1' }], activeTabId: 'tab1' },
       panes: {
@@ -1075,7 +1081,7 @@ describe('version 5 migration (drop claude-chat panes)', () => {
   })
 
   it('preserves explicit Freshopencode DeepSeek pane selections', () => {
-    localStorage.setItem('freshell.layout.v3', JSON.stringify({
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify({
       version: 3,
       tabs: { tabs: [{ id: 'tab1', title: 'Tab 1' }], activeTabId: 'tab1' },
       panes: {
@@ -1123,7 +1129,7 @@ describe('legacy agent-chat display settings migration', () => {
 
   it('drops legacy showThinking/showTools from agent-chat panes during migration, keeping showTimecodes', async () => {
     localStorageMock.clear()
-    localStorage.setItem('freshell.layout.v3', JSON.stringify({
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify({
       version: 3,
       tabs: { tabs: [{ id: 'tab1', title: 'Tab 1' }], activeTabId: 'tab1' },
       panes: {
@@ -1168,7 +1174,7 @@ describe('legacy agent-chat display settings migration', () => {
 
   it('drops legacy display settings from panes inside splits during migration', async () => {
     localStorageMock.clear()
-    localStorage.setItem('freshell.layout.v3', JSON.stringify({
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify({
       version: 3,
       tabs: { tabs: [{ id: 'tab1', title: 'Tab 1' }], activeTabId: 'tab1' },
       panes: {
@@ -1220,7 +1226,7 @@ describe('legacy agent-chat display settings migration', () => {
 
   it('does not touch panes that have no legacy fields', async () => {
     localStorageMock.clear()
-    localStorage.setItem('freshell.layout.v3', JSON.stringify({
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify({
       version: 3,
       tabs: { tabs: [{ id: 'tab1', title: 'Tab 1' }], activeTabId: 'tab1' },
       panes: {
@@ -1252,7 +1258,7 @@ describe('legacy agent-chat display settings migration', () => {
       settings: { theme: 'dark' },
       tabs: { searchRangeDays: 60 },
     }))
-    localStorage.setItem('freshell.layout.v3', JSON.stringify({
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify({
       version: 3,
       tabs: { tabs: [{ id: 'tab1', title: 'Tab 1' }], activeTabId: 'tab1' },
       panes: {
@@ -1317,7 +1323,7 @@ describe('schema version consistency', () => {
     store.dispatch(initLayout({ tabId, content: { kind: 'terminal', mode: 'shell' } }))
     vi.runAllTimers()
 
-    const raw = localStorage.getItem('freshell.layout.v3')!
+    const raw = localStorage.getItem(LAYOUT_STORAGE_KEY)!
     const parsed = JSON.parse(raw)
     // The version written by persist middleware must match persistedState's version
     expect(parsed.panes.version).toBe(PANES_SCHEMA_VERSION)

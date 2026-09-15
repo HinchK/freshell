@@ -6,10 +6,12 @@ import { setLocalSettings } from './settingsSlice'
 import { setTabRegistryClosedTabRetentionDays } from './tabRegistrySlice'
 import { hydrateTabs } from './tabsSlice'
 import { getPendingBrowserPreferencesWriteState } from './browserPreferencesPersistence'
-import { parsePersistedLayoutRaw, LAYOUT_STORAGE_KEY, type ParsedPersistedLayout } from './persistedState'
+import { parsePersistedLayoutRaw, type ParsedPersistedLayout } from './persistedState'
 import { getPersistBroadcastSourceId, onPersistBroadcast, PERSIST_BROADCAST_CHANNEL_NAME } from './persistBroadcast'
 import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
+import { getBootLoadedLayoutRaw } from './persistMiddleware'
 import { BROWSER_PREFERENCES_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY } from './storage-keys'
+import { getWindowLayoutKey, isDerivedLayoutKey } from './window-layout-keys'
 import { collectLiveTerminalPaneIds } from './tabRecencyPruneMiddleware'
 import {
   loadPersistedTabRecency,
@@ -32,11 +34,15 @@ const zPersistBroadcastMsg = z.object({
   sourceId: z.string(),
 })
 
-const CROSS_TAB_SYNC_STORAGE_KEYS = [
-  LAYOUT_STORAGE_KEY,
-  BROWSER_PREFERENCES_STORAGE_KEY,
-  TAB_RECENCY_STORAGE_KEY,
-] as const
+/** Delta round 3, finding 1: the layout subscription observes the per-window
+ * key PREFIX (freshell.layout.v3.<clientInstanceId>), not one exact key —
+ * events from OTHER windows' keys run the existing incoming-hydrate path.
+ * The exact keys below are the layout-independent sidecars. */
+function isCrossTabSyncStorageKey(key: string): boolean {
+  return key === BROWSER_PREFERENCES_STORAGE_KEY
+    || key === TAB_RECENCY_STORAGE_KEY
+    || isDerivedLayoutKey(key)
+}
 
 function collectPaneIdsSafe(node: unknown): string[] {
   const ids: string[] = []
@@ -306,7 +312,7 @@ function handleIncomingRaw(
   previousRaw?: string,
   localLayoutPersistedAt?: number,
 ) {
-  if (key === LAYOUT_STORAGE_KEY) {
+  if (isDerivedLayoutKey(key)) {
     dispatchHydrateLayoutFromPersisted(store, raw, localLayoutPersistedAt)
   } else if (key === BROWSER_PREFERENCES_STORAGE_KEY) {
     dispatchHydrateBrowserPreferencesFromPersisted(store, raw, previousRaw)
@@ -327,15 +333,17 @@ function handleIncomingRaw(
 export function installCrossTabSync(store: StoreLike): () => void {
   if (typeof window === 'undefined') return () => {}
 
+  const ownLayoutKey = getWindowLayoutKey()
+
   // Storage events and BroadcastChannel can both deliver the same persisted payload.
   // Dedupe by exact raw value so we don't hydrate twice.
   const lastProcessedRawByKey = new Map<string, string>()
   let currentLocalLayoutPersistedAt: number | undefined
-  for (const key of CROSS_TAB_SYNC_STORAGE_KEYS) {
+  for (const key of [ownLayoutKey, BROWSER_PREFERENCES_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY]) {
     const existingRaw = localStorage.getItem(key)
     if (typeof existingRaw === 'string') {
       lastProcessedRawByKey.set(key, existingRaw)
-      if (key === LAYOUT_STORAGE_KEY) {
+      if (key === ownLayoutKey) {
         const parsed = parsePersistedLayoutRaw(existingRaw)
         currentLocalLayoutPersistedAt = parsed?.persistedAt
       }
@@ -358,12 +366,35 @@ export function installCrossTabSync(store: StoreLike): () => void {
   const handleIncomingRawDeduped = (key: string, raw: string) => {
     // Ignore a foreign-machine layout entirely: no dispatch, no dedupe
     // mark, no authoritative-persistedAt merge (the event is not ours).
-    if (key === LAYOUT_STORAGE_KEY && isForeignIncomingLayout(store, raw)) return
+    if (isDerivedLayoutKey(key) && isForeignIncomingLayout(store, raw)) return
     const previousRaw = lastProcessedRawByKey.get(key)
     if (!tryDedupeAndMark(key, raw)) return
     handleIncomingRaw(store, key, raw, previousRaw, currentLocalLayoutPersistedAt)
-    if (key === LAYOUT_STORAGE_KEY) {
+    if (isDerivedLayoutKey(key)) {
       mergeAuthoritativeLayoutPersistedAt(parsePersistedLayoutRaw(raw)?.persistedAt)
+    }
+  }
+
+  // Install-time staleness check (delta round 3, finding 2, belt-and-braces):
+  // the module-init loaders read the envelope at module load; sync installs
+  // only at machine-ready. With per-window keys no OTHER window can replace
+  // this envelope, but the migration or a same-window writer still can —
+  // if the own-key raw changed since load, process the replacement as an
+  // incoming hydrate event (recency-guarded through the hydrate reducers)
+  // instead of silently marking it processed. `undefined` (loaders never
+  // ran in this module instance) keeps the previous silent-mark behavior.
+  const bootRaw = getBootLoadedLayoutRaw()
+  if (bootRaw !== undefined) {
+    const currentRaw = localStorage.getItem(ownLayoutKey)
+    if (typeof currentRaw === 'string' && currentRaw !== bootRaw && !isForeignIncomingLayout(store, currentRaw)) {
+      // The local side of the recency comparison is what Redux actually
+      // holds: the loaded raw's persistedAt (undefined when the loaders
+      // found nothing — the replacement then applies wholesale).
+      const bootPersistedAt = typeof bootRaw === 'string'
+        ? parsePersistedLayoutRaw(bootRaw)?.persistedAt
+        : undefined
+      handleIncomingRaw(store, ownLayoutKey, currentRaw, bootRaw ?? undefined, bootPersistedAt)
+      mergeAuthoritativeLayoutPersistedAt(parsePersistedLayoutRaw(currentRaw)?.persistedAt)
     }
   }
 
@@ -371,19 +402,24 @@ export function installCrossTabSync(store: StoreLike): () => void {
   // then diverge locally (persisted raw changes), a later remote event with the original raw
   // could be incorrectly ignored.
   const unsubscribeLocal = onPersistBroadcast((msg) => {
-    if (!CROSS_TAB_SYNC_STORAGE_KEYS.includes(msg.key as any)) {
+    if (!isCrossTabSyncStorageKey(msg.key)) {
       return
     }
     lastProcessedRawByKey.set(msg.key, msg.raw)
-    if (msg.key === LAYOUT_STORAGE_KEY) {
+    if (isDerivedLayoutKey(msg.key)) {
       currentLocalLayoutPersistedAt = parsePersistedLayoutRaw(msg.raw)?.persistedAt
     }
   })
 
+  // Storage events fire ONLY for cross-document writes (a window never
+  // receives its own localStorage writes as events — browser semantics),
+  // so an event carrying THIS window's own key is still a legitimate
+  // incoming event: another document wrote our key (e.g. the e2e recency
+  // staging, or a pre-change window during a deploy transition).
   const onStorage = (e: StorageEvent) => {
     if (e.storageArea && e.storageArea !== localStorage) return
     const key = e.key
-    if (typeof key !== 'string' || !CROSS_TAB_SYNC_STORAGE_KEYS.includes(key as any)) {
+    if (typeof key !== 'string' || !isCrossTabSyncStorageKey(key)) {
       return
     }
     if (typeof e.newValue !== 'string') return
@@ -399,6 +435,10 @@ export function installCrossTabSync(store: StoreLike): () => void {
       const res = zPersistBroadcastMsg.safeParse((event as any)?.data)
       if (!res.success) return
       if (res.data.sourceId === getPersistBroadcastSourceId()) return
+      // Defensive own-key filter on the broadcast path: the own key is
+      // only ever this window's envelope, and same-window writes already
+      // arrived through onPersistBroadcast above.
+      if (res.data.key === ownLayoutKey) return
       handleIncomingRawDeduped(res.data.key, res.data.raw)
     }
   }

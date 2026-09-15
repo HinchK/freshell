@@ -8,7 +8,6 @@ import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import { persistMiddleware, resetPersistedLayoutCacheForTests, resetPersistFlushListenersForTests } from '@/store/persistMiddleware'
 import { parsePersistedLayoutRaw } from '@/store/persistedState'
-import { LAYOUT_STORAGE_KEY } from '@/store/storage-keys'
 import { useAppSelector } from '@/store/hooks'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import TerminalView from '@/components/TerminalView'
@@ -17,6 +16,11 @@ import {
   createDefaultServerSettings,
   resolveLocalSettings,
 } from '@shared/settings'
+
+// Delta round 3, finding 1: the flush writes THIS window's per-window layout key.
+const WINDOW_ID = 'client-codex-refresh-tests'
+sessionStorage.setItem('freshell.tabs.client-instance-id.v1', WINDOW_ID)
+const LAYOUT_STORAGE_KEY = `freshell.layout.v3.${WINDOW_ID}`
 
 const wsHarness = vi.hoisted(() => {
   const messageHandlers = new Set<(msg: any) => void>()

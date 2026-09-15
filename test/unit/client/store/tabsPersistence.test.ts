@@ -29,7 +29,7 @@ import {
   resetPersistedLayoutCacheForTests,
 } from '@/store/persistMiddleware'
 import { onPersistBroadcast, resetPersistBroadcastForTests } from '@/store/persistBroadcast'
-import { LAYOUT_STORAGE_KEY, MACHINE_ID_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY } from '@/store/storage-keys'
+import { MACHINE_ID_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY } from '@/store/storage-keys'
 import { parsePersistedLayoutRaw } from '@/store/persistedState'
 import { handleUiCommand } from '@/lib/ui-commands'
 
@@ -103,6 +103,12 @@ function makeRecencyStore(preloadedState?: any) {
   })
 }
 
+// Delta round 3, finding 1: the flush writes THIS window's per-window layout
+// key (freshell.layout.v3.<clientInstanceId>).
+const WINDOW_ID = 'client-tabs-persistence-tests'
+sessionStorage.setItem('freshell.tabs.client-instance-id.v1', WINDOW_ID)
+const LAYOUT_STORAGE_KEY = `freshell.layout.v3.${WINDOW_ID}`
+
 describe('tabs persistence - skipPersist + strip volatile fields', () => {
   beforeEach(() => {
     localStorageMock.clear()
@@ -140,7 +146,7 @@ describe('tabs persistence - skipPersist + strip volatile fields', () => {
     store.dispatch(updateTab({ id: 'tab-1', updates: { lastInputAt: 999 } }))
     vi.runAllTimers()
 
-    const raw = localStorage.getItem('freshell.layout.v3')
+    const raw = localStorage.getItem(LAYOUT_STORAGE_KEY)
     expect(raw).not.toBeNull()
     const parsed = JSON.parse(raw!)
     expect(parsed.tabs.tabs[0].lastInputAt).toBeUndefined()
@@ -404,7 +410,7 @@ describe('tabs persistence - skipPersist + strip volatile fields', () => {
     localStorageMock.clear()
     resetPersistedLayoutCacheForTests()
 
-    localStorage.setItem('freshell.layout.v3', JSON.stringify({
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify({
       version: 4,
       tabs: {
         tabs: [{

@@ -1,5 +1,11 @@
 import { z } from 'zod'
-import { LAYOUT_STORAGE_KEY, TABS_STORAGE_KEY, PANES_STORAGE_KEY } from './storage-keys'
+import { TABS_STORAGE_KEY, PANES_STORAGE_KEY } from './storage-keys'
+import {
+  getWindowFreshAgentBackupKey,
+  getWindowFreshAgentCommitMarkerKey,
+  getWindowFreshAgentPendingMarkerKey,
+  getWindowLayoutKey,
+} from './window-layout-keys'
 import {
   buildRestoreError,
   migrateLegacyTerminalDurableState,
@@ -11,15 +17,20 @@ import { migrateLegacyFreshAgentContent, migrateLegacyFreshAgentDurableState } f
 import { normalizeFreshAgentPaneModelSelection } from './paneTypes'
 import { createLogger } from '@/lib/client-logger'
 
-export { LAYOUT_STORAGE_KEY, TABS_STORAGE_KEY, PANES_STORAGE_KEY }
+export { TABS_STORAGE_KEY, PANES_STORAGE_KEY }
 
 const log = createLogger('PersistedState')
 
 export const TABS_SCHEMA_VERSION = 2
 export const PANES_SCHEMA_VERSION = 7
-export const LAYOUT_FRESH_AGENT_BACKUP_KEY = `${LAYOUT_STORAGE_KEY}.backup-before-fresh-agent-centralization`
-export const LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY = `${LAYOUT_STORAGE_KEY}.fresh-agent-centralization-commit`
-export const LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY = `${LAYOUT_STORAGE_KEY}.fresh-agent-centralization-pending`
+// The fresh-agent centralization migration's payload-field constants: the
+// marker payloads carry these as the `backupKey`/migration identifiers
+// (parseLayoutFreshAgentCommitMarker validates against them), while the
+// marker/backup STORAGE keys are per-window channel suffixes — see
+// window-layout-keys.ts (delta round 3, finding 1).
+export const LAYOUT_FRESH_AGENT_BACKUP_KEY = 'freshell.layout.v3.backup-before-fresh-agent-centralization'
+export const LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY = 'freshell.layout.v3.fresh-agent-centralization-commit'
+export const LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY = 'freshell.layout.v3.fresh-agent-centralization-pending'
 export const LAYOUT_FRESH_AGENT_MIGRATION_ID = 'fresh-agent-centralization'
 
 // Compatibility-only fields: foreign/extension-authored tabs (e.g. from the MCP `tab.create`
@@ -497,10 +508,10 @@ export function parseLayoutFreshAgentPendingMarker(raw: string | null): LayoutFr
 }
 
 export function readRecoverablePersistedLayoutRaw(storage: Pick<Storage, 'getItem'> = localStorage): string | null {
-  const raw = storage.getItem(LAYOUT_STORAGE_KEY)
-  const backup = storage.getItem(LAYOUT_FRESH_AGENT_BACKUP_KEY)
-  const markerRaw = storage.getItem(LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY)
-  const pendingMarkerRaw = storage.getItem(LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY)
+  const raw = storage.getItem(getWindowLayoutKey())
+  const backup = storage.getItem(getWindowFreshAgentBackupKey())
+  const markerRaw = storage.getItem(getWindowFreshAgentCommitMarkerKey())
+  const pendingMarkerRaw = storage.getItem(getWindowFreshAgentPendingMarkerKey())
 
   if (!raw) return backup
   if (!backup) return raw
@@ -566,7 +577,7 @@ export function parsePersistedLayoutRaw(raw: string): ParsedPersistedLayout | nu
 export function migrateV2ToV3(): ParsedPersistedLayout | null {
   const tabsKey = TABS_STORAGE_KEY
   const panesKey = PANES_STORAGE_KEY
-  const layoutKey = LAYOUT_STORAGE_KEY
+  const layoutKey = getWindowLayoutKey()
 
   const tabsRaw = localStorage.getItem(tabsKey)
   if (!tabsRaw) return null
