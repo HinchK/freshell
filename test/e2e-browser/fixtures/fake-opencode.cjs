@@ -717,7 +717,7 @@ if (tuiParityEnabled) {
       const gateDb = openDatabase()
       try {
         ensureSchema(gateDb)
-        insertMessagePart(gateDb, {
+        insertPart(gateDb, {
           partId: 'msg_ses_c_2_assistant_part_tool_live',
           messageId: 'msg_ses_c_2_assistant',
           sessionId: 'ses_c',
