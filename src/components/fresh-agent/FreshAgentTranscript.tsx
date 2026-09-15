@@ -360,6 +360,14 @@ function buildTranscriptLayout(
   for (const [turnIndex, turn] of turns.entries()) {
     const layout: TurnLayout = { blocks: [] }
     layouts.push(layout)
+    if (turn.error) {
+      // LB-2 (stage-2 binding): an errored turn is a hard activity-line
+      // boundary. Its durable module renders in its own article, so its
+      // activity items must never be absorbed into a previous assistant's
+      // open line — absorbed turns get no blocks and the render loop below
+      // skips them entirely.
+      flushOpen(true)
+    }
     if (turn.items.length === 0) {
       // Zero-item turns hard-close any open line and render their own article;
       // they never carry a caption OF THEIR OWN (no Rust producer emits a
@@ -951,6 +959,25 @@ function FreshAgentTurnArticle({
         {isStreamingLastTurn && blocks.length === 0 && liveActivityBlockId === null ? (
           <FreshAgentActivityStrip rows={[]} live initialExpanded={expandTools} />
         ) : null}
+        {turn.error && turn.error.name !== 'MessageAbortedError' ? (
+          <div
+            role="note"
+            aria-label="Agent error"
+            data-testid="fresh-agent-turn-error"
+            className="fresh-agent-error-module rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
+          >
+            <div className="font-medium">Agent error</div>
+            <div className="whitespace-pre-wrap break-words">{turn.error.message}</div>
+          </div>
+        ) : null}
+        {turn.error?.name === 'MessageAbortedError' ? (
+          <div
+            data-testid="fresh-agent-turn-interrupted"
+            className="text-xs italic text-muted-foreground"
+          >
+            interrupted
+          </div>
+        ) : null}
       </div>
     </article>
   )
@@ -1088,14 +1115,16 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
           return `${item.id}:${item.kind}:${item.text?.length ?? 0}:${item.summary.join('\n').length}`
         }
         if ('status' in item) {
-          return `${item.id}:${item.kind}:${item.status}`
+          const errorLength = 'error' in item && item.error !== undefined ? formatJson(item.error).length : 0
+          return `${item.id}:${item.kind}:${item.status}:err:${errorLength}`
         }
         if (item.kind === 'tool_result') {
           return `${item.id}:${item.kind}:${item.isError ? 'error' : 'ok'}:${formatJson(item.content).length}`
         }
         return `${item.id}:${item.kind}`
       }).join(',')
-      return `${getFreshAgentDisplayTurnKey(turn)}:${turn.summary?.length ?? 0}:${itemSignature}`
+      const errorSignature = turn.error ? `err:${turn.error.name}:${turn.error.message.length}` : ''
+      return `${getFreshAgentDisplayTurnKey(turn)}:${turn.summary?.length ?? 0}:${errorSignature}:${itemSignature}`
     }).join('|')
   ), [displayTurns])
 
@@ -1252,10 +1281,14 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
       >
         {displayTurns.map((turn, index) => {
           const blocksForTurn = turnLayouts[index]?.blocks ?? []
-          const absorbed = turn.items.length > 0 && blocksForTurn.length === 0
+          // An errored turn is never "absorbed": even when its item mix renders
+          // no blocks (e.g. empty-text reasoning), its article must mount for
+          // the durable error module. The layout gate above keeps its activity
+          // items out of foreign lines.
+          const absorbed = turn.items.length > 0 && blocksForTurn.length === 0 && !turn.error
           const isLastStreaming = isStreaming && index === displayTurns.length - 1
           if (absorbed) return null
-          if (isLastStreaming && blocksForTurn.length === 0 && turn.items.length === 0 && liveActivityBlockId !== null) return null
+          if (isLastStreaming && blocksForTurn.length === 0 && turn.items.length === 0 && liveActivityBlockId !== null && !turn.error) return null
           // Fork/rewind/copy resolve to the article line's LAST contributing turn
           // (the most recent point the line covers), so the existing "fork from
           // the latest activity turn" protection survives merging.

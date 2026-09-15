@@ -271,7 +271,13 @@ export function itemToToolDisplay(item: FreshAgentTranscriptItem): FreshAgentToo
       id: item.id,
       name: item.namespace ? `${item.namespace}.${item.tool}` : item.tool,
       input: asRecord(item.arguments) ?? { arguments: item.arguments },
-      output: item.contentItems !== undefined ? formatJson(item.contentItems) : undefined,
+      // A persisted failed opencode tool carries its CLI-visible text in
+      // `state.error` (never `state.output`), so the absent-JSON-null
+      // contentItems path uses that text — the same destructive slot the card
+      // already renders for failed tool output.
+      output: item.contentItems != null
+        ? formatJson(item.contentItems)
+        : item.error ?? undefined,
       isError: item.status === 'failed' || item.success === false,
       status: item.status === 'running' ? 'running' : 'complete',
     }

@@ -605,6 +605,10 @@ export default function Sidebar({
     && hasRequestedQuery
   const showDeepSearchPending = !!sidebarWindow?.deepSearchPending
   const integrityError = sidebarWindow?.integrityError
+  // Integrity-banner dismissal: keyed by collision count so a CHANGED count
+  // (a fresh data problem) re-arms the banner; the dismissal never clears the
+  // store's integrity state (the server still quarantines those rows).
+  const [dismissedIntegrityCount, setDismissedIntegrityCount] = useState<number | null>(null)
   const sidebarHasMore = sidebarWindow?.hasMore ?? false
   const sidebarOldestLoadedTimestamp = sidebarWindow?.oldestLoadedTimestamp
   const sidebarOldestLoadedSessionId = sidebarWindow?.oldestLoadedSessionId
@@ -934,17 +938,28 @@ export default function Sidebar({
             className="h-full overflow-y-auto"
             onScroll={handleListScroll}
           >
-            {integrityError?.kind === 'identity_collision' ? (
+            {integrityError?.kind === 'identity_collision'
+              && integrityError.collisionCount !== dismissedIntegrityCount ? (
               <div
                 role="alert"
                 data-testid="session-directory-integrity-error"
-                className="mx-1 mt-2 flex gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-2 text-xs text-amber-950 dark:text-amber-100"
+                className="mx-1 mt-2 flex items-center justify-between gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-2 text-xs text-amber-950 dark:text-amber-100"
               >
-                <AlertCircle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" aria-hidden="true" />
-                <span>
-                  {integrityError.collisionCount} conflicting saved session {integrityError.collisionCount === 1 ? 'identity is' : 'identities are'} hidden.
-                  {' '}Running terminals remain available. Check the server log, then remove or rename the duplicate files.
-                </span>
+                <div className="flex gap-2">
+                  <AlertCircle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" aria-hidden="true" />
+                  <span>
+                    {integrityError.collisionCount} conflicting saved session {integrityError.collisionCount === 1 ? 'identity is' : 'identities are'} hidden.
+                    {' '}Running terminals remain available. Check the server log, then remove or rename the duplicate files.
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  aria-label="Dismiss"
+                  className="shrink-0 rounded p-0.5"
+                  onClick={() => setDismissedIntegrityCount(integrityError?.collisionCount ?? null)}
+                >
+                  <X className="h-3 w-3" aria-hidden="true" />
+                </button>
               </div>
             ) : null}
             {showBlockingLoad ? (

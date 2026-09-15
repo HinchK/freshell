@@ -1346,6 +1346,227 @@ describe('FreshAgentTranscript', () => {
     })
   })
 
+  describe('durable turn errors (opencode projection)', () => {
+    const deadlineRaw = '{"message":"request deadline exceeded after 1195s before the response completed","type":"request_deadline_exceeded"}'
+
+    it('renders the durable error module after the turn items', () => {
+      render(
+        <FreshAgentTranscript
+          turns={[{
+            id: 'turn-1', turnId: 'turn-1', role: 'assistant', summary: 'partial reply', summaryKind: 'echo',
+            error: { name: 'UnknownError', message: deadlineRaw },
+            items: [{ id: 'item-1', kind: 'text', text: 'partial reply' }],
+          }]}
+        />,
+      )
+
+      const module = screen.getByTestId('fresh-agent-turn-error')
+      expect(module).toHaveAttribute('role', 'note')
+      expect(module).toHaveAttribute('aria-label', 'Agent error')
+      expect(module).not.toHaveAttribute('aria-live')
+      expect(module).toBeVisible()
+      expect(module).toHaveTextContent('request deadline exceeded after 1195s before the response completed')
+      expect(module).toHaveTextContent('request_deadline_exceeded')
+      const article = module.closest('article')
+      expect(article).not.toBeNull()
+      const text = article?.textContent ?? ''
+      expect(text.indexOf('partial reply')).toBeGreaterThanOrEqual(0)
+      expect(text.indexOf('partial reply')).toBeLessThan(text.indexOf('Agent error'))
+    })
+
+    it('renders the module for an activity-only errored turn in the absorbed shape (LB-2)', () => {
+      render(
+        <FreshAgentTranscript
+          turns={[
+            {
+              id: 'turn-1', turnId: 'turn-1', role: 'assistant', summary: '', summaryKind: 'echo',
+              items: [{
+                id: 'tool-1', kind: 'dynamic_tool', namespace: 'opencode', tool: 'bash',
+                status: 'completed', arguments: { command: 'true' }, contentItems: ['ok'], success: true,
+              }],
+            },
+            {
+              id: 'turn-2', turnId: 'turn-2', role: 'assistant', summary: '', summaryKind: 'echo',
+              error: { name: 'UnknownError', message: deadlineRaw },
+              items: [{
+                id: 'reason-1', kind: 'reasoning',
+                summary: ['the provider never answered'], content: ['the provider never answered'],
+                text: 'the provider never answered',
+              }],
+            },
+          ]}
+        />,
+      )
+
+      const module = screen.getByTestId('fresh-agent-turn-error')
+      expect(module).toHaveTextContent('request deadline exceeded after 1195s before the response completed')
+      // The errored turn is a hard boundary: it mounts its own article. Pre-fix
+      // this turn was absorbed into turn-1's activity line and skipped entirely.
+      expect(screen.getAllByRole('article', { name: 'Assistant transcript turn' })).toHaveLength(2)
+      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(2)
+    })
+
+    it('renders a zero-item errored assistant turn as a visible module (the persisted deadline shape)', () => {
+      render(
+        <FreshAgentTranscript
+          turns={[{
+            id: 'turn-1', turnId: 'turn-1', role: 'assistant', summary: '', items: [],
+            error: { name: 'UnknownError', message: deadlineRaw },
+          }]}
+        />,
+      )
+
+      const module = screen.getByTestId('fresh-agent-turn-error')
+      expect(module).toHaveAttribute('role', 'note')
+      expect(module).toHaveAttribute('aria-label', 'Agent error')
+      expect(module).not.toHaveAttribute('aria-live')
+      expect(module).toBeVisible()
+      expect(module).toHaveTextContent(deadlineRaw)
+    })
+
+    it('keeps a zero-item errored last turn visible while the transcript is streaming', () => {
+      render(
+        <FreshAgentTranscript
+          isStreaming
+          turns={[
+            {
+              id: 'turn-1', turnId: 'turn-1', role: 'assistant', summary: '', summaryKind: 'echo',
+              items: [{
+                id: 'tool-1', kind: 'dynamic_tool', namespace: 'opencode', tool: 'bash',
+                status: 'completed', arguments: { command: 'true' }, contentItems: ['ok'], success: true,
+              }],
+            },
+            {
+              id: 'turn-2', turnId: 'turn-2', role: 'assistant', summary: '', summaryKind: 'echo',
+              error: { name: 'UnknownError', message: deadlineRaw },
+              items: [],
+            },
+          ]}
+        />,
+      )
+
+      const module = screen.getByTestId('fresh-agent-turn-error')
+      expect(module).toHaveAttribute('role', 'note')
+      expect(module).toHaveAttribute('aria-label', 'Agent error')
+      expect(module).not.toHaveAttribute('aria-live')
+      expect(module).toBeVisible()
+      expect(module).toHaveTextContent('request deadline exceeded after 1195s before the response completed')
+    })
+
+    it('renders MessageAbortedError as a muted interrupted marker, never an error module', () => {
+      render(
+        <FreshAgentTranscript
+          turns={[{
+            id: 'turn-1', turnId: 'turn-1', role: 'assistant', summary: '', items: [],
+            error: { name: 'MessageAbortedError', message: 'Aborted' },
+          }]}
+        />,
+      )
+
+      const marker = screen.getByTestId('fresh-agent-turn-interrupted')
+      expect(marker).toHaveTextContent('interrupted')
+      expect(within(marker.closest('article')!).queryByRole('alert')).not.toBeInTheDocument()
+      expect(screen.queryByTestId('fresh-agent-turn-error')).not.toBeInTheDocument()
+    })
+
+    it('renders the muted interrupted marker for an activity-only aborted turn after an activity turn', () => {
+      render(
+        <FreshAgentTranscript
+          turns={[
+            {
+              id: 'turn-1', turnId: 'turn-1', role: 'assistant', summary: '', summaryKind: 'echo',
+              items: [{
+                id: 'tool-1', kind: 'dynamic_tool', namespace: 'opencode', tool: 'bash',
+                status: 'completed', arguments: { command: 'true' }, contentItems: ['ok'], success: true,
+              }],
+            },
+            {
+              id: 'turn-2', turnId: 'turn-2', role: 'assistant', summary: '', summaryKind: 'echo',
+              error: { name: 'MessageAbortedError', message: 'Aborted' },
+              items: [{
+                id: 'reason-1', kind: 'reasoning',
+                summary: ['stopped mid-flight'], content: ['stopped mid-flight'],
+                text: 'stopped mid-flight',
+              }],
+            },
+          ]}
+        />,
+      )
+
+      const marker = screen.getByTestId('fresh-agent-turn-interrupted')
+      expect(marker).toHaveTextContent('interrupted')
+      expect(screen.queryByTestId('fresh-agent-turn-error')).not.toBeInTheDocument()
+      expect(within(marker.closest('article')!).queryByRole('alert')).not.toBeInTheDocument()
+    })
+
+    it('renders no error chrome for a turn without an error (regression)', () => {
+      render(
+        <FreshAgentTranscript
+          turns={[{
+            id: 'turn-1', turnId: 'turn-1', role: 'assistant', summary: 'ok',
+            items: [{ id: 'item-1', kind: 'text', text: 'ok' }],
+          }]}
+        />,
+      )
+
+      expect(screen.queryByTestId('fresh-agent-turn-error')).not.toBeInTheDocument()
+      expect(screen.queryByTestId('fresh-agent-turn-interrupted')).not.toBeInTheDocument()
+    })
+
+    it('re-runs signature-driven auto-scroll when an incremental snapshot adds a turn error', () => {
+      let scrollHeight = 1000
+      const baseTurn = {
+        id: 'turn-1', turnId: 'turn-1', role: 'assistant' as const, summary: 'partial reply', summaryKind: 'echo' as const,
+        items: [{ id: 'item-1', kind: 'text' as const, text: 'partial reply' }],
+      }
+      const { container, rerender } = render(<FreshAgentTranscript turns={[baseTurn]} />)
+      const scroller = container.querySelector('[data-context="fresh-agent-transcript"]') as HTMLDivElement
+      Object.defineProperty(scroller, 'clientHeight', { configurable: true, get: () => 200 })
+      Object.defineProperty(scroller, 'scrollHeight', { configurable: true, get: () => scrollHeight })
+      scroller.scrollTop = 800
+      fireEvent.scroll(scroller)
+
+      scrollHeight = 1200
+      rerender(
+        <FreshAgentTranscript
+          turns={[{ ...baseTurn, error: { name: 'UnknownError', message: deadlineRaw } }]}
+        />,
+      )
+
+      expect(scroller.scrollTop).toBe(1200)
+    })
+
+    it('increments the new-message badge when an incremental snapshot adds a dynamic tool error', async () => {
+      let scrollHeight = 1000
+      const baseItem = {
+        id: 'tool-1', kind: 'dynamic_tool' as const, namespace: 'opencode', tool: 'bash',
+        status: 'failed' as const, arguments: { command: 'false' }, contentItems: ['nope'], success: false,
+      }
+      const baseTurn = {
+        id: 'turn-1', turnId: 'turn-1', role: 'assistant' as const, summary: 'ran a tool', summaryKind: 'authored' as const,
+        items: [baseItem],
+      }
+      const { container, rerender } = render(<FreshAgentTranscript turns={[baseTurn]} />)
+      const scroller = container.querySelector('[data-context="fresh-agent-transcript"]') as HTMLDivElement
+      Object.defineProperty(scroller, 'clientHeight', { configurable: true, get: () => 200 })
+      Object.defineProperty(scroller, 'scrollHeight', { configurable: true, get: () => scrollHeight })
+
+      scroller.scrollTop = 100
+      fireEvent.scroll(scroller)
+      const button = await screen.findByRole('button', { name: 'Scroll to bottom' })
+      await waitFor(() => expect(button).toHaveTextContent('1 new'))
+
+      scrollHeight = 1200
+      rerender(
+        <FreshAgentTranscript
+          turns={[{ ...baseTurn, items: [{ ...baseItem, error: 'boom: request failed' }] }]}
+        />,
+      )
+
+      await waitFor(() => expect(button).toHaveTextContent('2 new'))
+    })
+  })
+
   describe('streaming height stability (jp70)', () => {
     const thinkingOnly = (turnId: string, thinkId: string, text: string) => ({
       id: turnId,

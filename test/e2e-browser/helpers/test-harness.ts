@@ -2,6 +2,70 @@ import type { Page } from '@playwright/test'
 import type { PerfAuditSnapshot } from '@/lib/perf-audit-bridge'
 import type { TerminalWriteEvent } from '@/lib/test-harness'
 
+/** Default waitForConnection window (ms) used when neither an explicit
+ * per-call timeout nor FRESHELL_E2E_WS_READY_TIMEOUT_MS applies. 30s
+ * preserves the historical REAL window: the old code passed 15s, but as
+ * the predicate's argument (never bound), so the real window was
+ * Playwright's 30s default. Binding 15s for real would have narrowed every
+ * no-arg call site from 30s to 16s and risked new cold-start flakes. */
+export const DEFAULT_WS_READY_TIMEOUT_MS = 30_000
+
+/**
+ * Resolve the effective waitForConnection window.
+ *
+ * Precedence: an explicit per-call timeout wins; otherwise the
+ * FRESHELL_E2E_WS_READY_TIMEOUT_MS env var scales the window (the cloud e2e
+ * lane sets it — see scripts/e2e-cloud.sh); otherwise the 30s default that
+ * preserves the historical real window. Cloud cold starts can need more:
+ * the client's 10s ready watchdog (CONNECTION_TIMEOUT_MS,
+ * src/lib/ws-client.ts) force-closes a slow handshake and reconnects with
+ * jittered 1→2→4s backoff, and the observed j90s flake exceeded a real 30s
+ * window. Empty, non-numeric, or non-positive env values fall back to the
+ * default — a malformed override must never poison the harness wait.
+ */
+export function resolveWsReadyTimeoutMs(
+  explicitMs: number | undefined,
+  env: Record<string, string | undefined> = process.env,
+): number {
+  if (explicitMs !== undefined) return explicitMs
+  const raw = env.FRESHELL_E2E_WS_READY_TIMEOUT_MS
+  if (raw === undefined || raw === '') return DEFAULT_WS_READY_TIMEOUT_MS
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_WS_READY_TIMEOUT_MS
+  return parsed
+}
+
+/**
+ * The ready predicate shared by every waitForConnection phase. Must stay a
+ * self-contained serializable function (Playwright ships its source to the
+ * page): no closures over harness state.
+ */
+function wsReadyPredicate(): boolean {
+  const harness = window.__FRESHELL_TEST_HARNESS__
+  if (!harness) return false
+  const reduxStatus = harness.getState()?.connection?.status
+  return harness.getWsReadyState() === 'ready' && reduxStatus === 'ready'
+}
+
+export interface WaitForConnectionOptions {
+  /**
+   * Opt-in, ONE-SHOT mid-wait self-heal for fresh-boot waits (kata j90s).
+   * When ready has not landed by half the resolved window, reload the page
+   * once — a fresh boot chain is the observed recovery path from the
+   * gVisor I/O wedge class, where a timeout-less boot fetch hangs and the
+   * WS can never start regardless of window size (see the j90s stall
+   * investigation) — then keep waiting with the remaining budget. The final
+   * phase still throws Playwright's native TimeoutError: the assertion is
+   * not loosened, only a transiently wedged boot is retried.
+   *
+   * Default OFF — every existing call site keeps its single-poll semantics.
+   * Only fresh-boot sites (the freshellPage fixture, post-goto reload legs)
+   * may opt in; a mid-test recovery wait must NOT (a reload would destroy
+   * the state under test).
+   */
+  selfHealReload?: boolean
+}
+
 /**
  * Helpers for interacting with the Freshell test harness from Playwright tests.
  */
@@ -16,17 +80,49 @@ export class TestHarness {
     )
   }
 
-  /** Wait for WebSocket connection to reach 'ready' state */
-  async waitForConnection(timeoutMs = 15_000): Promise<void> {
-    await this.page.waitForFunction(
-      () => {
-        const harness = window.__FRESHELL_TEST_HARNESS__
-        if (!harness) return false
-        const reduxStatus = harness.getState()?.connection?.status
-        return harness.getWsReadyState() === 'ready' && reduxStatus === 'ready'
-      },
-      { timeout: timeoutMs + 1000 },
-    )
+  /**
+   * Wait for WebSocket connection to reach 'ready' state.
+   *
+   * The timeout is passed as waitForFunction's OPTIONS (third argument).
+   * The historical two-arg call bound the timeout object to the
+   * predicate's argument, so every explicit window was decorative and the
+   * real wait was Playwright's 30s default (empirically confirmed — see
+   * the j90s load-bearing ledger, LB-1). The resolved window keeps +1s
+   * slack, so the no-arg default lands at 31s — preserving (by 1s of
+   * harmless widening) the real 30s window local runs always had.
+   *
+   * With opts.selfHealReload (opt-in, fresh-boot sites only), the window
+   * splits into two phases sized from the resolved window W: phase 1 is a
+   * boolean poll within floor(W/2); if ready has not landed, ONE
+   * page.reload({ timeout: W - floor(W/2) }) mints a fresh boot chain and
+   * the final phase waits the remaining budget, letting Playwright's
+   * native TimeoutError propagate on failure.
+   */
+  async waitForConnection(timeoutMs?: number, opts: WaitForConnectionOptions = {}): Promise<void> {
+    const resolvedTimeoutMs = resolveWsReadyTimeoutMs(timeoutMs)
+    if (!opts.selfHealReload) {
+      await this.page.waitForFunction(
+        wsReadyPredicate,
+        undefined,
+        { timeout: resolvedTimeoutMs + 1000 },
+      )
+      return
+    }
+    const phase1Ms = Math.floor(resolvedTimeoutMs / 2)
+    const remainingMs = resolvedTimeoutMs - phase1Ms
+    const readyWithinPhase1 = await this.page.waitForFunction(
+      wsReadyPredicate,
+      undefined,
+      { timeout: phase1Ms },
+    ).then(() => true, () => false)
+    if (!readyWithinPhase1) {
+      await this.page.reload({ timeout: remainingMs })
+      await this.page.waitForFunction(
+        wsReadyPredicate,
+        undefined,
+        { timeout: remainingMs },
+      )
+    }
   }
 
   /**

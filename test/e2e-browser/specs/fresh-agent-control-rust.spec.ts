@@ -2085,7 +2085,10 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Boot a freshopencode pane against the HTTP/SSE fake opencode serve. */
-async function bootOpencodeLane(page: Page): Promise<{
+async function bootOpencodeLane(
+  page: Page,
+  extraEnv: Record<string, string> = {},
+): Promise<{
   server: RustServer
   info: E2eServerInfo
   harness: TestHarness
@@ -2109,6 +2112,7 @@ async function bootOpencodeLane(page: Page): Promise<{
         PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ''}`,
         OPENCODE_CMD: fakeOpencode,
         FAKE_OPENCODE_AUDIT_LOG: auditLogPath,
+        ...extraEnv,
       },
       setupHome: seedWallConfig({ providers: ['opencode'], freshAgent: true }),
     })
@@ -2137,6 +2141,7 @@ async function sendOpencodeTurn(
   text: string,
   expectedPromptCount: number,
   auditLogPath: string,
+  options: { expectResponseText?: boolean } = {},
 ): Promise<string> {
   const paneRoot = page.locator('[data-context="fresh-agent"]').last()
   await sendComposerText(page, text)
@@ -2153,7 +2158,9 @@ async function sendOpencodeTurn(
     `prompt_async audit for "${text}"`,
   )
   // The assistant reply renders from the fake's own message store.
-  await expect(paneRoot).toContainText(`Fake OpenCode response: ${text}`, { timeout: 30_000 })
+  if (options.expectResponseText !== false) {
+    await expect(paneRoot).toContainText(`Fake OpenCode response: ${text}`, { timeout: 30_000 })
+  }
   return (await paneLeaf(harness, tabId))?.content?.sessionId as string
 }
 
@@ -2411,6 +2418,65 @@ test.describe('fresh-agent control surfaces — opencode lane (rust)', () => {
         }, { timeout: 30_000, message: 'post-restart resume+read evidence for BOTH source and child' })
         .toBe(true)
       sourceRestartWs.close()
+    } finally {
+      await lane.server.stop().catch(() => {})
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
+  test('durable provider error projects into the transcript and survives reload', async ({ page }) => {
+    const providerMessage = 'request deadline exceeded after 1195s before the response completed'
+    const toolErrorMessage = 'The user has specified a rule which prevents you from using this specific tool call.'
+    const lane = await bootOpencodeLane(page, {
+      FAKE_OPENCODE_PROMPT_ERROR: providerMessage,
+      FAKE_OPENCODE_TOOL_ERROR: toolErrorMessage,
+    })
+    try {
+      await sendOpencodeTurn(
+        page, lane.harness, lane.tabId, 'opencode error turn', 1, lane.auditLogPath,
+        { expectResponseText: false },
+      )
+
+      // The snapshot refetch after idle carries the persisted info.error: the
+      // activity-only errored turn mounts its own article + durable module.
+      // Pre-fix (no errored-turn boundary) it merged into the first assistant
+      // activity line and this locator never appeared.
+      const transcript = page.locator('[data-context="fresh-agent-transcript"]')
+      const errorModule = transcript.getByTestId('fresh-agent-turn-error')
+      await expect(errorModule).toBeVisible({ timeout: 30_000 })
+      await expect(errorModule).toContainText(providerMessage)
+      await expect(errorModule).toContainText('request_deadline_exceeded')
+
+      // The persisted tool-part state.error text is CLI-visible; the failed
+      // tool row (single-tool strip) expands to show it.
+      await transcript.getByRole('button', { name: 'Toggle activity details' }).first().click()
+      await expect(transcript.locator('[data-tool-output]').first()).toContainText(toolErrorMessage)
+
+      // Durability: both carriers re-derive from the REST snapshot after reload.
+      await flushPersistence(page)
+      await page.reload({ waitUntil: 'domcontentloaded' })
+      const harness2 = new TestHarness(page)
+      await harness2.waitForHarness()
+      await harness2.waitForConnection()
+      await expect(errorModule).toContainText(providerMessage, { timeout: 30_000 })
+      await transcript.getByRole('button', { name: 'Toggle activity details' }).first().click()
+      await expect(transcript.locator('[data-tool-output]').first()).toContainText(toolErrorMessage)
+
+      // Wire-shape pin: the raw double-encoded provider payload survived as the
+      // message, and the tool item carries the persisted error text.
+      const sessionId = (await paneLeaf(harness2, (await harness2.getActiveTabId())!))?.content?.sessionId
+      await expect(async () => {
+        const snapshot = await fetchSnapshot(lane.info, 'freshopencode', 'opencode', sessionId)
+        const erroredTurn = (snapshot?.turns ?? []).find((turn: any) => turn.error)
+        expect(erroredTurn?.error?.name).toBe('UnknownError')
+        expect(erroredTurn?.error?.message).toBe(
+          JSON.stringify({ message: providerMessage, type: 'request_deadline_exceeded' }),
+        )
+        const toolErrorItem = (snapshot?.turns ?? [])
+          .flatMap((turn: any) => turn.items ?? [])
+          .find((item: any) => item.kind === 'dynamic_tool' && item.error)
+        expect(toolErrorItem?.error).toBe(toolErrorMessage)
+      }).toPass({ timeout: 30_000 })
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})

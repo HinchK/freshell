@@ -943,6 +943,7 @@ mod tests {
                 session_body: json!({ "id": "ses_1", "time": { "updated": 5 } }),
                 messages_body: json!([
                     { "info": { "id": "m1", "role": "user" }, "parts": [{ "type": "text", "text": "hi" }] },
+                    { "info": { "id": "m2", "role": "assistant", "error": { "name": "UnknownError", "data": { "message": "boom" } } }, "parts": [{ "type": "step-start" }] },
                 ]),
             }),
             ports: Arc::new(FakeAllocator),
@@ -982,5 +983,7 @@ mod tests {
         assert_eq!(value["provider"], json!("opencode"));
         assert_eq!(value["threadId"], json!("ses_1"));
         assert_eq!(value["turns"][0]["items"][0]["text"], json!("hi"));
+        assert_eq!(value["turns"][1]["error"]["name"], json!("UnknownError"));
+        assert_eq!(value["turns"][1]["error"]["message"], json!("boom"));
     }
 }

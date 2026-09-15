@@ -1001,6 +1001,33 @@ fn opencode_model_from_info(info: &Value) -> Option<String> {
     }
 }
 
+/// The CLI/TUI `errorMessage` rendering (`packages/tui/src/util/error.ts`): a
+/// string `data.message` is shown verbatim (the real deadline failure persists
+/// its provider payload double-encoded there); every other persisted shape is
+/// pretty-printed as the whole error object, matching `errorFormat`'s
+/// `JSON.stringify(error, null, 2)`. The workspace serde_json
+/// `preserve_order` feature keeps the wire key order (`name`, then `data`).
+/// An empty `data.message` falls through to the JSON rendering, exactly like
+/// the helper's truthy-string check; the wire contract requires non-empty text.
+fn opencode_turn_error_from_info(info: &Value) -> Option<Value> {
+    let error = info.get("error")?;
+    error.as_object()?;
+    let name = error
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("UnknownError");
+    let message = error
+        .pointer("/data/message")
+        .and_then(Value::as_str)
+        .filter(|message| !message.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            serde_json::to_string_pretty(error).unwrap_or_else(|_| "unknown error".to_string())
+        });
+    Some(json!({ "name": name, "message": message }))
+}
+
 /// `tokenUsage(info)` (`normalize.ts:39-52`).
 fn opencode_token_usage(info: &Value) -> Value {
     let tokens = info.get("tokens").cloned().unwrap_or_else(|| json!({}));
@@ -1776,7 +1803,18 @@ fn opencode_item_from_part(
                 } else {
                     None
                 };
-                vec![json!({
+                // PR #779 (opencode-error-projection): failed dynamic tools carry
+                // their persisted wire error text for durable client rendering.
+                let error_text = if status == "failed" {
+                    state
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .filter(|error| !error.trim().is_empty())
+                        .map(str::to_string)
+                } else {
+                    None
+                };
+                let mut item = json!({
                     "id": id,
                     "kind": "dynamic_tool",
                     "namespace": "opencode",
@@ -1785,7 +1823,11 @@ fn opencode_item_from_part(
                     "arguments": arguments,
                     "contentItems": content_items,
                     "success": success,
-                })]
+                });
+                if let Some(error_text) = error_text {
+                    item["error"] = json!(error_text);
+                }
+                vec![item]
             }
         }
         Some("file") => vec![json!({
@@ -1968,6 +2010,9 @@ pub(crate) fn opencode_message_turn_json(message: &Value, ordinal: usize) -> Opt
     }
     if let Some(model) = opencode_model_from_info(&info) {
         turn.insert("model".to_string(), json!(model));
+    }
+    if let Some(error) = opencode_turn_error_from_info(&info) {
+        turn.insert("error".to_string(), error);
     }
     let (summary, summary_kind) = opencode_turn_summary(&items);
     turn.insert("summary".to_string(), json!(summary));
@@ -4638,6 +4683,183 @@ mod tests {
         assert_eq!(items[0]["status"], json!("running"));
         assert_eq!(items[0]["contentItems"], Value::Null);
         assert_eq!(items[0]["success"], Value::Null);
+    }
+
+    #[test]
+    fn opencode_item_from_part_error_tool_carries_the_persisted_state_error_text() {
+        // LB-3: a persisted failed tool part has non-empty `state.error` and no
+        // `state.output`; the TUI renders that text as the failure body. The
+        // projection must carry it on the item.
+        let part = json!({
+            "type": "tool", "id": "part-err", "tool": "bash",
+            "state": {
+                "status": "error",
+                "input": { "command": "false" },
+                "error": "The user has specified a rule which prevents you from using this specific tool call.",
+            },
+        });
+
+        let items = opencode_item_from_part(&part, "fallback", Some("assistant"), false);
+
+        assert_eq!(items[0]["status"], json!("failed"));
+        assert_eq!(
+            items[0]["contentItems"],
+            Value::Null,
+            "failed persisted parts carry no state.output"
+        );
+        assert_eq!(
+            items[0]["error"],
+            json!("The user has specified a rule which prevents you from using this specific tool call.")
+        );
+    }
+
+    #[test]
+    fn opencode_item_from_part_blank_tool_error_is_dropped() {
+        let part = json!({
+            "type": "tool", "id": "part-err-blank", "tool": "bash",
+            "state": { "status": "error", "input": {}, "error": "   " },
+        });
+
+        let items = opencode_item_from_part(&part, "fallback", Some("assistant"), false);
+
+        assert!(
+            items[0].get("error").is_none(),
+            "a blank persisted error carries no text"
+        );
+    }
+
+    #[test]
+    fn opencode_item_from_part_completed_and_running_tool_with_lingering_error_omit_the_key() {
+        // The brief's item interface: the `error` key is present exactly when the
+        // part is `state.status:"error"`. A completed/running part that lingers
+        // with a non-blank `state.error` (a future fixture or malformed serve
+        // response) must stay byte-identical to a part carrying no error at all.
+        for status in ["completed", "running"] {
+            let part = json!({
+                "type": "tool", "id": "part-lingering-err", "tool": "bash",
+                "state": {
+                    "status": status,
+                    "input": { "command": "ls" },
+                    "output": "a.txt\n",
+                    "error": "stale text from a previous attempt",
+                },
+            });
+
+            let items = opencode_item_from_part(&part, "fallback", Some("assistant"), false);
+
+            assert_eq!(items[0]["status"], json!(status));
+            assert!(
+                items[0].get("error").is_none(),
+                "the error key is present only for state.status:\"error\" parts, got {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_message_turn_json_projects_the_persisted_unknown_error_verbatim() {
+        // The exact persisted shape of the real provider request-deadline failure:
+        // `fromError` JSON.stringify's the plain `{message,type}` stream error into
+        // `UnknownError.data.message` (request_deadline_exceeded is embedded text,
+        // never a structured field). The TUI helper emits a string `data.message`
+        // verbatim, so the projection must too.
+        let raw = r#"{"message":"request deadline exceeded after 1195s before the response completed","type":"request_deadline_exceeded"}"#;
+        let message = json!({
+            "info": {
+                "id": "msg-deadline",
+                "role": "assistant",
+                "error": { "name": "UnknownError", "data": { "message": raw } },
+            },
+            "parts": [{ "type": "step-start" }],
+        });
+
+        let turn = opencode_message_turn_json(&message, 0).expect("error-only turn builds");
+
+        assert_eq!(
+            turn["items"],
+            json!([]),
+            "the real deadline message has no displayable parts"
+        );
+        assert_eq!(turn["error"]["name"], json!("UnknownError"));
+        assert_eq!(
+            turn["error"]["message"],
+            Value::String(raw.to_string()),
+            "the raw persisted string is surfaced as-is, matching the CLI"
+        );
+    }
+
+    #[test]
+    fn opencode_message_turn_json_renders_a_messageless_error_as_cli_pretty_json() {
+        // LB-4: MessageOutputLengthError persists `data: {}`; the TUI helper
+        // falls through to `errorFormat`'s `JSON.stringify(error, null, 2)`.
+        // With the workspace serde_json `preserve_order` feature the key order
+        // follows the wire (`name` then `data`), byte-identical to the CLI.
+        let message = json!({
+            "info": {
+                "id": "msg-len",
+                "role": "assistant",
+                "error": { "name": "MessageOutputLengthError", "data": {} },
+            },
+            "parts": [{ "type": "step-start" }],
+        });
+
+        let turn = opencode_message_turn_json(&message, 0).expect("turn builds");
+
+        assert_eq!(turn["error"]["name"], json!("MessageOutputLengthError"));
+        assert_eq!(
+            turn["error"]["message"],
+            json!("{\n  \"name\": \"MessageOutputLengthError\",\n  \"data\": {}\n}")
+        );
+    }
+
+    #[test]
+    fn opencode_message_turn_json_projects_message_aborted_error() {
+        let message = json!({
+            "info": {
+                "id": "msg-abort",
+                "role": "assistant",
+                "error": { "name": "MessageAbortedError", "data": { "message": "Aborted" } },
+            },
+            "parts": [],
+        });
+
+        let turn = opencode_message_turn_json(&message, 0).expect("turn builds");
+
+        assert_eq!(
+            turn["error"],
+            json!({ "name": "MessageAbortedError", "message": "Aborted" })
+        );
+        assert_eq!(turn["items"], json!([]));
+    }
+
+    #[test]
+    fn opencode_message_turn_json_omits_error_for_a_normal_assistant_turn() {
+        let message = json!({
+            "info": { "id": "msg-ok", "role": "assistant" },
+            "parts": [{ "type": "text", "text": "all good" }],
+        });
+
+        let turn = opencode_message_turn_json(&message, 0).expect("turn builds");
+
+        assert!(
+            turn.get("error").is_none(),
+            "a turn without info.error stays byte-identical"
+        );
+    }
+
+    #[test]
+    fn opencode_message_turn_json_ignores_a_malformed_error_payload() {
+        let message = json!({
+            "info": { "id": "msg-bad", "role": "assistant", "error": "boom" },
+            "parts": [{ "type": "text", "text": "still renders" }],
+        });
+
+        let turn = opencode_message_turn_json(&message, 0).expect("turn builds");
+
+        assert!(
+            turn.get("error").is_none(),
+            "a non-object error is never fatal"
+        );
+        assert_eq!(turn["items"][0]["text"], json!("still renders"));
     }
 
     #[test]

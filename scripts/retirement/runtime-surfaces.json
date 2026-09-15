@@ -292,6 +292,11 @@
       "role": "test-coordinator"
     },
     {
+      "id": "scripts-e2e-harness-timeout-env-test",
+      "path": "scripts/test/e2e-harness-timeout-env.test.sh",
+      "role": "test-coordinator"
+    },
+    {
       "id": "listener-coordinator",
       "path": "scripts/testing/coordinator-endpoint.ts",
       "role": "non-backend-listener",

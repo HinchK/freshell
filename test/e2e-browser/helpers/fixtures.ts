@@ -220,7 +220,16 @@ export const test = base.extend<{
   // returns a handle that points at an already-running EXTERNAL server (e.g. the
   // Rust port) instead of spawning a fresh local owned RustServer.
   testServer: [async ({}, use) => {
-    const server = await createE2eServerHandle(process.env)
+    const server = await createE2eServerHandle(process.env, {
+      // Server-log visibility (kata j90s): the owned RustServer captures
+      // stdout/stderr into in-memory buffers unless `verbose` pipes them
+      // to this process's console (rust-server.ts). On the cloud lane
+      // (FRESHELL_E2E_SERVER_VERBOSE=1, set by scripts/e2e-cloud.sh) that
+      // forwards the server's logs into the container log stream so a
+      // future wedge episode is diagnosable from Cloud Logging. No-op for
+      // external targets (construct is ignored there) and locally.
+      construct: { verbose: process.env.FRESHELL_E2E_SERVER_VERBOSE === '1' },
+    })
     await server.start()
     await use(server)
     await server.stop()
@@ -252,8 +261,16 @@ export const test = base.extend<{
     // Wait for the test harness to be installed
     await harness.waitForHarness()
 
-    // Wait for WebSocket to connect
-    await harness.waitForConnection()
+    // Wait for WebSocket to connect. Self-heal is opted IN on the cloud
+    // lane only (env var present): this is a fresh-boot wait, and the j90s
+    // wedge class (a gVisor I/O stall hanging a timeout-less boot fetch so
+    // the WS never starts) recovers via a fresh boot chain —
+    // waitForConnection performs at most ONE mid-wait reload when ready
+    // has not landed by half the window (kata j90s). The local lane keeps
+    // its exact historical single-shot wait semantics.
+    await harness.waitForConnection(undefined, {
+      selfHealReload: process.env.FRESHELL_E2E_WS_READY_TIMEOUT_MS !== undefined,
+    })
 
     // If a PanePicker is showing (new tab without auto-created terminal),
     // select a shell to create a terminal. On WSL/Windows the picker shows

@@ -439,6 +439,49 @@ describe('Sidebar Component - Session-Centric Display', () => {
     expect(screen.getByRole('button', { name: /Healthy session/ })).toBeInTheDocument()
   })
 
+  it('the integrity-error banner is dismissable with an X; a changed collision count re-shows it', async () => {
+    const projects: ProjectGroup[] = []
+    const buildStore = (collisionCount: number) => createTestStore({
+      projects,
+      sessions: {
+        activeSurface: 'sidebar',
+        windows: {
+          sidebar: {
+            projects,
+            lastLoadedAt: Date.now(),
+            integrityError: {
+              kind: 'identity_collision',
+              collisionCount,
+              duplicateItemCount: collisionCount * 2,
+            },
+          },
+        },
+      },
+    })
+
+    const store = buildStore(2)
+    renderSidebar(store)
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+    expect(screen.getByTestId('session-directory-integrity-error')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+    expect(screen.queryByTestId('session-directory-integrity-error')).toBeNull()
+
+    // A NEW collision count (fresh data problem) re-arms the banner.
+    await act(async () => {
+      store.dispatch(commitSessionWindowVisibleRefresh({
+        surface: 'sidebar',
+        projects,
+        totalSessions: 0,
+        hasMore: false,
+        integrityError: { kind: 'identity_collision', collisionCount: 3, duplicateItemCount: 6 },
+      }))
+    })
+    expect(screen.getByTestId('session-directory-integrity-error')).toHaveTextContent('3 conflicting saved session')
+  })
+
   describe('displays sessions only (not terminals)', () => {
     it('keeps restored open sessions visible without issuing sidebar directory fetches on mount', () => {
       const store = createTestStore({

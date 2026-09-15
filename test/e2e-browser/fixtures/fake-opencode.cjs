@@ -162,30 +162,6 @@ function sessionRowsForDirectory(db, directory) {
   return rows.filter((row) => normalizeDirectoryForComparison(row.directory) === expected)
 }
 
-function insertTextMessage(db, input) {
-  db.prepare(`
-      INSERT OR REPLACE INTO message (id, session_id, time_created, time_updated, data)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(
-      input.messageId,
-      input.sessionId,
-      input.now,
-      input.now,
-      JSON.stringify({ role: input.role }),
-    )
-  db.prepare(`
-      INSERT OR REPLACE INTO part (id, message_id, session_id, time_created, time_updated, data)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(
-      input.partId,
-      input.messageId,
-      input.sessionId,
-      input.now,
-      input.now,
-      JSON.stringify({ type: 'text', text: input.text }),
-    )
-}
-
 function insertMessage(db, input) {
   db.prepare(`
       INSERT OR REPLACE INTO message (id, session_id, time_created, time_updated, data)
@@ -195,11 +171,11 @@ function insertMessage(db, input) {
       input.sessionId,
       input.now,
       input.now,
-      JSON.stringify({ role: input.role }),
+      JSON.stringify({ role: input.role, ...(input.extra ?? {}) }),
     )
 }
 
-function insertMessagePart(db, input) {
+function insertPart(db, input) {
   db.prepare(`
       INSERT OR REPLACE INTO part (id, message_id, session_id, time_created, time_updated, data)
       VALUES (?, ?, ?, ?, ?, ?)
@@ -211,6 +187,17 @@ function insertMessagePart(db, input) {
       input.now,
       JSON.stringify(input.data),
     )
+}
+
+function insertTextMessage(db, input) {
+  insertMessage(db, input)
+  insertPart(db, {
+    sessionId: input.sessionId,
+    messageId: input.messageId,
+    partId: input.partId,
+    now: input.now,
+    data: { type: 'text', text: input.text },
+  })
 }
 
 // ── freshopencode TUI-parity scripted data (plan Task 7 e2e) ───────────────────
@@ -264,14 +251,14 @@ function seedTuiParityChildSessions(input) {
       role: 'user',
       now,
     })
-    insertMessagePart(db, {
+    insertPart(db, {
       partId: 'msg_ses_c_1_user_part_1_subtask',
       messageId: 'msg_ses_c_1_user',
       sessionId: TUI_PARITY_CHILD_SESSION_ID,
       now,
       data: { type: 'subtask', agent: 'general', description: 'Fix the flaky harness' },
     })
-    insertMessagePart(db, {
+    insertPart(db, {
       partId: 'msg_ses_c_1_user_part_2_text',
       messageId: 'msg_ses_c_1_user',
       sessionId: TUI_PARITY_CHILD_SESSION_ID,
@@ -284,14 +271,14 @@ function seedTuiParityChildSessions(input) {
       role: 'assistant',
       now: now + 1,
     })
-    insertMessagePart(db, {
+    insertPart(db, {
       partId: 'msg_ses_c_2_assistant_part_tool_bash',
       messageId: 'msg_ses_c_2_assistant',
       sessionId: TUI_PARITY_CHILD_SESSION_ID,
       now: now + 1,
       data: { type: 'tool', tool: 'bash', state: { status: 'completed', input: { command: 'sed -n 92,112p src/store/paneTypes.ts' } } },
     })
-    insertMessagePart(db, {
+    insertPart(db, {
       partId: 'msg_ses_c_2_assistant_part_tool_grep',
       messageId: 'msg_ses_c_2_assistant',
       sessionId: TUI_PARITY_CHILD_SESSION_ID,
@@ -304,7 +291,7 @@ function seedTuiParityChildSessions(input) {
       role: 'user',
       now,
     })
-    insertMessagePart(db, {
+    insertPart(db, {
       partId: 'msg_ses_bg_1_user_part_text',
       messageId: 'msg_ses_bg_1_user',
       sessionId: TUI_PARITY_BACKGROUND_CHILD_SESSION_ID,
@@ -317,7 +304,7 @@ function seedTuiParityChildSessions(input) {
       role: 'assistant',
       now: now + 1,
     })
-    insertMessagePart(db, {
+    insertPart(db, {
       partId: 'msg_ses_bg_2_assistant_part_tool_bash',
       messageId: 'msg_ses_bg_2_assistant',
       sessionId: TUI_PARITY_BACKGROUND_CHILD_SESSION_ID,
@@ -349,7 +336,7 @@ function appendTuiParityMessages(input) {
     const userMessageId = `msg_${input.sessionId}_${sequence}_user`
     const assistantMessageId = `msg_${input.sessionId}_${sequence + 1}_assistant`
     insertMessage(db, { messageId: userMessageId, sessionId: input.sessionId, role: 'user', now: userTime })
-    insertMessagePart(db, {
+    insertPart(db, {
       partId: `${userMessageId}_part_text`,
       messageId: userMessageId,
       sessionId: input.sessionId,
@@ -357,7 +344,7 @@ function appendTuiParityMessages(input) {
       data: { type: 'text', text: input.promptText },
     })
     insertMessage(db, { messageId: assistantMessageId, sessionId: input.sessionId, role: 'assistant', now: assistantTime })
-    insertMessagePart(db, {
+    insertPart(db, {
       partId: `${assistantMessageId}_part_1_reasoning`,
       messageId: assistantMessageId,
       sessionId: input.sessionId,
@@ -368,7 +355,7 @@ function appendTuiParityMessages(input) {
         time: { start: userTime - 3400, end: userTime },
       },
     })
-    insertMessagePart(db, {
+    insertPart(db, {
       partId: `${assistantMessageId}_part_2_task_foreground`,
       messageId: assistantMessageId,
       sessionId: input.sessionId,
@@ -389,7 +376,7 @@ function appendTuiParityMessages(input) {
         },
       },
     })
-    insertMessagePart(db, {
+    insertPart(db, {
       partId: `${assistantMessageId}_part_3_task_background`,
       messageId: assistantMessageId,
       sessionId: input.sessionId,
@@ -404,7 +391,7 @@ function appendTuiParityMessages(input) {
         },
       },
     })
-    insertMessagePart(db, {
+    insertPart(db, {
       partId: `${assistantMessageId}_part_4_retry`,
       messageId: assistantMessageId,
       sessionId: input.sessionId,
@@ -970,6 +957,60 @@ function appendPromptMessages(input) {
       text: promptText,
       now: userTime,
     })
+    // Durable provider-error scenario (LB-2/LB-3, e2e): an assistant activity
+    // message ending on a failed tool (whose persisted `state.error` text is
+    // CLI-visible), followed by an activity-only errored assistant message.
+    // The second message is the absorbed shape: without the transcript's
+    // errored-turn boundary it merged into the first assistant line and its
+    // turn-level error module never mounted.
+    const promptError = process.env.FAKE_OPENCODE_PROMPT_ERROR
+    if (promptError) {
+      const toolErrorText = process.env.FAKE_OPENCODE_TOOL_ERROR
+        || 'The user has specified a rule which prevents you from using this specific tool call.'
+      const activityMessageId = `${assistantMessageId}_activity`
+      const activityTime = userTime + 1
+      const erroredTime = userTime + 2
+      insertMessage(db, {
+        sessionId: input.sessionId,
+        messageId: activityMessageId,
+        role: 'assistant',
+        now: activityTime,
+      })
+      insertPart(db, {
+        sessionId: input.sessionId,
+        messageId: activityMessageId,
+        partId: `${activityMessageId}_part_tool`,
+        now: activityTime,
+        data: {
+          type: 'tool',
+          tool: 'bash',
+          state: { status: 'error', input: { command: 'false' }, error: toolErrorText },
+        },
+      })
+      insertMessage(db, {
+        sessionId: input.sessionId,
+        messageId: assistantMessageId,
+        role: 'assistant',
+        now: erroredTime,
+        extra: {
+          error: {
+            name: 'UnknownError',
+            data: {
+              message: JSON.stringify({ message: promptError, type: 'request_deadline_exceeded' }),
+            },
+          },
+        },
+      })
+      insertPart(db, {
+        sessionId: input.sessionId,
+        messageId: assistantMessageId,
+        partId: `${assistantMessageId}_part_reasoning`,
+        now: erroredTime,
+        data: { type: 'reasoning', text: 'waiting for the provider response' },
+      })
+      db.prepare('UPDATE session SET time_updated = ? WHERE id = ?').run(erroredTime, input.sessionId)
+      return { promptText, responseText, userMessageId, assistantMessageId, assistantTime: erroredTime }
+    }
     insertTextMessage(db, {
       sessionId: input.sessionId,
       messageId: assistantMessageId,

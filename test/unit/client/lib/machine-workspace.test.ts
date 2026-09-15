@@ -410,6 +410,28 @@ describe('restoreMachineWorkspace', () => {
     expect(store.getState().tabs.activeTabId).toBe('tab-b')
   })
 
+  it('restores the workspace tabs in the inventory device.tabs order', async () => {
+    const store = createStore()
+    addForeignWorkspace(store)
+    const base = inventoryFor(MACHINE_ID)
+    const pane = base.device!.tabs[0].panes[0]
+    const mkTab = (key: string, name: string) => ({
+      tabKey: key, tabName: name, panes: [{ ...pane, paneId: `${key}-pane` }],
+    })
+    vi.mocked(getRecoveryInventory).mockResolvedValue({
+      ...base,
+      device: {
+        ...base.device!,
+        // Deliberately NOT tabKey/alphabetical order.
+        tabs: [mkTab(`${MACHINE_ID}:tab-mango`, 'Mango'), mkTab(`${MACHINE_ID}:tab-apple`, 'Apple')],
+      },
+    })
+
+    await restoreMachineWorkspace(store, MACHINE_ID)
+
+    expect(store.getState().tabs.tabs.map((tab) => tab.title)).toEqual(['Mango', 'Apple'])
+  })
+
   it('refuses an unscoped foreign recovery response and preserves the current cache', async () => {
     const store = createStore()
     addForeignWorkspace(store)

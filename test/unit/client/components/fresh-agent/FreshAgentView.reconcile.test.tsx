@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { act, cleanup, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import panesReducer, {
@@ -663,5 +663,68 @@ describe('FreshAgentView lost revocation on reconnect evidence (reconnect-revive
     await flush()
     expect(leafContent(store.getState()).createRequestId).not.toBe(baseContent.createRequestId)
     expect(leafContent(store.getState()).status).toBe('creating')
+  })
+})
+
+// Persistent error banners are dismissable with an X: the pane's
+// agent-error banner (freshAgent.error folds), the create-failure card,
+// restore-failure banners, and the load-error banner. Dismissal CLEARS the
+// owning state (never a cosmetic hide), so a NEW error re-shows.
+describe('FreshAgentView error-banner dismissal', () => {
+  function receiveWsBoth(message: Record<string, unknown>) {
+    act(() => {
+      handleFreshAgentMessage(store.dispatch, message)
+      for (const call of wsMock.onMessage.mock.calls) {
+        call[0](message)
+      }
+    })
+  }
+
+  function agentErrorFrame(message: string) {
+    return {
+      type: 'freshAgent.event',
+      sessionId: DURABLE,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      event: { type: 'freshAgent.error', code: 'OPENCODE_COMPACT_FAILED', message },
+    }
+  }
+
+  it('the Agent error banner is dismissable: the X clears the session error and a NEW error re-shows', async () => {
+    renderFreshAgentPane({ sessionId: DURABLE, status: 'connected', sessionRef: { provider: 'claude', sessionId: DURABLE } })
+    await flush()
+
+    receiveWsBoth(agentErrorFrame('opencode serve transport error: timed out'))
+    await flush()
+    expect(screen.getByText(/Agent error: opencode serve transport error/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Dismiss' })).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+    await flush()
+    expect(screen.queryByText(/Agent error/)).toBeNull()
+    expect(sessionInStore(store.getState(), DURABLE).lastError).toBeUndefined()
+    expect(sessionInStore(store.getState(), DURABLE).lastErrorCode).toBeUndefined()
+
+    // Dismissal is honest state-clearing, not a cosmetic hide: a NEW error
+    // (different message) re-renders the banner.
+    receiveWsBoth(agentErrorFrame('a different failure'))
+    await flush()
+    expect(screen.getByText(/Agent error: a different failure/)).toBeInTheDocument()
+  })
+
+  it('the create-failure card is dismissable: the X clears the pending create failure and hides the card', async () => {
+    renderFreshAgentPane({ status: 'creating', createRequestId: 'req-1' })
+    await flush()
+
+    receiveWsBoth({ type: 'freshAgent.create.failed', requestId: 'req-1', code: 'SPAWN_FAILED', message: 'spawn exploded', retryable: false })
+    await flush()
+    expect(document.querySelector('.fresh-agent-error-card')).not.toBeNull()
+    expect(screen.getByRole('button', { name: 'Dismiss' })).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+    await flush()
+    expect(store.getState().freshAgent.pendingCreateFailures).toEqual({})
+    expect(leafContent(store.getState()).createError).toBeUndefined()
+    expect(document.querySelector('.fresh-agent-error-card')).toBeNull()
   })
 })

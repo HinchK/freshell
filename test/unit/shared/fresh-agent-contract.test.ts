@@ -330,3 +330,79 @@ describe('reasoning duration and title fields', () => {
     }).success).toBe(false)
   })
 })
+
+describe('durable opencode error projection (turn-level and tool-level)', () => {
+  const deadlineRaw = '{"message":"request deadline exceeded after 1195s before the response completed","type":"request_deadline_exceeded"}'
+  const toolErrorText = 'The user has specified a rule which prevents you from using this specific tool call.'
+
+  it('parses a turn carrying the projected opencode error', () => {
+    const parsed = FreshAgentTurnSchema.safeParse({
+      id: 't1', turnId: 't1', summary: '', items: [],
+      error: { name: 'UnknownError', message: deadlineRaw },
+    })
+    expect(parsed.success).toBe(true)
+    expect(parsed.data?.error).toEqual({ name: 'UnknownError', message: deadlineRaw })
+  })
+
+  it('parses snapshots whose errored turn is the only carrier of the failure', () => {
+    const parsed = FreshAgentSnapshotSchema.safeParse({
+      sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_1',
+      revision: 3, status: 'idle',
+      capabilities: { send: true, interrupt: true, approvals: false, questions: false, fork: true },
+      tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      turns: [{ id: 't1', turnId: 't1', summary: '', items: [], error: { name: 'MessageAbortedError', message: 'Aborted' } }],
+      extensions: {},
+    })
+    expect(parsed.success).toBe(true)
+    expect(parsed.data?.turns[0]?.error?.name).toBe('MessageAbortedError')
+  })
+
+  it('keeps the turn error key optional (claude/codex/legacy servers omit it)', () => {
+    const parsed = FreshAgentTurnSchema.safeParse({ id: 't1', turnId: 't1', summary: 's', items: [] })
+    expect(parsed.success).toBe(true)
+    expect(parsed.data && 'error' in parsed.data).toBe(false)
+  })
+
+  it('rejects a turn error without a message', () => {
+    expect(FreshAgentTurnSchema.safeParse({
+      id: 't1', turnId: 't1', summary: '', items: [], error: { name: 'UnknownError' },
+    }).success).toBe(false)
+  })
+
+  it('rejects a blank turn error message', () => {
+    expect(FreshAgentTurnSchema.safeParse({
+      id: 't1', turnId: 't1', summary: '', items: [], error: { name: 'UnknownError', message: '' },
+    }).success).toBe(false)
+  })
+
+  it('rejects unknown keys inside the turn error (strict)', () => {
+    expect(FreshAgentTurnSchema.safeParse({
+      id: 't1', turnId: 't1', summary: '', items: [],
+      error: { name: 'UnknownError', message: 'boom', code: 'request_deadline_exceeded' },
+    }).success).toBe(false)
+  })
+
+  it('parses a persisted opencode tool error on a dynamic_tool item', () => {
+    const parsed = FreshAgentTranscriptItemSchema.safeParse({
+      id: 'tool-1', kind: 'dynamic_tool', namespace: 'opencode', tool: 'bash',
+      status: 'failed', arguments: { command: 'false' }, contentItems: null, success: null,
+      error: toolErrorText,
+    })
+    expect(parsed.success && parsed.data.kind === 'dynamic_tool' && parsed.data.error).toBe(toolErrorText)
+  })
+
+  it('keeps the tool error key optional and rejects blank or non-string values', () => {
+    expect(FreshAgentTranscriptItemSchema.safeParse({
+      id: 'tool-1', kind: 'dynamic_tool', namespace: 'opencode', tool: 'bash',
+      status: 'completed', arguments: {}, contentItems: ['ok'], success: true,
+    }).success).toBe(true)
+    expect(FreshAgentTranscriptItemSchema.safeParse({
+      id: 'tool-1', kind: 'dynamic_tool', namespace: 'opencode', tool: 'bash',
+      status: 'failed', arguments: {}, contentItems: null, success: null, error: '',
+    }).success).toBe(false)
+    expect(FreshAgentTranscriptItemSchema.safeParse({
+      id: 'tool-1', kind: 'dynamic_tool', namespace: 'opencode', tool: 'bash',
+      status: 'failed', arguments: {}, contentItems: null, success: null, error: 42,
+    }).success).toBe(false)
+  })
+})

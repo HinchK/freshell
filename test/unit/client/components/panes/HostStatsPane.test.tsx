@@ -303,6 +303,23 @@ describe('HostStatsPane', () => {
       expect(ageLabel().textContent).toMatch(/updated .*ago|just now/)
     })
 
+    it('the refresh-error banner is dismissable with an X: the error slot clears in the store', () => {
+      const store = createMockStore()
+      seedLiveAndManual(store, makeLive(), makeManual(), 42_000)
+      renderHostStatsPane(store)
+
+      fireEvent.click(screen.getByRole('button', { name: 'Refresh on-request measurements' }))
+      const requestId = store.getState().hostStats.refresh.requestId!
+      act(() => {
+        store.dispatch(failHostStatsRefresh({ requestId, error: 'server exploded' }) as any)
+      })
+      expect(screen.getByRole('alert')).toHaveTextContent('server exploded')
+
+      fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+      expect(screen.queryByRole('alert')).toBeNull()
+      expect(store.getState().hostStats.refresh.error).toBeNull()
+    })
+
     it('resolution announces "Measurements refreshed" once via a sr-only role=status, cleared on the next tick', () => {
       vi.useFakeTimers({ now: 1_000_000 })
       const store = createMockStore()

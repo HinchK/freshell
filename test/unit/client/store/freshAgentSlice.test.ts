@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import reducer, {
+  clearRestoreFailure,
+  clearSessionError,
   createFailed,
   freshAgentSnapshotReceived,
   markSessionLost,
@@ -56,6 +58,34 @@ describe('freshAgentSlice busy/streaming clearing', () => {
     let state = streaming()
     state = reducer(state, sessionError({ ...loc, message: 'restore failed', code: 'RESTORE_TIMEOUT' }))
     expect(state.sessions[key].status).toBe('running')
+  })
+
+  it('clearSessionError dismisses the banner: clears lastError/lastErrorCode without minting or mutating status', () => {
+    let state = streaming()
+    state = reducer(state, sessionError({ ...loc, message: 'boom', code: 'OPENCODE_COMPACT_FAILED' }))
+    expect(state.sessions[key].lastError).toBe('boom')
+    state = reducer(state, clearSessionError(loc))
+    expect(state.sessions[key].lastError).toBeUndefined()
+    expect(state.sessions[key].lastErrorCode).toBeUndefined()
+    // Status/streaming untouched by dismissal (the error fold already de-blued).
+    expect(state.sessions[key].status).toBe('idle')
+    // A dismissal for an UNKNOWN session must never mint a record.
+    const ghost = reducer(state, clearSessionError({ sessionId: 'never-seen', provider: 'opencode' }))
+    expect(ghost.sessions[makeFreshAgentSessionKey({ sessionId: 'never-seen', sessionType: 'freshopencode', provider: 'opencode' })]).toBeUndefined()
+    expect(Object.keys(ghost.sessions)).toContain(key)
+  })
+
+  it('clearRestoreFailure dismisses the restore-failure fields without minting or touching retry counters', () => {
+    let state = streaming()
+    state = reducer(state, sessionError({ ...loc, message: 'restore failed', code: 'RESTORE_TIMEOUT' }))
+    expect(state.sessions[key].restoreFailureMessage).toBe('restore failed')
+    expect(state.sessions[key].restoreFailureCode).toBe('RESTORE_TIMEOUT')
+    state = reducer(state, clearRestoreFailure(loc))
+    expect(state.sessions[key].restoreFailureMessage).toBeUndefined()
+    expect(state.sessions[key].restoreFailureCode).toBeUndefined()
+    // A dismissal for an UNKNOWN session must never mint a record.
+    const ghost = reducer(state, clearRestoreFailure({ sessionId: 'never-seen', provider: 'claude' }))
+    expect(Object.keys(ghost.sessions).length).toBe(1)
   })
 })
 
