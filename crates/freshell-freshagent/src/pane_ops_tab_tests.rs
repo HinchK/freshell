@@ -940,9 +940,13 @@ async fn rest_resume_durable_ses_is_born_durable_with_ledger_settings_and_route(
         "ses_resumed_1",
         resume_session_body("ses_resumed_1", Some("/serve/dir")),
     )]));
+    let registry = std::sync::Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
     let (state, sink) = state_with_resume_http(http.clone()).await;
+    // b8ke ext r27 F5: the coordinator is wired so the resume's binding row
+    // carries a REAL observed (epoch, generation) pair.
+    let state = state.with_ownership(std::sync::Arc::clone(&registry));
     // A settings-bearing ledger record (seeded directly, bypassing `seed()`
-    // whose bindings-log row would muddy the no-binding-writes assertion).
+    // whose bindings-log row would muddy the per-write assertions below).
     sink.settings.lock().unwrap().insert(
         ("opencode".to_string(), "ses_resumed_1".to_string()),
         FreshAgentSettings {
@@ -1045,15 +1049,51 @@ async fn rest_resume_durable_ses_is_born_durable_with_ledger_settings_and_route(
         json!({ "provider": "opencode", "sessionId": "ses_resumed_1" })
     );
 
-    // Ledger read-only on resume: NO pending marker, NO binding row; and the
-    // bus carries NO materialized frame / sessions.changed (bounded drain).
+    // b8ke ext r27 F5: the resume writes the AUTHORITATIVE identity binding
+    // — the new pane's lineage + the observed ownership generation — BEFORE
+    // the session commits live (pre-r27 the ledger stayed READ-ONLY on
+    // resume: this block asserted the binding list stayed EMPTY, preserving
+    // the violation instead of detecting it).
+    {
+        let bindings = sink.bindings.lock().unwrap();
+        let row = bindings
+            .iter()
+            .rev()
+            .find(|b| b.provider == "opencode" && b.session_id == "ses_resumed_1")
+            .expect("the resume's authoritative binding row (r27 F5)");
+        assert_eq!(row.mode, "freshopencode");
+        assert_eq!(
+            row.create_request_id.as_deref(),
+            Some(crid),
+            "the row carries the NEW pane's lineage (the resumed pane's              createRequestId)"
+        );
+        assert_eq!(row.settings.model.as_deref(), Some("big-model"));
+        assert_eq!(row.settings.effort.as_deref(), Some("high"));
+        assert_eq!(row.settings.cwd.as_deref(), Some("/real/project"));
+        assert_eq!(
+            row.provenance,
+            crate::identity_sink::ProvenanceUpdate::Clear,
+            "the headless REST resume stamps Clear provenance (the \
+             materialization lane's policy)"
+        );
+        assert_eq!(
+            row.observed_epoch,
+            Some(registry.boot_epoch()),
+            "the row carries the coordinator's boot epoch"
+        );
+        let committed_generation = registry.observe("opencode", "ses_resumed_1").generation;
+        assert_eq!(
+            row.observed_generation,
+            Some(committed_generation),
+            "the row carries the resume's observed ownership generation — \
+             the delayed-write fence baseline"
+        );
+    }
+    // Still NO pending marker (create-only), and the bus carries NO
+    // materialized frame / sessions.changed (bounded drain).
     assert!(
         sink.pendings.lock().unwrap().is_empty(),
         "resume must not write a pending marker"
-    );
-    assert!(
-        sink.bindings.lock().unwrap().is_empty(),
-        "resume must not write a binding row"
     );
     assert_no_frame_contains(&mut rx, "session.materialized").await;
     assert_no_frame_contains(&mut rx, "sessions.changed").await;
@@ -1125,9 +1165,28 @@ async fn rest_resume_resolves_placeholder_sessionref_through_the_ledger() {
     let _ = rx.recv().await; // drain tab.create
     assert_no_frame_contains(&mut rx, "SETTINGS_RESET").await;
 
-    // The ledger is still read-only on resume: the only binding row is the
-    // seeded lineage row itself.
-    assert_eq!(sink.bindings.lock().unwrap().len(), 1);
+    // b8ke ext r27 F5 reshape: the resume now writes its AUTHORITATIVE
+    // binding row — the seeded lineage row PLUS the resume's own write.
+    // The resume's row carries the NEW pane's lineage key (not the seeded
+    // createRequestId), so the lineage resolution above stays intact.
+    {
+        let bindings = sink.bindings.lock().unwrap();
+        assert_eq!(
+            bindings.len(),
+            2,
+            "the seeded lineage row + the resume's own row"
+        );
+        let resume_row = bindings
+            .iter()
+            .rev()
+            .find(|b| b.provider == "opencode" && b.session_id == "ses_placeholder_resumed")
+            .expect("the resume's authoritative row");
+        assert_ne!(
+            resume_row.create_request_id.as_deref(),
+            Some("cr-abc123"),
+            "the resume's row carries the NEW pane's lineage, never the seeded row's"
+        );
+    }
     assert!(sink.pendings.lock().unwrap().is_empty());
 }
 

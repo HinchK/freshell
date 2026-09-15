@@ -3758,9 +3758,10 @@ async fn resume_session_ref_tab(
     // `freshopencode-`-prefixed id is ever minted for a resumed pane — the
     // snapshot/serve path sees a normal `ses_*` id from creation, behaving as
     // any already-materialized durable pane) with a FRESH uuid createRequestId.
-    // The ledger stays READ-ONLY on resume: no pending marker (Task 3's
-    // pending write is create-only), no binding row, NO materialized frame, NO
-    // sessions.changed.
+    // The ledger's PENDING marker stays create-only and no materialized
+    // frame/sessions.changed fires on resume — but the AUTHORITATIVE identity
+    // binding below now writes (b8ke ext r27 F5: the pane lineage + the
+    // observed ownership generation land before the commit-Live).
     let (tab_id, pane_id) = state.layout.create_tab(name.as_deref());
     let request_id = Uuid::new_v4().simple().to_string();
     let session_ref = json!({ "provider": PROVIDER, "sessionId": durable_id });
@@ -3790,12 +3791,70 @@ async fn resume_session_ref_tab(
         &pane_content,
         PaneEntry {
             placeholder_id: durable_id.clone(),
-            cwd,
-            model,
-            effort,
+            cwd: cwd.clone(),
+            model: model.clone(),
+            effort: effort.clone(),
             durable_id: Some(durable_id.clone()),
         },
     );
+
+    // b8ke ext r27 F5: the AUTHORITATIVE identity binding — the new
+    // pane's lineage + the observed ownership generation — lands BEFORE
+    // the resumed session commits live and BEFORE the tab.create
+    // broadcast (durable-before-answer). Pre-r27 the ledger stayed
+    // READ-ONLY on resume: a never-recorded but provider-discovered
+    // session had no authoritative identity binding, and an existing row
+    // was never updated with the new pane or the ownership generation.
+    // The write carries the resume's granted (epoch, generation) pair
+    // (the delayed-write fence baseline) and the headless Clear
+    // provenance (the REST materialization lane's policy). On failure
+    // the tab is closed and the resume answers the typed conflict —
+    // never a live pane over a session with no recoverable registration.
+    let (binding_epoch, binding_generation) =
+        match (state.ownership.as_ref(), resume_ticket.as_ref()) {
+            (Some(registry), Some(ticket)) => {
+                (Some(registry.boot_epoch()), Some(ticket.generation()))
+            }
+            _ => (None, None),
+        };
+    if let Some(sink) = state.identity_sink() {
+        if let Err(e) = sink
+            .record_binding(identity_sink::FreshAgentBindingUpsert {
+                provider: PROVIDER.into(),
+                session_id: durable_id.clone(),
+                mode: SESSION_TYPE.into(),
+                create_request_id: Some(request_id.clone()),
+                resolves_pending: None,
+                supersedes: None,
+                provenance: identity_sink::ProvenanceUpdate::Clear,
+                observed_epoch: binding_epoch,
+                observed_generation: binding_generation,
+                settings: identity_sink::FreshAgentSettings {
+                    model: model.clone(),
+                    sandbox: None,
+                    permission_mode: None,
+                    effort: effort.clone(),
+                    cwd: cwd.clone(),
+                },
+            })
+            .await
+        {
+            tracing::error!(target: "invariant",
+                provider = PROVIDER, session_id = %durable_id, error = %e,
+                "freshagent.opencode.rest_resume_binding_failed_typed: the durable \
+                 identity binding could not be persisted — the tab is closed and the \
+                 resume answers typed (kata b8ke ext r27 F5)"
+            );
+            state.layout.close_tab(&tab_id);
+            return fail_json_code(
+                StatusCode::CONFLICT,
+                "SESSION_RESERVED",
+                "The session's resume record could not be persisted; the pane is \
+                 not resumed"
+                    .to_string(),
+            );
+        }
+    }
     broadcast_tab_create(state, &tab_id, &pane_id, name.as_deref(), &pane_content);
 
     // b8ke ext r9 F1: the registration is complete — commit
