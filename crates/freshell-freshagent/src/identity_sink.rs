@@ -2456,6 +2456,8 @@ mod tests {
         fake.record_binding(FreshAgentBindingUpsert {
             provider: "claude".into(),
             session_id: "durable-h".into(),
+            observed_epoch: None,
+            observed_generation: None,
             ..upsert()
         })
         .await

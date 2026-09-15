@@ -2423,20 +2423,21 @@ impl FreshCodexState {
                 })
             };
             if let Some((model, effort, cwd, sandbox, permission_mode)) = parked {
-                self.record_codex_binding(
-                    thread_id,
-                    None,
-                    &model,
-                    sandbox.as_deref(),
-                    permission_mode.as_deref(),
-                    effort.as_deref(),
-                    cwd.as_deref(),
-                    None,
-                    Some(&p),
-                    None, // observed_epoch (b8ke ext r22 F2)
-                    None, // observed_generation
-                )
-                .await;
+                let _ = self
+                    .record_codex_binding(
+                        thread_id,
+                        None,
+                        &model,
+                        sandbox.as_deref(),
+                        permission_mode.as_deref(),
+                        effort.as_deref(),
+                        cwd.as_deref(),
+                        None,
+                        Some(&p),
+                        None, // observed_epoch (b8ke ext r22 F2)
+                        None, // observed_generation
+                    )
+                    .await;
             }
         }
         self.create_dedup
@@ -2644,22 +2645,23 @@ impl FreshCodexState {
             session.sandbox = sandbox.clone();
             session.permission_mode = permission_mode.clone();
         }
-        self.record_codex_binding(
-            &session_id,
-            None,
-            &model,
-            sandbox.as_deref(),
-            permission_mode.as_deref(),
-            effort.as_deref(),
-            turn_cwd.as_deref(),
-            None,
-            // Send/settings mutation is not a new browser assertion — conn-less
-            // (merge keeps prior stamps, ep4 writer rules).
-            None,
-            None, // observed_epoch (b8ke ext r22 F2)
-            None, // observed_generation
-        )
-        .await;
+        let _ = self
+            .record_codex_binding(
+                &session_id,
+                None,
+                &model,
+                sandbox.as_deref(),
+                permission_mode.as_deref(),
+                effort.as_deref(),
+                turn_cwd.as_deref(),
+                None,
+                // Send/settings mutation is not a new browser assertion — conn-less
+                // (merge keeps prior stamps, ep4 writer rules).
+                None,
+                None, // observed_epoch (b8ke ext r22 F2)
+                None, // observed_generation
+            )
+            .await;
 
         // DIAG-01: the turn was accepted by the sidecar -- session_id + turn
         // id only, never the submitted text/prompt.
@@ -3809,20 +3811,21 @@ impl FreshCodexState {
         // never the parent's stale park when the fork came from another tab).
         // `None` only when no source knows the attribution (a conn-less,
         // never-stamped parent) — unattributed rather than invented.
-        self.record_codex_binding(
-            &child_id,
-            None,
-            &eff_model,
-            parent_sandbox.as_deref(),
-            parent_permission_mode.as_deref(),
-            parent_effort.as_deref(),
-            eff_cwd.as_deref(),
-            None,
-            fork_provenance.as_ref(),
-            None, // observed_epoch (b8ke ext r22 F2)
-            None, // observed_generation
-        )
-        .await;
+        let _ = self
+            .record_codex_binding(
+                &child_id,
+                None,
+                &eff_model,
+                parent_sandbox.as_deref(),
+                parent_permission_mode.as_deref(),
+                parent_effort.as_deref(),
+                eff_cwd.as_deref(),
+                None,
+                fork_provenance.as_ref(),
+                None, // observed_epoch (b8ke ext r22 F2)
+                None, // observed_generation
+            )
+            .await;
 
         // kata b8ke Task 3: the child's registration is complete — commit
         // `Live{FreshAgent}` under the NEW child key (the stamp lands in the
@@ -5190,20 +5193,21 @@ impl FreshCodexState {
         // create/user change); the helper's no-laundering guard skips it if they
         // are all blank. AWAITED before this fn returns (durable-before-answer).
         // D8: conn-less refresh — provenance `None` keeps the create's stamps.
-        self.record_codex_binding(
-            session_id,
-            None,
-            &model,
-            sandbox.as_deref(),
-            permission_mode.as_deref(),
-            effort.as_deref(),
-            cwd.as_deref(),
-            None,
-            None,
-            None, // observed_epoch (b8ke ext r22 F2)
-            None, // observed_generation
-        )
-        .await;
+        let _ = self
+            .record_codex_binding(
+                session_id,
+                None,
+                &model,
+                sandbox.as_deref(),
+                permission_mode.as_deref(),
+                effort.as_deref(),
+                cwd.as_deref(),
+                None,
+                None,
+                None, // observed_epoch (b8ke ext r22 F2)
+                None, // observed_generation
+            )
+            .await;
 
         // FIX (CODEX-FIRST triage Finding 2): the app-server just proved this id alive again
         // -- clear any stale "recently gone" marking so it doesn't linger.
@@ -5495,22 +5499,23 @@ impl FreshCodexState {
         // the ledger retires the old row and links it to the new one. This is the
         // ONLY site that ever knows both ids; the edge is unrecoverable if not
         // written here. AWAITED before the materialized broadcast below goes out.
-        self.record_codex_binding(
-            &new_thread_id,
-            None,
-            &model,
-            sandbox.as_deref(),
-            permission_mode.as_deref(),
-            effort.as_deref(),
-            cwd.as_deref(),
-            Some(old_session_id),
-            // D8: conn-less crash-respawn — provenance `None`; the ledger
-            // inherits the superseded parent's stamps (fork-chain rule).
-            None,
-            None, // observed_epoch (b8ke ext r22 F2)
-            None, // observed_generation
-        )
-        .await;
+        let _ = self
+            .record_codex_binding(
+                &new_thread_id,
+                None,
+                &model,
+                sandbox.as_deref(),
+                permission_mode.as_deref(),
+                effort.as_deref(),
+                cwd.as_deref(),
+                Some(old_session_id),
+                // D8: conn-less crash-respawn — provenance `None`; the ledger
+                // inherits the superseded parent's stamps (fork-chain rule).
+                None,
+                None, // observed_epoch (b8ke ext r22 F2)
+                None, // observed_generation
+            )
+            .await;
 
         // DIAG-01: crash recovery had to mint a fresh thread -- the durable
         // identity MOVED (old_session_id -> new_thread_id); conversation
@@ -6754,22 +6759,23 @@ impl FreshCodexState {
         // permanently mask the miss (V7 §2's laundering finding). AWAITED before this
         // fn returns (durable-before-answer).
         if recovered.is_some() {
-            self.record_codex_binding(
-                thread_id,
-                None,
-                rec.model.as_deref().unwrap_or(""),
-                rec.sandbox.as_deref(),
-                rec.permission_mode.as_deref(),
-                rec.effort.as_deref(),
-                cwd.or(rec.cwd.as_deref()),
-                None,
-                // D8: conn-less attach-resume refresh — provenance `None`
-                // keeps the row's existing stamps.
-                None,
-                None, // observed_epoch (b8ke ext r22 F2)
-                None, // observed_generation
-            )
-            .await;
+            let _ = self
+                .record_codex_binding(
+                    thread_id,
+                    None,
+                    rec.model.as_deref().unwrap_or(""),
+                    rec.sandbox.as_deref(),
+                    rec.permission_mode.as_deref(),
+                    rec.effort.as_deref(),
+                    cwd.or(rec.cwd.as_deref()),
+                    None,
+                    // D8: conn-less attach-resume refresh — provenance `None`
+                    // keeps the row's existing stamps.
+                    None,
+                    None, // observed_epoch (b8ke ext r22 F2)
+                    None, // observed_generation
+                )
+                .await;
         }
 
         Ok(ResumedCodexSession {

@@ -1261,25 +1261,26 @@ impl FreshOpencodeState {
                 observed_generation: None,
                 settings: pre_park_settings.clone(),
             });
-            self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
-                provider: PROVIDER.into(),
-                session_id: durable_id.clone(),
-                mode: SESSION_TYPE.into(),
-                create_request_id: None,
-                resolves_pending: None,
-                supersedes: None,
-                provenance: crate::identity_sink::ProvenanceUpdate::Replace(p),
-                observed_epoch: None,
-                observed_generation: None,
-                settings: crate::identity_sink::FreshAgentSettings {
-                    model,
-                    sandbox: None,
-                    permission_mode: None,
-                    effort,
-                    cwd,
-                },
-            })
-            .await;
+            let _ = self
+                .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                    provider: PROVIDER.into(),
+                    session_id: durable_id.clone(),
+                    mode: SESSION_TYPE.into(),
+                    create_request_id: None,
+                    resolves_pending: None,
+                    supersedes: None,
+                    provenance: crate::identity_sink::ProvenanceUpdate::Replace(p),
+                    observed_epoch: None,
+                    observed_generation: None,
+                    settings: crate::identity_sink::FreshAgentSettings {
+                        model,
+                        sandbox: None,
+                        permission_mode: None,
+                        effort,
+                        cwd,
+                    },
+                })
+                .await;
         }
 
         // b8ke e3r4 F4 + e3 post-cap F4: the POST-WRITE RECHECK — strict:
@@ -1312,7 +1313,7 @@ impl FreshOpencodeState {
                 // upsert restores the PRE-write settings (captured before
                 // the mutation scope) with keep-when-None provenance.
                 if let Some(rollback) = binding_write_rollback.take() {
-                    self.record_binding_row(rollback).await;
+                    let _ = self.record_binding_row(rollback).await;
                 }
                 tracing::warn!(target: "freshell_freshagent::opencode",
                     session_id = %durable_id, state = ?snap.state,
@@ -1591,34 +1592,35 @@ impl FreshOpencodeState {
 
             // D8: stamps parked on the session at create reach the
             // materialization row here (Some asserts, None inherits).
-            self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
-                provider: PROVIDER.into(),
-                session_id: durable_id.clone(),
-                mode: SESSION_TYPE.into(),
-                // Task 3 binding fix: the lineage key is the CREATE requestId,
-                // derived from the placeholder minted at handle_create
-                // (`freshopencode-<createRequestId>`) — NOT this send's
-                // requestId (the old bug; every materialization re-keyed the
-                // lineage to the triggering send). A born-durable placeholder
-                // strips to None.
-                create_request_id: session
-                    .placeholder_id
-                    .strip_prefix(crate::OPENCODE_PLACEHOLDER_PREFIX)
-                    .map(str::to_string),
-                resolves_pending: Some(session.placeholder_id.clone()),
-                supersedes: None,
-                provenance: session.provenance.clone().into(),
-                observed_epoch: None,
-                observed_generation: None,
-                settings: crate::identity_sink::FreshAgentSettings {
-                    model: session.model.clone(),
-                    sandbox: None,
-                    permission_mode: None,
-                    effort: session.effort.clone(),
-                    cwd: session.cwd.clone(),
-                },
-            })
-            .await;
+            let _ = self
+                .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                    provider: PROVIDER.into(),
+                    session_id: durable_id.clone(),
+                    mode: SESSION_TYPE.into(),
+                    // Task 3 binding fix: the lineage key is the CREATE requestId,
+                    // derived from the placeholder minted at handle_create
+                    // (`freshopencode-<createRequestId>`) — NOT this send's
+                    // requestId (the old bug; every materialization re-keyed the
+                    // lineage to the triggering send). A born-durable placeholder
+                    // strips to None.
+                    create_request_id: session
+                        .placeholder_id
+                        .strip_prefix(crate::OPENCODE_PLACEHOLDER_PREFIX)
+                        .map(str::to_string),
+                    resolves_pending: Some(session.placeholder_id.clone()),
+                    supersedes: None,
+                    provenance: session.provenance.clone().into(),
+                    observed_epoch: None,
+                    observed_generation: None,
+                    settings: crate::identity_sink::FreshAgentSettings {
+                        model: session.model.clone(),
+                        sandbox: None,
+                        permission_mode: None,
+                        effort: session.effort.clone(),
+                        cwd: session.cwd.clone(),
+                    },
+                })
+                .await;
 
             // `freshAgent.session.materialized` (ws-handler.ts:3477-3484): placeholder ->
             // durable, emitted EXACTLY ONCE (a later send never re-enters this branch).
@@ -1675,25 +1677,26 @@ impl FreshOpencodeState {
             // D8: same session-carried stamps (a per-send refresh re-asserts
             // them via `Replace`; a conn-less refresh lane carries `None` →
             // `Inherit` and the ledger merge preserves them).
-            self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
-                provider: PROVIDER.into(),
-                session_id: acked_session_id.clone(),
-                mode: SESSION_TYPE.into(),
-                create_request_id: None,
-                resolves_pending: None,
-                supersedes: None,
-                provenance: session.provenance.clone().into(),
-                observed_epoch: None,
-                observed_generation: None,
-                settings: crate::identity_sink::FreshAgentSettings {
-                    model: session.model.clone(),
-                    sandbox: None,
-                    permission_mode: None,
-                    effort: session.effort.clone(),
-                    cwd: session.cwd.clone(),
-                },
-            })
-            .await;
+            let _ = self
+                .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                    provider: PROVIDER.into(),
+                    session_id: acked_session_id.clone(),
+                    mode: SESSION_TYPE.into(),
+                    create_request_id: None,
+                    resolves_pending: None,
+                    supersedes: None,
+                    provenance: session.provenance.clone().into(),
+                    observed_epoch: None,
+                    observed_generation: None,
+                    settings: crate::identity_sink::FreshAgentSettings {
+                        model: session.model.clone(),
+                        sandbox: None,
+                        permission_mode: None,
+                        effort: session.effort.clone(),
+                        cwd: session.cwd.clone(),
+                    },
+                })
+                .await;
         }
 
         let real_id = acked_session_id.clone();
@@ -3702,28 +3705,32 @@ impl FreshOpencodeState {
         // `_pattern :600-626`) — AWAITED BEFORE the forked reply
         // (durable-before-answer). Opencode has no sandbox/permission concepts —
         // always `None`.
-        self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
-            provider: PROVIDER.into(),
-            session_id: child.id.clone(),
-            mode: SESSION_TYPE.into(),
-            create_request_id: None,
-            resolves_pending: None,
-            supersedes: None,
-            // D8 (focused-ep1-r5): the RESOLVED fork provenance (forking
-            // connection > parent's parked > parent's row); `Inherit` only
-            // when no source knows the attribution — never invented.
-            provenance: fork_provenance.into(),
-            observed_epoch: None,
-            observed_generation: None,
-            settings: crate::identity_sink::FreshAgentSettings {
-                model,
-                sandbox: None,
-                permission_mode: None,
-                effort,
-                cwd: child_cwd.clone(),
-            },
-        })
-        .await;
+        // b8ke ext r22 F2: the fork lane's binding failure is log-and-continue
+        // (the fork child is already live; the maintenance write's Result is
+        // deliberately discarded).
+        let _ = self
+            .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                provider: PROVIDER.into(),
+                session_id: child.id.clone(),
+                mode: SESSION_TYPE.into(),
+                create_request_id: None,
+                resolves_pending: None,
+                supersedes: None,
+                // D8 (focused-ep1-r5): the RESOLVED fork provenance (forking
+                // connection > parent's parked > parent's row); `Inherit` only
+                // when no source knows the attribution — never invented.
+                provenance: fork_provenance.into(),
+                observed_epoch: None,
+                observed_generation: None,
+                settings: crate::identity_sink::FreshAgentSettings {
+                    model,
+                    sandbox: None,
+                    permission_mode: None,
+                    effort,
+                    cwd: child_cwd.clone(),
+                },
+            })
+            .await;
 
         // kata b8ke Task 3: the child's registration is complete — commit
         // `Live{FreshAgent}` under the NEW child key (the stamp lands in the

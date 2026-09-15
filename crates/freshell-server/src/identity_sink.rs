@@ -686,6 +686,8 @@ mod tests {
             supersedes: Some("old-thread".into()),
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             settings,
+            observed_epoch: None,
+            observed_generation: None,
         })
         .await
         .expect("codex crash-respawn binding write");
@@ -1007,6 +1009,8 @@ mod tests {
                     },
                 ),
                 now_ms: 42,
+                observed_epoch: None,
+                observed_generation: None,
             })
             .expect("terminal binding write ok");
         assert_eq!(

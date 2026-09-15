@@ -167,6 +167,179 @@ fn fa_write<'a>(provider: &'a str, session_id: &'a str, now_ms: i64) -> FreshAge
     }
 }
 
+/// b8ke ext r22 F2: a fenced FreshAgentBindingWrite helper (the observed pair).
+fn fa_write_fenced<'a>(
+    provider: &'a str,
+    session_id: &'a str,
+    now_ms: i64,
+    epoch: u64,
+    generation: u64,
+) -> FreshAgentBindingWrite<'a> {
+    FreshAgentBindingWrite {
+        provider,
+        session_id,
+        mode: provider,
+        cwd: Some("/tmp/proj"),
+        create_request_id: None,
+        model: Some("test-model"),
+        sandbox: None,
+        permission_mode: None,
+        effort: None,
+        supersedes: None,
+        provenance: ProvenancePolicy::Inherit,
+        observed_epoch: Some(epoch),
+        observed_generation: Some(generation),
+        now_ms,
+    }
+}
+
+/// b8ke ext r22 F2 (a): the DELAYED-WRITE FENCE — the terminal's commit
+/// stamped the row with the post-handoff pair (stamp_owner_pair); the old
+/// agent's delayed binding write arrives carrying the PRE-handoff pair →
+/// REFUSED typed, and the terminal's recovery row survives untouched.
+#[test]
+fn a_stale_pair_fresh_agent_binding_write_is_refused_and_the_terminal_row_survives() {
+    let root = temp_root("r22-f2-stale-pair");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    // The fresh create's row (the pre-handoff pair: epoch 7, generation 5).
+    ledger
+        .record_fresh_agent_binding(&fa_write_fenced("codex", "ses-r22", 1_000, 7, 5))
+        .expect("the fresh create's binding writes");
+
+    // The handoff completes: the terminal identity commit stamps the row
+    // with the post-handoff pair (epoch 7, generation 6).
+    ledger
+        .stamp_owner_pair("codex", "ses-r22", 7, 6)
+        .expect("the commit-side stamp");
+
+    // THE DELAYED WRITE: the old agent's in-flight write carries the
+    // PRE-handoff pair — refused typed.
+    let result =
+        ledger.record_fresh_agent_binding(&fa_write_fenced("codex", "ses-r22", 1_200, 7, 5));
+    let err = result.expect_err("the stale-pair write is refused typed");
+    assert!(
+        err.to_string().contains("STALE_BINDING_PAIR"),
+        "the refusal is typed: {err}"
+    );
+
+    // The row survives — the pre-handoff fresh-agent row is intact (the
+    // stamp is the terminal's; a newer-pair write still proceeds (c)).
+    let row = ledger
+        .load_binding("codex", "ses-r22")
+        .expect("the row survives the refused write");
+    assert_eq!(row.owner_epoch, Some(7));
+    assert_eq!(row.owner_generation, Some(6));
+    assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
+
+    // The CURRENT-pair write (the newer pair) proceeds — the fence only
+    // refuses the OLDER pair (c).
+    ledger
+        .record_fresh_agent_binding(&fa_write_fenced("codex", "ses-r22", 1_300, 7, 6))
+        .expect("the current-pair write proceeds");
+    // A NEWER-pair write also proceeds (the fence advances).
+    ledger
+        .record_fresh_agent_binding(&fa_write_fenced("codex", "ses-r22", 1_400, 7, 8))
+        .expect("the newer-pair write proceeds");
+    let row = ledger.load_binding("codex", "ses-r22").expect("the row");
+    assert_eq!(row.owner_generation, Some(8));
+}
+
+/// b8ke ext r22 F2: the TERMINAL write path shares the fence — a
+/// stale-pair BindingWrite on the terminal rows' path is refused the same
+/// way, and the legacy-unfenced write (None pair) proceeds (the pre-r22
+/// behavior; the row's prior stamp is preserved).
+#[test]
+fn the_terminal_write_path_shares_the_stale_pair_fence() {
+    let root = temp_root("r22-f2-terminal-fence");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    // Seed a terminal row stamped (epoch 3, generation 9).
+    ledger
+        .record_binding(&BindingWrite {
+            provider: "claude",
+            session_id: "ses-terminal-r22",
+            terminal_id: "t-r22",
+            mode: "claude",
+            cwd: Some("/w"),
+            create_request_id: Some("req-t"),
+            origin_create_request_id: None,
+            provenance: ProvenancePolicy::Inherit,
+            observed_epoch: Some(3),
+            observed_generation: Some(9),
+            now_ms: 1_000,
+        })
+        .expect("the seeded terminal row");
+    // The stale-pair terminal write is refused typed.
+    let result = ledger.record_binding(&BindingWrite {
+        provider: "claude",
+        session_id: "ses-terminal-r22",
+        terminal_id: "t-r22-late",
+        mode: "claude",
+        cwd: Some("/w"),
+        create_request_id: Some("req-t-late"),
+        origin_create_request_id: None,
+        provenance: ProvenancePolicy::Inherit,
+        observed_epoch: Some(3),
+        observed_generation: Some(8),
+        now_ms: 1_100,
+    });
+    let err = result.expect_err("the stale terminal write is refused");
+    assert!(err.to_string().contains("STALE_BINDING_PAIR"), "{err}");
+    // The row survived: the original terminal's identity.
+    let row = ledger
+        .load_binding("claude", "ses-terminal-r22")
+        .expect("the row");
+    assert_eq!(row.live_terminal_id.as_deref(), Some("t-r22"));
+    assert_eq!(row.owner_generation, Some(9));
+
+    // The legacy-unfenced write (None pair) PROCEEDS and the row's prior
+    // stamp is... the terminal path's write carries the pair it has (None —
+    // pre-r22 rows degrade to unfenced).
+    ledger
+        .record_binding(&BindingWrite {
+            provider: "claude",
+            session_id: "ses-terminal-r22",
+            terminal_id: "t-r22-now",
+            mode: "claude",
+            cwd: Some("/w"),
+            create_request_id: Some("req-t-now"),
+            origin_create_request_id: None,
+            provenance: ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+            now_ms: 1_200,
+        })
+        .expect("the legacy-unfenced write proceeds");
+}
+
+/// b8ke ext r22 F2: stamp_owner_pair is MONOTONIC — an older pair never
+/// regresses the row's baseline; a missing row is a no-op.
+#[test]
+fn stamp_owner_pair_is_monotonic_and_a_missing_row_is_a_noop() {
+    let root = temp_root("r22-f2-stamp-monotonic");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    // A missing row: a no-op (the binding writes own creation).
+    ledger
+        .stamp_owner_pair("codex", "ses-absent", 5, 1)
+        .expect("the missing-row stamp is a no-op");
+    assert!(ledger.load_binding("codex", "ses-absent").is_none());
+
+    // The row + the advancing stamp.
+    ledger
+        .record_fresh_agent_binding(&fa_write_fenced("codex", "ses-mono", 1_000, 5, 1))
+        .expect("the row");
+    ledger
+        .stamp_owner_pair("codex", "ses-mono", 5, 3)
+        .expect("the advancing stamp");
+    let row = ledger.load_binding("codex", "ses-mono").expect("the row");
+    assert_eq!(row.owner_generation, Some(3));
+    // An OLDER pair never regresses.
+    ledger
+        .stamp_owner_pair("codex", "ses-mono", 5, 2)
+        .expect("the regressive stamp is accepted (a no-op)");
+    let row = ledger.load_binding("codex", "ses-mono").expect("the row");
+    assert_eq!(row.owner_generation, Some(3), "the stamp never regresses");
+}
+
 /// `fa_write` variant with connection-supplied stamps asserted (`Replace`),
 /// asserted at the write's own `now_ms`.
 fn fa_write_provenance<'a>(
@@ -209,6 +382,8 @@ fn fa_write_provenance_at<'a>(
             tab_key,
             asserted_at,
         }),
+        observed_epoch: None,
+        observed_generation: None,
         ..fa_write(provider, session_id, now_ms)
     }
 }
@@ -404,6 +579,8 @@ fn fresh_agent_clear_rebind_erases_stamps_and_never_inherits_the_parent() {
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             provenance: ProvenancePolicy::Clear,
+            observed_epoch: None,
+            observed_generation: None,
             ..fa_write("claude", "sess-1", 2_000)
         })
         .unwrap();
@@ -428,6 +605,8 @@ fn fresh_agent_clear_rebind_erases_stamps_and_never_inherits_the_parent() {
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             supersedes: Some("sess-1"),
             provenance: ProvenancePolicy::Clear,
+            observed_epoch: None,
+            observed_generation: None,
             ..fa_write("claude", "sess-2", 3_000)
         })
         .unwrap();
@@ -459,6 +638,8 @@ fn fresh_agent_clear_rebind_erases_stamps_and_never_inherits_the_parent() {
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             supersedes: Some("sess-3"),
             provenance: ProvenancePolicy::Clear,
+            observed_epoch: None,
+            observed_generation: None,
             ..fa_write("claude", "sess-4", 5_000)
         })
         .unwrap();
@@ -542,6 +723,8 @@ fn fresh_agent_supersession_inherits_provenance_from_the_retired_parent() {
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             supersedes: Some("parent-id"),
+            observed_epoch: None,
+            observed_generation: None,
             ..fa_write("claude", "child-id", 2_000)
         })
         .unwrap();
@@ -1156,6 +1339,8 @@ fn fresh_agent_supersession_inherits_the_parents_assertion_time() {
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             supersedes: Some("parent-id"),
+            observed_epoch: None,
+            observed_generation: None,
             ..fa_write("claude", "child-id", 5_000)
         })
         .unwrap();
@@ -1354,6 +1539,8 @@ fn fresh_agent_out_of_order_replace_keeps_the_newer_attribution() {
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             model: Some("m-late"),
+            observed_epoch: None,
+            observed_generation: None,
             ..fa_write_provenance_at(
                 "opencode",
                 "ses_1",
@@ -1484,6 +1671,8 @@ fn fresh_agent_legacy_reassert_missing_tab_never_touches_the_attribution() {
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             model: Some("m-legacy"),
+            observed_epoch: None,
+            observed_generation: None,
             ..fa_write_provenance_at(
                 "codex",
                 "ses_1",
@@ -1616,6 +1805,8 @@ fn fresh_agent_legacy_create_and_fork_attach_their_provenance_without_a_tab() {
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             supersedes: Some("ses_parent"),
+            observed_epoch: None,
+            observed_generation: None,
             ..fa_write_provenance_at(
                 "claude",
                 "ses_child",
@@ -1811,6 +2002,8 @@ fn fresh_agent_clear_raises_the_attribution_floor_against_delayed_pre_clear_asse
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             provenance: ProvenancePolicy::Clear,
+            observed_epoch: None,
+            observed_generation: None,
             ..fa_write("opencode", "ses_1", 5_000)
         })
         .unwrap();
@@ -1826,6 +2019,8 @@ fn fresh_agent_clear_raises_the_attribution_floor_against_delayed_pre_clear_asse
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             model: Some("m-stale"),
+            observed_epoch: None,
+            observed_generation: None,
             ..fa_write_provenance_at(
                 "opencode",
                 "ses_1",
@@ -3025,6 +3220,8 @@ fn resolve_pending_records_the_markers_origin_create_request_id() {
         .resolve_pending(&BindingWrite {
             create_request_id: None, // the conn-less lane's deliberate None
             origin_create_request_id: None,
+            observed_epoch: None,
+            observed_generation: None,
             ..write("codex", "th-1", "t1", 2_000)
         })
         .unwrap();
@@ -3091,6 +3288,8 @@ fn a_crid_less_rebind_preserves_the_rows_origin_lineage() {
         .resolve_pending(&BindingWrite {
             create_request_id: None,
             origin_create_request_id: None,
+            observed_epoch: None,
+            observed_generation: None,
             ..write("codex", "th-1", "t1", 2_000)
         })
         .unwrap();
@@ -3101,6 +3300,8 @@ fn a_crid_less_rebind_preserves_the_rows_origin_lineage() {
         .resolve_pending(&BindingWrite {
             create_request_id: None,
             origin_create_request_id: None,
+            observed_epoch: None,
+            observed_generation: None,
             ..write("codex", "th-1", "t1", 3_000)
         })
         .unwrap();
@@ -3137,6 +3338,8 @@ fn note_pane_reattach_rekeys_the_origin_lineage_wholesale() {
         .resolve_pending(&BindingWrite {
             create_request_id: None,
             origin_create_request_id: None,
+            observed_epoch: None,
+            observed_generation: None,
             ..write("codex", "th-1", "t1", 2_000)
         })
         .unwrap();
@@ -3996,6 +4199,8 @@ fn fresh_agent_settings_recorded_keys_off_settings_bearing_rows() {
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             session_id: "ses_lineage",
             cwd: None,
+            observed_epoch: None,
+            observed_generation: None,
             ..base
         })
         .unwrap();
@@ -5542,6 +5747,8 @@ fn a_close_pane_records_the_close_under_the_pane_identity_and_survives_a_restart
     ledger
         .record_binding(&BindingWrite {
             create_request_id: Some("cr-close-1"),
+            observed_epoch: None,
+            observed_generation: None,
             ..write("codex", "sess-pc", "term-pc", 1_000)
         })
         .unwrap();

@@ -4426,6 +4426,8 @@ impl PaneLedger {
                     origin_create_request_id: marker_origin_crid
                         .as_deref()
                         .or(w.origin_create_request_id),
+                    observed_epoch: None,
+                    observed_generation: None,
                     ..*w
                 };
                 &effective
@@ -4436,6 +4438,8 @@ impl PaneLedger {
                     origin_create_request_id: marker_origin_crid
                         .as_deref()
                         .or(w.origin_create_request_id),
+                    observed_epoch: None,
+                    observed_generation: None,
                     ..*w
                 };
                 &effective
@@ -4448,6 +4452,8 @@ impl PaneLedger {
                     // because the resolve had its own policy).
                     effective = BindingWrite {
                         origin_create_request_id: marker_origin_crid.as_deref(),
+                        observed_epoch: None,
+                        observed_generation: None,
                         ..*w
                     };
                     &effective
