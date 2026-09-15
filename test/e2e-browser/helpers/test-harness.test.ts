@@ -3,9 +3,11 @@ import type { Page } from '@playwright/test'
 import {
   CLOUD_LANE_BUDGET_OVERHEAD_MS,
   DEFAULT_WS_READY_TIMEOUT_MS,
+  SHELL_RENDER_TIMEOUT_MS,
   TestHarness,
   resolveCloudLaneTestBudgetMs,
   resolveWsReadyTimeoutMs,
+  selectShellFromPicker,
 } from './test-harness'
 
 const ENV_VAR = 'FRESHELL_E2E_WS_READY_TIMEOUT_MS'
@@ -232,5 +234,140 @@ describe('TestHarness.waitForConnection wedge-tolerant self-heal (opt-in)', () =
     } finally {
       vi.useRealTimers()
     }
+  })
+})
+
+describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
+  interface ShellOutcome {
+    clickError?: 'timeout' | 'page-closed' // absent click by default
+    renderVisibleAfterMs?: number // omit = render never becomes visible
+  }
+
+  /**
+   * A fake Page shaped for selectShellFromPicker's real call sites:
+   * locator('.xterm').first() chains to isVisible() and
+   * waitFor({ state, timeout }); getByRole('button', { name }) chains to
+   * click({ timeout }); waitForTimeout(ms) is the stabilization pause.
+   * `clicks` records the real button names (the implementation builds its
+   * locator RegExp as `^Name$`), and `renderWaits` records every post-click
+   * .xterm wait window.
+   */
+  function pickerPage(
+    shells: Record<string, ShellOutcome>,
+    xtermInitiallyVisible = false,
+    opts: { xtermVisibleFromCall?: number } = {},
+  ) {
+    const clicks: string[] = []
+    const renderWaits: number[] = []
+    let xtermVisibilityChecks = 0
+    const xtermVisible = () => {
+      xtermVisibilityChecks += 1
+      if (opts.xtermVisibleFromCall !== undefined) {
+        return xtermVisibilityChecks >= opts.xtermVisibleFromCall
+      }
+      return xtermInitiallyVisible
+    }
+    const currentShell = () => (clicks.length ? shells[clicks[clicks.length - 1]] : undefined)
+    const page = {
+      locator: (selector: string) => ({
+        first: () => ({
+          isVisible: () => Promise.resolve(selector === '.xterm' && xtermVisible()),
+          waitFor: ({ timeout }: { state?: string; timeout?: number }) => {
+            renderWaits.push(timeout ?? 0)
+            const visibleAfter = currentShell()?.renderVisibleAfterMs
+            if (visibleAfter === undefined || visibleAfter > (timeout ?? 0)) {
+              return Promise.reject(new Error(`waitFor: Timeout ${timeout}ms exceeded`))
+            }
+            return Promise.resolve()
+          },
+        }),
+      }),
+      getByRole: (_kind: string, roleOpts: { name: RegExp }) => ({
+        click: (_clickOpts: { timeout?: number }) => {
+          const name = roleOpts.name.source.replace(/^\^/, '').replace(/\$$/, '')
+          clicks.push(name)
+          const outcome = shells[name]
+          if (outcome?.clickError === 'page-closed') {
+            return Promise.reject(Object.assign(new Error('Page closed'), { name: 'TargetClosedError' }))
+          }
+          if (!outcome) {
+            // Option not clickable (absent/detached/obstructed): Playwright's
+            // actionability TimeoutError — indistinguishable by name from any
+            // other not-clickable timeout, which is exactly the contract.
+            return Promise.reject(Object.assign(new Error('click: Timeout 5000ms exceeded'), { name: 'TimeoutError' }))
+          }
+          return Promise.resolve()
+        },
+      }),
+      waitForTimeout: () => Promise.resolve(),
+    }
+    return { page: page as unknown as Page, clicks, renderWaits, xtermVisibilityChecks: () => xtermVisibilityChecks }
+  }
+
+  it('returns immediately when .xterm is already visible', async () => {
+    const { page, clicks } = pickerPage({}, true)
+    await selectShellFromPicker(page)
+    expect(clicks).toEqual([])
+  })
+
+  it('returns without clicking when .xterm appears during the stabilization wait', async () => {
+    // The mid-wait recheck: a regression that skipped the second isVisible
+    // check would fall into the click loop and double-create a terminal.
+    const { page, clicks, xtermVisibilityChecks } = pickerPage({}, false, { xtermVisibleFromCall: 2 })
+    await selectShellFromPicker(page)
+    expect(clicks).toEqual([])
+    expect(xtermVisibilityChecks()).toBe(2)
+  })
+
+  it('a successful click waits the full render budget and never escalates to other shells', async () => {
+    const { page, clicks, renderWaits } = pickerPage({
+      Shell: { renderVisibleAfterMs: 5_000 },
+      WSL: {}, CMD: {}, PowerShell: {}, Bash: {},
+    })
+    await selectShellFromPicker(page)
+    expect(clicks).toEqual(['Shell'])
+    expect(renderWaits).toEqual([SHELL_RENDER_TIMEOUT_MS])
+  })
+
+  it('survives a render slower than the historical 30s wait (the recorded episode shape)', async () => {
+    // The recorded tg4e trace: render starved past 30s. A 30s
+    // implementation rejects here; the fix must wait longer.
+    const { page, clicks, renderWaits } = pickerPage({
+      Shell: { renderVisibleAfterMs: 35_000 },
+    })
+    await selectShellFromPicker(page)
+    expect(clicks).toEqual(['Shell'])
+    expect(renderWaits).toEqual([SHELL_RENDER_TIMEOUT_MS])
+  })
+
+  it('throws a diagnostic when a clicked shell never renders (loud, not silent)', async () => {
+    const { page, clicks, renderWaits } = pickerPage({
+      Shell: {}, // clicked, render never visible
+      WSL: {}, CMD: {}, PowerShell: {}, Bash: {},
+    })
+    await expect(selectShellFromPicker(page)).rejects.toThrow(/did not render/)
+    expect(clicks).toEqual(['Shell']) // no escalation, no terminal double-creation
+    expect(renderWaits).toEqual([SHELL_RENDER_TIMEOUT_MS])
+  })
+
+  it('a not-clickable option (click TimeoutError: absent, detached, or obstructed) advances to the next shell', async () => {
+    const { page, clicks } = pickerPage({
+      Bash: { renderVisibleAfterMs: 1_000 }, // Shell/WSL/CMD/PowerShell not clickable
+    })
+    await selectShellFromPicker(page)
+    expect(clicks).toEqual(['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash'])
+  })
+
+  it('a non-timeout click error propagates (page closure is loud, never "option absent")', async () => {
+    const { page, clicks } = pickerPage({
+      Shell: { clickError: 'page-closed' },
+    })
+    await expect(selectShellFromPicker(page)).rejects.toThrow('Page closed')
+    expect(clicks).toEqual(['Shell'])
+  })
+
+  it('falls through silently only when every option is not clickable (historical contract)', async () => {
+    const { page } = pickerPage({})
+    await expect(selectShellFromPicker(page)).resolves.toBeUndefined()
   })
 })

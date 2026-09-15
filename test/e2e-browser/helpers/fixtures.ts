@@ -6,7 +6,7 @@ import {
   type Page,
 } from '@playwright/test'
 import { type E2eServerInfo } from './server-fixture-support.js'
-import { TestHarness, resolveCloudLaneTestBudgetMs } from './test-harness.js'
+import { TestHarness, resolveCloudLaneTestBudgetMs, selectShellFromPicker } from './test-harness.js'
 import { TerminalHelper } from './terminal-helpers.js'
 import { createE2eServerHandle, type E2eServerHandle } from './external-target.js'
 import {
@@ -115,49 +115,6 @@ export async function createFreshE2ePage(
     await context.close().catch(() => {})
     throw error
   }
-}
-
-/**
- * Select a shell from the PanePicker, handling the race condition where
- * buttons can be detached during the platform-info Redux update.
- *
- * Strategy: Use Playwright's built-in auto-retry by clicking with a
- * reasonable timeout. If the first candidate detaches, move to the next.
- * After clicking, wait for .xterm to confirm the terminal was created.
- */
-async function selectShellFromPicker(page: Page): Promise<void> {
-  // First check if a terminal is already visible (no picker needed)
-  const xtermAlreadyVisible = await page.locator('.xterm').first().isVisible().catch(() => false)
-  if (xtermAlreadyVisible) return
-
-  // Wait a moment for the PanePicker to stabilize after WS connection
-  // (platform info arrives and may change the option set)
-  await page.waitForTimeout(500)
-
-  // Check again - maybe the terminal appeared during the wait
-  const xtermNow = await page.locator('.xterm').first().isVisible().catch(() => false)
-  if (xtermNow) return
-
-  // Try each shell option. Use a short timeout per attempt since we want
-  // to fall through to the next option quickly if one isn't present.
-  const shellNames = ['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash']
-  for (const name of shellNames) {
-    try {
-      const button = page.getByRole('button', { name: new RegExp(`^${name}$`, 'i') })
-      // click({ timeout: 5000 }) uses Playwright's auto-retry, which handles
-      // transient detachments by re-querying the locator
-      await button.click({ timeout: 5000 })
-      // Wait for .xterm to appear, confirming terminal was created
-      await page.locator('.xterm').first().waitFor({ state: 'visible', timeout: 30_000 })
-      return
-    } catch {
-      // This shell option wasn't available or click failed; try next
-      continue
-    }
-  }
-
-  // If none of the named buttons worked, the picker might not be showing
-  // (or uses different labels). Fall through and let the test handle it.
 }
 
 /**

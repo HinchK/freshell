@@ -426,3 +426,72 @@ export class TestHarness {
     }
   }
 }
+
+/**
+ * How long a SUCCESSFUL shell click waits for the terminal render
+ * (.xterm visible) before failing loudly (kata tg4e). Evidence-sized:
+ * the recorded failure's render starve exceeded 30s under container-wide
+ * CPU contention (a sibling worker's normally-200ms test took 74s in the
+ * same window), so a 30s wait conflated "slow render" with "wrong
+ * option" and the loop escalated into absent options, silently burning
+ * the test budget. 60s fits the recorded single-episode envelope inside
+ * the 120s cloud budget (24s slow boot + click + render < 120s).
+ */
+export const SHELL_RENDER_TIMEOUT_MS = 60_000
+
+/** Playwright's click TimeoutError is the not-clickable signal (absent,
+ * detached, or obstructed within the window — indistinguishable by name);
+ * anything else (page closed, interruption, unexpected errors) is loud. */
+function isClickUnavailableError(err: unknown): boolean {
+  return err instanceof Error && err.name === 'TimeoutError'
+}
+
+/**
+ * Select a shell from the PanePicker. Handles the race where buttons
+ * detach during the platform-info Redux update: a click TimeoutError
+ * means the option was not clickable within its window — absent,
+ * detached, or obstructed — advance to the next candidate (Playwright's
+ * click auto-retry already absorbs transient detachments inside its
+ * window). A SUCCESSFUL click is different: the terminal create is in
+ * flight, and a slow render is NOT evidence the option was wrong — wait
+ * generously and fail loudly on timeout instead of escalating
+ * (escalation after a successful click double-creates terminals and, in
+ * the recorded tg4e failure, burned the remaining test budget on
+ * options absent on this platform). Never reloads: the picker may already
+ * have created state.
+ */
+export async function selectShellFromPicker(page: Page): Promise<void> {
+  const xtermAlreadyVisible = await page.locator('.xterm').first().isVisible().catch(() => false)
+  if (xtermAlreadyVisible) return
+
+  // Wait a moment for the PanePicker to stabilize after WS connection
+  // (platform info arrives and may change the option set).
+  await page.waitForTimeout(500)
+
+  const xtermNow = await page.locator('.xterm').first().isVisible().catch(() => false)
+  if (xtermNow) return
+
+  const shellNames = ['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash']
+  for (const name of shellNames) {
+    const button = page.getByRole('button', { name: new RegExp(`^${name}$`, 'i') })
+    try {
+      await button.click({ timeout: 5_000 })
+    } catch (err) {
+      if (!isClickUnavailableError(err)) throw err
+      continue // option not clickable within the window — historical behavior
+    }
+    try {
+      await page.locator('.xterm').first().waitFor({ state: 'visible', timeout: SHELL_RENDER_TIMEOUT_MS })
+      return
+    } catch (err) {
+      throw new Error(
+        `Shell '${name}' was clicked but the terminal did not render within ${SHELL_RENDER_TIMEOUT_MS}ms. ` +
+          'A slow or starved render is a first-class failure, not a wrong-option signal — ' +
+          'not escalating (escalation double-creates terminals and burned the tg4e test budget). ' +
+          `Underlying wait error: ${String(err)}`,
+      )
+    }
+  }
+  // Every option was absent (no picker, or unexpected labels) — the
+  // historical fall-through contract: let the test surface its own error.
+}
