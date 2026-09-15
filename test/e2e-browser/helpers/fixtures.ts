@@ -6,7 +6,7 @@ import {
   type Page,
 } from '@playwright/test'
 import { type E2eServerInfo } from './server-fixture-support.js'
-import { TestHarness } from './test-harness.js'
+import { TestHarness, resolveCloudLaneTestBudgetMs } from './test-harness.js'
 import { TerminalHelper } from './terminal-helpers.js'
 import { createE2eServerHandle, type E2eServerHandle } from './external-target.js'
 import {
@@ -238,7 +238,33 @@ export const test = base.extend<{
   // Each test gets a distinct machine so the worker-scoped server cannot
   // restore the preceding test's workspace into a fresh browser context.
   // The id remains stable for every context that one test intentionally uses.
+  //
+  // Cloud-lane wedge budget (kata tg4e): this is the earliest test-scoped
+  // fixture — resolved before context/page, so every module-chain spec's
+  // whole fixture chain runs under the deadline set here. The freshellPage
+  // fixture's boot chain — self-healing waitForConnection (at most W+1s,
+  // a single total deadline) plus the picker/render tail (kata tg4e's
+  // retained trace: a container-wide CPU-contention episode starved the
+  // post-click .xterm render and the old picker loop silently burned the
+  // remaining budget escalating through options absent on this platform) —
+  // has an evidence-shaped envelope larger than the config's 60s default,
+  // which killed fixture setup mid-envelope: the recorded
+  // "Test timeout of 60000ms exceeded while setting up freshellPage"
+  // flake. Extending the deadline from inside this fixture makes the
+  // budget cover the chain's envelope for every module-chain spec, not
+  // just settings.spec.ts (whose private hook Task 5 removes). Locally
+  // the env var is unset and the default budget applies unchanged. The
+  // mechanism is probe-verified (settings.spec.ts precedent, kata j90s):
+  // a setTimeout issued during fixture resolution extends the live
+  // deadline over fixture time. EXTEND-ONLY: specs that declare a larger
+  // deadline (idle-gate 300s, reconcile specs 240s) keep their own
+  // budget — the guard must never shrink a declared deadline to the
+  // cloud budget.
   e2eMachineId: async ({ testServer }, use) => {
+    const cloudBudgetMs = resolveCloudLaneTestBudgetMs()
+    if (cloudBudgetMs !== null && test.info().timeout < cloudBudgetMs) {
+      test.info().setTimeout(cloudBudgetMs)
+    }
     await use((await registerE2eMachine(testServer.info)).id)
   },
 
