@@ -546,6 +546,17 @@ export function parsePersistedLayoutRaw(raw: string): ParsedPersistedLayout | nu
   if (!res.success) return null
   if (res.data.version > LAYOUT_SCHEMA_VERSION) return null
 
+  // Present-but-malformed top-level metadata is corruption, not a legacy
+  // absence (delta r5 finding 1): the schema passes both keys through, and
+  // silently coercing a non-string machineId or a non-number persistedAt to
+  // undefined let a corrupt envelope parse as unstamped legacy — the boot
+  // classifier kept it and the healthy path's stamp backfill relabeled it as
+  // the currently selected machine. Only genuinely ABSENT keys keep the
+  // legacy meaning, so refuse the parse instead of coercing.
+  const rawMetadata = res.data as { machineId?: unknown; persistedAt?: unknown }
+  if (rawMetadata.machineId !== undefined && typeof rawMetadata.machineId !== 'string') return null
+  if (rawMetadata.persistedAt !== undefined && typeof rawMetadata.persistedAt !== 'number') return null
+
   const panes = res.data.panes
   let panesVersion = typeof panes.version === 'number' ? panes.version : 1
   if (panesVersion < 1) panesVersion = 1

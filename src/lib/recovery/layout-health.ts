@@ -362,6 +362,27 @@ function hasSalvagedLeafContent(
   return false
 }
 
+/** Envelope-metadata discrimination (delta r5 finding 1): a PRESENT but
+ * wrongly-typed machineId/persistedAt is corruption, not a legacy
+ * absence. The parse refuses this class outright (parsePersistedLayoutRaw
+ * returns null, persistedState.ts), but the boot migration's rewrite
+ * silently DROPS a malformed machineId and REPLACES a malformed
+ * persistedAt with a fresh stamp (storage-migration.ts
+ * migratePersistedLayout), so post-rewrite the sanitized current raw
+ * parses clean and only the salvage raw — the evidence sidecar outranking
+ * this boot's capture — still shows the malformed value. The same
+ * present-but-malformed rule, applied to the comparison's envelope
+ * metadata key coverage: without it, a corrupted layout from machine A
+ * that the migration sanitized classifies healthy legacy and the boot's
+ * stamp backfill relabels it as machine B. */
+function hasMalformedEnvelopeMetadata(
+  rawEnvelope: { machineId?: unknown; persistedAt?: unknown } | undefined,
+): boolean {
+  if (!rawEnvelope) return false
+  if (rawEnvelope.machineId !== undefined && typeof rawEnvelope.machineId !== 'string') return true
+  return rawEnvelope.persistedAt !== undefined && typeof rawEnvelope.persistedAt !== 'number'
+}
+
 /** Aliased-identity check over a (already well-formedness-checked) tree:
  * EVERY node id — split ids AND leaf ids — must be non-empty and unique
  * across the envelope (pane and split ids are minted from the same
@@ -485,7 +506,13 @@ export { pruneOwnStaleLayoutEnvelope } from '@/store/storage-migration'
  *
  * - absent:   nothing usable is persisted.
  * - corrupt:  the envelope exists but does not parse, parse-level salvage
- *             dropped invalid tab rows, content-level salvage silently
+ *             dropped invalid tab rows, the envelope carries
+ *             present-but-malformed top-level metadata (a machineId that
+ *             is not a string, or a persistedAt that is not a number —
+ *             corruption, not a legacy absence; refused by the parse, and
+ *             caught through the pre-migration evidence below when the
+ *             boot migration's rewrite dropped or replaced the malformed
+ *             value), content-level salvage silently
  *             stripped a durable pane-content field (a raw leaf content
  *             key the parsed result dropped, outside the verified
  *             migration set — see hasSalvagedLeafContent), a layout tree
@@ -626,13 +653,21 @@ export function classifyPersistedLayoutHealth(
   const salvageRaw = readPreMigrationEvidenceRaw(storage)
     ?? getPreMigrationLayoutRaw()
     ?? raw
-  let salvageEnvelope: { panes?: { layouts?: unknown } } | undefined
+  let salvageEnvelope: { panes?: { layouts?: unknown }; machineId?: unknown; persistedAt?: unknown } | undefined
   try {
     salvageEnvelope = JSON.parse(salvageRaw)
   } catch {
     salvageEnvelope = undefined
   }
   if (hasSalvagedLeafContent(salvageEnvelope, parsed)) return 'corrupt'
+  // The comparison's envelope METADATA key coverage (delta r5 finding 1):
+  // a salvage raw whose machineId is present but not a string, or whose
+  // persistedAt is present but not a number, is the malformed class the
+  // migration's rewrite dropped or replaced — the sanitized current raw
+  // must not slide through as healthy legacy. (When the salvage raw IS the
+  // current raw, the parse-level refusal already classified it corrupt
+  // before this point, so this check is a no-op there.)
+  if (hasMalformedEnvelopeMetadata(salvageEnvelope)) return 'corrupt'
   // Referential integrity, BOTH directions — verified against the actual
   // loaders: a layout entry whose tabId is not among the parsed tabs is
   // DROPPED at load (cleanOrphanedLayouts, panesSlice.ts:328-371, called

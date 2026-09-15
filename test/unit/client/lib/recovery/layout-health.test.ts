@@ -662,6 +662,94 @@ describe('classifyPersistedLayoutHealth', () => {
   })
 })
 
+// Delta r5 finding 1: present-but-malformed top-level envelope metadata
+// (a machineId that is not a string, or a persistedAt that is not a
+// number) is CORRUPTION, distinct from legitimate ABSENCE. The parse used
+// to coerce both to undefined (persistedState.ts), so a corrupt envelope
+// classified as unstamped legacy — healthy — and the healthy boot's stamp
+// backfill then relabeled a corrupted layout from machine A as machine B,
+// published onward by tab sync. The boot migration compounds it: its
+// rewrite DROPS a malformed machineId and REPLACES a malformed persistedAt
+// with a fresh Date.now() (storage-migration.ts migratePersistedLayout),
+// so post-rewrite the sanitized current raw looks healthy and only the
+// pre-migration evidence sidecar still shows the malformed value.
+describe('malformed envelope metadata classifies corrupt — never silently coerced to legacy absence (delta r5 finding 1)', () => {
+  beforeEach(() => { localStorage.clear(); seedWindow() })
+
+  it('returns corrupt when machineId is present but not a string (direct parse path)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    envelope.machineId = 123
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('returns corrupt when persistedAt is present but not a number (direct parse path)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    envelope.persistedAt = 'recently'
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('stays healthy when machineId is absent while persistedAt is valid (legacy machine-id absence — direct parse path)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    delete envelope.machineId
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+  })
+
+  it('never classifies ABSENCE corrupt: an absent persistedAt keeps the pre-existing epoch fallback (stale, not corrupt — direct parse path)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    delete envelope.machineId
+    delete envelope.persistedAt
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('stale')
+  })
+
+  it('classifies corrupt through the pre-migration evidence when the migration dropped a malformed machineId (the sanitized current raw must not slide through as healthy legacy)', () => {
+    // The realistic post-rewrite shape: the migration's JSON.stringify
+    // omits the undefined machineId, so the current raw is unstamped and
+    // otherwise healthy — only the evidence sidecar still carries the
+    // malformed stamp.
+    const current = healthyEnvelope('machine-1')
+    delete current.machineId
+    seedEnvelope(current)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+    const original = healthyEnvelope('machine-1')
+    original.machineId = 123
+    localStorage.setItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY, JSON.stringify(original))
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+    localStorage.removeItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+  })
+
+  it('classifies corrupt through the pre-migration evidence when the migration replaced a malformed persistedAt with a fresh stamp', () => {
+    const current = healthyEnvelope('machine-1')
+    seedEnvelope(current)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+    const original = healthyEnvelope('machine-1')
+    original.persistedAt = 'recently'
+    localStorage.setItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY, JSON.stringify(original))
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('stays healthy when the evidence envelope legitimately lacks both metadata keys (legacy absence in evidence is not corruption)', () => {
+    const current = healthyEnvelope('machine-1')
+    seedEnvelope(current)
+    const original = healthyEnvelope('machine-1')
+    delete original.machineId
+    delete original.persistedAt
+    localStorage.setItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY, JSON.stringify(original))
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+  })
+
+  it('stays healthy when the evidence envelope carries valid metadata values (a string machineId and a number persistedAt)', () => {
+    const current = healthyEnvelope('machine-1')
+    seedEnvelope(current)
+    localStorage.setItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY, JSON.stringify(healthyEnvelope('machine-1')))
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+  })
+})
+
 // e2r1 review finding 1: the content-salvage check could never fire in the
 // REAL boot order. main.tsx imports the self-executing storage-migration
 // BEFORE the store and App (main.tsx:8 vs :9-10), and on essentially every
@@ -745,6 +833,36 @@ describe('classifyPersistedLayoutHealth in the real boot order (migration rewrit
     }))
     const { classify } = await classifyAfterRealBoot()
     expect(classify('machine-1')).toBe('corrupt')
+  })
+
+  // Delta r5 finding 1 through the REAL boot order: the migration rewrite
+  // drops a malformed machineId (JSON.stringify omits undefined) and
+  // replaces a malformed persistedAt with Date.now(), so the sanitized
+  // current raw alone looks like healthy legacy data — only the evidence
+  // sidecar the rewrite mirrors can keep the malformed class corrupt.
+  it('classifies corrupt when the boot migration dropped a malformed machineId stamp (the sanitized envelope must not slide through as healthy legacy)', async () => {
+    const envelope = healthyEnvelope('machine-1')
+    envelope.machineId = 123
+    seedEnvelope(envelope)
+    const { classify } = await classifyAfterRealBoot()
+    expect(classify('machine-1')).toBe('corrupt')
+  })
+
+  it('classifies corrupt when the boot migration replaced a malformed persistedAt with a fresh stamp', async () => {
+    const envelope = healthyEnvelope('machine-1')
+    envelope.persistedAt = 'recently'
+    seedEnvelope(envelope)
+    const { classify } = await classifyAfterRealBoot()
+    expect(classify('machine-1')).toBe('corrupt')
+  })
+
+  it('boots an unstamped, persistedAt-less legacy envelope healthy through the real order (the migration supplies the stamp; absence is never corruption)', async () => {
+    const envelope = healthyEnvelope('machine-1')
+    delete envelope.machineId
+    delete envelope.persistedAt
+    seedEnvelope(envelope)
+    const { classify } = await classifyAfterRealBoot()
+    expect(classify('machine-1')).toBe('healthy')
   })
 
   // Verified migration drops that must NOT classify corrupt once the

@@ -438,10 +438,21 @@ export function installCrossTabSync(store: StoreLike): () => void {
     if (isDerivedLayoutKey(key) && isForeignIncomingLayout(store, raw)) return
     const previousRaw = lastProcessedRawByKey.get(key)
     if (!tryDedupeAndMark(key, raw)) return
-    const foreignLayoutKey = isDerivedLayoutKey(key) && key !== ownLayoutKey
+    // Resolve the own key DYNAMICALLY at every classification/floor point
+    // (delta r5 finding 2): the registry lease-collision rotation can
+    // remint the layout-window id mid-session
+    // (tabRegistrySync.rotateClientInstanceIdAfterCollision →
+    // remintLayoutWindowId), so the key captured at install can name an id
+    // this window no longer holds. An OLD-key event after a remint is a
+    // FOREIGN window's event — handleIncomingRaw already routes it
+    // title-only through the dynamic getter, and the floor lines must
+    // classify it the same way instead of treating it as the receiver's
+    // own key (a no-op then advanced the recency floor and let it reject
+    // another window's strictly-newer title).
+    const foreignLayoutKey = isDerivedLayoutKey(key) && key !== getWindowLayoutKey()
     const paneTitleMetadataBefore = foreignLayoutKey ? paneTitleMetadataOf(store) : undefined
     handleIncomingRaw(store, key, raw, previousRaw, currentLocalLayoutPersistedAt)
-    if (key === ownLayoutKey) {
+    if (key === getWindowLayoutKey()) {
       // Recency floor (e3r4 finding 3): advance where the incoming
       // envelope actually REPLACED local state — the own-key full-hydrate
       // path (hydrateTabs + hydratePanes), mirroring the tabs winner
