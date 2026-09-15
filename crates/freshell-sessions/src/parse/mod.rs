@@ -11,8 +11,11 @@ pub mod opencode;
 pub use claude::{parse_session_content, ParseSessionOptions};
 pub use codex::parse_codex_session_content;
 pub use opencode::{
-    default_opencode_data_home, is_opencode_placeholder_title, opencode_session_row_by_id,
-    run_opencode_listing_query, session_exists_by_id, session_is_subagent_by_id, OpencodeByIdError,
-    OpencodeByIdRow, OpencodeDegrade, OpencodeListing, OpencodeListingResult, OpencodeProvider,
-    OpencodeReadError, OpencodeSession, OpencodeSessionRow, THREE_VIEWS_MARKER_SQL_PATTERN,
+    default_opencode_data_home, is_opencode_placeholder_title, opencode_compact_percent,
+    opencode_context_count, opencode_max_output_tokens, opencode_session_row_by_id,
+    opencode_usable_context, run_opencode_listing_query, session_exists_by_id,
+    session_is_subagent_by_id, OpencodeByIdError, OpencodeByIdRow, OpencodeDegrade,
+    OpencodeListing, OpencodeListingResult, OpencodeModelLimits, OpencodeProvider,
+    OpencodeReadError, OpencodeSession, OpencodeSessionRow, OpencodeStepUsage,
+    OPENCODE_COMPACTION_BUFFER_TOKENS, OPENCODE_OUTPUT_TOKEN_MAX, THREE_VIEWS_MARKER_SQL_PATTERN,
 };
