@@ -39,6 +39,7 @@ mod managed_ports;
 mod migrations;
 mod net_bind;
 mod network;
+mod opencode_limits;
 mod project_colors;
 mod proxy;
 mod rate_limit;
@@ -116,6 +117,38 @@ fn snapshot_close_evidence_references(
             None
         }
     }
+}
+
+/// The composition root's session-source list — the exact list `main`
+/// installs into `SessionIndex`. Factored so the production wiring is the
+/// tested artifact: the opencode_limits wiring test builds its index from
+/// this same fn (the opencode data home is a parameter so the test can
+/// point it at a fixture db; `main` passes `default_opencode_data_home()`).
+/// The opencode source carries the context-meter model-limit resolver
+/// (see [`opencode_limits`]'s module doc) — dropping that injection here
+/// fails this crate's wiring test.
+pub(crate) fn build_session_sources(
+    home: &Path,
+    opencode_data_home: PathBuf,
+    opencode_limits: &opencode_limits::Snapshot,
+) -> Vec<Arc<dyn freshell_sessions::directory_index::SessionSource>> {
+    vec![
+        Arc::new(freshell_sessions::directory_index::ClaudeSource::new(
+            session_directory::claude_home(home),
+        )) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
+        Arc::new(freshell_sessions::directory_index::CodexSource::new(
+            session_directory::codex_home(home),
+        )) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
+        Arc::new(
+            freshell_sessions::directory_index::OpencodeSource::new(opencode_data_home)
+                .with_model_limit_resolver(opencode_limits::build_opencode_limit_resolver(
+                    opencode_limits.clone(),
+                )),
+        ) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
+        Arc::new(freshell_sessions::amplifier::AmplifierSource::new(
+            freshell_sessions::amplifier::amplifier_home(home),
+        )) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
+    ]
 }
 
 #[tokio::main]
@@ -700,21 +733,21 @@ async fn main() -> ExitCode {
     // `<home>/.amplifier`, against the same `provider_home()` root
     // `claude_home`/`codex_home` use. `AMPLIFIER_HOME` is deliberately NOT
     // consulted anywhere broker-side.
+    //
+    // The source list itself lives in [`build_session_sources`] above (the
+    // exact list `main` installs, factored so the production wiring is the
+    // tested artifact); it additionally wires the opencode source's
+    // context-meter model-limit resolver (see `opencode_limits`'s module
+    // doc) into the shared snapshot refreshed by the task spawned below.
+    let opencode_limits = opencode_limits::snapshot();
     let session_index = session_directory::provider_home().as_ref().map(|h| {
-        Arc::new(freshell_sessions::directory_index::SessionIndex::new(vec![
-            Arc::new(freshell_sessions::directory_index::ClaudeSource::new(
-                session_directory::claude_home(h),
-            )) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
-            Arc::new(freshell_sessions::directory_index::CodexSource::new(
-                session_directory::codex_home(h),
-            )) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
-            Arc::new(freshell_sessions::directory_index::OpencodeSource::new(
+        Arc::new(freshell_sessions::directory_index::SessionIndex::new(
+            build_session_sources(
+                h,
                 freshell_sessions::parse::default_opencode_data_home(),
-            )) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
-            Arc::new(freshell_sessions::amplifier::AmplifierSource::new(
-                freshell_sessions::amplifier::amplifier_home(h),
-            )) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
-        ]))
+                &opencode_limits,
+            ),
+        ))
     });
 
     // Start the session-directory file watcher. This replaces the continuous
@@ -766,6 +799,24 @@ async fn main() -> ExitCode {
     } else {
         None
     };
+
+    // STATUS-STRIP (freshopencode context meter): the per-cwd opencode
+    // model-limit snapshot refresher — see `opencode_limits`'s module doc
+    // for the full rationale (cwd-strict resolution, wholesale bucket
+    // replacement, the F2 re-list nudge). Spawned AFTER the watcher above
+    // so the refresh loop's first snapshot publish funnels through the
+    // same startup gate every other boot-time publish honors. `main` is
+    // the only construction site where both the fresh-agent registry and
+    // the session index are in scope; the resolver closure itself only
+    // captured the snapshot, so ordering was free.
+    if let Some(index) = &session_index {
+        let registry = fresh_agent_state.model_capabilities();
+        let snap = opencode_limits.clone();
+        let idx = Arc::clone(index);
+        tokio::spawn(async move {
+            opencode_limits::refresh_loop(registry, idx, snap).await;
+        });
+    }
 
     // TERM-15/TERM-16: the terminal-mode CLI activity hub. Consumes the
     // registry tap (installed right below), broadcasts *.activity.updated /

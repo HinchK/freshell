@@ -667,6 +667,26 @@ fn find_uuid_substring(s: &str) -> Option<String> {
     None
 }
 
+/// Sync model-limit resolver handed to [`OpencodeSource`] by the
+/// freshell-server composition root: `(session cwd, model id
+/// ("provider/model")) -> limits`. The directory sweep runs on
+/// `spawn_blocking`, so the seam is synchronous by contract — production
+/// reads a pre-warmed snapshot (cwd-keyed so a project-scoped catalog can
+/// never leak another project's limits), and the default (no resolver)
+/// always answers `None`, keeping every existing construction
+/// meter-unknown.
+pub type OpencodeModelLimitResolver =
+    std::sync::Arc<dyn Fn(&str, &str) -> Option<crate::parse::OpencodeModelLimits> + Send + Sync>;
+
+/// Borrowed [`OpencodeModelLimitResolver`] threaded through the opencode
+/// mapping: [`OpencodeSource`] owns the `Arc` and hands `None` down when no
+/// resolver was injected. The trait object carries the same
+/// `+ Send + Sync` auto-trait bounds as the owned alias so
+/// `Option::as_deref` coerces without a cast (the parentheses are
+/// load-bearing: without them the `+` binds to the `Fn` return type).
+type OpencodeModelLimitResolverBorrow<'a> =
+    Option<&'a (dyn Fn(&str, &str) -> Option<crate::parse::OpencodeModelLimits> + Send + Sync)>;
+
 /// OpenCode source: direct-listed from `<data_home>/opencode.db` (one sqlite
 /// query enumerates every root session, unlike the file-per-session
 /// claude/codex layout) — a thin wrapper over [`OpencodeProvider`]
@@ -677,13 +697,22 @@ fn find_uuid_substring(s: &str) -> Option<String> {
 /// empty/`None` and are never called in practice.
 pub struct OpencodeSource {
     provider: crate::parse::OpencodeProvider,
+    model_limit_resolver: Option<OpencodeModelLimitResolver>,
 }
 
 impl OpencodeSource {
     pub fn new(data_home: PathBuf) -> Self {
         Self {
             provider: crate::parse::OpencodeProvider::new(data_home),
+            model_limit_resolver: None,
         }
+    }
+
+    /// Inject the model-limit resolver (production wiring only; tests seed
+    /// canned limits through it).
+    pub fn with_model_limit_resolver(mut self, resolver: OpencodeModelLimitResolver) -> Self {
+        self.model_limit_resolver = Some(resolver);
+        self
     }
 
     /// Convenience: one-shot listing, ignoring any incremental cache.
@@ -725,10 +754,11 @@ impl SessionSource for OpencodeSource {
             .provider
             .list_sessions(now_ms())
             .map_err(|e| e.to_string())?;
+        let resolver: OpencodeModelLimitResolverBorrow<'_> = self.model_limit_resolver.as_deref();
         Ok(listing
             .sessions
             .into_iter()
-            .map(opencode_session_to_indexed)
+            .map(|s| opencode_session_to_indexed(s, resolver))
             .collect())
     }
 
@@ -742,7 +772,10 @@ impl SessionSource for OpencodeSource {
     }
 }
 
-fn opencode_session_to_indexed(s: crate::parse::OpencodeSession) -> IndexedSession {
+fn opencode_session_to_indexed(
+    s: crate::parse::OpencodeSession,
+    resolver: OpencodeModelLimitResolverBorrow<'_>,
+) -> IndexedSession {
     // A non-placeholder opencode title is opencode's OWN session name
     // (opencode retitles sessions itself after the first exchange).
     // Surface it as provider-generated so the auto-title ladder yields to
@@ -755,6 +788,9 @@ fn opencode_session_to_indexed(s: crate::parse::OpencodeSession) -> IndexedSessi
         .title
         .as_deref()
         .is_some_and(|t| !t.trim().is_empty() && !crate::parse::is_opencode_placeholder_title(t));
+    // Compute BEFORE the literal: the IndexedSession construction below
+    // moves fields out of `s`, and the helper borrows the whole struct.
+    let token_usage = opencode_token_usage(&s, resolver);
     IndexedSession {
         session_id: s.session_id,
         legacy_session_id: None,
@@ -786,10 +822,58 @@ fn opencode_session_to_indexed(s: crate::parse::OpencodeSession) -> IndexedSessi
         // provider is un-searchable at the `userMessages`/`fullText` tiers
         // (title-tier metadata search is unaffected).
         source_file: None,
-        // opencode's direct lister surfaces no usage (faithful to Node's
-        // opencode provider, which never sets `tokenUsage` either).
-        token_usage: None,
+        // STATUS-STRIP: real step-finish usage + catalog-resolved limits —
+        // opencode's own auto-compaction decision mirrored (see
+        // parse/opencode.rs's overflow-semantics docs and
+        // docs/plans/2026-09-14-freshopencode-context-meter.md).
+        token_usage,
     }
+}
+
+/// Assemble the opencode [`TokenSummary`]: the four required counters plus
+/// the meter trio, mirroring opencode v1.18.31's auto-compaction trigger
+/// (`session/overflow.ts` `isOverflow` over the last finished assistant
+/// step): count vs `usable`, so 100% == the exact auto-compact moment.
+/// Usage with unresolvable limits still emits the required counters (the
+/// client guard keeps the meter muted); no usage emits `None`.
+fn opencode_token_usage(
+    s: &crate::parse::OpencodeSession,
+    resolver: OpencodeModelLimitResolverBorrow<'_>,
+) -> Option<crate::meta::TokenSummary> {
+    let usage = s.last_usage.as_ref()?;
+    let count = crate::parse::opencode_context_count(usage);
+    let cached = usage
+        .cache_read
+        .max(0)
+        .saturating_add(usage.cache_write.max(0));
+    let (model_context_window, compact_threshold_tokens, compact_percent) = match s
+        .model
+        .as_deref()
+        .and_then(|model| resolver?(s.cwd.as_str(), model))
+    {
+        None => (None, None, None),
+        Some(limits) => {
+            let usable = crate::parse::opencode_usable_context(&limits);
+            (
+                // NEVER emit 0/negative: the wire zod is `.positive()`
+                // and one violating item rejects the whole page parse
+                // (api.ts:646/:681). Zero-context resolves to None here.
+                (limits.context > 0).then_some(limits.context),
+                (usable > 0).then_some(usable),
+                crate::parse::opencode_compact_percent(count, usable),
+            )
+        }
+    };
+    Some(crate::meta::TokenSummary {
+        input_tokens: usage.input.max(0),
+        output_tokens: usage.output.max(0),
+        cached_tokens: cached,
+        total_tokens: count,
+        context_tokens: Some(count),
+        model_context_window,
+        compact_threshold_tokens,
+        compact_percent,
+    })
 }
 
 /// `fs::metadata(path).modified()` in milliseconds, `None` on any stat
@@ -3798,7 +3882,8 @@ pub(crate) mod tests {
     // ── Batch C: OpencodeSource ──────────────────────────────────────────
 
     /// A writable sqlite db at `<data_home>/opencode.db`, seeded with the
-    /// same schema/shape `tests/opencode_sqlite.rs` uses.
+    /// real schema shape (`tests/opencode_usage.rs` convention): the session
+    /// table carries the `model` JSON column — existing rows leave it NULL.
     fn opencode_data_home_with_sessions(
         label: &str,
         rows: &[(&str, &str, &str, i64, i64)], // (id, cwd, title, created, updated)
@@ -3812,13 +3897,13 @@ pub(crate) mod tests {
              CREATE TABLE session (
                 id TEXT PRIMARY KEY, directory TEXT, title TEXT,
                 time_created INTEGER, time_updated INTEGER, time_archived INTEGER,
-                project_id TEXT, parent_id TEXT
+                project_id TEXT, parent_id TEXT, model TEXT
              );",
         )
         .unwrap();
         for (id, cwd, title, created, updated) in rows {
             conn.execute(
-                "INSERT INTO session VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL)",
+                "INSERT INTO session VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL)",
                 rusqlite::params![id, cwd, title, created, updated],
             )
             .unwrap();
@@ -3827,25 +3912,38 @@ pub(crate) mod tests {
         data_home
     }
 
-    /// Seeds `message`/`part` rows (real-schema column shape: id + linkage +
-    /// time as real columns, role/type/text/synthetic in JSON `data`) for a
-    /// fixture db created by `opencode_data_home_with_sessions`.
-    fn seed_opencode_user_message(
-        data_home: &std::path::Path,
-        session_id: &str,
-        msg_id: &str,
-        time_created: i64,
-        role: &str,
-        parts: &[(&str, &str)], // (part_id, data_json)
-    ) {
-        let conn = rusqlite::Connection::open(data_home.join("opencode.db")).unwrap();
+    /// Create the fixture `message`/`part` tables if absent — the real
+    /// schema's column shape (id/linkage/time as REAL columns; role/type/
+    /// text/synthetic/tokens payloads in the JSON `data` column). Shared by
+    /// the seeding helpers below so a fixture db can seed user messages or
+    /// step-finishes independently. The usage walk orders messages by
+    /// `time_created` and a message's parts by `id`, never by part times.
+    fn ensure_opencode_message_tables(conn: &rusqlite::Connection) {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS message (
                 id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
              CREATE TABLE IF NOT EXISTS part (
-                id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT);",
+                id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+                time_created INTEGER NOT NULL, time_updated INTEGER, data TEXT);",
         )
         .unwrap();
+    }
+
+    /// Monotonic part-time stamp: real-schema fidelity (a later insert is
+    /// the newer part).
+    fn next_opencode_part_time() -> i64 {
+        static PART_TIME: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1000);
+        PART_TIME.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Insert one `message` row (role inside the JSON `data` column).
+    fn insert_opencode_message(
+        conn: &rusqlite::Connection,
+        msg_id: &str,
+        session_id: &str,
+        time_created: i64,
+        role: &str,
+    ) {
         conn.execute(
             "INSERT INTO message VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![
@@ -3856,13 +3954,68 @@ pub(crate) mod tests {
             ],
         )
         .unwrap();
+    }
+
+    /// Insert one `part` row (real-schema fidelity: `time_created` NOT NULL
+    /// + `time_updated` stamped from the monotonic counter).
+    fn insert_opencode_part(
+        conn: &rusqlite::Connection,
+        part_id: &str,
+        msg_id: &str,
+        session_id: &str,
+        data: &str,
+    ) {
+        let time_created = next_opencode_part_time();
+        conn.execute(
+            "INSERT INTO part VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+            rusqlite::params![part_id, msg_id, session_id, time_created, data],
+        )
+        .unwrap();
+    }
+
+    /// Seeds a user message + its parts (real-schema column shape: id +
+    /// linkage + time as real columns, role/type/text/synthetic in JSON
+    /// `data`) for a fixture db created by `opencode_data_home_with_sessions`.
+    fn seed_opencode_user_message(
+        data_home: &std::path::Path,
+        session_id: &str,
+        msg_id: &str,
+        time_created: i64,
+        role: &str,
+        parts: &[(&str, &str)], // (part_id, data_json)
+    ) {
+        let conn = rusqlite::Connection::open(data_home.join("opencode.db")).unwrap();
+        ensure_opencode_message_tables(&conn);
+        insert_opencode_message(&conn, msg_id, session_id, time_created, role);
         for (part_id, data) in parts {
-            conn.execute(
-                "INSERT INTO part VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![part_id, msg_id, session_id, data],
-            )
-            .unwrap();
+            insert_opencode_part(&conn, part_id, msg_id, session_id, data);
         }
+    }
+
+    /// Seed an assistant message + its step-finish part carrying the given
+    /// tokens JSON (real-schema part shape: type/tokens inside the JSON
+    /// `data` column) — what `OpencodeSource`'s usage walk reads.
+    fn seed_opencode_step_finish(data_home: &std::path::Path, session_id: &str, tokens_json: &str) {
+        let conn = rusqlite::Connection::open(data_home.join("opencode.db")).unwrap();
+        ensure_opencode_message_tables(&conn);
+        insert_opencode_message(&conn, "msg_usage", session_id, 200, "assistant");
+        insert_opencode_part(
+            &conn,
+            "prt_usage",
+            "msg_usage",
+            session_id,
+            &format!(r#"{{"reason":"stop","type":"step-finish","tokens":{tokens_json},"cost":0}}"#),
+        );
+    }
+
+    /// Point a fixture session row's `model` column at the given model JSON.
+    fn set_opencode_session_model(data_home: &std::path::Path, session_id: &str, model_json: &str) {
+        let conn = rusqlite::Connection::open(data_home.join("opencode.db")).unwrap();
+        conn.execute(
+            "UPDATE session SET model = ?1 WHERE id = ?2",
+            rusqlite::params![model_json, session_id],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -4049,6 +4202,185 @@ pub(crate) mod tests {
         );
         assert_eq!(snap2[0].session_id, "ses_a");
 
+        std::fs::remove_dir_all(&data_home).ok();
+    }
+
+    // ── opencode token usage / context meter (Task 3) ────────────────────
+
+    /// `session.model` JSON for the usage tests — the composite the parse
+    /// layer derives from it is "lunaroute/glm-5.3-vision-background".
+    const OPENCODE_TEST_MODEL: &str =
+        r#"{"id":"glm-5.3-vision-background","providerID":"lunaroute","variant":"default"}"#;
+
+    /// A canned resolver answering exactly the given (model, limits) pairs.
+    fn canned_limits_resolver(
+        pairs: Vec<(&'static str, crate::parse::OpencodeModelLimits)>,
+    ) -> OpencodeModelLimitResolver {
+        let map: HashMap<String, crate::parse::OpencodeModelLimits> =
+            pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        Arc::new(move |_cwd: &str, model: &str| map.get(model).cloned())
+    }
+
+    #[test]
+    fn opencode_resolver_receives_the_session_cwd() {
+        // The resolver's FIRST parameter is the session cwd (per-catalog
+        // provenance); the sessions crate must hand it through verbatim.
+        let data_home = opencode_data_home_with_sessions(
+            "opencodesrc-usage-cwd",
+            &[("ses_cwd", "/repo/x", "Named", 1000, 5000)],
+        );
+        set_opencode_session_model(&data_home, "ses_cwd", OPENCODE_TEST_MODEL);
+        seed_opencode_step_finish(
+            &data_home,
+            "ses_cwd",
+            r#"{"total":1000,"input":10,"output":20,"cache":{"write":0,"read":970}}"#,
+        );
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let seen_for_resolver = Arc::clone(&seen);
+        let resolver: OpencodeModelLimitResolver = Arc::new(move |cwd: &str, model: &str| {
+            seen_for_resolver
+                .lock()
+                .unwrap()
+                .push((cwd.to_string(), model.to_string()));
+            Some(crate::parse::OpencodeModelLimits {
+                context: 524_288,
+                input: None,
+                output: Some(131_072),
+            })
+        });
+        let source = OpencodeSource::new(data_home.clone()).with_model_limit_resolver(resolver);
+        assert!(source.scan()[0].token_usage.is_some());
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [(
+                "/repo/x".to_string(),
+                "lunaroute/glm-5.3-vision-background".to_string()
+            )]
+            .as_slice(),
+        );
+        std::fs::remove_dir_all(&data_home).ok();
+    }
+
+    #[test]
+    fn opencode_source_maps_token_usage_with_resolved_limits() {
+        let data_home = opencode_data_home_with_sessions(
+            "opencodesrc-usage-mapped",
+            &[("ses_usage", "/repo/x", "Named", 1000, 5000)],
+        );
+        set_opencode_session_model(&data_home, "ses_usage", OPENCODE_TEST_MODEL);
+        seed_opencode_step_finish(
+            &data_home,
+            "ses_usage",
+            r#"{"total":395980,"input":31,"output":556,"reasoning":1,"cache":{"write":0,"read":395392}}"#,
+        );
+        let resolver = canned_limits_resolver(vec![(
+            "lunaroute/glm-5.3-vision-background",
+            crate::parse::OpencodeModelLimits {
+                context: 524_288,
+                input: None,
+                output: Some(131_072),
+            },
+        )]);
+        let source = OpencodeSource::new(data_home.clone()).with_model_limit_resolver(resolver);
+        let sessions = source.scan();
+        let usage = sessions[0]
+            .token_usage
+            .as_ref()
+            .expect("token_usage present");
+        assert_eq!(usage.input_tokens, 31);
+        assert_eq!(usage.output_tokens, 556);
+        assert_eq!(usage.cached_tokens, 395_392);
+        assert_eq!(usage.total_tokens, 395_980);
+        assert_eq!(usage.context_tokens, Some(395_980));
+        assert_eq!(usage.model_context_window, Some(524_288));
+        assert_eq!(usage.compact_threshold_tokens, Some(492_288));
+        assert_eq!(usage.compact_percent, Some(80));
+        std::fs::remove_dir_all(&data_home).ok();
+    }
+
+    #[test]
+    fn opencode_usage_without_resolver_keeps_meter_fields_absent() {
+        // usage + model exist, no resolver injected: the four required
+        // counters and contextTokens still surface; the meter's three
+        // fields stay None (client guard -> muted "context —").
+        let data_home = opencode_data_home_with_sessions(
+            "opencodesrc-usage-unresolved",
+            &[("ses_usage", "/repo/x", "Named", 1000, 5000)],
+        );
+        set_opencode_session_model(&data_home, "ses_usage", OPENCODE_TEST_MODEL);
+        seed_opencode_step_finish(
+            &data_home,
+            "ses_usage",
+            r#"{"total":1000,"input":10,"output":20,"cache":{"write":0,"read":970}}"#,
+        );
+        let sessions = OpencodeSource::new(data_home.clone()).scan();
+        let usage = sessions[0]
+            .token_usage
+            .as_ref()
+            .expect("token_usage present");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.cached_tokens, 970);
+        assert_eq!(usage.total_tokens, 1_000);
+        assert_eq!(usage.context_tokens, Some(1_000));
+        assert_eq!(usage.compact_threshold_tokens, None);
+        assert_eq!(usage.compact_percent, None);
+        assert_eq!(usage.model_context_window, None);
+        std::fs::remove_dir_all(&data_home).ok();
+    }
+
+    #[test]
+    fn opencode_zero_context_limit_yields_no_meter() {
+        // limit.context 0 == upstream disables auto-compaction: threshold,
+        // percent AND modelContextWindow stay None (the wire zod is
+        // `.positive()` — emitting 0 would reject the whole page parse).
+        let data_home = opencode_data_home_with_sessions(
+            "opencodesrc-usage-zero-ctx",
+            &[("ses_usage", "/repo/x", "Named", 1000, 5000)],
+        );
+        set_opencode_session_model(&data_home, "ses_usage", OPENCODE_TEST_MODEL);
+        seed_opencode_step_finish(
+            &data_home,
+            "ses_usage",
+            r#"{"total":100,"input":10,"output":10,"cache":{"write":0,"read":80}}"#,
+        );
+        let resolver = canned_limits_resolver(vec![(
+            "lunaroute/glm-5.3-vision-background",
+            crate::parse::OpencodeModelLimits {
+                context: 0,
+                input: None,
+                output: None,
+            },
+        )]);
+        let source = OpencodeSource::new(data_home.clone()).with_model_limit_resolver(resolver);
+        let sessions = source.scan();
+        let usage = sessions[0]
+            .token_usage
+            .as_ref()
+            .expect("token_usage present");
+        assert_eq!(usage.model_context_window, None);
+        assert_eq!(usage.compact_threshold_tokens, None);
+        assert_eq!(usage.compact_percent, None);
+        std::fs::remove_dir_all(&data_home).ok();
+    }
+
+    #[test]
+    fn opencode_session_without_usage_has_no_token_usage() {
+        let data_home = opencode_data_home_with_sessions(
+            "opencodesrc-usage-absent",
+            &[("ses_plain", "/repo/x", "Named", 1000, 5000)],
+        );
+        set_opencode_session_model(&data_home, "ses_plain", OPENCODE_TEST_MODEL);
+        let resolver = canned_limits_resolver(vec![(
+            "lunaroute/glm-5.3-vision-background",
+            crate::parse::OpencodeModelLimits {
+                context: 524_288,
+                input: None,
+                output: Some(131_072),
+            },
+        )]);
+        let source = OpencodeSource::new(data_home.clone()).with_model_limit_resolver(resolver);
+        assert!(source.scan()[0].token_usage.is_none());
         std::fs::remove_dir_all(&data_home).ok();
     }
 

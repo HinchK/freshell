@@ -32,9 +32,8 @@ use futures_util::future::{FutureExt, Shared};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use freshell_opencode::catalog::{
-    probe_enabled_model_catalog, CatalogConfig, CatalogDeps, ModelCapability,
-};
+use freshell_opencode::catalog::{probe_enabled_model_catalog, CatalogConfig, CatalogDeps};
+pub use freshell_opencode::catalog::{ModelCapability, ModelLimits};
 use freshell_opencode::serve::BoxFuture;
 use freshell_opencode::transport::{LoopbackPortAllocator, ReqwestServeHttp, TokioProcessSpawner};
 
@@ -271,6 +270,7 @@ fn normalize_claude_catalog(raw: Value) -> CatalogOut {
                     .or_else(|| row.get("supports_adaptive_thinking"))
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                limit: None,
             });
         }
     }
@@ -359,25 +359,23 @@ impl ModelCapabilityRegistry {
             );
         }
         let key = catalog_cache_key(session_type, cwd.as_deref());
-        {
-            let state = self.state.lock().await;
-            if let Some(cached) = state.cache.get(&key) {
-                // `:270-271`: `now - fetchedAt <= ttlMs`.
-                let age_ms = (self.now)().saturating_sub(cached.fetched_at_ms);
-                if age_ms <= self.ttl.as_millis() as u64 {
-                    return (
-                        StatusCode::OK,
-                        success_body(
-                            session_type,
-                            "cached",
-                            cached.fetched_at_ms,
-                            cached.models.clone(),
-                        ),
-                    );
-                }
-            }
+        if let Some(cached) = self.cached_within_ttl(&key).await {
+            return (
+                StatusCode::OK,
+                success_body(session_type, "cached", cached.fetched_at_ms, cached.models),
+            );
         }
         self.finish_catalog(session_type, key, cwd).await
+    }
+
+    /// Cached catalog within TTL, if fresh. Shared by the HTTP envelope
+    /// path ([`Self::get`]) and the typed internal read ([`Self::models`]).
+    async fn cached_within_ttl(&self, key: &str) -> Option<CachedCatalog> {
+        let state = self.state.lock().await;
+        let cached = state.cache.get(key)?;
+        // `:270-271`: `now - fetchedAt <= ttlMs`.
+        let age_ms = (self.now)().saturating_sub(cached.fetched_at_ms);
+        (age_ms <= self.ttl.as_millis() as u64).then(|| cached.clone())
     }
 
     /// `refreshCapabilities` (`:236-254`): skips the TTL check but shares any
@@ -405,6 +403,28 @@ impl ModelCapabilityRegistry {
             cwd,
         )
         .await
+    }
+
+    /// Typed internal read for server-side consumers (the session-directory
+    /// context meter's model-limit snapshot): the same TTL/single-flight
+    /// path as [`Self::get`], returning rows instead of the HTTP envelope.
+    /// Codex resolves from its static table; a probe failure returns `Err`
+    /// and leaves the last successful cache entry in place.
+    pub async fn models(
+        &self,
+        session_type: SessionType,
+        cwd: Option<String>,
+    ) -> Result<Vec<ModelCapability>, CapabilityError> {
+        if session_type == SessionType::FreshCodex {
+            return Ok(static_models(session_type));
+        }
+        let key = catalog_cache_key(session_type, cwd.as_deref());
+        if let Some(cached) = self.cached_within_ttl(&key).await {
+            return Ok(cached.models);
+        }
+        self.refreshed_catalog(session_type, key, cwd)
+            .await
+            .map(|catalog| catalog.models)
     }
 
     async fn finish_catalog(
@@ -529,6 +549,7 @@ fn static_models(session_type: SessionType) -> Vec<ModelCapability> {
             supports_effort: !levels.is_empty(),
             supported_effort_levels: levels.iter().map(|s| s.to_string()).collect(),
             supports_adaptive_thinking: !levels.is_empty(),
+            limit: None,
         })
         .collect()
 }

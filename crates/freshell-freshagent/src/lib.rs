@@ -464,6 +464,16 @@ impl FreshAgentState {
         self
     }
 
+    /// Shared read access to the model-capability registry for the HTTP
+    /// routes and server-side consumers (the session-directory context
+    /// meter's opencode limit snapshot). The field stays `pub(crate)`;
+    /// this accessor is the public seam.
+    pub fn model_capabilities(
+        &self,
+    ) -> std::sync::Arc<model_capabilities::ModelCapabilityRegistry> {
+        self.model_capabilities.clone()
+    }
+
     /// Wire the P1.13 identity-event sink (set-once; later calls are no-ops).
     pub fn set_identity_sink(&self, sink: SharedPaneIdentitySink) {
         let _ = self.identity_sink.set(sink);

@@ -84,6 +84,9 @@ pub struct OpencodeSessionRow {
     pub last_activity_at: Option<i64>,
     pub project_path: Option<String>,
     pub has_three_views_marker: Option<i64>,
+    /// Raw `session.model` JSON text (`{"id","providerID","variant"}`),
+    /// `NULL` on older schemas without the column.
+    pub model: Option<String>,
 }
 
 /// `OpencodeListingResult`.
@@ -114,6 +117,14 @@ pub struct OpencodeSession {
     /// mainline deviation from the retired Node reference, which never
     /// read message content for opencode listings.
     pub first_user_message: Option<String>,
+    /// `provider/model` composite from the session row's `model` JSON —
+    /// the same key the model-capability catalog uses. `None` when the
+    /// column is absent (older schema), null, or malformed.
+    pub model: Option<String>,
+    /// Last `step-finish` token usage — what opencode's own compaction
+    /// trigger reads. `None` when the session has no completed model step
+    /// yet, has no model, or the bounded lookup degrades.
+    pub last_usage: Option<OpencodeStepUsage>,
 }
 
 /// Result of a direct listing pass, carrying the (once-)degrade signals for the caller
@@ -122,6 +133,114 @@ pub struct OpencodeSession {
 pub struct OpencodeListing {
     pub sessions: Vec<OpencodeSession>,
     pub degrade: Vec<OpencodeDegrade>,
+}
+
+/// Model context-window limits — the parsed counterpart of opencode's
+/// `models[id].limit { context, input?, output }`. The directory-index
+/// layer resolves these through an injected resolver (catalog-backed in
+/// production freshell-server wiring; `None` in every other construction).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpencodeModelLimits {
+    pub context: i64,
+    pub input: Option<i64>,
+    pub output: Option<i64>,
+}
+
+/// Token usage from a session's LAST `step-finish` part — the numbers
+/// opencode's own compaction trigger reads (`session/overflow.ts`
+/// `isOverflow({ tokens: lastFinished.tokens, ... })`, verified against
+/// the v1.18.31 source; `prompt.ts` passes the last finished assistant
+/// message's tokens).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpencodeStepUsage {
+    /// `tokens.total` — present on every real step-finish; `None` on
+    /// hand-trimmed payloads, where the sum fallback applies.
+    pub total: Option<i64>,
+    pub input: i64,
+    pub output: i64,
+    pub cache_read: i64,
+    pub cache_write: i64,
+}
+
+/// opencode `provider/transform.ts` `OUTPUT_TOKEN_MAX` (v1.18.31).
+pub const OPENCODE_OUTPUT_TOKEN_MAX: i64 = 32_000;
+/// opencode `session/overflow.ts` `COMPACTION_BUFFER`.
+pub const OPENCODE_COMPACTION_BUFFER_TOKENS: i64 = 20_000;
+
+/// `maxOutputTokens(model) = Math.min(model.limit.output, 32000) || 32000`.
+/// A missing/zero output limit falls back to the 32k cap (JS `||` on a
+/// falsy value); negatives are treated as absent (nonsense input).
+pub fn opencode_max_output_tokens(output_limit: Option<i64>) -> i64 {
+    match output_limit {
+        Some(o) if o > 0 => o.min(OPENCODE_OUTPUT_TOKEN_MAX),
+        _ => OPENCODE_OUTPUT_TOKEN_MAX,
+    }
+}
+
+/// opencode `session/overflow.ts` `usable()`: the context-token budget the
+/// auto-compaction trigger compares against (`count >= usable`). `context`
+/// of 0 returns 0 exactly as upstream (auto-compaction disabled there).
+/// The `input` branch mirrors JS truthiness: only a NON-ZERO `input` takes
+/// the `input - reserved` branch — `input: 0` is falsy upstream and falls
+/// through to the `context - maxOutputTokens` branch.
+pub fn opencode_usable_context(limits: &OpencodeModelLimits) -> i64 {
+    if limits.context == 0 {
+        return 0;
+    }
+    match limits.input {
+        Some(input) if input != 0 => {
+            let reserved =
+                OPENCODE_COMPACTION_BUFFER_TOKENS.min(opencode_max_output_tokens(limits.output));
+            (input - reserved).max(0)
+        }
+        _ => (limits.context - opencode_max_output_tokens(limits.output)).max(0),
+    }
+}
+
+/// The compaction count: `tokens.total || (input + output + cache.read +
+/// cache.write)` — opencode's `isOverflow` count verbatim (the fallback
+/// deliberately omits `reasoning`, mirroring upstream).
+pub fn opencode_context_count(usage: &OpencodeStepUsage) -> i64 {
+    usage.total.filter(|t| *t > 0).unwrap_or_else(|| {
+        usage
+            .input
+            .saturating_add(usage.output)
+            .saturating_add(usage.cache_read)
+            .saturating_add(usage.cache_write)
+            .max(0)
+    })
+}
+
+/// Meter percent: `round(count / usable * 100)` (half-up) clamped to
+/// 0..=100. `None` when `usable <= 0` — no meter, mirroring upstream
+/// disabling auto-compaction at `limit.context === 0`.
+pub fn opencode_compact_percent(context_count: i64, usable: i64) -> Option<i64> {
+    if usable <= 0 || context_count < 0 {
+        return None;
+    }
+    let pct = context_count.saturating_mul(100).saturating_add(usable / 2) / usable;
+    Some(pct.clamp(0, 100))
+}
+
+/// Parse the session row's `model` JSON (`{"id","providerID","variant"}`)
+/// into the model-capability catalog's `provider/model` composite id
+/// (`normalize_enabled_model_catalog` joins the same way — verbatim
+/// `provider_id + "/" + model_id`). The id may itself contain slashes
+/// (models.dev org/name ids like `moonshotai/Kimi-K3` — 44% of real
+/// sessions; the catalog composes those ids verbatim too), so there is NO
+/// id-side slash guard; the PROVIDER-side guard mirrors the catalog's own
+/// provider-slash skip (catalog.rs:195-200 — such providers never appear in
+/// the catalog, so the composite could never match). Degrades to `None` on
+/// absent/malformed input — the meter stays unknown, the listing never
+/// breaks.
+fn opencode_model_composite(raw: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let id = v.get("id")?.as_str()?.trim();
+    let provider = v.get("providerID")?.as_str()?.trim();
+    if id.is_empty() || provider.is_empty() || provider.contains('/') {
+        return None;
+    }
+    Some(format!("{provider}/{id}"))
 }
 
 fn to_opt_string(v: &SqlValue) -> Option<String> {
@@ -226,6 +345,162 @@ fn first_user_message_for_session(conn: &Connection, session_id: &str) -> Option
         .and_then(crate::text::normalize_first_user_message)
 }
 
+/// Assistant messages of a session, newest-first — the usage walk's cursor.
+/// EXPLAIN (live, read-only): `SEARCH m USING INDEX
+/// message_session_time_created_id_idx (session_id=?)` — pure index walk.
+const ASSISTANT_MESSAGES_NEWEST_FIRST_SQL: &str = "\
+    SELECT m.id FROM message m \
+    WHERE m.session_id = ?1 AND json_extract(m.data, '$.role') = 'assistant' \
+    ORDER BY m.time_created DESC, m.id DESC";
+
+/// One message's newest step-finish part — the usage walk's probe. EXPLAIN
+/// (live, read-only): `SEARCH p USING INDEX part_message_id_id_idx
+/// (message_id=?)`.
+const MESSAGE_STEP_FINISH_SQL: &str = "\
+    SELECT json_extract(p.data, '$.tokens.total'), \
+           json_extract(p.data, '$.tokens.input'), \
+           json_extract(p.data, '$.tokens.output'), \
+           json_extract(p.data, '$.tokens.cache.read'), \
+           json_extract(p.data, '$.tokens.cache.write') \
+    FROM part p \
+    WHERE p.message_id = ?1 AND json_extract(p.data, '$.type') = 'step-finish' \
+    ORDER BY p.id DESC LIMIT 1";
+
+/// Hard bound on the usage walk (fresh-eyes round-2 finding 2): the walk
+/// may probe at most this many assistant messages before degrading to
+/// `None`. Real sessions hit the step-finish on probe 1-2; a streak of 64
+/// consecutive unfinished steps is pathological (flappy interrupts) and
+/// the meter degrades there — a LOGGED miss, never a silent one, and
+/// always bounded per session.
+const USAGE_WALK_MAX_PROBES: u32 = 64;
+
+/// Bounded per-session lookup: the NEWEST finished assistant step's token
+/// usage — opencode's `lastFinished`. Walks assistant messages newest-first
+/// (index order), probing each for a step-finish part; the FIRST hit is the
+/// last finished step, so an in-flight or interrupted trailing step is
+/// skipped naturally (live-DB verified: a running session's newest message
+/// carries only step-start/reasoning parts). Work is at most
+/// [`USAGE_WALK_MAX_PROBES`] message probes, each a pure index search —
+/// never a whole-session part scan. Degrades to `None` on ANY
+/// schema/query error or on hitting the cap.
+fn last_step_finish_usage_for_session(
+    conn: &Connection,
+    session_id: &str,
+) -> Option<OpencodeStepUsage> {
+    let mut messages = match conn.prepare_cached(ASSISTANT_MESSAGES_NEWEST_FIRST_SQL) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            tracing::debug!(
+                session_id,
+                error = %e,
+                "opencode usage walk prepare failed; degrading to None"
+            );
+            return None;
+        }
+    };
+    let mut probe = match conn.prepare_cached(MESSAGE_STEP_FINISH_SQL) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            tracing::debug!(
+                session_id,
+                error = %e,
+                "opencode usage probe prepare failed; degrading to None"
+            );
+            return None;
+        }
+    };
+    let mut rows = match messages.query(rusqlite::params![session_id]) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::debug!(
+                session_id,
+                error = %e,
+                "opencode usage walk query failed; degrading to None"
+            );
+            return None;
+        }
+    };
+    let mut probes: u32 = 0;
+    loop {
+        let message_id: Option<String> = match rows.next() {
+            Ok(Some(row)) => match row.get(0) {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::debug!(
+                        session_id,
+                        error = %e,
+                        "opencode usage walk row read failed; degrading to None"
+                    );
+                    return None;
+                }
+            },
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::debug!(
+                    session_id,
+                    error = %e,
+                    "opencode usage walk advance failed; degrading to None"
+                );
+                return None;
+            }
+        };
+        let Some(message_id) = message_id else {
+            continue;
+        };
+        match probe.query_row(rusqlite::params![message_id], |row| {
+            Ok(OpencodeStepUsage {
+                total: row.get(0)?,
+                input: row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                output: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                cache_read: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                cache_write: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+            })
+        }) {
+            Ok(usage) => {
+                if probes > 8 {
+                    // Observability, not truncation: a session with many
+                    // trailing unfinished steps pays more probes — still
+                    // bounded by the cap below, all index searches.
+                    tracing::debug!(
+                        session_id,
+                        probes,
+                        "opencode usage walk probed several messages"
+                    );
+                }
+                return Some(usage);
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                // Count MISSES only after the probe executes
+                // (plan-review round-3 finding 3): checking before the
+                // query would allow only cap-1 real probes — a finish on
+                // the 64th candidate must be found, so the cap bounds
+                // consecutive misses, not candidates.
+                probes += 1;
+                if probes >= USAGE_WALK_MAX_PROBES {
+                    // A bounded miss, never a silent one: 64 consecutive
+                    // unfinished assistant steps is pathological — degrade
+                    // with observability instead of walking the whole
+                    // session.
+                    tracing::debug!(
+                        session_id,
+                        probes,
+                        "opencode usage walk hit the probe cap; degrading to None"
+                    );
+                    return None;
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    session_id,
+                    error = %e,
+                    "opencode step-finish probe failed; degrading to None"
+                );
+                return None;
+            }
+        }
+    }
+}
+
 fn run_opencode_query_inner(
     conn: &Connection,
     marker_pattern: &str,
@@ -236,17 +511,21 @@ fn run_opencode_query_inner(
         OPENCODE_DB_BUSY_TIMEOUT_MS,
     ))?;
 
-    // PRAGMA table_info(session) -> hasParentId
-    let has_parent_id = {
+    // PRAGMA table_info(session) -> hasParentId + hasModel (the schema-
+    // tolerance guards below branch on both).
+    let (has_parent_id, has_model) = {
         let mut stmt = conn.prepare("PRAGMA table_info(session)")?;
         let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
-        let mut found = false;
+        let mut has_parent_id = false;
+        let mut has_model = false;
         for name in names {
-            if name? == "parent_id" {
-                found = true;
+            match name?.as_str() {
+                "parent_id" => has_parent_id = true,
+                "model" => has_model = true,
+                _ => {}
             }
         }
-        found
+        (has_parent_id, has_model)
     };
     let root_filter = if has_parent_id {
         "AND s.parent_id IS NULL"
@@ -283,6 +562,15 @@ fn run_opencode_query_inner(
         format!("({})", marker_clauses.join(" OR "))
     };
 
+    // Schema tolerance (the parent_id discipline): older opencode schemas
+    // have no session.model column — a literal s.model would fail the whole
+    // listing there. NULL AS model keeps those DBs listable, meter-unknown.
+    let model_expr = if has_model {
+        "s.model AS model"
+    } else {
+        "NULL AS model"
+    };
+
     // `floor_ms`/`limit` are internally-produced i64 values (never user/network
     // text), so formatting them directly into the SQL text is safe and keeps the
     // marker parameter list (the only untrusted-shaped input) untouched.
@@ -303,7 +591,8 @@ fn run_opencode_query_inner(
             s.time_created AS createdAt, \
             s.time_updated AS lastActivityAt, \
             p.worktree AS projectPath, \
-            {marker_expr} AS hasThreeViewsMarker \
+            {marker_expr} AS hasThreeViewsMarker, \
+            {model_expr} \
          FROM session s \
          LEFT JOIN project p ON p.id = s.project_id \
          WHERE s.time_archived IS NULL \
@@ -330,6 +619,7 @@ fn run_opencode_query_inner(
             last_activity_at: to_opt_i64(&row.get::<_, SqlValue>(4)?),
             project_path: to_opt_string(&row.get::<_, SqlValue>(5)?),
             has_three_views_marker: to_opt_i64(&row.get::<_, SqlValue>(6)?),
+            model: to_opt_string(&row.get::<_, SqlValue>(7)?),
         })
     })?;
 
@@ -460,6 +750,15 @@ impl OpencodeProvider {
             } else {
                 None
             };
+            let model = row.model.as_deref().and_then(opencode_model_composite);
+            // Bounded usage lookup, gated on a resolvable model: usage
+            // without a model can never produce meter fields (limits are
+            // resolved per model), so those sessions skip the query.
+            let last_usage = if model.is_some() {
+                last_step_finish_usage_for_session(&conn, &row.session_id)
+            } else {
+                None
+            };
             sessions.push(OpencodeSession {
                 session_id: row.session_id,
                 project_path,
@@ -470,6 +769,8 @@ impl OpencodeProvider {
                 is_subagent: if is_three_views { Some(true) } else { None },
                 is_non_interactive: if is_three_views { Some(true) } else { None },
                 first_user_message,
+                model,
+                last_usage,
             });
         }
 
@@ -837,6 +1138,116 @@ mod placeholder_title_tests {
         assert!(!is_opencode_placeholder_title(
             "new session - 2026-08-10T23:47:23.950Z"
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opencode_math_mirrors_upstream_overflow_semantics() {
+        // maxOutputTokens: min(limit.output, 32000) || 32000
+        assert_eq!(opencode_max_output_tokens(Some(131_072)), 32_000);
+        assert_eq!(opencode_max_output_tokens(Some(8_192)), 8_192);
+        assert_eq!(opencode_max_output_tokens(None), 32_000);
+        assert_eq!(opencode_max_output_tokens(Some(0)), 32_000);
+        // lunaroute case: context 524288, output 131072, no input limit
+        let limits = OpencodeModelLimits {
+            context: 524_288,
+            input: None,
+            output: Some(131_072),
+        };
+        assert_eq!(opencode_usable_context(&limits), 524_288 - 32_000);
+        // input branch: reserved = min(20000, maxOutputTokens); input: 0 is
+        // JS-falsy upstream and must take the CONTEXT branch, not yield 0
+        let input_limited = OpencodeModelLimits {
+            context: 1_000_000,
+            input: Some(100_000),
+            output: Some(131_072),
+        };
+        assert_eq!(opencode_usable_context(&input_limited), 100_000 - 20_000);
+        let small_output = OpencodeModelLimits {
+            context: 1_000_000,
+            input: Some(100_000),
+            output: Some(8_192),
+        };
+        assert_eq!(opencode_usable_context(&small_output), 100_000 - 8_192);
+        let zero_input = OpencodeModelLimits {
+            context: 524_288,
+            input: Some(0),
+            output: Some(131_072),
+        };
+        assert_eq!(opencode_usable_context(&zero_input), 524_288 - 32_000);
+        // context 0 disables (upstream returns 0, never a threshold)
+        assert_eq!(
+            opencode_usable_context(&OpencodeModelLimits {
+                context: 0,
+                input: None,
+                output: None
+            }),
+            0
+        );
+        // count: total wins; fallback omits reasoning
+        let usage = OpencodeStepUsage {
+            total: Some(215_242),
+            input: 215,
+            output: 434,
+            cache_read: 214_592,
+            cache_write: 0,
+        };
+        assert_eq!(opencode_context_count(&usage), 215_242);
+        let no_total = OpencodeStepUsage {
+            total: None,
+            input: 100,
+            output: 50,
+            cache_read: 900,
+            cache_write: 10,
+        };
+        assert_eq!(opencode_context_count(&no_total), 1_060);
+        let zero_total = OpencodeStepUsage {
+            total: Some(0),
+            input: 100,
+            output: 50,
+            cache_read: 900,
+            cache_write: 10,
+        };
+        assert_eq!(opencode_context_count(&zero_total), 1_060);
+        // percent: round-half-up, clamped
+        assert_eq!(opencode_compact_percent(395_980, 492_288), Some(80));
+        assert_eq!(opencode_compact_percent(492_288, 492_288), Some(100));
+        assert_eq!(opencode_compact_percent(600_000, 492_288), Some(100));
+        assert_eq!(opencode_compact_percent(0, 492_288), Some(0));
+        assert_eq!(opencode_compact_percent(10, 0), None);
+        assert_eq!(opencode_compact_percent(10, -1), None);
+    }
+
+    #[test]
+    fn opencode_model_composite_joins_provider_and_id() {
+        assert_eq!(
+            opencode_model_composite(
+                r#"{"id":"glm-5.3","providerID":"lunaroute","variant":"default"}"#
+            ),
+            Some("lunaroute/glm-5.3".to_string())
+        );
+        // org/name ids (44% of real sessions, e.g. Kimi-K3) compose verbatim —
+        // the catalog builds the same triple-slash ids from its models-map keys
+        assert_eq!(
+            opencode_model_composite(r#"{"id":"moonshotai/Kimi-K3","providerID":"ms-runpod"}"#),
+            Some("ms-runpod/moonshotai/Kimi-K3".to_string())
+        );
+        // id-side slashes are legal (no id guard; live-verified join contract)
+        assert_eq!(
+            opencode_model_composite(r#"{"id":"a/b","providerID":"p"}"#),
+            Some("p/a/b".to_string())
+        );
+        assert_eq!(opencode_model_composite(r#"{"id":"x"}"#), None); // no providerID
+        assert_eq!(opencode_model_composite(r#"not json"#), None);
+        // provider-side slash stays guarded (mirrors the catalog's provider skip)
+        assert_eq!(
+            opencode_model_composite(r#"{"id":"m","providerID":"p/x"}"#),
+            None
+        );
     }
 }
 

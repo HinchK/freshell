@@ -56,6 +56,24 @@ pub struct ModelCapability {
     pub supported_effort_levels: Vec<String>,
     #[serde(rename = "supportsAdaptiveThinking")]
     pub supports_adaptive_thinking: bool,
+    /// Raw `limit { context, input?, output }` block when the provider
+    /// config declares one; `None` when absent. Server-internal: NEVER
+    /// serialized (see [`ModelLimits`]).
+    #[serde(skip_serializing)]
+    pub limit: Option<ModelLimits>,
+}
+
+/// Per-model token limits from the raw `/config/providers` model object
+/// (`models[id].limit { context, input?, output }`) — the inputs opencode's
+/// own `session/overflow.ts` compaction check consumes. Server-internal
+/// only: carried on [`ModelCapability::limit`] with
+/// `#[serde(skip_serializing)]` so it never reaches the wire (the client's
+/// `FreshAgentModelCapabilitySchema` is zod `.strict()`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ModelLimits {
+    pub context: i64,
+    pub input: Option<i64>,
+    pub output: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -239,6 +257,7 @@ pub fn normalize_enabled_model_catalog(raw: &Value) -> Vec<ModelCapability> {
             let supported_effort_levels =
                 order_thinking_level_ids(read_model_variant_level_ids(model));
             let has_levels = !supported_effort_levels.is_empty();
+            let limit = read_model_limits(model.get("limit"));
             models.push(ModelCapability {
                 id: format!("{provider_id}/{model_id}"),
                 display_name,
@@ -250,6 +269,7 @@ pub fn normalize_enabled_model_catalog(raw: &Value) -> Vec<ModelCapability> {
                 supports_effort: has_levels,
                 supported_effort_levels,
                 supports_adaptive_thinking: has_levels,
+                limit,
             });
         }
     }
@@ -273,6 +293,21 @@ fn read_non_empty_string(value: Option<&Value>) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+/// `models[id].limit { context, input?, output }`. Absent object -> `None`.
+/// A present-but-partial object keeps `context` at 0 (opencode treats
+/// `limit.context === 0` as "no auto-compaction"; the meter mirrors that
+/// by staying unknown). Negative values are treated as absent — nonsense
+/// input must not fabricate limits.
+fn read_model_limits(raw: Option<&Value>) -> Option<ModelLimits> {
+    let obj = raw?.as_object()?;
+    let read_nonneg = |key: &str| obj.get(key).and_then(Value::as_i64).filter(|v| *v >= 0);
+    Some(ModelLimits {
+        context: read_nonneg("context").unwrap_or(0),
+        input: read_nonneg("input"),
+        output: read_nonneg("output"),
+    })
 }
 
 /// `cleanDisplayName` (`model-catalog.ts:234-241`): strip C0 control chars + DEL
@@ -803,6 +838,7 @@ mod tests {
                 supports_effort: true,
                 supported_effort_levels: vec!["high".to_string(), "max".to_string()],
                 supports_adaptive_thinking: true,
+                limit: None,
             }]
         );
         let rendered = serde_json::to_string(&models).unwrap();
@@ -1060,6 +1096,7 @@ mod tests {
                 supports_effort: false,
                 supported_effort_levels: Vec::new(),
                 supports_adaptive_thinking: false,
+                limit: None,
             }]
         );
     }
@@ -1110,5 +1147,90 @@ mod tests {
         assert!(normalize_enabled_model_catalog(&json!({ "providers": null })).is_empty());
         assert!(normalize_enabled_model_catalog(&json!({ "providers": "nope" })).is_empty());
         assert!(normalize_enabled_model_catalog(&json!({})).is_empty());
+    }
+
+    // ── model limits (server-internal, never on the wire) ───────────────────────
+
+    #[test]
+    fn normalize_reads_model_limits_from_provider_models() {
+        let raw = serde_json::json!({
+            "providers": {
+                "lunaroute": {
+                    "id": "lunaroute",
+                    "name": "Lunaroute",
+                    "models": {
+                        "glm-5.3-vision-background": {
+                            "id": "glm-5.3-vision-background",
+                            "name": "GLM 5.3 Vision Background",
+                            "limit": { "context": 524288, "output": 131072 }
+                        },
+                        "deepseek-4.1-flash": {
+                            "limit": { "context": 1048576, "input": 2000000, "output": 262144 }
+                        },
+                        "unlimited-model": { "id": "unlimited-model", "name": "No Limits" }
+                    }
+                }
+            }
+        });
+        let models = normalize_enabled_model_catalog(&raw);
+        let by_id = |id: &str| {
+            models
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap_or_else(|| panic!("missing {id}"))
+        };
+        assert_eq!(
+            by_id("lunaroute/glm-5.3-vision-background").limit,
+            Some(ModelLimits {
+                context: 524288,
+                input: None,
+                output: Some(131072)
+            })
+        );
+        // no "id" key -> falls back to the models-map key; full triple parsed
+        assert_eq!(
+            by_id("lunaroute/deepseek-4.1-flash").limit,
+            Some(ModelLimits {
+                context: 1048576,
+                input: Some(2000000),
+                output: Some(262144)
+            })
+        );
+        // no limit block declared -> None (unresolvable, meter stays unknown)
+        assert_eq!(by_id("lunaroute/unlimited-model").limit, None);
+    }
+
+    #[test]
+    fn model_limits_never_serialize_to_the_strict_wire_schema() {
+        let cap = ModelCapability {
+            id: "lunaroute/glm-5.3".into(),
+            display_name: "GLM 5.3".into(),
+            provider: "opencode",
+            source: None,
+            supports_effort: false,
+            supported_effort_levels: Vec::new(),
+            supports_adaptive_thinking: false,
+            limit: Some(ModelLimits {
+                context: 524288,
+                input: None,
+                output: Some(131072),
+            }),
+        };
+        let value = serde_json::to_value(&cap).unwrap();
+        let obj = value.as_object().unwrap();
+        assert!(
+            !obj.contains_key("limit"),
+            "limit must never reach the wire"
+        );
+        for key in [
+            "id",
+            "displayName",
+            "provider",
+            "supportsEffort",
+            "supportedEffortLevels",
+            "supportsAdaptiveThinking",
+        ] {
+            assert!(obj.contains_key(key), "missing strict-schema key {key}");
+        }
     }
 }

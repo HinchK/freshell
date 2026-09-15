@@ -85,6 +85,7 @@ fn cap(id: &str, display: &str, source_id: Option<&str>) -> ModelCapability {
             .map(|s| s.to_string())
             .collect(),
         supports_adaptive_thinking: true,
+        limit: None,
     }
 }
 
@@ -173,6 +174,46 @@ async fn opencode_catalog_caches_by_cwd() {
         .await;
     assert_eq!(body_a2["status"], json!("cached"));
     assert_eq!(probe.call_count().await, 2);
+}
+
+/// The typed internal read (`ModelCapabilityRegistry::models`) returns the
+/// same rows the HTTP envelope serves — including the server-internal
+/// `limit` block — and shares the TTL cache with `get()`: within TTL, the
+/// envelope path must not re-probe.
+#[tokio::test]
+async fn models_returns_typed_rows_with_limits_and_shares_the_ttl_cache() {
+    let probe = Arc::new(RecordingProbe::new());
+    let mut model = cap(
+        "lunaroute/glm-5.3-vision-background",
+        "GLM 5.3 Vision Background",
+        Some("lunaroute"),
+    );
+    model.limit = Some(freshell_opencode::catalog::ModelLimits {
+        context: 524288,
+        input: None,
+        output: Some(131072),
+    });
+    probe.push_ok(vec![model]).await;
+    let (registry, _now) = registry_with(probe.clone());
+
+    let first = registry
+        .models(SessionType::FreshOpencode, None)
+        .await
+        .expect("catalog ok");
+    assert_eq!(first.len(), 1);
+    assert_eq!(
+        first[0].limit,
+        Some(freshell_opencode::catalog::ModelLimits {
+            context: 524288,
+            input: None,
+            output: Some(131072),
+        })
+    );
+    assert_eq!(probe.call_count().await, 1);
+    // the HTTP envelope path shares the same cache: within TTL, get() must not re-probe
+    let (status, _body) = registry.get(SessionType::FreshOpencode, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(probe.call_count().await, 1);
 }
 
 /// Port of the TTL arm of "coalesces concurrent refreshes, reuses successful
