@@ -162,7 +162,7 @@ function sessionRowsForDirectory(db, directory) {
   return rows.filter((row) => normalizeDirectoryForComparison(row.directory) === expected)
 }
 
-function insertTextMessage(db, input) {
+function insertMessage(db, input) {
   db.prepare(`
       INSERT OR REPLACE INTO message (id, session_id, time_created, time_updated, data)
       VALUES (?, ?, ?, ?, ?)
@@ -171,8 +171,11 @@ function insertTextMessage(db, input) {
       input.sessionId,
       input.now,
       input.now,
-      JSON.stringify({ role: input.role }),
+      JSON.stringify({ role: input.role, ...(input.extra ?? {}) }),
     )
+}
+
+function insertPart(db, input) {
   db.prepare(`
       INSERT OR REPLACE INTO part (id, message_id, session_id, time_created, time_updated, data)
       VALUES (?, ?, ?, ?, ?, ?)
@@ -182,8 +185,19 @@ function insertTextMessage(db, input) {
       input.sessionId,
       input.now,
       input.now,
-      JSON.stringify({ type: 'text', text: input.text }),
+      JSON.stringify(input.data),
     )
+}
+
+function insertTextMessage(db, input) {
+  insertMessage(db, input)
+  insertPart(db, {
+    sessionId: input.sessionId,
+    messageId: input.messageId,
+    partId: input.partId,
+    now: input.now,
+    data: { type: 'text', text: input.text },
+  })
 }
 
 function serverProjectDirectory() {
@@ -666,6 +680,60 @@ function appendPromptMessages(input) {
       text: promptText,
       now: userTime,
     })
+    // Durable provider-error scenario (LB-2/LB-3, e2e): an assistant activity
+    // message ending on a failed tool (whose persisted `state.error` text is
+    // CLI-visible), followed by an activity-only errored assistant message.
+    // The second message is the absorbed shape: without the transcript's
+    // errored-turn boundary it merged into the first assistant line and its
+    // turn-level error module never mounted.
+    const promptError = process.env.FAKE_OPENCODE_PROMPT_ERROR
+    if (promptError) {
+      const toolErrorText = process.env.FAKE_OPENCODE_TOOL_ERROR
+        || 'The user has specified a rule which prevents you from using this specific tool call.'
+      const activityMessageId = `${assistantMessageId}_activity`
+      const activityTime = userTime + 1
+      const erroredTime = userTime + 2
+      insertMessage(db, {
+        sessionId: input.sessionId,
+        messageId: activityMessageId,
+        role: 'assistant',
+        now: activityTime,
+      })
+      insertPart(db, {
+        sessionId: input.sessionId,
+        messageId: activityMessageId,
+        partId: `${activityMessageId}_part_tool`,
+        now: activityTime,
+        data: {
+          type: 'tool',
+          tool: 'bash',
+          state: { status: 'error', input: { command: 'false' }, error: toolErrorText },
+        },
+      })
+      insertMessage(db, {
+        sessionId: input.sessionId,
+        messageId: assistantMessageId,
+        role: 'assistant',
+        now: erroredTime,
+        extra: {
+          error: {
+            name: 'UnknownError',
+            data: {
+              message: JSON.stringify({ message: promptError, type: 'request_deadline_exceeded' }),
+            },
+          },
+        },
+      })
+      insertPart(db, {
+        sessionId: input.sessionId,
+        messageId: assistantMessageId,
+        partId: `${assistantMessageId}_part_reasoning`,
+        now: erroredTime,
+        data: { type: 'reasoning', text: 'waiting for the provider response' },
+      })
+      db.prepare('UPDATE session SET time_updated = ? WHERE id = ?').run(erroredTime, input.sessionId)
+      return { promptText, responseText, userMessageId, assistantMessageId, assistantTime: erroredTime }
+    }
     insertTextMessage(db, {
       sessionId: input.sessionId,
       messageId: assistantMessageId,

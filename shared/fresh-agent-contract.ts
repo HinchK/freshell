@@ -134,6 +134,10 @@ export const FreshAgentTranscriptItemSchema = z.discriminatedUnion('kind', [
     arguments: JsonValueSchema,
     contentItems: z.array(z.unknown()).nullable().optional(),
     success: z.boolean().nullable().optional(),
+    // Persisted opencode tool failure text (`part.state.error`), CLI-visible
+    // in the TUI's failed tool blocks. Optional: absent on every non-error
+    // state and on other providers.
+    error: z.string().min(1).optional(),
   }).strict(),
   z.object({
     id: z.string().min(1),
@@ -188,6 +192,18 @@ export const FreshAgentTurnSchema = z.object({
   role: z.enum(['user', 'assistant', 'system', 'tool']).optional(),
   timestamp: z.string().optional(),
   model: z.string().optional(),
+  // OpenCode persists provider/abort errors on the assistant message
+  // (`info.error`, `{name, data}`); the snapshot projects them onto the owning
+  // turn. The message mirrors the CLI's `errorMessage` helper: a string
+  // `data.message` verbatim, else the whole persisted error object as
+  // pretty-printed JSON. Optional and opencode-only: claude, codex, and older
+  // servers omit it.
+  error: z.object({
+    // OpenCode error class, e.g. 'UnknownError' / 'MessageAbortedError'.
+    name: z.string().min(1),
+    // Non-empty display text; the server always stamps prose.
+    message: z.string().min(1),
+  }).strict().optional(),
   summary: z.string(),
   // Provenance of `summary`: 'echo' = mechanical projection of the turn's own
   // items (foldable caption); 'authored' = provider-written prose (permanent
