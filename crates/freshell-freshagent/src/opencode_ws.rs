@@ -704,6 +704,10 @@ impl FreshOpencodeState {
     /// down, the claim settling typed), never a bare LEDGER_WRITE_FAILED
     /// notification under a committed Live; the maintenance lanes
     /// (rollback/refresh) log-and-continue by discarding the Result.
+    /// b8ke ext r26 F4: the MATERIALIZATION and FORK lanes propagate the
+    /// failure too (the create/fork contract covers every lane that
+    /// registers a NEW durable identity) — only the maintenance lanes
+    /// still discard.
     async fn record_binding_row(
         &self,
         upsert: crate::identity_sink::FreshAgentBindingUpsert,
@@ -1696,7 +1700,13 @@ impl FreshOpencodeState {
 
             // D8: stamps parked on the session at create reach the
             // materialization row here (Some asserts, None inherits).
-            let _ = self
+            // b8ke ext r26 F4: the binding failure PROPAGATES — the
+            // materialization is torn down (never a materialized
+            // broadcast, a started bridge, or a committed Live over a
+            // session missing from the authoritative recovery registry);
+            // the ticket's RAII drop settles the rekeyed claim typed and
+            // the pane answers the typed recoverable error.
+            if let Err(e) = self
                 .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
                     provider: PROVIDER.into(),
                     session_id: durable_id.clone(),
@@ -1724,7 +1734,28 @@ impl FreshOpencodeState {
                         cwd: session.cwd.clone(),
                     },
                 })
-                .await;
+                .await
+            {
+                tracing::error!(target: "invariant",
+                    provider = PROVIDER, session_id = %durable_id, error = %e,
+                    "freshagent.opencode.materialize_binding_failed_typed: the durable \
+                     row write failed — the session is torn down (kata b8ke ext r26 F4)"
+                );
+                {
+                    let mut guard = self.sessions.lock().await;
+                    guard.remove(&session.placeholder_id);
+                    guard.remove(&durable_id);
+                }
+                session.real_session_id = None;
+                session.killed.store(true, Ordering::SeqCst);
+                self.emit_fresh_agent_error(
+                    &session_id,
+                    "LEDGER_WRITE_FAILED",
+                    "This session's resume record could not be persisted; the pane is \
+                     not materialized — retry the send",
+                );
+                return;
+            }
 
             // `freshAgent.session.materialized` (ws-handler.ts:3477-3484): placeholder ->
             // durable, emitted EXACTLY ONCE (a later send never re-enters this branch).
@@ -3916,10 +3947,13 @@ impl FreshOpencodeState {
         // `_pattern :600-626`) — AWAITED BEFORE the forked reply
         // (durable-before-answer). Opencode has no sandbox/permission concepts —
         // always `None`.
-        // b8ke ext r22 F2: the fork lane's binding failure is log-and-continue
-        // (the fork child is already live; the maintenance write's Result is
-        // deliberately discarded).
-        let _ = self
+        // b8ke ext r26 F4: the binding failure PROPAGATES — the child is torn
+        // down and the fork answers the typed error, never a registered child
+        // with a live bridge and a committed Live over a row missing from the
+        // authoritative recovery registry (the pre-r26 log-and-continue
+        // discarded the Result); the ticket's RAII drop settles the rekeyed
+        // claim typed.
+        if let Err(e) = self
             .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
                 provider: PROVIDER.into(),
                 session_id: child.id.clone(),
@@ -3941,7 +3975,42 @@ impl FreshOpencodeState {
                     cwd: child_cwd.clone(),
                 },
             })
-            .await;
+            .await
+        {
+            tracing::error!(target: "invariant",
+                provider = PROVIDER, session_id = %child.id,
+                parent_session_id = %msg.session_id, error = %e,
+                "freshagent.opencode.fork_binding_failed_typed: the child's durable row \
+                 write failed — the child is torn down (kata b8ke ext r26 F4)"
+            );
+            // The sibling stale-commit teardown shape: KEEP the removed value
+            // so the bridge abort and the killed flag actually execute.
+            let removed = {
+                let mut guard = self.sessions.lock().await;
+                guard.remove(&child.id)
+            };
+            if let Some(removed) = removed {
+                let mut s = removed.lock().await;
+                s.killed.store(true, Ordering::SeqCst);
+                if let Some(task) = s.turn_task.take() {
+                    task.abort_and_settle().await;
+                }
+                if let Some(bridge) = s.serve_bridge.take() {
+                    bridge.abort();
+                }
+            }
+            reply_sink(event_frame(
+                &msg.session_id,
+                json!({
+                    "type": "freshAgent.error",
+                    "sessionId": msg.session_id,
+                    "code": "LEDGER_WRITE_FAILED",
+                    "message": "The forked session's resume record could not be \
+                                persisted; the child was torn down — retry the fork",
+                }),
+            ));
+            return;
+        }
 
         // kata b8ke Task 3: the child's registration is complete — commit
         // `Live{FreshAgent}` under the NEW child key (the stamp lands in the
@@ -9108,6 +9177,78 @@ mod tests {
         );
     }
 
+    /// b8ke ext r26 F4: a first-send materialization whose durable
+    /// binding-row write FAILS tears the session down and answers the
+    /// typed error — never the pre-r26 log-and-continue that broadcast
+    /// materialization, started the bridge, and committed Live over a
+    /// session missing from the authoritative recovery registry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_materialization_binding_failure_tears_the_session_down_typed() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx))
+            .with_ownership(Arc::clone(&registry));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-r26-f4"), None).await;
+        let placeholder = "freshopencode-req-r26-f4";
+        // Drain the create's frames so only the failed send's answer remains.
+        while rx.try_recv().is_ok() {}
+        // The ledger fails every write from here (disk-full/permission shape).
+        fake.set_fail_writes(true);
+
+        st.handle_send(send_msg(placeholder, "hello")).await;
+
+        // The session is torn down: both map keys gone, never a live
+        // session the recovery registry cannot resolve.
+        assert!(
+            !st.has_live_session(placeholder).await && !st.has_live_session("ses_1").await,
+            "the failed materialization must remove the session map entries"
+        );
+        // The coordinator never committed Live: the ticket's RAII drop
+        // settled the rekeyed claim typed (pre-r26 the failure was
+        // discarded and the materialization committed Live here).
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, "ses_1").state,
+                freshell_ownership::OwnershipState::Vacant
+            ),
+            "the failed materialization never commits Live — got {:?}",
+            registry.observe(PROVIDER, "ses_1").state
+        );
+        assert!(matches!(
+            registry.observe(PROVIDER, placeholder).state,
+            freshell_ownership::OwnershipState::Aliased { to, .. } if to == "ses_1"
+        ));
+        // The answer is the TYPED error — never a materialized broadcast
+        // or a send acceptance over an unregistered session.
+        let mut materialized = 0;
+        let mut ledger_error = None;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.session.materialized" {
+                materialized += 1;
+            }
+            if frame["type"] == "freshAgent.event" && frame["event"]["type"] == "freshAgent.error" {
+                ledger_error = Some(frame);
+            }
+        }
+        assert_eq!(materialized, 0, "no materialization broadcast on failure");
+        let ledger_error = ledger_error.expect("the failure surfaces a typed error");
+        assert_eq!(ledger_error["event"]["code"], json!("LEDGER_WRITE_FAILED"));
+        assert!(
+            ledger_error["event"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("could not be persisted"),
+            "the error message names the recoverable failure: {ledger_error}"
+        );
+    }
+
     #[tokio::test]
     async fn send_with_changed_settings_refreshes_the_binding() {
         // Same harness; after materialization, send again with
@@ -13135,6 +13276,56 @@ mod tests {
             captured.lock().expect("captured mutex").len(),
             1,
             "exactly one reply on the requesting sink"
+        );
+    }
+
+    /// b8ke ext r26 F4: a fork whose child binding-row write FAILS tears
+    /// the child down and answers the typed error — never the pre-r26
+    /// log-and-continue that registered the child, started its bridge,
+    /// committed Live, and replied `freshAgent.forked` success over a
+    /// child missing from the authoritative recovery registry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fork_binding_failure_tears_the_child_down_typed() {
+        let http = Arc::new(ForkFakeHttp::child_ok());
+        let mut st = fork_state(http.clone()).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+        insert_fork_parent(&st, "ses_parent", Some("/parent/cwd"), None, None).await;
+        fake.set_fail_writes(true);
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(fork_msg("ses_parent", "fork-req-f4", None), None, sink)
+            .await;
+
+        // The reply is the TYPED error, never the forked success.
+        let frames = captured.lock().expect("captured mutex").clone();
+        assert_eq!(frames.len(), 1, "exactly one reply on the requesting sink");
+        let v = serde_json::to_value(&frames[0]).unwrap();
+        assert_eq!(
+            v["event"]["code"],
+            json!("LEDGER_WRITE_FAILED"),
+            "the binding failure answers the typed error, got: {v}"
+        );
+        // The child is torn down: no map entry, never a live session the
+        // recovery registry cannot resolve.
+        assert!(
+            !st.has_live_session("ses_child").await,
+            "the failed fork must remove the child session entry"
+        );
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, "ses_child").state,
+                freshell_ownership::OwnershipState::Vacant
+            ),
+            "the failed fork never commits Live — got {:?}",
+            registry.observe(PROVIDER, "ses_child").state
+        );
+        assert_eq!(
+            http.fork_requests().len(),
+            1,
+            "fixture: the provider fork happened (the failure is at the binding write)"
         );
     }
 
