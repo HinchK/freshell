@@ -3503,6 +3503,15 @@ impl SessionHandoffRunner {
         generation: u64,
         target_spawn_watch: Option<crate::terminal_tabs::HandoffSpawnWatch>,
     ) -> Result<OwnerIdentity, (String, String)> {
+        // b8ke ext r23 F2: the attempt marker — start_target was ENTERED
+        // (the spawn/resume is being attempted on this call). The
+        // spawn-failure tests assert this event so a regression that
+        // answers the failure BEFORE the attempt (the pre-r23 pre-check
+        // shape) fails the tests: the cleanup contract is only proven by
+        // an actually-attempted-and-failed start.
+        if let Some(hooks) = self.test_hooks.as_ref() {
+            hooks.record("TargetSpawnAttempted");
+        }
         // b8ke ext r23 F2: the failure hook at the REAL error site —
         // after all pre-spawn bookkeeping, right before the actual
         // spawn/resume attempt, so the tests drive the actually-attempted-

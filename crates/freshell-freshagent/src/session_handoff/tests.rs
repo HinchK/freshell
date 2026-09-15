@@ -1062,10 +1062,12 @@ async fn handoff_to_terminal_reaps_sidecar_before_target_start_and_commits_owner
 
     // Hook-event ordering (M-1, round-3 review — the plan's explicit
     // assertion): the prior was reaped BEFORE the target spawned.
+    // b8ke ext r23 F2: TargetSpawnAttempted lands between them — start_target
+    // was ENTERED (the spawn actually attempted), never answered early.
     assert_eq!(
         *hooks.events.lock().unwrap(),
-        vec!["Reaped", "TargetStarted"],
-        "the runner's step order must be Reaped then TargetStarted"
+        vec!["Reaped", "TargetSpawnAttempted", "TargetStarted"],
+        "the runner's step order must be Reaped then TargetSpawnAttempted then TargetStarted"
     );
 
     // Cleanup: kill the committed terminal.
@@ -1131,6 +1133,21 @@ async fn handoff_target_spawn_failure_leaves_vacant_with_typed_error() {
             entry.mode == "claude" && entry.resume_session_id.as_deref() == Some(sid.as_str())
         }),
         "no terminal may own {sid} after the failed handoff"
+    );
+
+    // b8ke ext r23 F2: THE ATTEMPT PIN — start_target was ENTERED (the
+    // spawn was attempted on this call) before the failure. Pre-r23 the
+    // knob fired at a pre-check BEFORE start_target was called; a
+    // regression to that shape fails this assertion (the cleanup contract
+    // is only proven by an actually-attempted-and-failed start).
+    assert!(
+        hooks
+            .events
+            .lock()
+            .unwrap()
+            .contains(&"TargetSpawnAttempted"),
+        "the spawn-failure path must ENTER start_target (TargetSpawnAttempted): {:?}",
+        hooks.events.lock().unwrap()
     );
 
     // Round-2 review (failure-broadcast truth): the handoff-failed frame

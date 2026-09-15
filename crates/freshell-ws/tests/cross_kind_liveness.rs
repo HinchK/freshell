@@ -3719,6 +3719,19 @@ async fn race_target_spawn_failure_no_blank_session_id_preserved() {
         0,
         "no terminal may own {sid} after the failed handoff"
     );
+    // b8ke ext r23 F2: THE ATTEMPT PIN — start_target was ENTERED (the
+    // spawn was attempted on this call) before the failure. Pre-r23 the
+    // knob fired at a pre-check BEFORE start_target was called; a
+    // regression to that shape fails this assertion.
+    assert!(
+        hooks
+            .events
+            .lock()
+            .unwrap()
+            .contains(&"TargetSpawnAttempted"),
+        "the spawn-failure path must ENTER start_target (TargetSpawnAttempted): {:?}",
+        hooks.events.lock().unwrap()
+    );
     // The failure broadcast carries the truth: ownerKind vacant, the prior
     // fresh-agent previousKind, the typed reason.
     let failed = await_owner_transition(&mut h, &sid, "handoff-failed").await;
