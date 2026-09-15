@@ -834,6 +834,41 @@ async fn send_json(ws: &mut TestWs, value: &Value) {
         .expect("send frame");
 }
 
+/// [`connect`] variant whose hello carries the connection's `deviceId`
+/// identity (the D8 hello stamp `lib.rs` reads into `ConnectionIdentity`) —
+/// b8ke ext r24 F2's initiator tests drive a device-identifiable
+/// connection.
+async fn connect_with_device(url: &str, device_id: &str) -> TestWs {
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("ws connect");
+    let hello = json!({
+        "type": "hello",
+        "token": AUTH_TOKEN,
+        "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
+        "deviceId": device_id,
+        "capabilities": { "paneReconcileV1": true, "paneReconcileFreshAgentV1": true },
+    });
+    ws.send(WsMessage::Text(hello.to_string()))
+        .await
+        .expect("send hello");
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("handshake message within timeout")
+            .expect("stream not ended")
+            .expect("no ws error");
+        let WsMessage::Text(text) = msg else {
+            continue;
+        };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        if value["type"] == "ready" {
+            break;
+        }
+    }
+    ws
+}
+
 async fn await_frame(
     ws: &mut TestWs,
     budget: Duration,
@@ -5768,6 +5803,125 @@ async fn an_attach_while_a_different_terminal_owns_answers_the_typed_other_termi
         "terminal B still owns the session after the refused attach"
     );
     ws_state.registry.kill(&terminal_b);
+}
+
+/// b8ke ext r24 F2: the attach-guard and terminal-kill coordinator
+/// transitions record the CONNECTION'S device identity as the initiator —
+/// the same identity field the handoff paths record (the request's device
+/// id) — never a constant lane label, so the structured records identify
+/// which client/device initiated the operation. Pre-r24 the attach guard
+/// logged the constant "ws-terminal-attach" and the kill path logged
+/// "ws-kill-<terminalId>" (the TARGET, not the initiator).
+#[tokio::test]
+async fn the_attach_guard_and_kill_transitions_record_the_connection_device_identity() {
+    let (events, _capture_guard) = race_tracing_capture::capture();
+    let (url, _registry, ws_state) = spawn_server().await;
+    let mut ws = connect_with_device(&url, "device-r24-f2").await;
+    let (terminal_id, sid) = r24_negotiated_create(&mut ws, "req-r24-f2-identity").await;
+    let ownership = ws_state.ownership.as_ref().expect("coordinator wired");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let live = loop {
+        let snap = ownership.observe("claude", &sid);
+        if matches!(snap.state, freshell_ownership::OwnershipState::Live { .. }) {
+            break snap;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never committed Live"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+
+    // A current same-owner attach arms the guard (the legitimate path).
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.attach",
+            "terminalId": terminal_id,
+            "intent": "viewport_hydrate",
+            "cols": 80,
+            "rows": 24,
+            "sinceSeq": 0,
+            "attachRequestId": "req-r24-attach-identity",
+            "priority": "foreground",
+            "observedEpoch": live.epoch,
+            "observedGeneration": live.generation,
+        }),
+    )
+    .await;
+    let _ = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "terminal.attach.ready" && v["terminalId"] == json!(terminal_id)
+    })
+    .await;
+
+    // THE ASSERTION: the attach_guard.armed event's initiator carries the
+    // connection's device identity — never a constant.
+    let armed: Vec<_> = events
+        .lock()
+        .expect("capture lock")
+        .iter()
+        .filter(|e| {
+            e.target == "freshell_ownership"
+                && e.event == "ownership.attach_guard.armed"
+                && e.fields.get("session_id").map(String::as_str) == Some(sid.as_str())
+        })
+        .cloned()
+        .collect();
+    assert!(
+        !armed.is_empty(),
+        "the attach guard armed (the event exists for {sid}): total armed events = {}",
+        events
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .filter(|e| e.event == "ownership.attach_guard.armed")
+            .count()
+    );
+    for e in &armed {
+        let initiator = e.fields.get("initiator").map(String::as_str).unwrap_or("");
+        assert!(
+            initiator.contains("device-r24-f2"),
+            "the attach-guard initiator carries the connection's device identity, got {initiator:?}"
+        );
+    }
+
+    // The terminal-kill path: the stop.begin event's initiator carries the
+    // same device identity.
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.kill",
+            "terminalId": terminal_id,
+            "requestId": "req-r24-kill-identity",
+        }),
+    )
+    .await;
+    let _ = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "terminal.killed" && v["requestId"] == json!("req-r24-kill-identity")
+    })
+    .await;
+    let stop_begins: Vec<_> = events
+        .lock()
+        .expect("capture lock")
+        .iter()
+        .filter(|e| {
+            e.target == "freshell_ownership"
+                && e.event == "ownership.stop.begin"
+                && e.fields.get("session_id").map(String::as_str) == Some(sid.as_str())
+        })
+        .cloned()
+        .collect();
+    assert!(
+        !stop_begins.is_empty(),
+        "the kill began a coordinator stop for {sid}"
+    );
+    for e in &stop_begins {
+        let initiator = e.fields.get("initiator").map(String::as_str).unwrap_or("");
+        assert!(
+            initiator.contains("device-r24-f2"),
+            "the kill's stop.begin initiator carries the connection's device identity, got {initiator:?}"
+        );
+    }
 }
 
 /// b8ke ext r9 F2: the commit verifies the PTY is alive at commit time ─────

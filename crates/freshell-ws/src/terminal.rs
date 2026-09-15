@@ -248,6 +248,27 @@ impl ConnectionIdentity {
     }
 }
 
+/// b8ke ext r24 F2: the connection-scoped initiator for the WS
+/// coordinator transitions — the DEVICE/CLIENT identity the hello (or a
+/// later `tabs.sync.push`) stamped on this connection, the same identity
+/// field the handoff paths record from their requests, falling back to
+/// the connection id when the client never declared one. Pre-r24 the
+/// attach guard logged the constant "ws-terminal-attach" and the kill
+/// path logged "ws-kill-<terminalId>" (the TARGET, not the initiator) —
+/// the structured records could not identify which client/device
+/// initiated the operation.
+fn connection_initiator(prefix: &str, conn_id: u64, identity: &ConnectionIdentity) -> String {
+    match (
+        identity.device_id.as_deref(),
+        identity.client_instance_id.as_deref(),
+    ) {
+        (Some(device), Some(client)) => format!("{prefix}-device-{device}-client-{client}"),
+        (Some(device), None) => format!("{prefix}-device-{device}"),
+        (None, Some(client)) => format!("{prefix}-client-{client}-conn-{conn_id}"),
+        (None, None) => format!("{prefix}-conn-{conn_id}"),
+    }
+}
+
 /// Serve one authenticated connection's `terminal.*` traffic (and fan out the
 /// shared broadcast bus) until the socket closes. `socket` has already had the
 /// connect handshake written by the caller; `bcast_rx` is this connection's
@@ -1317,7 +1338,10 @@ async fn handle_client_text(
                         &session_ref.session_id,
                         &format!("attach-{}", attach.terminal_id),
                         attach_observed_generation,
-                        "ws-terminal-attach",
+                        // b8ke ext r24 F2: the connection's real device/client
+                        // identity — never the constant lane label, so the
+                        // structured coordinator records name the initiator.
+                        &connection_initiator("ws-terminal-attach", conn_id, &conn_identity),
                     ) {
                         freshell_ownership::AttachGuardOutcome::Armed(guard) => {
                             attach_guard = Some(guard);
@@ -1499,7 +1523,19 @@ async fn handle_client_text(
         ClientMessage::TerminalDetach(detach) => {
             handle_detach(&detach, ws_tx, state, conn_id).await
         }
-        ClientMessage::TerminalKill(kill) => handle_kill(kill, ws_tx, state).await,
+        ClientMessage::TerminalKill(kill) => {
+            // b8ke ext r24 F2: the kill's coordinator transitions record
+            // the connection's real device/client identity as the
+            // initiator — never "ws-kill-<terminalId>" (the TARGET, not
+            // the initiator).
+            handle_kill(
+                kill,
+                ws_tx,
+                state,
+                &connection_initiator("ws-kill", conn_id, &conn_identity),
+            )
+            .await
+        }
         ClientMessage::TerminalAutoResumeCancel(cancel) => {
             handle_auto_resume_cancel(cancel, state);
             true
@@ -7431,7 +7467,12 @@ fn handle_auto_resume_cancel(cancel: TerminalAutoResumeCancel, state: &WsState) 
     tracing::info!(terminal_id = %cancel.terminal_id, "terminal.auto_resume.user_cancelled");
 }
 
-async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) -> bool {
+async fn handle_kill(
+    kill: TerminalKill,
+    ws_tx: &mut WsSink,
+    state: &WsState,
+    initiator: &str,
+) -> bool {
     let unknown_terminal_error = |terminal_id: String| {
         ServerMessage::Error(ErrorMsg {
             owner_kind: None,
@@ -7580,7 +7621,10 @@ async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) ->
             &retained.locator.session_id,
             &stop_op_id,
             &claim,
-            &format!("ws-kill-{}", kill.terminal_id),
+            // b8ke ext r24 F2: the connection's real device/client
+            // identity (the caller threads the composed initiator) —
+            // never the target terminal id as a pseudo-initiator.
+            initiator,
             now_ms().max(0) as u64,
         );
         let refused_reason: Option<String> = match &outcome {
@@ -9097,7 +9141,7 @@ mod terminal_kill_stop_wedge_tests {
         let (state, ownership, terminal_id) =
             state_with_live_terminal_owner(crate::pane_ledger::PaneLedger::disabled());
         let mut ws_tx = test_sink();
-        handle_kill(kill_for(&terminal_id), &mut ws_tx, &state).await;
+        handle_kill(kill_for(&terminal_id), &mut ws_tx, &state, "ws-kill-conn-test").await;
         assert!(
             matches!(
                 ownership.observe(KILL_PROVIDER, KILL_SESSION).state,
@@ -9139,7 +9183,7 @@ mod terminal_kill_stop_wedge_tests {
         ledger.fail_next_close_envelope_writes(1);
         let (state, ownership, terminal_id) = state_with_live_terminal_owner(ledger);
         let mut ws_tx = test_sink();
-        handle_kill(kill_for(&terminal_id), &mut ws_tx, &state).await;
+        handle_kill(kill_for(&terminal_id), &mut ws_tx, &state, "ws-kill-conn-test").await;
         match ownership.observe(KILL_PROVIDER, KILL_SESSION).state {
             freshell_ownership::OwnershipState::Live {
                 owner, generation, ..
@@ -9161,7 +9205,7 @@ mod terminal_kill_stop_wedge_tests {
         // The retry (the ledger's injected failure was one-shot) must be
         // granted and complete — the full unwedge, end to end.
         let mut ws_tx = test_sink();
-        handle_kill(kill_for(&terminal_id), &mut ws_tx, &state).await;
+        handle_kill(kill_for(&terminal_id), &mut ws_tx, &state, "ws-kill-conn-test").await;
         assert!(
             matches!(
                 ownership.observe(KILL_PROVIDER, KILL_SESSION).state,
