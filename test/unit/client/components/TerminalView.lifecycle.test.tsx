@@ -5439,6 +5439,7 @@ describe('TerminalView lifecycle updates', () => {
           settings: settingsReducer,
           connection: connectionReducer,
           turnCompletion: turnCompletionReducer,
+          freshAgent: freshAgentReducer,
         },
         preloadedState: {
           tabs: {
@@ -9683,6 +9684,20 @@ describe('TerminalView lifecycle updates', () => {
         requestId: 'req-opencode-focus-gap',
         sessionRef,
       })
+      // b8ke ext r20 F2: the restored session has an owner record — the
+      // replacement kill must carry its observed (epoch, generation)
+      // pair so a reconnect-queued stale kill is typed-refused instead
+      // of killing a newer owner.
+      store.dispatch(applyRuntimeOwner({
+        type: 'session.runtimeOwner',
+        provider: 'opencode',
+        sessionId: 'ses_focus_replay_gap',
+        epoch: 12,
+        generation: 34,
+        ownerKind: 'terminal',
+        operationId: 'handoff-1',
+        transition: 'handoff-committed',
+      }))
 
       wsMocks.send.mockClear()
 
@@ -9722,9 +9737,13 @@ describe('TerminalView lifecycle updates', () => {
       })
 
       await waitFor(() => {
+        // b8ke ext r20 F2: the FENCED production shape — the kill rides
+        // with the session's observed pair (the seeded record above).
         expect(wsMocks.send).toHaveBeenCalledWith({
           type: 'terminal.kill',
           terminalId,
+          observedEpoch: 12,
+          observedGeneration: 34,
         })
       })
 
@@ -9784,6 +9803,18 @@ describe('TerminalView lifecycle updates', () => {
         requestId: 'req-opencode-hidden-gap',
         sessionRef,
       })
+      // b8ke ext r20 F2: same fenced production shape for the hidden
+      // background replacement — the kill carries the observed pair.
+      store.dispatch(applyRuntimeOwner({
+        type: 'session.runtimeOwner',
+        provider: 'opencode',
+        sessionId: 'ses_hidden_replay_gap',
+        epoch: 7,
+        generation: 21,
+        ownerKind: 'terminal',
+        operationId: 'handoff-2',
+        transition: 'handoff-committed',
+      }))
 
       wsMocks.send.mockClear()
       act(() => {
@@ -9825,9 +9856,13 @@ describe('TerminalView lifecycle updates', () => {
       })
 
       await waitFor(() => {
+        // b8ke ext r20 F2: the FENCED production shape (the seeded
+        // hidden-gap record: epoch 7, generation 21).
         expect(wsMocks.send).toHaveBeenCalledWith({
           type: 'terminal.kill',
           terminalId,
+          observedEpoch: 7,
+          observedGeneration: 21,
         })
       })
 

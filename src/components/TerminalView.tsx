@@ -66,7 +66,7 @@ import { focusNextTerminalSearchMatch, focusPreviousTerminalSearchMatch, loadTer
 import { isFatalConnectionErrorCode } from '@/store/connectionSlice'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { getWsClient, RECONCILE_VERDICT_WAIT_MS } from '@/lib/ws-client'
-import { sendTerminalKill } from '@/lib/terminal-kill'
+import { resolveTerminalKillFence, sendTerminalKill } from '@/lib/terminal-kill'
 import { getTerminalTheme } from '@/lib/terminal-themes'
 import {
   buildCodexIdentityMismatchRepairContent,
@@ -3554,7 +3554,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       lastSentViewportRef.current = null
       applySeqState(createAttachSeqState())
       writeLocalXtermNotice(term, '\r\n[Restarting OpenCode session because the saved terminal replay is no longer available]\r\n')
-      sendTerminalKill(terminalId)
+      // b8ke ext r20 F2: the replacement kill carries the session's
+      // observed (epoch, generation) pair — a reconnect-queued stale
+      // kill is typed-refused instead of killing a newer owner.
+      sendTerminalKill(
+        terminalId,
+        resolveTerminalKillFence(appStore, {
+          provider: sessionRef?.provider,
+          sessionRef: sessionRef ?? undefined,
+        }),
+      )
       return true
     }
 

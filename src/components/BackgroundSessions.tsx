@@ -1,9 +1,9 @@
 import { useCallback, useEffect } from 'react'
 import { nanoid } from 'nanoid'
-import { sendTerminalKill } from '@/lib/terminal-kill'
+import { resolveTerminalKillFence, sendTerminalKill } from '@/lib/terminal-kill'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { useAppDispatch, useAppSelector } from '@/store/hooks'
+import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { addTab } from '@/store/tabsSlice'
 import { initLayout } from '@/store/panesSlice'
 import { fetchTerminalDirectoryWindow } from '@/store/terminalDirectoryThunks'
@@ -22,6 +22,7 @@ function formatAge(ms: number): string {
 
 export default function BackgroundSessions() {
   const dispatch = useAppDispatch()
+  const appStore = useAppStore()
   const terminals = useAppSelector((state) => (
     (state as any).terminalDirectory?.windows?.background?.items ?? EMPTY_TERMINALS
   )) as BackgroundTerminal[]
@@ -116,7 +117,17 @@ export default function BackgroundSessions() {
                   <Button
                     size="sm"
                     variant="destructive"
-                    onClick={() => sendTerminalKill(t.terminalId)}
+                    onClick={() => sendTerminalKill(
+                      t.terminalId,
+                      // b8ke ext r20 F2: the kill carries the session's
+                      // observed (epoch, generation) pair — a reconnect-
+                      // queued stale kill is typed-refused instead of
+                      // killing a newer owner.
+                      resolveTerminalKillFence(appStore, {
+                        provider: t.sessionRef?.provider,
+                        sessionRef: t.sessionRef,
+                      }),
+                    )}
                   >
                     Kill
                   </Button>
