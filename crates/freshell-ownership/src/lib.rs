@@ -1017,6 +1017,17 @@ impl OperationTicket {
     pub fn disarm(&mut self) {
         self.disarmed = true;
     }
+
+    /// b8ke ext r22 F1: the ticket SURVIVES the id change — after a
+    /// [`RuntimeOwnershipRegistry::rekey_starting`] moved this ticket's
+    /// in-flight `Starting` record from the pane-scoped provisional key to
+    /// the minted canonical id, the ticket's own key is re-pointed so the
+    /// holder's later `commit_live` (and the RAII typed fail on a dropped
+    /// unarmed ticket) address the CANONICAL key, never the superseded
+    /// provisional one.
+    pub fn rekey_session_id(&mut self, new_session_id: &str) {
+        self.session_id = new_session_id.to_string();
+    }
 }
 
 impl Drop for OperationTicket {
@@ -1898,6 +1909,147 @@ impl RuntimeOwnershipRegistry {
             outcome = "rekeyed_committed", failure_reason = "",
             "the start's record moved to the client-visible durable id in one \
              atomic step — the old key is Aliased, the new key is Live");
+        CommitOutcome::Committed
+    }
+
+    /// b8ke ext r22 F1: re-key an IN-FLIGHT `Starting` record from the
+    /// pane-scoped provisional identity to the freshly minted canonical
+    /// session id — the fresh-create lane's mint-time step. The claim
+    /// (`operation_id`, `generation`, kind, initiator) is PRESERVED under
+    /// the new key (the ticket survives via
+    /// [`OperationTicket::rekey_session_id`]), so the holder's existing
+    /// registration-tail `commit_live` completes under the canonical key
+    /// exactly as if the claim had been made there — while the canonical
+    /// key is coordinator-owned from the MINT onward (the pre-mint spawn
+    /// window is owned by the provisional record). The provisional key
+    /// becomes `Aliased{to: new}` — the rekey family's old-key resolution
+    /// record (a duplicate create for the same pane-scoped id resolves to
+    /// the canonical owner and answers typed).
+    ///
+    /// A record already present under the NEW key means a competitor
+    /// claimed the freshly discoverable minted id in the claim window —
+    /// the typed refusal (FOREIGN_TARGET_KEY); NOTHING moves and the
+    /// caller tears its minted runtime down. Never two writers, never an
+    /// overwrite.
+    pub fn rekey_starting(
+        &self,
+        provider: &str,
+        old_session_id: &str,
+        new_session_id: &str,
+        operation_id: &str,
+        generation: u64,
+    ) -> CommitOutcome {
+        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let old_key = SessionKey::new(provider, old_session_id);
+        // Validation pass (immutable reads — the mutation below cannot
+        // interleave with any of these checks).
+        let (kind, initiator, since_ms) = {
+            let Some(record) = inner.get(&old_key) else {
+                tracing::error!(target: "invariant",
+                    event = "ownership.rekey_starting.old_claim_missing",
+                    operation_id, provider, old_session_id, new_session_id,
+                    from_kind = ?Option::<RuntimeOwnerKind>::None,
+                    to_kind = ?Option::<RuntimeOwnerKind>::None,
+                    runtime_id = ?Option::<String>::None, pid = ?Option::<u32>::None,
+                    epoch = self.epoch, generation,
+                    duration_ms = 0u64,
+                    outcome = "refused", failure_reason = "FOREIGN_OLD_CLAIM",
+                    "the provisional key holds no record — nothing moves");
+                return CommitOutcome::ForeignOperation;
+            };
+            if generation != record.generation {
+                tracing::warn!(target: "freshell_ownership",
+                    event = "ownership.rekey_starting.stale_generation",
+                    operation_id, provider, old_session_id, new_session_id,
+                    from_kind = ?Option::<RuntimeOwnerKind>::None,
+                    to_kind = ?Option::<RuntimeOwnerKind>::None,
+                    runtime_id = ?Option::<String>::None, pid = ?Option::<u32>::None,
+                    epoch = self.epoch, generation, current_generation = record.generation,
+                    duration_ms = 0u64,
+                    outcome = "refused", failure_reason = "STALE_GENERATION");
+                return CommitOutcome::StaleGeneration {
+                    current_generation: record.generation,
+                };
+            }
+            match &record.state {
+                OwnershipState::Starting {
+                    operation_id: op,
+                    kind,
+                    initiator,
+                    since_ms,
+                    ..
+                } if op == operation_id => (kind.clone(), initiator.clone(), *since_ms),
+                _ => {
+                    tracing::error!(target: "invariant",
+                        event = "ownership.rekey_starting.old_claim_mismatch",
+                        operation_id, provider, old_session_id, new_session_id,
+                        from_kind = ?Option::<RuntimeOwnerKind>::None,
+                        to_kind = ?Option::<RuntimeOwnerKind>::None,
+                        runtime_id = ?Option::<String>::None, pid = ?Option::<u32>::None,
+                        epoch = self.epoch, generation,
+                        duration_ms = 0u64,
+                        outcome = "refused", failure_reason = "FOREIGN_OLD_CLAIM",
+                        "the provisional key is not Starting under this operation — \
+                         nothing moves");
+                    return CommitOutcome::ForeignOperation;
+                }
+            }
+        };
+        // A record already present under the NEW key — the minted-key-lost
+        // race. The typed refusal; the caller tears its runtime down.
+        if inner
+            .get(&SessionKey::new(provider, new_session_id))
+            .is_some()
+        {
+            tracing::error!(target: "invariant",
+                event = "ownership.rekey_starting.target_occupied",
+                operation_id, provider, old_session_id, new_session_id,
+                from_kind = ?Option::<RuntimeOwnerKind>::None,
+                to_kind = ?Option::<RuntimeOwnerKind>::None,
+                runtime_id = ?Option::<String>::None, pid = ?Option::<u32>::None,
+                epoch = self.epoch, generation,
+                duration_ms = 0u64,
+                outcome = "refused", failure_reason = "FOREIGN_TARGET_KEY",
+                "a competitor claimed the minted canonical id in the claim window — \
+                 the rekey refuses typed and the caller tears its runtime down");
+            return CommitOutcome::ForeignOperation;
+        }
+        // THE MOVE (one lock scope): the provisional key → Aliased{to: new}
+        // (the rekey family's old-key resolution record); the new key →
+        // Starting carrying the SAME operation (id, generation, kind,
+        // initiator, since) — the claim continues under the canonical id.
+        let new_key = SessionKey::new(provider, new_session_id);
+        let moved_record = SessionRecord {
+            generation,
+            state: OwnershipState::Starting {
+                operation_id: operation_id.to_string(),
+                generation,
+                kind,
+                initiator: initiator.clone(),
+                since_ms,
+            },
+            ..SessionRecord::default()
+        };
+        if let Some(record) = inner.get_mut(&old_key) {
+            record.state = OwnershipState::Aliased {
+                to: new_session_id.to_string(),
+                generation,
+            };
+        }
+        inner.insert(new_key, moved_record);
+        tracing::info!(target: "freshell_ownership",
+            event = "ownership.start.rekey", operation_id, provider,
+            old_session_id, new_session_id,
+            initiator,
+            from_kind = ?Option::<RuntimeOwnerKind>::None,
+            to_kind = ?Option::<RuntimeOwnerKind>::None,
+            runtime_id = ?Option::<String>::None, pid = ?Option::<u32>::None,
+            epoch = self.epoch, generation,
+            duration_ms = now_epoch_ms().saturating_sub(since_ms),
+            outcome = "rekeyed_starting", failure_reason = "",
+            "the fresh create's in-flight start moved to the minted canonical id in \
+             one atomic step — the provisional key is Aliased, the canonical key is \
+             the operation's Starting record");
         CommitOutcome::Committed
     }
 
@@ -5142,6 +5294,229 @@ mod tests {
         assert!(matches!(
             r.observe(PROVIDER, "sid-stale-stop").state,
             OwnershipState::Fenced { .. }
+        ));
+    }
+
+    // ── b8ke ext r22 F1: the fresh-create window's mint-time rekey ────────
+
+    /// b8ke ext r22 F1: the provisional (pane-scoped) in-flight start moves
+    /// to the minted canonical id as the SAME in-flight operation — old key
+    /// `Aliased{to: new}`, new key `Starting` under the SAME operation id +
+    /// generation (the ticket survives via `rekey_session_id`, so the
+    /// holder's registration-tail commit and the RAII typed drop both
+    /// address the canonical key).
+    #[test]
+    fn rekey_starting_moves_the_in_flight_start_to_the_minted_key() {
+        let r = std::sync::Arc::new(RuntimeOwnershipRegistry::new());
+        let BeginOutcome::Granted { generation } = r.begin_start(
+            PROVIDER,
+            "pending-create-req-r22",
+            RuntimeOwnerKind::FreshAgent,
+            "op-r22-create",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!()
+        };
+        assert!(matches!(
+            r.rekey_starting(
+                PROVIDER,
+                "pending-create-req-r22",
+                "thread-minted-1",
+                "op-r22-create",
+                generation
+            ),
+            CommitOutcome::Committed
+        ));
+        // The provisional key is the rekey family's Aliased resolution
+        // record; the canonical key holds the SAME in-flight start.
+        assert!(matches!(
+            r.observe(PROVIDER, "pending-create-req-r22").state,
+            OwnershipState::Aliased { to, .. } if to == "thread-minted-1"
+        ));
+        assert_eq!(
+            r.resolve_canonical(PROVIDER, "pending-create-req-r22"),
+            "thread-minted-1"
+        );
+        match r.observe(PROVIDER, "thread-minted-1").state {
+            OwnershipState::Starting {
+                operation_id, kind, ..
+            } => {
+                assert_eq!(operation_id, "op-r22-create");
+                assert_eq!(kind, RuntimeOwnerKind::FreshAgent);
+            }
+            other => panic!("expected the moved Starting record, got {other:?}"),
+        }
+        assert_eq!(
+            r.observe(PROVIDER, "thread-minted-1").generation,
+            generation
+        );
+
+        // THE TICKET SURVIVES: re-pointed at the canonical key, its unarmed
+        // drop fails the CANONICAL record (the provisional Aliased record
+        // stays as the resolution record), and a competing claim on the
+        // canonical key while the start is in flight is refused typed.
+        let mut ticket = OperationTicket::new(
+            std::sync::Arc::clone(&r),
+            PROVIDER,
+            "pending-create-req-r22",
+            "op-r22-create",
+            RuntimeOwnerKind::FreshAgent,
+            generation,
+            "test",
+        );
+        ticket.rekey_session_id("thread-minted-1");
+        assert_eq!(ticket.session_id(), "thread-minted-1");
+        assert!(matches!(
+            r.begin_start(
+                PROVIDER,
+                "thread-minted-1",
+                RuntimeOwnerKind::Terminal,
+                "op-competing",
+                None,
+                "test",
+                1
+            ),
+            BeginOutcome::Blocked { .. }
+        ));
+        drop(ticket);
+        assert!(
+            matches!(
+                r.observe(PROVIDER, "thread-minted-1").state,
+                OwnershipState::Vacant
+            ),
+            "the rekeyed ticket's unarmed drop typed-fails the CANONICAL record"
+        );
+    }
+
+    /// b8ke ext r22 F1: the minted-key-lost race — a record already present
+    /// under the NEW key (a competitor claimed the freshly discoverable
+    /// minted id in the spawn window) refuses typed and NOTHING moves: the
+    /// provisional record stays the operation's in-flight start and the
+    /// competitor's record is untouched.
+    #[test]
+    fn rekey_starting_refuses_an_occupied_target_key() {
+        let r = RuntimeOwnershipRegistry::new();
+        let BeginOutcome::Granted { generation } = r.begin_start(
+            PROVIDER,
+            "pending-create-req-lost",
+            RuntimeOwnerKind::FreshAgent,
+            "op-r22-lost",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!()
+        };
+        // The competitor: a terminal claimed the minted id in the window.
+        let BeginOutcome::Granted {
+            generation: term_gen,
+        } = r.begin_start(
+            PROVIDER,
+            "thread-taken",
+            RuntimeOwnerKind::Terminal,
+            "op-terminal-won",
+            None,
+            "test",
+            0,
+        )
+        else {
+            panic!()
+        };
+        assert!(matches!(
+            r.commit_live(
+                PROVIDER,
+                "thread-taken",
+                "op-terminal-won",
+                term_gen,
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("t-r22".into()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: None,
+                }
+            ),
+            CommitOutcome::Committed
+        ));
+        // THE REFUSAL: nothing moves.
+        assert!(matches!(
+            r.rekey_starting(
+                PROVIDER,
+                "pending-create-req-lost",
+                "thread-taken",
+                "op-r22-lost",
+                generation
+            ),
+            CommitOutcome::ForeignOperation
+        ));
+        // The provisional record is still the operation's in-flight start.
+        assert!(matches!(
+            r.observe(PROVIDER, "pending-create-req-lost").state,
+            OwnershipState::Starting { operation_id, .. } if operation_id == "op-r22-lost"
+        ));
+        // The competitor's Live record is untouched.
+        assert!(matches!(
+            r.observe(PROVIDER, "thread-taken").state,
+            OwnershipState::Live { owner, .. }
+                if owner.kind == RuntimeOwnerKind::Terminal
+        ));
+    }
+
+    /// b8ke ext r22 F1: a foreign operation (wrong op id) or a stale
+    /// generation on the provisional key refuses typed — nothing moves.
+    #[test]
+    fn rekey_starting_refuses_a_foreign_or_stale_operation() {
+        let r = RuntimeOwnershipRegistry::new();
+        let BeginOutcome::Granted { generation } = r.begin_start(
+            PROVIDER,
+            "pending-create-req-foreign",
+            RuntimeOwnerKind::FreshAgent,
+            "op-mine",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!()
+        };
+        // A foreign operation id.
+        assert!(matches!(
+            r.rekey_starting(
+                PROVIDER,
+                "pending-create-req-foreign",
+                "thread-x",
+                "op-not-mine",
+                generation
+            ),
+            CommitOutcome::ForeignOperation
+        ));
+        // A stale generation.
+        assert!(matches!(
+            r.rekey_starting(
+                PROVIDER,
+                "pending-create-req-foreign",
+                "thread-x",
+                "op-mine",
+                generation + 1
+            ),
+            CommitOutcome::StaleGeneration { .. }
+        ));
+        // A missing old key.
+        assert!(matches!(
+            r.rekey_starting(
+                PROVIDER,
+                "pending-create-req-absent",
+                "thread-x",
+                "op-mine",
+                generation
+            ),
+            CommitOutcome::ForeignOperation
+        ));
+        // Nothing moved: the record is still the in-flight start.
+        assert!(matches!(
+            r.observe(PROVIDER, "pending-create-req-foreign").state,
+            OwnershipState::Starting { operation_id, .. } if operation_id == "op-mine"
         ));
     }
 
