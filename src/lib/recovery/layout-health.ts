@@ -107,12 +107,21 @@ function collectLeafContents(node: unknown, into: Map<string, Record<string, unk
  *   Claude ref is rejected into a restoreError
  *   (fresh-agent.ts:378-391, :412-418) while a valid ref is re-added
  *   (:421). Exempt iff the parsed content holds the restoreError.
- * - sessionRef on a legacy codex recovery_failed terminal: the remint
- *   rewrite (storage-migration.ts:162-177, normalizeLegacyRecoveryFailed
- *   :102-128; pinned by storage-migration.test.ts:291-345) always
- *   replaces the pane status with 'creating' (valid codex ref kept) or
- *   'error' (+ fresh restoreError) — exempt iff the parsed status shows
- *   the remint's announced replacement.
+ * - sessionRef / terminalId on a legacy codex recovery_failed terminal:
+ *   the remint rewrite destructures BOTH the invalid legacy sessionRef
+ *   and the failed recovery's dead terminalId (live handle) out — boot
+ *   side storage-migration.ts:110-115 via :162; parse side
+ *   persistedState.ts:120-125 via :245 — and never re-adds either,
+ *   always replacing the pane status with 'creating' (valid codex ref
+ *   kept) or 'error' (+ fresh invalid_legacy_restore_target)
+ *   (storage-migration.ts:116-127; persistedState.ts:126-137). Pinned by
+ *   storage-migration.test.ts:291-345, which asserts terminalId
+ *   undefined alongside the status/error rewrite. Exempt iff the raw
+ *   pane is the documented remint trigger (codex + recovery_failed) AND
+ *   the parsed status shows the remint's announced replacement; a
+ *   terminalId drop outside this trigger is unreachable via the
+ *   migration (every other terminal shape keeps it), so it stays
+ *   corruption.
  * - showThinking / showTools (fresh-agent family): vestigial per-pane
  *   display overrides with no writer since 2026-04, unconditionally
  *   deleted by the migration (fresh-agent.ts:310-311, :348-349, :404-405)
@@ -161,7 +170,8 @@ function isVerifiedMigrationContentDrop(
   }
   if (rawKind === 'terminal') {
     if (key === 'restoreError') return !!sanitizeRestoreError(rawContent.restoreError)
-    if (key === 'sessionRef' && rawContent.mode === 'codex' && rawContent.status === 'recovery_failed') {
+    if (key === 'sessionRef' || key === 'terminalId') {
+      if (rawContent.mode !== 'codex' || rawContent.status !== 'recovery_failed') return false
       const parsedStatus = parsedContent?.status
       return parsedStatus === 'creating' || parsedStatus === 'error'
     }

@@ -554,6 +554,22 @@ describe('verified migration exemptions: agent-chat kinds + value sensitivity (e
     expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
   })
 
+  it('classifies the legacy codex recovery_failed remint shape healthy (the remint drops the dead terminalId and announces the rewrite)', () => {
+    // The exact shape storage-migration.test.ts:291-345 pins as the valid
+    // legacy migration: the remint destructures the failed recovery's dead
+    // terminalId out (persistedState.ts:120-125 via :245; boot side
+    // storage-migration.ts:110-115 via :162) and replaces the status with
+    // 'error' + a fresh invalid_legacy_restore_target — the drop is the
+    // documented migration, not silent salvage.
+    seedPaneLayout({
+      kind: 'terminal', mode: 'codex', createRequestId: 'req-old', status: 'recovery_failed',
+      terminalId: 'term-old',
+      sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+      initialCwd: '/repo',
+    })
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+  })
+
   it.each([
     ['an empty string', ''],
     ['a non-string', 42],
