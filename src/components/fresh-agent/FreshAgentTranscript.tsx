@@ -1032,14 +1032,16 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
           return `${item.id}:${item.kind}:${item.text?.length ?? 0}:${item.summary.join('\n').length}`
         }
         if ('status' in item) {
-          return `${item.id}:${item.kind}:${item.status}`
+          const errorLength = 'error' in item && item.error !== undefined ? formatJson(item.error).length : 0
+          return `${item.id}:${item.kind}:${item.status}:err:${errorLength}`
         }
         if (item.kind === 'tool_result') {
           return `${item.id}:${item.kind}:${item.isError ? 'error' : 'ok'}:${formatJson(item.content).length}`
         }
         return `${item.id}:${item.kind}`
       }).join(',')
-      return `${getFreshAgentDisplayTurnKey(turn)}:${turn.summary?.length ?? 0}:${itemSignature}`
+      const errorSignature = turn.error ? `err:${turn.error.name}:${turn.error.message.length}` : ''
+      return `${getFreshAgentDisplayTurnKey(turn)}:${turn.summary?.length ?? 0}:${errorSignature}:${itemSignature}`
     }).join('|')
   ), [displayTurns])
 

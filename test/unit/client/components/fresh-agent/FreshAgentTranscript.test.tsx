@@ -1503,6 +1503,59 @@ describe('FreshAgentTranscript', () => {
       expect(screen.queryByTestId('fresh-agent-turn-error')).not.toBeInTheDocument()
       expect(screen.queryByTestId('fresh-agent-turn-interrupted')).not.toBeInTheDocument()
     })
+
+    it('re-runs signature-driven auto-scroll when an incremental snapshot adds a turn error', () => {
+      let scrollHeight = 1000
+      const baseTurn = {
+        id: 'turn-1', turnId: 'turn-1', role: 'assistant' as const, summary: 'partial reply', summaryKind: 'echo' as const,
+        items: [{ id: 'item-1', kind: 'text' as const, text: 'partial reply' }],
+      }
+      const { container, rerender } = render(<FreshAgentTranscript turns={[baseTurn]} />)
+      const scroller = container.querySelector('[data-context="fresh-agent-transcript"]') as HTMLDivElement
+      Object.defineProperty(scroller, 'clientHeight', { configurable: true, get: () => 200 })
+      Object.defineProperty(scroller, 'scrollHeight', { configurable: true, get: () => scrollHeight })
+      scroller.scrollTop = 800
+      fireEvent.scroll(scroller)
+
+      scrollHeight = 1200
+      rerender(
+        <FreshAgentTranscript
+          turns={[{ ...baseTurn, error: { name: 'UnknownError', message: deadlineRaw } }]}
+        />,
+      )
+
+      expect(scroller.scrollTop).toBe(1200)
+    })
+
+    it('increments the new-message badge when an incremental snapshot adds a dynamic tool error', async () => {
+      let scrollHeight = 1000
+      const baseItem = {
+        id: 'tool-1', kind: 'dynamic_tool' as const, namespace: 'opencode', tool: 'bash',
+        status: 'failed' as const, arguments: { command: 'false' }, contentItems: ['nope'], success: false,
+      }
+      const baseTurn = {
+        id: 'turn-1', turnId: 'turn-1', role: 'assistant' as const, summary: 'ran a tool', summaryKind: 'authored' as const,
+        items: [baseItem],
+      }
+      const { container, rerender } = render(<FreshAgentTranscript turns={[baseTurn]} />)
+      const scroller = container.querySelector('[data-context="fresh-agent-transcript"]') as HTMLDivElement
+      Object.defineProperty(scroller, 'clientHeight', { configurable: true, get: () => 200 })
+      Object.defineProperty(scroller, 'scrollHeight', { configurable: true, get: () => scrollHeight })
+
+      scroller.scrollTop = 100
+      fireEvent.scroll(scroller)
+      const button = await screen.findByRole('button', { name: 'Scroll to bottom' })
+      await waitFor(() => expect(button).toHaveTextContent('1 new'))
+
+      scrollHeight = 1200
+      rerender(
+        <FreshAgentTranscript
+          turns={[{ ...baseTurn, items: [{ ...baseItem, error: 'boom: request failed' }] }]}
+        />,
+      )
+
+      await waitFor(() => expect(button).toHaveTextContent('2 new'))
+    })
   })
 
   describe('streaming height stability (jp70)', () => {
