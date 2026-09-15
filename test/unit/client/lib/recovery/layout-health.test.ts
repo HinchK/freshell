@@ -684,6 +684,23 @@ describe('malformed envelope metadata classifies corrupt — never silently coer
     expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
   })
 
+  // e5r2: an empty-string machineId is the same malformed class — the
+  // validity rule follows machine-identity.ts's nonEmptyString
+  // normalization (which trims, so whitespace-only is empty too). The
+  // gate used to accept "" as a string, the classifier treated the
+  // envelope as unstamped legacy — healthy — and the stamp backfill
+  // relabeled a possibly wrong-machine workspace as the current machine.
+  it('returns corrupt when machineId is present but empty (empty stamp is malformed metadata, not legacy absence — direct parse path)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    envelope.machineId = ''
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+    const whitespace = healthyEnvelope('machine-1')
+    whitespace.machineId = '   '
+    seedEnvelope(whitespace)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
   it('returns corrupt when persistedAt is present but not a number (direct parse path)', () => {
     const envelope = healthyEnvelope('machine-1')
     envelope.persistedAt = 'recently'
@@ -717,6 +734,23 @@ describe('malformed envelope metadata classifies corrupt — never silently coer
     expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
     const original = healthyEnvelope('machine-1')
     original.machineId = 123
+    localStorage.setItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY, JSON.stringify(original))
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+    localStorage.removeItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+  })
+
+  // e5r2: the migration's falsy machineId guard drops "" exactly like a
+  // mistyped one, and hasMalformedEnvelopeMetadata must flag it in the
+  // evidence the same way — an empty stamp is malformed metadata, never
+  // legacy absence.
+  it('classifies corrupt through the pre-migration evidence when the migration dropped an empty-string machineId (e5r2)', () => {
+    const current = healthyEnvelope('machine-1')
+    delete current.machineId
+    seedEnvelope(current)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+    const original = healthyEnvelope('machine-1')
+    original.machineId = ''
     localStorage.setItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY, JSON.stringify(original))
     expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
     localStorage.removeItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)
@@ -907,6 +941,33 @@ describe('classifyPersistedLayoutHealth in the real boot order (migration rewrit
     seedEnvelope(malformedPrimary)
     localStorage.setItem(LAYOUT_FRESH_AGENT_BACKUP_STORAGE_KEY, JSON.stringify(backupTabEnvelope()))
     const { classify } = await classifyAfterRealBoot()
+    expect(classify('machine-1')).toBe('corrupt')
+  })
+
+  // e5r2: the empty-string machineId variant of the lane above. The
+  // migration's falsy guard drops "" from the sanitized current raw (so
+  // the direct parse path can no longer catch it), the recoverable read
+  // must NOT swap the older backup in (parseLayoutStructure is
+  // structural-only), and the evidence sidecar must preserve the
+  // malformed PRIMARY so the metadata comparison classifies corrupt →
+  // rebuild, instead of the healthy-legacy keep that relabeled a
+  // possibly wrong-machine workspace via the stamp backfill.
+  it('classifies corrupt when an empty-string machineId primary coexists with a surviving migration backup: no backup swap, the evidence preserves the malformed primary (e5r2)', async () => {
+    const malformedPrimary = healthyEnvelope('machine-1')
+    malformedPrimary.machineId = ''
+    const primaryRaw = JSON.stringify(malformedPrimary)
+    seedEnvelope(primaryRaw)
+    localStorage.setItem(LAYOUT_FRESH_AGENT_BACKUP_STORAGE_KEY, JSON.stringify(backupTabEnvelope()))
+
+    const { classify } = await classifyAfterRealBoot()
+
+    // No backup swap: the durable layout still holds the PRIMARY's tab —
+    // the migration delivered the malformed primary, not the older backup.
+    const durable = JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY)!) as { tabs: { tabs: Array<{ id: string }> } }
+    expect(durable.tabs.tabs.map((t) => t.id)).toEqual(['tab-a'])
+    // The evidence sidecar preserves the malformed PRIMARY so the
+    // metadata comparison below can still see the corrupt stamp.
+    expect(localStorage.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)).toBe(primaryRaw)
     expect(classify('machine-1')).toBe('corrupt')
   })
 

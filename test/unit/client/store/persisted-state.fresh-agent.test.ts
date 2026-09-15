@@ -365,6 +365,25 @@ describe('persistedState fresh-agent migration', () => {
     }) as Storage)).toBe(malformedRaw)
   })
 
+  // e5r2: the empty-string machineId is the same metadata-malformed
+  // class. parseLayoutStructure stays structural-only — an empty stamp
+  // must NOT select the backup; the malformed PRIMARY is the corrupt
+  // evidence the boot classifier needs.
+  it('keeps an empty-string machineId primary when a backup exists — no backup swap (e5r2)', () => {
+    const backupRaw = layoutRaw({
+      'tab-1': leaf('pane-backup', { kind: 'terminal', mode: 'shell' }),
+    })
+    const malformedRaw = JSON.stringify({
+      ...JSON.parse(layoutRaw({ 'tab-1': leaf('pane-current', { kind: 'terminal', mode: 'codex' }) })),
+      machineId: '',
+    })
+
+    expect(readRecoverablePersistedLayoutRaw(storageWith({
+      [LAYOUT_STORAGE_KEY]: malformedRaw,
+      [LAYOUT_FRESH_AGENT_BACKUP_STORAGE_KEY]: backupRaw,
+    }) as Storage)).toBe(malformedRaw)
+  })
+
   it('still selects the backup when the primary is structurally destroyed (JSON garbage, wrong shape, or a newer schema version)', () => {
     const backupRaw = layoutRaw({
       'tab-1': leaf('pane-backup', { kind: 'terminal', mode: 'shell' }),

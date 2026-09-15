@@ -374,6 +374,18 @@ describe('persistedState parsers', () => {
       expect(parsePersistedLayoutRaw(metadataEnvelope({ machineId: null }))).toBeNull()
     })
 
+    // e5r2: an empty-string machineId is the same malformed class — the
+    // validity rule follows machine-identity.ts's nonEmptyString
+    // normalization, which TRIMS, so whitespace-only values are empty too.
+    // Legacy absence is the key being ABSENT from the envelope, never a
+    // present-but-empty value (the Rust recovery API rejects "" the same
+    // way); letting it parse kept a possibly wrong-machine workspace as
+    // healthy legacy and the stamp backfill relabeled it.
+    it('returns null when machineId is present but empty or whitespace-only (malformed stamp — corruption, not legacy absence)', () => {
+      expect(parsePersistedLayoutRaw(metadataEnvelope({ machineId: '' }))).toBeNull()
+      expect(parsePersistedLayoutRaw(metadataEnvelope({ machineId: '   ' }))).toBeNull()
+    })
+
     it('returns null when persistedAt is present but not a number (malformed stamp)', () => {
       expect(parsePersistedLayoutRaw(metadataEnvelope({ persistedAt: 'recently' }))).toBeNull()
       expect(parsePersistedLayoutRaw(metadataEnvelope({ persistedAt: null }))).toBeNull()

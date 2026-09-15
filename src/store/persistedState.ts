@@ -16,6 +16,7 @@ import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
 import { migrateLegacyFreshAgentContent, migrateLegacyFreshAgentDurableState } from '@shared/fresh-agent'
 import { normalizeFreshAgentPaneModelSelection } from './paneTypes'
 import { createLogger } from '@/lib/client-logger'
+import { isValidMachineIdStamp } from '@/lib/machine-identity'
 
 export { TABS_STORAGE_KEY, PANES_STORAGE_KEY }
 
@@ -547,9 +548,9 @@ export function readRecoverablePersistedLayoutRaw(storage: Pick<Storage, 'getIte
 /** The structural parse gate shared by the loader-grade parse and the
  * recoverable-read fallback (e5r1): JSON-level, envelope-shape (zod), and
  * schema-version checks ONLY. Present-but-malformed envelope METADATA
- * (machineId/persistedAt of the wrong type) is deliberately outside this
- * gate — it is a corruption class the boot classifier must see, not
- * structural destruction. */
+ * (a machineId that is not a non-empty string, or a persistedAt that is
+ * not a number) is deliberately outside this gate — it is a corruption
+ * class the boot classifier must see, not structural destruction. */
 function parseLayoutStructure(raw: string): z.infer<typeof zPersistedLayoutPayload> | null {
   let parsed: unknown
   try {
@@ -569,14 +570,16 @@ export function parsePersistedLayoutRaw(raw: string): ParsedPersistedLayout | nu
   if (!structural) return null
 
   // Present-but-malformed top-level metadata is corruption, not a legacy
-  // absence (delta r5 finding 1): the schema passes both keys through, and
-  // silently coercing a non-string machineId or a non-number persistedAt to
-  // undefined let a corrupt envelope parse as unstamped legacy — the boot
-  // classifier kept it and the healthy path's stamp backfill relabeled it as
-  // the currently selected machine. Only genuinely ABSENT keys keep the
-  // legacy meaning, so refuse the parse instead of coercing.
+  // absence (delta r5 finding 1, empty values added e5r2): the schema
+  // passes both keys through, and silently coercing a non-string machineId
+  // (or, per machine-identity's nonEmptyString normalization, an empty or
+  // whitespace-only one) or a non-number persistedAt to undefined let a
+  // corrupt envelope parse as unstamped legacy — the boot classifier kept
+  // it and the healthy path's stamp backfill relabeled it as the currently
+  // selected machine. Only genuinely ABSENT keys keep the legacy meaning,
+  // so refuse the parse instead of coercing.
   const rawMetadata = structural as { machineId?: unknown; persistedAt?: unknown }
-  if (rawMetadata.machineId !== undefined && typeof rawMetadata.machineId !== 'string') return null
+  if (rawMetadata.machineId !== undefined && !isValidMachineIdStamp(rawMetadata.machineId)) return null
   if (rawMetadata.persistedAt !== undefined && typeof rawMetadata.persistedAt !== 'number') return null
 
   const panes = structural.panes

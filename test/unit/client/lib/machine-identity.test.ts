@@ -8,6 +8,7 @@ import {
   getBrowserMachineLabel,
   getSelectedMachineId,
   getSuggestedMachineLabel,
+  isValidMachineIdStamp,
   markActiveMachineSelection,
   peekActiveMachineSelectionMark,
   persistSelectedMachineId,
@@ -172,6 +173,23 @@ describe('machine identity', () => {
     expect(getSelectedMachineId()).toBeUndefined()
     expect(getSelectedMachineId('srv-a')).toBeUndefined()
     expect(localStorage.getItem(MACHINE_SELECTIONS_STORAGE_KEY)).toBeNull()
+  })
+
+  // e5r2: the shared validity rule for a persisted machine id STAMP,
+  // consumed by the layout parse gate and the health classifier's
+  // evidence path. It mirrors this module's nonEmptyString
+  // normalization: non-empty after trimming, so whitespace-only counts
+  // as empty. Legacy absence is the key being ABSENT from the envelope,
+  // never a present-but-empty value.
+  it('validates machine id stamps by the nonEmptyString rule: non-empty after trimming', () => {
+    expect(isValidMachineIdStamp('machine-1')).toBe(true)
+    expect(isValidMachineIdStamp(' padded ')).toBe(true)
+    expect(isValidMachineIdStamp('')).toBe(false)
+    expect(isValidMachineIdStamp('   ')).toBe(false)
+    expect(isValidMachineIdStamp(123)).toBe(false)
+    expect(isValidMachineIdStamp(null)).toBe(false)
+    expect(isValidMachineIdStamp(undefined)).toBe(false)
+    expect(isValidMachineIdStamp({ id: 'machine-1' })).toBe(false)
   })
 })
 
