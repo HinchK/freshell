@@ -570,7 +570,8 @@ git commit -m "test(e2e): waitForConnection self-heal enforces its window as a s
 
 **Files:**
 - Modify: `test/e2e-browser/helpers/fixtures.ts` (convert `freshellPage` to the tuple form with its own `{ timeout }` option — the fixture-timeout mechanism, delta review r9; make `e2eMachineId` deadline-neutral with its CONDITIONALLY-bounded registration fetch — delta reviews r5+r6; extend the module's existing `import` from `'./test-harness.js'`)
-- Modify: `test/e2e-browser/playwright.config.ts` (delta review r5: import `DEFAULT_TEST_TIMEOUT_MS` from the helpers and use it as the config's `timeout` — one source of truth for the default-class threshold both lanes share; the cloud config inherits the base value)
+- Modify: `test/e2e-browser/helpers/test-harness.test.ts` (the wiring-presence regression pin, delta review r10)
+- Modify: `test/e2e-browser/playwright.config.ts` (import `DEFAULT_TEST_TIMEOUT_MS` from the helpers and use it as the config's `timeout` — one source of truth for the body ceiling both lanes share; the cloud config inherits the base value)
 - Create: `test/e2e-browser/specs/e2e-budget-contract.spec.ts`
 - Test: the new contract spec is this task's behavioral test (it runs on both lanes; on the cloud lane — env always present — it pins the real budget).
 
