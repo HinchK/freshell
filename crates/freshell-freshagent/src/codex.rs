@@ -87,6 +87,14 @@ mod metadata;
 const SESSION_TYPE: &str = "freshcodex";
 /// The runtime provider (`AGENT_SESSION_TYPES.codex.provider`).
 const PROVIDER: &str = "codex";
+
+/// b8ke ext r22 F1: the pane-scoped PROVISIONAL identity for a fresh
+/// create's pre-spawn claim — the createRequestId the caller already
+/// carries, namespaced so it can never collide with a provider-minted
+/// session id. The claim under this key owns the whole spawn window
+/// (watchdog state + cancellation + typed recovery); at mint the SAME
+/// ticket rekeys to the canonical thread id (rekey_starting).
+const PENDING_CREATE_PREFIX: &str = "pending-create-";
 /// Default TTL for the [`FreshCodexState::dead_threads`] negative cache (CODEX-FIRST
 /// triage Finding 2). Long enough to absorb a burst of retries from a client with no
 /// backoff (the empirically-observed storm), short enough that a thread this process was
@@ -828,6 +836,19 @@ impl FreshCodexState {
         );
     }
 
+    /// b8ke ext r22 F1: resolve a wire id to its canonical coordinator key
+    /// (the registry's own alias fixpoint — a pane-scoped provisional id
+    /// left `Aliased{to: canonical}` by an earlier create resolves to the
+    /// canonical owner, so the idempotent re-drive ADOPTS instead of
+    /// spawning a second runtime; the claude lane's discipline). Unwired
+    /// (no coordinator): the identity.
+    fn resolve_ownership_key(&self, session_id: &str) -> String {
+        match self.ownership.as_ref() {
+            Some(registry) => registry.resolve_canonical(PROVIDER, session_id),
+            None => session_id.to_string(),
+        }
+    }
+
     fn begin_lane_claim_at(
         &self,
         session_id: &str,
@@ -1477,6 +1498,65 @@ impl FreshCodexState {
             return;
         }
 
+        // b8ke ext r22 F1: the fresh create is coordinator-owned from BEFORE
+        // spawn — the pane-scoped provisional claim (the createRequestId the
+        // caller already carries; the established pre-spawn-claim discipline
+        // of the resume paths). The whole spawn window (sidecar boot +
+        // thread/start) then has a Starting generation, a cancellation
+        // handle, watchdog state, and the typed recovery record; at mint the
+        // SAME ticket rekeys to the canonical thread id, so the canonical
+        // key is fenced from the moment the id exists (a terminal that
+        // opened the freshly discoverable session inside the window makes
+        // the rekey refuse typed and the minted runtime is torn down).
+        let provisional_id = format!("{PENDING_CREATE_PREFIX}{request_id}");
+        let claim_op_id = format!("create-{request_id}");
+        let start_pid_slot = crate::ownership_lane::sidecar_pid_cancel_slot();
+        let mut _start_cancellation: Option<crate::ownership_lane::StartCancellationGuard> = None;
+        let mut own_ticket: Option<freshell_ownership::OperationTicket> = None;
+        let claim_key = self.resolve_ownership_key(&provisional_id);
+        match self.begin_lane_claim_at(
+            &claim_key,
+            &claim_op_id,
+            None,
+            &Self::initiator_for(provenance.as_ref(), "freshcodex/create"),
+        ) {
+            crate::ownership_lane::LaneClaim::Granted(ticket) => {
+                own_ticket = Some(ticket);
+                // The watchdog machinery for the WHOLE window: the pid-slot
+                // cancellation (armed once the child exists below) + the
+                // settle guard held to this handler's end.
+                _start_cancellation = Some(
+                    crate::ownership_lane::register_start_cancellation_for_ticket(
+                        &self.ownership,
+                        PROVIDER,
+                        &claim_key,
+                        &own_ticket,
+                        crate::ownership_lane::pid_slot_cancellation(&start_pid_slot),
+                    ),
+                );
+            }
+            crate::ownership_lane::LaneClaim::Unwired => {}
+            crate::ownership_lane::LaneClaim::Adopt => {
+                // The pane-scoped key resolves to a LIVE same-kind owner —
+                // an earlier create for this pane completed (the key is
+                // Aliased{to: canonical}); the idempotent re-drive ADOPTS
+                // the live session, never a second spawn.
+                self.adopt_live_create(&request_id, &claim_key, provenance.clone())
+                    .await;
+                return;
+            }
+            crate::ownership_lane::LaneClaim::Refused(outcome) => {
+                tracing::warn!(target: "freshell_freshagent::codex",
+                    session_id = %claim_key, request_id = %request_id,
+                    outcome = ?outcome,
+                    "fresh_agent_create_refused: the ownership coordinator refused the \
+                     fresh create's provisional claim (kata b8ke ext r22 F1)"
+                );
+                self.fail_create_session_reserved(&request_id);
+                return;
+            }
+        }
+
         // Spawn + initialize the app-server sidecar.
         let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd.as_deref()).await {
             Ok(parts) => parts,
@@ -1485,6 +1565,22 @@ impl FreshCodexState {
                 return;
             }
         };
+
+        // b8ke ext r22 F1: the child exists — arm the registered
+        // cancellation (the watchdog's cancel SIGTERMs this child from here
+        // on) and register the partial runtime (the reap target) under the
+        // PROVISIONAL key the ticket holds; the mint-time rekey below
+        // carries it to the canonical record with the claim.
+        let sidecar_pid = child.id();
+        crate::ownership_lane::arm_sidecar_pid_slot(&start_pid_slot, sidecar_pid);
+        crate::ownership_lane::register_partial_fresh_runtime(
+            &self.ownership,
+            PROVIDER,
+            &claim_key,
+            &own_ticket,
+            &claim_key,
+            sidecar_pid,
+        );
 
         // thread/start → the STABLE codex thread id (a UUID). No placeholder→durable step.
         let started = client
@@ -1511,75 +1607,61 @@ impl FreshCodexState {
             }
         };
 
-        // kata b8ke Task 3: the plain create MINTS the canonical thread id —
-        // claim it under the NEW key (no fence: a minted id was never
-        // observed by anyone) before `finish_create` registers + commits the
-        // runtime. The claim cannot meet a competitor on a fresh UUID; it
-        // exists so the coordinator is authoritative from the session's
-        // first registered moment.
-        let claim_op_id = format!("create-{request_id}");
-        let own_ticket = match self.begin_lane_claim_at(
-            &thread_id,
-            &claim_op_id,
-            None,
-            &Self::initiator_for(provenance.as_ref(), "freshcodex/create"),
-        ) {
-            crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
-            crate::ownership_lane::LaneClaim::Unwired => None,
-            crate::ownership_lane::LaneClaim::Adopt => {
-                // Unreachable on a fresh UUID in practice — the adopt answer
-                // names a live runtime under a brand-new id; honored by
-                // tearing our own spawn down and refusing the create.
-                client.close().await;
-                let mut child = child;
-                let _ = child.start_kill();
-                reap_owned_codex_sidecars(&ownership_id);
-                crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
-                self.fail_create_session_reserved(&request_id);
-                return;
+        // b8ke ext r22 F1: the MINT-TIME REKEY — the SAME ticket's
+        // in-flight record moves from the pane-scoped provisional key to
+        // the canonical thread id in ONE atomic step (`rekey_starting`:
+        // the provisional key becomes `Aliased{to: new}` — the rekey
+        // family's resolution record, so an idempotent re-drive of this
+        // createRequestId resolves to the canonical owner and adopts —
+        // and the canonical key holds the SAME operation's `Starting`;
+        // the ticket SURVIVES via `rekey_session_id`, so the
+        // registration-tail commit inside `finish_create` lands under the
+        // CANONICAL key). The canonical key is coordinator-owned from the
+        // moment the id exists: a competitor that claimed the freshly
+        // discoverable thread inside the window (a terminal opened it)
+        // left a record under it and the rekey REFUSES typed — the
+        // minted runtime is torn down below (never two writers, never an
+        // orphan); the unarmed ticket's drop settles the provisional
+        // record typed on every failure return.
+        if let Some(ticket) = own_ticket.as_mut() {
+            let Some(registry) = self.ownership.as_ref() else {
+                unreachable!("a live ticket implies a wired coordinator");
+            };
+            match registry.rekey_starting(
+                PROVIDER,
+                ticket.session_id(),
+                &thread_id,
+                ticket.operation_id(),
+                ticket.generation(),
+            ) {
+                freshell_ownership::CommitOutcome::Committed => {
+                    // The ticket survives the id change: the rekeyed key is
+                    // the registration-tail commit's target (and the RAII
+                    // typed fail's, on any later failure return).
+                    ticket.rekey_session_id(&thread_id);
+                }
+                outcome => {
+                    tracing::error!(target: "invariant",
+                        provider = PROVIDER, session_id = %thread_id, request_id = %request_id,
+                        outcome = ?outcome,
+                        "freshagent.codex.create_rekey_refused: the minted thread id was \
+                         claimed by another owner during the create window — the minted \
+                         runtime is torn down (kata b8ke ext r22 F1)"
+                    );
+                    client.close().await;
+                    let mut child = child;
+                    let _ = child.start_kill();
+                    reap_owned_codex_sidecars(&ownership_id);
+                    crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
+                    self.fail_create(
+                        &request_id,
+                        "FRESH_AGENT_CREATE_FAILED",
+                        "the minted thread id was claimed by another owner during the create; torn down",
+                    );
+                    return;
+                }
             }
-            crate::ownership_lane::LaneClaim::Refused(outcome) => {
-                // Unreachable on a fresh UUID in practice (nothing else can
-                // hold it) — honored as a typed refusal regardless.
-                tracing::warn!(target: "freshell_freshagent::codex",
-                    session_id = %thread_id, request_id = %request_id,
-                    outcome = ?outcome,
-                    "fresh_agent_create_refused: the ownership coordinator refused the \
-                     minted-key claim (kata b8ke)"
-                );
-                client.close().await;
-                let mut child = child;
-                let _ = child.start_kill();
-                reap_owned_codex_sidecars(&ownership_id);
-                crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
-                self.fail_create_session_reserved(&request_id);
-                return;
-            }
-        };
-        let sidecar_pid = child.id();
-        // b8ke delta round-2 F2: the start's watchdog machinery — the
-        // direct-pid cancellation (the child exists: the watchdog's cancel
-        // SIGTERMs it; the start's own gates tear down and unwind) + the
-        // settle guard held to this handler's end (the watchdog's bounded
-        // settle treats its firing as the operation's confirmed death).
-        let _start_cancellation = crate::ownership_lane::register_start_cancellation_for_ticket(
-            &self.ownership,
-            PROVIDER,
-            &thread_id,
-            &own_ticket,
-            crate::ownership_lane::sidecar_pid_cancellation(
-                sidecar_pid,
-                crate::session_lease::recorded_start_time(sidecar_pid),
-            ),
-        );
-        crate::ownership_lane::register_partial_fresh_runtime(
-            &self.ownership,
-            PROVIDER,
-            &thread_id,
-            &own_ticket,
-            &thread_id,
-            sidecar_pid,
-        );
+        }
 
         self.finish_create(
             request_id,
@@ -20836,6 +20918,317 @@ pub(crate) mod tests {
                 freshell_ownership::OwnershipState::Vacant
             ),
             "the Vacant record is untouched by the refused fork"
+        );
+    }
+
+    // ── b8ke ext r22 F1: the fresh create is coordinator-owned from BEFORE spawn ──
+
+    /// b8ke ext r22 F1 (a+c): during the fresh create's spawn window the
+    /// coordinator shows a Starting record under the pane-scoped provisional
+    /// identity (the createRequestId) — a competing claim on that key is
+    /// refused typed, never a silent overlap — and the SAME ticket rekeys
+    /// at mint, so the completed create commits Live at the minted
+    /// canonical key with the provisional key left as the resolution alias.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fresh_create_window_holds_a_coordinator_starting_record() {
+        let _guard = ENV_LOCK.lock().await;
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        configure_fake_codex_cmd("{}");
+        let provisional = "pending-create-req-r22-window";
+
+        // Drive the create CONCURRENTLY so the spawn window is observable.
+        let task_st = st.clone();
+        let create = tokio::spawn(async move {
+            task_st
+                .handle_create(
+                    FreshAgentCreate {
+                        observed_epoch: None,
+                        observed_generation: None,
+                        request_id: "req-r22-window".to_string(),
+                        session_type: freshell_protocol::SessionType::Freshcodex,
+                        provider: Some(freshell_protocol::AgentProvider::Codex),
+                        cwd: None,
+                        legacy_restore_context: None,
+                        resume_session_id: None,
+                        session_ref: None,
+                        model: None,
+                        model_selection: None,
+                        permission_mode: None,
+                        sandbox: None,
+                        effort: None,
+                        plugins: None,
+                        tab_id: None,
+                    },
+                    None,
+                )
+                .await;
+        });
+
+        // THE WINDOW: the provisional record is Starting{FreshAgent} while
+        // the sidecar spawns (red pre-r22: no record at all — the poll
+        // starves).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if matches!(
+                registry.observe(PROVIDER, provisional).state,
+                freshell_ownership::OwnershipState::Starting { .. }
+            ) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the fresh create's spawn window never showed the provisional \
+                 Starting record (r22 F1)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // A competing claim on the pane-scoped key is refused typed — the
+        // window's record blocks, it is never silently overlapped.
+        assert!(matches!(
+            registry.begin_start(
+                PROVIDER,
+                provisional,
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "op-r22-compete",
+                None,
+                "test",
+                freshell_ownership::now_epoch_ms(),
+            ),
+            freshell_ownership::BeginOutcome::Blocked { .. }
+        ));
+
+        // Let the create finish: it commits Live at the minted key (the
+        // fake's deterministic thread id) with the SAME ticket, and the
+        // provisional key becomes the resolution alias.
+        create.await.expect("the create task joins");
+        let mut saw_created = false;
+        while let Ok(frame) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&frame).expect("json frame");
+            if frame["type"] == "freshAgent.created" {
+                saw_created = true;
+            }
+        }
+        assert!(saw_created, "the create answered created (r22 F1 (c))");
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, "thread-new-1").state,
+                freshell_ownership::OwnershipState::Live {
+                    owner,
+                    ..
+                } if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            ),
+            "the completed create commits Live at the minted canonical key — got {:?}",
+            registry.observe(PROVIDER, "thread-new-1").state
+        );
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, provisional).state,
+                freshell_ownership::OwnershipState::Aliased { to, .. } if to == "thread-new-1",
+            ),
+            "the provisional key is the rekey family's resolution alias"
+        );
+    }
+
+    /// b8ke ext r22 F1 (b): a spawn failure during the fresh-create window
+    /// settles the provisional record typed through the ticket — the
+    /// record is never left wedged in Starting and the create answers the
+    /// typed failure.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_spawn_failure_during_the_fresh_create_window_settles_the_provisional_record() {
+        let _guard = ENV_LOCK.lock().await;
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        // An invalid behavior JSON kills the fake sidecar on its FIRST method
+        // call (the lazy per-method parse throws) — a real spawn window (the
+        // node boot + the thread/start RPC) that ends in the typed
+        // CODEX_THREAD_START_FAILED failure.
+        configure_fake_codex_cmd("NOT-VALID-JSON-{{{");
+        let provisional = "pending-create-req-r22-fail";
+
+        let task_st = st.clone();
+        let create = tokio::spawn(async move {
+            task_st
+                .handle_create(
+                    FreshAgentCreate {
+                        observed_epoch: None,
+                        observed_generation: None,
+                        request_id: "req-r22-fail".to_string(),
+                        session_type: freshell_protocol::SessionType::Freshcodex,
+                        provider: Some(freshell_protocol::AgentProvider::Codex),
+                        cwd: None,
+                        legacy_restore_context: None,
+                        resume_session_id: None,
+                        session_ref: None,
+                        model: None,
+                        model_selection: None,
+                        permission_mode: None,
+                        sandbox: None,
+                        effort: None,
+                        plugins: None,
+                        tab_id: None,
+                    },
+                    None,
+                )
+                .await;
+        });
+
+        // The window's record exists BEFORE the failure lands.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if matches!(
+                registry.observe(PROVIDER, provisional).state,
+                freshell_ownership::OwnershipState::Starting { .. }
+            ) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the spawn-failure create never showed the provisional record"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // The failure lands: the ticket's RAII typed fail settles the
+        // provisional record — never a wedged Starting.
+        create.await.expect("the create task joins");
+        let mut failed_code = None;
+        while let Ok(frame) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&frame).expect("json frame");
+            if frame["type"] == "freshAgent.create.failed"
+                && frame["requestId"] == json!("req-r22-fail")
+            {
+                failed_code = frame["code"].as_str().map(str::to_string);
+            }
+        }
+        assert_eq!(
+            failed_code.as_deref(),
+            Some("CODEX_APP_SERVER_START_FAILED"),
+            "the spawn failure answers typed"
+        );
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, provisional).state,
+                freshell_ownership::OwnershipState::Vacant
+            ),
+            "the provisional record settles typed (Vacant) — got {:?}",
+            registry.observe(PROVIDER, provisional).state
+        );
+    }
+
+    /// b8ke ext r22 F1 (d): the minted-key-lost race — a competitor (a
+    /// terminal) claimed the freshly minted/discoverable thread id inside
+    /// the spawn window; the mint-time rekey REFUSES typed and the minted
+    /// runtime is torn down (never two writers, never an orphan), the
+    /// competitor's record untouched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_minted_key_lost_to_a_competing_owner_refuses_typed_and_tears_down() {
+        let _guard = ENV_LOCK.lock().await;
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        configure_fake_codex_cmd("{}");
+        let provisional = "pending-create-req-r22-lost";
+
+        // The competitor: a terminal owns the id the fake will mint
+        // (thread-new-1 — deterministic) from before the create starts.
+        let freshell_ownership::BeginOutcome::Granted {
+            generation: term_gen,
+        } = registry.begin_start(
+            PROVIDER,
+            "thread-new-1",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-r22-terminal",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        )
+        else {
+            panic!("expected Granted")
+        };
+        assert!(matches!(
+            registry.commit_live(
+                PROVIDER,
+                "thread-new-1",
+                "op-r22-terminal",
+                term_gen,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("t-r22".to_string()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: None,
+                }
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        ));
+
+        st.handle_create(
+            FreshAgentCreate {
+                observed_epoch: None,
+                observed_generation: None,
+                request_id: "req-r22-lost".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                provider: Some(freshell_protocol::AgentProvider::Codex),
+                cwd: None,
+                legacy_restore_context: None,
+                resume_session_id: None,
+                session_ref: None,
+                model: None,
+                model_selection: None,
+                permission_mode: None,
+                sandbox: None,
+                effort: None,
+                plugins: None,
+                tab_id: None,
+            },
+            None,
+        )
+        .await;
+
+        // The create answered the typed failure (the rekey refusal — the
+        // minted runtime is torn down: no created broadcast, no session
+        // row, the terminal's record untouched, the provisional record
+        // settled by the ticket's drop).
+        let mut failed_code = None;
+        while let Ok(frame) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&frame).expect("json frame");
+            if frame["type"] == "freshAgent.created" {
+                panic!("the minted-key-lost race must never answer created: {frame}");
+            }
+            if frame["type"] == "freshAgent.create.failed"
+                && frame["requestId"] == json!("req-r22-lost")
+            {
+                failed_code = frame["code"].as_str().map(str::to_string);
+            }
+        }
+        assert_eq!(
+            failed_code.as_deref(),
+            Some("FRESH_AGENT_CREATE_FAILED"),
+            "the minted-key-lost race answers the typed failure"
+        );
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, "thread-new-1").state,
+                freshell_ownership::OwnershipState::Live {
+                    owner,
+                    ..
+                } if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal,
+            ),
+            "the competitor's Live record is untouched"
+        );
+        assert!(
+            st.sessions.lock().await.get("thread-new-1").is_none(),
+            "the torn-down minted runtime never registers a session row"
+        );
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, provisional).state,
+                freshell_ownership::OwnershipState::Vacant
+            ),
+            "the provisional record settles typed after the refused rekey"
         );
     }
 
