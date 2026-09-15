@@ -1418,6 +1418,32 @@ describe('FreshAgentTranscript', () => {
       expect(module).toHaveTextContent(deadlineRaw)
     })
 
+    it('keeps a zero-item errored last turn visible while the transcript is streaming', () => {
+      render(
+        <FreshAgentTranscript
+          isStreaming
+          turns={[
+            {
+              id: 'turn-1', turnId: 'turn-1', role: 'assistant', summary: '', summaryKind: 'echo',
+              items: [{
+                id: 'tool-1', kind: 'dynamic_tool', namespace: 'opencode', tool: 'bash',
+                status: 'completed', arguments: { command: 'true' }, contentItems: ['ok'], success: true,
+              }],
+            },
+            {
+              id: 'turn-2', turnId: 'turn-2', role: 'assistant', summary: '', summaryKind: 'echo',
+              error: { name: 'UnknownError', message: deadlineRaw },
+              items: [],
+            },
+          ]}
+        />,
+      )
+
+      const module = screen.getByTestId('fresh-agent-turn-error')
+      expect(module).toHaveAttribute('role', 'alert')
+      expect(module).toHaveTextContent('request deadline exceeded after 1195s before the response completed')
+    })
+
     it('renders MessageAbortedError as a muted interrupted marker, never an error module', () => {
       render(
         <FreshAgentTranscript

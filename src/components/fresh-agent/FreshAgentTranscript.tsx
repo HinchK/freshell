@@ -1203,7 +1203,7 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
           const absorbed = turn.items.length > 0 && blocksForTurn.length === 0 && !turn.error
           const isLastStreaming = isStreaming && index === displayTurns.length - 1
           if (absorbed) return null
-          if (isLastStreaming && blocksForTurn.length === 0 && turn.items.length === 0 && liveActivityBlockId !== null) return null
+          if (isLastStreaming && blocksForTurn.length === 0 && turn.items.length === 0 && liveActivityBlockId !== null && !turn.error) return null
           // Fork/rewind/copy resolve to the article line's LAST contributing turn
           // (the most recent point the line covers), so the existing "fork from
           // the latest activity turn" protection survives merging.
