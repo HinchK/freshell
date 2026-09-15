@@ -4034,6 +4034,18 @@ describe('FreshAgentView', () => {
 
   it('dispatches slash compact with optional instructions over the fresh-agent channel', async () => {
     const store = createStore()
+    // b8ke ext r21 F2: the pane's session carries an owner record — the
+    // reshaped fenced expectation (epoch 12, generation 34) reads it.
+    store.dispatch(applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'opencode',
+      sessionId: 'freshopencode-req-compact',
+      epoch: 12,
+      generation: 34,
+      ownerKind: 'fresh-agent',
+      operationId: 'handoff-r21-existing',
+      transition: 'handoff-committed',
+    }))
     store.dispatch(initLayout({
       tabId: 'tab-1',
       paneId: 'pane-1',
@@ -4062,6 +4074,10 @@ describe('FreshAgentView', () => {
     })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
 
+    // b8ke ext r21 F2: the compact frame carries the session's observed
+    // (epoch, generation) fence — the seeded runtimeOwner record's pair —
+    // so a reconnect-replayed stale compact is typed-refused server-side,
+    // never an unfenced recreation.
     expect(wsMock.send).toHaveBeenCalledWith({
       type: 'freshAgent.compact',
       sessionId: 'freshopencode-req-compact',
@@ -4069,6 +4085,8 @@ describe('FreshAgentView', () => {
       provider: 'opencode',
       cwd: '/repo/route-aware',
       instructions: 'keep implementation notes',
+      observedEpoch: 12,
+      observedGeneration: 34,
     })
   })
 
@@ -9865,5 +9883,221 @@ describe('b8ke ext F1: locatorMatchesPane accepts canonical-session events for a
       undefined,
       runtimeOwners,
     )).toBe(false)
+  })
+})
+
+// ── b8ke ext r21 F2: the compact/undo/fork frames carry the observed fence ──
+
+describe('b8ke ext r21 F2: the compact/undo/fork senders carry the observed fence', () => {
+  function seedOwnerRecord(
+    store: ReturnType<typeof createStore>,
+    sessionId: string,
+    epoch: number,
+    generation: number,
+  ) {
+    store.dispatch(applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'opencode',
+      sessionId,
+      epoch,
+      generation,
+      ownerKind: 'fresh-agent',
+      operationId: `handoff-r21-${sessionId}`,
+      transition: 'handoff-committed',
+    }))
+  }
+
+  function getComposer() {
+    return screen.getByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+  }
+
+  it('/compact carries the session-owner fence on the wire', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'r21 compact',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [],
+    })
+    // The pane's session carries an owner record: (epoch 12, generation 34).
+    seedOwnerRecord(store, 'ses-r21-compact', 12, 34)
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-r21-compact',
+        sessionId: 'ses-r21-compact',
+        initialCwd: '/repo/r21',
+        status: 'idle',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(getComposer()).not.toBeDisabled())
+    wsMock.send.mockClear()
+
+    fireEvent.change(getComposer(), { target: { value: '/compact' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    // The queued frame carries the observed pair — the server's stale-pair
+    // rejection can refuse a reconnect-replayed stale compact, never an
+    // unfenced recreation.
+    expect(wsMock.send).toHaveBeenCalledWith({
+      type: 'freshAgent.compact',
+      sessionId: 'ses-r21-compact',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/r21',
+      observedEpoch: 12,
+      observedGeneration: 34,
+    })
+  })
+
+  it('/compact with NO owner record sends no pair (the legacy-unfenced shape)', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'r21 no-fence',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [],
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-r21-nofence',
+        sessionId: 'ses-r21-nofence',
+        initialCwd: '/repo/r21',
+        status: 'idle',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(getComposer()).not.toBeDisabled())
+    wsMock.send.mockClear()
+
+    fireEvent.change(getComposer(), { target: { value: '/compact' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    const frame = sentFreshAgentMessages('freshAgent.compact').at(-1)
+    expect(frame).toMatchObject({ type: 'freshAgent.compact', sessionId: 'ses-r21-nofence' })
+    expect(frame).not.toHaveProperty('observedEpoch')
+    expect(frame).not.toHaveProperty('observedGeneration')
+  })
+
+  it('/undo carries the session-owner fence on the wire', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'r21 undo',
+      capabilities: { send: true, interrupt: true, fork: true, undo: true, redo: true },
+      rollback: { canRedo: true, undoneDepth: 1 },
+      rolledBackTurns: [
+        { id: 'u9', turnId: 'u9', role: 'user', summary: 'rolled prompt', items: [{ id: 'u9-i', kind: 'text', text: 'rolled prompt' }], rolledBack: true },
+      ],
+      turns: [
+        { id: 'u1', turnId: 'u1', role: 'user', summary: 'first prompt', items: [{ id: 'u1-i', kind: 'text', text: 'first prompt' }] },
+      ],
+    })
+    seedOwnerRecord(store, 'ses-r21-undo', 5, 9)
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-r21-undo',
+        sessionId: 'ses-r21-undo',
+        initialCwd: '/repo/r21',
+        status: 'idle',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('first prompt')).toBeInTheDocument())
+    wsMock.send.mockClear()
+
+    fireEvent.change(getComposer(), { target: { value: '/undo' } })
+    fireEvent.keyDown(getComposer(), { key: 'Enter' })
+
+    const frame = sentFreshAgentMessages('freshAgent.undo').at(-1)
+    expect(frame).toMatchObject({
+      type: 'freshAgent.undo',
+      sessionId: 'ses-r21-undo',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      mode: 'step',
+      observedEpoch: 5,
+      observedGeneration: 9,
+    })
+  })
+
+  it('the Fork button carries the session-owner fence on the wire', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      status: 'idle',
+      summary: 'r21 fork',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [
+        {
+          id: 'turn-r21-fork',
+          turnId: 'turn-r21-fork',
+          role: 'assistant',
+          summary: 'Ready to fork',
+          items: [{ id: 'item-r21-fork', kind: 'text', text: 'Ready to fork' }],
+        },
+      ],
+    })
+    seedOwnerRecord(store, 'ses-r21-fork', 8, 21)
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-r21-fork',
+        sessionId: 'ses-r21-fork',
+        initialCwd: '/repo/r21',
+        status: 'idle',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Fork conversation from here' }))
+
+    // The fork frame carries the observed pair of the PARENT's session.
+    expect(wsMock.send).toHaveBeenCalledWith({
+      type: 'freshAgent.fork',
+      requestId: 'req-r21-fork',
+      sessionId: 'ses-r21-fork',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      tabId: 'tab-1',
+      cwd: '/repo/r21',
+      input: { atTurnId: 'turn-r21-fork' },
+      observedEpoch: 8,
+      observedGeneration: 21,
+    })
   })
 })

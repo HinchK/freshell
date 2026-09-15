@@ -6133,6 +6133,8 @@ async fn opencode_handoff_during_compaction_aborts_the_daemon_side_summarize() {
             session_type: SessionType::Freshopencode,
             cwd: Some("/tmp".to_string()),
             instructions: None,
+            observed_epoch: None,
+            observed_generation: None,
         })
         .await;
     env.await_audit_row(Duration::from_secs(20), |r| {

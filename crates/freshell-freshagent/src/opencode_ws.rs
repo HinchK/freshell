@@ -10727,6 +10727,8 @@ mod tests {
             session_type: SessionType::Freshopencode,
             cwd: None,
             instructions: None,
+            observed_epoch: None,
+            observed_generation: None,
         }
     }
 
@@ -12435,6 +12437,8 @@ mod tests {
             request_id: Some(request_id.to_string()),
             cwd: None,
             tab_id: None,
+            observed_epoch: None,
+            observed_generation: None,
         }
     }
 
@@ -13574,6 +13578,8 @@ mod tests {
             provider: AgentProvider::Opencode,
             request_id: request_id.into(),
             cwd: None,
+            observed_epoch: None,
+            observed_generation: None,
         }
     }
 

@@ -858,6 +858,12 @@ export const FreshAgentCompactSchema = z.object({
   provider: z.enum(['claude', 'codex', 'opencode']),
   cwd: z.string().optional(),
   instructions: z.string().trim().min(1).optional(),
+  /** b8ke ext r21 F2: the delayed-request fence (additive; the pair rides
+   *  the coordinator's generation discipline so a queued compact/undo/redo/
+   *  fork landing after a crash + generation advance is typed-refused,
+   *  never an unfenced recreation). */
+  observedEpoch: z.number().int().nonnegative().optional(),
+  observedGeneration: z.number().int().nonnegative().optional(),
 })
 
 export const FreshAgentApprovalRespondSchema = z.object({
@@ -904,6 +910,12 @@ export const FreshAgentForkSchema = z.object({
    * row's provenance stamps from the forking connection, `deviceId:tabId`.
    * Non-strict schema — tolerated by older servers. */
   tabId: z.string().min(1).optional(),
+  /** b8ke ext r21 F2: the delayed-request fence (additive; the pair rides
+   *  the coordinator's generation discipline so a queued compact/undo/redo/
+   *  fork landing after a crash + generation advance is typed-refused,
+   *  never an unfenced recreation). */
+  observedEpoch: z.number().int().nonnegative().optional(),
+  observedGeneration: z.number().int().nonnegative().optional(),
 })
 
 const freshAgentRollbackShape = {
@@ -914,6 +926,12 @@ const freshAgentRollbackShape = {
   cwd: z.string().optional(),
   mode: z.enum(['step', 'toTurn']).optional(),
   turnId: z.string().min(1).optional(),
+  /** b8ke ext r21 F2: the delayed-request fence (additive; the pair rides
+   *  the coordinator's generation discipline so a queued undo/redo landing
+   *  after a crash + generation advance is typed-refused, never an
+   *  unfenced recreation). */
+  observedEpoch: z.number().int().nonnegative().optional(),
+  observedGeneration: z.number().int().nonnegative().optional(),
 } as const
 
 /** kata 1wxv: conversation rollback. mode absent => 'step'. turnId required by the SERVER for 'toTurn'. */

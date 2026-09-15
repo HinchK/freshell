@@ -838,6 +838,15 @@ pub struct FreshAgentCompact {
     pub cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    /// b8ke ext r21 F2: the delayed-request fence (additive, parity with
+    /// send/attach/kill): the pair rides the coordinator's generation
+    /// discipline so a queued compact/undo/redo/fork landing after a
+    /// crash + generation advance is typed-refused, never an unfenced
+    /// recreation of the runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -905,6 +914,15 @@ pub struct FreshAgentFork {
     /// stamps the connection's identity without a tabKey).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tab_id: Option<String>,
+    /// b8ke ext r21 F2: the delayed-request fence (additive, parity with
+    /// send/attach/kill): the pair rides the coordinator's generation
+    /// discipline so a queued compact/undo/redo/fork landing after a
+    /// crash + generation advance is typed-refused, never an unfenced
+    /// recreation of the runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -928,6 +946,15 @@ pub struct FreshAgentUndo {
     pub turn_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// b8ke ext r21 F2: the delayed-request fence (additive, parity with
+    /// send/attach/kill): the pair rides the coordinator's generation
+    /// discipline so a queued compact/undo/redo/fork landing after a
+    /// crash + generation advance is typed-refused, never an unfenced
+    /// recreation of the runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -943,6 +970,15 @@ pub struct FreshAgentRedo {
     pub turn_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// b8ke ext r21 F2: the delayed-request fence (additive, parity with
+    /// send/attach/kill): the pair rides the coordinator's generation
+    /// discipline so a queued compact/undo/redo/fork landing after a
+    /// crash + generation advance is typed-refused, never an unfenced
+    /// recreation of the runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<u64>,
 }
 
 // --- hoststats.* -----------------------------------------------------------

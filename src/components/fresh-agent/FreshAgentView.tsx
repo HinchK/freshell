@@ -1426,6 +1426,12 @@ export function FreshAgentView({
     // fork mid-thread fork from the tip. D8 (focused-ep1-r5): `tabId` lets
     // the fork child row stamp this forking tab's identity — a forceNew
     // multi-tab fork must not inherit the OTHER tab's parked attribution.
+    // b8ke ext r21 F2: the fork's delayed-request fence (the r8 F5
+    // send/attach discipline): the observed pair rides the frame so a
+    // reconnect-replayed stale fork landing after a crash + generation
+    // advance is typed-refused server-side, never an unfenced recreation
+    // of the parent runtime.
+    const fence = selectPaneOwnerFence(appStore.getState(), current)
     sendFreshAgentMessage({
       type: 'freshAgent.fork',
       requestId: current.createRequestId,
@@ -1435,8 +1441,9 @@ export function FreshAgentView({
       tabId,
       ...(cwd ? { cwd } : {}),
       ...(atTurnId ? { input: { atTurnId } } : {}),
+      ...(fence ? { observedEpoch: fence.epoch, observedGeneration: fence.generation } : {}),
     })
-  }, [sendFreshAgentMessage, tabId])
+  }, [appStore, sendFreshAgentMessage, tabId])
 
   // kata 1wxv: rollback requests mint a requestId so the requesting-sink ack
   // (composer refill) and any rollback-flagged refusal route back to THIS pane;
@@ -1452,6 +1459,12 @@ export function FreshAgentView({
     const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
     const requestId = nanoid()
     pendingRollbackRef.current.set(requestId, { direction })
+    // b8ke ext r21 F2: the undo/redo delayed-request fence (the r8 F5
+    // send/attach discipline): the observed pair rides the frame so a
+    // reconnect-replayed stale rollback landing after a crash +
+    // generation advance is typed-refused server-side, never an
+    // unfenced recreation.
+    const fence = selectPaneOwnerFence(appStore.getState(), current)
     sendFreshAgentMessage(buildRollbackFrame({
       direction,
       requestId,
@@ -1461,8 +1474,9 @@ export function FreshAgentView({
       ...(cwd ? { cwd } : {}),
       mode,
       ...(turnId ? { turnId } : {}),
+      ...(fence ? { observedEpoch: fence.epoch, observedGeneration: fence.generation } : {}),
     }))
-  }, [sendFreshAgentMessage])
+  }, [appStore, sendFreshAgentMessage])
 
   const runSlashCommand = useCallback((command: FreshAgentSlashCommand, args: string) => {
     const current = paneContentRef.current
@@ -1479,6 +1493,12 @@ export function FreshAgentView({
     if (command.action === 'compact') {
       if (!current.sessionId) return
       const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
+      // b8ke ext r21 F2: the compact's delayed-request fence (the r8 F5
+      // send/attach discipline): the observed pair rides the frame so a
+      // reconnect-replayed stale compact landing after a crash +
+      // generation advance is typed-refused server-side, never an
+      // unfenced recreation.
+      const fence = selectPaneOwnerFence(appStore.getState(), current)
       sendFreshAgentMessage({
         type: 'freshAgent.compact',
         sessionId: current.sessionId,
@@ -1486,6 +1506,7 @@ export function FreshAgentView({
         provider: current.provider,
         ...(cwd ? { cwd } : {}),
         ...(args ? { instructions: args } : {}),
+        ...(fence ? { observedEpoch: fence.epoch, observedGeneration: fence.generation } : {}),
       })
       return
     }

@@ -16190,6 +16190,8 @@ rl.on('line', (line) => {
             session_type: SessionType::Freshclaude,
             cwd: None,
             instructions: instructions.map(str::to_string),
+            observed_epoch: None,
+            observed_generation: None,
         }
     }
 
@@ -17456,6 +17458,8 @@ rl.on('line', (line) => {
             provider: freshell_protocol::AgentProvider::Claude,
             request_id: request_id.to_string(),
             cwd: None,
+            observed_epoch: None,
+            observed_generation: None,
         }
     }
 

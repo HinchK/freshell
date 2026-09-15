@@ -81,6 +81,13 @@ pub struct RollbackRequest {
     pub provider: AgentProvider,
     pub request_id: String,
     pub cwd: Option<String>,
+    /// b8ke ext r21 F2: the caller's observed (epoch, generation) fence
+    /// (additive parity with send/attach): the reclaim-capable
+    /// ensure-alive claim consumes it, so a reconnect-replayed stale
+    /// undo/redo after a crash + generation advance is typed-refused,
+    /// never an unfenced recreation.
+    pub observed_epoch: Option<u64>,
+    pub observed_generation: Option<u64>,
 }
 
 fn request_mode(mode: Option<RollbackMode>) -> RollbackModeReq {
@@ -101,6 +108,8 @@ impl RollbackRequest {
             provider: m.provider,
             request_id: m.request_id,
             cwd: m.cwd,
+            observed_epoch: m.observed_epoch,
+            observed_generation: m.observed_generation,
         }
     }
 
@@ -114,6 +123,8 @@ impl RollbackRequest {
             provider: m.provider,
             request_id: m.request_id,
             cwd: m.cwd,
+            observed_epoch: m.observed_epoch,
+            observed_generation: m.observed_generation,
         }
     }
 }
