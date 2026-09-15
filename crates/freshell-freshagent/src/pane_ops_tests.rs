@@ -1192,6 +1192,177 @@ async fn respawn_resolves_a_create_failed_pane_through_the_layout_store() {
     state.terminal_registry.clone().unwrap().kill(&terminal_id);
 }
 
+/// b8ke ext r21 F1: a browser-content pane seed — the stale shape the
+/// authoritative snapshot must NOT keep after a respawn/attach recovers
+/// the pane (the finding's "old browser/error/detached content").
+fn r21_browser_content_ui_layout_sync(
+    pane_id: &str,
+    tab_id: &str,
+) -> freshell_protocol::UiLayoutSync {
+    freshell_protocol::UiLayoutSync {
+        tabs: vec![freshell_protocol::UiLayoutTab {
+            id: tab_id.to_string(),
+            title: Some("R21".to_string()),
+            fallback_session_ref: None,
+        }],
+        layouts: json!({
+            tab_id: {
+                "type": "leaf",
+                "id": pane_id,
+                "content": {
+                    "kind": "browser",
+                    "url": "https://example.com/stale",
+                    "devToolsOpen": false,
+                },
+            },
+        }),
+        active_pane: [(tab_id.to_string(), pane_id.to_string())]
+            .into_iter()
+            .collect(),
+        timestamp: 1,
+        active_tab_id: Some(Some(tab_id.to_string())),
+        pane_titles: None,
+        pane_title_set_by_user: None,
+    }
+}
+
+/// b8ke ext r21 F1: a HEADLESS respawn writes the recovered content through
+/// the AUTHORITATIVE LayoutStore at the moment of the reply — the snapshot
+/// (and the persisted layout a restart would load) carries the recovered
+/// terminal content (mode, cwd, sessionRef, terminalId) even with NO
+/// connected browser to mirror the pane.attach broadcast back. Pre-r21 the
+/// broadcast was the only write: lost with no observer, the snapshot kept
+/// the stale browser content.
+#[tokio::test]
+async fn respawn_writes_the_recovered_content_through_the_layout_store_headless() {
+    let state = state_with_registry().with_cli_commands(Arc::new(vec![task10_claude_spec()]));
+    let router = app(state.clone());
+
+    // A browser-created pane whose snapshot content is BROWSER content.
+    state.layout.update_from_ui(
+        &r21_browser_content_ui_layout_sync("pane-r21-f1-respawn", "tab-r21-f1-respawn"),
+        "client-r21-a",
+    );
+    let before = state
+        .layout
+        .get_pane_snapshot("pane-r21-f1-respawn")
+        .expect("the seeded pane resolves");
+    assert_eq!(
+        before.kind.as_deref(),
+        Some("browser"),
+        "red-harness sanity: the seed holds the stale browser content"
+    );
+
+    let tmp = std::env::temp_dir();
+    let (status, body) = post(
+        router,
+        "/api/panes/pane-r21-f1-respawn/respawn",
+        json!({
+            "mode": "claude",
+            "cwd": tmp.to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": "sid-r21-f1-respawn" },
+        }),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
+    assert!(!terminal_id.is_empty());
+
+    // THE AUTHORITATIVE SNAPSHOT (no browser ever observed the broadcast):
+    // the recovered terminal content — never the stale browser content.
+    let pane = state
+        .layout
+        .get_pane_snapshot("pane-r21-f1-respawn")
+        .expect("the pane stays resolvable in the authoritative store");
+    assert_eq!(
+        pane.kind.as_deref(),
+        Some("terminal"),
+        "the snapshot carries the recovered terminal content, not the stale browser content"
+    );
+    assert_eq!(pane.terminal_id.as_deref(), Some(terminal_id.as_str()));
+    let content = pane.pane_content.expect("the recovered content");
+    assert_eq!(content["mode"], json!("claude"));
+    assert_eq!(
+        content["sessionRef"]["sessionId"],
+        json!("sid-r21-f1-respawn")
+    );
+    assert_eq!(content["initialCwd"], json!(tmp.to_string_lossy()));
+    assert_eq!(content["terminalId"], json!(terminal_id));
+
+    state.terminal_registry.clone().unwrap().kill(&terminal_id);
+}
+
+/// b8ke ext r21 F1: the DIRECT ATTACH path writes through the authoritative
+/// LayoutStore too — a headless attach of a browser-content pane replaces
+/// the stale snapshot content with the bound terminal content at the moment
+/// of the reply (pre-r21 the broadcast was the only write).
+#[tokio::test]
+async fn attach_writes_the_rebound_content_through_the_layout_store_headless() {
+    const SID: &str = "33333333-4444-5555-8666-777777777777";
+    const TID: &str = "t-r21-live-owner";
+    let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+    let state = state_with_registry()
+        .with_ownership(ownership.clone())
+        .with_session_identity(Arc::new(Task10SessionIdentity {
+            provider: "claude",
+            session_id: SID,
+            terminal_id: TID,
+        }));
+    let registry = state.terminal_registry.clone().unwrap();
+    registry.register_headless(freshell_terminal::registry::HeadlessTerminal {
+        terminal_id: TID.to_string(),
+        stream_id: "s-r21".to_string(),
+        mode: "claude".to_string(),
+        resume_session_id: Some(SID.to_string()),
+        create_request_id: None,
+        created_at: None,
+    });
+    task10_seed_live_owner(
+        &ownership,
+        "claude",
+        SID,
+        freshell_ownership::RuntimeOwnerKind::Terminal,
+        None,
+    );
+
+    let router = app(state.clone());
+
+    // The pane exists ONLY in the synced layout, with stale browser content.
+    state.layout.update_from_ui(
+        &r21_browser_content_ui_layout_sync("pane-r21-f1-attach", "tab-r21-f1-attach"),
+        "client-r21-b",
+    );
+
+    let (status, body) = post(
+        router,
+        "/api/panes/pane-r21-f1-attach/attach",
+        json!({ "sessionRef": { "provider": "claude", "sessionId": SID } }),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["ok"], json!(true));
+    assert_eq!(body["data"]["terminalId"], json!(TID));
+
+    // THE AUTHORITATIVE SNAPSHOT: the re-bound terminal content.
+    let pane = state
+        .layout
+        .get_pane_snapshot("pane-r21-f1-attach")
+        .expect("the pane stays resolvable in the authoritative store");
+    assert_eq!(
+        pane.kind.as_deref(),
+        Some("terminal"),
+        "the snapshot carries the re-bound terminal content, not the stale browser content"
+    );
+    assert_eq!(pane.terminal_id.as_deref(), Some(TID));
+    let content = pane.pane_content.expect("the re-bound content");
+    assert_eq!(content["mode"], json!("claude"));
+    assert_eq!(content["terminalId"], json!(TID));
+    assert_eq!(content["liveTerminal"]["terminalId"], json!(TID));
+    assert_eq!(content["sessionRef"]["sessionId"], json!(SID));
+}
+
 /// kata b8ke Task 10 (round-1 review, authoritative registry): a pane that
 /// exists in a CONNECTED browser but missed the mirror debounce
 /// (create-then-immediately-respawn) is recovered by the re-sync

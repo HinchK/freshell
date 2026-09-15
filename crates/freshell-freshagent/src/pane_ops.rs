@@ -823,6 +823,17 @@ pub(crate) async fn respawn_pane(
         .expect("content_panes mutex")
         .remove(&pane_id);
 
+    // b8ke ext r21 F1: the recovered content is written through the
+    // AUTHORITATIVE LayoutStore at the moment of the reply — the snapshot
+    // (and the persisted layout a restart would load) carries the respawn
+    // result even with NO connected browser to mirror the pane.attach
+    // broadcast back (pre-r21 the broadcast was the only write, so a
+    // headless REST/MCP recovery, reconnect, or restart re-exposed the
+    // stale browser/error/detached content).
+    state
+        .layout
+        .attach_pane_content(&tab_id, &pane_id, pane_content.clone());
+
     state.broadcast(&ServerMessage::UiCommand(UiCommand {
         command: "pane.attach".to_string(),
         payload: Some(json!({ "tabId": tab_id, "paneId": pane_id, "content": pane_content })),
@@ -970,6 +981,14 @@ pub(crate) async fn attach_pane(
                 "status": "running",
                 "createRequestId": uuid::Uuid::new_v4().simple().to_string(),
             });
+            // b8ke ext r21 F1: the re-bound content is written through the
+            // AUTHORITATIVE LayoutStore here too — the snapshot (and the
+            // persisted layout a restart would load) carries the attach
+            // result at the moment of the reply, no browser observer
+            // required.
+            state
+                .layout
+                .attach_pane_content(&tab_id, &pane_id, content.clone());
             state.broadcast(&ServerMessage::UiCommand(UiCommand {
                 command: "pane.attach".to_string(),
                 payload: Some(json!({ "tabId": tab_id, "paneId": pane_id, "content": content })),
