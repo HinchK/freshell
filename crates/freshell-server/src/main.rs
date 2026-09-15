@@ -2285,22 +2285,32 @@ async fn main() -> ExitCode {
         broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
         sessions_revision: Arc<std::sync::atomic::AtomicI64>,
     }
-    impl freshell_freshagent::session_handoff::FlavorWrite for HandoffFlavorWriter {
-        fn write(
-            &self,
-            provider: &str,
-            session_id: &str,
-            flavor: &str,
+    /// b8ke ext r28 F4: the STAGED half — the durable mutation (the
+    /// store's atomic merge + rename + the changed-gated broadcast)
+    /// happens ONLY in `commit`, which the runner awaits AFTER the
+    /// coordinator commits Live(targetKind). A cancellation before the
+    /// commit drops this handle and NOTHING durable changed.
+    struct StagedHandoffFlavor {
+        store: session_metadata::SessionMetadataStore,
+        broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+        sessions_revision: Arc<std::sync::atomic::AtomicI64>,
+        provider: String,
+        session_id: String,
+        flavor: String,
+    }
+    impl freshell_freshagent::session_handoff::StagedFlavor for StagedHandoffFlavor {
+        fn commit(
+            self: Box<Self>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
         {
-            let store = self.store.clone();
-            let broadcast_tx = Arc::clone(&self.broadcast_tx);
-            let sessions_revision = Arc::clone(&self.sessions_revision);
-            let (provider, session_id, flavor) = (
-                provider.to_string(),
-                session_id.to_string(),
-                flavor.to_string(),
-            );
+            let StagedHandoffFlavor {
+                store,
+                broadcast_tx,
+                sessions_revision,
+                provider,
+                session_id,
+                flavor,
+            } = *self;
             Box::pin(async move {
                 session_metadata::apply_session_metadata(
                     &store,
@@ -2314,6 +2324,46 @@ async fn main() -> ExitCode {
                 .await
                 .map(|_| ())
                 .map_err(|err| err.to_string())
+            })
+        }
+    }
+    impl freshell_freshagent::session_handoff::FlavorWrite for HandoffFlavorWriter {
+        fn stage(
+            &self,
+            provider: &str,
+            session_id: &str,
+            flavor: &str,
+        ) -> freshell_freshagent::session_handoff::StagedFlavorFuture {
+            let store = self.store.clone();
+            let broadcast_tx = Arc::clone(&self.broadcast_tx);
+            let sessions_revision = Arc::clone(&self.sessions_revision);
+            let (provider, session_id, flavor) = (
+                provider.to_string(),
+                session_id.to_string(),
+                flavor.to_string(),
+            );
+            Box::pin(async move {
+                // b8ke ext r28 F4: the PRE-COMMIT probe — the metadata
+                // directory must accept a temp write BEFORE the target
+                // commits; a disk failure answers the typed
+                // SESSION_METADATA_WRITE_FAILED failure (the uncommitted
+                // target reaped), never a post-commit surprise. No
+                // durable mutation happens here.
+                store
+                    .probe_writable()
+                    .await
+                    .map_err(|err| err.to_string())?;
+                Ok(Some(Box::new(StagedHandoffFlavor {
+                    store,
+                    broadcast_tx,
+                    sessions_revision,
+                    provider,
+                    session_id,
+                    flavor,
+                })
+                    as Box<
+                        dyn freshell_freshagent::session_handoff::StagedFlavor,
+                    >))
             })
         }
 

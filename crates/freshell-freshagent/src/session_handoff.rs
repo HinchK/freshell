@@ -265,20 +265,43 @@ enum StopOutcomePriv {
 /// with the SAME fresh states, registry, coordinator, broadcast bus, and CLI
 /// specs every other lane holds.
 /// b8ke e3r1 F4 + e3r2 F3: the host-wired durable flavor writer. The
-/// handoff commit AWAITS `write` INSIDE the Handoff window (before the
-/// owner commit) — persistence completes before success returns, and the
-/// next handoff on the same session cannot begin until this write does
-/// (the coordinator's own generation discipline enforces the order), so
-/// a detached out-of-generation write overwriting a newer owner's flavor
-/// is impossible by construction. Failures surface as the typed
-/// SESSION_METADATA_WRITE_FAILED handoff failure.
-pub trait FlavorWrite: Send + Sync {
-    fn write(
-        &self,
-        provider: &str,
-        session_id: &str,
-        flavor: &str,
+/// handoff AWAITS `stage` INSIDE the Handoff window (before the owner
+/// commit) — stage performs every pre-commit check (the hidden-flavor
+/// resolution + the writability probe) WITHOUT the durable mutation.
+/// b8ke ext r28 F4: the write is TWO-PHASE — the durable mutation (the
+/// store's atomic rename) happens ONLY in the staged handle's `commit`,
+/// which the runner awaits AFTER the coordinator commits
+/// Live(targetKind). A cancellation anywhere before the commit drops the
+/// staged handle and NOTHING durable changed: the pre-r28 single-phase
+/// write renamed the metadata into place before a later awaited cleanup
+/// and before the commit, so an abort in that interval reaped the target
+/// and restored/fenced ownership while the persisted flavor already named
+/// the TARGET kind — restart recovery could then select a runtime kind
+/// that never became owner. Stage failures (disk unwritable, a failing
+/// writer) still surface as the typed SESSION_METADATA_WRITE_FAILED
+/// handoff failure (the uncommitted target reaped); a `commit` failure
+/// after the owner is committed is logged loud and the owner stands (the
+/// session runs; the next metadata write re-converges the flavor).
+pub trait StagedFlavor: Send {
+    /// The durable mutation — the ONE atomic write. Awaited only after
+    /// Live(targetKind) committed.
+    fn commit(
+        self: Box<Self>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
+}
+
+/// The staged-write future's shape ([`FlavorWrite::stage`]'s return).
+pub type StagedFlavorFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = StagedFlavorOutcome> + Send>>;
+/// [`FlavorWrite::stage`]'s outcome: the staged handle, or `Ok(None)` when
+/// the store already holds this flavor (a no-op — nothing to commit).
+pub type StagedFlavorOutcome = Result<Option<Box<dyn StagedFlavor>>, String>;
+
+pub trait FlavorWrite: Send + Sync {
+    /// The pre-commit phase: validate + prepare, NEVER durably mutate.
+    /// `Ok(None)` = the store already holds this flavor (a no-op —
+    /// nothing to commit).
+    fn stage(&self, provider: &str, session_id: &str, flavor: &str) -> StagedFlavorFuture;
 
     /// b8ke e3r3 F4: the session's CURRENT durable flavor — the
     /// hidden-flavor preservation read. A terminal-target handoff whose
@@ -1209,6 +1232,9 @@ impl SessionHandoffRunner {
                 // failure surfaces as the TYPED handoff failure (the
                 // spawned target is reaped + the entry fails, mirroring
                 // the stale-commit unwind — never log-only success).
+                // b8ke ext r28 F4: the STAGED flavor handle — stage pre-commit
+                // (inside the Handoff window), commit AFTER Live(targetKind).
+                let mut staged_flavor: Option<Box<dyn StagedFlavor>> = None;
                 if let Some(writer) = &self.flavor_writer {
                     // b8ke e3r3 F4: the durable flavor derives from the
                     // session's provider/kind pairing — NEVER the wire mode
@@ -1237,105 +1263,124 @@ impl SessionHandoffRunner {
                         }
                     };
                     if let Some(flavor) = flavor {
-                        if let Err(err) =
-                            writer.write(&req.provider, &req.session_id, &flavor).await
-                        {
-                            tracing::error!(target: "invariant",
-                                operation_id = %operation_id, provider = %req.provider,
-                                session_id = %req.session_id, flavor = %flavor,
-                                error = %err,
-                                event = "ownership.handoff.flavor_write_failed",
-                                "the durable flavor write failed inside the commit \
-                                 window — the uncommitted target is reaped and the \
-                                 handoff answers the typed failure"
-                            );
-                            let reap_outcome = self
-                                .reap_uncommitted_target(&req, &owner, &operation_id, generation)
-                                .await;
-                            if let StopOutcomePriv::PlatformLimitedFenced = reap_outcome {
-                                // b8ke d4 F1: the platform-limited teardown
-                                // fences the typed fence (no watcher can
-                                // ever confirm the descendant tree here).
-                                // b8ke e4 post-cap F2: the fence records
-                                // the UNCONFIRMED TARGET's identity — the
-                                // runtime with the unverifiable descendant
-                                // tree is the newly spawned target, not the
-                                // already-reaped source, so the snapshot/
-                                // broadcast/typed answers name the right
-                                // runtime.
-                                guard.disarm();
-                                let _ = self.ownership.fence_unconfirmed_handoff_with_prior(
-                                    &req.provider,
-                                    &req.session_id,
+                        // b8ke ext r28 F4: the STAGED (two-phase) flavor
+                        // write — `stage` performs the pre-commit checks
+                        // (writability probe; no durable mutation) inside
+                        // the Handoff window; the durable rename lands in
+                        // the staged handle's `commit`, awaited AFTER the
+                        // Live(targetKind) commit below. A cancellation
+                        // between the two drops the staged handle and
+                        // NOTHING durable changed — the pre-r28
+                        // single-phase write renamed the metadata into
+                        // place here, so an abort in the later awaited
+                        // cleanup (or before the commit) left the
+                        // persisted flavor naming the TARGET kind over a
+                        // reaped/fenced target.
+                        match writer.stage(&req.provider, &req.session_id, &flavor).await {
+                            Ok(staged) => staged_flavor = staged,
+                            Err(err) => {
+                                tracing::error!(target: "invariant",
+                                    operation_id = %operation_id, provider = %req.provider,
+                                    session_id = %req.session_id, flavor = %flavor,
+                                    error = %err,
+                                    event = "ownership.handoff.flavor_write_failed",
+                                    "the durable flavor write failed inside the commit \
+                                     window — the uncommitted target is reaped and the \
+                                     handoff answers the typed failure"
+                                );
+                                let reap_outcome = self
+                                    .reap_uncommitted_target(
+                                        &req,
+                                        &owner,
+                                        &operation_id,
+                                        generation,
+                                    )
+                                    .await;
+                                if let StopOutcomePriv::PlatformLimitedFenced = reap_outcome {
+                                    // b8ke d4 F1: the platform-limited teardown
+                                    // fences the typed fence (no watcher can
+                                    // ever confirm the descendant tree here).
+                                    // b8ke e4 post-cap F2: the fence records
+                                    // the UNCONFIRMED TARGET's identity — the
+                                    // runtime with the unverifiable descendant
+                                    // tree is the newly spawned target, not the
+                                    // already-reaped source, so the snapshot/
+                                    // broadcast/typed answers name the right
+                                    // runtime.
+                                    guard.disarm();
+                                    let _ = self.ownership.fence_unconfirmed_handoff_with_prior(
+                                        &req.provider,
+                                        &req.session_id,
+                                        &operation_id,
+                                        generation,
+                                        freshell_ownership::FenceReason::PlatformLimited,
+                                        Some((owner.clone(), generation)),
+                                    );
+                                } else if !self
+                                    .uncommitted_target_reap_vacates(&reap_outcome, &mut guard)
+                                {
+                                    tracing::warn!(target: "freshell_ownership",
+                                        operation_id = %operation_id,
+                                        provider = %req.provider,
+                                        session_id = %req.session_id,
+                                        "ownership.handoff.uncommitted_target_reap_unconfirmed: \
+                                         the flavor-write failure's target reap is unconfirmed — \
+                                         the key stays FENCED (the detached watcher resolves it), \
+                                         never Vacant over an unconfirmed target");
+                                }
+                                self.broadcast_failure_truth(
+                                    &req,
                                     &operation_id,
                                     generation,
-                                    freshell_ownership::FenceReason::PlatformLimited,
-                                    Some((owner.clone(), generation)),
+                                    prior_kind,
+                                    "SESSION_METADATA_WRITE_FAILED",
+                                )
+                                .await;
+                                let current = self
+                                    .ownership
+                                    .observe(&req.provider, &req.session_id)
+                                    .generation;
+                                // b8ke e4r1 F2: the truthful outcome label —
+                                // the reap's CONFIRMATION class, never a
+                                // blanket "reaped" (a timeout/platform-limited
+                                // reap was explicitly NOT confirmed; the old
+                                // label recorded the opposite of the
+                                // safety-critical outcome).
+                                let outcome =
+                                    if Self::uncommitted_target_reap_confirmed(&reap_outcome) {
+                                        "flavor_write_failed_target_reaped"
+                                    } else {
+                                        "flavor_write_failed_target_unconfirmed"
+                                    };
+                                self.log_transition(
+                                    TransitionLog {
+                                        operation_id: &operation_id,
+                                        provider: &req.provider,
+                                        session_id: &req.session_id,
+                                        initiator: &initiator,
+                                        epoch: self.ownership.boot_epoch(),
+                                        generation,
+                                        live_session_key: owner.live_session_key.as_deref(),
+                                        from_kind: prior_kind,
+                                        to_kind: Some(owner.kind),
+                                        runtime_id: owner.terminal_id.as_deref(),
+                                        pid: owner.pid,
+                                        outcome,
+                                        duration_ms: began.elapsed().as_millis() as u64,
+                                        failure_reason: Some("SESSION_METADATA_WRITE_FAILED"),
+                                        stale: None,
+                                    },
+                                    "ownership.handoff.done",
+                                    TransitionLevel::Error,
                                 );
-                            } else if !self
-                                .uncommitted_target_reap_vacates(&reap_outcome, &mut guard)
-                            {
-                                tracing::warn!(target: "freshell_ownership",
-                                    operation_id = %operation_id,
-                                    provider = %req.provider,
-                                    session_id = %req.session_id,
-                                    "ownership.handoff.uncommitted_target_reap_unconfirmed: \
-                                     the flavor-write failure's target reap is unconfirmed — \
-                                     the key stays FENCED (the detached watcher resolves it), \
-                                     never Vacant over an unconfirmed target");
+                                return typed_failure(
+                                    "SESSION_METADATA_WRITE_FAILED",
+                                    "the handoff switched the runtime but could not persist the \
+                                     session's durable flavor; retry the handoff",
+                                    true,
+                                    current,
+                                );
                             }
-                            self.broadcast_failure_truth(
-                                &req,
-                                &operation_id,
-                                generation,
-                                prior_kind,
-                                "SESSION_METADATA_WRITE_FAILED",
-                            )
-                            .await;
-                            let current = self
-                                .ownership
-                                .observe(&req.provider, &req.session_id)
-                                .generation;
-                            // b8ke e4r1 F2: the truthful outcome label —
-                            // the reap's CONFIRMATION class, never a
-                            // blanket "reaped" (a timeout/platform-limited
-                            // reap was explicitly NOT confirmed; the old
-                            // label recorded the opposite of the
-                            // safety-critical outcome).
-                            let outcome = if Self::uncommitted_target_reap_confirmed(&reap_outcome)
-                            {
-                                "flavor_write_failed_target_reaped"
-                            } else {
-                                "flavor_write_failed_target_unconfirmed"
-                            };
-                            self.log_transition(
-                                TransitionLog {
-                                    operation_id: &operation_id,
-                                    provider: &req.provider,
-                                    session_id: &req.session_id,
-                                    initiator: &initiator,
-                                    epoch: self.ownership.boot_epoch(),
-                                    generation,
-                                    live_session_key: owner.live_session_key.as_deref(),
-                                    from_kind: prior_kind,
-                                    to_kind: Some(owner.kind),
-                                    runtime_id: owner.terminal_id.as_deref(),
-                                    pid: owner.pid,
-                                    outcome,
-                                    duration_ms: began.elapsed().as_millis() as u64,
-                                    failure_reason: Some("SESSION_METADATA_WRITE_FAILED"),
-                                    stale: None,
-                                },
-                                "ownership.handoff.done",
-                                TransitionLevel::Error,
-                            );
-                            return typed_failure(
-                                "SESSION_METADATA_WRITE_FAILED",
-                                "the handoff switched the runtime but could not persist the \
-                                 session's durable flavor; retry the handoff",
-                                true,
-                                current,
-                            );
                         }
                     }
                 }
@@ -1368,9 +1413,25 @@ impl SessionHandoffRunner {
                             None,
                             None,
                         );
-                        // (The durable flavor write already landed — e3r2
-                        // F3 moved it INSIDE the Handoff window, before
-                        // the owner commit, awaited.)
+                        // b8ke ext r28 F4: the durable flavor mutation lands
+                        // HERE — AFTER the coordinator committed
+                        // Live(targetKind). The staged handle's Drop (an
+                        // abort anywhere before this point) removed its
+                        // probe residue and NOTHING durable changed; a
+                        // commit failure here is logged loud and the
+                        // committed owner stands (the session runs; the
+                        // next metadata write re-converges the flavor) —
+                        // never a reaped committed owner over metadata.
+                        if let Some(staged) = staged_flavor.take() {
+                            if let Err(err) = staged.commit().await {
+                                tracing::error!(target: "invariant",
+                                    operation_id = %operation_id, provider = %req.provider,
+                                    session_id = %req.session_id, error = %err,
+                                    event = "ownership.handoff.flavor_commit_failed_post_commit",
+                                    "the durable flavor rename failed AFTER the owner                                      committed — the committed owner stands; the flavor                                      re-converges on the next metadata write (kata b8ke                                      ext r28 F4)"
+                                );
+                            }
+                        }
                         self.log_transition(
                             TransitionLog {
                                 operation_id: &operation_id,

@@ -372,24 +372,43 @@ fn sleeper_cli_spec(name: &str) -> freshell_platform::CliCommandSpec {
 type FlavorWriteLog = Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
 
 /// The recording writer (the rig's default): records (provider, session,
-/// flavor) and succeeds.
+/// flavor) and succeeds. b8ke ext r28 F4: TWO-PHASE — the log entry lands
+/// at the staged handle's COMMIT (after Live(targetKind)), never at stage.
 struct RecordingFlavorWriter {
     log: FlavorWriteLog,
 }
 
+struct StagedRecordingFlavor {
+    log: FlavorWriteLog,
+    entry: (String, String, String),
+}
+
+impl crate::session_handoff::StagedFlavor for StagedRecordingFlavor {
+    fn commit(
+        self: Box<Self>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
+        self.log.lock().expect("flavor log lock").push(self.entry);
+        Box::pin(std::future::ready(Ok(())))
+    }
+}
+
 impl crate::session_handoff::FlavorWrite for RecordingFlavorWriter {
-    fn write(
+    fn stage(
         &self,
         provider: &str,
         session_id: &str,
         flavor: &str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
-        self.log.lock().expect("flavor log lock").push((
-            provider.to_string(),
-            session_id.to_string(),
-            flavor.to_string(),
-        ));
-        Box::pin(std::future::ready(Ok(())))
+    ) -> crate::session_handoff::StagedFlavorFuture {
+        let staged: Box<dyn crate::session_handoff::StagedFlavor> =
+            Box::new(StagedRecordingFlavor {
+                log: Arc::clone(&self.log),
+                entry: (
+                    provider.to_string(),
+                    session_id.to_string(),
+                    flavor.to_string(),
+                ),
+            });
+        Box::pin(std::future::ready(Ok(Some(staged))))
     }
 }
 
@@ -2060,18 +2079,21 @@ struct FixedFlavorWriter {
 }
 
 impl crate::session_handoff::FlavorWrite for FixedFlavorWriter {
-    fn write(
+    fn stage(
         &self,
         provider: &str,
         session_id: &str,
         flavor: &str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
-        self.log.lock().expect("flavor log lock").push((
+    ) -> crate::session_handoff::StagedFlavorFuture {
+        let log = Arc::clone(&self.log);
+        let entry = (
             provider.to_string(),
             session_id.to_string(),
             flavor.to_string(),
-        ));
-        Box::pin(std::future::ready(Ok(())))
+        );
+        let staged: Box<dyn crate::session_handoff::StagedFlavor> =
+            Box::new(StagedLoggingFlavor { log, entry });
+        Box::pin(std::future::ready(Ok(Some(staged))))
     }
 
     fn current_flavor(
@@ -3042,6 +3064,193 @@ async fn the_confirmed_reap_flavor_failure_broadcasts_the_truthful_vacancy() {
 /// AlreadyGone/Reaped answer was converted to a confirmed reap and
 /// `abort_cleanup` VACATED while the first teardown was unconfirmed
 /// (a competing lifecycle request could start a second writer).
+/// b8ke ext r28 F4: the cancellation-atomicity driver — a fake whose
+/// STAGE performs the durable-mutation precursor (the temp write,
+/// modeled by the `staged_tmp` log) and THEN blocks, so the abort
+/// lands with the precursor done but NOTHING promoted (the `durable`
+/// log — the rename model — must stay empty). Pre-r28 the single-phase
+/// write performed the durable mutation before its park, so an abort in
+/// that interval left the persisted flavor naming the TARGET kind over
+/// a reaped/fenced target: restart recovery could select a runtime kind
+/// that never became owner.
+struct TwoPhaseProbeFlavorWriter {
+    staged_tmp: FlavorWriteLog,
+    durable: FlavorWriteLog,
+    release: Arc<tokio::sync::Notify>,
+    reached: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct StagedTwoPhaseProbe {
+    durable: FlavorWriteLog,
+    entry: (String, String, String),
+}
+
+impl crate::session_handoff::StagedFlavor for StagedTwoPhaseProbe {
+    fn commit(
+        self: Box<Self>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
+        self.durable
+            .lock()
+            .expect("durable flavor log lock")
+            .push(self.entry);
+        Box::pin(std::future::ready(Ok(())))
+    }
+}
+
+impl crate::session_handoff::FlavorWrite for TwoPhaseProbeFlavorWriter {
+    fn stage(
+        &self,
+        provider: &str,
+        session_id: &str,
+        flavor: &str,
+    ) -> crate::session_handoff::StagedFlavorFuture {
+        // Perform the durable-mutation precursor and THEN block — the
+        // reviewer's exact reshaped shape (pre-r28 the fake blocked BEFORE
+        // performing any durable mutation, so the mismatch was
+        // untestable).
+        self.staged_tmp.lock().expect("staged tmp log lock").push((
+            provider.to_string(),
+            session_id.to_string(),
+            flavor.to_string(),
+        ));
+        self.reached
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let release = Arc::clone(&self.release);
+        let durable = Arc::clone(&self.durable);
+        let entry = (
+            provider.to_string(),
+            session_id.to_string(),
+            flavor.to_string(),
+        );
+        Box::pin(async move {
+            let _ = release.notified().await;
+            let staged: Box<dyn crate::session_handoff::StagedFlavor> =
+                Box::new(StagedTwoPhaseProbe { durable, entry });
+            Ok(Some(staged))
+        })
+    }
+}
+
+/// b8ke ext r28 F4: an abort AFTER the staged flavor precursor but
+/// BEFORE the Live(targetKind) commit NEVER persists the target flavor —
+/// the durable mutation is the staged handle's commit, which the abort
+/// drops (restart recovery can never select a runtime kind that never
+/// became owner); the guard's cleanup still fences/restores ownership
+/// exactly as before.
+#[tokio::test]
+async fn an_abort_after_the_staged_flavor_precursor_never_persists_the_target_flavor() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let store_dir =
+        std::env::temp_dir().join(format!("freshell-r28-f4-store-{}", uuid_like_suffix()));
+    let project_dir = store_dir.join("projects").join("slug");
+    std::fs::create_dir_all(&project_dir).expect("create transcript project dir");
+    std::fs::write(
+        project_dir.join(format!("{sid}.jsonl")),
+        "{\"cwd\": \"/tmp\"}\n",
+    )
+    .expect("write fake transcript");
+    std::env::set_var("CLAUDE_CONFIG_DIR", &store_dir);
+
+    let staged_tmp: FlavorWriteLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let durable: FlavorWriteLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let rig = build_rig_inner(
+        None,
+        None,
+        None,
+        10_000,
+        None,
+        false,
+        Some(Arc::new(TwoPhaseProbeFlavorWriter {
+            staged_tmp: Arc::clone(&staged_tmp),
+            durable: Arc::clone(&durable),
+            release: Arc::clone(&release),
+            reached: Arc::clone(&reached),
+        })),
+        None,
+    );
+    establish_fresh_claude_owner(&rig, &sid).await;
+
+    // The handoff to a terminal target stages its flavor (the precursor
+    // lands) and parks BEFORE the staged handle returns.
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let HandoffHandle {
+        mut completion,
+        task,
+    } = handle;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            result = &mut completion => {
+                panic!("the handoff failed before its flavor stage: {result:?}");
+            }
+        }
+        if reached.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the handoff never reached its flavor stage"
+        );
+    }
+    assert_eq!(
+        staged_tmp.lock().expect("staged tmp log lock").len(),
+        1,
+        "fixture: the durable-mutation precursor RAN (the window is real)"
+    );
+
+    // ABORT inside the stage park — after the precursor, before the
+    // commit. The guard's cleanup runs (ownership settles), and the
+    // staged handle is dropped with the task: NOTHING is promoted.
+    task.abort();
+    let _ = task.await;
+
+    // THE r28 F4 CONTRACT: the durable log is EMPTY — the target flavor
+    // was never renamed into place, so restart recovery never selects a
+    // runtime kind that never became owner. (Pre-r28 the single-phase
+    // write had already performed the durable mutation before its park —
+    // the reshaped fake proves the rollback/atomicity, not a pre-mutation
+    // park.)
+    assert_eq!(
+        durable.lock().expect("durable flavor log lock").len(),
+        0,
+        "the aborted handoff persisted NO target flavor"
+    );
+    // The precursor did run — the suppression is the atomicity, not a
+    // stage that never reached its write.
+    assert_eq!(
+        staged_tmp.lock().expect("staged tmp log lock").len(),
+        1,
+        "the precursor ran and was abandoned (never promoted)"
+    );
+
+    // Ownership settles to the typed recoverable state exactly as the
+    // pre-r28 abort contract demands (the prior was reaped; the target
+    // was spawned — the guard's cleanup fences, never vacates over an
+    // unconfirmed target).
+    await_cond("the aborted handoff must settle (fenced)", || {
+        matches!(
+            rig.ownership.observe("claude", &sid).state,
+            OwnershipState::Fenced { .. } | OwnershipState::Vacant
+        )
+    })
+    .await;
+    // Release the parked stage (its task is gone; the notify is inert —
+    // drop the permit so the test's runtime winds down cleanly).
+    release.notify_one();
+
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+    let _ = std::fs::remove_dir_all(&store_dir);
+    let _ = _env;
+}
+
 #[tokio::test]
 async fn an_abort_in_the_flavor_window_with_an_unconfirmed_target_teardown_fences_not_vacates() {
     let _guard = ENV_LOCK.lock().await;
@@ -3174,44 +3383,62 @@ async fn an_abort_in_the_flavor_window_with_an_unconfirmed_target_teardown_fence
 struct FailingFlavorWriter;
 
 impl crate::session_handoff::FlavorWrite for FailingFlavorWriter {
-    fn write(
+    fn stage(
         &self,
         _provider: &str,
         _session_id: &str,
         _flavor: &str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
+    ) -> crate::session_handoff::StagedFlavorFuture {
         Box::pin(std::future::ready(Err(
             "metadata store write failed (test)".to_string(),
         )))
     }
 }
 
-/// b8ke e3r2 F3: a BLOCKING writer — parks inside the write until released
-/// (the generation-order test's window).
+/// b8ke e3r2 F3: a BLOCKING writer — parks inside the STAGE until released
+/// (the generation-order/abort-window tests' hold). b8ke ext r28 F4:
+/// TWO-PHASE — the log entry lands at the staged handle's COMMIT.
 struct BlockingFlavorWriter {
     log: FlavorWriteLog,
     release: Arc<tokio::sync::Notify>,
     reached: Arc<std::sync::atomic::AtomicBool>,
 }
 
+struct StagedLoggingFlavor {
+    log: FlavorWriteLog,
+    entry: (String, String, String),
+}
+
+impl crate::session_handoff::StagedFlavor for StagedLoggingFlavor {
+    fn commit(
+        self: Box<Self>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
+        self.log.lock().expect("flavor log lock").push(self.entry);
+        Box::pin(std::future::ready(Ok(())))
+    }
+}
+
 impl crate::session_handoff::FlavorWrite for BlockingFlavorWriter {
-    fn write(
+    fn stage(
         &self,
         provider: &str,
         session_id: &str,
         flavor: &str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
-        self.log.lock().expect("flavor log lock").push((
-            provider.to_string(),
-            session_id.to_string(),
-            flavor.to_string(),
-        ));
+    ) -> crate::session_handoff::StagedFlavorFuture {
         self.reached
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let release = Arc::clone(&self.release);
+        let log = Arc::clone(&self.log);
+        let entry = (
+            provider.to_string(),
+            session_id.to_string(),
+            flavor.to_string(),
+        );
         Box::pin(async move {
             let _ = release.notified().await;
-            Ok(())
+            let staged: Box<dyn crate::session_handoff::StagedFlavor> =
+                Box::new(StagedLoggingFlavor { log, entry });
+            Ok(Some(staged))
         })
     }
 }
@@ -3280,10 +3507,14 @@ async fn the_flavor_write_serializes_consecutive_handoffs_in_generation_order() 
     // coordinator's own generation discipline blocks it (pre-e3r2 the
     // detached post-commit write let B proceed and its flavor could land
     // before A's).
+    // b8ke ext r28 F4 reshape: NOTHING durable has landed while A's stage
+    // is parked — the rename waits for the owner commit (the pre-r28
+    // single-phase writer recorded A's flavor here, pre-park).
     assert_eq!(
         log.lock().expect("flavor log lock").len(),
-        1,
-        "A's write is recorded (pre-park) and B's has NOT landed"
+        0,
+        "A's flavor is staged but NOT durably landed (the rename waits for \
+         the Live commit) and B's has NOT landed"
     );
     let handle_b = rig
         .runner

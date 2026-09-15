@@ -263,6 +263,32 @@ impl SessionMetadataStore {
         *guard = Some(data);
         Ok(())
     }
+
+    /// b8ke ext r28 F4: the handoff flavor write's PRE-COMMIT probe —
+    /// proves the metadata directory accepts a temp write WITHOUT any
+    /// durable mutation (the probe file is removed immediately). The
+    /// runner stages the flavor inside the Handoff window: a disk
+    /// failure here answers the typed SESSION_METADATA_WRITE_FAILED
+    /// failure BEFORE the target commits (the e3r2 F3 contract), while
+    /// the durable rename happens only in the staged commit — after
+    /// Live(targetKind). A dropped staged future can leak at most this
+    /// inert, never-renamed probe file.
+    pub async fn probe_writable(&self) -> std::io::Result<()> {
+        let dir = self
+            .path
+            .parent()
+            .expect("session-metadata.json always has a parent directory");
+        tokio::fs::create_dir_all(dir).await?;
+        let pid = std::process::id();
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let probe_path = dir.join(format!("session-metadata.json.probe-{pid}-{millis}"));
+        tokio::fs::write(&probe_path, b"probe").await?;
+        let _ = tokio::fs::remove_file(&probe_path).await;
+        Ok(())
+    }
 }
 
 /// `shouldApplySessionTypeMetadata` (`shared/session-flavor.ts:79-90`).
