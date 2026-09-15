@@ -5574,16 +5574,18 @@ async fn an_attach_while_a_fresh_agent_owns_answers_the_typed_fresh_owner_confli
     r24_natural_exit(&ws_state, "claude", &sid, &terminal_id).await;
 
     // Another device establishes Live{FreshAgent} for the same session.
-    let freshell_ownership::BeginOutcome::Granted { generation: fresh_gen } =
-        ownership.begin_start(
-            "claude",
-            &sid,
-            freshell_ownership::RuntimeOwnerKind::FreshAgent,
-            "op-r24-fresh-owner",
-            None,
-            "test",
-            freshell_ownership::now_epoch_ms(),
-        ) else {
+    let freshell_ownership::BeginOutcome::Granted {
+        generation: fresh_gen,
+    } = ownership.begin_start(
+        "claude",
+        &sid,
+        freshell_ownership::RuntimeOwnerKind::FreshAgent,
+        "op-r24-fresh-owner",
+        None,
+        "test",
+        freshell_ownership::now_epoch_ms(),
+    )
+    else {
         panic!("expected Granted")
     };
     assert!(matches!(
@@ -5637,14 +5639,11 @@ async fn an_attach_while_a_fresh_agent_owns_answers_the_typed_fresh_owner_confli
     // NO attach.ready for the refused attach (a bounded drain finds none).
     let deadline = tokio::time::Instant::now() + Duration::from_millis(750);
     while tokio::time::Instant::now() < deadline {
-        if let Ok(Some(Ok(msg))) =
-            tokio::time::timeout(Duration::from_millis(250), ws.next()).await
+        if let Ok(Some(Ok(msg))) = tokio::time::timeout(Duration::from_millis(250), ws.next()).await
         {
             if let WsMessage::Text(text) = msg {
                 let v: Value = serde_json::from_str(&text).unwrap();
-                if v["type"] == "terminal.attach.ready"
-                    && v["terminalId"] == json!(terminal_id)
-                {
+                if v["type"] == "terminal.attach.ready" && v["terminalId"] == json!(terminal_id) {
                     panic!("no attach.ready may follow the typed conflict: {v}");
                 }
             }
@@ -5711,7 +5710,10 @@ async fn an_attach_while_a_different_terminal_owns_answers_the_typed_other_termi
         .as_str()
         .expect("terminalId")
         .to_string();
-    assert_ne!(terminal_a, terminal_b, "the new owner is a different terminal");
+    assert_ne!(
+        terminal_a, terminal_b,
+        "the new owner is a different terminal"
+    );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         match ownership.observe("claude", &sid).state {
@@ -5783,9 +5785,7 @@ async fn an_attach_while_a_different_terminal_owns_answers_the_typed_other_termi
         {
             if let WsMessage::Text(text) = msg {
                 let v: Value = serde_json::from_str(&text).unwrap();
-                if v["type"] == "terminal.attach.ready"
-                    && v["terminalId"] == json!(terminal_a)
-                {
+                if v["type"] == "terminal.attach.ready" && v["terminalId"] == json!(terminal_a) {
                     panic!("no attach.ready may follow the typed conflict: {v}");
                 }
             }

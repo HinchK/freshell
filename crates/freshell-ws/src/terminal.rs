@@ -1201,8 +1201,7 @@ async fn handle_client_text(
                         // restamp and no attach.ready on any conflict arm —
                         // the early return precedes the guard, the restamp,
                         // and the attach registration.
-                        if let freshell_ownership::OwnershipState::Live { owner, .. } =
-                            &snap.state
+                        if let freshell_ownership::OwnershipState::Live { owner, .. } = &snap.state
                         {
                             let same_terminal = owner.kind
                                 == freshell_ownership::RuntimeOwnerKind::Terminal
@@ -1215,31 +1214,31 @@ async fn handle_client_text(
                                         "fresh-agent"
                                     }
                                 };
-                                let live_terminal_id =
-                                    if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal
-                                    {
-                                        owner.terminal_id.clone()
-                                    } else {
-                                        None
-                                    };
-                                let message =
-                                    if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
-                                    {
-                                        format!(
-                                            "This session is currently owned by a Fresh Agent \
+                                let live_terminal_id = if owner.kind
+                                    == freshell_ownership::RuntimeOwnerKind::Terminal
+                                {
+                                    owner.terminal_id.clone()
+                                } else {
+                                    None
+                                };
+                                let message = if owner.kind
+                                    == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                                {
+                                    format!(
+                                        "This session is currently owned by a Fresh Agent \
                                              (opened as Fresh Agent elsewhere); retry after it \
                                              settles or attach from the Fresh Agent pane. \
                                              (session {})",
-                                            session_ref.session_id
-                                        )
-                                    } else {
-                                        format!(
-                                            "This session is currently owned by a different \
+                                        session_ref.session_id
+                                    )
+                                } else {
+                                    format!(
+                                        "This session is currently owned by a different \
                                              terminal; the old terminal is no longer the \
                                              session's runtime. (session {})",
-                                            session_ref.session_id
-                                        )
-                                    };
+                                        session_ref.session_id
+                                    )
+                                };
                                 tracing::warn!(
                                     target: "freshell_ws::terminal",
                                     terminal_id = %attach.terminal_id,
@@ -9141,7 +9140,13 @@ mod terminal_kill_stop_wedge_tests {
         let (state, ownership, terminal_id) =
             state_with_live_terminal_owner(crate::pane_ledger::PaneLedger::disabled());
         let mut ws_tx = test_sink();
-        handle_kill(kill_for(&terminal_id), &mut ws_tx, &state, "ws-kill-conn-test").await;
+        handle_kill(
+            kill_for(&terminal_id),
+            &mut ws_tx,
+            &state,
+            "ws-kill-conn-test",
+        )
+        .await;
         assert!(
             matches!(
                 ownership.observe(KILL_PROVIDER, KILL_SESSION).state,
@@ -9183,7 +9188,13 @@ mod terminal_kill_stop_wedge_tests {
         ledger.fail_next_close_envelope_writes(1);
         let (state, ownership, terminal_id) = state_with_live_terminal_owner(ledger);
         let mut ws_tx = test_sink();
-        handle_kill(kill_for(&terminal_id), &mut ws_tx, &state, "ws-kill-conn-test").await;
+        handle_kill(
+            kill_for(&terminal_id),
+            &mut ws_tx,
+            &state,
+            "ws-kill-conn-test",
+        )
+        .await;
         match ownership.observe(KILL_PROVIDER, KILL_SESSION).state {
             freshell_ownership::OwnershipState::Live {
                 owner, generation, ..
@@ -9205,7 +9216,13 @@ mod terminal_kill_stop_wedge_tests {
         // The retry (the ledger's injected failure was one-shot) must be
         // granted and complete — the full unwedge, end to end.
         let mut ws_tx = test_sink();
-        handle_kill(kill_for(&terminal_id), &mut ws_tx, &state, "ws-kill-conn-test").await;
+        handle_kill(
+            kill_for(&terminal_id),
+            &mut ws_tx,
+            &state,
+            "ws-kill-conn-test",
+        )
+        .await;
         assert!(
             matches!(
                 ownership.observe(KILL_PROVIDER, KILL_SESSION).state,
