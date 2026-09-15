@@ -157,7 +157,8 @@ struct DirItem {
     /// `shared/read-models.ts`; Node's `CodingCliSession.tokenUsage`,
     /// `coding-cli/types.ts:190`). Powers the fresh-agent strip's context
     /// meter (`compactPercent` etc.). `None` when the source carries none
-    /// (opencode direct rows, live-terminal synthesized items).
+    /// (live-terminal synthesized items; opencode direct rows carry real
+    /// step-finish usage since the context-meter fix).
     token_usage: Option<freshell_sessions::meta::TokenSummary>,
     /// b5fb provenance exposure (`SessionDirectoryItem.titleOverridden`,
     /// `shared/read-models.ts`): `true` exactly when a stored `titleOverride`
@@ -4205,7 +4206,9 @@ mod tests {
     // -- Batch C: CodexSource + OpencodeSource wired into the same
     //    `SessionIndex`-backed handler --
 
-    use freshell_sessions::directory_index::{CodexSource, OpencodeSource};
+    use freshell_sessions::directory_index::{
+        CodexSource, OpencodeModelLimitResolver, OpencodeSource,
+    };
 
     /// A codex `session_meta` with `payload.source == "exec"` -- a
     /// non-interactive (`codex exec`) run -- must be HIDDEN by the default
@@ -4463,6 +4466,209 @@ mod tests {
             json!("/tmp/real/dir"),
             "wire projectPath must be the cwd, not '/'"
         );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── STATUS-STRIP: opencode context-meter token usage on the wire ──
+    //
+    // The e2e-of-record for the opencode meter's data path: real fixture
+    // opencode.db -> real `OpencodeSource` (resolver injected) -> real
+    // `SessionIndex` -> real router -> the `SessionDirectoryItem.tokenUsage`
+    // JSON the client's zod schema parses.
+
+    /// The usage-bearing fixture opencode data home (Task 3's fixture
+    /// shape, mirroring the inline construction of the neighboring
+    /// fixture-db tests above): one session in `/repo/x` whose `model`
+    /// column derives the composite `lunaroute/glm-5.3-vision-background`,
+    /// plus an assistant message whose last part is a step-finish carrying
+    /// the tokens the meter reads. Built in a temp dir only — never the
+    /// user's real opencode db.
+    fn fixture_opencode_data_home_with_usage(home: &Path) -> PathBuf {
+        let data_home = home.join("opencode-data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        {
+            let conn = rusqlite::Connection::open(data_home.join("opencode.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT);
+                 CREATE TABLE session (
+                    id TEXT PRIMARY KEY, directory TEXT, title TEXT,
+                    time_created INTEGER, time_updated INTEGER, time_archived INTEGER,
+                    project_id TEXT, parent_id TEXT, model TEXT
+                 );
+                 CREATE TABLE message (
+                    id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+                 CREATE TABLE part (
+                    id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+                    time_created INTEGER NOT NULL, time_updated INTEGER, data TEXT);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session VALUES ('ses_usage','/repo/x','Named',1000,5000,NULL,NULL,NULL,?1)",
+                rusqlite::params![
+                    r#"{"id":"glm-5.3-vision-background","providerID":"lunaroute","variant":"default"}"#
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO message VALUES ('msg_usage','ses_usage',200,'{\"role\":\"assistant\"}')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO part VALUES ('prt_usage','msg_usage','ses_usage',1000,1000,?1)",
+                rusqlite::params![
+                    r#"{"reason":"stop","type":"step-finish","tokens":{"total":395980,"input":31,"output":556,"reasoning":1,"cache":{"write":0,"read":395392}},"cost":0}"#
+                ],
+            )
+            .unwrap();
+        }
+        data_home
+    }
+
+    /// The resolver matching the fixture model to the lunaroute deployment
+    /// limits (524,288-token context, 131,072-token output — the numbers
+    /// the plan's wire assertions are computed from).
+    fn lunaroute_usage_resolver() -> OpencodeModelLimitResolver {
+        std::sync::Arc::new(|_cwd: &str, model: &str| match model {
+            "lunaroute/glm-5.3-vision-background" => {
+                Some(freshell_sessions::parse::OpencodeModelLimits {
+                    context: 524_288,
+                    input: None,
+                    output: Some(131_072),
+                })
+            }
+            _ => None,
+        })
+    }
+
+    /// The neighboring fixture-db wiring tests' app/state construction,
+    /// with the opencode source's resolver injection as the only knob.
+    /// Returns the parsed directory page (the HTTP response is consumed
+    /// here so every test asserts on the same real wire JSON) plus the
+    /// temp home for cleanup.
+    async fn opencode_usage_fixture_app(
+        resolver: Option<OpencodeModelLimitResolver>,
+    ) -> (Value, PathBuf) {
+        use tower::ServiceExt;
+
+        let home = unique_temp_dir();
+        std::fs::create_dir_all(&home).unwrap();
+        let data_home = fixture_opencode_data_home_with_usage(&home);
+        let source = match resolver {
+            Some(resolver) => OpencodeSource::new(data_home).with_model_limit_resolver(resolver),
+            None => OpencodeSource::new(data_home),
+        };
+        let settings = crate::settings_store::SettingsStore::load(
+            Some(&home),
+            vec!["codex".into(), "opencode".into()],
+        );
+        let auth_token: Arc<String> = Arc::new("tok".into());
+        let session_index = Arc::new(test_session_index(vec![
+            Arc::new(source) as Arc<dyn SessionSource>
+        ]));
+        let state = SessionDirectoryState {
+            auth_token,
+            settings,
+            session_index: Some(session_index),
+            identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+            metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+            server_instance: std::sync::Arc::new("srv-test".to_string()),
+        };
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/api/session-directory?priority=visible&includeEmpty=1")
+                    .header("x-auth-token", "tok")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: Value = serde_json::from_slice(&bytes).unwrap();
+        (page, home)
+    }
+
+    #[tokio::test]
+    async fn opencode_session_directory_items_carry_context_meter_token_usage() {
+        // fixture opencode.db: one session with model JSON + a last
+        // step-finish carrying tokens, indexed through a REAL OpencodeSource
+        // whose resolver returns the lunaroute deployment limits.
+        let (page, home) = opencode_usage_fixture_app(Some(lunaroute_usage_resolver())).await;
+        let item = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["provider"] == "opencode")
+            .expect("opencode item present");
+        let usage = &item["tokenUsage"];
+        assert_eq!(usage["inputTokens"], 31);
+        assert_eq!(usage["outputTokens"], 556);
+        assert_eq!(usage["cachedTokens"], 395_392);
+        assert_eq!(usage["totalTokens"], 395_980);
+        assert_eq!(usage["contextTokens"], 395_980);
+        assert_eq!(usage["modelContextWindow"], 524_288);
+        assert_eq!(usage["compactThresholdTokens"], 492_288);
+        assert_eq!(usage["compactPercent"], 80);
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test]
+    async fn opencode_items_without_resolver_omit_meter_fields_on_the_wire() {
+        // same fixture, NO resolver: tokenUsage still present with the
+        // required counters, and compactThresholdTokens/compactPercent
+        // keys ABSENT (zod .optional() semantics) -> client meter muted.
+        let (page, home) = opencode_usage_fixture_app(None).await;
+        let item = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["provider"] == "opencode")
+            .expect("opencode item present");
+        let usage = &item["tokenUsage"];
+        assert_eq!(usage["contextTokens"], 395_980);
+        assert!(usage.get("compactThresholdTokens").is_none());
+        assert!(usage.get("compactPercent").is_none());
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test]
+    async fn opencode_items_with_zero_context_limits_omit_window_and_meter_fields() {
+        // F1's wire contract: a RESOLVED zero-context limit must NOT emit
+        // modelContextWindow at all (zod `.positive()` — a 0 would reject the
+        // whole page parse at api.ts:646/:681). Same fixture; the resolver
+        // maps the model to {context: 0, input: None, output: None}.
+        let resolver: OpencodeModelLimitResolver =
+            std::sync::Arc::new(|_cwd: &str, model: &str| match model {
+                "lunaroute/glm-5.3-vision-background" => {
+                    Some(freshell_sessions::parse::OpencodeModelLimits {
+                        context: 0,
+                        input: None,
+                        output: None,
+                    })
+                }
+                _ => None,
+            });
+        let (page, home) = opencode_usage_fixture_app(Some(resolver)).await;
+        let item = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["provider"] == "opencode")
+            .expect("opencode item present");
+        let usage = &item["tokenUsage"];
+        assert_eq!(usage["inputTokens"], 31);
+        assert!(usage.get("modelContextWindow").is_none());
+        assert!(usage.get("compactThresholdTokens").is_none());
+        assert!(usage.get("compactPercent").is_none());
 
         std::fs::remove_dir_all(&home).ok();
     }

@@ -628,8 +628,11 @@ export function FreshAgentView({
   })
   // Status-strip context meter source: the unified usage map stamped by
   // committed sidebar refreshes (fresh rows + out-of-band extras). Deliberately
-  // NOT the fresh-agent snapshot tokenUsage — it never carries compactPercent,
-  // so reading it would be a silent "always unknown" bug.
+  // NOT the fresh-agent snapshot tokenUsage — that channel never carries
+  // compactPercent on any provider, so reading it would be a silent
+  // "always unknown" bug. (The session-directory channel itself carries
+  // complete opencode usage too — see
+  // docs/plans/2026-09-14-freshopencode-context-meter.md.)
   const hasUnresolvedLocalEchoForSession = useAppSelector((state) => {
     if (!paneContent.sessionId) return false
     return Object.values(state.panes.layouts).some((layout) => {
