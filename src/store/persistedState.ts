@@ -426,6 +426,7 @@ export type ParsedPersistedLayout = {
   panes: ParsedPersistedPanes
   tombstones: Array<{ id: string; deletedAt: number }>
   persistedAt?: number
+  machineId?: string
 }
 
 export type LayoutFreshAgentCommitMarker = {
@@ -554,6 +555,7 @@ export function parsePersistedLayoutRaw(raw: string): ParsedPersistedLayout | nu
     },
     tombstones: res.data.tombstones || [],
     persistedAt: typeof (res.data as any).persistedAt === 'number' ? (res.data as any).persistedAt : undefined,
+    machineId: typeof (res.data as any).machineId === 'string' ? (res.data as any).machineId : undefined,
   }
 }
 

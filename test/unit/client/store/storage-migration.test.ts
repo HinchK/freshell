@@ -438,4 +438,49 @@ describe('storage-migration', () => {
 
     expect(second).toEqual(first)
   })
+
+  it('carries the machineId stamp through the every-boot layout rewrite (LB-05)', async () => {
+    localStorage.setItem('freshell_version', '5')
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify({
+      persistedAt: 1_760_000_000_000,
+      version: 4,
+      machineId: 'machine-stamp-1',
+      tabs: {
+        activeTabId: 'tab-1',
+        tabs: [{ id: 'tab-1', title: 'Work', createdAt: 1 }],
+      },
+      panes: {
+        version: 7,
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'editor',
+              filePath: '/tmp/a.md',
+              language: null,
+              readOnly: false,
+              content: '',
+              viewMode: 'source',
+              wordWrap: true,
+            },
+          },
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    }))
+
+    await importFreshStorageMigration()
+
+    const migratedRaw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+    expect(migratedRaw).not.toBeNull()
+    expect(JSON.parse(migratedRaw!).machineId).toBe('machine-stamp-1')
+
+    const parsed = parsePersistedLayoutRaw(migratedRaw!)
+    expect(parsed).not.toBeNull()
+    expect(parsed?.machineId).toBe('machine-stamp-1')
+  })
 })

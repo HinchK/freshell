@@ -1,6 +1,7 @@
 import type { Middleware } from '@reduxjs/toolkit'
 import type { TabsState } from './tabsSlice'
 import type { PanesState } from './paneTypes'
+import type { MachineIdentityState } from './machineIdentitySlice.js'
 import type { Tab } from './types'
 import { nanoid } from 'nanoid'
 import { broadcastPersistedRaw } from './persistBroadcast'
@@ -16,6 +17,7 @@ import {
 } from './persistedState.js'
 import { LAYOUT_BACKUP_STORAGE_KEY, LAYOUT_STORAGE_KEY, PANES_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY, TURN_COMPLETION_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
+import { getSelectedMachineId } from '@/lib/machine-identity'
 import { flushPersistedLayoutNow } from './persistControl'
 import { sanitizeSessionRef } from '@shared/session-contract'
 import { normalizeFreshAgentEffortOverride, normalizeFreshAgentPaneModelSelection } from './paneTypes'
@@ -498,6 +500,20 @@ type PersistState = {
   panes?: PanesState
   tabRecency?: TabRecencyState
   turnCompletion?: TurnCompletionState
+  machineIdentity?: MachineIdentityState
+}
+
+/** Machine id for the persisted-layout stamp: the resolved machine when
+ * known, else the remembered selection (the same localStorage key the
+ * chooser writes), else undefined (envelope stays unstamped). */
+function selectStampMachineId(state: PersistState): string | undefined {
+  const known = state.machineIdentity?.selectedMachine?.id
+  if (typeof known === 'string' && known) return known
+  try {
+    return getSelectedMachineId() ?? undefined
+  } catch {
+    return undefined
+  }
 }
 
 export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
@@ -630,6 +646,7 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
         const layoutPayload = {
           persistedAt: Date.now(),
           version: LAYOUT_SCHEMA_VERSION,
+          machineId: selectStampMachineId(state),
           tabs: {
             activeTabId: state.tabs?.activeTabId ?? null,
             tabs: (state.tabs?.tabs ?? []).map(stripTabVolatileFields),

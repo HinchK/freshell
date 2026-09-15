@@ -412,6 +412,7 @@ function migratePersistedLayout(): PersistedLayoutMigrationResult {
   const migratedRaw = JSON.stringify({
     persistedAt: typeof parsed.persistedAt === 'number' ? parsed.persistedAt : Date.now(),
     version: LAYOUT_SCHEMA_VERSION,
+    machineId: typeof parsed.machineId === 'string' && parsed.machineId ? parsed.machineId : undefined,
     tabs: {
       ...parsed.tabs,
       activeTabId: parsed.tabs.activeTabId ?? null,
