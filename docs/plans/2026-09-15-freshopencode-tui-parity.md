@@ -35,7 +35,7 @@
 ## Global Constraints
 
 - **Rust-only backend.** The Node server is fully retired at base_ref (commit a7d36d5f8); `server/fresh-agent/**` does not exist. The User Request's "Node and Rust normalizers stay in sync" is satisfied vacuously; the live surfaces are `shared/fresh-agent-contract.ts` (zod), the Rust normalizer in `crates/freshell-freshagent/src/lib.rs`, and the client. Never re-create Node-side adapters.
-- **Strict schemas.** Every zod variant is `.strict()`: every field the Rust producer emits must exist in the schema, and vice versa. Contract changes must be additive (new union members + optional fields) so old payloads keep parsing. The client zod-parses snapshots (src/lib/api.ts), so contract and Rust changes must not ship without each other.
+- **Strict schemas.** Every zod variant is `.strict()`: every field the Rust producer emits must exist in the schema, and vice versa. Contract changes must be additive (new union members + optional fields) so old payloads keep parsing. The client zod-parses snapshots and THROWS `FreshAgentApiContractError` on unknown item kinds (src/lib/api.ts:445–449) — additive contract growth therefore relies on the repo's established buildId self-heal (the `ready` frame's buildId mismatch reloads a stale client once per tab session; see AGENTS.md "WebSocket Protocol"). Client and server must ship atomically in one PR, exactly as every prior item-kind addition did. Never widen the contract without shipping the client rendering in the same change.
 - **NodeNext/ESM.** Relative TypeScript imports need explicit `.js` extensions. Path aliases: `@/` → src/, `@shared` → shared/, `@test` → test/.
 - **A11y.** New interactive elements (the "Open session" button) need real button semantics + `aria-label`; icon-only indicators need `aria-label`s. `npm run lint` (jsx-a11y) is a CI requirement.
 - **Test commands.** Focused vitest: `npm run test:vitest -- run <paths> --config config/vitest/vitest.config.ts` (repo-owned passthrough). Focused Rust: `cargo test -p freshell-freshagent --lib <filter> --locked` (narrowed selectors are delegated/uncoordinated). E2E local: `npm run test:e2e:chromium -- test/e2e-browser/specs/<spec>.ts`. Broad suites only via the coordinator (`npm test`) — never raw broad runs. Do NOT add the new spec to `CLOUD_SKIP_SPECS` (test/e2e-browser/playwright.cloud.config.ts); affected e2e specs must pass on the configured backend (local this run).
@@ -561,12 +561,18 @@ git commit -m "feat(freshagent): opencode task delegations, retry + subtask item
 ### Task 3: Rust child-session join — embed child activity rows and refresh the parent on child events
 
 **Files:**
-- Modify: `crates/freshell-freshagent/src/lib.rs` (`get_opencode_snapshot` at line 820 — attach the join after `build_opencode_snapshot_json`; add `attach_child_activity` + `opencode_child_activity_rows`)
-- Modify: `crates/freshell-freshagent/src/opencode_ws.rs` (child→parent link registry + watcher on `FreshOpencodeState`, line ~92; prune on session removal in `handle_kill`/cleanup paths)
-- Test: `crates/freshell-freshagent/src/opencode_ws.rs` (`mod tests` line 3520, `FakeHttp` pattern at 3540) and `crates/freshell-freshagent/src/lib.rs` (`mod tests`)
+- Modify: `crates/freshell-freshagent/src/lib.rs` (`get_opencode_snapshot` at line 820 — attach the join + registration after `build_opencode_snapshot_json`; add `attach_child_activity`, `opencode_child_activity_rows`, the child-watcher registry and `spawn_child_watcher` on `FreshAgentState`)
+- Test: `crates/freshell-freshagent/src/lib.rs` (`mod tests` at line 3198)
+
+**Load-bearing decisions baked into this task (Stage 2, ledger LB-2/LB-3/LB-6/LB-7/LB-8):**
+- The join, the child→parent registry, and the watcher all live on **`FreshAgentState`** (lib.rs) — NOT on `opencode_ws.rs`'s `FreshOpencodeState`. The join call site is the REST `get_opencode_snapshot` (the single client-visible snapshot producer; the WS module only broadcasts events), and `FreshOpencodeState` cannot be reached from there. `FreshAgentState` already owns `ensure_manager`, the broadcast, and the serve bridge — everything the watcher needs.
+- Registration re-arms on EVERY snapshot build: each `get_opencode_snapshot` call re-discovers child ids and ensures a watcher exists per child (active-watcher set). A watcher that exits removes its registry entry, so the next parent build re-arms it — dead watchers never cause permanent refresh loss.
+- The watcher's recv loop mirrors `spawn_serve_bridge`'s exact tolerance arms (opencode_ws.rs:3310–3315): `Ok(SessionSignal::Lost) => {}` continue, `Err(RecvError::Lagged(_)) => {}` continue, `Err(RecvError::Closed) => break`. A burst of child events must not silently kill the live refresh.
+- Activity rows are capped at 200 per delegation (full detail lives in the child session pane — recorded residual). Child fetches use the parent's Route (children share the parent's cwd by task-tool semantics) and accept a single message page per child (serve's `list_messages` does not thread the pagination cursor; truncation is acceptable for a summary). A 404 child yields an empty array — silent BY DESIGN (a pruned child correctly contributes no rows); `tracing::warn!` fires only on transport errors.
+- If the REAL opencode serve ever fails to emit child-session `message.*` events on `/global/event`, the join degrades gracefully: the parent's own `message.updated` events (task part state changes at start/end) still rebuild the snapshot and refresh the rows — no compensating machinery (ledger LB-5 residual).
 
 **Interfaces:**
-- Consumes: `OpencodeServeManager::list_messages(id, route)` (crates/freshell-opencode/src/serve.rs:961 — `GET /session/:id/message`, 404→empty array), `OpencodeServeManager::subscribe(session_id)` (serve.rs:1162), `SessionSignal::Event` + `serve_event_to_sdk` (events.rs), the ws `changed_event`/`event_frame` helpers used by `spawn_serve_bridge` (opencode_ws.rs ~3265–3305), and Task 2's `opencode_child_activity_preview`.
+- Consumes: `OpencodeServeManager::list_messages(id, route)` (crates/freshell-opencode/src/serve.rs:961 — `GET /session/:id/message`, 404→empty array), `OpencodeServeManager::subscribe(session_id)` (serve.rs:1162), `SessionSignal::Event` + `parse_serve_event` (events.rs:121 — child session ids arrive via `properties.sessionID`/`part.sessionID`/`info.sessionID`), the ws `changed_event`/`event_frame` helpers used by `spawn_serve_bridge` (opencode_ws.rs ~3265–3305 — locate the definitions once and reuse; if they are private to `opencode_ws`, make them `pub(crate)` in place), and Task 2's `opencode_child_activity_preview`.
 - Produces: every client-visible opencode snapshot's `task_delegation` items carry `activity: [{tool, status, preview}]` for their child sessions; a child session `message.*` event causes a `freshAgent.session.changed` frame for the PARENT session id (reason `opencode-message`), which drives the client's existing snapshot refetch.
 
 - [ ] **Step 1: Write the failing Rust tests**
@@ -593,13 +599,22 @@ fn opencode_child_activity_rows_collects_tool_parts_from_child_messages() {
         json!({ "tool": "read", "status": "running", "preview": "src/index.css" }),
     ]);
 }
+
+#[test]
+fn opencode_child_activity_rows_cap_at_200() {
+    let parts: Vec<Value> = (0..250)
+        .map(|i| json!({ "type": "tool", "tool": "bash", "state": { "status": "completed", "input": { "command": format!("echo {i}") } } }))
+        .collect();
+    let messages = vec![json!({ "info": { "id": "m", "role": "assistant" }, "parts": parts })];
+    assert_eq!(opencode_child_activity_rows(&messages).len(), 200);
+}
 ```
 
-1b. End-to-end join test in opencode_ws.rs `mod tests` (FakeHttp): the fake serve answers `GET /session/ses_c/message` with the child messages above; a parent session `ses_p` (inserted via the existing test helper used by `get_opencode_snapshot_of_live_placeholder…`-style tests) whose message list contains the Task-2 task tool part with `state.metadata.sessionId = "ses_c"`. Assert `st.get_opencode_snapshot("ses_p", None)` returns a snapshot whose `task_delegation` item has the three activity rows. Model the setup on the existing `get_opencode_snapshot_returns_a_schema_shaped_snapshot_with_turn_text` test (lib.rs:3457) and the FakeHttp serving of `/session/:id/message` it already implements for transcript capture — extend the fake's routed responses for the child session id.
+1b. End-to-end join test (lib.rs `mod tests`, using the crate's existing fake-serve seam the way `get_opencode_snapshot_returns_a_schema_shaped_snapshot_with_turn_text` at line 3457 drives `get_opencode_snapshot`): the fake serve answers `GET /session/ses_p` + `GET /session/ses_p/message` with the parent (its assistant message contains the Task-2 task tool part with `state.metadata.sessionId = "ses_c"`) and `GET /session/ses_c/message` with the child messages above. Assert `get_opencode_snapshot("ses_p", None)` returns a snapshot whose `task_delegation` item has the three activity rows. Extend the existing fake's routed responses for the child session id (follow the fake's existing message-serving structure).
 
-1c. Live-refresh test in opencode_ws.rs `mod tests`: after building the parent snapshot once (which registers the child link), dispatch a `message.updated` SSE event for `ses_c` through the injected event-stream seam (the same mechanism existing tests use to script `session.idle`/`message.*` events for a session), then assert the ws sink receives a `freshAgent.session.changed` frame addressed to `ses_p` with reason `opencode-message` (use the existing `frames_until(&mut rx, |f| is_event(f, "freshAgent.session.changed", …))` helper).
+1c. Live-refresh test (same seam): after building the parent snapshot once (which registers the child link + watcher), dispatch a `message.updated` serve event carrying the CHILD session id (`properties.info.sessionID = "ses_c"`) through the manager's scripted event path, then assert a `freshAgent.session.changed` frame addressed to `ses_p` with reason `opencode-message` reaches the broadcast sink (use the existing `frames_until(&mut rx, |f| is_event(f, "freshAgent.session.changed", …))` helper pattern).
 
-1d. Graceful-degradation test: when `GET /session/<child>/message` 404s (child pruned), `get_opencode_snapshot` still succeeds and the `task_delegation` item simply has no `activity` key.
+1d. Graceful-degradation tests: when `GET /session/ses_c/message` 404s (child pruned), `get_opencode_snapshot` still succeeds and the `task_delegation` item simply has no `activity` key; when the child fetch errors on transport, the snapshot still succeeds (warn logged).
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
@@ -660,46 +675,64 @@ async fn attach_child_activity(manager: &OpencodeServeManager, route: &Route, sn
 }
 ```
 
-Call it in `get_opencode_snapshot` (line ~820): after the existing `build_opencode_snapshot_json` call produces the snapshot `Value` and before it is returned, run `attach_child_activity(&manager, &route, &mut snapshot).await` using the same manager handle and `Route` the function already uses for its session/message fetches (thread the values already in scope; if `get_opencode_snapshot` does not hold a manager yet, obtain it through the same manager cell accessor `opencode_ws` uses — `ensure_manager` (lib.rs ~748) — and the existing route resolution used by `list_messages` callers).
-
-3b. opencode_ws.rs — child-link registry + watcher on `FreshOpencodeState`:
+Call both pieces in `get_opencode_snapshot` (line ~820): replace the final `Ok(build_opencode_snapshot_json(thread_id, &info, &messages, rollback.as_ref()))` with:
 
 ```rust
-// Child→parent session links discovered from task_delegation items. Keyed by
-// child session id; drives live parent refresh on child message events.
-child_links: std::sync::Mutex<HashMap<String, String>>,
+        let mut snapshot = build_opencode_snapshot_json(thread_id, &info, &messages, rollback.as_ref());
+        // Server-side child-session join (Stage-2 ledger LB-2): this REST builder is the
+        // single client-visible snapshot producer, so the join AND the live-refresh
+        // registry live here, on FreshAgentState — reachable for every session
+        // (live or sidebar-opened durable), re-armed on every build (LB-8).
+        attach_child_activity(&manager, &route, &mut snapshot).await;
+        self.ensure_child_watchers(&manager, thread_id, &snapshot);
+        Ok(snapshot)
 ```
 
-Registration: after `get_opencode_snapshot` builds a snapshot for a live session (same call path that broadcasts/returns it), scan the snapshot's `turns[].items[]` for `task_delegation` items with `childSessionId`, and for each NEW (child, parent) pair call `spawn_child_watcher(manager.clone(), parent_id, child_id)`.
+And the registry + watcher on `FreshAgentState` (lib.rs, near the other shared opencode state):
 
 ```rust
-/// Map child-session `message.*` activity onto the PARENT's transcript
-/// invalidation: every child message event re-broadcasts
-/// `freshAgent.session.changed` for the parent (reason "opencode-message"),
-/// which triggers the client's existing snapshot refetch (the join in
-/// `attach_child_activity` then picks up fresh child rows). Exits when the
-/// parent session is no longer live so watchers never leak.
-fn spawn_child_watcher(&self, manager: OpencodeServeManager, parent_id: String, child_id: String) {
-    let fresh_agent = self.fresh_agent.clone();
-    let mut rx = manager.subscribe(&child_id);
-    tokio::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(SessionSignal::Event(parsed)) => {
-                    if !parsed.kind.starts_with("message.") { continue; }
-                    if !fresh_agent_has_live_session(&fresh_agent, &parent_id).await { break; }
-                    fresh_agent.broadcast(&event_frame(&parent_id, changed_event(&parent_id, "opencode-message")));
+/// Child→parent session links discovered from task_delegation items, with the
+/// set of children that have a live watcher spawned. Guarded by a std Mutex
+/// with short critical sections. Watchers self-remove on exit; every snapshot
+/// build re-arms missing ones.
+child_watchers: std::sync::Mutex<std::collections::HashMap<String, String>>,
+
+const OPENCODE_CHILD_ACTIVITY_ROW_CAP: usize = 200;
+
+fn ensure_child_watchers(&self, manager: &OpencodeServeManager, parent_id: &str, snapshot: &Value) {
+    for child in opencode_snapshot_child_session_ids(snapshot) {
+        let mut watchers = self.child_watchers.lock().expect("child_watchers poisoned");
+        if watchers.contains_key(&child) { continue; }
+        watchers.insert(child.clone(), parent_id.to_string());
+        drop(watchers);
+        let manager = manager.clone_handle_for_watcher(); // however spawn_serve_bridge clones the manager into a task
+        let fresh_agent = self.clone_for_bridge();        // same clone shape spawn_serve_bridge uses for its task
+        let registry = Arc::new(self.child_watchers.clone_for_task_use()); // or restructure: registry as Arc<Mutex<…>> field
+        tokio::spawn(async move {
+            let mut rx = manager.subscribe(&child);
+            loop {
+                // 30-minute idle retire bound (LB-8): an orphaned entry never leaks forever.
+                match tokio::time::timeout(Duration::from_secs(1800), rx.recv()).await {
+                    Err(_elapsed) => break,
+                    Ok(Ok(SessionSignal::Event(parsed))) => {
+                        if !parsed.kind.starts_with("message.") { continue; }
+                        fresh_agent.broadcast(&event_frame(&parent_id, changed_event(&parent_id, "opencode-message")));
+                    }
+                    Ok(Ok(SessionSignal::Lost)) => {}
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {} // LB-3: bursts must not kill the refresh
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
                 }
-                _ => break,
             }
-        }
-    });
+            registry.lock().expect("child_watchers poisoned").remove(&child); // re-arms on the next parent build
+        });
+    }
 }
+
+/// Child session ids referenced by this snapshot's task_delegation items.
+fn opencode_snapshot_child_session_ids(snapshot: &Value) -> Vec<String> { /* walk turns[].items[] */ }
 ```
 
-(Model the borrow/clone shape exactly on `spawn_serve_bridge` (lines ~3258–3305): whatever state it clones into the spawned task to broadcast through `fresh_agent`, the watcher clones the same way. For the liveness check, prefer whatever spawn_serve_bridge's abort path already consults — if no live-session probe is reachable from the spawned task, exit the loop on `broadcast::error` (channel close, sidecar lost) AND check the `child_links` registry: prune the watcher when the entry is removed. `changed_event` and `event_frame` are the same helpers `spawn_serve_bridge` uses at lines ~3288–3292.)
-
-Prune `child_links` entries for a parent when that parent session is removed (`handle_kill` and the session-removal/cleanup paths — wherever `spawn_serve_bridge`'s handle is aborted today).
+(Adapt the clone/sharing shapes to exactly what `spawn_serve_bridge` (opencode_ws.rs:3258–3305) already does to move a manager + `FreshAgentState` into a spawned task — it solved the identical problem for per-session bridges; if `changed_event`/`event_frame` are private helpers of `opencode_ws`, make them `pub(crate)` in place rather than duplicating them. If the existing `FreshAgentState` cannot be cheaply cloned into tasks, follow the same channel/handle pattern the serve bridge uses. Also cap `opencode_child_activity_rows` output at `OPENCODE_CHILD_ACTIVITY_ROW_CAP` (take the first 200; full detail lives in the child session pane).)
 
 - [ ] **Step 4: Run the focused tests**
 
@@ -720,7 +753,8 @@ Expected: PASS (lib + integration surface of the crate). This change touches the
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add crates/freshell-freshagent/src/lib.rs crates/freshell-freshagent/src/opencode_ws.rs
+git add crates/freshell-freshagent/src/lib.rs
+git add crates/freshell-freshagent/src/opencode_ws.rs 2>/dev/null || true  # only if changed_event/event_frame needed pub(crate)
 git commit -m "feat(freshagent): join opencode child-session activity into task delegation snapshots"
 ```
 
@@ -1033,6 +1067,15 @@ describe('task delegation + retry folding', () => {
     // settledSummary counts the delegation as one used tool: "1 tool used".
     expect(screen.getByText(/1 tool used/)).toBeInTheDocument()
   })
+
+  it('names Retrying on the live line when a retry is the last activity', () => {
+    render(<FreshAgentTranscript turns={[{ ...delegationTurn, items: [{ ...delegationTurn.items[1], status: 'completed' as const }, delegationTurn.items[2]] }]} /* through the file's existing live/streaming path — see adaptation rules */ />)
+    const strip = screen.getByRole('region', { name: 'Activity strip' })
+    // The settled delegation must not mask the between-attempts retry marker (LB-4).
+    expect(within(strip).getByText('Retrying')).toBeInTheDocument()
+    expect(within(strip).getByText('attempt 2')).toBeInTheDocument()
+    expect(within(strip).queryByText('Task')).not.toBeInTheDocument()
+  })
 })
 
 describe('thought duration labels', () => {
@@ -1090,17 +1133,21 @@ In `buildActivity`: thinking/reasoning merge keeps working and carries `duration
 
 - `activityTools(rows)` includes `row.type === 'delegation' ? row.tool : row.type === 'tool' ? row.tool : null` so `settledSummary` counts delegations as tools and `hasErrors` sees `isError`.
 - Expanded view: `row.type === 'delegation'` renders `<FreshAgentDelegationBlock item={row.item} />`; `row.type === 'retry'` renders `<FreshAgentRetryRow ... />` (both inside the existing expanded-rows map).
-- Live reel: `reelName`/`reelPreview` computation becomes
+- Live reel (LB-4 from the load-bearing ledger: a retry marker as the last row IS the running thing — a settled tool display must not mask it):
   ```ts
+  const runningTool = live ? [...tools].reverse().find((tool) => tool.status === 'running') ?? null : null
+  const retryLast = live && lastRow?.type === 'retry' ? lastRow : null
+  const liveTool = !thinkingLive && live && !runningTool && !retryLast ? (tools[tools.length - 1] ?? null) : null
   const activeTool = runningTool ?? liveTool
-  const lastRow = /* existing non-caption last row */
-  const retryLive = live && lastRow?.type === 'retry'
-  const reelName = activeTool ? activeTool.name : retryLive ? 'Retrying' : thinkingLive ? 'Thinking' : null
-  const reelPreview = activeTool
-    ? (activeTool.previewOverride ?? getToolPreview(activeTool.name, activeTool.input))
-    : retryLive ? `attempt ${(lastRow as { attempt: number }).attempt}` : null
+  const reelName = retryLast ? 'Retrying' : activeTool ? activeTool.name : thinkingLive ? 'Thinking' : null
+  const reelPreview = retryLast
+    ? `attempt ${retryLast.attempt}`
+    : activeTool
+      ? (activeTool.previewOverride ?? getToolPreview(activeTool.name, activeTool.input))
+      : null
+  const running = live && (activeTool !== null || thinkingLive || retryLast !== null)
   ```
-  (running-tool detection already iterates `tools`, which now includes delegation displays via 3b.)
+  (running-tool detection already iterates `tools`, which now includes delegation displays via 3b. Priority: an actually-running tool → the between-attempts retry marker → the last settled tool, matching "the live strip line names the running thing".)
 
 3d. `FreshAgentThinkingRow` label — the button's `aria-label` MUST match its visible label (a11y lint + the "identifiable interactive elements" rule):
 
