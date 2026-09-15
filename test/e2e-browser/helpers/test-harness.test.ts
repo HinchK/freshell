@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Page } from '@playwright/test'
 import {
   CLOUD_LANE_BUDGET_OVERHEAD_MS,
@@ -29,7 +29,10 @@ interface FakeWaitOutcome {
  * window decorative (the real window was Playwright's 30s default — the j90s
  * load-bearing ledger, LB-1).
  */
-function fakePage(outcomes: FakeWaitOutcome[] = []) {
+function fakePage(
+  outcomes: FakeWaitOutcome[] = [],
+  opts: { reloadAdvanceMs?: number } = {},
+) {
   const calls: unknown[][] = []
   const reloads: unknown[][] = []
   const queue = [...outcomes]
@@ -42,6 +45,7 @@ function fakePage(outcomes: FakeWaitOutcome[] = []) {
     },
     reload: (...args: unknown[]) => {
       reloads.push(args)
+      if (opts.reloadAdvanceMs) vi.setSystemTime(Date.now() + opts.reloadAdvanceMs)
       return Promise.resolve()
     },
   }
@@ -156,31 +160,47 @@ describe('TestHarness.waitForConnection wedge-tolerant self-heal (opt-in)', () =
   })
 
   it('(c) self-heal ON + phase-1 timeout: exactly ONE reload, then a second poll with the remaining budget', async () => {
-    const phase1 = Math.floor(DEFAULT_WS_READY_TIMEOUT_MS / 2)
-    const remaining = DEFAULT_WS_READY_TIMEOUT_MS - phase1
-    const { page, calls, reloads } = fakePage([{ reject: nativeTimeout(phase1) }, {}])
-    await new TestHarness(page).waitForConnection(undefined, { selfHealReload: true })
-    expect(reloads).toHaveLength(1)
-    expect(reloads[0]).toEqual([{ timeout: remaining }])
-    expect(calls).toHaveLength(2)
-    // The three-argument binding contract holds for BOTH phases (LB-1):
-    // a two-arg second poll would silently revert to the decorative-window
-    // bug this kata already fixed once.
-    expect(calls[1]).toHaveLength(3)
-    expect(calls[1][1]).toBeUndefined()
-    expect(calls[1][2]).toEqual({ timeout: remaining })
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      const phase1 = Math.floor(DEFAULT_WS_READY_TIMEOUT_MS / 2)
+      const remaining = DEFAULT_WS_READY_TIMEOUT_MS - phase1
+      const { page, calls, reloads } = fakePage([{ reject: nativeTimeout(phase1) }, {}])
+      await new TestHarness(page).waitForConnection(undefined, { selfHealReload: true })
+      expect(reloads).toHaveLength(1)
+      expect(reloads[0]).toEqual([{ timeout: remaining }])
+      expect(calls).toHaveLength(2)
+      // The three-argument binding contract holds for BOTH phases (LB-1):
+      // a two-arg second poll would silently revert to the decorative-window
+      // bug this kata already fixed once.
+      expect(calls[1]).toHaveLength(3)
+      expect(calls[1][1]).toBeUndefined()
+      // Total-deadline contract: phase 2 receives the remainder AFTER the
+      // reload's elapsed time (+1s slack) — with the fake clock's elapsed
+      // 0, exactly remaining + 1000, never a fresh full window.
+      expect(calls[1][2]).toEqual({ timeout: remaining + 1000 })
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('(d) explicit timeout + self-heal: phases derive from the explicit window (floor), env var ignored', async () => {
-    process.env[ENV_VAR] = '45000'
-    const W = 20_001
-    const phase1 = Math.floor(W / 2) // 10_000 — pins the floor()
-    const remaining = W - phase1 // 10_001
-    const { page, calls, reloads } = fakePage([{ reject: nativeTimeout(phase1) }, {}])
-    await new TestHarness(page).waitForConnection(W, { selfHealReload: true })
-    expect(calls[0][2]).toEqual({ timeout: phase1 })
-    expect(reloads[0]).toEqual([{ timeout: remaining }])
-    expect(calls[1][2]).toEqual({ timeout: remaining })
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      process.env[ENV_VAR] = '45000'
+      const W = 20_001
+      const phase1 = Math.floor(W / 2) // 10_000 — pins the floor()
+      const remaining = W - phase1 // 10_001
+      const { page, calls, reloads } = fakePage([{ reject: nativeTimeout(phase1) }, {}])
+      await new TestHarness(page).waitForConnection(W, { selfHealReload: true })
+      expect(calls[0][2]).toEqual({ timeout: phase1 })
+      expect(reloads[0]).toEqual([{ timeout: remaining }])
+      // Total-deadline contract: phase 2 receives the remainder AFTER the
+      // reload's elapsed time (+1s slack) — with the fake clock's elapsed
+      // 0, exactly remaining + 1000, never a fresh full window.
+      expect(calls[1][2]).toEqual({ timeout: remaining + 1000 })
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('(e) self-heal ON + both phases time out: the native TimeoutError propagates (exactly one reload, no retry loop)', async () => {
@@ -191,5 +211,26 @@ describe('TestHarness.waitForConnection wedge-tolerant self-heal (opt-in)', () =
     ).rejects.toThrow('Timeout 15000ms exceeded')
     expect(reloads).toHaveLength(1)
     expect(calls).toHaveLength(2)
+  })
+
+  it('(f) total-deadline: the reload elapsed time is charged to phase 2 (no 3xW sequential envelope)', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      const phase1 = Math.floor(DEFAULT_WS_READY_TIMEOUT_MS / 2)
+      const remaining = DEFAULT_WS_READY_TIMEOUT_MS - phase1
+      const { page, calls, reloads } = fakePage(
+        [{ reject: nativeTimeout(phase1) }, {}],
+        { reloadAdvanceMs: 10_000 },
+      )
+      await new TestHarness(page).waitForConnection(undefined, { selfHealReload: true })
+      expect(reloads).toHaveLength(1)
+      expect(reloads[0]).toEqual([{ timeout: remaining }])
+      expect(calls).toHaveLength(2)
+      // The reload "took" 10s of wall clock: phase 2 must receive the
+      // remainder MINUS that time (+1s slack), not a fresh full window.
+      expect(calls[1][2]).toEqual({ timeout: remaining - 10_000 + 1000 })
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

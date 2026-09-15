@@ -130,7 +130,9 @@ export class TestHarness {
    * splits into two phases sized from the resolved window W: phase 1 is a
    * boolean poll within floor(W/2); if ready has not landed, ONE
    * page.reload({ timeout: W - floor(W/2) }) mints a fresh boot chain and
-   * the final phase waits the remaining budget, letting Playwright's
+   * the final phase waits the remaining budget MINUS the reload's elapsed
+   * time (+1s slack) — W is a single total deadline, so the whole
+   * self-heal path spends at most W + 1s wall clock — letting Playwright's
    * native TimeoutError propagate on failure.
    */
   async waitForConnection(timeoutMs?: number, opts: WaitForConnectionOptions = {}): Promise<void> {
@@ -151,11 +153,18 @@ export class TestHarness {
       { timeout: phase1Ms },
     ).then(() => true, () => false)
     if (!readyWithinPhase1) {
+      // Enforce W as a SINGLE TOTAL deadline (kata tg4e): the reload's
+      // navigation and phase-2's poll SHARE the remaining budget, so the
+      // self-heal path spends at most W + 1s wall clock. The previous
+      // shape let each step consume its own full window (up to 3xW
+      // sequentially at W=90s), a drift that outgrew any per-test budget.
+      const reloadStartedAt = Date.now()
       await this.page.reload({ timeout: remainingMs })
+      const phase2Ms = Math.max(0, remainingMs - (Date.now() - reloadStartedAt)) + 1000
       await this.page.waitForFunction(
         wsReadyPredicate,
         undefined,
-        { timeout: remainingMs },
+        { timeout: phase2Ms },
       )
     }
   }
