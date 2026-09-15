@@ -3267,6 +3267,46 @@ impl RuntimeOwnershipRegistry {
             } = record.state.clone()
             {
                 if now_ms.saturating_sub(since_ms) >= max_age_ms {
+                    // b8ke ext r20 F1: consult the start's SETTLEMENT
+                    // EVIDENCE before converting on age — the e3r3 F7
+                    // stop-sweep discipline. A registered settle flag
+                    // that has NOT fired means the start's handler is
+                    // STILL RUNNING (a slow-but-live start: the WS/REST
+                    // managed codex launch planning takes multiple
+                    // 45-second attempts, enabled by default, while this
+                    // sweep declares unwitnessed starts stale at 30s) —
+                    // a legitimate in-progress start the watchdog does
+                    // NOT fence (pre-r20 the sweep converted EVERY
+                    // over-age Starting unconditionally, so an ordinary
+                    // slow launch was fenced Fenced{StaleStart}
+                    // mid-planning with no probe evidence, wedging the
+                    // session until restart and stale-rejecting the
+                    // eventual commit). Only a FIRED flag (the handler
+                    // unwound without commit) or an UNREGISTERED start
+                    // (a pre-witness path) converts — the watchdog's
+                    // zombie authority is untouched.
+                    if let Some(flag) = record.settle_fired.as_ref() {
+                        if !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                            tracing::info!(target: "freshell_ownership",
+                                event = "ownership.start.stale_start_skipped_live",
+                                operation_id = %operation_id,
+                                provider = %key.provider,
+                                session_id = %key.session_id,
+                                initiator = %initiator,
+                                from_kind = ?Some(kind),
+                                to_kind = ?Option::<RuntimeOwnerKind>::None,
+                                runtime_id = ?Option::<String>::None,
+                                pid = ?Option::<u32>::None,
+                                epoch = self.epoch, generation,
+                                duration_ms = now_ms.saturating_sub(since_ms),
+                                outcome = "skipped",
+                                failure_reason = "START_HANDLER_STILL_RUNNING",
+                                "the over-age start's settle witness is armed and NOT \
+                                 fired — the handler still runs; a slow launch is a \
+                                 legitimate in-progress start the watchdog does not fence");
+                            continue;
+                        }
+                    }
                     let cancellation = record.cancellation.take();
                     let settle = record.settle.take();
                     let partial_runtime = record.partial_runtime.take();
@@ -4884,6 +4924,10 @@ mod tests {
             Box::new(std::future::ready(())),
             Some(Arc::clone(&start_flag)),
         ));
+        // b8ke ext r20 F1: a NOT-FIRED settle flag is a live handler the
+        // sweep SKIPS now — fire the flag (the handler-unwound shape) so
+        // the fence-reason fixture reaches the sweep.
+        start_flag.store(true, std::sync::atomic::Ordering::SeqCst);
         let recovered = r.recover_stale_starts(0, 0);
         assert_eq!(recovered.len(), 1);
         assert!(matches!(
@@ -4904,8 +4948,11 @@ mod tests {
         assert_eq!(f2.reason, FenceReason::StaleStart);
         assert_eq!(
             f2.settle_concluded,
-            Some(false),
-            "the START's unfired evidence is carried for the StaleStart fence"
+            Some(true),
+            "the START's settle evidence is carried for the StaleStart fence \
+             (b8ke ext r20 F1: the fixture fires the flag — the handler-unwound \
+             arm — because a live not-fired flag is a legitimate in-progress \
+             start the sweep now skips)"
         );
     }
 
@@ -8325,6 +8372,113 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    // ── b8ke ext r20 F1: the start-sweep's settlement consultation ────
+
+    // The witness fixture: a Starting claim with a REGISTERED settle
+    // witness whose settle_fired flag is armed-but-NOT-fired (the
+    // handler still runs — the slow-managed-launch shape).
+    fn witnessed_start(r: &RuntimeOwnershipRegistry, op: &str, fired: bool) -> u64 {
+        let BeginOutcome::Granted { generation } = r.begin_start(
+            PROVIDER,
+            "sid-witness",
+            RuntimeOwnerKind::Terminal,
+            op,
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("fixture granted")
+        };
+        let settle_fired = Arc::new(AtomicBool::new(false));
+        let registered = r.register_start_cancellation(
+            PROVIDER,
+            "sid-witness",
+            op,
+            generation,
+            Arc::new(|| {}),
+            Box::new(std::future::pending::<()>()),
+            Some(Arc::clone(&settle_fired)),
+        );
+        assert!(registered, "fixture: the witness registered");
+        if fired {
+            settle_fired.store(true, Ordering::SeqCst);
+        }
+        generation
+    }
+
+    #[test]
+    fn a_witnessed_slow_start_is_not_swept_while_its_handler_runs() {
+        let r = RuntimeOwnershipRegistry::new();
+        witnessed_start(&r, "op-r20-f1-live", false);
+        // The handler still runs: the over-age sweep SKIPS the
+        // witnessed slow-but-live start (a slow managed launch is a
+        // legitimate in-progress start the watchdog does NOT fence —
+        // pre-r20 the sweep converted it unconditionally).
+        let recovered = r.recover_stale_starts(100_000, 30_000);
+        assert!(
+            recovered.is_empty(),
+            "a witness-backed in-progress start is NOT stale — got {} ops",
+            recovered
+                .iter()
+                .map(|rec| rec.operation_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert!(
+            matches!(
+                r.observe(PROVIDER, "sid-witness").state,
+                OwnershipState::Starting { .. }
+            ),
+            "the in-progress start keeps its Starting record"
+        );
+    }
+
+    #[test]
+    fn a_witnessed_start_whose_handler_unwound_is_swept() {
+        // The settle_fired flag (the handler unwound WITHOUT commit) —
+        // the sweep takes the record and the host resolves it through
+        // the witness (the abandoned-start arm the watchdog exists for).
+        let r = RuntimeOwnershipRegistry::new();
+        witnessed_start(&r, "op-r20-f1-fired", true);
+        let recovered = r.recover_stale_starts(100_000, 30_000);
+        assert!(
+            recovered
+                .iter()
+                .any(|rec| rec.operation_id == "op-r20-f1-fired"),
+            "a handler-unwound witnessed start IS swept"
+        );
+        assert!(matches!(
+            r.observe(PROVIDER, "sid-witness").state,
+            OwnershipState::Stopping { .. }
+        ));
+    }
+
+    #[test]
+    fn an_unwitnessed_overage_start_is_still_swept() {
+        // The no-witness arm (a pre-witness path or a crashed
+        // pre-registration handler) — the sweep's zombie authority is
+        // unchanged.
+        let r = RuntimeOwnershipRegistry::new();
+        let BeginOutcome::Granted { .. } = r.begin_start(
+            PROVIDER,
+            "sid-unwitnessed",
+            RuntimeOwnerKind::Terminal,
+            "op-r20-f1-bare",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("fixture granted")
+        };
+        let recovered = r.recover_stale_starts(100_000, 30_000);
+        assert!(
+            recovered
+                .iter()
+                .any(|rec| rec.operation_id == "op-r20-f1-bare"),
+            "an unwitnessed over-age start IS swept"
+        );
     }
 
     /// b8ke ext r15 F3: the attach-guard release event's duration is

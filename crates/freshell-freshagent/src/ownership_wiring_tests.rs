@@ -496,8 +496,12 @@ async fn start_cancellation_registers_on_the_tickets_canonical_key() {
         &own_ticket,
         cancel,
     );
-    // The watchdog's sweep finds the CANCELLATION + the settle-fired
-    // evidence on the canonical record.
+    // b8ke ext r20 F1: the sweep now SKIPS a witnessed LIVE start (the
+    // registered-and-not-fired flag means the handler still runs) — drop
+    // the guard first (the handler-unwound arm) so the sweep takes the
+    // record and the canonical-key machinery assertions observe through
+    // the arm the watchdog exists for.
+    drop(guard);
     let recovered = registry.recover_stale_starts(0, 0);
     assert_eq!(
         recovered.len(),
@@ -525,7 +529,8 @@ async fn start_cancellation_registers_on_the_tickets_canonical_key() {
         ),
         freshell_ownership::FenceOutcome::Fenced
     ));
-    drop(guard);
+    // (the guard already dropped above — its Drop fired the sender-side
+    // settle evidence the assertion below reads)
     let fences = registry.stale_start_fences();
     assert_eq!(fences.len(), 1);
     assert_eq!(

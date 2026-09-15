@@ -1656,6 +1656,11 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
     // stop can NEVER begin and commit inside the create's window (pre-r13
     // the Adopt arm proceeded with NO ticket or guard).
     let mut _rest_adopt_guard: Option<freshell_ownership::AttachGuard> = None;
+    // b8ke ext r20 F1: the claim's settlement witness (held to this
+    // function's end — its Drop fires the settle) and the pre-minted
+    // terminal id threaded to the spawn (the WS cancel-slot discipline).
+    let mut _rest_start_cancellation: Option<crate::ownership_lane::StartCancellationGuard> = None;
+    let mut ownership_start_terminal_id: Option<String> = None;
     if let Some(locator) = learned_claim_locator.clone() {
         let operation_id = handoff
             .map(|t| t.operation_id.clone())
@@ -1691,7 +1696,77 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
             now_ms().max(0) as u64,
         ) {
             crate::ownership_lane::TerminalLaneClaim::Granted(ticket) => {
-                ownership_claim = Some(RestOwnershipClaim { ticket, locator });
+                // b8ke ext r20 F1: WS-path parity — the REST create
+                // pipeline registers the PRE-SPAWN
+                // cancellation/settlement witness BEFORE any asynchronous
+                // work (the managed codex launch planning can take
+                // multiple 45-second attempts, enabled by default, while
+                // the server sweep declares unwitnessed starts stale at
+                // 30s). Pre-r20 the claim armed a Starting record with
+                // NO witness and NO runtime identity, so an ordinary slow
+                // or failed launch was fenced Fenced{StaleStart}
+                // mid-planning — an unprovable fence no probe could
+                // clear, wedging the session until restart and
+                // stale-rejecting the eventual commit while reaping its
+                // child. The witness makes a slow launch a legitimate
+                // in-progress start the watchdog does NOT fence, and the
+                // failure path settles through the witness typed.
+                let registry_handle = registry.clone();
+                let cancel_terminal_id = Uuid::new_v4().to_string();
+                let cancel_id_for_closure = cancel_terminal_id.clone();
+                let cancel: std::sync::Arc<dyn Fn() + Send + Sync> =
+                    std::sync::Arc::new(move || {
+                        tracing::warn!(target: "freshell_freshagent::terminal_tabs",
+                            terminal_id = %cancel_id_for_closure,
+                            event = "ownership.start.cancel_signal",
+                            "the watchdog's REST-start cancellation kills the \
+                             terminal's registry row"
+                        );
+                        registry_handle.kill(&cancel_id_for_closure);
+                    });
+                let mut registration_ticket = Some(ticket);
+                _rest_start_cancellation = Some(
+                    crate::ownership_lane::register_start_cancellation_for_ticket(
+                        &state.ownership,
+                        &locator.provider,
+                        &locator.session_id,
+                        &registration_ticket,
+                        cancel,
+                    ),
+                );
+                // The WS F4 evidence discipline: the claim-time partial
+                // runtime with the PRE-MINTED terminal id (the kind-
+                // appropriate identity) — a watchdog sweep in the
+                // planning window finds ARMED evidence, never fences on
+                // nothing.
+                if let Some(ownership) = state.ownership.as_ref() {
+                    ownership.register_partial_runtime(
+                        &locator.provider,
+                        &locator.session_id,
+                        registration_ticket
+                            .as_ref()
+                            .expect("the ticket is present on the Granted arm")
+                            .operation_id(),
+                        registration_ticket
+                            .as_ref()
+                            .expect("the ticket is present on the Granted arm")
+                            .generation(),
+                        freshell_ownership::OwnerIdentity {
+                            kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                            terminal_id: Some(cancel_terminal_id.clone()),
+                            live_session_key: None,
+                            pid: None,
+                            ownership_id: None,
+                        },
+                    );
+                }
+                ownership_start_terminal_id = Some(cancel_terminal_id);
+                ownership_claim = Some(RestOwnershipClaim {
+                    ticket: registration_ticket
+                        .take()
+                        .expect("the ticket is present on the Granted arm"),
+                    locator,
+                });
             }
             crate::ownership_lane::TerminalLaneClaim::Unwired => {}
             crate::ownership_lane::TerminalLaneClaim::Adopt => {
@@ -1808,6 +1883,14 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                 });
             }
         }
+    }
+    // b8ke ext r20 F1 test seam (WS parity): park the REST create INSIDE
+    // its held-authority window (after the claim + the witness arms,
+    // before the spawn) — the deterministic-race tests prove the
+    // witness-backed slow launch is NOT stale-fenced by the watchdog.
+    // No-op in production.
+    if let Some(pause) = registry.terminal_create_postclaim_pause_hook() {
+        pause(&create_request_id).await;
     }
     if let Some(live_sid) = guard_locator.as_ref().map(|r| r.session_id.as_str()) {
         // Reconnect-revive Task 7: every refusal that CAN name a live terminal
@@ -1979,6 +2062,7 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
         host_os,
         is_wsl,
         amplifier_stub,
+        ownership_start_terminal_id,
     };
     let settle = {
         // Round-3 review I-1: the settle marks settlement (success or
@@ -2060,6 +2144,10 @@ struct GatedSettleInputs {
     /// the spawn-spec construction here can never disagree.
     host_os: HostOs,
     is_wsl: bool,
+    /// b8ke ext r20 F1: the DOOR claim's pre-minted terminal id — the
+    /// identity the witness's cancel closure kills, and the id the spawn
+    /// uses (`None` for the claim-less paths: the spawn mints as before).
+    ownership_start_terminal_id: Option<String>,
     /// Launcher-assigned amplifier identity: the stub [`spawn_terminal_pane`]
     /// pre-created for this create (Task 11) — consumed here for the
     /// spawn-failure GC and the exit hook's never-used-stub GC.
@@ -2102,9 +2190,17 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         host_os,
         is_wsl,
         amplifier_stub,
+        ownership_start_terminal_id: _,
     } = inputs;
 
-    let terminal_id = Uuid::new_v4().to_string();
+    // b8ke ext r20 F1: the DOOR claim pre-minted the terminal id when it
+    // armed its settlement witness (the cancel-slot identity) — use it so
+    // the witness's cancellation kills THIS row; the claim-less paths mint
+    // as before.
+    let terminal_id = inputs
+        .ownership_start_terminal_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let stream_id = Uuid::new_v4().to_string();
 
     let mut cli: Option<CliLaunch> = None;
@@ -8076,6 +8172,209 @@ if (args.includes('app-server')) {{
 
     /// b8ke ext r16 F3: a REST resume to a DEFINITIVELY MISSING session
     /// answers the TYPED SESSION_MISSING refusal — nothing was started, no
+    /// b8ke ext r20 F1 (b): the launch-FAILURE path settles through the
+    /// witness typed — the create fails, the witness guard's Drop fires
+    /// the settle, and the RAII ticket fail releases the Starting claim:
+    /// the key ends VACANT (its correct typed end state), never a
+    /// fence no probe can clear (pre-r20 an unwitnessed launch failure
+    /// left a fence the probes could not prove safe to clear).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failing_rest_create_settles_through_the_witness_to_vacant() {
+        let _ = isolate_amplifier_home();
+        let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let registry =
+            freshell_terminal::TerminalRegistry::new().with_ownership(Arc::clone(&ownership));
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        // A CLI spec whose binary does not exist: the spawn fails after
+        // the claim — the post-claim failure path.
+        let broken_spec = freshell_platform::CliCommandSpec {
+            name: "claude".to_string(),
+            label: "claude-broken".to_string(),
+            env_var: None,
+            default_cmd: "/nonexistent/freshell-r20-f1/cli".to_string(),
+            base_args: vec![],
+            base_env: std::collections::BTreeMap::new(),
+            resume_args: Some(vec!["--resume".to_string(), "{{sessionId}}".to_string()]),
+            create_session_args: Some(vec![
+                "--session-id".to_string(),
+                "{{sessionId}}".to_string(),
+            ]),
+            model_args: None,
+            sandbox_args: None,
+            permission_mode_args: None,
+        };
+        let state = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx))
+            .with_terminal_registry(registry.clone())
+            .with_cli_commands(Arc::new(vec![broken_spec]))
+            .with_ownership(Arc::clone(&ownership));
+        let tmp = std::env::temp_dir();
+
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": tmp.to_string_lossy(),
+            }),
+            true,
+        )
+        .await;
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "the broken-CLI create fails: {body}"
+        );
+
+        // THE TYPED END STATE: the failure settled through the witness +
+        // the RAII ticket fail — the minted key ends VACANT (never a
+        // StaleStart fence, never Stopping).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let mut mint: Option<String> = None;
+            for row in registry.identity_probe_rows() {
+                // The failure may or may not have minted the row — find
+                // any claude row created by this request; if none, the
+                // key never existed and the assertion is trivially true.
+                if row.mode == "claude" {
+                    mint = row.resume_session_id.clone();
+                }
+            }
+            let Some(mint) = mint else { break };
+            let state_now = ownership.observe("claude", &mint).state;
+            match state_now {
+                freshell_ownership::OwnershipState::Vacant => break,
+                freshell_ownership::OwnershipState::Starting { .. } => {
+                    // The witness guard may still be dropping — bounded.
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the failed create's Starting claim never released — state: {state_now:?}"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                other => panic!("the failed create's key must end Vacant — got {other:?}"),
+            }
+        }
+    }
+
+    /// b8ke ext r20 F1: a REST create parked INSIDE its held-authority
+    /// window (after the claim, before the spawn — the managed-launch
+    /// planning shape) survives an over-age watchdog sweep: the pre-spawn
+    /// settlement witness registered at the claim makes the sweep SKIP
+    /// the witnessed live start, and the released create commits
+    /// Live{Terminal} — the commit WINS because the record was never
+    /// taken (pre-r20 the claim armed Starting with NO witness: the
+    /// sweep fenced Fenced{StaleStart} mid-planning, stale-rejected the
+    /// eventual commit, reaped its child, and wedged the session until
+    /// restart).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_witnessed_rest_create_survives_the_stale_start_sweep_and_commits() {
+        let _ = isolate_amplifier_home();
+        let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let registry =
+            freshell_terminal::TerminalRegistry::new().with_ownership(Arc::clone(&ownership));
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let state = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx))
+            .with_terminal_registry(registry.clone())
+            .with_cli_commands(Arc::new(vec![claude_prealloc_recording_cli_spec(
+                &unique_argv_file("rest-r20-witness"),
+            )]))
+            .with_ownership(Arc::clone(&ownership));
+        let tmp = std::env::temp_dir();
+
+        // Park the REST create INSIDE its held-authority window (the
+        // postclaim seam — the WS-parity park point this pipeline now
+        // shares).
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let entered_for_hook = Arc::clone(&entered);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = std::sync::Mutex::new(Some(release_rx));
+        registry.set_terminal_create_postclaim_pause_for_tests(Arc::new(
+            move |request_id: &str| {
+                let entered = Arc::clone(&entered_for_hook);
+                let release_rx = release_rx.lock().expect("release rx lock").take();
+                let request_id = request_id.to_string();
+                Box::pin(async move {
+                    let _ = request_id;
+                    entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if let Some(release_rx) = release_rx {
+                        let _ = release_rx.await;
+                    }
+                })
+            },
+        ));
+        let state_for_task = state.clone();
+        let spawn_task = tokio::spawn(async move {
+            spawn_terminal_pane(
+                &state_for_task,
+                &json!({
+                    "mode": "claude",
+                    "cwd": tmp.to_string_lossy(),
+                }),
+                "tab-r20",
+                "pane-r20",
+            )
+            .await
+        });
+        // Park proof: the create reached its window holding the claim.
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !entered.load(std::sync::atomic::Ordering::SeqCst) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the REST create never reached its postclaim window"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+
+        // THE OVER-AGE SWEEP (the managed-launch shape: the create is
+        // parked well past the 30s threshold — modeled with a now far
+        // past the claim's real since_ms): the witnessed live start is
+        // SKIPPED (pre-r20: converted + fenced).
+        let sweep_now = freshell_ownership::now_epoch_ms().saturating_add(60_000);
+        let recovered = ownership.recover_stale_starts(sweep_now, 30_000);
+        assert!(
+            recovered.is_empty(),
+            "the witnessed REST create is NOT swept mid-planning — got {} ops",
+            recovered
+                .iter()
+                .map(|rec| rec.operation_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        // Release the create: it completes and commits Live{Terminal}
+        // under the minted key — the commit WINS.
+        let _ = release_tx.send(());
+        let result = spawn_task.await.expect("the REST create task");
+        let spawned = result.expect("the witnessed REST create succeeds");
+        let mint = registry
+            .identity_probe_rows()
+            .iter()
+            .find(|r| r.terminal_id == spawned.terminal_id)
+            .expect("the row")
+            .resume_session_id
+            .clone()
+            .expect("the preallocated id");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if matches!(
+                ownership.observe("claude", &mint).state,
+                freshell_ownership::OwnershipState::Live { owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal
+            ) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the witnessed REST create never committed Live — state: {:?}",
+                ownership.observe("claude", &mint).state
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        registry.kill(&spawned.terminal_id);
+        registry.clear_terminal_create_postclaim_pause_for_tests();
+    }
+
     /// session id changed, no substitution record (pre-r16 the REST door
     /// auto-substituted a replacement session and recorded
     /// SESSION_MISSING_RESUMED_FRESH on the paneContent). The separate
