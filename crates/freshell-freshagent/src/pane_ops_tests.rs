@@ -1721,6 +1721,105 @@ async fn attach_pane_binds_a_terminal_owned_session_and_broadcasts_pane_attach()
         .kill(&shell_terminal_id);
 }
 
+// ── b8ke ext r23 F3: the attach consumes the probe status ─────────────
+
+/// b8ke ext r23 F3: a terminal-owner attach against a DEAD or ABSENT
+/// terminal row answers the typed RESTORE_UNAVAILABLE — never a
+/// successful attachment of a running pane to a terminal that has
+/// exited (pre-r23 the probe's status was ignored, the mode defaulted
+/// to "shell", and the attach persisted + broadcast status "running"
+/// for a dead terminal).
+#[tokio::test]
+async fn attach_pane_against_a_dead_terminal_answers_typed_restore_unavailable() {
+    const SID: &str = "33333333-4444-5555-8666-7777777777aa";
+    const TID: &str = "t-r23f3-dead-owner";
+    let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+    let state = state_with_registry()
+        .with_ownership(ownership.clone())
+        .with_session_identity(Arc::new(Task10SessionIdentity {
+            provider: "claude",
+            session_id: SID,
+            terminal_id: TID,
+        }));
+
+    // The terminal OWNS the session on the coordinator — but its
+    // registry row is ABSENT (it exited and was removed before the
+    // attach).
+    let freshell_ownership::BeginOutcome::Granted { generation } = ownership.begin_start(
+        "claude",
+        SID,
+        freshell_ownership::RuntimeOwnerKind::Terminal,
+        "op-r23f3",
+        None,
+        "test",
+        0,
+    ) else {
+        panic!("expected Granted")
+    };
+    assert!(matches!(
+        ownership.commit_live(
+            "claude",
+            SID,
+            "op-r23f3",
+            generation,
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                terminal_id: Some(TID.to_string()),
+                live_session_key: None,
+                pid: None,
+                ownership_id: None,
+            },
+        ),
+        freshell_ownership::CommitOutcome::Committed
+    ));
+
+    let router = app(state.clone());
+    let mut rx = state.broadcast_tx.subscribe();
+    let (_tab_id, pane_id, _shell) = create_shell_tab(router.clone()).await;
+    let _ = rx.recv().await; // drain tab.create
+
+    // THE ATTACH against the dead terminal: the typed refusal.
+    let (status, body) = post(
+        router,
+        &format!("/api/panes/{pane_id}/attach"),
+        json!({ "sessionRef": { "provider": "claude", "sessionId": SID } }),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["status"], json!("error"), "{body}");
+    assert_eq!(body["code"], json!("RESTORE_UNAVAILABLE"), "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("exited or its row is absent"),
+        "the typed refusal carries the dead-terminal reason: {body}"
+    );
+
+    // NO layout write or broadcast of a running attachment — the pane
+    // never left its shell state (the broadcast channel carries only
+    // the tab.create frame).
+    let mut saw_pane_attach = false;
+    while let Ok(frame) = rx.try_recv() {
+        let msg: Value = serde_json::from_str(&frame).expect("json frame");
+        if msg["command"] == json!("pane.attach") {
+            saw_pane_attach = true;
+        }
+    }
+    assert!(
+        !saw_pane_attach,
+        "no pane.attach broadcast may occur for a dead-terminal attach"
+    );
+    // The coordinator's owner record is UNCHANGED (the attach never
+    // entered — no generation bump, no Handoff).
+    assert!(matches!(
+        ownership.observe("claude", SID).state,
+        freshell_ownership::OwnershipState::Live { owner, .. }
+            if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal
+    ));
+}
+
 /// b8ke ext r7 F3: pane recovery resolves the coordinator's ALIAS CHAIN —
 /// a pre-rekey sessionRef follows the canonical live owner and ATTACHES,
 /// never the raw key's Aliased→HANDOFF_IN_PROGRESS dead end (the rekey

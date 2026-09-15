@@ -934,14 +934,34 @@ pub(crate) async fn attach_pane(
                     format!("pane {pane_id} not found in the pane registry or any synced layout"),
                 );
             };
-            // The terminal's mode comes from the registry row (the same
-            // surface `spawn_terminal_pane`'s content construction reads).
-            let mode = state
+            // b8ke ext r23 F3: the attach consumes the probe's STATUS —
+            // a dead or absent terminal row answers the typed
+            // RESTORE_UNAVAILABLE, never a successful attachment to a
+            // dead terminal (pre-r23 the attach defaulted the mode to
+            // "shell" and persisted/broadcast status "running" for a row
+            // that had already exited — the pane needed another repair
+            // cycle). The mode comes from the LIVE row only.
+            let probe = state
                 .terminal_registry
                 .as_ref()
-                .and_then(|registry| registry.probe(&terminal_id))
-                .map(|row| row.mode)
-                .unwrap_or_else(|| "shell".to_string());
+                .and_then(|registry| registry.probe(&terminal_id));
+            let mode = match &probe {
+                Some(row) if row.status == freshell_protocol::TerminalRunStatus::Running => {
+                    row.mode.clone()
+                }
+                Some(_) | None => {
+                    return crate::fail_json_conflict_with_owner(
+                        "RESTORE_UNAVAILABLE",
+                        format!(
+                            "Session {} is terminal-owned but the terminal has exited or its row is absent — \
+                             no live terminal to attach.",
+                            session_ref.session_id
+                        ),
+                        None,
+                        None,
+                    );
+                }
+            };
             // b8ke ext r12 F2: the REST attach's REAL claim — the guard
             // arms under the coordinator lock and is held ACROSS the pane
             // resolution + the pane.attach broadcast, so a handoff/stop
