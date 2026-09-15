@@ -186,6 +186,243 @@ function insertTextMessage(db, input) {
     )
 }
 
+function insertMessage(db, input) {
+  db.prepare(`
+      INSERT OR REPLACE INTO message (id, session_id, time_created, time_updated, data)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(
+      input.messageId,
+      input.sessionId,
+      input.now,
+      input.now,
+      JSON.stringify({ role: input.role }),
+    )
+}
+
+function insertMessagePart(db, input) {
+  db.prepare(`
+      INSERT OR REPLACE INTO part (id, message_id, session_id, time_created, time_updated, data)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      input.partId,
+      input.messageId,
+      input.sessionId,
+      input.now,
+      input.now,
+      JSON.stringify(input.data),
+    )
+}
+
+// ── freshopencode TUI-parity scripted data (plan Task 7 e2e) ───────────────────
+// Everything in this section is gated behind FAKE_OPENCODE_TUI_PARITY=1: with the
+// env unset (every other spec), none of this code runs and the prompt/export
+// behaviors are byte-identical to before.
+
+const TUI_PARITY_CHILD_SESSION_ID = 'ses_c'
+const TUI_PARITY_BACKGROUND_CHILD_SESSION_ID = 'ses_bg'
+
+function tuiParityTaskResultOutput() {
+  const lines = []
+  for (let i = 1; i <= 40; i++) lines.push(`sample task output line ${i} of 40`)
+  return `<task id="${TUI_PARITY_CHILD_SESSION_ID}" state="completed"><task_result>${lines.join('\n')}</task_result></task>`
+}
+
+// Static child sessions served from the shared DB. ses_c carries the delegated
+// subtask turn (caption source) plus completed/failed child tool rows; ses_bg
+// stays ACTIVE (a running bash tool row and an assistant message with no
+// time.completed) so the server-side join derives the background delegation's
+// live state from the authoritative session-status map instead of the outer
+// part's immediately-completed state.
+function seedTuiParityChildSessions(input) {
+  const now = Date.now()
+  const db = openDatabase()
+  try {
+    ensureSchema(db)
+    insertSession(db, {
+      sessionId: TUI_PARITY_CHILD_SESSION_ID,
+      projectId: 'proj-tui-parity',
+      parentId: input.parentSessionId,
+      slug: TUI_PARITY_CHILD_SESSION_ID,
+      directory: input.directory,
+      title: 'Fix the flaky harness',
+      createdAt: now,
+      updatedAt: now,
+    })
+    insertSession(db, {
+      sessionId: TUI_PARITY_BACKGROUND_CHILD_SESSION_ID,
+      projectId: 'proj-tui-parity',
+      parentId: input.parentSessionId,
+      slug: TUI_PARITY_BACKGROUND_CHILD_SESSION_ID,
+      directory: input.directory,
+      title: 'Index the repository',
+      createdAt: now,
+      updatedAt: now,
+    })
+    insertMessage(db, {
+      messageId: 'msg_ses_c_1_user',
+      sessionId: TUI_PARITY_CHILD_SESSION_ID,
+      role: 'user',
+      now,
+    })
+    insertMessagePart(db, {
+      partId: 'msg_ses_c_1_user_part_1_subtask',
+      messageId: 'msg_ses_c_1_user',
+      sessionId: TUI_PARITY_CHILD_SESSION_ID,
+      now,
+      data: { type: 'subtask', agent: 'general', description: 'Fix the flaky harness' },
+    })
+    insertMessagePart(db, {
+      partId: 'msg_ses_c_1_user_part_2_text',
+      messageId: 'msg_ses_c_1_user',
+      sessionId: TUI_PARITY_CHILD_SESSION_ID,
+      now,
+      data: { type: 'text', text: 'Fix the flaky harness — locate the intermittently failing test and stabilize it' },
+    })
+    insertMessage(db, {
+      messageId: 'msg_ses_c_2_assistant',
+      sessionId: TUI_PARITY_CHILD_SESSION_ID,
+      role: 'assistant',
+      now: now + 1,
+    })
+    insertMessagePart(db, {
+      partId: 'msg_ses_c_2_assistant_part_tool_bash',
+      messageId: 'msg_ses_c_2_assistant',
+      sessionId: TUI_PARITY_CHILD_SESSION_ID,
+      now: now + 1,
+      data: { type: 'tool', tool: 'bash', state: { status: 'completed', input: { command: 'sed -n 92,112p src/store/paneTypes.ts' } } },
+    })
+    insertMessagePart(db, {
+      partId: 'msg_ses_c_2_assistant_part_tool_grep',
+      messageId: 'msg_ses_c_2_assistant',
+      sessionId: TUI_PARITY_CHILD_SESSION_ID,
+      now: now + 1,
+      data: { type: 'tool', tool: 'grep', state: { status: 'error', input: { pattern: 'reasoningEffort' } } },
+    })
+    insertMessage(db, {
+      messageId: 'msg_ses_bg_1_user',
+      sessionId: TUI_PARITY_BACKGROUND_CHILD_SESSION_ID,
+      role: 'user',
+      now,
+    })
+    insertMessagePart(db, {
+      partId: 'msg_ses_bg_1_user_part_text',
+      messageId: 'msg_ses_bg_1_user',
+      sessionId: TUI_PARITY_BACKGROUND_CHILD_SESSION_ID,
+      now,
+      data: { type: 'text', text: 'Index the repository — walk the tree and build the file index' },
+    })
+    insertMessage(db, {
+      messageId: 'msg_ses_bg_2_assistant',
+      sessionId: TUI_PARITY_BACKGROUND_CHILD_SESSION_ID,
+      role: 'assistant',
+      now: now + 1,
+    })
+    insertMessagePart(db, {
+      partId: 'msg_ses_bg_2_assistant_part_tool_bash',
+      messageId: 'msg_ses_bg_2_assistant',
+      sessionId: TUI_PARITY_BACKGROUND_CHILD_SESSION_ID,
+      now: now + 1,
+      data: { type: 'tool', tool: 'bash', state: { status: 'running', input: { command: 'find . -type f | wc -l' } } },
+    })
+  } finally {
+    db.close()
+  }
+}
+
+// The scripted TUI-parity turn: the pane's first prompt_async materializes the
+// PARENT session (the pane's own minted ses_* id) with an assistant message
+// carrying a reasoning part (leading bold title + pinned 3400 ms window), a
+// foreground task delegation (child ses_c, 7.5 s state.time span, long
+// <task_result> output), a background task delegation (immediately-completed
+// outer state, child ses_bg), and an opencode retry part (serialized
+// NamedError shape). Part ids are sequence-prefixed because the serve orders
+// parts by id ASC.
+function appendTuiParityMessages(input) {
+  const db = openDatabase()
+  try {
+    ensureSchema(db)
+    const existing = sessionRow(db, input.sessionId)
+    if (!existing) return undefined
+    const sequence = nextMessageSequence(db, input.sessionId)
+    const userTime = Date.now()
+    const assistantTime = userTime + 1
+    const userMessageId = `msg_${input.sessionId}_${sequence}_user`
+    const assistantMessageId = `msg_${input.sessionId}_${sequence + 1}_assistant`
+    insertMessage(db, { messageId: userMessageId, sessionId: input.sessionId, role: 'user', now: userTime })
+    insertMessagePart(db, {
+      partId: `${userMessageId}_part_text`,
+      messageId: userMessageId,
+      sessionId: input.sessionId,
+      now: userTime,
+      data: { type: 'text', text: input.promptText },
+    })
+    insertMessage(db, { messageId: assistantMessageId, sessionId: input.sessionId, role: 'assistant', now: assistantTime })
+    insertMessagePart(db, {
+      partId: `${assistantMessageId}_part_1_reasoning`,
+      messageId: assistantMessageId,
+      sessionId: input.sessionId,
+      now: assistantTime,
+      data: {
+        type: 'reasoning',
+        text: '**Planning the fix**\n\nweighing options',
+        time: { start: userTime - 3400, end: userTime },
+      },
+    })
+    insertMessagePart(db, {
+      partId: `${assistantMessageId}_part_2_task_foreground`,
+      messageId: assistantMessageId,
+      sessionId: input.sessionId,
+      now: assistantTime,
+      data: {
+        type: 'tool',
+        tool: 'task',
+        state: {
+          status: 'completed',
+          input: { description: 'Fix the flaky harness', prompt: '…', subagent_type: 'general' },
+          metadata: {
+            parentSessionId: input.sessionId,
+            sessionId: TUI_PARITY_CHILD_SESSION_ID,
+            model: { modelID: 'fake-opencode', providerID: 'opencode' },
+          },
+          output: tuiParityTaskResultOutput(),
+          time: { start: userTime - 7500, end: userTime },
+        },
+      },
+    })
+    insertMessagePart(db, {
+      partId: `${assistantMessageId}_part_3_task_background`,
+      messageId: assistantMessageId,
+      sessionId: input.sessionId,
+      now: assistantTime,
+      data: {
+        type: 'tool',
+        tool: 'task',
+        state: {
+          status: 'completed',
+          input: { description: 'Index the repository', subagent_type: 'general' },
+          metadata: { background: true, sessionId: TUI_PARITY_BACKGROUND_CHILD_SESSION_ID },
+        },
+      },
+    })
+    insertMessagePart(db, {
+      partId: `${assistantMessageId}_part_4_retry`,
+      messageId: assistantMessageId,
+      sessionId: input.sessionId,
+      now: assistantTime,
+      data: {
+        type: 'retry',
+        attempt: 2,
+        error: { name: 'APIError', data: { message: 'stream disconnected' } },
+      },
+    })
+    db.prepare('UPDATE session SET time_updated = ? WHERE id = ?').run(assistantTime, input.sessionId)
+    seedTuiParityChildSessions({ parentSessionId: input.sessionId, directory: existing.directory })
+    return { promptText: input.promptText, userMessageId, assistantMessageId, assistantTime }
+  } finally {
+    db.close()
+  }
+}
+
 function serverProjectDirectory() {
   if (process.env.FAKE_OPENCODE_PROJECT_CWD) return process.env.FAKE_OPENCODE_PROJECT_CWD
   try {
@@ -324,13 +561,20 @@ function readExport(sessionId) {
           sessionID: message.session_id,
           time: { created: message.time_created, updated: message.time_updated },
         },
-        parts: partRows.map((part) => ({
-          ...(parseJsonText(part.data) ?? {}),
-          id: part.id,
-          sessionID: part.session_id,
-          messageID: part.message_id,
-          time: { created: part.time_created, updated: part.time_updated },
-        })),
+        parts: partRows.map((part) => {
+          const data = parseJsonText(part.data) ?? {}
+          // TUI-parity: a part blob may carry its own `time` (e.g. a reasoning
+          // part's {start,end} window) — merge it over the DB row timestamps
+          // instead of clobbering it, mirroring the real serve's passthrough.
+          const blobTime = typeof data.time === 'object' && data.time !== null ? data.time : {}
+          return {
+            ...data,
+            id: part.id,
+            sessionID: part.session_id,
+            messageID: part.message_id,
+            time: { created: part.time_created, updated: part.time_updated, ...blobTime },
+          }
+        }),
       }
     })
     return {
@@ -455,6 +699,60 @@ if (process.env.FAKE_OPENCODE_BUSY_AT_LAUNCH === '1') {
   busyAtLaunchPending = true
 }
 
+// freshopencode TUI-parity scripted lane (plan Task 7 e2e). Everything here is
+// gated behind FAKE_OPENCODE_TUI_PARITY=1; sibling specs leave it unset and are
+// provably unaffected.
+const tuiParityEnabled = process.env.FAKE_OPENCODE_TUI_PARITY === '1'
+const tuiParityChildEventGatePath = process.env.FAKE_OPENCODE_TUI_PARITY_CHILD_EVENT_GATE
+
+if (tuiParityEnabled) {
+  // The background delegation's child session stays ACTIVE: the authoritative
+  // session-status map reports ses_bg busy so the server-side join shows the
+  // child-derived live state (spinner, no duration) instead of the outer task
+  // part's immediately-completed state.
+  sessionStatuses.set('ses_bg', 'busy')
+  // Live-join trigger (plan Task 7, scripted SSE injection — the same env/gate
+  // pattern as FAKE_OPENCODE_SESSION_EVENT_GATE_PATH): when the spec creates
+  // the gate file, grow the served child state (a third bash tool row) AND
+  // broadcast a message.updated event carrying ses_c's id, so the parent's
+  // server-side child watcher drives a parent snapshot refresh whose re-join
+  // picks up the new row. One-shot: the gate file is consumed. The catalog
+  // probe's `serve --pure` sidecar must never eat the gate.
+  if (tuiParityChildEventGatePath && !process.argv.includes('--pure')) {
+    const gateInterval = setInterval(() => {
+      if (!fs.existsSync(tuiParityChildEventGatePath)) return
+      clearInterval(gateInterval)
+      try {
+        fs.rmSync(tuiParityChildEventGatePath, { force: true })
+      } catch {
+        // ignore
+      }
+      const gateDb = openDatabase()
+      try {
+        ensureSchema(gateDb)
+        insertMessagePart(gateDb, {
+          partId: 'msg_ses_c_2_assistant_part_tool_live',
+          messageId: 'msg_ses_c_2_assistant',
+          sessionId: 'ses_c',
+          now: Date.now(),
+          data: { type: 'tool', tool: 'bash', state: { status: 'completed', input: { command: 'echo live-join-refresh' } } },
+        })
+      } finally {
+        gateDb.close()
+      }
+      appendAudit({ event: 'tui_parity_child_event', sessionId: 'ses_c' })
+      broadcastServeEvent({
+        type: 'message.updated',
+        properties: {
+          info: { sessionID: 'ses_c', id: 'msg_ses_c_2_assistant' },
+          part: { sessionID: 'ses_c' },
+        },
+      })
+    }, 50)
+    gateInterval.unref?.()
+  }
+}
+
 function sendJson(res, statusCode, body, headers = {}) {
   res.writeHead(statusCode, { 'content-type': 'application/json', ...headers })
   res.end(JSON.stringify(body))
@@ -575,13 +873,19 @@ function messagesForSession(db, sessionId, input = {}) {
           sessionID: message.session_id,
           time: { created: message.time_created, updated: message.time_updated },
         },
-        parts: partRows.map((part) => ({
-          ...(parseJsonText(part.data) ?? {}),
-          id: part.id,
-          sessionID: part.session_id,
-          messageID: part.message_id,
-          time: { created: part.time_created, updated: part.time_updated },
-        })),
+        parts: partRows.map((part) => {
+          const data = parseJsonText(part.data) ?? {}
+          // Same blob-time merge as readExport: keep a part's own {start,end}
+          // window (TUI-parity reasoning parts) alongside the DB timestamps.
+          const blobTime = typeof data.time === 'object' && data.time !== null ? data.time : {}
+          return {
+            ...data,
+            id: part.id,
+            sessionID: part.session_id,
+            messageID: part.message_id,
+            time: { created: part.time_created, updated: part.time_updated, ...blobTime },
+          }
+        }),
       }
     }),
     nextCursor,
@@ -864,7 +1168,18 @@ const server = http.createServer(async (req, res) => {
       // kata 1wxv: a new submission supersedes the reverted tail — the pointer
       // clears and the tail rows are deleted BEFORE the turn simulation.
       clearRevertAndDeleteTail(sessionId)
-      const appended = appendPromptMessages({ sessionId, parts })
+      // TUI-parity lane: with FAKE_OPENCODE_TUI_PARITY=1 the pane's first
+      // prompt materializes the scripted delegation/reasoning/retry fixture
+      // (parent + static child sessions) instead of the plain text pair.
+      const appended = tuiParityEnabled
+        ? appendTuiParityMessages({
+            sessionId,
+            promptText: parts
+              .map((part) => typeof part?.text === 'string' ? part.text : '')
+              .filter(Boolean)
+              .join('\n'),
+          })
+        : appendPromptMessages({ sessionId, parts })
       if (!appended) {
         emitSessionIdle(sessionId, {
           routeDirectory: directory,
