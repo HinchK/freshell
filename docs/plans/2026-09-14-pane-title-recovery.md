@@ -64,6 +64,24 @@ All facts below were verified against the worktree at `bab7d5189` by five explor
 
 ---
 
+## Load-bearing corrections (Stage 2 — the executor must honor these)
+
+Evidence: `reports/load-bearing-finder.md` (LB-IDs) in the run's logs dir. These corrections amend the task sketches; where a sketch and this section disagree, this section wins.
+
+1. **LB-05 (HIGH — silent trap, fix INSIDE Task 1):** `src/store/storage-migration.ts` `migratePersistedLayout()` (~:386-430) rewrites `freshell.layout.v3` on essentially every boot (each flush removes the fresh-agent commit marker at persistMiddleware.ts:641-645, so the preserve-guard at storage-migration.ts:432-437 always fails) using a FIXED top-level literal that drops unknown fields — it would strip Task 1's `machineId` stamp BEFORE the classifier reads it, making upgrade 2 silently non-functional and the accepted tradeoff (same-machine re-pick keeps a healthy layout) false. Task 1 MUST also modify `storage-migration.ts` to carry the top-level `machineId` through the migration payload (a string on the parsed raw — the same treatment `persistedAt` gets) and add a pin that a flushed stamped envelope survives `runStorageMigration()` (extend the storage-migration suite, e.g. `test/unit/client/store/storage-migration*.test.ts`).
+2. **LB-04:** the machineIdentity slice field is `selectedMachine` (`machineIdentitySlice.ts:7-14`) — Task 1's `selectStampMachineId` reads `state.machineIdentity.selectedMachine.id` (set by `setMachineRestoring` BEFORE the classification runs).
+3. **LB-02 (residual, documented):** with two windows where the rebuilding one sat idle >15 min, the A15 fence drops its own generations; the bootstrap rebuild then restores the sibling's newer snapshot (same machine). That is the accepted multi-window tradeoff, not a regression.
+4. **LB-06:** `fetchSessionWindow` is a hand-rolled thunk — there is NO `sessions/fetchSessionWindow/fulfilled` action. Task 6's red test must land rows via the REAL commit action: `sessions/commitSessionWindowVisibleRefresh` (payload `{ surface, projects, ... }` per sessionsThunks.ts:610-629) or `sessions/setProjects`. All session mutations are `sessions/`-prefixed (sessionsSlice.ts:321-322), so the middleware trigger design is sound.
+5. **LB-07:** Task 4's sketch corrected to the real APIs: the owned server is `new RustServer(options)` + `await server.start()` (rust-server.ts:319/:337 — there is NO `RustServerHandle.spawn`); `connect` and the generation-file fs-poll `(clientInstanceId, minRecords, timeoutMs)` over `path.join(info.homeDir, '.freshell', 'tabs-snapshots')` are donor-spec-local (recover-my-panes-rust.spec.ts:210-211, :452-494) — copy them into the new spec; read the page's clientInstanceId from `sessionStorage['freshell.tabs.client-instance-id.v1']`; `ensureRustServerBuilt` is synchronous.
+6. **LB-08 (coverage-critical):** Task 4 must NOT clear sessionStorage on every load — `addInitScript(() => sessionStorage.clear())` runs on each reload, minting a fresh clientInstanceId, which would let Scenario 2 pass even if the `machine-bootstrap:` prefix regressed (false green). Use a once-guard (clear only on the context's first load) so the same-tab reload preserves the clientInstanceId and the prefix is load-bearing for the spec's outcome.
+7. **LB-11:** Task 4 Step 6's first verification command needs `--project=chromium` (without it, `--list` enumerates all projects and the grep count can never be 0).
+8. **LB-16:** the root store setup is `src/store/store.ts` (configureStore :51; middleware chain :85-102) — Task 6 modifies and commits THAT file, not `src/store/index.ts`.
+9. **LB-17 (real helper names for the test sketches):** `App.machine-identity.test.tsx` has NO `renderAppWithMachineApi`/`waitForMachineReady`/`exposeChooserHandlers` — its real style is a module-level `createStore()` + `render(<App .../>)` + `waitFor(...)` against the `mocks.restoreMachineWorkspace`/`mocks.startTabRegistrySync` refs (:49-51, :114-224), and `MachineChooser` is NOT mocked (drive the real dialog); the existing pin at :222-224 is the one Task 2 updates. `machine-workspace.test.ts`'s real helpers: `createStore()`, `inventoryFor(machineId)`, `addForeignWorkspace(store)` (assert via the imported, mocked `getRecoveryInventory`). `build-recovery-plan.test.ts`'s real builders: `inv(panes, ledgerOnly?)` (:11), `pane(over?)` (:7), `leavesOf(node)` (:17).
+10. **LB-18:** consuming the active-selection marker only after a successful restore is correct; once the LB-05 fix makes stamps work, a lingering armed marker is inert on healthy boots (the stamp branch ignores it). No change.
+11. **LB-14 (watch-item):** the new spec's persistence polls are content-based and bounded like the donor's fs-polls (not cloud-skipped); watch the mandated cloud-lane run for `rest-tab-persistence`-class timing sensitivity and prefer generous bounded timeouts.
+
+---
+
 ### Task 1: Persisted-layout machine-id stamp + health classification module
 
 **Files:**
@@ -71,7 +89,9 @@ All facts below were verified against the worktree at `bab7d5189` by five explor
 - Create: `test/unit/client/lib/recovery/layout-health.test.ts`
 - Modify: `src/store/persistMiddleware.ts:630-639` (stamp write in `flush()`)
 - Modify: `src/store/persistedState.ts:525-558` (`parsePersistedLayoutRaw` surfaces `machineId`)
+- Modify: `src/store/storage-migration.ts:386-430` (`migratePersistedLayout` carries the top-level `machineId` through — LB-05, without this the stamp is stripped at every boot before the classifier reads it)
 - Test: extend `test/unit/client/store/tabsPersistence.test.ts` (stamp round-trip pin)
+- Test: extend the storage-migration suite (a flushed stamped envelope survives `runStorageMigration()` — LB-05 pin)
 
 **Interfaces:**
 - Consumes: `LAYOUT_STORAGE_KEY` (`src/store/storage-keys.ts:2`), `getSelectedMachineId()` (`src/lib/machine-identity.ts:89-100`), `parsePersistedLayoutRaw`.
@@ -293,6 +313,15 @@ export function classifyPersistedLayoutHealth(
 
 (If `parsePersistedLayoutRaw` returns `null` rather than throwing on corruption, keep the try/catch anyway — both shapes classify as corrupt. If `ParsedPersistedLayout` already exposes `persistedAt` under a different field name, use that field.)
 
+In `src/store/storage-migration.ts` `migratePersistedLayout()` (~:386-430), add the stamp to the fixed top-level rewrite payload — preserve `machineId` when the parsed raw carries a string one, the same treatment `persistedAt` already gets (LB-05: without this, the every-boot rewrite strips the stamp before `classifyPersistedLayoutHealth` runs):
+
+```typescript
+// in the re-serialized payload literal:
+machineId: typeof parsed.machineId === 'string' && parsed.machineId ? parsed.machineId : undefined,
+```
+
+(omit the field when absent — never write `null`; confirm the exact local variable name for the parsed raw in that function.)
+
 - [ ] **Step 4: Run the focused test**
 
 Run: `npm run test:vitest -- run test/unit/client/lib/recovery/layout-health.test.ts test/unit/client/store/tabsPersistence.test.ts`
@@ -314,7 +343,7 @@ Expected: PASS (no existing test asserts the exact envelope field set; if one do
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add src/lib/recovery/layout-health.ts src/store/persistedState.ts src/store/persistMiddleware.ts test/unit/client/lib/recovery/layout-health.test.ts test/unit/client/store/tabsPersistence.test.ts
+git add src/lib/recovery/layout-health.ts src/store/persistedState.ts src/store/persistMiddleware.ts src/store/storage-migration.ts test/unit/client/lib/recovery/layout-health.test.ts test/unit/client/store/tabsPersistence.test.ts
 git commit -m "feat(client): stamp the persisted layout with its machine id and classify layout health"
 ```
 
@@ -720,8 +749,7 @@ Create `test/e2e-browser/specs/local-first-reload-rust.spec.ts`:
 
 ```typescript
 import { test, expect } from '../helpers/fixtures.js'
-import { connect, ensureRustServerBuilt } from '../helpers/rust-server.js'
-import type { RustServerHandle } from '../helpers/rust-server.js'
+import { ensureRustServerBuilt, RustServer } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -743,11 +771,13 @@ import path from 'node:path'
 test.describe('local-first machine workspace', () => {
   test.describe.configure({ mode: 'serial' })
 
-  let server: RustServerHandle
+  let server: RustServer
+  let serverInfo: Awaited<ReturnType<RustServer['start']>>
 
   test.beforeAll(async () => {
     await ensureRustServerBuilt()
-    server = await RustServerHandle.spawn({/* fresh FRESHELL_HOME + ephemeral port per the fixture's API */})
+    server = new RustServer({/* fresh FRESHELL_HOME + ephemeral port per the fixture's options */})
+    serverInfo = await server.start()
   })
   test.afterAll(async () => { await server?.stop() })
 
@@ -757,8 +787,16 @@ test.describe('local-first machine workspace', () => {
   ]
 
   test('reload keeps a healthy local workspace exactly; corrupt envelope rebuilds from own snapshot with preserved ids', async ({ page }) => {
-    await page.addInitScript(() => sessionStorage.clear())
-    const serverInfo = await connect(page, server)
+    // LB-08: clear only on the context's FIRST load. addInitScript runs on
+    // every reload; clearing each time mints a fresh clientInstanceId, which
+    // would let Scenario 2 pass even if the machine-bootstrap prefix regressed.
+    await page.addInitScript(() => {
+      if (!(window as { __FRESHELL_E2E_STORAGE_CLEARED__?: boolean }).__FRESHELL_E2E_STORAGE_CLEARED__) {
+        ;(window as { __FRESHELL_E2E_STORAGE_CLEARED__?: boolean }).__FRESHELL_E2E_STORAGE_CLEARED__ = true
+        sessionStorage.clear()
+      }
+    })
+    // LB-07: `connect` is donor-spec-local — navigate directly instead.
     await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
     const harness = new TestHarness(page)
     await harness.waitForHarness()
@@ -864,7 +902,7 @@ Keep poll helpers inside the spec file (other runs own the shared helper files).
 
 The config edit affects e2e collection only. Verify the spec is registered in BOTH lists: the match-all `chromium` project must NOT collect it, and `rust-chromium` must:
 
-Run: `npx playwright test --config test/e2e-browser/playwright.config.ts --list 2>/dev/null | grep -c 'local-first-reload' || true`
+Run: `npx playwright test --config test/e2e-browser/playwright.config.ts --project=chromium --list 2>/dev/null | grep -c 'local-first-reload' || true`
 
 Expected: 0
 
@@ -1068,7 +1106,7 @@ git commit -m "feat(client): fold terminal inventory titles into pane titles on 
 **Files:**
 - Create: `src/store/sessionTitleMirror.ts`
 - Create: `test/unit/client/store/sessionTitleMirror.test.ts`
-- Modify: the store setup file (wherever the root `configureStore` assembles middleware — confirm the exact file, e.g. `src/store/index.ts`; add the middleware to the chain)
+- Modify: `src/store/store.ts` (the root `configureStore` at :51 and its middleware concat chain at :85-102 — LB-16: NOT `src/store/index.ts`; add the middleware to the existing chain)
 
 **Interfaces:**
 - Consumes: `updatePaneTitleBySessionRef` (panesSlice.ts:2242, existing, `setByUser:false`-guarded; matches fresh-agent panes by `provider`+`sessionId` and terminal panes by `content.sessionRef`), sessions slice state (`state.sessions.windows[surface].projects[]` rows carrying `sessionId`/`provider`/`title?`, sessionsSlice.ts:66-96).
@@ -1099,15 +1137,13 @@ function seedFreshAgentPane(store: ReturnType<typeof buildStore>, sessionId: str
   }))
 }
 
-/** Land a session row the way a directory refresh does. Mirror the REAL
- * fulfilled action + payload shape from sessionsThunks.test.ts (the
- * 'lands title-override provenance fields' tests at :247/:305 show the
- * exact landed row shape) — do not invent a fake action type that the
- * production middleware would not see. */
 function landSessionRow(store: ReturnType<typeof buildStore>, row: { sessionId: string; provider: string; title?: string }) {
+  // LB-06: fetchSessionWindow is a hand-rolled thunk — there is NO
+  // 'sessions/fetchSessionWindow/fulfilled' action. Land rows via the REAL
+  // commit action the thunk dispatches (sessionsThunks.ts:610-629):
   store.dispatch({
-    type: 'sessions/fetchSessionWindow/fulfilled',   // confirm the real thunk type name
-    payload: /* shape that puts `row` into state.sessions.windows[surface].projects */,
+    type: 'sessions/commitSessionWindowVisibleRefresh',
+    payload: /* { surface, projects: [{ ...project fields..., sessions: [row] }] } — mirror the exact builder payload from sessionsThunks.ts:610-629 */,
   })
 }
 
@@ -1241,7 +1277,7 @@ export const sessionTitleMirrorMiddleware: Middleware = (store) => (next) => (ac
 }
 ```
 
-Register the middleware in the root store setup (confirm the file; add to the existing middleware chain so ordering with other custom middleware is deliberate — it only reads sessions state and writes panes actions, so it has no ordering constraints with persistMiddleware).
+Register the middleware in `src/store/store.ts`'s existing middleware concat chain (:85-102); ordering is free — it only reads sessions state and writes panes actions, so it has no ordering constraints with persistMiddleware.
 
 - [ ] **Step 4: Run the focused tests**
 
@@ -1264,7 +1300,7 @@ Expected: PASS
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add src/store/sessionTitleMirror.ts src/store/index.ts test/unit/client/store/sessionTitleMirror.test.ts
+git add src/store/sessionTitleMirror.ts src/store/store.ts test/unit/client/store/sessionTitleMirror.test.ts
 git commit -m "feat(client): mirror session-directory titles into open agent panes by sessionRef"
 ```
 
