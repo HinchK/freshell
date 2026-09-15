@@ -6,7 +6,12 @@ import {
   type Page,
 } from '@playwright/test'
 import { type E2eServerInfo } from './server-fixture-support.js'
-import { TestHarness, resolveCloudLaneTestBudgetMs, selectShellFromPicker } from './test-harness.js'
+import {
+  TestHarness,
+  isCloudLaneWindowConfigured,
+  resolveCloudLaneTestBudgetMs,
+  selectShellFromPicker,
+} from './test-harness.js'
 import { TerminalHelper } from './terminal-helpers.js'
 import { createE2eServerHandle, type E2eServerHandle } from './external-target.js'
 import {
@@ -245,14 +250,16 @@ export const test = base.extend<{
     await harness.waitForHarness()
 
     // Wait for WebSocket to connect. Self-heal is opted IN on the cloud
-    // lane only (env var present): this is a fresh-boot wait, and the j90s
+    // lane only (window env configured — one presence rule shared with the
+    // budget resolver, kata tg4e): this is a fresh-boot wait, and the j90s
     // wedge class (a gVisor I/O stall hanging a timeout-less boot fetch so
     // the WS never starts) recovers via a fresh boot chain —
     // waitForConnection performs at most ONE mid-wait reload when ready
     // has not landed by half the window (kata j90s). The local lane keeps
-    // its exact historical single-shot wait semantics.
+    // its exact historical single-shot wait semantics, and a stray EMPTY
+    // export means "unset" everywhere (self-heal and budget agree).
     await harness.waitForConnection(undefined, {
-      selfHealReload: process.env.FRESHELL_E2E_WS_READY_TIMEOUT_MS !== undefined,
+      selfHealReload: isCloudLaneWindowConfigured(),
     })
 
     // If a PanePicker is showing (new tab without auto-created terminal),

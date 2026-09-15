@@ -5,6 +5,7 @@ import {
   DEFAULT_WS_READY_TIMEOUT_MS,
   SHELL_RENDER_TIMEOUT_MS,
   TestHarness,
+  isCloudLaneWindowConfigured,
   resolveCloudLaneTestBudgetMs,
   resolveWsReadyTimeoutMs,
   selectShellFromPicker,
@@ -109,6 +110,27 @@ describe('resolveCloudLaneTestBudgetMs', () => {
     for (const malformed of ['not-a-number', '0', '-5']) {
       expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: malformed }))
         .toBe(DEFAULT_WS_READY_TIMEOUT_MS + CLOUD_LANE_BUDGET_OVERHEAD_MS)
+    }
+  })
+})
+
+describe('isCloudLaneWindowConfigured (one presence rule for every cloud-lane gate)', () => {
+  it('is false when the env key is absent', () => {
+    expect(isCloudLaneWindowConfigured({})).toBe(false)
+  })
+
+  it('is false when the env key is empty (empty means unset — a stray empty export must not arm self-heal without the budget that covers it)', () => {
+    expect(isCloudLaneWindowConfigured({ [ENV_VAR]: '' })).toBe(false)
+  })
+
+  it('is true when the env key is present and non-empty (including malformed values, which the window parser safely falls back)', () => {
+    expect(isCloudLaneWindowConfigured({ [ENV_VAR]: '90000' })).toBe(true)
+    expect(isCloudLaneWindowConfigured({ [ENV_VAR]: 'not-a-number' })).toBe(true)
+  })
+
+  it('agrees with the budget resolver on presence (coherence)', () => {
+    for (const env of [{}, { [ENV_VAR]: '' }, { [ENV_VAR]: '0' }, { [ENV_VAR]: '90000' }]) {
+      expect(resolveCloudLaneTestBudgetMs(env) !== null).toBe(isCloudLaneWindowConfigured(env))
     }
   })
 })

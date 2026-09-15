@@ -821,7 +821,7 @@ Expected: PASS (exit 0). This covers client/tooling vitest, source-runtime, Rust
 FRESHELL_TEST_SUMMARY='the-usual hoststats-freshellpage-flake: final e2e lane gate at HEAD' npm run test:e2e
 ```
 
-Expected: exit 0 with a zero-flake receipt, OR exit 1 that satisfies ALL THREE gate conditions above (no terminal Playwright failure; every recovered-retry case one of the three ledger-recorded flakes; no infrastructure failure — each verified from the saved full run log). Save the complete run log under the run's reports directory as the gate evidence. A receipt containing a retry-evidence case for `host-stats-pane.spec.ts`, `e2e-budget-contract.spec.ts`, `settings.spec.ts`, any other non-ledger spec, OR any terminal failure, OR any infrastructure failure is a gate failure: this run's fix is incomplete or regressed something.
+Expected: exit 0 with a zero-flake receipt, OR exit 1 that satisfies ALL THREE gate conditions above — no terminal Playwright failure; every recovered-retry case dispositioned pre-existing per condition 2 (per-case causal analysis showing the failing mechanism is untouched by this delta, population/`base_ref` receipts, each case kata-filed); no infrastructure failure — each verified from the saved full run log. Save the complete run log under the run's reports directory as the gate evidence. A receipt containing a retry-evidence case for `host-stats-pane.spec.ts`, `e2e-budget-contract.spec.ts`, `settings.spec.ts`, OR any spec whose failing mechanism this delta touches, OR any terminal failure, OR any infrastructure failure is a gate failure: this run's fix is incomplete or regressed something.
 
 - [ ] **Step 3: Record the gate entry**
 

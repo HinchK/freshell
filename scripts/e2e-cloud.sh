@@ -540,10 +540,13 @@ cmd_run() {
   # the j90s stall investigation). Wedges self-heal — a fresh boot chain
   # completes in ~6s afterwards — so the harness's opt-in self-heal
   # (ONE mid-wait page.reload once ready misses half the window) plus this
-  # 90s window (phase 1 + reload + phase 2) survives the observed wedge
-  # class with margin; the settings:185 spec carries a cloud-only 120s
-  # per-test budget for the same reason. Override by exporting
-  # FRESHELL_E2E_WS_READY_TIMEOUT_MS (ms) before this script.
+  # 90s window (a single total deadline: phase 1 + reload + phase 2) survives
+  # the observed wedge class with margin. Every module-chain spec's per-test
+  # deadline derives from this window (+30s overhead, extend-only) via the
+  # e2eMachineId fixture in test/e2e-browser/helpers/fixtures.ts (kata tg4e)
+  # — no spec carries a private budget hook anymore. Override by exporting
+  # FRESHELL_E2E_WS_READY_TIMEOUT_MS (ms) before this script; the derived
+  # per-test budget scales with the override.
   echo "FRESHELL_E2E_WS_READY_TIMEOUT_MS: \"${FRESHELL_E2E_WS_READY_TIMEOUT_MS:-90000}\"" >> "$RUN_ENV_FILE"
   # Server-log visibility (kata j90s): the TestServer pipes its
   # stdout/stderr into the container log stream only when the e2e

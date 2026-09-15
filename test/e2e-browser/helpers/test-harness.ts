@@ -49,6 +49,24 @@ export function resolveWsReadyTimeoutMs(
 export const CLOUD_LANE_BUDGET_OVERHEAD_MS = 30_000
 
 /**
+ * Whether the cloud-lane window env key is configured (present AND
+ * non-empty). ONE presence rule for every cloud-lane gate — the
+ * freshellPage self-heal opt-in, settings' mid-test reload-leg opt-in,
+ * and the per-test budget resolver (kata tg4e): an empty value means
+ * "unset", exactly as a malformed value means "default" inside
+ * resolveWsReadyTimeoutMs. A stray empty export must never arm the
+ * self-heal while the budget resolver treats it as local (the incoherent
+ * state delta-review round 1 flagged: self-heal at the 30s default
+ * window plus the 60s render wait under the unchanged 60s deadline).
+ */
+export function isCloudLaneWindowConfigured(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  const raw = env.FRESHELL_E2E_WS_READY_TIMEOUT_MS
+  return raw !== undefined && raw !== ''
+}
+
+/**
  * Resolve the cloud-lane per-test deadline budget, or null on the local
  * lane (kata tg4e): the freshellPage fixture's boot chain — self-healing
  * waitForConnection (a total-deadline window of W + 1s) plus the
@@ -65,8 +83,7 @@ export const CLOUD_LANE_BUDGET_OVERHEAD_MS = 30_000
 export function resolveCloudLaneTestBudgetMs(
   env: Record<string, string | undefined> = process.env,
 ): number | null {
-  const raw = env.FRESHELL_E2E_WS_READY_TIMEOUT_MS
-  if (raw === undefined || raw === '') return null
+  if (!isCloudLaneWindowConfigured(env)) return null
   return resolveWsReadyTimeoutMs(undefined, env) + CLOUD_LANE_BUDGET_OVERHEAD_MS
 }
 

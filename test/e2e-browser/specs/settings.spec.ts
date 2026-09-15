@@ -1,4 +1,5 @@
 import { test, expect } from '../helpers/fixtures.js'
+import { isCloudLaneWindowConfigured } from '../helpers/test-harness.js'
 
 // The browser-preferences persist path debounces localStorage writes by
 // 500ms; wait past it before reading the blob.
@@ -208,13 +209,14 @@ test.describe('Settings', () => {
     expect(parsed.settings?.freshAgent?.expandTools).toBe(true)
 
     // The opt-in persists across reload. Self-heal is safe (and opted in,
-    // cloud lane only) on this fresh-boot leg: the state under test lives in
+    // cloud lane only — one presence rule shared with the budget resolver,
+    // kata tg4e) on this fresh-boot leg: the state under test lives in
     // localStorage, which survives a reload by design. Locally the wait
     // keeps its exact historical single-shot semantics.
     await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
     await harness.waitForHarness()
     await harness.waitForConnection(undefined, {
-      selfHealReload: process.env.FRESHELL_E2E_WS_READY_TIMEOUT_MS !== undefined,
+      selfHealReload: isCloudLaneWindowConfigured(),
     })
     const afterReload = (await harness.getSettings()).freshAgent
     expect(afterReload.expandThinking).toBe(true)
