@@ -126,12 +126,14 @@ import { MACHINE_ID_STORAGE_KEY } from '@/store/storage-keys'
 
 const NOW = 1_760_000_000_000
 
-// Delta round 3: seed the window's per-window key (id from sessionStorage).
+// Delta round 3 (e3r1 finding 3 correction): seed the window's per-window
+// key — derived from the IMMUTABLE layout-window-id (sessionStorage
+// freshell.layout-window-id.v1), NOT the tab-registry client id.
 const WINDOW_ID = 'client-health-tests'
 const LAYOUT_STORAGE_KEY = `freshell.layout.v3.${WINDOW_ID}`
 
 function seedEnvelope(raw: unknown): void {
-  sessionStorage.setItem('freshell.tabs.client-instance-id.v1', WINDOW_ID)
+  sessionStorage.setItem('freshell.layout-window-id.v1', WINDOW_ID)
   localStorage.setItem(LAYOUT_STORAGE_KEY, typeof raw === 'string' ? raw : JSON.stringify(raw))
 }
 
