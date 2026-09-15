@@ -19,9 +19,9 @@
 ### Accepted tradeoffs and residuals
 - None stated by the user.
 
-**Goal:** Eliminate the `host-stats-pane.spec.ts:47` freshellPage setup-timeout flake by making the per-test deadline cover the fixture chain's entire legal self-heal window on the cloud lane, for every spec that boots the app — not just `settings.spec.ts`.
+**Goal:** Eliminate the `host-stats-pane.spec.ts:47` freshellPage setup-timeout flake by making the per-test deadline cover the fixture chain's entire legal self-heal window on the cloud lane, for every spec that boots the app through the fixtures module — not just `settings.spec.ts`.
 
-**Architecture:** The j90s wedge-tolerant self-heal in `TestHarness.waitForConnection` can legally spend ~91s+ inside the `freshellPage` fixture on the cloud lane (phase-1 `floor(W/2)` + one reload + phase-2 remaining, W=90s), but the Playwright per-test deadline stays at the config default 60s for every spec except `settings.spec.ts` (which got a hook-based 120s extension). A wedge that survives phase 1 therefore dies mid-recovery at the 60s deadline — the recorded tg4e failure. The fix derives the per-test budget from the same env that scales the window (`FRESHELL_E2E_WS_READY_TIMEOUT_MS`): budget = window + 30s overhead (= 120s at the cloud default, matching the probe-verified settings precedent), applied from inside the earliest test-scoped fixture (`e2eMachineId`, resolved before `context`/`page` for every app-boot spec). The local lane (env unset) is unchanged. The redundant settings-only hook is then removed so the budget has exactly one source of truth.
+**Architecture:** The j90s wedge-tolerant self-heal in `TestHarness.waitForConnection` can legally spend ~91s+ inside the `freshellPage` fixture on the cloud lane (phase-1 `floor(W/2)` + one reload + phase-2 remaining, W=90s), but the Playwright per-test deadline stays at the config default 60s for every spec except `settings.spec.ts` (which got a hook-based 120s extension). A wedge that survives phase 1 therefore dies mid-recovery at the 60s deadline — the recorded tg4e failure. The fix derives the per-test budget from the same env that scales the window (`FRESHELL_E2E_WS_READY_TIMEOUT_MS`): budget = window + 30s overhead (= 120s at the cloud default, matching the probe-verified settings precedent), applied as an EXTEND-ONLY maximum from inside the earliest test-scoped fixture (`e2eMachineId`, resolved before `context`/`page` for every module-chain spec). Extend-only is load-bearing: several live cloud-lane specs declare larger budgets (300s idle-gate, 240s reconcile specs) and an unconditional override would shrink them. The local lane (env unset) is unchanged. The redundant settings-only hook is then removed so the budget has exactly one source of truth.
 
 **Tech Stack:** Playwright 1.58.2 fixtures and `test.info().setTimeout`, TypeScript (NodeNext/ESM — relative imports in test files carry `.js`), Vitest for the e2e-helpers unit lane, the repo's cloud e2e lane (`scripts/e2e-cloud.sh`) for proof.
 
@@ -33,6 +33,8 @@
 - The other three baseline flakes (kata 38hj `restore-contract-wall-rust.spec.ts:579`, kata 5kyg `recover-my-panes-rust.spec.ts:733`, kata ebp6 `reconcile-client-adoption-rust.spec.ts:542`) are pre-existing failures at base_ref 39192e8aa and stay out of scope; the final full e2e lane gate passes if they are the only retry-evidence cases.
 - Malformed env values must never poison the budget (reuse `resolveWsReadyTimeoutMs`'s parsing/fallback — one parsing rule).
 - A budget that covers the legal window must not silently become a per-test entitlement: assertions and waits inside test bodies keep their own explicit timeouts; only the deadline arithmetic changes.
+- The wiring is EXTEND-ONLY (`test.info().timeout < budget` guard): a spec's own declared deadline (e.g. idle-gate-semantics' 300_000, the reconcile specs' 240_000) must never be shrunk by the cloud budget. The contract spec pins this.
+- Accepted residuals, deliberately out of scope (recorded so the reviewer sees conscious scoping): (a) the client's timeout-less boot fetches (App.tsx:1691-1753, api.ts:181) remain unbounded — that product-level hardening is the qq5m flake class, tracked by its own kata and later campaign runs; the budget fix makes one wedge episode survivable without it. (b) `selectShellFromPicker`'s silent error-swallowing loop (fixtures.ts:128-161, ~177s absolute worst case) stays as-is — its realistic single-wedge tail is covered by the 120s budget, and bounding it changes local-lane failure semantics; a pathological multi-wedge run exceeding the budget remains possible (the j90s run accepted the same residual class). (c) `waitForHarness`'s decorative 15s (real 30s) is a known cosmetic quirk not implicated in this flake. (d) Raw-base specs that import `test` from `@playwright/test` directly and boot the app in-body (terminal-escape-key-rust, cli-rust, silent-input-loss-rust, sidebar-registry-sync-rust, sidebar-remote-status-rings-rust, sidebar-status-tier-sort-rust, diag03-rotation-redaction-rust — per the load-bearing finder, LB-B2) never resolve `e2eMachineId`; they keep the same 60s deadline with env-scaled 91s single-shot windows they have today. This run does not regress them and does not cover them; they are tracked by their own kata and addressed by a later campaign step.
 - The gVisor wedge itself is infra-layer and cannot be deterministically forced; acceptance evidence is (a) the budget arithmetic covering the legal window (unit-pinned), (b) the contract spec proving the wiring under the env-present path, and (c) zero-flake cloud receipts for the affected spec at the committed HEAD.
 - The full e2e lane at the run HEAD is part of this run's final gate (`npm run test:e2e`, cloud backend); PR checks do not run e2e on this repo, so the lane must be run explicitly.
 - Accepted residuals, deliberately out of scope (recorded so the reviewer sees conscious scoping): (a) the client's timeout-less boot fetches (App.tsx:1691-1753, api.ts:181) remain unbounded — that product-level hardening is the qq5m flake class, tracked by its own kata and later campaign runs; the budget fix makes one wedge episode survivable without it. (b) `selectShellFromPicker`'s silent error-swallowing loop (fixtures.ts:128-161, ~177s absolute worst case) stays as-is — its realistic single-wedge tail is covered by the 120s budget, and bounding it changes local-lane failure semantics; a pathological multi-wedge run exceeding the budget remains possible (the j90s run accepted the same residual class). (c) `waitForHarness`'s decorative 15s (real 30s) is a known cosmetic quirk not implicated in this flake.
@@ -169,14 +171,16 @@ import { test, expect } from '../helpers/fixtures.js'
 import { resolveCloudLaneTestBudgetMs } from '../helpers/test-harness.js'
 
 // Contract (kata tg4e, main-green campaign): when the cloud-lane window
-// env is present, every test that boots the app resolves the e2eMachineId
-// fixture BEFORE any page/context work, and that fixture extends the
-// per-test deadline to cover the fixture chain's legal window — the
-// self-healing waitForConnection inside freshellPage can legally spend
-// phase-1 (W/2) + one reload + phase-2 (W - W/2) before the test body
-// starts, so the config's 60s default would kill fixture setup
-// mid-self-heal (the recorded flake). When the env is absent (local
-// lane) the default budget applies unchanged.
+// env is present, every test that boots the app through this fixtures
+// module resolves the e2eMachineId fixture BEFORE any page/context work,
+// and that fixture extends the per-test deadline (extend-only) to cover
+// the fixture chain's legal window — the self-healing waitForConnection
+// inside freshellPage can legally spend phase-1 (W/2) + one reload +
+// phase-2 (W - W/2) before the test body starts, so the config's 60s
+// default would kill fixture setup mid-self-heal (the recorded flake).
+// When the env is absent (local lane) the default budget applies
+// unchanged, and a spec's own larger declared deadline is always kept.
+
 test('per-test deadline covers the harness wedge budget on the cloud lane', ({ freshellPage }) => {
   const cloudBudgetMs = resolveCloudLaneTestBudgetMs()
   if (cloudBudgetMs === null) {
@@ -188,6 +192,20 @@ test('per-test deadline covers the harness wedge budget on the cloud lane', ({ f
   }
   expect(test.info().timeout).toBeGreaterThanOrEqual(cloudBudgetMs)
 })
+
+// Extend-only contract: a spec that declares a LARGER deadline than the
+// derived budget keeps its own — the wiring must never shrink a declared
+// budget (idle-gate-semantics declares 300_000; the reconcile specs
+// declare 240_000). Hooks run before fixture resolution, so the declared
+// value is what the fixture sees on entry.
+test.describe('declared budgets larger than the wedge budget', () => {
+  test.beforeEach(() => {
+    test.setTimeout(300_000)
+  })
+  test('keeps its declared deadline under the cloud lane budget', ({ freshellPage }) => {
+    expect(test.info().timeout).toBeGreaterThanOrEqual(300_000)
+  })
+})
 ```
 
 - [ ] **Step 2: Run the test and verify the intended failure**
@@ -198,7 +216,7 @@ Run (env-set local invocation reproduces the cloud-shaped path; first local run 
 FRESHELL_E2E_WS_READY_TIMEOUT_MS=90000 npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/e2e-budget-contract.spec.ts
 ```
 
-Expected: FAIL because `test.info().timeout` is still the 60_000 config default — `60_000 < 120_000` (the budget extension is absent). Also run the no-env leg and confirm it PASSES at this point (60_000 pin, nothing extended — the local default must be green before the wiring too):
+Expected: the FIRST test FAILs because `test.info().timeout` is still the 60_000 config default — `60_000 < 120_000` (the budget extension is absent). The SECOND (never-shrink) test PASSes at this point and keeps passing after the wiring — it is a regression pin against override-instead-of-extend semantics, not part of this Red step. Also run the no-env leg and confirm the FIRST test PASSES at this point (60_000 pin, nothing extended — the local default must be green before the wiring too):
 
 ```bash
 npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/e2e-budget-contract.spec.ts
@@ -214,23 +232,28 @@ In `test/e2e-browser/helpers/fixtures.ts`: extend the existing import from `'./t
   // The id remains stable for every context that one test intentionally uses.
   //
   // Cloud-lane wedge budget (kata tg4e): this is the earliest test-scoped
-  // fixture — resolved before context/page, so every app-boot spec's whole
-  // fixture chain runs under the deadline set here. The freshellPage
+  // fixture — resolved before context/page, so every module-chain spec's
+  // whole fixture chain runs under the deadline set here. The freshellPage
   // fixture's self-healing waitForConnection can legally spend ~91s+ at
   // the 90s cloud window (phase-1 floor(W/2) + one reload + phase-2
   // remainder) before the test body starts; the config's 60s default
   // deadline kills fixture setup mid-self-heal — the recorded
   // "Test timeout of 60000ms exceeded while setting up freshellPage"
   // flake. Extending the deadline from inside this fixture makes the
-  // budget cover the chain's own legal window for every spec, not just
-  // settings.spec.ts (whose private hook this replaces). Locally the env
-  // var is unset and the default budget applies unchanged. The mechanism
-  // is probe-verified (settings.spec.ts precedent, kata j90s): a
-  // setTimeout issued during fixture resolution extends the live deadline
-  // over fixture time.
+  // budget cover the chain's own legal window for every module-chain
+  // spec, not just settings.spec.ts (whose private hook this replaces).
+  // Locally the env var is unset and the default budget applies
+  // unchanged. The mechanism is probe-verified (settings.spec.ts
+  // precedent, kata j90s): a setTimeout issued during fixture resolution
+  // extends the live deadline over fixture time. EXTEND-ONLY: specs that
+  // declare a larger deadline (idle-gate 300s, reconcile specs 240s)
+  // keep their own budget — the guard must never shrink a declared
+  // deadline to the cloud budget.
   e2eMachineId: async ({ testServer }, use) => {
     const cloudBudgetMs = resolveCloudLaneTestBudgetMs()
-    if (cloudBudgetMs !== null) test.info().setTimeout(cloudBudgetMs)
+    if (cloudBudgetMs !== null && test.info().timeout < cloudBudgetMs) {
+      test.info().setTimeout(cloudBudgetMs)
+    }
     await use((await registerE2eMachine(testServer.info)).id)
   },
 ```
@@ -243,13 +266,13 @@ Run:
 FRESHELL_E2E_WS_READY_TIMEOUT_MS=90000 npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/e2e-budget-contract.spec.ts
 ```
 
-Expected: PASS (deadline now 120_000 under the env-set path). Then re-run the no-env leg:
+Expected: PASS (deadline now 120_000 under the env-set path; the never-shrink test still sees its declared 300_000). Then re-run the no-env leg:
 
 ```bash
 npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/e2e-budget-contract.spec.ts
 ```
 
-Expected: PASS (local default still exactly 60_000 — byte-identical local semantics).
+Expected: PASS (local default still exactly 60_000 for the first test — byte-identical local semantics; the never-shrink test keeps its 300_000).
 
 - [ ] **Step 5: Refactor while green**
 
@@ -280,7 +303,7 @@ git commit -m "test(e2e): extend the per-test deadline to the cloud wedge budget
 - Modify: `test/e2e-browser/specs/settings.spec.ts` (delete the `test.beforeEach` block, lines 8-21 in the current file: the cloud-only `test.setTimeout(120_000)` hook; its probe-verified mechanism documentation has moved into the `e2eMachineId` fixture comment in Task 2)
 
 **Interfaces:**
-- Consumes: Task 2's fixture-level budget (settings.spec.ts uses `freshellPage`, so it resolves `e2eMachineId` first: derived budget 120_000 at the cloud default window == the hook's 120_000; at any other configured window the derived budget scales, strictly superseding the fixed hook).
+- Consumes: Task 2's fixture-level budget (settings.spec.ts uses `freshellPage`, so it resolves `e2eMachineId` first: derived budget 120_000 at the cloud default window == the hook's 120_000, so the operative cloud-lane behavior is unchanged; at other configured windows the derived budget scales with the window — equal-or-larger than the old fixed hook at windows >= 90s, smaller below that but still arithmetically sufficient (window + overhead by construction)). The extend-only guard also means settings keeps any larger deadline it might declare in the future.
 - Produces: one source of truth for the cloud wedge budget (the fixture), no per-spec opt-in.
 
 - [ ] **Step 1: Write the failing behavioral test**
@@ -306,7 +329,13 @@ Expected: PASS both (settings still green with and without the env; the budget n
 
 - [ ] **Step 5: Refactor while green**
 
-The deletion IS the refactor. Confirm no other spec carries a private cloud budget hook (`grep -rn "setTimeout(120" test/e2e-browser/specs/` returns nothing), and confirm the j90s script suite `scripts/test/e2e-harness-timeout-env.test.sh` is unaffected (it uses settings.spec.ts only as a stubbed pass-through arg and pins the e2e-cloud.sh env plumbing, not the hook).
+The deletion IS the refactor. Confirm the env-gated hook pattern is gone from every spec — the corrected check (the raw `setTimeout(120` grep matches ~28 benign unconditional declaration-time timeouts in other specs; the env-gated cloud hook is uniquely identified by its env reference):
+
+```bash
+grep -rn "FRESHELL_E2E_WS_READY_TIMEOUT_MS" test/e2e-browser/specs/
+```
+
+Expected: no output (settings.spec.ts was the only spec referencing the env var). Also confirm the j90s script suite `scripts/test/e2e-harness-timeout-env.test.sh` is unaffected (it uses settings.spec.ts only as a stubbed pass-through arg and pins the e2e-cloud.sh env plumbing, not the hook).
 
 - [ ] **Step 6: Run impacted-test verification**
 
