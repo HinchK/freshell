@@ -139,8 +139,8 @@ use freshell_opencode::transport::{
     LoopbackPortAllocator, ReqwestEventSource, ReqwestServeHttp, TokioProcessSpawner,
 };
 use freshell_opencode::{
-    normalize_opencode_effort, normalize_opencode_model, OpencodeServeManager, ServeConfig,
-    ServeDeps, ServeError,
+    normalize_opencode_effort, normalize_opencode_model, OpencodeServeManager, Route, ServeConfig,
+    ServeDeps, ServeError, SessionSignal,
 };
 use freshell_protocol::{
     FreshAgentEvent, FreshAgentSessionMaterialized, ServerMessage, SessionLocator, SessionsChanged,
@@ -338,6 +338,12 @@ pub struct FreshAgentState {
     /// wired fields above, production construction is unconditional); tests
     /// install a scripted probe via [`Self::with_model_capability_probe`].
     pub(crate) model_capabilities: Arc<model_capabilities::ModelCapabilityRegistry>,
+    /// Task-3 child-session join (freshopencode TUI parity): child session id
+    /// → the parent session id whose live watcher exists (Stage-2 ledger
+    /// LB-2/LB-8). A watcher self-removes its entry on exit, so every parent
+    /// snapshot build re-arms missing watchers — dead watchers never cause
+    /// permanent refresh loss. std Mutex, short critical sections.
+    child_watchers: Arc<Mutex<HashMap<String, String>>>,
     /// Task 4 test seam: the REST resume probe's `get_session` budget override
     /// (a wedged fake serve must NEVER wait the real 10s). Production
     /// resolution reads the same `FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS`
@@ -440,6 +446,7 @@ impl FreshAgentState {
             model_capabilities: Arc::new(model_capabilities::ModelCapabilityRegistry::new(
                 Arc::new(model_capabilities::OpencodeCatalogProbe::default()),
             )),
+            child_watchers: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             resume_probe_timeout_ms: Arc::new(Mutex::new(None)),
         }
@@ -873,12 +880,87 @@ impl FreshAgentState {
         let rollback = self
             .identity_sink()
             .and_then(|s| s.load_rollback(PROVIDER, thread_id));
-        Ok(build_opencode_snapshot_json(
-            thread_id,
-            &info,
-            &messages,
-            rollback.as_ref(),
-        ))
+        let mut snapshot =
+            build_opencode_snapshot_json(thread_id, &info, &messages, rollback.as_ref());
+        // Server-side child-session join (Stage-2 ledger LB-2): this REST builder
+        // is the single client-visible snapshot producer, so the join AND the
+        // live-refresh registry live here, on FreshAgentState — reachable for
+        // every session (live or sidebar-opened durable), re-armed on every
+        // build (LB-8).
+        // ORDER (plan-review round 1, Finding 4): watch FIRST, fetch SECOND. The
+        // subscribe call creates the broadcast receiver synchronously BEFORE the
+        // child-history fetch runs, so a child event racing the fetch is buffered
+        // in the channel instead of lost — a tokio broadcast receiver does not
+        // replay.
+        self.ensure_child_watchers(&manager, thread_id, &snapshot);
+        attach_child_activity(&manager, &route, &mut snapshot).await;
+        Ok(snapshot)
+    }
+
+    /// Ensure a live child→parent watcher exists for every child session this
+    /// snapshot's `task_delegation` items reference (the live-refresh half of
+    /// the Task-3 child-session join). Subscribe BEFORE spawning
+    /// (`spawn_serve_bridge` discipline): the tokio broadcast receiver is
+    /// created synchronously here, so child events racing the spawned task's
+    /// startup are buffered, not lost. The watcher maps child `message.*`
+    /// events to a `freshAgent.session.changed` frame for the PARENT session
+    /// (reason `opencode-message`) — the frame that drives the client's
+    /// existing snapshot refetch — and self-removes its registry entry on exit
+    /// so the next parent build re-arms it (LB-8).
+    fn ensure_child_watchers(
+        &self,
+        manager: &OpencodeServeManager,
+        parent_id: &str,
+        snapshot: &Value,
+    ) {
+        for child in opencode_snapshot_child_session_ids(snapshot) {
+            let mut watchers = self.child_watchers.lock().expect("child_watchers poisoned");
+            if watchers.contains_key(&child) {
+                continue;
+            }
+            watchers.insert(child.clone(), parent_id.to_string());
+            drop(watchers);
+            // The registry entry is inserted BEFORE subscribe+spawn, so a
+            // concurrent build never double-spawns for the same child.
+            let rx = manager.subscribe(&child);
+            let fresh_agent = self.clone();
+            let parent_id = parent_id.to_string();
+            tokio::spawn(async move {
+                let mut rx = rx;
+                loop {
+                    match tokio::time::timeout(
+                        Duration::from_secs(OPENCODE_CHILD_WATCHER_IDLE_SECS),
+                        rx.recv(),
+                    )
+                    .await
+                    {
+                        Err(_elapsed) => break,
+                        Ok(Ok(SessionSignal::Event(parsed))) => {
+                            if !parsed.kind.starts_with("message.") {
+                                continue;
+                            }
+                            fresh_agent.broadcast(&opencode_ws::event_frame(
+                                &parent_id,
+                                opencode_ws::changed_event(&parent_id, "opencode-message"),
+                            ));
+                        }
+                        // Same tolerance arms as `spawn_serve_bridge`: a lost
+                        // sidecar is surfaced by the parent's own serve bridge,
+                        // and a Lagged burst must not kill the live refresh
+                        // (LB-3).
+                        Ok(Ok(SessionSignal::Lost)) => {}
+                        Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                        Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                    }
+                }
+                // Self-remove: the next parent snapshot build re-arms (LB-8).
+                fresh_agent
+                    .child_watchers
+                    .lock()
+                    .expect("child_watchers poisoned")
+                    .remove(&child);
+            });
+        }
     }
 }
 
@@ -1351,8 +1433,6 @@ fn opencode_tool_status(state: &Value) -> &'static str {
 /// One-line child-activity preview (the client's `getToolPreview` core cases).
 /// Unknown tools (or known tools with no preview key) fall back to compact JSON
 /// verbatim, braces included.
-// Task 3's child-session activity join consumes this; until then only the unit tests do.
-#[allow(dead_code)]
 pub(crate) fn opencode_child_activity_preview(tool: &str, input: &Value) -> String {
     let get = |key: &str| input.get(key).and_then(Value::as_str).unwrap_or("");
     let preview = match tool {
@@ -1370,6 +1450,217 @@ pub(crate) fn opencode_child_activity_preview(tool: &str, input: &Value) -> Stri
         preview.to_string()
     };
     text.chars().take(120).collect()
+}
+
+/// Task-3 join: the most child-activity rows embedded per delegation. Full
+/// detail lives in the child session pane (sidebar + "Open session"); this is a
+/// summary strip (recorded residual).
+const OPENCODE_CHILD_ACTIVITY_ROW_CAP: usize = 200;
+
+/// Idle retire bound for orphaned watchers (plan review round 1, Finding 5):
+/// 2 hours covers realistic long-running delegations and post-"Open session"
+/// child resumes; a quieter child than that rearms on the parent's next build.
+const OPENCODE_CHILD_WATCHER_IDLE_SECS: u64 = 7200;
+
+/// Compact child-session activity rows for a task delegation (the opencode TUI's
+/// nested `↳ <tool> <summary>` lines, joined server-side from the child
+/// session's message page): tool parts only, in wire order, each with the
+/// contract's `running | completed | failed` status and a one-line preview,
+/// capped at [`OPENCODE_CHILD_ACTIVITY_ROW_CAP`].
+pub(crate) fn opencode_child_activity_rows(messages: &[Value]) -> Vec<Value> {
+    messages
+        .iter()
+        .flat_map(|message| {
+            message
+                .get("parts")
+                .and_then(Value::as_array)
+                .map(|parts| parts.as_slice())
+                .unwrap_or(&[])
+        })
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("tool"))
+        .map(|part| {
+            let tool = part.get("tool").and_then(Value::as_str).unwrap_or("tool");
+            let state = part.get("state").cloned().unwrap_or_else(|| json!({}));
+            let input = state.get("input").cloned().unwrap_or_else(|| json!({}));
+            json!({
+                "tool": tool,
+                "status": opencode_tool_status(&state),
+                "preview": opencode_child_activity_preview(tool, &input),
+            })
+        })
+        .take(OPENCODE_CHILD_ACTIVITY_ROW_CAP)
+        .collect()
+}
+
+/// Background delegations (plan-review round 2, Finding 12): opencode completes
+/// the outer task part IMMEDIATELY for a background launch while the child
+/// session keeps running. The TUI (session/index.tsx) shows the delegation as
+/// running while the child session isn't idle, and derives its duration from
+/// the child's messages (first user `info.time.created` → last assistant
+/// `info.time.completed`). Mirror that. The AUTHORITATIVE liveness signal is
+/// the serve's session-status map entry for the child (`type` busy/retry —
+/// `is_running_status_type`, plan-review round 3, Finding 17 — it applies even
+/// when the child message page is empty); the message shapes (any tool part
+/// still `running`, or an assistant message lacking `info.time.completed`) are
+/// the secondary signal covering a serve whose status map lags. Non-background
+/// items keep the parent part's authoritative status (a foreground task part
+/// completes only when the child finishes), and a parent `running`/`failed`
+/// status always stays authoritative.
+pub(crate) fn opencode_apply_background_child_status(
+    item: &mut Value,
+    messages: &[Value],
+    child_status: Option<&Value>,
+) {
+    if item.get("background").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
+    if item.get("status").and_then(Value::as_str) != Some("completed") {
+        return;
+    }
+    // Authoritative signal first: the serve's session-status map entry
+    // (`{type:'busy'|'retry'|…}`).
+    let status_type = child_status.and_then(|status| status.get("type"));
+    let mut child_active = freshell_opencode::events::is_running_status_type(status_type);
+    if !child_active {
+        for message in messages {
+            if let Some(parts) = message.get("parts").and_then(Value::as_array) {
+                if parts.iter().any(|part| {
+                    part.pointer("/state/status").and_then(Value::as_str) == Some("running")
+                }) {
+                    child_active = true;
+                }
+            }
+            if message.pointer("/info/role").and_then(Value::as_str) == Some("assistant")
+                && message.pointer("/info/time/completed").is_none()
+            {
+                child_active = true;
+            }
+        }
+    }
+    if child_active {
+        // Live background work: spinner, no duration (the TUI shows none while
+        // running).
+        item["status"] = json!("running");
+        if let Some(map) = item.as_object_mut() {
+            map.remove("durationMs");
+        }
+        return;
+    }
+    // Child finished: duration = last assistant completed − first user created.
+    let first_user_created = messages
+        .iter()
+        .find(|message| message.pointer("/info/role").and_then(Value::as_str) == Some("user"))
+        .and_then(|message| {
+            message
+                .pointer("/info/time/created")
+                .and_then(Value::as_i64)
+        });
+    let last_assistant_completed = messages
+        .iter()
+        .filter(|message| {
+            message.pointer("/info/role").and_then(Value::as_str) == Some("assistant")
+        })
+        .filter_map(|message| {
+            message
+                .pointer("/info/time/completed")
+                .and_then(Value::as_i64)
+        })
+        .max();
+    if let (Some(start), Some(end)) = (first_user_created, last_assistant_completed) {
+        if end >= start {
+            item["durationMs"] = json!((end - start) as u64);
+        }
+    }
+}
+
+/// Child session ids referenced by this snapshot's `task_delegation` items —
+/// the one parent-scan traversal both the watcher registration and the join's
+/// fetch gate walk.
+fn opencode_snapshot_child_session_ids(snapshot: &Value) -> Vec<String> {
+    snapshot
+        .get("turns")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|turn| turn.get("items").and_then(Value::as_array))
+        .flatten()
+        .filter(|item| item.get("kind").and_then(Value::as_str) == Some("task_delegation"))
+        .filter_map(|item| {
+            item.get("childSessionId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// Server-side child-session join: for every task_delegation item referencing a
+/// child session, fetch the child's message page and embed compact activity
+/// rows, then apply the child-derived live status for background delegations.
+/// Graceful on any child fetch failure (pruned child, sidecar hiccup): the item
+/// keeps its own fields and simply gains no `activity` — a 404 maps to an empty
+/// page (silent BY DESIGN; `tracing::warn!` fires only on transport errors).
+async fn attach_child_activity(
+    manager: &OpencodeServeManager,
+    route: &Route,
+    snapshot: &mut Value,
+) {
+    // No delegations -> no join: a snapshot without task_delegation items must
+    // not pay the status-map round trip (the fetch happens ONCE per join, only
+    // when there is a join).
+    if opencode_snapshot_child_session_ids(snapshot).is_empty() {
+        return;
+    }
+    // Plan-review round 3, Finding 17: the AUTHORITATIVE child liveness signal
+    // is the serve's session-status map (GET /session/status — the same
+    // endpoint the TUI uses). Message-shape inference alone misses a
+    // freshly-busy child that has only its first user message.
+    let status_map = manager
+        .get_session_status_map(route)
+        .await
+        .unwrap_or_default();
+    let Some(turns) = snapshot.get_mut("turns").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for turn in turns.iter_mut() {
+        let Some(items) = turn.get_mut("items").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for item in items.iter_mut() {
+            if item.get("kind").and_then(Value::as_str) != Some("task_delegation") {
+                continue;
+            }
+            let Some(child) = item
+                .get("childSessionId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            match manager.list_messages(&child, route).await {
+                Ok(Value::Array(messages)) => {
+                    if !messages.is_empty() {
+                        item["activity"] = Value::Array(opencode_child_activity_rows(&messages));
+                    }
+                    // Background live status applies even for an empty message
+                    // page (Finding 17).
+                    let child_status = status_map.get(&child);
+                    opencode_apply_background_child_status(item, &messages, child_status);
+                }
+                // A 200 that is not a message array: nothing to embed, nothing
+                // to warn about.
+                Ok(_) => {}
+                Err(err) => {
+                    // Structured warn, never a hard failure: a pruned child or
+                    // a sidecar hiccup must not break the parent's snapshot.
+                    tracing::warn!(
+                        child_session = %child,
+                        error = %err,
+                        "opencode child activity join skipped"
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// `itemFromPart(part, fallbackId, role, followedByTool)` (`normalize.ts:191-238`), covering
@@ -3744,6 +4035,292 @@ mod tests {
         assert!(matches!(err, OpencodeSnapshotError::NotFound));
     }
 
+    // ── Task 3 (freshopencode TUI parity): the server-side child-session join ──
+
+    /// Routed per-session fake serve HTTP: answers `GET /session/:id` and
+    /// `GET /session/:id/message` per session id, `GET /session/status` with a
+    /// scripted status map, and optionally fails any URL containing
+    /// `fail_substring` with a transport error (the join's warn path). Unknown
+    /// session paths 404 (the pruned-child case).
+    struct RoutedSessionHttp {
+        sessions: HashMap<String, Value>,
+        messages: HashMap<String, Value>,
+        status_map: Value,
+        fail_substring: Option<String>,
+    }
+
+    impl RoutedSessionHttp {
+        fn new(sessions: HashMap<String, Value>, messages: HashMap<String, Value>) -> Self {
+            Self {
+                sessions,
+                messages,
+                status_map: json!({}),
+                fail_substring: None,
+            }
+        }
+    }
+
+    /// The session id a serve URL addresses: the segment after the LAST
+    /// `/session/`, with `suffix` (e.g. `/message`) stripped.
+    fn session_id_in_url(url: &str, suffix: &str) -> Option<String> {
+        let path = url.split('?').next().unwrap_or(url);
+        let rest = path.strip_suffix(suffix)?;
+        let (_, id) = rest.rsplit_once("/session/")?;
+        (!id.is_empty()).then(|| id.to_string())
+    }
+
+    impl ServeHttp for RoutedSessionHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                if let Some(sub) = &self.fail_substring {
+                    if req.url.contains(sub.as_str()) {
+                        return Err(ServeHttpError::Ambiguous(
+                            "simulated transport failure".to_string(),
+                        ));
+                    }
+                }
+                if req.url.contains("/global/health") {
+                    return Ok(ServeHttpResponse::new(200, b"{}".to_vec()));
+                }
+                // Before the bare `/session/` arm: `/session/status` is the
+                // status map, not a session.
+                if req.url.contains("/session/status") {
+                    return Ok(ServeHttpResponse::new(
+                        200,
+                        serde_json::to_vec(&self.status_map).unwrap(),
+                    ));
+                }
+                if req.url.contains("/message") {
+                    let Some(id) = session_id_in_url(&req.url, "/message") else {
+                        return Ok(ServeHttpResponse::new(200, b"{}".to_vec()));
+                    };
+                    let Some(body) = self.messages.get(&id) else {
+                        return Ok(ServeHttpResponse::new(404, b"not found".to_vec()));
+                    };
+                    return Ok(ServeHttpResponse::new(
+                        200,
+                        serde_json::to_vec(body).unwrap(),
+                    ));
+                }
+                if let Some(id) = session_id_in_url(&req.url, "") {
+                    let Some(body) = self.sessions.get(&id) else {
+                        return Ok(ServeHttpResponse::new(404, b"not found".to_vec()));
+                    };
+                    return Ok(ServeHttpResponse::new(
+                        200,
+                        serde_json::to_vec(body).unwrap(),
+                    ));
+                }
+                Ok(ServeHttpResponse::new(200, b"{}".to_vec()))
+            })
+        }
+    }
+
+    async fn state_with_routed_http(http: RoutedSessionHttp) -> FreshAgentState {
+        let st = state();
+        let deps = ServeDeps {
+            spawner: Arc::new(NoopSpawner),
+            http: Arc::new(http),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        st.set_manager_for_test(manager).await;
+        st
+    }
+
+    /// The parent fixture every join test shares: an assistant turn carrying the
+    /// Task-2 task tool part whose `state.metadata.sessionId` is the child
+    /// `ses_c`.
+    fn join_parent_fixture() -> (HashMap<String, Value>, HashMap<String, Value>) {
+        let sessions = HashMap::from([(
+            "ses_p".to_string(),
+            json!({
+                "id": "ses_p", "title": "parent",
+                "time": { "created": 1_700_000_000_000i64, "updated": 1_700_000_005_000i64 },
+            }),
+        )]);
+        let messages = HashMap::from([(
+            "ses_p".to_string(),
+            json!([
+                { "info": { "id": "msg-u", "role": "user" }, "parts": [
+                    { "type": "text", "text": "delegate this" } ] },
+                { "info": { "id": "msg-a", "role": "assistant" }, "parts": [
+                    { "type": "tool", "id": "part_task", "tool": "task", "state": {
+                        "status": "completed",
+                        "input": { "description": "Fix the flaky harness", "subagent_type": "general" },
+                        "metadata": { "sessionId": "ses_c", "parentSessionId": "ses_p" },
+                        "output": "<task id=\"ses_c\" state=\"completed\"><task_result>ok</task_result></task>",
+                        "time": { "start": 1000, "end": 3000 }
+                    } } ] },
+            ]),
+        )]);
+        (sessions, messages)
+    }
+
+    /// The child fixture: bash completed / grep error / read running — the
+    /// exact three-row activity the join must embed.
+    fn join_child_messages() -> Value {
+        json!([
+            { "info": { "id": "m_u", "role": "user" }, "parts": [
+                { "type": "subtask", "agent": "general", "description": "Fix the flaky harness" },
+                { "type": "text", "text": "go" } ] },
+            { "info": { "id": "m_a", "role": "assistant" }, "parts": [
+                { "type": "reasoning", "text": "hmm" },
+                { "type": "tool", "tool": "bash", "state": { "status": "completed", "input": { "command": "sed -n 92,112p src/store/paneTypes.ts" } } },
+                { "type": "tool", "tool": "grep", "state": { "status": "error", "input": { "pattern": "reasoningEffort" } } },
+                { "type": "tool", "tool": "read", "state": { "status": "running", "input": { "filePath": "src/index.css" } } } ] },
+        ])
+    }
+
+    /// The snapshot's single task_delegation item (panics when absent).
+    fn snapshot_delegation_item(snapshot: &Value) -> Value {
+        snapshot["turns"]
+            .as_array()
+            .expect("turns array")
+            .iter()
+            .flat_map(|turn| turn["items"].as_array().cloned().unwrap_or_default())
+            .find(|item| item["kind"] == "task_delegation")
+            .expect("the snapshot carries the task_delegation item")
+    }
+
+    #[tokio::test]
+    async fn get_opencode_snapshot_joins_child_activity_rows_into_the_delegation() {
+        let (sessions, mut messages) = join_parent_fixture();
+        messages.insert("ses_c".to_string(), join_child_messages());
+        let st = state_with_routed_http(RoutedSessionHttp::new(sessions, messages)).await;
+
+        let snapshot = st
+            .get_opencode_snapshot("ses_p", None)
+            .await
+            .expect("snapshot builds");
+        let delegation = snapshot_delegation_item(&snapshot);
+        assert_eq!(delegation["childSessionId"], json!("ses_c"));
+        assert_eq!(
+            delegation["activity"],
+            json!([
+                { "tool": "bash", "status": "completed", "preview": "sed -n 92,112p src/store/paneTypes.ts" },
+                { "tool": "grep", "status": "failed", "preview": "reasoningEffort" },
+                { "tool": "read", "status": "running", "preview": "src/index.css" },
+            ])
+        );
+    }
+
+    /// Graceful degradation: a pruned child (its message page 404s, which
+    /// `list_messages` maps to an empty array) contributes no rows — silent BY
+    /// DESIGN — and the parent's snapshot still builds, the delegation simply
+    /// carrying no `activity` key.
+    #[tokio::test]
+    async fn get_opencode_snapshot_survives_a_pruned_child_session() {
+        let (sessions, messages) = join_parent_fixture();
+        let st = state_with_routed_http(RoutedSessionHttp::new(sessions, messages)).await;
+
+        let snapshot = st
+            .get_opencode_snapshot("ses_p", None)
+            .await
+            .expect("snapshot builds");
+        let delegation = snapshot_delegation_item(&snapshot);
+        assert!(delegation.get("activity").is_none());
+    }
+
+    /// Graceful degradation: a child fetch failing on transport logs a warn and
+    /// moves on — the parent's snapshot must still build, with no `activity`.
+    #[tokio::test]
+    async fn get_opencode_snapshot_survives_a_child_transport_error() {
+        let (sessions, messages) = join_parent_fixture();
+        let mut http = RoutedSessionHttp::new(sessions, messages);
+        http.fail_substring = Some("/session/ses_c/message".to_string());
+        let st = state_with_routed_http(http).await;
+
+        let snapshot = st
+            .get_opencode_snapshot("ses_p", None)
+            .await
+            .expect("snapshot builds");
+        let delegation = snapshot_delegation_item(&snapshot);
+        assert!(delegation.get("activity").is_none());
+    }
+
+    /// Collect bus frames (in arrival order) until `pred` matches one of them,
+    /// returning everything seen INCLUDING the matching frame. Bounded: panics
+    /// after 5s with no match, so a missing frame fails loudly instead of
+    /// hanging the suite (same shape as `opencode_ws`'s tests helper).
+    async fn frames_until(
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        pred: impl Fn(&Value) -> bool,
+    ) -> Vec<Value> {
+        let mut out = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let raw = rx.recv().await.expect("the bus stays open");
+                let Ok(v) = serde_json::from_str::<Value>(&raw) else {
+                    continue;
+                };
+                let hit = pred(&v);
+                out.push(v);
+                if hit {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("a matching frame arrives within the budget");
+        out
+    }
+
+    /// Live refresh (LB-4 ordering): the child watcher's broadcast receiver is
+    /// created synchronously BEFORE the join fetch, so a `message.*` serve event
+    /// for the CHILD dispatched after the build returns must surface as a
+    /// `freshAgent.session.changed` frame for the PARENT (reason
+    /// `opencode-message`) — the frame that drives the client's snapshot
+    /// refetch.
+    #[tokio::test]
+    async fn child_message_events_refresh_the_parent_session_changed_frame() {
+        let (sessions, mut messages) = join_parent_fixture();
+        messages.insert("ses_c".to_string(), join_child_messages());
+        let st = state_with_routed_http(RoutedSessionHttp::new(sessions, messages)).await;
+        let mut rx = st.broadcast_tx.subscribe();
+
+        // The build RETURNS with the watcher armed: dispatch only after this
+        // await, so the test is deterministic (the receiver pre-existed the
+        // fetch).
+        let snapshot = st
+            .get_opencode_snapshot("ses_p", None)
+            .await
+            .expect("snapshot builds");
+        assert_eq!(
+            snapshot_delegation_item(&snapshot)["childSessionId"],
+            json!("ses_c")
+        );
+
+        let event = freshell_opencode::parse_serve_event(&json!({
+            "type": "message.updated",
+            "properties": { "info": { "sessionID": "ses_c" } }
+        }))
+        .expect("a well-formed message.updated event");
+        st.ensure_manager().await.dispatch_event(event);
+
+        frames_until(&mut rx, |frame| {
+            frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "freshAgent.session.changed"
+                && frame["event"]["sessionId"] == "ses_p"
+                && frame["event"]["reason"] == "opencode-message"
+        })
+        .await;
+    }
+
     // -- P1.13 Task 7: REST send-keys materialization writes a binding row --
 
     /// Like `opencode_ws::tests::FakeHttp`: `POST /session` mints `ses_1`; everything
@@ -4425,6 +5002,112 @@ mod tests {
             opencode_child_activity_preview("unknown", &json!({ "a": "b" })),
             r#"{"a":"b"}"#
         );
+    }
+
+    #[test]
+    fn opencode_child_activity_rows_collects_tool_parts_from_child_messages() {
+        let messages = json!([
+            { "info": { "id": "m_u", "role": "user" }, "parts": [
+                { "type": "subtask", "agent": "general", "description": "Fix the flaky harness" },
+                { "type": "text", "text": "go" } ] },
+            { "info": { "id": "m_a", "role": "assistant" }, "parts": [
+                { "type": "reasoning", "text": "hmm" },
+                { "type": "tool", "tool": "bash", "state": { "status": "completed", "input": { "command": "sed -n 92,112p src/store/paneTypes.ts" } } },
+                { "type": "tool", "tool": "grep", "state": { "status": "error", "input": { "pattern": "reasoningEffort" } } },
+                { "type": "tool", "tool": "read", "state": { "status": "running", "input": { "filePath": "src/index.css" } } } ] },
+        ]);
+        let rows = opencode_child_activity_rows(messages.as_array().unwrap());
+        assert_eq!(
+            rows,
+            vec![
+                json!({ "tool": "bash", "status": "completed", "preview": "sed -n 92,112p src/store/paneTypes.ts" }),
+                json!({ "tool": "grep", "status": "failed", "preview": "reasoningEffort" }),
+                json!({ "tool": "read", "status": "running", "preview": "src/index.css" }),
+            ]
+        );
+    }
+
+    #[test]
+    fn opencode_child_activity_rows_cap_at_200() {
+        let parts: Vec<Value> = (0..250)
+            .map(|i| json!({ "type": "tool", "tool": "bash", "state": { "status": "completed", "input": { "command": format!("echo {i}") } } }))
+            .collect();
+        let messages = vec![json!({ "info": { "id": "m", "role": "assistant" }, "parts": parts })];
+        assert_eq!(opencode_child_activity_rows(&messages).len(), 200);
+    }
+
+    #[test]
+    fn background_delegation_stays_running_while_child_is_active() {
+        // opencode completes the outer task part immediately for background
+        // launches (plan-review round 2, Finding 12); the child's live state
+        // must win.
+        let mut item = json!({ "kind": "task_delegation", "status": "completed", "background": true, "durationMs": 200u64 });
+        let messages = vec![
+            json!({ "info": { "id": "u", "role": "user", "time": { "created": 1000 } }, "parts": [] }),
+            json!({ "info": { "id": "a", "role": "assistant", "time": { "created": 1100 } }, "parts": [
+                json!({ "type": "tool", "tool": "bash", "state": { "status": "running", "input": {} } })
+            ] }),
+        ];
+        opencode_apply_background_child_status(&mut item, &messages, None);
+        assert_eq!(item["status"], json!("running"));
+        assert!(item.get("durationMs").is_none());
+    }
+
+    #[test]
+    fn background_delegation_with_busy_status_map_and_only_user_message_stays_running() {
+        // Plan-review round 3, Finding 17: a freshly-busy child with only its
+        // first user message (or an empty message page) is running per the
+        // AUTHORITATIVE serve session-status map — message-shape inference
+        // alone would miss it.
+        let mut item = json!({ "kind": "task_delegation", "status": "completed", "background": true, "durationMs": 200u64 });
+        let messages = vec![
+            json!({ "info": { "id": "u", "role": "user", "time": { "created": 1000 } }, "parts": [] }),
+        ];
+        opencode_apply_background_child_status(
+            &mut item,
+            &messages,
+            Some(&json!({ "type": "busy" })),
+        );
+        assert_eq!(item["status"], json!("running"));
+        assert!(item.get("durationMs").is_none());
+
+        // Even an empty child message page honors the status map.
+        let mut item =
+            json!({ "kind": "task_delegation", "status": "completed", "background": true });
+        opencode_apply_background_child_status(&mut item, &[], Some(&json!({ "type": "busy" })));
+        assert_eq!(item["status"], json!("running"));
+    }
+
+    #[test]
+    fn background_delegation_completes_with_child_span_duration() {
+        let mut item = json!({ "kind": "task_delegation", "status": "completed", "background": true, "durationMs": 5u64 });
+        let messages = vec![
+            json!({ "info": { "id": "u", "role": "user", "time": { "created": 1000 } }, "parts": [] }),
+            json!({ "info": { "id": "a", "role": "assistant", "time": { "created": 1100, "completed": 61000 } }, "parts": [
+                json!({ "type": "tool", "tool": "bash", "state": { "status": "completed", "input": {} } })
+            ] }),
+        ];
+        opencode_apply_background_child_status(
+            &mut item,
+            &messages,
+            Some(&json!({ "type": "idle" })),
+        );
+        assert_eq!(item["status"], json!("completed"));
+        assert_eq!(item["durationMs"], json!(60000u64));
+    }
+
+    #[test]
+    fn non_background_and_errored_delegations_keep_parent_status() {
+        let mut item = json!({ "kind": "task_delegation", "status": "completed", "background": false, "durationMs": 7u64 });
+        opencode_apply_background_child_status(
+            &mut item,
+            &[json!({ "info": { "role": "assistant" }, "parts": [] })],
+            Some(&json!({ "type": "busy" })),
+        );
+        assert_eq!(item["durationMs"], json!(7u64));
+        let mut item = json!({ "kind": "task_delegation", "status": "failed", "background": true });
+        opencode_apply_background_child_status(&mut item, &[], Some(&json!({ "type": "busy" })));
+        assert_eq!(item["status"], json!("failed"));
     }
 
     #[test]
