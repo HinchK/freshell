@@ -4010,8 +4010,17 @@ async fn send_keys(
         // pane while the cold-start runs hits the pane key's Starting
         // record and answers the typed 409 — never a silent double
         // materialization.
+        // b8ke ext r26 F2: the operation id is UNIQUE PER REQUEST. The
+        // pane-scoped prefix keys the logs to the pane, and the uuid
+        // suffix makes a competing drive's begin_start hit the held
+        // Starting record under a DIFFERENT operation id — the typed
+        // Blocked refusal — instead of `begin_start`'s same-kind +
+        // same-op RE-ENTRY grant (pre-r26 both concurrent drives got
+        // tickets, both called create_session, and the rekey loser's
+        // freshly minted conversation was orphaned outside coordinator
+        // ownership).
         let provisional_id = format!("{PENDING_CREATE_PREFIX}{pane_id}");
-        let materialize_op = format!("rest-materialize-{pane_id}");
+        let materialize_op = format!("rest-materialize-{pane_id}-{}", Uuid::new_v4());
         let start_pid_slot = ownership_lane::sidecar_pid_cancel_slot();
         let mut _start_cancellation: Option<ownership_lane::StartCancellationGuard> = None;
         let mut own_ticket: Option<freshell_ownership::OperationTicket> = None;
@@ -6320,6 +6329,178 @@ mod tests {
                 .state,
             freshell_ownership::OwnershipState::Vacant
         ));
+    }
+
+    /// b8ke ext r26 F2: the create-GATING http — every POST /session
+    /// signals its arrival and then parks until the test's release, so a
+    /// concurrent REST materialization sits deterministically inside its
+    /// cold-start window (the exact interleaving where the pre-r26
+    /// shared operation id granted re-entry to a second drive).
+    struct GatedCreateHttp {
+        creates: std::sync::atomic::AtomicUsize,
+        arrived_tx: tokio::sync::mpsc::UnboundedSender<()>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    impl GatedCreateHttp {
+        fn creates(&self) -> usize {
+            self.creates.load(Ordering::SeqCst)
+        }
+    }
+    impl ServeHttp for GatedCreateHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let is_create = matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
+                && (req.url.ends_with("/session") || req.url.contains("/session?"));
+            if is_create {
+                self.creates.fetch_add(1, Ordering::SeqCst);
+                let _ = self.arrived_tx.send(());
+                let release = Arc::clone(&self.release);
+                return Box::pin(async move {
+                    release.notified().await;
+                    Ok(ServeHttpResponse::new(
+                        200,
+                        serde_json::to_vec(&json!({ "id": "ses_1", "directory": null })).unwrap(),
+                    ))
+                });
+            }
+            Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) })
+        }
+    }
+
+    /// b8ke ext r26 F2: two CONCURRENT REST/MCP first-sends for the same
+    /// unmaterialized pane materialize EXACTLY ONE durable session — the
+    /// competing drive is refused typed BEFORE any provider mutation.
+    /// Pre-r26 every drive shared the `rest-materialize-{paneId}`
+    /// operation id and `begin_start`'s re-entry arm grants same-kind +
+    /// same-op claims, so the second drive ALSO received a ticket and
+    /// ALSO called `create_session` (the panes mutex is released after
+    /// the pane clone, so nothing serialized them); only one drive
+    /// could rekey the provisional record, leaving the other freshly
+    /// minted OpenCode conversation orphaned outside coordinator
+    /// ownership and typed recovery.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_rest_materializations_yield_exactly_one_provider_mutation() {
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let st = state().with_ownership(Arc::clone(&registry));
+        let (arrived_tx, mut arrived_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let http = Arc::new(GatedCreateHttp {
+            creates: std::sync::atomic::AtomicUsize::new(0),
+            arrived_tx,
+            release: Arc::new(tokio::sync::Notify::new()),
+        });
+        let deps = ServeDeps {
+            spawner: Arc::new(NoopSpawner),
+            http: Arc::clone(&http) as Arc<dyn freshell_opencode::ServeHttp>,
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        st.set_manager_for_test(manager).await;
+        st.panes.lock().expect("panes mutex").insert(
+            "pane-r26-race".to_string(),
+            PaneEntry {
+                placeholder_id: "freshopencode-r26-race".to_string(),
+                cwd: Some("/w".to_string()),
+                model: None,
+                effort: None,
+                durable_id: None,
+            },
+        );
+
+        // Drive A: parks inside its cold-start create.
+        let st_a = st.clone();
+        let drive_a = tokio::spawn(async move {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-auth-token", "tok".parse().unwrap());
+            send_keys(
+                State(st_a),
+                Path("pane-r26-race".to_string()),
+                headers,
+                Json(json!({ "text": "hello", "timeout": 0 })),
+            )
+            .await
+        });
+        arrived_rx
+            .recv()
+            .await
+            .expect("drive A reaches its provider mutation");
+
+        // Drive B: the same pane, cloned before A's durable write-back —
+        // the exact competing-request window. Post-r26 it must answer the
+        // typed conflict WITHOUT any provider mutation; pre-r26 the
+        // shared operation id granted it re-entry and it issued a SECOND
+        // create (the test observes that as B never answering before the
+        // release + a create count of 2).
+        let st_b = st.clone();
+        let drive_b = tokio::spawn(async move {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-auth-token", "tok".parse().unwrap());
+            send_keys(
+                State(st_b),
+                Path("pane-r26-race".to_string()),
+                headers,
+                Json(json!({ "text": "hello", "timeout": 0 })),
+            )
+            .await
+        });
+        let b_resp = tokio::time::timeout(std::time::Duration::from_secs(3), drive_b)
+            .await
+            .expect("the competing drive answers before any provider mutation")
+            .expect("the competing drive joins");
+        assert_eq!(
+            b_resp.status(),
+            StatusCode::CONFLICT,
+            "the competing materialization is refused typed"
+        );
+        assert_eq!(
+            http.creates(),
+            1,
+            "exactly ONE provider mutation — the competing drive never reached create_session"
+        );
+
+        // Release A's parked create: the materialization completes and
+        // commits Live at the minted key with the provisional alias.
+        http.release.notify_waiters();
+        let a_resp = tokio::time::timeout(std::time::Duration::from_secs(10), drive_a)
+            .await
+            .expect("drive A completes after the release")
+            .expect("drive A joins");
+        assert_eq!(a_resp.status(), StatusCode::OK);
+        assert_eq!(http.creates(), 1, "still exactly one provider mutation");
+        assert!(matches!(
+            registry.observe(PROVIDER, "ses_1").state,
+            freshell_ownership::OwnershipState::Live { owner, .. }
+                if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+        ));
+        assert!(matches!(
+            registry
+                .observe(PROVIDER, "pending-create-pane-r26-race")
+                .state,
+            freshell_ownership::OwnershipState::Aliased { to, .. } if to == "ses_1"
+        ));
+        assert_eq!(
+            st.panes
+                .lock()
+                .expect("panes mutex")
+                .get("pane-r26-race")
+                .unwrap()
+                .durable_id
+                .as_deref(),
+            Some("ses_1"),
+            "the winning drive binds the pane"
+        );
     }
 
     /// Task 3 (corrected semantics — this test previously asserted the WAVE-B
