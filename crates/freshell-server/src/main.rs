@@ -4901,13 +4901,25 @@ mod stale_start_watchdog_tests {
         let _ = live_child.wait();
     }
 
-    /// A registered start whose settle NEVER fires (the operation is still
-    /// running) fences — the settle timeout is UNCONFIRMED, never Vacant.
+    /// b8ke r22 follow-up (the r20 F1 contract reshape): a SETTLED stale
+    /// start whose partial runtime reap is UNCONFIRMABLE fences — the
+    /// settle resolved (the guard dropped, the flag fired: the r20 sweep
+    /// only converts a fired/unregistered witness, the still-running
+    /// handler protection) but the runtime cannot be confirmed dead, so the
+    /// key fences, never Vacant. The downstream contract is unchanged: the
+    /// ticket's unwind never releases and release_fenced (the
+    /// confirmed-death probe) is the only release. Pre-r20 the settle
+    /// TIMEOUT was the unconfirmable source; the r20 sweep-skip makes
+    /// that shape unreachable (the sweep never fences a still-running
+    /// handler — the ownership crate's
+    /// a_witnessed_slow_start_is_not_swept_while_its_handler_runs pins
+    /// the skip itself).
     #[tokio::test]
     async fn a_settle_timeout_fences_the_still_running_start() {
         let states = watchdog_states();
         let generation = begin_stale_start(&states.0, "op-settle-timeout").await;
-        // The start HOLDS its ticket (the operation is still running).
+        // The start's ticket + the settlement witness (the production
+        // registration).
         let own_ticket = Some(freshell_ownership::OperationTicket::new(
             Arc::clone(&states.0),
             "claude",
@@ -4917,14 +4929,33 @@ mod stale_start_watchdog_tests {
             generation,
             "test",
         ));
-        // The guard is HELD (never dropped): the operation never settles.
-        let _guard = freshell_freshagent::ownership_lane::register_start_cancellation_for_ticket(
+        let guard = freshell_freshagent::ownership_lane::register_start_cancellation_for_ticket(
             &Some(Arc::clone(&states.0)),
             "claude",
             "sid-stale",
             &own_ticket,
             Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>,
         );
+        // The UNCONFIRMABLE partial: a FreshAgent runtime for a session
+        // with NO lane state — the reap cannot confirm its death (no live
+        // session to kill, no recorded identity to confirm), so the fence
+        // holds even with the settle resolved.
+        states.0.register_partial_runtime(
+            "claude",
+            "sid-stale",
+            "op-settle-timeout",
+            generation,
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                terminal_id: None,
+                live_session_key: Some("sid-stale".into()),
+                pid: None,
+                ownership_id: None,
+            },
+        );
+        // The r20 contract: the settle must FIRE before the sweep converts
+        // the record (the guard's drop is the operation's conclusion).
+        drop(guard);
         let _ = recover_one(&states, std::time::Duration::from_millis(50)).await;
         assert!(
             matches!(
@@ -4934,8 +4965,8 @@ mod stale_start_watchdog_tests {
                     ..
                 }
             ),
-            "the settle timeout is UNCONFIRMED — the still-running start's key fences, \
-             never Vacant"
+            "the settle RESOLVED but the partial reap is UNCONFIRMABLE — the \
+             stale start's key fences, never Vacant"
         );
         // b8ke focused episode-2 round-1 F1: the operation's own unwind
         // (its ticket's typed fail) is NOT a confirmed runtime death — it
@@ -5299,6 +5330,10 @@ mod stale_start_watchdog_tests {
             &own_ticket_fr,
             Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>,
         );
+        // b8ke r22 follow-up (the r20 F1 contract): the settle must FIRE
+        // before the sweep converts a witnessed start — the operation
+        // concluded (the guard's drop) precedes the recovery.
+        drop(guard_fr);
         let recs_fr = states_fr.0.recover_stale_starts(0, 0);
         assert_eq!(recs_fr.len(), 1);
         let rec_fr = recs_fr.into_iter().next().unwrap();
@@ -5312,7 +5347,6 @@ mod stale_start_watchdog_tests {
             ),
             freshell_ownership::FenceOutcome::Fenced
         ));
-        drop(guard_fr); // the operation concluded → the settle fired
         let (probe_tx, _probe_rx) = tokio::sync::broadcast::channel::<String>(64);
         probe_stale_start_fences(
             &states_fr.0,
@@ -5551,7 +5585,13 @@ mod stale_start_watchdog_tests {
         };
         // b8ke e4r4: the production create's settlement registration —
         // the PID-less prior releases only once the stale operation's
-        // settlement CONCLUDED (the settled-vs-unsettled contract).
+        // settlement CONCLUDED. b8ke r22 follow-up (the r20 F1 contract
+        // reshape): the sweep only converts a FIRED/unregistered witness,
+        // so the settle must fire BEFORE the recovery — the
+        // "unsettled fence" probe phase is now unreachable through the
+        // production sweep (the r20 sweep-skip IS the still-running
+        // protection, subsuming the e4r4 unsettled-holds arm; the
+        // ownership crate's r20-F1 tests pin the skip).
         let own_ticket_d4f2 = Some(freshell_ownership::OperationTicket::new(
             Arc::clone(&states.0),
             "opencode",
@@ -5582,6 +5622,9 @@ mod stale_start_watchdog_tests {
                 ownership_id: None,
             },
         );
+        // The settle fires BEFORE the sweep (the r20 contract: the flag
+        // must be fired for the conversion).
+        drop(settle_guard_d4f2);
         let recs = states.0.recover_stale_starts(0, 0);
         assert_eq!(recs.len(), 1);
         assert!(matches!(
@@ -5595,8 +5638,10 @@ mod stale_start_watchdog_tests {
             freshell_ownership::FenceOutcome::Fenced
         ));
 
-        // (a) THE PROBE HOLDS while the terminal runs (pre-d4: the
-        // opencode Fresh probe released it here — the terminal still ran).
+        // (a) THE PROBE HOLDS while the terminal runs — the TERMINAL-row
+        // evidence is the gate (pre-d4: the opencode Fresh probe released
+        // it here because no Fresh record existed — the terminal still
+        // ran). The settled flag does NOT shortcut the row check.
         let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
         probe_stale_start_fences(&states.0, &states.1, &states.2, &states.3, &states.4, &tx).await;
         assert!(
@@ -5607,12 +5652,12 @@ mod stale_start_watchdog_tests {
             "the fence HOLDS while the recorded terminal still runs"
         );
 
-        // (b) The terminal's confirmed death is necessary but NOT
-        // sufficient while the stale operation's settlement is
-        // UNSETTLED — b8ke e4r4: the PID-less prior additionally needs
-        // the operation to have concluded (the settled-vs-unsettled
-        // contract; the operation's handler can still hold the recorded
-        // pane's lease shape even after its runtime died).
+        // (b) The terminal's confirmed death releases the fence (the
+        // settled + dead-row evidence). b8ke r22 follow-up: the
+        // "holds through the dead row while UNSETTLED" phase is subsumed
+        // by the r20 sweep-skip (an unsettled start is never swept, so
+        // its fence is never armed) — the reachable probe contract is
+        // settled → dead row → releases.
         states.1.kill(live_tid);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         while !states.1.terminal_is_dead(live_tid) {
@@ -5622,18 +5667,6 @@ mod stale_start_watchdog_tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        probe_stale_start_fences(&states.0, &states.1, &states.2, &states.3, &states.4, &tx).await;
-        assert!(
-            matches!(
-                states.0.observe("opencode", "sid-stale").state,
-                OwnershipState::Fenced { .. }
-            ),
-            "the fence HOLDS through the dead row while the stale \
-             operation's settlement is still unsettled"
-        );
-        // The settlement concludes (the operation's guard dropped): the
-        // confirmed terminal death now releases the fence.
-        drop(settle_guard_d4f2);
         probe_stale_start_fences(&states.0, &states.1, &states.2, &states.3, &states.4, &tx).await;
         assert_eq!(
             states.0.observe("opencode", "sid-stale").state,
@@ -5704,6 +5737,13 @@ mod stale_start_watchdog_tests {
                 ownership_id: None,
             },
         );
+        // b8ke r22 follow-up (the r20 F1 contract): the settle must FIRE
+        // before the sweep converts a witnessed start. The "holds while
+        // unsettled" probe phase is subsumed by the r20 sweep-skip (an
+        // unsettled start is never swept, so the fence is never armed)
+        // — the reachable release contract is: settled + the gone row →
+        // the probe releases.
+        drop(settle_guard_d4f2c);
         let recs = states.0.recover_stale_starts(0, 0);
         assert_eq!(recs.len(), 1);
         assert!(matches!(
@@ -5717,30 +5757,18 @@ mod stale_start_watchdog_tests {
             freshell_ownership::FenceOutcome::Fenced
         ));
 
-        // THE PROBE (unsettled): the terminal row is gone, but the stale
-        // operation's settlement has NOT concluded — b8ke e4r4: the
-        // fence HOLDS (an absent row alone never proves a PID-less start
-        // safe; pre-d4 the claude Fresh probe's false held it forever,
-        // pre-e4r4 the absent row released it too early).
+        // THE PROBE: the terminal row is gone and the stale operation's
+        // settlement CONCLUDED (pre-d4 the claude Fresh probe's false
+        // wedged it forever; pre-e4r4 the absent row released too
+        // early for an unsettled start — now unreachable: the r20
+        // sweep never arms an unsettled fence).
         let sink_d4f2c = transition_log_capture::install();
         let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
-        probe_stale_start_fences(&states.0, &states.1, &states.2, &states.3, &states.4, &tx).await;
-        assert!(
-            matches!(
-                states.0.observe("claude", "sid-stale").state,
-                OwnershipState::Fenced { .. }
-            ),
-            "the fence HOLDS through the gone row while the stale \
-             operation's settlement is still unsettled"
-        );
-        // The settlement concludes (the operation's guard dropped): the
-        // terminal row's confirmed absence now releases.
-        drop(settle_guard_d4f2c);
         probe_stale_start_fences(&states.0, &states.1, &states.2, &states.3, &states.4, &tx).await;
         assert_eq!(
             states.0.observe("claude", "sid-stale").state,
             OwnershipState::Vacant,
-            "the dead terminal's fence releases once the settlement \
+            "the dead terminal's fence releases with the settlement \
              concluded (pre-d4: the Fresh probe wedged it forever)"
         );
 
@@ -5962,7 +5990,13 @@ mod stale_start_watchdog_tests {
         };
         // The production create's settlement registration (the ticket the
         // start-cancellation machinery arms — the operation's guard; its
-        // drop concludes the settlement).
+        // drop concludes the settlement). b8ke r22 follow-up (the r20 F1
+        // contract reshape): the settle must FIRE before the sweep
+        // converts a witnessed start — the still-running-handler
+        // protection (the sweep's skip) subsumes the e4r4 "unsettled
+        // holds" contract: an unsettled pre-spawn start is never swept,
+        // so a production-path fence always carries a concluded
+        // settlement.
         let own_ticket = Some(freshell_ownership::OperationTicket::new(
             Arc::clone(&states.0),
             "claude",
@@ -5993,9 +6027,10 @@ mod stale_start_watchdog_tests {
                 ownership_id: None,
             },
         );
-        // THE WATCHDOG PASS: the sweep fences the stale start (the
-        // operation is still active — its settlement has NOT concluded)
-        // and the probe runs in the SAME pass.
+        // The settle fires BEFORE the sweep (the r20 contract).
+        drop(settle_guard);
+        // THE WATCHDOG PASS: the sweep converts the stale start and the
+        // probe runs in the SAME pass.
         let recs = states.0.recover_stale_starts(0, 0);
         assert_eq!(recs.len(), 1);
         assert!(matches!(
@@ -6010,25 +6045,11 @@ mod stale_start_watchdog_tests {
         ));
         let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
         probe_stale_start_fences(&states.0, &states.1, &states.2, &states.3, &states.4, &tx).await;
-        // THE CONTRACT: the UNSETTLED pre-spawn operation holds the fence
-        // through the same-pass probe (pre-e4r4 the absent row read as
-        // confirmed death and the key vacated while the handler could
-        // still spawn its CLI).
-        assert!(
-            matches!(
-                states.0.observe("claude", "sid-stale").state,
-                OwnershipState::Fenced { .. }
-            ),
-            "the fence HOLDS while the pre-spawn operation is still \
-             unsettled — an absent row is not confirmed death for a \
-             start that never spawned"
-        );
-
-        // The settlement concludes (the operation's guard dropped — the
-        // handler will never spawn): the absent-row evidence now
-        // releases.
-        drop(settle_guard);
-        probe_stale_start_fences(&states.0, &states.1, &states.2, &states.3, &states.4, &tx).await;
+        // THE CONTRACT: the settlement concluded and the pre-spawn row is
+        // absent — the probe RELEASES (the e4r4 evidence: the row absence
+        // + the concluded settlement). Pre-e4r4 the absent row alone
+        // released even for an unsettled handler that could still spawn
+        // — the r20 sweep-skip now prevents that fence from ever arming.
         assert_eq!(
             states.0.observe("claude", "sid-stale").state,
             OwnershipState::Vacant,
@@ -6699,6 +6720,14 @@ mod stale_start_watchdog_tests {
             &own_ticket,
             Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>,
         );
+        // b8ke r22 follow-up (the r20 F1 contract): the settle must FIRE
+        // before the sweep converts a witnessed start — the "unsettled
+        // keeps the fence held" phase is subsumed by the r20 sweep-skip
+        // (an unsettled start is never swept, so its fence is never
+        // armed). The production-path contract: a CONCLUDED operation +
+        // a lane with no live session releases — the kind-aware positive
+        // answer (the opencode recovery path).
+        drop(guard);
         let recs4 = states4.0.recover_stale_starts(0, 0);
         assert_eq!(recs4.len(), 1);
         let rec4 = recs4.into_iter().next().unwrap();
@@ -6712,23 +6741,6 @@ mod stale_start_watchdog_tests {
             ),
             freshell_ownership::FenceOutcome::Fenced
         ));
-        // The operation is STILL in flight (the guard lives): the probe
-        // must NOT release on the lane-absent answer alone.
-        let (probe_tx, _probe_rx) = tokio::sync::broadcast::channel::<String>(64);
-        probe_stale_start_fences(
-            &states4.0, &states4.1, &states4.2, &states4.3, &states4.4, &probe_tx,
-        )
-        .await;
-        assert!(
-            matches!(
-                states4.0.observe("claude", "sid-stale").state,
-                OwnershipState::Fenced { .. }
-            ),
-            "an UNSETTLED operation keeps the fence held even when the lane \
-             reports no live session"
-        );
-        // The operation concludes (the guard drops → the settle fired).
-        drop(guard);
         let (probe_tx, _probe_rx) = tokio::sync::broadcast::channel::<String>(64);
         probe_stale_start_fences(
             &states4.0, &states4.1, &states4.2, &states4.3, &states4.4, &probe_tx,
