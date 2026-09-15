@@ -1096,6 +1096,36 @@ pub mod ownership_lane {
         }
     }
 
+    /// The FRESH-AGENT lane's `BeginOutcome` owner-fields derivation
+    /// (b8ke ext r26 F5): the same envelope fields
+    /// [`terminal_owner_fields_from_outcome`] produces, but
+    /// `OwnedByOtherKind` names the ACTUAL owner kind (the fresh lane
+    /// observes the cross-kind owner from the opposite direction — a
+    /// TERMINAL owner answers `ownerKind: "terminal"`). One derivation
+    /// for every fresh-lane REST/MCP ownership-conflict refusal (the
+    /// resume path and the materialization path share it so the typed
+    /// envelopes can never drift apart).
+    pub fn fresh_agent_owner_fields_from_outcome(
+        registry: &Option<Arc<RuntimeOwnershipRegistry>>,
+        outcome: &BeginOutcome,
+    ) -> Option<TerminalOwnerFields> {
+        match outcome {
+            BeginOutcome::OwnedByOtherKind { owner, generation } => {
+                let registry = registry.as_ref()?;
+                Some(TerminalOwnerFields {
+                    owner_kind: if owner.kind == RuntimeOwnerKind::Terminal {
+                        "terminal"
+                    } else {
+                        "fresh-agent"
+                    },
+                    owner_generation: *generation,
+                    owner_epoch: registry.boot_epoch(),
+                })
+            }
+            _ => terminal_owner_fields_from_outcome(registry, outcome),
+        }
+    }
+
     /// Derive the additive owner fields from a live coordinator observation
     /// (`observe`) — `None` when the key is vacant/unwired.
     pub fn terminal_owner_fields_from_snapshot(
@@ -3627,29 +3657,10 @@ async fn resume_session_ref_tab(
             }
         }
         ownership_lane::LaneClaim::Refused(outcome) => {
-            // The fresh-agent lane's cross-kind refusal names the ACTUAL
-            // owner kind (OwnedByOtherKind carries the owner — a TERMINAL
-            // owner answers ownerKind "terminal"; the terminal-lane helper
-            // hardcodes the opposite direction, so derive here).
-            let owner_fields = match &outcome {
-                freshell_ownership::BeginOutcome::OwnedByOtherKind { owner, generation } => {
-                    Some(ownership_lane::TerminalOwnerFields {
-                        owner_kind: if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal
-                        {
-                            "terminal"
-                        } else {
-                            "fresh-agent"
-                        },
-                        owner_generation: *generation,
-                        owner_epoch: state
-                            .ownership
-                            .as_ref()
-                            .map(|registry| registry.boot_epoch())
-                            .unwrap_or_default(),
-                    })
-                }
-                _ => ownership_lane::terminal_owner_fields_from_outcome(&state.ownership, &outcome),
-            };
+            // b8ke ext r26 F5: the fresh lane's ONE shared owner-fields
+            // derivation (the same helper the materialization path uses).
+            let owner_fields =
+                ownership_lane::fresh_agent_owner_fields_from_outcome(&state.ownership, &outcome);
             tracing::warn!(target: "freshell_freshagent::opencode",
                 provider = PROVIDER, session_id = %durable_id,
                 outcome = ?outcome,
@@ -4060,9 +4071,22 @@ async fn send_keys(
                      materialization key resolves to a live owner; the pane is not \
                      materialized by this drive"
                 );
-                return fail_json(
-                    StatusCode::CONFLICT,
-                    "SESSION_RESERVED: another lifecycle operation owns this session".to_string(),
+                // b8ke ext r26 F5: the ONE shared typed conflict envelope
+                // (machine-readable code + the coordinator's owner fields),
+                // never the prose-only fail_json shape.
+                let owner_fields = state.ownership.as_ref().and_then(|ownership| {
+                    ownership_lane::terminal_owner_fields_from_snapshot(
+                        &ownership.observe(PROVIDER, &claim_key),
+                    )
+                });
+                return fail_json_conflict_with_owner(
+                    "SESSION_RESERVED",
+                    format!(
+                        "Session {claim_key} is already materialized by a live owner; \
+                         retry after it settles."
+                    ),
+                    None,
+                    owner_fields.as_ref(),
                 );
             }
             ownership_lane::LaneClaim::Refused(outcome) => {
@@ -4073,9 +4097,18 @@ async fn send_keys(
                      refused the pane-scoped pre-spawn claim; the pane is not \
                      materialized (kata b8ke r22 F1)"
                 );
-                return fail_json(
-                    StatusCode::CONFLICT,
-                    "SESSION_RESERVED: another lifecycle operation owns this session".to_string(),
+                let owner_fields = ownership_lane::fresh_agent_owner_fields_from_outcome(
+                    &state.ownership,
+                    &outcome,
+                );
+                return fail_json_conflict_with_owner(
+                    "SESSION_RESERVED",
+                    format!(
+                        "Another lifecycle operation owns session {claim_key}; \
+                         retry after it settles."
+                    ),
+                    None,
+                    owner_fields.as_ref(),
                 );
             }
         }
@@ -4282,9 +4315,21 @@ async fn send_keys(
                 "freshagent.opencode.materialize_commit_stale: the coordinator moved on \
                  while the materialization registered"
             );
-            return fail_json(
-                StatusCode::CONFLICT,
-                "SESSION_RESERVED: session ownership changed during materialization".to_string(),
+            // b8ke ext r26 F5: the typed conflict envelope — the
+            // machine-readable code plus the owner the coordinator moved
+            // to, when the key landed somewhere live.
+            let owner_fields = state.ownership.as_ref().and_then(|ownership| {
+                ownership_lane::terminal_owner_fields_from_snapshot(
+                    &ownership.observe(PROVIDER, &durable_id),
+                )
+            });
+            return fail_json_conflict_with_owner(
+                "SESSION_RESERVED",
+                "Session ownership changed during materialization; retry after it \
+                 settles."
+                    .to_string(),
+                None,
+                owner_fields.as_ref(),
             );
         }
 
@@ -6500,6 +6545,215 @@ mod tests {
                 .as_deref(),
             Some("ses_1"),
             "the winning drive binds the pane"
+        );
+    }
+
+    /// b8ke ext r26 F5: the REST/MCP materialization's ownership
+    /// conflicts answer the ONE shared typed conflict envelope — a
+    /// machine-readable `code` plus the additive `ownerKind`/
+    /// `ownerGeneration` pair the coordinator knows (pre-r26 both the
+    /// Adopt and Refused arms used the prose-only `fail_json` shape, so
+    /// MCP and REST callers could not distinguish a live owner from an
+    /// in-progress transition).
+    async fn send_keys_and_read_body(st: &FreshAgentState, pane_id: &str) -> (StatusCode, Value) {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-auth-token", "tok".parse().unwrap());
+        let resp = send_keys(
+            State(st.clone()),
+            Path(pane_id.to_string()),
+            headers,
+            Json(json!({ "text": "hello", "timeout": 0 })),
+        )
+        .await;
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    fn insert_unmaterialized_pane(st: &FreshAgentState, pane_id: &str) {
+        st.panes.lock().expect("panes mutex").insert(
+            pane_id.to_string(),
+            PaneEntry {
+                placeholder_id: format!("freshopencode-{pane_id}"),
+                cwd: Some("/w".to_string()),
+                model: None,
+                effort: None,
+                durable_id: None,
+            },
+        );
+    }
+
+    async fn rest_materialization_state() -> (
+        FreshAgentState,
+        Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+    ) {
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let st = state().with_ownership(Arc::clone(&registry));
+        let deps = ServeDeps {
+            spawner: Arc::new(NoopSpawner),
+            http: Arc::new(CreateCapableHttp),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        st.set_manager_for_test(manager).await;
+        (st, registry)
+    }
+
+    /// The Adopt conflict: the pane-scoped key resolves through its
+    /// alias to a LIVE same-kind owner (an earlier materialization
+    /// completed) — the duplicate drive answers the typed envelope with
+    /// the owner's kind + generation, never prose.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rest_materialization_adopt_conflict_answers_the_typed_owner_envelope() {
+        let (st, registry) = rest_materialization_state().await;
+        insert_unmaterialized_pane(&st, "pane-r26-adopt");
+        // The earlier materialization's end state: Live{FreshAgent} under
+        // the durable id, and the pane's provisional key aliased to it
+        // (the REST lane's own placeholder-alias step).
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
+            PROVIDER,
+            "ses_r26_adopt",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-r26-earlier",
+            None,
+            "test",
+            crate::session_lease::now_epoch_ms(),
+        ) else {
+            panic!("expected Granted")
+        };
+        assert!(matches!(
+            registry.commit_live(
+                PROVIDER,
+                "ses_r26_adopt",
+                "op-r26-earlier",
+                generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("ses_r26_adopt".to_string()),
+                    pid: None,
+                    ownership_id: None,
+                }
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        ));
+        assert!(matches!(
+            registry.alias_vacant_key(
+                PROVIDER,
+                "pending-create-pane-r26-adopt",
+                "ses_r26_adopt",
+                "test"
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        ));
+
+        let (status, body) = send_keys_and_read_body(&st, "pane-r26-adopt").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["status"], json!("error"));
+        assert_eq!(
+            body["code"],
+            json!("SESSION_RESERVED"),
+            "the Adopt conflict carries the machine-readable code"
+        );
+        assert_eq!(
+            body["ownerKind"],
+            json!("fresh-agent"),
+            "the envelope names the live owner's kind"
+        );
+        assert_eq!(
+            body["ownerGeneration"],
+            json!(generation),
+            "the envelope names the live owner's generation"
+        );
+    }
+
+    /// The Refused conflict: a lifecycle transition holds the pane-scoped
+    /// key (another materialization's in-flight Starting) — the competing
+    /// drive answers the typed envelope before any provider mutation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rest_materialization_refused_conflict_answers_the_typed_envelope() {
+        let (st, registry) = rest_materialization_state().await;
+        insert_unmaterialized_pane(&st, "pane-r26-refused");
+        // A competing drive's in-flight start under the pane-scoped key.
+        assert!(matches!(
+            registry.begin_start(
+                PROVIDER,
+                "pending-create-pane-r26-refused",
+                freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                "op-r26-holder",
+                None,
+                "test",
+                crate::session_lease::now_epoch_ms(),
+            ),
+            freshell_ownership::BeginOutcome::Granted { .. }
+        ));
+
+        let (status, body) = send_keys_and_read_body(&st, "pane-r26-refused").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["status"], json!("error"));
+        assert_eq!(
+            body["code"],
+            json!("SESSION_RESERVED"),
+            "the refused claim carries the machine-readable code"
+        );
+    }
+
+    /// The stale-commit conflict: the coordinator moved on while the
+    /// materialization registered (here: the record failed out from
+    /// under the parked binding-row write) — the drive answers the typed
+    /// envelope, never prose.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rest_materialization_commit_stale_answers_the_typed_envelope() {
+        let (st, registry) = rest_materialization_state().await;
+        let fake = Arc::new(identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+        insert_unmaterialized_pane(&st, "pane-r26-stale");
+        // Park the materialization inside its durable binding-row write
+        // (post-mint, pre-commit — the registration window).
+        let stall = fake.arm_binding_stall(PROVIDER, "ses_1");
+        let st_drive = st.clone();
+        let drive =
+            tokio::spawn(async move { send_keys_and_read_body(&st_drive, "pane-r26-stale").await });
+
+        // The materialization parks: the rekeyed canonical record is
+        // Starting under ses_1. Move the coordinator on (the watchdog's
+        // own recovery shape for a concluded start) and release the park.
+        stall
+            .entered
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the materialization parks at its binding write");
+        let (held_op, held_generation) = match registry.observe(PROVIDER, "ses_1").state {
+            freshell_ownership::OwnershipState::Starting {
+                operation_id,
+                generation,
+                ..
+            } => (operation_id, generation),
+            other => panic!("expected the rekeyed Starting record, got {other:?}"),
+        };
+        assert!(matches!(
+            registry.fail(PROVIDER, "ses_1", &held_op, held_generation, false),
+            freshell_ownership::FailOutcome::Released
+        ));
+        stall.release.send(()).expect("release the stalled write");
+
+        let (status, body) = drive.await.expect("the drive completes after the release");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["status"], json!("error"));
+        assert_eq!(
+            body["code"],
+            json!("SESSION_RESERVED"),
+            "the stale commit carries the machine-readable code"
+        );
+        assert!(
+            body.get("ownerKind").is_none() || body["ownerKind"].is_null(),
+            "a vacated key honestly reports no live owner"
         );
     }
 
