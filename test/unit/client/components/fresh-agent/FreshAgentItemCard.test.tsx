@@ -140,4 +140,49 @@ describe('FreshAgentItemCard', () => {
       expect(card.className).toContain('px-2')
     })
   })
+
+  it('renders the persisted opencode tool error text for a failed dynamic_tool', () => {
+    const { container } = render(
+      <FreshAgentItemCard
+        item={{
+          id: 'tool-err',
+          kind: 'dynamic_tool',
+          namespace: 'opencode',
+          tool: 'bash',
+          status: 'failed',
+          arguments: { command: 'false' },
+          contentItems: null,
+          success: null,
+          error: 'The user has specified a rule which prevents you from using this specific tool call.',
+        }}
+      />,
+    )
+
+    expect(screen.getByLabelText('error')).toBeInTheDocument()
+    expect(screen.getByText('(error)')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'opencode.bash tool call' }))
+    expect(container.querySelector('[data-tool-output]')).toHaveTextContent(
+      'The user has specified a rule which prevents you from using this specific tool call.',
+    )
+  })
+
+  it('keeps rendering contentItems for a dynamic_tool without a persisted error (regression)', () => {
+    const { container } = render(
+      <FreshAgentItemCard
+        item={{
+          id: 'tool-ok',
+          kind: 'dynamic_tool',
+          namespace: 'opencode',
+          tool: 'bash',
+          status: 'completed',
+          arguments: { command: 'true' },
+          contentItems: ['PASS'],
+          success: true,
+        }}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'opencode.bash tool call' }))
+    expect(container.querySelector('[data-tool-output]')).toHaveTextContent('PASS')
+  })
 })
