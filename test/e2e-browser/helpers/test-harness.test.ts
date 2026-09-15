@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { Page } from '@playwright/test'
 import {
+  CLOUD_LANE_BUDGET_OVERHEAD_MS,
   DEFAULT_WS_READY_TIMEOUT_MS,
   TestHarness,
+  resolveCloudLaneTestBudgetMs,
   resolveWsReadyTimeoutMs,
 } from './test-harness'
 
@@ -77,6 +79,31 @@ describe('resolveWsReadyTimeoutMs', () => {
     expect(resolveWsReadyTimeoutMs(undefined, { [ENV_VAR]: 'abc' })).toBe(DEFAULT_WS_READY_TIMEOUT_MS)
     expect(resolveWsReadyTimeoutMs(undefined, { [ENV_VAR]: '0' })).toBe(DEFAULT_WS_READY_TIMEOUT_MS)
     expect(resolveWsReadyTimeoutMs(undefined, { [ENV_VAR]: '-5' })).toBe(DEFAULT_WS_READY_TIMEOUT_MS)
+  })
+})
+
+describe('resolveCloudLaneTestBudgetMs', () => {
+  it('returns null when the cloud window env is absent (local lane budget untouched)', () => {
+    expect(resolveCloudLaneTestBudgetMs({})).toBeNull()
+  })
+
+  it('returns null when the cloud window env is empty', () => {
+    expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: '' })).toBeNull()
+  })
+
+  it('derives window + overhead at the cloud default window (90s -> 120s)', () => {
+    expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: '90000' })).toBe(120_000)
+  })
+
+  it('scales with the configured window (60s -> 90s)', () => {
+    expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: '60000' })).toBe(90_000)
+  })
+
+  it('falls back to the default window plus overhead on malformed values (one parsing rule)', () => {
+    for (const malformed of ['not-a-number', '0', '-5']) {
+      expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: malformed }))
+        .toBe(DEFAULT_WS_READY_TIMEOUT_MS + CLOUD_LANE_BUDGET_OVERHEAD_MS)
+    }
   })
 })
 

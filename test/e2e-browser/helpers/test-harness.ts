@@ -36,6 +36,41 @@ export function resolveWsReadyTimeoutMs(
 }
 
 /**
+ * Overhead added to the resolved WS-ready window when computing the
+ * cloud-lane per-test budget. Covers the fixture steps that are not the
+ * connection wait itself: page.goto + waitForHarness (1-3s healthy), the
+ * selectShellFromPicker envelope in the evidence-shaped single-episode
+ * case (click + up-to-60s render wait; see selectShellFromPicker), and
+ * body-start margin. 30s matches the probe-verified settings.spec.ts
+ * precedent (120s budget at the 90s cloud window). The connection wait
+ * itself needs no extra room: waitForConnection enforces its window W as
+ * a single total deadline (W + 1s slack).
+ */
+export const CLOUD_LANE_BUDGET_OVERHEAD_MS = 30_000
+
+/**
+ * Resolve the cloud-lane per-test deadline budget, or null on the local
+ * lane (kata tg4e): the freshellPage fixture's boot chain — self-healing
+ * waitForConnection (a total-deadline window of W + 1s) plus the
+ * picker/render tail — has an evidence-shaped envelope larger than the
+ * config's 60s default, and the 60s deadline kills fixture setup
+ * mid-envelope ("Test timeout of 60000ms exceeded while setting up
+ * freshellPage"). The budget derives from the SAME env that scales the
+ * window (one source of truth, one parsing rule via
+ * resolveWsReadyTimeoutMs) so a custom window scales the budget with it.
+ * Callers must treat null as "do not touch the deadline" — the local
+ * lane keeps the config default unchanged — and must apply the budget
+ * EXTEND-ONLY (never shrink a declared deadline).
+ */
+export function resolveCloudLaneTestBudgetMs(
+  env: Record<string, string | undefined> = process.env,
+): number | null {
+  const raw = env.FRESHELL_E2E_WS_READY_TIMEOUT_MS
+  if (raw === undefined || raw === '') return null
+  return resolveWsReadyTimeoutMs(undefined, env) + CLOUD_LANE_BUDGET_OVERHEAD_MS
+}
+
+/**
  * The ready predicate shared by every waitForConnection phase. Must stay a
  * self-contained serializable function (Playwright ships its source to the
  * page): no closures over harness state.
