@@ -167,11 +167,11 @@ git commit -m "test(e2e): add cloud-lane per-test budget resolver (kata tg4e)"
 
 **Why this is required scope:** the budget (Task 3) is sized W + 30s; with the current 3-full-windows drift, a wedge that survives phase 1 and has a slow reload legally burns 135s of connection wait alone — more than the entire budget — recreating the recorded failure class. The j90s design intent ("keeps waiting with the remaining budget") and the j90s recap's Optional finding #4 both call for exactly this total-deadline enforcement; this run lands it.
 
-- [ ] **Step 1: Write the failing behavioral test**
+- [ ] **Step 1: Write the failing behavioral tests (the complete new contract, RED as one unit)**
 
-In `test-harness.test.ts`, extend `fakePage` to support a reload that advances the (fake) clock, and add test (f). Test (f) is the RED: the current code gives phase-2 the full remainder regardless of reload elapsed time.
+In `test-harness.test.ts`, extend `fakePage` to support a reload that advances the (fake) clock, wrap the affected tests in the fake clock for determinism, update tests (c)/(d) to the total-deadline expectations, and add test (f). All of these are the RED suite: the implementation must take them to green in one Green step, with no assertion changes after implementation (Refactor happens while green).
 
-Extend `fakePage` (add an optional second parameter; keep every existing call site working unchanged):
+(a) Extend `fakePage` (add an optional second parameter; keep every existing call site working unchanged):
 
 ```ts
 function fakePage(
@@ -187,7 +187,18 @@ function fakePage(
 }
 ```
 
-Add to the self-heal describe (after test (e)):
+(b) Add `vi` to the existing `vitest` import. Wrap tests (c) and (d) each in `vi.useFakeTimers({ toFake: ['Date'] })` / `try { ... } finally { vi.useRealTimers() }` (the fake clock makes the instant fake reload's elapsed time exactly 0, so the assertions below are exact and cannot flake under scheduler pauses), and replace each `expect(calls[1][2]).toEqual({ timeout: remaining })` in (c) and (d) with the total-deadline expectation:
+
+```ts
+    // Total-deadline contract: phase 2 receives the remainder AFTER the
+    // reload's elapsed time (+1s slack) — with the fake clock's elapsed
+    // 0, exactly remaining + 1000, never a fresh full window.
+    expect(calls[1][2]).toEqual({ timeout: remaining + 1000 })
+```
+
+(Keep every other assertion in (c)/(d) — the reload count, the three-argument binding pins, `reloads[0]` — unchanged.)
+
+(c) Add to the self-heal describe (after test (e)):
 
 ```ts
   it('(f) total-deadline: the reload elapsed time is charged to phase 2 (no 3xW sequential envelope)', async () => {
@@ -212,11 +223,16 @@ Add to the self-heal describe (after test (e)):
   })
 ```
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+- [ ] **Step 2: Run the focused tests and verify the intended failures**
 
 Run: `npm run test:e2e:helpers -- test-harness`
 
-Expected: test (f) FAILs because the current phase-2 poll is bound to the full `remaining` window (`calls[1][2]` = `{ timeout: remaining }` = 15000 at the default W=30_000, not `remaining - 10_000 + 1000` = 6000) — the total-deadline behavior is absent.
+Expected: THREE RED, all for the same absent behavior — the current phase-2 poll is bound to the full `remaining` window regardless of the reload's elapsed time:
+
+- test (f) FAILs: `calls[1][2]` = `{ timeout: remaining }` = 15000 at the default W=30_000, not `remaining - 10_000 + 1000` = 6000.
+- tests (c)/(d) FAIL their updated exact assertions: the current code yields `{ timeout: remaining }` = 15000, not `remaining + 1000` = 16000.
+
+Every other test in the lane stays green (the non-self-heal path and tests (a)/(b)/(e) are untouched).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -240,27 +256,15 @@ In `test-harness.ts`, replace the self-healing branch's reload + final poll:
     }
 ```
 
-- [ ] **Step 4: Run the focused test**
+- [ ] **Step 4: Run the focused tests (complete focused suite to GREEN)**
 
 Run: `npm run test:e2e:helpers -- test-harness`
 
-Expected: test (f) PASSes. Tests (c) and (d) FAIL their `calls[1][2]` assertions (the instant fake reload makes phase-2 = `remaining + 1000`, no longer exactly `remaining`) — update them per Step 5. This is expected mid-task red on those two assertions only; do not weaken any other assertion.
+Expected: PASS — the implementation takes the complete focused suite (updated (c)/(d) and new (f), plus every untouched test) to green in this one Green step.
 
-- [ ] **Step 5: Refactor while green (update the two affected assertions to the total-deadline semantics, deterministically)**
+- [ ] **Step 5: Refactor while green**
 
-Tests (c) and (d) must run under the same faked clock as test (f) so the instant fake reload makes the elapsed time exactly 0 and the phase-2 window exactly `remaining + 1000` — a real-clock `toBeGreaterThan(remaining)` assertion would itself flake under a scheduler pause (the elapsed ms would eat the slack). Wrap each of (c) and (d) in `vi.useFakeTimers({ toFake: ['Date'] })` / `try { ... } finally { vi.useRealTimers() }` exactly like test (f), and replace each `expect(calls[1][2]).toEqual({ timeout: remaining })` with the exact deterministic assertion:
-
-```ts
-    // Total-deadline semantics: an instant (fake-clock elapsed 0) reload
-    // leaves phase 2 the remainder plus the 1s slack — exactly.
-    expect(calls[1][2]).toEqual({ timeout: remaining + 1000 })
-```
-
-Then re-run:
-
-Run: `npm run test:e2e:helpers -- test-harness`
-
-Expected: PASS (all self-heal tests, including the updated (c)/(d) and new (f), and every other describe).
+Placement and comment polish only — no assertion or behavior changes (all assertion changes happened in Step 1 and went RED-to-GREEN through Step 3).
 
 - [ ] **Step 6: Run impacted-test verification**
 
@@ -348,7 +352,7 @@ FRESHELL_E2E_WS_READY_TIMEOUT_MS=90000 npm run test:e2e:local -- --project=chrom
 Expected: the FIRST test FAILs because `test.info().timeout` is still the 60_000 config default — `60_000 < 120_000` (the budget extension is absent). The SECOND (never-shrink) test PASSes at this point and keeps passing after the wiring — it is a regression pin against override-instead-of-extend semantics, not part of this Red step. Also run the no-env leg and confirm the FIRST test PASSES at this point (60_000 pin, nothing extended — the local default must be green before the wiring too):
 
 ```bash
-npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/e2e-budget-contract.spec.ts
+env -u FRESHELL_E2E_WS_READY_TIMEOUT_MS npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/e2e-budget-contract.spec.ts
 ```
 
 - [ ] **Step 3: Add the minimal production implementation**
@@ -401,7 +405,7 @@ FRESHELL_E2E_WS_READY_TIMEOUT_MS=90000 npm run test:e2e:local -- --project=chrom
 Expected: PASS (deadline now 120_000 under the env-set path; the never-shrink test still sees its declared 300_000). Then re-run the no-env leg:
 
 ```bash
-npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/e2e-budget-contract.spec.ts
+env -u FRESHELL_E2E_WS_READY_TIMEOUT_MS npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/e2e-budget-contract.spec.ts
 ```
 
 Expected: PASS (local default still exactly 60_000 for the first test; the never-shrink test keeps its 300_000).
@@ -417,7 +421,7 @@ None beyond the comment placement above (the settings.spec.ts duplicate hook rem
 ```bash
 npm run test:e2e:helpers
 FRESHELL_E2E_WS_READY_TIMEOUT_MS=90000 npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/host-stats-pane.spec.ts test/e2e-browser/specs/settings.spec.ts test/e2e-browser/specs/e2e-budget-contract.spec.ts
-npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/host-stats-pane.spec.ts test/e2e-browser/specs/e2e-budget-contract.spec.ts
+env -u FRESHELL_E2E_WS_READY_TIMEOUT_MS npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/host-stats-pane.spec.ts test/e2e-browser/specs/e2e-budget-contract.spec.ts
 ```
 
 Expected: PASS for all four commands (the env-set invocation proves the cloud-shaped path boots, self-heal armed, picker selects a shell, and the budgeted tests pass; the unset invocation proves local semantics are unchanged).
@@ -442,9 +446,11 @@ git commit -m "test(e2e): extend the per-test deadline to the cloud wedge budget
 
 **Why this is required scope (not residual):** the retained trace (validator LB-C, `reports/load-bearing-validator-LB-C.md`) proves the recorded tg4e failure was exactly this conflation: after a successful Shell click (terminal created server-side, active, `hasClients:true`), the 30s `.xterm` render wait failed under container-wide CPU contention, and the loop escalated into WSL/CMD — options absent on the Linux picker — silently burning the remaining budget until the 60s deadline (and double-creating terminals whenever escalation reaches an option that exists, e.g. Bash). The budget fix alone does not survive this episode class; the loop's semantics are the defect.
 
-- [ ] **Step 1: Write the failing behavioral test**
+- [ ] **Step 1: Expose the current behavior unchanged, then write the failing behavioral tests**
 
-Add to `test/e2e-browser/helpers/test-harness.test.ts` (extend the existing import from `'./test-harness'` with `selectShellFromPicker` and `SHELL_RENDER_TIMEOUT_MS`):
+**(a) Pure move, no semantic change:** move the CURRENT `selectShellFromPicker` implementation verbatim from `fixtures.ts` (lines 128-161, with its doc comment) to `test/e2e-browser/helpers/test-harness.ts` as an exported function, and import it in `fixtures.ts` from `'./test-harness.js'` (the `freshellPage` call site is unchanged). This is not the fix — it exposes the existing defective behavior so the new tests can fail against it behaviorally, not as a module-load error. Do not change the function's logic, timeouts, or swallow-shape in this step.
+
+**(b) Write the tests:** add to `test/e2e-browser/helpers/test-harness.test.ts` (extend the existing import from `'./test-harness'` with `selectShellFromPicker` and `SHELL_RENDER_TIMEOUT_MS`):
 
 ```ts
 describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
@@ -576,13 +582,21 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
 
 (The fake above is a draft: the implementer must adapt it to the real call shapes in the source — how the shell-name RegExp is built, how `locator('.xterm').first()` chains, and the exact click option object — so `clicks` records the real button names. Keep the eight behavioral assertions exactly as specified, including the two `SHELL_RENDER_TIMEOUT_MS` pins and the mid-wait recheck pin.)
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+- [ ] **Step 2: Run the tests and verify the intended BEHAVIORAL failures**
 
 Run: `npm run test:e2e:helpers -- test-harness`
 
-Expected: FAIL because `selectShellFromPicker` and `SHELL_RENDER_TIMEOUT_MS` are not exported from `./test-harness` (the function is still fixtures.ts-private) — the missing exports are the absent behavior.
+Expected: the moved-but-unfixed implementation produces multiple BEHAVIORAL failures (the module exports exist — this is not a load failure; the tests execute the current defective behavior and fail for the right reasons):
 
-- [ ] **Step 3: Add the minimal production implementation**
+- `a successful click waits the full render budget and never escalates` FAILs: `renderWaits` is `[30_000]` (the current 30s wait), not `[SHELL_RENDER_TIMEOUT_MS]` (60_000).
+- `survives a render slower than the historical 30s wait` FAILs: the current 30s wait rejects at 35s and the loop escalates — `clicks` is `['Shell', 'WSL', ...]`, not `['Shell']`.
+- `throws a diagnostic when a clicked shell never renders` FAILs: the current loop catches the wait error, swallows it, and escalates/falls through — no throw, and `clicks` grows past `['Shell']`.
+- `a non-timeout click error propagates` FAILs: the current loop's bare `catch { continue }` swallows the page-closed error and advances.
+- `falls through silently only when every option is not clickable` PASSES (that is the current behavior too — it stays).
+- The already-visible and mid-wait-recheck tests PASS (early-return behavior is unchanged by the fix).
+- `a not-clickable option ... advances to the next shell` PASSES (advance-on-timeout is the historical behavior the fix keeps).
+
+- [ ] **Step 3: Add the minimal production implementation (replace the moved function's loop with the fixed contract)**
 
 In `test/e2e-browser/helpers/test-harness.ts` (exported, near TestHarness):
 
@@ -676,7 +690,7 @@ None needed — the move to `test-harness.ts` IS the cohesion refactor (page-flo
 ```bash
 npm run test:e2e:helpers
 FRESHELL_E2E_WS_READY_TIMEOUT_MS=90000 npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/host-stats-pane.spec.ts test/e2e-browser/specs/settings.spec.ts test/e2e-browser/specs/e2e-budget-contract.spec.ts
-npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/host-stats-pane.spec.ts test/e2e-browser/specs/e2e-budget-contract.spec.ts
+env -u FRESHELL_E2E_WS_READY_TIMEOUT_MS npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/host-stats-pane.spec.ts test/e2e-browser/specs/e2e-budget-contract.spec.ts
 ```
 
 Expected: PASS for all four commands.
@@ -694,7 +708,7 @@ git commit -m "test(e2e): picker loop distinguishes absent options from slow ren
 - Modify: `test/e2e-browser/specs/settings.spec.ts` (delete the `test.beforeEach` block, lines 8-21 in the current file: the cloud-only `test.setTimeout(120_000)` hook; its probe-verified mechanism documentation has moved into the `e2eMachineId` fixture comment in Task 3)
 
 **Interfaces:**
-- Consumes: Task 3's fixture-level budget (settings.spec.ts uses `freshellPage`, so it resolves `e2eMachineId` first: derived budget 120_000 at the cloud default window == the hook's 120_000, so the operative cloud-lane behavior is unchanged; at other configured windows the derived budget scales with the window — equal-or-larger than the old fixed hook at windows >= 90s, smaller below that but still arithmetically sufficient (window + overhead by construction)). The extend-only guard also means settings keeps any larger deadline it might declare in the future.
+- Consumes: Task 3's fixture-level budget (settings.spec.ts uses `freshellPage`, so it resolves `e2eMachineId` first: derived budget 120_000 at the cloud default window == the hook's 120_000, so the operative cloud-lane behavior is unchanged). Under a supported operator override of `FRESHELL_E2E_WS_READY_TIMEOUT_MS` below 90s the derived budget is proportionally tighter than the old flat 120s hook — an operator overriding the window accepts a proportionally tighter envelope for every internal wait that derives from it (the connection phases derive from W; only the picker render wait is fixed at 60s, so an override-window wedge-plus-render co-occurrence has a thinner margin there). That thinner margin is the already-accepted residual class (b) — co-occurrence exceeding the budget — not a new residual; the operative lane (which always bakes 90s) is unaffected. The extend-only guard also means settings keeps any larger deadline it might declare in the future.
 - Produces: one source of truth for the cloud wedge budget (the fixture), no per-spec opt-in.
 
 - [ ] **Step 1: Write the failing behavioral test**
@@ -713,7 +727,7 @@ Delete the `test.beforeEach(async ({}) => { ... })` block from `test/e2e-browser
 
 ```bash
 FRESHELL_E2E_WS_READY_TIMEOUT_MS=90000 npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/settings.spec.ts test/e2e-browser/specs/e2e-budget-contract.spec.ts
-npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/settings.spec.ts
+env -u FRESHELL_E2E_WS_READY_TIMEOUT_MS npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/settings.spec.ts
 ```
 
 Expected: PASS both (settings still green with and without the env; the budget now arrives via the fixture; settings' own mid-test reload leg at settings.spec.ts:225-233 keeps working under the same 120s-equivalent budget it had before).
@@ -731,7 +745,7 @@ Expected: no output (settings.spec.ts was the only spec referencing the env var)
 - [ ] **Step 6: Run impacted-test verification**
 
 ```bash
-npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/settings.spec.ts test/e2e-browser/specs/host-stats-pane.spec.ts test/e2e-browser/specs/e2e-budget-contract.spec.ts
+env -u FRESHELL_E2E_WS_READY_TIMEOUT_MS npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/settings.spec.ts test/e2e-browser/specs/host-stats-pane.spec.ts test/e2e-browser/specs/e2e-budget-contract.spec.ts
 ```
 
 Expected: PASS (both lanes' semantics for settings and the target spec verified together).
