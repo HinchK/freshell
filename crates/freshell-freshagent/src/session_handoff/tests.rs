@@ -5101,6 +5101,121 @@ async fn handoff_abort_during_fresh_target_resume_reaps_the_registered_session_a
     let _ = std::fs::remove_dir_all(&store_dir);
 }
 
+/// b8ke ext r27 F2 (the Claude target arm): the under-ticket target
+/// resume's session-init adoption stamps its durable binding row with the
+/// SUPPLIED handoff (epoch, generation) pair — pre-r27 the under-ticket
+/// adoption held no own ticket (the runner performs the ONE commit), so
+/// the write carried a None generation, the target row preserved the
+/// PRIOR generation, and a delayed prior-generation write could pass the
+/// ledger's comparison and replace the new owner's recovery metadata.
+#[tokio::test]
+async fn the_claude_handoff_target_binding_carries_the_handoff_generation() {
+    let _guard = ENV_LOCK.lock().await;
+    // The claude-lane env surface is process-global (see the pattern above).
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let env = FakeSidecarEnv::install();
+    // The claude-lane resume gates on transcript presence (the 6b pattern).
+    let store_dir =
+        std::env::temp_dir().join(format!("freshell-handoff-r27-f2-{}", uuid_like_suffix()));
+    let project_dir = store_dir.join("projects").join("slug");
+    std::fs::create_dir_all(&project_dir).expect("create transcript project dir");
+    let sid = uuid::Uuid::new_v4().to_string();
+    std::fs::write(
+        project_dir.join(format!("{sid}.jsonl")),
+        "{\"cwd\": \"/tmp\"}\n",
+    )
+    .expect("write fake transcript");
+    std::env::set_var("CLAUDE_CONFIG_DIR", &store_dir);
+
+    let rig = build_rig(None);
+    // The sink wired BEFORE the seed below; the establish's own
+    // all-blank adoption writes NOTHING (the V7 no-laundering gate), so
+    // the ONLY binding row is the handoff target's.
+    let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+    rig.fresh_claude.set_identity_sink(fake.clone());
+    establish_fresh_claude_owner(&rig, &sid).await;
+    assert!(
+        fake.bindings.lock().unwrap().is_empty(),
+        "fixture: the all-blank establish wrote no binding row"
+    );
+    // Seed the settings record so the TARGET resume's create carries
+    // non-default settings — its session-init adoption's binding write is
+    // recordable (the settings-bearing row).
+    fake.seed(
+        "claude",
+        &sid,
+        crate::identity_sink::FreshAgentSettings {
+            model: Some("opus-x".into()),
+            sandbox: None,
+            permission_mode: Some("plan".into()),
+            effort: Some("high".into()),
+            cwd: None,
+        },
+    );
+
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_fresh("claude", &sid, "freshclaude"));
+    let result = handle
+        .completion
+        .await
+        .expect("the handoff runner completed");
+    assert_eq!(result["ok"], json!(true), "the handoff commits: {result}");
+    let committed_generation = {
+        let snap = rig.ownership.observe("claude", &sid);
+        assert!(matches!(snap.state, OwnershipState::Live { .. }));
+        snap.generation
+    };
+
+    // The target resume's sidecar init adoption writes the binding row
+    // (async to the runner's commit) — bounded-poll until it lands.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if fake
+            .bindings
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|b| b.provider == "claude" && b.session_id == sid && b.mode == "freshclaude")
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the target resume's session-init adoption never wrote its binding row"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    {
+        let bindings = fake.bindings.lock().unwrap();
+        let target_binding = bindings
+            .iter()
+            .rev()
+            .find(|b| b.provider == "claude" && b.session_id == sid && b.mode == "freshclaude")
+            .expect("the target binding row");
+        assert_eq!(
+            target_binding.observed_epoch,
+            Some(rig.ownership.boot_epoch()),
+            "the under-ticket adoption stamps the boot epoch"
+        );
+        assert_eq!(
+            target_binding.observed_generation,
+            Some(committed_generation),
+            "the under-ticket adoption stamps the SUPPLIED handoff generation — \
+             pre-r27 it carried None (the adoption holds no own ticket)"
+        );
+    }
+
+    // Cleanup: the runner retained the stamp — the lane kill works.
+    let _ = rig
+        .fresh_claude
+        .kill_for_handoff(&sid, "test-cleanup")
+        .await;
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+    let _ = std::fs::remove_dir_all(&store_dir);
+    let _ = env;
+}
+
 /// 5g. b8ke focused round-3 review R3-6: an abort inside the fresh-target
 /// window must HOLD the coordinator fence until the uncommitted target's
 /// `NotConfirmed` continuation settles — the global record does not go

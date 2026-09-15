@@ -6758,6 +6758,19 @@ impl FreshCodexState {
         // must NOT run: writing would launder blank defaults into the ledger and
         // permanently mask the miss (V7 §2's laundering finding). AWAITED before this
         // fn returns (durable-before-answer).
+        // b8ke ext r27 F2: the UNDER-TICKET continuation holds NO own ticket
+        // by design — the SUPPLIED handoff (epoch, generation) stamps the
+        // row instead, so the target's durable row carries the handoff's
+        // generation (pre-r27 the write carried (None, None), the row
+        // preserved the PRIOR generation, and a delayed prior-generation
+        // write could pass the ledger's comparison and replace the new
+        // owner's recovery metadata).
+        let (binding_epoch, binding_generation) = match (self.ownership.as_ref(), handoff) {
+            (Some(registry), Some((_, handoff_generation))) => {
+                (Some(registry.boot_epoch()), Some(handoff_generation))
+            }
+            _ => (None, None),
+        };
         if recovered.is_some() {
             let _ = self
                 .record_codex_binding(
@@ -6772,8 +6785,8 @@ impl FreshCodexState {
                     // D8: conn-less attach-resume refresh — provenance `None`
                     // keeps the row's existing stamps.
                     None,
-                    None, // observed_epoch (b8ke ext r22 F2)
-                    None, // observed_generation
+                    binding_epoch,
+                    binding_generation,
                 )
                 .await;
         }
@@ -10879,6 +10892,63 @@ pub(crate) mod tests {
                 .contains(&("codex".to_string(), thread_id.to_string())),
             "the claim's own write is never suppressed"
         );
+        st.shutdown().await;
+    }
+
+    /// b8ke ext r27 F2 (the Codex target arm): the handoff continuation's
+    /// durable binding write carries the SUPPLIED handoff (epoch,
+    /// generation) pair — pre-r27 the under-ticket lane passed (None,
+    /// None) (its own ticket is deliberately absent), so the target row
+    /// preserved the PRIOR generation and a delayed prior-generation write
+    /// could pass the ledger's comparison and replace the new owner's
+    /// recovery metadata.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_codex_handoff_target_binding_carries_the_handoff_generation() {
+        let _guard = ENV_LOCK.lock().await;
+        let (mut st, mut rx, fake) = state_with_sink();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        let thread_id = "thread-r27-handoff-target";
+        // The refresh-write gate opens on a RECOVERED settings snapshot.
+        fake.settings.lock().unwrap().insert(
+            ("codex".to_string(), thread_id.to_string()),
+            crate::identity_sink::FreshAgentSettings {
+                model: Some("gpt-5.3-codex-spark".to_string()),
+                effort: Some("high".to_string()),
+                cwd: Some("/tmp".to_string()),
+                ..Default::default()
+            },
+        );
+        configure_fake_codex_cmd("{}");
+
+        let owner = st
+            .resume_for_handoff(thread_id, None, "handoff-op-r27", 11)
+            .await
+            .expect("the under-ticket target resume succeeds");
+        assert_eq!(owner.kind, freshell_ownership::RuntimeOwnerKind::FreshAgent);
+        assert_eq!(owner.live_session_key.as_deref(), Some(thread_id));
+
+        {
+            let bindings = fake.bindings.lock().unwrap();
+            let last = bindings
+                .iter()
+                .rev()
+                .find(|b| b.session_id == thread_id)
+                .expect("the target resume wrote its binding row");
+            assert_eq!(
+                last.observed_epoch,
+                Some(registry.boot_epoch()),
+                "the handoff continuation stamps the boot epoch"
+            );
+            assert_eq!(
+                last.observed_generation,
+                Some(11),
+                "the handoff continuation stamps the SUPPLIED handoff generation — \
+                 pre-r27 it carried None (the under-ticket lane has no own ticket)"
+            );
+        }
+        // Drain the bus so the shutdown's frames do not leak into other tests.
+        while rx.try_recv().is_ok() {}
         st.shutdown().await;
     }
 

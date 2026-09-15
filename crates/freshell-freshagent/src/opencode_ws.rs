@@ -5254,13 +5254,26 @@ impl FreshOpencodeState {
         // b8ke ext r22 F2: the binding row's fence pair — captured at the
         // moment this resume's commit runs (the delayed-write fence
         // baseline the durable row carries below).
-        let (binding_epoch, binding_generation) =
-            match (self.fresh_agent.ownership.as_ref(), own_ticket.as_ref()) {
-                (Some(registry), Some(ticket)) => {
-                    (Some(registry.boot_epoch()), Some(ticket.generation()))
-                }
-                _ => (None, None),
-            };
+        // b8ke ext r27 F2: the UNDER-TICKET continuation holds NO ticket
+        // by design — the SUPPLIED handoff (epoch, generation) stamps the
+        // row instead, so the target's durable row carries the handoff's
+        // generation (pre-r27 the derivation collapsed to (None, None)
+        // here, the row preserved the PRIOR generation, and a delayed
+        // prior-generation write could pass the ledger's comparison and
+        // replace the new owner's recovery metadata).
+        let (binding_epoch, binding_generation) = match (
+            self.fresh_agent.ownership.as_ref(),
+            own_ticket.as_ref(),
+            handoff,
+        ) {
+            (Some(registry), Some(ticket), _) => {
+                (Some(registry.boot_epoch()), Some(ticket.generation()))
+            }
+            (Some(registry), None, Some((_, handoff_generation))) => {
+                (Some(registry.boot_epoch()), Some(handoff_generation))
+            }
+            _ => (None, None),
+        };
         if handoff.is_none() {
             if let Err(outcome) = self.commit_lane_claim_at(&mut own_ticket, session_id) {
                 tracing::error!(target: "invariant",
@@ -9174,6 +9187,60 @@ mod tests {
         assert!(
             st.has_live_session("ses_gated_r26").await,
             "the materialized session registered"
+        );
+    }
+
+    /// b8ke ext r27 F2 (the OpenCode target arm): the handoff
+    /// continuation's durable binding write carries the SUPPLIED handoff
+    /// (epoch, generation) pair — pre-r27 the under-ticket lane derived
+    /// the pair from its OWN (deliberately absent) ticket, so the target
+    /// row preserved the PRIOR generation and a delayed prior-generation
+    /// write could pass the ledger's comparison and replace the new
+    /// owner's recovery metadata.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_handoff_target_resume_binding_carries_the_handoff_generation() {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx))
+            .with_ownership(Arc::clone(&registry));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+        // The refresh-write gate opens on a RECOVERED settings snapshot.
+        fake.settings.lock().unwrap().insert(
+            ("opencode".to_string(), "ses_r27_oc".to_string()),
+            crate::identity_sink::FreshAgentSettings {
+                model: Some("m".to_string()),
+                effort: Some("high".to_string()),
+                cwd: Some("/w".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let owner = st
+            .opencode_resume_for_handoff("ses_r27_oc", None, "handoff-op-r27", 9)
+            .await
+            .expect("the under-ticket target resume succeeds");
+        assert_eq!(owner.kind, freshell_ownership::RuntimeOwnerKind::FreshAgent);
+
+        let bindings = fake.bindings.lock().unwrap();
+        let last = bindings
+            .iter()
+            .rev()
+            .find(|b| b.session_id == "ses_r27_oc")
+            .expect("the target resume wrote its binding row");
+        assert_eq!(
+            last.observed_epoch,
+            Some(registry.boot_epoch()),
+            "the handoff continuation stamps the boot epoch"
+        );
+        assert_eq!(
+            last.observed_generation,
+            Some(9),
+            "the handoff continuation stamps the SUPPLIED handoff generation — \
+             pre-r27 it carried None (derived from its own absent ticket)"
         );
     }
 

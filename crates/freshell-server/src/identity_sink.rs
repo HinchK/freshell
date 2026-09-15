@@ -701,6 +701,98 @@ mod tests {
         );
     }
 
+    /// b8ke ext r27 F2: the delayed-prior-generation rejection, END-TO-END
+    /// through the production sink bridge + the real PaneLedger (the
+    /// OpenCode target arm's shape): a handoff target's binding write
+    /// stamped with the SUPPLIED handoff (epoch, generation) pair advances
+    /// the row's delayed-write fence baseline, so a delayed write from the
+    /// PRIOR generation (the old writer's in-flight upsert) is refused
+    /// typed and the new owner's recovery row survives untouched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_handoff_generation_binding_rejects_a_delayed_prior_generation_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone());
+        const EPOCH: u64 = 4_242;
+        const SESSION: &str = "ses_r27_e2e";
+
+        // The pre-handoff fresh-agent row (the old owner's pair: gen 3).
+        sink.record_binding(FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: SESSION.into(),
+            mode: "freshopencode".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: Some(EPOCH),
+            observed_generation: Some(3),
+            settings: FreshAgentSettings {
+                model: Some("old-model".into()),
+                ..Default::default()
+            },
+        })
+        .await
+        .expect("the pre-handoff row writes");
+
+        // The handoff target's binding write carries the SUPPLIED handoff
+        // pair (the new owner: gen 4) — the row's fence baseline advances.
+        sink.record_binding(FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: SESSION.into(),
+            mode: "freshopencode".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: Some(EPOCH),
+            observed_generation: Some(4),
+            settings: FreshAgentSettings {
+                model: Some("new-owner-model".into()),
+                ..Default::default()
+            },
+        })
+        .await
+        .expect("the handoff target's stamped write lands");
+
+        // THE DELAYED PRIOR-GENERATION WRITE (the old writer's in-flight
+        // upsert, carrying its PRE-handoff pair) — refused typed.
+        let err = sink
+            .record_binding(FreshAgentBindingUpsert {
+                provider: "opencode".into(),
+                session_id: SESSION.into(),
+                mode: "freshopencode".into(),
+                create_request_id: None,
+                resolves_pending: None,
+                supersedes: None,
+                provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+                observed_epoch: Some(EPOCH),
+                observed_generation: Some(3),
+                settings: FreshAgentSettings {
+                    model: Some("stale-writer-model".into()),
+                    ..Default::default()
+                },
+            })
+            .await
+            .expect_err("the delayed prior-generation write is refused typed");
+        assert!(
+            err.to_string().contains("STALE_BINDING_PAIR"),
+            "the refusal is typed: {err}"
+        );
+
+        // The new owner's row survived: the handoff pair + the new owner's
+        // settings, never the stale writer's.
+        let row = ledger
+            .load_binding("opencode", SESSION)
+            .expect("the row survives");
+        assert_eq!(row.owner_epoch, Some(EPOCH));
+        assert_eq!(row.owner_generation, Some(4));
+        assert_eq!(row.model.as_deref(), Some("new-owner-model"));
+        assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
+    }
+
     /// Focused-review ep1-r1 F3: a PERSISTED pre-F8 record whose entries lack
     /// the epoch fields and whose `redoDestroyed` bit is set (a legacy record
     /// with a destroy mid-history — the undo → … → send durable shapes the

@@ -2039,6 +2039,19 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
     // detached, an aborted create is FULLY BOOKKEPT — never a
     // half-initialized orphan. (The WS door solves the same hazard by
     // spawning its settled restore create: `spawn_gated_restore_create`.)
+    // b8ke ext r27 F2: the handoff token's SUPPLIED (epoch, generation)
+    // pair — the settle's identity registration stamps the terminal
+    // target's durable row with it (the delayed-write fence baseline).
+    let handoff_observed = handoff.map(|token| {
+        (
+            state
+                .ownership
+                .as_ref()
+                .map(|registry| registry.boot_epoch())
+                .unwrap_or_default(),
+            token.generation,
+        )
+    });
     let inputs = GatedSettleInputs {
         state: state.clone(),
         body: body.clone(),
@@ -2058,6 +2071,7 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
         claim_locator: learned_claim_locator,
         under_handoff_ticket,
         handoff_spawn_watch,
+        handoff_observed,
         registry,
         host_os,
         is_wsl,
@@ -2138,6 +2152,12 @@ struct GatedSettleInputs {
     /// settle publishes the spawned terminal id into it (and parks on its
     /// test seam) at the under-ticket surface point.
     handoff_spawn_watch: Option<HandoffSpawnWatch>,
+    /// b8ke ext r27 F2: the handoff token's SUPPLIED (epoch, generation)
+    /// pair — the settle's identity registration stamps the terminal
+    /// target's durable row with it (the delayed-write fence baseline), so
+    /// the target row carries the handoff's generation. `None` for every
+    /// non-handoff caller (legacy-unfenced).
+    handoff_observed: Option<(u64, u64)>,
     registry: freshell_terminal::TerminalRegistry,
     /// Hoisted spawn-environment inputs (Task 11): computed ONCE in
     /// [`spawn_terminal_pane`] so the amplifier windows-arm guard there and
@@ -2186,6 +2206,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         claim_locator,
         under_handoff_ticket,
         handoff_spawn_watch,
+        handoff_observed,
         registry,
         host_os,
         is_wsl,
@@ -2806,8 +2827,23 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             cwd.clone(),
             create_request_id.clone(),
         );
+        // b8ke ext r27 F2: the spawning lifecycle operation's observed
+        // (epoch, generation) pair rides the registration — a handoff
+        // runner's terminal target stamps its durable row with the
+        // SUPPLIED handoff pair (the delayed-write fence baseline), so
+        // the target row carries the handoff's generation instead of
+        // preserving the prior one; every other caller stays
+        // legacy-unfenced (None).
+        let observed = handoff_observed;
         if let Err(join_err) = tokio::task::spawn_blocking(move || {
-            binder.register_create_identity(&tid, &m, sid.as_deref(), c.as_deref(), Some(&rid));
+            binder.register_create_identity(
+                &tid,
+                &m,
+                sid.as_deref(),
+                c.as_deref(),
+                Some(&rid),
+                observed,
+            );
         })
         .await
         {
@@ -5453,11 +5489,17 @@ if (args.includes('app-server')) {{
             resume_session_id: Option<&str>,
             _cwd: Option<&str>,
             _create_request_id: Option<&str>,
+            observed: Option<(u64, u64)>,
         ) {
             self.events.lock().unwrap().push(format!(
                 "register:{terminal_id}:{mode}:{}",
                 resume_session_id.unwrap_or("-")
             ));
+            let (epoch, generation) = observed.unwrap_or((0, 0));
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("register-observed:{epoch}:{generation}"));
         }
         fn retire_pane_identity(&self, terminal_id: &str) {
             self.events
@@ -5551,9 +5593,82 @@ if (args.includes('app-server')) {{
             events.contains(&format!("register:{tid}:claude:{S}")),
             "{events:?}"
         );
+        // b8ke ext r27 F2: the NON-handoff REST rung stays legacy-unfenced
+        // (no observed pair threads into the registration).
+        assert!(
+            events.contains(&"register-observed:0:0".to_string()),
+            "the non-handoff REST registration carries NO observed pair: {events:?}"
+        );
 
         registry.kill(&tid);
         let _ = std::fs::remove_file(&_capture);
+    }
+
+    /// b8ke ext r27 F2 (the terminal target arm): a handoff runner's
+    /// terminal-target spawn registers the durable identity carrying the
+    /// SUPPLIED handoff (epoch, generation) pair — pre-r27 the
+    /// registration was legacy-unfenced, so the target row preserved the
+    /// PRIOR generation and a delayed prior-generation write could pass
+    /// the ledger's comparison and replace the new owner's recovery
+    /// metadata.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_handoff_terminal_target_registration_carries_the_handoff_generation() {
+        let binder = std::sync::Arc::new(RecordingBinder::default());
+        let (state, registry, capture) = state_with_claude_capture_spec("binder-r27-f2");
+        let ownership = std::sync::Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let state = state
+            .with_ownership(std::sync::Arc::clone(&ownership))
+            .with_pane_identity_binder(binder.clone());
+
+        const S: &str = "29a53649-3333-4444-8555-666677778888";
+        // The runner's entered handoff (the token's claim context): the
+        // key sits in Handoff under the runner's operation id.
+        let freshell_ownership::BeginOutcome::Granted { generation } = ownership.begin_handoff(
+            "claude",
+            S,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "handoff-op-r27-term",
+            None,
+            "test",
+            crate::session_lease::now_epoch_ms(),
+        ) else {
+            panic!("the handoff enter must grant")
+        };
+        let token = HandoffToken {
+            operation_id: "handoff-op-r27-term".to_string(),
+            generation,
+            watch: HandoffSpawnWatch::new(None),
+        };
+
+        let spawned = spawn_terminal_pane_with_handoff(
+            &state,
+            &serde_json::json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": {"provider": "claude", "sessionId": S},
+            }),
+            "tab-r27-f2",
+            "pane-r27-f2",
+            Some(&token),
+        )
+        .await
+        .expect("the under-ticket spawn succeeds");
+
+        let tid = spawned.terminal_id.clone();
+        let events = binder.events();
+        assert!(
+            events.contains(&format!("register:{tid}:claude:{S}")),
+            "the identity registration ran: {events:?}"
+        );
+        let expected = format!("register-observed:{}:{generation}", ownership.boot_epoch());
+        assert!(
+            events.contains(&expected),
+            "the registration carries the SUPPLIED handoff (epoch, generation) pair \
+             (expected {expected}): {events:?}"
+        );
+
+        registry.kill(&tid);
+        let _ = std::fs::remove_file(&capture);
     }
 
     #[tokio::test]

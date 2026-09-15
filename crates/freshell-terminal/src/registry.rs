@@ -780,6 +780,12 @@ pub trait PaneIdentityBinder: Send + Sync + std::fmt::Debug {
     /// (freshell-ws/src/terminal.rs): identity row + durable binding for any
     /// non-shell create with a session id; pending marker for the
     /// locator-resolved providers (codex/opencode/amplifier) without one.
+    /// `observed` (b8ke ext r27 F2): the ownership (epoch, generation) pair
+    /// the spawning lifecycle operation holds — a handoff runner's terminal
+    /// target passes its SUPPLIED handoff pair so the durable row carries
+    /// the handoff's generation (the delayed-write fence baseline); other
+    /// callers pass `None` (legacy-unfenced; the row's prior stamp is
+    /// preserved by the write path).
     fn register_create_identity(
         &self,
         terminal_id: &str,
@@ -787,6 +793,7 @@ pub trait PaneIdentityBinder: Send + Sync + std::fmt::Debug {
         resume_session_id: Option<&str>,
         cwd: Option<&str>,
         create_request_id: Option<&str>,
+        observed: Option<(u64, u64)>,
     );
     /// Exit-side hygiene (load-bearing ledger A2): mirrors the WS pane
     /// EXIT hook (terminal.rs:1334-1342) EXACTLY — retire the identity row

@@ -535,6 +535,16 @@ struct ClaudeSession {
     /// freshly spawned runtime is torn down, never left running unowned
     /// while the other operation believes there was no prior owner.
     owning_operation: Option<String>,
+    /// b8ke ext r27 F2: the GENERATION of the lifecycle op that owns this
+    /// runtime's coordinator transition (the handoff runner's under-ticket
+    /// target resume) — `owning_operation`'s numeric twin. The session-init
+    /// adoption's durable binding write stamps the row with this generation
+    /// when the adoption holds no own ticket (the under-ticket shape), so
+    /// the target row carries the HANDOFF's generation instead of
+    /// preserving the prior one (pre-r27 the under-ticket write carried no
+    /// pair and a delayed prior-generation write could pass the ledger's
+    /// comparison and replace the new owner's recovery metadata).
+    owning_generation: Option<u64>,
     /// The envelope-stamp id the stdout consumer reads PER EVENT (Task 10b). Starts as
     /// the sessions-map key; an attach-by-durable REBIND flips it to the durable id so
     /// the pane keyed on the durable receives events. A shared mutable handle because
@@ -1201,7 +1211,6 @@ impl FreshClaudeState {
         operation_id: &str,
         generation: u64,
     ) -> Result<freshell_ownership::OwnerIdentity, (String, String)> {
-        let _ = (operation_id, generation); // the under-ticket seam: the runner holds the claim
         let Some(flavor) = session_type_from_flavor(session_type) else {
             return Err((
                 "unsupported claude-lane sessionType for handoff".to_string(),
@@ -1300,6 +1309,10 @@ impl FreshClaudeState {
                 // owns this target resume's coordinator transition — the
                 // session records it for the adoption's Blocked correlation.
                 Some(operation_id.to_string()),
+                // b8ke ext r27 F2: the SUPPLIED handoff generation — the
+                // session-init adoption's binding write stamps the target
+                // row with it (the under-ticket shape holds no own ticket).
+                Some(generation),
             )
             .await;
         if let Some(mut g) = lease_guard.take() {
@@ -2292,6 +2305,7 @@ impl FreshClaudeState {
                 // adoption's Blocked arm can correlate its OWN in-flight
                 // claim (a foreign blocker tears down instead).
                 owning_operation: own_ticket.as_ref().map(|t| t.operation_id().to_string()),
+                owning_generation: None,
                 broadcast_id,
                 pending,
                 in_turn,
@@ -5743,6 +5757,7 @@ impl FreshClaudeState {
                 // owns this respawn's coordinator transition — the
                 // adoption's Blocked arm correlates through the op id.
                 owning_operation: own_ticket.as_ref().map(|t| t.operation_id().to_string()),
+                owning_generation: None,
                 broadcast_id: Arc::clone(&broadcast_id),
                 pending,
                 in_turn: in_turn.clone(),
@@ -6197,6 +6212,9 @@ impl FreshClaudeState {
                 &mut lease_guard,
                 &mut own_ticket,
                 attach_owning_operation,
+                // b8ke ext r27 F2: the attach path holds its OWN ticket —
+                // no handoff generation to thread.
+                None,
             )
             .await;
         self.resuming
@@ -6284,6 +6302,15 @@ impl FreshClaudeState {
         // runtime's OWN operation may proceed claim-free; an unrelated
         // blocker fails closed).
         owning_operation: Option<String>,
+        // b8ke ext r27 F2: the GENERATION of the lifecycle op that owns
+        // this runtime's coordinator transition (the handoff runner's
+        // under-ticket target resume) — `owning_operation`'s numeric
+        // twin, recorded on the session beside it. The session-init
+        // adoption's durable binding write stamps the row with this
+        // generation when the adoption holds no own ticket (the
+        // under-ticket shape), so the target row carries the HANDOFF's
+        // generation instead of preserving the prior one.
+        handoff_generation: Option<u64>,
     ) -> Result<(), ResumeClaudeError> {
         // b8ke delta round-2 F2: the attach-start's REAL watchdog machinery
         // — the sidecar pid slot (the registered cancellation SIGTERMs the
@@ -6501,6 +6528,7 @@ impl FreshClaudeState {
                 sidecar_session_id,
                 cli_session_id: Some(durable.to_string()),
                 owning_operation,
+                owning_generation: handoff_generation,
                 broadcast_id,
                 pending,
                 in_turn,
@@ -6961,7 +6989,13 @@ impl FreshClaudeState {
         // flag, the session's existing durable id (the rollback-fork remint
         // test), the registration presence (the F2 pre-registration test),
         // and the sidecar pid.
-        let (gated, existing_cli_id, registered, sidecar_pid);
+        // b8ke ext r27 F2: the session's recorded handoff generation reads
+        // HERE — inside the pre-publication read scope — so the binding
+        // pair's derivation (below) adds NO await between the publication
+        // and the commit (a mid-flow sessions-lock await there widened
+        // the publication→commit window a concurrent stamp take could
+        // land inside).
+        let (gated, existing_cli_id, registered, sidecar_pid, owning_generation);
         {
             let _index = self.cli_index.lock().await;
             let sessions = self.sessions.lock().await;
@@ -6983,6 +7017,7 @@ impl FreshClaudeState {
                 .and_then(|s| s.cli_session_id.clone());
             registered = sessions.contains_key(session_id);
             sidecar_pid = sessions.get(session_id).and_then(|s| s.child.id());
+            owning_generation = sessions.get(session_id).and_then(|s| s.owning_generation);
         }
         // b8ke focused episode-2 round-2 F3 test seam: the deterministic
         // kill-between-read-and-publication hold (never armed in
@@ -7197,9 +7232,20 @@ impl FreshClaudeState {
         // carries below). `None` when no ticket was claimed (the Adopt
         // arms — the record is already authoritative) or the coordinator
         // is unwired.
+        // b8ke ext r27 F2: the UNDER-TICKET handoff continuation holds NO
+        // own ticket — the session's recorded HANDOFF generation (the
+        // runner's supplied pair, read in the phase-1 scope above) stamps
+        // the row instead, so the target's durable row carries the
+        // handoff's generation (pre-r27 the write carried a None
+        // generation here, the row preserved the PRIOR generation, and a
+        // delayed prior-generation write could pass the ledger's
+        // comparison and replace the new owner's recovery metadata).
         let (binding_epoch, binding_generation) = (
             self.ownership.as_ref().map(|r| r.boot_epoch()),
-            adoption_ticket.as_ref().map(|t| t.generation()),
+            adoption_ticket
+                .as_ref()
+                .map(|t| t.generation())
+                .or(owning_generation),
         );
         if let Some(ticket) = adoption_ticket.as_ref() {
             let generation = ticket.generation();
@@ -9114,6 +9160,7 @@ pub(crate) mod tests {
                 sidecar_session_id: session_id.to_string(),
                 cli_session_id: None,
                 owning_operation: None,
+                owning_generation: None,
                 broadcast_id: Arc::new(std::sync::Mutex::new(session_id.to_string())),
                 pending: Arc::new(std::sync::Mutex::new(ClaudePending::default())),
                 in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -16565,6 +16612,7 @@ rl.on('line', (line) => {
                 sidecar_session_id: session_id.to_string(),
                 cli_session_id: None,
                 owning_operation: None,
+                owning_generation: None,
                 broadcast_id: Arc::new(std::sync::Mutex::new(session_id.to_string())),
                 pending: Arc::new(std::sync::Mutex::new(pending)),
                 in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -17898,6 +17946,7 @@ rl.on('line', (line) => {
                 sidecar_session_id: map_key.to_string(),
                 cli_session_id: Some(durable.to_string()),
                 owning_operation: None,
+                owning_generation: None,
                 broadcast_id,
                 pending,
                 in_turn,
@@ -17947,6 +17996,7 @@ rl.on('line', (line) => {
                 sidecar_session_id: map_key.to_string(),
                 cli_session_id: Some(durable.to_string()),
                 owning_operation: None,
+                owning_generation: None,
                 broadcast_id: Arc::new(std::sync::Mutex::new(map_key.to_string())),
                 pending: Arc::new(std::sync::Mutex::new(ClaudePending::default())),
                 in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -18040,6 +18090,7 @@ rl.on('line', (line) => {
                 sidecar_session_id: map_key.to_string(),
                 cli_session_id: Some(durable.to_string()),
                 owning_operation: None,
+                owning_generation: None,
                 broadcast_id,
                 pending,
                 in_turn,
