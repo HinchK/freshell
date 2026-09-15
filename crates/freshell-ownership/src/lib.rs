@@ -1943,7 +1943,7 @@ impl RuntimeOwnershipRegistry {
         let old_key = SessionKey::new(provider, old_session_id);
         // Validation pass (immutable reads — the mutation below cannot
         // interleave with any of these checks).
-        let (kind, initiator, since_ms, partial_runtime) = {
+        let (initiator, since_ms) = {
             let Some(record) = inner.get(&old_key) else {
                 tracing::error!(target: "invariant",
                     event = "ownership.rekey_starting.old_claim_missing",
@@ -1974,16 +1974,10 @@ impl RuntimeOwnershipRegistry {
             match &record.state {
                 OwnershipState::Starting {
                     operation_id: op,
-                    kind,
                     initiator,
                     since_ms,
                     ..
-                } if op == operation_id => (
-                    *kind,
-                    initiator.clone(),
-                    *since_ms,
-                    record.partial_runtime.clone(),
-                ),
+                } if op == operation_id => (initiator.clone(), *since_ms),
                 _ => {
                     tracing::error!(target: "invariant",
                         event = "ownership.rekey_starting.old_claim_mismatch",
@@ -2021,31 +2015,30 @@ impl RuntimeOwnershipRegistry {
         }
         // THE MOVE (one lock scope): the provisional key → Aliased{to: new}
         // (the rekey family's old-key resolution record); the new key →
-        // Starting carrying the SAME operation (id, generation, kind,
-        // initiator, since) — the claim continues under the canonical id.
+        // the SAME record — the validated Starting state (operation id,
+        // generation, kind, initiator, since) moves untouched, and with it
+        // EVERY in-flight witness the operation registered on the
+        // provisional key (b8ke ext r22 F1's partial_runtime — the
+        // watchdog's cancel/reap target; b8ke ext r26 F1's cancellation,
+        // settle, settle_fired — the stale-start sweep's live-handler
+        // evidence). Rebuilding the record from `SessionRecord::default()`
+        // here would strand a post-rekey registration as UNWITNESSED: the
+        // sweep fences over-age unwitnessed starts, and OpenCode's
+        // 50-70s cold start routinely outlives the 30s sweep age while its
+        // durable binding/registration/commit are still running.
         let new_key = SessionKey::new(provider, new_session_id);
-        let moved_record = SessionRecord {
-            generation,
-            state: OwnershipState::Starting {
-                operation_id: operation_id.to_string(),
-                generation,
-                kind,
-                initiator: initiator.clone(),
-                since_ms,
-            },
-            // b8ke ext r22 F1: the registered partial runtime (the
-            // watchdog's cancel/reap target) moves with the claim — the
-            // rekey never leaves the canonical key without its reap
-            // target while the start is in flight.
-            partial_runtime,
-            ..SessionRecord::default()
-        };
-        if let Some(record) = inner.get_mut(&old_key) {
+        let moved_record = {
+            let record = inner
+                .get_mut(&old_key)
+                .expect("validated above — the registry lock is held throughout");
+            let moved = std::mem::take(record);
+            record.generation = moved.generation;
             record.state = OwnershipState::Aliased {
                 to: new_session_id.to_string(),
                 generation,
             };
-        }
+            moved
+        };
         inner.insert(new_key, moved_record);
         tracing::info!(target: "freshell_ownership",
             event = "ownership.start.rekey", operation_id, provider,
@@ -5666,6 +5659,120 @@ mod tests {
             r.observe(PROVIDER, "pending-create-req-foreign").state,
             OwnershipState::Starting { operation_id, .. } if operation_id == "op-mine"
         ));
+    }
+
+    /// b8ke ext r26 F1: the mint-time rekey CARRIES the in-flight start
+    /// witnesses. Pre-r26 `rekey_starting` rebuilt the canonical record
+    /// from `SessionRecord::default()`, so a start that registered its
+    /// cancellation/settle/settle_fired on the provisional key BEFORE the
+    /// mint (the fresh claude/codex lanes and the REST/MCP opencode
+    /// materialization) arrived at the canonical key UNWITNESSED: the
+    /// stale-start sweep then treated the still-running post-rekey
+    /// registration as an unwitnessed over-age start and fenced it on a
+    /// later tick (OpenCode's 50-70s cold start makes that window a normal
+    /// path, not a remote race). The carried witnesses keep the sweep's
+    /// skip-live discipline intact through the rekey, and a
+    /// genuinely-concluded start still fences with its carried handles.
+    #[test]
+    fn rekey_starting_carries_the_in_flight_witnesses_past_the_sweep_age() {
+        let r = RuntimeOwnershipRegistry::new();
+        let BeginOutcome::Granted { generation } = r.begin_start(
+            PROVIDER,
+            "pending-create-req-r26",
+            RuntimeOwnerKind::FreshAgent,
+            "op-r26-create",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!()
+        };
+        // The fresh lanes' PRE-MINT registration: the abort handle, the
+        // boxed settle future, and the sender-side settle flag, all armed
+        // on the PROVISIONAL key before the durable id is minted.
+        let settle_fired = Arc::new(AtomicBool::new(false));
+        assert!(r.register_start_cancellation(
+            PROVIDER,
+            "pending-create-req-r26",
+            "op-r26-create",
+            generation,
+            Arc::new(|| {}),
+            Box::new(async {}),
+            Some(Arc::clone(&settle_fired)),
+        ));
+        assert!(matches!(
+            r.rekey_starting(
+                PROVIDER,
+                "pending-create-req-r26",
+                "ses_minted_r26",
+                "op-r26-create",
+                generation
+            ),
+            CommitOutcome::Committed
+        ));
+        // Over-age by any measure: the sweep must SKIP the rekeyed start
+        // while its handler is STILL RUNNING (the carried settle flag has
+        // not fired) — pre-r26 the canonical record lost the flag and the
+        // sweep fenced the live post-rekey registration here.
+        assert!(
+            r.recover_stale_starts(u64::MAX, 0).is_empty(),
+            "the witnessed post-rekey start is skipped while still in flight"
+        );
+        // The handler unwinds without commit: the FIRED settle flag lets
+        // the watchdog fence the concluded start, and the CARRIED
+        // cancellation/settle handles reach the recovery (the host's
+        // abort/await targets) instead of vanishing at the rekey.
+        settle_fired.store(true, Ordering::SeqCst);
+        let recovered = r.recover_stale_starts(u64::MAX, 0);
+        assert_eq!(recovered.len(), 1);
+        let rec = &recovered[0];
+        assert_eq!(rec.session_id, "ses_minted_r26");
+        assert_eq!(rec.operation_id, "op-r26-create");
+        assert!(
+            rec.cancellation.is_some(),
+            "the carried cancellation handle reaches the sweep's recovery"
+        );
+        assert!(
+            rec.settle.is_some(),
+            "the carried settle future reaches the sweep's recovery"
+        );
+    }
+
+    /// b8ke ext r26 F1: the sweep still fences a genuinely-unwitnessed
+    /// post-rekey start — carrying the witnesses must never widen the
+    /// watchdog's zombie authority (an operation that registered NOTHING
+    /// before the rekey stays fenceable on age exactly as before).
+    #[test]
+    fn rekey_starting_still_fences_an_unwitnessed_over_age_start() {
+        let r = RuntimeOwnershipRegistry::new();
+        let BeginOutcome::Granted { generation } = r.begin_start(
+            PROVIDER,
+            "pending-create-req-r26-bare",
+            RuntimeOwnerKind::FreshAgent,
+            "op-r26-bare",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!()
+        };
+        assert!(matches!(
+            r.rekey_starting(
+                PROVIDER,
+                "pending-create-req-r26-bare",
+                "ses_minted_r26_bare",
+                "op-r26-bare",
+                generation
+            ),
+            CommitOutcome::Committed
+        ));
+        let recovered = r.recover_stale_starts(u64::MAX, 0);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].session_id, "ses_minted_r26_bare");
+        assert!(
+            recovered[0].cancellation.is_none(),
+            "an unregistered start recovers with no abort handle"
+        );
     }
 
     // ── b8ke ext r23 F1: the placeholder→durable coordinator alias ────────
