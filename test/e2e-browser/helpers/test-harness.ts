@@ -635,12 +635,17 @@ export async function selectShellFromPicker(page: Page): Promise<void> {
       await button.click({ timeout: SHELL_CLICK_TIMEOUT_MS })
     } catch (err) {
       if (!isTimeoutError(err)) throw err
-      // A click timeout does NOT prove the click never dispatched
-      // (Playwright's timeout spans every click stage): probe for the
-      // pane the handler would have created. A late dispatch joins the
-      // success path below; only a confirmed nothing-created advances
-      // (delta review r5 — escalating on a late dispatch is the
-      // historical double-creation path).
+      // An option that never existed cannot have dispatched: advance on
+      // the click timeout alone, with NO probe cost (delta review r7 —
+      // absent options paid a needless 5s probe on every healthy boot
+      // whose picker omits them, under the unchanged local 60s budget).
+      if (await button.count() === 0) continue
+      // A click timeout on an EXISTING button does not prove the click
+      // never dispatched (Playwright's timeout spans every click stage):
+      // probe for the pane the handler would have created. A late
+      // dispatch joins the success path below; only a confirmed
+      // nothing-created advances (delta review r5 — escalating on a late
+      // dispatch is the historical double-creation path).
       if (!(await paneWasCreatedOnLateDispatch(page))) continue
     }
     try {

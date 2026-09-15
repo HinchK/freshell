@@ -483,6 +483,7 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
     clickError?: 'page-closed' // not-clickable click by default (TimeoutError)
     renderVisibleAfterMs?: number // omit = render never becomes visible
     lateDispatch?: boolean // click times out BUT the handler ran: the probe finds a created pane
+    clickTimesOut?: boolean // click times out with NOTHING dispatched (the button exists)
   }
 
   /**
@@ -532,6 +533,13 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
         }),
       }),
       getByRole: (_kind: string, roleOpts: { name: RegExp }) => ({
+        // Existence signal for the post-timeout precheck (delta r7): a
+        // non-existent option cannot have dispatched and must not pay a
+        // probe.
+        count: () => {
+          const name = roleOpts.name.source.replace(/^\^/, '').replace(/\$$/, '')
+          return Promise.resolve(shells[name] ? 1 : 0)
+        },
         click: (clickOpts: { timeout?: number }) => {
           clickTimeouts.push(clickOpts?.timeout ?? 0)
           const name = roleOpts.name.source.replace(/^\^/, '').replace(/\$$/, '')
@@ -543,6 +551,11 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
           if (outcome?.lateDispatch) {
             // The click's actionability window expired mid-dispatch: the
             // timeout fires even though the handler ran (delta r5 probe case).
+            return Promise.reject(Object.assign(new Error(`click: Timeout ${clickOpts?.timeout}ms exceeded`), { name: 'TimeoutError' }))
+          }
+          if (outcome?.clickTimesOut) {
+            // The button exists but the actionability window expired with
+            // nothing dispatched (delta r7 precheck case).
             return Promise.reject(Object.assign(new Error(`click: Timeout ${clickOpts?.timeout}ms exceeded`), { name: 'TimeoutError' }))
           }
           if (!outcome) {
@@ -665,21 +678,41 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
     expect(renderWaits).toEqual([SHELL_RENDER_TIMEOUT_MS]) // success-path render wait
   })
 
-  it('a click timeout with NOTHING created advances to the next shell, and every advance probes once', async () => {
+  it('a click timeout on a NON-EXISTENT option (count 0) advances with NO probe cost (delta review r7)', async () => {
+    // A button that never existed cannot have dispatched: paying a probe
+    // here cost every healthy boot whose picker omits the candidate a
+    // deterministic extra 5s under the unchanged local 60s budget.
     const { page, clicks, clickTimeouts, probeWaits } = pickerPage({
       Bash: { renderVisibleAfterMs: 1_000 }, // Shell/WSL/CMD/PowerShell absent
     })
     await selectShellFromPicker(page)
     expect(clicks).toEqual(['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash'])
     expect(clickTimeouts).toEqual(Array.from({ length: 5 }, () => SHELL_CLICK_TIMEOUT_MS))
-    // Four absent options -> four probes, each using the exported probe
-    // budget (the fifth click succeeded, so no probe ran for it).
+    // Absent options advance on the click timeout ALONE — no probe runs.
+    expect(probeWaits).toEqual([])
+  })
+
+  it('a click timeout on an EXISTING option probes once before advancing (only an existing button could have dispatched)', async () => {
+    const { page, clicks, probeWaits } = pickerPage({
+      Shell: { clickTimesOut: true }, // exists, times out, nothing dispatched
+      WSL: { clickTimesOut: true },
+      CMD: { clickTimesOut: true },
+      PowerShell: { clickTimesOut: true },
+      Bash: { renderVisibleAfterMs: 1_000 },
+    })
+    await selectShellFromPicker(page)
+    expect(clicks).toEqual(['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash'])
+    // Four existing-but-timed-out options -> four probes, each using the
+    // exported probe budget; Bash succeeds, so no probe for it.
     expect(probeWaits).toEqual(Array.from({ length: 4 }, () => SHELL_PROBE_TIMEOUT_MS))
   })
 
   it('a probe hard error (page closed) propagates loudly, never "option absent"', async () => {
+    // The option EXISTS and its click timed out — the precheck passes the
+    // probe the error belongs to. (A non-existent option would advance
+    // before the probe, correctly.)
     const { page, clicks } = pickerPage(
-      {},
+      { Shell: { lateDispatch: true } },
       false,
       { probeHardError: true },
     )
