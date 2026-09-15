@@ -58,6 +58,60 @@ fixed order:
 A resolved identity pins every `--account` the wrappers emit and exports
 `CLOUDSDK_CORE_ACCOUNT`/`CLOUDSDK_CORE_PROJECT` for any unpinned descendants.
 
+## OneCLI gateway broker (garageserver)
+
+garageserver routes all outbound HTTPS through the OneCLI gateway
+(`127.0.0.1:10255`; see `/srv/onecli/docker-compose.yml`). Since 2026-09-15
+the gateway holds a **Google Cloud app connection** — a dedicated
+gcloud-robot service-account key stored in OneCLI — that mints short-lived
+robot tokens and injects them on the lane control-plane hosts:
+
+`artifactregistry.googleapis.com`, `cloudbuild.googleapis.com`,
+`run.googleapis.com` (+ regional `-run`), `logging.googleapis.com`
+(+ regional `-logging`), `serviceusage.googleapis.com`,
+`containeranalysis.googleapis.com`.
+
+What this buys: a request to those hosts with a **dead or missing
+credential** (the classic culled interactive OAuth token on a shared agent
+host) is brokered as the robot instead of dying as a 401/403. The 2026-09-14
+incident recovery was blocked exactly there — direct tag deletion failing
+on both a dead ambient token and (misleadingly) on the robot's missing
+delete permission.
+
+Deliberately NOT brokered, so do not "fix" their absence:
+
+- `cloudresourcemanager.googleapis.com` — the identity probe above must
+  reflect the CALLER's credentials; injecting the robot would fabricate a
+  pass for every account and break ladder ordering.
+- `iam.googleapis.com`, `compute.googleapis.com` — admin surfaces stay on
+  client credentials; the broker key is least-privilege by design.
+- `oauth2.googleapis.com` token refresh — every other Google account on the
+  machine refreshes through the same proxy; serving the broker's cached
+  token to their refresh POSTs would corrupt client credential state.
+
+Consequence for operators: gcloud calls on a brokered host from
+garageserver run as the robot regardless of the active account — including
+admin calls. For IAM/admin operations on those hosts, bypass the gateway:
+`env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy gcloud ...`.
+
+Facts on disk (garageserver):
+
+- OneCLI image `1.45.0-gcloud-iap-wrap-7cdf9b6` (local build, not in any
+  registry; `ONECLI_VERSION` in `/srv/onecli/.env`), source branch
+  `gcp-broker` in the onecli fork (`~/code/onecli`, GitHub
+  `danshapiro/onecli`). The gateway's `google-cloud` provider and the
+  web/API connect flow live there.
+- Broker key file: `~/.local/share/gcloud-robot/misc-puttering-onecli-broker.json`
+  (user-managed key id `9ba89633eb32cfe902738f6d8747e3e193cda7ca`) — a
+  SEPARATE key from the lane key, so lane-key rotation never breaks the
+  broker. Connection granted to the `garageserver` OneCLI agent; other
+  agents can be attached from the OneCLI UI
+  (`http://192.168.3.150:10254` → Connections → Google Cloud).
+- The robot's repo-level IAM on `freshell-e2e` now carries BOTH
+  `roles/artifactregistry.writer` (push) and
+  `roles/artifactregistry.repoAdmin` (tag/version deletion — the poisoned-
+  tag recovery lever; `writer` alone cannot delete tags).
+
 ## Operator setup
 
 ### Prerequisites
@@ -116,14 +170,17 @@ account (export it). All skill scripts are invoked via
      --repository-format=docker --location=us-west1 --project=misc-puttering-project \
      --account="$GCLOUD_ROBOT_ADMIN_ACCOUNT"
 
-   # Push/write power is granted on THIS repository only (repository-level
-   # binding), never project-wide — the bearer key must not gain write access
-   # to every current and future repo:
-   gcloud artifacts repositories add-iam-policy-binding freshell-e2e \
-     --location=us-west1 --project=misc-puttering-project \
-     --member="serviceAccount:gcloud-robot@misc-puttering-project.iam.gserviceaccount.com" \
-     --role=roles/artifactregistry.writer \
-     --account="$GCLOUD_ROBOT_ADMIN_ACCOUNT" --condition=None
+    # Push/write power is granted on THIS repository only (repository-level
+    # binding), never project-wide — the bearer key must not gain write access
+    # to every current and future repo. repoAdmin adds tag/version DELETION
+    # (the poisoned-tag recovery lever) — writer alone cannot delete tags:
+    for role in roles/artifactregistry.writer roles/artifactregistry.repoAdmin; do
+      gcloud artifacts repositories add-iam-policy-binding freshell-e2e \
+        --location=us-west1 --project=misc-puttering-project \
+        --member="serviceAccount:gcloud-robot@misc-puttering-project.iam.gserviceaccount.com" \
+        --role="$role" \
+        --account="$GCLOUD_ROBOT_ADMIN_ACCOUNT" --condition=None
+    done
    ```
 
 2. Scoped grants (bootstrap does NOT do these; skipping them is the classic
@@ -236,6 +293,11 @@ account (export it). All skill scripts are invoked via
 3. Delete the OLD key id in IAM (list with `--managed-by=user`, pick the row
    whose id matches the old key file's `private_key_id`):
 
+   NOTE: this service account also holds a SECOND user-managed key — the
+   OneCLI gateway broker key (`9ba89633…`, see the broker section above).
+   Pick the row by key id, never "delete all others"; deleting the broker
+   key breaks the garageserver gateway's brokered credentials.
+
    ```bash
    gcloud iam service-accounts keys list --managed-by=user \
      --iam-account=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com \
@@ -309,12 +371,22 @@ for immediacy.)
   `gcloud auth print-access-token --account=<robot> --project=misc-puttering-project`
   (mints). Do not re-run bootstrap for this.
 - The identity probe (`rung 3`) fails silently on machines behind a
-  credential-broker proxy that lacks a credential for
-  cloudresourcemanager.googleapis.com (e.g. a OneCLI gateway) → the lane
-  falls to ambient with the one-line note. Either unset `https_proxy` /
+  credential-broker proxy that does not broker
+  cloudresourcemanager.googleapis.com (garageserver's OneCLI gateway
+  deliberately does not — see the broker section) → the lane falls to
+  ambient with the one-line note. Either unset `https_proxy` /
   `HTTPS_PROXY` for the lane process (probe then reaches Google directly) or
   pin `GCLOUD_IDENT=<robot>` for the lane (this is why the operator machine's
   pin exists).
+- A `403 … "credential not found"` error from OneCLI is the gateway's
+  MASKED version of Google's own 401/403: it means the request's own
+  credential was dead or absent AND the gateway holds no brokered
+  credential for that host. It is NOT a Google permission verdict and has
+  fooled incident triage before (2026-09-14: it hid both a dead ambient
+  token and the robot's missing `artifactregistry.tags.delete` permission
+  behind one identical error). On garageserver's brokered hosts this error
+  should no longer occur; elsewhere it still means the calling credential
+  is dead — fix the credential, not the registry.
 - A lane prints the ambient-fallback note and then gcloud's
   "Reauthentication failed" → the lane fell back to ambient gcloud: the
   robot is not provisioned (or not activated) on this machine. Provision
