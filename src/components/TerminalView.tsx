@@ -79,6 +79,7 @@ import {
 } from '@/lib/terminal-restore'
 import { isTerminalPasteShortcut } from '@/lib/terminal-input-policy'
 import { terminalFollowsOscTitle } from '@/lib/terminal-title-policy'
+import { recordTerminalTitleForReplay } from '@/lib/terminal-inventory-titles'
 import {
   clearTerminalCursor,
   loadTerminalSurfaceCheckpoint,
@@ -2593,6 +2594,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         dispatch(updateTab({ id: currentTab.id, updates: { title: cleanTitle } }))
       }
       dispatch(updatePaneTitle({ tabId, paneId: paneIdRef.current, title: cleanTitle, setByUser: false }))
+      recordTerminalTitleForReplay(terminalIdRef.current, cleanTitle)
     })
 
     return () => disposable.dispose()
@@ -4778,6 +4780,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             dispatch(updateTab({ id: titleTab.id, updates: { title: msg.title } }))
           }
           dispatch(updatePaneTitle({ tabId, paneId: paneIdRef.current, title: msg.title, setByUser: false }))
+          recordTerminalTitleForReplay(tid, msg.title)
         }
 
         // Handle one-time session association from the authoritative canonical sessionRef.

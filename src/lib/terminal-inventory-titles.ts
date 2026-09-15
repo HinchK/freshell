@@ -1,6 +1,5 @@
 import type { Middleware } from '@reduxjs/toolkit'
 import { updatePaneTitleByTerminalId } from '@/store/panesSlice'
-import { collectPaneEntries } from '@/lib/pane-utils'
 import type { RootState } from '@/store'
 
 type FoldStore = {
@@ -141,8 +140,8 @@ const TERMINAL_BINDING_PANE_ACTIONS = new Set([
 ])
 
 /** Replace a terminal's cached snapshot title when a NEWER authoritative
- * TERMINAL-LEVEL title write lands a DIFFERENT title (e2r2 review finding
- * 3, correcting the e2r1 eviction): the cache is a FALLBACK for late-bound
+ * TERMINAL-LEVEL title lands a DIFFERENT title (e2r2 review finding 3,
+ * corrected e2r3 review finding 3): the cache is a FALLBACK for late-bound
  * panes, and a newer write makes the boot snapshot stale — REPLACE the
  * entry, never delete it. Eviction left a live terminal.title.updated/OSC
  * title arriving before another pane binds that terminal titleless until
@@ -157,25 +156,18 @@ function replaceStaleInventoryTitle(terminalId: string | undefined, title: unkno
   lastInventoryTitles.set(terminalId, title)
 }
 
-/** The terminalId of the pane a panes/updatePaneTitle action addressed,
- * or undefined when the pane is absent or not a bound terminal pane.
- * The verified newer-writer paths that retitle terminal panes through
- * updatePaneTitle: the live terminal.title.updated fold
- * (TerminalView.tsx:4780) and the OSC onTitleChange fold
- * (TerminalView.tsx:2595); through updatePaneTitleByTerminalId (whose
- * payload carries the terminalId directly, so no lookup is needed):
- * the open-tab-with-title fold (tabsSlice.ts:1098), the session-rename
- * cascade (titleSync.ts:40), and the rename UI paths
- * (OverviewView.tsx:59, ContextMenuProvider.tsx:829). */
-function terminalIdBoundToPane(panes: RootState['panes'], tabId: unknown, paneId: unknown): string | undefined {
-  if (typeof tabId !== 'string' || typeof paneId !== 'string') return undefined
-  const layout = panes.layouts?.[tabId]
-  if (!layout) return undefined
-  for (const { paneId: id, content } of collectPaneEntries(layout)) {
-    if (id !== paneId) continue
-    return content.kind === 'terminal' && typeof content.terminalId === 'string' ? content.terminalId : undefined
-  }
-  return undefined
+/** Record a live TERMINAL-LEVEL title write into the replay cache (e2r3
+ * review finding 3). Called ONLY by the two authoritative live handlers
+ * in TerminalView — the terminal.title.updated fold (~:4780) and the OSC
+ * onTitleChange fold (~:2595) — because a redux title action alone cannot
+ * prove terminal-level scope: Sidebar.tsx:492 dispatches
+ * panes/updatePaneTitle with setByUser:false carrying a SESSION-DIRECTORY
+ * title when an existing session pane is selected, and the old middleware
+ * watching let that wrong-scope title replace the cache entry and replay
+ * into sibling/recovered panes. The record REPLACES the cached entry,
+ * never deletes it. */
+export function recordTerminalTitleForReplay(terminalId: string | undefined, title: string): void {
+  replaceStaleInventoryTitle(terminalId, title)
 }
 
 /**
@@ -183,42 +175,24 @@ function terminalIdBoundToPane(panes: RootState['panes'], tabId: unknown, paneId
  * landed a terminalId into pane content (delta review round 2, finding 2).
  * Churn-free by the same guard as the fold: an already-titled pane and a
  * user-set pane dispatch nothing, and an empty cache (before the first
- * terminal.inventory frame) is a no-op. Additionally watches the two
- * terminal-pane title actions — but only TERMINAL-LEVEL writes (e2r2
- * review finding 3, rename scope contract): a DIFFERING newer title
- * REPLACES that terminal's cache entry (see replaceStaleInventoryTitle)
- * so a late-bound pane receives the NEW title, while user or pane-local
- * renames NEVER touch terminal-level delivery state.
- * - panes/updatePaneTitleByTerminalId: its payload is terminal-scoped by
- *   construction, so every NON-USER write replaces the entry — the
- *   terminal.inventory fold (:54) and the open-tab-with-title fold
- *   (tabsSlice.ts:1098), both setByUser:false. The setByUser:true
- *   writers (rename UI OverviewView.tsx:59 / ContextMenuProvider.tsx:829,
- *   session-rename cascade titleSync.ts:40) are USER renames and never
- *   touch the cache.
- * - panes/updatePaneTitle: ONLY the live terminal fold path
- *   (setByUser:false — TerminalView.tsx:4780 terminal.title.updated,
- *   :2595 OSC onTitleChange) replaces the entry. The layout-local rename
- *   paths carry no setByUser:false — applyPaneRename/applyTabRename
- *   (titleSync.ts:51, :82) — and the session-directory mirror
- *   (sessionTitleMirror.ts) only titles panes with no resolvable
- *   terminalId, so neither ever disturbs the cache.
+ * terminal.inventory frame) is a no-op. The middleware watches NO title
+ * actions (e2r3 review finding 3): a setByUser:false title action cannot
+ * prove terminal-level scope — Sidebar.tsx:492 dispatches
+ * panes/updatePaneTitle with setByUser:false carrying a SESSION-DIRECTORY
+ * title when an existing session pane is selected, and the old title
+ * watching let that wrong-scope title replace the cache entry, so a later
+ * binding action replayed it into sibling/recovered panes. The cache is
+ * written ONLY by authoritative terminal-level sources: the inventory
+ * frame fold (foldTerminalInventoryTitles replaces the whole cache per
+ * frame) and the recordTerminalTitleForReplay calls the two live
+ * TerminalView handlers (terminal.title.updated ~:4780, OSC
+ * onTitleChange ~:2595) now make.
  */
 export const terminalInventoryTitleReplayMiddleware: Middleware = (store) => (next) => (action: any) => {
   const result = next(action)
   const type = action?.type
-  if (typeof type === 'string') {
-    if (type === 'panes/updatePaneTitleByTerminalId') {
-      const { terminalId, title, setByUser } = action?.payload ?? {}
-      if (setByUser !== true) replaceStaleInventoryTitle(terminalId, title)
-    } else if (type === 'panes/updatePaneTitle') {
-      const { tabId, paneId, title, setByUser } = action?.payload ?? {}
-      if (setByUser === false) {
-        replaceStaleInventoryTitle(terminalIdBoundToPane((store as FoldStore).getState().panes, tabId, paneId), title)
-      }
-    } else if (TERMINAL_BINDING_PANE_ACTIONS.has(type)) {
-      replayTerminalInventoryTitles(store as FoldStore)
-    }
+  if (typeof type === 'string' && TERMINAL_BINDING_PANE_ACTIONS.has(type)) {
+    replayTerminalInventoryTitles(store as FoldStore)
   }
   return result
 }

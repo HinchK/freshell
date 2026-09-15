@@ -80,12 +80,18 @@ function collectLeafContents(node: unknown, into: Map<string, Record<string, unk
  * - model (freshopencode fresh-agent): the parse destructures the raw key
  *   and rebuilds modelSelection (persistedState.ts:316-333; boot side
  *   storage-migration.ts:238-255). Exempt iff the parsed content holds a
- *   modelSelection, OR the raw value is the stale DeepSeek default — the
- *   one documented drop whose product is deliberately ABSENT
- *   (paneTypes.ts:48-55; pinned by
+ *   modelSelection, OR the raw value TRIMS to the stale DeepSeek default —
+ *   the one documented drop whose product is deliberately ABSENT
+ *   (paneTypes.ts:48-55; the trim mirrors the normalizer's own
+ *   `legacyModel.trim()` comparison, paneTypes.ts:52, so a padded legacy
+ *   default is the same deliberate drop — e2r3 review finding 2; pinned by
  *   persisted-state.fresh-agent.test.ts:233-254). A garbage value
  *   (non-string/blank) produces no modelSelection (paneTypes.ts:27-35) →
- *   the pane would reopen with the default model → corruption.
+ *   the pane would reopen with the default model → corruption. The raw
+ *   modelSelection key itself has NO exemption: a schema-invalid value
+ *   that normalizes away (parsed-effective value undefined, no usable
+ *   legacy model) was silently discarded, not migrated → corruption
+ *   (e2r3 review finding 1).
  * - restoreError (terminal): exempt iff the RAW value is a valid
  *   RESTORE_UNAVAILABLE error — the only shape whose shed is the
  *   documented migration (the boot rewrite destructures a flush-carried
@@ -156,10 +162,11 @@ function isVerifiedMigrationContentDrop(
     if (key === 'showThinking' || key === 'showTools') return true
     if (key === 'timelineSessionId' || key === 'cliSessionId') return parsedHasDurableProduct
     if (key === 'model') {
+      const rawModel = rawContent.model
       return parsedContent?.sessionType === 'freshopencode'
         && parsedContent?.provider === 'opencode'
         && (parsedContent?.modelSelection !== undefined
-          || rawContent.model === LEGACY_FRESHOPENCODE_DEFAULT_MODEL)
+          || (typeof rawModel === 'string' && rawModel.trim() === LEGACY_FRESHOPENCODE_DEFAULT_MODEL))
     }
     if (key === 'sessionRef') {
       return rawKind === 'agent-chat'
@@ -197,7 +204,10 @@ function isVerifiedMigrationContentDrop(
  * (storage-migration.ts:148-290), so only the captured pre-rewrite raw
  * still shows them (e2r1 review finding 1). Parsed may have MORE keys
  * (normalization adds sessionRef/codexDurability/restoreError/
- * modelSelection) — the rule is raw-keys ⊆ parsed-keys. Legit current
+ * modelSelection) — the rule is raw-keys ⊆ parsed-EFFECTIVE-keys, where
+ * an effective key is one whose value is not `undefined` (e2r3 review
+ * finding 1; see the inline rule below for why presence alone is
+ * insufficient). Legit current
  * flushes never produce a dropped key: in-memory content is normalized
  * on every write path (normalizePaneContent, panesSlice.ts:60-108 —
  * sessionRef via sanitizeSessionRef :72, codexDurability :73,
@@ -221,9 +231,21 @@ function hasSalvagedLeafContent(
   for (const [paneId, rawContent] of rawLeafContents) {
     const parsedContent = parsedLeafContents.get(paneId)
     if (!parsedContent) continue
-    const parsedKeys = new Set(Object.keys(parsedContent))
+    // e2r3 review finding 1: parsed-EFFECTIVE keys are the keys whose
+    // value is not `undefined`. Key presence alone is insufficient:
+    // normalizeFreshAgentContent ALWAYS re-adds the modelSelection key
+    // (persistedState.ts:242-251) — with value undefined when the raw
+    // selection fails FreshAgentModelSelectionSchema — so a key-presence
+    // rule calls the pane healthy although the parse silently discarded
+    // the selected model. JSON raw values are never undefined, so every
+    // raw content key is a non-undefined value; a raw key whose
+    // parsed-effective value is absent (key missing OR explicitly
+    // undefined) is a DROP, subject to the same verified exemption set.
+    const parsedEffectiveKeys = new Set(
+      Object.keys(parsedContent).filter((key) => parsedContent[key] !== undefined),
+    )
     for (const key of Object.keys(rawContent)) {
-      if (parsedKeys.has(key)) continue
+      if (parsedEffectiveKeys.has(key)) continue
       if (isVerifiedMigrationContentDrop(rawContent, parsedContent, key)) continue
       return true
     }

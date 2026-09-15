@@ -643,6 +643,78 @@ describe('verified migration exemptions: agent-chat kinds + value sensitivity (e
   })
 })
 
+// e2r3 review finding 1: salvage detection was keyed on key PRESENCE only.
+// normalizeFreshAgentContent ALWAYS re-adds the modelSelection key
+// (persistedState.ts:242-251) — with value undefined when
+// normalizeFreshAgentPaneModelSelection discards a schema-invalid raw
+// selection (FreshAgentModelSelectionSchema,
+// fresh-agent-model-capabilities.ts:29-32, is a strict discriminated union
+// on kind ∈ {tracked, exact} whose modelId is z.string().trim().min(1)),
+// so key-presence classification called the pane healthy although the
+// parse silently discarded the selected model and the pane would reopen
+// with the default model. The salvage rule must be VALUE-level:
+// parsed-EFFECTIVE keys are the keys whose value is not undefined (raw
+// JSON values are never undefined), and a raw key whose parsed-effective
+// value is absent is a DROP subject to the same verified exemption set.
+// e2r3 review finding 2: the stale-default exemption compared the raw
+// value EXACTLY while the canonical normalizer TRIMS before comparing
+// (paneTypes.ts:52, normalizeFreshAgentPaneModelSelection) — a padded
+// legacy default was deliberately normalized away (no modelSelection
+// product) yet classified corrupt, forcing a needless rebuild that lost
+// geometry/titles.
+describe('value-level salvage rule + trimmed stale-default exemption (e2r3 findings 1-2)', () => {
+  beforeEach(() => { localStorage.clear() })
+
+  function seedPaneLayout(content: Record<string, unknown>): void {
+    const envelope = healthyEnvelope('machine-1')
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': { type: 'leaf', id: 'pane-a', content },
+    }
+    seedEnvelope(envelope)
+  }
+
+  it.each([
+    ['an unknown kind discriminator', { kind: 'bogus', modelId: 'm' }],
+    ['a missing modelId', { kind: 'exact' }],
+    ['an empty modelId', { kind: 'exact', modelId: '' }],
+  ])('classifies corrupt when a freshopencode pane holds a schema-invalid durable modelSelection (%s) with no legacy model', (_label, modelSelection) => {
+    seedPaneLayout({
+      kind: 'fresh-agent', sessionType: 'freshopencode', provider: 'opencode',
+      createRequestId: 'cr-oc-badsel', status: 'idle',
+      modelSelection,
+    })
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('classifies healthy when the freshopencode pane holds a VALID durable modelSelection (the parsed-effective value survives)', () => {
+    seedPaneLayout({
+      kind: 'fresh-agent', sessionType: 'freshopencode', provider: 'opencode',
+      createRequestId: 'cr-oc-goodsel', status: 'idle',
+      modelSelection: { kind: 'exact', modelId: 'gpt-5.2' },
+    })
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+  })
+
+  it('stays healthy when a schema-invalid modelSelection is salvaged by a usable legacy model (the migration product exists)', () => {
+    seedPaneLayout({
+      kind: 'fresh-agent', sessionType: 'freshopencode', provider: 'opencode',
+      createRequestId: 'cr-oc-legacymodel', status: 'idle',
+      model: 'gpt-5.2',
+      modelSelection: { kind: 'bogus', modelId: 'm' },
+    })
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+  })
+
+  it('stays healthy when the stale freshopencode default arrives PADDED — the exemption mirrors the normalizer\u2019s trim (paneTypes.ts:52)', () => {
+    seedPaneLayout({
+      kind: 'fresh-agent', sessionType: 'freshopencode', provider: 'opencode',
+      createRequestId: 'cr-oc-stale-pad', status: 'idle',
+      model: ' opencode-go/deepseek-v4-flash ',
+    })
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+  })
+})
+
 describe('backfillPersistedLayoutMachineId', () => {
   beforeEach(() => { localStorage.clear() })
 
