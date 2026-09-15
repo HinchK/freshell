@@ -19,24 +19,25 @@
 ### Accepted tradeoffs and residuals
 - None stated by the user.
 
-**Goal:** Eliminate the `host-stats-pane.spec.ts:47` freshellPage setup-timeout flake by (a) making the per-test deadline cover the fixture chain's boot + recovery envelope on the cloud lane (extend-only, for every spec that boots through the fixtures module), and (b) fixing the `selectShellFromPicker` tail that the retained trace proved was the actual budget burner: it conflates a slow terminal render with "wrong shell option", silently escalates through options that do not exist, swallows every error, and double-creates terminals.
+**Goal:** Eliminate the `host-stats-pane.spec.ts:47` freshellPage setup-timeout flake by fixing the three harness defects that jointly produced it: (1) the self-healing `waitForConnection` lets its phases, reload, and final poll each consume their own full window (a sequential 3-window drift up to 135s at W=90s) instead of enforcing W as a single total deadline; (2) the per-test deadline (60s) is smaller than the fixture chain's evidence-shaped envelope on the cloud lane (only `settings.spec.ts` got a hook-based 120s extension); (3) `selectShellFromPicker` — the piece the retained trace proves was the actual budget burner — conflates a slow terminal render with "wrong shell option", silently escalates through options that do not exist on this platform, swallows every error, and double-creates terminals.
 
-**Architecture:** The retained attempt-1 trace (validator report, LB-C) shows the recorded failure was NOT the j90s zero-CPU wedge: the boot chain completed, WS ready landed at t0+23s (inside phase 1 — no self-heal reload), the fixture clicked "Shell" (terminal created server-side, active with `hasClients:true`), but the `.xterm` render starved >30s under container-wide CPU contention (54% CPU, a sibling worker's normally-200ms test took 74s in the same window). The loop's 30s `.xterm` wait then failed, and the loop escalated — WSL (5s click timeout), CMD (mid-click at the 60s deadline) — options that do not exist on the Linux picker, burning the rest of the budget silently. Two coordinated harness defects therefore produced tg4e: (1) the per-test deadline (60s) is smaller than the fixture chain's legal envelope on the cloud lane (the self-healing waitForConnection alone can legally spend ~91s at the 90s window; only `settings.spec.ts` got a hook-based 120s extension); (2) `selectShellFromPicker` treats "clicked but render pending" identically to "option absent", escalates into absent options, and never reports why. The fix: derive the per-test budget from the same env that scales the window (`FRESHELL_E2E_WS_READY_TIMEOUT_MS`): budget = window + 30s overhead (= 120s at the cloud default, matching the probe-verified settings precedent), applied as an EXTEND-ONLY maximum from inside the earliest test-scoped fixture (`e2eMachineId`, resolved before `context`/`page` for every module-chain spec); AND restructure the picker loop so a successful click waits generously for the render and fails loudly on timeout instead of escalating. The local lane (env unset) keeps the default budget; the picker loop's healthy path (xterm already visible or appears quickly) is unchanged.
+**Architecture:** The retained attempt-1 trace (validator report, LB-C) shows the recorded failure was NOT the j90s zero-CPU wedge: the boot chain completed, WS ready landed at t0+23s (inside phase 1 — no self-heal reload), the fixture clicked "Shell" (terminal created server-side, active with `hasClients:true`), but the `.xterm` render starved >30s under container-wide CPU contention (54% CPU, a sibling worker's normally-200ms test took 74s in the same window). The loop's 30s `.xterm` wait failed, and the loop escalated — WSL (5s click timeout), CMD (mid-click at the 60s deadline) — options absent on the Linux picker, silently burning the remaining budget. The fix makes the harness envelope coherent and covered: `waitForConnection` enforces W as a single total deadline (phase-1 `floor(W/2)`; the reload and phase-2 share the remainder, +1s slack — the documented design intent and the j90s recap's Optional finding #4); the per-test budget derives from the same env that scales the window (`FRESHELL_E2E_WS_READY_TIMEOUT_MS`): budget = window + 30s overhead (= 120s at the cloud default), applied as an EXTEND-ONLY maximum from inside the earliest test-scoped fixture (`e2eMachineId`, resolved before `context`/`page` for every module-chain spec); and `selectShellFromPicker` distinguishes an absent option (click TimeoutError — advance) from a successful click (wait generously for the render, fail loudly on timeout — never escalate). The local lane (env unset) keeps the default budget; the picker's healthy path is unchanged.
 
-**Tech Stack:** Playwright 1.58.2 fixtures and `test.info().setTimeout`, TypeScript (NodeNext/ESM — relative imports in test files carry `.js`; type-only imports stay type-only), Vitest for the e2e-helpers unit lane, the repo's cloud e2e lane (`scripts/e2e-cloud.sh`) for proof.
+**Tech Stack:** Playwright 1.58.2 fixtures and `test.info().setTimeout`, TypeScript (NodeNext/ESM — relative imports in test files carry `.js`; type-only imports stay type-only), Vitest for the e2e-helpers unit lane (fake timers for clock-sensitive coherence tests), the repo's cloud e2e lane (`scripts/e2e-cloud.sh`) for proof.
 
 ## Global Constraints
 
 - Budget changes are cloud-only and env-gated: with `FRESHELL_E2E_WS_READY_TIMEOUT_MS` unset, no timeout changes and no different call shapes on the default path (byte-identical local lane for the budget dimension).
-- The picker-loop fix deliberately changes FAILURE semantics on all lanes (loud, diagnosable error replaces silent unbounded swallowing) — evidenced by the retained trace (LB-C). Its healthy path (early returns / quick render) must stay behaviorally identical.
+- `waitForConnection`'s self-heal window W is a SINGLE TOTAL deadline: phase-1 + the reload's navigation + phase-2 share W (+1s slack), so the connection-wait envelope is W+1s (91s at the cloud window) — the budget never needs to cover a multi-W envelope. The pre-fix sequential drift (up to 135s) is fixed at the source (Task 2), not budgeted around.
+- Budget = window + `CLOUD_LANE_BUDGET_OVERHEAD_MS` (30s) = 120s at the cloud default. Sizing the budget to the unreduced chain maxima (~280s) was considered and rejected: it would multiply every cloud test's hang-detection latency and risk the 60-minute lane task timeout for tail coverage with zero recorded evidence; this lane follows the j90s evidence-sized-budget doctrine. With Tasks 2-4 in place the budget covers, with margin, every recorded single-episode class: a full-window wedge envelope (~91s connection + healthy picker) and the recorded slowness episode (~24s boot + click + up-to-60s render ≈ 90s).
 - The wiring is EXTEND-ONLY (`test.info().timeout < budget` guard): a spec's own declared deadline (e.g. idle-gate-semantics' 300_000, the reconcile specs' 240_000) must never be shrunk by the cloud budget. The contract spec pins this.
 - The self-heal stays cloud-only (env-presence gated) and fresh-boot-only: never opt a mid-test `waitForConnection` site into `selfHealReload` (a reload would destroy the state under test).
-- Never loosen the ready assertion, never skip or exclude specs, never raise `retries`, never widen `CLOUD_SKIP_SPECS` — those are coverage reductions, not fixes. The picker fix TIGHTENS failure semantics (a thrown diagnostic replaces a silent fall-through past a successful click); it must not touch any passing-path assertion.
+- Never loosen the ready assertion, never skip or exclude specs, never raise `retries`, never widen `CLOUD_SKIP_SPECS` — those are coverage reductions, not fixes. The picker fix TIGHTENS failure semantics (a thrown diagnostic replaces a silent fall-through past a successful click; non-timeout click errors propagate); it must not touch any passing-path assertion.
 - Malformed env values must never poison the budget (reuse `resolveWsReadyTimeoutMs`'s parsing/fallback — one parsing rule).
-- A budget that covers the legal envelope must not silently become a per-test entitlement: assertions and waits inside test bodies keep their own explicit timeouts.
-- The other three baseline flakes (kata 38hj `restore-contract-wall-rust.spec.ts:579`, kata 5kyg `recover-my-panes-rust.spec.ts:733`, kata ebp6 `reconcile-client-adoption-rust.spec.ts:542`) are pre-existing failures at base_ref 39192e8aa and stay out of scope; the final full e2e lane gate passes if they are the only retry-evidence cases.
-- The gVisor wedge and container-slowness episodes are infra-layer and cannot be deterministically forced; acceptance evidence is (a) the budget arithmetic covering the legal envelope (unit-pinned), (b) the contract spec proving the wiring under the env-present path, (c) the picker loop's new contract (unit-pinned: no escalation after a successful click; loud timeout), and (d) zero-flake cloud receipts for the affected spec at the committed HEAD.
-- Accepted residuals, deliberately out of scope (recorded so the reviewer sees conscious scoping): (a) the client's timeout-less boot fetches (App.tsx:1691-1753, api.ts:181) remain unbounded — that product-level hardening is the qq5m flake class, tracked by its own kata and later campaign runs; both fixes make single infra episodes survivable without it. (b) A pathological co-occurrence (a full 91s self-heal boot envelope AND a ~60s render starve in the same test) can still exceed the 120s budget — it now fails loudly with the picker's diagnostic instead of silently, and is the same pathological class the j90s run accepted (its LB-6). (c) `waitForHarness`'s decorative 15s (real 30s) is a known cosmetic quirk not implicated in this flake. (d) Raw-base specs that import `test` from `@playwright/test` directly and boot the app in-body (terminal-escape-key-rust, cli-rust, silent-input-loss-rust, sidebar-registry-sync-rust, sidebar-remote-status-rings-rust, sidebar-status-tier-sort-rust, diag03-rotation-redaction-rust — load-bearing LB-B2) never resolve `e2eMachineId`; they keep the same 60s deadline with env-scaled 91s single-shot windows they have today. This run does not regress them and does not cover them; they are tracked by kata j96j and addressed by a later campaign step.
+- A budget that covers the evidence-shaped envelope must not silently become a per-test entitlement: assertions and waits inside test bodies keep their own explicit timeouts.
+- The other three baseline flakes (kata 38hj `restore-contract-wall-rust.spec.ts:579`, kata 5kyg `recover-my-panes-rust.spec.ts:733`, kata ebp6 `reconcile-client-adoption-rust.spec.ts:542`) are pre-existing failures at base_ref 39192e8aa and stay out of scope; they are the campaign's next one-test-at-a-time steps.
+- The gVisor wedge and container-slowness episodes are infra-layer and cannot be deterministically forced; acceptance evidence is (a) the budget arithmetic and total-deadline coherence (unit-pinned), (b) the contract spec proving the wiring under the env-present path, (c) the picker loop's new contract (unit-pinned: no escalation after a successful click; the render wait receives `SHELL_RENDER_TIMEOUT_MS`; loud timeout; non-timeout click errors propagate), and (d) zero-flake cloud receipts for the affected spec at the committed HEAD.
+- Accepted residuals, deliberately out of scope (recorded so the reviewer sees conscious scoping): (a) the client's timeout-less boot fetches (App.tsx:1691-1753, api.ts:181) remain unbounded — that product-level hardening is the qq5m flake class, tracked by its own kata and later campaign runs; the fixes here make single infra episodes survivable without it. (b) A pathological co-occurrence — a full-W wedge envelope (91s) AND a ~60s render starve in the same test (~151s+) — can still exceed the 120s budget; it now fails loudly with the picker's diagnostic instead of silently, and is the same pathological class the j90s run accepted (its LB-6). Covering it would require the ~280s legal-maximum budget rejected above. (c) `waitForHarness`'s decorative 15s (real 30s) is a known cosmetic quirk not implicated in this flake. (d) Raw-base specs that import `test` from `@playwright/test` directly and boot the app in-body (terminal-escape-key-rust, cli-rust, silent-input-loss-rust, sidebar-registry-sync-rust, sidebar-remote-status-rings-rust, sidebar-status-tier-sort-rust, diag03-rotation-redaction-rust — load-bearing LB-B2) never resolve `e2eMachineId`; they keep the same 60s deadline they have today. This run does not regress them and does not cover them; they are tracked by kata j96j and addressed by a later campaign step.
 - The full e2e lane at the run HEAD is part of this run's final gate (`npm run test:e2e`, cloud backend); PR checks do not run e2e on this repo, so the lane must be run explicitly.
 
 ---
@@ -96,22 +97,23 @@ In `test/e2e-browser/helpers/test-harness.ts`, directly after `resolveWsReadyTim
 /**
  * Overhead added to the resolved WS-ready window when computing the
  * cloud-lane per-test budget. Covers the fixture steps that are not the
- * connection wait itself: page.goto + waitForHarness (1-3s), the one-shot
- * self-heal reload + fresh boot chain after a wedge episode (observed
- * ~6-10s), the selectShellFromPicker envelope in the evidence-shaped
- * single-episode case (click + render wait; see selectShellFromPicker),
- * and body-start margin. 30s matches the probe-verified settings.spec.ts
- * precedent (120s budget at the 90s cloud window).
+ * connection wait itself: page.goto + waitForHarness (1-3s healthy), the
+ * selectShellFromPicker envelope in the evidence-shaped single-episode
+ * case (click + up-to-60s render wait; see selectShellFromPicker), and
+ * body-start margin. 30s matches the probe-verified settings.spec.ts
+ * precedent (120s budget at the 90s cloud window). The connection wait
+ * itself needs no extra room: waitForConnection enforces its window W as
+ * a single total deadline (W + 1s slack).
  */
 export const CLOUD_LANE_BUDGET_OVERHEAD_MS = 30_000
 
 /**
  * Resolve the cloud-lane per-test deadline budget, or null on the local
- * lane (kata tg4e): the freshellPage fixture's self-healing
- * waitForConnection can legally spend phase-1 (floor(W/2)) + one reload +
- * phase-2 (W - floor(W/2)) ≈ 91s+ at the cloud window W=90s before the
- * test body starts — the config's 60s default deadline kills fixture
- * setup mid-recovery ("Test timeout of 60000ms exceeded while setting up
+ * lane (kata tg4e): the freshellPage fixture's boot chain — self-healing
+ * waitForConnection (a total-deadline window of W + 1s) plus the
+ * picker/render tail — has an evidence-shaped envelope larger than the
+ * config's 60s default, and the 60s deadline kills fixture setup
+ * mid-envelope ("Test timeout of 60000ms exceeded while setting up
  * freshellPage"). The budget derives from the SAME env that scales the
  * window (one source of truth, one parsing rule via
  * resolveWsReadyTimeoutMs) so a custom window scales the budget with it.
@@ -153,7 +155,133 @@ git add test/e2e-browser/helpers/test-harness.ts test/e2e-browser/helpers/test-h
 git commit -m "test(e2e): add cloud-lane per-test budget resolver (kata tg4e)"
 ```
 
-### Task 2: Wire the budget into the `e2eMachineId` fixture + committed contract spec
+### Task 2: `waitForConnection` self-heal enforces W as a single total deadline
+
+**Files:**
+- Modify: `test/e2e-browser/helpers/test-harness.ts` (the self-healing branch of `waitForConnection`, test-harness.ts:101-126)
+- Test: `test/e2e-browser/helpers/test-harness.test.ts` (the `TestHarness.waitForConnection wedge-tolerant self-heal (opt-in)` describe: update tests (c)/(d), add test (f), extend `fakePage` with a reload clock-advance option)
+
+**Interfaces:**
+- Consumes: the existing `fakePage(outcomes)` helper, `DEFAULT_WS_READY_TIMEOUT_MS`, `vi` from vitest (add to the existing vitest import).
+- Produces: self-heal semantics where phase-1 = `floor(W/2)`, the reload's navigation timeout = the remainder, and phase-2's poll = `max(0, remainder - reloadElapsedMs) + 1000` — the whole self-heal path spends at most W + 1s wall clock, instead of each of the three steps independently consuming a full window (up to 135s at W=90s, a sequential drift that outgrew any per-test budget). Non-self-heal (`selfHealReload` absent) semantics are untouched: single poll, `W + 1000`.
+
+**Why this is required scope:** the budget (Task 3) is sized W + 30s; with the current 3-full-windows drift, a wedge that survives phase 1 and has a slow reload legally burns 135s of connection wait alone — more than the entire budget — recreating the recorded failure class. The j90s design intent ("keeps waiting with the remaining budget") and the j90s recap's Optional finding #4 both call for exactly this total-deadline enforcement; this run lands it.
+
+- [ ] **Step 1: Write the failing behavioral test**
+
+In `test-harness.test.ts`, extend `fakePage` to support a reload that advances the (fake) clock, and add test (f). Test (f) is the RED: the current code gives phase-2 the full remainder regardless of reload elapsed time.
+
+Extend `fakePage` (add an optional second parameter; keep every existing call site working unchanged):
+
+```ts
+function fakePage(
+  outcomes: FakeWaitOutcome[] = [],
+  opts: { reloadAdvanceMs?: number } = {},
+) {
+  // ...existing body unchanged except the reload fake:
+  //   reload: (...args: unknown[]) => {
+  //     reloads.push(args)
+  //     if (opts.reloadAdvanceMs) vi.setSystemTime(Date.now() + opts.reloadAdvanceMs)
+  //     return Promise.resolve()
+  //   },
+}
+```
+
+Add to the self-heal describe (after test (e)):
+
+```ts
+  it('(f) total-deadline: the reload elapsed time is charged to phase 2 (no 3xW sequential envelope)', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      const phase1 = Math.floor(DEFAULT_WS_READY_TIMEOUT_MS / 2)
+      const remaining = DEFAULT_WS_READY_TIMEOUT_MS - phase1
+      const { page, calls, reloads } = fakePage(
+        [{ reject: nativeTimeout(phase1) }, {}],
+        { reloadAdvanceMs: 10_000 },
+      )
+      await new TestHarness(page).waitForConnection(undefined, { selfHealReload: true })
+      expect(reloads).toHaveLength(1)
+      expect(reloads[0]).toEqual([{ timeout: remaining }])
+      expect(calls).toHaveLength(2)
+      // The reload "took" 10s of wall clock: phase 2 must receive the
+      // remainder MINUS that time (+1s slack), not a fresh full window.
+      expect(calls[1][2]).toEqual({ timeout: remaining - 10_000 + 1000 })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+```
+
+- [ ] **Step 2: Run the test and verify the intended failure**
+
+Run: `npm run test:e2e:helpers -- test-harness`
+
+Expected: test (f) FAILs because the current phase-2 poll is bound to the full `remaining` window (`calls[1][2]` = `{ timeout: remaining }` = 45000, not `remaining - 10_000 + 1000` = 36000) — the total-deadline behavior is absent.
+
+- [ ] **Step 3: Add the minimal production implementation**
+
+In `test-harness.ts`, replace the self-healing branch's reload + final poll:
+
+```ts
+    if (!readyWithinPhase1) {
+      // Enforce W as a SINGLE TOTAL deadline (kata tg4e): the reload's
+      // navigation and phase-2's poll SHARE the remaining budget, so the
+      // self-heal path spends at most W + 1s wall clock. The previous
+      // shape let each step consume its own full window (up to 3xW
+      // sequentially at W=90s), a drift that outgrew any per-test budget.
+      const reloadStartedAt = Date.now()
+      await this.page.reload({ timeout: remainingMs })
+      const phase2Ms = Math.max(0, remainingMs - (Date.now() - reloadStartedAt)) + 1000
+      await this.page.waitForFunction(
+        wsReadyPredicate,
+        undefined,
+        { timeout: phase2Ms },
+      )
+    }
+```
+
+- [ ] **Step 4: Run the focused test**
+
+Run: `npm run test:e2e:helpers -- test-harness`
+
+Expected: test (f) PASSes. Tests (c) and (d) FAIL their `calls[1][2]` assertions (the instant fake reload makes phase-2 = `remaining + 1000`, no longer exactly `remaining`) — update them per Step 5. This is expected mid-task red on those two assertions only; do not weaken any other assertion.
+
+- [ ] **Step 5: Refactor while green (update the two affected assertions to the total-deadline semantics)**
+
+In test (c), replace `expect(calls[1][2]).toEqual({ timeout: remaining })` with:
+
+```ts
+    // Total-deadline semantics: an (instant) reload leaves phase 2 the
+    // remainder minus elapsed (+1s slack), not a fresh full window.
+    expect((calls[1][2] as { timeout: number }).timeout).toBeGreaterThan(remaining)
+    expect((calls[1][2] as { timeout: number }).timeout).toBeLessThanOrEqual(remaining + 1000)
+```
+
+In test (d), apply the identical replacement against its own `remaining` variable (keep its `reloads[0]` and `calls[0][2]` assertions unchanged). Then re-run:
+
+Run: `npm run test:e2e:helpers -- test-harness`
+
+Expected: PASS (all self-heal tests, including the updated (c)/(d) and new (f), and every other describe).
+
+- [ ] **Step 6: Run impacted-test verification**
+
+The self-heal path is exercised by: the helpers unit lane (all of it), and every cloud-lane spec's freshellPage fixture (real-behavior set below; the local lane runs the non-self-heal path because the env is unset).
+
+```bash
+npm run test:e2e:helpers
+FRESHELL_E2E_WS_READY_TIMEOUT_MS=90000 npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/host-stats-pane.spec.ts test/e2e-browser/specs/settings.spec.ts
+```
+
+Expected: PASS (the env-set local invocation runs the self-heal path for real: boots, phase-1 ready, no reload, picker selects a shell).
+
+- [ ] **Step 7: Commit the task**
+
+```bash
+git add test/e2e-browser/helpers/test-harness.ts test/e2e-browser/helpers/test-harness.test.ts
+git commit -m "test(e2e): waitForConnection self-heal enforces its window as a single total deadline (kata tg4e)"
+```
+
+### Task 3: Wire the budget into the `e2eMachineId` fixture + committed contract spec
 
 **Files:**
 - Modify: `test/e2e-browser/helpers/fixtures.ts` (the `e2eMachineId` fixture, currently `e2eMachineId: async ({ testServer }, use) => { await use((await registerE2eMachine(testServer.info)).id) }`; also extend the module's existing `import` from `'./test-harness.js'`)
@@ -176,13 +304,12 @@ import { resolveCloudLaneTestBudgetMs } from '../helpers/test-harness.js'
 // env is present, every test that boots the app through this fixtures
 // module resolves the e2eMachineId fixture BEFORE any page/context work,
 // and that fixture extends the per-test deadline (extend-only) to cover
-// the fixture chain's legal envelope — the self-healing waitForConnection
-// inside freshellPage can legally spend phase-1 (W/2) + one reload +
-// phase-2 (W - W/2) before the test body starts, and the picker/render
-// tail adds its own envelope, so the config's 60s default can kill fixture
-// setup mid-recovery (the recorded flake). When the env is absent (local
-// lane) the default budget applies unchanged, and a spec's own larger
-// declared deadline is always kept.
+// the fixture chain's evidence-shaped envelope — the self-healing
+// waitForConnection spends at most W+1s (a single total deadline), and
+// the picker/render tail adds its own envelope, so the config's 60s
+// default can kill fixture setup mid-envelope (the recorded flake).
+// When the env is absent (local lane) the default budget applies
+// unchanged, and a spec's own larger declared deadline is always kept.
 
 test('per-test deadline covers the harness wedge budget on the cloud lane', ({ freshellPage }) => {
   const cloudBudgetMs = resolveCloudLaneTestBudgetMs()
@@ -237,25 +364,24 @@ In `test/e2e-browser/helpers/fixtures.ts`: extend the existing import from `'./t
   // Cloud-lane wedge budget (kata tg4e): this is the earliest test-scoped
   // fixture — resolved before context/page, so every module-chain spec's
   // whole fixture chain runs under the deadline set here. The freshellPage
-  // fixture's self-healing waitForConnection can legally spend ~91s+ at
-  // the 90s cloud window (phase-1 floor(W/2) + one reload + phase-2
-  // remainder) before the test body starts, and the picker/render tail
-  // adds its own envelope (kata tg4e's retained trace: a container-wide
-  // CPU-contention episode starved the post-click .xterm render past the
-  // 30s wait, and the old picker loop silently burned the remaining
-  // budget escalating through options absent on this platform). The
-  // config's 60s default deadline kills fixture setup mid-envelope — the
-  // recorded "Test timeout of 60000ms exceeded while setting up
-  // freshellPage" flake. Extending the deadline from inside this fixture
-  // makes the budget cover the chain's envelope for every module-chain
-  // spec, not just settings.spec.ts (whose private hook Task 4 removes).
-  // Locally the env var is unset and the default budget applies
-  // unchanged. The mechanism is probe-verified (settings.spec.ts
-  // precedent, kata j90s): a setTimeout issued during fixture resolution
-  // extends the live deadline over fixture time. EXTEND-ONLY: specs that
-  // declare a larger deadline (idle-gate 300s, reconcile specs 240s) keep
-  // their own budget — the guard must never shrink a declared deadline
-  // to the cloud budget.
+  // fixture's boot chain — self-healing waitForConnection (at most W+1s,
+  // a single total deadline) plus the picker/render tail (kata tg4e's
+  // retained trace: a container-wide CPU-contention episode starved the
+  // post-click .xterm render and the old picker loop silently burned the
+  // remaining budget escalating through options absent on this platform) —
+  // has an evidence-shaped envelope larger than the config's 60s default,
+  // which killed fixture setup mid-envelope: the recorded
+  // "Test timeout of 60000ms exceeded while setting up freshellPage"
+  // flake. Extending the deadline from inside this fixture makes the
+  // budget cover the chain's envelope for every module-chain spec, not
+  // just settings.spec.ts (whose private hook Task 5 removes). Locally
+  // the env var is unset and the default budget applies unchanged. The
+  // mechanism is probe-verified (settings.spec.ts precedent, kata j90s):
+  // a setTimeout issued during fixture resolution extends the live
+  // deadline over fixture time. EXTEND-ONLY: specs that declare a larger
+  // deadline (idle-gate 300s, reconcile specs 240s) keep their own
+  // budget — the guard must never shrink a declared deadline to the
+  // cloud budget.
   e2eMachineId: async ({ testServer }, use) => {
     const cloudBudgetMs = resolveCloudLaneTestBudgetMs()
     if (cloudBudgetMs !== null && test.info().timeout < cloudBudgetMs) {
@@ -283,7 +409,7 @@ Expected: PASS (local default still exactly 60_000 for the first test; the never
 
 - [ ] **Step 5: Refactor while green**
 
-None beyond the comment placement above (the settings.spec.ts duplicate hook removal is Task 4 — keep it in place until then so settings never runs un-budgeted).
+None beyond the comment placement above (the settings.spec.ts duplicate hook removal is Task 5 — keep it in place until then so settings never runs un-budgeted).
 
 - [ ] **Step 6: Run impacted-test verification**
 
@@ -304,65 +430,69 @@ git add test/e2e-browser/helpers/fixtures.ts test/e2e-browser/specs/e2e-budget-c
 git commit -m "test(e2e): extend the per-test deadline to the cloud wedge budget from the earliest test-scoped fixture (kata tg4e)"
 ```
 
-### Task 3: Fix the `selectShellFromPicker` slow-render conflation (the recorded budget burner)
+### Task 4: Fix the `selectShellFromPicker` slow-render conflation (the recorded budget burner)
 
 **Files:**
-- Modify: `test/e2e-browser/helpers/test-harness.ts` (add the restructured `selectShellFromPicker` as an exported page-flow helper near `TestHarness` — it is page-manipulation logic, not fixture wiring)
-- Modify: `test/e2e-browser/helpers/fixtures.ts` (delete the module-private `selectShellFromPicker` at lines 128-161 and import the new one from `'./test-harness.js'`; the only call site is the `freshellPage` fixture)
-- Test: `test/e2e-browser/helpers/test-harness.test.ts` (new `describe` with a fake page following the file's existing fakePage pattern)
+- Modify: `test/e2e-browser/helpers/test-harness.ts` (add the restructured `selectShellFromPicker` as an exported page-flow helper near `TestHarness` — it is page-manipulation logic, not fixture wiring; plus the `SHELL_RENDER_TIMEOUT_MS` export)
+- Modify: `test/e2e-browser/helpers/fixtures.ts` (delete the module-private `selectShellFromPicker` and import the new one from `'./test-harness.js'`; the only call site is the `freshellPage` fixture)
+- Test: `test/e2e-browser/helpers/test-harness.test.ts` (new `describe` with a purpose-built fake page following the file's existing fakePage pattern)
 
 **Interfaces:**
-- Consumes: `Page` (type-only), `selectShellFromPicker(page: Page): Promise<void>`.
-- Produces: `selectShellFromPicker` exported from `test-harness.ts` with the contract: (a) early returns unchanged (xterm already visible, or appears within the 500ms stabilization wait); (b) an option ABSENT (click timeout) advances to the next shell name — the historical detachment-race behavior; (c) a SUCCESSFUL click never escalates: it waits up to `SHELL_RENDER_TIMEOUT_MS` (60_000) for `.xterm` to become visible, and on timeout throws a diagnostic error naming the clicked shell and the wait ("Shell 'Shell' was clicked but the terminal did not render within 60000ms — a slow or starved render is a first-class failure, not a wrong-option signal; see kata tg4e"); (d) the all-options-absent fall-through contract is preserved (returns normally).
+- Consumes: `Page` (type-only).
+- Produces: `SHELL_RENDER_TIMEOUT_MS: number` (60_000) and `selectShellFromPicker(page: Page): Promise<void>` with the contract: (a) early returns unchanged (xterm already visible, or appears within the 500ms stabilization wait); (b) a click that fails with Playwright's `TimeoutError` means the option was absent/detached — advance to the next shell name (the historical detachment-race behavior); (c) a click that fails with ANY OTHER error (page closed, test interrupted, actionability errors) propagates — loud, never swallowed; (d) a SUCCESSFUL click never escalates: it waits up to `SHELL_RENDER_TIMEOUT_MS` for `.xterm` to become visible and on timeout throws a diagnostic error naming the clicked shell and the wait; (e) the all-options-absent fall-through contract is preserved (returns normally).
 
-**Why this is required scope (not residual):** the retained trace (validator LB-C, `reports/load-bearing-validator-LB-C.md`) proves the recorded tg4e failure was exactly this conflation: after a successful Shell click (terminal created server-side, active, `hasClients:true`), the 30s `.xterm` render wait failed under container-wide CPU contention, and the loop escalated into WSL/CMD — options absent on the Linux picker — silently burning the remaining budget until the 60s deadline (and double-creating terminals whenever escalation reaches an option that exists, e.g. Bash). The budget fix alone does not survive this episode class (the escalation tail re-burns any budget); the loop's semantics are the defect.
+**Why this is required scope (not residual):** the retained trace (validator LB-C, `reports/load-bearing-validator-LB-C.md`) proves the recorded tg4e failure was exactly this conflation: after a successful Shell click (terminal created server-side, active, `hasClients:true`), the 30s `.xterm` render wait failed under container-wide CPU contention, and the loop escalated into WSL/CMD — options absent on the Linux picker — silently burning the remaining budget until the 60s deadline (and double-creating terminals whenever escalation reaches an option that exists, e.g. Bash). The budget fix alone does not survive this episode class; the loop's semantics are the defect.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
-Add to `test/e2e-browser/helpers/test-harness.test.ts` (extend the existing import from `'./test-harness'` with `selectShellFromPicker` and the exported constant; add a purpose-built fake page alongside the existing `fakePage`):
+Add to `test/e2e-browser/helpers/test-harness.test.ts` (extend the existing import from `'./test-harness'` with `selectShellFromPicker` and `SHELL_RENDER_TIMEOUT_MS`):
 
 ```ts
 describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
-  interface PickerOutcome {
-    clickOk?: boolean        // does this shell's click() resolve (option present)?
-    renderVisibleAfter?: number // ms after click when .xterm becomes visible; omit = never
+  interface ShellOutcome {
+    clickError?: 'timeout' | 'page-closed' // absent click by default
+    renderVisibleAfterMs?: number // omit = render never becomes visible
   }
 
-  function pickerPage(outcomes: Record<string, PickerOutcome>, xtermInitiallyVisible = false) {
+  function pickerPage(
+    shells: Record<string, ShellOutcome>,
+    xtermInitiallyVisible = false,
+  ) {
     const clicks: string[] = []
-    const now = { ms: 0 }
+    const renderWaits: number[] = []
+    const currentShell = () => (clicks.length ? shells[clicks[clicks.length - 1]] : undefined)
     const page = {
       locator: (selector: string) => ({
         first: () => ({
           isVisible: () => Promise.resolve(selector === '.xterm' && xtermInitiallyVisible),
           waitFor: ({ timeout }: { timeout: number }) => {
-            const outcome = clicks.length ? outcomes[clicks[clicks.length - 1]] : undefined
-            const visibleAfter = outcome?.renderVisibleAfter
+            renderWaits.push(timeout)
+            const visibleAfter = currentShell()?.renderVisibleAfterMs
             if (visibleAfter === undefined || visibleAfter > timeout) {
-              return Promise.reject(new Error(`waitFor timed out after ${timeout}ms`))
+              return Promise.reject(new Error(`waitFor: Timeout ${timeout}ms exceeded`))
             }
             return Promise.resolve()
           },
         }),
       }),
-      getByRole: (_role: string, opts: { name: RegExp }) => ({
-        click: ({ timeout }: { timeout: number }) => {
-          const name = opts.name.source.replace('^', '').replace('$', '').replace('\\\\i', '')
+      getByRole: (_kind: string, opts: { name: RegExp }) => ({
+        click: () => {
+          const name = /^(\w+)/.exec(opts.name.source)?.[1] ?? opts.name.source
           clicks.push(name)
-          const outcome = outcomes[name]
-          if (!outcome?.clickOk) {
-            return new Promise((_, reject) =>
-              setTimeout(() => reject(new Error(`click timed out after ${timeout}ms`)), 1))
+          const outcome = shells[name]
+          if (outcome?.clickError === 'page-closed') {
+            return Promise.reject(Object.assign(new Error('Page closed'), { name: 'TargetClosedError' }))
+          }
+          if (!outcome) {
+            // Option absent: Playwright's actionability TimeoutError.
+            return Promise.reject(Object.assign(new Error('click: Timeout 5000ms exceeded'), { name: 'TimeoutError' }))
           }
           return Promise.resolve()
         },
       }),
-      waitForTimeout: (ms: number) => new Promise<void>((resolve) => {
-        now.ms += ms
-        resolve()
-      }),
+      waitForTimeout: () => Promise.resolve(),
     }
-    return { page: page as unknown as Page, clicks: clicks as string[] }
+    return { page: page as unknown as Page, clicks, renderWaits }
   }
 
   it('returns immediately when .xterm is already visible', async () => {
@@ -371,62 +501,67 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
     expect(clicks).toEqual([])
   })
 
-  it('a successful click waits for the render and never escalates to other shells', async () => {
-    const { page, clicks } = pickerPage({
-      Shell: { clickOk: true, renderVisibleAfter: 5_000 },
-      WSL: { clickOk: true },
-      CMD: { clickOk: true },
-      PowerShell: { clickOk: true },
-      Bash: { clickOk: true },
+  it('a successful click waits the full render budget and never escalates to other shells', async () => {
+    const { page, clicks, renderWaits } = pickerPage({
+      Shell: { renderVisibleAfterMs: 5_000 },
+      WSL: {}, CMD: {}, PowerShell: {}, Bash: {},
     })
     await selectShellFromPicker(page)
     expect(clicks).toEqual(['Shell'])
+    expect(renderWaits).toEqual([SHELL_RENDER_TIMEOUT_MS])
+  })
+
+  it('survives a render slower than the historical 30s wait (the recorded episode shape)', async () => {
+    // The recorded tg4e trace: render starved past 30s. A 30s
+    // implementation rejects here; the fix must wait longer.
+    const { page, clicks, renderWaits } = pickerPage({
+      Shell: { renderVisibleAfterMs: 35_000 },
+    })
+    await selectShellFromPicker(page)
+    expect(clicks).toEqual(['Shell'])
+    expect(renderWaits).toEqual([SHELL_RENDER_TIMEOUT_MS])
   })
 
   it('throws a diagnostic when a clicked shell never renders (loud, not silent)', async () => {
-    const { page, clicks } = pickerPage({
-      Shell: { clickOk: true }, // clicked, render never visible
-      WSL: { clickOk: true },
-      CMD: { clickOk: true },
-      PowerShell: { clickOk: true },
-      Bash: { clickOk: true },
+    const { page, clicks, renderWaits } = pickerPage({
+      Shell: {}, // clicked, render never visible
+      WSL: {}, CMD: {}, PowerShell: {}, Bash: {},
     })
     await expect(selectShellFromPicker(page)).rejects.toThrow(/did not render/)
     expect(clicks).toEqual(['Shell']) // no escalation, no terminal double-creation
+    expect(renderWaits).toEqual([SHELL_RENDER_TIMEOUT_MS])
   })
 
-  it('an absent option (click timeout) advances to the next shell', async () => {
+  it('an absent option (click TimeoutError) advances to the next shell', async () => {
     const { page, clicks } = pickerPage({
-      Shell: { clickOk: false },
-      WSL: { clickOk: false },
-      CMD: { clickOk: false },
-      PowerShell: { clickOk: false },
-      Bash: { clickOk: true, renderVisibleAfter: 1_000 },
+      Bash: { renderVisibleAfterMs: 1_000 }, // Shell/WSL/CMD/PowerShell absent
     })
     await selectShellFromPicker(page)
     expect(clicks).toEqual(['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash'])
   })
 
-  it('falls through silently only when every option is absent (historical contract)', async () => {
-    const { page } = pickerPage({
-      Shell: { clickOk: false },
-      WSL: { clickOk: false },
-      CMD: { clickOk: false },
-      PowerShell: { clickOk: false },
-      Bash: { clickOk: false },
+  it('a non-timeout click error propagates (page closure is loud, never "option absent")', async () => {
+    const { page, clicks } = pickerPage({
+      Shell: { clickError: 'page-closed' },
     })
+    await expect(selectShellFromPicker(page)).rejects.toThrow('Page closed')
+    expect(clicks).toEqual(['Shell'])
+  })
+
+  it('falls through silently only when every option is absent (historical contract)', async () => {
+    const { page } = pickerPage({})
     await expect(selectShellFromPicker(page)).resolves.toBeUndefined()
   })
 })
 ```
 
-(The fake above is a draft: the implementer must adapt it to the real call shapes observed in the source — e.g. how the shell-name RegExp is built and how `locator('.xterm').first()` chains — so the fake records the actual button names clicked; keep the five behavioral assertions exactly as specified.)
+(The fake above is a draft: the implementer must adapt it to the real call shapes in the source — how the shell-name RegExp is built, how `locator('.xterm').first()` chains, and the exact click option object — so `clicks` records the real button names. Keep the seven behavioral assertions exactly as specified, including the two `SHELL_RENDER_TIMEOUT_MS` pins.)
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
 Run: `npm run test:e2e:helpers -- test-harness`
 
-Expected: FAIL because `selectShellFromPicker` is not exported from `./test-harness` (it is still fixtures.ts-private) — the missing export is the absent behavior.
+Expected: FAIL because `selectShellFromPicker` and `SHELL_RENDER_TIMEOUT_MS` are not exported from `./test-harness` (the function is still fixtures.ts-private) — the missing exports are the absent behavior.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -438,24 +573,31 @@ In `test/e2e-browser/helpers/test-harness.ts` (exported, near TestHarness):
  * (.xterm visible) before failing loudly (kata tg4e). Evidence-sized:
  * the recorded failure's render starve exceeded 30s under container-wide
  * CPU contention (a sibling worker's normally-200ms test took 74s in the
- * same window), so 30s conflated "slow render" with "wrong option" and
- * the loop escalated into absent options, silently burning the test
- * budget. 60s fits the observed single-episode envelope inside the
- * 120s cloud budget (24s slow boot + click + render < 120s).
+ * same window), so a 30s wait conflated "slow render" with "wrong
+ * option" and the loop escalated into absent options, silently burning
+ * the test budget. 60s fits the recorded single-episode envelope inside
+ * the 120s cloud budget (24s slow boot + click + render < 120s).
  */
 export const SHELL_RENDER_TIMEOUT_MS = 60_000
 
+/** Playwright's actionability timeout is the "option absent" signal;
+ * anything else (page closed, interruption, unexpected errors) is loud. */
+function isClickAbsenceError(err: unknown): boolean {
+  return err instanceof Error && err.name === 'TimeoutError'
+}
+
 /**
  * Select a shell from the PanePicker. Handles the race where buttons
- * detach during the platform-info Redux update: a click TIMEOUT means
- * the option was absent/detached — advance to the next candidate. A
- * SUCCESSFUL click is different: the terminal create is in flight, and a
- * slow render is NOT evidence the option was wrong — wait generously
- * and fail loudly on timeout instead of escalating (escalation after a
- * successful click double-creates terminals and, in the recorded tg4e
- * failure, burned the remaining test budget on options absent on this
- * platform). Never opts into page reloads: the fixture is fresh-boot,
- * but the picker may already have created state.
+ * detach during the platform-info Redux update: a click TimeoutError
+ * means the option was absent/detached — advance to the next candidate
+ * (Playwright's click auto-retry already absorbs transient detachments
+ * inside its window). A SUCCESSFUL click is different: the terminal
+ * create is in flight, and a slow render is NOT evidence the option was
+ * wrong — wait generously and fail loudly on timeout instead of
+ * escalating (escalation after a successful click double-creates
+ * terminals and, in the recorded tg4e failure, burned the remaining
+ * test budget on options absent on this platform). Never reloads: the
+ * picker may already have created state.
  */
 export async function selectShellFromPicker(page: Page): Promise<void> {
   const xtermAlreadyVisible = await page.locator('.xterm').first().isVisible().catch(() => false)
@@ -471,8 +613,12 @@ export async function selectShellFromPicker(page: Page): Promise<void> {
   const shellNames = ['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash']
   for (const name of shellNames) {
     const button = page.getByRole('button', { name: new RegExp(`^${name}$`, 'i') })
-    const clicked = await button.click({ timeout: 5_000 }).then(() => true, () => false)
-    if (!clicked) continue // option absent/detached — historical behavior
+    try {
+      await button.click({ timeout: 5_000 })
+    } catch (err) {
+      if (!isClickAbsenceError(err)) throw err
+      continue // option absent/detached — historical behavior
+    }
     try {
       await page.locator('.xterm').first().waitFor({ state: 'visible', timeout: SHELL_RENDER_TIMEOUT_MS })
       return
@@ -490,13 +636,13 @@ export async function selectShellFromPicker(page: Page): Promise<void> {
 }
 ```
 
-In `test/e2e-browser/helpers/fixtures.ts`: delete the module-private `selectShellFromPicker` (lines 128-161) and add it to the import from `'./test-harness.js'`; the `freshellPage` fixture's call site (`await selectShellFromPicker(page)`) is unchanged.
+In `test/e2e-browser/helpers/fixtures.ts`: delete the module-private `selectShellFromPicker` (with its doc comment) and add `selectShellFromPicker` to the import from `'./test-harness.js'`; the `freshellPage` fixture's call site (`await selectShellFromPicker(page)`) is unchanged.
 
 - [ ] **Step 4: Run the focused test**
 
 Run: `npm run test:e2e:helpers -- test-harness`
 
-Expected: PASS (all five new contract tests green; all pre-existing tests green).
+Expected: PASS (all seven new contract tests green; all pre-existing tests green).
 
 - [ ] **Step 5: Refactor while green**
 
@@ -521,18 +667,18 @@ git add test/e2e-browser/helpers/test-harness.ts test/e2e-browser/helpers/test-h
 git commit -m "test(e2e): picker loop distinguishes absent options from slow renders and fails loudly (kata tg4e)"
 ```
 
-### Task 4: Remove the now-redundant settings.spec.ts budget hook
+### Task 5: Remove the now-redundant settings.spec.ts budget hook
 
 **Files:**
-- Modify: `test/e2e-browser/specs/settings.spec.ts` (delete the `test.beforeEach` block, lines 8-21 in the current file: the cloud-only `test.setTimeout(120_000)` hook; its probe-verified mechanism documentation has moved into the `e2eMachineId` fixture comment in Task 2)
+- Modify: `test/e2e-browser/specs/settings.spec.ts` (delete the `test.beforeEach` block, lines 8-21 in the current file: the cloud-only `test.setTimeout(120_000)` hook; its probe-verified mechanism documentation has moved into the `e2eMachineId` fixture comment in Task 3)
 
 **Interfaces:**
-- Consumes: Task 2's fixture-level budget (settings.spec.ts uses `freshellPage`, so it resolves `e2eMachineId` first: derived budget 120_000 at the cloud default window == the hook's 120_000, so the operative cloud-lane behavior is unchanged; at other configured windows the derived budget scales with the window — equal-or-larger than the old fixed hook at windows >= 90s, smaller below that but still arithmetically sufficient (window + overhead by construction)). The extend-only guard also means settings keeps any larger deadline it might declare in the future.
+- Consumes: Task 3's fixture-level budget (settings.spec.ts uses `freshellPage`, so it resolves `e2eMachineId` first: derived budget 120_000 at the cloud default window == the hook's 120_000, so the operative cloud-lane behavior is unchanged; at other configured windows the derived budget scales with the window — equal-or-larger than the old fixed hook at windows >= 90s, smaller below that but still arithmetically sufficient (window + overhead by construction)). The extend-only guard also means settings keeps any larger deadline it might declare in the future.
 - Produces: one source of truth for the cloud wedge budget (the fixture), no per-spec opt-in.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
-No new test: the behavior change (settings still budgeted after hook removal) is already protected by Task 2's contract spec (the wiring under the env-present path) and this task's verification runs below. Removing a redundant duplicate is a refactor under green, not new behavior.
+No new test: the behavior change (settings still budgeted after hook removal) is already protected by Task 3's contract spec (the wiring under the env-present path) and this task's verification runs below. Removing a redundant duplicate is a refactor under green, not new behavior.
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
@@ -576,14 +722,14 @@ git add test/e2e-browser/specs/settings.spec.ts
 git commit -m "refactor(e2e): drop settings-only cloud budget hook superseded by the fixture-level budget (kata tg4e)"
 ```
 
-### Task 5: Cloud-lane proof at the committed HEAD
+### Task 6: Cloud-lane proof at the committed HEAD
 
 **Files:**
 - No source changes. Evidence receipts go to the run's logs dir (outside the tracked tree). The worktree must be clean and committed before each cloud invocation (dirty trees force a non-addressable full rebuild).
 
 **Interfaces:**
-- Consumes: Tasks 1-4 at the branch HEAD; the cloud lane (`scripts/e2e-cloud.sh run --cloud`), which bakes `FRESHELL_E2E_WS_READY_TIMEOUT_MS=90000` and `FRESHELL_E2E_SERVER_VERBOSE=1` into the job env.
-- Produces: zero-flake receipts for the target spec and the contract spec at HEAD; evidence for the final gate and the kata tg4e close.
+- Consumes: Tasks 1-5 at the branch HEAD; the cloud lane (`scripts/e2e-cloud.sh run --cloud`), which bakes `FRESHELL_E2E_WS_READY_TIMEOUT_MS=90000` and `FRESHELL_E2E_SERVER_VERBOSE=1` into the job env.
+- Produces: zero-flake receipts for the target spec and the contract spec at HEAD; evidence for the final gate.
 
 - [ ] **Step 1: Run the target spec and the contract spec on the cloud lane**
 
@@ -597,7 +743,7 @@ Expected: PASS with a zero-flake receipt ("All tasks completed successfully", no
 
 - [ ] **Step 2: Repeat for confidence**
 
-Re-run the same command once more. Expected: PASS zero-flake again (the flake was observed ~1-in-7 for the class; two clean focused runs plus the arithmetic, contract pin, and picker-contract pin is the practical pre-gate evidence).
+Re-run the same command once more. Expected: PASS zero-flake again (the flake was observed ~1-in-7 for the class; two clean focused runs plus the unit-pinned arithmetic, the contract spec, and the picker-contract tests is the practical pre-gate evidence).
 
 - [ ] **Step 3: Record evidence**
 
@@ -607,14 +753,16 @@ Save both receipts under `.worktrees/.the-usual-logs/hoststats-freshellpage-flak
 
 No tracked changes in this task (evidence lives outside the tree). If investigation reveals a defect, file it as a new focused task rather than expanding this one silently.
 
-### Task 6: Full-suite gate at the final HEAD + kata close
+### Task 7: Full-suite gate at the final HEAD
 
 **Files:**
 - No source changes expected. Gate fixes (if any) follow the-usual's gate procedure as a batch.
 
 **Interfaces:**
 - Consumes: the final committed HEAD of all tasks.
-- Produces: the run's gate evidence — standard suite green; full e2e lane green excluding the ledger-recorded pre-existing flakes (katas 38hj, 5kyg, ebp6 — reproducing at base_ref per the campaign baseline receipts); kata tg4e closed with evidence.
+- Produces: the run's gate evidence — standard suite green; e2e lane green under the-usual's ledger-exemption criterion.
+
+**Gate criterion (stated precisely):** the gate passes when every suite is green EXCEPT failures that are ledger-recorded pre-existing failures — each reproduced at base_ref 39192e8aa with receipts (the campaign baseline receipts at `.worktrees/.the-usual-logs/main-green-campaign/baseline-receipts.md`). The three pre-existing e2e flakes (katas 38hj, 5kyg, ebp6) are exactly that: reproduced at base_ref, recorded, and slated as the campaign's next one-test-at-a-time runs per the User Request. The e2e zero-flake receipt itself therefore remains red-by-design until those later campaign runs land — this run's gate does NOT claim a green receipt, it claims green-exempted-per-ledger. Any retry-evidence case that is NOT one of the three ledger-recorded flakes is a gate failure requiring root-cause.
 
 - [ ] **Step 1: Standard coordinated suite**
 
@@ -630,16 +778,21 @@ Expected: PASS (exit 0). This covers client/tooling vitest, source-runtime, Rust
 FRESHELL_TEST_SUMMARY='the-usual hoststats-freshellpage-flake: final e2e lane gate at HEAD' npm run test:e2e
 ```
 
-Expected: PASS with a zero-flake receipt, OR exit 1 whose ONLY recovered-retry cases are the three ledger-recorded pre-existing flakes (`restore-contract-wall-rust.spec.ts:579`, `recover-my-panes-rust.spec.ts:733`, `reconcile-client-adoption-rust.spec.ts:542`). Any retry-evidence case for `host-stats-pane.spec.ts`, `e2e-budget-contract.spec.ts`, `settings.spec.ts`, or any OTHER spec is a gate failure requiring root-cause (it means this run's fix is incomplete or regressed something).
+Expected: exit 0 with a zero-flake receipt, OR exit 1 whose recovered-retry cases are EXACTLY a subset of {`restore-contract-wall-rust.spec.ts:579`, `recover-my-panes-rust.spec.ts:733`, `reconcile-client-adoption-rust.spec.ts:542`} — the ledger-recorded pre-existing flakes. A receipt containing any retry-evidence case for `host-stats-pane.spec.ts`, `e2e-budget-contract.spec.ts`, `settings.spec.ts`, or any other spec is a gate failure: this run's fix is incomplete or regressed something.
 
 - [ ] **Step 3: Record the gate entry**
 
-Record time, HEAD SHA, exact commands, results, and the exemption evidence (base_ref reproduction receipts in `.worktrees/.the-usual-logs/main-green-campaign/baseline-receipts.md`) in the progress ledger and run-state.
+Record time, HEAD SHA, exact commands, results, and the exemption evidence (the base_ref reproduction receipts) in the progress ledger and run-state. Note explicitly which (if any) of the three pre-existing flakes appeared, for the campaign's bookkeeping.
 
-- [ ] **Step 4: Close kata tg4e**
+- [ ] **Step 4: No commit**
 
-```bash
-kata close tg4e --done --commit <final-HEAD-sha> --comment "Fixed by the-usual hoststats-freshellpage-flake: (1) cloud-lane per-test budget derives from FRESHELL_E2E_WS_READY_TIMEOUT_MS (window+30s, extend-only) applied from the e2eMachineId fixture for every module-chain spec; (2) selectShellFromPicker distinguishes absent options from slow renders and fails loudly instead of escalating (the recorded budget burner per the retained trace); settings' private hook removed. Evidence: resolver + picker contract unit-pinned; e2e-budget-contract spec green on both lanes; zero-flake cloud receipts at HEAD; full-lane gate green excluding the three ledger-recorded pre-existing flakes (38hj/5kyg/ebp6)."
-```
+No tracked changes in this task. The worktree stays at the final HEAD with all tasks committed.
 
-Expected: kata closes (asserts work complete). The other three katas stay open for their own runs.
+## Post-run integration sequence (orchestrator-owned, outside the plan's tasks — recorded so the full path to the requested result on main is visible)
+
+The the-usual run itself ends at Task 7 (execution + reviews do not merge or push). The integration that delivers the fix onto `main` follows, in order:
+
+1. Final delta Fresh Eyes review on the complete committed delta (base_ref 39192e8aa...HEAD), up to 15 rounds per the user's authorization.
+2. If and only if the delta review finishes PASSED: per the user's explicit pre-approval, push the branch and open a PR onto `main`, wait for required checks, merge, and fast-forward local `main` from `origin/main`.
+3. Close kata tg4e with the MERGE commit SHA and the evidence bundle (unit pins, contract spec, cloud receipts, gate entry).
+4. Re-run the campaign's e2e gate at `origin/main` — this doubles as the post-merge proof of the tg4e fix on main and the refreshed baseline for the campaign's next one-test-at-a-time run (the remaining flakes: katas 38hj, 5kyg, ebp6, then the backlog katas).
