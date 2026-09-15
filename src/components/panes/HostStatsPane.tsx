@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { Loader2, RefreshCw } from 'lucide-react'
+import { Loader2, RefreshCw, X } from 'lucide-react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import {
   activateHostStats,
   deactivateHostStats,
+  dismissHostStatsRefreshError,
   requestHostStatsRefresh,
 } from '@/store/hostStatsSlice'
 import {
@@ -434,7 +435,20 @@ export default function HostStatsPane(_props: HostStatsPaneProps) {
             </button>
             <span data-host-stats-age className="text-xs text-muted-foreground tabular-nums">{ageText}</span>
             {refresh.error !== null ? (
-              <div role="alert" className="text-xs text-destructive">{refresh.error}</div>
+              <div
+                role="alert"
+                className="flex items-center justify-between gap-2 text-xs text-destructive"
+              >
+                <span className="min-w-0">{refresh.error}</span>
+                <button
+                  type="button"
+                  aria-label="Dismiss"
+                  className="shrink-0 rounded p-0.5"
+                  onClick={() => dispatch(dismissHostStatsRefreshError())}
+                >
+                  <X className="h-3 w-3" aria-hidden="true" />
+                </button>
+              </div>
             ) : null}
           </div>
 

@@ -485,6 +485,36 @@ const freshAgentSlice = createSlice({
       session.lost = false
     },
 
+    /**
+     * Dismiss the pane's "Agent error" banner: clears `lastError`/`lastErrorCode`
+     * so the banner disappears — honest state-clearing, never a cosmetic hide: a
+     * NEW `freshAgent.error` re-sets the fields and re-shows the banner. Never
+     * ENSURE-creates a session record (a dismissal must not mint state), and
+     * never touches status/streaming (the error fold already de-blued the pane).
+     */
+    clearSessionError(state, action: PayloadAction<SessionMutationPayload>) {
+      const key = resolveSessionKey(state, action.payload)
+      if (!key) return
+      const session = state.sessions[key]
+      if (!session) return
+      session.lastError = undefined
+      session.lastErrorCode = undefined
+    },
+
+    /**
+     * Dismiss a restore-failure banner: clears the restore-failure fields
+     * WITHOUT minting a session record or touching retry counters — a later
+     * retry/reconcile still owns its own state.
+     */
+    clearRestoreFailure(state, action: PayloadAction<SessionMutationPayload>) {
+      const key = resolveSessionKey(state, action.payload)
+      if (!key) return
+      const session = state.sessions[key]
+      if (!session) return
+      session.restoreFailureCode = undefined
+      session.restoreFailureMessage = undefined
+    },
+
     removeSession(state, action: PayloadAction<SessionMutationPayload>) {
       const key = resolveSessionKey(state, action.payload)
       if (!key) return
@@ -639,6 +669,8 @@ export const {
   clearPendingCreate,
   clearPendingCreateFailure,
   clearPendingCreateFailureForSession,
+  clearRestoreFailure,
+  clearSessionError,
   clearSessionLost,
   clearStreaming,
   createFailed,

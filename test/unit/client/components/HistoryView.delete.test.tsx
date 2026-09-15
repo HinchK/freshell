@@ -133,4 +133,19 @@ describe('HistoryView session delete', () => {
         .some((s: any) => s.sessionId === 'session-123'),
     ).toBe(true)
   })
+
+  it('the delete-error banner is dismissable with an X (error clears, session kept)', async () => {
+    apiMocks.delete.mockRejectedValueOnce(new Error('boom'))
+    renderHistoryView()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Delete session' }))
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent('Failed to delete session: boom')
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+    await waitFor(() => {
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    })
+  })
 })

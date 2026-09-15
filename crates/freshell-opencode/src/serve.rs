@@ -566,6 +566,15 @@ pub struct ServeConfig {
     pub required_idle_status_polls: u32,
     /// Per-request timeout for non-health calls (`DEFAULT_REQUEST_TIMEOUT_MS`, 30 s).
     pub request_timeout: Duration,
+    /// Per-request timeout for the compact/summarize POST — the ONLY serve call
+    /// whose handler runs a full LLM summarization before answering. A real
+    /// session's summarize routinely exceeds the generic 30 s bound (the
+    /// 2026-09-11 compact incident + its 2026-09-14 recurrence both timed out
+    /// there, surfacing as `OPENCODE_COMPACT_FAILED` "operation timed out"
+    /// banners), so compact gets its own LLM-scale budget — aligned with the
+    /// 600 s opencode turn budget that also bounds the compact's await-idle
+    /// tail (`opencode_ws.rs`'s `DEFAULT_TURN_TIMEOUT`).
+    pub compact_timeout: Duration,
 }
 
 impl Default for ServeConfig {
@@ -582,6 +591,7 @@ impl Default for ServeConfig {
             idle_poll_interval: Duration::from_millis(500),
             required_idle_status_polls: 2,
             request_timeout: Duration::from_millis(30_000),
+            compact_timeout: Duration::from_millis(600_000),
         }
     }
 }
@@ -830,9 +840,10 @@ impl OpencodeServeManager {
         self.ensure_started().await
     }
 
-    /// One JSON request/response through the transport, bounded by `timeout`. On a
-    /// timeout the running sidecar is discarded (`discardRunning('request_timeout')`,
-    /// `serve-manager.ts:320-324`). `not_found_value` mirrors `json`'s 404 handling.
+    /// One JSON request/response through the transport, bounded by the config's
+    /// `request_timeout`. On a timeout the running sidecar is discarded
+    /// (`discardRunning('request_timeout')`, `serve-manager.ts:320-324`).
+    /// `not_found_value` mirrors `json`'s 404 handling.
     async fn json_request(
         &self,
         method: HttpMethod,
@@ -840,15 +851,19 @@ impl OpencodeServeManager {
         body: Option<Value>,
         not_found_value: Option<Value>,
     ) -> Result<Value, ServeError> {
-        self.json_request_maybe_witnessed(method, path, body, not_found_value, None)
+        self.json_request_maybe_witnessed(method, path, body, not_found_value, None, None)
             .await
     }
 
-    /// [`json_request`] with an optional dispatch witness: when present, the
-    /// flag flips exactly once the URL exists and the HTTP send is issued —
-    /// after this call's own `require_base` — the TRUE dispatch point (ep4-r6
-    /// F3: arming the witness between two require_base calls misclassifies an
-    /// abort that lands inside the second one's wait as "dispatched").
+    /// [`json_request`] with an optional dispatch witness and per-call timeout
+    /// override. The witness flips to `true` exactly once the URL exists and
+    /// the HTTP send is issued — after this call's own `require_base` — the
+    /// TRUE dispatch point (ep4-r6 F3: arming the witness between two
+    /// require_base calls misclassifies an abort that lands inside the second
+    /// one's wait as "dispatched"). `timeout_override` replaces the generic
+    /// `request_timeout` for THIS exchange (both the transport-level
+    /// `.timeout()` and the tokio wrapper resolve from it) — `compact()` uses
+    /// it for the LLM-scale `compact_timeout`.
     async fn json_request_maybe_witnessed(
         &self,
         method: HttpMethod,
@@ -856,10 +871,11 @@ impl OpencodeServeManager {
         body: Option<Value>,
         not_found_value: Option<Value>,
         dispatch_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        timeout_override: Option<Duration>,
     ) -> Result<Value, ServeError> {
         let base = self.require_base().await?;
         let url = format!("{base}{path}");
-        let timeout = self.config().request_timeout;
+        let timeout = timeout_override.unwrap_or_else(|| self.config().request_timeout);
         let mut req = match (method, &body) {
             (HttpMethod::Get, _) => ServeHttpRequest::get(&url),
             (HttpMethod::Post, Some(value)) => {
@@ -1068,6 +1084,12 @@ impl OpencodeServeManager {
             Some(json!({ "providerID": provider_id, "modelID": model_id })),
             None,
             dispatched_witness,
+            // The ONLY LLM-in-handler serve call: the sidecar runs the whole
+            // summarize turn before answering, so the generic 30 s request
+            // bound fires mid-summarize on real sessions (the 2026-09-11
+            // compact incident class). Bound it by the dedicated LLM-scale
+            // compact timeout instead.
+            Some(self.config().compact_timeout),
         )
         .await?;
         Ok(())
@@ -1601,9 +1623,11 @@ mod tests {
     /// A `ServeHttp` fake that records every request (`METHOD url body?`) and scripts
     /// responses: healthy probes, summarize per `summarize_status`, fork per
     /// `fork_status`/`fork_body`, `/config` per `config_body`, everything else a
-    /// benign 200 `{}`.
+    /// benign 200 `{}`. Per-request timeouts land in the index-aligned
+    /// [`RecordingHttp::timeouts`] vec (`requests[i]`'s timeout is `timeouts[i]`).
     struct RecordingHttp {
         requests: Mutex<Vec<(String, String, Option<String>)>>,
+        timeouts: Mutex<Vec<Option<Duration>>>,
         summarize_status: u16,
         fork_status: u16,
         fork_body: Vec<u8>,
@@ -1615,6 +1639,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 requests: Mutex::new(Vec::new()),
+                timeouts: Mutex::new(Vec::new()),
                 summarize_status: 200,
                 fork_status: 200,
                 fork_body: br#"{"id":"ses_child","directory":"/tmp/x"}"#.to_vec(),
@@ -1626,6 +1651,17 @@ mod tests {
         fn recorded(&self) -> Vec<(String, String, Option<String>)> {
             self.requests.lock().expect("requests mutex").clone()
         }
+
+        /// The per-request timeout recorded for the request at `index` (index-aligned
+        /// with `recorded()`; health probes carry their probe budget, not `None`).
+        fn recorded_timeout(&self, index: usize) -> Option<Duration> {
+            self.timeouts
+                .lock()
+                .expect("timeouts mutex")
+                .get(index)
+                .copied()
+                .flatten()
+        }
     }
 
     impl ServeHttp for RecordingHttp {
@@ -1635,6 +1671,10 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<ServeHttpResponse, ServeHttpError>> + Send + 'a>>
         {
             let method = format!("{:?}", req.method).to_uppercase();
+            self.timeouts
+                .lock()
+                .expect("timeouts mutex")
+                .push(req.timeout);
             self.requests.lock().expect("requests mutex").push((
                 method,
                 req.url.clone(),
@@ -1715,13 +1755,20 @@ mod tests {
     }
 
     async fn started_recording_manager(http: Arc<RecordingHttp>) -> OpencodeServeManager {
+        started_recording_manager_with_config(http, ServeConfig::default()).await
+    }
+
+    async fn started_recording_manager_with_config(
+        http: Arc<RecordingHttp>,
+        config: ServeConfig,
+    ) -> OpencodeServeManager {
         let deps = ServeDeps {
             spawner: Arc::new(FakeSpawner),
             http,
             ports: Arc::new(FakeAllocator),
             events: Arc::new(NoopEventSource),
         };
-        let mgr = OpencodeServeManager::new(deps, ServeConfig::default());
+        let mgr = OpencodeServeManager::new(deps, config);
         mgr.ensure_started()
             .await
             .expect("healthy fake serve starts");
@@ -1766,6 +1813,50 @@ mod tests {
         );
         assert_eq!(body["providerID"], serde_json::json!("prov-a"));
         assert_eq!(body["modelID"], serde_json::json!("mdl-x"));
+    }
+
+    /// The compact/summarize POST is the ONE serve call whose handler runs a
+    /// full LLM summarization before answering, so it must carry the dedicated
+    /// LLM-scale `compact_timeout` — NOT the generic 30 s request bound that
+    /// every other call keeps. This pins the exact per-request timeout the
+    /// manager hands the transport for the summarize POST (both the reqwest
+    /// `.timeout()` and the tokio wrapper resolve from it), using a distinct
+    /// compact budget so a regression back to the generic bound fails
+    /// deterministically.
+    #[tokio::test]
+    async fn compact_uses_the_dedicated_compact_timeout_not_the_generic_request_bound() {
+        let http = Arc::new(RecordingHttp::new());
+        let config = ServeConfig {
+            compact_timeout: Duration::from_millis(123_456),
+            ..ServeConfig::default()
+        };
+        let mgr = started_recording_manager_with_config(http.clone(), config).await;
+
+        mgr.compact("ses_9", "prov-a", "mdl-x", &None, None)
+            .await
+            .expect("200 summarize succeeds");
+        // A non-compact call in the SAME manager keeps the generic bound.
+        mgr.get_config(&None).await.expect("config fetches");
+
+        let requests = http.recorded();
+        let summarize_index = requests
+            .iter()
+            .position(|(method, url, _)| method == "POST" && url.contains("/summarize"))
+            .expect("a summarize POST was recorded");
+        assert_eq!(
+            http.recorded_timeout(summarize_index),
+            Some(Duration::from_millis(123_456)),
+            "the summarize POST carries the dedicated compact timeout, not the generic 30 s bound"
+        );
+        let config_index = requests
+            .iter()
+            .position(|(method, url, _)| method == "GET" && url.contains("/config"))
+            .expect("a /config GET was recorded");
+        assert_eq!(
+            http.recorded_timeout(config_index),
+            Some(Duration::from_millis(30_000)),
+            "non-compact calls keep the generic request timeout"
+        );
     }
 
     #[tokio::test]

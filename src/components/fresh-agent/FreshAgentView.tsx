@@ -20,7 +20,7 @@ import { createLogger } from '@/lib/client-logger'
 import { api, getFreshAgentModelCapabilities, getFreshAgentThreadSnapshot, setSessionMetadata } from '@/lib/api'
 import { clearReconcilePendingPane, consumePaneRefreshRequest, mergePaneContent, updatePaneContent } from '@/store/panesSlice'
 import { FRESH_AGENT_MODEL_CATALOG_UNAVAILABLE_NOTICE } from '@/lib/fresh-agent-model-capabilities'
-import { clearPendingCreateFailure, clearSessionLost, sessionError, setSessionStatus } from '@/store/freshAgentSlice'
+import { clearPendingCreateFailure, clearRestoreFailure, clearSessionError, clearSessionLost, sessionError, setSessionStatus } from '@/store/freshAgentSlice'
 import { buildReconcileRequestForPanes, foldVerdicts, isFreshAgentReconcileActive } from '@/lib/pane-reconcile'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
@@ -2719,6 +2719,15 @@ export function FreshAgentView({
     ))
     const canFork = snapshot?.capabilities?.fork === true
     const questionAgentLabel = getQuestionAgentLabel(paneContent, descriptor?.label)
+    // Session-record locator for the dismissal dispatches below — the same
+    // triple the agentSession selector keys on. `sessionId` is non-empty
+    // whenever a dismissable session-record banner is showing (the record
+    // must already exist to have produced the error).
+    const sessionRecordLocator = {
+      sessionId: paneContent.sessionId ?? '',
+      sessionType: paneContent.sessionType,
+      provider: paneContent.provider,
+    }
     const visibleRestoreFailure = paneContent.provider === 'claude'
       ? claudeSession?.restoreFailureMessage
       : null
@@ -2800,7 +2809,24 @@ export function FreshAgentView({
               ) : null}
               {pendingCreateFailure || paneContent.createError ? (
                 <div className="fresh-agent-error-card flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm">
-                  <FreshAgentApprovalBanner text={(pendingCreateFailure ?? paneContent.createError)?.message ?? 'Create failed'} />
+                  <FreshAgentApprovalBanner
+                    text={(pendingCreateFailure ?? paneContent.createError)?.message ?? 'Create failed'}
+                    onDismiss={() => {
+                      if (paneContent.createRequestId) {
+                        dispatch(clearPendingCreateFailure({ requestId: paneContent.createRequestId }))
+                      }
+                      if (paneContent.createError) {
+                        dispatch(updatePaneContent({
+                          tabId,
+                          paneId,
+                          content: {
+                            ...paneContentRef.current,
+                            createError: undefined,
+                          },
+                        }))
+                      }
+                    }}
+                  />
                   {(pendingCreateFailure ?? paneContent.createError)?.retryable ? (
                     <button
                       type="button"
@@ -2825,15 +2851,39 @@ export function FreshAgentView({
                   ) : null}
                 </div>
               ) : null}
-              {visibleRestoreFailure ? <FreshAgentApprovalBanner text={visibleRestoreFailure} /> : null}
-              {visiblePaneRestoreFailure ? <FreshAgentApprovalBanner text={visiblePaneRestoreFailure} /> : null}
-              {visibleLoadError ? <FreshAgentApprovalBanner text={visibleLoadError} /> : null}
+              {visibleRestoreFailure ? (
+                <FreshAgentApprovalBanner
+                  text={visibleRestoreFailure}
+                  onDismiss={() => dispatch(clearRestoreFailure(sessionRecordLocator))}
+                />
+              ) : null}
+              {visiblePaneRestoreFailure ? (
+                <FreshAgentApprovalBanner
+                  text={visiblePaneRestoreFailure}
+                  onDismiss={() => dispatch(updatePaneContent({
+                    tabId,
+                    paneId,
+                    content: {
+                      ...paneContentRef.current,
+                      restoreError: undefined,
+                    },
+                  }))}
+                />
+              ) : null}
+              {visibleLoadError ? (
+                <FreshAgentApprovalBanner text={visibleLoadError} onDismiss={() => setLoadError(null)} />
+              ) : null}
               {paneContent.reconcileNotice ? (
                 <div role="status" className="px-3 py-1 text-xs text-amber-600 dark:text-amber-400">
                   {paneContent.reconcileNotice}
                 </div>
               ) : null}
-              {sessionErrorMessage ? <FreshAgentApprovalBanner text={`Agent error: ${sessionErrorMessage}`} /> : null}
+              {sessionErrorMessage ? (
+                <FreshAgentApprovalBanner
+                  text={`Agent error: ${sessionErrorMessage}`}
+                  onDismiss={() => dispatch(clearSessionError(sessionRecordLocator))}
+                />
+              ) : null}
               {effectiveStatus === 'stuck' ? (
                 <div
                   className="fresh-agent-stuck-card flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
