@@ -673,7 +673,7 @@ git commit -m "feat(freshagent): opencode task delegations, retry + subtask item
 - If the REAL opencode serve ever fails to emit child-session `message.*` events on `/global/event`, the join degrades gracefully: the parent's own `message.updated` events (task part state changes at start/end) still rebuild the snapshot and refresh the rows — no compensating machinery (ledger LB-5 residual).
 
 **Interfaces:**
-- Consumes: `OpencodeServeManager::list_messages(id, route)` (crates/freshell-opencode/src/serve.rs:961 — `GET /session/:id/message`, 404→empty array), `OpencodeServeManager::subscribe(session_id)` (serve.rs:1162), `SessionSignal::Event` + `parse_serve_event` (events.rs:121 — child session ids arrive via `properties.sessionID`/`part.sessionID`/`info.sessionID`), the ws `changed_event`/`event_frame` helpers used by `spawn_serve_bridge` (opencode_ws.rs ~3265–3305 — locate the definitions once and reuse; if they are private to `opencode_ws`, make them `pub(crate)` in place), and Task 2's `opencode_child_activity_preview`.
+- Consumes: `OpencodeServeManager::list_messages(id, route)` (crates/freshell-opencode/src/serve.rs:961 — `GET /session/:id/message`, 404→empty array), `OpencodeServeManager::get_session_status_map(route)` (serve.rs:996 — `GET /session/status`, the authoritative session-status map), `is_running_status_type` (events.rs:149 — busy/retry classifier), `OpencodeServeManager::subscribe(session_id)` (serve.rs:1162), `SessionSignal::Event` + `parse_serve_event` (events.rs:121 — child session ids arrive via `properties.sessionID`/`part.sessionID`/`info.sessionID`), the ws `changed_event`/`event_frame` helpers used by `spawn_serve_bridge` (opencode_ws.rs ~3265–3305 — locate the definitions once and reuse; if they are private to `opencode_ws`, make them `pub(crate)` in place), and Task 2's `opencode_child_activity_preview`.
 - Produces: every client-visible opencode snapshot's `task_delegation` items carry `activity: [{tool, status, preview}]` for their child sessions; a child session `message.*` event causes a `freshAgent.session.changed` frame for the PARENT session id (reason `opencode-message`), which drives the client's existing snapshot refetch; and background delegations display the child-derived live status (spinner while the child works, child-span duration when it finishes — plan-review round 2, Finding 12) instead of the outer task part's immediately-completed state.
 
 - [ ] **Step 1: Write the failing Rust tests**
@@ -721,9 +721,28 @@ fn background_delegation_stays_running_while_child_is_active() {
             json!({ "type": "tool", "tool": "bash", "state": { "status": "running", "input": {} } })
         ] }),
     ];
-    opencode_apply_background_child_status(&mut item, &messages);
+    opencode_apply_background_child_status(&mut item, &messages, None);
     assert_eq!(item["status"], json!("running"));
     assert!(item.get("durationMs").is_none());
+}
+
+#[test]
+fn background_delegation_with_busy_status_map_and_only_user_message_stays_running() {
+    // Plan-review round 3, Finding 17: a freshly-busy child with only its first
+    // user message (or an empty message page) is running per the AUTHORITATIVE
+    // serve session-status map — message-shape inference alone would miss it.
+    let mut item = json!({ "kind": "task_delegation", "status": "completed", "background": true, "durationMs": 200u64 });
+    let messages = vec![
+        json!({ "info": { "id": "u", "role": "user", "time": { "created": 1000 } }, "parts": [] }),
+    ];
+    opencode_apply_background_child_status(&mut item, &messages, Some(&json!({ "type": "busy" })));
+    assert_eq!(item["status"], json!("running"));
+    assert!(item.get("durationMs").is_none());
+
+    // Even an empty child message page honors the status map.
+    let mut item = json!({ "kind": "task_delegation", "status": "completed", "background": true });
+    opencode_apply_background_child_status(&mut item, &[], Some(&json!({ "type": "busy" })));
+    assert_eq!(item["status"], json!("running"));
 }
 
 #[test]
@@ -735,7 +754,7 @@ fn background_delegation_completes_with_child_span_duration() {
             json!({ "type": "tool", "tool": "bash", "state": { "status": "completed", "input": {} } })
         ] }),
     ];
-    opencode_apply_background_child_status(&mut item, &messages);
+    opencode_apply_background_child_status(&mut item, &messages, Some(&json!({ "type": "idle" })));
     assert_eq!(item["status"], json!("completed"));
     assert_eq!(item["durationMs"], json!(60000u64));
 }
@@ -743,10 +762,10 @@ fn background_delegation_completes_with_child_span_duration() {
 #[test]
 fn non_background_and_errored_delegations_keep_parent_status() {
     let mut item = json!({ "kind": "task_delegation", "status": "completed", "background": false, "durationMs": 7u64 });
-    opencode_apply_background_child_status(&mut item, &[json!({ "info": { "role": "assistant" }, "parts": [] })]);
+    opencode_apply_background_child_status(&mut item, &[json!({ "info": { "role": "assistant" }, "parts": [] })], Some(&json!({ "type": "busy" })));
     assert_eq!(item["durationMs"], json!(7u64));
     let mut item = json!({ "kind": "task_delegation", "status": "failed", "background": true });
-    opencode_apply_background_child_status(&mut item, &[]);
+    opencode_apply_background_child_status(&mut item, &[], Some(&json!({ "type": "busy" })));
     assert_eq!(item["status"], json!("failed"));
 }
 ```
@@ -795,17 +814,26 @@ pub(crate) fn opencode_child_activity_rows(messages: &[Value]) -> Vec<Value> {
 /// keeps its own fields and simply gains no `activity`.
 async fn attach_child_activity(manager: &OpencodeServeManager, route: &Route, snapshot: &mut Value) {
     let Some(turns) = snapshot.get_mut("turns").and_then(Value::as_array_mut) else { return };
+    // Plan-review round 3, Finding 17: the AUTHORITATIVE child liveness signal is
+    // the serve's session-status map (GET /session/status — the same endpoint the
+    // TUI uses). Message-shape inference alone misses a freshly-busy child that
+    // has only its first user message, and the old loop skipped status work
+    // entirely when the child message list came back empty.
+    let status_map = manager.get_session_status_map(route).await.unwrap_or_default();
     for turn in turns.iter_mut() {
         let Some(items) = turn.get_mut("items").and_then(Value::as_array_mut) else { continue };
         for item in items.iter_mut() {
             if item.get("kind").and_then(Value::as_str) != Some("task_delegation") { continue; }
             let Some(child) = item.get("childSessionId").and_then(Value::as_str).map(str::to_string) else { continue };
             match manager.list_messages(&child, route).await {
-                Ok(Value::Array(messages)) if !messages.is_empty() => {
-                    item["activity"] = Value::Array(opencode_child_activity_rows(&messages));
-                    opencode_apply_background_child_status(item, &messages);
+                Ok(Value::Array(messages)) => {
+                    if !messages.is_empty() {
+                        item["activity"] = Value::Array(opencode_child_activity_rows(&messages));
+                    }
+                    // Background live status applies even for an empty message page.
+                    let child_status = status_map.get(&child);
+                    opencode_apply_background_child_status(item, &messages, child_status);
                 }
-                Ok(_) => {}
                 Err(err) => {
                     // Structured warn, never a hard failure: a pruned child or a
                     // sidecar hiccup must not break the parent's snapshot.
@@ -820,23 +848,32 @@ async fn attach_child_activity(manager: &OpencodeServeManager, route: &Route, sn
 /// outer task part IMMEDIATELY for a background launch while the child session keeps
 /// running. The TUI (session/index.tsx) shows the delegation as running while the
 /// child session isn't idle and derives its duration from the child's messages
-/// (first user message created → last assistant completed). Mirror that from the
-/// fetched child messages. Non-background items keep the parent part's
-/// authoritative status (a foreground task part completes only when the child
-/// finishes), and a parent 'running'/'error' status always stays authoritative.
-pub(crate) fn opencode_apply_background_child_status(item: &mut Value, messages: &[Value]) {
+/// (first user message created → last assistant completed). Mirror that. The
+/// AUTHORITATIVE liveness is the serve's session-status map entry for the child
+/// (`session.status.type` busy/retry — plan-review round 3, Finding 17); the
+/// message shapes (a running tool part, or an assistant message lacking
+/// `info.time.completed`) are the secondary signal covering a serve whose status
+/// map lags. Non-background items keep the parent part's authoritative status (a
+/// foreground task part completes only when the child finishes), and a parent
+/// 'running'/'error' status always stays authoritative.
+pub(crate) fn opencode_apply_background_child_status(item: &mut Value, messages: &[Value], child_status: Option<&Value>) {
     if item.get("background").and_then(Value::as_bool) != Some(true) { return; }
     if item.get("status").and_then(Value::as_str) != Some("completed") { return; }
-    let mut child_active = false;
-    for message in messages {
-        if let Some(parts) = message.get("parts").and_then(Value::as_array) {
-            if parts.iter().any(|p| p.pointer("/state/status").and_then(Value::as_str) == Some("running")) {
+    // Authoritative signal first: the serve's session-status map entry
+    // (`{type:'busy'|'retry'|'idle'|…}` — events::is_running_status_type).
+    let status_type = child_status.and_then(|s| s.get("type"));
+    let mut child_active = freshell_opencode::is_running_status_type(status_type);
+    if !child_active {
+        for message in messages {
+            if let Some(parts) = message.get("parts").and_then(Value::as_array) {
+                if parts.iter().any(|p| p.pointer("/state/status").and_then(Value::as_str) == Some("running")) {
+                    child_active = true;
+                }
+            }
+            if message.pointer("/info/role").and_then(Value::as_str) == Some("assistant")
+                && message.pointer("/info/time/completed").is_none() {
                 child_active = true;
             }
-        }
-        if message.pointer("/info/role").and_then(Value::as_str) == Some("assistant")
-            && message.pointer("/info/time/completed").is_none() {
-            child_active = true;
         }
     }
     if child_active {
@@ -1285,6 +1322,28 @@ describe('task delegation + retry folding', () => {
     expect(screen.getByTestId('fresh-agent-retry-row')).toHaveTextContent('Retrying (attempt 2) — stream disconnected')
   })
 
+  it('shows a running delegation on the collapsed line even while the parent session is idle', () => {
+    // Plan-review round 3, Finding 16: background delegations outlive the parent
+    // turn — the strip's `live` flag (parent-session streaming) must not gate a
+    // running delegation row. No streaming path is needed for this turn.
+    render(<FreshAgentTranscript turns={[{ ...delegationTurn, items: [delegationTurn.items[1]] }]} />)
+    const strip = screen.getByRole('region', { name: 'Activity strip' })
+    expect(within(strip).getByText('Task')).toBeInTheDocument()
+    expect(within(strip).getByText('General Task — Fix the flaky harness')).toBeInTheDocument()
+    expect(within(strip).getByLabelText('running')).toBeInTheDocument() // the status-slot spinner
+  })
+
+  it('keeps a heading-only streaming reasoning row so the live strip still shows Thinking', () => {
+    // Plan-review round 3, Finding 18: `**Planning**` arrives before its body;
+    // the empty text must not drop the row or the strip falls back to an
+    // unnamed spinner instead of the required Thinking behavior.
+    render(<FreshAgentTranscript turns={[{
+      id: 't_h', turnId: 't_h', role: 'assistant', summary: '',
+      items: [{ id: 'r_h', kind: 'reasoning', summary: [], content: [], text: '', title: 'Planning' }],
+    }]} /* through the file's existing live/streaming path — see adaptation rules */ />)
+    expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()
+  })
+
   it('settled delegation turns summarize like other tool lines', () => {
     render(<FreshAgentTranscript turns={[{ ...delegationTurn, items: [{ ...delegationTurn.items[1], status: 'completed' }] }]} />)
     // settledSummary counts the delegation as one used tool: "1 tool used".
@@ -1350,15 +1409,32 @@ type ActivityRow =
   | { type: 'caption'; id: string; text: string }
 ```
 
-In `buildActivity`: thinking/reasoning merge keeps working and carries `durationMs`/`title` (only `reasoning` items have them; consecutive merges keep the LAST non-undefined duration); `task_delegation` items push `{ type: 'delegation', item, tool: { id: item.id, name: 'Task', previewOverride: item.title, output: item.result, isError: item.status === 'failed', status: item.status === 'running' ? 'running' : 'complete' } }`; `retry` items push `{ type: 'retry', ... }`.
+In `buildActivity`: thinking/reasoning merge keeps working and carries `durationMs`/`title` (only `reasoning` items have them; consecutive merges keep the LAST non-undefined duration). Plan-review round 3, Finding 18: the existing `pushThinking` drops empty-text rows — change it to keep a row when it carries a TITLE even with empty text (a streaming `**Planning**` heading arrives before its body; dropping it leaves the live strip on the unnamed spinner instead of the required `Thinking` behavior). The row keeps its id; when the same part's body arrives in a later snapshot revision the row replaces it wholesale, so no special merge machinery is needed beyond not discarding the title-only row:
+
+```ts
+  const pushThinking = (row: { id: string; text: string; durationMs?: number; title?: string }, itemIndex: number) => {
+    if (!row.text && row.title === undefined) return
+    const last = rows[rows.length - 1]
+    if (last?.type === 'thinking') {
+      rows[rows.length - 1] = { ...last, text: row.text && last.text ? `${last.text}\n\n${row.text}` : (row.text || last.text) }
+      return
+    }
+    rowStartItemIndexes.push(itemIndex)
+    rows.push({ type: 'thinking', ...row })
+  }
+```
+
+Row pushes for the new kinds: `task_delegation` items push `{ type: 'delegation', item, tool: { id: item.id, name: 'Task', previewOverride: item.title, output: item.result, isError: item.status === 'failed', status: item.status === 'running' ? 'running' : 'complete' } }`; `retry` items push `{ type: 'retry', ... }`.
 
 3c. Strip rendering in `FreshAgentActivityStrip`:
 
 - `activityTools(rows)` includes `row.type === 'delegation' ? row.tool : row.type === 'tool' ? row.tool : null` so `settledSummary` counts delegations as tools and `hasErrors` sees `isError`.
 - Expanded view: `row.type === 'delegation'` renders `<FreshAgentDelegationBlock item={row.item} />`; `row.type === 'retry'` renders `<FreshAgentRetryRow ... />` (both inside the existing expanded-rows map).
-- Live reel (LB-4 from the load-bearing ledger: a retry marker as the last row IS the running thing — a settled tool display must not mask it):
+- Live reel (LB-4 from the load-bearing ledger: a retry marker as the last row IS the running thing — a settled tool display must not mask it). PLUS plan-review round 3, Finding 16: a running delegation is live information EVEN WHEN THE SESSION IS IDLE — a background task completes the parent's turn immediately while its child works, so the strip's `live` flag (which tracks parent-session streaming) must not gate it. A running delegation display drives the collapsed line on its own:
   ```ts
-  const runningTool = live ? [...tools].reverse().find((tool) => tool.status === 'running') ?? null : null
+  // runningTool is NOT gated on `live`: a task_delegation display whose status is
+  // 'running' (background child active, server-joined) is live information.
+  const runningTool = [...tools].reverse().find((tool) => tool.status === 'running') ?? null
   const retryLast = live && lastRow?.type === 'retry' ? lastRow : null
   const liveTool = !thinkingLive && live && !runningTool && !retryLast ? (tools[tools.length - 1] ?? null) : null
   const activeTool = runningTool ?? liveTool
@@ -1368,9 +1444,9 @@ In `buildActivity`: thinking/reasoning merge keeps working and carries `duration
     : activeTool
       ? (activeTool.previewOverride ?? getToolPreview(activeTool.name, activeTool.input))
       : null
-  const running = live && (activeTool !== null || thinkingLive || retryLast !== null)
+  const running = (live && (activeTool !== null || thinkingLive || retryLast !== null)) || runningTool !== null
   ```
-  (running-tool detection already iterates `tools`, which now includes delegation displays via 3b. Priority: an actually-running tool → the between-attempts retry marker → the last settled tool, matching "the live strip line names the running thing".)
+  (Priority: an actually-running tool/delegation → the between-attempts retry marker → the last settled tool, matching "the live strip line names the running thing". A running background delegation shows the spinner + `Task: General Task — …` on the collapsed line while the parent session is idle; the server watcher's `changed` frames keep that row current until the child finishes and the status flips to completed.)
 
 3d. `FreshAgentThinkingRow` label — the button's `aria-label` MUST match its visible label (a11y lint + the "identifiable interactive elements" rule):
 
@@ -1541,7 +1617,7 @@ The spec (`test/e2e-browser/specs/freshopencode-tui-parity.spec.ts`) asserts, in
 1. The pane opens and after the send, the parent transcript folds into a single collapsed activity line (existing `fresh-agent-activity-summary` visible; NO standalone delegation article outside the strip while collapsed).
 2. Expanding the strip (`Toggle activity details`) shows: the delegation header `General Task — Fix the flaky harness`, a nested row `↳ Bash sed -n 92,112p src/store/paneTypes.ts` (title-cased tool label), a failed row with `(failed)`, the `Retrying (attempt 2) — stream disconnected` retry row, and the `fresh-agent-delegation-result` body — which the fixture serves as a LONG multi-line result — rendered with a REAL-browser bounded box: `const box = await resultElement.boundingBox(); expect(box!.height).toBeLessThanOrEqual(160)` (the `max-h-24` clamp ≈ 96px + padding; plan-review round 1, Finding 6 makes this assertion protective).
 3. The thinking disclosure shows the settled duration label with the extracted title: `Thought: Planning the fix · 3.4s` (the fixture pins the reasoning part's `time` window to exactly 3400 ms and its leading bold block to the title — matching the Task 5 label formula and the TUI's `reasoningSummary` derivation).
-4. The BACKGROUND delegation (a second task tool part in the same message, `background: true`, completed outer state, child `ses_bg` still active with a running tool part and no assistant `time.completed`) shows the child-derived LIVE state per plan-review round 2, Finding 12: its block displays the running spinner (`aria-label="running"`) and NO duration — not the outer part's completed check.
+4. The BACKGROUND delegation (a second task tool part in the same message, `background: true`, completed outer state, child `ses_bg` still active — its serve status map reports `busy` and its messages carry a running tool part with no assistant `time.completed`) shows the child-derived LIVE state per plan-review round 2, Finding 12: BEFORE expanding, the COLLAPDED strip line names the running background task (`Task` + `General Task — Index the repository` + the status-slot spinner — plan-review round 3, Finding 16 protects the collapsed line, not only the expanded block), and after expanding, its block shows the running spinner (`aria-label="running"`) and NO duration — not the outer part's completed check.
 5. Clicking `Open session` (on the foreground delegation block) opens a pane on the child session `ses_c`, whose transcript shows the muted caption `Delegated — General · Fix the flaky harness` (title-cased agent) above the child's prompt.
 6. Live refresh of the server-side join: the spec triggers the fake sidecar's scripted child event (see Step 3), and the parent pane's expanded delegation block gains the NEW child activity row that the event's state mutation added.
 
@@ -1563,7 +1639,7 @@ Extend `test/e2e-browser/fixtures/fake-opencode.cjs` (following its existing ses
   - a BACKGROUND `task` tool part with `state.status:'completed'` (opencode completes the outer part immediately for background launches), `state.input:{ description:'Index the repository', subagent_type:'general' }`, `state.metadata:{ background:true, sessionId:'ses_bg' }` — its child `ses_bg` stays ACTIVE;
   - a `retry` part `{ type:'retry', attempt:2, error:{ name:'APIError', data:{ message:'stream disconnected' } } }` (authoritative serialized shape).
 - Child session `ses_c` served statically by `GET /session/ses_c/message`: a user message with a `subtask` part (`{ type:'subtask', agent:'general', description:'Fix the flaky harness' }`) and an assistant message with `bash` tool parts — one `completed` (`sed -n 92,112p src/store/paneTypes.ts`) and one `error` (grep `reasoningEffort`);
-- Child session `ses_bg` served statically: a user message and an assistant message WITHOUT `info.time.completed` carrying a `bash` tool part with `state.status:'running'` (so the join's background derivation shows the live spinner — plan-review round 2, Finding 12);
+- Child session `ses_bg` served statically: a user message and an assistant message WITHOUT `info.time.completed` carrying a `bash` tool part with `state.status:'running'`, and the fake's `GET /session/status` map reporting `ses_bg` as `{ type:'busy' }` (so the join's background derivation shows the live spinner — plan-review round 2, Finding 12 + round 3, Finding 17);
 - A scripted SSE trigger on `/global/event` for the child that BOTH emits a `message.updated` event carrying `ses_c`'s id AND mutates the fake's served child message state by appending a third `bash` tool part (e.g. `echo live-join-refresh`) — plan-review round 1, Finding 9: the parent watcher responds to the event by triggering a refetch of `/session/:id/message`, so only a fixture whose REST-visible state grows alongside the event makes the "new row appears" assertion pass and prove the live join refresh. If the fake's SSE emitter does not support scripted child-session events yet, add the minimal injection the existing fake uses for `session.idle` scripting.
 
 - [ ] **Step 4: Run the focused spec**
