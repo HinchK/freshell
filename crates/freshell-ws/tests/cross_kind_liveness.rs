@@ -3659,7 +3659,10 @@ async fn race_reap_timeout_no_early_target_start_and_recoverable() {
 /// R5: target terminal spawn failure — no blank session, session id
 /// preserved, ownership restored or Vacant with the typed error. Uses the
 /// runner's `fail_target_spawn_once` (the prior is REALLY reaped; the target
-/// never starts).
+/// never starts). b8ke ext r23 F2: the knob now fires INSIDE start_target
+/// (the real error site) — the runner's Err arm handles the failure (the
+/// guard's disarm_and_fail, the typed broadcast, the log), so the cleanup
+/// assertions exercise the real error path, never a pre-check skip.
 #[tokio::test]
 async fn race_target_spawn_failure_no_blank_session_id_preserved() {
     let _guard = ENV_LOCK.lock().await;

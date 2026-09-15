@@ -1143,51 +1143,6 @@ impl SessionHandoffRunner {
         // 5. Start/attach the target UNDER the handoff's ticket (single
         // commit authority — the target paths skip their own commit and
         // surface the identity; THIS runner performs the one commit_live).
-        if let Some(hooks) = self.test_hooks.as_ref() {
-            if hooks
-                .fail_target_spawn_once
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
-                // The prior was reaped: the key must end Vacant, NOT restore
-                // the dead prior (round-1 review).
-                let _ = guard.disarm_and_fail();
-                self.broadcast_failure_truth(
-                    &req,
-                    &operation_id,
-                    generation,
-                    prior_kind,
-                    "TARGET_SPAWN_FAILED",
-                )
-                .await;
-                self.log_transition(
-                    TransitionLog {
-                        operation_id: &operation_id,
-                        provider: &req.provider,
-                        session_id: &req.session_id,
-                        initiator: &initiator,
-                        epoch: self.ownership.boot_epoch(),
-                        generation,
-                        live_session_key: None,
-                        from_kind: prior_kind,
-                        to_kind: Some(req.target_kind),
-                        runtime_id: None,
-                        pid: None,
-                        outcome: "target_spawn_failed",
-                        duration_ms: began.elapsed().as_millis() as u64,
-                        failure_reason: Some("TARGET_SPAWN_FAILED"),
-                        stale: None,
-                    },
-                    "ownership.handoff.done",
-                    TransitionLevel::Warn,
-                );
-                return typed_failure(
-                    "TARGET_SPAWN_FAILED",
-                    "target runtime failed to start (session id preserved)",
-                    true,
-                    generation,
-                );
-            }
-        }
         // Round-3 review I-1 (target-spawn window): for a terminal target,
         // arm the guard-visible spawn watch BEFORE the await — an abort
         // landing anywhere inside `start_target` leaves the settle running
@@ -3548,6 +3503,26 @@ impl SessionHandoffRunner {
         generation: u64,
         target_spawn_watch: Option<crate::terminal_tabs::HandoffSpawnWatch>,
     ) -> Result<OwnerIdentity, (String, String)> {
+        // b8ke ext r23 F2: the failure hook at the REAL error site —
+        // after all pre-spawn bookkeeping, right before the actual
+        // spawn/resume attempt, so the tests drive the actually-attempted-
+        // and-failed start (the real Err arm + the guard's cleanup of any
+        // partially registered target). Pre-r23 the knob was consumed at
+        // the pre-check (before start_target was called) so the tests
+        // never reached the real error arm.
+        if let Some(hooks) = self.test_hooks.as_ref() {
+            if hooks
+                .fail_target_spawn_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err((
+                    "TARGET_SPAWN_FAILED".to_string(),
+                    "the target spawn was attempted and failed (the fixture's \
+                     deterministic failure)"
+                        .to_string(),
+                ));
+            }
+        }
         match req.target_kind {
             RuntimeOwnerKind::Terminal => {
                 let mode = req.mode.clone().unwrap_or_else(|| req.provider.clone());
