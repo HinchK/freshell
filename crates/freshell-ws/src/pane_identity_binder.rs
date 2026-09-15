@@ -129,7 +129,7 @@ impl freshell_terminal::registry::PaneIdentityBinder for LedgerPaneIdentityBinde
         cwd: Option<&str>,
         create_request_id: Option<&str>,
         observed: Option<(u64, u64)>,
-    ) {
+    ) -> Result<(), std::io::Error> {
         // Mirrors terminal.rs's post-spawn block (the DEV-0008 create-time
         // slice): identity row + binding for any non-shell create carrying a
         // session id (terminal_meta_record_for_create semantics --
@@ -139,7 +139,7 @@ impl freshell_terminal::registry::PaneIdentityBinder for LedgerPaneIdentityBinde
         // surface_write_failure, and dropping the spawn_blocking wrappers
         // (the async hop lives at the Task 5 call sites, not here).
         if mode == "shell" {
-            return;
+            return Ok(());
         }
         if let Some(session_id) = resume_session_id.filter(|s| !s.is_empty()) {
             self.identity
@@ -158,7 +158,11 @@ impl freshell_terminal::registry::PaneIdentityBinder for LedgerPaneIdentityBinde
                     }
                 }
             }
-            if let Err(err) = self.ledger.record_binding(&BindingWrite {
+            // b8ke ext r27 F3: the binding write's failure PROPAGATES —
+            // the caller owns the typed decision (a handoff runner's
+            // terminal target fails the handoff typed; the REST create
+            // rung keeps its documented degradation policy).
+            self.ledger.record_binding(&BindingWrite {
                 provider: mode, // keep exactly what the WS block does (provider = mode)
                 session_id,
                 terminal_id,
@@ -182,9 +186,7 @@ impl freshell_terminal::registry::PaneIdentityBinder for LedgerPaneIdentityBinde
                 observed_epoch: observed.map(|(epoch, _)| epoch),
                 observed_generation: observed.map(|(_, generation)| generation),
                 now_ms: now_ms(),
-            }) {
-                Self::warn_write_failure(terminal_id, "post-spawn identity binding", &err);
-            }
+            })?;
         } else if crate::terminal::MARKER_MODES.contains(&mode) {
             // The pending-marker arm (terminal.rs:2523-2540): identity-bearing
             // pane whose identity is still in flight (fresh codex/opencode/
@@ -195,7 +197,9 @@ impl freshell_terminal::registry::PaneIdentityBinder for LedgerPaneIdentityBinde
             // time, exactly its binding-write `Clear` policy), so a later
             // locator/signal resolution of this marker still ends
             // unattributed and the D8 judgment correctly never offers it.
-            if let Err(err) = self.ledger.record_pending(
+            // b8ke ext r27 F3: the marker write's failure PROPAGATES with
+            // the binding's.
+            self.ledger.record_pending(
                 terminal_id,
                 mode,
                 cwd,
@@ -207,10 +211,9 @@ impl freshell_terminal::registry::PaneIdentityBinder for LedgerPaneIdentityBinde
                 create_request_id,
                 crate::pane_ledger::ProvenanceStamps::default(),
                 now_ms(),
-            ) {
-                Self::warn_write_failure(terminal_id, "spawn-time pending marker", &err);
-            }
+            )?;
         }
+        Ok(())
     }
 
     fn retire_pane_identity(&self, terminal_id: &str) {
@@ -305,7 +308,8 @@ mod tests {
             Some("/tmp"),
             Some("req-2"),
             None,
-        );
+        )
+        .expect("register ok");
         let row = identity
             .get("t-rest-2")
             .expect("identity row (the A13/signal-drain prerequisite)");
@@ -379,7 +383,8 @@ mod tests {
             Some("/tmp"),
             Some("req-c"),
             None,
-        );
+        )
+        .expect("register ok");
         assert_eq!(
             identity.get("t-rest-child").and_then(|i| i.is_subagent),
             Some(true),
@@ -392,7 +397,8 @@ mod tests {
             Some("/tmp"),
             Some("req-r"),
             None,
-        );
+        )
+        .expect("register ok");
         assert_eq!(
             identity.get("t-rest-root").and_then(|i| i.is_subagent),
             Some(false),
@@ -406,12 +412,14 @@ mod tests {
         use freshell_terminal::registry::PaneIdentityBinder as _;
         let (b, ledger, identity, dir) = binder("markers");
         // shell: nothing at all
-        b.register_create_identity("t-shell", "shell", None, None, None, None);
+        b.register_create_identity("t-shell", "shell", None, None, None, None)
+            .expect("register ok");
         assert!(identity.get("t-shell").is_none());
         assert!(ledger.pending_for_terminal("t-shell").is_none());
         // codex without an id: pending marker (locator lane resolves later),
         // exactly the WS MARKER_MODES arm (terminal.rs:2523-2540).
-        b.register_create_identity("t-codex", "codex", None, Some("/tmp"), Some("req-3"), None);
+        b.register_create_identity("t-codex", "codex", None, Some("/tmp"), Some("req-3"), None)
+            .expect("register ok");
         assert!(
             identity.get("t-codex").is_none(),
             "no premature identity row"
@@ -433,7 +441,8 @@ mod tests {
         let b =
             LedgerPaneIdentityBinder::new(identity.clone(), Arc::new(PaneLedger::disabled()), None);
         b.record_prespawn_claude_binding(SID, "t-x", "claude", None, None);
-        b.register_create_identity("t-x", "claude", Some(SID), None, None, None);
+        b.register_create_identity("t-x", "claude", Some(SID), None, None, None)
+            .expect("register ok");
         // identity row still lands even when durability is degraded:
         assert!(identity.get("t-x").is_some());
     }
@@ -479,7 +488,8 @@ mod tests {
             Some("/w"),
             Some("req-9"),
             None,
-        );
+        )
+        .expect("register ok");
         let row = ledger
             .load_binding("claude", SID)
             .expect("row survives the rebind");
@@ -535,7 +545,8 @@ mod tests {
         // Sync test on purpose: retire MUST be callable with no runtime,
         // because production calls it from the PTY reader thread's exit hook.
         let (b, ledger, identity, dir) = binder("retire");
-        b.register_create_identity("t-rest-4", "claude", Some(SID), Some("/tmp"), None, None);
+        b.register_create_identity("t-rest-4", "claude", Some(SID), Some("/tmp"), None, None)
+            .expect("register ok");
         b.retire_pane_identity("t-rest-4");
         // Retired == invisible to live lookups, exactly what the WS pane
         // EXIT hook produces: the live find_by_session no longer returns the
@@ -561,7 +572,8 @@ mod tests {
         assert!(binding.retired_reason.is_none());
         // And the pending-marker delete arm: register a marker-mode pane,
         // retire it, assert its pending marker is gone.
-        b.register_create_identity("t-codex-r", "codex", None, Some("/tmp"), None, None);
+        b.register_create_identity("t-codex-r", "codex", None, Some("/tmp"), None, None)
+            .expect("register ok");
         assert!(
             ledger.pending_for_terminal("t-codex-r").is_some(),
             "marker present before retire"

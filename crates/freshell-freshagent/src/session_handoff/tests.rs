@@ -467,6 +467,46 @@ fn build_rig_full(
 /// the real lane only produces under `cfg(not(linux))`, driven on Linux
 /// for the fenced-platform-limited red/green).
 #[allow(clippy::too_many_arguments)]
+fn build_rig_with_pane_identity_binder(
+    binder: std::sync::Arc<dyn freshell_terminal::registry::PaneIdentityBinder>,
+) -> Rig {
+    build_rig_inner(None, None, None, 10_000, None, false, None, Some(binder))
+}
+
+/// b8ke ext r27 F3: a handoff runner's binder whose terminal-target
+/// identity registration FAILS — the typed recoverable handoff failure's
+/// driver.
+#[derive(Debug, Default)]
+struct FailingCreateIdentityBinder;
+
+impl freshell_terminal::registry::PaneIdentityBinder for FailingCreateIdentityBinder {
+    fn record_prespawn_claude_binding(
+        &self,
+        _session_id: &str,
+        _terminal_id: &str,
+        _mode: &str,
+        _cwd: Option<&str>,
+        _create_request_id: Option<&str>,
+    ) {
+    }
+    fn delete_prespawn_claude_binding(&self, _session_id: &str) {}
+    fn register_create_identity(
+        &self,
+        _terminal_id: &str,
+        _mode: &str,
+        _resume_session_id: Option<&str>,
+        _cwd: Option<&str>,
+        _create_request_id: Option<&str>,
+        _observed: Option<(u64, u64)>,
+    ) -> Result<(), std::io::Error> {
+        Err(std::io::Error::other(
+            "TARGET_BINDING_FAILED: the fixture's ledger refuses the durable \
+             registration write",
+        ))
+    }
+    fn retire_pane_identity(&self, _terminal_id: &str) {}
+}
+
 fn build_rig_with_options(
     hooks: Option<Arc<HandoffTestHooks>>,
     kill_pause: Option<Arc<tokio::sync::Notify>>,
@@ -483,16 +523,17 @@ fn build_rig_with_options(
         claude_confirm_rounds,
         claude_platform_limited,
         None,
+        None,
     )
 }
 
 /// b8ke e3r2 F3: a rig with a CUSTOM flavor writer (the failing/blocking
 /// shapes the awaited-in-window contract needs).
 fn build_rig_with_flavor_writer(writer: FlavorWriter) -> Rig {
-    build_rig_inner(None, None, None, 10_000, None, false, Some(writer))
+    build_rig_inner(None, None, None, 10_000, None, false, Some(writer), None)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // the test rig's full knob set
 fn build_rig_inner(
     hooks: Option<Arc<HandoffTestHooks>>,
     kill_pause: Option<Arc<tokio::sync::Notify>>,
@@ -501,6 +542,7 @@ fn build_rig_inner(
     claude_confirm_rounds: Option<u8>,
     claude_platform_limited: bool,
     flavor_writer_override: Option<FlavorWriter>,
+    pane_identity: Option<std::sync::Arc<dyn freshell_terminal::registry::PaneIdentityBinder>>,
 ) -> Rig {
     let auth_token = Arc::new("handoff-test-token".to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
@@ -529,11 +571,14 @@ fn build_rig_inner(
         sleeper_cli_spec("claude"),
         sleeper_cli_spec("opencode"),
     ]);
-    let fresh_agent =
+    let mut fresh_agent =
         crate::FreshAgentState::new(Arc::clone(&auth_token), Arc::clone(&broadcast_tx))
             .with_ownership(Arc::clone(&ownership))
             .with_terminal_registry(registry.clone())
             .with_cli_commands(Arc::clone(&cli_commands));
+    if let Some(binder) = pane_identity {
+        fresh_agent = fresh_agent.with_pane_identity_binder(binder);
+    }
     let mut fresh_opencode = crate::FreshOpencodeState::new(fresh_agent.clone());
     fresh_opencode.set_ownership(Arc::clone(&ownership));
 
@@ -2085,6 +2130,7 @@ async fn an_unconfirmed_target_reap_on_the_flavor_failure_fences_then_the_watche
         None,
         false,
         Some(Arc::new(FailingFlavorWriter)),
+        None,
     );
     establish_fresh_claude_owner(&rig, &sid).await;
 
@@ -2163,6 +2209,7 @@ async fn a_platform_limited_target_reap_on_the_flavor_failure_fences_typed() {
         None,
         false,
         Some(Arc::new(FailingFlavorWriter)),
+        None,
     );
     establish_fresh_claude_owner(&rig, &sid).await;
 
@@ -2235,6 +2282,7 @@ async fn the_unconfirmed_reap_flavor_failure_frame_stays_fenced_never_vacant() {
         None,
         false,
         Some(Arc::new(FailingFlavorWriter)),
+        None,
     );
     establish_fresh_claude_owner(&rig, &sid).await;
 
@@ -2316,6 +2364,7 @@ async fn the_platform_limited_reap_failure_frame_stays_fenced_never_vacant() {
         None,
         false,
         Some(Arc::new(FailingFlavorWriter)),
+        None,
     );
     establish_fresh_claude_owner(&rig, &sid).await;
 
@@ -2834,7 +2883,7 @@ async fn the_uncommitted_target_reap_never_confirms_on_a_missing_row() {
     let sid = uuid::Uuid::new_v4().to_string();
     // A SHORT reap budget: the pid-alive window deterministically fences
     // within the test instead of waiting the production budget.
-    let rig = build_rig_inner(None, None, None, 50, None, false, None);
+    let rig = build_rig_inner(None, None, None, 50, None, false, None, None);
     // The target's stand-in process: ALIVE, its registry row ABSENT —
     // the exact row-removed-but-not-yet-reaped shape a concurrent kill
     // produces.
@@ -3024,6 +3073,7 @@ async fn an_abort_in_the_flavor_window_with_an_unconfirmed_target_teardown_fence
             release: Arc::clone(&release),
             reached: Arc::clone(&reached),
         })),
+        None,
     );
     establish_fresh_claude_owner(&rig, &sid).await;
 
@@ -5211,6 +5261,101 @@ async fn the_claude_handoff_target_binding_carries_the_handoff_generation() {
         .fresh_claude
         .kill_for_handoff(&sid, "test-cleanup")
         .await;
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+    let _ = std::fs::remove_dir_all(&store_dir);
+    let _ = env;
+}
+
+/// b8ke ext r27 F3: a handoff whose TERMINAL target's durable identity
+/// registration FAILS answers the TYPED recoverable handoff failure —
+/// never a successful owner + Live{Terminal} commit with no recoverable
+/// target registration. The spawned target is reaped, the prior was
+/// already reaped so the key ends Vacant (never restoring a dead
+/// runtime), and the failure names the binding's typed code.
+#[tokio::test]
+async fn a_terminal_target_binding_failure_fails_the_handoff_typed() {
+    let _guard = ENV_LOCK.lock().await;
+    // The claude-lane env surface is process-global (see the pattern above).
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let env = FakeSidecarEnv::install();
+    // The claude-lane resume gates on transcript presence (the 6b pattern).
+    let store_dir =
+        std::env::temp_dir().join(format!("freshell-handoff-r27-f3-{}", uuid_like_suffix()));
+    let project_dir = store_dir.join("projects").join("slug");
+    std::fs::create_dir_all(&project_dir).expect("create transcript project dir");
+    let sid = uuid::Uuid::new_v4().to_string();
+    std::fs::write(
+        project_dir.join(format!("{sid}.jsonl")),
+        "{\"cwd\": \"/tmp\"}\n",
+    )
+    .expect("write fake transcript");
+    std::env::set_var("CLAUDE_CONFIG_DIR", &store_dir);
+
+    // The rig whose runner's terminal-target registration ALWAYS fails.
+    let rig = build_rig_with_pane_identity_binder(std::sync::Arc::new(FailingCreateIdentityBinder));
+    establish_fresh_claude_owner(&rig, &sid).await;
+
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"));
+    let result = handle
+        .completion
+        .await
+        .expect("the handoff runner completed");
+
+    // THE TYPED RECOVERABLE FAILURE — never `ok: true` over a target
+    // with no recoverable registration.
+    assert_eq!(
+        result["ok"],
+        json!(false),
+        "the handoff fails typed: {result}"
+    );
+    assert_eq!(
+        result["error"]["code"],
+        json!("TARGET_SPAWN_FAILED"),
+        "the start-target failure answers the runner's typed code: {result}"
+    );
+    assert!(
+        result["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("TARGET_BINDING_FAILED"),
+        "the failure's message names the binding's typed code (the spawn's \
+         typed envelope, not a Debug dump): {result}"
+    );
+    assert_eq!(result["error"]["retryable"], json!(true), "{result}");
+
+    // NO Live commit: the prior was reaped, the target was never committed
+    // — the key ends Vacant (the typed recoverable state; never a dead
+    // runtime restored as Live).
+    await_cond("the key must end Vacant (no Live commit)", || {
+        rig.ownership.observe("claude", &sid).state == OwnershipState::Vacant
+    })
+    .await;
+
+    // The spawned target terminal was reaped — no live claude-mode
+    // terminal row for the session survives the failed handoff.
+    await_cond("the failed target terminal must be reaped", || {
+        !rig.registry.directory().into_iter().any(|entry| {
+            entry.mode == "claude" && entry.resume_session_id.as_deref() == Some(sid.as_str())
+        })
+    })
+    .await;
+
+    // The key reopens (not wedged).
+    assert!(matches!(
+        rig.ownership.begin_start(
+            "claude",
+            &sid,
+            RuntimeOwnerKind::Terminal,
+            "post-failure-probe",
+            None,
+            "test",
+            0,
+        ),
+        BeginOutcome::Granted { .. }
+    ));
+
     std::env::remove_var("CLAUDE_CONFIG_DIR");
     let _ = std::fs::remove_dir_all(&store_dir);
     let _ = env;
@@ -7542,7 +7687,7 @@ async fn the_prior_stop_never_confirms_on_a_missing_row() {
     let sid = uuid::Uuid::new_v4().to_string();
     // A SHORT reap budget: the pid-alive window deterministically fences
     // within the test.
-    let rig = build_rig_inner(None, None, None, 50, None, false, None);
+    let rig = build_rig_inner(None, None, None, 50, None, false, None, None);
     // The prior's stand-in process: ALIVE, its registry row ABSENT — the
     // exact row-removed-but-not-yet-reaped shape a concurrent kill
     // produces.
@@ -7632,7 +7777,7 @@ async fn the_replacement_probe_never_confirms_a_terminal_prior_on_a_missing_row(
     let _guard = ENV_LOCK.lock().await;
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
     let _env = FakeSidecarEnv::install();
-    let rig = build_rig_inner(None, None, None, 10_000, None, false, None);
+    let rig = build_rig_inner(None, None, None, 10_000, None, false, None, None);
     // The prior's stand-in process: ALIVE, its registry row ABSENT — the
     // exact row-removed-but-not-yet-reaped shape a concurrent kill
     // produces.

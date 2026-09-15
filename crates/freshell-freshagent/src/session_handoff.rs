@@ -3561,7 +3561,7 @@ impl SessionHandoffRunner {
                     watch: target_spawn_watch
                         .unwrap_or_else(|| crate::terminal_tabs::HandoffSpawnWatch::new(None)),
                 };
-                let spawned = crate::terminal_tabs::spawn_terminal_pane_with_handoff(
+                let spawned = match crate::terminal_tabs::spawn_terminal_pane_with_handoff(
                     &self.fresh_agent,
                     &body,
                     &tab_id,
@@ -3569,7 +3569,33 @@ impl SessionHandoffRunner {
                     Some(&token),
                 )
                 .await
-                .map_err(|resp| ("terminal spawn failed".to_string(), format!("{resp:?}")))?;
+                {
+                    Ok(spawned) => spawned,
+                    Err(resp) => {
+                        // b8ke ext r27 F3: the typed spawn refusal's code +
+                        // message ride the handoff failure — the response's
+                        // OWN typed envelope (a registration failure answers
+                        // TARGET_BINDING_FAILED), never a Debug dump that
+                        // would bury the code.
+                        let status = resp.status();
+                        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                            .await
+                            .unwrap_or_default();
+                        let body: serde_json::Value =
+                            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+                        let code = body
+                            .get("code")
+                            .and_then(Value::as_str)
+                            .unwrap_or("terminal spawn failed")
+                            .to_string();
+                        let message = body
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| format!("terminal spawn failed (status {status})"));
+                        return Err((code, message));
+                    }
+                };
                 // Session-ID preservation: the spawned pane must carry the
                 // canonical sessionRef — a gate-fired mint (a stale resume
                 // id healed into a fresh one) is a handoff FAILURE, never a

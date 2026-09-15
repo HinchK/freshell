@@ -786,6 +786,12 @@ pub trait PaneIdentityBinder: Send + Sync + std::fmt::Debug {
     /// the handoff's generation (the delayed-write fence baseline); other
     /// callers pass `None` (legacy-unfenced; the row's prior stamp is
     /// preserved by the write path).
+    /// b8ke ext r27 F3: the registration is TYPED — the durable write's
+    /// failure propagates as `Err` so a handoff runner's terminal target can
+    /// fail the handoff typed (never a committed Live owner with no
+    /// recoverable registration). `Ok(())` covers every no-op arm (shell,
+    /// marker-less modes) and every successful write; callers without a
+    /// typed channel deliberately keep their documented degradation policy.
     fn register_create_identity(
         &self,
         terminal_id: &str,
@@ -794,7 +800,7 @@ pub trait PaneIdentityBinder: Send + Sync + std::fmt::Debug {
         cwd: Option<&str>,
         create_request_id: Option<&str>,
         observed: Option<(u64, u64)>,
-    );
+    ) -> Result<(), std::io::Error>;
     /// Exit-side hygiene (load-bearing ledger A2): mirrors the WS pane
     /// EXIT hook (terminal.rs:1334-1342) EXACTLY — retire the identity row
     /// (in-memory flag flip) and delete any pending marker. Deliberately

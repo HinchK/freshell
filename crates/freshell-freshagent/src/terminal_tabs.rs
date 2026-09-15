@@ -2835,7 +2835,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         // preserving the prior one; every other caller stays
         // legacy-unfenced (None).
         let observed = handoff_observed;
-        if let Err(join_err) = tokio::task::spawn_blocking(move || {
+        let registration = tokio::task::spawn_blocking(move || {
             binder.register_create_identity(
                 &tid,
                 &m,
@@ -2843,12 +2843,58 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                 c.as_deref(),
                 Some(&rid),
                 observed,
-            );
+            )
         })
         .await
-        {
+        .unwrap_or_else(|join_err| {
             // JoinError means the closure panicked
             tracing::warn!(target: "freshell_freshagent::invariants", error = %join_err, "create-identity binder task panicked");
+            Ok(())
+        });
+        if let Err(reg_err) = registration {
+            if under_handoff_ticket {
+                // b8ke ext r27 F3: the handoff runner's terminal target
+                // holds NO typed channel of its own here — the spawn
+                // answers the TYPED failure so the runner lands the typed
+                // recoverable handoff state (guard fail → the key settles,
+                // never a successful owner + Live commit with no
+                // recoverable registration). The just-spawned terminal is
+                // killed and confirmed first — never a live unowned writer.
+                tracing::error!(target: "freshell_freshagent::invariants",
+                    terminal_id = %terminal_id, error = %reg_err,
+                    "handoff_target_registration_failed: the terminal target's                      durable identity registration failed — the spawned terminal                      is reaped and the handoff fails typed (kata b8ke ext r27 F3)"
+                );
+                let pid = registry.pid_of(&terminal_id);
+                registry.kill(&terminal_id);
+                let confirmed = match pid {
+                    Some(pid) => confirm_pid_dead_within_500ms(pid).await,
+                    // No pid handle to probe: the registry kill removed the
+                    // row; nothing is left to signal, so treat as confirmed.
+                    None => true,
+                };
+                if !confirmed {
+                    tracing::error!(target: "invariant",
+                        terminal_id = %terminal_id,
+                        "handoff_target_registration_failure_kill_unconfirmed: the                          spawned terminal did not confirm dead within budget"
+                    );
+                }
+                return Err(fail_json_code(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "TARGET_BINDING_FAILED",
+                    format!(
+                        "the terminal target's durable recovery registration failed; \
+                         the spawned terminal was reaped: {reg_err}"
+                    ),
+                ));
+            }
+            // The REST create rung keeps its documented degradation policy
+            // (a create is never blocked by durability degradation); the
+            // handoff arm above is the one caller with a typed channel
+            // (through the runner's recoverable failure).
+            tracing::warn!(target: "freshell_freshagent::invariants",
+                terminal_id = %terminal_id, error = %reg_err,
+                "create_identity_registration_failed (REST rung; create proceeds, durability degraded)"
+            );
         }
     }
 
@@ -5490,7 +5536,7 @@ if (args.includes('app-server')) {{
             _cwd: Option<&str>,
             _create_request_id: Option<&str>,
             observed: Option<(u64, u64)>,
-        ) {
+        ) -> Result<(), std::io::Error> {
             self.events.lock().unwrap().push(format!(
                 "register:{terminal_id}:{mode}:{}",
                 resume_session_id.unwrap_or("-")
@@ -5500,6 +5546,7 @@ if (args.includes('app-server')) {{
                 .lock()
                 .unwrap()
                 .push(format!("register-observed:{epoch}:{generation}"));
+            Ok(())
         }
         fn retire_pane_identity(&self, terminal_id: &str) {
             self.events
