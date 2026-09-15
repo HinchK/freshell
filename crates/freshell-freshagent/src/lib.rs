@@ -1259,6 +1259,119 @@ fn opencode_compute_tool_after_by_part_index(parts: &[Value]) -> Vec<bool> {
     tool_after
 }
 
+/// Duration of a wire part from its `time` (ms). Absent/incomplete time yields None.
+/// Takes the object CARRYING the `time` key -- the part itself for `reasoning` parts,
+/// the `state` sub-object for `tool` parts.
+fn opencode_part_duration_ms(holder: &Value) -> Option<u64> {
+    let time = holder.get("time")?;
+    let start = time.get("start").and_then(Value::as_i64)?;
+    let end = time.get("end").and_then(Value::as_i64)?;
+    (end >= start).then_some((end - start) as u64)
+}
+
+/// Mirror of the opencode TUI's `reasoningSummary` (thinking.ts): a leading bold
+/// block `**Title**` followed by a blank line (or end of text -- a title still
+/// awaiting its body while streaming) is disclosure metadata; the text after the
+/// blank line is the body. The TUI regex is `/^\*\*([^*\n]+)\*\*(?:\r?\n\r?\n|$)/`.
+fn opencode_reasoning_title_and_body(raw: &str) -> (Option<String>, String) {
+    let content = raw.trim();
+    let Some(rest) = content.strip_prefix("**") else {
+        return (None, content.to_string());
+    };
+    let Some(close) = rest.find("**") else {
+        return (None, content.to_string());
+    };
+    let candidate = &rest[..close];
+    if candidate.is_empty() || candidate.contains('\n') || candidate.contains('*') {
+        return (None, content.to_string());
+    }
+    let after = rest[close + 2..].trim_start_matches('\r');
+    // Require end-of-text or a blank line (the TUI's `\r?\n\r?\n`), matching \r\n too.
+    let body = if after.is_empty() {
+        String::new()
+    } else if let Some(stripped) = after.strip_prefix('\n') {
+        let stripped = stripped.trim_start_matches('\r');
+        if stripped.starts_with('\n') {
+            stripped.trim().to_string()
+        } else {
+            return (None, content.to_string());
+        }
+    } else {
+        return (None, content.to_string());
+    };
+    (Some(candidate.trim().to_string()), body)
+}
+
+/// Unwrap the opencode task output envelope -- `state.output` carries
+/// `<task …><task_result>BODY</task_result></task>` -- so users see the task-result
+/// content, never the internal markup. Any other shape passes through raw.
+fn opencode_task_result_text(output: &str) -> String {
+    const OPEN: &str = "<task_result>";
+    const CLOSE: &str = "</task_result>";
+    let Some(open) = output.find(OPEN) else {
+        return output.to_string();
+    };
+    let Some(close) = output.rfind(CLOSE) else {
+        return output.to_string();
+    };
+    if close > open {
+        output[open + OPEN.len()..close].trim().to_string()
+    } else {
+        output.to_string()
+    }
+}
+
+/// The opencode TUI header: `titlecase(subagent_type ?? "General") + " Task"` (+ " (background)")
+/// + " — " + description.
+fn opencode_task_delegation_title(subagent: &str, background: bool, description: &str) -> String {
+    let mut chars = subagent.chars();
+    let titlecased = match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    };
+    let name = if titlecased.trim().is_empty() {
+        "General".to_string()
+    } else {
+        titlecased
+    };
+    let marker = if background { " (background)" } else { "" };
+    format!("{name} Task{marker} — {description}")
+}
+
+/// Wire `state.status` triple shared by every opencode tool-shaped part: the
+/// contract's `running | completed | failed` enum.
+fn opencode_tool_status(state: &Value) -> &'static str {
+    match state.get("status").and_then(Value::as_str) {
+        Some("completed") => "completed",
+        Some("error") => "failed",
+        _ => "running",
+    }
+}
+
+/// One-line child-activity preview (the client's `getToolPreview` core cases).
+/// Unknown tools (or known tools with no preview key) fall back to compact JSON
+/// verbatim, braces included.
+// Task 3's child-session activity join consumes this; until then only the unit tests do.
+#[allow(dead_code)]
+pub(crate) fn opencode_child_activity_preview(tool: &str, input: &Value) -> String {
+    let get = |key: &str| input.get(key).and_then(Value::as_str).unwrap_or("");
+    let preview = match tool {
+        "bash" | "shell" => get("command"),
+        "read" | "write" | "edit" => get("filePath"),
+        "grep" => get("pattern"),
+        "glob" => get("pattern"),
+        "task" => get("description"),
+        "webfetch" => get("url"),
+        _ => "",
+    };
+    let text = if preview.is_empty() {
+        serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string())
+    } else {
+        preview.to_string()
+    };
+    text.chars().take(120).collect()
+}
+
 /// `itemFromPart(part, fallbackId, role, followedByTool)` (`normalize.ts:191-238`), covering
 /// `text`, `reasoning`, `tool`, `file`, `patch`, and `compaction` part types -- the full set the
 /// task scope calls for. Structural parts (`step-start`/`step-finish`) and any other
@@ -1291,19 +1404,25 @@ fn opencode_item_from_part(
             }
         }
         Some("reasoning") => {
-            let text = part
-                .get("text")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
+            let raw = part.get("text").and_then(Value::as_str).unwrap_or("");
+            // The opencode TUI (packages/tui/src/context/thinking.ts reasoningSummary)
+            // treats a leading bold block — "**Title**\n\n<body>" — as disclosure
+            // metadata, styling the header independently of the markdown body.
+            // Mirror that: the title splits off and the body carries the rest.
+            let (title, text) = opencode_reasoning_title_and_body(raw);
             let segment = if text.is_empty() {
                 vec![]
             } else {
                 vec![text.clone()]
             };
-            vec![
-                json!({ "id": id, "kind": "reasoning", "summary": segment.clone(), "content": segment, "text": text }),
-            ]
+            let mut item = json!({ "id": id, "kind": "reasoning", "summary": segment.clone(), "content": segment, "text": text });
+            if let Some(duration) = opencode_part_duration_ms(part) {
+                item["durationMs"] = json!(duration);
+            }
+            if let Some(title) = title {
+                item["title"] = json!(title);
+            }
+            vec![item]
         }
         Some("tool") => {
             let state = part
@@ -1311,31 +1430,72 @@ fn opencode_item_from_part(
                 .filter(|v| v.is_object())
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let status = match state.get("status").and_then(Value::as_str) {
-                Some("completed") => "completed",
-                Some("error") => "failed",
-                _ => "running",
-            };
-            let arguments = state.get("input").cloned().unwrap_or_else(|| json!({}));
-            let content_items = state
-                .get("output")
-                .and_then(Value::as_str)
-                .map(|s| json!([s]));
-            let success = if status == "completed" {
-                Some(true)
+            if part.get("tool").and_then(Value::as_str) == Some("task") {
+                // The `task` tool is a subagent delegation, not a plain dynamic tool:
+                // render it as the first-class task_delegation item the client's
+                // activity strip folds into one delegation block.
+                let input = state.get("input").cloned().unwrap_or_else(|| json!({}));
+                let description = input
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .or_else(|| state.get("title").and_then(Value::as_str))
+                    .unwrap_or("");
+                let subagent = input
+                    .get("subagent_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("general");
+                let background = state
+                    .pointer("/metadata/background")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let status = opencode_tool_status(&state);
+                let mut item = json!({
+                    "id": id, "kind": "task_delegation", "status": status,
+                    "title": opencode_task_delegation_title(subagent, background, description),
+                    "subagent": subagent, "background": background,
+                });
+                if !description.is_empty() {
+                    item["description"] = json!(description);
+                }
+                if let Some(child) = state.pointer("/metadata/sessionId").and_then(Value::as_str) {
+                    item["childSessionId"] = json!(child);
+                }
+                if let Some(start) = state.pointer("/time/start").and_then(Value::as_i64) {
+                    item["startedAtMs"] = json!(start);
+                }
+                if let Some(end) = state.pointer("/time/end").and_then(Value::as_i64) {
+                    item["endedAtMs"] = json!(end);
+                }
+                if let Some(duration) = opencode_part_duration_ms(&state) {
+                    item["durationMs"] = json!(duration);
+                }
+                if let Some(output) = state.get("output").and_then(Value::as_str) {
+                    item["result"] = json!(opencode_task_result_text(output));
+                }
+                vec![item]
             } else {
-                None
-            };
-            vec![json!({
-                "id": id,
-                "kind": "dynamic_tool",
-                "namespace": "opencode",
-                "tool": part.get("tool").and_then(Value::as_str).unwrap_or("tool"),
-                "status": status,
-                "arguments": arguments,
-                "contentItems": content_items,
-                "success": success,
-            })]
+                let status = opencode_tool_status(&state);
+                let arguments = state.get("input").cloned().unwrap_or_else(|| json!({}));
+                let content_items = state
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .map(|s| json!([s]));
+                let success = if status == "completed" {
+                    Some(true)
+                } else {
+                    None
+                };
+                vec![json!({
+                    "id": id,
+                    "kind": "dynamic_tool",
+                    "namespace": "opencode",
+                    "tool": part.get("tool").and_then(Value::as_str).unwrap_or("tool"),
+                    "status": status,
+                    "arguments": arguments,
+                    "contentItems": content_items,
+                    "success": success,
+                })]
+            }
         }
         Some("file") => vec![json!({
             "id": id,
@@ -1350,6 +1510,40 @@ fn opencode_item_from_part(
             "extensions": { "opencode": part },
         })],
         Some("compaction") => vec![json!({ "id": id, "kind": "context_compaction" })],
+        Some("retry") => {
+            let attempt = part
+                .get("attempt")
+                .and_then(Value::as_i64)
+                .unwrap_or(1)
+                .max(1);
+            // Serialized NamedError shape is {name, data:{message,…}} (retry.ts reads
+            // error.data.message); tolerate legacy {message} and bare-string shapes.
+            let error = part.get("error").and_then(|err| {
+                err.pointer("/data/message")
+                    .and_then(Value::as_str)
+                    .or_else(|| err.get("message").and_then(Value::as_str))
+                    .or_else(|| err.as_str())
+                    .or_else(|| err.get("name").and_then(Value::as_str))
+            });
+            let mut item = json!({ "id": id, "kind": "retry", "attempt": attempt });
+            if let Some(error) = error {
+                item["error"] = json!(error);
+            }
+            vec![item]
+        }
+        Some("subtask") => {
+            let mut item = json!({ "id": id, "kind": "delegated_task" });
+            if let Some(agent) = part.get("agent").and_then(Value::as_str) {
+                item["agent"] = json!(agent);
+            }
+            if let Some(description) = part.get("description").and_then(Value::as_str) {
+                item["description"] = json!(description);
+            }
+            if let Some(command) = part.get("command").and_then(Value::as_str) {
+                item["command"] = json!(command);
+            }
+            vec![item]
+        }
         _ => vec![],
     }
 }
@@ -3979,6 +4173,257 @@ mod tests {
             vec![
                 json!({ "id": "part-10", "kind": "text", "text": "<thinking>not reasoning</thinking>" })
             ]
+        );
+    }
+
+    // -- freshopencode TUI parity: reasoning duration/title, task delegations, retries, subtasks --
+
+    #[test]
+    fn opencode_item_from_part_reasoning_part_carries_duration_without_title() {
+        let items = opencode_item_from_part(
+            &json!({
+                "type": "reasoning", "id": "part_r1", "text": "weighing options",
+                "time": { "start": 1789417896153i64, "end": 1789417897984i64 },
+                "metadata": { "anthropic": { "signature": "sig" } }
+            }),
+            "fallback",
+            Some("assistant"),
+            false,
+        );
+        assert_eq!(
+            items,
+            vec![json!({
+                "id": "part_r1", "kind": "reasoning",
+                "summary": ["weighing options"], "content": ["weighing options"],
+                "text": "weighing options", "durationMs": 1831u64
+            })]
+        );
+    }
+
+    #[test]
+    fn opencode_item_from_part_reasoning_without_time_has_no_duration() {
+        let items = opencode_item_from_part(
+            &json!({ "type": "reasoning", "id": "part_r2", "text": "hmm" }),
+            "fallback",
+            Some("assistant"),
+            false,
+        );
+        assert_eq!(items[0].get("durationMs"), None);
+        assert_eq!(items[0].get("title"), None);
+    }
+
+    #[test]
+    fn opencode_item_from_part_reasoning_leading_bold_block_becomes_title() {
+        // Mirrors the opencode TUI's reasoningSummary (thinking.ts): a leading bold
+        // block "**Title**" followed by a blank line is disclosure metadata.
+        let items = opencode_item_from_part(
+            &json!({
+                "type": "reasoning", "id": "part_r3",
+                "text": "**Planning the fix**\n\nweighing options",
+                "time": { "start": 1000, "end": 4200 }
+            }),
+            "fallback",
+            Some("assistant"),
+            false,
+        );
+        assert_eq!(items[0]["durationMs"], json!(3200u64));
+        assert_eq!(items[0]["title"], json!("Planning the fix"));
+        assert_eq!(items[0]["text"], json!("weighing options"));
+        assert_eq!(items[0]["summary"], json!(["weighing options"]));
+    }
+
+    #[test]
+    fn opencode_item_from_part_reasoning_bold_title_awaiting_body_is_title_only() {
+        // The TUI also treats a complete title still awaiting its body (streaming)
+        // as disclosure metadata: "**Title**" with nothing after it.
+        let items = opencode_item_from_part(
+            &json!({ "type": "reasoning", "id": "part_r4", "text": "**Planning**" }),
+            "fallback",
+            Some("assistant"),
+            false,
+        );
+        assert_eq!(items[0]["title"], json!("Planning"));
+        assert_eq!(items[0]["summary"], json!([]));
+    }
+
+    #[test]
+    fn opencode_item_from_part_reasoning_bold_without_blank_line_is_not_a_title() {
+        // No blank line after the bold block => the TUI regex does not match; the
+        // text stays whole and no title is emitted.
+        let items = opencode_item_from_part(
+            &json!({ "type": "reasoning", "id": "part_r5", "text": "**bold intro** still the same paragraph" }),
+            "fallback",
+            Some("assistant"),
+            false,
+        );
+        assert_eq!(items[0].get("title"), None);
+        assert_eq!(
+            items[0]["text"],
+            json!("**bold intro** still the same paragraph")
+        );
+    }
+
+    #[test]
+    fn opencode_item_from_part_task_tool_part_becomes_task_delegation() {
+        let items = opencode_item_from_part(
+            &json!({
+                "type": "tool", "tool": "task", "id": "part_t1",
+                "state": {
+                    "status": "completed",
+                    "input": { "description": "Fix the flaky harness", "prompt": "…", "subagent_type": "general" },
+                    "metadata": { "parentSessionId": "ses_p", "sessionId": "ses_c", "model": { "modelID": "m", "providerID": "p" } },
+                    "output": "<task id=\"ses_c\" state=\"completed\"><task_result>ok</task_result></task>",
+                    "title": "Fix the flaky harness",
+                    "time": { "start": 1000, "end": 3000 }
+                }
+            }),
+            "fallback",
+            Some("assistant"),
+            false,
+        );
+        // The <task …><task_result>…</task_result></task> envelope is unwrapped:
+        // users see the task-result content, never the internal markup.
+        assert_eq!(
+            items,
+            vec![json!({
+                "id": "part_t1", "kind": "task_delegation", "status": "completed",
+                "title": "General Task — Fix the flaky harness",
+                "description": "Fix the flaky harness", "subagent": "general", "background": false,
+                "childSessionId": "ses_c", "startedAtMs": 1000i64, "endedAtMs": 3000i64,
+                "durationMs": 2000u64,
+                "result": "ok"
+            })]
+        );
+    }
+
+    #[test]
+    fn opencode_task_result_text_unwraps_envelope_and_passes_raw_through() {
+        assert_eq!(
+            opencode_task_result_text("<task id=\"x\" state=\"completed\"><task_result>\n  all green  \n</task_result></task>"),
+            "all green"
+        );
+        assert_eq!(opencode_task_result_text("plain output"), "plain output");
+        assert_eq!(opencode_task_result_text(""), "");
+    }
+
+    #[test]
+    fn opencode_item_from_part_task_tool_part_minimal_has_title_and_no_child() {
+        let items = opencode_item_from_part(
+            &json!({ "type": "tool", "tool": "task", "id": "part_t2",
+                "state": { "status": "running", "input": { "description": "Do things" } } }),
+            "fallback",
+            Some("assistant"),
+            false,
+        );
+        assert_eq!(items[0]["kind"], json!("task_delegation"));
+        assert_eq!(items[0]["title"], json!("General Task — Do things"));
+        assert_eq!(items[0].get("childSessionId"), None);
+        assert_eq!(items[0].get("result"), None);
+    }
+
+    #[test]
+    fn opencode_item_from_part_task_tool_part_background_and_custom_subagent() {
+        let items = opencode_item_from_part(
+            &json!({ "type": "tool", "tool": "task", "id": "part_t3",
+                "state": { "status": "error", "input": { "description": "side quest", "subagent_type": "fixer" },
+                           "metadata": { "background": true, "sessionId": "ses_bg" } } }),
+            "fallback",
+            Some("assistant"),
+            false,
+        );
+        assert_eq!(
+            items[0]["title"],
+            json!("Fixer Task (background) — side quest")
+        );
+        assert_eq!(items[0]["status"], json!("failed"));
+        assert_eq!(items[0]["background"], json!(true));
+        assert_eq!(items[0]["childSessionId"], json!("ses_bg"));
+    }
+
+    #[test]
+    fn opencode_item_from_part_retry_part_becomes_retry_item() {
+        // Authoritative serialized shape: NamedError.toObject() => {name, data:{message,…}}
+        // (retry.ts reads error.data.message).
+        let items = opencode_item_from_part(
+            &json!({ "type": "retry", "id": "part_rr1", "attempt": 2,
+                     "error": { "name": "APIError", "data": { "message": "stream disconnected" } } }),
+            "fallback",
+            Some("assistant"),
+            false,
+        );
+        assert_eq!(
+            items,
+            vec![json!({
+                "id": "part_rr1", "kind": "retry", "attempt": 2i64, "error": "stream disconnected"
+            })]
+        );
+    }
+
+    #[test]
+    fn opencode_item_from_part_retry_part_defaults_attempt_and_string_error() {
+        let items = opencode_item_from_part(
+            &json!({ "type": "retry", "id": "part_rr2", "error": "boom" }),
+            "fallback",
+            Some("assistant"),
+            false,
+        );
+        assert_eq!(items[0]["attempt"], json!(1i64));
+        assert_eq!(items[0]["error"], json!("boom"));
+    }
+
+    #[test]
+    fn opencode_item_from_part_subtask_part_becomes_delegated_task() {
+        let items = opencode_item_from_part(
+            &json!({ "type": "subtask", "id": "part_s1", "agent": "general",
+                     "description": "Fix the flaky harness", "command": "/fix" }),
+            "fallback",
+            Some("user"),
+            false,
+        );
+        assert_eq!(
+            items,
+            vec![json!({
+                "id": "part_s1", "kind": "delegated_task", "agent": "general",
+                "description": "Fix the flaky harness", "command": "/fix"
+            })]
+        );
+    }
+
+    #[test]
+    fn opencode_child_activity_preview_formats_common_tools() {
+        assert_eq!(
+            opencode_child_activity_preview(
+                "bash",
+                &json!({ "command": "sed -n 92,112p src/store/paneTypes.ts" })
+            ),
+            "sed -n 92,112p src/store/paneTypes.ts"
+        );
+        assert_eq!(
+            opencode_child_activity_preview("read", &json!({ "filePath": "src/index.css" })),
+            "src/index.css"
+        );
+        assert_eq!(
+            opencode_child_activity_preview("grep", &json!({ "pattern": "reasoningEffort" })),
+            "reasoningEffort"
+        );
+        assert_eq!(
+            opencode_child_activity_preview("glob", &json!({ "pattern": "*.rs" })),
+            "*.rs"
+        );
+        assert_eq!(
+            opencode_child_activity_preview("task", &json!({ "description": "inner task" })),
+            "inner task"
+        );
+        assert_eq!(
+            opencode_child_activity_preview(
+                "webfetch",
+                &json!({ "url": "https://example.test/x" })
+            ),
+            "https://example.test/x"
+        );
+        assert_eq!(
+            opencode_child_activity_preview("unknown", &json!({ "a": "b" })),
+            r#"{"a":"b"}"#
         );
     }
 
