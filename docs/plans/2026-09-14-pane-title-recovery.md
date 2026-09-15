@@ -53,8 +53,22 @@ Implement the user-selected product behavior (Choice B — window sovereignty) p
 
 All facts below were verified against the worktree at `bab7d5189` by five explorer reports under `/home/dan/code/freshell/.worktrees/.the-usual-logs/pane-title-recovery/reports/` — `plan-boot-restore.md` (boot/restore/persist map, in-flight branch diffs), `plan-title-pipelines.md` (title lifecycle), `plan-inventory-union.md` (item-3 refutation, rebuild-route facts), `plan-test-infra.md` (test patterns), `workspace-baseline.md` (commands/env/readiness). Key facts the tasks depend on:
 
+> **Delta round 3 remediation (post-review):** the layout envelope is no
+> longer the origin-wide `freshell.layout.v3` key. It is now PER WINDOW —
+> `freshell.layout.v3.<clientInstanceId>` (the SAME sessionStorage id the
+> tab-registry sync uses), with one-time LEGACY adoption
+> (`storage-migration.ts` copies the bare legacy key byte-identically into
+> a window's derived key on its first post-change boot and NEVER deletes
+> the legacy key), per-window `.bak` / fresh-agent-centralization /
+> pre-migration-evidence side channels, an install-time staleness hydrate
+> in `installCrossTabSync`, and terminal-content lifecycle invariants
+> (non-empty envelope-wide-unique createRequestId, TerminalStatus-union
+> status, non-empty mode) in the health classifier. Where the sketches
+> below say `LAYOUT_STORAGE_KEY` / `freshell.layout.v3`, read the window's
+> per-window key (`src/store/window-layout-keys.ts`).
+
 - `restoreMachineWorkspace` (src/lib/machine-workspace.ts:47-77) is called unconditionally by `resolveMachineBeforeTransport` (src/App.tsx:805-863, call at :831) and always dispatches `clearTabsForMachine` + `clearPanesForMachine` + `clearTabRegistryLocalClosed` before rebuilding from `buildRecoveryPlan` — whose `paneTitles` is always `{}` (build-recovery-plan.ts:359).
-- The persisted envelope `freshell.layout.v3` (version 4) is written by `persistMiddleware.flush()` (persistMiddleware.ts:630-639) with a top-level `persistedAt`; `parsePersistedLayoutRaw` (persistedState.ts:525-558) is passthrough-tolerant but reconstructs a fixed shape, so a new `machineId` field must be surfaced explicitly. `clearTabsForMachine` sets `userClosedTabsIntent=true` (persistMiddleware.ts:739-747) making an empty restore destructively overwrite the cache.
+- The persisted envelope — the window's per-window key `freshell.layout.v3.<clientInstanceId>` (version 4; delta round 3, previously the origin-wide `freshell.layout.v3`) — is written by `persistMiddleware.flush()` (persistMiddleware.ts:630-639) with a top-level `persistedAt`; `parsePersistedLayoutRaw` (persistedState.ts:525-558) is passthrough-tolerant but reconstructs a fixed shape, so a new `machineId` field must be surfaced explicitly. `clearTabsForMachine` sets `userClosedTabsIntent=true` (persistMiddleware.ts:739-747) making an empty restore destructively overwrite the cache.
 - Slices rehydrate from localStorage at module eval, BEFORE the App effect — so the health classification reads the same envelope the slices just rehydrated.
 - `updatePaneTitleByTerminalId` and `updatePaneTitleBySessionRef` already exist (panesSlice.ts:2212/2242) with the `setByUser:false` user-set guard; `terminal.inventory` is sent on every connection (crates/freshell-ws/src/lib.rs:614-622) with rows carrying `title` (server_messages.rs:1125), and the sole client handler (App.tsx:1419-1470) ignores it.
 - Session-directory rows (`SessionDirectoryItem`, shared/read-models.ts:51-86) carry `sessionId`, `provider`, `title?` and arrive via `/api/session-directory` fetches triggered by `sessions.changed` broadcasts; the sessions slice normalizes them under `state.sessions.windows[surface].projects` (sessionsSlice.ts:66-96).
@@ -93,7 +107,7 @@ Evidence: `reports/load-bearing-finder.md` (LB-IDs) in the run's logs dir. These
 - Test: extend `test/unit/client/store/storage-migration.test.ts` (a flushed stamped envelope survives `runStorageMigration()` — the LB-05 pin; exact filename verified in this worktree)
 
 **Interfaces:**
-- Consumes: `LAYOUT_STORAGE_KEY` (`src/store/storage-keys.ts:2`), `getSelectedMachineId()` (`src/lib/machine-identity.ts:89-100`), `parsePersistedLayoutRaw`, and `isWellFormedPaneTree` (`src/store/paneTreeValidation.ts:133` — the SAME well-formedness predicate the persist/load path uses; it is already exported from its own module, so panesSlice.ts needs no new export and must not grow).
+- Consumes: the window's per-window layout key via `getWindowLayoutKey()` (`src/store/window-layout-keys.ts`, delta round 3 — previously `LAYOUT_STORAGE_KEY` from `src/store/storage-keys.ts`), `getSelectedMachineId()` (`src/lib/machine-identity.ts:89-100`), `parsePersistedLayoutRaw`, and `isWellFormedPaneTree` (`src/store/paneTreeValidation.ts:133` — the SAME well-formedness predicate the persist/load path uses; it is already exported from its own module, so panesSlice.ts needs no new export and must not grow).
 - Produces (used by Task 2):
   - `export type PersistedLayoutHealth = 'absent' | 'corrupt' | 'foreign' | 'stale' | 'healthy'`
   - `export const STALE_LAYOUT_MS = 7 * 24 * 60 * 60 * 1000`
@@ -107,11 +121,16 @@ Create `test/unit/client/lib/recovery/layout-health.test.ts`:
 ```typescript
 import { beforeEach, describe, expect, it } from 'vitest'
 import { classifyPersistedLayoutHealth, STALE_LAYOUT_MS } from '@/lib/recovery/layout-health'
-import { LAYOUT_STORAGE_KEY, MACHINE_ID_STORAGE_KEY } from '@/store/storage-keys'
+import { MACHINE_ID_STORAGE_KEY } from '@/store/storage-keys'
 
 const NOW = 1_760_000_000_000
 
+// Delta round 3: seed the window's per-window key (id from sessionStorage).
+const WINDOW_ID = 'client-health-tests'
+const LAYOUT_STORAGE_KEY = `freshell.layout.v3.${WINDOW_ID}`
+
 function seedEnvelope(raw: unknown): void {
+  sessionStorage.setItem('freshell.tabs.client-instance-id.v1', WINDOW_ID)
   localStorage.setItem(LAYOUT_STORAGE_KEY, typeof raw === 'string' ? raw : JSON.stringify(raw))
 }
 
