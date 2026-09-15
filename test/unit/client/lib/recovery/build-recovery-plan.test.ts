@@ -27,6 +27,24 @@ describe('buildRecoveryPlan', () => {
     expect(content.sessionRef).toBeUndefined()
   })
 
+  it('produces one plan per device tab, in the inventory device.tabs order', () => {
+    const p = () => pane()
+    const inventory = {
+      recoverable: true, contentId: 'cid',
+      device: {
+        deviceId: 'd', deviceLabel: 'l', capturedAt: 1,
+        tabs: [
+          { tabKey: 'd:tab-mango', tabName: 'Mango', panes: [p()] },
+          { tabKey: 'd:tab-apple', tabName: 'Apple', panes: [p()] },
+          { tabKey: 'd:tab-zebra', tabName: 'Zebra', panes: [p()] },
+        ],
+      },
+      otherDevices: [], ledgerOnly: [],
+    } as RecoveryInventory
+    const plans = buildRecoveryPlan(inventory)
+    expect(plans.map((plan) => plan.title)).toEqual(['Mango', 'Apple', 'Zebra'])
+  })
+
   it('same-machine recovery preserves a terminal snapshot createRequestId with its pane and tab identities', () => {
     const inventory = inv([pane({ payload: { createRequestId: 'terminal-snapshot-key' } })])
     inventory.device!.tabs[0].tabKey = 'd:tab-1'

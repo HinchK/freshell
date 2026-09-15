@@ -1016,7 +1016,11 @@ fn union_by_ids_resolves_exact_generation_files_when_digests_repeat_across_clien
         .iter()
         .filter_map(|r| r["tabKey"].as_str())
         .collect();
-    assert_eq!(keys, vec!["dev:x", "dev:y"]);
+    // First-seen order: the picked bundle's newest source is clientB's
+    // generation (capturedAt 1001 > 1000), so dev:y precedes dev:x. The
+    // test's subject is exact-file resolution (both records present);
+    // the order assertion documents the union's ordering contract.
+    assert_eq!(keys, vec!["dev:y", "dev:x"]);
 }
 
 // Helper: the parsed generation owned by a given client (there is one each here).
@@ -1560,4 +1564,126 @@ fn retained_snapshot_references_collect_every_pane_identity_shape() {
         retained_snapshot_references(dir.path()).is_err(),
         "a corrupt generation fails the scan loudly"
     );
+}
+
+#[test]
+fn union_preserves_the_newest_sources_pushed_record_order() {
+    // The regression: the union deduped into a HashMap and emitted records
+    // sorted by tabKey, so the recovery inventory rebuilt the tab strip in
+    // an order unrelated to the user's strip. The client pushes records in
+    // strip order (tabRegistrySync's buildRecords iterates state.tabs.tabs);
+    // a single-client union must return them in exactly that pushed order.
+    let dir = tempfile::tempdir().unwrap();
+    put(
+        dir.path(),
+        "dev",
+        "clientA",
+        3,
+        1000,
+        vec![
+            open_record("dev:k3", "Third", 30),
+            open_record("dev:k1", "First", 10),
+            open_record("dev:k2", "Second", 20),
+        ],
+    );
+    let out = union(dir.path(), "dev").unwrap();
+    let keys: Vec<&str> = out["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["tabKey"].as_str())
+        .collect();
+    assert_eq!(keys, vec!["dev:k3", "dev:k1", "dev:k2"]);
+}
+
+#[test]
+fn union_positions_keys_by_first_seen_source_and_content_by_dedupe_rank() {
+    // POSITION: a tab's slot comes from the NEWEST source that knows it
+    // (deterministic source order: capturedAt desc, then the label_src
+    // tie-break tuple). CONTENT: the per-key dedupe-rank winner is
+    // unchanged — client B's older push carries the highest-rank record
+    // for dev:y, so dev:y sits in client A's slot (index 1) but with B's
+    // newer record content.
+    let dir = tempfile::tempdir().unwrap();
+    put(
+        dir.path(),
+        "dev",
+        "clientA",
+        1,
+        2000,
+        vec![
+            open_record("dev:x", "X", 10),
+            open_record("dev:y", "Y-old", 10),
+        ],
+    );
+    put(
+        dir.path(),
+        "dev",
+        "clientB",
+        1,
+        1000,
+        vec![
+            open_record("dev:z", "Z", 10),
+            open_record("dev:y", "Y-new", 5000),
+            open_record("dev:w", "W", 10),
+        ],
+    );
+    let out = union(dir.path(), "dev").unwrap();
+    let records = out["records"].as_array().unwrap();
+    let keys: Vec<&str> = records
+        .iter()
+        .filter_map(|r| r["tabKey"].as_str())
+        .collect();
+    assert_eq!(keys, vec!["dev:x", "dev:y", "dev:z", "dev:w"]);
+    let y = records
+        .iter()
+        .find(|r| r["tabKey"] == json!("dev:y"))
+        .unwrap();
+    assert_eq!(
+        y["tabName"],
+        json!("Y-new"),
+        "content winner stays the dedupe-rank winner"
+    );
+}
+
+#[test]
+fn union_source_order_is_deterministic_when_captured_at_and_revision_tie() {
+    // Determinism made CHECKABLE, not probabilistic: both clients push at
+    // the same capturedAt and revision, so the source ranking falls through
+    // to clientInstanceId — DESCENDING, because the ranking tuple is the
+    // same one `label_src` takes the max of: the tie resolves to the
+    // LARGER client id ("clientB" before "clientA"), keeping sources[0]
+    // equal to the label source. A total order HashMap iteration must
+    // never decide. The write order below is deliberately reversed (B's
+    // file created before A's) to also prove the union normalizes
+    // file-scan order through its input ranking. Expected first-seen
+    // order: clientB's [dev:m3], then clientA's [dev:z1, dev:a2].
+    let dir = tempfile::tempdir().unwrap();
+    put(
+        dir.path(),
+        "dev",
+        "clientB",
+        1,
+        1000,
+        vec![open_record("dev:m3", "M3", 10)],
+    );
+    put(
+        dir.path(),
+        "dev",
+        "clientA",
+        1,
+        1000,
+        vec![
+            open_record("dev:z1", "Z1", 10),
+            open_record("dev:a2", "A2", 10),
+        ],
+    );
+    let out = union(dir.path(), "dev").unwrap();
+    let keys: Vec<&str> = out["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["tabKey"].as_str())
+        .collect();
+    assert_eq!(keys, vec!["dev:m3", "dev:z1", "dev:a2"]);
 }
