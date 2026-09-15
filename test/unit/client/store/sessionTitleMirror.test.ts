@@ -175,4 +175,80 @@ describe('sessionTitleMirrorMiddleware', () => {
     landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-1', provider: 'opencode', title: 'Both mirror' })
     expect(store.getState().panes).toBe(before.panes)
   })
+
+  // Reconcile-attach lifecycle (delta review round 1, finding 2): a
+  // persisted fresh-agent pane rehydrates with sessionRef only (persistence
+  // strips the top-level sessionId when a canonical sessionRef exists —
+  // persistMiddleware stripTransientSessionFields), and the reconcile
+  // verdicts that (re)bind sessions are generated panes actions the mirror
+  // must trigger on.
+  it('titles a persisted-shape fresh-agent pane (sessionRef only, no top-level sessionId) when its directory row lands — the healthy-reload pre-attach window', () => {
+    const store = buildStore()
+    store.dispatch(addTab({ id: 'tab-z', title: 'ZZ probe' }))
+    store.dispatch(initLayout({
+      tabId: 'tab-z',
+      paneId: 'pane-z',
+      content: {
+        kind: 'fresh-agent',
+        provider: 'opencode',
+        sessionType: 'freshopencode',
+        createRequestId: 'req-z',
+        status: 'idle',
+        sessionRef: { provider: 'opencode', sessionId: 'sess-1' },
+      },
+    }))
+    landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-1', provider: 'opencode', title: 'ZZ probe summarize' })
+    expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('ZZ probe summarize')
+    expect(store.getState().panes.paneTitleSetByUser['tab-z']?.['pane-z']).toBeFalsy()
+  })
+
+  it('updates the pane title when applyFreshAgentReconcileAttach rebinds the pane to a different titled session', () => {
+    const store = buildStore()
+    seedFreshAgentPane(store, 'sess-1')
+    landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-1', provider: 'opencode', title: 'Old session title' })
+    landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-2', provider: 'opencode', title: 'New session title' })
+    expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('Old session title')
+    store.dispatch({
+      type: 'panes/applyFreshAgentReconcileAttach',
+      payload: { tabId: 'tab-z', paneId: 'pane-z', sessionRef: { provider: 'opencode', sessionId: 'sess-2' } },
+    })
+    expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('New session title')
+  })
+
+  it('updates a terminal pane title when applyReconcileAttach rebinds it to a different titled session', () => {
+    const store = buildStore()
+    store.dispatch(addTab({ id: 'tab-z', title: 'ZZ probe' }))
+    store.dispatch(initLayout({
+      tabId: 'tab-z',
+      paneId: 'pane-z',
+      content: {
+        kind: 'terminal',
+        mode: 'claude',
+        createRequestId: 'req-t',
+        status: 'running',
+        terminalId: 'term-1',
+        sessionRef: { provider: 'claude', sessionId: 's1' },
+      },
+    }))
+    landSessionRow(store, { surface: 'sidebar', sessionId: 's1', provider: 'claude', title: 'First claude title' })
+    landSessionRow(store, { surface: 'sidebar', sessionId: 's2', provider: 'claude', title: 'Second claude title' })
+    expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('First claude title')
+    store.dispatch({
+      type: 'panes/applyReconcileAttach',
+      payload: { tabId: 'tab-z', paneId: 'pane-z', terminalId: 'term-1', sessionRef: { provider: 'claude', sessionId: 's2' } },
+    })
+    expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('Second claude title')
+  })
+
+  it('never overwrites a user-set pane title when reconcile-attach rebinds the pane (rename-scope contract)', () => {
+    const store = buildStore()
+    seedFreshAgentPane(store, 'sess-1')
+    store.dispatch(updatePaneTitle({ tabId: 'tab-z', paneId: 'pane-z', title: 'My name', setByUser: true }))
+    landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-2', provider: 'opencode', title: 'New session title' })
+    store.dispatch({
+      type: 'panes/applyFreshAgentReconcileAttach',
+      payload: { tabId: 'tab-z', paneId: 'pane-z', sessionRef: { provider: 'opencode', sessionId: 'sess-2' } },
+    })
+    expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('My name')
+  })
 })

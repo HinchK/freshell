@@ -32,12 +32,35 @@ function collectLeafIdsOf(node: unknown, into: Set<string> = new Set()): Set<str
   return into
 }
 
+/** Aliased-identity check over a (already well-formedness-checked) tree:
+ * an empty leaf id, or a leaf id already seen in this envelope (pane ids
+ * are minted globally unique by nanoid — legit flushes can never alias).
+ * Runs after isWellFormedPaneTree, so leaf ids are strings here; a
+ * non-string still classifies aliased rather than trusting the caller. */
+function hasAliasedLeafIds(node: unknown, seenLeafIds: Set<string>): boolean {
+  const n = node as { type?: string; id?: string; children?: unknown[] } | null
+  if (!n || typeof n !== 'object') return false
+  if (n.type === 'leaf') {
+    const id = n.id
+    if (typeof id !== 'string' || id === '' || seenLeafIds.has(id)) return true
+    seenLeafIds.add(id)
+    return false
+  }
+  for (const child of n.children ?? []) {
+    if (hasAliasedLeafIds(child, seenLeafIds)) return true
+  }
+  return false
+}
+
 /** Classify the persisted layout envelope for the machine this boot
  * resolved. Reads only localStorage; no network.
  *
  * - absent:   nothing usable is persisted.
  * - corrupt:  the envelope exists but does not parse, parse-level salvage
  *             dropped invalid tab rows, a layout tree is malformed,
+ *             identities are aliased (a duplicate tab id, or a duplicate
+ *             or empty pane leaf id — legit flushes mint unique non-empty
+ *             ids, so aliases are corruption by definition),
  *             referential integrity is broken (a layout entry without its
  *             tab, or a tab without its layout entry), or an active
  *             reference is missing/dangling (activeTabId not a parsed tab
@@ -83,8 +106,16 @@ export function classifyPersistedLayoutHealth(
   // (paneTreeValidation.ts). Bounded residual: pane CONTENT payload
   // sanitization (loaders replace invalid content with safe defaults) stays
   // out of scope — only tree well-formedness is classified here.
+  // Aliased identities (duplicate or empty leaf ids across the envelope's
+  // trees) classify corrupt for the same reason: the raw-count/membership/
+  // active-reference checks below all PASS on aliased ids, and the zod
+  // layouts schema passes trees through as z.unknown while
+  // paneTreeValidation only checks typeof id === 'string' — so without
+  // this check a corrupt-cache state classifies healthy.
+  const seenLeafIds = new Set<string>()
   for (const layout of Object.values(parsed.panes?.layouts ?? {})) {
     if (!isWellFormedPaneTree(layout)) return 'corrupt'
+    if (hasAliasedLeafIds(layout, seenLeafIds)) return 'corrupt'
   }
   // Parse-level salvage drops rows SILENTLY (persistedState.ts salvageTabs
   // :88-102 — one structurally-invalid tab is dropped while the rest parse),
@@ -113,11 +144,19 @@ export function classifyPersistedLayoutHealth(
   // a flush landing in the transient window between addTab and its
   // initLayout classifies 'corrupt' and forces a rebuild; that path is safe
   // (upgrade 1 rebuilds from the window's own snapshot with preserved ids).
-  const parsedTabIds = new Set(
-    (parsed.tabs?.tabs ?? [])
-      .map((t) => (t as { id?: unknown })?.id)
-      .filter((id): id is string => typeof id === 'string'),
-  )
+  // Tab ids must be unique: duplicates survive zTab parsing (z.array does
+  // not reject them) and every other check below passes on aliased ids, but
+  // the in-memory writers mint tab ids uniquely (nanoid in tabsSlice's
+  // addTab/hydrateTabs paths), so a duplicate is corruption by definition.
+  // Empty tab ids are unreachable here (zTab requires min(1), so salvage
+  // drops the row and the raw-count check above classifies it).
+  const parsedTabIds = new Set<string>()
+  for (const t of parsed.tabs?.tabs ?? []) {
+    const id = (t as { id?: unknown })?.id
+    if (typeof id !== 'string') continue
+    if (parsedTabIds.has(id)) return 'corrupt'
+    parsedTabIds.add(id)
+  }
   const layoutTabIds = Object.keys(parsed.panes?.layouts ?? {})
   for (const layoutTabId of layoutTabIds) {
     if (!parsedTabIds.has(layoutTabId)) return 'corrupt'

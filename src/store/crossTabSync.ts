@@ -1,11 +1,12 @@
 import { z } from 'zod'
 import { mergeLocalSettings, resolveLocalSettings } from '@shared/settings'
+import { getSelectedMachineId } from '@/lib/machine-identity'
 import { hydratePanes } from './panesSlice'
 import { setLocalSettings } from './settingsSlice'
 import { setTabRegistryClosedTabRetentionDays } from './tabRegistrySlice'
 import { hydrateTabs } from './tabsSlice'
 import { getPendingBrowserPreferencesWriteState } from './browserPreferencesPersistence'
-import { parsePersistedLayoutRaw, LAYOUT_STORAGE_KEY } from './persistedState'
+import { parsePersistedLayoutRaw, LAYOUT_STORAGE_KEY, type ParsedPersistedLayout } from './persistedState'
 import { getPersistBroadcastSourceId, onPersistBroadcast, PERSIST_BROADCAST_CHANNEL_NAME } from './persistBroadcast'
 import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
 import { BROWSER_PREFERENCES_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY } from './storage-keys'
@@ -145,6 +146,34 @@ function protectCanonicalPaneResumeIdentity(remoteNode: unknown, localLayout: un
   }
 
   return visit(remoteNode)
+}
+
+/** Receiving page's machine id, from the same source the persist stamp uses
+ * (persistMiddleware's selectStampMachineId: store slice first, remembered
+ * selection fallback). */
+function selectReceivingMachineId(store: StoreLike): string | undefined {
+  const known = store.getState()?.machineIdentity?.selectedMachine?.id
+  if (typeof known === 'string' && known) return known
+  return getSelectedMachineId()
+}
+
+/** Foreign-layout guard: the layout storage key and broadcast channel are
+ * origin-wide, so a window on another machine can hydrate its stamped
+ * layout into this page — a later mutation here would then persist a mixed
+ * workspace under THIS machine's stamp. A stamped incoming layout is
+ * ignored unless its machineId equals the receiving page's machine.
+ * Unstamped (legacy) incoming never counts foreign, mirroring the boot
+ * classifier's unstamped-never-foreign rule (layout-health.ts). */
+function isForeignIncomingLayout(store: StoreLike, raw: string): boolean {
+  let parsed: ParsedPersistedLayout | null = null
+  try {
+    parsed = parsePersistedLayoutRaw(raw)
+  } catch {
+    parsed = null
+  }
+  const stamp = parsed?.machineId
+  if (typeof stamp !== 'string' || !stamp) return false
+  return stamp !== selectReceivingMachineId(store)
 }
 
 function dispatchHydrateLayoutFromPersisted(
@@ -327,6 +356,9 @@ export function installCrossTabSync(store: StoreLike): () => void {
   }
 
   const handleIncomingRawDeduped = (key: string, raw: string) => {
+    // Ignore a foreign-machine layout entirely: no dispatch, no dedupe
+    // mark, no authoritative-persistedAt merge (the event is not ours).
+    if (key === LAYOUT_STORAGE_KEY && isForeignIncomingLayout(store, raw)) return
     const previousRaw = lastProcessedRawByKey.get(key)
     if (!tryDedupeAndMark(key, raw)) return
     handleIncomingRaw(store, key, raw, previousRaw, currentLocalLayoutPersistedAt)

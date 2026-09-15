@@ -132,6 +132,53 @@ describe('classifyPersistedLayoutHealth', () => {
     seedEnvelope(envelope)
     expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
   })
+
+  // Duplicate/empty identity corruption (delta review round 1, finding 3):
+  // the raw-count, membership, and active-reference checks all pass on
+  // aliased ids, so a corrupt cache classifies healthy unless uniqueness
+  // is checked explicitly. Legit flushes can never produce duplicates
+  // (reducers mint unique non-empty ids) — duplicates are corruption by
+  // definition. Empty tab ids are unreachable (zTab requires min(1), so
+  // salvage drops the row and the raw-count check catches it); empty pane
+  // leaf ids ARE reachable (paneTreeValidation only checks
+  // typeof id === 'string' and the zod layouts schema passes trees
+  // through as z.unknown).
+  it('returns corrupt when the parsed tabs contain a duplicate tab id', () => {
+    const envelope = healthyEnvelope('machine-1')
+    const tabsSection = envelope.tabs as { tabs: Array<Record<string, unknown>> }
+    tabsSection.tabs = [...tabsSection.tabs, { ...tabsSection.tabs[0] }]
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('returns corrupt when one layout tree carries a duplicate pane leaf id', () => {
+    const envelope = healthyEnvelope('machine-1')
+    const editorContent = () => ({ kind: 'editor', filePath: '/tmp/a.md', language: null, readOnly: false, content: '', viewMode: 'source', wordWrap: true })
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': {
+        type: 'split',
+        id: 'split-1',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          { type: 'leaf', id: 'pane-a', content: editorContent() },
+          { type: 'leaf', id: 'pane-a', content: editorContent() },
+        ],
+      },
+    }
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('returns corrupt when a layout tree carries an empty pane leaf id (reachable per the persisted shape)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': { type: 'leaf', id: '', content: { kind: 'editor', filePath: '/tmp/a.md', language: null, readOnly: false, content: '', viewMode: 'source', wordWrap: true } },
+    }
+    ;(envelope.panes as { activePane: Record<string, string> }).activePane['tab-a'] = ''
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
 })
 
 describe('backfillPersistedLayoutMachineId', () => {

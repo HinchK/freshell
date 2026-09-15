@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest'
 import {
   buildPaneRefreshTarget,
   collectPaneContents,
+  paneContentMatchesSessionRef,
   paneRefreshTargetMatchesContent,
 } from '@/lib/pane-utils'
 import type { PaneNode, PaneContent } from '@/store/paneTypes'
@@ -154,5 +155,48 @@ describe('paneRefreshTargetMatchesContent', () => {
         } as any,
       ),
     ).toBe(false)
+  })
+})
+
+describe('paneContentMatchesSessionRef', () => {
+  const freshAgentContent: PaneContent = {
+    kind: 'fresh-agent',
+    sessionType: 'freshopencode',
+    provider: 'opencode',
+    sessionId: 'sess-1',
+    createRequestId: 'req-1',
+    status: 'idle',
+    sessionRef: { provider: 'opencode', sessionId: 'sess-1' },
+  }
+
+  it('matches a fresh-agent pane by top-level provider+sessionId', () => {
+    expect(paneContentMatchesSessionRef(freshAgentContent, 'opencode', 'sess-1')).toBe(true)
+  })
+
+  it('matches a persisted-shape fresh-agent pane (sessionRef only, no top-level sessionId) by its sessionRef', () => {
+    const { sessionId: _sessionId, ...persistedShape } = freshAgentContent
+    expect(persistedShape).not.toHaveProperty('sessionId')
+    expect(paneContentMatchesSessionRef(persistedShape as PaneContent, 'opencode', 'sess-1')).toBe(true)
+  })
+
+  it('does not match a fresh-agent pane whose live sessionId names a different session, even with a stale sessionRef', () => {
+    const rebound = { ...freshAgentContent, sessionId: 'sess-2' } as PaneContent
+    expect(paneContentMatchesSessionRef(rebound, 'opencode', 'sess-1')).toBe(false)
+  })
+
+  it('does not match a fresh-agent pane when the provider differs', () => {
+    expect(paneContentMatchesSessionRef(freshAgentContent, 'claude', 'sess-1')).toBe(false)
+  })
+
+  it('matches a terminal pane by its sessionRef', () => {
+    const terminalContent: PaneContent = {
+      kind: 'terminal',
+      mode: 'claude',
+      createRequestId: 'req-2',
+      status: 'running',
+      sessionRef: { provider: 'claude', sessionId: 's1' },
+    }
+    expect(paneContentMatchesSessionRef(terminalContent, 'claude', 's1')).toBe(true)
+    expect(paneContentMatchesSessionRef(terminalContent, 'claude', 's2')).toBe(false)
   })
 })

@@ -91,7 +91,8 @@ function sessionTitleDiffers(panes: RootState['panes'], provider: string, sessio
  * (slice name 'panes'; reducers initLayout, updatePaneContent,
  * materializeFreshAgentSession, mergePaneContent,
  * reconcileTerminalSessionRefByTerminalId, splitPane, addPane,
- * restoreLayout, hydratePanes). Real binding paths for the four
+ * restoreLayout, hydratePanes, applyReconcileAttach,
+ * applyFreshAgentReconcileAttach). Real binding paths for the four
  * additions: panes/splitPane — REST/MCP agent split
  * (ui-commands.ts:119-127); panes/addPane — sidebar split-open
  * (Sidebar.tsx:551-562) and tab-registry reconstruction
@@ -99,6 +100,11 @@ function sessionTitleDiffers(panes: RootState['panes'], provider: string, sessio
  * machine-bootstrap/recovery-offer rebuild plan loops
  * (machine-workspace.ts:95, RecoveryOfferPanel.tsx:165);
  * panes/hydratePanes — cross-window hydration (crossTabSync.ts:206-219).
+ * The two reconcile-attach folds are the healthy-reload rebind path: a
+ * persisted fresh-agent pane rehydrates with sessionRef only (persistence
+ * strips the top-level sessionId when a canonical sessionRef exists), and
+ * the pane.reconcile verdict that restores the live session id — or
+ * corrects the pane onto a DIFFERENT session — must re-run the mirror.
  */
 const SESSION_BINDING_PANE_ACTIONS = new Set([
   'panes/initLayout',
@@ -110,6 +116,8 @@ const SESSION_BINDING_PANE_ACTIONS = new Set([
   'panes/addPane',
   'panes/restoreLayout',
   'panes/hydratePanes',
+  'panes/applyReconcileAttach',
+  'panes/applyFreshAgentReconcileAttach',
 ])
 
 /**

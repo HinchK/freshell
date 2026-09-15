@@ -3,6 +3,7 @@ import { configureStore } from '@reduxjs/toolkit'
 
 import tabsReducer, { hydrateTabs } from '../../../../src/store/tabsSlice'
 import panesReducer, { hydratePanes } from '../../../../src/store/panesSlice'
+import machineIdentityReducer, { setMachineReady } from '../../../../src/store/machineIdentitySlice'
 import tabRecencyReducer from '../../../../src/store/tabRecencySlice'
 import settingsReducer, { setLocalSettings, updateSettingsLocal } from '../../../../src/store/settingsSlice'
 import tabRegistryReducer, { setTabRegistrySearchRangeDays } from '../../../../src/store/tabRegistrySlice'
@@ -18,7 +19,7 @@ import {
   resetBrowserPreferencesFlushListenersForTests,
 } from '../../../../src/store/browserPreferencesPersistence'
 import { broadcastPersistedRaw, resetPersistBroadcastForTests } from '../../../../src/store/persistBroadcast'
-import { BROWSER_PREFERENCES_STORAGE_KEY, LAYOUT_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY } from '../../../../src/store/storage-keys'
+import { BROWSER_PREFERENCES_STORAGE_KEY, LAYOUT_STORAGE_KEY, MACHINE_ID_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY } from '../../../../src/store/storage-keys'
 import { resolveLocalSettings } from '@shared/settings'
 import { sessionMetadataKey } from '@/lib/session-metadata'
 
@@ -1692,5 +1693,150 @@ describe('crossTabSync', () => {
       provider: 'claude',
     })
     expect(paneContent.resumeSessionId).toBe(canonicalSessionId)
+  })
+
+  // Machine-stamp guard (delta review round 1, finding 1): the layout
+  // storage key and broadcast channel are origin-wide, so a window on
+  // another machine can hydrate its stamped layout into this page unless
+  // the receiving page compares the stamp against its OWN selected
+  // machine (persistMiddleware's selectStampMachineId source: store
+  // slice first, remembered-selection fallback).
+  function seedLocalTabsAndPanes(store: ReturnType<typeof configureStore>) {
+    store.dispatch(hydrateTabs({
+      tabs: [
+        { id: 't1', title: 'T1', createdAt: 1 },
+        { id: 't2', title: 'T2', createdAt: 2 },
+      ],
+      activeTabId: 't1',
+      renameRequestTabId: null,
+    }))
+    store.dispatch(hydratePanes({
+      layouts: {
+        'tab-1': {
+          type: 'leaf',
+          id: 'pane-local',
+          content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-local', status: 'running' },
+        } as any,
+      },
+      activePane: { 'tab-1': 'pane-local' },
+      paneTitles: {},
+    }))
+  }
+
+  function stampedRemoteRaw(machineId: string | undefined, tabIds: string[] = ['t1', 't2', 't3']): string {
+    return JSON.stringify({
+      version: 3,
+      ...(machineId !== undefined ? { machineId } : {}),
+      tabs: {
+        activeTabId: tabIds[tabIds.length - 1],
+        tabs: tabIds.map((id, index) => ({ id, title: id.toUpperCase(), createdAt: index + 1 })),
+      },
+      panes: {
+        version: 6,
+        layouts: {
+          'tab-1': {
+            type: 'split',
+            id: 'split-remote',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              { type: 'leaf', id: 'pane-a', content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-a', status: 'running' } },
+              { type: 'leaf', id: 'pane-b', content: { kind: 'browser', url: 'https://example.com', devToolsOpen: false } },
+            ],
+          },
+        },
+        activePane: { 'tab-1': 'pane-a' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    })
+  }
+
+  function machineReadyAction(machineId: string) {
+    return setMachineReady({
+      machine: { id: machineId, label: machineId, createdAt: 1, lastSeenAt: 1 },
+      mode: 'server-managed',
+    })
+  }
+
+  it('hydrates a machine-stamped incoming layout when the stamp matches the receiving store\u2019s selected machine (tabs AND panes)', () => {
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer, machineIdentity: machineIdentityReducer },
+    })
+    store.dispatch(machineReadyAction('machine-1'))
+    seedLocalTabsAndPanes(store)
+
+    cleanups.push(installCrossTabSync(store as any))
+
+    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: stampedRemoteRaw('machine-1') }))
+
+    expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['t1', 't2', 't3'])
+    expect(store.getState().panes.layouts['tab-1']?.id).toBe('split-remote')
+  })
+
+  it('ignores a machine-stamped incoming layout from a different machine — no tabs and no panes hydrate', () => {
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer, machineIdentity: machineIdentityReducer },
+    })
+    store.dispatch(machineReadyAction('machine-1'))
+    seedLocalTabsAndPanes(store)
+
+    cleanups.push(installCrossTabSync(store as any))
+
+    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: stampedRemoteRaw('machine-OTHER') }))
+
+    expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['t1', 't2'])
+    expect(store.getState().tabs.activeTabId).toBe('t1')
+    expect(store.getState().panes.layouts['tab-1']?.id).toBe('pane-local')
+    expect((store.getState().panes.layouts['tab-1'] as any)?.content?.createRequestId).toBe('req-local')
+    expect(store.getState().panes.activePane['tab-1']).toBe('pane-local')
+  })
+
+  it('hydrates an unstamped (legacy) incoming layout — the stamp guard never counts unstamped foreign', () => {
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer, machineIdentity: machineIdentityReducer },
+    })
+    store.dispatch(machineReadyAction('machine-1'))
+    seedLocalTabsAndPanes(store)
+
+    cleanups.push(installCrossTabSync(store as any))
+
+    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: stampedRemoteRaw() }))
+
+    expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['t1', 't2', 't3'])
+    expect(store.getState().panes.layouts['tab-1']?.id).toBe('split-remote')
+  })
+
+  it('ignores a machine-stamped incoming layout when the receiving page has no selected machine id at all', () => {
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+    })
+    seedLocalTabsAndPanes(store)
+
+    cleanups.push(installCrossTabSync(store as any))
+
+    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: stampedRemoteRaw('machine-1') }))
+
+    expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['t1', 't2'])
+    expect(store.getState().panes.layouts['tab-1']?.id).toBe('pane-local')
+  })
+
+  it('guards by the remembered machine selection when the store slice has not resolved yet (getSelectedMachineId fallback)', () => {
+    localStorage.setItem(MACHINE_ID_STORAGE_KEY, 'machine-1')
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+    })
+    seedLocalTabsAndPanes(store)
+
+    cleanups.push(installCrossTabSync(store as any))
+
+    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: stampedRemoteRaw('machine-1') }))
+    expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['t1', 't2', 't3'])
+    expect(store.getState().panes.layouts['tab-1']?.id).toBe('split-remote')
+
+    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: stampedRemoteRaw('machine-OTHER', ['t1', 't2', 't4']) }))
+    expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['t1', 't2', 't3'])
+    expect(store.getState().panes.layouts['tab-1']?.id).toBe('split-remote')
   })
 })
