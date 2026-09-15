@@ -3042,6 +3042,33 @@ mod race_tracing_capture {
         let guard = tracing::subscriber::set_default(subscriber);
         (events, guard)
     }
+
+    /// b8ke ext r24 F2: the PROCESS-GLOBAL capture — installed once via
+    /// `set_global_default`, it sees EVERY thread's events with no
+    /// thread-attribution race. The thread-local [`capture`] is fragile
+    /// under libtest's parallel execution for PRESENCE assertions: the
+    /// events the test just drove intermittently miss the capture (~50%
+    /// under parallel load, always green serial/isolated), while the
+    /// established ABSENCE assertions (d4-F4) are immune to a capture
+    /// that saw nothing. Tests filter by their unique session id; a
+    /// thread-local `set_default` still wins on its own thread, so every
+    /// other test's captures are unchanged.
+    static GLOBAL_EVENTS: std::sync::OnceLock<Arc<Mutex<Vec<CapturedEvent>>>> =
+        std::sync::OnceLock::new();
+
+    pub fn global_events() -> Arc<Mutex<Vec<CapturedEvent>>> {
+        GLOBAL_EVENTS
+            .get_or_init(|| {
+                let events: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+                let layer = CaptureLayer {
+                    events: Arc::clone(&events),
+                };
+                let subscriber = tracing_subscriber::registry().with(layer);
+                let _ = tracing::subscriber::set_global_default(subscriber);
+                events
+            })
+            .clone()
+    }
 }
 
 /// The first captured `freshell_ownership` event with this name (R7's
@@ -5639,13 +5666,12 @@ async fn an_attach_while_a_fresh_agent_owns_answers_the_typed_fresh_owner_confli
     // NO attach.ready for the refused attach (a bounded drain finds none).
     let deadline = tokio::time::Instant::now() + Duration::from_millis(750);
     while tokio::time::Instant::now() < deadline {
-        if let Ok(Some(Ok(msg))) = tokio::time::timeout(Duration::from_millis(250), ws.next()).await
+        if let Ok(Some(Ok(WsMessage::Text(text)))) =
+            tokio::time::timeout(Duration::from_millis(250), ws.next()).await
         {
-            if let WsMessage::Text(text) = msg {
-                let v: Value = serde_json::from_str(&text).unwrap();
-                if v["type"] == "terminal.attach.ready" && v["terminalId"] == json!(terminal_id) {
-                    panic!("no attach.ready may follow the typed conflict: {v}");
-                }
+            let v: Value = serde_json::from_str(&text).unwrap();
+            if v["type"] == "terminal.attach.ready" && v["terminalId"] == json!(terminal_id) {
+                panic!("no attach.ready may follow the typed conflict: {v}");
             }
         }
     }
@@ -5780,14 +5806,12 @@ async fn an_attach_while_a_different_terminal_owns_answers_the_typed_other_termi
     // NO attach.ready for the refused attach.
     let deadline = tokio::time::Instant::now() + Duration::from_millis(750);
     while tokio::time::Instant::now() < deadline {
-        if let Ok(Some(Ok(msg))) =
+        if let Ok(Some(Ok(WsMessage::Text(text)))) =
             tokio::time::timeout(Duration::from_millis(250), ws_a.next()).await
         {
-            if let WsMessage::Text(text) = msg {
-                let v: Value = serde_json::from_str(&text).unwrap();
-                if v["type"] == "terminal.attach.ready" && v["terminalId"] == json!(terminal_a) {
-                    panic!("no attach.ready may follow the typed conflict: {v}");
-                }
+            let v: Value = serde_json::from_str(&text).unwrap();
+            if v["type"] == "terminal.attach.ready" && v["terminalId"] == json!(terminal_a) {
+                panic!("no attach.ready may follow the typed conflict: {v}");
             }
         }
     }
@@ -5814,7 +5838,11 @@ async fn an_attach_while_a_different_terminal_owns_answers_the_typed_other_termi
 /// "ws-kill-<terminalId>" (the TARGET, not the initiator).
 #[tokio::test]
 async fn the_attach_guard_and_kill_transitions_record_the_connection_device_identity() {
-    let (events, _capture_guard) = race_tracing_capture::capture();
+    // The PROCESS-GLOBAL capture (not the thread-local): the assertion is a
+    // PRESENCE check, and the thread-local default is racy under libtest's
+    // parallel execution — the global layer sees every thread's events and
+    // the unique session id isolates this test's transitions.
+    let events = race_tracing_capture::global_events();
     let (url, _registry, ws_state) = spawn_server().await;
     let mut ws = connect_with_device(&url, "device-r24-f2").await;
     let (terminal_id, sid) = r24_negotiated_create(&mut ws, "req-r24-f2-identity").await;
@@ -5869,12 +5897,20 @@ async fn the_attach_guard_and_kill_transitions_record_the_connection_device_iden
         .collect();
     assert!(
         !armed.is_empty(),
-        "the attach guard armed (the event exists for {sid}): total armed events = {}",
+        "the attach guard armed (the event exists for {sid}): total armed events = {}, \
+         total captured events = {}, ownership events = {}",
         events
             .lock()
             .expect("capture lock")
             .iter()
             .filter(|e| e.event == "ownership.attach_guard.armed")
+            .count(),
+        events.lock().expect("capture lock").len(),
+        events
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .filter(|e| e.target == "freshell_ownership")
             .count()
     );
     for e in &armed {
@@ -5924,7 +5960,7 @@ async fn the_attach_guard_and_kill_transitions_record_the_connection_device_iden
     }
 }
 
-/// b8ke ext r9 F2: the commit verifies the PTY is alive at commit time ─────
+// ── b8ke ext r9 F2: the commit verifies the PTY is alive at commit time ─────
 
 /// An instantly-dying claude spec (the fast-failing exact-resume shape —
 /// exits before the settle's binding/registration work can finish).

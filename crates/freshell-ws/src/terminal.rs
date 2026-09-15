@@ -1340,7 +1340,7 @@ async fn handle_client_text(
                         // b8ke ext r24 F2: the connection's real device/client
                         // identity — never the constant lane label, so the
                         // structured coordinator records name the initiator.
-                        &connection_initiator("ws-terminal-attach", conn_id, &conn_identity),
+                        &connection_initiator("ws-terminal-attach", conn_id, conn_identity),
                     ) {
                         freshell_ownership::AttachGuardOutcome::Armed(guard) => {
                             attach_guard = Some(guard);
@@ -1531,7 +1531,7 @@ async fn handle_client_text(
                 kill,
                 ws_tx,
                 state,
-                &connection_initiator("ws-kill", conn_id, &conn_identity),
+                &connection_initiator("ws-kill", conn_id, conn_identity),
             )
             .await
         }
