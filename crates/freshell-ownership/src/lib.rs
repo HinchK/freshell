@@ -5599,13 +5599,6 @@ mod tests {
         ));
     }
 
-    /// b8ke focused episode-2 round-2 F1: the atomic re-key — a start's
-    /// `Starting{op}` record under the OLD key moves to the NEW key as
-    /// `Live{owner}` in ONE registry step: never both-Live, never
-    /// both-Vacant, no half-moved record. The claude rollback's fork uses
-    /// this to put ownership under the client-visible new durable id; the
-    /// old key replays Vacant so stale divergence clears. A foreign record
-    /// under the TARGET key is the typed refusal — never an overwrite.
     // ── b8ke ext r23 F1: the placeholder→durable coordinator alias ────────
 
     /// b8ke ext r23 F1: `alias_vacant_key` creates an `Aliased{to}` record
@@ -5676,6 +5669,13 @@ mod tests {
         ));
     }
 
+    /// b8ke focused episode-2 round-2 F1: the atomic re-key — a start's
+    /// `Starting{op}` record under the OLD key moves to the NEW key as
+    /// `Live{owner}` in ONE registry step: never both-Live, never
+    /// both-Vacant, no half-moved record. The claude rollback's fork uses
+    /// this to put ownership under the client-visible new durable id; the
+    /// old key replays Vacant so stale divergence clears. A foreign record
+    /// under the TARGET key is the typed refusal — never an overwrite.
     #[test]
     fn commit_live_rekey_moves_the_record_atomically() {
         let r = RuntimeOwnershipRegistry::new();
