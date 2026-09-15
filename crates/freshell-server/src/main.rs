@@ -1683,7 +1683,9 @@ async fn main() -> ExitCode {
                 tracing::warn!(
                     provider = %provider,
                     stale_session_id = %stale_id,
-                    "resume validation (REST): cached session missing on disk; spawning fresh"
+                    "resume validation (REST): cached session missing on disk; the row is \
+                     retired as missing and the create answers the typed SESSION_MISSING — \
+                     nothing is spawned"
                 );
                 let _ = ledger.retire_missing(provider, stale_id);
             })
