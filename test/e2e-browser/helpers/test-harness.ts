@@ -175,8 +175,11 @@ export class TestHarness {
    * passed as waitForFunction's OPTIONS (third argument) — the historical
    * two-arg call bound the timeout object to the predicate's argument,
    * making every explicit window decorative (the LB-1 defect class,
-   * fixed here in delta review r5). */
-  async waitForHarness(timeoutMs = 15_000): Promise<void> {
+   * fixed in delta review r5). The default is 30_000 — the HISTORICAL
+   * EFFECTIVE window, not the old decorative 15s: the binding bug made
+   * every call run on Playwright's 30s default, and fixing the binding
+   * must never shrink any caller's effective window (delta review r6). */
+  async waitForHarness(timeoutMs = 30_000): Promise<void> {
     await this.page.waitForFunction(
       () => !!window.__FRESHELL_TEST_HARNESS__,
       undefined,
@@ -556,19 +559,30 @@ function isTimeoutError(err: unknown): boolean {
 }
 
 /**
- * Whether the page's harness state shows a created tab or pane layout —
- * the in-page predicate for the post-click-timeout creation probe. Must
- * stay self-contained serializable (Playwright ships its source): reads
- * only the harness state contract (tabs.tabs array, panes.layouts map).
+ * Whether the page's harness state shows a TERMINAL-content pane — the
+ * in-page predicate for the post-click-timeout creation probe (delta
+ * reviews r5+r6). Must stay self-contained serializable (Playwright ships
+ * its source). The signal is deliberately NOT "any tab or layout exists":
+ * Freshell creates the initial tab and its picker pane BEFORE
+ * selectShellFromPicker runs, so only a terminal-content leaf (what a
+ * fresh-boot pick uniquely creates) distinguishes a late-dispatched click
+ * from the pre-existing picker state. Exported for direct unit testing
+ * against real state shapes.
  */
-function paneCreationProbePredicate(): boolean {
+export function paneCreationProbePredicate(): boolean {
   const state = window.__FRESHELL_TEST_HARNESS__?.getState?.() as unknown as
-    | { tabs?: { tabs?: unknown[] }; panes?: { layouts?: Record<string, unknown> } }
+    | { panes?: { layouts?: Record<string, unknown> } }
     | undefined
   if (!state) return false
-  const tabCount = state.tabs?.tabs?.length ?? 0
-  const layoutCount = Object.keys(state.panes?.layouts ?? {}).length
-  return tabCount > 0 || layoutCount > 0
+  const layouts = state.panes?.layouts ?? {}
+  const hasTerminalPane = (node: unknown): boolean => {
+    if (node == null || typeof node !== 'object') return false
+    const n = node as { type?: string; content?: { kind?: string }; children?: unknown[] }
+    if (n.type === 'leaf') return n.content?.kind === 'terminal'
+    if (Array.isArray(n.children)) return n.children.some(hasTerminalPane)
+    return false
+  }
+  return Object.values(layouts).some(hasTerminalPane)
 }
 
 /**

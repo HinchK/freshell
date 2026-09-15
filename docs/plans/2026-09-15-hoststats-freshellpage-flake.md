@@ -38,7 +38,7 @@
 - A budget that covers the evidence-shaped envelope must not silently become a per-test entitlement: assertions and waits inside test bodies keep their own explicit timeouts.
 - The other three baseline flakes (kata 38hj `restore-contract-wall-rust.spec.ts:579`, kata 5kyg `recover-my-panes-rust.spec.ts:733`, kata ebp6 `reconcile-client-adoption-rust.spec.ts:542`) are pre-existing failures at base_ref 39192e8aa and stay out of scope; they are the campaign's next one-test-at-a-time steps.
 - The gVisor wedge and container-slowness episodes are infra-layer and cannot be deterministically forced; acceptance evidence is (a) the budget arithmetic and total-deadline coherence (unit-pinned), (b) the contract spec proving the wiring under the env-present path, (c) the picker loop's new contract (unit-pinned: no escalation after a successful click; the render wait receives `SHELL_RENDER_TIMEOUT_MS`; loud timeout; non-timeout click errors propagate; and — delta r5 — a click timeout followed by a late-dispatched create joins the success path, a click timeout with nothing created advances, and probe hard errors propagate), and (d) zero-flake cloud receipts for the affected spec at the committed HEAD.
-- Accepted residuals, deliberately out of scope (recorded so the reviewer sees conscious scoping): (a) the client's timeout-less boot fetches (App.tsx:1691-1753, api.ts:181) remain unbounded — that product-level hardening is the qq5m flake class, tracked by its own kata and later campaign runs; the fixes here make single infra episodes survivable without it. (b) The budget covers the fixture chain's permitted composition but not unbounded TEST-BODY work (bodies keep their own declared/explicit timeouts) and not the goto/waitForHarness maxima — both fail with their own distinct timeout signatures long before the outer deadline, never the "while setting up freshellPage" signature this run eliminates. (c) `waitForHarness`'s decorative 15s (real 30s) was an LB-1-class two-argument binding bug FIXED by this run (delta review r5, alongside the unlimited-deadline hang hazard): the committed call is the three-argument form with the timeout as waitForFunction's options. (d) Raw-base specs that import `test` from `@playwright/test` directly and boot the app in-body (terminal-escape-key-rust, cli-rust, silent-input-loss-rust, sidebar-registry-sync-rust, sidebar-remote-status-rings-rust, sidebar-status-tier-sort-rust, diag03-rotation-redaction-rust — load-bearing LB-B2) never resolve `e2eMachineId`; they keep the same 60s deadline they have today. This run does not regress them and does not cover them; they are tracked by kata j96j and addressed by a later campaign step.
+- Accepted residuals, deliberately out of scope (recorded so the reviewer sees conscious scoping): (a) the client's timeout-less boot fetches (App.tsx:1691-1753, api.ts:181) remain unbounded — that product-level hardening is the qq5m flake class, tracked by its own kata and later campaign runs; the fixes here make single infra episodes survivable without it. (b) The budget covers the fixture chain's permitted composition but not unbounded TEST-BODY work (bodies keep their own declared/explicit timeouts) and not the goto/waitForHarness maxima — both fail with their own distinct timeout signatures long before the outer deadline, never the "while setting up freshellPage" signature this run eliminates. (c) `waitForHarness`'s decorative 15s (real 30s) was an LB-1-class two-argument binding bug FIXED by this run (delta reviews r5+r6): the committed call is the three-argument form with the timeout as waitForFunction's options, and the DEFAULT is 30_000 — the historical EFFECTIVE window — so honoring the binding shrinks no caller (the old decorative 15s, honored for real, would have halved every no-arg caller's window). The one explicit-argument call site (perf/run-sample.ts) passes 30_000, equal to its historical effective window. (d) Raw-base specs that import `test` from `@playwright/test` directly and boot the app in-body (terminal-escape-key-rust, cli-rust, silent-input-loss-rust, sidebar-registry-sync-rust, sidebar-remote-status-rings-rust, sidebar-status-tier-sort-rust, diag03-rotation-redaction-rust — load-bearing LB-B2) never resolve `e2eMachineId`; they keep the same 60s deadline they have today. This run does not regress them and does not cover them; they are tracked by kata j96j and addressed by a later campaign step.
 - The full e2e lane at the run HEAD is part of this run's final gate (`npm run test:e2e`, cloud backend); PR checks do not run e2e on this repo, so the lane must be run explicitly.
 
 ---
@@ -635,8 +635,10 @@ test.describe('declared budgets smaller than the wedge budget', () => {
 // untouched on both lanes. Resolves ONLY e2eMachineId — the fixture the
 // guard lives in — so the unlimited deadline never wraps a full page
 // boot (goto/picker chains whose wedges could otherwise hang the cloud
-// task to its own kill timer; delta review r5). The registration fetch
-// is independently bounded (AbortSignal) inside the fixture.
+// task to its own kill timer; delta review r5). Under the unlimited
+// deadline the fixture bounds its registration fetch (60s AbortSignal);
+// under every finite deadline the fetch keeps its pre-run unbounded
+// behavior (the test deadline itself bounds it — delta review r6).
 test.describe('declared unlimited (0) deadline', () => {
   test.beforeEach(() => {
     test.setTimeout(0)
@@ -723,16 +725,34 @@ In `test/e2e-browser/helpers/fixtures.ts`: extend the existing import from `'./t
   },
 ```
 
-And in the same module, bound the registration fetch (delta review r5 — an unbounded fetch would be the only un-wedge-limited operation left in a test chain whose deadline is unlimited; the contract spec's declared-0 pin resolves exactly this fixture):
+And in the same module, bound the registration fetch CONDITIONALLY (delta reviews r5+r6 — an unbounded fetch is un-killable only under an unlimited test deadline; a finite deadline already bounds it, because Playwright aborts fixture resolution at the deadline, and an unconditional private bound would be a NEW setup-flake vector inside the FIRST fixture every freshellPage test resolves, with no retry to survive the documented 40-60s container/loopback stall class):
 
 ```ts
-  const created = await fetch(`${serverInfo.baseUrl}/api/machines`, {
-    method: 'POST',
-    headers: { ...headers, 'content-type': 'application/json' },
-    body: JSON.stringify({ label }),
-    signal: AbortSignal.timeout(30_000),
+  // registerE2eMachine gains an opts param (unbounded by default):
+  export async function registerE2eMachine(
+    serverInfo: E2eServerInfo,
+    label = `Playwright test machine ${Date.now()}`,
+    opts: { fetchTimeoutMs?: number } = {},
+  ): Promise<E2eMachine> {
+    // ...
+    const created = await fetch(`${serverInfo.baseUrl}/api/machines`, {
+      method: 'POST',
+      headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ label }),
+      ...(opts.fetchTimeoutMs !== undefined
+        ? { signal: AbortSignal.timeout(opts.fetchTimeoutMs) }
+        : {}),
+    })
+  }
+
+  // The e2eMachineId fixture bounds it ONLY under an unlimited deadline:
+  const machine = await registerE2eMachine(testServer.info, undefined, {
+    fetchTimeoutMs: test.info().timeout === 0 ? 60_000 : undefined,
   })
+  await use(machine.id)
 ```
+
+The 60s bound is generous beyond every documented stall episode in this run's receipts; under a genuine wedge the unlimited-deadline pin fails loudly at 60s instead of hanging the cloud task to its own kill timer. Finite-deadline tests keep their exact pre-run behavior. The abort-fires path is not unit-tested: exercising it would require an artificially wedged server (a mock would test the mock); the bounded path itself is exercised by the unlimited pin's resolution on every run of the contract spec.
 
 - [ ] **Step 4: Run the focused test**
 
@@ -782,7 +802,7 @@ git commit -m "test(e2e): extend the per-test deadline to the cloud wedge budget
 
 **Interfaces:**
 - Consumes: `Page` (type-only).
-- Produces: `SHELL_RENDER_TIMEOUT_MS: number` (60_000), `SHELL_PROBE_TIMEOUT_MS: number` (5_000, delta review r5), and `selectShellFromPicker(page: Page): Promise<void>` with the contract: (a) early returns unchanged (xterm already visible, or appears during the 500ms stabilization wait); (b) a click that fails with Playwright's `TimeoutError` does NOT prove the handler never ran (the timeout spans every click stage): the picker probes for a created tab/pane in the harness state within `SHELL_PROBE_TIMEOUT_MS` — a late dispatch joins the success path (d), and only a confirmed nothing-created advances to the next shell name (the historical detachment-race advance, now dispatch-safe; delta review r5); (c) a click (or probe) that fails with ANY non-timeout error (page closed, test interrupted, unexpected errors) propagates — loud, never swallowed; (d) a SUCCESSFUL click never escalates: it waits up to `SHELL_RENDER_TIMEOUT_MS` for `.xterm` to become visible and on timeout throws a diagnostic error naming the clicked shell and the wait; (e) the every-option-confirmed-absent fall-through contract is preserved (returns normally).
+- Produces: `SHELL_RENDER_TIMEOUT_MS: number` (60_000), `SHELL_PROBE_TIMEOUT_MS: number` (5_000, delta review r5), and `selectShellFromPicker(page: Page): Promise<void>` with the contract: (a) early returns unchanged (xterm already visible, or appears during the 500ms stabilization wait); (b) a click that fails with Playwright's `TimeoutError` does NOT prove the handler never ran (the timeout spans every click stage): the picker probes for a TERMINAL-content pane in the harness state within `SHELL_PROBE_TIMEOUT_MS` — the only state a fresh-boot pick uniquely creates, since the initial tab and its picker pane already exist before the picker leg runs (delta review r6: an any-tab/any-layout signal is always true on fresh boot and would misroute absent options into the 60s render wait). A late dispatch joins the success path (d); only a confirmed nothing-created advances to the next shell name (the historical detachment-race advance, now dispatch-safe; delta reviews r5+r6); (c) a click (or probe) that fails with ANY non-timeout error (page closed, test interrupted, unexpected errors) propagates — loud, never swallowed; (d) a SUCCESSFUL click never escalates: it waits up to `SHELL_RENDER_TIMEOUT_MS` for `.xterm` to become visible and on timeout throws a diagnostic error naming the clicked shell and the wait; (e) the every-option-confirmed-absent fall-through contract is preserved (returns normally).
 
 **Why this is required scope (not residual):** the retained trace (validator LB-C, `reports/load-bearing-validator-LB-C.md`) proves the recorded tg4e failure was exactly this conflation: after a successful Shell click (terminal created server-side, active, `hasClients:true`), the 30s `.xterm` render wait failed under container-wide CPU contention, and the loop escalated into WSL/CMD — options absent on the Linux picker — silently burning the remaining budget until the 60s deadline (and double-creating terminals whenever escalation reaches an option that exists, e.g. Bash). The budget fix alone does not survive this episode class; the loop's semantics are the defect.
 
@@ -914,6 +934,7 @@ Expected: the moved-but-unfixed implementation produces multiple BEHAVIORAL fail
 - `falls through silently only when every option is not clickable` PASSES (that is the current behavior too — it stays).
 - The already-visible and mid-wait-recheck tests PASS (early-return behavior is unchanged by the fix).
 - `a not-clickable option ... advances to the next shell` PASSES against the moved pre-fix loop (advance-on-timeout without a probe is the historical behavior) but the delta-r5 probe rows RED against it: `a click timeout with a LATE DISPATCH ... is treated as the success path` FAILs (the pre-probe loop escalates — `clicks` grows past `['Shell']`), `a click timeout with NOTHING created advances ... and every advance probes once` FAILs (`probeWaits` is empty — no probe call exists), and `a probe hard error (page closed) propagates loudly` FAILs (the pre-probe loop swallows the whole click-timeout path and falls through silently).
+- The `paneCreationProbePredicate semantics` describe (delta review r6) executes the REAL exported predicate against stubbed harness states — fresh-boot picker state false, terminal pane true, split-tree recursion, picker-only split false, missing harness false — so the probe's state-shape contract is pinned independently of the flow fakes (the fakes exercise the picker LOOP's use of the probe; the semantics tests prove what the probe itself answers in the states Freshell really boots into).
 
 - [ ] **Step 3: Add the minimal production implementation (replace the moved function's loop with the fixed contract)**
 
@@ -966,19 +987,30 @@ function isTimeoutError(err: unknown): boolean {
 }
 
 /**
- * Whether the page's harness state shows a created tab or pane layout —
- * the in-page predicate for the post-click-timeout creation probe. Must
- * stay self-contained serializable (Playwright ships its source): reads
- * only the harness state contract (tabs.tabs array, panes.layouts map).
+ * Whether the page's harness state shows a TERMINAL-content pane —
+ * the in-page predicate for the post-click-timeout creation probe (delta
+ * reviews r5+r6). Must stay self-contained serializable (Playwright ships
+ * its source). The signal is deliberately NOT "any tab or layout exists":
+ * Freshell creates the initial tab and its picker pane BEFORE
+ * selectShellFromPicker runs, so only a terminal-content leaf (what a
+ * fresh-boot pick uniquely creates) distinguishes a late-dispatched click
+ * from the pre-existing picker state. Exported for direct unit testing
+ * against real state shapes.
  */
-function paneCreationProbePredicate(): boolean {
+export function paneCreationProbePredicate(): boolean {
   const state = window.__FRESHELL_TEST_HARNESS__?.getState?.() as unknown as
-    | { tabs?: { tabs?: unknown[] }; panes?: { layouts?: Record<string, unknown> } }
+    | { panes?: { layouts?: Record<string, unknown> } }
     | undefined
   if (!state) return false
-  const tabCount = state.tabs?.tabs?.length ?? 0
-  const layoutCount = Object.keys(state.panes?.layouts ?? {}).length
-  return tabCount > 0 || layoutCount > 0
+  const layouts = state.panes?.layouts ?? {}
+  const hasTerminalPane = (node: unknown): boolean => {
+    if (node == null || typeof node !== 'object') return false
+    const n = node as { type?: string; content?: { kind?: string }; children?: unknown[] }
+    if (n.type === 'leaf') return n.content?.kind === 'terminal'
+    if (Array.isArray(n.children)) return n.children.some(hasTerminalPane)
+    return false
+  }
+  return Object.values(layouts).some(hasTerminalPane)
 }
 
 /**

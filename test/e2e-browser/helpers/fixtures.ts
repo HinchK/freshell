@@ -32,21 +32,29 @@ export interface E2eMachine {
   label: string
 }
 
-/** Register a machine the Rust server will accept before an isolated context boots.
- * The registration fetch is independently bounded (delta review r5): an
- * unbounded fetch would be the only un-wedged-limited operation left in a
- * test chain whose deadline is unlimited (the contract spec's declared-0
- * pin resolves exactly this fixture). */
+/** Register a machine the Rust server will accept before an isolated context
+ * boots. The registration fetch is unbounded by default (delta reviews
+ * r5+r6): a finite test deadline already bounds it — Playwright aborts
+ * fixture resolution at the deadline — and an unconditional private bound
+ * would be a NEW setup-flake vector inside the first fixture every
+ * freshellPage test resolves (the documented container/loopback stall
+ * class outlives any tight bound with no retry to save it). The one
+ * caller that must bound it is the unlimited-deadline contract pin: it
+ * passes opts.fetchTimeoutMs so a wedged registration fails loudly in
+ * bounded time instead of hanging the cloud task to its own kill timer. */
 export async function registerE2eMachine(
   serverInfo: E2eServerInfo,
   label = `Playwright test machine ${Date.now()}`,
+  opts: { fetchTimeoutMs?: number } = {},
 ): Promise<E2eMachine> {
   const headers = { 'x-auth-token': serverInfo.token }
   const created = await fetch(`${serverInfo.baseUrl}/api/machines`, {
     method: 'POST',
     headers: { ...headers, 'content-type': 'application/json' },
     body: JSON.stringify({ label }),
-    signal: AbortSignal.timeout(30_000),
+    ...(opts.fetchTimeoutMs !== undefined
+      ? { signal: AbortSignal.timeout(opts.fetchTimeoutMs) }
+      : {}),
   })
   if (!created.ok) {
     throw new Error(`Could not create E2E machine: HTTP ${created.status}`)
@@ -240,7 +248,19 @@ export const test = base.extend<{
     ) {
       test.info().setTimeout(cloudBudgetMs)
     }
-    await use((await registerE2eMachine(testServer.info)).id)
+    // Bound the registration fetch ONLY under an unlimited (0) test
+    // deadline (delta reviews r5+r6): finite-deadline tests keep their
+    // exact pre-run behavior (the deadline itself bounds resolution —
+    // a private unconditional bound would be a new setup-flake vector
+    // inside this, the FIRST fixture every freshellPage test resolves);
+    // under unlimited there is no deadline to bound anything, so the
+    // generous 60s bound (beyond every documented stall episode in this
+    // run's receipts) makes a wedge fail loudly instead of hanging the
+    // cloud task to its own kill timer.
+    const machine = await registerE2eMachine(testServer.info, undefined, {
+      fetchTimeoutMs: test.info().timeout === 0 ? 60_000 : undefined,
+    })
+    await use(machine.id)
   },
 
   serverInfo: async ({ testServer }, use) => {

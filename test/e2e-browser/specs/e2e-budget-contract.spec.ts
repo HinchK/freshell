@@ -70,8 +70,10 @@ test.describe('declared budgets smaller than the wedge budget', () => {
 // untouched on both lanes. Resolves ONLY e2eMachineId — the fixture the
 // guard lives in — so the unlimited deadline never wraps a full page
 // boot (goto/picker chains whose wedges could otherwise hang the cloud
-// task to its own kill timer; delta review r5). The registration fetch
-// is independently bounded (AbortSignal) inside the fixture.
+// task to its own kill timer; delta review r5). Under the unlimited
+// deadline the fixture bounds its registration fetch (60s AbortSignal);
+// under every finite deadline the fetch keeps its pre-run unbounded
+// behavior (the test deadline itself bounds it — delta review r6).
 test.describe('declared unlimited (0) deadline', () => {
   test.beforeEach(() => {
     test.setTimeout(0)

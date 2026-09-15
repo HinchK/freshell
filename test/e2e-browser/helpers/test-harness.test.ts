@@ -4,6 +4,7 @@ import {
   CLOUD_LANE_START_RESERVE_MS,
   DEFAULT_TEST_TIMEOUT_MS,
   DEFAULT_WS_READY_TIMEOUT_MS,
+  paneCreationProbePredicate,
   SHELL_CLICK_TIMEOUT_MS,
   SHELL_NAMES,
   SHELL_PICKER_SETTLE_MS,
@@ -239,6 +240,16 @@ describe('TestHarness.waitForConnection timeout wiring', () => {
     expect(calls[0][1]).toBeUndefined()
     expect(calls[0][2]).toEqual({ timeout: 15_000 })
   })
+
+  it('waitForHarness default keeps the HISTORICAL EFFECTIVE window: 30s, not the decorative 15s (delta review r6)', async () => {
+    // Honoring the old decorative 15s default for real would HALVE every
+    // no-arg caller's effective window vs. the pre-run state — the bug made
+    // the real window Playwright's 30s default. Fixing the binding must not
+    // shrink anyone: the default IS the historical effective window.
+    const { page, calls } = fakePage()
+    await new TestHarness(page).waitForHarness()
+    expect(calls[0][2]).toEqual({ timeout: 30_000 })
+  })
 })
 
 describe('TestHarness.waitForConnection wedge-tolerant self-heal (opt-in)', () => {
@@ -385,6 +396,85 @@ describe('TestHarness.waitForConnection wedge-tolerant self-heal (opt-in)', () =
     // floor(1/2) = 0 would hand Playwright an UNLIMITED phase-1 window —
     // the absolute-deadline contract would be void. Clamp to >= 1ms.
     expect(calls[0][2]).toEqual({ timeout: 1 })
+  })
+})
+
+describe('paneCreationProbePredicate semantics (delta review r6 — the real predicate, not a fake)', () => {
+  /** The fresh-boot state: ONE tab whose single leaf is the picker pane —
+   * the state Freshell creates BEFORE selectShellFromPicker runs. The r5
+   * predicate (any tab OR any layout) was ALWAYS TRUE here, so an absent
+   * option was misclassified as a late dispatch and burned the 60s render
+   * wait instead of advancing. The predicate must be false in exactly
+   * this shape. */
+  const stubHarness = (state: unknown) => {
+    vi.stubGlobal('window', { __FRESHELL_TEST_HARNESS__: { getState: () => state } })
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('is FALSE on the fresh-boot picker state (initial tab + picker leaf, no terminal pane)', () => {
+    stubHarness({
+      tabs: { tabs: [{ id: 't1' }] },
+      panes: { layouts: { t1: { type: 'leaf', id: 'p1', content: { kind: 'picker' } } } },
+    })
+    expect(paneCreationProbePredicate()).toBe(false)
+  })
+
+  it('is TRUE once a terminal pane exists (the late-dispatched pick)', () => {
+    stubHarness({
+      tabs: { tabs: [{ id: 't1' }] },
+      panes: { layouts: { t1: { type: 'leaf', id: 'p1', content: { kind: 'terminal' } } } },
+    })
+    expect(paneCreationProbePredicate()).toBe(true)
+  })
+
+  it('walks split trees: a terminal pane nested under a split is found', () => {
+    stubHarness({
+      tabs: { tabs: [{ id: 't1' }] },
+      panes: {
+        layouts: {
+          t1: {
+            type: 'split',
+            id: 's1',
+            direction: 'horizontal',
+            sizes: [0.5, 0.5],
+            children: [
+              { type: 'leaf', id: 'p1', content: { kind: 'picker' } },
+              { type: 'leaf', id: 'p2', content: { kind: 'terminal' } },
+            ],
+          },
+        },
+      },
+    })
+    expect(paneCreationProbePredicate()).toBe(true)
+  })
+
+  it('is FALSE for a split tree of picker-only panes', () => {
+    stubHarness({
+      tabs: { tabs: [{ id: 't1' }] },
+      panes: {
+        layouts: {
+          t1: {
+            type: 'split',
+            id: 's1',
+            direction: 'vertical',
+            sizes: [0.5, 0.5],
+            children: [
+              { type: 'leaf', id: 'p1', content: { kind: 'picker' } },
+              { type: 'leaf', id: 'p2', content: { kind: 'picker' } },
+            ],
+          },
+        },
+      },
+    })
+    expect(paneCreationProbePredicate()).toBe(false)
+  })
+
+  it('is FALSE when the harness state is absent (no harness, no proof of creation)', () => {
+    vi.stubGlobal('window', {})
+    expect(paneCreationProbePredicate()).toBe(false)
   })
 })
 
