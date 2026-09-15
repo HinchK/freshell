@@ -2,8 +2,9 @@ import { parsePersistedLayoutRaw, type ParsedPersistedLayout } from '@/store/per
 import { isWellFormedPaneTree } from '@/store/paneTreeValidation'
 import type { TerminalStatus } from '@/store/types'
 import { getPreMigrationLayoutRaw } from '@/store/storage-migration'
-import { LEGACY_FRESHOPENCODE_DEFAULT_MODEL } from '@/store/paneTypes'
+import { LEGACY_FRESHOPENCODE_DEFAULT_MODEL, type SdkSessionStatus } from '@/store/paneTypes'
 import { getWindowLayoutKey, getWindowLayoutPreMigrationRawKey } from '@/store/window-layout-keys'
+import { ShellSchema } from '@shared/ws-protocol'
 import { sanitizeRestoreError, sanitizeSessionRef } from '@shared/session-contract'
 import { STALE_LAYOUT_MS } from './stale-layout-threshold'
 
@@ -15,6 +16,25 @@ const TERMINAL_STATUS_SET = new Set<TerminalStatus>([
   'recovering',
   'exited',
   'error',
+])
+
+/** The real client SdkSessionStatus union (src/store/paneTypes.ts:179 —
+ * the persisted FreshAgentPaneContent status field), as a runtime set.
+ * The typed Set constructor pins the members to the union at compile
+ * time. The shared/ws-protocol SdkSessionStatus is the server→client
+ * MESSAGE union (8 members); pane content additionally carries the
+ * client-local 'create-failed' edge, so paneTypes' union is the one
+ * persisted pane content can legitimately hold. */
+const SDK_SESSION_STATUS_SET = new Set<SdkSessionStatus>([
+  'creating',
+  'starting',
+  'connected',
+  'running',
+  'idle',
+  'compacting',
+  'exited',
+  'stuck',
+  'create-failed',
 ])
 
 /** A local layout older than this rebuilds from the server instead of being
@@ -367,55 +387,88 @@ function hasAliasedNodeIds(node: unknown, seenIds: Set<string>): boolean {
 }
 
 /** Content lifecycle invariants over the PARSED pane trees (delta review
- * round 3, finding 3): isWellFormedPaneTree only checks
- * createRequestId/status/mode are STRINGS, so empty createRequestIds,
- * duplicate createRequestIds across terminal panes, non-union statuses,
- * and empty modes all passed while the loader silently heals or the server
- * rejects/dedupes the creates —
- * - an EMPTY createRequestId: the loader mints a fresh nanoid identity
- *   (persistMiddleware migratePaneContent `createRequestId || nanoid()`,
- *   panesSlice normalizePaneContent :79-81), silently losing the pane's
- *   durable terminal binding; the wire schema would reject it outright
- *   (TerminalCreateSchema requestId z.string().min(1),
- *   shared/ws-protocol.ts:468) and the reconcile path answers
- *   missing_create_request_id invalid (crates/freshell-ws/src/reconcile.rs:245).
- * - a DUPLICATE createRequestId across terminal panes: the server's
- *   single-flight create-dedupe ADOPTS the existing live terminal for a
- *   repeated key (crates/freshell-ws/src/terminal.rs:2884-2933 — "a create
- *   whose createRequestId already has a live terminal ADOPTS it"), so both
- *   panes would alias onto ONE PTY, and the reconcile derivation flags
- *   duplicate_create_request_id within one request (reconcile.rs:56-59).
- * - a status outside the TerminalStatus union: no loader normalizes pane
- *   content status (migratePaneContent only heals falsy → 'creating';
- *   panesSlice normalizePaneContent keeps any string), so an unsupported
- *   status installs verbatim.
- * - an EMPTY mode: the load path silently substitutes 'shell'
+ * round 3, finding 3; e3r4 finding 2 extends them beyond terminals):
+ * isWellFormedPaneTree only checks createRequestId/status/mode are
+ * STRINGS, so empty createRequestIds, duplicate createRequestIds across
+ * panes, non-union statuses, and empty modes all passed while the loader
+ * silently heals or the server rejects/dedupes the creates —
+ * - an EMPTY createRequestId (terminal OR fresh-agent): the loader mints
+ *   a fresh nanoid identity (persistMiddleware migratePaneContent
+ *   `createRequestId || nanoid()`, panesSlice normalizePaneContent
+ *   :79-81), silently losing the pane's durable binding; the terminal
+ *   wire schema rejects it outright (TerminalCreateSchema requestId
+ *   z.string().min(1), shared/ws-protocol.ts:468) and the fresh-agent
+ *   one too (FreshAgentCreateSchema requestId z.string().min(1),
+ *   shared/ws-protocol.ts:757), while the reconcile path answers
+ *   missing_create_request_id invalid (crates/freshell-ws/src/
+ *   reconcile.rs:245).
+ * - a DUPLICATE createRequestId across panes (terminal OR fresh-agent —
+ *   one shared envelope-wide set: both kinds mint from the same nanoid
+ *   space, so legit flushes can never alias across kinds either): the
+ *   server's single-flight terminal create-dedupe ADOPTS the existing
+ *   live terminal for a repeated key (crates/freshell-ws/src/terminal.rs:
+ *   2884-2933), so both panes would alias onto ONE PTY; on the
+ *   fresh-agent side the duplicate aliases the request-keyed
+ *   pending-create routing (freshAgent.create is keyed by requestId, so
+ *   both panes would bind one session's created event). The reconcile
+ *   derivation flags duplicate_create_request_id within one request
+ *   (reconcile.rs:56-59).
+ * - a TERMINAL status outside the TerminalStatus union: no loader
+ *   normalizes pane content status (migratePaneContent only heals falsy
+ *   → 'creating'; panesSlice normalizePaneContent keeps any string), so
+ *   an unsupported status installs verbatim.
+ * - a FRESH-AGENT status outside the SdkSessionStatus union: a bogus
+ *   status without a session identity prevents FreshAgentView from ever
+ *   sending a create — the pane reopens dead. The fresh-agent pane's
+ *   "mode" fields (sessionType + provider) need no lifecycle check
+ *   here: the tree-level isPaneContentShape pass the classifier already
+ *   ran pins them against the real FreshAgentSessionType union and the
+ *   resolved runtime provider (paneTreeValidation.ts:65-73).
+ * - an EMPTY terminal mode: the load path silently substitutes 'shell'
  *   (migratePaneContent `mode || 'shell'`), so a mode-wiped CLI pane
  *   reopens as a shell — identity loss. The valid mode set per the
  *   protocol is 'shell' | a non-empty provider string (TabMode,
  *   src/store/types.ts:29; CodingCliProviderSchema z.string().min(1),
  *   shared/ws-protocol.ts:47) — the wire accepts any string, so the
- *   enforceable invariant is exactly non-empty. */
-function hasLifecycleInvalidTerminalContent(node: unknown, seenCreateRequestIds: Set<string>): boolean {
+ *   enforceable invariant is exactly non-empty.
+ * - a TERMINAL shell outside ShellSchema: absent/undefined is the
+ *   loader's 'system' default = healthy, but any other value the wire
+ *   schema rejects survives loading verbatim
+ *   (panesSlice normalizePaneContent keeps any string shell :78) and is
+ *   sent in a rejected terminal.create (ShellSchema,
+ *   shared/ws-protocol.ts:45). */
+function hasLifecycleInvalidPaneContent(node: unknown, seenCreateRequestIds: Set<string>): boolean {
   const n = node as {
     type?: string
-    content?: { kind?: unknown; createRequestId?: unknown; status?: unknown; mode?: unknown }
+    content?: { kind?: unknown; createRequestId?: unknown; status?: unknown; mode?: unknown; shell?: unknown }
     children?: unknown[]
   } | null
   if (!n || typeof n !== 'object') return false
   if (n.type === 'leaf') {
     const content = n.content
-    if (!content || typeof content !== 'object' || content.kind !== 'terminal') return false
-    const createRequestId = content.createRequestId
-    if (typeof createRequestId !== 'string' || createRequestId.length === 0) return true
-    if (seenCreateRequestIds.has(createRequestId)) return true
-    seenCreateRequestIds.add(createRequestId)
-    if (typeof content.status !== 'string' || !TERMINAL_STATUS_SET.has(content.status as TerminalStatus)) return true
-    if (typeof content.mode !== 'string' || content.mode.length === 0) return true
+    if (!content || typeof content !== 'object') return false
+    if (content.kind === 'terminal') {
+      const createRequestId = content.createRequestId
+      if (typeof createRequestId !== 'string' || createRequestId.length === 0) return true
+      if (seenCreateRequestIds.has(createRequestId)) return true
+      seenCreateRequestIds.add(createRequestId)
+      if (typeof content.status !== 'string' || !TERMINAL_STATUS_SET.has(content.status as TerminalStatus)) return true
+      if (typeof content.mode !== 'string' || content.mode.length === 0) return true
+      if (content.shell !== undefined && !ShellSchema.safeParse(content.shell).success) return true
+      return false
+    }
+    if (content.kind === 'fresh-agent') {
+      const createRequestId = content.createRequestId
+      if (typeof createRequestId !== 'string' || createRequestId.length === 0) return true
+      if (seenCreateRequestIds.has(createRequestId)) return true
+      seenCreateRequestIds.add(createRequestId)
+      if (typeof content.status !== 'string' || !SDK_SESSION_STATUS_SET.has(content.status as SdkSessionStatus)) return true
+      return false
+    }
     return false
   }
   for (const child of n.children ?? []) {
-    if (hasLifecycleInvalidTerminalContent(child, seenCreateRequestIds)) return true
+    if (hasLifecycleInvalidPaneContent(child, seenCreateRequestIds)) return true
   }
   return false
 }
@@ -435,8 +488,15 @@ function hasLifecycleInvalidTerminalContent(node: unknown, seenCreateRequestIds:
  *             non-empty ids, so aliases are corruption by definition),
  *             terminal pane content violates the lifecycle invariants
  *             (an empty or envelope-wide duplicate createRequestId, a
- *             status outside the TerminalStatus union, or an empty mode —
- *             see hasLifecycleInvalidTerminalContent),
+ *             status outside the TerminalStatus union, an empty mode, or
+ *             a shell outside ShellSchema — see
+ *             hasLifecycleInvalidPaneContent),
+ *             fresh-agent pane content violates its lifecycle invariants
+ *             (an empty or envelope-wide duplicate createRequestId —
+ *             shared with terminals, both kinds mint from the same
+ *             nanoid space — or a status outside the SdkSessionStatus
+ *             union; its sessionType/provider "mode" fields are already
+ *             pinned by the tree-level isPaneContentShape check),
  *             referential integrity is broken (a layout entry without its
  *             tab, or a tab without its layout entry), or an active
  *             reference is missing/dangling (activeTabId not a parsed tab
@@ -508,11 +568,11 @@ export function classifyPersistedLayoutHealth(
   // z.unknown while paneTreeValidation only checks typeof id === 'string'
   // — so without this check a corrupt-cache state classifies healthy.
   const seenNodeIds = new Set<string>()
-  const seenTerminalCreateRequestIds = new Set<string>()
+  const seenCreateRequestIds = new Set<string>()
   for (const layout of Object.values(parsed.panes?.layouts ?? {})) {
     if (!isWellFormedPaneTree(layout)) return 'corrupt'
     if (hasAliasedNodeIds(layout, seenNodeIds)) return 'corrupt'
-    if (hasLifecycleInvalidTerminalContent(layout, seenTerminalCreateRequestIds)) return 'corrupt'
+    if (hasLifecycleInvalidPaneContent(layout, seenCreateRequestIds)) return 'corrupt'
   }
   // Parse-level salvage drops rows SILENTLY (persistedState.ts salvageTabs
   // :88-102 — one structurally-invalid tab is dropped while the rest parse),

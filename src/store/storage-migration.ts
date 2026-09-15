@@ -532,26 +532,43 @@ function preservePersistedLayout(): PersistedLayoutMigrationResult {
  * pre-change windows may still read it. A window that already has its
  * own envelope ignores later legacy-key writes from pre-change windows.
  *
- * e3r2 finding 2 (claim-then-verify): two simultaneous upgrade boots can
- * both pass the absent checks above before either sets the marker, each
- * copying the shared legacy envelope into its own key and the loser
- * classifying the copied last-writer layout as healthy. The claim is
- * therefore written FIRST — the marker carrying THIS window's
+ * e3r2 finding 2 (claim-then-verify) + e3r4 finding 1
+ * (claim → copy → confirm-commit): two simultaneous upgrade boots can
+ * both pass the absent checks before either sets the marker, so the
+ * claim is written FIRST — the marker carrying THIS window's
  * layout-window-id — and read back immediately; the copy proceeds ONLY
- * if the read still returns the claimer's own id. A window that reads a
- * foreign id skips adoption entirely (its key stays absent → boot
- * rebuilds — the safe outcome). Serialization guarantee relied on: each
- * single localStorage getItem/setItem is atomic against the shared
+ * if the read still returns the claimer's own id. The one-shot is
+ * committed as spent only AFTER the legacy copy succeeds: a failed copy
+ * (quota/write error) rolls the claim back — best-effort remove, and
+ * only while the marker still carries OUR id (removing a foreign
+ * claimant's marker would un-spend THEIR one-shot) — so a later window
+ * can still adopt. A POST-COPY re-verify round then re-reads the claim:
+ * if a foreign claimant won the marker while we copied, we discard our
+ * copied key (best-effort remove) and take the absent path (own-snapshot
+ * rebuild), so the previously unrecoverable interleave
+ * A-write → A-read → B-write → B-read (both read back their own id,
+ * both copy) converges to exactly ONE adopter: B keeps, A discards and
+ * rebuilds. Residual, irreducible without an atomic test-and-set: when
+ * the claim legitimately survives our re-verify BEFORE a foreign
+ * claimant's write lands (A completes fully, then B claims), BOTH
+ * windows adopt — but they copy the SAME shared legacy envelope, so the
+ * worst case equals the pre-upgrade shared-envelope behavior for exactly
+ * those two simultaneously-booting windows; every later window is still
+ * gated by the marker-present check. Serialization guarantee relied on:
+ * each single localStorage getItem/setItem is atomic against the shared
  * per-origin map, but HTML explicitly promises NO locking across agent
  * clusters — "authors are encouraged to assume that there is no locking
- * mechanism" (webstorage.html §12.1) — so the other renderer process's
- * claim CAN land between our setItem and our getItem; the read-back
- * detects it. Residual, bounded: if the interleave is exactly
- * A-write → A-read → B-write → B-read, both windows read back their own
- * id and both adopt — but they copy the SAME shared legacy envelope, so
- * the worst case equals the pre-upgrade shared-envelope behavior for
- * exactly those two simultaneously-booting windows; every later window
- * is still gated by the marker-present check. */
+ * mechanism" (webstorage.html §12.1). The COMPLETE future mechanism is
+ * navigator.locks (Web Locks API); this path deliberately stays
+ * dependency-free. */
+function readLegacyAdoptionClaimOwnerId(): unknown {
+  try {
+    return (JSON.parse(localStorage.getItem(LEGACY_LAYOUT_ADOPTION_MARKER_STORAGE_KEY) ?? '') as { ownerId?: unknown })?.ownerId
+  } catch {
+    return undefined
+  }
+}
+
 function adoptLegacyLayoutIntoWindowKey(): void {
   const ownKey = getWindowLayoutKey()
   try {
@@ -565,14 +582,39 @@ function adoptLegacyLayoutIntoWindowKey(): void {
       ownerId,
       adoptedAt: Date.now(),
     }))
-    let claimedOwnerId: unknown
+    if (readLegacyAdoptionClaimOwnerId() !== ownerId) return
     try {
-      claimedOwnerId = (JSON.parse(localStorage.getItem(LEGACY_LAYOUT_ADOPTION_MARKER_STORAGE_KEY) ?? '') as { ownerId?: unknown })?.ownerId
-    } catch {
-      claimedOwnerId = undefined
+      localStorage.setItem(ownKey, legacyRaw)
+    } catch (error) {
+      if (readLegacyAdoptionClaimOwnerId() === ownerId) {
+        try {
+          localStorage.removeItem(LEGACY_LAYOUT_ADOPTION_MARKER_STORAGE_KEY)
+        } catch {
+          // best-effort rollback: a retained marker only costs later
+          // windows the rebuild path
+        }
+      }
+      warnStructured('layout_legacy_adoption_copy_failed', {
+        key: ownKey,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      return
     }
-    if (claimedOwnerId !== ownerId) return
-    localStorage.setItem(ownKey, legacyRaw)
+    if (readLegacyAdoptionClaimOwnerId() !== ownerId) {
+      let discarded = false
+      try {
+        localStorage.removeItem(ownKey)
+        discarded = true
+      } catch {
+        // best-effort discard: a surviving copy degrades to the bounded
+        // double-adopt residual, never data loss
+      }
+      warnStructured('layout_legacy_adoption_claim_lost', {
+        key: ownKey,
+        discarded,
+      })
+      return
+    }
     log.info('Adopted the legacy layout envelope into this window\u2019s per-window key (one-shot).')
   } catch (error) {
     warnStructured('layout_legacy_adoption_write_failed', {

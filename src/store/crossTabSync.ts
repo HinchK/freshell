@@ -427,7 +427,19 @@ export function installCrossTabSync(store: StoreLike): () => void {
     const previousRaw = lastProcessedRawByKey.get(key)
     if (!tryDedupeAndMark(key, raw)) return
     handleIncomingRaw(store, key, raw, previousRaw, currentLocalLayoutPersistedAt)
-    if (isDerivedLayoutKey(key)) {
+    if (key === ownLayoutKey) {
+      // Recency floor (e3r4 finding 3): advance ONLY where the incoming
+      // envelope actually REPLACED local state — the own-key full-hydrate
+      // path (hydrateTabs + hydratePanes), mirroring the tabs winner
+      // pattern. A foreign window's envelope — title-only, a no-op, or
+      // sharing no panes — never replaces local state, so its
+      // persistedAt must not move the floor: storage and
+      // BroadcastChannel deliveries from independent windows have no
+      // cross-source total ordering, and a foreign no-op at a higher
+      // stamp would otherwise reject a different window's
+      // strictly-newer title delivery. The floor advances for an
+      // APPLIED foreign title through the receiver's own durable
+      // reconciliation flush (onPersistBroadcast below).
       mergeAuthoritativeLayoutPersistedAt(parsePersistedLayoutRaw(raw)?.persistedAt)
     }
   }

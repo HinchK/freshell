@@ -2258,6 +2258,81 @@ describe('crossTabSync', () => {
     expect(store.getState().panes.paneTitles['t1']?.['pane-a'], 'an older remote title never overwrites').toBe('Local title')
   })
 
+  it('e3r4 finding 3: a foreign no-op flush never raises the recency floor — a different window\u2019s strictly-newer title still applies (the reviewer\u2019s exact ordering)', () => {
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+    })
+    seedLocalWorkspace(store)
+
+    // The receiver's own durable envelope: persistedAt 100 is what install
+    // seeds the recency floor from.
+    localStorage.setItem(OWN_LAYOUT_KEY, JSON.stringify({
+      version: 3,
+      persistedAt: 100,
+      tabs: { activeTabId: 't1', tabs: [{ id: 't1', title: 'T1', createdAt: 1 }] },
+      panes: {
+        version: 6,
+        layouts: {
+          't1': {
+            type: 'leaf',
+            id: 'pane-a',
+            content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-a', status: 'running' },
+          },
+        },
+        activePane: { 't1': 'pane-a' },
+        paneTitles: { 't1': { 'pane-a': 'Local title' } },
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    }))
+
+    cleanups.push(installCrossTabSync(store as any))
+
+    // Window W1 (another window) flushes a NO-OP envelope at 300: it
+    // shares no panes with the receiver and delivers no titles — but its
+    // parse used to advance the recency floor to 300 anyway.
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: 'freshell.layout.v3.layout-window-w1',
+      newValue: JSON.stringify({
+        version: 3,
+        persistedAt: 300,
+        tabs: { activeTabId: 't9', tabs: [{ id: 't9', title: 'T9', createdAt: 9 }] },
+        panes: { version: 6, layouts: {}, activePane: {}, paneTitles: {}, paneTitleSetByUser: {} },
+        tombstones: [],
+      }),
+    }))
+
+    // Window W2 (a different window) delivers a title at 200 — not newer
+    // than W1's 300, but strictly newer than the receiver's OWN envelope
+    // (100), so it must apply. Deliveries from independent windows have no
+    // cross-source total ordering, so only the receiver's own envelope may
+    // set the floor.
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: 'freshell.layout.v3.layout-window-w2',
+      newValue: JSON.stringify({
+        version: 3,
+        persistedAt: 200,
+        tabs: { activeTabId: 't1', tabs: [{ id: 't1', title: 'T1', createdAt: 1 }] },
+        panes: {
+          version: 6,
+          layouts: {
+            't1': {
+              type: 'leaf',
+              id: 'pane-a',
+              content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-a', status: 'running' },
+            },
+          },
+          activePane: { 't1': 'pane-a' },
+          paneTitles: { 't1': { 'pane-a': 'Title from window two' } },
+          paneTitleSetByUser: {},
+        },
+        tombstones: [],
+      }),
+    }))
+
+    expect(store.getState().panes.paneTitles['t1']?.['pane-a'], 'the strictly-newer-than-local title applies — the foreign no-op never moved the floor').toBe('Title from window two')
+  })
+
   it('keeps user-set pane titles against another window\u2019s NEWER flush (title-only path)', () => {
     const store = configureStore({
       reducer: { tabs: tabsReducer, panes: panesReducer },

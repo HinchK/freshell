@@ -404,6 +404,131 @@ describe('classifyPersistedLayoutHealth', () => {
     expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
   })
 
+  // e3r4 finding 2: the lifecycle invariants must also cover FRESH-AGENT
+  // panes and the terminal shell. isWellFormedPaneTree only checks
+  // strings, so a fresh-agent pane with an EMPTY or envelope-wide
+  // DUPLICATE createRequestId or a status outside the client
+  // SdkSessionStatus union passed string-only tree validation and
+  // classified healthy — an empty id violates FreshAgentCreateSchema
+  // (requestId z.string().min(1), shared/ws-protocol.ts:757), a
+  // duplicate aliases the request-keyed pending-create routing, and a
+  // bogus status without a session identity prevents FreshAgentView
+  // from ever sending a create. A terminal shell outside ShellSchema
+  // (shared/ws-protocol.ts:45) likewise survived loading verbatim
+  // (normalizePaneContent keeps any string shell, panesSlice.ts:78) and
+  // was sent in a rejected terminal.create. The fresh-agent pane's
+  // "mode" fields (sessionType + provider) are already pinned by the
+  // tree-level isPaneContentShape check the classifier runs first, so
+  // the lifecycle layer adds the id and status invariants.
+  it('returns corrupt when a fresh-agent pane content carries an EMPTY createRequestId (violates FreshAgentCreateSchema; the loader would mint a fresh identity)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': {
+        type: 'leaf',
+        id: 'pane-a',
+        content: { kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude', createRequestId: '', status: 'idle' },
+      },
+    }
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('returns corrupt when two fresh-agent panes share one createRequestId (request-keyed pending-create routing would alias both panes)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': {
+        type: 'split',
+        id: 'split-fa',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          { type: 'leaf', id: 'pane-a', content: { kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude', createRequestId: 'cr-fa-dup', status: 'idle' } },
+          { type: 'leaf', id: 'pane-b', content: { kind: 'fresh-agent', sessionType: 'freshcodex', provider: 'codex', createRequestId: 'cr-fa-dup', status: 'running' } },
+        ],
+      },
+    }
+    ;(envelope.panes as { activePane: Record<string, string> }).activePane['tab-a'] = 'pane-a'
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('returns corrupt when a terminal pane and a fresh-agent pane share one createRequestId (both kinds mint from the same nanoid space — legit flushes never alias)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': {
+        type: 'split',
+        id: 'split-mixed',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          { type: 'leaf', id: 'pane-a', content: { kind: 'terminal', mode: 'shell', createRequestId: 'cr-shared', status: 'running' } },
+          { type: 'leaf', id: 'pane-b', content: { kind: 'fresh-agent', sessionType: 'freshopencode', provider: 'opencode', createRequestId: 'cr-shared', status: 'idle' } },
+        ],
+      },
+    }
+    ;(envelope.panes as { activePane: Record<string, string> }).activePane['tab-a'] = 'pane-a'
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('returns corrupt when a fresh-agent pane status is outside the SdkSessionStatus union (a bogus status without a session identity never sends a create)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': {
+        type: 'leaf',
+        id: 'pane-a',
+        content: { kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude', createRequestId: 'cr-fa', status: 'zombie-status' },
+      },
+    }
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('returns corrupt when a terminal pane shell is a nonempty value outside ShellSchema (survives loading verbatim and is sent in a rejected terminal.create)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': {
+        type: 'leaf',
+        id: 'pane-a',
+        content: { kind: 'terminal', mode: 'shell', createRequestId: 'cr-a', status: 'running', shell: 'fish' },
+      },
+    }
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('stays healthy when a terminal pane OMITS shell (absent = the loader\u2019s system default = healthy)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': {
+        type: 'leaf',
+        id: 'pane-a',
+        content: { kind: 'terminal', mode: 'shell', createRequestId: 'cr-a', status: 'running' },
+      },
+    }
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+  })
+
+  it('stays healthy for a valid fresh-agent pane (non-empty id, union-member status) alongside a terminal pane with a valid shell', () => {
+    const envelope = healthyEnvelope('machine-1')
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': {
+        type: 'split',
+        id: 'split-ok',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          { type: 'leaf', id: 'pane-a', content: { kind: 'terminal', mode: 'shell', shell: 'wsl', createRequestId: 'cr-term', status: 'running' } },
+          { type: 'leaf', id: 'pane-b', content: { kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude', createRequestId: 'cr-fa', status: 'idle' } },
+        ],
+      },
+    }
+    ;(envelope.panes as { activePane: Record<string, string> }).activePane['tab-a'] = 'pane-a'
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+  })
+
   // Content-salvage classification (delta review round 2, finding 3):
   // parsePersistedLayoutRaw silently strips malformed DURABLE pane-content
   // fields BEFORE tree validation (normalizeTerminalContent destructures
