@@ -7241,6 +7241,79 @@ describe('snapshot scheduler integration (zrrj)', () => {
     }
   })
 
+  // b8ke ext r28 F3: the hidden-pane queue captures `undefined` when no
+  // owner record exists at enqueue time and never refreshes that
+  // observation. If another device subsequently starts AND stops the
+  // session (the generation bumps; the record lands vacant), the pre-fix
+  // superseded check treated the vacant record as safe and the queued
+  // callback sent NEITHER generation NOR operation ID — the unfenced
+  // create let the server grant ownership from Vacant, recreating a
+  // runtime the newer cross-device lifecycle explicitly stopped.
+  it('a queued create captured before a cross-device start+stop cycle never recreates the runtime (b8ke ext r28 F3)', async () => {
+    vi.useFakeTimers()
+    try {
+      resetRebindQueueForTests()
+      const store = createStore()
+      const content = {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-owner-vacant-cycle',
+        sessionRef: { provider: 'codex', sessionId: 'sid-owner-vacant-cycle' },
+        status: 'creating',
+      } as const
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: { ...content } }))
+
+      render(
+        <Provider store={store}>
+          <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={content} hidden />
+        </Provider>,
+      )
+      // The hidden pane's create is armed in the rebind queue with an
+      // UNDEFINED observed fence (no owner record exists for the key).
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+
+      // THE CROSS-DEVICE LIFECYCLE while the create sits queued: another
+      // device starts the session (gen 1)…
+      act(() => store.dispatch(applyRuntimeOwner({
+        type: 'session.runtimeOwner',
+        provider: 'codex',
+        sessionId: 'sid-owner-vacant-cycle',
+        epoch: 3,
+        generation: 1,
+        ownerKind: 'fresh-agent',
+        operationId: 'handoff-start-cycle',
+        transition: 'handoff-committed',
+      })))
+      // …and then explicitly stops it (the key returns vacant at the
+      // BUMPED generation 2 — a start+stop cycle).
+      act(() => store.dispatch(applyRuntimeOwner({
+        type: 'session.runtimeOwner',
+        provider: 'codex',
+        sessionId: 'sid-owner-vacant-cycle',
+        epoch: 3,
+        generation: 2,
+        ownerKind: 'vacant',
+        operationId: 'stop-cycle',
+        transition: 'released',
+      })))
+
+      // Drain the queue: the delayed create must NOT recreate the runtime.
+      // Pre-r28 the vacant record read as safe and the create was sent
+      // UNFENCED (neither generation nor epoch on the wire) — the server
+      // grants from Vacant and the runtime comes back.
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_000) })
+      const creates = sentFreshAgentMessages('freshAgent.create')
+        .filter((message: any) => message?.requestId === 'req-owner-vacant-cycle')
+      expect(creates).toHaveLength(0)
+      expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(0)
+    } finally {
+      cleanup()
+      resetRebindQueueForTests()
+      vi.useRealTimers()
+    }
+  })
+
   it('create and attach carries the observed (epoch, generation) fence from the runtime-owner record', async () => {
     vi.useFakeTimers()
     try {

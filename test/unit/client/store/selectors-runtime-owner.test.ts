@@ -622,6 +622,52 @@ describe('b8ke ext F1: rekey alias chains resolve to the canonical key', () => {
     )).toBe(true)
   })
 
+  // b8ke ext r28 F3: an ABSENT captured observation is NOT safe when the
+  // store now holds a record a cross-device lifecycle advanced — the
+  // queue-time world ("no owner observation") predates a start+stop
+  // cycle, and sending the create UNFENCED would let the server grant
+  // ownership from the bumped Vacant key (recreating a runtime the newer
+  // lifecycle explicitly stopped).
+  it('an ABSENT captured observation is stale once a record exists at an advanced generation (the start+stop cycle)', () => {
+    const state = ownersState([
+      { provider: 'codex', sessionId: 'sid-cycle', ownerKind: 'vacant', generation: 2, epoch: 3, transition: 'released' },
+    ])
+    const pane = {
+      paneKind: 'fresh-agent' as const,
+      provider: 'codex',
+      sessionRef: { provider: 'codex', sessionId: 'sid-cycle' },
+    }
+    // The captured-undefined create over a record at generation 2: the
+    // queue-time "no owner" observation predates the cycle → STALE.
+    expect(isLifecycleStartSuperseded(state, pane.paneKind, pane, undefined)).toBe(true)
+    // A record at generation 0 (no lifecycle ever advanced it) stays safe —
+    // the pre-existing "no owner observation" truth holds.
+    const genZero = ownersState([
+      { provider: 'codex', sessionId: 'sid-genzero', ownerKind: 'vacant', generation: 0, epoch: 3, transition: 'released' },
+    ])
+    expect(isLifecycleStartSuperseded(
+      genZero,
+      'fresh-agent',
+      { provider: 'codex', sessionRef: { provider: 'codex', sessionId: 'sid-genzero' } },
+      undefined,
+    )).toBe(false)
+    // No record at all: the undefined observation is the truth — proceed.
+    expect(isLifecycleStartSuperseded(
+      genZero,
+      'fresh-agent',
+      { provider: 'codex', sessionRef: { provider: 'codex', sessionId: 'sid-never' } },
+      undefined,
+    )).toBe(false)
+    // A DEFINED fence against the vacant record keeps the pre-r28
+    // multi-device semantics (the server-side fence owns the stale pair).
+    expect(isLifecycleStartSuperseded(
+      state,
+      'fresh-agent',
+      { provider: 'codex', sessionRef: { provider: 'codex', sessionId: 'sid-cycle' } },
+      { epoch: 3, generation: 2 },
+    )).toBe(false)
+  })
+
   it('a released-vacant stop frame refreshes the fence the next lifecycle request carries (b8ke ext r18 F1)', () => {
     // The kill → immediate recreate "Restart sidecar" sequence: the pane's
     // stored owner record still names the LIVE owner at generation 4, then

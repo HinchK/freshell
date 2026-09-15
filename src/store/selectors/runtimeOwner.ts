@@ -320,6 +320,24 @@ export function isLifecycleStartSuperseded(
     if (!observedFence) return true
     return record.epoch !== observedFence.epoch || record.generation >= observedFence.generation
   }
+  // b8ke ext r28 F3: an ABSENT captured observation is NOT safe when the
+  // store now holds a VACANT record at a generation a lifecycle ADVANCED —
+  // the queue-time world ("no owner observation") predates a cross-device
+  // start+stop cycle (the record lands vacant at the bumped generation),
+  // and sending the start UNFENCED would let the server grant ownership
+  // from Vacant and recreate a runtime the newer lifecycle explicitly
+  // stopped. Suppressed here; the pane re-decides from the divergence
+  // state (the server-side generation fence stays the backstop). A
+  // record at generation 0 never advanced — the pre-existing
+  // "no owner observation" truth holds and the start proceeds — and a
+  // LIVE same-kind owner keeps the multi-device attachment shape below.
+  if (
+    !observedFence
+    && record.generation > 0
+    && record.ownerKind === 'vacant'
+  ) {
+    return true
+  }
   if (record.ownerKind === 'vacant' || record.ownerKind === paneKind) return false
   if (!observedFence) return true
   return record.epoch !== observedFence.epoch || record.generation >= observedFence.generation
