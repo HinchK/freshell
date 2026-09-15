@@ -315,7 +315,18 @@ function dispatchHydrateBrowserPreferencesFromPersisted(
  * exist in BOTH envelopes, under the Task-7 merge rules (recency via the
  * layout persistedAt meta, user-set precedence). No hydrateTabs, no
  * hydratePanes: tab set, order, trees, content, active panes, and
- * ephemeral pane state (zoom, refresh requests, …) are never adopted. */
+ * ephemeral pane state (zoom, refresh requests, …) are never adopted.
+ *
+ * DURABLE by design (e3r3 finding 1): the title apply is deliberately
+ * NOT skipPersist — the receiving window's own envelope must carry the
+ * received title (and its user-set flag), or a refresh before any
+ * unrelated mutation causes a flush would lose it. The write converges
+ * instead of echoing: hydratePaneTitles is a reducer-level no-op when
+ * the merge produces exactly the titles the state already holds
+ * (paneTitleMetadataEquals), so a receiver that already has the title
+ * neither changes state nor re-flushes, and the per-key raw dedupe drops
+ * repeat deliveries of the same envelope bytes. One flush per real title
+ * change, zero for equal ones. */
 function dispatchHydratePaneTitlesFromPersisted(
   store: StoreLike,
   raw: string,
@@ -335,7 +346,6 @@ function dispatchHydratePaneTitlesFromPersisted(
       layouts: parsed.panes.layouts,
     }),
     meta: {
-      skipPersist: true,
       source: 'cross-tab',
       localLayoutPersistedAt,
       remoteLayoutPersistedAt: parsed.persistedAt,

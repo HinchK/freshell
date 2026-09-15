@@ -263,6 +263,45 @@ describe('per-window layout keys', () => {
     expect(firstId, 'the minted id never contains dots (reserved-suffix collision)').not.toContain('.')
   })
 
+  it('e3r3 finding 3: a remint whose setItem is rejected stays authoritative in memory — repeated getters keep the reminted id over the stale stored id', async () => {
+    // A duplicated tab COPIES the layout-window-id in sessionStorage, so
+    // at the lease-collision rotation the duplicate remints. When that
+    // remint's setItem FAILS (quota edge), storage keeps the STALE copied
+    // id — the getter must never re-read storage over the established
+    // remint, or both tabs share one layout key again (the exact
+    // lease-collision recovery the rotation exists to fix).
+    seedWindow(WINDOW_B_ID)
+    vi.resetModules()
+    const { getLayoutWindowId, getWindowLayoutKey, remintLayoutWindowId } = await import('@/store/window-layout-keys')
+
+    // The context first adopts the stored (copied) id, as at real boot.
+    expect(getLayoutWindowId()).toBe(WINDOW_B_ID)
+
+    // setItem rejects from here on (jsdom's Storage is a Proxy that
+    // defeats vi.spyOn — stub the global with a forwarding stub).
+    const realSessionStorage = sessionStorage
+    const rejecting = new Proxy(realSessionStorage, {
+      get(target, prop) {
+        if (prop === 'setItem') {
+          return () => { throw new Error('QuotaExceededError (test)') }
+        }
+        const value = Reflect.get(target, prop, target)
+        return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(target) : value
+      },
+    })
+    vi.stubGlobal('sessionStorage', rejecting)
+    try {
+      const reminted = remintLayoutWindowId()
+      expect(reminted).not.toBe(WINDOW_B_ID)
+      expect(getLayoutWindowId(), 'the reminted id is authoritative, not the stale stored id').toBe(reminted)
+      expect(getLayoutWindowId(), 'repeated getter calls keep the reminted id').toBe(reminted)
+      expect(getWindowLayoutKey()).toBe(`freshell.layout.v3.${reminted}`)
+      expect(realSessionStorage.getItem(LAYOUT_WINDOW_ID_STORAGE_KEY), 'the storage write genuinely failed — the stale copied id is still stored').toBe(WINDOW_B_ID)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('the FIRST fresh window adopts the legacy envelope into its derived key AND sets the one-shot global marker', async () => {
     seedWindow(WINDOW_B_ID)
     const legacyRaw = envelopeFor('tab-adopted')

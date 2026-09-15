@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 
 import tabsReducer, { hydrateTabs } from '../../../../src/store/tabsSlice'
-import panesReducer, { hydratePanes } from '../../../../src/store/panesSlice'
+import panesReducer, { hydratePanes, hydratePaneTitles } from '../../../../src/store/panesSlice'
 import machineIdentityReducer, { setMachineReady } from '../../../../src/store/machineIdentitySlice'
 import tabRecencyReducer from '../../../../src/store/tabRecencySlice'
 import settingsReducer, { setLocalSettings, updateSettingsLocal } from '../../../../src/store/settingsSlice'
@@ -2290,5 +2290,232 @@ describe('crossTabSync', () => {
     expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['t1', 't2'])
     expect(store.getState().panes.layouts['t1']?.id).toBe('split-local')
     expect(store.getState().panes.paneTitles['t1']?.['pane-a']).toBe('Remote newer title')
+  })
+
+  // ── e3r3 finding 1: DURABLE cross-window title reconciliation ──
+  //
+  // The title-only dispatch used to carry skipPersist: the receiver's
+  // Redux state adopted the title, but its sovereign per-window envelope
+  // kept the OLD one — a refresh before any unrelated mutation caused a
+  // flush lost the received title (including a user-set one). The apply
+  // must be durable (the receiver flushes its OWN envelope), and the
+  // write must converge instead of echoing: the merge is a reducer-level
+  // no-op when it produces exactly the titles the state already holds,
+  // so a receiver that already has the title neither changes state nor
+  // re-flushes, and the per-key raw dedupe drops repeat deliveries of
+  // the same envelope bytes. One flush per real title change, zero for
+  // equal ones.
+
+  /** Another window's NEWER flush carrying a USER-SET title for the
+   * shared pane (unstamped — legacy incoming never counts foreign). */
+  function remoteUserSetTitleRaw(persistedAt: number): string {
+    return JSON.stringify({
+      version: 3,
+      persistedAt,
+      tabs: { activeTabId: 't1', tabs: [{ id: 't1', title: 'T1', createdAt: 1 }] },
+      panes: {
+        version: 6,
+        layouts: {
+          't1': {
+            type: 'split',
+            id: 'split-remote',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              { type: 'leaf', id: 'pane-a', content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-remote', status: 'running' } },
+              { type: 'leaf', id: 'pane-remote-only', content: { kind: 'browser', url: 'https://remote.example', devToolsOpen: false } },
+            ],
+          },
+        },
+        activePane: { 't1': 'pane-a' },
+        paneTitles: { 't1': { 'pane-a': 'User title from window A' } },
+        paneTitleSetByUser: { 't1': { 'pane-a': true } },
+      },
+      tombstones: [],
+    })
+  }
+
+  function configureDurableReceiverStore() {
+    return configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
+    })
+  }
+
+  it('e3r3 (a): a received cross-window pane title (and its user-set flag) lands in the receiver\u2019s OWN envelope through the debounce — durable before any unrelated mutation', async () => {
+    vi.useFakeTimers()
+    const store = configureDurableReceiverStore()
+    seedLocalWorkspace(store)
+    cleanups.push(installCrossTabSync(store as any))
+
+    // Settle the seed's own flush FIRST: the reviewer's case is a
+    // receiver with NO pending flush when the cross-window title arrives
+    // (otherwise the seed's own flush would write the envelope and mask
+    // the defect).
+    await vi.advanceTimersByTimeAsync(PERSIST_DEBOUNCE_MS + 100)
+    const seedRaw = localStorage.getItem(OWN_LAYOUT_KEY)
+    expect(seedRaw, 'the seed flush wrote the receiver\u2019s envelope').toBeTruthy()
+
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: REMOTE_LAYOUT_KEY,
+      newValue: remoteUserSetTitleRaw(Date.now() + 1_000),
+    }))
+
+    // Positive control: the receiver's Redux state adopted title + flag.
+    expect(store.getState().panes.paneTitles['t1']?.['pane-a']).toBe('User title from window A')
+    expect(store.getState().panes.paneTitleSetByUser['t1']?.['pane-a']).toBe(true)
+
+    await vi.advanceTimersByTimeAsync(PERSIST_DEBOUNCE_MS + 100)
+
+    const raw = localStorage.getItem(OWN_LAYOUT_KEY)
+    expect(raw, 'the reconciliation caused a NEW flush of the receiver\u2019s envelope').not.toBe(seedRaw)
+    const env = JSON.parse(raw!)
+    expect(env.panes.paneTitles['t1']?.['pane-a'], 'the received title is durable in the receiver\u2019s envelope').toBe('User title from window A')
+    expect(env.panes.paneTitleSetByUser['t1']?.['pane-a'], 'the received user-set flag is durable too').toBe(true)
+  })
+
+  it('e3r3 (b): the reviewer\u2019s exact durability case — a receiver that reloads after the cross-window title arrives boots WITH the title (fresh boot from its own envelope)', async () => {
+    vi.useFakeTimers()
+    const store = configureDurableReceiverStore()
+    seedLocalWorkspace(store)
+    cleanups.push(installCrossTabSync(store as any))
+
+    await vi.advanceTimersByTimeAsync(PERSIST_DEBOUNCE_MS + 100)
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: REMOTE_LAYOUT_KEY,
+      newValue: remoteUserSetTitleRaw(Date.now() + 1_000),
+    }))
+    expect(store.getState().panes.paneTitles['t1']?.['pane-a']).toBe('User title from window A')
+
+    // The durable reconciliation flush (debounce), before ANY unrelated
+    // mutation.
+    await vi.advanceTimersByTimeAsync(PERSIST_DEBOUNCE_MS + 100)
+    const durableRaw = localStorage.getItem(OWN_LAYOUT_KEY)
+    expect(JSON.parse(durableRaw!).panes.paneTitles['t1']['pane-a']).toBe('User title from window A')
+
+    // A fresh boot: the fresh module realm re-runs the module-init
+    // loaders against the receiver's own envelope (sessionStorage still
+    // holds the same layout-window id).
+    vi.resetModules()
+    const { configureStore: freshConfigureStore } = await import('@reduxjs/toolkit')
+    const { default: freshTabsReducer } = await import('@/store/tabsSlice')
+    const { default: freshPanesReducer } = await import('@/store/panesSlice')
+    const reloaded = freshConfigureStore({
+      reducer: { tabs: freshTabsReducer, panes: freshPanesReducer },
+    })
+    expect(reloaded.getState().panes.paneTitles['t1']?.['pane-a'], 'the received title survives the healthy reload').toBe('User title from window A')
+    expect(reloaded.getState().panes.paneTitleSetByUser['t1']?.['pane-a'], 'the received user-set flag survives the healthy reload').toBe(true)
+  })
+
+  it('e3r3 (c): the convergence pin — a title flowing A→B flushes B\u2019s own envelope exactly once; B\u2019s flush reaching A applies NOTHING (equal-title guard) and flush counts settle', async () => {
+    vi.useFakeTimers()
+    const WIN_A_ID = 'client-crosstab-conv-a'
+    const WIN_A_KEY = `freshell.layout.v3.${WIN_A_ID}`
+    const WIN_B_ID = 'client-crosstab-conv-b'
+    const WIN_B_KEY = `freshell.layout.v3.${WIN_B_ID}`
+
+    const seedSharedPane = (store: ReturnType<typeof configureStore>, title?: string) => {
+      store.dispatch(hydrateTabs({
+        tabs: [{ id: 't1', title: 'T1', createdAt: 1 }],
+        activeTabId: 't1',
+        renameRequestTabId: null,
+      }))
+      store.dispatch(hydratePanes({
+        layouts: {
+          't1': {
+            type: 'leaf',
+            id: 'pane-a',
+            content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-shared', status: 'running' },
+          } as any,
+        },
+        activePane: { 't1': 'pane-a' },
+        paneTitles: title ? { 't1': { 'pane-a': title } } : {},
+      }))
+    }
+
+    // Window B first: same shared pane, NO title. Its seed flush happens
+    // before any sync is installed (no dedupe marking anywhere).
+    sessionStorage.setItem(LAYOUT_WINDOW_ID_STORAGE_KEY, WIN_B_ID)
+    const storeB = configureDurableReceiverStore()
+    seedSharedPane(storeB)
+    await vi.advanceTimersByTimeAsync(PERSIST_DEBOUNCE_MS + 100)
+    const rawB0 = localStorage.getItem(WIN_B_KEY)
+    expect(JSON.parse(rawB0!).panes.paneTitles['t1']?.['pane-a']).toBeUndefined()
+
+    // Window A: the shared pane WITH the title; flushes while no sync is
+    // installed either, so its raw is not pre-marked on B.
+    sessionStorage.setItem(LAYOUT_WINDOW_ID_STORAGE_KEY, WIN_A_ID)
+    const storeA = configureDurableReceiverStore()
+    seedSharedPane(storeA, 'Shared title')
+    await vi.advanceTimersByTimeAsync(PERSIST_DEBOUNCE_MS + 100)
+    const rawA0 = localStorage.getItem(WIN_A_KEY)
+    expect(JSON.parse(rawA0!).panes.paneTitles['t1']['pane-a']).toBe('Shared title')
+
+    // B boots its sync (marking only its OWN envelope raw), then receives
+    // A's raw through a storage event on A's per-window key: title-only,
+    // A's envelope is strictly newer than B's → the title applies.
+    sessionStorage.setItem(LAYOUT_WINDOW_ID_STORAGE_KEY, WIN_B_ID)
+    cleanups.push(installCrossTabSync(storeB as any))
+    window.dispatchEvent(new StorageEvent('storage', { key: WIN_A_KEY, newValue: rawA0 }))
+    expect(storeB.getState().panes.paneTitles['t1']?.['pane-a'], 'B adopted the title').toBe('Shared title')
+
+    // The DURABLE reconciliation flush: B writes its OWN envelope exactly
+    // once (the debounce, under B's window id).
+    await vi.advanceTimersByTimeAsync(PERSIST_DEBOUNCE_MS + 100)
+    const rawB1 = localStorage.getItem(WIN_B_KEY)
+    expect(rawB1, 'B flushed its envelope over the received title').not.toBe(rawB0)
+    expect(JSON.parse(rawB1!).panes.paneTitles['t1']['pane-a'], 'B\u2019s envelope now durably carries the title').toBe('Shared title')
+
+    // A boots its sync and receives B's raw. A already has the title, so
+    // the merge must be a NO-OP: same panes state reference (no persist
+    // dirty flag, no flush scheduled) — the feedback loop's convergence.
+    sessionStorage.setItem(LAYOUT_WINDOW_ID_STORAGE_KEY, WIN_A_ID)
+    cleanups.push(installCrossTabSync(storeA as any))
+    const panesABefore = storeA.getState().panes
+    window.dispatchEvent(new StorageEvent('storage', { key: WIN_B_KEY, newValue: rawB1 }))
+    expect(storeA.getState().panes.paneTitles['t1']['pane-a']).toBe('Shared title')
+    expect(storeA.getState().panes).toBe(panesABefore)
+
+    // Flush counts settle: a long quiet window produces NO further
+    // envelope writes on either side (byte-identity — every flush stamps
+    // a new persistedAt, so any flush would change the bytes).
+    await vi.advanceTimersByTimeAsync(5 * PERSIST_DEBOUNCE_MS)
+    expect(localStorage.getItem(WIN_A_KEY), 'A never re-flushes over an equal title').toBe(rawA0)
+    expect(localStorage.getItem(WIN_B_KEY), 'B does not flush again').toBe(rawB1)
+
+    // Per-key dedupe: re-delivering the SAME raw settles identically.
+    window.dispatchEvent(new StorageEvent('storage', { key: WIN_B_KEY, newValue: rawB1 }))
+    await vi.advanceTimersByTimeAsync(5 * PERSIST_DEBOUNCE_MS)
+    expect(localStorage.getItem(WIN_A_KEY), 'the deduped repeat delivery flushes nothing').toBe(rawA0)
+  })
+
+  it('e3r3: hydratePaneTitles is a reducer-level no-op (same state reference) when the merged result equals the current titles — the churn guard the durable write\u2019s convergence relies on', () => {
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+    })
+    seedLocalWorkspace(store)
+    const before = store.getState().panes
+
+    store.dispatch({
+      ...hydratePaneTitles({
+        paneTitles: { 't1': { 'pane-a': 'Local title' } },
+        paneTitleSetByUser: {},
+        layouts: {
+          't1': {
+            type: 'split',
+            id: 'split-local',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              { type: 'leaf', id: 'pane-a', content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-a', status: 'running' } },
+              { type: 'leaf', id: 'pane-b', content: { kind: 'browser', url: 'https://local.example', devToolsOpen: false } },
+            ],
+          } as any,
+        },
+      }),
+      meta: { source: 'cross-tab', localLayoutPersistedAt: 1_000, remoteLayoutPersistedAt: 2_000 },
+    })
+
+    expect(store.getState().panes).toBe(before)
   })
 })

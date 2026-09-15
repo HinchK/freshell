@@ -88,15 +88,26 @@ export function isDerivedLayoutKey(key: string): boolean {
 }
 
 let inMemoryLayoutWindowId = ''
+let remintedLayoutWindowId = false
 
 /** The mint-once per-window layout-window id: read from sessionStorage,
  * minted once per context when absent, and cached in memory regardless of
  * write success (a quota-exhausted sessionStorage must not re-mint per
  * call — one persistence flush resolves the key repeatedly). Reminted
  * ONLY by remintLayoutWindowId() — the tab-registry lease-collision
- * rotation; every other path keeps it stable. Duplicated tabs share the
- * copied sessionStorage value until that rotation resolves. */
+ * rotation; every other path keeps it stable. After a remint the
+ * in-memory id is AUTHORITATIVE for the context's lifetime: a remint
+ * whose setItem failed leaves the duplicated tab's STALE copied id in
+ * storage, and a later getter must never re-read it over the established
+ * remint (e3r3 finding 3) — that would re-share one layout key between
+ * the tabs the rotation just split. A context with NO established
+ * in-memory id still reads storage (the initial-boot mint-once
+ * semantics). Duplicated tabs share the copied sessionStorage value
+ * until that rotation resolves. */
 export function getLayoutWindowId(): string {
+  if (remintedLayoutWindowId && inMemoryLayoutWindowId) {
+    return inMemoryLayoutWindowId
+  }
   const storage = safeSessionStorage()
   let layoutWindowId = ''
   try {
@@ -128,10 +139,14 @@ export function getLayoutWindowId(): string {
  * derived key is absent → boot rebuilds from the inventory; the
  * ORIGINAL's copy is a separate sessionStorage object and is unaffected).
  * No other path may call this — every other consumer relies on the
- * mint-once stability. */
+ * mint-once stability. Once reminted, the in-memory id is authoritative
+ * for this context's lifetime: a rejected setItem leaves the stale
+ * copied value in storage, and the getter keeps the remint instead of
+ * re-reading it (e3r3 finding 3). */
 export function remintLayoutWindowId(): string {
   const layoutWindowId = `layout-window-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`
   inMemoryLayoutWindowId = layoutWindowId
+  remintedLayoutWindowId = true
   try {
     safeSessionStorage()?.setItem(LAYOUT_WINDOW_ID_STORAGE_KEY, layoutWindowId)
   } catch {

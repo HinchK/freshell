@@ -172,6 +172,47 @@ export function mergeHydratedPaneMetadata(
   return { activePane, paneTitles, paneTitleSetByUser }
 }
 
+/** Deep-equality for one pane-title metadata record (primitive leaves):
+ * same tab keys, same per-tab pane keys, same values. `undefined` and
+ * an absent record are equal (an empty merge result equals an empty
+ * current record). */
+function paneTitleRecordsEqual<T>(
+  a: Record<string, Record<string, T>> | undefined,
+  b: Record<string, Record<string, T>> | undefined,
+): boolean {
+  const aTabIds = Object.keys(a ?? {})
+  const bTabIds = Object.keys(b ?? {})
+  if (aTabIds.length !== bTabIds.length) return false
+  for (const tabId of aTabIds) {
+    if (!b || !(tabId in b)) return false
+    const aTab = a?.[tabId]
+    const bTab = b[tabId]
+    const aPaneIds = Object.keys(aTab ?? {})
+    const bPaneIds = Object.keys(bTab ?? {})
+    if (aPaneIds.length !== bPaneIds.length) return false
+    for (const paneId of aPaneIds) {
+      if (!bTab || !(paneId in bTab)) return false
+      if (aTab![paneId] !== bTab[paneId]) return false
+    }
+  }
+  return true
+}
+
+/** Equal-result churn guard (e3r3 finding 1): true when a cross-window
+ * title merge produced EXACTLY the pane titles and user-set flags the
+ * state already holds. hydratePaneTitles uses this to leave the state
+ * reference untouched, so persistMiddleware sees no panes change and a
+ * receiver that already has the delivered title never re-flushes — the
+ * convergence that makes the durable title apply safe without an echo
+ * loop. */
+export function paneTitleMetadataEquals(
+  a: Pick<PanesState, 'paneTitles' | 'paneTitleSetByUser'>,
+  b: Pick<PanesState, 'paneTitles' | 'paneTitleSetByUser'>,
+): boolean {
+  return paneTitleRecordsEqual(a.paneTitles, b.paneTitles)
+    && paneTitleRecordsEqual(a.paneTitleSetByUser, b.paneTitleSetByUser)
+}
+
 /** TITLE-ONLY cross-window reconciliation (e3r1 finding 4): another
  * window's layout event may never adopt tabs, trees, content, active
  * panes, or ephemeral pane state — only pane TITLES flow across windows,

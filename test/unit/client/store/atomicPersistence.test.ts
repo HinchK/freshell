@@ -19,7 +19,7 @@ describe('atomic persistence', () => {
       expect(LEGACY_LAYOUT_STORAGE_KEY).toBe('freshell.layout.v3')
     })
 
-    it('derives the window’s layout key from the tab-registry clientInstanceId', async () => {
+    it('derives the window’s layout key from the dedicated layout-window id (freshell.layout-window-id.v1), not the tab-registry client id', async () => {
       const { getWindowLayoutKey } = await import('@/store/window-layout-keys')
       expect(getWindowLayoutKey()).toBe(OWN_LAYOUT_KEY)
     })

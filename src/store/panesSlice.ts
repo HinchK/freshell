@@ -24,7 +24,7 @@ import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { buildPaneRefreshTarget, paneContentMatchesSessionRef, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
 import { loadPersistedPanes, loadPersistedTabs } from './persistMiddleware.js'
 import { hasPaneTreeShape, isWellFormedPaneTree } from './paneTreeValidation.js'
-import { mergeHydratedPaneMetadata, mergeCrossWindowPaneTitles, type HydratePanesMeta } from './hydrate-pane-metadata-merge.js'
+import { mergeHydratedPaneMetadata, mergeCrossWindowPaneTitles, paneTitleMetadataEquals, type HydratePanesMeta } from './hydrate-pane-metadata-merge.js'
 import { createLogger } from '@/lib/client-logger'
 import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
 import { sanitizeRestoreError, sanitizeCrashTrace, sanitizeSessionRef, type RestoreError } from '@shared/session-contract'
@@ -2021,6 +2021,11 @@ export const panesSlice = createSlice({
         HydratePanesMeta | undefined
       >).meta
       const merged = mergeCrossWindowPaneTitles(state, action.payload, action.payload.layouts, meta)
+      // Equal-result churn guard (e3r3 finding 1): leave the state
+      // reference untouched when the merge changed nothing, so the
+      // persist middleware marks no dirty cycle and an equal-title
+      // receiver never re-flushes.
+      if (paneTitleMetadataEquals(merged, state)) return
       state.paneTitles = merged.paneTitles
       state.paneTitleSetByUser = merged.paneTitleSetByUser
     },

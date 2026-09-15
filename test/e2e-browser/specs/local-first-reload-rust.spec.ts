@@ -19,7 +19,9 @@ import type { Page } from '@playwright/test'
  *    panes over the real storage-event path, while page2's tab arrangement
  *    stays strictly its own (no tab/tree adoption — the divergence pin);
  *    an older staged envelope does not clobber newer local titles, and a
- *    user-set title survives everything.
+ *    user-set title survives everything. The received titles are also
+ *    DURABLE (e3r3 finding 1): the receiver writes them into its OWN
+ *    envelope, so a reload of the healthy receiver boots WITH them.
  *
  * Cloud-runnable by construction: editor panes (no PTY, no CLI binaries),
  * owned fresh RustServer (fresh FRESHELL_HOME auto-creates the machine —
@@ -232,7 +234,7 @@ test.describe('local-first machine workspace', () => {
     expect(JSON.stringify(rebuilt.panes.layouts['tab-apple'])).toContain('tab-apple-pane')
   })
 
-  test('cross-window pane-title hydration is title-only: newer titles deliver, older do not clobber, user-set survives, and each window keeps its own arrangement', async ({ page }) => {
+  test('cross-window pane-title hydration is title-only: newer titles deliver, older do not clobber, user-set survives, each window keeps its own arrangement, and received titles are durable across the receiver\u2019s reload', async ({ page }) => {
     // Establish the remembered machine in this FRESH context BEFORE first
     // navigation (see the donor-idiom note above): seed the payload
     // Scenario 1 captured, then boot page1 — it resolves the seeded machine
@@ -370,6 +372,24 @@ test.describe('local-first machine workspace', () => {
     expect(page1After.tabIds, 'page1\u2019s arrangement stays exactly its own across page2\u2019s flush').toEqual(page1TabsBefore)
     expect(page1After.tabIds).not.toContain('tab-page2-only')
     expect(page1After.appleTitleUserSet, 'the incoming user-set flag propagates').toBe(true)
+
+    // ── Step B-reload (e3r3 finding 1): the received title must be DURABLE.
+    // page1 is the RECEIVER of a cross-window title (Step B's user-set
+    // apple title, folded in through the title-only path). The durable
+    // reconciliation writes the received title into page1's OWN envelope
+    // (the debounced persist flush), so a refresh of the HEALTHY receiver
+    // boots WITH it — the reviewer's exact durability case: a receiver
+    // that reloads before any unrelated mutation flushes must not lose
+    // the received title.
+    await waitForPersistedEnvelopeTitled(page, 'tab-apple', 'tab-apple-pane', 'User-set on page2')
+    await page.reload()
+    await harness.waitForHarness()
+    await harness.waitForConnection()
+    const reloadedReceiver = await page.evaluate(() =>
+      window.__FRESHELL_TEST_HARNESS__?.getState()?.panes)
+    expect(reloadedReceiver?.paneTitles?.['tab-apple']?.['tab-apple-pane'], 'the received user-set title survives the receiver\u2019s healthy reload').toBe('User-set on page2')
+    expect(reloadedReceiver?.paneTitleSetByUser?.['tab-apple']?.['tab-apple-pane'], 'the received user-set flag survives the reload too').toBe(true)
+    expect(reloadedReceiver?.paneTitles?.['tab-mango']?.['tab-mango-pane'], 'the receiver\u2019s own Step A title also survives the reload').toBe('Newer from page1')
 
     // ── Step C: an OLDER staged envelope does not clobber newer local
     // titles, and the user-set title survives it. From page1, mutate PAGE2's
