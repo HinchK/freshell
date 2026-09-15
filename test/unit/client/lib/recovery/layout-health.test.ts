@@ -179,6 +179,88 @@ describe('classifyPersistedLayoutHealth', () => {
     seedEnvelope(envelope)
     expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
   })
+
+  // e1r1 review finding 2: the alias check covered LEAF ids only, so a
+  // tree with distinct leaves but two same-ID nested splits classified
+  // healthy — and the renderer throws on it: collectSurfaceOrder throws
+  // `Duplicate split ID` (pane-surface-layout.ts:47, consumed by
+  // StablePaneLayout.tsx:97 during render), stranding the tab in its
+  // error boundary until the layout is manually replaced. Split ids and
+  // leaf ids are minted from the same globally-unique nanoid space
+  // (panesSlice.ts splitPane/addPane: `id: nanoid()` / `paneId = nanoid()`),
+  // so ANY duplicated node id — split or leaf — is corruption by
+  // definition. Empty split ids are reachable in the persisted raw shape
+  // exactly like empty leaf ids (isPaneSplitNodeShape only requires
+  // `typeof id === 'string'`, and the zod layouts schema passes trees
+  // through as z.unknown).
+  it('returns corrupt when a layout tree has two nested splits sharing one id (distinct leaves — the renderer throws Duplicate split ID)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    const editorContent = () => ({ kind: 'editor', filePath: '/tmp/a.md', language: null, readOnly: false, content: '', viewMode: 'source', wordWrap: true })
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': {
+        type: 'split',
+        id: 'split-dup',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          {
+            type: 'split',
+            id: 'split-dup',
+            direction: 'vertical',
+            sizes: [50, 50],
+            children: [
+              { type: 'leaf', id: 'pane-a', content: editorContent() },
+              { type: 'leaf', id: 'pane-b', content: editorContent() },
+            ],
+          },
+          { type: 'leaf', id: 'pane-c', content: editorContent() },
+        ],
+      },
+    }
+    ;(envelope.panes as { activePane: Record<string, string> }).activePane['tab-a'] = 'pane-a'
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('returns corrupt when a layout tree carries an empty split id (reachable: isPaneSplitNodeShape only requires typeof id === string)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    const editorContent = () => ({ kind: 'editor', filePath: '/tmp/a.md', language: null, readOnly: false, content: '', viewMode: 'source', wordWrap: true })
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': {
+        type: 'split',
+        id: '',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          { type: 'leaf', id: 'pane-a', content: editorContent() },
+          { type: 'leaf', id: 'pane-b', content: editorContent() },
+        ],
+      },
+    }
+    ;(envelope.panes as { activePane: Record<string, string> }).activePane['tab-a'] = 'pane-a'
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('returns corrupt when a leaf id aliases a split id (all node ids share one globally-unique mint space)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    const editorContent = () => ({ kind: 'editor', filePath: '/tmp/a.md', language: null, readOnly: false, content: '', viewMode: 'source', wordWrap: true })
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': {
+        type: 'split',
+        id: 'shared-id',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          { type: 'leaf', id: 'shared-id', content: editorContent() },
+          { type: 'leaf', id: 'pane-b', content: editorContent() },
+        ],
+      },
+    }
+    ;(envelope.panes as { activePane: Record<string, string> }).activePane['tab-a'] = 'shared-id'
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
 })
 
 describe('backfillPersistedLayoutMachineId', () => {

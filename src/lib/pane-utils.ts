@@ -109,20 +109,26 @@ export function collectPaneEntries(node: PaneNode): PaneEntry[] {
 /**
  * Match rule for session-keyed pane-title folds: a fresh-agent pane owning
  * the given provider:sessionId, or a terminal pane whose sessionRef points
- * at it. A fresh-agent pane in the persisted shape carries sessionRef only
- * (persistence strips the top-level sessionId when a canonical sessionRef
- * exists) — match that shape by the sessionRef's provider+sessionId, the
- * same identity reconcile-attach restores. A present-but-different
- * top-level sessionId never matches (the live binding wins over a stale
- * sessionRef).
+ * at it. A fresh-agent pane PREFERS its canonical sessionRef when one
+ * exists: a live FreshClaude/kilroy pane keeps an EPHEMERAL nanoid runtime
+ * handle in the top-level sessionId (the SDK bridge mints it with no
+ * placeholder→durable materialization) while the durable Claude UUID lives
+ * in sessionRef — and session-directory rows key on the durable id — so
+ * in that shape the top-level sessionId is transient and never participates
+ * in matching. Fall back to the top-level provider+sessionId only when no
+ * sessionRef exists (a creating pane before a durable ref lands).
+ * Persistence strips the top-level sessionId when a canonical sessionRef
+ * exists, so the persisted shape matches by sessionRef too — the same
+ * identity reconcile-attach restores.
  */
 export function paneContentMatchesSessionRef(content: PaneContent, provider: string, sessionId: string): boolean {
   if (content.kind === 'fresh-agent') {
     if (content.provider !== provider) return false
-    if (content.sessionId === sessionId) return true
-    return content.sessionId === undefined
-      && content.sessionRef?.provider === provider
-      && content.sessionRef?.sessionId === sessionId
+    if (content.sessionRef) {
+      return content.sessionRef.provider === provider
+        && content.sessionRef.sessionId === sessionId
+    }
+    return content.sessionId === sessionId
   }
   return content.kind === 'terminal'
     && content.sessionRef?.provider === provider

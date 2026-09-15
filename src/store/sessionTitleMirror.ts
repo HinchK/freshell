@@ -66,8 +66,9 @@ function collectTitledSessionRows(sessions: RootState['sessions']): TitledSessio
 
 /**
  * Any pane bound to this session holding a different title? Matches the
- * same rule updatePaneTitleBySessionRef's reducer uses (fresh-agent
- * provider+sessionId; terminal content.sessionRef). A pane whose user-set
+ * same rule updatePaneTitleBySessionRef's reducer uses (the shared
+ * paneContentMatchesSessionRef: fresh-agent sessionRef-preferred, terminal
+ * content.sessionRef). A pane whose user-set
  * flag is true is NEVER a fold target — treat it as NOT differing so no
  * no-op dispatch fires for it on every refresh.
  */

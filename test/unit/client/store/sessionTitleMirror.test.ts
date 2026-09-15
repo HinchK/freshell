@@ -182,6 +182,49 @@ describe('sessionTitleMirrorMiddleware', () => {
   // persistMiddleware stripTransientSessionFields), and the reconcile
   // verdicts that (re)bind sessions are generated panes actions the mirror
   // must trigger on.
+  // e1r1 review finding 1 (the reviewer's exact failure case): a LIVE
+  // FreshClaude pane keeps an EPHEMERAL nanoid runtime handle in the
+  // top-level content.sessionId (minted by the SDK bridge with no
+  // placeholder→durable materialization; FreshAgentView.tsx:1804-1828
+  // retains it) while the DURABLE Claude UUID lives in content.sessionRef
+  // — real shape verified in panesPersistence.test.ts:384-447 and
+  // fresh-agent-turn-complete.test.ts:143-184. Directory rows key by the
+  // durable UUID, so the mirror must title the pane through sessionRef.
+  const DURABLE_CLAUDE = '11111111-2222-4333-8444-555555555555'
+
+  function seedLiveDualIdClaudePane(store: ReturnType<typeof buildStore>) {
+    store.dispatch(addTab({ id: 'tab-z', title: 'Claude probe' }))
+    store.dispatch(initLayout({
+      tabId: 'tab-z',
+      paneId: 'pane-z',
+      content: {
+        kind: 'fresh-agent',
+        provider: 'claude',
+        sessionType: 'freshclaude',
+        sessionId: 'claude-runtime-nanoid',
+        createRequestId: 'req-claude',
+        status: 'connected',
+        sessionRef: { provider: 'claude', sessionId: DURABLE_CLAUDE },
+      },
+    }))
+  }
+
+  it('titles a live FreshClaude pane (ephemeral top-level sessionId, durable sessionRef) when its directory row lands', () => {
+    const store = buildStore()
+    seedLiveDualIdClaudePane(store)
+    landSessionRow(store, { surface: 'sidebar', sessionId: DURABLE_CLAUDE, provider: 'claude', title: 'Durable row title' })
+    expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('Durable row title')
+    expect(store.getState().panes.paneTitleSetByUser['tab-z']?.['pane-z']).toBeFalsy()
+  })
+
+  it('never overwrites a user-set pane title on a live dual-id FreshClaude pane', () => {
+    const store = buildStore()
+    seedLiveDualIdClaudePane(store)
+    store.dispatch(updatePaneTitle({ tabId: 'tab-z', paneId: 'pane-z', title: 'My name', setByUser: true }))
+    landSessionRow(store, { surface: 'sidebar', sessionId: DURABLE_CLAUDE, provider: 'claude', title: 'Directory title' })
+    expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('My name')
+  })
+
   it('titles a persisted-shape fresh-agent pane (sessionRef only, no top-level sessionId) when its directory row lands — the healthy-reload pre-attach window', () => {
     const store = buildStore()
     store.dispatch(addTab({ id: 'tab-z', title: 'ZZ probe' }))
