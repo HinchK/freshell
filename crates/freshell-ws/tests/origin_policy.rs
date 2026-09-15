@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::{handshake::client::generate_key, http::Request};
 
@@ -175,6 +176,176 @@ async fn connect_with_origin(url: &str, addr: &str, origin: Option<&str>) -> boo
     }
 }
 
+/// Encode one small masked text frame for a client-side WebSocket stream.
+/// This deliberately pipelines a valid hello behind the HTTP upgrade request
+/// so the server has unread client data when it applies the Origin reject.
+fn masked_client_text_frame(payload: &[u8]) -> Vec<u8> {
+    assert!(
+        payload.len() < 126,
+        "test hello must fit the short frame form"
+    );
+    let mask = [0x11, 0x22, 0x33, 0x44];
+    let mut frame = Vec::with_capacity(2 + mask.len() + payload.len());
+    frame.push(0x81); // FIN + text
+    frame.push(0x80 | payload.len() as u8); // masked client payload
+    frame.extend(mask);
+    frame.extend(
+        payload
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| byte ^ mask[index % mask.len()]),
+    );
+    frame
+}
+
+/// Parse one unmasked server frame, returning `None` until all bytes arrive.
+fn parse_server_frame(bytes: &[u8]) -> Option<(u8, &[u8], usize)> {
+    if bytes.len() < 2 {
+        return None;
+    }
+    let first = bytes[0];
+    let opcode = first & 0x0f;
+    if opcode == 0x8 {
+        assert_ne!(first & 0x80, 0, "server close frame must set FIN");
+        assert_eq!(first & 0x70, 0, "server close frame must not set RSV bits");
+        assert!(
+            bytes[1] & 0x7f <= 125,
+            "server close frame payload must be at most 125 bytes"
+        );
+    }
+    assert_eq!(bytes[1] & 0x80, 0, "server frames must not be masked");
+    let (payload_len, header_len) = match bytes[1] & 0x7f {
+        short @ 0..=125 => (short as usize, 2usize),
+        126 => {
+            if bytes.len() < 4 {
+                return None;
+            }
+            (u16::from_be_bytes([bytes[2], bytes[3]]) as usize, 4usize)
+        }
+        127 => {
+            if bytes.len() < 10 {
+                return None;
+            }
+            let payload_len =
+                u64::from_be_bytes(bytes[2..10].try_into().expect("eight-byte length"));
+            (
+                usize::try_from(payload_len).expect("test frame length fits usize"),
+                10usize,
+            )
+        }
+        _ => unreachable!("WebSocket payload length is seven bits"),
+    };
+    if opcode == 0x8 {
+        assert_ne!(
+            payload_len, 1,
+            "server close payload must be empty or include a code"
+        );
+    }
+    let end = header_len.checked_add(payload_len)?;
+    (bytes.len() >= end).then_some((opcode, &bytes[header_len..end], end))
+}
+
+#[test]
+#[should_panic(expected = "server close frame must set FIN")]
+fn origin_close_parser_rejects_fragmented_close() {
+    let _ = parse_server_frame(&[0x08, 0x02, 0x0f, 0xab]);
+}
+
+#[test]
+#[should_panic(expected = "server close frame must not set RSV bits")]
+fn origin_close_parser_rejects_rsv_close() {
+    let _ = parse_server_frame(&[0xc8, 0x02, 0x0f, 0xab]);
+}
+
+#[test]
+#[should_panic(expected = "server close frame payload must be at most 125 bytes")]
+fn origin_close_parser_rejects_extended_length() {
+    let _ = parse_server_frame(&[0x88, 126]);
+}
+
+#[test]
+#[should_panic(expected = "server close payload must be empty or include a code")]
+fn origin_close_parser_rejects_one_byte_payload() {
+    let _ = parse_server_frame(&[0x88, 0x01, 0x00]);
+}
+
+/// A client may write its hello as soon as it has emitted the upgrade request,
+/// before it has read the server's 101. The reject path must still deliver the
+/// exact close frame rather than dropping the socket with unread hello bytes.
+async fn pipelined_origin_rejection_close(addr: &str, origin: &str) -> (u16, String) {
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect raw websocket client");
+    let hello = serde_json::json!({
+        "type": "hello",
+        "token": AUTH_TOKEN,
+        "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
+    })
+    .to_string();
+    let request = format!(
+        "GET /ws HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\nOrigin: {origin}\r\n\r\n",
+        generate_key(),
+    );
+    let hello_frame = masked_client_text_frame(hello.as_bytes());
+    let mut pipelined_request = Vec::with_capacity(request.len() + hello_frame.len());
+    pipelined_request.extend_from_slice(request.as_bytes());
+    pipelined_request.extend_from_slice(&hello_frame);
+    stream
+        .write_all(&pipelined_request)
+        .await
+        .expect("write upgrade request and pipelined hello together");
+    stream.flush().await.expect("flush pipelined client bytes");
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let mut bytes = Vec::new();
+        let mut read_buf = [0u8; 4096];
+        let mut frame_offset = None;
+        loop {
+            if let Some(offset) = frame_offset {
+                let mut cursor = offset;
+                while let Some((opcode, payload, consumed)) = parse_server_frame(&bytes[cursor..]) {
+                    cursor += consumed;
+                    if opcode == 0x8 {
+                        assert!(
+                            payload.len() >= 2,
+                            "origin close must carry an application code"
+                        );
+                        let code = u16::from_be_bytes([payload[0], payload[1]]);
+                        let reason =
+                            String::from_utf8(payload[2..].to_vec()).expect("UTF-8 close reason");
+                        return (code, reason);
+                    }
+                }
+            }
+
+            let read = stream
+                .read(&mut read_buf)
+                .await
+                .expect("read upgrade response and websocket frames");
+            assert_ne!(
+                read, 0,
+                "peer closed before delivering the Origin rejection close frame"
+            );
+            bytes.extend_from_slice(&read_buf[..read]);
+            if frame_offset.is_none() {
+                frame_offset = bytes
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|index| {
+                        let response = String::from_utf8_lossy(&bytes[..index]);
+                        assert!(
+                            response.starts_with("HTTP/1.1 101"),
+                            "expected websocket upgrade, got {response:?}"
+                        );
+                        index + 4
+                    });
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the Origin rejection close frame")
+}
+
 #[tokio::test]
 async fn no_origin_header_is_allowed_through_to_handshake() {
     let (addr, url) = spawn_server(freshell_ws::origin::default_allowed_origins()).await;
@@ -213,6 +384,14 @@ async fn null_origin_is_rejected() {
         !connect_with_origin(&url, &addr, Some("null")).await,
         "the literal `null` Origin (sandboxed iframe / file://) must be rejected"
     );
+}
+
+#[tokio::test]
+async fn pipelined_hello_still_receives_exact_origin_rejection_close() {
+    let (addr, _url) = spawn_server(freshell_ws::origin::default_allowed_origins()).await;
+    let (code, reason) = pipelined_origin_rejection_close(&addr, "not-a-url").await;
+    assert_eq!(code, 4011);
+    assert_eq!(reason, "Origin not allowed");
 }
 
 #[tokio::test]

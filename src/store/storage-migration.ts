@@ -26,7 +26,12 @@ import {
   parseLayoutFreshAgentCommitMarker,
   readRecoverablePersistedLayoutRaw,
 } from './persistedState'
-import { BROWSER_PREFERENCES_STORAGE_KEY, LAYOUT_STORAGE_KEY } from './storage-keys'
+import {
+  BROWSER_PREFERENCES_STORAGE_KEY,
+  LAYOUT_STORAGE_KEY,
+  STORAGE_VERSION,
+  STORAGE_VERSION_KEY,
+} from './storage-keys'
 import {
   buildRestoreError,
   migrateLegacyTerminalDurableState,
@@ -39,8 +44,6 @@ import { normalizeFreshAgentPaneModelSelection } from './paneTypes'
 
 const log = createLogger('StorageMigration')
 
-const STORAGE_VERSION = 5
-const STORAGE_VERSION_KEY = 'freshell_version'
 const AUTH_STORAGE_KEY = 'freshell.auth-token'
 const LEGACY_BROWSER_PREFERENCE_KEYS = [
   'freshell.terminal.fontFamily.v1',

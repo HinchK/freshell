@@ -15,6 +15,7 @@ import { useCoarsePointer } from '@/lib/pointer'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import type { FreshAgentSessionMenuRow, FreshAgentSlashCommand } from '@shared/fresh-agent-slash-commands'
+import { RUST_BASELINE_UNAVAILABLE } from '@/lib/rust-baseline-unavailable'
 import { RESERVED_ROLLBACK_SLASH_NAMES } from '@shared/fresh-agent-slash-commands'
 
 export type FreshAgentAttachment = {
@@ -111,7 +112,6 @@ export function attachmentRejection(provider: string | undefined, filename: stri
   }
   return `.${ext} isn’t supported — attach images, PDFs (claude), or text files`
 }
-
 function getCommandPrefix(value: string): string | null {
   if (!value.startsWith('/')) return null
   const withoutSlash = value.slice(1)
@@ -167,14 +167,7 @@ function isTextEntryElement(value: Element | null): boolean {
   return Boolean(value.closest('input, textarea, select, [contenteditable=""], [contenteditable="true"]'))
 }
 
-/**
- * Maps a failed upload response to the attachment chip's error text. The
- * server-oracle messages win (data.error / data.message), except two statuses
- * get clearer client-side wording: 404 means the attachments route is absent
- * on this server (e.g. a build without it), and 413 trips the 10 MB cap —
- * express's error body there is an unparseable HTML page, so the size limit is
- * spelled out here instead.
- */
+/** Maps an attachment-upload failure to the visible chip text. */
 export function attachmentUploadErrorMessage(
   status: number,
   data: { error?: string; message?: string } | null,
@@ -185,12 +178,7 @@ export function attachmentUploadErrorMessage(
   return data?.error || data?.message || `upload failed (${status})`
 }
 
-/**
- * Raw binary upload. Deliberately NOT base64-in-JSON: the server's global
- * express.json caps JSON bodies at 1mb, so attachments ship as
- * application/octet-stream (which the JSON parser ignores) with the filename
- * in the query string. Auth header matches src/lib/api.ts's request().
- */
+/** Upload raw bytes; the Rust endpoint accepts an octet stream and filename query parameter. */
 async function uploadAttachment(file: globalThis.File): Promise<{ path: string; bytes: number }> {
   const headers = new Headers({ 'Content-Type': 'application/octet-stream' })
   const token = getAuthToken()
@@ -201,10 +189,7 @@ async function uploadAttachment(file: globalThis.File): Promise<{ path: string; 
     headers,
   })
   if (!res.ok) {
-    const data = (await res.json().catch(() => null)) as {
-      error?: string
-      message?: string
-    } | null
+    const data = (await res.json().catch(() => null)) as { error?: string; message?: string } | null
     throw new Error(attachmentUploadErrorMessage(res.status, data, file.name))
   }
   return res.json() as Promise<{ path: string; bytes: number }>
@@ -239,6 +224,7 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
   const [fileSuggestions, setFileSuggestions] = useState<FileSuggestion[]>([])
   const [historyIndex, setHistoryIndex] = useState(-1)
   const [attachments, setAttachments] = useState<FreshAgentAttachment[]>([])
+  const [notice, setNotice] = useState<string | null>(null)
   const [queueExpanded, setQueueExpanded] = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
   const filterRef = useRef<HTMLInputElement | null>(null)
@@ -277,7 +263,7 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
 
   const chatPrefix = getCommandPrefix(text)
   const mention = useMemo(() => getMentionToken(text), [text])
-  const isShellInput = onShellCommand !== undefined && text.startsWith('!')
+  const isShellInput = text.startsWith('!')
   const activeFilter = menuMode === 'chat' ? (chatPrefix ?? '') : filter.toLowerCase()
   // Pinned semantics: name-substring only (never description), shared by both
   // groups.
@@ -493,10 +479,14 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
     const trimmed = text.trim()
     if (disabled) return
     if (isShellInput && trimmed.length > 1) {
-      onShellCommand?.(trimmed.slice(1).trim())
-      pushHistory(trimmed)
-      setText('')
-      closeMenu()
+      if (onShellCommand) {
+        onShellCommand(trimmed.slice(1).trim())
+        pushHistory(trimmed)
+        setText('')
+        closeMenu()
+      } else {
+        setNotice(RUST_BASELINE_UNAVAILABLE.shellCommand)
+      }
       return
     }
     const readyAttachments = attachments.filter((entry) => entry.status === 'ready' && entry.path)
@@ -789,6 +779,8 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
           ))}
         </div>
       ) : null}
+
+      {notice ? <div role="status" className="mb-2 text-sm text-muted-foreground">{notice}</div> : null}
 
       <div
         className="fresh-agent-thinking-bar mb-2 flex h-[0.5em] justify-center"

@@ -19,7 +19,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import WebSocket from 'ws'
-import { test, expect } from '../helpers/fixtures.js'
+import { createFreshE2eBrowserContext, test, expect } from '../helpers/fixtures.js'
 import { RustServer } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
@@ -241,9 +241,7 @@ test.describe('Amplifier events-lane resilience (Rust only)', () => {
 
   test('events.jsonl truncation mid-session degrades then recovers: status flows again', async ({
     page,
-    e2eServerKind,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-amp-lane-'))
     // Pinned FRESHELL_AMPLIFIER_HOME so this spec can find and mutate
     // events.jsonl; both the broker (resolve_amplifier_home, validated F1)
@@ -330,9 +328,7 @@ test.describe('Amplifier events-lane resilience (Rust only)', () => {
 
   test('abrupt server death mid-turn: lane re-attaches after restore and status flows again', async ({
     page,
-    e2eServerKind,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-amp-restart-'))
     const amplifierHome = path.join(sharedRoot, 'amplifier-home')
     let capture: WsCapture | null = null
@@ -456,9 +452,7 @@ test.describe('Amplifier events-lane resilience (Rust only)', () => {
   test('two concurrent servers run independent amplifier lanes', async ({
     page,
     browser,
-    e2eServerKind,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     const rootA = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-amp-dual-a-'))
     const rootB = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-amp-dual-b-'))
     const homeA = path.join(rootA, 'amplifier-home')
@@ -482,7 +476,7 @@ test.describe('Amplifier events-lane resilience (Rust only)', () => {
       const [infoA, infoB] = await Promise.all([serverA.start(), serverB.start()])
       expect(infoA.port).not.toBe(infoB.port)
 
-      contextB = await browser.newContext()
+      contextB = (await createFreshE2eBrowserContext(browser, infoB)).context
       const pageB = await contextB.newPage()
 
       captureA = new WsCapture(infoA.baseUrl, infoA.token)

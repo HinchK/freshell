@@ -925,10 +925,18 @@ fn prepared_codex_launch_reuses_reserved_setup_and_discards_after_adopt_failure(
             "FAKE_CODEX_APP_SERVER_BEHAVIOR",
             "FAKE_CODEX_APP_SERVER_ARG_LOG",
             "FRESHELL_CODEX_MANAGED_LAUNCH",
+            "FRESHELL",
             "FRESHELL_URL",
+            "FRESHELL_TOKEN",
+            "FRESHELL_TERMINAL_ID",
+            "FRESHELL_TAB_ID",
+            "FRESHELL_PANE_ID",
             "PORT",
         ]);
         let _injected_failure = AdoptionFailureMode::enable();
+        for key in FRESHELL_CONTEXT_ENV_KEYS {
+            std::env::remove_var(key);
+        }
         std::env::set_var("CODEX_CMD", codex_dispatcher());
         std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "1");
         std::env::set_var("PORT", "23125");

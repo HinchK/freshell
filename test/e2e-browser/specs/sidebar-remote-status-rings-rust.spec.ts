@@ -38,7 +38,8 @@ import * as os from 'node:os'
 import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import WebSocket from 'ws'
-import { RustServer, ensureRustServerBuilt, type TestServerInfo } from '../helpers/rust-server.js'
+import { RustServer, ensureRustServerBuilt, type E2eServerInfo } from '../helpers/rust-server.js'
+import { installE2eMachineIdentity, registerE2eMachine } from '../helpers/fixtures.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 
@@ -47,7 +48,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const SEEDED_CLAUDE_ID = randomUUID()
 const SESSION_KEY = `claude:${SEEDED_CLAUDE_ID}`
 const PROJECT_DIR = '/tmp/remote-status-rings-project'
-const DEVICE_B_ID = 'e2e-device-b'
+const DEVICE_A_LABEL = 'E2E Device A'
+const DEVICE_B_LABEL = 'E2E Device B'
 const DEVICE_B_CLIENT = 'e2e-device-b-window'
 
 // Copied VERBATIM from pane-ledger-restart-rust.spec.ts:29 (per this
@@ -110,13 +112,11 @@ async function declineRecoveryOfferIfShowing(page: import('@playwright/test').Pa
 }
 
 // Donor: sidebar-registry-sync-rust.spec.ts:81-91 (buildClaudeSessionJsonl),
-// which trimmed session-directory-matrix.spec.ts:36 (buildSessionJsonl) down
 // to ONE user turn. This spec needs the seed visible in the DEFAULT sidebar
 // window (priority=visible&limit=50, no includeNonInteractive): a one-turn
 // transcript parses as isNonInteractive (claude.rs: user_message_count <= 1 →
 // non-interactive) and is excluded there (the donor spec never noticed — its
 // rows surface via LIVE terminal directory entries). So this copy keeps the
-// matrix donor's second user/assistant turn. Field names verified against the
 // donor (system/init: session_id, uuid, timestamp, cwd; turns: parentUuid,
 // sessionId, cwd, message, uuid, timestamp).
 function buildClaudeSessionJsonl(sessionId: string, cwd: string, title: string): string {
@@ -155,10 +155,15 @@ function nextMessage(ws: WebSocket, predicate: (msg: any) => boolean, timeoutMs 
 
 type RawSnapshotRecord = Record<string, unknown> & { status?: string }
 
+interface RawClientIdentity {
+  deviceId: string
+  deviceLabel: string
+  clientInstanceId: string
+}
+
 /**
  * A raw second WS device (not a browser). Handshake: bare `ws://` connect then
  * in-band `{type:'hello', token, protocolVersion}` → `ready` (Stage-2
- * evidence; raw-WS precedent: safe03-origin-matrix.spec.ts). `pushSnapshot`
  * assigns monotonically increasing `snapshotRevision` values and awaits the
  * matching ack per the file's header push discipline.
  */
@@ -233,10 +238,10 @@ async function connectRawDevice(wsUrl: string, token: string): Promise<{
  * payload `mode` satisfy the Rust push validation
  * (crates/freshell-ws/src/tabs_persist_validation.rs `validate_terminal`).
  */
-function buildRemoteClaudeTabRecord(busy: boolean): RawSnapshotRecord {
+function buildRemoteClaudeTabRecord(identity: RawClientIdentity, busy: boolean): RawSnapshotRecord {
   const now = Date.now()
   return {
-    tabKey: `${DEVICE_B_ID}:claude-tab-1`,
+    tabKey: `${identity.deviceId}:claude-tab-1`,
     tabId: 'claude-tab-1',
     tabName: 'Claude (e2e device b)',
     status: 'open',
@@ -297,16 +302,16 @@ async function reloadAndReconnect(page: import('@playwright/test').Page): Promis
 test.describe.serial('sidebar remote status rings (rust)', () => {
   test.setTimeout(240_000)
   let server: RustServer
-  let info: TestServerInfo
+  let info: E2eServerInfo
   let sharedRoot: string
   let deviceB: Awaited<ReturnType<typeof connectRawDevice>>
+  let deviceBIdentity: RawClientIdentity
+  let pageMachineId: string
 
   test.beforeAll(async () => {
     // Same hook-timeout + prebuild pattern as
     // sidebar-registry-sync-rust.spec.ts:168-172: the first release build of
     // freshell-server can take minutes, and the default 60s hook timeout would
-    // kill server.start() mid-build. Unlike the donor (which is RUST_ONLY_SPECS
-    // and never enters the cloud matrix), this spec runs under the plain
     // chromium project, so it ALSO runs in cloud images that ship a prebuilt
     // server binary but no Cargo toolchain: skip the prebuild when the
     // override is configured; RustServer.start() resolves it fail-closed via
@@ -342,7 +347,18 @@ test.describe.serial('sidebar remote status rings (rust)', () => {
       },
     })
     info = await server.start()
+    pageMachineId = (await registerE2eMachine(info, DEVICE_A_LABEL)).id
+    const machine = await registerE2eMachine(info, DEVICE_B_LABEL)
+    deviceBIdentity = {
+      deviceId: machine.id,
+      deviceLabel: machine.label,
+      clientInstanceId: DEVICE_B_CLIENT,
+    }
     deviceB = await connectRawDevice(info.wsUrl, info.token)
+  })
+
+  test.beforeEach(async ({ page }) => {
+    await installE2eMachineIdentity(page.context(), info, pageMachineId)
   })
 
   test.afterAll(async () => {
@@ -359,29 +375,23 @@ test.describe.serial('sidebar remote status rings (rust)', () => {
 
     // Busy on another device → reload → blue ring.
     await deviceB.pushSnapshot({
-      deviceId: DEVICE_B_ID,
-      deviceLabel: 'E2E Device B',
-      clientInstanceId: DEVICE_B_CLIENT,
-      records: [buildRemoteClaudeTabRecord(true)],
+      ...deviceBIdentity,
+      records: [buildRemoteClaudeTabRecord(deviceBIdentity, true)],
     })
     await reloadAndReconnect(page)
     await expectRing(row, 'busy')
 
     // Open (not busy) on another device → reload → green ring.
     await deviceB.pushSnapshot({
-      deviceId: DEVICE_B_ID,
-      deviceLabel: 'E2E Device B',
-      clientInstanceId: DEVICE_B_CLIENT,
-      records: [buildRemoteClaudeTabRecord(false)],
+      ...deviceBIdentity,
+      records: [buildRemoteClaudeTabRecord(deviceBIdentity, false)],
     })
     await reloadAndReconnect(page)
     await expectRing(row, 'open')
 
     // The other device no longer has the session open → reload → no ring.
     await deviceB.pushSnapshot({
-      deviceId: DEVICE_B_ID,
-      deviceLabel: 'E2E Device B',
-      clientInstanceId: DEVICE_B_CLIENT,
+      ...deviceBIdentity,
       records: [],
     })
     await reloadAndReconnect(page)
@@ -393,9 +403,7 @@ test.describe.serial('sidebar remote status rings (rust)', () => {
     // query sees no remote record for the seeded session. (Self-sufficient
     // even if case-reload did not run first.)
     await deviceB.pushSnapshot({
-      deviceId: DEVICE_B_ID,
-      deviceLabel: 'E2E Device B',
-      clientInstanceId: DEVICE_B_CLIENT,
+      ...deviceBIdentity,
       records: [],
     })
 
@@ -408,10 +416,8 @@ test.describe.serial('sidebar remote status rings (rust)', () => {
     // periodic `tabs.sync.query` (the path under test for R4) must deliver
     // it. Window = one interval + slack (45s); per-test budget is 240s.
     await deviceB.pushSnapshot({
-      deviceId: DEVICE_B_ID,
-      deviceLabel: 'E2E Device B',
-      clientInstanceId: DEVICE_B_CLIENT,
-      records: [buildRemoteClaudeTabRecord(true)],
+      ...deviceBIdentity,
+      records: [buildRemoteClaudeTabRecord(deviceBIdentity, true)],
     })
     await expectRing(row, 'busy', 45_000)
   })
@@ -419,10 +425,8 @@ test.describe.serial('sidebar remote status rings (rust)', () => {
   test('case-suppression: locally-open session and same-device records never ring (R3)', async ({ page }) => {
     // Install the remote busy ring BEFORE boot so the boot query delivers it.
     await deviceB.pushSnapshot({
-      deviceId: DEVICE_B_ID,
-      deviceLabel: 'E2E Device B',
-      clientInstanceId: DEVICE_B_CLIENT,
-      records: [buildRemoteClaudeTabRecord(true)],
+      ...deviceBIdentity,
+      records: [buildRemoteClaudeTabRecord(deviceBIdentity, true)],
     })
 
     await bootAndConnect(page, info)
@@ -456,9 +460,7 @@ test.describe.serial('sidebar remote status rings (rust)', () => {
     // Isolate the same-device phase: clear device-b's record, reload → the
     // ring is really gone before the impostor acts.
     await deviceB.pushSnapshot({
-      deviceId: DEVICE_B_ID,
-      deviceLabel: 'E2E Device B',
-      clientInstanceId: DEVICE_B_CLIENT,
+      ...deviceBIdentity,
       records: [],
     })
     await reloadAndReconnect(page)
@@ -466,15 +468,26 @@ test.describe.serial('sidebar remote status rings (rust)', () => {
 
     // R3 (same device): a raw client claiming THIS page's deviceId with a
     // distinct clientInstanceId partitions into `sameDeviceOpen`, which must
-    // never produce a ring. The page deviceId is the canonical localStorage one.
-    const pageDeviceId = await page.evaluate(() => window.localStorage.getItem('freshell.device-id.v2'))
-    expect(pageDeviceId, 'page deviceId must be persisted in localStorage').toBeTruthy()
+    // never produce a ring. TabRegistry holds the server-selected machine
+    // identity after bootstrap, including its canonical label.
+    const pageDeviceIdentity = await page.evaluate(() => {
+      const state = window.__FRESHELL_TEST_HARNESS__?.getState()
+      const { deviceId, deviceLabel } = state?.tabRegistry ?? {}
+      if (typeof deviceId !== 'string' || !deviceId || typeof deviceLabel !== 'string' || !deviceLabel) {
+        return null
+      }
+      return { deviceId, deviceLabel }
+    })
+    expect(pageDeviceIdentity, 'page selected machine identity must be available in TabRegistry').not.toBeNull()
+    const impostorIdentity: RawClientIdentity = {
+      deviceId: pageDeviceIdentity!.deviceId,
+      deviceLabel: pageDeviceIdentity!.deviceLabel,
+      clientInstanceId: 'e2e-same-device-impostor',
+    }
     const impostor = await connectRawDevice(info.wsUrl, info.token)
     await impostor.pushSnapshot({
-      deviceId: pageDeviceId!,
-      deviceLabel: 'E2E same-device impostor',
-      clientInstanceId: 'e2e-same-device-impostor',
-      records: [buildRemoteClaudeTabRecord(true)],
+      ...impostorIdentity,
+      records: [buildRemoteClaudeTabRecord(impostorIdentity, true)],
     })
 
     // Reload → the ready-edge query partitions the impostor record into

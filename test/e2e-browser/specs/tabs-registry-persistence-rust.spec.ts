@@ -3,9 +3,9 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import WebSocket from 'ws'
-import { test, expect } from '../helpers/fixtures.js'
+import { registerE2eMachine, test, expect } from '../helpers/fixtures.js'
 import { RustServer } from '../helpers/rust-server.js'
-import type { TestServerInfo } from '../helpers/test-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 
 /**
@@ -27,7 +27,6 @@ import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
  * `tabs.sync.client.retire` wire messages over the same `/ws` endpoint +
  * harness-token `hello` handshake the browser uses (the raw-WS option the
  * task brief's Interfaces line allows; handshake helpers copied verbatim
- * from `ws-ping-pong-matrix.spec.ts`). Closing a raw socket without sending
  * retire is EXACTLY "close context A WITHOUT retiring" — the server retires
  * only on an explicit retire frame or the REST unload beacon, never on
  * socket close (see `tabs-client-retire.spec.ts` for the browser-side
@@ -55,8 +54,7 @@ const ISO_TIMESTAMP_MILLIS_Z = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/
 const STALE_REVISION_MESSAGE = 'Stale snapshot revision rejected for tabs registry client snapshot'
 const DUPLICATE_CONTENT_MESSAGE = 'Duplicate snapshot revision has different tabs registry content'
 
-/** Open a raw WS connection and complete the harness-token `hello` handshake.
- *  (Copied verbatim from `ws-ping-pong-matrix.spec.ts`.) */
+/** Open a raw WS connection and complete the harness-token `hello` handshake. */
 function connectAndHello(wsUrl: string, token: string): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(wsUrl)
@@ -86,8 +84,7 @@ function connectAndHello(wsUrl: string, token: string): Promise<WebSocket> {
   })
 }
 
-/** Resolve with the next message matching `predicate`, or reject on timeout.
- *  (Copied verbatim from `ws-ping-pong-matrix.spec.ts`.) */
+/** Resolve with the next message matching `predicate`, or reject on timeout. */
 function nextMessage(ws: WebSocket, predicate: (message: unknown) => boolean, timeoutMs = 5_000): Promise<any> {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
@@ -112,6 +109,19 @@ interface ClientIdentity {
   deviceId: string
   deviceLabel: string
   clientInstanceId: string
+}
+
+async function registerClientIdentity(
+  info: E2eServerInfo,
+  deviceLabel: string,
+  clientInstanceId: string,
+): Promise<ClientIdentity> {
+  const machine = await registerE2eMachine(info, deviceLabel)
+  return {
+    deviceId: machine.id,
+    deviceLabel: machine.label,
+    clientInstanceId,
+  }
 }
 
 /** A registry-schema-complete OPEN record (all fields `validate_registry_record`
@@ -235,25 +245,17 @@ test.describe('Durable tabs registry across restart (rust)', () => {
     let wsB: WebSocket | undefined
     let wsC: WebSocket | undefined
     try {
-      const info: TestServerInfo = await server.start()
+      const info: E2eServerInfo = await server.start()
       const now = Date.now()
 
-      // Context A: deviceId dev-A, revision 1, ONE open record.
-      const identityA: ClientIdentity = {
-        deviceId: 'dev-A',
-        deviceLabel: 'Device A (e2e)',
-        clientInstanceId: 'client-A',
-      }
+      // Context A: a registered server-owned machine, revision 1, ONE open record.
+      const identityA = await registerClientIdentity(info, 'Device A (e2e)', 'client-A')
       const openA = openTabRecord(identityA, { tabId: 'tab-a1', tabName: 'A open tab', at: now })
       wsA = await connectAndHello(info.wsUrl, info.token)
       expectAck(await pushTabs(wsA, identityA, 1, [openA]), { openRecords: 1, closedRecords: 0 })
 
-      // Context B: deviceId dev-B, revision 1, open + closed records.
-      const identityB: ClientIdentity = {
-        deviceId: 'dev-B',
-        deviceLabel: 'Device B (e2e)',
-        clientInstanceId: 'client-B',
-      }
+      // Context B: a separately registered server-owned machine, revision 1, open + closed records.
+      const identityB = await registerClientIdentity(info, 'Device B (e2e)', 'client-B')
       const openB = openTabRecord(identityB, { tabId: 'tab-b1', tabName: 'B open tab', at: now + 1 })
       const closedB = closedTabRecord(identityB, { tabId: 'tab-b2', tabName: 'B closed tab', at: now + 2 })
       wsB = await connectAndHello(info.wsUrl, info.token)
@@ -266,13 +268,9 @@ test.describe('Durable tabs registry across restart (rust)', () => {
       // RESTART the rust server (fixture restart(): same home/port/token).
       await server.restart()
 
-      // From a NEW context C (deviceId dev-C), query BEFORE A or B republish
+      // From a NEW registered context C, query BEFORE A or B republish
       // (raw sockets never republish; B's socket died with the old process).
-      const identityC: ClientIdentity = {
-        deviceId: 'dev-C',
-        deviceLabel: 'Device C (e2e)',
-        clientInstanceId: 'client-C',
-      }
+      const identityC = await registerClientIdentity(info, 'Device C (e2e)', 'client-C')
       wsC = await connectAndHello(info.wsUrl, info.token)
       const data = await queryTabs(wsC, identityC)
 
@@ -283,7 +281,7 @@ test.describe('Durable tabs registry across restart (rust)', () => {
         .toEqual(sortByTabKey([openA, openB]))
       // ... and closed contains B's tombstone.
       expect(data.closed.map(withoutServerInstanceId)).toEqual([closedB])
-      // Nothing leaks into dev-C's own partitions.
+      // Nothing leaks into C's own partitions.
       expect(data.localOpen).toEqual([])
       expect(data.sameDeviceOpen).toEqual([])
     } finally {
@@ -301,11 +299,7 @@ test.describe('Durable tabs registry across restart (rust)', () => {
     try {
       const info = await server.start()
       const now = Date.now()
-      const identity: ClientIdentity = {
-        deviceId: 'dev-D',
-        deviceLabel: 'Device D (e2e)',
-        clientInstanceId: 'client-D',
-      }
+      const identity = await registerClientIdentity(info, 'Device D (e2e)', 'client-D')
       const record = openTabRecord(identity, { tabId: 'tab-d1', tabName: 'D open tab', at: now })
       ws = await connectAndHello(info.wsUrl, info.token)
 
@@ -359,15 +353,14 @@ test.describe('Durable tabs registry across restart (rust)', () => {
     }
   })
 
-  test('corruption recovery matches Node semantics', async () => {
+  test('corruption recovery preserves established registry semantics', async () => {
     // Explicit homeDir (RustServer never deletes a caller-provided home), so
     // a SECOND server can boot on the same home after the first stops.
     const homeRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-tabs-registry-e2e-'))
     const registryRoot = path.join(homeRoot, '.freshell', 'tabs-registry')
     const v1Dir = path.join(registryRoot, 'v1')
-    // The legacy log the open() fall-through would rehydrate from lives at
-    // `<store root>/tabs-registry.jsonl` (tabs_store.rs:215, Node
-    // store.ts:692). The sibling `<home>/.freshell/tabs-registry.jsonl` is
+    // `<store root>/tabs-registry.jsonl` (tabs_store.rs:215). The sibling
+    // `<home>/.freshell/tabs-registry.jsonl` is
     // asserted too, so the accounting holds even against a path regression.
     const legacyJsonlCandidates = [
       path.join(registryRoot, 'tabs-registry.jsonl'),
@@ -381,11 +374,7 @@ test.describe('Durable tabs registry across restart (rust)', () => {
     try {
       const info = await serverBefore.start()
       const now = Date.now()
-      const identity: ClientIdentity = {
-        deviceId: 'dev-E',
-        deviceLabel: 'Device E (e2e)',
-        clientInstanceId: 'client-E',
-      }
+      const identity = await registerClientIdentity(info, 'Device E (e2e)', 'client-E')
       ws = await connectAndHello(info.wsUrl, info.token)
       expectAck(
         await pushTabs(ws, identity, 1, [
@@ -399,10 +388,7 @@ test.describe('Durable tabs registry across restart (rust)', () => {
       // Stop the server (process only — the caller-provided home survives).
       await serverBefore.stop()
 
-      // validator-A8-A9 legacy-file accounting: after the missing-object
-      // archive, `open()` falls through to the LEGACY branch BEFORE empty
       // (store.ts:692-709 / tabs_store.rs:215-242). The isolated home must
-      // hold NO stray legacy `tabs-registry.jsonl`, so the fall-through is
       // GUARANTEED to land on the empty branch — making "archive => empty" a
       // sound assertion below.
       for (const candidate of legacyJsonlCandidates) {
@@ -410,7 +396,7 @@ test.describe('Durable tabs registry across restart (rust)', () => {
       }
 
       // Delete ONE referenced content-addressed object: the committed
-      // manifest names its component objects; remove dev-E's open-snapshot
+      // manifest names its component objects; remove E's open-snapshot
       // object (objects/<sha256>.json). `fs.unlink` throws if the store
       // layout were not what this spec claims.
       const manifest = JSON.parse(await fs.readFile(path.join(v1Dir, 'manifest.json'), 'utf8'))
@@ -425,7 +411,6 @@ test.describe('Durable tabs registry across restart (rust)', () => {
       const infoAfter = await serverAfter.start()
 
       // ...the tabs query returns EMPTY (missing-object self-heal discarded
-      // the whole registry; no legacy file existed to rehydrate from)...
       wsAfter = await connectAndHello(infoAfter.wsUrl, infoAfter.token)
       expect(await queryTabs(wsAfter, identity)).toEqual({
         localOpen: [],
@@ -440,7 +425,6 @@ test.describe('Durable tabs registry across restart (rust)', () => {
       const v1Entries = await fs.readdir(v1Dir)
       expect(v1Entries.filter((name) => name.startsWith('manifest.json.invalid-'))).toHaveLength(1)
       expect(v1Entries).not.toContain('manifest.json')
-      // Self-heal must not fabricate a legacy file either.
       for (const candidate of legacyJsonlCandidates) {
         await expect(fs.access(candidate)).rejects.toThrow()
       }

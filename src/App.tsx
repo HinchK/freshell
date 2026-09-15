@@ -67,8 +67,11 @@ import {
 } from '@/store/machineIdentitySlice'
 import type { Machine } from '@/lib/machine-identity'
 import {
+  consumeActiveMachineSelectionMark,
   getSuggestedMachineLabel,
+  markActiveMachineSelection,
   persistSelectedMachineId,
+  peekActiveMachineSelectionMark,
   resolveMachineIdentity,
 } from '@/lib/machine-identity'
 import { restoreMachineWorkspace } from '@/lib/machine-workspace'
@@ -555,12 +558,17 @@ export default function App() {
   }, [])
 
   const selectMachineFromChooser = useCallback(async (machine: Machine) => {
+    // An ACTIVE choice: arm the one-shot marker so the next boot's restore
+    // knows the local layout may be a foreign machine's cache (the
+    // non-recoverable-inventory clear must still apply after the reload).
+    markActiveMachineSelection()
     persistSelectedMachineId(machine.id)
     restartAfterMachineSelection()
   }, [restartAfterMachineSelection])
 
   const addMachineFromChooser = useCallback(async (label: string) => {
     const machine = await createMachine(label)
+    markActiveMachineSelection()
     persistSelectedMachineId(machine.id)
     restartAfterMachineSelection()
   }, [restartAfterMachineSelection])
@@ -828,7 +836,17 @@ export default function App() {
             deviceId: resolution.machine.id,
             deviceLabel: resolution.machine.label,
           }))
-          await restoreMachineWorkspace(appStore, resolution.machine.id)
+          // The chooser's one-shot marker: an ACTIVE machine choice keeps the
+          // non-recoverable clear (foreign cache); a natural reload of a
+          // remembered selection keeps the rehydrated layout. PEEK before the
+          // (async) inventory request and CONSUME only after a successful
+          // restore — a failure, cancellation, or in-flight manual reload
+          // leaves the marker armed, so the retry always knows the machine
+          // was actively chosen and never keeps a foreign machine's stale
+          // local cache over the user's choice.
+          const activeSelection = peekActiveMachineSelectionMark()
+          await restoreMachineWorkspace(appStore, resolution.machine.id, { activeSelection })
+          consumeActiveMachineSelectionMark()
           if (cancelled) return false
           dispatch(setMachineReady({ machine: resolution.machine, mode: 'server-managed' }))
           return true
@@ -1905,6 +1923,14 @@ export default function App() {
       void exitFullscreen()
     }
   }, [exitFullscreen, isFullscreen, isLandscapeTerminalView, isMobile, view])
+
+  // Machine discovery is authenticated. If that bootstrap request rejects the
+  // current token, the auth prompt must take precedence over the machine gate;
+  // otherwise the user is stranded forever on "Preparing this machine" with
+  // no way to supply a valid token.
+  if (machineIdentity && machineIdentity.status !== 'ready' && authRequiredVisible) {
+    return <AuthRequiredModal />
+  }
 
   if (machineIdentity && machineIdentity.status !== 'ready') {
     if (machineIdentity.status === 'choosing') {

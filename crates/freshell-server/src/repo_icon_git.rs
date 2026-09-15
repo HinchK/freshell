@@ -22,6 +22,11 @@ pub(crate) struct RepoInfo {
 
 /// Walk up from `start` looking for `.git`; see module docs for semantics.
 pub(crate) fn resolve_repo(start: &Path) -> RepoInfo {
+    resolve_repo_from(start, None)
+}
+
+/// Like [`resolve_repo`], optionally stopping after checking an inclusive boundary.
+fn resolve_repo_from(start: &Path, stop_at: Option<&Path>) -> RepoInfo {
     let mut current = start.to_path_buf();
     loop {
         let git_path = current.join(".git");
@@ -41,6 +46,11 @@ pub(crate) fn resolve_repo(start: &Path) -> RepoInfo {
                 };
             }
             _ => {}
+        }
+        if let Some(stop_at) = stop_at {
+            if current == stop_at {
+                break;
+            }
         }
         match current.parent() {
             Some(parent) => current = parent.to_path_buf(),
@@ -106,7 +116,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("plain");
         fs::create_dir_all(&dir).unwrap();
-        let info = resolve_repo(&dir);
+        let info = resolve_repo_from(&dir, Some(tmp.path()));
         assert_eq!(info.repo_root, dir);
         assert_eq!(info.checkout_root, dir);
     }

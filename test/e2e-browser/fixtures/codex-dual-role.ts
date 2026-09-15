@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -33,15 +33,22 @@ export async function installDualRoleCodexCli(
   await fs.mkdir(binDir, { recursive: true })
   const target = path.join(binDir, 'codex')
   const terminalEnvExtra = JSON.stringify(terminalEnv ?? {})
+  const fakeAppServerUrl = pathToFileURL(FAKE_CODEX_APP_SERVER).href
   const script = `#!/usr/bin/env node
 const { spawnSync } = require('node:child_process')
 const argv = process.argv.slice(2)
 if (argv.includes('app-server')) {
-  const result = spawnSync(process.execPath, [${JSON.stringify(FAKE_CODEX_APP_SERVER)}, ...argv], { stdio: 'inherit', env: process.env })
+  // Load the ESM fixture into this process rather than creating a wrapper
+  // plus sidecar child. The caller therefore owns one direct process on every
+  // platform; forceful Windows termination cannot orphan an inner listener.
+  void import(${JSON.stringify(fakeAppServerUrl)}).catch((error) => {
+    console.error(error)
+    process.exitCode = 1
+  })
+} else {
+  const result = spawnSync(process.execPath, [${JSON.stringify(terminalSource)}, ...argv], { stdio: 'inherit', env: { ...process.env, ...${terminalEnvExtra} } })
   process.exit(result.status ?? 1)
 }
-const result = spawnSync(process.execPath, [${JSON.stringify(terminalSource)}, ...argv], { stdio: 'inherit', env: { ...process.env, ...${terminalEnvExtra} } })
-process.exit(result.status ?? 1)
 `
   await fs.writeFile(target, script, 'utf8')
   await fs.chmod(target, 0o755)

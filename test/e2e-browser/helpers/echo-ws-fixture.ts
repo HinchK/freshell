@@ -16,6 +16,8 @@
  *     tests always use comfortably larger sizes)
  *   - text `drop` → the underlying TCP connection is destroyed abruptly
  *     (`ws.terminate()`), with NO close frame
+ *   - text `reset` → the underlying TCP connection is reset abruptly (RST),
+ *     with NO close frame
  *   - text `emptyclose` → server initiates a close with an EMPTY close frame
  *     (no code)
  *
@@ -124,6 +126,15 @@ export class EchoWsFixture {
 
       if (text === 'drop') {
         ws.terminate()
+        return
+      }
+
+      if (text === 'reset') {
+        // `terminate()` normally produces an orderly peer EOF on loopback.
+        // This command deliberately exercises the distinct ECONNRESET path
+        // that a raw client must fail closed on.
+        const socket = (ws as unknown as { _socket: import('node:net').Socket })._socket
+        socket.resetAndDestroy()
         return
       }
 

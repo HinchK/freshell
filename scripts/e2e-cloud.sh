@@ -245,13 +245,19 @@ cmd_build() {
   freshell_resolve_cloud_identity "cloudbuild.builds.create"
 
   # Content-addressed tag (see image_tag_for_head): the only tag `run` pins.
-  local tag remote_base
+  local tag remote_base build_commit
   tag="$(image_tag_for_head)"
   remote_base="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/${IMAGE_NAME}"
+  build_commit="$(git -C "$ROOT" rev-parse HEAD)"
+  if ! [[ "$build_commit" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "[e2e-cloud] ERROR: HEAD is not a lowercase 40-hex commit: $build_commit" >&2
+    exit 1
+  fi
 
   if $local_build; then
     echo "[e2e-cloud] Building Docker image locally (tag: $tag)..."
     docker build -f "$ROOT/docker/cloud-run/Dockerfile" \
+      --build-arg "FRESHELL_BUILD_COMMIT=${build_commit}" \
       -t "$IMAGE_LOCAL" \
       -t "${IMAGE_NAME}:${tag}" \
       "$ROOT"
@@ -263,7 +269,7 @@ cmd_build() {
       --config "$ROOT/docker/cloud-run/cloudbuild.yaml" \
       $(account_flag) \
       --project="$GCP_PROJECT" \
-      --substitutions=_IMAGE="${remote_base}:${tag}" \
+      --substitutions=_IMAGE="${remote_base}:${tag}",_FRESHELL_BUILD_COMMIT="$build_commit" \
       "$ROOT"
     echo "[e2e-cloud] Cloud Build complete: ${remote_base}:${tag}"
   fi
@@ -425,6 +431,20 @@ cmd_run() {
     fi
   done
   pw_args=("${normalized[@]}")
+
+  # The container entrypoint treats --dry-run as a diagnostic-only request: it
+  # calculates and prints shard assignments, then exits before Playwright runs.
+  # Such a task has no completion/retry receipt by design, so keep Cloud Run's
+  # task-success checks below but do not reconcile execution receipts that
+  # truthfully do not exist. Scan the normalized array so split-form flags and
+  # PLAYWRIGHT_ARGS serialization have one authoritative representation.
+  local playwright_dry_run=false
+  for arg in "${pw_args[@]}"; do
+    if [ "$arg" = "--dry-run" ]; then
+      playwright_dry_run=true
+      break
+    fi
+  done
 
   # Resolve backend: explicit flags override env var; env var defaults to local.
   if $cloud_mode; then
@@ -611,10 +631,69 @@ cmd_run() {
   # per-shard summary, even when some shards fail.
   echo "[e2e-cloud] Fetching logs..."
   local log_output
-  log_output=$(gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" 2>/dev/null || true)
+  if ! log_output=$(gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" 2>&1); then
+    # This human formatter exposes textPayload only. It remains useful for
+    # display, but never decides whether retry evidence exists; that decision
+    # comes from the required jsonPayload query below.
+    echo "[e2e-cloud] WARNING: could not read display logs: $log_output" >&2
+    log_output=""
+  fi
 
-  # Print full log output from ALL shards.
-  echo "$log_output"
+  # Print logs from every shard. Retry traces are retained as bounded base64
+  # JSONL chunks in Cloud Logging; redact their bytes here so a successful
+  # retry's terminal receipt remains readable while retaining the immutable
+  # artifact id and first-attempt stack in the underlying logs.
+  local display_log_output
+  display_log_output=$(printf '%s\n' "$log_output" | sed -E \
+    '/"event":"e2e_playwright_retry_trace_chunk"/ s/("data":")[^"]*/\1<retained-in-cloud-logging>/' )
+  echo "$display_log_output"
+
+  # Cloud Run turns structured stdout JSON into jsonPayload, which the human
+  # `executions logs read` formatter deliberately does not print. Fetch the
+  # machine-readable entries directly, wait through bounded Cloud Logging
+  # ingestion lag, and require one exact completion receipt from every task.
+  # A query/read/parser failure is never evidence of zero retries.
+  query_structured_retry_receipts() {
+    local query attempt raw parsed parser_error
+    query="resource.type=\"cloud_run_job\" AND labels.\"run.googleapis.com/execution_name\"=\"${execution_id}\" AND (jsonPayload.event=\"e2e_playwright_task_complete\" OR jsonPayload.event=\"e2e_playwright_retry_evidence\")"
+    for attempt in 1 2 3 4 5; do
+      if raw=$(gcloud logging read "$query" $(account_flag) --project="$GCP_PROJECT" --format=json --limit=1000 2>&1); then
+        if parsed=$(printf '%s' "$raw" | node "$ROOT/scripts/e2e-cloud-structured-receipts.mjs" "$execution_id" "$shards" 2>&1); then
+          printf '%s\n' "$parsed"
+          return 0
+        fi
+        parser_error="$parsed"
+      else
+        parser_error="$raw"
+      fi
+      if [ "$attempt" -lt 5 ]; then
+        echo "[e2e-cloud] Waiting for complete structured retry receipts (attempt ${attempt}/5): $parser_error" >&2
+        sleep 3
+      fi
+    done
+    echo "[e2e-cloud] ERROR: could not retrieve complete structured retry receipts: $parser_error" >&2
+    return 1
+  }
+
+  local retry_evidence_count=0
+  if $playwright_dry_run; then
+    echo "[e2e-cloud] Skipping structured retry-receipt reconciliation for --dry-run (no Playwright task executed)."
+  else
+    local structured_retry_receipts
+    if ! structured_retry_receipts=$(query_structured_retry_receipts); then
+      exit 1
+    fi
+
+    retry_evidence_count=$(jq -r '.recoveredRetryCount' <<< "$structured_retry_receipts")
+    if ! [[ "$retry_evidence_count" =~ ^[0-9]+$ ]]; then
+      echo "[e2e-cloud] ERROR: structured retry receipt returned an invalid recoveredRetryCount." >&2
+      exit 1
+    fi
+    if [ "$retry_evidence_count" -gt 0 ]; then
+      echo "[e2e-cloud] Recovered Playwright retry evidence retained in Cloud Logging (${retry_evidence_count} case(s)):"
+      jq -c '.retryEvidence[] | {taskIndex, failureAttempt, test, error, trace}' <<< "$structured_retry_receipts"
+    fi
+  fi
 
   # Extract and display a per-shard summary from the Playwright output.
   # Each shard's entrypoint prints "Shard X/Y assignment" and Playwright's
@@ -664,6 +743,15 @@ cmd_run() {
   # ran zero tests).
   if [ "$succeeded" != "$shards" ]; then
     echo "[e2e-cloud] ERROR: expected $shards succeeded task(s), got $succeeded."
+    exit 1
+  fi
+
+  # Playwright retries are useful diagnostics, but a task that passes only on
+  # retry is not a zero-flake release receipt. The structured evidence above
+  # names the exact first failure and durable trace artifact before failing the
+  # wrapper; retry policy itself remains unchanged.
+  if [ "$retry_evidence_count" -gt 0 ]; then
+    echo "[e2e-cloud] ERROR: recovered Playwright retry evidence prevents a zero-flake cloud receipt."
     exit 1
   fi
 

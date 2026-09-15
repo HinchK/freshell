@@ -1,15 +1,15 @@
 import { defineConfig } from '@playwright/test'
 import baseConfig from './playwright.config.js'
+import { LOCAL_ONLY_SPECS } from './playwright.config.js'
 
 // Cloud Run Playwright config.
 //
 // Extends the base playwright.config.ts and overrides only the cloud-specific
-// settings. This avoids duplicating the MATRIX_SPECS / RUST_ONLY_SPECS / project
-// testMatch lists, which are tightly coupled to the base config.
+// settings. The base config is Rust-only, so cloud inherits its fixture contract.
 //
 // Key differences from base:
-// - No globalSetup/globalTeardown: the Docker image pre-builds dist/client +
-//   dist/server and the Rust binary, so there's no build step to run.
+// - No globalSetup/globalTeardown: the Docker image pre-builds dist/client and
+//   the Rust binary, so there's no build step to run.
 // - workers: 2, retries: 2: cloud is a CI-like environment.
 // - forbidOnly: true: always enforce in cloud.
 // - Reporter: line + html (open: 'never'): line for log parsing, html for
@@ -27,7 +27,7 @@ import baseConfig from './playwright.config.js'
 // require external CLI binaries (opencode, codex, claude/amplifier) that
 // are not installed, or because they depend on environment-specific
 // rendering/timing that differs in cloud.
-const CLOUD_SKIP_SPECS = [
+export const CLOUD_SKIP_SPECS = [
   // Requires opencode binary
   // (freshopencode-model-picker.spec.ts is cloud-legal: every fetch is routed
   // and the sidecar is suppressed via the test harness, so it needs no binary)
@@ -50,19 +50,9 @@ const CLOUD_SKIP_SPECS = [
   'pane-activity-indicator.spec.ts',
   // Environment-sensitive: timing-sensitive localStorage persistence
   'rest-tab-persistence.spec.ts',
-  // Rust-only: asserts e2eServerKind === 'rust'; runs only under the
-  // rust-chromium project (registered in RUST_ONLY_SPECS). Skipped in cloud
-  // pending cloud validation of this rust-only lane.
+  // Rust-only PATH shadow proof requires the local Rust fixture and is not a
+  // cloud-compatible match-all run.
   'term28-path-shadow-rust.spec.ts',
-  // Server-build mismatch reload: the Cloud Run image builds WITHOUT git
-  // metadata (.dockerignore drops .git), so the Rust bake and the Vite
-  // define are both "unknown" there and the client's compare is inert BY
-  // DESIGN — a mismatched ready can never trigger a reload on that lane.
-  // Coverage lives on the local rust-chromium project.
-  'server-build-mismatch-rust.spec.ts',
-  // Environment-sensitive: page lifecycle (pagehide/unload) timing differs
-  // in cloud containers; passes locally but flakes in cloud
-  'tabs-client-retire.spec.ts',
   // Environment-sensitive: idle grace period timing + shade transition
   // depends on precise wall-clock scheduling that differs in cloud
   'truly-idle-alerting.spec.ts',
@@ -72,8 +62,9 @@ const CLOUD_SKIP_SPECS = [
   // Environment-sensitive: checkpoint/rewind with fake codex sidecar
   // exceeds 120s timeout under cloud resource constraints
   'agent-checkpoint-rewind.spec.ts',
-  // Requires codex binary (creates mode:'codex' tabs via MCP)
-  'mcp-qa-smoke-rust.spec.ts',
+  // Local-only receipt: cloud must never substitute for this provider-binary
+  // contract. The positive local selector is exported by the base config.
+  ...LOCAL_ONLY_SPECS.map(({ spec }) => spec),
 ]
 
 // Test titles to exclude via grepInvert (keeps the spec file but skips
@@ -83,6 +74,11 @@ const CLOUD_SKIP_TITLES = [
   /new JS asset after the click/,
 ]
 
+// The Cloud Run entrypoint sets this per task. The JSON report is consumed
+// before the container exits so recovered retries can be retained in Cloud
+// Logging instead of disappearing with the task filesystem.
+const retryEvidenceReportPath = process.env.FRESHELL_CLOUD_RETRY_REPORT_PATH
+
 export default defineConfig({
   ...baseConfig,
   globalSetup: undefined,
@@ -90,7 +86,17 @@ export default defineConfig({
   forbidOnly: true,
   retries: 2,
   workers: 2,
-  reporter: [['line'], ['html', { open: 'never' }]],
+  use: {
+    ...baseConfig.use,
+    // Keep the first failed attempt's trace, even when a later retry passes.
+    // The Cloud receipt associates evidence only with that failed attempt.
+    trace: 'retain-on-first-failure',
+  },
+  reporter: [
+    ['line'],
+    ['html', { open: 'never' }],
+    ...(retryEvidenceReportPath ? [['json', { outputFile: retryEvidenceReportPath }]] : []),
+  ],
   grepInvert: CLOUD_SKIP_TITLES,
   projects: (baseConfig.projects ?? [])
     .filter(
