@@ -100,6 +100,7 @@ import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from 
 import { clearAllReconcilePendingPanes, clearDeadSessionAdjudication, clearDeadTerminals, clearReconcileWarming, clearTerminalLiveHandles, setReconcilePendingPanes } from '@/store/panesSlice'
 import { addTerminalFreshRecoveryRequestId, addTerminalRestoreRequestId, setPaneReconcileActive } from '@/lib/terminal-restore'
 import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
+import { foldTerminalInventoryTitles } from '@/lib/terminal-inventory-titles'
 import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, resetCodexActivity } from '@/store/codexActivitySlice'
 import { setClaudeActivitySnapshot, upsertClaudeActivity, removeClaudeActivity, resetClaudeActivity } from '@/store/claudeActivitySlice'
 import { setAmplifierActivitySnapshot, upsertAmplifierActivity, removeAmplifierActivity, resetAmplifierActivity } from '@/store/amplifierActivitySlice'
@@ -1476,6 +1477,7 @@ export default function App() {
             upsert: terminalMeta,
             remove: removedTerminalMetaIds,
           }))
+          foldTerminalInventoryTitles(appStore, msg.terminals)
           // fetchTerminalDirectoryWindow still re-throws on failure, so contain its
           // rejection. queueActiveSessionWindowRefresh resolves even on failure.
           void appStore.dispatch(fetchTerminalDirectoryWindow({
