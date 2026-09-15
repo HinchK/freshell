@@ -63,3 +63,16 @@ test.describe('declared budgets smaller than the wedge budget', () => {
     expect(test.info().timeout).toBe(cloudBudgetMs)
   })
 })
+
+// Extend-only contract, unlimited side (delta review r4): Playwright's
+// timeout value 0 means UNLIMITED. Replacing an unlimited deadline with
+// any finite budget SHRINKS it, so the wiring must leave a declared 0
+// untouched on both lanes.
+test.describe('declared unlimited (0) deadline', () => {
+  test.beforeEach(() => {
+    test.setTimeout(0)
+  })
+  test('stays unlimited on both lanes (a finite budget would shrink it)', ({ freshellPage }) => {
+    expect(test.info().timeout).toBe(0)
+  })
+})

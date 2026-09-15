@@ -157,15 +157,16 @@ export class TestHarness {
    * slack, so the no-arg default lands at 31s — preserving (by 1s of
    * harmless widening) the real 30s window local runs always had.
    *
-   * With opts.selfHealReload (opt-in, fresh-boot sites only), the window
-   * splits into two phases sized from the resolved window W: phase 1 is a
-   * boolean poll within floor(W/2); if ready has not landed, ONE
-   * page.reload({ timeout: W - floor(W/2) }) mints a fresh boot chain and
-   * the final phase waits the remaining budget MINUS the reload's elapsed
-   * time (+1s slack) — W is a single total deadline, so the whole
-   * self-heal path spends at most W + 1s wall clock — letting Playwright's
-   * native TimeoutError propagate on failure.
-   */
+     * With opts.selfHealReload (opt-in, fresh-boot sites only), the window
+     * splits into two phases sized from the resolved window W: phase 1 is a
+     * boolean poll within floor(W/2); if ready has not landed, ONE
+     * page.reload — itself bounded by the time REMAINING on the absolute
+     * clock — mints a fresh boot chain, and the final phase waits the
+     * remaining budget MINUS everything already elapsed (+1s slack) — W is
+     * a single total deadline, so the whole self-heal path spends at most
+     * W + 1s wall clock — letting Playwright's native TimeoutError
+     * propagate on failure.
+     */
   async waitForConnection(timeoutMs?: number, opts: WaitForConnectionOptions = {}): Promise<void> {
     const resolvedTimeoutMs = resolveWsReadyTimeoutMs(timeoutMs)
     if (!opts.selfHealReload) {
@@ -176,22 +177,29 @@ export class TestHarness {
       )
       return
     }
-    // ABSOLUTE deadline (kata tg4e, delta review r3): the clock starts
-    // BEFORE phase 1, and phase-2 receives W minus the TOTAL elapsed
-    // (phase-1 + reload), so the whole self-heal path spends at most
-    // W + 1s wall clock regardless of which phase burns the time. A
-    // reload-only clock would let a delayed phase-1 land on top of the
-    // envelope under the same CPU contention this change addresses.
+    // ABSOLUTE deadline (kata tg4e, delta reviews r3+r4): the clock starts
+    // BEFORE phase 1; the reload's OWN window and phase 2 both derive from
+    // the time remaining on that clock, so the whole self-heal path spends
+    // at most W + 1s wall clock regardless of which phase burns the time.
+    // A reload-only or half-window reload clock would let a delayed phase 1
+    // land on top of the envelope under the same CPU contention this change
+    // addresses.
     const selfHealStartedAt = Date.now()
     const phase1Ms = Math.floor(resolvedTimeoutMs / 2)
-    const remainingMs = resolvedTimeoutMs - phase1Ms
     const readyWithinPhase1 = await this.page.waitForFunction(
       wsReadyPredicate,
       undefined,
       { timeout: phase1Ms },
     ).then(() => true, () => false)
     if (!readyWithinPhase1) {
-      await this.page.reload({ timeout: remainingMs })
+      // Math.max(1, ...) — never 0: Playwright treats a 0 timeout as
+      // UNLIMITED, and an exhausted envelope must fail fast, not mint an
+      // unbounded reload on top of an already-blown deadline.
+      const remainingAtReloadMs = Math.max(
+        1,
+        resolvedTimeoutMs - (Date.now() - selfHealStartedAt),
+      )
+      await this.page.reload({ timeout: remainingAtReloadMs })
       const elapsedMs = Date.now() - selfHealStartedAt
       const phase2Ms = Math.max(0, resolvedTimeoutMs - elapsedMs) + 1000
       await this.page.waitForFunction(

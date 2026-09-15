@@ -221,10 +221,15 @@ export const test = base.extend<{
   // deadline over fixture time. EXTEND-ONLY: specs that declare a larger
   // deadline (idle-gate 300s, reconcile specs 240s) keep their own
   // budget — the guard must never shrink a declared deadline to the
-  // cloud budget.
+  // cloud budget. A declared 0 is Playwright's UNLIMITED: any finite
+  // budget would shrink it, so the guard skips it too.
   e2eMachineId: async ({ testServer }, use) => {
     const cloudBudgetMs = resolveCloudLaneTestBudgetMs()
-    if (cloudBudgetMs !== null && test.info().timeout < cloudBudgetMs) {
+    if (
+      cloudBudgetMs !== null
+      && test.info().timeout !== 0
+      && test.info().timeout < cloudBudgetMs
+    ) {
       test.info().setTimeout(cloudBudgetMs)
     }
     await use((await registerE2eMachine(testServer.info)).id)

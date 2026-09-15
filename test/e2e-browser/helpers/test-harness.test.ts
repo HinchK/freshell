@@ -220,11 +220,13 @@ describe('TestHarness.waitForConnection wedge-tolerant self-heal (opt-in)', () =
     vi.useFakeTimers({ toFake: ['Date'] })
     try {
       const phase1 = Math.floor(DEFAULT_WS_READY_TIMEOUT_MS / 2)
-      const remaining = DEFAULT_WS_READY_TIMEOUT_MS - phase1
       const { page, calls, reloads } = fakePage([{ reject: nativeTimeout(phase1) }, {}])
       await new TestHarness(page).waitForConnection(undefined, { selfHealReload: true })
       expect(reloads).toHaveLength(1)
-      expect(reloads[0]).toEqual([{ timeout: remaining }])
+      // Absolute-deadline contract: the reload's OWN timeout is the time
+      // remaining on the absolute clock (W with the fake clock's elapsed 0),
+      // not the original half-window — a late-firing phase 1 must shrink it.
+      expect(reloads[0]).toEqual([{ timeout: DEFAULT_WS_READY_TIMEOUT_MS }])
       expect(calls).toHaveLength(2)
       // The three-argument binding contract holds for BOTH phases (LB-1):
       // a two-arg second poll would silently revert to the decorative-window
@@ -246,13 +248,12 @@ describe('TestHarness.waitForConnection wedge-tolerant self-heal (opt-in)', () =
       process.env[ENV_VAR] = '45000'
       const W = 20_001
       const phase1 = Math.floor(W / 2) // 10_000 — pins the floor()
-      const remaining = W - phase1 // 10_001
       const { page, calls, reloads } = fakePage([{ reject: nativeTimeout(phase1) }, {}])
       await new TestHarness(page).waitForConnection(W, { selfHealReload: true })
       expect(calls[0][2]).toEqual({ timeout: phase1 })
-      expect(reloads[0]).toEqual([{ timeout: remaining }])
-      // Absolute-deadline contract: phase 2 = W - totalElapsed + 1s, and
-      // with the fake clock's elapsed 0 that is W + 1000 exactly.
+      // Absolute-deadline contract: the reload's timeout is the absolute
+      // remaining (W with fake elapsed 0), and phase 2 = W - totalElapsed + 1s.
+      expect(reloads[0]).toEqual([{ timeout: W }])
       expect(calls[1][2]).toEqual({ timeout: W + 1000 })
     } finally {
       vi.useRealTimers()
@@ -273,17 +274,16 @@ describe('TestHarness.waitForConnection wedge-tolerant self-heal (opt-in)', () =
     vi.useFakeTimers({ toFake: ['Date'] })
     try {
       const phase1 = Math.floor(DEFAULT_WS_READY_TIMEOUT_MS / 2)
-      const remaining = DEFAULT_WS_READY_TIMEOUT_MS - phase1
       const { page, calls, reloads } = fakePage(
         [{ reject: nativeTimeout(phase1) }, {}],
         { reloadAdvanceMs: 10_000 },
       )
       await new TestHarness(page).waitForConnection(undefined, { selfHealReload: true })
       expect(reloads).toHaveLength(1)
-      expect(reloads[0]).toEqual([{ timeout: remaining }])
+      // The reload's own timeout is the absolute remaining at its start
+      // (W with fake elapsed 0), then its 10s burn is charged to phase 2.
+      expect(reloads[0]).toEqual([{ timeout: DEFAULT_WS_READY_TIMEOUT_MS }])
       expect(calls).toHaveLength(2)
-      // The reload "took" 10s of wall clock: phase 2 receives W minus the
-      // TOTAL elapsed (+1s slack) — never a fresh full window.
       expect(calls[1][2]).toEqual({ timeout: DEFAULT_WS_READY_TIMEOUT_MS - 10_000 + 1000 })
     } finally {
       vi.useRealTimers()
@@ -294,16 +294,39 @@ describe('TestHarness.waitForConnection wedge-tolerant self-heal (opt-in)', () =
     vi.useFakeTimers({ toFake: ['Date'] })
     try {
       const phase1 = Math.floor(DEFAULT_WS_READY_TIMEOUT_MS / 2)
-      const { page, calls } = fakePage(
+      const { page, calls, reloads } = fakePage(
         [{ reject: nativeTimeout(phase1) }, {}],
         { phase1AdvanceMs: 8_000 },
       )
       await new TestHarness(page).waitForConnection(undefined, { selfHealReload: true })
+      expect(reloads).toHaveLength(1)
+      // Phase 1 burned 8s of wall clock before its poll expired; BOTH the
+      // reload's own timeout AND phase 2 must shrink by it (delta r4).
+      expect(reloads[0]).toEqual([{ timeout: DEFAULT_WS_READY_TIMEOUT_MS - 8_000 }])
       expect(calls).toHaveLength(2)
-      // Phase 1 burned 8s of wall clock before its poll expired; an
-      // absolute deadline must charge it: phase 2 = W - 8s (+1s slack).
-      // A reload-only clock would hand phase 2 a fresh window.
       expect(calls[1][2]).toEqual({ timeout: DEFAULT_WS_READY_TIMEOUT_MS - 8_000 + 1000 })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('(h) absolute deadline: a phase-1 timeout firing LATE (beyond its own allowance) still keeps the envelope at W+1s', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      const phase1 = Math.floor(DEFAULT_WS_READY_TIMEOUT_MS / 2)
+      // Starvation delays the timeout processing past the 15s allowance:
+      // phase 1 consumed 18s of wall clock before its rejection ran.
+      const { page, calls, reloads } = fakePage(
+        [{ reject: nativeTimeout(phase1) }, {}],
+        { phase1AdvanceMs: 18_000 },
+      )
+      await new TestHarness(page).waitForConnection(undefined, { selfHealReload: true })
+      expect(reloads).toHaveLength(1)
+      // The reload's timeout is the ABSOLUTE remaining (W - 18s), never
+      // the original half-window — this is the drift delta r4 closed.
+      expect(reloads[0]).toEqual([{ timeout: DEFAULT_WS_READY_TIMEOUT_MS - 18_000 }])
+      expect(calls).toHaveLength(2)
+      expect(calls[1][2]).toEqual({ timeout: DEFAULT_WS_READY_TIMEOUT_MS - 18_000 + 1000 })
     } finally {
       vi.useRealTimers()
     }

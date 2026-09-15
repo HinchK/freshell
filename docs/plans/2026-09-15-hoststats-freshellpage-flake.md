@@ -30,8 +30,8 @@
 
 - Budget changes are cloud-only and env-gated: with `FRESHELL_E2E_WS_READY_TIMEOUT_MS` unset, no timeout changes and no different call shapes on the default path (byte-identical local lane for the budget dimension).
 - `waitForConnection`'s self-heal window W is a SINGLE TOTAL deadline: phase-1 + the reload's navigation + phase-2 share W (+1s slack), so the connection-wait envelope is W+1s (91s at the cloud window) — the budget never needs to cover a multi-W envelope. The pre-fix sequential drift (up to 135s) is fixed at the source (Task 2), not budgeted around.
-- Budget = the fixture chain's PERMITTED COMPOSITION (delta-review r2): connection envelope (W + 1s total-deadline slack) + the picker's permitted worst case (derived from the picker's own exported constants — settle + one click budget per shell name + the render wait = 85.5s) + start/body reserve (30s) = 206.5s at the cloud default W=90s, unit-pinned so the composition cannot drift. A budget merely "evidence-sized" to the recorded episodes was rejected by review: the retained trace shows connection AND render slowness co-occurring in one container-wide disturbance, so the outer deadline must cover the waits the chain is permitted to compose, or the same outer setup-timeout flake recurs before the picker's diagnostic can fire. The extend-only guard keeps every declared budget >= the composition untouched (300s/240s/180s specs keep theirs).
-- The wiring is EXTEND-ONLY (`test.info().timeout < budget` guard): a spec's own declared deadline (e.g. idle-gate-semantics' 300_000, the reconcile specs' 240_000) must never be shrunk by the cloud budget. The contract spec pins this.
+- Budget = the fixture chain's PERMITTED COMPOSITION (delta-review r2): connection envelope (W + 1s total-deadline slack) + the picker's permitted worst case (derived from the picker's own exported constants — settle + one click budget per shell name + the render wait = 85.5s) + start/body reserve (30s) = 206.5s at the cloud default W=90s, unit-pinned so the composition cannot drift. A budget merely "evidence-sized" to the recorded episodes was rejected by review: the retained trace shows connection AND render slowness co-occurring in one container-wide disturbance, so the outer deadline must cover the waits the chain is permitted to compose, or the same outer setup-timeout flake recurs before the picker's diagnostic can fire. The extend-only guard keeps every declared budget >= the composition untouched (300s/240s specs keep theirs); declared budgets BELOW the composition (e.g. the 180s specs) are raised to it — strictly more headroom, never less.
+- The wiring is EXTEND-ONLY (`timeout !== 0 && timeout < budget` guard — a declared 0 is Playwright's UNLIMITED and must never be replaced by a finite budget): a spec's own declared deadline (e.g. idle-gate-semantics' 300_000, the reconcile specs' 240_000) must never be shrunk by the cloud budget. The contract spec pins this.
 - The self-heal stays cloud-only (env-presence gated) and fresh-boot-only: never opt a mid-test `waitForConnection` site into `selfHealReload` (a reload would destroy the state under test).
 - Never loosen the ready assertion, never skip or exclude specs, never raise `retries`, never widen `CLOUD_SKIP_SPECS` — those are coverage reductions, not fixes. The picker fix TIGHTENS failure semantics (a thrown diagnostic replaces a silent fall-through past a successful click; non-timeout click errors propagate); it must not touch any passing-path assertion.
 - Malformed env values must never poison the budget (reuse `resolveWsReadyTimeoutMs`'s parsing/fallback — one parsing rule).
@@ -544,6 +544,19 @@ test.describe('declared budgets smaller than the wedge budget', () => {
     expect(test.info().timeout).toBe(cloudBudgetMs)
   })
 })
+
+// Extend-only contract, unlimited side (delta review r4): Playwright's
+// timeout value 0 means UNLIMITED. Replacing an unlimited deadline with
+// any finite budget SHRINKS it, so the wiring must leave a declared 0
+// untouched on both lanes.
+test.describe('declared unlimited (0) deadline', () => {
+  test.beforeEach(() => {
+    test.setTimeout(0)
+  })
+  test('stays unlimited on both lanes (a finite budget would shrink it)', ({ freshellPage }) => {
+    expect(test.info().timeout).toBe(0)
+  })
+})
 ```
 
 - [ ] **Step 2: Run the test and verify the intended failure**
@@ -554,7 +567,7 @@ Run (env-set local invocation reproduces the cloud-shaped path; first local run 
 FRESHELL_E2E_WS_READY_TIMEOUT_MS=90000 npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/e2e-budget-contract.spec.ts
 ```
 
-Expected: the FIRST test FAILs because `test.info().timeout` is still the 60_000 config default — `60_000 < 206_500` (the budget extension is absent). The never-shrink and declared-60s describe tests PASS at this point and keep their local-side behavior after the wiring — the declared-60s test is the two-sided extend-only pin (exactly 60_000 locally; exactly the budget on the cloud lane), not part of this Red step. Also run the no-env leg and confirm every test PASSES at this point (the wiring is a no-op locally — the local default must be green before the wiring too):
+Expected: the FIRST test FAILs because `test.info().timeout` is still the 60_000 config default — `60_000 < 206_500` (the budget extension is absent). The never-shrink and declared-60s describe tests PASS at this point and keep their local-side behavior after the wiring — the declared-60s test is the two-sided extend-only pin (exactly 60_000 locally; exactly the budget on the cloud lane), not part of this Red step. The declared-unlimited (0) test also PASSES at this point (with no wiring, a declared 0 trivially stays 0); its Red moment is against a wiring that would REPLACE a declared 0 with the finite budget — the delta-review r4 remediation demonstrated it. Also run the no-env leg and confirm every test PASSES at this point (the wiring is a no-op locally — the local default must be green before the wiring too):
 
 ```bash
 env -u FRESHELL_E2E_WS_READY_TIMEOUT_MS npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/e2e-budget-contract.spec.ts
@@ -589,10 +602,15 @@ In `test/e2e-browser/helpers/fixtures.ts`: extend the existing import from `'./t
   // deadline over fixture time. EXTEND-ONLY: specs that declare a larger
   // deadline (idle-gate 300s, reconcile specs 240s) keep their own
   // budget — the guard must never shrink a declared deadline to the
-  // cloud budget.
+  // cloud budget. A declared 0 is Playwright's UNLIMITED: any finite
+  // budget would shrink it, so the guard skips it too.
   e2eMachineId: async ({ testServer }, use) => {
     const cloudBudgetMs = resolveCloudLaneTestBudgetMs()
-    if (cloudBudgetMs !== null && test.info().timeout < cloudBudgetMs) {
+    if (
+      cloudBudgetMs !== null
+      && test.info().timeout !== 0
+      && test.info().timeout < cloudBudgetMs
+    ) {
       test.info().setTimeout(cloudBudgetMs)
     }
     await use((await registerE2eMachine(testServer.info)).id)
@@ -773,7 +791,7 @@ In `test/e2e-browser/helpers/test-harness.ts` (exported, near TestHarness):
  * same window), so a 30s wait conflated "slow render" with "wrong
  * option" and the loop escalated into absent options, silently burning
  * the test budget. 60s fits the recorded single-episode envelope inside
- * the 120s cloud budget (24s slow boot + click + render < 120s).
+ * the composed cloud budget.
  */
 export const SHELL_RENDER_TIMEOUT_MS = 60_000
 
@@ -946,7 +964,7 @@ Re-run the same command once more. Expected: PASS zero-flake again (the flake wa
 
 - [ ] **Step 3: Record evidence**
 
-Save both receipts under `.worktrees/.the-usual-logs/hoststats-freshellpage-flake/reports/cloud-focus-*.log` with the invocation, exit codes, and the zero-flake footer. Note any recovered-retry case for investigation — a failure now carries a diagnosable signature: a picker diagnostic ("did not render") names a still-starved render; a "Test timeout of 120000ms" names a budget-outliving episode. Either requires root-cause before the gate, not a wider budget.
+Save both receipts under `.worktrees/.the-usual-logs/hoststats-freshellpage-flake/reports/cloud-focus-*.log` with the invocation, exit codes, and the zero-flake footer. Note any recovered-retry case for investigation — a failure now carries a diagnosable signature: a picker diagnostic ("did not render") names a still-starved render; a "Test timeout of 206500ms" (the composed budget at the default window; it scales with operator window overrides) names a budget-outliving episode. Either requires root-cause before the gate, not a wider budget.
 
 - [ ] **Step 4: No commit**
 
