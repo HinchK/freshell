@@ -1104,3 +1104,152 @@ fn update_from_ui_migrates_legacy_agent_chat_and_fresh_agent_content() {
     assert!(p.get("sessionRef").is_none());
     assert!(p.get("resumeSessionId").is_none());
 }
+
+// ── b8ke ext r25 F2: the server recovery's content authority ──────────────
+
+/// One tab `t1`, single leaf `p1` with the caller's content.
+fn r25_pane_sync(content: &Value, timestamp: i64) -> UiLayoutSync {
+    sync_from(json!({
+        "tabs": [{ "id": "t1", "title": "First" }],
+        "activeTabId": "t1",
+        "layouts": { "t1": leaf("p1", content.clone()) },
+        "activePane": { "t1": "p1" },
+        "timestamp": timestamp,
+    }))
+}
+
+/// b8ke ext r25 F2: a reconnecting client's STALE copy cannot erase a
+/// server-side pane recovery. The REST/MCP respawn (an
+/// `attach_pane_content` write-through) replaces an offline
+/// browser-created pane's content with the recovered terminal identity
+/// (mode/cwd/sessionRef); the offline browser's later reconnect re-sends
+/// its pre-recovery copy — `update_from_ui` REJECTS the pane write (the
+/// server recovery wins; the reconnecting client receives/observes the
+/// server's current layout state as usual). Pre-r25 the incoming
+/// snapshot's wholesale insert erased the recovery, and the stale client
+/// pane never received the new sessionRef so runtime-owner replay could
+/// not associate or repair it.
+#[test]
+fn a_reconnecting_clients_stale_copy_cannot_erase_a_server_pane_recovery() {
+    let store = LayoutStore::default();
+    let browser_content = json!({
+        "kind": "browser",
+        "url": "https://example.com/old",
+        "devToolsOpen": false,
+    });
+    store.update_from_ui(&r25_pane_sync(&browser_content, 1_000), "conn-browser");
+
+    // The server's authoritative recovery (the REST respawn
+    // write-through): the offline browser pane becomes the recovered
+    // terminal with its durable session identity.
+    let recovered = json!({
+        "kind": "terminal",
+        "mode": "codex",
+        "cwd": "/work/project",
+        "sessionRef": { "provider": "codex", "sessionId": "ses-recovered" },
+        "status": "running",
+    });
+    let out = store.attach_pane_content("t1", "p1", recovered.clone());
+    assert_eq!(out.message, None, "the recovery write-through applied");
+
+    // The offline browser reconnects with its STALE copy — the same
+    // pre-recovery content for the pane (it never saw the recovery).
+    store.update_from_ui(&r25_pane_sync(&browser_content, 2_000), "conn-browser");
+
+    // THE RECOVERY SURVIVES: the pane keeps the recovered identity — the
+    // stale copy's pane write was rejected.
+    let snap = store.get_normalized_snapshot(None);
+    assert_eq!(snap["layouts"]["t1"]["content"]["kind"], json!("terminal"));
+    assert_eq!(snap["layouts"]["t1"]["content"]["mode"], json!("codex"));
+    assert_eq!(
+        snap["layouts"]["t1"]["content"]["cwd"],
+        json!("/work/project")
+    );
+    assert_eq!(
+        snap["layouts"]["t1"]["content"]["sessionRef"]["sessionId"],
+        json!("ses-recovered")
+    );
+}
+
+/// b8ke ext r25 F2 (the release point — documented in update_from_ui):
+/// the stamp is PER-RECOVERY-WRITE. A client whose sync carries ANY
+/// content other than the exact pre-recovery copy has moved past the
+/// stale state — it either OBSERVED the server's recovered layout (the
+/// reconnect hand-off) or EDITED the pane — and the stamp RELEASES: the
+/// pane write applies and the client is authoritative again. A server
+/// recovery therefore never permanently blocks legitimate client edits.
+#[test]
+fn a_server_recovery_then_a_legitimate_client_reedit_is_not_blocked() {
+    let store = LayoutStore::default();
+    let browser_content = json!({
+        "kind": "browser",
+        "url": "https://x.example/old",
+        "devToolsOpen": false,
+    });
+    store.update_from_ui(&r25_pane_sync(&browser_content, 1_000), "conn-1");
+    let recovered = json!({
+        "kind": "terminal",
+        "mode": "codex",
+        "cwd": "/a",
+        "status": "running",
+    });
+    assert_eq!(
+        store
+            .attach_pane_content("t1", "p1", recovered.clone())
+            .message,
+        None
+    );
+
+    // The stale copy is rejected (the recovery survives) — test 1's arm.
+    store.update_from_ui(&r25_pane_sync(&browser_content, 2_000), "conn-1");
+    let snap = store.get_normalized_snapshot(None);
+    assert_eq!(snap["layouts"]["t1"]["content"]["kind"], json!("terminal"));
+
+    // The OBSERVED sync — the client received the server's layout and now
+    // carries the recovered content — applies and RELEASES the stamp.
+    store.update_from_ui(&r25_pane_sync(&recovered, 3_000), "conn-1");
+    let snap = store.get_normalized_snapshot(None);
+    assert_eq!(snap["layouts"]["t1"]["content"]["mode"], json!("codex"));
+    assert_eq!(snap["timestamp"], json!(3_000));
+
+    // The subsequent legitimate EDIT flows (the client wins again — the
+    // normal loop resumed; never a permanent block).
+    let edited = json!({
+        "kind": "terminal",
+        "mode": "codex",
+        "cwd": "/edited",
+        "status": "running",
+    });
+    store.update_from_ui(&r25_pane_sync(&edited, 4_000), "conn-1");
+    let snap = store.get_normalized_snapshot(None);
+    assert_eq!(snap["layouts"]["t1"]["content"]["cwd"], json!("/edited"));
+
+    // A DIRECT edit past the recovery (without an observed sync first)
+    // also flows: a second recovery + an immediate client edit of the
+    // recovered pane — the client demonstrably moved past the
+    // pre-recovery state, so the write applies and the stamp releases.
+    let recovered2 = json!({
+        "kind": "terminal",
+        "mode": "claude",
+        "cwd": "/b",
+        "status": "running",
+    });
+    assert_eq!(
+        store
+            .attach_pane_content("t1", "p1", recovered2.clone())
+            .message,
+        None
+    );
+    let direct_edit = json!({
+        "kind": "terminal",
+        "mode": "claude",
+        "cwd": "/directly-edited",
+        "status": "running",
+    });
+    store.update_from_ui(&r25_pane_sync(&direct_edit, 5_000), "conn-1");
+    let snap = store.get_normalized_snapshot(None);
+    assert_eq!(
+        snap["layouts"]["t1"]["content"]["cwd"],
+        json!("/directly-edited")
+    );
+}

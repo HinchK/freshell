@@ -98,12 +98,34 @@ const SERVER_CLIENT_KEY: &str = "__server__";
 ///   hard eviction would leave that client's ids unresolvable for an
 ///   unbounded window. A stale entry is dropped only when a live sync covers
 ///   every one of its pane ids (lossless supersede), or past the stale cap.
+/// b8ke ext r25 F2: the per-recovery content-authority stamp — the
+/// pane's PRE-recovery leaf content recorded at the authoritative
+/// write-through (`attach_pane_content`). A reconnecting client's
+/// stale copy re-sends exactly this content (it never saw the
+/// recovery); `update_from_ui` rejects that pane write. ANY other
+/// incoming content (the client observed the recovered state, or edited
+/// past it) RELEASES the stamp — the client is authoritative again, so
+/// a server recovery never permanently blocks legitimate edits.
+#[derive(Clone, Debug, PartialEq)]
+struct RecoveryStamp {
+    pre_recovery_content: Value,
+}
+
 #[derive(Default)]
 struct LayoutInner {
     /// Most-recent-sync-first. The PRIMARY is the most recently synced LIVE
     /// entry; if only stale entries remain, the most recent stale one
     /// (Node-parity post-disconnect reads).
     clients: Vec<ClientEntry>,
+    /// b8ke ext r25 F2: the server-side CONTENT-AUTHORITY stamps for panes
+    /// mutated through the authoritative recovery paths (the
+    /// `attach_pane_content` write-throughs — the REST/MCP respawn and
+    /// attach materializations). Keyed by pane id; each stamp records the
+    /// pane's PRE-recovery leaf content — the exact stale copy a
+    /// disconnected client still holds and may re-send on reconnect.
+    /// In-memory only (a transient reconnect-reconciliation aid): the
+    /// persist format serializes the client snapshots, not the stamps.
+    recovery_stamps: std::collections::HashMap<String, RecoveryStamp>,
     /// kata b8ke Task 10 (round-1 review, DURABILITY): `Some` → every
     /// mutation that changes the snapshot set rewrites the multi-client
     /// snapshot to this path (atomic temp+rename) and construction loads
@@ -356,6 +378,62 @@ impl LayoutStore {
         }
         let incoming_pane_ids = pane_ids_of(&snapshot);
         let mut inner = self.lock();
+        // b8ke ext r25 F2: THE SERVER RECOVERY'S CONTENT AUTHORITY. A
+        // pane mutated through an authoritative recovery path (an
+        // `attach_pane_content` write-through — the REST/MCP respawn and
+        // attach materializations) carries a recovery stamp holding the
+        // pane's PRE-recovery content. A reconnecting client's STALE
+        // copy re-sends exactly that content (it never saw the recovery —
+        // its pane never received the new sessionRef, so runtime-owner
+        // replay cannot associate or repair an overwrite); that pane's
+        // write is REJECTED: the incoming leaf is overridden with the
+        // store's CURRENT (recovered) content — the server recovery wins,
+        // and the reconnecting client receives/observes the server's
+        // current layout state as usual (its next sync carries the
+        // recovered content and converges).
+        //
+        // THE RELEASE POINT (per-recovery-write, never a permanent
+        // block): ANY other incoming content releases the stamp — the
+        // client either OBSERVED the server's recovered layout (its sync
+        // now carries the recovered content) or EDITED past the
+        // pre-recovery state — and the pane write applies; the client is
+        // authoritative again. Panes without a stamp (ordinary client
+        // layout edits) flow unchanged.
+        if !inner.recovery_stamps.is_empty() {
+            let mut stale_pane_writes: Vec<String> = Vec::new();
+            let mut released_stamps: Vec<String> = Vec::new();
+            for (pane_id, stamp) in inner.recovery_stamps.iter() {
+                let Some(incoming_content) = pane_content_in_snapshot(&snapshot, pane_id) else {
+                    // The pane is not in this sync — the stamp stays (a
+                    // later sync may still carry the stale copy).
+                    continue;
+                };
+                if incoming_content == stamp.pre_recovery_content {
+                    stale_pane_writes.push(pane_id.clone());
+                } else {
+                    released_stamps.push(pane_id.clone());
+                }
+            }
+            for pane_id in stale_pane_writes {
+                if let Some(current) = inner
+                    .snapshots()
+                    .find_map(|s| pane_content_in_snapshot(s, &pane_id))
+                {
+                    let tab_ids: Vec<String> = snapshot.tabs.iter().map(|t| t.id.clone()).collect();
+                    for tab_id in &tab_ids {
+                        let Some(root) = snapshot.layouts.get_mut(tab_id) else {
+                            continue;
+                        };
+                        if root.replace_leaf_content(&pane_id, current.clone()) {
+                            seed_pane_title(&mut snapshot, tab_id, &pane_id, &current);
+                        }
+                    }
+                }
+            }
+            for pane_id in released_stamps {
+                inner.recovery_stamps.remove(&pane_id);
+            }
+        }
         // Re-sync replaces this client's own snapshot; a real client sync also
         // supersedes the server bootstrap entry (old wholesale-replace parity).
         // SUBSET supersede-eviction: a STALE entry is dropped only when EVERY
@@ -841,6 +919,14 @@ impl LayoutStore {
             return RenameOutcome::failed("no layout snapshot");
         }
         let normalized = migrate_legacy_fresh_agent_content(&content);
+        // b8ke ext r25 F2: capture the pane's PRE-recovery content (the
+        // first snapshot holding the pane, primary-first) for the
+        // content-authority stamp — a reconnecting client's stale copy of
+        // this pane re-sends exactly this content and must not erase the
+        // recovery.
+        let pre_recovery = inner
+            .snapshots()
+            .find_map(|snapshot| pane_content_in_snapshot(snapshot, pane_id));
         let mut found = false;
         for snapshot in inner.snapshots_mut() {
             let Some(root) = snapshot.layouts.get_mut(tab_id) else {
@@ -853,6 +939,17 @@ impl LayoutStore {
             found = true;
         }
         if found {
+            // b8ke ext r25 F2: record the recovery stamp ONLY when the
+            // write actually changed the pane's content — an idempotent
+            // re-attach (the same content) stamps nothing.
+            if pre_recovery.as_ref().is_some_and(|pre| *pre != normalized) {
+                inner.recovery_stamps.insert(
+                    pane_id.to_string(),
+                    RecoveryStamp {
+                        pre_recovery_content: pre_recovery.expect("checked above"),
+                    },
+                );
+            }
             persist_locked(&inner);
             RenameOutcome::tab_pane(tab_id, pane_id)
         } else {
@@ -883,6 +980,9 @@ impl LayoutStore {
             }
         }
         if first.as_ref().is_some_and(|result| result.is_ok()) {
+            // b8ke ext r25 F2: a closed pane's recovery stamp is dead
+            // weight — the pane no longer exists to protect.
+            inner.recovery_stamps.remove(pane_id);
             persist_locked(&inner);
         }
         first.unwrap_or(Err("pane not found"))
@@ -1281,6 +1381,19 @@ fn leaves_of(snapshot: &UiSnapshot, tab_id: &str) -> Vec<(String, Value)> {
             PaneNode::Split { .. } => None,
         })
         .collect()
+}
+
+/// b8ke ext r25 F2: the pane's leaf content within one snapshot (the
+/// first tab layout holding it) — the content-authority stamp's capture
+/// and the reconnecting-stale-copy comparison.
+fn pane_content_in_snapshot(snapshot: &UiSnapshot, pane_id: &str) -> Option<Value> {
+    snapshot
+        .layouts
+        .values()
+        .find_map(|root| match root.find_leaf(pane_id) {
+            Some(PaneNode::Leaf { content, .. }) => Some(content.clone()),
+            _ => None,
+        })
 }
 
 /// `closePane` (`layout-store.ts:501-516`) against ONE snapshot: `None` when
