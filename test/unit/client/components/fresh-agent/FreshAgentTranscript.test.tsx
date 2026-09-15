@@ -2857,3 +2857,146 @@ describe('rolled-back section (kata 1wxv decision 6)', () => {
     expect(screen.getByText('conversation b second marker')).toBeInTheDocument()
   })
 })
+
+describe('FreshAgentTranscript task delegation + retry folding', () => {
+  afterEach(() => cleanup())
+
+  const delegationTurn = {
+    id: 't_deleg',
+    turnId: 't_deleg',
+    role: 'assistant' as const,
+    summary: '',
+    items: [
+      { id: 'r1', kind: 'reasoning' as const, summary: ['planning'], content: ['planning'], durationMs: 3400 },
+      {
+        id: 'task1',
+        kind: 'task_delegation' as const,
+        status: 'running' as const,
+        title: 'General Task — Fix the flaky harness',
+        description: 'Fix the flaky harness',
+        childSessionId: 'ses_child_1',
+        activity: [
+          { tool: 'bash', status: 'completed' as const, preview: 'sed -n 92,112p src/store/paneTypes.ts' },
+          { tool: 'grep', status: 'failed' as const, preview: 'reasoningEffort' },
+        ],
+      },
+      { id: 'rr1', kind: 'retry' as const, attempt: 2, error: 'stream disconnected' },
+    ],
+  }
+
+  describe('task delegation + retry folding', () => {
+    it('folds a delegation turn into a single activity line with a live Task slot', () => {
+      // Plan-review round 2, Finding 13: this turn must NOT include the retry item —
+      // the retry-last reel precedence (its own test below) would otherwise name
+      // "Retrying" instead of the running delegation on the live line.
+      render(
+        <FreshAgentTranscript
+          isStreaming
+          turns={[{ ...delegationTurn, items: [delegationTurn.items[0], delegationTurn.items[1]] }]}
+        />,
+      )
+      const strip = screen.getByRole('region', { name: 'Activity strip' })
+      // One collapsed line: the SlotReel names the running thing.
+      expect(within(strip).getByText('Task')).toBeInTheDocument()
+      expect(within(strip).getByText('General Task — Fix the flaky harness')).toBeInTheDocument()
+      // Nothing renders as a standalone article between assistant messages while
+      // the strip is collapsed (queryAllByTestId — getAllBy* throws on zero
+      // matches and cannot assert absence).
+      expect(screen.queryAllByTestId('fresh-agent-delegation-block')).toHaveLength(0)
+    })
+
+    it('expands to the delegation block and the retry row', () => {
+      render(<FreshAgentTranscript turns={[delegationTurn]} />)
+      fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+      // The delegation block and retry row are STRIP members: they render inside
+      // the expanded strip, never as standalone articles between messages.
+      const strip = screen.getByRole('region', { name: 'Activity strip' })
+      expect(within(strip).getByTestId('fresh-agent-delegation-block')).toBeInTheDocument()
+      expect(within(strip).getByText(/sed -n 92,112p src\/store\/paneTypes\.ts/)).toBeInTheDocument()
+      expect(within(strip).getByText('(failed)')).toBeInTheDocument()
+      expect(within(strip).getByTestId('fresh-agent-retry-row')).toHaveTextContent('Retrying (attempt 2) — stream disconnected')
+    })
+
+    it('shows a running delegation on the collapsed line even while the parent session is idle', () => {
+      // Plan-review round 3, Finding 16: background delegations outlive the parent
+      // turn — the strip's `live` flag (parent-session streaming) must not gate a
+      // running delegation row. No streaming path is needed for this turn.
+      render(
+        <FreshAgentTranscript
+          turns={[{ ...delegationTurn, items: [delegationTurn.items[1]] }]}
+        />,
+      )
+      const strip = screen.getByRole('region', { name: 'Activity strip' })
+      expect(within(strip).getByText('Task')).toBeInTheDocument()
+      expect(within(strip).getByText('General Task — Fix the flaky harness')).toBeInTheDocument()
+      expect(within(strip).getByLabelText('running')).toBeInTheDocument() // the status-slot spinner
+    })
+
+    it('keeps a heading-only streaming reasoning row so the live strip still shows Thinking', () => {
+      // Plan-review round 3, Finding 18: `**Planning**` arrives before its body;
+      // the empty text must not drop the row or the strip falls back to an
+      // unnamed spinner instead of the required Thinking behavior.
+      render(
+        <FreshAgentTranscript
+          isStreaming
+          turns={[{
+            id: 't_h', turnId: 't_h', role: 'assistant', summary: '',
+            items: [{ id: 'r_h', kind: 'reasoning', summary: [], content: [], text: '', title: 'Planning' }],
+          }]}
+        />,
+      )
+      expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()
+    })
+
+    it('settled delegation turns summarize like other tool lines', () => {
+      render(
+        <FreshAgentTranscript
+          turns={[{ ...delegationTurn, items: [{ ...delegationTurn.items[1], status: 'completed' as const }] }]}
+        />,
+      )
+      // settledSummary counts the delegation as one used tool: "1 tool used".
+      expect(screen.getByText(/1 tool used/)).toBeInTheDocument()
+    })
+
+    it('names Retrying on the live line when a retry is the last activity', () => {
+      render(
+        <FreshAgentTranscript
+          isStreaming
+          turns={[{
+            ...delegationTurn,
+            items: [{ ...delegationTurn.items[1], status: 'completed' as const }, delegationTurn.items[2]],
+          }]}
+        />,
+      )
+      const strip = screen.getByRole('region', { name: 'Activity strip' })
+      // The settled delegation must not mask the between-attempts retry marker (LB-4).
+      expect(within(strip).getByText('Retrying')).toBeInTheDocument()
+      expect(within(strip).getByText('attempt 2')).toBeInTheDocument()
+      expect(within(strip).queryByText('Task')).not.toBeInTheDocument()
+    })
+  })
+
+  describe('thought duration labels', () => {
+    it('labels a settled reasoning row with its duration', () => {
+      render(
+        <FreshAgentTranscript
+          turns={[{ id: 't1', turnId: 't1', role: 'assistant', summary: '', items: [delegationTurn.items[0]] }]}
+        />,
+      )
+      expect(screen.getByRole('button', { name: 'Thought · 3.4s' })).toBeInTheDocument()
+      expect(screen.getByText('Thought · 3.4s')).toBeInTheDocument()
+    })
+
+    it('keeps the Thinking label for rows without a duration', () => {
+      render(
+        <FreshAgentTranscript
+          turns={[{
+            id: 't1', turnId: 't1', role: 'assistant', summary: '',
+            items: [{ id: 'r0', kind: 'reasoning', summary: ['x'], content: ['x'] }],
+          }]}
+        />,
+      )
+      expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()
+    })
+  })
+})
