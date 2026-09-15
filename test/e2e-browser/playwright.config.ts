@@ -375,6 +375,7 @@ export const RUST_ONLY_SPECS = [
   // >=400ms on reload. See docs/plans/2026-09-08-stagger-restore-launches.md
   /restore-create-stagger-rust\.spec\.ts$/,
   /local-first-reload-rust\.spec\.ts$/,
+  /pane-title-folds-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -659,6 +660,7 @@ export default defineConfig({
         // wire sends are spaced >=400ms on reload.
         /restore-create-stagger-rust\.spec\.ts$/,
         /local-first-reload-rust\.spec\.ts$/,
+        /pane-title-folds-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
