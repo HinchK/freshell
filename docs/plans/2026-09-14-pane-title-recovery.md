@@ -40,7 +40,7 @@ Implement the user-selected product behavior (Choice B — window sovereignty) p
 
 - **Focused client tests:** `npm run test:vitest -- run <paths>` (repo-owned passthrough; auto-routes client paths to the default jsdom config). Never raw `npx vitest`.
 - **Type/lint gates:** `npm run typecheck` and `npm run lint` must pass before the full-suite gate (CI requirement; eslint jsx-a11y).
-- **E2e registration:** a new rust-only spec must be added to BOTH `RUST_ONLY_SPECS` (~test/e2e-browser/playwright.config.ts:187) AND the `rust-chromium` project's `testMatch` (~:430-660). A spec registered in only one list is a known past-bug class. Run locally with `bash scripts/e2e-cloud.sh run --local --project=rust-chromium <spec-path>`; the new spec must be cloud-runnable (editor panes + store dispatches only, no external CLI binaries, not added to `CLOUD_SKIP_SPECS`).
+- **E2e registration:** every new rust-only spec (Task 4's `local-first-reload-rust.spec.ts` and Task 8's `pane-title-folds-rust.spec.ts`) must be added to BOTH `RUST_ONLY_SPECS` (~test/e2e-browser/playwright.config.ts:187) AND the `rust-chromium` project's `testMatch` (~:430-660). A spec registered in only one list is a known past-bug class. Run locally with `bash scripts/e2e-cloud.sh run --local --project=rust-chromium <spec-path>`; the new specs must be cloud-runnable (editor panes, a default-shell terminal pane, and store dispatches only — no external coding-CLI binaries, not added to `CLOUD_SKIP_SPECS`).
 - **Cloud-lane env (non-login shells):** verify with `printenv` and export explicitly when unset: `FRESHELL_VITEST_BACKEND=cloud`, `FRESHELL_E2E_BACKEND=cloud`, `GCLOUD_IDENT=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com`. Local lanes never need GCP identity.
 - **Full-suite gate:** coordinated `npm test` (waits on the shared coordinator; check `npm run test:status` first, never kill a foreign holder). Set `FRESHELL_TEST_SUMMARY="pane-title-recovery end-of-execution gate"`.
 - **1000-line cap:** new logic in new modules (`src/lib/recovery/layout-health.ts`, `src/lib/terminal-inventory-titles.ts`, `src/store/sessionTitleMirror.ts`, `src/store/hydrate-pane-metadata-merge.ts`); over-cap files receive wiring-only edits.
@@ -68,17 +68,17 @@ All facts below were verified against the worktree at `bab7d5189` by five explor
 
 Evidence: `reports/load-bearing-finder.md` (LB-IDs) in the run's logs dir. These corrections amend the task sketches; where a sketch and this section disagree, this section wins.
 
-1. **LB-05 (HIGH — silent trap, fix INSIDE Task 1):** `src/store/storage-migration.ts` `migratePersistedLayout()` (~:386-430) rewrites `freshell.layout.v3` on essentially every boot (each flush removes the fresh-agent commit marker at persistMiddleware.ts:641-645, so the preserve-guard at storage-migration.ts:432-437 always fails) using a FIXED top-level literal that drops unknown fields — it would strip Task 1's `machineId` stamp BEFORE the classifier reads it, making upgrade 2 silently non-functional and the accepted tradeoff (same-machine re-pick keeps a healthy layout) false. Task 1 MUST also modify `storage-migration.ts` to carry the top-level `machineId` through the migration payload (a string on the parsed raw — the same treatment `persistedAt` gets) and add a pin that a flushed stamped envelope survives `runStorageMigration()` (extend the storage-migration suite, e.g. `test/unit/client/store/storage-migration*.test.ts`).
+1. **LB-05 (HIGH — silent trap, fix INSIDE Task 1):** `src/store/storage-migration.ts` `migratePersistedLayout()` (~:386-430) rewrites `freshell.layout.v3` on essentially every boot (each flush removes the fresh-agent commit marker at persistMiddleware.ts:641-645, so the preserve-guard at storage-migration.ts:432-437 always fails) using a FIXED top-level literal that drops unknown fields — it would strip Task 1's `machineId` stamp BEFORE the classifier reads it, making upgrade 2 silently non-functional and the accepted tradeoff (same-machine re-pick keeps a healthy layout) false. Task 1 MUST also modify `storage-migration.ts` to carry the top-level `machineId` through the migration payload (a string on the parsed raw — the same treatment `persistedAt` gets) and add a pin that a flushed stamped envelope survives `runStorageMigration()` (extend `test/unit/client/store/storage-migration.test.ts` — the exact existing filename, verified in this worktree).
 2. **LB-04:** the machineIdentity slice field is `selectedMachine` (`machineIdentitySlice.ts:7-14`) — Task 1's `selectStampMachineId` reads `state.machineIdentity.selectedMachine.id` (set by `setMachineRestoring` BEFORE the classification runs).
 3. **LB-02 (residual, documented):** with two windows where the rebuilding one sat idle >15 min, the A15 fence drops its own generations; the bootstrap rebuild then restores the sibling's newer snapshot (same machine). That is the accepted multi-window tradeoff, not a regression.
 4. **LB-06:** `fetchSessionWindow` is a hand-rolled thunk — there is NO `sessions/fetchSessionWindow/fulfilled` action. Task 6's red test must land rows via the REAL commit action: `sessions/commitSessionWindowVisibleRefresh` (payload `{ surface, projects, ... }` per sessionsThunks.ts:610-629) or `sessions/setProjects`. All session mutations are `sessions/`-prefixed (sessionsSlice.ts:321-322), so the middleware trigger design is sound.
 5. **LB-07:** Task 4's sketch corrected to the real APIs: the owned server is `new RustServer(options)` + `await server.start()` (rust-server.ts:319/:337 — there is NO `RustServerHandle.spawn`); `connect` and the generation-file fs-poll `(clientInstanceId, minRecords, timeoutMs)` over `path.join(info.homeDir, '.freshell', 'tabs-snapshots')` are donor-spec-local (recover-my-panes-rust.spec.ts:210-211, :452-494) — copy them into the new spec; read the page's clientInstanceId from `sessionStorage['freshell.tabs.client-instance-id.v1']`; `ensureRustServerBuilt` is synchronous.
-6. **LB-08 (coverage-critical):** Task 4 must NOT clear sessionStorage on every load — `addInitScript(() => sessionStorage.clear())` runs on each reload, minting a fresh clientInstanceId, which would let Scenario 2 pass even if the `machine-bootstrap:` prefix regressed (false green). Use a once-guard (clear only on the context's first load) so the same-tab reload preserves the clientInstanceId and the prefix is load-bearing for the spec's outcome.
-7. **LB-11:** Task 4 Step 6's first verification command needs `--project=chromium` (without it, `--list` enumerates all projects and the grep count can never be 0).
+6. **LB-08 (coverage-critical):** Task 4 must NOT clear sessionStorage via `addInitScript` — an init script (even a once-guarded `sessionStorage.clear()`) cannot survive a reload (each reload is a new document/window, so the guard resets and the clear runs on EVERY load), minting a fresh clientInstanceId each time, which would let Scenario 2 pass even if the `machine-bootstrap:` prefix regressed (false green). Resolution: NO `addInitScript` at all — a fresh Playwright context starts with EMPTY storage, so there is nothing to clear, and the natural reload then preserves the clientInstanceId, making the prefix load-bearing for the spec's outcome.
+7. **LB-11:** Task 4 Step 5's first verification command needs `--project=chromium` (without it, `--list` enumerates all projects and the grep count can never be 0).
 8. **LB-16:** the root store setup is `src/store/store.ts` (configureStore :51; middleware chain :85-102) — Task 6 modifies and commits THAT file, not `src/store/index.ts`.
 9. **LB-17 (real helper names for the test sketches):** `App.machine-identity.test.tsx` has NO `renderAppWithMachineApi`/`waitForMachineReady`/`exposeChooserHandlers` — its real style is a module-level `createStore()` + `render(<App .../>)` + `waitFor(...)` against the `mocks.restoreMachineWorkspace`/`mocks.startTabRegistrySync` refs (:49-51, :114-224), and `MachineChooser` is NOT mocked (drive the real dialog); the existing pin at :222-224 is the one Task 2 updates. `machine-workspace.test.ts`'s real helpers: `createStore()`, `inventoryFor(machineId)`, `addForeignWorkspace(store)` (assert via the imported, mocked `getRecoveryInventory`). `build-recovery-plan.test.ts`'s real builders: `inv(panes, ledgerOnly?)` (:11), `pane(over?)` (:7), `leavesOf(node)` (:17).
 10. **LB-18:** consuming the active-selection marker only after a successful restore is correct; once the LB-05 fix makes stamps work, a lingering armed marker is inert on healthy boots (the stamp branch ignores it). No change.
-11. **LB-14 (watch-item):** the new spec's persistence polls are content-based and bounded like the donor's fs-polls (not cloud-skipped); watch the mandated cloud-lane run for `rest-tab-persistence`-class timing sensitivity and prefer generous bounded timeouts.
+11. **LB-14 (watch-item):** the new specs' persistence polls are content-based and bounded like the donor's fs-polls (not cloud-skipped); watch the mandated cloud-lane runs for `rest-tab-persistence`-class timing sensitivity and prefer generous bounded timeouts.
 
 ---
 
@@ -91,10 +91,10 @@ Evidence: `reports/load-bearing-finder.md` (LB-IDs) in the run's logs dir. These
 - Modify: `src/store/persistedState.ts:525-558` (`parsePersistedLayoutRaw` surfaces `machineId`)
 - Modify: `src/store/storage-migration.ts:386-430` (`migratePersistedLayout` carries the top-level `machineId` through — LB-05, without this the stamp is stripped at every boot before the classifier reads it)
 - Test: extend `test/unit/client/store/tabsPersistence.test.ts` (stamp round-trip pin)
-- Test: extend the storage-migration suite (a flushed stamped envelope survives `runStorageMigration()` — LB-05 pin)
+- Test: extend `test/unit/client/store/storage-migration.test.ts` (a flushed stamped envelope survives `runStorageMigration()` — the LB-05 pin; exact filename verified in this worktree)
 
 **Interfaces:**
-- Consumes: `LAYOUT_STORAGE_KEY` (`src/store/storage-keys.ts:2`), `getSelectedMachineId()` (`src/lib/machine-identity.ts:89-100`), `parsePersistedLayoutRaw`.
+- Consumes: `LAYOUT_STORAGE_KEY` (`src/store/storage-keys.ts:2`), `getSelectedMachineId()` (`src/lib/machine-identity.ts:89-100`), `parsePersistedLayoutRaw`, and `isWellFormedPaneTree` (`src/store/paneTreeValidation.ts:133` — the SAME well-formedness predicate the persist/load path uses; it is already exported from its own module, so panesSlice.ts needs no new export and must not grow).
 - Produces (used by Task 2):
   - `export type PersistedLayoutHealth = 'absent' | 'corrupt' | 'foreign' | 'stale' | 'healthy'`
   - `export const STALE_LAYOUT_MS = 7 * 24 * 60 * 60 * 1000`
@@ -146,6 +146,16 @@ describe('classifyPersistedLayoutHealth', () => {
 
   it('returns corrupt when the stored envelope does not parse', () => {
     seedEnvelope('{ not json')
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('returns corrupt when any persisted layout tree is malformed (valid tab + broken pane tree)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    envelope.panes = {
+      ...(envelope.panes as Record<string, unknown>),
+      layouts: { 'tab-a': {} },   // {} fails isWellFormedPaneTree — the loader drops it and rehydrates a default pane
+    }
+    seedEnvelope(envelope)
     expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
   })
 
@@ -239,6 +249,7 @@ Create `src/lib/recovery/layout-health.ts`:
 ```typescript
 import { getSelectedMachineId } from '@/lib/machine-identity'
 import { parsePersistedLayoutRaw, type ParsedPersistedLayout } from '@/store/persistedState'
+import { isWellFormedPaneTree } from '@/store/paneTreeValidation'
 import { LAYOUT_STORAGE_KEY } from '@/store/storage-keys'
 
 /** A local layout older than this rebuilds from the server instead of being
@@ -286,6 +297,16 @@ export function classifyPersistedLayoutHealth(
     parsed = null
   }
   if (!parsed) return 'corrupt'
+  // A shallowly-parsed envelope whose layout trees fail the loader's
+  // well-formedness predicate would rehydrate as DEFAULT panes (the load
+  // path drops malformed trees), silently losing the saved layout — that is
+  // a corrupt layout, not a healthy one. Same predicate the loader uses
+  // (paneTreeValidation.ts). Bounded residual: pane CONTENT payload
+  // sanitization (loaders replace invalid content with safe defaults) stays
+  // out of scope — only tree well-formedness is classified here.
+  for (const layout of Object.values(parsed.panes?.layouts ?? {})) {
+    if (!isWellFormedPaneTree(layout)) return 'corrupt'
+  }
   const tabCount = parsed.tabs?.tabs?.length ?? 0
   const paneCount = Object.keys(parsed.panes?.layouts ?? {}).length
   if (tabCount === 0 && paneCount === 0) return 'absent'
@@ -324,7 +345,7 @@ machineId: typeof parsed.machineId === 'string' && parsed.machineId ? parsed.mac
 
 - [ ] **Step 4: Run the focused test**
 
-Run: `npm run test:vitest -- run test/unit/client/lib/recovery/layout-health.test.ts test/unit/client/store/tabsPersistence.test.ts`
+Run: `npm run test:vitest -- run test/unit/client/lib/recovery/layout-health.test.ts test/unit/client/store/tabsPersistence.test.ts test/unit/client/store/storage-migration.test.ts`
 
 Expected: PASS
 
@@ -343,7 +364,7 @@ Expected: PASS (no existing test asserts the exact envelope field set; if one do
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add src/lib/recovery/layout-health.ts src/store/persistedState.ts src/store/persistMiddleware.ts src/store/storage-migration.ts test/unit/client/lib/recovery/layout-health.test.ts test/unit/client/store/tabsPersistence.test.ts
+git add src/lib/recovery/layout-health.ts src/store/persistedState.ts src/store/persistMiddleware.ts src/store/storage-migration.ts test/unit/client/lib/recovery/layout-health.test.ts test/unit/client/store/tabsPersistence.test.ts test/unit/client/store/storage-migration.test.ts
 git commit -m "feat(client): stamp the persisted layout with its machine id and classify layout health"
 ```
 
@@ -743,7 +764,7 @@ git commit -m "feat(recovery): machine bootstrap includes the window's own snaps
 - Consumes: the owned `RustServer` fixture + `ensureRustServerBuilt` (`helpers/rust-server.ts`), the `connect` + generation-file fs-poll idioms from `recover-my-panes-rust.spec.ts`, and the harness dispatch seam `window.__FRESHELL_TEST_HARNESS__` (`helpers/test-harness.ts`).
 - Produces: the e2e pin for Tasks 1-3 (no production code in this task).
 
-- [ ] **Step 1: Write the failing e2e test**
+- [ ] **Step 1: Write the e2e spec (and register it in BOTH config lists)**
 
 Create `test/e2e-browser/specs/local-first-reload-rust.spec.ts`:
 
@@ -787,15 +808,14 @@ test.describe('local-first machine workspace', () => {
   ]
 
   test('reload keeps a healthy local workspace exactly; corrupt envelope rebuilds from own snapshot with preserved ids', async ({ page }) => {
-    // LB-08: clear only on the context's FIRST load. addInitScript runs on
-    // every reload; clearing each time mints a fresh clientInstanceId, which
-    // would let Scenario 2 pass even if the machine-bootstrap prefix regressed.
-    await page.addInitScript(() => {
-      if (!(window as { __FRESHELL_E2E_STORAGE_CLEARED__?: boolean }).__FRESHELL_E2E_STORAGE_CLEARED__) {
-        ;(window as { __FRESHELL_E2E_STORAGE_CLEARED__?: boolean }).__FRESHELL_E2E_STORAGE_CLEARED__ = true
-        sessionStorage.clear()
-      }
-    })
+    // NO addInitScript at all: a fresh Playwright context starts with EMPTY
+    // storage, so there is nothing to clear — and any init script (even a
+    // once-guarded clear) cannot survive a reload (each reload is a new
+    // document), so it would run on every load and mint a fresh
+    // clientInstanceId, letting Scenario 2 pass even if the
+    // machine-bootstrap prefix regressed (the LB-08 false green). With no
+    // init script the natural reload PRESERVES the clientInstanceId, which
+    // makes the `machine-bootstrap:` prefix load-bearing for Scenario 2.
     // LB-07: `connect` is donor-spec-local — navigate directly instead.
     await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
     const harness = new TestHarness(page)
@@ -878,27 +898,49 @@ Registration (both lists — per the known past-bug class):
 // rust-chromium project testMatch (~:430-660): append the same regex to the array.
 ```
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+- [ ] **Step 2: Non-vacuity receipt — run the spec at the base commit and EXPECT FAIL**
+
+Task 4 runs after Tasks 1-3 implement the behavior, so an "expected FAIL on current main" run in THIS worktree is unreachable. Prove the spec is non-vacuous in a THROWAWAY git worktree at the plan's base_ref `bab7d5189`:
+
+```bash
+SCRATCH="$(mktemp -d /tmp/freshell-pane-title-nonvacuity.XXXXXX)"
+git worktree add --detach "$SCRATCH" bab7d5189
+# The scratch tree starts bare. Reuse the real worktree's installed deps and
+# already-built server binary (Tasks 1-3 add no dependencies and no Rust
+# code, so base and worktree tooling are identical):
+ln -s "$(pwd)/node_modules" "$SCRATCH/node_modules"
+cp test/e2e-browser/specs/local-first-reload-rust.spec.ts "$SCRATCH/test/e2e-browser/specs/"
+# Then apply the SAME two registration edits (RUST_ONLY_SPECS ~:187 AND the
+# rust-chromium testMatch ~:430-660) to the scratch copy's
+# test/e2e-browser/playwright.config.ts.
+```
+
+Run the spec from the scratch tree, reusing the built binary through the fixture's fail-closed override (`FRESHELL_E2E_RUST_SERVER_BIN`, helpers/rust-server.ts:93):
+
+```bash
+( cd "$SCRATCH" && FRESHELL_E2E_RUST_SERVER_BIN="<real-worktree>/target/release/freshell-server" \
+  bash scripts/e2e-cloud.sh run --local --project=rust-chromium test/e2e-browser/specs/local-first-reload-rust.spec.ts )
+```
+
+Expected: FAIL — Scenario 1's `kept` assertions fail (at base the reload clears and re-mints the workspace: fresh nanoid tab ids, derived-default pane titles, re-minted active tab) and Scenario 2 fails (no `machine-bootstrap:` prefix, ids re-minted). Record the receipt (command + failure summary) at `.worktrees/.the-usual-logs/pane-title-recovery/reports/local-first-reload-nonvacuity-receipt.md`.
+
+Then remove the throwaway — verify the path is the scratch dir (never the real worktree) before forcing:
+
+```bash
+[ -n "$SCRATCH" ] && [ "$SCRATCH" != "$(pwd)" ] && git worktree remove --force "$SCRATCH"
+```
+
+- [ ] **Step 3: Run the spec in the REAL worktree — EXPECT PASS (it pins landed Tasks 1-3)**
 
 Run: `bash scripts/e2e-cloud.sh run --local --project=rust-chromium test/e2e-browser/specs/local-first-reload-rust.spec.ts`
 
-Expected: FAIL at Scenario 1 — on current main the reload clears and re-mints the workspace (tab ids become fresh nanoids, pane titles fall back to derived defaults, active tab is re-minted), so the `kept` assertions fail; Scenario 2 also fails (ids re-minted).
+Expected: PASS (both scenarios). This is not a red-first step — the red was recorded in Step 2's receipt; this run pins the landed Tasks 1-3 behavior. No new production code: if it fails for harness reasons (auto-tab timing, generation-file polling, predicate serialization), fix the SPEC, not production code. (The `waitForPersistedEnvelope` sketch above must be implemented as a bounded node-side poll — `new Function` serialization is not acceptable in the final spec.)
 
-- [ ] **Step 3: No new production code**
-
-The spec pins Tasks 1-3, already implemented and green at unit level. If it fails for harness reasons (auto-tab timing, generation-file polling, predicate serialization), fix the SPEC, not production code. (The `waitForPersistedEnvelope` sketch above must be implemented as a bounded node-side poll — `new Function` serialization is not acceptable in the final spec.)
-
-- [ ] **Step 4: Run the focused test again**
-
-Run: `bash scripts/e2e-cloud.sh run --local --project=rust-chromium test/e2e-browser/specs/local-first-reload-rust.spec.ts`
-
-Expected: PASS (both scenarios)
-
-- [ ] **Step 5: Refactor while green**
+- [ ] **Step 4: Refactor while green**
 
 Keep poll helpers inside the spec file (other runs own the shared helper files).
 
-- [ ] **Step 6: Run impacted-test verification**
+- [ ] **Step 5: Run impacted-test verification**
 
 The config edit affects e2e collection only. Verify the spec is registered in BOTH lists: the match-all `chromium` project must NOT collect it, and `rust-chromium` must:
 
@@ -910,7 +952,7 @@ Run: `npx playwright test --config test/e2e-browser/playwright.config.ts --proje
 
 Expected: at least one listed test.
 
-- [ ] **Step 7: Commit the task**
+- [ ] **Step 6: Commit the task**
 
 ```bash
 git add test/e2e-browser/specs/local-first-reload-rust.spec.ts test/e2e-browser/playwright.config.ts
@@ -964,11 +1006,11 @@ describe('foldTerminalInventoryTitles', () => {
     expect(store.getState().panes.paneTitleSetByUser['tab-1']?.['pane-1']).toBeFalsy()
   })
 
-  it('never overwrites a user-set pane title', () => {
+  it('never overwrites a user-set pane title (and does not count it as a fold)', () => {
     const store = buildStore()
     seedTerminalPane(store, 'tab-1', 'pane-1', 't-9')
     store.dispatch(updatePaneTitle({ tabId: 'tab-1', paneId: 'pane-1', title: 'My own name', setByUser: true }))
-    foldTerminalInventoryTitles(store, [{ terminalId: 't-9', title: 'Sweep title' }])
+    expect(foldTerminalInventoryTitles(store, [{ terminalId: 't-9', title: 'Sweep title' }])).toBe(0)
     expect(store.getState().panes.paneTitles['tab-1']['pane-1']).toBe('My own name')
   })
 
@@ -1023,7 +1065,9 @@ type InventoryRow = { terminalId?: string; title?: string }
 
 /** Does any pane bound to this terminal hold a title that differs?
  * Carries the owning tabId through the walk so the title comparison can
- * read paneTitles[tabId][paneId]. */
+ * read paneTitles[tabId][paneId]. A pane whose user-set flag is true is
+ * NEVER a fold target — treat it as NOT differing so the fold count only
+ * reports real folds and no no-op dispatch fires for it on every refresh. */
 function paneTitleDiffersForTerminal(panes: RootState['panes'], terminalId: string, title: string): boolean {
   for (const [tabId, layout] of Object.entries(panes.layouts ?? {})) {
     if (!layout) continue
@@ -1032,6 +1076,7 @@ function paneTitleDiffersForTerminal(panes: RootState['panes'], terminalId: stri
       const n = node as { type?: string; id?: string; content?: { kind?: string; terminalId?: string }; children?: unknown[] }
       if (n.type === 'leaf') {
         if (n.content?.kind === 'terminal' && n.content.terminalId === terminalId) {
+          if (panes.paneTitleSetByUser?.[tabId]?.[n.id ?? '']) return false
           if (((panes.paneTitles?.[tabId]?.[n.id ?? '']) ?? '') !== title) return true
         }
         return false
@@ -1050,7 +1095,8 @@ function paneTitleDiffersForTerminal(panes: RootState['panes'], terminalId: stri
  * re-delivered the current registry title. All writes go through
  * updatePaneTitleByTerminalId with setByUser:false — user renames stick.
  * Returns the number of dispatched folds (churn-free: rows whose panes
- * already hold the title dispatch nothing).
+ * already hold the title dispatch nothing, and user-set panes are skipped
+ * entirely so they are never dispatched or counted).
  */
 export function foldTerminalInventoryTitles(store: FoldStore, terminals: InventoryRow[] | undefined): number {
   let dispatched = 0
@@ -1106,10 +1152,11 @@ git commit -m "feat(client): fold terminal inventory titles into pane titles on 
 **Files:**
 - Create: `src/store/sessionTitleMirror.ts`
 - Create: `test/unit/client/store/sessionTitleMirror.test.ts`
+- Create: `test/unit/client/store/sessionTitleMirror.registration.test.ts` (production-store registration pin)
 - Modify: `src/store/store.ts` (the root `configureStore` at :51 and its middleware concat chain at :85-102 — LB-16: NOT `src/store/index.ts`; add the middleware to the existing chain)
 
 **Interfaces:**
-- Consumes: `updatePaneTitleBySessionRef` (panesSlice.ts:2242, existing, `setByUser:false`-guarded; matches fresh-agent panes by `provider`+`sessionId` and terminal panes by `content.sessionRef`), sessions slice state (`state.sessions.windows[surface].projects[]` rows carrying `sessionId`/`provider`/`title?`, sessionsSlice.ts:66-96).
+- Consumes: `updatePaneTitleBySessionRef` (panesSlice.ts:2242, existing, `setByUser:false`-guarded; matches fresh-agent panes by `provider`+`sessionId` and terminal panes by `content.sessionRef`), sessions slice state (`state.sessions.windows[surface].projects[]` rows carrying `sessionId`/`provider`/`title?`/`lastActivityAt`, sessionsSlice.ts:66-96; surfaces are `'sidebar' | 'history' | 'bootstrap'` per sessionsThunks.ts:27), and the pane-binding action types `panes/initLayout`, `panes/updatePaneContent`, `panes/mergePaneContent`, `panes/materializeFreshAgentSession`, `panes/reconcileTerminalSessionRefByTerminalId` (verified against panesSlice.ts — slice name `'panes'` at :1223; reducers at :1226/:1741/:1841/:1809/:2265).
 - Produces: `export const sessionTitleMirrorMiddleware: Middleware` (registered once in the store setup).
 
 - [ ] **Step 1: Write the failing behavioral test**
@@ -1137,13 +1184,15 @@ function seedFreshAgentPane(store: ReturnType<typeof buildStore>, sessionId: str
   }))
 }
 
-function landSessionRow(store: ReturnType<typeof buildStore>, row: { sessionId: string; provider: string; title?: string }) {
+function landSessionRow(store: ReturnType<typeof buildStore>, row: {
+  surface: string; sessionId: string; provider: string; title?: string; lastActivityAt?: number
+}) {
   // LB-06: fetchSessionWindow is a hand-rolled thunk — there is NO
   // 'sessions/fetchSessionWindow/fulfilled' action. Land rows via the REAL
   // commit action the thunk dispatches (sessionsThunks.ts:610-629):
   store.dispatch({
     type: 'sessions/commitSessionWindowVisibleRefresh',
-    payload: /* { surface, projects: [{ ...project fields..., sessions: [row] }] } — mirror the exact builder payload from sessionsThunks.ts:610-629 */,
+    payload: /* { surface: row.surface, projects: [{ ...project fields..., sessions: [{ ...row, lastActivityAt }] }] } — mirror the exact builder payload from sessionsThunks.ts:610-629 */,
   })
 }
 
@@ -1151,7 +1200,7 @@ describe('sessionTitleMirrorMiddleware', () => {
   it('mirrors a session-directory title into a matching fresh-agent pane (the MCP-created-pane symptom)', () => {
     const store = buildStore()
     seedFreshAgentPane(store, 'sess-1')
-    landSessionRow(store, { sessionId: 'sess-1', provider: 'opencode', title: 'ZZ probe summarize' })
+    landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-1', provider: 'opencode', title: 'ZZ probe summarize' })
     expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('ZZ probe summarize')
     expect(store.getState().panes.paneTitleSetByUser['tab-z']?.['pane-z']).toBeFalsy()
   })
@@ -1160,14 +1209,14 @@ describe('sessionTitleMirrorMiddleware', () => {
     const store = buildStore()
     seedFreshAgentPane(store, 'sess-1')
     store.dispatch(updatePaneTitle({ tabId: 'tab-z', paneId: 'pane-z', title: 'My name', setByUser: true }))
-    landSessionRow(store, { sessionId: 'sess-1', provider: 'opencode', title: 'Directory title' })
+    landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-1', provider: 'opencode', title: 'Directory title' })
     expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('My name')
   })
 
   it('skips rows without a title and ignores non-sessions actions', () => {
     const store = buildStore()
     seedFreshAgentPane(store, 'sess-1')
-    landSessionRow(store, { sessionId: 'sess-1', provider: 'opencode' })   // no title
+    landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-1', provider: 'opencode' })   // no title
     store.dispatch({ type: 'settings/updated', payload: {} })
     const title = store.getState().panes.paneTitles['tab-z']?.['pane-z']
     expect(title).toBeUndefined()   // still the derived default is NOT stored — initLayout seeds derived; assert whatever initLayout seeded, unchanged
@@ -1176,21 +1225,39 @@ describe('sessionTitleMirrorMiddleware', () => {
   it('does not re-dispatch when the mirrored title already equals the pane title', () => {
     const store = buildStore()
     seedFreshAgentPane(store, 'sess-1')
-    landSessionRow(store, { sessionId: 'sess-1', provider: 'opencode', title: 'Same title' })
+    landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-1', provider: 'opencode', title: 'Same title' })
     const before = store.getState()
-    landSessionRow(store, { sessionId: 'sess-1', provider: 'opencode', title: 'Same title' })
+    landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-1', provider: 'opencode', title: 'Same title' })
     expect(store.getState().panes).toBe(before.panes)
+  })
+
+  it('a stale title in a later-committed surface does not beat a fresher row for the same session', () => {
+    const store = buildStore()
+    seedFreshAgentPane(store, 'sess-1')
+    landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-1', provider: 'opencode', title: 'Fresh sidebar title', lastActivityAt: 2_000 })
+    landSessionRow(store, { surface: 'history', sessionId: 'sess-1', provider: 'opencode', title: 'Stale history title', lastActivityAt: 1_000 })
+    expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('Fresh sidebar title')
+  })
+
+  it('titles a pane created AFTER its directory row is already loaded (the missed-ordering symptom)', () => {
+    const store = buildStore()
+    landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-1', provider: 'opencode', title: 'ZZ probe summarize' })
+    seedFreshAgentPane(store, 'sess-1')   // the pane arrives AFTER the row — panes/initLayout must re-fire the mirror
+    expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('ZZ probe summarize')
+    expect(store.getState().panes.paneTitleSetByUser['tab-z']?.['pane-z']).toBeFalsy()
   })
 })
 ```
 
 (Note: the third assertion must be pinned against whatever `initLayout` actually seeded for the fresh-agent pane — read the state and assert it did NOT change, rather than hard-coding a derived label.)
 
+Registration pin (`test/unit/client/store/sessionTitleMirror.registration.test.ts`, new file — the production `src/store/store.ts` registration is otherwise untested): import the PRODUCTION store singleton — `import { store } from '@/store'` (`src/store/index.ts` re-exports `export * from './store'`; the singleton is `store` at store.ts:51, the real `configureStore` whose middleware chain Task 6 just extended) — in a jsdom environment whose localStorage starts EMPTY (fresh per test file; do not seed storage before import — the slices rehydrate at module eval). Seed a fresh-agent pane by dispatching the real `addTab` + `initLayout` action creators through THAT store, dispatch the real `commitSessionWindowVisibleRefresh` action creator (exported from `@/store/sessionsSlice`, :677) with a `{ surface: 'sidebar', projects: [{ projectPath, sessions: [{ sessionId, provider, title, lastActivityAt }] }] }` payload, and assert `store.getState().panes.paneTitles` mirrored the title — proving the middleware is registered in the production chain, not just hand-installed in test stores.
+
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `npm run test:vitest -- run test/unit/client/store/sessionTitleMirror.test.ts`
+Run: `npm run test:vitest -- run test/unit/client/store/sessionTitleMirror.test.ts test/unit/client/store/sessionTitleMirror.registration.test.ts`
 
-Expected: FAIL — the module does not exist (import error).
+Expected: FAIL — the module does not exist (import error, both suites).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -1201,16 +1268,22 @@ import type { Middleware } from '@reduxjs/toolkit'
 import { updatePaneTitleBySessionRef } from '@/store/panesSlice'
 import type { RootState } from '@/store'
 
-type TitledSessionRow = { provider: string; sessionId: string; title: string }
+type TitledSessionRow = { provider: string; sessionId: string; title: string; surface: string; lastActivityAt: number }
 
-/** Collect every session row that currently has a title. The row shape and
- * nesting (windows[surface].projects[] → sessions[]) must be taken from
- * sessionsSlice.ts:66-96 — adjust field names to the real normalized
- * state, not to this sketch. */
+/** Collect every session row that currently has a title, DEDUPED by
+ * `${provider}:${sessionId}`: the same session can sit in several retained
+ * windows (e.g. sidebar AND history), and without a dedupe a stale title in
+ * a later-iterated surface wins by insertion order. Keep the row with the
+ * greatest `lastActivityAt`; ties break deterministically — prefer the
+ * `sidebar` surface, then first-encountered. Row shape and nesting
+ * (windows[surface].projects[] → sessions[]) per sessionsSlice.ts:66-96;
+ * surfaces are 'sidebar' | 'history' | 'bootstrap' (sessionsThunks.ts:27);
+ * rows carry lastActivityAt (SessionDirectoryItem, shared/read-models.ts).
+ * Adjust field names to the real normalized state, not to this sketch. */
 function collectTitledSessionRows(sessions: RootState['sessions']): TitledSessionRow[] {
-  const rows: TitledSessionRow[] = []
+  const byKey = new Map<string, TitledSessionRow>()
   const windows = (sessions as unknown as { windows?: Record<string, { projects?: Array<Record<string, unknown>> }> })?.windows ?? {}
-  for (const window of Object.values(windows)) {
+  for (const [surface, window] of Object.entries(windows)) {
     for (const project of window?.projects ?? []) {
       const sessionsList = (project?.sessions ?? []) as Array<Record<string, unknown>>
       for (const session of sessionsList) {
@@ -1218,17 +1291,32 @@ function collectTitledSessionRows(sessions: RootState['sessions']): TitledSessio
         const sessionId = session?.sessionId
         const title = session?.title
         if (typeof provider === 'string' && typeof sessionId === 'string' && typeof title === 'string' && title) {
-          rows.push({ provider, sessionId, title })
+          const candidate: TitledSessionRow = {
+            provider, sessionId, title, surface,
+            lastActivityAt: typeof session?.lastActivityAt === 'number' ? session.lastActivityAt : 0,
+          }
+          const key = `${provider}:${sessionId}`
+          const existing = byKey.get(key)
+          if (
+            !existing ||
+            candidate.lastActivityAt > existing.lastActivityAt ||
+            (candidate.lastActivityAt === existing.lastActivityAt &&
+              existing.surface !== 'sidebar' && candidate.surface === 'sidebar')
+          ) {
+            byKey.set(key, candidate)
+          }
         }
       }
     }
   }
-  return rows
+  return [...byKey.values()]
 }
 
 /** Any pane bound to this session holding a different title? Matches the
  * same rule updatePaneTitleBySessionRef's reducer uses (fresh-agent
- * provider+sessionId; terminal content.sessionRef — panesSlice.ts:448-461). */
+ * provider+sessionId; terminal content.sessionRef — panesSlice.ts:448-461).
+ * A pane whose user-set flag is true is NEVER a fold target — treat it as
+ * NOT differing so no no-op dispatch fires for it on every refresh. */
 function sessionTitleDiffers(panes: RootState['panes'], provider: string, sessionId: string, title: string): boolean {
   for (const [tabId, layout] of Object.entries(panes.layouts ?? {})) {
     if (!layout) continue
@@ -1242,7 +1330,10 @@ function sessionTitleDiffers(panes: RootState['panes'], provider: string, sessio
           (typeof c.sessionRef === 'object' && c.sessionRef !== null &&
             ((c.sessionRef as Record<string, unknown>).provider === provider) &&
             ((c.sessionRef as Record<string, unknown>).sessionId === sessionId))
-        if (matches && (((panes.paneTitles?.[tabId]?.[n.id ?? '']) ?? '') !== title)) return true
+        if (matches) {
+          if (panes.paneTitleSetByUser?.[tabId]?.[n.id ?? '']) return false
+          if (((panes.paneTitles?.[tabId]?.[n.id ?? '']) ?? '') !== title) return true
+        }
         return false
       }
       return (n.children ?? []).some(walk)
@@ -1252,19 +1343,39 @@ function sessionTitleDiffers(panes: RootState['panes'], provider: string, sessio
   return false
 }
 
+/** Pane-binding actions that can introduce or re-bind a sessionRef AFTER
+ * its directory row is already loaded (the MCP/REST-created-pane symptom:
+ * the row lands via sessions/*, the pane arrives later via panes/*).
+ * Exact generated action-type strings, verified against panesSlice.ts
+ * (slice name 'panes'; reducers initLayout :1226, updatePaneContent :1741,
+ * materializeFreshAgentSession :1809, mergePaneContent :1841,
+ * reconcileTerminalSessionRefByTerminalId :2265). */
+const SESSION_BINDING_PANE_ACTIONS = new Set([
+  'panes/initLayout',
+  'panes/updatePaneContent',
+  'panes/mergePaneContent',
+  'panes/materializeFreshAgentSession',
+  'panes/reconcileTerminalSessionRefByTerminalId',
+])
+
 /**
  * Session-directory titles are the canonical names for agent sessions, but
  * only the composer flow ever folded them into panes — MCP/REST-created
  * panes stayed on derived defaults forever. This middleware folds titled
- * session rows into their open panes after every sessions-state change,
- * through updatePaneTitleBySessionRef with setByUser:false (rename scope
+ * session rows into their open panes after every sessions-state change AND
+ * after the pane-binding actions above (a pane created after its row is
+ * loaded must still get titled — the missed-ordering case), through
+ * updatePaneTitleBySessionRef with setByUser:false (rename scope
  * contract: user renames stick; nothing durable is written; no dispatch
  * when the title already matches).
  */
 export const sessionTitleMirrorMiddleware: Middleware = (store) => (next) => (action) => {
   const result = next(action)
   const type = (action as { type?: unknown })?.type
-  if (typeof type === 'string' && type.startsWith('sessions/')) {
+  const fires =
+    (typeof type === 'string' && type.startsWith('sessions/')) ||
+    (typeof type === 'string' && SESSION_BINDING_PANE_ACTIONS.has(type))
+  if (fires) {
     const state = store.getState() as RootState
     for (const row of collectTitledSessionRows(state.sessions)) {
       if (!sessionTitleDiffers(state.panes, row.provider, row.sessionId, row.title)) continue
@@ -1281,7 +1392,7 @@ Register the middleware in `src/store/store.ts`'s existing middleware concat cha
 
 - [ ] **Step 4: Run the focused tests**
 
-Run: `npm run test:vitest -- run test/unit/client/store/sessionTitleMirror.test.ts`
+Run: `npm run test:vitest -- run test/unit/client/store/sessionTitleMirror.test.ts test/unit/client/store/sessionTitleMirror.registration.test.ts`
 
 Expected: PASS
 
@@ -1300,7 +1411,7 @@ Expected: PASS
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add src/store/sessionTitleMirror.ts src/store/store.ts test/unit/client/store/sessionTitleMirror.test.ts
+git add src/store/sessionTitleMirror.ts src/store/store.ts test/unit/client/store/sessionTitleMirror.test.ts test/unit/client/store/sessionTitleMirror.registration.test.ts
 git commit -m "feat(client): mirror session-directory titles into open agent panes by sessionRef"
 ```
 
@@ -1312,13 +1423,13 @@ git commit -m "feat(client): mirror session-directory titles into open agent pan
 - Create: `src/store/hydrate-pane-metadata-merge.ts` (the extracted pure merge function)
 - Modify: `src/store/panesSlice.ts` (import the extracted merge; delete the private copy; pass `action.meta` through from `hydratePanes` — panesSlice must SHRINK, not grow)
 - Test: `test/unit/client/store/panesSlice.test.ts` (extend the `hydratePanes` describe; the two existing pins at :2876/:2939 are the anchors)
+- Test: modify `test/e2e-browser/specs/local-first-reload-rust.spec.ts` (append the cross-window recency scenario; the spec Task 4 created — its registration in BOTH config lists is already in place)
 
 **Interfaces:**
-- Consumes: `HydratePanesMeta` (`panesSlice.ts:37-40` — `localLayoutPersistedAt?`/`remoteLayoutPersistedAt?`, already dispatched by crossTabSync.ts:213-218), the tabs winner pattern (`pickHydratedTabWinner`, tabsSlice.ts:115-128).
-- Produces: `export function mergeHydratedPaneMetadata(state, incoming, layouts, incomingLayoutTabIds, meta?: HydratePanesMeta)` in the new module, imported by panesSlice. Behavior contract:
-  - meta absent → exactly the current behavior (incoming titles are the base when the incoming layout won);
-  - meta present and `remoteLayoutPersistedAt > localLayoutPersistedAt` → current behavior (incoming base);
-  - meta present and `remoteLayoutPersistedAt <= localLayoutPersistedAt` → LOCAL titles are kept for tabs whose layout the incoming side won (incoming titles for those tabs are dropped); the existing local-user-set re-application and user-set-flag merging are unchanged in all branches.
+- Consumes: `HydratePanesMeta` (`panesSlice.ts:37-40` — `localLayoutPersistedAt?`/`remoteLayoutPersistedAt?`, already dispatched by crossTabSync.ts:213-218), the tabs winner pattern (`pickHydratedTabWinner`, tabsSlice.ts:115-128) and its title reconcile analogue (`reconcileHydratedTabTitle`, tabsSlice.ts:137-142).
+- Produces: `export function mergeHydratedPaneMetadata(state, incoming, layouts, incomingLayoutTabIds, meta?: HydratePanesMeta)` in the new module, imported by panesSlice. Behavior contract (tabs-style per-pane reconcile):
+  - Recency BASE selection: meta absent → the legacy layout-side base (incoming titles are the base when the incoming layout won); meta present → the incoming side is the base iff `remoteLayoutPersistedAt > localLayoutPersistedAt` (strictly), else the local side is the base. Ties keep LOCAL (conservative — never clobber on ambiguity).
+  - Per-PANE reconciliation, applied on that base for every pane: if exactly one side's pane is user-set, that side's title wins AND its flag lands true; if both sides are user-set, the base (recency/layout winner) side's title stands with the flag true; otherwise the base source's title, with the flag = (either side's flag). Incoming user-set titles are therefore NEVER dropped, and a user-set flag can never freeze the wrong text — "user-set pane titles always survive" holds on both sides.
 
 - [ ] **Step 1: Write the failing behavioral tests**
 
@@ -1355,6 +1466,36 @@ it('user-set local pane titles survive regardless of recency', () => {
   expect(state.paneTitles['tab-1']['pane-1']).toBe('My frozen title')
 })
 
+it('an incoming USER-SET title survives when the incoming layout wins (remote newer)', () => {
+  const state = hydratePanesWith({
+    local: localStateWithPaneTitle('tab-1', 'pane-1', 'Older local title', { userSet: false }),
+    incoming: incomingWithPaneTitles('tab-1', { 'pane-1': 'Remote chosen name' }, { userSet: true }),
+    meta: crossTabMeta(Date.now() - 60_000, Date.now()),   // remote newer — incoming user-set title + flag land
+  })
+  expect(state.paneTitles['tab-1']['pane-1']).toBe('Remote chosen name')
+  expect(state.paneTitleSetByUser['tab-1']['pane-1']).toBe(true)
+})
+
+it('an incoming USER-SET title survives even when the local layout is preserved (remote older)', () => {
+  const state = hydratePanesWith({
+    local: localStateWithPaneTitle('tab-1', 'pane-1', 'Newer local title', { userSet: false }),
+    incoming: incomingWithPaneTitles('tab-1', { 'pane-1': 'Remote chosen name' }, { userSet: true }),
+    meta: crossTabMeta(Date.now(), Date.now() - 60_000),   // local newer — layout stays local, but the incoming USER-SET title still wins
+  })
+  expect(state.paneTitles['tab-1']['pane-1']).toBe('Remote chosen name')
+  expect(state.paneTitleSetByUser['tab-1']['pane-1']).toBe(true)
+})
+
+it('both sides user-set: the recency winner\'s title stands, flag true', () => {
+  const state = hydratePanesWith({
+    local: localStateWithPaneTitle('tab-1', 'pane-1', 'Local mine', { userSet: true }),
+    incoming: incomingWithPaneTitles('tab-1', { 'pane-1': 'Remote mine' }, { userSet: true }),
+    meta: crossTabMeta(Date.now() - 60_000, Date.now()),   // remote newer — the incoming user-set title stands
+  })
+  expect(state.paneTitles['tab-1']['pane-1']).toBe('Remote mine')
+  expect(state.paneTitleSetByUser['tab-1']['pane-1']).toBe(true)
+})
+
 it('keeps the legacy merge when no hydrate meta is provided', () => {
   const state = hydratePanesWith({
     local: localStateWithPaneTitle('tab-1', 'pane-1', 'Newer local title', { userSet: false }),
@@ -1365,13 +1506,13 @@ it('keeps the legacy merge when no hydrate meta is provided', () => {
 })
 ```
 
-(`hydratePanesWith`/`localStateWithPaneTitle`/`incomingWithPaneTitles` wrap the hand-built `PanesState` + hydrate action idioms already used by the :2876/:2939 tests — reuse their builders so the fixtures produce an incoming layout that actually wins (`incomingLayoutTabIds`).)
+(`hydratePanesWith`/`localStateWithPaneTitle`/`incomingWithPaneTitles` wrap the hand-built `PanesState` + hydrate action idioms already used by the :2876/:2939 tests — reuse their builders so the fixtures produce an incoming layout that actually wins (`incomingLayoutTabIds`), and extend `incomingWithPaneTitles` with the optional `{ userSet }` arg shown above so the incoming side can seed `paneTitleSetByUser`.)
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
 Run: `npm run test:vitest -- run test/unit/client/store/panesSlice.test.ts`
 
-Expected: FAIL — only the first new test fails (an older incoming layout currently overwrites the newer local title whenever the incoming layout wins); the other three already pass and must KEEP passing.
+Expected: FAIL — the older-incoming-layout test fails (an older incoming layout currently overwrites the newer local title whenever the incoming layout wins), AND the incoming-user-set/local-preserved test fails (the current merge drops the incoming USER-SET title when the local layout is preserved while its flag still merges — freezing the wrong local text as user-set); the remaining new tests are contract pins that already pass and must KEEP passing, as must all pre-existing suite members.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -1380,6 +1521,24 @@ Extract the current `mergeHydratedPaneMetadata` (panesSlice.ts:578-648) VERBATIM
 ```typescript
 import type { HydratePanesMeta } from '@/store/panesSlice'   // or move the type here and re-export
 
+/** Tabs-style per-PANE title/flag reconcile — the `reconcileHydratedTabTitle`
+ * analogue (tabsSlice.ts:137-142). A user-set title ALWAYS survives, and a
+ * user-set flag never freezes the wrong text:
+ *  - base side already user-set → it stands (covers both-user-set: the base
+ *    is the recency/layout winner, so its title stands) with the flag true;
+ *  - exactly one side user-set  → that side's title wins, flag true;
+ *  - neither user-set           → the base side's title, flag = either side's flag. */
+function reconcilePaneTitle(
+  local: { title?: string; userSet?: boolean } | undefined,
+  incoming: { title?: string; userSet?: boolean } | undefined,
+  base: { title?: string; userSet?: boolean },
+): { title?: string; userSet?: boolean } {
+  if (base.userSet) return base
+  const userSide = local?.userSet ? local : incoming?.userSet ? incoming : undefined
+  if (userSide) return { title: userSide.title, userSet: true }
+  return { title: base.title, userSet: !!(local?.userSet || incoming?.userSet) }
+}
+
 export function mergeHydratedPaneMetadata(
   state: Pick<PanesState, 'paneTitles' | 'paneTitleSetByUser'>,
   incoming: HydratePanesPayload,
@@ -1387,23 +1546,32 @@ export function mergeHydratedPaneMetadata(
   incomingLayoutTabIds: Set<string>,
   meta?: HydratePanesMeta,
 ): { activePane: ...; paneTitles: ...; paneTitleSetByUser: ... } {
-  // Tabs winner pattern (tabsSlice.ts pickHydratedTabWinner): layout
-  // persistedAt decides; ties keep LOCAL (conservative — never clobber on
-  // ambiguity). No meta → legacy behavior (incoming base when incoming
-  // layout won).
+  // Tabs winner pattern (tabsSlice.ts pickHydratedTabWinner :115-128) for the
+  // TITLE BASE: layout persistedAt decides; ties keep LOCAL (conservative —
+  // never clobber on ambiguity). No meta → legacy behavior (the incoming side
+  // is the base when the incoming layout won).
   const remoteStrictlyNewer =
     meta !== undefined &&
     typeof meta.remoteLayoutPersistedAt === 'number' &&
     typeof meta.localLayoutPersistedAt === 'number' &&
     meta.remoteLayoutPersistedAt > meta.localLayoutPersistedAt
-  const incomingTitlesApply = meta === undefined || remoteStrictlyNewer
 
   for (const [tabId, layout] of Object.entries(layouts)) {
     const localLayoutPreserved = !incomingLayoutTabIds.has(tabId)
-    const preferredTitleSource = localLayoutPreserved
-      ? state.paneTitles
-      : (incomingTitlesApply ? incoming.paneTitles : state.paneTitles)   // CHANGED: older remote never clobbers
-    // ... rest of the current merge body unchanged, using preferredTitleSource
+    const incomingIsBase = meta === undefined
+      ? !localLayoutPreserved                        // legacy: incoming layout won → incoming base
+      : !localLayoutPreserved && remoteStrictlyNewer // recency-guarded: an older remote is never the base
+    const baseTitles = incomingIsBase ? incoming.paneTitles : state.paneTitles
+    const baseFlags = incomingIsBase ? incoming.paneTitleSetByUser : state.paneTitleSetByUser
+    // ... rest of the current merge body, but each pane's title/flag decision
+    // goes through reconcilePaneTitle(
+    //   { title: state.paneTitles?.[tabId]?.[paneId], userSet: state.paneTitleSetByUser?.[tabId]?.[paneId] },
+    //   { title: incoming.paneTitles?.[tabId]?.[paneId], userSet: incoming.paneTitleSetByUser?.[tabId]?.[paneId] },
+    //   { title: baseTitles?.[tabId]?.[paneId], userSet: baseFlags?.[tabId]?.[paneId] },
+    // ) instead of copying the base side unconditionally. The existing
+    // local-user-set re-application is subsumed by reconcilePaneTitle's
+    // exactly-one-side-user-set arm; keep every other part of the merge
+    // (active pane, layouts, tabId iteration) unchanged.
   }
 }
 ```
@@ -1420,7 +1588,54 @@ Expected: PASS (new pins + all 5000-line suite members)
 
 With the merge extracted, confirm the module boundary is clean: `hydrate-pane-metadata-merge.ts` is pure (no store import), typed over the slice's own types, and panesSlice's `hydratePanes` remains its only caller.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [ ] **Step 6: Extend `local-first-reload-rust.spec.ts` with the cross-window recency scenario (e2e pin)**
+
+Add a third serial test to the spec Task 4 created — extending the existing file is cleaner than a new spec, and its registration in BOTH config lists is already in place. Two pages in ONE browser context drive the real cross-tab hydrate channel (storage events + BroadcastChannel, crossTabSync.ts:301-370); the two-pages-one-context idiom is `const page2 = await page.context().newPage()` (multi-client.spec.ts:198-199 — read it and layout-sync-authoritative.spec.ts first, as this plan's verification did):
+
+```typescript
+test('an older persisted layout from a second page does not clobber a newer local pane title', async ({ page }) => {
+  // page = page1. Fresh context: seed the workspace (Task 4's dispatch idiom:
+  // tab-mango + editor pane), wait for the persisted envelope flush.
+  // page2 opens in the SAME context (shared localStorage) and rehydrates it.
+  const page2 = await page.context().newPage()
+  await page2.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+  const harness2 = new TestHarness(page2)
+  await harness2.waitForHarness(); await harness2.waitForConnection()
+
+  // page2 sets a NEWER non-user-set pane title; its flush stamps a new
+  // persistedAt which page2's crossTabSync tracks as its local stamp.
+  await page2.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.dispatch({
+    type: 'panes/updatePaneTitle',
+    payload: { tabId: 'tab-mango', paneId: 'tab-mango-pane', title: 'Newer local title', setByUser: false },
+  }))
+  // (poll until the raw envelope carries 'Newer local title' — its stamp is T_local)
+
+  // Stage the STALE remote: from page1, overwrite the shared localStorage
+  // envelope with the same JSON but the pane title reverted and persistedAt
+  // 60s OLDER than page2's local stamp. page1's write fires a storage event
+  // on page2 only — the real crossTabSync path hydrates page2 with
+  // remoteLayoutPersistedAt < localLayoutPersistedAt.
+  await page.evaluate(() => {
+    const env = JSON.parse(localStorage.getItem('freshell.layout.v3') ?? '{}')
+    env.paneTitles['tab-mango']['tab-mango-pane'] = 'Stale from page1'
+    env.persistedAt = <T_local> - 60_000
+    localStorage.setItem('freshell.layout.v3', JSON.stringify(env))
+  })
+
+  // Bounded settle for the storage-event hydration, then ONE hard read (not a
+  // poll — a poll could sample before the hydrate lands and false-pass).
+  await page2.waitForTimeout(2_000)
+  const title = await page2.evaluate(() =>
+    window.__FRESHELL_TEST_HARNESS__?.getState()?.panes?.paneTitles?.['tab-mango']?.['tab-mango-pane'])
+  expect(title).toBe('Newer local title')
+})
+```
+
+At base this FAILS: the incoming layout wins the merge for its tab id and the incoming title clobbers page2's newer local title ('Stale from page1'). With Task 7 it PASSES (remote not strictly newer → local base; per-pane reconcile keeps the non-user-set local title). The full production path is exercised — real storage-event hydration with real `localLayoutPersistedAt`/`remoteLayoutPersistedAt` meta. (For a recorded red, reuse Task 4 Step 2's throwaway-receipt mechanism at base; otherwise the Step 2 unit reds are the red evidence. The direct stale-envelope write is the deterministic staging of an interleaved older flush — a real flush from page1 would stamp Date.now() and be newer, not older.)
+
+Then run it: `bash scripts/e2e-cloud.sh run --local --project=rust-chromium test/e2e-browser/specs/local-first-reload-rust.spec.ts` — Expected: PASS (all three scenarios; the first two unchanged from Task 4).
+
+- [ ] **Step 7: Run impacted-test verification**
 
 Impacted: every `hydratePanes` consumer — panesSlice suites, `paneCloseGate.test.ts`, `panesPersistence.test.ts`, `createRequestIdStability.test.ts`, `crossTabSync.test.ts` (14 refs), and the component suites that dispatch hydrate actions.
 
@@ -1428,22 +1643,109 @@ Run: `npm run test:vitest -- run test/unit/client/store/panesSlice.test.ts test/
 
 Expected: PASS
 
-- [ ] **Step 7: Commit the task**
+- [ ] **Step 8: Commit the task**
 
 ```bash
-git add src/store/hydrate-pane-metadata-merge.ts src/store/panesSlice.ts test/unit/client/store/panesSlice.test.ts
-git commit -m "fix(panes): cross-window pane-title hydration respects layout recency"
+git add src/store/hydrate-pane-metadata-merge.ts src/store/panesSlice.ts test/unit/client/store/panesSlice.test.ts test/e2e-browser/specs/local-first-reload-rust.spec.ts
+git commit -m "fix(panes): cross-window pane-title hydration respects layout recency and preserves user-set titles on both sides"
+```
+
+---
+
+### Task 8: E2e — pane-title delivery folds (terminal inventory + session-directory mirror)
+
+**Files:**
+- Create: `test/e2e-browser/specs/pane-title-folds-rust.spec.ts`
+- Modify: `test/e2e-browser/playwright.config.ts` (`RUST_ONLY_SPECS` ~:187 AND the `rust-chromium` project `testMatch` ~:430-660 — BOTH lists, same past-bug class as Task 4)
+
+**Interfaces:**
+- Consumes: the owned `RustServer` fixture + its `setupHome` hook (`helpers/rust-server.ts` — populates the isolated HOME before boot), `ensureRustServerBuilt`, the harness dispatch seam `window.__FRESHELL_TEST_HARNESS__`, the authenticated-REST idiom (`fetch` + `x-auth-token` header, layout-sync-authoritative.spec.ts:43-50), and the fake-session seeding idioms (recover-my-panes-rust.spec.ts:1479-1512 JSONL seed; session-directory-matrix.spec.ts's `setupHome` shapes at :114-297 — read both first, as this plan's verification did).
+- Produces: the e2e pins for Tasks 5-6 (no production code in this task).
+
+- [ ] **Step 1: Write the e2e spec — two scenarios**
+
+Create `test/e2e-browser/specs/pane-title-folds-rust.spec.ts` (owned `RustServer`, fresh `FRESHELL_HOME`, `test.describe.configure({ mode: 'serial' })`, one owned server per scenario so Scenario B's seeded home never sees Scenario A's terminal):
+
+**Scenario A — terminal.inventory title fold (Task 5's story):**
+1. Boot the owned server; navigate; harness + connection; remove the auto-created shell tab (Task 4's idiom).
+2. Create a shell terminal pane via harness dispatch: `tabs/addTab` + `panes/initLayout` with `content: { kind: 'terminal', mode: 'shell', createRequestId: 'cr-t8-a', status: 'ready' }`; poll the harness state until the pane content carries a real `terminalId` (the mounted pane's TerminalView drives `terminal.create` from the createRequestId; the WS `terminal.created` fold writes it).
+3. Rename the terminal over REST — the auto-title sweep is structurally blind to terminal renames, so the inventory fold is the ONLY delivery: `PATCH /api/terminals/<terminalId>` with body `{ "titleOverride": "Renamed via REST" }` and header `x-auth-token` (route verified: crates/freshell-server/src/terminals.rs:850-908; `TerminalPatchSchema`'s string field is `titleOverride`).
+4. `page.reload()`; wait harness + connection (the server sends `terminal.inventory` on every connect).
+5. Assert `panes.paneTitles[tabId][paneId] === 'Renamed via REST'` and `paneTitleSetByUser` falsy.
+   At base this FAILS: nothing folds the inventory title into pane titles, so the pane keeps its derived default.
+
+**Scenario B — session-directory title mirror (Task 6's story):**
+1. Boot a second owned `RustServer` with the `setupHome` hook seeding a Claude session row the recover-my-panes way (verified idiom, recover-my-panes-rust.spec.ts:1479-1512):
+
+```typescript
+const SEED_SESSION_ID = 'sess-t8-b'
+const SEED_PROJECT = 't8-mirror-probe'
+server = new RustServer({
+  setupHome: async (homeDir) => {
+    const sessionDir = path.join(homeDir, '.claude', 'projects', SEED_PROJECT)
+    fs.mkdirSync(sessionDir, { recursive: true })
+    const lines = [
+      // system/init line: { type: 'system', subtype: 'init', session_id, uuid, timestamp, cwd: <homeDir>/<SEED_PROJECT>, git: {...} }
+      // then TWO user/assistant turn pairs — a single-user-message session is
+      // flagged isNonInteractive and hidden by the directory (the recover-my-panes
+      // note at :1478-1480); copy the exact seededLines shape from :1495-1512.
+    ]
+    fs.writeFileSync(path.join(sessionDir, `${SEED_SESSION_ID}.jsonl`), lines.join('\n') + '\n')
+  },
+})
+```
+
+2. Navigate; wait harness + connection; poll the harness state until the seeded row appears in the sessions window (`sessions.windows.sidebar.projects[].sessions[]` — the App fetches `/api/session-directory` and the server's live watcher indexes the seeded file without a restart, per the recover-my-panes/auto-title precedents).
+3. Dispatch a fresh-agent pane with the matching sessionRef through the harness: `panes/initLayout` with `content: { kind: 'fresh-agent', provider: 'claude', sessionId: SEED_SESSION_ID, sessionType: 'freshclaude', sessionRef: { provider: 'claude', sessionId: SEED_SESSION_ID } }` (the normalized fresh-agent content shape, layout-sync-authoritative.spec.ts:345-351).
+4. Assert the pane title mirrors the session-directory row's `title` (read the actual row title from the harness sessions state — for a Claude row the directory derives it from the seeded project path — do not hard-code), with `paneTitleSetByUser` falsy.
+   At base this FAILS: an MCP/REST-created pane never receives the directory title (the exact symptom Task 6 fixes).
+
+Cloud-runnable by construction: no external coding-CLI binaries (Scenario A's pane is a default shell; Scenario B's pane is a store-dispatched fresh-agent pane against a seeded, non-running session — nothing spawns). Registration (BOTH lists — the known past-bug class):
+
+```typescript
+// RUST_ONLY_SPECS (~:187): add
+/pane-title-folds-rust\.spec\.ts$/,
+// rust-chromium project testMatch (~:430-660): append the same regex.
+```
+
+- [ ] **Step 2: Run the spec in the real worktree — EXPECT PASS (it pins landed Tasks 5-6)**
+
+Run: `bash scripts/e2e-cloud.sh run --local --project=rust-chromium test/e2e-browser/specs/pane-title-folds-rust.spec.ts`
+
+Expected: PASS (both scenarios). Not red-first: Tasks 5-6 are landed and unit-green; the scenario texts record the at-base failure modes (for a recorded red, reuse Task 4 Step 2's throwaway-receipt mechanism at base). If it fails for harness reasons, fix the SPEC, not production code.
+
+- [ ] **Step 3: Refactor while green**
+
+Keep poll helpers inside the spec file (other runs own the shared helper files); keep each scenario on its own owned server.
+
+- [ ] **Step 4: Run impacted-test verification**
+
+The config edit affects e2e collection only. Verify registration in BOTH lists (Task 4 Step 5's checks, adapted):
+
+Run: `npx playwright test --config test/e2e-browser/playwright.config.ts --project=chromium --list 2>/dev/null | grep -c 'pane-title-folds' || true`
+
+Expected: 0
+
+Run: `npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium --list | grep 'pane-title-folds'`
+
+Expected: at least one listed test.
+
+- [ ] **Step 5: Commit the task**
+
+```bash
+git add test/e2e-browser/specs/pane-title-folds-rust.spec.ts test/e2e-browser/playwright.config.ts
+git commit -m "test(e2e): pin pane-title delivery folds — terminal inventory titles and session-directory mirror"
 ```
 
 ---
 
 ## End-of-execution verification (after all tasks)
 
-**Coverage decision (deliberate, for the plan reviewer to see):** e2e coverage concentrates on Task 4 — the primary user-visible story (reload keeps the workspace; corrupt envelope rebuilds from the own snapshot). The two title folds (Tasks 5-6) are pinned at unit level plus App-wiring level (a real WS `terminal.inventory` frame through the mocked client, and the real sessions thunk fulfilled shape through the real store): forcing their end-to-end lanes would require either live coding-CLI binaries or auto-title-sweep session association in the browser, both of which are exactly the cloud-skipped flakiness classes the repo's e2e rules warn against. If the plan review judges e2e mandatory for the folds, the session-seeding idiom from the session-directory e2e precedents (fake-CLI session files under the owned server's isolated home — see `recover-my-panes-rust.spec.ts` fixtures) is the sanctioned mechanism; otherwise this unit+App-wiring level is the accepted coverage.
+**Coverage decision:** every task has BOTH unit and e2e coverage, per the repo rule. Spec map: `local-first-reload-rust.spec.ts` (Task 4) covers Tasks 1-3 (healthy reload keeps the workspace exactly; corrupt envelope rebuilds from the own snapshot with preserved ids) and — via its Scenario 3 extension (Task 7 Step 6) — the cross-window pane-title recency guard; `pane-title-folds-rust.spec.ts` (Task 8) covers Task 5 (terminal.inventory title fold after a REST terminal rename + reload) and Task 6 (session-directory title mirrored into a harness-dispatched fresh-agent pane). The session-directory seeding mechanism (fake-CLI session files under the owned server's isolated home — `recover-my-panes-rust.spec.ts` fixtures / `session-directory-matrix.spec.ts`'s `setupHome`) makes the Task 6 lane cloud-runnable without live coding-CLI binaries. The LB-14 watch-item stays: watch the mandated cloud-lane runs for `rest-tab-persistence`-class timing sensitivity in the new specs' bounded persistence polls.
 
 1. `npm run typecheck` — Expected: PASS
 2. `npm run lint` — Expected: PASS
 3. Coordinated full suite with the shared gate (check `npm run test:status` first; set `FRESHELL_TEST_SUMMARY="pane-title-recovery end-of-execution gate"`; export the cloud env vars if unset — see Global Constraints): `npm test` — Expected: PASS excluding any ledger-recorded pre-existing failures (none expected: the base was green at `bab7d5189`; the known `recover-my-panes-rust.spec.ts` scenario-1 failure is in the separate e2e lane, not this suite)
-4. E2e on the configured backend: the new spec must pass on BOTH the local rust lane (already run in Task 4) and the cloud lane before any PR is proposed: with `FRESHELL_E2E_BACKEND=cloud` and `GCLOUD_IDENT` exported, run the cloud lane filtered to the new spec — Expected: PASS, and confirm the spec is NOT in `CLOUD_SKIP_SPECS`.
+4. E2e on the configured backend: BOTH new specs must pass on the local rust lane (already run in Tasks 4/7/8) AND the cloud lane before any PR is proposed: with `FRESHELL_E2E_BACKEND=cloud` and `GCLOUD_IDENT` exported, run the cloud lane filtered to `local-first-reload-rust.spec.ts` (including Task 7's Scenario 3) and to `pane-title-folds-rust.spec.ts` — Expected: PASS for both, and confirm neither spec is in `CLOUD_SKIP_SPECS`.
 
 
