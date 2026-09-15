@@ -1943,7 +1943,7 @@ impl RuntimeOwnershipRegistry {
         let old_key = SessionKey::new(provider, old_session_id);
         // Validation pass (immutable reads — the mutation below cannot
         // interleave with any of these checks).
-        let (kind, initiator, since_ms) = {
+        let (kind, initiator, since_ms, partial_runtime) = {
             let Some(record) = inner.get(&old_key) else {
                 tracing::error!(target: "invariant",
                     event = "ownership.rekey_starting.old_claim_missing",
@@ -1978,7 +1978,12 @@ impl RuntimeOwnershipRegistry {
                     initiator,
                     since_ms,
                     ..
-                } if op == operation_id => (*kind, initiator.clone(), *since_ms),
+                } if op == operation_id => (
+                    *kind,
+                    initiator.clone(),
+                    *since_ms,
+                    record.partial_runtime.clone(),
+                ),
                 _ => {
                     tracing::error!(target: "invariant",
                         event = "ownership.rekey_starting.old_claim_mismatch",
@@ -2028,6 +2033,11 @@ impl RuntimeOwnershipRegistry {
                 initiator: initiator.clone(),
                 since_ms,
             },
+            // b8ke ext r22 F1: the registered partial runtime (the
+            // watchdog's cancel/reap target) moves with the claim — the
+            // rekey never leaves the canonical key without its reap
+            // target while the start is in flight.
+            partial_runtime,
             ..SessionRecord::default()
         };
         if let Some(record) = inner.get_mut(&old_key) {
