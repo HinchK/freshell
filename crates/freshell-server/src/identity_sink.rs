@@ -793,6 +793,101 @@ mod tests {
         assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
     }
 
+    /// b8ke ext r27 F1: a stale FENCED fresh-agent compensation cannot
+    /// overwrite the new TERMINAL owner's authoritative recovery row.
+    /// The exact race the in-memory OpenCode create/resume path leaves
+    /// behind when a handoff commits while its binding write is stalled:
+    /// the compensation now carries the OBSERVED (pre-handoff) pair, so
+    /// the real ledger's delayed-write fence REFUSES it typed — the
+    /// terminal owner's runtime kind AND terminal identity survive
+    /// (pre-r27 the unfenced compensation replaced the shared row with
+    /// live_terminal_id: None and pane_kind: "fresh-agent").
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_fenced_compensation_cannot_overwrite_the_terminal_owners_recovery_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone());
+        const EPOCH: u64 = 9_191;
+        const SESSION: &str = "ses_r27_f1_race";
+
+        // The pre-handoff fresh-agent row (the old owner's pair: gen 3).
+        sink.record_binding(FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: SESSION.into(),
+            mode: "freshopencode".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: Some(EPOCH),
+            observed_generation: Some(3),
+            settings: FreshAgentSettings::default(),
+        })
+        .await
+        .expect("the pre-handoff row writes");
+
+        // THE HANDOFF COMMITS mid-write: the terminal target's row write
+        // (stamped with the handoff's newer pair) lands while the stale
+        // create's binding write is still stalled.
+        ledger
+            .record_binding(&freshell_ws::pane_ledger::BindingWrite {
+                provider: "opencode",
+                session_id: SESSION,
+                terminal_id: "t-mid-await",
+                mode: "opencode",
+                cwd: Some("/w"),
+                create_request_id: None,
+                origin_create_request_id: None,
+                provenance: freshell_ws::pane_ledger::ProvenancePolicy::Clear,
+                observed_epoch: Some(EPOCH),
+                observed_generation: Some(4),
+                now_ms: 1_200,
+            })
+            .expect("the handoff's terminal-side row write lands");
+
+        // THE STALE COMPENSATION (the delayed create's rollback upsert,
+        // carrying its OBSERVED pre-handoff pair) — refused typed.
+        let err = sink
+            .record_binding(FreshAgentBindingUpsert {
+                provider: "opencode".into(),
+                session_id: SESSION.into(),
+                mode: "freshopencode".into(),
+                create_request_id: None,
+                resolves_pending: None,
+                supersedes: None,
+                // keep-when-None provenance — the compensating rollback's
+                // shape.
+                provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+                observed_epoch: Some(EPOCH),
+                observed_generation: Some(3),
+                settings: FreshAgentSettings::default(),
+            })
+            .await
+            .expect_err("the stale fenced compensation is refused typed");
+        assert!(
+            err.to_string().contains("STALE_BINDING_PAIR"),
+            "the refusal is typed: {err}"
+        );
+
+        // The TERMINAL owner's authoritative recovery row SURVIVED: its
+        // runtime kind (a terminal row — pane_kind None, live_terminal_id
+        // set) AND its terminal identity, with the handoff's fence pair.
+        let row = ledger
+            .load_binding("opencode", SESSION)
+            .expect("the row survives");
+        assert_eq!(row.pane_kind, None, "the terminal row's kind stands");
+        assert_eq!(
+            row.live_terminal_id.as_deref(),
+            Some("t-mid-await"),
+            "the terminal owner's identity stands — the stale fresh-agent \
+             compensation did not erase it"
+        );
+        assert_eq!(row.owner_epoch, Some(EPOCH));
+        assert_eq!(row.owner_generation, Some(4));
+    }
+
     /// Focused-review ep1-r1 F3: a PERSISTED pre-F8 record whose entries lack
     /// the epoch fields and whose `redoDestroyed` bit is set (a legacy record
     /// with a destroy mid-history — the undo → … → send durable shapes the

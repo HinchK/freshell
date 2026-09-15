@@ -1202,6 +1202,29 @@ impl FreshOpencodeState {
         // restore the row (a compensating upsert).
         let mut binding_write_rollback: Option<crate::identity_sink::FreshAgentBindingUpsert> =
             None;
+        // b8ke ext r27 F1: the OBSERVED (epoch, generation) fence for BOTH
+        // the refresh write below AND the compensating upsert it can leave
+        // behind — the pair this handler observed BEFORE any of its
+        // awaits (the delayed-write fence baseline). Pre-r27 both writes
+        // carried (None, None), so a handoff committing while the write
+        // was stalled left the compensating upsert UNFENCED: the ledger's
+        // delayed-write comparison could not refuse it and the stale
+        // fresh-agent compensation overwrote the new TERMINAL owner's
+        // authoritative recovery row (live_terminal_id erased,
+        // pane_kind rewritten). Carrying the observed pair makes the
+        // stale compensation refuse typed (STALE_BINDING_PAIR) — the
+        // new owner's row survives. (None, None) stays the legacy shape
+        // when no coordinator or no Live owner was observed.
+        let observed_binding_pair = pre_await_generation.map(|generation| {
+            (
+                self.fresh_agent
+                    .ownership
+                    .as_ref()
+                    .map(|registry| registry.boot_epoch())
+                    .unwrap_or(pre_await.epoch),
+                generation,
+            )
+        });
 
         // b8ke e3 post-cap F4: the PRE-WRITE recheck — after the
         // session-mutation awaits, BEFORE the durable binding write: the
@@ -1272,8 +1295,13 @@ impl FreshOpencodeState {
                     Some(parked) => crate::identity_sink::ProvenanceUpdate::Replace(parked),
                     None => crate::identity_sink::ProvenanceUpdate::Inherit,
                 },
-                observed_epoch: None,
-                observed_generation: None,
+                // b8ke ext r27 F1: the compensating upsert carries the
+                // OBSERVED pair — a stale compensation (a handoff
+                // committed while the write stalled) is refused typed by
+                // the ledger's delayed-write fence instead of overwriting
+                // the new terminal owner's recovery row.
+                observed_epoch: observed_binding_pair.map(|(epoch, _)| epoch),
+                observed_generation: observed_binding_pair.map(|(_, generation)| generation),
                 settings: pre_park_settings.clone(),
             });
             let _ = self
@@ -1285,8 +1313,12 @@ impl FreshOpencodeState {
                     resolves_pending: None,
                     supersedes: None,
                     provenance: crate::identity_sink::ProvenanceUpdate::Replace(p),
-                    observed_epoch: None,
-                    observed_generation: None,
+                    // b8ke ext r27 F1: the refresh write carries the SAME
+                    // observed pair (it can land after a turnover's
+                    // terminal-side row write — the fence refuses it typed
+                    // instead of letting it corrupt the new owner's row).
+                    observed_epoch: observed_binding_pair.map(|(epoch, _)| epoch),
+                    observed_generation: observed_binding_pair.map(|(_, generation)| generation),
                     settings: crate::identity_sink::FreshAgentSettings {
                         model,
                         sandbox: None,
@@ -6623,6 +6655,13 @@ mod tests {
         // binding write STALLED — the handoff commits while the create
         // awaits.
         st.insert_live_session_for_test(&real_id).await;
+        // b8ke ext r27 F1: the pair the delayed create OBSERVES before
+        // any of its awaits (the pre-await snapshot the handler captures)
+        // — the compensating upsert must carry exactly this fence.
+        let expected_observed_pair = {
+            let snap = registry.observe("opencode", &real_id);
+            (snap.epoch, snap.generation)
+        };
         // Drain the setup's frames (the created/materialized broadcasts).
         while rx.try_recv().is_ok() {}
         let stall = fake.arm_binding_stall("opencode", &real_id);
@@ -6730,6 +6769,29 @@ mod tests {
                  (keep-when-None provenance) — the turnover's stale \
                  metadata did not survive: {:?}",
                 last.provenance
+            );
+            // b8ke ext r27 F1: the compensating upsert CARRIES the
+            // OBSERVED (epoch, generation) pair — the delayed-write fence
+            // baseline. Pre-r27 it carried (None, None), so the real
+            // ledger could not refuse it and the stale fresh-agent
+            // compensation overwrote the new TERMINAL owner's
+            // authoritative recovery row. With the fence the ledger
+            // refuses the stale compensation typed (STALE_BINDING_PAIR)
+            // and the terminal owner's runtime kind AND terminal identity
+            // survive — pinned end-to-end (production sink + real
+            // PaneLedger) by a_stale_fenced_compensation_cannot_overwrite_
+            // the_terminal_owners_recovery_row (identity_sink tests).
+            assert_eq!(
+                last.observed_epoch,
+                Some(expected_observed_pair.0),
+                "the compensating upsert carries the observed epoch"
+            );
+            assert_eq!(
+                last.observed_generation,
+                Some(expected_observed_pair.1),
+                "the compensating upsert carries the observed generation — \
+                 pre-r27 it was unfenced and could overwrite the new terminal \
+                 owner's recovery row"
             );
         }
     }
