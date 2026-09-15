@@ -13,6 +13,10 @@ import * as path from 'node:path'
  *    broadcasts `terminals.changed` — NOT `terminal.title.updated` — so the
  *    live pane-title fold never fires for it, and the reload's
  *    terminal.inventory frame is the ONLY delivery of the renamed title.
+ *    Scenario A also pins the delta-round-2 finding-1 precedence: the
+ *    session-directory title mirror targets FRESH-AGENT panes only, so
+ *    binding the (session-less) shell pane to a seeded Claude session row
+ *    must NOT overwrite the folded terminal rename.
  * 2. The session-directory title mirror lands in a harness-dispatched
  *    fresh-agent pane whose provider+sessionId match a seeded, NON-RUNNING
  *    Claude session row — the MCP/REST-created-pane symptom Task 6 fixes —
@@ -22,8 +26,56 @@ import * as path from 'node:path'
  * (Scenario A's pane is a default shell; Scenario B's pane is a
  * store-dispatched fresh-agent pane against a seeded, non-running session —
  * nothing spawns). One OWNED RustServer per scenario (fresh FRESHELL_HOME,
- * no chooser) so Scenario B's seeded home never sees Scenario A's terminal.
+ * no chooser) so each scenario's seeded home never sees the other's
+ * terminal.
  */
+
+/** Seed a Claude session row the recover-my-panes way: system/init line,
+ * then TWO user/assistant turn pairs — a single-user-message session is
+ * flagged isNonInteractive and hidden by the directory. The row's
+ * sessionId is the transcript FILENAME (Claude's provider identity). */
+function writeSeededClaudeSession(
+  homeDir: string,
+  sessionId: string,
+  projectSlug: string,
+  firstUserMessage: string,
+  timestampBase: string,
+): void {
+  const sessionDir = path.join(homeDir, '.claude', 'projects', projectSlug)
+  fs.mkdirSync(sessionDir, { recursive: true })
+  const projectCwd = path.join(homeDir, projectSlug)
+  const seededLines: string[] = [
+    JSON.stringify({
+      type: 'system', subtype: 'init', session_id: sessionId,
+      uuid: `${sessionId}-system`, timestamp: `${timestampBase}:00.000Z`,
+      cwd: projectCwd, git: { branch: 'main', dirty: false },
+    }),
+  ]
+  let previousUuid = `${sessionId}-system`
+  const messages = [firstUserMessage, 'Any progress on that request?']
+  for (const [turnIndex, userMessage] of messages.entries()) {
+    const userUuid = `${sessionId}-user-${turnIndex + 1}`
+    const assistantUuid = `${sessionId}-assistant-${turnIndex + 1}`
+    seededLines.push(JSON.stringify({
+      parentUuid: previousUuid, cwd: projectCwd, sessionId,
+      version: '2.1.23', gitBranch: 'main', type: 'user',
+      message: { role: 'user', content: userMessage },
+      uuid: userUuid, timestamp: `${timestampBase}:0${turnIndex}:01.000Z`,
+    }))
+    seededLines.push(JSON.stringify({
+      parentUuid: userUuid, cwd: projectCwd, sessionId,
+      version: '2.1.23', gitBranch: 'main', type: 'assistant',
+      message: {
+        role: 'assistant', model: 'claude-opus-4-6-20260301',
+        content: [{ type: 'text', text: `Working on it (${turnIndex + 1}).` }],
+      },
+      uuid: assistantUuid, timestamp: `${timestampBase}:0${turnIndex}:02.000Z`,
+    }))
+    previousUuid = assistantUuid
+  }
+  fs.writeFileSync(path.join(sessionDir, `${sessionId}.jsonl`), `${seededLines.join('\n')}\n`)
+}
+
 test.describe('pane-title delivery folds', () => {
   test.describe.configure({ mode: 'serial' })
 
@@ -34,7 +86,12 @@ test.describe('pane-title delivery folds', () => {
 
   test('terminal.inventory folds a REST terminal rename into the pane title after reload', async ({ page }) => {
     test.setTimeout(300_000)
-    const server = new RustServer()
+    const BIND_SESSION_ID = 'sess-t8-a-bound'
+    const server = new RustServer({
+      setupHome: async (homeDir) => {
+        writeSeededClaudeSession(homeDir, BIND_SESSION_ID, 't8-precedence-probe', 't8 session-bound rename probe', '2026-09-14T09:00')
+      },
+    })
     const serverInfo = await server.start()
     try {
       await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
@@ -105,6 +162,49 @@ test.describe('pane-title delivery folds', () => {
       const state = await harness.getState()
       expect(state.panes.paneTitles['tab-t8-a']['pane-t8-a']).toBe('Renamed via REST')
       expect(state.panes.paneTitleSetByUser?.['tab-t8-a']?.['pane-t8-a'] ?? false).toBeFalsy()
+
+      // Delta review round 2, finding 1 — end-to-end precedence pin: bind
+      // this shell pane to a seeded, titled Claude session row via the
+      // REAL session-association fold (terminal.session.associated's
+      // client handler dispatches panes/reconcileTerminalSessionRefByTerminalId,
+      // terminal-session-association.ts:245 — mirrored here by the harness
+      // dispatch). The session mirror must target FRESH-AGENT panes only:
+      // the folded terminal rename survives the binding and every later
+      // sessions/* commit (the mirror fires synchronously on the binding
+      // action — sessionTitleMirror.ts SESSION_BINDING_PANE_ACTIONS).
+      await page.waitForFunction((sessionId) => {
+        const projects = window.__FRESHELL_TEST_HARNESS__?.getState()?.sessions?.windows?.sidebar?.projects ?? []
+        for (const project of projects) {
+          for (const session of project?.sessions ?? []) {
+            if (session?.provider === 'claude' && session?.sessionId === sessionId
+              && typeof session?.title === 'string' && session.title.length > 0
+              && session.title !== 'Renamed via REST') {
+              return true
+            }
+          }
+        }
+        return false
+      }, BIND_SESSION_ID, { timeout: 30_000 })
+
+      const bound = await page.evaluate(([tabId, paneId, terminalId, sessionId]) => {
+        window.__FRESHELL_TEST_HARNESS__?.dispatch({
+          type: 'panes/reconcileTerminalSessionRefByTerminalId',
+          payload: { terminalId, sessionRef: { provider: 'claude', sessionId } },
+        })
+        const state = window.__FRESHELL_TEST_HARNESS__?.getState()
+        const content = state?.panes?.layouts?.[tabId]?.content
+        return {
+          sessionRef: content?.kind === 'terminal' ? content.sessionRef : undefined,
+          paneTitle: state?.panes?.paneTitles?.[tabId]?.[paneId],
+          setByUser: state?.panes?.paneTitleSetByUser?.[tabId]?.[paneId] ?? false,
+        }
+      }, ['tab-t8-a', 'pane-t8-a', terminalId, BIND_SESSION_ID] as const)
+      expect(bound.sessionRef, 'the binding fold landed the sessionRef on the terminal pane').toEqual({
+        provider: 'claude',
+        sessionId: BIND_SESSION_ID,
+      })
+      expect(bound.paneTitle).toBe('Renamed via REST')
+      expect(bound.setByUser).toBeFalsy()
     } finally {
       await server.stop()
     }
@@ -116,44 +216,9 @@ test.describe('pane-title delivery folds', () => {
     const SEED_PROJECT = 't8-mirror-probe'
     const server = new RustServer({
       setupHome: async (homeDir) => {
-        // Seed a Claude session row the recover-my-panes way: system/init
-        // line, then TWO user/assistant turn pairs — a single-user-message
-        // session is flagged isNonInteractive and hidden by the directory.
-        // The row's sessionId is the transcript FILENAME (Claude's provider
-        // identity), so the fresh-agent pane's provider+sessionId can match
-        // it directly.
-        const sessionDir = path.join(homeDir, '.claude', 'projects', SEED_PROJECT)
-        fs.mkdirSync(sessionDir, { recursive: true })
-        const projectCwd = path.join(homeDir, SEED_PROJECT)
-        const seededLines: string[] = [
-          JSON.stringify({
-            type: 'system', subtype: 'init', session_id: SEED_SESSION_ID,
-            uuid: `${SEED_SESSION_ID}-system`, timestamp: '2026-09-14T08:00:00.000Z',
-            cwd: projectCwd, git: { branch: 'main', dirty: false },
-          }),
-        ]
-        let previousUuid = `${SEED_SESSION_ID}-system`
-        for (const [turnIndex, userMessage] of ['t8 mirror probe session', 'Any progress on that request?'].entries()) {
-          const userUuid = `${SEED_SESSION_ID}-user-${turnIndex + 1}`
-          const assistantUuid = `${SEED_SESSION_ID}-assistant-${turnIndex + 1}`
-          seededLines.push(JSON.stringify({
-            parentUuid: previousUuid, cwd: projectCwd, sessionId: SEED_SESSION_ID,
-            version: '2.1.23', gitBranch: 'main', type: 'user',
-            message: { role: 'user', content: userMessage },
-            uuid: userUuid, timestamp: `2026-09-14T08:0${turnIndex}:01.000Z`,
-          }))
-          seededLines.push(JSON.stringify({
-            parentUuid: userUuid, cwd: projectCwd, sessionId: SEED_SESSION_ID,
-            version: '2.1.23', gitBranch: 'main', type: 'assistant',
-            message: {
-              role: 'assistant', model: 'claude-opus-4-6-20260301',
-              content: [{ type: 'text', text: `Working on it (${turnIndex + 1}).` }],
-            },
-            uuid: assistantUuid, timestamp: `2026-09-14T08:0${turnIndex}:02.000Z`,
-          }))
-          previousUuid = assistantUuid
-        }
-        fs.writeFileSync(path.join(sessionDir, `${SEED_SESSION_ID}.jsonl`), `${seededLines.join('\n')}\n`)
+        // Seed a Claude session row whose sessionId the fresh-agent pane's
+        // provider+sessionId can match directly.
+        writeSeededClaudeSession(homeDir, SEED_SESSION_ID, SEED_PROJECT, 't8 mirror probe session', '2026-09-14T08:00')
       },
     })
     const serverInfo = await server.start()

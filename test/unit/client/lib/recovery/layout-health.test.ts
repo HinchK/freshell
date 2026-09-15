@@ -261,6 +261,95 @@ describe('classifyPersistedLayoutHealth', () => {
     seedEnvelope(envelope)
     expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
   })
+
+  // Content-salvage classification (delta review round 2, finding 3):
+  // parsePersistedLayoutRaw silently strips malformed DURABLE pane-content
+  // fields BEFORE tree validation (normalizeTerminalContent destructures
+  // sessionRef out and re-adds it only when
+  // migrateLegacyTerminalDurableState accepts it — persistedState.ts:231-261),
+  // so a pane whose sessionRef fails sanitizeSessionRef rehydrates WITHOUT
+  // its durable identity while every tree-level check passes. The
+  // classifier pairs RAW and PARSED leaf contents by pane id: a raw
+  // top-level content key the parse dropped is corruption — the pane would
+  // reopen as a FRESH session, so the own-snapshot rebuild must run.
+  it('returns corrupt when a terminal pane content holds a sessionRef the content schema drops (the reviewer\u2019s exact case: invalid terminal sessionRef)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': {
+        type: 'leaf',
+        id: 'pane-a',
+        content: {
+          kind: 'terminal', mode: 'claude', createRequestId: 'cr-a', status: 'running',
+          sessionRef: { provider: 'claude', sessionId: '' },
+        },
+      },
+    }
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('returns healthy when the same envelope carries a VALID terminal sessionRef', () => {
+    const envelope = healthyEnvelope('machine-1')
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': {
+        type: 'leaf',
+        id: 'pane-a',
+        content: {
+          kind: 'terminal', mode: 'claude', createRequestId: 'cr-a', status: 'running',
+          sessionRef: { provider: 'claude', sessionId: '11111111-2222-4333-8444-555555555555' },
+        },
+      },
+    }
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+  })
+
+  it('returns healthy when normalization ADDS a field the raw content lacks (legacy claude terminal content migrates resumeSessionId into sessionRef)', () => {
+    // Raw: no sessionRef key at all; parse fills sessionRef from the
+    // canonical resumeSessionId (persistedState.ts:115-158). resumeSessionId
+    // itself is destructured out (:238) — a verified migration exemption:
+    // current flushes strip it (persistMiddleware.ts:261), so its presence
+    // is legacy-only and its durable value lands in parsed.sessionRef.
+    const envelope = healthyEnvelope('machine-1')
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': {
+        type: 'leaf',
+        id: 'pane-a',
+        content: {
+          kind: 'terminal', mode: 'claude', createRequestId: 'cr-a', status: 'creating',
+          resumeSessionId: '11111111-2222-4333-8444-555555555555',
+        },
+      },
+    }
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+  })
+
+  it('returns healthy for a model-pinned freshopencode pane whose model the parser migrates into modelSelection', () => {
+    // The FreshAgentModelDialog write shape (model + modelSelection,
+    // FreshAgentModelDialog.tsx:348-372): the parse migrates freshopencode
+    // model into modelSelection and drops the model key
+    // (persistedState.ts:316-333) — a verified migration exemption, not
+    // silent salvage.
+    const envelope = healthyEnvelope('machine-1')
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': {
+        type: 'leaf',
+        id: 'pane-a',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          createRequestId: 'cr-fa',
+          status: 'idle',
+          model: 'gpt-5.2',
+          modelSelection: { kind: 'exact', modelId: 'gpt-5.2' },
+        },
+      },
+    }
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+  })
 })
 
 describe('backfillPersistedLayoutMachineId', () => {

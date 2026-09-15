@@ -65,17 +65,24 @@ function collectTitledSessionRows(sessions: RootState['sessions']): TitledSessio
 }
 
 /**
- * Any pane bound to this session holding a different title? Matches the
- * same rule updatePaneTitleBySessionRef's reducer uses (the shared
- * paneContentMatchesSessionRef: fresh-agent sessionRef-preferred, terminal
- * content.sessionRef). A pane whose user-set
- * flag is true is NEVER a fold target — treat it as NOT differing so no
- * no-op dispatch fires for it on every refresh.
+ * Any FRESH-AGENT pane bound to this session holding a different title?
+ * The walk targets fresh-agent panes ONLY (delta review round 2, finding
+ * 1): terminal panes' titles are owned by the registry-title pipeline
+ * (server auto-title sweep, terminal renames via
+ * PATCH /api/terminals/:id, the terminal.inventory fold, the live
+ * terminal.title fold) — mirroring session-directory titles into
+ * session-bound terminal panes UNDID terminal renames on every
+ * sessions/* commit. The reducer action updatePaneTitleBySessionRef keeps
+ * its terminal branch (the pre-existing session-rename cascade); only
+ * this middleware's pane-walk filters to the fresh-agent kind. A pane
+ * whose user-set flag is true is NEVER a fold target — treat it as NOT
+ * differing so no no-op dispatch fires for it on every refresh.
  */
 function sessionTitleDiffers(panes: RootState['panes'], provider: string, sessionId: string, title: string): boolean {
   for (const [tabId, layout] of Object.entries(panes.layouts ?? {})) {
     if (!layout) continue
     for (const { paneId, content } of collectPaneEntries(layout)) {
+      if (content.kind !== 'fresh-agent') continue
       if (!paneContentMatchesSessionRef(content, provider, sessionId)) continue
       if (panes.paneTitleSetByUser?.[tabId]?.[paneId]) continue
       if ((panes.paneTitles?.[tabId]?.[paneId] ?? '') !== title) return true
@@ -125,12 +132,14 @@ const SESSION_BINDING_PANE_ACTIONS = new Set([
  * Session-directory titles are the canonical names for agent sessions, but
  * only the composer flow ever folded them into panes — MCP/REST-created
  * panes stayed on derived defaults forever. This middleware folds titled
- * session rows into their open panes after every sessions-state change AND
- * after the pane-binding actions above (a pane created after its row is
- * loaded must still get titled — the missed-ordering case), through
- * updatePaneTitleBySessionRef with setByUser:false (rename scope
+ * session rows into their open FRESH-AGENT panes after every sessions-state
+ * change AND after the pane-binding actions above (a pane created after
+ * its row is loaded must still get titled — the missed-ordering case),
+ * through updatePaneTitleBySessionRef with setByUser:false (rename scope
  * contract: user renames stick; nothing durable is written; no dispatch
- * when the title already matches).
+ * when the title already matches). Terminal panes are NEVER targets —
+ * their titles are owned by the registry-title pipeline (see
+ * sessionTitleDiffers).
  */
 export const sessionTitleMirrorMiddleware: Middleware = (store) => (next) => (action: any) => {
   const result = next(action)

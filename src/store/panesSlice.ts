@@ -421,21 +421,6 @@ function loadInitialPanesState(): PanesState {
 
 const initialState: PanesState = loadInitialPanesState()
 
-/**
- * Recursively walk a pane tree to find the leaf pane ID whose terminal
- * content has the given terminalId. Returns undefined if no match.
- */
-function findPaneIdByTerminalId(node: PaneNode, terminalId: string): string | undefined {
-  if (node.type === 'leaf') {
-    if (node.content.kind === 'terminal' && node.content.terminalId === terminalId) {
-      return node.id
-    }
-    return undefined
-  }
-  return findPaneIdByTerminalId(node.children[0], terminalId)
-    ?? findPaneIdByTerminalId(node.children[1], terminalId)
-}
-
 // Helper to find and replace a node (leaf or split) in the tree
 function findAndReplace(
   node: PaneNode,
@@ -2071,9 +2056,11 @@ export const panesSlice = createSlice({
     },
 
     /**
-     * Walk all tabs' pane trees and update the title for any pane whose
-     * terminal content has the given terminalId. Used when a session rename
-     * from the history view should cascade to the pane title bar.
+     * Walk all tabs' pane trees and update the title for EVERY pane whose
+     * terminal content has the given terminalId (multi-match — two panes
+     * in one tab can share a terminal). Used when a session rename from
+     * the history view cascades to pane title bars, and by the
+     * terminal.inventory title fold.
      */
     updatePaneTitleByTerminalId: (
       state,
@@ -2081,8 +2068,9 @@ export const panesSlice = createSlice({
     ) => {
       const { terminalId, title, setByUser } = action.payload
       for (const tabId of Object.keys(state.layouts)) {
-        const paneId = findPaneIdByTerminalId(state.layouts[tabId], terminalId)
-        if (paneId) {
+        for (const leaf of collectLeaves(state.layouts[tabId])) {
+          if (leaf.content.kind !== 'terminal' || leaf.content.terminalId !== terminalId) continue
+          const paneId = leaf.id
           if (setByUser === false && state.paneTitleSetByUser?.[tabId]?.[paneId]) {
             continue
           }

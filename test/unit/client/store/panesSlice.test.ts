@@ -4977,6 +4977,85 @@ describe('panesSlice', () => {
       expect(result.paneTitles['tab-2']['pane-b']).toBe('Shared Title')
     })
 
+    // Multi-match (delta review round 2, finding 4): findPaneIdByTerminalId
+    // is single-match, so with two panes in ONE tab sharing a terminal the
+    // second pane never received its inventory title. The action updates
+    // ALL matching panes in every tab, mirroring the collectLeaves swap the
+    // session action received in Task 6.
+    it('updates EVERY pane in a tab bound to the same terminal (two panes, one tab)', () => {
+      const leafA: PaneNode = {
+        type: 'leaf',
+        id: 'pane-a',
+        content: { kind: 'terminal', terminalId: 'term-shared', createRequestId: 'req-1', status: 'running', mode: 'shell' },
+      }
+      const leafB: PaneNode = {
+        type: 'leaf',
+        id: 'pane-b',
+        content: { kind: 'terminal', terminalId: 'term-shared', createRequestId: 'req-2', status: 'running', mode: 'shell' },
+      }
+      const root: PaneNode = {
+        type: 'split',
+        id: 'split-1',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [leafA, leafB],
+      }
+      const state: PanesState = {
+        layouts: { 'tab-1': root },
+        activePane: { 'tab-1': 'pane-a' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+      }
+
+      const result = panesReducer(state, updatePaneTitleByTerminalId({ terminalId: 'term-shared', title: 'Both Titled' }))
+
+      expect(result.paneTitles['tab-1']['pane-a']).toBe('Both Titled')
+      expect(result.paneTitles['tab-1']['pane-b']).toBe('Both Titled')
+    })
+
+    it('updates every matching pane in a second tab too (two panes in tab-1, one in tab-2, all same terminal)', () => {
+      const leafA: PaneNode = {
+        type: 'leaf',
+        id: 'pane-a',
+        content: { kind: 'terminal', terminalId: 'term-shared', createRequestId: 'req-1', status: 'running', mode: 'shell' },
+      }
+      const leafB: PaneNode = {
+        type: 'leaf',
+        id: 'pane-b',
+        content: { kind: 'terminal', terminalId: 'term-shared', createRequestId: 'req-2', status: 'running', mode: 'shell' },
+      }
+      const root: PaneNode = {
+        type: 'split',
+        id: 'split-1',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [leafA, leafB],
+      }
+      const leafC: PaneNode = {
+        type: 'leaf',
+        id: 'pane-c',
+        content: { kind: 'terminal', terminalId: 'term-shared', createRequestId: 'req-3', status: 'running', mode: 'shell' },
+      }
+      const state: PanesState = {
+        layouts: { 'tab-1': root, 'tab-2': leafC },
+        activePane: { 'tab-1': 'pane-a', 'tab-2': 'pane-c' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+      }
+
+      const result = panesReducer(state, updatePaneTitleByTerminalId({ terminalId: 'term-shared', title: 'All Titled' }))
+
+      expect(result.paneTitles['tab-1']['pane-a']).toBe('All Titled')
+      expect(result.paneTitles['tab-1']['pane-b']).toBe('All Titled')
+      expect(result.paneTitles['tab-2']['pane-c']).toBe('All Titled')
+    })
+
     it('skips non-terminal panes', () => {
       const leaf: PaneNode = {
         type: 'leaf',

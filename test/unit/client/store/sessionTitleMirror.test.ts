@@ -258,9 +258,15 @@ describe('sessionTitleMirrorMiddleware', () => {
     expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('New session title')
   })
 
-  it('updates a terminal pane title when applyReconcileAttach rebinds it to a different titled session', () => {
-    const store = buildStore()
-    store.dispatch(addTab({ id: 'tab-z', title: 'ZZ probe' }))
+  // Delta review round 2, finding 1: the mirror's pane-walk targets
+  // FRESH-AGENT panes only. Terminal panes' titles are owned by the
+  // registry-title pipeline (server auto-title sweep, terminal renames
+  // via PATCH /api/terminals/:id, the terminal.inventory fold, the live
+  // terminal.title fold) — a session-bound terminal pane must NEVER be
+  // re-titled by the session directory, or a terminal rename is undone
+  // on the next sessions/* commit.
+  function seedSessionBoundTerminalPane(store: ReturnType<typeof buildStore>) {
+    store.dispatch(addTab({ id: 'tab-z', title: 'Claude probe' }))
     store.dispatch(initLayout({
       tabId: 'tab-z',
       paneId: 'pane-z',
@@ -273,14 +279,29 @@ describe('sessionTitleMirrorMiddleware', () => {
         sessionRef: { provider: 'claude', sessionId: 's1' },
       },
     }))
+  }
+
+  it('does not overwrite a session-bound terminal pane\u2019s folded terminal title when its session row lands (the reviewer\u2019s exact conflict)', () => {
+    const store = buildStore()
+    seedSessionBoundTerminalPane(store)
+    store.dispatch(updatePaneTitle({ tabId: 'tab-z', paneId: 'pane-z', title: 'Renamed via REST', setByUser: false }))
+    landSessionRow(store, { surface: 'sidebar', sessionId: 's1', provider: 'claude', title: 'Session directory title' })
+    expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('Renamed via REST')
+    expect(store.getState().panes.paneTitleSetByUser['tab-z']?.['pane-z']).toBeFalsy()
+  })
+
+  it('leaves a session-bound terminal pane untouched when applyReconcileAttach rebinds it to a different titled session (registry-title pipeline owns terminal pane titles)', () => {
+    const store = buildStore()
+    seedSessionBoundTerminalPane(store)
+    store.dispatch(updatePaneTitle({ tabId: 'tab-z', paneId: 'pane-z', title: 'Renamed via REST', setByUser: false }))
     landSessionRow(store, { surface: 'sidebar', sessionId: 's1', provider: 'claude', title: 'First claude title' })
     landSessionRow(store, { surface: 'sidebar', sessionId: 's2', provider: 'claude', title: 'Second claude title' })
-    expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('First claude title')
+    expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('Renamed via REST')
     store.dispatch({
       type: 'panes/applyReconcileAttach',
       payload: { tabId: 'tab-z', paneId: 'pane-z', terminalId: 'term-1', sessionRef: { provider: 'claude', sessionId: 's2' } },
     })
-    expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('Second claude title')
+    expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('Renamed via REST')
   })
 
   it('never overwrites a user-set pane title when reconcile-attach rebinds the pane (rename-scope contract)', () => {

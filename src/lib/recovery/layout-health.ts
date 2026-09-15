@@ -32,6 +32,94 @@ function collectLeafIdsOf(node: unknown, into: Set<string> = new Set()): Set<str
   return into
 }
 
+/** Leaf pane contents by pane id of a (possibly raw, unvalidated) layout
+ * tree — only leaves whose content is a plain object contribute. Used by
+ * the content-salvage check to pair RAW and PARSED leaf contents. */
+function collectLeafContents(node: unknown, into: Map<string, Record<string, unknown>>): void {
+  const n = node as { type?: string; id?: string; content?: unknown; children?: unknown[] } | null
+  if (!n || typeof n !== 'object') return
+  if (n.type === 'leaf') {
+    if (typeof n.id === 'string' && !!n.content && typeof n.content === 'object' && !Array.isArray(n.content)) {
+      into.set(n.id, n.content as Record<string, unknown>)
+    }
+    return
+  }
+  if (!Array.isArray(n.children)) return
+  for (const child of n.children) collectLeafContents(child, into)
+}
+
+/** Parse-side migrations that deliberately DROP a raw content key while
+ * carrying its durable value into another parsed key — verified against
+ * the loader (persistedState.ts):
+ * - resumeSessionId (terminal + fresh-agent): destructured out and never
+ *   re-added (persistedState.ts:238, :307-315); its durable value lands in
+ *   parsed sessionRef via migrateLegacyTerminalDurableState
+ *   (persistedState.ts:231-261, shared/session-contract.ts:115-158).
+ *   Current flushes never write it (stripTransientSessionFields,
+ *   persistMiddleware.ts:261), so a raw resumeSessionId is legacy-only —
+ *   its drop is migration, not salvage.
+ * - model (freshopencode fresh-agent): migrated into modelSelection and
+ *   the raw key dropped (persistedState.ts:316-333) — and a LEGITIMATE
+ *   current flush DOES write model alongside modelSelection
+ *   (FreshAgentModelDialog.tsx:348-372), so without this exemption a
+ *   healthy model-pinned pane would misclassify corrupt.
+ * Every other raw-key drop is silent salvage of a malformed durable field
+ * — corruption by definition. */
+function isParseMigratedContentKey(content: Record<string, unknown>, key: string): boolean {
+  if (key === 'resumeSessionId') return true
+  return key === 'model'
+    && content.kind === 'fresh-agent'
+    && content.sessionType === 'freshopencode'
+    && content.provider === 'opencode'
+}
+
+/** Content-salvage detection (delta review round 2, finding 3): the
+ * classifier's tree checks all validate the SANITIZED parse result, but
+ * parsePersistedLayoutRaw silently strips malformed durable pane-content
+ * fields BEFORE tree validation — e.g. a terminal sessionRef that fails
+ * sanitizeSessionRef is destructured out and only re-added when
+ * migrateLegacyTerminalDurableState accepts it (normalizeTerminalContent,
+ * persistedState.ts:231-261), so the pane rehydrates WITHOUT its durable
+ * identity while every tree-level check passes and the pane reopens as a
+ * FRESH session. Pair RAW and PARSED leaf contents by pane id: any
+ * top-level raw content key the parsed content dropped (outside the
+ * verified migration set above) means the loader will silently discard
+ * durable data → corruption. Parsed may have MORE keys (normalization
+ * adds sessionRef/codexDurability/restoreError/modelSelection) — the rule
+ * is raw-keys ⊆ parsed-keys. Legit current flushes never produce a
+ * dropped key: in-memory content is normalized on every write path
+ * (normalizePaneContent, panesSlice.ts:60-108 — sessionRef via
+ * sanitizeSessionRef :72, codexDurability :73, restoreError :74) and the
+ * flush strips the volatile keys the parse also drops
+ * (persistMiddleware.ts:255-285). */
+function hasSalvagedLeafContent(
+  rawEnvelope: { panes?: { layouts?: unknown } } | undefined,
+  parsed: ParsedPersistedLayout,
+): boolean {
+  const rawLayouts = rawEnvelope?.panes?.layouts
+  if (!rawLayouts || typeof rawLayouts !== 'object') return false
+  const rawLeafContents = new Map<string, Record<string, unknown>>()
+  for (const node of Object.values(rawLayouts as Record<string, unknown>)) {
+    collectLeafContents(node, rawLeafContents)
+  }
+  if (rawLeafContents.size === 0) return false
+  const parsedLeafContents = new Map<string, Record<string, unknown>>()
+  for (const node of Object.values(parsed.panes?.layouts ?? {})) {
+    collectLeafContents(node, parsedLeafContents)
+  }
+  for (const [paneId, rawContent] of rawLeafContents) {
+    const parsedContent = parsedLeafContents.get(paneId)
+    if (!parsedContent) continue
+    const parsedKeys = new Set(Object.keys(parsedContent))
+    for (const key of Object.keys(rawContent)) {
+      if (parsedKeys.has(key)) continue
+      if (isParseMigratedContentKey(rawContent, key)) continue
+      return true
+    }
+  }
+  return false
+}
+
 /** Aliased-identity check over a (already well-formedness-checked) tree:
  * EVERY node id — split ids AND leaf ids — must be non-empty and unique
  * across the envelope (pane and split ids are minted from the same
@@ -61,7 +149,11 @@ function hasAliasedNodeIds(node: unknown, seenIds: Set<string>): boolean {
  *
  * - absent:   nothing usable is persisted.
  * - corrupt:  the envelope exists but does not parse, parse-level salvage
- *             dropped invalid tab rows, a layout tree is malformed,
+ *             dropped invalid tab rows, content-level salvage silently
+ *             stripped a durable pane-content field (a raw leaf content
+ *             key the parsed result dropped, outside the verified
+ *             migration set — see hasSalvagedLeafContent), a layout tree
+ *             is malformed,
  *             identities are aliased (a duplicate tab id, or a duplicate
  *             or empty node id — split or leaf; legit flushes mint unique
  *             non-empty ids, so aliases are corruption by definition),
@@ -107,9 +199,11 @@ export function classifyPersistedLayoutHealth(
   // well-formedness predicate would rehydrate as DEFAULT panes (the load
   // path drops malformed trees), silently losing the saved layout — that is
   // a corrupt layout, not a healthy one. Same predicate the loader uses
-  // (paneTreeValidation.ts). Bounded residual: pane CONTENT payload
-  // sanitization (loaders replace invalid content with safe defaults) stays
-  // out of scope — only tree well-formedness is classified here.
+  // (paneTreeValidation.ts). Pane CONTENT payload sanitization is
+  // classified too — by the raw-vs-parsed pairing below
+  // (hasSalvagedLeafContent), which catches a durable field the parse
+  // silently strips even though the sanitized result passes this
+  // well-formedness predicate (delta review round 2, finding 3).
   // Aliased identities (duplicate or empty node ids — split or leaf —
   // across the envelope's trees) classify corrupt for the same reason:
   // the raw-count/membership/active-reference checks below all PASS on
@@ -126,17 +220,24 @@ export function classifyPersistedLayoutHealth(
   // so a parsed result can be healthy-looking while the loader actually
   // discarded part of the workspace. One extra JSON.parse of the same raw
   // tells us how many tabs the loader SAW; if the parsed result kept fewer,
-  // salvage dropped rows → corrupt.
-  let rawTabCount: number | undefined
+  // salvage dropped rows → corrupt. The same raw envelope also feeds the
+  // content-salvage check below.
+  let rawEnvelope: { tabs?: { tabs?: unknown[] }; panes?: { layouts?: unknown } } | undefined
   try {
-    const rawEnvelope = JSON.parse(raw) as { tabs?: { tabs?: unknown[] } }
-    rawTabCount = Array.isArray(rawEnvelope?.tabs?.tabs) ? rawEnvelope.tabs.tabs.length : undefined
+    rawEnvelope = JSON.parse(raw)
   } catch {
-    rawTabCount = undefined   // unreachable here: JSON.parse already succeeded inside parsePersistedLayoutRaw
+    rawEnvelope = undefined   // unreachable here: JSON.parse already succeeded inside parsePersistedLayoutRaw
   }
+  const rawTabCount = Array.isArray(rawEnvelope?.tabs?.tabs) ? rawEnvelope.tabs.tabs.length : undefined
   if (rawTabCount !== undefined && rawTabCount !== (parsed.tabs?.tabs?.length ?? 0)) {
     return 'corrupt'
   }
+  // Content-salvage: a durable pane-content field the parse silently
+  // strips (tree checks pass on the sanitized result) is corruption — the
+  // pane would rehydrate without its durable identity. See
+  // hasSalvagedLeafContent for the pairing rule and the verified
+  // migration exemptions.
+  if (hasSalvagedLeafContent(rawEnvelope, parsed)) return 'corrupt'
   // Referential integrity, BOTH directions — verified against the actual
   // loaders: a layout entry whose tabId is not among the parsed tabs is
   // DROPPED at load (cleanOrphanedLayouts, panesSlice.ts:328-371, called
