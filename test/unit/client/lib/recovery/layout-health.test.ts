@@ -895,6 +895,62 @@ describe('classifyPersistedLayoutHealth in the real boot order (migration rewrit
     expect(localStorage.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)).toBeNull()
     expect(boot2.classify('machine-1')).toBe('healthy')
   })
+
+  // e3 post-cap finding 2: the migration-boot prune sweep deleted THIS
+  // window's beyond-threshold envelope BEFORE the App classifier ran, so
+  // a real stale boot was classified (and logged) 'absent' — the five-state
+  // classification and the stale reason propagation were never exercised.
+  // The sweep now spares the own key (still pruning OTHER windows'
+  // abandoned keys), the classifier sees the stale envelope and the gate
+  // rebuilds with reason 'stale', and only the COMPLETED decision runs the
+  // deferred own-key prune.
+  it('a stale own envelope SURVIVES the migration-boot sweep, classifies STALE (not absent), and is retired by the gate-time prune afterward (e3 post-cap finding 2)', async () => {
+    const STALE_PERSISTED_AT = NOW - STALE_LAYOUT_MS - 1
+    seedEnvelope(healthyEnvelope('machine-1', STALE_PERSISTED_AT))
+    const OTHER_WINDOW_KEY = 'freshell.layout.v3.client-other-window'
+    localStorage.setItem(OTHER_WINDOW_KEY, JSON.stringify(healthyEnvelope('machine-1', STALE_PERSISTED_AT)))
+
+    const { classify } = await classifyAfterRealBoot()
+
+    // The sweep's abandoned-key hygiene is intact: the OTHER window's
+    // stale envelope was pruned at migration boot.
+    expect(localStorage.getItem(OTHER_WINDOW_KEY)).toBeNull()
+    // THIS window's stale envelope survived for the classifier (the
+    // migration's rewrite preserves persistedAt).
+    const ownRaw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+    expect(ownRaw).not.toBeNull()
+    expect(JSON.parse(ownRaw!).persistedAt).toBe(STALE_PERSISTED_AT)
+    // The classifier-then-prune ordering: the boot classifies STALE, not
+    // absent — the reason the gate propagates to the rebuild.
+    expect(classify('machine-1')).toBe('stale')
+
+    // The decision completed: the gate's deferred own-key prune removes
+    // the stale envelope (and its channels) afterward.
+    const { pruneOwnStaleLayoutEnvelope } = await import('@/store/storage-migration')
+    vi.useFakeTimers()
+    vi.setSystemTime(NOW)
+    try {
+      pruneOwnStaleLayoutEnvelope()
+    } finally {
+      vi.useRealTimers()
+    }
+    expect(localStorage.getItem(LAYOUT_STORAGE_KEY)).toBeNull()
+  })
+
+  it('the gate-time own-key prune removes only a beyond-threshold envelope — a fresh own envelope survives it', async () => {
+    seedEnvelope(healthyEnvelope('machine-1', NOW))
+    await classifyAfterRealBoot()
+
+    const { pruneOwnStaleLayoutEnvelope } = await import('@/store/storage-migration')
+    vi.useFakeTimers()
+    vi.setSystemTime(NOW)
+    try {
+      pruneOwnStaleLayoutEnvelope()
+    } finally {
+      vi.useRealTimers()
+    }
+    expect(localStorage.getItem(LAYOUT_STORAGE_KEY)).not.toBeNull()
+  })
 })
 
 // e2r5 review finding 1: the boot gate's evidence clear raced the persist

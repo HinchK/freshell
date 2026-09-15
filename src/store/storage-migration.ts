@@ -641,36 +641,50 @@ function removeLayoutEnvelopeAndChannels(envelopeKey: string, layoutWindowId?: s
   )
 }
 
+/** The prune paths' shared aging rule: returns the envelope's numeric
+ * persistedAt ONLY when it is older than STALE_LAYOUT_MS — the same
+ * threshold the health gate uses — else null (including unparseable raw
+ * or a non-numeric persistedAt: an envelope whose age cannot be
+ * determined is kept, because the health gate owns corrupt
+ * classification and the prune never destroys evidence it cannot age). */
+function staleEnvelopePersistedAt(raw: string | null, now: number): number | null {
+  if (raw === null) return null
+  let persistedAt: unknown
+  try {
+    persistedAt = (JSON.parse(raw) as { persistedAt?: unknown })?.persistedAt
+  } catch {
+    return null
+  }
+  return typeof persistedAt === 'number' && now - persistedAt > STALE_LAYOUT_MS
+    ? persistedAt
+    : null
+}
+
 /** Stale-threshold prune sweep at migration boot (e3r1 finding 5): fresh
  * contexts mint new layout-window ids with no close/expiry path, so
  * closed-window envelopes (and their side channels) would accumulate
  * unboundedly until quota exhaustion breaks persistence. Enumerate the
  * layout-prefix keys, parse ONLY envelope-shaped keys (the derived
- * per-window envelopes and the bare legacy key), and remove those whose
- * persistedAt is older than STALE_LAYOUT_MS — the same threshold the
- * health gate uses, which would classify them stale → rebuild anyway. An
- * envelope whose age cannot be determined (unparseable, or no numeric
- * persistedAt) is kept: the health gate owns corrupt classification, and
- * the sweep never destroys evidence it cannot age. Runs BEFORE legacy
- * adoption so a beyond-threshold legacy envelope is pruned rather than
- * adopted. */
+ * per-window envelopes and the bare legacy key), and remove those beyond
+ * the shared stale age. Runs BEFORE legacy adoption so a beyond-threshold
+ * legacy envelope is pruned rather than adopted. THIS window's own
+ * derived key is SPARED (e3 post-cap finding 2): the boot classifier must
+ * see a stale own envelope to classify it STALE and rebuild with the
+ * stale reason propagated — sweeping it here relabeled every real stale
+ * boot 'absent'. The App gate retires the own envelope after its
+ * keep-vs-rebuild decision via pruneOwnStaleLayoutEnvelope(); every other
+ * window's key keeps the abandoned-key hygiene below. */
 function pruneStaleLayoutEnvelopes(): void {
   try {
     const now = Date.now()
+    const ownKey = getWindowLayoutKey()
     for (const key of Object.keys(localStorage)) {
       if (!key.startsWith(LAYOUT_STORAGE_KEY_PREFIX)) continue
       const isLegacyEnvelope = key === LEGACY_LAYOUT_STORAGE_KEY
       if (!isLegacyEnvelope && !isDerivedLayoutKey(key)) continue
-      const raw = localStorage.getItem(key)
-      if (raw === null) continue
-      let persistedAt: unknown
-      try {
-        persistedAt = (JSON.parse(raw) as { persistedAt?: unknown })?.persistedAt
-      } catch {
-        continue
-      }
-      if (typeof persistedAt !== 'number') continue
-      if (!(now - persistedAt > STALE_LAYOUT_MS)) continue
+      if (key === ownKey) continue
+      const persistedAt = staleEnvelopePersistedAt(localStorage.getItem(key), now)
+      if (persistedAt === null) continue
       if (isLegacyEnvelope) {
         removeLayoutEnvelopeAndChannels(key)
         continue
@@ -682,6 +696,33 @@ function pruneStaleLayoutEnvelopes(): void {
         persistedAt,
       })
     }
+  } catch (error) {
+    warnStructured('layout_stale_prune_failed', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+  }
+}
+
+/** The App boot gate's DEFERRED own-key prune (e3 post-cap finding 2):
+ * the migration-boot sweep above spares this window's envelope so
+ * classifyPersistedLayoutHealth can see a stale layout; once the gate's
+ * keep-vs-rebuild decision completes, it calls this to retire the
+ * beyond-threshold envelope (and its channels) with the shared aging
+ * rule. A fresh or absent envelope is a no-op, and the gate never
+ * reaches the call on a failed rebuild — the envelope survives as the
+ * retry boot's stale-classification evidence. Re-exported through
+ * layout-health (the gate's recovery boundary) so App's import graph
+ * keeps a single recovery module. */
+export function pruneOwnStaleLayoutEnvelope(): void {
+  try {
+    const key = getWindowLayoutKey()
+    const persistedAt = staleEnvelopePersistedAt(localStorage.getItem(key), Date.now())
+    if (persistedAt === null) return
+    removeLayoutEnvelopeAndChannels(key, getLayoutWindowId())
+    warnStructured('layout_stale_envelope_pruned', {
+      key,
+      persistedAt,
+    })
   } catch (error) {
     warnStructured('layout_stale_prune_failed', {
       error: error instanceof Error ? error.message : String(error),

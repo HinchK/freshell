@@ -51,6 +51,7 @@ const mocks = vi.hoisted(() => ({
   classifyPersistedLayoutHealth: vi.fn(),
   backfillPersistedLayoutMachineId: vi.fn(),
   clearPreMigrationLayoutEvidence: vi.fn(),
+  pruneOwnStaleLayoutEnvelope: vi.fn(),
   installCrossTabSync: vi.fn(),
   startTabRegistrySync: vi.fn(),
   setHelloExtensionProvider: vi.fn(),
@@ -88,6 +89,7 @@ vi.mock('@/lib/recovery/layout-health', () => ({
   classifyPersistedLayoutHealth: (...args: unknown[]) => mocks.classifyPersistedLayoutHealth(...args),
   backfillPersistedLayoutMachineId: (...args: unknown[]) => mocks.backfillPersistedLayoutMachineId(...args),
   clearPreMigrationLayoutEvidence: (...args: unknown[]) => mocks.clearPreMigrationLayoutEvidence(...args),
+  pruneOwnStaleLayoutEnvelope: (...args: unknown[]) => mocks.pruneOwnStaleLayoutEnvelope(...args),
 }))
 
 vi.mock('@/store/crossTabSync', () => ({

@@ -14,10 +14,17 @@ import { TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY, TAB_REGISTRY_SNAPSHOT_REVI
  * One window is one JS realm; sessionStorage (unlike localStorage) is NOT
  * shared across tabs, which is exactly the per-window scope the id needs.
  * The in-memory fallback keeps the id stable when sessionStorage is
- * unavailable (tests, privacy modes) or when writes fail (quota).
+ * unavailable (tests, privacy modes) or when writes fail (quota). After a
+ * lease-collision rotation the in-memory id is AUTHORITATIVE for the
+ * context's lifetime: a rotation whose setItem failed leaves the stale
+ * copied id in storage, and the getter never re-reads it over the
+ * established rotation (e3 post-cap finding 3). A context with no
+ * established rotation keeps the initial-boot mint-once semantics and
+ * still reads storage.
  */
 let inMemoryClientInstanceId = ''
 let inMemorySnapshotRevision = 0
+let rotatedClientInstanceId = false
 
 export function randomClientInstanceId(): string {
   return `client-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`
@@ -55,9 +62,17 @@ export function mintTabRegistryClientInstanceId(): string {
 }
 
 /** Force a specific id (registry lease-collision rotation): in-memory id +
- * sessionStorage persist, snapshot revision untouched. */
+ * sessionStorage persist, snapshot revision untouched. Once rotated, the
+ * in-memory id is AUTHORITATIVE for the context's lifetime (e3 post-cap
+ * finding 3, mirroring window-layout-keys' remint stickiness): a rotation
+ * whose setItem failed leaves the duplicated tab's STALE copied id in
+ * storage, and a later getter must never re-read it over the established
+ * rotation — that would identify the duplicate as the original for
+ * hello/bootstrap consumers while tabRegistrySync keeps its closure-local
+ * rotated id. */
 export function setTabRegistryClientInstanceId(clientInstanceId: string): void {
   inMemoryClientInstanceId = clientInstanceId
+  rotatedClientInstanceId = true
   try {
     safeSessionStorage()?.setItem(TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY, clientInstanceId)
   } catch {
@@ -65,7 +80,20 @@ export function setTabRegistryClientInstanceId(clientInstanceId: string): void {
   }
 }
 
+/** Test-only: clear the rotation-authority latch. A production realm is
+ * one window for the module's lifetime, so the latch never legitimately
+ * clears; test files that simulate MANY independent window contexts in
+ * one module instance (tabRegistrySync.test.ts) reset it alongside
+ * sessionStorage.clear() so each simulated context reads storage again
+ * (the same pattern as resetPreMigrationEvidenceArmForTests). */
+export function resetClientInstanceIdRotationForTests(): void {
+  rotatedClientInstanceId = false
+}
+
 export function getCurrentTabRegistryClientInstanceId(): string {
+  if (rotatedClientInstanceId && inMemoryClientInstanceId) {
+    return inMemoryClientInstanceId
+  }
   const storage = safeSessionStorage()
   let clientInstanceId = ''
   try {

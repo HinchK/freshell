@@ -473,6 +473,13 @@ function hasLifecycleInvalidPaneContent(node: unknown, seenCreateRequestIds: Set
   return false
 }
 
+/** The App boot gate's deferred own-key prune — implemented in
+ * storage-migration.ts (which owns the envelope-removal machinery) and
+ * re-exported here so the gate keeps a single recovery import boundary
+ * (e3 post-cap finding 2: the migration-boot sweep spares this window's
+ * envelope for the classifier; the gate retires it after its decision). */
+export { pruneOwnStaleLayoutEnvelope } from '@/store/storage-migration'
+
 /** Classify the persisted layout envelope for the machine this boot
  * resolved. Reads only localStorage; no network.
  *

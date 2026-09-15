@@ -25,6 +25,7 @@ import {
   createDefaultServerSettings,
   resolveLocalSettings,
 } from '@shared/settings'
+import { getWindowLayoutKey } from '@/store/window-layout-keys'
 
 vi.mock('@/components/TabContent', () => ({ default: () => <div /> }))
 vi.mock('@/components/Sidebar', () => ({ default: () => <aside />, AppView: {} as any }))
@@ -59,12 +60,19 @@ const mocks = vi.hoisted(() => ({
   backfillPersistedLayoutMachineId: vi.fn(),
   clearPreMigrationLayoutEvidence: vi.fn(),
   armPreMigrationEvidenceClear: vi.fn(),
+  pruneOwnStaleLayoutEnvelope: vi.fn(),
   installCrossTabSync: vi.fn(),
   startTabRegistrySync: vi.fn(),
   setHelloExtensionProvider: vi.fn(),
   connect: vi.fn(),
   onMessage: vi.fn(),
   onReconnect: vi.fn(),
+  // The REAL layout-health implementations, captured by the mock factory's
+  // importOriginal: the foreign-path failure tests below delegate classify/
+  // backfill to them, because the fully mocked pair cannot observe the
+  // machine-id stamp transition on the envelope (e3 post-cap finding 1's
+  // reviewer note).
+  realLayoutHealth: {} as typeof import('@/lib/recovery/layout-health'),
 }))
 
 vi.mock('@/lib/api', () => ({
@@ -91,12 +99,16 @@ vi.mock('@/lib/machine-workspace', () => ({
   restoreMachineWorkspace: (...args: unknown[]) => mocks.restoreMachineWorkspace(...args),
 }))
 
-vi.mock('@/lib/recovery/layout-health', () => ({
-  classifyPersistedLayoutHealth: (...args: unknown[]) => mocks.classifyPersistedLayoutHealth(...args),
-  backfillPersistedLayoutMachineId: (...args: unknown[]) => mocks.backfillPersistedLayoutMachineId(...args),
-  clearPreMigrationLayoutEvidence: (...args: unknown[]) => mocks.clearPreMigrationLayoutEvidence(...args),
-  armPreMigrationEvidenceClear: (...args: unknown[]) => mocks.armPreMigrationEvidenceClear(...args),
-}))
+vi.mock('@/lib/recovery/layout-health', async (importOriginal) => {
+  mocks.realLayoutHealth = await importOriginal<typeof import('@/lib/recovery/layout-health')>()
+  return {
+    classifyPersistedLayoutHealth: (...args: unknown[]) => mocks.classifyPersistedLayoutHealth(...args),
+    backfillPersistedLayoutMachineId: (...args: unknown[]) => mocks.backfillPersistedLayoutMachineId(...args),
+    clearPreMigrationLayoutEvidence: (...args: unknown[]) => mocks.clearPreMigrationLayoutEvidence(...args),
+    armPreMigrationEvidenceClear: (...args: unknown[]) => mocks.armPreMigrationEvidenceClear(...args),
+    pruneOwnStaleLayoutEnvelope: (...args: unknown[]) => mocks.pruneOwnStaleLayoutEnvelope(...args),
+  }
+})
 
 vi.mock('@/store/crossTabSync', () => ({
   installCrossTabSync: (...args: unknown[]) => mocks.installCrossTabSync(...args),
@@ -128,6 +140,52 @@ const MACHINE: Machine = {
   label: 'DANDESKTOP',
   createdAt: 1_789_171_200_000,
   lastSeenAt: 1_789_171_200_000,
+}
+
+/** Seed a real, well-formed layout envelope under THIS window's per-window
+ * key (the same shape layout-health.test.ts's healthyEnvelope uses, so the
+ * REAL classifier parses it and runs its full validation pipeline).
+ * `machineId` omitted from overrides = an UNSTAMPED legacy envelope. */
+function seedLayoutEnvelope(overrides: { machineId?: string; persistedAt?: number } = {}): string {
+  const persistedAt = overrides.persistedAt ?? Date.now()
+  const envelope = {
+    persistedAt,
+    version: 4,
+    ...(overrides.machineId !== undefined ? { machineId: overrides.machineId } : {}),
+    tabs: {
+      activeTabId: 'tab-a',
+      tabs: [{ id: 'tab-a', title: 'A', createdAt: persistedAt, updatedAt: persistedAt }],
+    },
+    panes: {
+      layouts: {
+        'tab-a': {
+          type: 'leaf',
+          id: 'pane-a',
+          content: { kind: 'editor', filePath: '/tmp/a.md', language: null, readOnly: false, content: '', viewMode: 'source', wordWrap: true },
+        },
+      },
+      activePane: { 'tab-a': 'pane-a' },
+      paneTitles: { 'tab-a': { 'pane-a': 'A notes' } },
+      paneTitleSetByUser: { 'tab-a': { 'pane-a': true } },
+    },
+    tombstones: [],
+  }
+  const key = getWindowLayoutKey()
+  localStorage.setItem(key, JSON.stringify(envelope))
+  return key
+}
+
+/** Delegate the gate's classify/backfill mocks to the REAL implementations
+ * (captured by the mock factory's importOriginal) with exact-args
+ * passthrough, so the test observes the real classification and the real
+ * stamp transition on the seeded envelope. */
+function useRealLayoutHealth(): void {
+  mocks.classifyPersistedLayoutHealth.mockImplementation(
+    (...args: unknown[]) => (mocks.realLayoutHealth.classifyPersistedLayoutHealth as (...a: unknown[]) => unknown)(...args),
+  )
+  mocks.backfillPersistedLayoutMachineId.mockImplementation(
+    (...args: unknown[]) => (mocks.realLayoutHealth.backfillPersistedLayoutMachineId as (...a: unknown[]) => unknown)(...args),
+  )
 }
 
 function createStore() {
@@ -325,6 +383,10 @@ describe('App machine identity bootstrap', () => {
     )
     expect(mocks.backfillPersistedLayoutMachineId).toHaveBeenCalledTimes(1)
     expect(mocks.backfillPersistedLayoutMachineId).toHaveBeenCalledWith(MACHINE.id)
+    // The decision completed here too — the deferred own-key prune runs on
+    // every adjudicated boot (healthy-keep included); it no-ops on a fresh
+    // envelope.
+    expect(mocks.pruneOwnStaleLayoutEnvelope).toHaveBeenCalledTimes(1)
     // Consume-clear (e2r4 finding 1): a healthy-keep boot retires the
     // durable pre-migration evidence sidecar directly — the healthy
     // envelope is ALREADY the durable state, so no pending write can
@@ -381,8 +443,11 @@ describe('App machine identity bootstrap', () => {
       expect(mocks.restoreMachineWorkspace.mock.invocationCallOrder[0]).toBeLessThan(
         mocks.startTabRegistrySync.mock.invocationCallOrder[0],
       )
-      expect(mocks.backfillPersistedLayoutMachineId).toHaveBeenCalledTimes(1)
-      expect(mocks.backfillPersistedLayoutMachineId).toHaveBeenCalledWith(MACHINE.id)
+      // e3 post-cap finding 1: an unhealthy boot NEVER stamps the old
+      // envelope — the backfill is healthy-only. The eager pre-recovery
+      // stamp poisoned interrupted/failed rebuilds into next-boot
+      // 'healthy'; the successful rebuild's own flush is the only stamper.
+      expect(mocks.backfillPersistedLayoutMachineId).not.toHaveBeenCalled()
       // e2r5 finding 1: a completed rebuild ARMS the evidence clear — the
       // sidecar is never deleted at the Redux boundary. Persistence is
       // debounced 500ms and a failed write clears the dirty flags without
@@ -398,8 +463,40 @@ describe('App machine identity bootstrap', () => {
       expect(mocks.restoreMachineWorkspace.mock.invocationCallOrder[0]).toBeLessThan(
         mocks.armPreMigrationEvidenceClear.mock.invocationCallOrder[0],
       )
+      // e3 post-cap finding 2: the decision completed, so the deferred
+      // own-key prune runs (the migration-boot sweep left this window's
+      // envelope for the classifier; the gate retires it after deciding).
+      expect(mocks.pruneOwnStaleLayoutEnvelope).toHaveBeenCalledTimes(1)
+      expect(mocks.restoreMachineWorkspace.mock.invocationCallOrder[0]).toBeLessThan(
+        mocks.pruneOwnStaleLayoutEnvelope.mock.invocationCallOrder[0],
+      )
     },
   )
+
+  it('a real stale envelope classifies STALE (not absent) through the gate — the reason propagates and the deferred sweep retires it after the decision (e3 post-cap finding 2)', async () => {
+    // Real-boot wiring pin with the REAL classifier: the migration-boot
+    // prune sweep no longer deletes this window's beyond-threshold
+    // envelope before the classifier runs (that ordering relabeled every
+    // real stale boot 'absent'), so the gate sees the stale envelope,
+    // rebuilds with the stale reason propagated, and only then runs the
+    // deferred own-key prune.
+    useRealLayoutHealth()
+    seedLayoutEnvelope({ machineId: MACHINE.id, persistedAt: Date.now() - 8 * 24 * 60 * 60 * 1000 })
+    localStorage.setItem(MACHINE_ID_STORAGE_KEY, MACHINE.id)
+    mocks.getMachines.mockResolvedValue([MACHINE])
+    const store = createStore()
+
+    render(<Provider store={store}><App /></Provider>)
+
+    await waitFor(() => expect(mocks.startTabRegistrySync).toHaveBeenCalledTimes(1))
+    expect(mocks.restoreMachineWorkspace).toHaveBeenCalledTimes(1)
+    expect(mocks.restoreMachineWorkspace).toHaveBeenCalledWith(store, MACHINE.id, { reason: 'stale' })
+    // classifier-then-prune: the prune runs only after the decision.
+    expect(mocks.pruneOwnStaleLayoutEnvelope).toHaveBeenCalledTimes(1)
+    expect(mocks.restoreMachineWorkspace.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.pruneOwnStaleLayoutEnvelope.mock.invocationCallOrder[0],
+    )
+  })
 
   it('peeks before the restore and consumes only after success — the marker stays armed through an in-flight reload', async () => {
     // The protocol's ORDERING pin, discriminated against the
@@ -434,13 +531,19 @@ describe('App machine identity bootstrap', () => {
     expect(peekActiveMachineSelectionMark()).toBe(false)
   })
 
-  it('keeps the marker armed when the restore fails, so the retry still treats the machine as actively chosen', async () => {
-    // The failure path, pinned through the same in-flight ordering: the
-    // failing boot never consumes the marker, so the app's reload action
-    // retries with the marker still armed and never keeps a foreign
-    // machine's stale local cache over the machine the user just chose.
+  it('a failed foreign-path rebuild never stamps the old envelope — the marker stays armed and a fresh boot re-classifies foreign, not healthy (e3 post-cap finding 1)', async () => {
+    // The failure path rewritten against REAL classification and backfill:
+    // the fully mocked pair (the pre-fix version of this test) could not
+    // catch the stamp transition. A healthy-shaped UNSTAMPED envelope plus
+    // the armed chooser marker classifies FOREIGN, so the boot rebuilds —
+    // and the failing rebuild must leave the old envelope UNSTAMPED (and
+    // the marker armed), or the next boot would see a stamped same-machine
+    // cache, classify it healthy, and permanently keep the PREVIOUS
+    // machine's layout. The eager pre-recovery stamp was exactly that
+    // poisoning; the successful rebuild's own flush is the only stamper.
     markActiveMachineSelection()
-    mocks.classifyPersistedLayoutHealth.mockReturnValue('absent')
+    useRealLayoutHealth()
+    const layoutKey = seedLayoutEnvelope()
     localStorage.setItem(MACHINE_ID_STORAGE_KEY, MACHINE.id)
     mocks.getMachines.mockResolvedValue([MACHINE])
     let rejectRestore: ((reason: unknown) => void) | undefined
@@ -452,12 +555,66 @@ describe('App machine identity bootstrap', () => {
     render(<Provider store={store}><App /></Provider>)
 
     await waitFor(() => expect(mocks.restoreMachineWorkspace).toHaveBeenCalledTimes(1))
-    expect(peekActiveMachineSelectionMark()).toBe(true)
+    expect(mocks.restoreMachineWorkspace).toHaveBeenCalledWith(store, MACHINE.id, { reason: 'foreign' })
     await act(async () => { rejectRestore?.(new Error('inventory unavailable')) })
     await waitFor(() => expect(store.getState().machineIdentity?.status).toBe('error'))
     expect(mocks.startTabRegistrySync).not.toHaveBeenCalled()
+    // The old envelope is NOT stamped with the newly selected machine id.
+    expect(JSON.parse(localStorage.getItem(layoutKey)!).machineId).toBeUndefined()
     // Still armed for the retry — the failing boot never consumed it.
     expect(peekActiveMachineSelectionMark()).toBe(true)
+    // A fresh boot classifies the envelope FOREIGN (a stamped same-machine
+    // envelope would classify healthy and mis-keep the previous machine's
+    // layout).
+    expect(mocks.realLayoutHealth.classifyPersistedLayoutHealth(MACHINE.id, { activeSelection: peekActiveMachineSelectionMark() })).toBe('foreign')
+    // The post-decision own-key prune never ran: the decision did not
+    // complete, so the evidence envelope survives for the retry boot.
+    expect(mocks.pruneOwnStaleLayoutEnvelope).not.toHaveBeenCalled()
+  })
+
+  it('an old-machine-stamped envelope keeps its old stamp through a failed foreign-path rebuild — the retry boot still classifies foreign', async () => {
+    // The foreign path's stamped variant: the stamp names a DIFFERENT
+    // machine, so the envelope classifies foreign regardless of the
+    // marker. A failed rebuild must not rewrite the stamp to the newly
+    // selected machine (the eager backfill no-ops on stamped envelopes,
+    // but the pin guards the whole gate against any future stamper).
+    localStorage.setItem(MACHINE_ID_STORAGE_KEY, MACHINE.id)
+    useRealLayoutHealth()
+    const layoutKey = seedLayoutEnvelope({ machineId: 'machine-OTHER' })
+    mocks.getMachines.mockResolvedValue([MACHINE])
+    mocks.restoreMachineWorkspace.mockRejectedValue(new Error('inventory fetch failed'))
+    const store = createStore()
+
+    render(<Provider store={store}><App /></Provider>)
+
+    await waitFor(() => expect(store.getState().machineIdentity.status).toBe('error'))
+    expect(mocks.restoreMachineWorkspace).toHaveBeenCalledWith(store, MACHINE.id, { reason: 'foreign' })
+    expect(JSON.parse(localStorage.getItem(layoutKey)!).machineId).toBe('machine-OTHER')
+    expect(mocks.realLayoutHealth.classifyPersistedLayoutHealth(MACHINE.id)).toBe('foreign')
+  })
+
+  it('a reload while the foreign-path recovery is in flight leaves the envelope unstamped and the marker armed — the next boot re-classifies foreign (e3 post-cap finding 1)', async () => {
+    // The reload-before-persist vector, as an in-flight interruption: the
+    // restore (and its inventory request) never settles, exactly like a
+    // page that dies mid-recovery. The envelope must still be unstamped
+    // and the marker still armed, so the post-reload boot re-enters
+    // foreign classification and retries the rebuild.
+    markActiveMachineSelection()
+    useRealLayoutHealth()
+    const layoutKey = seedLayoutEnvelope()
+    localStorage.setItem(MACHINE_ID_STORAGE_KEY, MACHINE.id)
+    mocks.getMachines.mockResolvedValue([MACHINE])
+    mocks.restoreMachineWorkspace.mockImplementationOnce(
+      () => new Promise<{ restoredTabs: number }>(() => {}),
+    )
+    const store = createStore()
+
+    render(<Provider store={store}><App /></Provider>)
+
+    await waitFor(() => expect(mocks.restoreMachineWorkspace).toHaveBeenCalledTimes(1))
+    expect(peekActiveMachineSelectionMark()).toBe(true)
+    expect(JSON.parse(localStorage.getItem(layoutKey)!).machineId).toBeUndefined()
+    expect(mocks.realLayoutHealth.classifyPersistedLayoutHealth(MACHINE.id, { activeSelection: peekActiveMachineSelectionMark() })).toBe('foreign')
   })
 
   it('leaves the pre-migration evidence sidecar when the rebuild fails — the next boot retries with the corrupt raw intact (e2r4 finding 1)', async () => {
