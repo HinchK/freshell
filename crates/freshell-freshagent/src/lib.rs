@@ -1353,11 +1353,15 @@ fn opencode_item_from_part(
             } else {
                 None
             };
-            let error_text = state
-                .get("error")
-                .and_then(Value::as_str)
-                .filter(|error| !error.trim().is_empty())
-                .map(str::to_string);
+            let error_text = if status == "failed" {
+                state
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .filter(|error| !error.trim().is_empty())
+                    .map(str::to_string)
+            } else {
+                None
+            };
             let mut item = json!({
                 "id": id,
                 "kind": "dynamic_tool",
@@ -3949,6 +3953,33 @@ mod tests {
             items[0].get("error").is_none(),
             "a blank persisted error carries no text"
         );
+    }
+
+    #[test]
+    fn opencode_item_from_part_completed_and_running_tool_with_lingering_error_omit_the_key() {
+        // The brief's item interface: the `error` key is present exactly when the
+        // part is `state.status:"error"`. A completed/running part that lingers
+        // with a non-blank `state.error` (a future fixture or malformed serve
+        // response) must stay byte-identical to a part carrying no error at all.
+        for status in ["completed", "running"] {
+            let part = json!({
+                "type": "tool", "id": "part-lingering-err", "tool": "bash",
+                "state": {
+                    "status": status,
+                    "input": { "command": "ls" },
+                    "output": "a.txt\n",
+                    "error": "stale text from a previous attempt",
+                },
+            });
+
+            let items = opencode_item_from_part(&part, "fallback", Some("assistant"), false);
+
+            assert_eq!(items[0]["status"], json!(status));
+            assert!(
+                items[0].get("error").is_none(),
+                "the error key is present only for state.status:\"error\" parts, got {status}"
+            );
+        }
     }
 
     #[test]
