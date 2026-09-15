@@ -13,10 +13,12 @@ import * as path from 'node:path'
  *    broadcasts `terminals.changed` — NOT `terminal.title.updated` — so the
  *    live pane-title fold never fires for it, and the reload's
  *    terminal.inventory frame is the ONLY delivery of the renamed title.
- *    Scenario A also pins the delta-round-2 finding-1 precedence: the
- *    session-directory title mirror targets FRESH-AGENT panes only, so
- *    binding the (session-less) shell pane to a seeded Claude session row
- *    must NOT overwrite the folded terminal rename.
+ *    Scenario A also pins the delta-round-2 finding-1 precedence (as
+ *    corrected by the e2r2 finding-4 rule): the session-directory title
+ *    mirror skips any terminal pane that HOLDS a terminalId — the
+ *    inventory fold owns its title — so binding the shell pane to a
+ *    seeded Claude session row must NOT overwrite the folded terminal
+ *    rename.
  * 2. The session-directory title mirror lands in a harness-dispatched
  *    fresh-agent pane whose provider+sessionId match a seeded, NON-RUNNING
  *    Claude session row — the MCP/REST-created-pane symptom Task 6 fixes —
@@ -41,13 +43,26 @@ function writeSeededClaudeSession(
   firstUserMessage: string,
   timestampBase: string,
 ): void {
+  // timestampBase carries `YYYY-MM-DDTHH:mm` — append `:${ss}.${ms}Z` for a
+  // valid ISO-8601 instant, with the seconds derived from the turn index
+  // (the old `${base}:0${turnIndex}:01.000Z` template produced invalid
+  // `hh:mm:00:01` strings the Rust timestamp parser ignored). Every seeded
+  // timestamp goes through this helper, so its validity gate verifies all
+  // of the fixture's time fields.
+  const seededTimestamp = (seconds: number, milliseconds: number): string => {
+    const stamped = `${timestampBase}:${String(seconds).padStart(2, '0')}.${String(milliseconds).padStart(3, '0')}Z`
+    if (Number.isNaN(Date.parse(stamped))) {
+      throw new Error(`seeded session timestamp is not valid ISO-8601: ${stamped}`)
+    }
+    return stamped
+  }
   const sessionDir = path.join(homeDir, '.claude', 'projects', projectSlug)
   fs.mkdirSync(sessionDir, { recursive: true })
   const projectCwd = path.join(homeDir, projectSlug)
   const seededLines: string[] = [
     JSON.stringify({
       type: 'system', subtype: 'init', session_id: sessionId,
-      uuid: `${sessionId}-system`, timestamp: `${timestampBase}:00.000Z`,
+      uuid: `${sessionId}-system`, timestamp: seededTimestamp(0, 0),
       cwd: projectCwd, git: { branch: 'main', dirty: false },
     }),
   ]
@@ -60,7 +75,7 @@ function writeSeededClaudeSession(
       parentUuid: previousUuid, cwd: projectCwd, sessionId,
       version: '2.1.23', gitBranch: 'main', type: 'user',
       message: { role: 'user', content: userMessage },
-      uuid: userUuid, timestamp: `${timestampBase}:0${turnIndex}:01.000Z`,
+      uuid: userUuid, timestamp: seededTimestamp(turnIndex * 2 + 1, 1),
     }))
     seededLines.push(JSON.stringify({
       parentUuid: userUuid, cwd: projectCwd, sessionId,
@@ -69,7 +84,7 @@ function writeSeededClaudeSession(
         role: 'assistant', model: 'claude-opus-4-6-20260301',
         content: [{ type: 'text', text: `Working on it (${turnIndex + 1}).` }],
       },
-      uuid: assistantUuid, timestamp: `${timestampBase}:0${turnIndex}:02.000Z`,
+      uuid: assistantUuid, timestamp: seededTimestamp(turnIndex * 2 + 2, 1),
     }))
     previousUuid = assistantUuid
   }
@@ -168,10 +183,11 @@ test.describe('pane-title delivery folds', () => {
       // REAL session-association fold (terminal.session.associated's
       // client handler dispatches panes/reconcileTerminalSessionRefByTerminalId,
       // terminal-session-association.ts:245 — mirrored here by the harness
-      // dispatch). The session mirror must target FRESH-AGENT panes only:
-      // the folded terminal rename survives the binding and every later
-      // sessions/* commit (the mirror fires synchronously on the binding
-      // action — sessionTitleMirror.ts SESSION_BINDING_PANE_ACTIONS).
+      // dispatch). The session mirror must skip terminal panes that HOLD a
+      // terminalId (the inventory fold owns their titles): the folded
+      // terminal rename survives the binding and every later sessions/*
+      // commit (the mirror fires synchronously on the binding action —
+      // sessionTitleMirror.ts SESSION_BINDING_PANE_ACTIONS).
       await page.waitForFunction((sessionId) => {
         const projects = window.__FRESHELL_TEST_HARNESS__?.getState()?.sessions?.windows?.sidebar?.projects ?? []
         for (const project of projects) {

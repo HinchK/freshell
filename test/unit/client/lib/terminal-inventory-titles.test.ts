@@ -7,6 +7,7 @@ import {
 } from '@/lib/terminal-inventory-titles'
 import tabsReducer, { addTab } from '@/store/tabsSlice'
 import panesReducer, { initLayout, updatePaneTitle, updatePaneTitleByTerminalId } from '@/store/panesSlice'
+import { applyPaneRename } from '@/store/titleSync'
 
 function seedTerminalPane(store: ReturnType<typeof buildStore>, tabId: string, paneId: string, terminalId: string) {
   store.dispatch(addTab({ id: tabId, title: tabId }))
@@ -273,23 +274,27 @@ describe('terminal inventory title cache + replay', () => {
   })
 })
 
-// e2r1 review finding 2: the replay cache treated the boot snapshot as
-// permanently authoritative. The live title writers — the
-// terminal.title.updated fold (TerminalView.tsx:4780) and the OSC
-// onTitleChange fold (TerminalView.tsx:2595) — write through
-// updatePaneTitle, and the open-tab-with-title / rename cascade paths
-// (tabsSlice.ts:1098, titleSync.ts:40, OverviewView.tsx:59,
-// ContextMenuProvider.tsx:829) write through
-// updatePaneTitleByTerminalId — none of them touch the cache, so any
-// later listed action replayed the STALE cached title over the newer
-// one. The cache is a FALLBACK for late-bound panes only: a newer
-// differing title write EVICTS that terminal's cache entry (regardless
-// of any churn guard); an equal write keeps it (the fold's own
-// dispatches never self-evict); a new inventory frame re-populates it.
-// The module-level cache is shared across the whole file, so every test
-// here owns a UNIQUE terminalId — a previous test's leaked cache entry
-// then matches no pane in this test's store (vitest shuffles order).
-describe('inventory title cache eviction on newer title writes', () => {
+// e2r1 review finding 2 installed cache EVICTION on newer title writes;
+// e2r2 review finding 3 corrects it to REPLACEMENT: deleting the entry
+// left a live terminal.title.updated/OSC title arriving before another
+// pane binds that terminal titleless until reconnect — the exact
+// missed-delivery failure the replay was built to fix. The watched set
+// covers TERMINAL-LEVEL title writes only (rename scope contract:
+// pane/tab renames are layout-local and must never disturb terminal-level
+// delivery state): updatePaneTitleByTerminalId on every NON-USER write
+// (its payload is terminal-scoped by construction — the terminal.inventory
+// fold and the open-tab-with-title fold, tabsSlice.ts:1098), and
+// updatePaneTitle ONLY on the live terminal fold path (setByUser:false —
+// TerminalView.tsx:4780 terminal.title.updated, :2595 OSC onTitleChange).
+// User or pane-local renames NEVER touch the cache: the setByUser:true
+// writers through the terminal-scoped action (rename UI
+// OverviewView.tsx:59 / ContextMenuProvider.tsx:829, session-rename
+// cascade titleSync.ts:40) and the setByUser-less applyPaneRename /
+// applyTabRename thunks (titleSync.ts:51, :82). The module-level cache is
+// shared across the whole file, so every test here owns a UNIQUE
+// terminalId — a previous test's leaked cache entry then matches no pane
+// in this test's store (vitest shuffles order).
+describe('inventory title cache replacement on newer terminal-level title writes', () => {
   function shellContentFor(tid: string, createRequestId: string) {
     return { kind: 'terminal', mode: 'shell', shell: 'wsl', terminalId: tid, createRequestId, status: 'running' } as const
   }
@@ -311,7 +316,7 @@ describe('inventory title cache eviction on newer title writes', () => {
     })
   }
 
-  it('a newer live title (updatePaneTitle — the terminal.title.updated/OSC action) evicts the entry: a replay trigger keeps the newer title and a later late-bound pane gets nothing', () => {
+  it('a newer live title (updatePaneTitle setByUser:false — the terminal.title.updated/OSC action) REPLACES the entry: a late-bound pane receives the NEW title', () => {
     const store = buildStore()
     seedTerminalPane(store, 'tab-1', 'pane-1', 't-ev-live')
     expect(foldTerminalInventoryTitles(store, [{ terminalId: 't-ev-live', title: 'Boot snapshot' }])).toBe(1)
@@ -319,10 +324,10 @@ describe('inventory title cache eviction on newer title writes', () => {
     retriggerReplay(store, 't-ev-live')
     expect(store.getState().panes.paneTitles['tab-1']['pane-1']).toBe('Live newer title')
     splitSecondPaneBound(store, 't-ev-live')
-    expect(store.getState().panes.paneTitles['tab-1']['pane-2']).not.toBe('Boot snapshot')
+    expect(store.getState().panes.paneTitles['tab-1']['pane-2']).toBe('Live newer title')
   })
 
-  it('a newer title through updatePaneTitleByTerminalId (open-tab-with-title, tabsSlice.ts:1098) evicts the entry the same way', () => {
+  it('a newer title through updatePaneTitleByTerminalId (open-tab-with-title, tabsSlice.ts:1098) replaces the entry the same way', () => {
     const store = buildStore()
     seedTerminalPane(store, 'tab-1', 'pane-1', 't-ev-open')
     expect(foldTerminalInventoryTitles(store, [{ terminalId: 't-ev-open', title: 'Boot snapshot' }])).toBe(1)
@@ -330,20 +335,30 @@ describe('inventory title cache eviction on newer title writes', () => {
     retriggerReplay(store, 't-ev-open')
     expect(store.getState().panes.paneTitles['tab-1']['pane-1']).toBe('Open-tab title')
     splitSecondPaneBound(store, 't-ev-open')
-    expect(store.getState().panes.paneTitles['tab-1']['pane-2']).not.toBe('Boot snapshot')
+    expect(store.getState().panes.paneTitles['tab-1']['pane-2']).toBe('Open-tab title')
   })
 
-  it('eviction holds regardless of the user-set guard: a user rename evicts too, so a sibling pane sharing the terminal never replays the stale snapshot', () => {
+  it('a user pane rename (setByUser:true) leaves the cache intact: sibling panes still receive the terminal title', () => {
     const store = buildStore()
     seedTerminalPane(store, 'tab-1', 'pane-1', 't-ev-user')
     expect(foldTerminalInventoryTitles(store, [{ terminalId: 't-ev-user', title: 'Boot snapshot' }])).toBe(1)
     store.dispatch(updatePaneTitleByTerminalId({ terminalId: 't-ev-user', title: 'My own name', setByUser: true }))
     splitSecondPaneBound(store, 't-ev-user')
     expect(store.getState().panes.paneTitles['tab-1']['pane-1']).toBe('My own name')
-    expect(store.getState().panes.paneTitles['tab-1']['pane-2']).not.toBe('Boot snapshot')
+    expect(store.getState().panes.paneTitles['tab-1']['pane-2']).toBe('Boot snapshot')
   })
 
-  it('an EQUAL title write keeps the entry: the fold\u2019s own dispatches never self-evict, and a late-bound pane still replays', () => {
+  it('a layout-local applyPaneRename never touches the cache: a late-bound sibling still receives the terminal title', () => {
+    const store = buildStore()
+    seedTerminalPane(store, 'tab-1', 'pane-1', 't-ev-rename')
+    expect(foldTerminalInventoryTitles(store, [{ terminalId: 't-ev-rename', title: 'Boot snapshot' }])).toBe(1)
+    store.dispatch(applyPaneRename({ tabId: 'tab-1', paneId: 'pane-1', title: 'Pane-local name' }))
+    expect(store.getState().panes.paneTitles['tab-1']['pane-1']).toBe('Pane-local name')
+    splitSecondPaneBound(store, 't-ev-rename')
+    expect(store.getState().panes.paneTitles['tab-1']['pane-2']).toBe('Boot snapshot')
+  })
+
+  it('an EQUAL title write keeps the entry: the fold\u2019s own dispatches never self-replace, and a late-bound pane still replays', () => {
     const store = buildStore()
     seedTerminalPane(store, 'tab-1', 'pane-1', 't-ev-equal')
     expect(foldTerminalInventoryTitles(store, [{ terminalId: 't-ev-equal', title: 'Same title' }])).toBe(1)
@@ -353,7 +368,7 @@ describe('inventory title cache eviction on newer title writes', () => {
     expect(store.getState().panes.paneTitles['tab-1']['pane-2']).toBe('Same title')
   })
 
-  it('a new inventory frame re-populates the cache after an eviction (reconnect recovers)', () => {
+  it('a new inventory frame re-populates the cache over a replaced entry (reconnect recovers)', () => {
     const store = buildStore()
     seedTerminalPane(store, 'tab-1', 'pane-1', 't-ev-refold')
     expect(foldTerminalInventoryTitles(store, [{ terminalId: 't-ev-refold', title: 'Boot snapshot' }])).toBe(1)

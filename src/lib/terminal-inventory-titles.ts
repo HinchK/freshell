@@ -140,22 +140,21 @@ const TERMINAL_BINDING_PANE_ACTIONS = new Set([
   'panes/addPane',
 ])
 
-/** Evict a terminal's cached snapshot title when a NEWER authoritative
- * title write lands a DIFFERENT title (e2r1 review finding 2): the
- * cache is a FALLBACK for late-bound panes only, and a newer write makes
- * the boot snapshot stale — without eviction, any later listed binding
- * action replayed the stale cached title over the newer one and it
- * stuck until the next reconnect. An EQUAL write keeps the entry, so
- * the fold's own dispatches (which re-apply the cached title) never
- * self-evict. Eviction is independent of the replay churn guard: the
- * guard protects one pane's title, but a sibling pane sharing the same
- * terminalId would still replay the stale entry. */
-function evictStaleInventoryTitle(terminalId: string | undefined, title: unknown): void {
+/** Replace a terminal's cached snapshot title when a NEWER authoritative
+ * TERMINAL-LEVEL title write lands a DIFFERENT title (e2r2 review finding
+ * 3, correcting the e2r1 eviction): the cache is a FALLBACK for late-bound
+ * panes, and a newer write makes the boot snapshot stale — REPLACE the
+ * entry, never delete it. Eviction left a live terminal.title.updated/OSC
+ * title arriving before another pane binds that terminal titleless until
+ * reconnect (the exact missed-delivery failure the replay was built to
+ * fix). An EQUAL write is a no-op, so the fold's own dispatches never
+ * churn the entry. Replacement is independent of the replay churn guard:
+ * the guard protects one pane's title, but a sibling pane sharing the same
+ * terminalId must also replay the NEW title, not the stale snapshot. */
+function replaceStaleInventoryTitle(terminalId: string | undefined, title: unknown): void {
   if (!terminalId || typeof title !== 'string') return
-  const cached = lastInventoryTitles.get(terminalId)
-  if (cached !== undefined && cached !== title) {
-    lastInventoryTitles.delete(terminalId)
-  }
+  if (lastInventoryTitles.get(terminalId) === title) return
+  lastInventoryTitles.set(terminalId, title)
 }
 
 /** The terminalId of the pane a panes/updatePaneTitle action addressed,
@@ -185,20 +184,38 @@ function terminalIdBoundToPane(panes: RootState['panes'], tabId: unknown, paneId
  * Churn-free by the same guard as the fold: an already-titled pane and a
  * user-set pane dispatch nothing, and an empty cache (before the first
  * terminal.inventory frame) is a no-op. Additionally watches the two
- * terminal-pane title actions: a DIFFERING newer title evicts that
- * terminal's cache entry (see evictStaleInventoryTitle) so the stale
- * snapshot can never be replayed over it.
+ * terminal-pane title actions — but only TERMINAL-LEVEL writes (e2r2
+ * review finding 3, rename scope contract): a DIFFERING newer title
+ * REPLACES that terminal's cache entry (see replaceStaleInventoryTitle)
+ * so a late-bound pane receives the NEW title, while user or pane-local
+ * renames NEVER touch terminal-level delivery state.
+ * - panes/updatePaneTitleByTerminalId: its payload is terminal-scoped by
+ *   construction, so every NON-USER write replaces the entry — the
+ *   terminal.inventory fold (:54) and the open-tab-with-title fold
+ *   (tabsSlice.ts:1098), both setByUser:false. The setByUser:true
+ *   writers (rename UI OverviewView.tsx:59 / ContextMenuProvider.tsx:829,
+ *   session-rename cascade titleSync.ts:40) are USER renames and never
+ *   touch the cache.
+ * - panes/updatePaneTitle: ONLY the live terminal fold path
+ *   (setByUser:false — TerminalView.tsx:4780 terminal.title.updated,
+ *   :2595 OSC onTitleChange) replaces the entry. The layout-local rename
+ *   paths carry no setByUser:false — applyPaneRename/applyTabRename
+ *   (titleSync.ts:51, :82) — and the session-directory mirror
+ *   (sessionTitleMirror.ts) only titles panes with no resolvable
+ *   terminalId, so neither ever disturbs the cache.
  */
 export const terminalInventoryTitleReplayMiddleware: Middleware = (store) => (next) => (action: any) => {
   const result = next(action)
   const type = action?.type
   if (typeof type === 'string') {
     if (type === 'panes/updatePaneTitleByTerminalId') {
-      const { terminalId, title } = action?.payload ?? {}
-      evictStaleInventoryTitle(terminalId, title)
+      const { terminalId, title, setByUser } = action?.payload ?? {}
+      if (setByUser !== true) replaceStaleInventoryTitle(terminalId, title)
     } else if (type === 'panes/updatePaneTitle') {
-      const { tabId, paneId, title } = action?.payload ?? {}
-      evictStaleInventoryTitle(terminalIdBoundToPane((store as FoldStore).getState().panes, tabId, paneId), title)
+      const { tabId, paneId, title, setByUser } = action?.payload ?? {}
+      if (setByUser === false) {
+        replaceStaleInventoryTitle(terminalIdBoundToPane((store as FoldStore).getState().panes, tabId, paneId), title)
+      }
     } else if (TERMINAL_BINDING_PANE_ACTIONS.has(type)) {
       replayTerminalInventoryTitles(store as FoldStore)
     }

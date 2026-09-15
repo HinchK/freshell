@@ -34,7 +34,7 @@ export function normalizeFreshAgentModelSelection(
   return undefined
 }
 
-const LEGACY_FRESHOPENCODE_DEFAULT_MODEL = 'opencode-go/deepseek-v4-flash'
+export const LEGACY_FRESHOPENCODE_DEFAULT_MODEL = 'opencode-go/deepseek-v4-flash'
 
 export function normalizeFreshAgentPaneModelSelection(args: {
   sessionType?: unknown

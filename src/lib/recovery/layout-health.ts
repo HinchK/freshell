@@ -2,7 +2,8 @@ import { parsePersistedLayoutRaw, type ParsedPersistedLayout } from '@/store/per
 import { isWellFormedPaneTree } from '@/store/paneTreeValidation'
 import { LAYOUT_STORAGE_KEY } from '@/store/storage-keys'
 import { getPreMigrationLayoutRaw } from '@/store/storage-migration'
-import { sanitizeRestoreError } from '@shared/session-contract'
+import { LEGACY_FRESHOPENCODE_DEFAULT_MODEL } from '@/store/paneTypes'
+import { sanitizeRestoreError, sanitizeSessionRef } from '@shared/session-contract'
 
 /** A local layout older than this rebuilds from the server instead of being
  * kept. 7 days is far beyond any terminal lifetime (15-minute default idle
@@ -54,62 +55,115 @@ function collectLeafContents(node: unknown, into: Map<string, Record<string, unk
  * (persistedState.ts) or boot-migration-side (storage-migration.ts, whose
  * PRE-rewrite raw the salvage comparison reads via
  * getPreMigrationLayoutRaw) — as distinct from SILENT salvage of a
- * malformed durable field, which is corruption by definition. Each entry
- * cites its verified implementation:
- * - resumeSessionId (terminal + fresh-agent): parse destructures it out
- *   and never re-adds it (persistedState.ts:238, :307-315); its durable
- *   value lands in parsed sessionRef via migrateLegacyTerminalDurableState
- *   (persistedState.ts:231-261, shared/session-contract.ts:115-158).
- *   Current flushes never write it (stripTransientSessionFields,
- *   persistMiddleware.ts:261), so a raw resumeSessionId is legacy-only —
- *   its drop is migration, not salvage.
- * - model (freshopencode fresh-agent): parse migrates it into
- *   modelSelection and drops the raw key (persistedState.ts:316-333) —
- *   and a LEGITIMATE current flush DOES write model alongside
- *   modelSelection (FreshAgentModelDialog.tsx:348-372), so without this
- *   exemption a healthy model-pinned pane would misclassify corrupt.
- * - restoreError (terminal, any shape): the boot migration's terminal
- *   branch destructures the pane's EXISTING restoreError out and
- *   re-adds only the resume-migration's own error
- *   (storage-migration.ts:160, :177), so every boot's rewrite sheds a
- *   flush-carried restoreError — and current writers do produce it
- *   (TerminalView.tsx:4998 dead_live_handle, :5193
- *   durable_artifact_missing, panesSlice.ts:2556) while the flush
- *   keeps it (persistMiddleware.ts:255-285). Without this exemption
- *   any window holding a restore-errored terminal pane would
- *   misclassify corrupt on every boot.
+ * malformed durable field, which is corruption by definition. Every entry
+ * cites its verified drop site, and every identity-bearing key is
+ * VALUE-SENSITIVE (e2r2 review findings 1-2): a raw-key drop is exempt
+ * ONLY when the parsed content shows the migration actually consumed the
+ * value — drop + product = exempt; drop + no product = corruption.
+ *
+ * The exemption set covers BOTH content kinds of the fresh-agent
+ * centralization migration: `fresh-agent` AND the legacy `agent-chat`
+ * (the rewrite consumes agent-chat panes through the same
+ * migrateLegacyFreshAgentContent, shared/fresh-agent.ts:365-424).
+ *
+ * - resumeSessionId (any kind): exempt iff the parsed content holds the
+ *   migration product. Terminal: the parse destructures it out and never
+ *   re-adds it (persistedState.ts:238; boot side storage-migration.ts:160),
+ *   and migrateLegacyTerminalDurableState converts it into a sessionRef
+ *   or restoreError (session-contract.ts:115-158) — an empty or non-string
+ *   value produces NEITHER (session-contract.ts:132-134), so the pane
+ *   would reopen as a fresh session → corruption. Fresh-agent family: a
+ *   STRING value is re-added verbatim (fresh-agent.ts:318-320, :359, :420)
+ *   so a drop means the value was non-string (unconsumed — no product
+ *   unless another identity resolves) or the restore path shed it (the
+ *   kept restoreError IS the product, fresh-agent.ts:321, :417).
+ * - model (freshopencode fresh-agent): the parse destructures the raw key
+ *   and rebuilds modelSelection (persistedState.ts:316-333; boot side
+ *   storage-migration.ts:238-255). Exempt iff the parsed content holds a
+ *   modelSelection, OR the raw value is the stale DeepSeek default — the
+ *   one documented drop whose product is deliberately ABSENT
+ *   (paneTypes.ts:48-55; pinned by
+ *   persisted-state.fresh-agent.test.ts:233-254). A garbage value
+ *   (non-string/blank) produces no modelSelection (paneTypes.ts:27-35) →
+ *   the pane would reopen with the default model → corruption.
+ * - restoreError (terminal): exempt iff the RAW value is a valid
+ *   RESTORE_UNAVAILABLE error — the only shape whose shed is the
+ *   documented migration (the boot rewrite destructures a flush-carried
+ *   error out and re-adds only the resume-migration's own,
+ *   storage-migration.ts:160, :177; the parse keeps a valid one,
+ *   persistedState.ts:246-248). A garbage value fails readRestoreError
+ *   (persistedState.ts:140-149) and is dropped by BOTH sides with no
+ *   replacement → corruption.
+ * - restoreError (fresh-agent family): valid errors are always re-added
+ *   (fresh-agent.ts:321, :356-357, :417; parse side :338-341), so a drop
+ *   means the raw value was garbage — exempt only when the migration
+ *   produced the replacement verdict (the parsed restoreError), e.g. an
+ *   agent-chat pane with no usable identity (fresh-agent.ts:386-391).
+ * - sessionRef (fresh-agent): the restore-unavailable identity shed — the
+ *   existing-restoreError path destructures sessionRef out and never
+ *   re-adds it while keeping the error (fresh-agent.ts:298-307, :313-322).
+ *   Exempt iff the raw restoreError is valid (it is the announced shed).
+ * - sessionRef (agent-chat): the conversion verdict — a non-canonical
+ *   Claude ref is rejected into a restoreError
+ *   (fresh-agent.ts:378-391, :412-418) while a valid ref is re-added
+ *   (:421). Exempt iff the parsed content holds the restoreError.
  * - sessionRef on a legacy codex recovery_failed terminal: the remint
- *   sheds the invalid legacy identity and ANNOUNCES it — a fresh
- *   restoreError/status lands in the migrated content
- *   (storage-migration.ts:163-177; pinned by
- *   storage-migration.test.ts:291-345).
- * - sessionRef / timelineSessionId / cliSessionId on a fresh-agent
- *   pane carrying a VALID restoreError: the restore-unavailable
- *   identity shed — the boot migration drops sessionRef with the
- *   error kept (storage-migration.ts:182-214), and the timeline/cli
- *   ids only under reason invalid_legacy_restore_target
- *   (:195-205); the in-memory normalizer mirrors the shed and never
- *   keeps sessionRef alongside a valid restoreError
- *   (panesSlice.ts:143-194). showThinking/showTools are vestigial
- *   display overrides with no writer since 2026-04
- *   (persistMiddleware.ts:271-274 scrubs them on the next flush). */
-function isVerifiedMigrationContentDrop(content: Record<string, unknown>, key: string): boolean {
-  if (key === 'resumeSessionId') return true
-  if (key === 'model'
-    && content.kind === 'fresh-agent'
-    && content.sessionType === 'freshopencode'
-    && content.provider === 'opencode') return true
-  if (key === 'restoreError' && content.kind === 'terminal') return true
-  if (key === 'sessionRef'
-    && content.kind === 'terminal'
-    && content.mode === 'codex'
-    && content.status === 'recovery_failed') return true
-  if (content.kind === 'fresh-agent') {
+ *   rewrite (storage-migration.ts:162-177, normalizeLegacyRecoveryFailed
+ *   :102-128; pinned by storage-migration.test.ts:291-345) always
+ *   replaces the pane status with 'creating' (valid codex ref kept) or
+ *   'error' (+ fresh restoreError) — exempt iff the parsed status shows
+ *   the remint's announced replacement.
+ * - showThinking / showTools (fresh-agent family): vestigial per-pane
+ *   display overrides with no writer since 2026-04, unconditionally
+ *   deleted by the migration (fresh-agent.ts:310-311, :348-349, :404-405)
+ *   and scrubbed on the next flush (persistMiddleware). No migration
+ *   product exists BY DESIGN, so these two keys stay value-insensitive:
+ *   any value is dead weight, and the fixture shapes pin live values
+ *   (persisted-state.fresh-agent.test.ts:102-104).
+ * - timelineSessionId / cliSessionId (fresh-agent family): consumed into
+ *   the durable identity — the fallback resumeSessionId chain
+ *   (fresh-agent.ts:325-329, :373-377) feeds
+ *   migrateLegacyFreshAgentDurableState (:330-335, :378-383), which
+ *   yields the parsed sessionRef (:360, :421) or a restoreError
+ *   (:356-357, :412-418); the existing-restoreError path sheds them under
+ *   reason invalid_legacy_restore_target (:296-307; parse side
+ *   persistedState.ts:276-286; boot side storage-migration.ts:195-205)
+ *   with the error kept as the product. Exempt iff the parsed content
+ *   holds the sessionRef or restoreError product; an empty-string id
+ *   resolves to nothing (fresh-agent.ts:168-170) → corruption. */
+function isVerifiedMigrationContentDrop(
+  rawContent: Record<string, unknown>,
+  parsedContent: Record<string, unknown> | undefined,
+  key: string,
+): boolean {
+  const parsedSessionRef = sanitizeSessionRef(parsedContent?.sessionRef)
+  const parsedRestoreError = sanitizeRestoreError(parsedContent?.restoreError)
+  const parsedHasDurableProduct = !!parsedSessionRef || !!parsedRestoreError
+  const rawKind = rawContent.kind
+  const isFreshAgentFamily = rawKind === 'fresh-agent' || rawKind === 'agent-chat'
+
+  if (key === 'resumeSessionId') return parsedHasDurableProduct
+  if (isFreshAgentFamily) {
     if (key === 'showThinking' || key === 'showTools') return true
-    if (key === 'sessionRef') return !!sanitizeRestoreError(content.restoreError)
-    if (key === 'timelineSessionId' || key === 'cliSessionId') {
-      const restoreError = sanitizeRestoreError(content.restoreError)
-      return !!restoreError && restoreError.reason === 'invalid_legacy_restore_target'
+    if (key === 'timelineSessionId' || key === 'cliSessionId') return parsedHasDurableProduct
+    if (key === 'model') {
+      return parsedContent?.sessionType === 'freshopencode'
+        && parsedContent?.provider === 'opencode'
+        && (parsedContent?.modelSelection !== undefined
+          || rawContent.model === LEGACY_FRESHOPENCODE_DEFAULT_MODEL)
+    }
+    if (key === 'sessionRef') {
+      return rawKind === 'agent-chat'
+        ? !!parsedRestoreError
+        : !!sanitizeRestoreError(rawContent.restoreError)
+    }
+    if (key === 'restoreError') return !!parsedRestoreError
+  }
+  if (rawKind === 'terminal') {
+    if (key === 'restoreError') return !!sanitizeRestoreError(rawContent.restoreError)
+    if (key === 'sessionRef' && rawContent.mode === 'codex' && rawContent.status === 'recovery_failed') {
+      const parsedStatus = parsedContent?.status
+      return parsedStatus === 'creating' || parsedStatus === 'error'
     }
   }
   return false
@@ -160,7 +214,7 @@ function hasSalvagedLeafContent(
     const parsedKeys = new Set(Object.keys(parsedContent))
     for (const key of Object.keys(rawContent)) {
       if (parsedKeys.has(key)) continue
-      if (isVerifiedMigrationContentDrop(rawContent, key)) continue
+      if (isVerifiedMigrationContentDrop(rawContent, parsedContent, key)) continue
       return true
     }
   }

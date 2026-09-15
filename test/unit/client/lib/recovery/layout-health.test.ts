@@ -470,6 +470,163 @@ describe('classifyPersistedLayoutHealth in the real boot order (migration rewrit
   })
 })
 
+// e2r2 review findings 1+2: the verified-drop exemption set was keyed on
+// the PRE-migration content kind (legacy agent-chat panes were never
+// exempt, so the fixture-shaped legacy layouts classify corrupt → forced
+// rebuild losing geometry/titles) and was value-INSENSITIVE (an empty or
+// garbage legacy value was exempted even when the migration consumed
+// nothing and produced no durable product — the pane reopened as a fresh
+// session or with a default model while classifying healthy).
+describe('verified migration exemptions: agent-chat kinds + value sensitivity (e2r2 findings 1-2)', () => {
+  beforeEach(() => { localStorage.clear() })
+
+  const CANONICAL_A = '00000000-0000-4000-8000-000000000121'
+  const CANONICAL_B = '00000000-0000-4000-8000-000000000122'
+  const CANONICAL_C = '00000000-0000-4000-8000-000000000123'
+
+  function seedPaneLayout(content: Record<string, unknown>): void {
+    const envelope = healthyEnvelope('machine-1')
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': { type: 'leaf', id: 'pane-a', content },
+    }
+    seedEnvelope(envelope)
+  }
+
+  function seedSplitPaneLayout(contents: Record<string, Record<string, unknown>>): void {
+    const leaves = Object.entries(contents).map(([paneId, content]) => ({
+      type: 'leaf' as const, id: paneId, content,
+    }))
+    const buildTree = (
+      nodes: Array<{ type: 'leaf'; id: string; content: Record<string, unknown> }>,
+    ): unknown => {
+      if (nodes.length === 1) return nodes[0]
+      const mid = Math.floor(nodes.length / 2)
+      return {
+        type: 'split',
+        id: `split-${nodes[0].id}-${nodes[nodes.length - 1].id}`,
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [buildTree(nodes.slice(0, mid)), buildTree(nodes.slice(mid))],
+      }
+    }
+    const envelope = healthyEnvelope('machine-1')
+    ;(envelope.panes as Record<string, unknown>).layouts = { 'tab-a': buildTree(leaves) }
+    ;(envelope.panes as { activePane: Record<string, string> }).activePane['tab-a'] = leaves[0].id
+    seedEnvelope(envelope)
+  }
+
+  it('classifies the legacy agent-chat fixture shapes healthy (the fresh-agent centralization migration is a verified rewrite, not salvage)', () => {
+    // The exact shapes persisted-state.fresh-agent.test.ts pins as VALID
+    // legacy migrations: vestigial showThinking/showTools, a
+    // timelineSessionId, a cliSessionId, and a non-canonical sessionRef
+    // alias — each deliberately removed by the agent-chat rewrite while
+    // the durable identity converts into the parsed sessionRef/restoreError.
+    seedSplitPaneLayout({
+      'pane-ac-resume': {
+        kind: 'agent-chat', provider: 'freshclaude', createRequestId: 'req-ac-1', status: 'idle',
+        resumeSessionId: CANONICAL_A, showThinking: false, showTools: true, showTimecodes: true,
+      },
+      'pane-ac-timeline': {
+        kind: 'agent-chat', provider: 'kilroy', createRequestId: 'req-ac-2', status: 'idle',
+        timelineSessionId: CANONICAL_B,
+      },
+      'pane-ac-cli': {
+        kind: 'agent-chat', provider: 'claude', createRequestId: 'req-ac-3', status: 'idle',
+        cliSessionId: CANONICAL_C,
+      },
+      'pane-ac-alias': {
+        kind: 'agent-chat', provider: 'claude', createRequestId: 'req-ac-4', status: 'idle',
+        sessionRef: { provider: 'claude', sessionId: 'named-alias' },
+      },
+    })
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+  })
+
+  it('classifies a legacy fresh-agent pane with timelineSessionId/cliSessionId and NO restoreError healthy (the ids migrate into sessionRef)', () => {
+    // A healthy legacy fresh-agent pane carried its Claude UUID in the
+    // timeline/cli id slots; the migration consumes them into the durable
+    // sessionRef (fresh-agent.ts:325-335) with no restoreError involved.
+    seedPaneLayout({
+      kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude',
+      createRequestId: 'req-fa-tl', status: 'idle',
+      timelineSessionId: CANONICAL_A, cliSessionId: CANONICAL_B,
+    })
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+  })
+
+  it.each([
+    ['an empty string', ''],
+    ['a non-string', 42],
+  ])('classifies corrupt when a legacy terminal resumeSessionId (%s) is dropped without its migration product', (_label, resumeSessionId) => {
+    // Value sensitivity: migrateLegacyTerminalDurableState discards an
+    // empty/non-string resumeSessionId and produces NEITHER a sessionRef
+    // NOR a restoreError (session-contract.ts:132-134) — the pane would
+    // reopen as a fresh session while the old code exempted the drop.
+    seedPaneLayout({
+      kind: 'terminal', mode: 'claude', createRequestId: 'cr-rs', status: 'creating',
+      resumeSessionId,
+    })
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it.each([
+    ['a non-string', 42],
+    ['a blank string', '   '],
+  ])('classifies corrupt when a freshopencode model value (%s) is dropped without modelSelection', (_label, model) => {
+    // Value sensitivity: normalizeFreshAgentPaneModelSelection produces no
+    // modelSelection for a non-string/blank legacy model (paneTypes.ts:27-35,
+    // :48-56) — the pane would reopen with the default model while the old
+    // code exempted the drop.
+    seedPaneLayout({
+      kind: 'fresh-agent', sessionType: 'freshopencode', provider: 'opencode',
+      createRequestId: 'cr-oc-model', status: 'idle', model,
+    })
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it.each([
+    ['a plain string', 'dead handle'],
+    ['an empty object', {}],
+  ])('classifies corrupt when a terminal restoreError (%s) is dropped — only a VALID error\u2019s shed is the documented migration', (_label, restoreError) => {
+    // Value sensitivity: readRestoreError rejects the value
+    // (persistedState.ts:140-149) and the parse drops it with no
+    // replacement — a garbage error verdict is silent salvage, not a
+    // documented shed of a real RESTORE_UNAVAILABLE error.
+    seedPaneLayout({
+      kind: 'terminal', mode: 'claude', createRequestId: 'cr-re', status: 'running',
+      sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+      restoreError,
+    })
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('stays healthy when the freshopencode stale-default model is dropped without modelSelection (the documented deliberate drop)', () => {
+    // persisted-state.fresh-agent.test.ts:233-254 pins this migration
+    // outcome: the stale DeepSeek default is deliberately NOT carried into
+    // modelSelection — the drop has no product BY DESIGN
+    // (paneTypes.ts:37, :48-55).
+    seedPaneLayout({
+      kind: 'fresh-agent', sessionType: 'freshopencode', provider: 'opencode',
+      createRequestId: 'cr-oc-stale', status: 'idle',
+      model: 'opencode-go/deepseek-v4-flash',
+    })
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+  })
+
+  it('stays corrupt when a fresh-agent timelineSessionId produces no durable product (value sensitivity of the id exemptions)', () => {
+    // An empty-string timelineSessionId is consumed as an empty
+    // resumeSessionId → migrateLegacyFreshAgentDurableState returns {}
+    // (fresh-agent.ts:168-170) — dropped with neither sessionRef nor
+    // restoreError.
+    seedPaneLayout({
+      kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude',
+      createRequestId: 'cr-fa-empty-tl', status: 'idle',
+      timelineSessionId: '',
+    })
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+})
+
 describe('backfillPersistedLayoutMachineId', () => {
   beforeEach(() => { localStorage.clear() })
 

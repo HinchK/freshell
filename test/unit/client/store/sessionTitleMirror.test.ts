@@ -4,6 +4,7 @@ import tabsReducer, { addTab } from '@/store/tabsSlice'
 import { panesSlice, initLayout, updatePaneTitle, updatePaneTitleBySessionRef } from '@/store/panesSlice'
 import sessionsReducer, { commitSessionWindowVisibleRefresh } from '@/store/sessionsSlice'
 import { sessionTitleMirrorMiddleware } from '@/store/sessionTitleMirror'
+import { foldTerminalInventoryTitles, terminalInventoryTitleReplayMiddleware } from '@/lib/terminal-inventory-titles'
 
 function buildStore() {
   return configureStore({
@@ -394,8 +395,66 @@ describe('sessionTitleMirrorMiddleware', () => {
       }))
       expect(store.getState().panes.paneTitles['tab-z']['pane-fa']).toBe('Renamed from history')
       expect(store.getState().panes.paneTitles['tab-z']['pane-term']).toBe('Renamed from history')
-      expect(store.getState().panes.paneTitleSetByUser['tab-z']?.['pane-fa']).toBe(true)
-      expect(store.getState().panes.paneTitleSetByUser['tab-z']?.['pane-term']).toBe(true)
+      expect(store.getState().panes.paneTitleSetByUser['tab-z']['pane-fa']).toBe(true)
+      expect(store.getState().panes.paneTitleSetByUser['tab-z']['pane-term']).toBe(true)
+    })
+  })
+
+  // e2r2 review finding 4: the blanket fresh-agent filter removed the
+  // directory fold from EVERY session-bound terminal pane — a terminal
+  // pane with a valid sessionRef but NO usable terminalId (exited,
+  // unavailable, not-yet-reattached after rebuild) can't receive
+  // inventory or live terminal-title events; the directory row is its
+  // only runtime title source. The requirement is a PRECEDENCE rule, not
+  // a kind exclusion: the mirror titles a terminal pane IFF its content
+  // has NO terminalId — once a terminalId exists, the inventory
+  // fold/replay owns that pane's title (the delta-round-2 precedence
+  // pins above stay green: those panes hold terminalIds).
+  describe('no-terminalId terminal panes mirror until the registry fold takes over', () => {
+    function seedUnboundSessionTerminalPane(store: ReturnType<typeof buildStore>) {
+      store.dispatch(addTab({ id: 'tab-z', title: 'Unbound terminal probe' }))
+      store.dispatch(initLayout({
+        tabId: 'tab-z',
+        paneId: 'pane-z',
+        content: {
+          kind: 'terminal',
+          mode: 'claude',
+          createRequestId: 'req-unbound',
+          status: 'exited',
+          sessionRef: { provider: 'claude', sessionId: 's1' },
+        },
+      }))
+    }
+
+    it('mirrors the directory row into a session-bound terminal pane WITHOUT a terminalId (its only runtime title source)', () => {
+      const store = buildStore()
+      seedUnboundSessionTerminalPane(store)
+      landSessionRow(store, { surface: 'sidebar', sessionId: 's1', provider: 'claude', title: 'Session directory title' })
+      expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('Session directory title')
+      expect(store.getState().panes.paneTitleSetByUser['tab-z']?.['pane-z']).toBeFalsy()
+    })
+
+    it('reattach ordering: once the replay binds the terminalId, the registry title WINS over the earlier mirror write (non-user-set)', () => {
+      const store = configureStore({
+        reducer: { tabs: tabsReducer, panes: panesSlice.reducer, sessions: sessionsReducer },
+        middleware: (gDM) => gDM({ serializableCheck: false })
+          .concat(terminalInventoryTitleReplayMiddleware, sessionTitleMirrorMiddleware),
+      })
+      seedUnboundSessionTerminalPane(store)
+      landSessionRow(store, { surface: 'sidebar', sessionId: 's1', provider: 'claude', title: 'Session directory title' })
+      expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('Session directory title')
+      // The boot inventory frame carries the terminal's registry title; the
+      // pane has no terminalId yet, so the fold only caches it.
+      expect(foldTerminalInventoryTitles(store, [{ terminalId: 'term-1', title: 'Registry title' }])).toBe(0)
+      store.dispatch({
+        type: 'panes/applyReconcileAttach',
+        payload: { tabId: 'tab-z', paneId: 'pane-z', terminalId: 'term-1' },
+      })
+      // The binding action triggers BOTH middlewares: the mirror now skips
+      // the pane (it holds a terminalId) and the replay writes the cached
+      // registry title — the fold's write beats the earlier mirror write.
+      expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('Registry title')
+      expect(store.getState().panes.paneTitleSetByUser['tab-z']?.['pane-z']).toBeFalsy()
     })
   })
 })
