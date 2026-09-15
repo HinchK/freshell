@@ -14,7 +14,7 @@
 //!   supersession-chain reader rule end-to-end through the real ledger.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -772,8 +772,9 @@ use tracing::{Event, Subscriber};
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::Layer;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct CapturedEvent {
+    level: tracing::Level,
     message: String,
     /// The event's OWN fields only (all dead-session log fields are recorded
     /// on the event; no span merge needed).
@@ -820,104 +821,99 @@ where
             .lock()
             .expect("capture lock")
             .push(CapturedEvent {
+                level: *event.metadata().level(),
                 message: visitor.message,
                 fields: visitor.fields,
             });
     }
 }
 
-/// Thread-local capture. `#[tokio::test]` is a current-thread runtime, so the
-/// in-process server's reconcile task (tokio::spawn'd by the accept loop) is
-/// polled on THIS thread and observes the guard — the
-/// `diag01_lifecycle_events.rs` convention.
-///
-/// Deliberately NOT a global capture: several tests in this binary drive
-/// dead-session verdicts through their own in-process servers (e.g.
-/// `respawn_cap_turns_the_fourth_answer_into_dead_session`), so a
-/// process-global subscriber would leak their WARNs into any concurrently
-/// armed capture and break the exactly-one assertion below (verified by
-/// repro: a global install made the full binary fail fast on 2 hits where
-/// the thread-local design passes).
-fn log_capture() -> (
-    Arc<Mutex<Vec<CapturedEvent>>>,
-    tracing::subscriber::DefaultGuard,
-) {
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let layer = LogCapture {
-        events: Arc::clone(&events),
-    };
-    let subscriber = tracing_subscriber::registry().with(layer);
-    let guard = tracing::subscriber::set_default(subscriber);
-    (events, guard)
+/// Process-wide capture for this integration-test binary. Do not replace this
+/// with a scoped `set_default`: parallel scoped subscribers make tracing-core
+/// use its guarded TLS dispatch path, which can drop a re-entrant event before
+/// this layer sees it.
+fn log_capture() -> Arc<Mutex<Vec<CapturedEvent>>> {
+    static EVENTS: OnceLock<Arc<Mutex<Vec<CapturedEvent>>>> = OnceLock::new();
+
+    Arc::clone(EVENTS.get_or_init(|| {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let layer = LogCapture {
+            events: Arc::clone(&events),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("install pane-reconcile integration-test log capture");
+        events
+    }))
 }
 
 #[tokio::test]
 async fn dead_session_verdict_is_warn_logged_with_claimed_identity() {
-    let (events, _guard) = log_capture();
+    let events = log_capture();
+    let marker = uuid_like_suffix();
+    let pane_key = format!("deadpane-{marker}");
+    let session_id = format!("gone-{marker}");
     let probe = std::sync::Arc::new(StubProbe::default());
     // GoneObserved: ledger-observed before, Absent now.
-    probe
-        .answers
-        .lock()
-        .unwrap()
-        .insert(("codex".into(), "gone-1".into()), SessionExistence::Absent);
+    probe.answers.lock().unwrap().insert(
+        ("codex".into(), session_id.clone()),
+        SessionExistence::Absent,
+    );
     probe
         .observed
         .lock()
         .unwrap()
-        .insert(("codex".into(), "gone-1".into()));
+        .insert(("codex".into(), session_id.clone()));
     let server = spawn_server_with_probe(probe).await;
     let (mut ws, _ready) = connect(&server.url, true, true).await;
+    let capture_start = events.lock().expect("capture lock").len();
     let verdicts = reconcile_request(
         &mut ws,
         serde_json::json!([
-            { "paneKey": "deadpane", "kind": "fresh-agent",
-              "sessionRef": {"provider": "codex", "sessionId": "gone-1"} }
+            { "paneKey": pane_key, "kind": "fresh-agent",
+              "sessionRef": {"provider": "codex", "sessionId": session_id} }
         ]),
     )
     .await;
     assert_eq!(verdicts[0]["verdict"], "dead_session");
     assert_eq!(verdicts[0]["reason"], "session_not_on_disk");
 
-    // The WARN is emitted before the response frame is sent, but under CI
-    // contention the tracing layer's push can lag the client's read by a
-    // scheduling quantum. Bounded-poll the capture instead of asserting
-    // immediately so the test is resilient to that lag without masking a
-    // genuinely missing log (a 5s budget on a current-thread runtime).
-    // The poll waits only for the FIRST hit — never for an exact count — so a
-    // scheduling-starved wakeup cannot hang the loop into the timeout when the
-    // capture already holds the expected WARN; the exactly-one contract is
-    // asserted below with the full evidence printed (the 2026-09-14 evening
-    // gate flakes hit exactly this hang: the poll's `len() == 1` wait burned
-    // the whole 5s budget and the Elapsed masked the real capture state).
-    let hits = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let hits: Vec<CapturedEvent> = {
-                let events = events.lock().expect("capture lock");
-                events
-                    .iter()
-                    .filter(|e| e.message.contains("pane_reconcile.dead_session"))
-                    .cloned()
-                    .collect()
-            };
-            if !hits.is_empty() {
-                return hits;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("dead_session WARN was not captured within 5s");
+    // The WARN is emitted synchronously before the response frame. Limit the
+    // assertion to events after this request and to its unique identity so
+    // unrelated parallel tests cannot satisfy it.
+    let hits: Vec<CapturedEvent> = events
+        .lock()
+        .expect("capture lock")
+        .iter()
+        .skip(capture_start)
+        .filter(|event| {
+            event.message == "pane_reconcile.dead_session"
+                && event
+                    .fields
+                    .get("pane_key")
+                    .is_some_and(|value| value.contains(&pane_key))
+                && event
+                    .fields
+                    .get("provider")
+                    .is_some_and(|value| value.contains("codex"))
+                && event
+                    .fields
+                    .get("session_id")
+                    .is_some_and(|value| value.contains(&session_id))
+        })
+        .cloned()
+        .collect();
     assert_eq!(
         hits.len(),
         1,
         "exactly one dead_session WARN per dead verdict; got {hits:?}"
     );
+    assert_eq!(hits[0].level, tracing::Level::WARN);
     let fields = &hits[0].fields;
     assert!(
         fields
             .get("pane_key")
-            .is_some_and(|v| v.contains("deadpane")),
+            .is_some_and(|v| v.contains(&pane_key)),
         "pane_key recorded: {fields:?}"
     );
     assert!(
@@ -927,7 +923,7 @@ async fn dead_session_verdict_is_warn_logged_with_claimed_identity() {
     assert!(
         fields
             .get("session_id")
-            .is_some_and(|v| v.contains("gone-1")),
+            .is_some_and(|v| v.contains(&session_id)),
         "session_id recorded: {fields:?}"
     );
     assert!(
