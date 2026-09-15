@@ -18,6 +18,7 @@ const VALID_CLAUDE_SESSION_ID = '11111111-2222-4333-8444-555555555555'
 const WINDOW_ID = 'client-health-tests'
 const LAYOUT_STORAGE_KEY = `freshell.layout.v3.${WINDOW_ID}`
 const LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY = `freshell.layout.pre-migration-raw.v1.${WINDOW_ID}`
+const LAYOUT_FRESH_AGENT_BACKUP_STORAGE_KEY = `${LAYOUT_STORAGE_KEY}.backup-before-fresh-agent-centralization`
 
 function seedWindow(): void {
   sessionStorage.setItem('freshell.layout-window-id.v1', WINDOW_ID)
@@ -852,6 +853,59 @@ describe('classifyPersistedLayoutHealth in the real boot order (migration rewrit
     const envelope = healthyEnvelope('machine-1')
     envelope.persistedAt = 'recently'
     seedEnvelope(envelope)
+    const { classify } = await classifyAfterRealBoot()
+    expect(classify('machine-1')).toBe('corrupt')
+  })
+
+  // e5r1 (review of the delta r5 fix): the r5 real-boot lanes above seeded
+  // no backup, but readRecoverablePersistedLayoutRaw's fallback treated ANY
+  // parse failure — including the r5 metadata refusal — as a reason to
+  // select the surviving .backup-before-fresh-agent-centralization value.
+  // With a backup present, the migration rewrote the layout key with the
+  // OLDER BACKUP's content and mirrored the backup — not the malformed
+  // primary — as pre-migration evidence, so the classifier saw a healthy
+  // layout and silently rolled back newer tabs and panes instead of
+  // rebuilding.
+  function backupTabEnvelope(): Record<string, unknown> {
+    return {
+      persistedAt: NOW,
+      version: 4,
+      machineId: 'machine-1',
+      tabs: { activeTabId: 'tab-backup', tabs: [{ id: 'tab-backup', title: 'Backup', createdAt: NOW, updatedAt: NOW }] },
+      panes: {
+        layouts: { 'tab-backup': { type: 'leaf', id: 'pane-backup', content: { kind: 'editor', filePath: '/tmp/b.md', language: null, readOnly: false, content: '', viewMode: 'source', wordWrap: true } } },
+        activePane: { 'tab-backup': 'pane-backup' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    }
+  }
+
+  it('classifies corrupt when a metadata-malformed primary coexists with a surviving migration backup: no backup swap, the evidence preserves the malformed primary (e5r1)', async () => {
+    const malformedPrimary = healthyEnvelope('machine-1')
+    malformedPrimary.machineId = 123
+    const primaryRaw = JSON.stringify(malformedPrimary)
+    seedEnvelope(primaryRaw)
+    localStorage.setItem(LAYOUT_FRESH_AGENT_BACKUP_STORAGE_KEY, JSON.stringify(backupTabEnvelope()))
+
+    const { classify } = await classifyAfterRealBoot()
+
+    // No backup swap: the durable layout still holds the PRIMARY's tab —
+    // the migration delivered the malformed primary, not the older backup.
+    const durable = JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY)!) as { tabs: { tabs: Array<{ id: string }> } }
+    expect(durable.tabs.tabs.map((t) => t.id)).toEqual(['tab-a'])
+    // The evidence sidecar preserves the malformed PRIMARY so the
+    // metadata comparison below can still see the corrupt stamp.
+    expect(localStorage.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)).toBe(primaryRaw)
+    expect(classify('machine-1')).toBe('corrupt')
+  })
+
+  it('classifies corrupt when a malformed persistedAt coexists with a surviving migration backup (e5r1)', async () => {
+    const malformedPrimary = healthyEnvelope('machine-1')
+    malformedPrimary.persistedAt = 'recently'
+    seedEnvelope(malformedPrimary)
+    localStorage.setItem(LAYOUT_FRESH_AGENT_BACKUP_STORAGE_KEY, JSON.stringify(backupTabEnvelope()))
     const { classify } = await classifyAfterRealBoot()
     expect(classify('machine-1')).toBe('corrupt')
   })
