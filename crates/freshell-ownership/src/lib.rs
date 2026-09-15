@@ -2737,27 +2737,34 @@ impl RuntimeOwnershipRegistry {
         }
         match record.state.clone() {
             OwnershipState::Fenced {
-                reason: reason @ FenceReason::PlatformLimited,
+                reason:
+                    reason @ (FenceReason::PlatformLimited
+                    | FenceReason::StaleStart
+                    | FenceReason::StaleStop),
                 operation_id,
                 prior,
                 since_ms,
                 ..
             } => {
-                // b8ke e3r4 F2 (the DESIGN RECONCILIATION): the
-                // acknowledged operator force-clear is PLATFORM-LIMITED
-                // ONLY — the one fence reason whose unverification is a
-                // documented platform limitation (the direct child's
-                // awaited exit IS confirmed; only the descendant tree is
-                // unverifiable here). The STALE reasons mean the prior
-                // runtime may STILL BE LIVE — clearing them to Vacant
-                // and chaining a writer would weaken active-writer
-                // refusal; their recovery is the CONFIRMED-DEATH PROBE
-                // ONLY (the kind-aware lane confirmation), never an
-                // unconfirmed clear. The operator's acknowledged risk:
-                // the recorded runtime's DESCENDANT tree is UNVERIFIED on
-                // this platform — surviving processes are the operator's
-                // acknowledged
-                // risk — never a silent licensing.
+                // b8ke ext r25 F1(b): the acknowledged operator force-clear
+                // accepts the UNCONFIRMABLE fence reasons — PlatformLimited
+                // AND the stale reasons (StaleStart/StaleStop). Pre-r25 the
+                // stale reasons' recovery was the confirmed-death probe
+                // ONLY, but the probe relies on the provider's retained
+                // live-session/condemned-prior evidence — once those
+                // records are gone (cancellation, panic, watchdog recovery)
+                // the stale fence was PERMANENT (no automatic recovery, no
+                // operator escape). The active-writer refusal is NOT
+                // weakened: the clear lands the TYPED cleared-unverified
+                // state through the EXISTING r16-F4 pipeline — never plain
+                // Vacant — and a lifecycle start on the cleared key still
+                // requires the acknowledged-risk arm (the ONE atomic
+                // acknowledged start). The stale reasons' automatic
+                // recovery stays the confirmed-death probe (now with the
+                // r25 PID-level death confirmation for PID-bearing
+                // priors); this clear is the explicit operator escape —
+                // every typed fence has a working recovery or an escape,
+                // NONE is permanent.
                 let duration_ms = now_epoch_ms().saturating_sub(since_ms);
                 // b8ke ext r16 F4: the acknowledged clear lands in the
                 // TYPED cleared-unverified state — never plain Vacant
@@ -2782,8 +2789,8 @@ impl RuntimeOwnershipRegistry {
                 tracing::warn!(target: "freshell_ownership",
                     // b8ke ext r7 F4: the UNIFORM transition schema —
                     // the release creates no new runtime (to_kind
-                    // None-valued) and the not-applicable failure_reason is
-                    // the empty string.
+                    // None-valued) and the reason-typed acknowledgment is
+                    // the recorded failure_reason context.
                     event = "ownership.fenced.force_released_unconfirmable",
                     provider, session_id, initiator,
                     operation_id = %operation_id,
@@ -2794,9 +2801,9 @@ impl RuntimeOwnershipRegistry {
                     epoch = self.epoch, generation = record.generation, duration_ms,
                     fence_reason = ?reason,
                     outcome = "force_released_on_operator_action",
-                    failure_reason = "PLATFORM_LIMITED_ACKNOWLEDGED",
+                    failure_reason = "UNCONFIRMABLE_FENCE_ACKNOWLEDGED",
                     "an explicit acknowledged operator force-clear released an \
-                     UNCONFIRMABLE fence (PlatformLimited or PID-less StaleStart) into \
+                     UNCONFIRMABLE fence (PlatformLimited, StaleStart, or StaleStop) into \
                      the TYPED cleared-unverified state — the recorded runtime identity \
                      could not be confirmed dead, so a new lifecycle start still requires \
                      the acknowledged-risk arm; surviving processes are the operator's \
@@ -5281,6 +5288,11 @@ mod tests {
     /// TYPED (StaleStop) so the key can never strand blocking every
     /// claimant until restart; the fence is recoverable through the
     /// acknowledged force-clear (the same discipline as StaleStart).
+    /// b8ke ext r25 F1(b): the force-clear now genuinely ACCEPTS the
+    /// stale reasons (pre-r25 it was PlatformLimited-only, so a stale
+    /// fence whose provider evidence was gone was permanent) — the clear
+    /// lands the TYPED cleared-unverified state and the ONE atomic
+    /// acknowledged start consumes it.
     #[test]
     fn stale_stopping_records_fence_typed_and_recover_via_the_force_clear() {
         let r = RuntimeOwnershipRegistry::new();
@@ -5352,13 +5364,15 @@ mod tests {
                 ..
             }
         ));
-        // Still blocked (typed). b8ke e3r4 F2 (the DESIGN RECONCILIATION):
-        // the acknowledged force-clear REFUSES StaleStop — a stale-reason
-        // fence means the prior runtime may STILL BE LIVE; recovery is
-        // the CONFIRMED-DEATH PROBE ONLY (the kind-aware lane
-        // confirmation), never an unconfirmed clear.
+        // b8ke ext r25 F1(b): the acknowledged force-clear now ACCEPTS the
+        // stale fence reasons — landing the SAME typed cleared-unverified
+        // state as PlatformLimited (never plain Vacant; the start on the
+        // cleared key still requires the acknowledged-risk arm). The
+        // stale fence's automatic recovery is the confirmed-death probe
+        // (with the r25 PID arm); the acknowledged clear is the operator
+        // escape — NO typed fence may become permanent.
         let snap = r.observe(PROVIDER, "sid-stale-stop");
-        assert!(matches!(
+        assert_eq!(
             r.force_release_platform_limited(
                 PROVIDER,
                 "sid-stale-stop",
@@ -5368,11 +5382,66 @@ mod tests {
                 },
                 "operator",
             ),
-            ForceReleaseOutcome::NotPlatformLimited { .. }
-        ));
+            ForceReleaseOutcome::Released
+        );
+        assert!(
+            matches!(
+                r.observe(PROVIDER, "sid-stale-stop").state,
+                OwnershipState::Fenced {
+                    reason: FenceReason::ClearedUnverified,
+                    ..
+                }
+            ),
+            "the stale-reason force-clear lands the TYPED cleared-unverified \
+             state — never plain Vacant"
+        );
+        // A NAIVE start on the cleared-unverified key is BLOCKED typed —
+        // the acknowledged-risk arm is required (the existing r16-F4
+        // discipline, unchanged).
         assert!(matches!(
+            r.begin_start(
+                PROVIDER,
+                "sid-stale-stop",
+                RuntimeOwnerKind::Terminal,
+                "post-force-create-naive",
+                None,
+                "test",
+                8,
+            ),
+            BeginOutcome::Blocked { .. }
+        ));
+        // THE ACKNOWLEDGED START vacates the state to plain Vacant — the
+        // operator's explicit risk acceptance recorded at the START (the
+        // existing r16-F4 pipeline, unchanged).
+        let snap = r.observe(PROVIDER, "sid-stale-stop");
+        assert_eq!(
+            r.acknowledge_cleared_unverified(
+                PROVIDER,
+                "sid-stale-stop",
+                ObservedFence {
+                    epoch: snap.epoch,
+                    generation: snap.generation,
+                },
+                "op-ack-start",
+                "operator-start-again",
+            ),
+            ForceReleaseOutcome::Released
+        );
+        assert_eq!(
             r.observe(PROVIDER, "sid-stale-stop").state,
-            OwnershipState::Fenced { .. }
+            OwnershipState::Vacant
+        );
+        assert!(matches!(
+            r.begin_start(
+                PROVIDER,
+                "sid-stale-stop",
+                RuntimeOwnerKind::Terminal,
+                "post-ack-start",
+                None,
+                "test",
+                9,
+            ),
+            BeginOutcome::Granted { .. }
         ));
     }
 

@@ -663,15 +663,22 @@ impl SessionHandoffRunner {
                 // is the operator path, with the risk typed identically.
                 state:
                     freshell_ownership::OwnershipState::Fenced {
-                        // b8ke e3r4 F2 (the DESIGN RECONCILIATION):
-                        // the acknowledged force-clear is PLATFORM-LIMITED
-                        // ONLY. The STALE reasons mean the prior runtime
-                        // may STILL BE LIVE — clearing them to Vacant and
-                        // chaining a writer would weaken active-writer
-                        // refusal; their recovery is the CONFIRMED-DEATH
-                        // PROBE ONLY. Stale-reason fences enter the same
-                        // reason-typed refusal arm below — the
-                        // acknowledgment flag does NOT clear them.
+                        // b8ke ext r25 F1(b): the acknowledged force-clear
+                        // accepts ALL the unconfirmable fence reasons —
+                        // PlatformLimited AND the stale reasons
+                        // (StaleStart/StaleStop). Pre-r25 the stale
+                        // reasons were probe-only, and once the
+                        // provider's retained records were gone the
+                        // fence was PERMANENT — no typed fence may lack
+                        // a working automatic recovery or an operator
+                        // escape. The clear never lands plain Vacant
+                        // (the r16-F4 typed cleared-unverified state);
+                        // the subsequent start requires the
+                        // acknowledged-risk arm, so the active-writer
+                        // refusal holds. The probe keeps its OWN
+                        // confirmed-death discipline (with the r25
+                        // PID-level death confirmation); this is the
+                        // operator path, with the risk typed identically.
                         reason:
                             reason @ (freshell_ownership::FenceReason::PlatformLimited
                             | freshell_ownership::FenceReason::StaleStart
@@ -682,26 +689,24 @@ impl SessionHandoffRunner {
                 ..
             } => {
                 // The reason-aware typed refusal: an ordinary retry never
-                // clears an UNCONFIRMABLE fence. b8ke e3r4 F2: for the
-                // STALE reasons the acknowledgment flag does NOT clear
-                // either — their recovery is the CONFIRMED-DEATH PROBE
-                // ONLY (retry after the probe clears the fence); the
-                // acknowledged force-clear stays PlatformLimited-only
-                // (the documented platform limitation). The refusal code
-                // is REASON-TYPED so the client's recovery UI presents
-                // the truthful guidance.
+                // clears an UNCONFIRMABLE fence. b8ke ext r25 F1(b): for
+                // the STALE reasons the acknowledgment flag NOW clears —
+                // through the SAME typed pipeline as PlatformLimited (the
+                // clear lands Fenced{ClearedUnverified}, never plain
+                // Vacant, and the subsequent start requires the
+                // acknowledged-risk arm, so the active-writer refusal
+                // holds). Pre-r25 the stale reasons were probe-only, and
+                // once the provider's retained records were gone the
+                // fence was PERMANENT — no typed fence may lack either a
+                // working automatic recovery or an operator escape. The
+                // refusal code is REASON-TYPED so the client's recovery UI
+                // presents the truthful guidance.
                 let fence_code = match reason {
                     freshell_ownership::FenceReason::PlatformLimited => "PLATFORM_LIMITED_FENCED",
                     freshell_ownership::FenceReason::StaleStop => "STALE_STOP_FENCED",
                     _ => "STALE_START_FENCED",
                 };
-                if !req.acknowledge_platform_limited_risk
-                    || matches!(
-                        reason,
-                        freshell_ownership::FenceReason::StaleStart
-                            | freshell_ownership::FenceReason::StaleStop
-                    )
-                {
+                if !req.acknowledge_platform_limited_risk {
                     let generation = self
                         .ownership
                         .observe(&req.provider, &req.session_id)
@@ -727,15 +732,17 @@ impl SessionHandoffRunner {
                                 "the session is fenced pending recovery: a stop operation ended \
                                  without confirming the prior runtime's death. The server's \
                                  confirmed-death probe recovers the fence once the prior is \
-                                 confirmed gone — retry after the probe clears it (the \
-                                 acknowledgment flag cannot clear an unconfirmed stale fence).",
+                                 confirmed gone — or retry with the acknowledged force-clear \
+                                 (acknowledgePlatformLimitedRisk: true), accepting that surviving \
+                                 processes are the operator's acknowledged risk.",
                             _ =>
                                 "the session is fenced pending recovery: the prior runtime's \
                                  death could not be confirmed (a stale start left it \
                                  unconfirmable). The server's confirmed-death probe recovers the \
-                                 fence once the prior is confirmed gone — retry after the probe \
-                                 clears it (the acknowledgment flag cannot clear an unconfirmed \
-                                 stale fence).",
+                                 fence once the prior is confirmed gone — or retry with the \
+                                 acknowledged force-clear (acknowledgePlatformLimitedRisk: true), \
+                                 accepting that surviving processes are the operator's \
+                                 acknowledged risk.",
                         },
                         true,
                         generation,

@@ -1882,10 +1882,14 @@ async fn a_stale_stop_fence_recovers_through_the_handoff_runner() {
         OwnershipState::Fenced { .. }
     ));
 
-    // (b) b8ke e3r4 F2 (the DESIGN RECONCILIATION): the acknowledged
-    // flag does NOT clear a StaleStop fence — recovery is the
-    // CONFIRMED-DEATH PROBE ONLY; the fence HOLDS under the acknowledged
-    // request.
+    // (b) b8ke ext r25 F1(b): the acknowledged force-clear now ACCEPTS
+    // the stale reasons — the operator escape through the EXISTING
+    // r16-F4 cleared-unverified pipeline (pre-r25 the flag answered the
+    // same typed refusal and a stale fence whose provider evidence was
+    // gone was PERMANENT). The clear STOPS AT THE CLEAR: the typed clear
+    // answer, the key lands Fenced{ClearedUnverified} (never plain
+    // Vacant), no owner committed, no handoff started.
+    let _ = drain_runtime_owner_frames(&mut rig.rx);
     let snap = rig.ownership.observe("claude", &sid);
     let mut clear_req = handoff_req_terminal("claude", &sid, "claude");
     clear_req.acknowledge_platform_limited_risk = true;
@@ -1897,15 +1901,93 @@ async fn a_stale_stop_fence_recovers_through_the_handoff_runner() {
         .await
         .expect("the acknowledged request completed");
     assert_eq!(
-        cleared["error"]["code"],
-        json!("STALE_STOP_FENCED"),
-        "the acknowledged flag answers the SAME typed refusal (never a \
-         clear): {cleared}"
+        cleared["ok"],
+        json!(true),
+        "the acknowledged force-clear answers the typed clear: {cleared}"
     );
-    assert!(matches!(
-        rig.ownership.observe("claude", &sid).state,
-        OwnershipState::Fenced { .. }
-    ));
+    assert_eq!(
+        cleared["cleared"],
+        json!("stale-stop-fence"),
+        "the typed clear names the stale-stop fence: {cleared}"
+    );
+    assert!(
+        cleared.get("owner").is_none(),
+        "the typed clear is NOT a handoff success — no owner is committed"
+    );
+    assert!(
+        matches!(
+            rig.ownership.observe("claude", &sid).state,
+            OwnershipState::Fenced {
+                reason: FenceReason::ClearedUnverified,
+                ..
+            }
+        ),
+        "the clear lands the TYPED cleared-unverified state — never plain Vacant"
+    );
+    // The cleared state was broadcast with the reason-typed clear event.
+    let frames = await_owner_frames(&mut rig.rx, &["released"]).await;
+    let released = runtime_owner_frame(&frames, "released");
+    assert_eq!(
+        released["reason"],
+        json!("STALE_STOP_FORCE_CLEARED"),
+        "the clear broadcast names the typed stale-stop force-clear: {released}"
+    );
+
+    // (c) An UNACKNOWLEDGED retry on the cleared-unverified key answers
+    // the typed refusal — the start requires the acknowledged-risk arm.
+    let snap = rig.ownership.observe("claude", &sid);
+    let mut naive = handoff_req_terminal("claude", &sid, "claude");
+    naive.observed_epoch = Some(snap.epoch);
+    naive.observed_generation = Some(snap.generation);
+    let naive_handle = rig.runner.spawn_handoff(naive);
+    let naive_result = naive_handle
+        .completion
+        .await
+        .expect("naive retry completed");
+    assert_eq!(
+        naive_result["error"]["code"],
+        json!("CLEARED_UNVERIFIED_FENCED"),
+        "an unacknowledged start on the cleared-unverified key refuses typed: {naive_result}"
+    );
+    assert!(
+        matches!(
+            rig.ownership.observe("claude", &sid).state,
+            OwnershipState::Fenced {
+                reason: FenceReason::ClearedUnverified,
+                ..
+            }
+        ),
+        "the naive retry left the cleared-unverified state held"
+    );
+
+    // (d) THE ACKNOWLEDGED START: the retry carrying the flag enters
+    // Handoff atomically over the cleared-unverified state (the ONE
+    // atomic acknowledged start) and the handoff proceeds fresh (the
+    // no-prior sequence) — the terminal owner commits.
+    let _ = drain_runtime_owner_frames(&mut rig.rx);
+    let snap = rig.ownership.observe("claude", &sid);
+    let mut start_req = handoff_req_terminal("claude", &sid, "claude");
+    start_req.acknowledge_platform_limited_risk = true;
+    start_req.observed_epoch = Some(snap.epoch);
+    start_req.observed_generation = Some(snap.generation);
+    let start = rig.runner.spawn_handoff(start_req);
+    let started = start
+        .completion
+        .await
+        .expect("acknowledged start completed");
+    assert_eq!(
+        started["ok"],
+        json!(true),
+        "the acknowledged start proceeds over the cleared-unverified state: {started}"
+    );
+    assert!(
+        matches!(
+            rig.ownership.observe("claude", &sid).state,
+            OwnershipState::Live { owner, .. }
+                if owner.kind == RuntimeOwnerKind::Terminal
+        ),
+        "the acknowledged start committed the terminal owner"
+    );
 }
 
 /// b8ke e3r3 F4: the durable flavor derives from the session's kind
@@ -3209,12 +3291,19 @@ async fn the_handoff_commit_writes_the_durable_flavor_server_side() {
 /// matched PlatformLimited only — a StaleStart fence fell to generic
 /// HANDOFF_IN_PROGRESS even with the acknowledgment flag set, permanently
 /// wedging the documented recoverable state through the lifecycle API.
-/// The two-phase contract:
+/// The four-phase contract:
 ///   (a) an ordinary retry is the typed STALE_START_FENCED refusal and
 ///       the key STAYS fenced;
-///   (b) the acknowledged force-clear clears the key Vacant and answers
-///       the TYPED CLEAR (the probe keeps its own confirmed-death
-///       discipline; this is the operator path).
+///   (b) b8ke ext r25 F1(b): the acknowledged force-clear accepts the
+///       stale reasons — the TYPED CLEAR answer, the key lands
+///       Fenced{ClearedUnverified} (never plain Vacant), the clear
+///       STOPS AT THE CLEAR (no owner committed, no handoff started),
+///       and the cleared state is broadcast;
+///   (c) an UNACKNOWLEDGED retry on the cleared-unverified key refuses
+///       typed (the start requires the acknowledged-risk arm);
+///   (d) the acknowledged retry enters Handoff atomically over the
+///       cleared-unverified state (the ONE atomic acknowledged start)
+///       and the handoff proceeds fresh (the no-prior sequence).
 #[tokio::test]
 async fn a_stale_start_fence_recovers_through_the_acknowledged_force_clear() {
     let _guard = ENV_LOCK.lock().await;
@@ -3272,12 +3361,14 @@ async fn a_stale_start_fence_recovers_through_the_acknowledged_force_clear() {
         "the ordinary retry left the fence held"
     );
 
-    // (b) b8ke e3r4 F2 (the DESIGN RECONCILIATION): the acknowledged
-    // flag does NOT clear a stale-reason fence — the prior runtime may
-    // STILL BE LIVE, and clearing to Vacant + chaining a writer would
-    // weaken active-writer refusal. Recovery is the CONFIRMED-DEATH
-    // PROBE ONLY: the same reason-typed refusal answers regardless of the
-    // acknowledgment, and the fence HOLDS.
+    // (b) b8ke ext r25 F1(b): the acknowledged force-clear now ACCEPTS the
+    // stale reasons — the operator escape through the EXISTING r16-F4
+    // cleared-unverified pipeline (pre-r25 the flag answered the same
+    // typed refusal and a stale fence whose provider evidence was gone
+    // was PERMANENT). The clear STOPS AT THE CLEAR: the typed clear
+    // answer, the key lands Fenced{ClearedUnverified} (never plain
+    // Vacant), no owner committed, no handoff started.
+    let _ = drain_runtime_owner_frames(&mut rig.rx);
     let snap = rig.ownership.observe("claude", &sid);
     let mut clear_req = handoff_req_terminal("claude", &sid, "claude");
     clear_req.acknowledge_platform_limited_risk = true;
@@ -3289,18 +3380,92 @@ async fn a_stale_start_fence_recovers_through_the_acknowledged_force_clear() {
         .await
         .expect("the acknowledged request completed");
     assert_eq!(
-        cleared["error"]["code"],
-        json!("STALE_START_FENCED"),
-        "the acknowledged flag answers the SAME typed refusal (never a \
-         clear): {cleared}"
+        cleared["ok"],
+        json!(true),
+        "the acknowledged force-clear answers the typed clear: {cleared}"
+    );
+    assert_eq!(
+        cleared["cleared"],
+        json!("stale-start-fence"),
+        "the typed clear names the stale-start fence: {cleared}"
+    );
+    assert!(
+        cleared.get("owner").is_none(),
+        "the typed clear is NOT a handoff success — no owner is committed"
     );
     assert!(
         matches!(
             rig.ownership.observe("claude", &sid).state,
-            OwnershipState::Fenced { .. }
+            OwnershipState::Fenced {
+                reason: FenceReason::ClearedUnverified,
+                ..
+            }
         ),
-        "the stale-reason fence HOLDS under the acknowledged request — \
-         recovery is the confirmed-death probe only"
+        "the clear lands the TYPED cleared-unverified state — never plain Vacant"
+    );
+    // The cleared state was broadcast for cross-device convergence.
+    let frames = await_owner_frames(&mut rig.rx, &["released"]).await;
+    let released = runtime_owner_frame(&frames, "released");
+    assert_eq!(
+        released["reason"],
+        json!("STALE_START_FORCE_CLEARED"),
+        "the clear broadcast names the typed stale-start force-clear: {released}"
+    );
+
+    // (c) An UNACKNOWLEDGED retry on the cleared-unverified key answers
+    // the typed refusal — the start requires the acknowledged-risk arm.
+    let snap = rig.ownership.observe("claude", &sid);
+    let mut naive = handoff_req_terminal("claude", &sid, "claude");
+    naive.observed_epoch = Some(snap.epoch);
+    naive.observed_generation = Some(snap.generation);
+    let naive_handle = rig.runner.spawn_handoff(naive);
+    let naive_result = naive_handle
+        .completion
+        .await
+        .expect("naive retry completed");
+    assert_eq!(
+        naive_result["error"]["code"],
+        json!("CLEARED_UNVERIFIED_FENCED"),
+        "an unacknowledged start on the cleared-unverified key refuses typed: {naive_result}"
+    );
+    assert!(
+        matches!(
+            rig.ownership.observe("claude", &sid).state,
+            OwnershipState::Fenced {
+                reason: FenceReason::ClearedUnverified,
+                ..
+            }
+        ),
+        "the naive retry left the cleared-unverified state held"
+    );
+
+    // (d) THE ACKNOWLEDGED START: the retry carrying the flag enters
+    // Handoff atomically over the cleared-unverified state (the ONE
+    // atomic acknowledged start) and the handoff proceeds fresh (the
+    // no-prior sequence) — the terminal owner commits.
+    let _ = drain_runtime_owner_frames(&mut rig.rx);
+    let snap = rig.ownership.observe("claude", &sid);
+    let mut start_req = handoff_req_terminal("claude", &sid, "claude");
+    start_req.acknowledge_platform_limited_risk = true;
+    start_req.observed_epoch = Some(snap.epoch);
+    start_req.observed_generation = Some(snap.generation);
+    let start = rig.runner.spawn_handoff(start_req);
+    let started = start
+        .completion
+        .await
+        .expect("acknowledged start completed");
+    assert_eq!(
+        started["ok"],
+        json!(true),
+        "the acknowledged start proceeds over the cleared-unverified state: {started}"
+    );
+    assert!(
+        matches!(
+            rig.ownership.observe("claude", &sid).state,
+            OwnershipState::Live { owner, .. }
+                if owner.kind == RuntimeOwnerKind::Terminal
+        ),
+        "the acknowledged start committed the terminal owner"
     );
 }
 
