@@ -7309,13 +7309,19 @@ impl FreshClaudeState {
             })
             .await
         {
-            tracing::warn!(error = %e, session = %cli_id, "freshagent.claude.binding_write_failed");
-            self.emit_fresh_agent_error(
-                cli_id,
-                session_type,
-                "LEDGER_WRITE_FAILED",
-                "Failed to persist this session's resume record - settings may not survive a server restart.",
+            // b8ke ext r22 F2: the binding failure PROPAGATES — the
+            // freshly adopted runtime is torn down and the adoption is
+            // ABANDONED (the claim settles typed through the teardown's
+            // release), never a bare LEDGER_WRITE_FAILED notification
+            // under a committed Live that a restart cannot recover.
+            tracing::error!(target: "invariant",
+                error = %e, session = %cli_id,
+                "freshagent.claude.binding_write_failed_typed: the durable row write \
+                 failed — the freshly adopted runtime is torn down (kata b8ke ext r22 F2)"
             );
+            self.teardown_unadopted_session(session_id, session_type)
+                .await;
+            return SessionInitAdoptionOutcome::Abandoned;
         }
         SessionInitAdoptionOutcome::Published
     }

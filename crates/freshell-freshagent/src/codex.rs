@@ -1055,9 +1055,9 @@ impl FreshCodexState {
         // legacy-unfenced lanes (no commit under way).
         observed_epoch: Option<u64>,
         observed_generation: Option<u64>,
-    ) {
+    ) -> Result<(), std::io::Error> {
         let Some(sink) = self.identity_sink() else {
-            return;
+            return Ok(());
         };
         let settings = crate::identity_sink::FreshAgentSettings {
             model: if model.is_empty() {
@@ -1083,7 +1083,7 @@ impl FreshCodexState {
             && supersedes.is_none()
             && provenance.is_none()
         {
-            return;
+            return Ok(());
         }
         if let Err(e) = sink
             .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
@@ -1104,13 +1104,18 @@ impl FreshCodexState {
             })
             .await
         {
-            tracing::warn!(error = %e, session = %session_id, "freshagent.codex.ledger_write_failed");
-            self.emit_fresh_agent_error(
-                session_id,
-                "LEDGER_WRITE_FAILED",
-                "Failed to persist this session's resume record - settings may not survive a server restart.",
+            // b8ke ext r22 F2: a binding failure PROPAGATES — the caller takes
+            // its typed failure path (the create is torn down, the claim
+            // settles typed), never a bare LEDGER_WRITE_FAILED notification
+            // under a committed Live.
+            tracing::error!(target: "invariant",
+                error = %e, session = %session_id,
+                "freshagent.codex.binding_write_failed: the durable row write failed — \
+                 the failure propagates to the lane's typed teardown (kata b8ke r22 F2)"
             );
+            return Err(e);
         }
+        Ok(())
     }
 
     /// Broadcast a `freshAgent.error` alarm/degradation frame (Tasks 5/6 consume this
@@ -2248,21 +2253,52 @@ impl FreshCodexState {
         // AWAITED before the `freshAgent.created` reply below goes out
         // (durable-before-answer). Covers both the healthy create and the
         // `handle_create_resume` (R1) path -- both funnel through this shared tail.
-        self.record_codex_binding(
-            &thread_id,
-            Some(&request_id),
-            &model,
-            sandbox.as_deref(),
-            permission_mode.as_deref(),
-            effort.as_deref(),
-            cwd.as_deref(),
-            None,
-            provenance.as_ref(),
-            // b8ke ext r22 F2: the commit-time pair (the fence).
-            binding_epoch,
-            binding_generation,
-        )
-        .await;
+        // b8ke ext r22 F2: the binding failure PROPAGATES — the create is
+        // torn down and the claim settles typed (the watcher's confirmed
+        // death releases the record), never a bare LEDGER_WRITE_FAILED
+        // notification under a committed Live.
+        if let Err(e) = self
+            .record_codex_binding(
+                &thread_id,
+                Some(&request_id),
+                &model,
+                sandbox.as_deref(),
+                permission_mode.as_deref(),
+                effort.as_deref(),
+                cwd.as_deref(),
+                None,
+                provenance.as_ref(),
+                // b8ke ext r22 F2: the commit-time pair (the fence).
+                binding_epoch,
+                binding_generation,
+            )
+            .await
+        {
+            tracing::error!(target: "invariant",
+                provider = PROVIDER, session_id = %thread_id, request_id = %request_id,
+                error = %e,
+                "freshagent.codex.create_binding_failed: the durable binding row could \
+                 not be persisted — the registered session is torn down and the create \
+                 fails typed (kata b8ke ext r22 F2)"
+            );
+            if let Some(session) = self.sessions.lock().await.remove(&thread_id) {
+                session.consumer.abort();
+                session.client.close().await;
+                if let Some(kill_tx) = session.kill_tx {
+                    let _ = kill_tx.send(());
+                }
+                let _ = session.watcher.await;
+            }
+            if let Some(mut g) = lease_guard.take() {
+                g.fail();
+            }
+            self.fail_create(
+                &request_id,
+                "FRESH_AGENT_CREATE_FAILED",
+                "the session's resume record could not be persisted; torn down",
+            );
+            return;
+        }
 
         // DIAG-01: fresh-agent session lifecycle -- provider/session_id/cwd,
         // never the turn text/prompt content.
@@ -17569,10 +17605,12 @@ pub(crate) mod tests {
         );
     }
 
-    /// Task 4 (P1.13, awaited-writes policy): a failed ledger write is surfaced as a
-    /// live `freshAgent.error{code:'LEDGER_WRITE_FAILED'}` frame (never a silent
-    /// warn-and-drop) AND the create still succeeds -- a write failure never blocks
-    /// the identity event.
+    /// b8ke ext r22 F2 (the reshaped contract): a binding failure mid-create
+    /// PROPAGATES — the create answers the typed `freshAgent.create.failed`
+    /// and the registered session is torn down (never a bare
+    /// LEDGER_WRITE_FAILED notification with the create still succeeding
+    /// under a committed Live; pre-r22 the alarm frame rode beside a
+    /// successful created).
     #[tokio::test(flavor = "multi_thread")]
     async fn ledger_write_failure_is_surfaced_as_a_live_frame() {
         let _guard = ENV_LOCK.lock().await;
@@ -17607,47 +17645,60 @@ pub(crate) mod tests {
             )
             .await;
 
-        // Drain the bus (bounded, as in the alarm tests): both the alarm frame and
-        // the created frame must arrive -- in either order.
-        let mut failure_frame: Option<Value> = None;
+        // b8ke ext r22 F2: the create answers the TYPED failure and never
+        // a freshAgent.created (the session is torn down before the reply);
+        // no LEDGER_WRITE_FAILED frame rides beside it.
+        let mut failed_frame: Option<Value> = None;
         let mut created_frame: Option<Value> = None;
+        let mut alarm_frame: Option<Value> = None;
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
-                if frame["type"] == "freshAgent.event"
-                    && frame["event"]["code"] == "LEDGER_WRITE_FAILED"
+                if frame["type"] == "freshAgent.create.failed"
+                    && frame["requestId"] == "req-ledger-fail"
                 {
-                    failure_frame = Some(frame);
+                    failed_frame = Some(frame);
                 } else if frame["type"] == "freshAgent.created" {
                     created_frame = Some(frame);
+                } else if frame["type"] == "freshAgent.event"
+                    && frame["event"]["code"] == "LEDGER_WRITE_FAILED"
+                {
+                    alarm_frame = Some(frame);
                 }
-                if failure_frame.is_some() && created_frame.is_some() {
+                if failed_frame.is_some() {
                     return;
                 }
             }
         })
         .await
-        .expect("a LEDGER_WRITE_FAILED frame AND freshAgent.created arrive within the budget");
+        .expect("the typed create failure arrives within the budget");
 
-        let failure = failure_frame.expect("a LEDGER_WRITE_FAILED frame was broadcast");
-        assert_eq!(failure["sessionType"], "freshcodex");
-        assert_eq!(failure["provider"], "codex");
-        assert_eq!(failure["event"]["type"], "freshAgent.error");
-        assert!(
-            failure["event"]["message"]
-                .as_str()
-                .is_some_and(|m| !m.is_empty()),
-            "the alarm carries a user-facing message: {failure}"
+        let failed = failed_frame.expect("the create failed frame");
+        assert_eq!(
+            failed["code"], "FRESH_AGENT_CREATE_FAILED",
+            "the failure carries the create's typed code: {failed}"
         );
-
-        // The create still succeeded: the session exists under the created id.
-        let created = created_frame.expect("the create still succeeded");
-        let thread_id = created["sessionId"].as_str().unwrap().to_string();
-        let guard = state.sessions.lock().await;
         assert!(
-            guard.contains_key(&thread_id),
-            "a write failure never blocks the identity event"
+            failed["message"].as_str().is_some_and(|m| !m.is_empty()),
+            "the typed failure carries a user-facing message: {failed}"
         );
+        assert!(
+            created_frame.is_none(),
+            "a failed binding write never answers created: {created_frame:?}"
+        );
+        assert!(
+            alarm_frame.is_none(),
+            "the pre-r22 LEDGER_WRITE_FAILED notification is gone: {alarm_frame:?}"
+        );
+        // The registered session was torn down (no live session under any id).
+        {
+            let guard = state.sessions.lock().await;
+            assert!(
+                guard.is_empty(),
+                "the failed-create session is torn down: {:?}",
+                guard.keys().collect::<Vec<_>>()
+            );
+        }
     }
 
     /// FIX-2 (codex-first triage): crash recovery is resume-first now. The crashed

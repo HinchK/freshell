@@ -688,19 +688,28 @@ impl FreshOpencodeState {
     /// failure surfaces as a user-visible `LEDGER_WRITE_FAILED` `freshAgent.error`
     /// broadcast but NEVER blocks the caller's reply — the same failure policy at
     /// every call site.
-    async fn record_binding_row(&self, upsert: crate::identity_sink::FreshAgentBindingUpsert) {
+    /// b8ke ext r22 F2: the binding row write returns its typed outcome —
+    /// the CREATE/RESUME lanes propagate the failure (the runtime torn
+    /// down, the claim settling typed), never a bare LEDGER_WRITE_FAILED
+    /// notification under a committed Live; the maintenance lanes
+    /// (rollback/refresh) log-and-continue by discarding the Result.
+    async fn record_binding_row(
+        &self,
+        upsert: crate::identity_sink::FreshAgentBindingUpsert,
+    ) -> Result<(), std::io::Error> {
         let Some(sink) = self.identity_sink() else {
-            return;
+            return Ok(());
         };
         let session_id = upsert.session_id.clone();
         if let Err(e) = sink.record_binding(upsert).await {
-            tracing::warn!(error = %e, session = %session_id, "freshagent.opencode.binding_write_failed");
-            self.emit_fresh_agent_error(
-                &session_id,
-                "LEDGER_WRITE_FAILED",
-                "Failed to persist this session's resume record - settings may not survive a server restart.",
+            tracing::error!(target: "invariant",
+                error = %e, session = %session_id,
+                "freshagent.opencode.binding_write_failed: the durable row write failed — \
+                 the failure propagates to the lane's typed path (kata b8ke ext r22 F2)"
             );
+            return Err(e);
         }
+        Ok(())
     }
 
     /// Retire-on-kill round 2/3 (focused-ep5-r1 Finding 2, -r2 Finding 4),
@@ -5030,19 +5039,52 @@ impl FreshOpencodeState {
             } else {
                 crate::identity_sink::FreshAgentSettings::default()
             };
-            self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
-                provider: PROVIDER.into(),
-                session_id: session_id.to_string(),
-                mode: SESSION_TYPE.into(),
-                create_request_id: None,
-                resolves_pending: None,
-                supersedes: None,
-                provenance,
-                observed_epoch: binding_epoch,
-                observed_generation: binding_generation,
-                settings,
-            })
-            .await;
+            // b8ke ext r22 F2: the binding failure PROPAGATES — the
+            // rebuilt session is torn down and the resume answers the
+            // typed failure (the claim settles through the teardown),
+            // never a bare LEDGER_WRITE_FAILED notification under a
+            // committed Live.
+            if let Err(e) = self
+                .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                    provider: PROVIDER.into(),
+                    session_id: session_id.to_string(),
+                    mode: SESSION_TYPE.into(),
+                    create_request_id: None,
+                    resolves_pending: None,
+                    supersedes: None,
+                    provenance,
+                    observed_epoch: binding_epoch,
+                    observed_generation: binding_generation,
+                    settings,
+                })
+                .await
+            {
+                tracing::error!(target: "invariant",
+                    provider = PROVIDER, session_id = %session_id,
+                    error = %e,
+                    "freshagent.opencode.resume_binding_failed_typed: the durable row \
+                     write failed — the rebuilt session is torn down (kata b8ke ext r22 F2)"
+                );
+                let removed = {
+                    let mut guard = self.sessions.lock().await;
+                    guard.remove(session_id)
+                };
+                if let Some(removed) = removed {
+                    let mut s = removed.lock().await;
+                    s.killed.store(true, Ordering::SeqCst);
+                    if let Some(task) = s.turn_task.take() {
+                        task.abort_and_settle().await;
+                    }
+                    if let Some(bridge) = s.serve_bridge.take() {
+                        bridge.abort();
+                    }
+                }
+                return Err(ResumeOpencodeError::Manager(
+                    freshell_opencode::ServeError::Transport(format!(
+                        "opencode session {session_id} resume record could not be persisted; torn down"
+                    )),
+                ));
+            }
         }
 
         Ok(session_arc)

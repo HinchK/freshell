@@ -4202,20 +4202,24 @@ async fn send_keys(
                 })
                 .await
             {
-                tracing::warn!(error = %e, session = %durable_id, "freshagent.opencode.rest_binding_write_failed");
-                // Same LEDGER_WRITE_FAILED frame shape the WS sites emit (top-level
-                // sessionType/provider + user-facing message), via state.broadcast.
-                state.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
-                    event: json!({
-                        "type": "freshAgent.error",
-                        "sessionId": durable_id,
-                        "code": "LEDGER_WRITE_FAILED",
-                        "message": "Failed to persist this session's resume record - settings may not survive a server restart.",
-                    }),
-                    provider: PROVIDER.to_string(),
-                    session_id: durable_id.clone(),
-                    session_type: SESSION_TYPE.to_string(),
-                }));
+                // b8ke ext r22 F2: the binding failure PROPAGATES — the
+                // materialization REFUSES typed here (the pane is NOT
+                // bound; the ticket's RAII drop settles the pane-scoped
+                // claim typed), never a LEDGER_WRITE_FAILED notification
+                // with the session still materializing and the ownership
+                // committing Live.
+                tracing::error!(target: "invariant",
+                    error = %e, session_id = %durable_id,
+                    "freshagent.opencode.rest_binding_write_failed_typed: the durable \
+                     row write failed — the materialization is refused (kata b8ke \
+                     ext r22 F2)"
+                );
+                return fail_json(
+                    StatusCode::CONFLICT,
+                    "SESSION_RESERVED: the session's resume record could not be persisted; \
+                     the pane is not materialized"
+                        .to_string(),
+                );
             }
         }
 
