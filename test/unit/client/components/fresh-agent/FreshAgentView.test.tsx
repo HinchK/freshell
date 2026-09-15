@@ -1,7 +1,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, waitFor, fireEvent, createEvent, cleanup, act, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
-import { configureStore } from '@reduxjs/toolkit'
+import { configureStore, type Middleware } from '@reduxjs/toolkit'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { previewServerSettingsPatch, updateSettingsLocal } from '@/store/settingsSlice'
 import sessionsReducer, { applySessionsPatch, applyContextUsageExtras } from '@/store/sessionsSlice'
@@ -89,7 +89,7 @@ vi.mock('@/store/settingsThunks', () => ({
   saveServerSettingsPatch: (patch: unknown) => saveServerSettingsPatchSpy(patch),
 }))
 
-function createStore(tabTitleSetByUser = false) {
+function createStore(tabTitleSetByUser = false, extraMiddleware: Middleware[] = []) {
   return configureStore({
     reducer: {
       panes: panesReducer,
@@ -110,7 +110,7 @@ function createStore(tabTitleSetByUser = false) {
         serializableCheck: {
           ignoredPaths: ['sessions.expandedProjects'],
         },
-      }),
+      }).concat(extraMiddleware),
     preloadedState: {
       connection: {
         status: 'ready' as const,
@@ -9206,5 +9206,79 @@ describe('diff panel view wiring (ekc6)', () => {
     fireEvent.click(trigger)
     await waitFor(() => expect(trigger).toHaveAttribute('aria-expanded', 'true'))
     expect(screen.queryByText('Diff unavailable for this file.')).toBeNull()
+  })
+})
+
+describe('task delegation open-session link (freshopencode tui parity)', () => {
+  // Renders a freshopencode pane whose snapshot carries the given turns,
+  // following the file's direct-render harness (mocked snapshot fetch +
+  // FreshAgentView with a concrete paneContent). The store records every
+  // dispatched action via an injected middleware — a store.dispatch property
+  // spy CANNOT observe a createAsyncThunk's pending/fulfilled frames because
+  // the thunk middleware dispatches them through the composed closure captured
+  // at store creation, never through the property.
+  function renderFreshOpencodeViewWithSnapshot(options: {
+    sessionId: string
+    turns: Array<Record<string, unknown>>
+  }) {
+    const actions: Array<{ type?: string; meta?: { arg?: Record<string, unknown> } }> = []
+    const recordActions: Middleware = () => (next) => (action) => {
+      actions.push(action as { type?: string; meta?: { arg?: Record<string, unknown> } })
+      return next(action)
+    }
+    const store = createStore(false, [recordActions])
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      status: 'idle',
+      summary: 'OpenCode summary',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: options.turns,
+    })
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshopencode',
+            provider: 'opencode',
+            createRequestId: 'req-delegation-open',
+            sessionId: options.sessionId,
+            initialCwd: '/repo/parent',
+            status: 'idle',
+          }}
+        />
+      </Provider>,
+    )
+    return { store, actions }
+  }
+
+  it('dispatches openSessionTab with the child session when the delegation Open session button is clicked', async () => {
+    const { actions } = renderFreshOpencodeViewWithSnapshot({
+      sessionId: 'ses_parent',
+      turns: [{
+        id: 't1', turnId: 't1', role: 'assistant', summary: '',
+        items: [{
+          id: 'task1', kind: 'task_delegation', status: 'completed',
+          title: 'General Task — Fix the flaky harness', description: 'Fix the flaky harness',
+          childSessionId: 'ses_child_1',
+        }],
+      }],
+    })
+    // The delegation block (and its Open session button) render only inside
+    // the EXPANDED activity strip — expand FIRST (plan-review round 2,
+    // Finding 14), like the transcript tests do.
+    fireEvent.click(await screen.findByRole('button', { name: 'Toggle activity details' }))
+    fireEvent.click(screen.getByRole('button', { name: /open session/i }))
+    const pending = actions.find((action) => action.type === 'tabs/openSessionTab/pending')
+    expect(pending).toBeDefined()
+    expect(pending?.meta?.arg).toMatchObject({
+      sessionId: 'ses_child_1',
+      title: 'Fix the flaky harness',
+      cwd: '/repo/parent',
+      provider: 'opencode',
+      sessionType: 'freshopencode',
+      isSubagent: true,
+    })
   })
 })
