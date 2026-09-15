@@ -1,4 +1,5 @@
 import { getRecoveryInventory } from '@/lib/api'
+import { createLogger } from '@/lib/client-logger'
 import {
   getMachineWorkspaceOriginId,
   persistMachineWorkspaceOriginId,
@@ -13,6 +14,8 @@ import { clearTabsForMachine, addTab, setActiveTab } from '@/store/tabsSlice'
 import { clearPanesForMachine, restoreLayout, setPaneCrashTrace } from '@/store/panesSlice'
 import type { CrashTrace, PaneNode } from '@/store/paneTypes'
 import type { RootState } from '@/store/store'
+
+const log = createLogger('machine-workspace')
 
 type MachineWorkspaceStore = {
   dispatch: (action: any) => unknown
@@ -102,16 +105,11 @@ function assertInventoryIsScopedToMachine(inventory: RecoveryInventory, machineI
   }
 }
 
+export type RestoreMachineWorkspaceReason = 'absent' | 'corrupt' | 'foreign' | 'stale'
+
 export type RestoreMachineWorkspaceOptions = {
-  /**
-   * True when the machine was ACTIVELY chosen this boot (the chooser pick's
-   * one-shot sessionStorage marker). An active choice may be adopting a
-   * different machine over a foreign local cache, so a NON-recoverable
-   * inventory still clears local state (the chosen machine's empty truth
-   * wins). Absent/false — the remembered-selection reload path — keeps the
-   * rehydrated local layout when nothing foreign is recoverable.
-   */
-  activeSelection?: boolean
+  /** Why this boot is rebuilding instead of keeping the local layout. */
+  reason?: RestoreMachineWorkspaceReason
 }
 
 /**
@@ -119,18 +117,35 @@ export type RestoreMachineWorkspaceOptions = {
  * tabs.sync are allowed to start. The server must honor the additive
  * `machineId` inventory scope; checking the returned device id again keeps a
  * stale server from restoring an arbitrary other machine into a fresh client.
+ *
+ * Reconciliation note (Choice B merge of #774/#699): the App boot gate owns
+ * the keep-vs-rebuild decision — classifyPersistedLayoutHealth keeps a
+ * healthy local layout and calls this ONLY for an absent/corrupt/foreign/
+ * stale one. #774's activeSelection option (the clear-if-non-recoverable
+ * gate that used to live here) is therefore superseded: its keep-on-natural-
+ * reload intent is subsumed by the gate's healthy-keep, and its
+ * clear-on-active-choice intent moved into the classifier (the chooser's
+ * one-shot active-selection marker makes an otherwise-healthy UNSTAMPED
+ * envelope classify foreign — a stamped same-machine layout still keeps).
+ * Because the gate has already decided to rebuild, the local clear below is
+ * unconditional.
  */
 export async function restoreMachineWorkspace(
   store: MachineWorkspaceStore,
   machineId: string,
   options: RestoreMachineWorkspaceOptions = {},
 ): Promise<{ restoredTabs: number }> {
+  log.info('rebuilding machine workspace from server inventory', {
+    reason: options.reason,
+    machineId,
+  })
   // The recovery endpoint treats clientInstanceId as an opaque exclusion key.
   // The general recovery offer passes the real id so it cannot offer the page
-  // its own already-loaded state. Machine bootstrap is different: local state
-  // is about to be replaced, and a reload keeps the same sessionStorage id.
-  // A reserved, non-client prefix therefore includes that window's last
-  // durable snapshot without changing the normal recovery-offer contract.
+  // its own already-loaded state. Machine bootstrap is different: a rebuild
+  // WANTS the window's own last durable snapshot included, and a reload keeps
+  // the same sessionStorage id. A reserved, non-client prefix therefore
+  // includes that window's last snapshot without changing the normal
+  // recovery-offer contract.
   const bootstrapExclusionId =
     `${MACHINE_BOOTSTRAP_RECOVERY_EXCLUSION_PREFIX}${getCurrentTabRegistryClientInstanceId()}`
   const inventory = await getRecoveryInventory(
@@ -155,24 +170,17 @@ export async function restoreMachineWorkspace(
     : []
   const recoveredTabIds = new Set(plans.map((plan) => plan.tabId))
 
-  // bb58dc001 follow-up (reload-safety): the recovery inventory EXCLUDES the
-  // requester's own generations by design (D2 — a live client owns its own
-  // data). When nothing foreign is recoverable and this boot did NOT
-  // actively choose the machine (a natural reload of a remembered
-  // selection), the rehydrated local layout IS this machine's newest truth —
-  // keep it. Destroying it here blanked the workspace on every same-tab
-  // reload, and the destructive persist bypass then wiped the localStorage
-  // cache too. An active choice keeps the clear: a freshly chosen machine
-  // with no durable workspace must still clear a foreign machine's stale
-  // cache. A RECOVERABLE inventory always replaces (the machine's newest
-  // cross-client truth wins on every path).
-  if (inventory.recoverable || options.activeSelection === true) {
-    // These are local cache actions, not tab/pane closes. Sync is still gated,
-    // so no blank or mixed-machine snapshot can reach the server mid-replace.
-    store.dispatch(clearTabsForMachine())
-    store.dispatch(clearPanesForMachine())
-    store.dispatch(clearTabRegistryLocalClosed())
-  }
+  // The gate decided to rebuild (see the reconciliation note above), so the
+  // local layout is absent, corrupt, foreign, or stale — clear it and replace
+  // with the machine's durable truth. A non-recoverable inventory means the
+  // chosen machine has NO durable workspace, so the clear yields the chosen
+  // machine's empty truth (this is also the actively-chosen-machine lane from
+  // #774: the gate classifies a possibly-foreign local cache as foreign).
+  // These are local cache actions, not tab/pane closes. Sync is still gated,
+  // so no blank or mixed-machine snapshot can reach the server mid-replace.
+  store.dispatch(clearTabsForMachine())
+  store.dispatch(clearPanesForMachine())
+  store.dispatch(clearTabRegistryLocalClosed())
 
   for (const plan of plans) {
     store.dispatch(addTab({ id: plan.tabId, title: plan.title }))

@@ -121,6 +121,14 @@ export interface CodingCliSession {
   titleOverridden?: boolean
   providerTitle?: string
   titleOverrideSource?: TitleSource
+  /**
+   * Client-side only monotonic fetch stamp set by the sessions commit
+   * reducer (sessionsSlice commitWindowPayload): rows freshly fetched in a
+   * commit get the next counter value; rows RETAINED from an earlier fetch
+   * keep their old stamps. Never sent to the server, never persisted —
+   * the session-title mirror keys row freshness on it.
+   */
+  fetchSeq?: number
 }
 
 export interface ProjectGroup {

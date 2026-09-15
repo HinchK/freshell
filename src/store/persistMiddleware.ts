@@ -1,21 +1,28 @@
 import type { Middleware } from '@reduxjs/toolkit'
 import type { TabsState } from './tabsSlice'
 import type { PanesState } from './paneTypes'
+import type { MachineIdentityState } from './machineIdentitySlice.js'
 import type { Tab } from './types'
 import { nanoid } from 'nanoid'
 import { broadcastPersistedRaw } from './persistBroadcast'
 import { isWellFormedPaneTree } from './paneTreeValidation.js'
 import {
-  LAYOUT_FRESH_AGENT_BACKUP_KEY,
-  LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY,
-  LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY,
   PANES_SCHEMA_VERSION,
   LAYOUT_SCHEMA_VERSION,
   parsePersistedLayoutRaw,
   readRecoverablePersistedLayoutRaw,
 } from './persistedState.js'
-import { LAYOUT_BACKUP_STORAGE_KEY, LAYOUT_STORAGE_KEY, PANES_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY, TURN_COMPLETION_STORAGE_KEY } from './storage-keys'
+import { PANES_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY, TURN_COMPLETION_STORAGE_KEY } from './storage-keys'
+import {
+  getWindowFreshAgentBackupKey,
+  getWindowFreshAgentCommitMarkerKey,
+  getWindowFreshAgentPendingMarkerKey,
+  getWindowLayoutBackupKey,
+  getWindowLayoutKey,
+} from './window-layout-keys'
 import { createLogger } from '@/lib/client-logger'
+import { getSelectedMachineId } from '@/lib/machine-identity'
+import { consumeArmedPreMigrationEvidenceClear } from '@/lib/recovery/layout-health'
 import { flushPersistedLayoutNow } from './persistControl'
 import { sanitizeSessionRef } from '@shared/session-contract'
 import { normalizeFreshAgentEffortOverride, normalizeFreshAgentPaneModelSelection } from './paneTypes'
@@ -94,6 +101,18 @@ import { migrateV2ToV3 } from './persistedState.js'
 
 let cachedPersistedLayout: { tabs: any; panes: any; tombstones: any; persistedAt?: number } | null | undefined
 
+// Delta round 3, finding 2 (belt-and-braces): the raw this window's module-
+// init loaders actually READ (null when nothing was loadable), captured so
+// installCrossTabSync can detect an envelope replacement between
+// module-load and sync install and hydrate it instead of silently marking
+// it processed. `undefined` = the loaders have not run in this module
+// instance yet.
+let bootLoadedLayoutRaw: string | null | undefined
+
+export function getBootLoadedLayoutRaw(): string | null | undefined {
+  return bootLoadedLayoutRaw
+}
+
 // --- Destructive empty-tabs write guard ---
 //
 // If the persisted layout exists on disk but could not be turned into a
@@ -132,8 +151,10 @@ export function loadPersistedLayout(): typeof cachedPersistedLayout {
   let rawExisted = false
 
   try {
+    bootLoadedLayoutRaw = null
     const raw = readRecoverablePersistedLayoutRaw(localStorage)
     rawExisted = !!raw
+    bootLoadedLayoutRaw = raw
     if (raw) {
       const layoutParsed = parsePersistedLayoutRaw(raw)
       if (layoutParsed) {
@@ -155,6 +176,13 @@ export function loadPersistedLayout(): typeof cachedPersistedLayout {
         panes: migrated.panes,
         tombstones: migrated.tombstones,
       }
+      // The v2→v3 write targeted this window's own key; capture what the
+      // next boot would find there as the load baseline.
+      try {
+        bootLoadedLayoutRaw = localStorage.getItem(getWindowLayoutKey())
+      } catch {
+        // keep the null baseline — a failed read means no comparison
+      }
       return cachedPersistedLayout
     }
   } catch {
@@ -174,6 +202,7 @@ export function loadPersistedLayout(): typeof cachedPersistedLayout {
 
 export function resetPersistedLayoutCacheForTests() {
   cachedPersistedLayout = undefined
+  bootLoadedLayoutRaw = undefined
 }
 
 export function loadPersistedTabs(): any | null {
@@ -498,6 +527,20 @@ type PersistState = {
   panes?: PanesState
   tabRecency?: TabRecencyState
   turnCompletion?: TurnCompletionState
+  machineIdentity?: MachineIdentityState
+}
+
+/** Machine id for the persisted-layout stamp: the resolved machine when
+ * known, else the remembered selection (the same localStorage key the
+ * chooser writes), else undefined (envelope stays unstamped). */
+function selectStampMachineId(state: PersistState): string | undefined {
+  const known = state.machineIdentity?.selectedMachine?.id
+  if (typeof known === 'string' && known) return known
+  try {
+    return getSelectedMachineId() ?? undefined
+  } catch {
+    return undefined
+  }
 }
 
 export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
@@ -545,7 +588,7 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
         const nextTabs = state.tabs?.tabs ?? []
 
         if (nextTabs.length === 0) {
-          const existingRaw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+          const existingRaw = localStorage.getItem(getWindowLayoutKey())
           const existingParsed = existingRaw ? parsePersistedLayoutRaw(existingRaw) : null
           // If existingRaw exists but fails to parse, we can't prove it's
           // safe to overwrite -- conservatively treat it as worth
@@ -559,11 +602,11 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
             // overwrite -- whether or not the write below proceeds. This
             // is the last line of defense: if some future bug slips past
             // the guard (or the guard's premise is ever wrong), the prior
-            // non-empty layout is still recoverable from
-            // LAYOUT_BACKUP_STORAGE_KEY.
+            // non-empty layout is still recoverable from this window's
+            // per-window backup key (freshell.layout.v3.<id>.bak).
             if (existingRaw) {
               try {
-                localStorage.setItem(LAYOUT_BACKUP_STORAGE_KEY, existingRaw)
+                localStorage.setItem(getWindowLayoutBackupKey(), existingRaw)
               } catch (backupErr) {
                 log.error('Failed to write layout backup before empty-tabs write', backupErr)
               }
@@ -573,7 +616,7 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
               log.error(
                 'Refusing to persist empty tabs over a non-empty persisted layout: no genuine ' +
                 'user close action was observed for this write. Leaving the existing layout ' +
-                'untouched (backed up to LAYOUT_BACKUP_STORAGE_KEY).',
+                'untouched (backed up to the per-window layout backup key).',
                 {
                   reason: 'empty_tabs_write_refused',
                   wasLoadRecovery: wasTabsLoadRecovery(),
@@ -630,6 +673,7 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
         const layoutPayload = {
           persistedAt: Date.now(),
           version: LAYOUT_SCHEMA_VERSION,
+          machineId: selectStampMachineId(state),
           tabs: {
             activeTabId: state.tabs?.activeTabId ?? null,
             tabs: (state.tabs?.tabs ?? []).map(stripTabVolatileFields),
@@ -639,11 +683,18 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
         }
 
         const raw = JSON.stringify(layoutPayload)
-        localStorage.setItem(LAYOUT_STORAGE_KEY, raw)
-        localStorage.removeItem(LAYOUT_FRESH_AGENT_BACKUP_KEY)
-        localStorage.removeItem(LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY)
-        localStorage.removeItem(LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY)
-        broadcastPersistedRaw(LAYOUT_STORAGE_KEY, raw)
+        localStorage.setItem(getWindowLayoutKey(), raw)
+        localStorage.removeItem(getWindowFreshAgentBackupKey())
+        localStorage.removeItem(getWindowFreshAgentCommitMarkerKey())
+        localStorage.removeItem(getWindowFreshAgentPendingMarkerKey())
+        broadcastPersistedRaw(getWindowLayoutKey(), raw)
+        // Durable boundary (e2r5 review finding 1): an armed post-rebuild
+        // pre-migration evidence clear is consumed ONLY here — after the
+        // rebuilt envelope is durably written. A reload before this line
+        // (debounce never fired) or a throwing setItem (caught below, which
+        // skips this line and keeps the arm) leaves the evidence intact, so
+        // the next boot still classifies corrupt and rebuilds again.
+        consumeArmedPreMigrationEvidenceClear()
       }
 
       if (tabRecencyDirty) {

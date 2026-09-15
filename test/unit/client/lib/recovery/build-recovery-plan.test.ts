@@ -739,3 +739,43 @@ describe('buildRecoveryPlan', () => {
     expect(countRecoverablePanes(inventory)).toBe(produced)
   })
 })
+
+describe('buildRecoveryPlan preserveIdsForMachine', () => {
+  const inventoryWithTabs = (
+    machineId: string,
+    tabs: Array<{ tabKey: string; tabName: string; panes: unknown[] }>,
+  ): RecoveryInventory =>
+    ({
+      recoverable: true, contentId: 'cid',
+      device: { deviceId: machineId, deviceLabel: 'l', capturedAt: 1, tabs },
+      otherDevices: [], ledgerOnly: [],
+    }) as RecoveryInventory
+
+  const collectLeafPaneIds = (node: unknown): string[] => leavesOf(node).map((l) => l.id)
+
+  const ownInv = inventoryWithTabs('machine-1', [{
+    tabKey: 'machine-1:tab-keep', tabName: 'Keep',
+    panes: [pane({ paneId: 'pane-keep' })],
+  }])
+
+  it('preserveIdsForMachine keeps the inventory’s tab ids and pane ids', () => {
+    const [plan] = buildRecoveryPlan(ownInv, { preserveIdsForMachine: 'machine-1' })
+    expect(plan.tabId).toBe('tab-keep')
+    expect(collectLeafPaneIds(plan.layout)).toEqual(['pane-keep'])
+  })
+
+  it('preserveIdsForMachine throws loudly on a foreign tab key', () => {
+    const foreign = inventoryWithTabs('machine-1', [{
+      tabKey: 'machine-OTHER:tab-x', tabName: 'X',
+      panes: [pane({ paneId: 'pane-x' })],
+    }])
+    expect(() => buildRecoveryPlan(foreign, { preserveIdsForMachine: 'machine-1' }))
+      .toThrow(/does not belong to machine/)
+  })
+
+  it('without options, ids are still re-minted (recovery-offer contract unchanged)', () => {
+    const [plan] = buildRecoveryPlan(ownInv)
+    expect(plan.tabId).not.toBe('tab-keep')
+    expect(collectLeafPaneIds(plan.layout)).not.toContain('pane-keep')
+  })
+})

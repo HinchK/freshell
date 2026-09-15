@@ -75,6 +75,7 @@ import {
   resolveMachineIdentity,
 } from '@/lib/machine-identity'
 import { restoreMachineWorkspace } from '@/lib/machine-workspace'
+import { armPreMigrationEvidenceClear, backfillPersistedLayoutMachineId, classifyPersistedLayoutHealth, clearPreMigrationLayoutEvidence } from '@/lib/recovery/layout-health'
 import { buildLocalSettingsPatch } from '@/store/browserPreferencesPersistence'
 import Sidebar, { AppView } from '@/components/Sidebar'
 import TabBar from '@/components/TabBar'
@@ -102,6 +103,7 @@ import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from 
 import { clearAllReconcilePendingPanes, clearDeadSessionAdjudication, clearDeadTerminals, clearReconcileWarming, clearTerminalLiveHandles, setReconcilePendingPanes } from '@/store/panesSlice'
 import { addTerminalFreshRecoveryRequestId, addTerminalRestoreRequestId, setPaneReconcileActive } from '@/lib/terminal-restore'
 import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
+import { foldTerminalInventoryTitles } from '@/lib/terminal-inventory-titles'
 import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, resetCodexActivity } from '@/store/codexActivitySlice'
 import { setClaudeActivitySnapshot, upsertClaudeActivity, removeClaudeActivity, resetClaudeActivity } from '@/store/claudeActivitySlice'
 import { setAmplifierActivitySnapshot, upsertAmplifierActivity, removeAmplifierActivity, resetAmplifierActivity } from '@/store/amplifierActivitySlice'
@@ -836,18 +838,56 @@ export default function App() {
             deviceId: resolution.machine.id,
             deviceLabel: resolution.machine.label,
           }))
-          // The chooser's one-shot marker: an ACTIVE machine choice keeps the
-          // non-recoverable clear (foreign cache); a natural reload of a
-          // remembered selection keeps the rehydrated layout. PEEK before the
-          // (async) inventory request and CONSUME only after a successful
-          // restore — a failure, cancellation, or in-flight manual reload
-          // leaves the marker armed, so the retry always knows the machine
-          // was actively chosen and never keeps a foreign machine's stale
-          // local cache over the user's choice.
+          // The chooser's one-shot active-selection marker (#774, merged into
+          // the Choice B gate): PEEK before the (async) inventory request and
+          // CONSUME only after the boot's adjudication completes — a restore
+          // failure, cancellation, or in-flight manual reload leaves the
+          // marker armed, so the retry always knows the machine was actively
+          // chosen. The peeked marker feeds the classifier: an armed marker
+          // makes an otherwise-healthy UNSTAMPED legacy envelope classify
+          // foreign (the one case the machine-id stamp cannot prove), while
+          // a STAMPED same-machine healthy layout still keeps — Choice B
+          // window sovereignty wins over #774's clear-on-active-choice.
           const activeSelection = peekActiveMachineSelectionMark()
-          await restoreMachineWorkspace(appStore, resolution.machine.id, { activeSelection })
+          // Local-first (Choice B): a healthy local layout IS this window's newest
+          // truth — keep it and skip the inventory entirely. Only an absent,
+          // corrupt, stale, or foreign layout rebuilds from the server.
+          const layoutHealth = classifyPersistedLayoutHealth(resolution.machine.id, { activeSelection })
+          // Stamp backfill — classify FIRST, then backfill (AFTER the health gate
+          // reads the envelope). Unstamped is a one-boot transitional state: this
+          // is the only deterministic restamp for a terminal-free healthy layout.
+          // One call site covers both resolution paths — the bootstrap success
+          // path AND a chooser selection (a pick persists the selection and
+          // reloads; the next boot's resolution lands here). Safe on every
+          // classification outcome: absent/corrupt envelopes no-op inside the
+          // helper, and a rebuilt envelope is restamped by its own flush.
+          backfillPersistedLayoutMachineId(resolution.machine.id)
+          if (layoutHealth !== 'healthy') {
+            await restoreMachineWorkspace(appStore, resolution.machine.id, { reason: layoutHealth })
+            if (cancelled) return false
+            // e2r5 review finding 1: a completed rebuild ARMS the evidence
+            // clear — the sidecar is never deleted at the Redux boundary.
+            // The rebuild's own dispatches schedule the debounced persist
+            // flush; when it lands, the persist middleware consumes the arm
+            // (a reload before it fires, or a failed write, leaves the
+            // evidence intact so the next boot rebuilds again — a stranded
+            // arm costs at most one redundant rebuild). Forcing the flush
+            // HERE is deliberately NOT done: a synchronous gate-time write
+            // splits the rebuild's persistence in two, and the second
+            // (mount-dirtied) flush can land after ANOTHER page's newer
+            // write and clobber it with a fresh persistedAt —
+            // local-first-reload-rust.spec.ts scenario 3.
+            armPreMigrationEvidenceClear()
+          } else {
+            // Healthy-keep: the durable envelope already classifies
+            // healthy — no pending write can strand the evidence, so the
+            // gate retires it directly.
+            clearPreMigrationLayoutEvidence()
+          }
+          // Adjudication complete (healthy-keep or successful rebuild): the
+          // one-shot marker is spent. Any earlier return (cancellation) or a
+          // thrown restore leaves it armed for the retry boot.
           consumeActiveMachineSelectionMark()
-          if (cancelled) return false
           dispatch(setMachineReady({ machine: resolution.machine, mode: 'server-managed' }))
           return true
         } catch (err) {
@@ -1478,6 +1518,7 @@ export default function App() {
             upsert: terminalMeta,
             remove: removedTerminalMetaIds,
           }))
+          foldTerminalInventoryTitles(appStore, msg.terminals)
           // fetchTerminalDirectoryWindow still re-throws on failure, so contain its
           // rejection. queueActiveSessionWindowRefresh resolves even on failure.
           void appStore.dispatch(fetchTerminalDirectoryWindow({

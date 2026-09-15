@@ -183,7 +183,7 @@ async function flushPersistedLayout(page: Page, terminalId: string): Promise<voi
     window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
   })
   await page.waitForFunction((id) => {
-    const raw = window.localStorage.getItem('freshell.layout.v3')
+    const raw = window.localStorage.getItem(`freshell.layout.v3.${sessionStorage.getItem('freshell.layout-window-id.v1')}`)
     return typeof raw === 'string' && raw.includes(id)
   }, terminalId, { timeout: 10_000 })
 }

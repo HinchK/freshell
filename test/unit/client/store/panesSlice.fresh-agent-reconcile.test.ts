@@ -90,13 +90,17 @@ async function persistLeafWithContent(
 
   vi.runAllTimers()
 
-  const raw = localStorage.getItem('freshell.layout.v3')
-  if (!raw) throw new Error('nothing persisted to freshell.layout.v3')
+  const raw = localStorage.getItem(`freshell.layout.v3.${WINDOW_ID}`)
+  if (!raw) throw new Error('nothing persisted to the per-window layout key')
   const parsed = JSON.parse(raw)
   const leaf = parsed.panes.layouts[tabId]
   if (!leaf || leaf.type !== 'leaf') throw new Error('expected persisted leaf')
   return leaf
 }
+
+// Delta round 3, finding 1: the flush writes THIS window's per-window layout key.
+const WINDOW_ID = 'client-fa-reconcile-tests'
+sessionStorage.setItem('freshell.layout-window-id.v1', WINDOW_ID)
 
 describe('fresh-agent reconcile volatile fields', () => {
   const initialState = emptyState()
@@ -446,8 +450,8 @@ describe('reconcilePendingPanes', () => {
 
     vi.runAllTimers()
 
-    const raw = localStorage.getItem('freshell.layout.v3')
-    if (!raw) throw new Error('nothing persisted to freshell.layout.v3')
+    const raw = localStorage.getItem(`freshell.layout.v3.${WINDOW_ID}`)
+    if (!raw) throw new Error('nothing persisted to the per-window layout key')
     const parsed = JSON.parse(raw)
     expect('reconcilePendingPanes' in parsed.panes).toBe(false)
     // Neighbouring ephemeral fields are also stripped (sanity anchor for the strip site)

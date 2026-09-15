@@ -1,9 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const LAYOUT_KEY = 'freshell.layout.v3'
-const BACKUP_KEY = 'freshell.layout.v3.backup-before-fresh-agent-centralization'
-const MARKER_KEY = 'freshell.layout.v3.fresh-agent-centralization-commit'
-const PENDING_KEY = 'freshell.layout.v3.fresh-agent-centralization-pending'
+// Delta round 3, finding 1: the fresh-agent centralization migration's
+// backup/marker/sidecar channels are per-window key suffixes — two windows
+// migrating concurrently must not cross-contaminate recovery state.
+const WINDOW_ID = 'client-fresh-agent-migration'
+const LAYOUT_KEY = `freshell.layout.v3.${WINDOW_ID}`
+const BACKUP_KEY = `freshell.layout.v3.${WINDOW_ID}.backup-before-fresh-agent-centralization`
+const MARKER_KEY = `freshell.layout.v3.${WINDOW_ID}.fresh-agent-centralization-commit`
+const PENDING_KEY = `freshell.layout.v3.${WINDOW_ID}.fresh-agent-centralization-pending`
+const SIDECAR_KEY = `freshell.layout.pre-migration-raw.v1.${WINDOW_ID}`
 const VERSION_KEY = 'freshell_version'
 
 type StorageHooks = {
@@ -142,6 +147,7 @@ function makeLargeLegacyLayoutRaw(): string {
 describe('storage-migration fresh-agent', () => {
   beforeEach(() => {
     vi.resetModules()
+    sessionStorage.setItem('freshell.layout-window-id.v1', WINDOW_ID)
   })
 
   it('does not clear freshell layout storage during the fresh-agent migration', async () => {
@@ -243,6 +249,36 @@ describe('storage-migration fresh-agent', () => {
     })
     expect(content.sessionRef).toBeUndefined()
     expect(content.resumeSessionId).toBeUndefined()
+  })
+
+  it('writes the pre-rewrite raw to the pre-migration evidence sidecar on the forced-rewrite path (e2r4 finding 1)', async () => {
+    const originalRaw = makeLegacyLayoutRaw()
+    const storage = createStorage()
+    Object.defineProperty(globalThis, 'localStorage', { value: storage, writable: true })
+    storage.seed(VERSION_KEY, '5')
+    storage.seed(LAYOUT_KEY, originalRaw)
+
+    await import('@/store/storage-migration')
+
+    expect(localStorage.getItem(SIDECAR_KEY)).toBe(originalRaw)
+  })
+
+  it('does not overwrite a pre-existing pre-migration evidence sidecar on a later forced rewrite (oldest evidence wins)', async () => {
+    const originalRaw = makeLegacyLayoutRaw()
+    const oldestEvidence = JSON.stringify({ version: 1, note: 'oldest pre-rewrite evidence' })
+    const storage = createStorage()
+    Object.defineProperty(globalThis, 'localStorage', { value: storage, writable: true })
+    storage.seed(VERSION_KEY, '5')
+    storage.seed(LAYOUT_KEY, originalRaw)
+    storage.seed(SIDECAR_KEY, oldestEvidence)
+
+    await import('@/store/storage-migration')
+
+    // The rewrite ran (layout migrated) but the sidecar still holds the
+    // EARLIER boot's capture — a later rewrite must never replace the
+    // original evidence.
+    expect(localStorage.getItem(LAYOUT_KEY)).toContain('"fresh-agent"')
+    expect(localStorage.getItem(SIDECAR_KEY)).toBe(oldestEvidence)
   })
 
   it('aborts before touching the original layout when the backup write fails', async () => {

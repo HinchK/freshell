@@ -6,6 +6,7 @@ import {
   foldCanonicalSessionActivity,
   foldTerminalAliasActivity,
 } from '@/lib/terminal-session-association'
+import { recordTerminalTitleForReplay } from '@/lib/terminal-inventory-titles'
 import type { AppDispatch, RootState } from './store'
 import {
   clearTerminalSearch,
@@ -180,6 +181,22 @@ export function fetchTerminalDirectoryWindow(args: FetchTerminalDirectoryWindowA
           provider: identity.provider,
           sessionId: identity.sessionId,
         })
+      }
+
+      // e2r5 review finding 2: the terminals.changed broadcast carries no
+      // titles (crates/freshell-ws/src/terminal.rs:5053-5060 — {type,
+      // revision} only), so this applied page IS the fresh-title delivery
+      // for a REST-renamed UNOPENED terminal. Record every titled item
+      // into the terminal-title replay cache or opening the terminal
+      // replays the stale boot-frame title — the server's registry already
+      // holds the new title and never re-emits terminal.title.updated for
+      // it. Records REPLACE per terminalId (equal writes are no-ops), and
+      // the boot inventory frame still replaces the whole cache on every
+      // reconnect.
+      for (const item of items) {
+        if (item?.terminalId && item?.title) {
+          recordTerminalTitleForReplay(item.terminalId, item.title)
+        }
       }
 
       dispatch(setTerminalDirectoryWindowData({

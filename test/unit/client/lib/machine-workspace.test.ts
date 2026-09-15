@@ -149,6 +149,43 @@ describe('restoreMachineWorkspace', () => {
     expect(store.getState().panes.layouts['foreign-tab']).toBeUndefined()
   })
 
+  it('requests the machine-bootstrap inventory so the window’s own last snapshot is included', async () => {
+    const store = createStore()
+    vi.mocked(getRecoveryInventory).mockResolvedValue(inventoryFor(MACHINE_ID))
+
+    await restoreMachineWorkspace(store, MACHINE_ID, { reason: 'corrupt' })
+
+    expect(getRecoveryInventory).toHaveBeenCalledWith(
+      'machine-bootstrap:client-machine-test',
+      expect.any(Number),
+      { machineId: MACHINE_ID },
+    )
+  })
+
+  it('derives the bootstrap exclusion id from the REGISTRY client id, not the per-window layout-window id (e3r1 finding 3c pin)', async () => {
+    // The layout envelope key follows the mint-once layout-window-id
+    // (window-layout-keys.ts), but the bootstrap exclusion id keeps using
+    // the tab-registry client id so the server can still exclude (or, for
+    // the reserved prefix, include) the window's own tabs-sync snapshot.
+    sessionStorage.setItem('freshell.layout-window-id.v1', 'layout-window-distinct-from-registry-id')
+    const store = createStore()
+    vi.mocked(getRecoveryInventory).mockResolvedValue(inventoryFor(MACHINE_ID))
+
+    await restoreMachineWorkspace(store, MACHINE_ID, { reason: 'absent' })
+
+    expect(getRecoveryInventory).toHaveBeenCalledWith(
+      'machine-bootstrap:client-machine-test',
+      expect.any(Number),
+      { machineId: MACHINE_ID },
+    )
+    expect(getRecoveryInventory).not.toHaveBeenCalledWith(
+      'machine-bootstrap:layout-window-distinct-from-registry-id',
+      expect.any(Number),
+      expect.anything(),
+    )
+    sessionStorage.removeItem('freshell.layout-window-id.v1')
+  })
+
   it('preserves snapshot createRequestIds through the same-machine restore reducer for terminals and every fresh-agent variant', async () => {
     const store = createStore()
     const inventory = inventoryFor(MACHINE_ID)
@@ -442,9 +479,16 @@ describe('restoreMachineWorkspace', () => {
   })
 
   it('clears stale local state when the ACTIVELY CHOSEN machine has no durable workspace', async () => {
-    // The chooser-pick lane: the user just picked this machine, so the local
-    // layout may be a DIFFERENT machine's stale cache — a non-recoverable
-    // inventory (the chosen machine has no durable workspace) must clear it.
+    // The chooser-pick lane under the MERGED (Choice B) semantics: the user
+    // just picked this machine, so the App boot gate classifies the local
+    // layout — possibly a DIFFERENT machine's stale cache — as foreign and
+    // rebuilds with reason:'foreign' (the chooser's one-shot active-selection
+    // marker plus the machine-id stamp prove foreignness at the gate; see
+    // App.machine-identity.test.tsx and layout-health.test.ts). A
+    // non-recoverable inventory (the chosen machine has no durable
+    // workspace) still clears it: the chosen machine's empty truth wins.
+    // Updated from #774's `{ activeSelection: true }` option, which the
+    // merged gate superseded.
     const store = createStore()
     addForeignWorkspace(store)
     vi.mocked(getRecoveryInventory).mockResolvedValue({
@@ -455,21 +499,13 @@ describe('restoreMachineWorkspace', () => {
       ledgerOnly: [],
     })
 
-    await restoreMachineWorkspace(store, MACHINE_ID, { activeSelection: true })
+    await restoreMachineWorkspace(store, MACHINE_ID, { reason: 'foreign' })
 
     expect(store.getState().tabs.tabs).toEqual([])
     expect(store.getState().panes.layouts).toEqual({})
   })
 
-  it('keeps the rehydrated local layout when nothing foreign is recoverable on a remembered-machine reload', async () => {
-    // The bb58dc001 reload regression: the inventory EXCLUDES the requester's
-    // own generations by design (D2 — a live client owns its own data), so a
-    // same-tab reload of a single-client machine sees recoverable:false with
-    // its own layout rehydrated from localStorage. That layout IS this
-    // machine's newest truth — destroying it blanked the workspace on every
-    // F5 (and the destructive persist bypass then wiped the localStorage
-    // cache too). It must survive when the boot did not actively choose the
-    // machine.
+  it('clears stale local state when the selected machine has no durable workspace', async () => {
     const store = createStore()
     addForeignWorkspace(store)
     vi.mocked(getRecoveryInventory).mockResolvedValue({
@@ -480,16 +516,45 @@ describe('restoreMachineWorkspace', () => {
       ledgerOnly: [],
     })
 
-    const result = await restoreMachineWorkspace(store, MACHINE_ID)
+    await restoreMachineWorkspace(store, MACHINE_ID)
 
-    expect(result.restoredTabs).toBe(0)
-    expect(store.getState().tabs.tabs.map((tab) => tab.title)).toEqual(['Foreign workspace'])
-    expect(store.getState().panes.layouts['foreign-tab']).toBeDefined()
+    expect(store.getState().tabs.tabs).toEqual([])
+    expect(store.getState().panes.layouts).toEqual({})
   })
 
-  it('still converges to a recoverable foreign generation on a remembered-machine reload', async () => {
-    // Reload with a NEWER foreign generation on the machine: the restore still
-    // replaces the local layout with the machine's newest cross-client truth.
+  it('replaces the local layout unconditionally on a rebuild decision — the boot gate owns the keep-vs-rebuild call (Choice B merge of #774)', async () => {
+    // MERGED SEMANTICS (replaces #774's restore-level "keeps the rehydrated
+    // local layout when nothing foreign is recoverable on a
+    // remembered-machine reload"): under Choice B the App boot gate keeps a
+    // HEALTHY local layout and never calls restoreMachineWorkspace, so this
+    // function — reached only for absent/corrupt/foreign/stale layouts —
+    // always replaces local state, even when the inventory is
+    // non-recoverable. #774's underlying intent (a natural reload with
+    // nothing foreign keeps the workspace) SURVIVES one layer up: the
+    // healthy-keep gate is pinned in App.machine-identity.test.tsx ("keeps
+    // a healthy local workspace: no restore call...") and end-to-end in
+    // local-first-reload-rust.spec.ts scenario 1.
+    const store = createStore()
+    addForeignWorkspace(store)
+    vi.mocked(getRecoveryInventory).mockResolvedValue({
+      recoverable: false,
+      contentId: 'empty',
+      device: null,
+      otherDevices: [],
+      ledgerOnly: [],
+    })
+
+    const result = await restoreMachineWorkspace(store, MACHINE_ID, { reason: 'stale' })
+
+    expect(result.restoredTabs).toBe(0)
+    expect(store.getState().tabs.tabs).toEqual([])
+    expect(store.getState().panes.layouts).toEqual({})
+  })
+
+  it('still converges to a recoverable foreign generation on a rebuild', async () => {
+    // A rebuild with a NEWER foreign generation on the machine: the restore
+    // still replaces the local layout with the machine's newest
+    // cross-client truth.
     const store = createStore()
     addForeignWorkspace(store)
     vi.mocked(getRecoveryInventory).mockResolvedValue(inventoryFor(MACHINE_ID))
@@ -500,4 +565,25 @@ describe('restoreMachineWorkspace', () => {
     expect(store.getState().tabs.tabs.map((tab) => tab.title)).toEqual(['Recovered workspace'])
     expect(store.getState().tabs.tabs.map((tab) => tab.id)).not.toContain('foreign-tab')
   })
+
+  it.each(['absent', 'corrupt', 'foreign', 'stale'] as const)(
+    'still fetches with the bootstrap exclusion id, clears, and restores when told the boot reason is %s',
+    async (reason) => {
+      const store = createStore()
+      addForeignWorkspace(store)
+      vi.mocked(getRecoveryInventory).mockResolvedValue(inventoryFor(MACHINE_ID))
+
+      const result = await restoreMachineWorkspace(store, MACHINE_ID, { reason })
+
+      expect(getRecoveryInventory).toHaveBeenCalledWith(
+        'machine-bootstrap:client-machine-test',
+        expect.any(Number),
+        { machineId: MACHINE_ID },
+      )
+      expect(result).toEqual({ restoredTabs: 1 })
+      expect(store.getState().tabs.tabs.map((tab) => tab.title)).toEqual(['Recovered workspace'])
+      expect(store.getState().tabs.tabs.map((tab) => tab.id)).not.toContain('foreign-tab')
+      expect(store.getState().panes.layouts['foreign-tab']).toBeUndefined()
+    },
+  )
 })

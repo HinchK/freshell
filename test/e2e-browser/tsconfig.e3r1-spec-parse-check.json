@@ -1,0 +1,20 @@
+{
+  "//": "e3r1 spec parse gate. The repo-owned typecheck configs (tsconfig.json / tsconfig.server.json) deliberately exclude test/, so this config gives every e2e spec the previous round touched an EXECUTABLE, file-attributed parse gate: `npx tsc -p test/e2e-browser/tsconfig.e3r1-spec-parse-check.json`, then require zero error lines attributed to any included spec file. Mirrors the TERM-04 convention (tsconfig.term04-check.json).",
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "incremental": false,
+    "types": ["node"]
+  },
+  "include": [
+    "specs/createrequestid-stabilization-rust.spec.ts",
+    "specs/fresh-agent-centralization-smoke.spec.ts",
+    "specs/local-first-reload-rust.spec.ts",
+    "specs/multi-client.spec.ts",
+    "specs/opencode-rebind-rust.spec.ts",
+    "specs/opencode-restart-recovery.spec.ts",
+    "specs/remote-tab-linkage-rust.spec.ts",
+    "specs/rest-tab-persistence.spec.ts",
+    "specs/sidebar-registry-sync-rust.spec.ts"
+  ]
+}

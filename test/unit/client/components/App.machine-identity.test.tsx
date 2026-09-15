@@ -55,6 +55,10 @@ const mocks = vi.hoisted(() => ({
   createMachine: vi.fn(),
   fetchSidebarSessionsSnapshot: vi.fn(),
   restoreMachineWorkspace: vi.fn(),
+  classifyPersistedLayoutHealth: vi.fn(),
+  backfillPersistedLayoutMachineId: vi.fn(),
+  clearPreMigrationLayoutEvidence: vi.fn(),
+  armPreMigrationEvidenceClear: vi.fn(),
   installCrossTabSync: vi.fn(),
   startTabRegistrySync: vi.fn(),
   setHelloExtensionProvider: vi.fn(),
@@ -85,6 +89,13 @@ vi.mock('@/lib/api', () => ({
 
 vi.mock('@/lib/machine-workspace', () => ({
   restoreMachineWorkspace: (...args: unknown[]) => mocks.restoreMachineWorkspace(...args),
+}))
+
+vi.mock('@/lib/recovery/layout-health', () => ({
+  classifyPersistedLayoutHealth: (...args: unknown[]) => mocks.classifyPersistedLayoutHealth(...args),
+  backfillPersistedLayoutMachineId: (...args: unknown[]) => mocks.backfillPersistedLayoutMachineId(...args),
+  clearPreMigrationLayoutEvidence: (...args: unknown[]) => mocks.clearPreMigrationLayoutEvidence(...args),
+  armPreMigrationEvidenceClear: (...args: unknown[]) => mocks.armPreMigrationEvidenceClear(...args),
 }))
 
 vi.mock('@/store/crossTabSync', () => ({
@@ -166,6 +177,8 @@ describe('App machine identity bootstrap', () => {
     mocks.onReconnect.mockReturnValue(() => {})
     mocks.connect.mockResolvedValue(undefined)
     mocks.restoreMachineWorkspace.mockResolvedValue({ restoredTabs: 0 })
+    mocks.classifyPersistedLayoutHealth.mockReturnValue('healthy')
+    mocks.backfillPersistedLayoutMachineId.mockReturnValue(false)
     mocks.installCrossTabSync.mockReturnValue(() => {})
     mocks.startTabRegistrySync.mockReturnValue(() => {})
     mocks.fetchSidebarSessionsSnapshot.mockResolvedValue([])
@@ -261,6 +274,7 @@ describe('App machine identity bootstrap', () => {
   })
 
   it('restores the selected machine before configuring the hello and tab-sync transport', async () => {
+    mocks.classifyPersistedLayoutHealth.mockReturnValue('absent')
     localStorage.setItem(MACHINE_ID_STORAGE_KEY, MACHINE.id)
     mocks.getMachines.mockResolvedValue([MACHINE])
     const store = createStore()
@@ -268,12 +282,14 @@ describe('App machine identity bootstrap', () => {
     render(<Provider store={store}><App /></Provider>)
 
     await waitFor(() => expect(mocks.startTabRegistrySync).toHaveBeenCalledTimes(1))
-    // The remembered-selection boot passes the consumed one-shot marker: a
-    // natural reload (no active chooser pick) must keep a non-recoverable
-    // local layout — the reload-wipe fix's core wiring.
-    expect(mocks.restoreMachineWorkspace).toHaveBeenCalledWith(store, MACHINE.id, { activeSelection: false })
-    // The boot PEEKED the (unarmed) marker and CONSUMED after the successful
-    // restore: nothing stays armed for later boots.
+    expect(mocks.restoreMachineWorkspace).toHaveBeenCalledWith(store, MACHINE.id, { reason: 'absent' })
+    // Merged wiring (#774 into the Choice B gate): the boot PEEKED the
+    // (unarmed) marker and fed it to the classifier — a natural reload
+    // (no active chooser pick) classifies with activeSelection:false and
+    // keeps a healthy local layout instead of restoring.
+    expect(mocks.classifyPersistedLayoutHealth).toHaveBeenCalledWith(MACHINE.id, { activeSelection: false })
+    // CONSUMED after the successful adjudication: nothing stays armed for
+    // later boots.
     expect(consumeActiveMachineSelectionMark()).toBe(false)
     expect(mocks.restoreMachineWorkspace.mock.invocationCallOrder[0]).toBeLessThan(
       mocks.startTabRegistrySync.mock.invocationCallOrder[0],
@@ -290,14 +306,113 @@ describe('App machine identity bootstrap', () => {
     })
   })
 
+  it('keeps a healthy local workspace: no restore call, backfill stamps, straight to ready', async () => {
+    mocks.classifyPersistedLayoutHealth.mockReturnValue('healthy')
+    localStorage.setItem(MACHINE_ID_STORAGE_KEY, MACHINE.id)
+    mocks.getMachines.mockResolvedValue([MACHINE])
+    const store = createStore()
+
+    render(<Provider store={store}><App /></Provider>)
+
+    await waitFor(() => expect(mocks.startTabRegistrySync).toHaveBeenCalledTimes(1))
+    expect(mocks.restoreMachineWorkspace).not.toHaveBeenCalled()
+    // classify FIRST, then backfill — the gate calls the backfill once with
+    // the resolved machine id (after classification, before any rebuild):
+    expect(mocks.classifyPersistedLayoutHealth).toHaveBeenCalledTimes(1)
+    expect(mocks.classifyPersistedLayoutHealth).toHaveBeenCalledWith(MACHINE.id, { activeSelection: false })
+    expect(mocks.classifyPersistedLayoutHealth.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.backfillPersistedLayoutMachineId.mock.invocationCallOrder[0],
+    )
+    expect(mocks.backfillPersistedLayoutMachineId).toHaveBeenCalledTimes(1)
+    expect(mocks.backfillPersistedLayoutMachineId).toHaveBeenCalledWith(MACHINE.id)
+    // Consume-clear (e2r4 finding 1): a healthy-keep boot retires the
+    // durable pre-migration evidence sidecar directly — the healthy
+    // envelope is ALREADY the durable state, so no pending write can
+    // strand the evidence. The durable-boundary arm is never used on a
+    // healthy-keep boot.
+    expect(mocks.clearPreMigrationLayoutEvidence).toHaveBeenCalledTimes(1)
+    expect(mocks.armPreMigrationEvidenceClear).not.toHaveBeenCalled()
+    expect(store.getState().machineIdentity.status).toBe('ready')
+  })
+
+  it('KEEPS a healthy local layout for an actively chosen machine — Choice B wins the #774 boot-gate conflict (merged pin)', async () => {
+    // Merged semantics: the chooser's one-shot marker is ARMED (the user
+    // just re-picked this machine), but the classifier says the local
+    // layout is healthy (a stamped same-machine envelope). Choice B window
+    // sovereignty keeps it — #774's clear-on-active-choice never reaches a
+    // healthy own layout. The marker still feeds the classifier (for the
+    // unstamped-legacy foreign case, pinned in layout-health.test.ts) and
+    // is consumed by the completed healthy-keep adjudication. Under #774's
+    // pre-merge wiring this pin is red: restoreMachineWorkspace would have
+    // been called with { activeSelection: true } and, on a non-recoverable
+    // inventory, cleared the healthy workspace.
+    markActiveMachineSelection()
+    mocks.classifyPersistedLayoutHealth.mockReturnValue('healthy')
+    localStorage.setItem(MACHINE_ID_STORAGE_KEY, MACHINE.id)
+    mocks.getMachines.mockResolvedValue([MACHINE])
+    const store = createStore()
+
+    render(<Provider store={store}><App /></Provider>)
+
+    await waitFor(() => expect(mocks.startTabRegistrySync).toHaveBeenCalledTimes(1))
+    expect(mocks.classifyPersistedLayoutHealth).toHaveBeenCalledWith(MACHINE.id, { activeSelection: true })
+    expect(mocks.restoreMachineWorkspace).not.toHaveBeenCalled()
+    expect(mocks.clearPreMigrationLayoutEvidence).toHaveBeenCalledTimes(1)
+    expect(mocks.armPreMigrationEvidenceClear).not.toHaveBeenCalled()
+    // The adjudication completed (healthy-keep): the one-shot marker is spent.
+    expect(peekActiveMachineSelectionMark()).toBe(false)
+    expect(store.getState().machineIdentity.status).toBe('ready')
+  })
+
+  it.each(['absent', 'corrupt', 'foreign', 'stale'] as const)(
+    'rebuilds for an unhealthy layout (%s) and passes the health as the reason',
+    async (reason) => {
+      mocks.classifyPersistedLayoutHealth.mockReturnValue(reason)
+      localStorage.setItem(MACHINE_ID_STORAGE_KEY, MACHINE.id)
+      mocks.getMachines.mockResolvedValue([MACHINE])
+      const store = createStore()
+
+      render(<Provider store={store}><App /></Provider>)
+
+      await waitFor(() => expect(mocks.startTabRegistrySync).toHaveBeenCalledTimes(1))
+      expect(mocks.restoreMachineWorkspace).toHaveBeenCalledTimes(1)
+      expect(mocks.restoreMachineWorkspace).toHaveBeenCalledWith(store, MACHINE.id, { reason })
+      // order pin: restore still precedes tab-registry sync on rebuild boots
+      expect(mocks.restoreMachineWorkspace.mock.invocationCallOrder[0]).toBeLessThan(
+        mocks.startTabRegistrySync.mock.invocationCallOrder[0],
+      )
+      expect(mocks.backfillPersistedLayoutMachineId).toHaveBeenCalledTimes(1)
+      expect(mocks.backfillPersistedLayoutMachineId).toHaveBeenCalledWith(MACHINE.id)
+      // e2r5 finding 1: a completed rebuild ARMS the evidence clear — the
+      // sidecar is never deleted at the Redux boundary. Persistence is
+      // debounced 500ms and a failed write clears the dirty flags without
+      // a durable write, so a reload inside that window (or a failed
+      // write) would strand the sanitized old envelope with the evidence
+      // gone; the persist middleware consumes the arm only on the rebuild's
+      // own successful layout write. (No forced gate-time flush: it splits
+      // the rebuild's persistence in two, and the mount-dirtied second
+      // flush can clobber another page's newer write — pinned by
+      // local-first-reload-rust.spec.ts scenario 3.)
+      expect(mocks.armPreMigrationEvidenceClear).toHaveBeenCalledTimes(1)
+      expect(mocks.clearPreMigrationLayoutEvidence).not.toHaveBeenCalled()
+      expect(mocks.restoreMachineWorkspace.mock.invocationCallOrder[0]).toBeLessThan(
+        mocks.armPreMigrationEvidenceClear.mock.invocationCallOrder[0],
+      )
+    },
+  )
+
   it('peeks before the restore and consumes only after success — the marker stays armed through an in-flight reload', async () => {
     // The protocol's ORDERING pin, discriminated against the
     // consume-before-await implementation: while the restore (and its
     // inventory request) is IN FLIGHT the marker must still be ARMED — a
     // manual reload here carries the active-choice state into the next
-    // boot. Only a SUCCESSFUL restore consumes it (a later natural reload
-    // boots with activeSelection:false).
+    // boot. Only a COMPLETED adjudication consumes it (a later natural
+    // reload boots with activeSelection:false). Merged wiring: the armed
+    // marker plus no local layout classifies absent, so the boot rebuilds
+    // from the server's truth with reason:'absent' (#774's actively-chosen
+    // intent — an active choice never keeps a foreign cache).
     markActiveMachineSelection()
+    mocks.classifyPersistedLayoutHealth.mockReturnValue('absent')
     localStorage.setItem(MACHINE_ID_STORAGE_KEY, MACHINE.id)
     mocks.getMachines.mockResolvedValue([MACHINE])
     let resolveRestore: ((value: { restoredTabs: number }) => void) | undefined
@@ -308,9 +423,9 @@ describe('App machine identity bootstrap', () => {
 
     render(<Provider store={store}><App /></Provider>)
 
-    // In flight: called with the peeked value, marker still armed.
+    // In flight: called with the classified reason, marker still armed.
     await waitFor(() => expect(mocks.restoreMachineWorkspace).toHaveBeenCalledTimes(1))
-    expect(mocks.restoreMachineWorkspace).toHaveBeenCalledWith(store, MACHINE.id, { activeSelection: true })
+    expect(mocks.restoreMachineWorkspace).toHaveBeenCalledWith(store, MACHINE.id, { reason: 'absent' })
     expect(peekActiveMachineSelectionMark()).toBe(true)
 
     // Success consumes the marker.
@@ -322,9 +437,10 @@ describe('App machine identity bootstrap', () => {
   it('keeps the marker armed when the restore fails, so the retry still treats the machine as actively chosen', async () => {
     // The failure path, pinned through the same in-flight ordering: the
     // failing boot never consumes the marker, so the app's reload action
-    // retries with activeSelection again and never keeps a foreign
+    // retries with the marker still armed and never keeps a foreign
     // machine's stale local cache over the machine the user just chose.
     markActiveMachineSelection()
+    mocks.classifyPersistedLayoutHealth.mockReturnValue('absent')
     localStorage.setItem(MACHINE_ID_STORAGE_KEY, MACHINE.id)
     mocks.getMachines.mockResolvedValue([MACHINE])
     let rejectRestore: ((reason: unknown) => void) | undefined
@@ -342,5 +458,22 @@ describe('App machine identity bootstrap', () => {
     expect(mocks.startTabRegistrySync).not.toHaveBeenCalled()
     // Still armed for the retry — the failing boot never consumed it.
     expect(peekActiveMachineSelectionMark()).toBe(true)
+  })
+
+  it('leaves the pre-migration evidence sidecar when the rebuild fails — the next boot retries with the corrupt raw intact (e2r4 finding 1)', async () => {
+    mocks.classifyPersistedLayoutHealth.mockReturnValue('corrupt')
+    mocks.restoreMachineWorkspace.mockRejectedValue(new Error('inventory fetch failed'))
+    localStorage.setItem(MACHINE_ID_STORAGE_KEY, MACHINE.id)
+    mocks.getMachines.mockResolvedValue([MACHINE])
+    const store = createStore()
+
+    render(<Provider store={store}><App /></Provider>)
+
+    await waitFor(() => expect(store.getState().machineIdentity.status).toBe('error'))
+    expect(mocks.restoreMachineWorkspace).toHaveBeenCalledTimes(1)
+    expect(mocks.clearPreMigrationLayoutEvidence).not.toHaveBeenCalled()
+    // e2r5 finding 1: a failed rebuild never arms the durable-boundary
+    // clear either — the evidence must drive the next boot's retry.
+    expect(mocks.armPreMigrationEvidenceClear).not.toHaveBeenCalled()
   })
 })

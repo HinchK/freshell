@@ -13,10 +13,29 @@ import { buildOpenTabRegistryRecord } from '@/lib/tab-registry-snapshot'
 import { collectPaneIdentityActivity } from '@/lib/pane-activity'
 import type { PaneNode } from './paneTypes'
 import {
+  getCurrentTabRegistryClientInstanceId,
+  readInMemorySnapshotRevision,
+  writeInMemorySnapshotRevision,
+  mintTabRegistryClientInstanceId,
+  randomClientInstanceId,
+  safeSessionStorage,
+  setTabRegistryClientInstanceId,
+} from './client-instance-id'
+import {
   TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY,
   TAB_REGISTRY_SNAPSHOT_REVISION_STORAGE_KEY,
 } from './storage-keys'
 import { deriveTabRecencyAt } from '@/lib/tab-recency'
+import { remintLayoutWindowId } from './window-layout-keys'
+
+// Re-exported for the existing call sites (App, TabsView, machine-workspace):
+// the getter now lives in the dependency-free client-instance-id leaf shared
+// with the per-window layout-key derivation (delta round 3, finding 1).
+export {
+  getCurrentTabRegistryClientInstanceId,
+  randomClientInstanceId,
+  safeSessionStorage,
+} from './client-instance-id'
 
 export const SYNC_INTERVAL_MS = 5000
 export const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000
@@ -35,84 +54,37 @@ type TabRegistryWsClient = Pick<WsClient, 'state' | 'onMessage' | 'serverInstanc
 type RevisionState = Map<string, { fingerprint: string; revision: number; updatedAt: number }>
 const claimedClientInstanceIds = new Set<string>()
 const TAB_REGISTRY_CLIENT_LEASE_CHANNEL = 'freshell-tabs-registry-client-lease'
-let inMemoryClientInstanceId = ''
-let inMemorySnapshotRevision = 0
-
-function randomClientInstanceId(): string {
-  return `client-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`
-}
-
-function safeSessionStorage(): Storage | null {
-  try {
-    return typeof sessionStorage !== 'undefined' ? sessionStorage : null
-  } catch {
-    return null
-  }
-}
-
-export function getCurrentTabRegistryClientInstanceId(): string {
-  const storage = safeSessionStorage()
-  let clientInstanceId = ''
-  try {
-    clientInstanceId = storage?.getItem(TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY) || ''
-  } catch {
-    clientInstanceId = inMemoryClientInstanceId
-  }
-  if (!storage) {
-    clientInstanceId = inMemoryClientInstanceId
-  }
-  if (!clientInstanceId) {
-    clientInstanceId = randomClientInstanceId()
-    inMemoryClientInstanceId = clientInstanceId
-    inMemorySnapshotRevision = 0
-    try {
-      storage?.setItem(TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY, clientInstanceId)
-      storage?.setItem(TAB_REGISTRY_SNAPSHOT_REVISION_STORAGE_KEY, '0')
-    } catch {
-      // Keep the per-window module fallback stable when sessionStorage is unavailable.
-    }
-  }
-  inMemoryClientInstanceId = clientInstanceId
-  return clientInstanceId
-}
-
-function claimTabRegistryClientInstanceId(): string {
-  const storage = safeSessionStorage()
-  let clientInstanceId = getCurrentTabRegistryClientInstanceId()
-  if (!clientInstanceId || claimedClientInstanceIds.has(clientInstanceId)) {
-    clientInstanceId = randomClientInstanceId()
-    inMemoryClientInstanceId = clientInstanceId
-    inMemorySnapshotRevision = 0
-    try {
-      storage?.setItem(TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY, clientInstanceId)
-      storage?.setItem(TAB_REGISTRY_SNAPSHOT_REVISION_STORAGE_KEY, '0')
-    } catch {
-      // Keep the per-window module fallback stable when sessionStorage is unavailable.
-    }
-  }
-  claimedClientInstanceIds.add(clientInstanceId)
-  return clientInstanceId
-}
 
 function readSnapshotRevision(): number {
   let raw: string | null | undefined
   try {
     raw = safeSessionStorage()?.getItem(TAB_REGISTRY_SNAPSHOT_REVISION_STORAGE_KEY)
   } catch {
-    raw = String(inMemorySnapshotRevision)
+    raw = String(readInMemorySnapshotRevision())
   }
-  if (raw == null && inMemorySnapshotRevision > 0) raw = String(inMemorySnapshotRevision)
+  if (raw == null && readInMemorySnapshotRevision() > 0) raw = String(readInMemorySnapshotRevision())
   const parsed = raw ? Number(raw) : 0
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : 0
 }
 
 function writeSnapshotRevision(revision: number): void {
-  inMemorySnapshotRevision = revision
+  writeInMemorySnapshotRevision(revision)
   try {
     safeSessionStorage()?.setItem(TAB_REGISTRY_SNAPSHOT_REVISION_STORAGE_KEY, String(revision))
   } catch {
     // Keep the per-window module fallback stable when sessionStorage is unavailable.
   }
+}
+
+function claimTabRegistryClientInstanceId(): string {
+  const clientInstanceId = getCurrentTabRegistryClientInstanceId()
+  if (!clientInstanceId || claimedClientInstanceIds.has(clientInstanceId)) {
+    const minted = mintTabRegistryClientInstanceId()
+    claimedClientInstanceIds.add(minted)
+    return minted
+  }
+  claimedClientInstanceIds.add(clientInstanceId)
+  return clientInstanceId
 }
 
 function stableStringifyForFingerprint(value: unknown): string {
@@ -275,7 +247,7 @@ export function startTabRegistrySync(store: AppStore, ws: TabRegistryWsClient): 
   try {
     hadStoredClientInstanceId = !!storage?.getItem(TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY)
   } catch {
-    hadStoredClientInstanceId = !!inMemoryClientInstanceId
+    hadStoredClientInstanceId = !!getCurrentTabRegistryClientInstanceId()
   }
   let clientInstanceId = claimTabRegistryClientInstanceId()
   const leaseId = randomClientInstanceId()
@@ -413,13 +385,18 @@ export function startTabRegistrySync(store: AppStore, ws: TabRegistryWsClient): 
     const previousClientInstanceId = clientInstanceId
     claimedClientInstanceIds.delete(previousClientInstanceId)
     clientInstanceId = randomClientInstanceId()
-    inMemoryClientInstanceId = clientInstanceId
+    setTabRegistryClientInstanceId(clientInstanceId)
+    // e3r2 finding 1: the duplicated tab's sessionStorage COPIED the
+    // layout-window-id too, and without this remint both tabs keep one
+    // layout key (either tab's flush fully hydrating the other, the last
+    // writer's envelope winning every refresh). The rotation is the one
+    // moment a window's identity legitimately splits — the duplicate
+    // becomes a sovereign NEW window (fresh layout key → absent → boot
+    // rebuilds from the inventory); the ORIGINAL's separate sessionStorage
+    // copy is unaffected. This rotation is the ONLY path that remints the
+    // layout-window-id.
+    remintLayoutWindowId()
     claimedClientInstanceIds.add(clientInstanceId)
-    try {
-      safeSessionStorage()?.setItem(TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY, clientInstanceId)
-    } catch {
-      // Keep the per-window module fallback stable when sessionStorage is unavailable.
-    }
     snapshotRevision = 0
     writeSnapshotRevision(snapshotRevision)
     lastPushFingerprint = ''

@@ -4,7 +4,14 @@ import terminalDirectoryReducer from '@/store/terminalDirectorySlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
 import tabsReducer, { addTab, closeTab } from '@/store/tabsSlice'
 import panesReducer, { initLayout } from '@/store/panesSlice'
+import { upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
+import { patchSessionRunningStateFromTerminalMeta } from '@/store/sessionsSlice'
 import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
+import { createTerminalInvalidationHandler } from '@/lib/terminal-invalidation-handler'
+import {
+  foldTerminalInventoryTitles,
+  terminalInventoryTitleReplayMiddleware,
+} from '@/lib/terminal-inventory-titles'
 import {
   _resetTerminalDirectoryThunkControllers,
   fetchTerminalDirectoryWindow,
@@ -668,5 +675,76 @@ describe('mid-ack-wait identity binding stranding (composition)', () => {
     expect(folded['opencode:s-strand']).toBe(sessions['opencode:terminal:t-strand'])
     // Ratchet-only: the source entry stays (pruned by existing retention).
     expect(folded['opencode:terminal:t-strand']).toBe(sessions['opencode:terminal:t-strand'])
+  })
+})
+
+// e2r5 review finding 2: the terminals.changed broadcast carries NO titles
+// (crates/freshell-ws/src/terminal.rs:5053-5060 — {type, revision} only), so
+// the invalidation handler's directory re-pull IS the fresh-title delivery
+// for a REST-renamed UNOPENED terminal. Without recording the refreshed
+// titles into the terminal-title replay cache, opening the terminal replays
+// the STALE boot-frame title: the server's registry already holds the new
+// title and never re-emits terminal.title.updated for it, so nothing else
+// corrects the pane until reconnect.
+describe('directory refresh records titles into the replay cache (e2r5 finding 2)', () => {
+  beforeEach(() => {
+    getTerminalDirectoryPage.mockReset()
+    searchTerminalView.mockReset()
+    _resetTerminalDirectoryThunkControllers()
+  })
+
+  it('a REST rename of an UNOPENED terminal (real terminals.changed broadcast shape) replays the NEW title when the terminal is opened', async () => {
+    const store = configureStore({
+      reducer: {
+        terminalDirectory: terminalDirectoryReducer,
+        tabs: tabsReducer,
+        panes: panesReducer,
+      },
+      middleware: (gDM) => gDM().concat(terminalInventoryTitleReplayMiddleware),
+    })
+    // This window's boot inventory frame cached the terminal's OLD title;
+    // no pane is open for it, so the fold only caches.
+    expect(foldTerminalInventoryTitles(store, [{ terminalId: 't-e2r5-rename', title: 'A' }])).toBe(0)
+
+    // The terminal is renamed (PATCH /api/terminals/:id, e.g. from
+    // Overview) while unopened; the server broadcasts the REAL
+    // terminals.changed shape — revision only, no title — and the
+    // invalidation handler refetches the sidebar directory page, which
+    // now carries the NEW title.
+    getTerminalDirectoryPage.mockResolvedValue({
+      items: [{
+        terminalId: 't-e2r5-rename',
+        title: 'B',
+        createdAt: 1,
+        lastActivityAt: 10,
+        status: 'running',
+        hasClients: false,
+        mode: 'shell',
+      }],
+      nextCursor: null,
+      revision: 2,
+    })
+    const handler = createTerminalInvalidationHandler({
+      dispatch: store.dispatch,
+      upsertTerminalMeta,
+      removeTerminalMeta,
+      patchSessionRunningStateFromTerminalMeta,
+      queueActiveSessionWindowRefresh: () => ({ type: 'sessions/noop' }) as any,
+      fetchTerminalDirectoryWindow,
+      refreshDelayMs: 0,
+    })
+    handler.handle({ type: 'terminals.changed', revision: 2 })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(store.getState().terminalDirectory.windows.sidebar.items).toHaveLength(1)
+
+    // Opening the terminal binds the terminalId: initLayout must replay
+    // the NEW title B, not the stale boot-frame title A.
+    store.dispatch(addTab({ id: 'tab-e2r5', title: 'E2R5 rename' }))
+    store.dispatch(initLayout({
+      tabId: 'tab-e2r5',
+      paneId: 'pane-e2r5',
+      content: { kind: 'terminal', mode: 'shell', shell: 'wsl', terminalId: 't-e2r5-rename', createRequestId: 'cr-e2r5', status: 'running' },
+    }))
+    expect(store.getState().panes.paneTitles['tab-e2r5']['pane-e2r5']).toBe('B')
   })
 })

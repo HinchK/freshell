@@ -79,6 +79,7 @@ import {
 } from '@/lib/terminal-restore'
 import { isTerminalPasteShortcut } from '@/lib/terminal-input-policy'
 import { terminalFollowsOscTitle } from '@/lib/terminal-title-policy'
+import { recordTerminalTitleForReplay } from '@/lib/terminal-inventory-titles'
 import {
   clearTerminalCursor,
   loadTerminalSurfaceCheckpoint,
@@ -2593,6 +2594,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         dispatch(updateTab({ id: currentTab.id, updates: { title: cleanTitle } }))
       }
       dispatch(updatePaneTitle({ tabId, paneId: paneIdRef.current, title: cleanTitle, setByUser: false }))
+      recordTerminalTitleForReplay(terminalIdRef.current, cleanTitle)
     })
 
     return () => disposable.dispose()
@@ -4772,12 +4774,21 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
 
         // Auto-update title from Claude session
         // Tab and pane titles are independently guarded
-        if (msg.type === 'terminal.title.updated' && msg.terminalId === tid && msg.title) {
-          const titleTab = tabRef.current
-          if (titleTab && !titleTab.titleSetByUser) {
-            dispatch(updateTab({ id: titleTab.id, updates: { title: msg.title } }))
+        if (msg.type === 'terminal.title.updated' && msg.title) {
+          // e2r4 review finding 2: record for the MESSAGE's terminalId,
+          // independent of this pane's binding — during recovery the
+          // inventory is cached before the pane receives its reconciled
+          // terminalId, so a binding-gated record would drop a NEWER
+          // broadcast and the later binding action would replay the stale
+          // snapshot. The pane's own title update below stays tid-gated.
+          recordTerminalTitleForReplay(msg.terminalId, msg.title)
+          if (msg.terminalId === tid) {
+            const titleTab = tabRef.current
+            if (titleTab && !titleTab.titleSetByUser) {
+              dispatch(updateTab({ id: titleTab.id, updates: { title: msg.title } }))
+            }
+            dispatch(updatePaneTitle({ tabId, paneId: paneIdRef.current, title: msg.title, setByUser: false }))
           }
-          dispatch(updatePaneTitle({ tabId, paneId: paneIdRef.current, title: msg.title, setByUser: false }))
         }
 
         // Handle one-time session association from the authoritative canonical sessionRef.

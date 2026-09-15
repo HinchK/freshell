@@ -3,7 +3,14 @@ import { parsePersistedLayoutRaw } from '@/store/persistedState'
 import { BROWSER_PREFERENCES_STORAGE_KEY, PANES_STORAGE_KEY, TABS_STORAGE_KEY } from '@/store/storage-keys'
 
 const AUTH_STORAGE_KEY = 'freshell.auth-token'
-const LAYOUT_STORAGE_KEY = 'freshell.layout.v3'
+// Delta round 3, finding 1 / e3r1 findings 3+6: the migration operates on
+// THIS window's per-window layout key (derived from the mint-once
+// layout-window-id, sessionStorage freshell.layout-window-id.v1); the bare
+// freshell.layout.v3 stays as the LEGACY adoption source (never deleted).
+const WINDOW_ID = 'client-migration-tests'
+const LAYOUT_STORAGE_KEY = `freshell.layout.v3.${WINDOW_ID}`
+const OWN_SIDECAR_KEY = `freshell.layout.pre-migration-raw.v1.${WINDOW_ID}`
+const LEGACY_SIDECAR_KEY = 'freshell.layout.pre-migration-raw.v1'
 const VALID_CLAUDE_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
 
 async function importFreshStorageMigration(): Promise<Record<string, unknown>> {
@@ -23,6 +30,7 @@ describe('storage-migration', () => {
   beforeEach(() => {
     localStorage.clear()
     sessionStorage.clear()
+    sessionStorage.setItem('freshell.layout-window-id.v1', WINDOW_ID)
     document.cookie = 'freshell-auth=; Max-Age=0; path=/'
   })
 
@@ -65,6 +73,27 @@ describe('storage-migration', () => {
 
     expect(localStorage.getItem(AUTH_STORAGE_KEY)).toBeNull()
     expect(document.cookie).not.toContain('freshell-auth=')
+  })
+
+  it('spares the pre-migration raw evidence sidecar in the version-bump full wipe (e2r4 finding 1)', async () => {
+    // The sidecar holds the OLDEST pre-rewrite raw the health classifier
+    // needs after a reload (clearFreshellKeysExcept wipes every freshell.*
+    // key on a version bump); it must sit on the wipe's keep list with the
+    // auth token and browser preferences. Delta round 3: the keep-list
+    // entry is the sidecar PREFIX — this window's per-window sidecar AND
+    // the pre-change shared sidecar both survive.
+    localStorage.setItem('freshell_version', '2')
+    localStorage.setItem(AUTH_STORAGE_KEY, 'token-123')
+    localStorage.setItem('freshell.tabs.v1', 'legacy-tabs')
+    localStorage.setItem(OWN_SIDECAR_KEY, 'original-corrupt-raw')
+    localStorage.setItem(LEGACY_SIDECAR_KEY, 'original-legacy-corrupt-raw')
+
+    await importFreshStorageMigration()
+
+    expect(localStorage.getItem(OWN_SIDECAR_KEY)).toBe('original-corrupt-raw')
+    expect(localStorage.getItem(LEGACY_SIDECAR_KEY)).toBe('original-legacy-corrupt-raw')
+    expect(localStorage.getItem('freshell.tabs.v1')).toBeNull()
+    expect(localStorage.getItem('freshell_version')).toBe('5')
   })
 
   it('preserves legacy terminal font migration when storage cleanup runs before browser preferences load', async () => {
@@ -437,5 +466,54 @@ describe('storage-migration', () => {
     const second = snapshotLocalStorage()
 
     expect(second).toEqual(first)
+  })
+
+  it('carries the machineId stamp through the every-boot layout rewrite (LB-05)', async () => {
+    localStorage.setItem('freshell_version', '5')
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify({
+      // Real-clock-fresh (e3r1 finding 5): the boot migration's stale
+      // prune sweep removes beyond-STALE_LAYOUT_MS envelopes, and a fixed
+      // 2025 timestamp has drifted past the threshold. The stamp's
+      // survival through the rewrite is the pin; the age is incidental.
+      persistedAt: Date.now(),
+      version: 4,
+      machineId: 'machine-stamp-1',
+      tabs: {
+        activeTabId: 'tab-1',
+        tabs: [{ id: 'tab-1', title: 'Work', createdAt: 1 }],
+      },
+      panes: {
+        version: 7,
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'editor',
+              filePath: '/tmp/a.md',
+              language: null,
+              readOnly: false,
+              content: '',
+              viewMode: 'source',
+              wordWrap: true,
+            },
+          },
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    }))
+
+    await importFreshStorageMigration()
+
+    const migratedRaw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+    expect(migratedRaw).not.toBeNull()
+    expect(JSON.parse(migratedRaw!).machineId).toBe('machine-stamp-1')
+
+    const parsed = parsePersistedLayoutRaw(migratedRaw!)
+    expect(parsed).not.toBeNull()
+    expect(parsed?.machineId).toBe('machine-stamp-1')
   })
 })

@@ -16,6 +16,7 @@ Object.defineProperty(globalThis, 'localStorage', { value: localStorageMock, wri
 
 import tabsReducer, { updateTab } from '@/store/tabsSlice'
 import panesReducer, { replacePane } from '@/store/panesSlice'
+import machineIdentityReducer, { setMachineReady } from '@/store/machineIdentitySlice'
 import tabRecencyReducer, {
   loadPersistedTabRecency,
   recordPaneTabActivity,
@@ -28,7 +29,7 @@ import {
   resetPersistedLayoutCacheForTests,
 } from '@/store/persistMiddleware'
 import { onPersistBroadcast, resetPersistBroadcastForTests } from '@/store/persistBroadcast'
-import { LAYOUT_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY } from '@/store/storage-keys'
+import { MACHINE_ID_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY } from '@/store/storage-keys'
 import { parsePersistedLayoutRaw } from '@/store/persistedState'
 import { handleUiCommand } from '@/lib/ui-commands'
 
@@ -102,6 +103,12 @@ function makeRecencyStore(preloadedState?: any) {
   })
 }
 
+// Delta round 3, finding 1: the flush writes THIS window's per-window layout
+// key (freshell.layout.v3.<layoutWindowId>).
+const WINDOW_ID = 'client-tabs-persistence-tests'
+sessionStorage.setItem('freshell.layout-window-id.v1', WINDOW_ID)
+const LAYOUT_STORAGE_KEY = `freshell.layout.v3.${WINDOW_ID}`
+
 describe('tabs persistence - skipPersist + strip volatile fields', () => {
   beforeEach(() => {
     localStorageMock.clear()
@@ -139,7 +146,7 @@ describe('tabs persistence - skipPersist + strip volatile fields', () => {
     store.dispatch(updateTab({ id: 'tab-1', updates: { lastInputAt: 999 } }))
     vi.runAllTimers()
 
-    const raw = localStorage.getItem('freshell.layout.v3')
+    const raw = localStorage.getItem(LAYOUT_STORAGE_KEY)
     expect(raw).not.toBeNull()
     const parsed = JSON.parse(raw!)
     expect(parsed.tabs.tabs[0].lastInputAt).toBeUndefined()
@@ -403,7 +410,7 @@ describe('tabs persistence - skipPersist + strip volatile fields', () => {
     localStorageMock.clear()
     resetPersistedLayoutCacheForTests()
 
-    localStorage.setItem('freshell.layout.v3', JSON.stringify({
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify({
       version: 4,
       tabs: {
         tabs: [{
@@ -512,5 +519,78 @@ describe('tabs persistence - skipPersist + strip volatile fields', () => {
     const extTab = parsed!.tabs.tabs.find((t) => t.id === 'ext-tab')
     expect(extTab).toBeDefined()
     expect(extTab!.mode).toBeUndefined()
+  })
+})
+
+describe('persisted layout machineId stamp', () => {
+  beforeEach(() => {
+    localStorageMock.clear()
+    vi.useFakeTimers()
+    resetPersistFlushListenersForTests()
+    resetPersistBroadcastForTests()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  function makeMachineStampStore() {
+    return configureStore({
+      reducer: { tabs: tabsReducer, machineIdentity: machineIdentityReducer },
+      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: 'tab-1',
+            createRequestId: 'req-1',
+            title: 'Test',
+            status: 'running',
+            mode: 'shell',
+            createdAt: 123,
+            lastInputAt: 111,
+          }],
+          activeTabId: 'tab-1',
+          tombstones: [],
+        },
+      },
+    })
+  }
+
+  it('stamps the flushed envelope with the machine identity slice current machine id', () => {
+    const store = makeMachineStampStore()
+    store.dispatch(setMachineReady({
+      machine: { id: 'machine-stamp-1', label: 'Garage', createdAt: 1, lastSeenAt: 2 },
+      mode: 'server-managed',
+    }))
+    store.dispatch(updateTab({ id: 'tab-1', updates: { title: 'Stamped' } }))
+    vi.runAllTimers()
+
+    const raw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+    expect(raw).not.toBeNull()
+    expect(JSON.parse(raw!).machineId).toBe('machine-stamp-1')
+  })
+
+  it('falls back to the remembered machine selection when the machine identity slice holds no machine yet', () => {
+    localStorage.setItem(MACHINE_ID_STORAGE_KEY, 'machine-remembered-1')
+    const store = makeMachineStampStore()
+
+    store.dispatch(updateTab({ id: 'tab-1', updates: { title: 'Stamped' } }))
+    vi.runAllTimers()
+
+    const raw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+    expect(raw).not.toBeNull()
+    expect(JSON.parse(raw!).machineId).toBe('machine-remembered-1')
+  })
+
+  it('omits the machineId field when no machine is known and no selection is remembered', () => {
+    const store = makeMachineStampStore()
+
+    store.dispatch(updateTab({ id: 'tab-1', updates: { title: 'Stamped' } }))
+    vi.runAllTimers()
+
+    const raw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+    expect(raw).not.toBeNull()
+    expect(JSON.parse(raw!)).not.toHaveProperty('machineId')
   })
 })

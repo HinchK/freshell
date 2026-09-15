@@ -1,16 +1,27 @@
-// Tests for atomic tabs+panes persistence via freshell.layout.v3
-import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { LAYOUT_STORAGE_KEY, TABS_STORAGE_KEY, PANES_STORAGE_KEY } from '@/store/storage-keys'
+// Tests for atomic tabs+panes persistence via the per-window layout key
+// (delta round 3, finding 1 / e3r1 finding 3: freshell.layout.v3.<layoutWindowId>,
+// with freshell.layout.v3 retained as the LEGACY key only).
+import { describe, it, expect, beforeEach } from 'vitest'
+import { LEGACY_LAYOUT_STORAGE_KEY, TABS_STORAGE_KEY, PANES_STORAGE_KEY } from '@/store/storage-keys'
 import { parsePersistedLayoutRaw, migrateV2ToV3 } from '@/store/persistedState'
+
+const WINDOW_ID = 'client-atomic-persistence'
+const OWN_LAYOUT_KEY = `freshell.layout.v3.${WINDOW_ID}`
 
 describe('atomic persistence', () => {
   beforeEach(() => {
     localStorage.clear()
+    sessionStorage.setItem('freshell.layout-window-id.v1', WINDOW_ID)
   })
 
-  describe('LAYOUT_STORAGE_KEY', () => {
-    it('is freshell.layout.v3', () => {
-      expect(LAYOUT_STORAGE_KEY).toBe('freshell.layout.v3')
+  describe('layout storage keys', () => {
+    it('keeps the bare freshell.layout.v3 as the LEGACY key only (adoption source, never deleted)', () => {
+      expect(LEGACY_LAYOUT_STORAGE_KEY).toBe('freshell.layout.v3')
+    })
+
+    it('derives the window’s layout key from the dedicated layout-window id (freshell.layout-window-id.v1), not the tab-registry client id', async () => {
+      const { getWindowLayoutKey } = await import('@/store/window-layout-keys')
+      expect(getWindowLayoutKey()).toBe(OWN_LAYOUT_KEY)
     })
   })
 
@@ -82,8 +93,8 @@ describe('atomic persistence', () => {
       const result = migrateV2ToV3()
       expect(result).not.toBeNull()
 
-      // Should have written the v3 key
-      const v3Raw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+      // Should have written the window's own v3 key (never the legacy key)
+      const v3Raw = localStorage.getItem(OWN_LAYOUT_KEY)
       expect(v3Raw).not.toBeNull()
 
       const v3 = JSON.parse(v3Raw!)
@@ -95,6 +106,7 @@ describe('atomic persistence', () => {
       // Should have deleted v2 keys
       expect(localStorage.getItem(TABS_STORAGE_KEY)).toBeNull()
       expect(localStorage.getItem(PANES_STORAGE_KEY)).toBeNull()
+      expect(localStorage.getItem('freshell.layout.v3'), 'the v2→v3 write targets the window\u2019s own key, never the legacy key').toBeNull()
     })
 
     it('returns null when no v2 keys exist', () => {

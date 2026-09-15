@@ -103,7 +103,7 @@ test.describe('createRequestId stabilization (rust REST ingress + reload)', () =
     await page.evaluate(() => {
       (window as any).__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
     })
-    const layoutRaw = await page.evaluate(() => localStorage.getItem('freshell.layout.v3'))
+    const layoutRaw = await page.evaluate(() => localStorage.getItem(`freshell.layout.v3.${sessionStorage.getItem('freshell.layout-window-id.v1')}`))
     expect(layoutRaw, 'layout must be persisted before reload').toBeTruthy()
     expect(layoutRaw).toContain(keyBefore)
 

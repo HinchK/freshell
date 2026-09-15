@@ -21,9 +21,10 @@ import {
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
 import { matchesDerivedPaneTitle } from '@/lib/pane-title'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
-import { buildPaneRefreshTarget, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
+import { buildPaneRefreshTarget, paneContentMatchesSessionRef, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
 import { loadPersistedPanes, loadPersistedTabs } from './persistMiddleware.js'
 import { hasPaneTreeShape, isWellFormedPaneTree } from './paneTreeValidation.js'
+import { mergeHydratedPaneMetadata, mergeCrossWindowPaneTitles, paneTitleMetadataEquals, type HydratePanesMeta } from './hydrate-pane-metadata-merge.js'
 import { createLogger } from '@/lib/client-logger'
 import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
 import { sanitizeRestoreError, sanitizeCrashTrace, sanitizeSessionRef, type RestoreError } from '@shared/session-contract'
@@ -33,11 +34,6 @@ import { normalizeFreshAgentStyleOverride } from '@shared/settings'
 
 
 const log = createLogger('PanesSlice')
-
-type HydratePanesMeta = {
-  localLayoutPersistedAt?: number
-  remoteLayoutPersistedAt?: number
-}
 
 type FreshAgentSessionMaterializedPayload = {
   previousSessionId: string
@@ -425,41 +421,6 @@ function loadInitialPanesState(): PanesState {
 
 const initialState: PanesState = loadInitialPanesState()
 
-/**
- * Recursively walk a pane tree to find the leaf pane ID whose terminal
- * content has the given terminalId. Returns undefined if no match.
- */
-function findPaneIdByTerminalId(node: PaneNode, terminalId: string): string | undefined {
-  if (node.type === 'leaf') {
-    if (node.content.kind === 'terminal' && node.content.terminalId === terminalId) {
-      return node.id
-    }
-    return undefined
-  }
-  return findPaneIdByTerminalId(node.children[0], terminalId)
-    ?? findPaneIdByTerminalId(node.children[1], terminalId)
-}
-
-/**
- * Recursively walk a pane tree to find the leaf pane ID bound to the given
- * provider:sessionId — a fresh-agent pane owning that session, or a terminal
- * pane whose sessionRef points at it. Returns undefined if no match.
- */
-function findPaneIdBySessionRef(node: PaneNode, provider: string, sessionId: string): string | undefined {
-  if (node.type === 'leaf') {
-    const content = node.content
-    if (content.kind === 'fresh-agent' && content.provider === provider && content.sessionId === sessionId) {
-      return node.id
-    }
-    if (content.kind === 'terminal' && content.sessionRef?.provider === provider && content.sessionRef?.sessionId === sessionId) {
-      return node.id
-    }
-    return undefined
-  }
-  return findPaneIdBySessionRef(node.children[0], provider, sessionId)
-    ?? findPaneIdBySessionRef(node.children[1], provider, sessionId)
-}
-
 // Helper to find and replace a node (leaf or split) in the tree
 function findAndReplace(
   node: PaneNode,
@@ -535,116 +496,6 @@ function normalizePaneTree(node: PaneNode, previous?: PaneNode): PaneNode | null
     ...node,
     children: [normalizedLeft, normalizedRight],
   }
-}
-
-function collectLeafPaneIds(node: PaneNode): string[] {
-  if (node.type === 'leaf') {
-    return [node.id]
-  }
-  return [
-    ...collectLeafPaneIds(node.children[0]),
-    ...collectLeafPaneIds(node.children[1]),
-  ]
-}
-
-function filterPaneMetadataByLayout<T>(
-  metadata: Record<string, Record<string, T>> | undefined,
-  tabId: string,
-  paneIds: Set<string>,
-): Record<string, T> | undefined {
-  const tabMetadata = metadata?.[tabId]
-  if (!tabMetadata) return undefined
-  const filtered = Object.fromEntries(
-    Object.entries(tabMetadata).filter(([paneId]) => paneIds.has(paneId)),
-  )
-  return Object.keys(filtered).length > 0 ? filtered : undefined
-}
-
-function pickHydratedActivePane(
-  paneIds: string[],
-  incomingActivePaneId: string | undefined,
-  localActivePaneId: string | undefined,
-): string | undefined {
-  const paneIdSet = new Set(paneIds)
-  if (incomingActivePaneId && paneIdSet.has(incomingActivePaneId)) {
-    return incomingActivePaneId
-  }
-  if (localActivePaneId && paneIdSet.has(localActivePaneId)) {
-    return localActivePaneId
-  }
-  return paneIds[paneIds.length - 1]
-}
-
-function mergeHydratedPaneMetadata(
-  state: PanesState,
-  incoming: PanesState,
-  layouts: Record<string, PaneNode>,
-  incomingLayoutTabIds: Set<string>,
-): Pick<PanesState, 'activePane' | 'paneTitles' | 'paneTitleSetByUser'> {
-  const activePane: Record<string, string> = {}
-  const paneTitles: Record<string, Record<string, string>> = {}
-  const paneTitleSetByUser: Record<string, Record<string, boolean>> = {}
-
-  for (const [tabId, layout] of Object.entries(layouts)) {
-    const paneIds = collectLeafPaneIds(layout)
-    const paneIdSet = new Set(paneIds)
-    const localLayoutPreserved = !incomingLayoutTabIds.has(tabId)
-    const preferredTitleSource = localLayoutPreserved
-      ? state.paneTitles
-      : incoming.paneTitles
-    const preferredTitleSetByUserSource = localLayoutPreserved
-      ? state.paneTitleSetByUser
-      : incoming.paneTitleSetByUser
-
-    const nextActivePane = pickHydratedActivePane(
-      paneIds,
-      localLayoutPreserved ? undefined : incoming.activePane?.[tabId],
-      state.activePane?.[tabId],
-    )
-    if (nextActivePane) {
-      activePane[tabId] = nextActivePane
-    }
-
-    const nextPaneTitles = filterPaneMetadataByLayout(preferredTitleSource, tabId, paneIdSet)
-    const fallbackTitles = !localLayoutPreserved
-      ? filterPaneMetadataByLayout(state.paneTitles, tabId, paneIdSet)
-      : undefined
-    const localUserSetTitleFlags = !localLayoutPreserved
-      ? filterPaneMetadataByLayout(state.paneTitleSetByUser, tabId, paneIdSet)
-      : undefined
-    if (nextPaneTitles) {
-      if (fallbackTitles && localUserSetTitleFlags) {
-        const merged = { ...nextPaneTitles }
-        for (const [paneId, title] of Object.entries(fallbackTitles)) {
-          if (localUserSetTitleFlags[paneId]) {
-            merged[paneId] = title
-          }
-        }
-        paneTitles[tabId] = merged
-      } else {
-        paneTitles[tabId] = nextPaneTitles
-      }
-    } else if (fallbackTitles) {
-      paneTitles[tabId] = fallbackTitles
-    }
-
-    const nextPaneTitleSetByUser = filterPaneMetadataByLayout(
-      preferredTitleSetByUserSource,
-      tabId,
-      paneIdSet,
-    )
-    const fallbackTitleSetByUser = !localLayoutPreserved
-      ? filterPaneMetadataByLayout(state.paneTitleSetByUser, tabId, paneIdSet)
-      : undefined
-    if (nextPaneTitleSetByUser || fallbackTitleSetByUser) {
-      paneTitleSetByUser[tabId] = {
-        ...(nextPaneTitleSetByUser || {}),
-        ...(fallbackTitleSetByUser || {}),
-      }
-    }
-  }
-
-  return { activePane, paneTitles, paneTitleSetByUser }
 }
 
 function clearPaneRefreshRequest(state: PanesState, tabId: string, paneId: string) {
@@ -2140,7 +1991,7 @@ export const panesSlice = createSlice({
       }
 
       state.layouts = mergedLayouts
-      const nextMetadata = mergeHydratedPaneMetadata(state, incoming, mergedLayouts, incomingLayoutTabIds)
+      const nextMetadata = mergeHydratedPaneMetadata(state, incoming, mergedLayouts, incomingLayoutTabIds, meta)
       state.activePane = nextMetadata.activePane
       state.paneTitles = nextMetadata.paneTitles
       state.paneTitleSetByUser = nextMetadata.paneTitleSetByUser
@@ -2167,6 +2018,32 @@ export const panesSlice = createSlice({
       state.deadSessionAdjudication = []
       state.reconcileWarming = null
       state.reconcilePendingPanes = {}
+    },
+
+    // TITLE-ONLY cross-window hydration (e3r1 finding 4): another window's
+    // layout event applies ONLY the Task-7 pane-title reconciliation to
+    // panes that exist in BOTH envelopes. Trees, content, active panes,
+    // and every ephemeral pane signal (zoom, refresh requests, …) are this
+    // window's own business and stay untouched.
+    hydratePaneTitles: (
+      state,
+      action: PayloadAction<
+        Pick<PanesState, 'paneTitles' | 'paneTitleSetByUser'> & { layouts: Record<string, unknown> }
+      >,
+    ) => {
+      const meta = (action as PayloadAction<
+        Pick<PanesState, 'paneTitles' | 'paneTitleSetByUser'> & { layouts: Record<string, unknown> },
+        string,
+        HydratePanesMeta | undefined
+      >).meta
+      const merged = mergeCrossWindowPaneTitles(state, action.payload, action.payload.layouts, meta)
+      // Equal-result churn guard (e3r3 finding 1): leave the state
+      // reference untouched when the merge changed nothing, so the
+      // persist middleware marks no dirty cycle and an equal-title
+      // receiver never re-flushes.
+      if (paneTitleMetadataEquals(merged, state)) return
+      state.paneTitles = merged.paneTitles
+      state.paneTitleSetByUser = merged.paneTitleSetByUser
     },
 
     updatePaneTitle: (
@@ -2221,9 +2098,11 @@ export const panesSlice = createSlice({
     },
 
     /**
-     * Walk all tabs' pane trees and update the title for any pane whose
-     * terminal content has the given terminalId. Used when a session rename
-     * from the history view should cascade to the pane title bar.
+     * Walk all tabs' pane trees and update the title for EVERY pane whose
+     * terminal content has the given terminalId (multi-match — two panes
+     * in one tab can share a terminal). Used when a session rename from
+     * the history view cascades to pane title bars, and by the
+     * terminal.inventory title fold.
      */
     updatePaneTitleByTerminalId: (
       state,
@@ -2231,8 +2110,9 @@ export const panesSlice = createSlice({
     ) => {
       const { terminalId, title, setByUser } = action.payload
       for (const tabId of Object.keys(state.layouts)) {
-        const paneId = findPaneIdByTerminalId(state.layouts[tabId], terminalId)
-        if (paneId) {
+        for (const leaf of collectLeaves(state.layouts[tabId])) {
+          if (leaf.content.kind !== 'terminal' || leaf.content.terminalId !== terminalId) continue
+          const paneId = leaf.id
           if (setByUser === false && state.paneTitleSetByUser?.[tabId]?.[paneId]) {
             continue
           }
@@ -2261,8 +2141,9 @@ export const panesSlice = createSlice({
     ) => {
       const { provider, sessionId, title, setByUser } = action.payload
       for (const tabId of Object.keys(state.layouts)) {
-        const paneId = findPaneIdBySessionRef(state.layouts[tabId], provider, sessionId)
-        if (paneId) {
+        for (const leaf of collectLeaves(state.layouts[tabId])) {
+          if (!paneContentMatchesSessionRef(leaf.content, provider, sessionId)) continue
+          const paneId = leaf.id
           if (setByUser === false && state.paneTitleSetByUser?.[tabId]?.[paneId]) {
             continue
           }
@@ -2796,6 +2677,7 @@ export const {
   markPaneClosing,
   clearPaneClosing,
   hydratePanes,
+  hydratePaneTitles,
   updatePaneTitle,
   updatePaneTitleByTerminalId,
   updatePaneTitleBySessionRef,

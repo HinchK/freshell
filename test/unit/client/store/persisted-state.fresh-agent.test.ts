@@ -1,14 +1,25 @@
-import { describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it } from 'vitest'
 
 import {
   LAYOUT_FRESH_AGENT_BACKUP_KEY,
-  LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY,
-  LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY,
-  LAYOUT_STORAGE_KEY,
   hashPersistedLayoutRaw,
   parsePersistedLayoutRaw,
   readRecoverablePersistedLayoutRaw,
 } from '@/store/persistedState'
+
+// Delta round 3, finding 1: the recoverable-read path resolves THIS
+// window's per-window layout key and its per-window fresh-agent
+// backup/marker channels; the marker PAYLOAD's backupKey field stays the
+// migration-identifier constant.
+const WINDOW_ID = 'client-persisted-fresh-agent'
+const LAYOUT_STORAGE_KEY = `freshell.layout.v3.${WINDOW_ID}`
+const LAYOUT_FRESH_AGENT_BACKUP_STORAGE_KEY = `${LAYOUT_STORAGE_KEY}.backup-before-fresh-agent-centralization`
+const LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY = `${LAYOUT_STORAGE_KEY}.fresh-agent-centralization-pending`
+const LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY = `${LAYOUT_STORAGE_KEY}.fresh-agent-centralization-commit`
+
+function seedWindow(): void {
+  sessionStorage.setItem('freshell.layout-window-id.v1', WINDOW_ID)
+}
 
 function collectLeafContents(node: any, contents: any[] = []): any[] {
   if (!node || typeof node !== 'object') return contents
@@ -72,6 +83,8 @@ function storageWith(values: Record<string, string | null>): Pick<Storage, 'getI
 }
 
 describe('persistedState fresh-agent migration', () => {
+  beforeEach(seedWindow)
+
   it('migrates persisted agent-chat panes to fresh-agent panes in the combined layout key shape', () => {
     const parsed = parsePersistedLayoutRaw(layoutRaw({
       'tab-1': {
@@ -295,7 +308,7 @@ describe('persistedState fresh-agent migration', () => {
 
     expect(readRecoverablePersistedLayoutRaw(storageWith({
       [LAYOUT_STORAGE_KEY]: partialRaw,
-      [LAYOUT_FRESH_AGENT_BACKUP_KEY]: backupRaw,
+      [LAYOUT_FRESH_AGENT_BACKUP_STORAGE_KEY]: backupRaw,
       [LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY]: pendingMarker,
     }) as Storage)).toBe(backupRaw)
   })
@@ -310,7 +323,7 @@ describe('persistedState fresh-agent migration', () => {
 
     expect(readRecoverablePersistedLayoutRaw(storageWith({
       [LAYOUT_STORAGE_KEY]: currentRaw,
-      [LAYOUT_FRESH_AGENT_BACKUP_KEY]: backupRaw,
+      [LAYOUT_FRESH_AGENT_BACKUP_STORAGE_KEY]: backupRaw,
     }) as Storage)).toBe(currentRaw)
   })
 
@@ -332,7 +345,7 @@ describe('persistedState fresh-agent migration', () => {
 
     expect(readRecoverablePersistedLayoutRaw(storageWith({
       [LAYOUT_STORAGE_KEY]: currentRaw,
-      [LAYOUT_FRESH_AGENT_BACKUP_KEY]: backupRaw,
+      [LAYOUT_FRESH_AGENT_BACKUP_STORAGE_KEY]: backupRaw,
       [LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY]: marker,
     }) as Storage)).toBe(currentRaw)
   })

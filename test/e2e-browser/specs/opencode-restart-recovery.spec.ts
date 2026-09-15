@@ -773,14 +773,15 @@ test.describe('OpenCode restart recovery', () => {
       await addTerminalTab(page, shellTab)
       await waitForRunningTerminals(page, [shellTab.tabId])
 
-      const persistedRaw = await page.evaluate(({ layoutKey }) => {
+      const persistedRaw = await page.evaluate(() => {
         const harness = window.__FRESHELL_TEST_HARNESS__
         if (!harness) throw new Error('Freshell test harness is not installed')
         harness.dispatch({ type: 'persist/flushNow' })
+        const layoutKey = `freshell.layout.v3.${sessionStorage.getItem('freshell.layout-window-id.v1')}`
         const raw = window.localStorage.getItem(layoutKey)
         if (!raw) throw new Error(`Missing persisted layout ${layoutKey}`)
         return raw
-      }, { layoutKey: 'freshell.layout.v3' })
+      })
       const persistedBeforeClose = JSON.parse(persistedRaw)
       expect(persistedBeforeClose.tabs?.activeTabId).toBe(shellTab.tabId)
       expect(persistedBeforeClose.tabs?.tabs?.find((tab: any) => tab.id === opencodeTab.tabId)?.sessionRef).toBeUndefined()

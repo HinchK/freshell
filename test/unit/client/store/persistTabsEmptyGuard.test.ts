@@ -35,11 +35,19 @@
 // log at `error` level with a structured reason.
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
-import { LAYOUT_BACKUP_STORAGE_KEY, LAYOUT_STORAGE_KEY } from '@/store/storage-keys'
+
+// Delta round 3, finding 1: the guard reads and backs up THIS window's own
+// per-window layout key (freshell.layout.v3.<layoutWindowId>) and its
+// per-window .bak — another window's refusal must never clobber this
+// window's backup, and vice versa.
+const WINDOW_ID = 'client-empty-guard-tests'
+const LAYOUT_STORAGE_KEY = `freshell.layout.v3.${WINDOW_ID}`
+const LAYOUT_BACKUP_STORAGE_KEY = `freshell.layout.v3.${WINDOW_ID}.bak`
 
 describe('persist middleware — destructive empty-tabs guard', () => {
   beforeEach(() => {
     localStorage.clear()
+    sessionStorage.setItem('freshell.layout-window-id.v1', WINDOW_ID)
     vi.useFakeTimers()
     vi.resetModules()
   })

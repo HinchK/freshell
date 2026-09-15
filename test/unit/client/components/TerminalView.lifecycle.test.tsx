@@ -12,7 +12,6 @@ import turnCompletionReducer from '@/store/turnCompletionSlice'
 import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
 import { persistMiddleware, resetPersistedLayoutCacheForTests, resetPersistFlushListenersForTests } from '@/store/persistMiddleware'
 import { parsePersistedLayoutRaw } from '@/store/persistedState'
-import { LAYOUT_STORAGE_KEY } from '@/store/storage-keys'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { useAppSelector } from '@/store/hooks'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
@@ -148,6 +147,11 @@ import TerminalView, {
   isEngagementInput,
 } from '@/components/TerminalView'
 import { resetEnsureExtensionsRegistryCacheForTests } from '@/hooks/useEnsureExtensionsRegistry'
+
+// Delta round 3, finding 1: the flush writes THIS window's per-window layout key.
+const WINDOW_ID = 'client-tv-lifecycle-tests'
+sessionStorage.setItem('freshell.layout-window-id.v1', WINDOW_ID)
+const LAYOUT_STORAGE_KEY = `freshell.layout.v3.${WINDOW_ID}`
 
 describe('isEngagementInput (real-keystroke detection)', () => {
   it('treats printable characters and Enter as engagement', () => {

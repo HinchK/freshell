@@ -106,6 +106,18 @@ const legacyMigrationBoundaryAllowances: LegacyBoundaryAllowance[] = [
       /^const LEGACY_AGENT_CHAT_PANE_KIND = 'agent-chat'$/,
     ],
   },
+  {
+    file: 'src/lib/recovery/layout-health.ts',
+    reason: 'boot layout-health classifier reads the persisted legacy pane kind (and documents its verified migration exemptions) to tell migrated legacy panes from corrupted envelopes',
+    patterns: [
+      /^\s*\* centralization migration: `fresh-agent` AND the legacy `agent-chat`$/,
+      /^\s*\* \(the rewrite consumes agent-chat panes through the same$/,
+      /^\s*\*\s+agent-chat pane with no usable identity \(fresh-agent\.ts:386-391\)\.$/,
+      /^\s*\* - sessionRef \(agent-chat\): the conversion verdict — a non-canonical$/,
+      /^\s*const isFreshAgentFamily = rawKind === 'fresh-agent' \|\| rawKind === 'agent-chat'$/,
+      /^\s*return rawKind === 'agent-chat'$/,
+    ],
+  },
 ]
 
 function toRepoRelativePath(filePath: string): string {
