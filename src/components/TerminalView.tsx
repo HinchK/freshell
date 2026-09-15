@@ -58,7 +58,7 @@ import {
 } from '@/store/terminalLifecycleSlice'
 import { TerminalExitBanner } from '@/components/TerminalExitBanner'
 import { TerminalLaunchFailureCard } from '@/components/TerminalLaunchFailureCard'
-import { SessionHandoffErrorBanner } from '@/components/SessionHandoffErrorBanner'
+import { FencedOwnerRecoveryActions, SessionHandoffErrorBanner } from '@/components/SessionHandoffErrorBanner'
 import { buildResumeContent, freshSessionTypeForPaneFlavor } from '@/lib/session-type-utils'
 import type { LaunchFailure } from '@/store/paneTypes'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
@@ -5910,6 +5910,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           <span>
             {`This conversation is blocked pending recovery (${freshAgentOwnerDivergence.fencedReason}).`}
           </span>
+          {/* b8ke ext r28 F2: the direct recovery actions — the same
+           * acknowledged force-clear / acknowledged-start set the Fresh
+           * Agent card renders (never a passive card). */}
+          <FencedOwnerRecoveryActions
+            fencedReason={freshAgentOwnerDivergence.fencedReason}
+            appStore={appStore}
+            tabId={tabId}
+            paneId={paneId}
+          />
         </div>
       ) : freshAgentOwnerDivergence?.ownerKind === 'fresh-agent' ? (
         <div

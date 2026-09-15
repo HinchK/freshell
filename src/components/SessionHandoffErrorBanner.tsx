@@ -17,7 +17,11 @@ import { runPaneSessionHandoff, SESSION_HANDOFF_RETRY_BACKOFF_MS } from '@/lib/s
  * operator force-clear action — "Force clear" sends the handoff request
  * with the `acknowledgePlatformLimitedRisk` acknowledgment: the server
  * clears the fence (recording the unverified-descendant limitation) and
- * answers the typed clear. b8ke ext r12 F1: the clear STOPS AT THE CLEAR —
+ * answers the typed clear. b8ke ext r28 F2: the r25 server repair made
+ * the acknowledged clear accept the STALE-reason fences too (their
+ * probe-only recovery left an evidence-less stale fence permanently
+ * unrecoverable), so those refusals render the same action. b8ke ext r12
+ * F1: the clear STOPS AT THE CLEAR —
  * acknowledgment covers clearing the fence, not starting a writer over the
  * acknowledged-risk tree, so the client performs NO handoff request after
  * the clear; the cleared banner (HANDOFF_FORCE_CLEARED) surfaces the state
@@ -54,23 +58,35 @@ export function SessionHandoffErrorBanner({ error, appStore, tabId, paneId }: {
     }
   }, [error])
 
-  // R4-4: the force-clear action surfaces for the platform-limited fence
-  // shapes — the original PLATFORM_LIMITED failure and the ordinary
-  // retry's PLATFORM_LIMITED_FENCED refusal. b8ke e3r4 F2 (the DESIGN
-  // RECONCILIATION): the STALE-reason refusals (STALE_START_FENCED /
-  // STALE_STOP_FENCED) NEVER offer the force-clear — those states mean
-  // the prior runtime may STILL BE LIVE, so clearing to Vacant and
-  // chaining a writer would weaken active-writer refusal; their recovery
-  // is the server's CONFIRMED-DEATH PROBE ONLY (the Banner presents the
-  // fenced state and probe-based retry guidance).
-  const platformLimited = error.code === 'PLATFORM_LIMITED'
+  // R4-4: the force-clear action surfaces for the fence shapes the
+  // server's acknowledged clear ACCEPTS — the PlatformLimited shapes
+  // (the original PLATFORM_LIMITED failure and the ordinary retry's
+  // PLATFORM_LIMITED_FENCED refusal) and, since the r25 server repair,
+  // the STALE-reason refusals (STALE_START_FENCED / STALE_STOP_FENCED):
+  // their recovery was the confirmed-death probe ONLY, so a stale fence
+  // whose retained runtime evidence was gone was permanently
+  // unrecoverable through the browser. The pre-r28 e3r4 DESIGN
+  // RECONCILIATION rationale (clearing to Vacant + chaining a writer
+  // would weaken active-writer refusal) no longer holds: the r25 clear
+  // lands the TYPED cleared-unverified state and never chains a writer —
+  // the acknowledged START is its own atomic arm, so the active-writer
+  // refusal stays intact.
+  const forceClearable = error.code === 'PLATFORM_LIMITED'
     || error.code === 'PLATFORM_LIMITED_FENCED'
+    || error.code === 'STALE_START_FENCED'
+    || error.code === 'STALE_STOP_FENCED'
 
   // b8ke ext r12 F1: the acknowledged force-clear's STOPPED state — the
   // fence cleared, no reopen ran. The explicit re-initiation affordance
   // ("Start reopen again") is the ONLY next step; no automatic retry ever
   // runs from the clear.
+  // b8ke ext r28 F2: the CLEARED_UNVERIFIED_FENCED refusal (an ordinary
+  // retry against the cleared-unverified key) is the SAME state — the
+  // acknowledged START is the only next step, so its retry IS the
+  // start-again action (an unfenced retry would loop the refusal
+  // forever).
   const forceCleared = error.code === 'HANDOFF_FORCE_CLEARED'
+    || error.code === 'CLEARED_UNVERIFIED_FENCED'
 
   if (!error.retryable) {
     return (
@@ -94,7 +110,7 @@ export function SessionHandoffErrorBanner({ error, appStore, tabId, paneId }: {
     >
       <span>{error.message}</span>
       <div className="flex shrink-0 items-center gap-2">
-        {platformLimited ? (
+        {forceClearable ? (
           <button
             type="button"
             className="rounded border border-amber-500/70 px-2 py-1 text-xs disabled:opacity-60"
@@ -145,5 +161,100 @@ export function SessionHandoffErrorBanner({ error, appStore, tabId, paneId }: {
         </button>
       </div>
     </div>
+  )
+}
+
+/**
+ * b8ke ext r28 F2: the fenced-owner card's DIRECT recovery actions — the
+ * shared action set FreshAgentView's and TerminalView's `fencedReason`
+ * cards render. Pre-r28 the remote fenced-owner cards were passive, so
+ * a stale fence whose retained runtime evidence was gone (the confirmed-
+ * death probe could never resolve it) was PERMANENTLY unrecoverable
+ * through the browser despite the server implementing the acknowledged
+ * clear. The actions follow the server's accepted recovery arms:
+ * - platform-limited | stale-start | stale-stop → the acknowledged
+ *   FORCE-CLEAR (runPaneSessionHandoff with the risk acknowledgment;
+ *   the server answers the typed clear and the pane surfaces the
+ *   cleared state with its own start-again affordance);
+ * - cleared-unverified (the r28-F1 post-clear state) → the acknowledged
+ *   START ("Start reopen again" — the clear is not permission to start
+ *   a writer; the acknowledgment at the START is);
+ * - every other fenced reason (watcher-failed — probe-recovered) renders
+ *   nothing: no operator clear exists for those.
+ */
+export function FencedOwnerRecoveryActions({ fencedReason, appStore, tabId, paneId }: {
+  fencedReason: string
+  appStore: AppStore
+  tabId: string
+  paneId: string
+}) {
+  const [armed, setArmed] = useState(false)
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => {
+    setArmed(false)
+    return () => {
+      if (timerRef.current !== null) {
+        clearTimeout(timerRef.current)
+        timerRef.current = null
+      }
+    }
+  }, [fencedReason])
+
+  const forceClearable = fencedReason === 'platform-limited'
+    || fencedReason === 'stale-start'
+    || fencedReason === 'stale-stop'
+  const clearedUnverified = fencedReason === 'cleared-unverified'
+  if (!forceClearable && !clearedUnverified) return null
+
+  const arm = (action: () => void) => {
+    if (timerRef.current !== null) return
+    setArmed(true)
+    timerRef.current = setTimeout(() => {
+      timerRef.current = null
+      setArmed(false)
+      action()
+    }, SESSION_HANDOFF_RETRY_BACKOFF_MS)
+  }
+
+  return (
+    <>
+      {forceClearable ? (
+        <button
+          type="button"
+          className="shrink-0 rounded border border-amber-500/70 px-2 py-1 text-xs disabled:opacity-60"
+          aria-label={`Force clear the ${fencedReason} fence, acknowledging the unverified runtime's processes may remain — the reopen is a separate explicit action`}
+          data-testid="fenced-owner-force-clear-button"
+          disabled={armed}
+          onClick={() => {
+            arm(() => {
+              void runPaneSessionHandoff(appStore, { tabId, paneId, acknowledgePlatformLimitedRisk: true })
+            })
+          }}
+        >
+          Force clear
+        </button>
+      ) : null}
+      {clearedUnverified ? (
+        <button
+          type="button"
+          className="shrink-0 rounded border border-border/70 px-2 py-1 text-xs disabled:opacity-60"
+          aria-label="Start the reopen again now that the fence is cleared"
+          data-testid="fenced-owner-start-again-button"
+          disabled={armed}
+          onClick={() => {
+            arm(() => {
+              // The acknowledged START — the cleared-unverified state is
+              // not permission to start a writer; the acknowledgment at
+              // the START is (the same arm the cleared banner's
+              // start-again action carries).
+              void runPaneSessionHandoff(appStore, { tabId, paneId, acknowledgePlatformLimitedRisk: true })
+            })
+          }}
+        >
+          Start reopen again
+        </button>
+      ) : null}
+    </>
   )
 }

@@ -243,13 +243,23 @@ export async function runPaneSessionHandoff(
       tabId,
       paneId,
       generation: handoff.generation,
+      // b8ke ext r28 F2: the reason-typed cleared label rides the log.
+      cleared: handoff.cleared,
     })
+    // b8ke ext r28 F2: the cleared banner's message names the ACTUAL
+    // fenced reason (pre-r28 it was hard-coded platform-limited — a
+    // stale-start/stale-stop clear surfaced a wrong-reason message).
+    const clearedMessage = handoff.cleared === 'stale-start-fence'
+      ? 'The stale-start fence was force-cleared (the unconfirmed runtime\'s surviving processes are the acknowledged risk). No reopen has run — start it again when ready.'
+      : handoff.cleared === 'stale-stop-fence'
+        ? 'The stale-stop fence was force-cleared (the unconfirmed runtime\'s surviving processes are the acknowledged risk). No reopen has run — start it again when ready.'
+        : 'The platform-limited fence was cleared (unverified descendant processes are the acknowledged risk). No reopen has run — start it again when ready.'
     appStore.dispatch(setPaneHandoffError({
       tabId,
       paneId,
       error: {
         code: 'HANDOFF_FORCE_CLEARED',
-        message: 'The platform-limited fence was cleared (unverified descendant processes are the acknowledged risk). No reopen has run — start it again when ready.',
+        message: clearedMessage,
         retryable: true,
         generation: handoff.generation,
       },

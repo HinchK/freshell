@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { SessionHandoffErrorBanner } from '@/components/SessionHandoffErrorBanner'
+import { FencedOwnerRecoveryActions, SessionHandoffErrorBanner } from '@/components/SessionHandoffErrorBanner'
 import type { HandoffError } from '@/store/paneTypes'
 
 const runPaneSessionHandoffMock = vi.hoisted(() => vi.fn())
@@ -75,13 +75,17 @@ describe('SessionHandoffErrorBanner (kata b8ke R4-4 force-clear action)', () => 
     expect(screen.getByRole('button', { name: /force clear/i })).toBeDefined()
   })
 
-  // b8ke e3r4 F2 (the DESIGN RECONCILIATION): the stale-reason refusals
-  // NEVER offer the force-clear — those states mean the prior runtime may
-  // STILL BE LIVE (clearing to Vacant + chaining a writer would weaken
-  // active-writer refusal); their recovery is the server's
-  // confirmed-death probe, so the Banner presents the fenced state with
-  // Retry guidance only.
-  it('renders NO force-clear for the stale-reason fences (probe-based recovery only)', () => {
+  // b8ke ext r28 F2: the r25 server change made the acknowledged
+  // force-clear accept the STALE-reason fences (their recovery was the
+  // confirmed-death probe ONLY, so a stale fence whose retained runtime
+  // evidence was gone was PERMANENTLY unrecoverable through the browser).
+  // The pre-r28 banner deliberately withheld the action — the e3r4 DESIGN
+  // RECONCILIATION's rationale (clearing to Vacant + chaining a writer)
+  // no longer holds: the server's clear lands the TYPED
+  // cleared-unverified state and NEVER chains a writer (the acknowledged
+  // START is its own atomic arm), so the active-writer refusal is intact.
+  it('renders the Force clear action for the stale-reason fences (the acknowledged clear is their operator escape)', async () => {
+    const user = userEvent.setup()
     for (const code of ['STALE_START_FENCED', 'STALE_STOP_FENCED']) {
       const { unmount } = render(
         <SessionHandoffErrorBanner
@@ -91,12 +95,52 @@ describe('SessionHandoffErrorBanner (kata b8ke R4-4 force-clear action)', () => 
           paneId="pane-1"
         />,
       )
-      expect(
-        screen.queryByRole('button', { name: /force clear/i }),
-        code,
-      ).toBeNull()
+      const button = screen.getByRole('button', { name: /force clear/i })
+      expect(button, code).toBeDefined()
+      await user.click(button)
+      await waitFor(() => {
+        expect(runPaneSessionHandoffMock).toHaveBeenCalledWith(
+          store,
+          expect.objectContaining({
+            tabId: 'tab-1',
+            paneId: 'pane-1',
+            acknowledgePlatformLimitedRisk: true,
+          }),
+        )
+      })
+      runPaneSessionHandoffMock.mockClear()
       unmount()
     }
+  })
+
+  // b8ke ext r28 F2: an ordinary retry against a CLEARED-UNVERIFIED key
+  // answers the typed CLEARED_UNVERIFIED_FENCED refusal — the state IS the
+  // cleared fence, so the banner's action is the ACKNOWLEDGED START (the
+  // same start-again affordance the cleared banner offers), never an
+  // unfenced retry that would loop the refusal forever.
+  it('renders the acknowledged Start-again action for CLEARED_UNVERIFIED_FENCED (the ordinary retry is refused)', async () => {
+    const user = userEvent.setup()
+    render(
+      <SessionHandoffErrorBanner
+        error={errorWith({ code: 'CLEARED_UNVERIFIED_FENCED' })}
+        appStore={store}
+        tabId="tab-1"
+        paneId="pane-1"
+      />,
+    )
+    expect(screen.queryByRole('button', { name: /force clear/i })).toBeNull()
+    const startAgain = screen.getByRole('button', { name: /start the reopen again/i })
+    await user.click(startAgain)
+    await waitFor(() => {
+      expect(runPaneSessionHandoffMock).toHaveBeenCalledWith(
+        store,
+        expect.objectContaining({
+          tabId: 'tab-1',
+          paneId: 'pane-1',
+          acknowledgePlatformLimitedRisk: true,
+        }),
+      )
+    })
   })
 
   it('no force-clear action for ordinary retryable failures — Retry stays the only action', async () => {
@@ -188,5 +232,91 @@ describe('b8ke ext r12 F1: the cleared state presents the explicit re-initiation
     expect(screen.getByRole('button', { name: /start the reopen again/i })).toBeDefined()
     // No force-clear action on the CLEARED state (the fence is gone).
     expect(screen.queryByRole('button', { name: /force clear/i })).toBeNull()
+  })
+})
+
+describe('b8ke ext r28 F2: FencedOwnerRecoveryActions (the fenced-owner card recovery)', () => {
+  beforeEach(() => {
+    runPaneSessionHandoffMock.mockReset()
+    runPaneSessionHandoffMock.mockResolvedValue(false)
+  })
+
+  afterEach(() => {
+    cleanup()
+  })
+
+  // Pre-r28 the remote fenced-owner cards (FreshAgentView's and
+  // TerminalView's `fencedReason` cards) were PASSIVE — a stale fence
+  // whose retained runtime evidence was gone was permanently
+  // unrecoverable through the browser despite the server implementing
+  // the acknowledged clear.
+  it('renders the Force clear action for the server-accepted unconfirmable reasons', async () => {
+    const user = userEvent.setup()
+    for (const fencedReason of [
+      'platform-limited',
+      'stale-start',
+      'stale-stop',
+    ] as const) {
+      const { unmount } = render(
+        <FencedOwnerRecoveryActions
+          fencedReason={fencedReason}
+          appStore={store}
+          tabId="tab-1"
+          paneId="pane-1"
+        />,
+      )
+      const button = screen.getByRole('button', { name: /force clear/i })
+      expect(button, fencedReason).toBeDefined()
+      await user.click(button)
+      await waitFor(() => {
+        expect(runPaneSessionHandoffMock).toHaveBeenCalledWith(
+          store,
+          expect.objectContaining({
+            tabId: 'tab-1',
+            paneId: 'pane-1',
+            acknowledgePlatformLimitedRisk: true,
+          }),
+        )
+      })
+      runPaneSessionHandoffMock.mockClear()
+      unmount()
+    }
+  })
+
+  it('renders the Start-again action (the acknowledged START) for the cleared-unverified state', async () => {
+    const user = userEvent.setup()
+    render(
+      <FencedOwnerRecoveryActions
+        fencedReason="cleared-unverified"
+        appStore={store}
+        tabId="tab-1"
+        paneId="pane-1"
+      />,
+    )
+    expect(screen.queryByRole('button', { name: /force clear/i })).toBeNull()
+    const startAgain = screen.getByRole('button', { name: /start the reopen again/i })
+    await user.click(startAgain)
+    await waitFor(() => {
+      expect(runPaneSessionHandoffMock).toHaveBeenCalledWith(
+        store,
+        expect.objectContaining({
+          tabId: 'tab-1',
+          paneId: 'pane-1',
+          acknowledgePlatformLimitedRisk: true,
+        }),
+      )
+    })
+  })
+
+  it('renders nothing for the probe-recovered fences (no operator clear exists)', () => {
+    const { container } = render(
+      <FencedOwnerRecoveryActions
+        fencedReason="watcher-failed"
+        appStore={store}
+        tabId="tab-1"
+        paneId="pane-1"
+      />,
+    )
+    expect(container.querySelectorAll('button')).toHaveLength(0)
   })
 })

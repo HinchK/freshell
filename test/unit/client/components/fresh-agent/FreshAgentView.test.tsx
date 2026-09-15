@@ -6870,6 +6870,62 @@ describe('freshcodex wedged-sidecar notice', () => {
     expect(remints[0].payload.content.sessionId).toBeUndefined()
     expect(remints[0].payload.content.createRequestId).not.toBe('req-focus-0bc6')
   })
+
+  // b8ke ext r28 F2: the remote fenced-owner card offers the DIRECT
+  // force-clear action — pre-r28 the card was passive, so a stale fence
+  // whose retained runtime evidence was gone was permanently unrecoverable
+  // through the browser despite the server implementing the acknowledged
+  // clear.
+  it('the fenced-owner card offers the direct force-clear action (b8ke ext r28 F2)', async () => {
+    apiMock.requestSessionHandoff.mockClear()
+    const { store } = renderFocusPane({ sessionId: 'thread-fenced-1', status: 'idle' })
+    // Seed the pane content into the LAYOUT slice — runPaneSessionHandoff
+    // resolves its reopen context from the store layout, not the prop.
+    act(() => {
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-focus-0bc6',
+          sessionId: 'thread-fenced-1',
+          // The durable ref the reopen target resolves through.
+          resumeSessionId: 'thread-fenced-1',
+          status: 'idle',
+        },
+      }))
+    })
+    act(() => {
+      store.dispatch(applyRuntimeOwner({
+        type: 'session.runtimeOwner',
+        provider: 'codex',
+        sessionId: 'thread-fenced-1',
+        epoch: 3,
+        generation: 9,
+        ownerKind: 'fresh-agent',
+        operationId: 'stale-start-fence-1',
+        transition: 'handoff-failed',
+        reason: 'stale-start',
+        fenced: true,
+      }))
+    })
+    const card = await screen.findByRole('alert', { name: 'Session blocked pending recovery' })
+    expect(card).toHaveTextContent(/stale-start/)
+    // THE DIRECT ACTION: Force clear sends the handoff request with the
+    // acknowledged-risk arm.
+    const button = screen.getByRole('button', { name: /force clear/i })
+    await waitFor(() => expect(button).not.toBeDisabled())
+    fireEvent.click(button)
+    await waitFor(() => {
+      expect(apiMock.requestSessionHandoff).toHaveBeenCalledWith(expect.objectContaining({
+        provider: 'codex',
+        sessionId: 'thread-fenced-1',
+        acknowledgePlatformLimitedRisk: true,
+      }))
+    }, { timeout: 5_000 })
+  })
 })
 
 describe('snapshot scheduler integration (zrrj)', () => {

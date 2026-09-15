@@ -71,7 +71,7 @@ import {
 } from '@/lib/fresh-agent-rollback'
 import { registerFreshAgentPaneActions } from '@/lib/pane-action-registry'
 import { buildTerminalAttachContent } from '@/lib/session-type-utils'
-import { SessionHandoffErrorBanner } from '@/components/SessionHandoffErrorBanner'
+import { FencedOwnerRecoveryActions, SessionHandoffErrorBanner } from '@/components/SessionHandoffErrorBanner'
 import {
   freshAgentContextSessionId,
   guardContextUsageTokenSummary,
@@ -3063,6 +3063,16 @@ export function FreshAgentView({
                   <span>
                     {`This conversation is blocked pending recovery (${ownerDivergence.fencedReason}).`}
                   </span>
+                  {/* b8ke ext r28 F2: the direct recovery actions — the
+                   * acknowledged force-clear for the server's accepted
+                   * unconfirmable reasons, the acknowledged START for the
+                   * cleared-unverified state; never a passive card. */}
+                  <FencedOwnerRecoveryActions
+                    fencedReason={ownerDivergence.fencedReason}
+                    appStore={appStore}
+                    tabId={tabId}
+                    paneId={paneId}
+                  />
                 </div>
               ) : ownerDivergence?.ownerKind === 'terminal' ? (
                 <div

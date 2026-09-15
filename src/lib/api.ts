@@ -732,6 +732,11 @@ export const SessionHandoffErrorCodeSchema = z.enum([
   /** b8ke e3r3 F3: an ordinary retry against a StaleStop fence (the
    *  stale-Stopping watchdog's unconfirmed residue). */
   'STALE_STOP_FENCED',
+  /** b8ke ext r28 F2: an ordinary (unacknowledged) retry against a
+   *  CLEARED-UNVERIFIED key — the r16-F4 clear's typed refusal (the
+   *  clear is not permission to start a writer; the acknowledged-risk
+   *  arm is the only start). */
+  'CLEARED_UNVERIFIED_FENCED',
 ])
 export type SessionHandoffErrorCode = z.infer<typeof SessionHandoffErrorCodeSchema>
 
@@ -768,21 +773,20 @@ export const SessionHandoffResultSchema = z.union([
     owner: SessionHandoffOwnerSchema,
   }),
   // b8ke focused round-4 R4-4 + ext r12 F1: the acknowledged
-  // PlatformLimited force-clear's TYPED answer — the fence was cleared
-  // (key Vacant) but NO handoff ran and no owner is committed. The answer
-  // carries NO retry instruction: the clear STOPS at the clear (the
-  // client surfaces the cleared state with an explicit user action to
-  // re-initiate the handoff, which then goes through the coordinator
-  // fresh, as any new request would).
+  // force-clear's TYPED answer — the fence was cleared (the key sits in
+  // the typed cleared-unverified state) but NO handoff ran and no owner
+  // is committed. The answer carries NO retry instruction: the clear
+  // STOPS at the clear (the client surfaces the cleared state with an
+  // explicit user action to re-initiate the handoff, which then goes
+  // through the coordinator fresh, as any new request would).
   z.object({
     ok: z.literal(true),
-    /** b8ke e3r4 F2 (the DESIGN RECONCILIATION): the cleared label is
-     *  platform-limited ONLY — the stale-reason fences are never
-     *  force-cleared (their recovery is the confirmed-death probe), so
-     *  the server cannot emit a stale-reason cleared label. The enum
-     *  stays a closed literal: a server that ever emits an unexpected
-     *  label fails the parse loudly. */
-    cleared: z.literal('platform-limited-fence'),
+    /** b8ke ext r28 F2: the reason-typed cleared label. The r25 server
+     *  change made the acknowledged force-clear accept the STALE-reason
+     *  fences alongside PlatformLimited, so the server emits all three;
+     *  the enum stays closed (a server that ever emits an unexpected
+     *  label fails the parse loudly). */
+    cleared: z.enum(['platform-limited-fence', 'stale-start-fence', 'stale-stop-fence']),
     operationId: z.string(),
     generation: z.number().int().nonnegative(),
   }),

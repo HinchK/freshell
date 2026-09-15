@@ -1242,6 +1242,10 @@ describe('requestSessionHandoff()', () => {
       'SESSION_METADATA_WRITE_FAILED',
       'STALE_START_FENCED',
       'STALE_STOP_FENCED',
+      // b8ke ext r28 F2: the unacknowledged start against a
+      // CLEARED-UNVERIFIED key (the r16-F4 clear's typed refusal after an
+      // ordinary retry on the cleared fence).
+      'CLEARED_UNVERIFIED_FENCED',
     ] as const
     for (const code of SERVER_EMITTED_FAILURE_CODES) {
       expect(SessionHandoffErrorCodeSchema.safeParse(code).success, code).toBe(true)
@@ -1262,12 +1266,16 @@ describe('requestSessionHandoff()', () => {
   })
 
   it('accepts EVERY server-emitted cleared label (the force-clear result)', () => {
-    // b8ke e3r4 F2 (the DESIGN RECONCILIATION): the force-clear is
-    // PlatformLimited-only — the stale-reason fences are never cleared
-    // (their recovery is the confirmed-death probe), so this is the
-    // server's COMPLETE emitted label set.
+    // b8ke ext r28 F2: the r25 server change made the acknowledged
+    // force-clear accept the STALE-reason fences — the server now emits
+    // all three typed cleared labels (the pre-r28 closed literal was the
+    // e3r4 DESIGN RECONCILIATION's PlatformLimited-only set, which the
+    // r25 repair made stale: a successful stale-fence clear failed the
+    // client parse and downgraded to a generic handoff failure).
     const SERVER_EMITTED_CLEARED_LABELS = [
       'platform-limited-fence',
+      'stale-start-fence',
+      'stale-stop-fence',
     ] as const
     for (const cleared of SERVER_EMITTED_CLEARED_LABELS) {
       const parsed = SessionHandoffResultSchema.safeParse({
@@ -1278,16 +1286,6 @@ describe('requestSessionHandoff()', () => {
       })
       expect(parsed.success, cleared).toBe(true)
     }
-    // And a stale-reason cleared label CANNOT parse (the server never
-    // emits one — the closed literal rejects it loudly).
-    expect(
-      SessionHandoffResultSchema.safeParse({
-        ok: true,
-        cleared: 'stale-start-fence',
-        operationId: 'op-clear',
-        generation: 3,
-      }).success,
-    ).toBe(false)
   })
 
   it('parses the server-emitted STALE_START_FENCED refusal frame', async () => {
@@ -1315,6 +1313,66 @@ describe('requestSessionHandoff()', () => {
         message: 'the session is fenced pending recovery: the prior runtime\u0027s death could not be confirmed (a stale start left it unconfirmable). Retry with the acknowledged force-clear (acknowledgePlatformLimitedRisk: true) to release the fence, accepting that the unconfirmed runtime\u0027s processes may remain.',
         retryable: true,
         ownerGeneration: 9,
+      },
+    })
+  })
+
+  // b8ke ext r28 F2: the r25 server's stale-fence acknowledged force-clear
+  // answers the TYPED clear with the stale-reason labels — pre-r28 the
+  // closed literal rejected them, requestSessionHandoff THREW, and the
+  // caller downgraded the successful clear to HANDOFF_REQUEST_FAILED.
+  it('parses the server-emitted stale-stop-fence cleared result (the acknowledged force-clear)', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(200, {
+      ok: true,
+      cleared: 'stale-stop-fence',
+      operationId: 'op-clear-ss',
+      generation: 7,
+    }))
+
+    const result = await requestSessionHandoff({
+      provider: 'claude',
+      sessionId: 'sid-clear',
+      targetKind: 'terminal',
+      mode: 'claude',
+      acknowledgePlatformLimitedRisk: true,
+    })
+
+    expect(result).toEqual({
+      ok: true,
+      cleared: 'stale-stop-fence',
+      operationId: 'op-clear-ss',
+      generation: 7,
+    })
+  })
+
+  // b8ke ext r28 F2: the unacknowledged start against a CLEARED-UNVERIFIED
+  // key answers the typed refusal — the browser's acknowledged-start flow
+  // depends on the code parsing.
+  it('parses the server-emitted CLEARED_UNVERIFIED_FENCED refusal frame', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(409, {
+      ok: false,
+      error: {
+        code: 'CLEARED_UNVERIFIED_FENCED',
+        message: 'the session sits in the cleared-unverified state: the prior runtime\'s descendant processes were never confirmed dead. The prior clear is not permission to start a writer — retry with the acknowledged risk (acknowledgePlatformLimitedRisk: true; the pane\'s start-again action carries it).',
+        retryable: true,
+        ownerGeneration: 4,
+      },
+    }))
+
+    const result = await requestSessionHandoff({
+      provider: 'claude',
+      sessionId: 'sid-cu',
+      targetKind: 'terminal',
+      mode: 'claude',
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        code: 'CLEARED_UNVERIFIED_FENCED',
+        message: 'the session sits in the cleared-unverified state: the prior runtime\'s descendant processes were never confirmed dead. The prior clear is not permission to start a writer — retry with the acknowledged risk (acknowledgePlatformLimitedRisk: true; the pane\'s start-again action carries it).',
+        retryable: true,
+        ownerGeneration: 4,
       },
     })
   })
