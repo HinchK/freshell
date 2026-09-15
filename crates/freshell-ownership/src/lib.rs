@@ -2211,6 +2211,75 @@ impl RuntimeOwnershipRegistry {
         current
     }
 
+    /// b8ke ext r23 F1: create an `Aliased{to}` resolution record for a
+    /// key that NEVER held a coordinator presence — the OpenCode
+    /// placeholder→durable materialization's alias (the `freshopencode-*`
+    /// pane identity is not a runtime id; the durable `ses_*` key holds the
+    /// actual owner). The placeholder's alias record carries the DURABLE
+    /// key's current generation so the fence arithmetic stays coherent.
+    /// An already-occupied key refuses typed (never overwrite an existing
+    /// record — a prior alias or a real owner is never clobbered); a
+    /// missing target key's record also refuses (the alias must point at
+    /// a real owner).
+    pub fn alias_vacant_key(
+        &self,
+        provider: &str,
+        from_session_id: &str,
+        to_session_id: &str,
+        initiator: &str,
+    ) -> CommitOutcome {
+        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let from_key = SessionKey::new(provider, from_session_id);
+        let to_key = SessionKey::new(provider, to_session_id);
+        // The FROM key must be truly vacant (no record, or an existing
+        // Vacant record with no state identity): never overwrite a prior
+        // alias or any live/transitioning state.
+        if let Some(record) = inner.get(&from_key) {
+            let _ = record;
+            tracing::warn!(target: "freshell_ownership",
+                provider = %provider, from_session_id, to_session_id,
+                epoch = self.epoch,
+                duration_ms = 0u64,
+                outcome = "refused", failure_reason = "FOREIGN_FROM_KEY",
+                "alias_vacant_key: the from key already holds a coordinator \
+                 record — never clobber an existing identity");
+            return CommitOutcome::ForeignOperation;
+        }
+        // The TO key must hold a record (the alias must resolve to a real
+        // owner — pointing at nothing is a dead-end alias).
+        let Some(to_record) = inner.get(&to_key) else {
+            tracing::warn!(target: "freshell_ownership",
+                provider = %provider, from_session_id, to_session_id,
+                epoch = self.epoch,
+                duration_ms = 0u64,
+                outcome = "refused", failure_reason = "FOREIGN_TARGET_KEY",
+                "alias_vacant_key: the target key holds no coordinator record \
+                 — the alias must point at a real owner");
+            return CommitOutcome::ForeignOperation;
+        };
+        let target_generation = to_record.generation;
+        inner.insert(
+            from_key,
+            SessionRecord {
+                generation: target_generation,
+                state: OwnershipState::Aliased {
+                    to: to_session_id.to_string(),
+                    generation: target_generation,
+                },
+                ..SessionRecord::default()
+            },
+        );
+        tracing::info!(target: "freshell_ownership",
+            event = "ownership.key.alias_vacant", provider,
+            from_session_id, to_session_id, initiator,
+            epoch = self.epoch, generation = target_generation,
+            duration_ms = 0u64,
+            outcome = "aliased", failure_reason = "",
+            "a placeholder identity becomes a coordinator alias — the wire id \
+             resolves to the durable key through the canonical chain");
+        CommitOutcome::Committed
+    }
+
     /// Fail an in-flight operation: `Starting` → Vacant; `Handoff` → restore
     /// the prior owner ONLY when the caller confirms it is still live
     /// (`prior_confirmed_live: true`) — restored at the RECORD's CURRENT
@@ -5537,6 +5606,76 @@ mod tests {
     /// this to put ownership under the client-visible new durable id; the
     /// old key replays Vacant so stale divergence clears. A foreign record
     /// under the TARGET key is the typed refusal — never an overwrite.
+    // ── b8ke ext r23 F1: the placeholder→durable coordinator alias ────────
+
+    /// b8ke ext r23 F1: `alias_vacant_key` creates an `Aliased{to}` record
+    /// for a key that never held coordinator presence — the OpenCode
+    /// placeholder→durable materialization's resolution record. The alias
+    /// carries the DURABLE key's generation; `resolve_canonical` walks it.
+    #[test]
+    fn alias_vacant_key_creates_the_resolution_alias() {
+        let r = RuntimeOwnershipRegistry::new();
+        // Seed the durable owner (Live at generation G).
+        let BeginOutcome::Granted { generation } = r.begin_start(
+            PROVIDER,
+            "ses_durable",
+            RuntimeOwnerKind::FreshAgent,
+            "op-seed",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("expected Granted")
+        };
+        assert!(matches!(
+            r.commit_live(
+                PROVIDER,
+                "ses_durable",
+                "op-seed",
+                generation,
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("map".into()),
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            CommitOutcome::Committed
+        ));
+
+        // THE ALIAS: the placeholder key (no prior record) becomes an
+        // Aliased{to: ses_durable} carrying the durable's generation.
+        assert!(matches!(
+            r.alias_vacant_key(PROVIDER, "freshopencode-req-1", "ses_durable", "test"),
+            CommitOutcome::Committed
+        ));
+        // resolve_canonical walks the chain.
+        assert_eq!(
+            r.resolve_canonical(PROVIDER, "freshopencode-req-1"),
+            "ses_durable"
+        );
+        assert_eq!(r.resolve_canonical(PROVIDER, "ses_durable"), "ses_durable");
+        // The alias record carries the durable's generation (coherent fence
+        // arithmetic).
+        assert_eq!(
+            r.observe(PROVIDER, "freshopencode-req-1").generation,
+            generation
+        );
+
+        // An already-aliased key refuses typed (never clobber).
+        assert!(matches!(
+            r.alias_vacant_key(PROVIDER, "freshopencode-req-1", "ses_durable", "test"),
+            CommitOutcome::ForeignOperation
+        ));
+        // A missing target key refuses typed (the alias must resolve to a
+        // real owner).
+        assert!(matches!(
+            r.alias_vacant_key(PROVIDER, "freshopencode-req-2", "ses_absent", "test"),
+            CommitOutcome::ForeignOperation
+        ));
+    }
+
     #[test]
     fn commit_live_rekey_moves_the_record_atomically() {
         let r = RuntimeOwnershipRegistry::new();

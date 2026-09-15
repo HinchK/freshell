@@ -567,6 +567,17 @@ impl FreshOpencodeState {
         &self.fresh_agent
     }
 
+    /// b8ke ext r23 F1: resolve a wire id to its canonical coordinator key
+    /// — the placeholder (`freshopencode-*`) resolves to the durable `ses_*`
+    /// key through the registry's alias chain (the materialization creates
+    /// the `Aliased{to}` record). Unwired (no coordinator): the identity.
+    pub fn resolve_ownership_key(&self, session_id: &str) -> String {
+        match self.fresh_agent.ownership.as_ref() {
+            Some(registry) => registry.resolve_canonical(PROVIDER, session_id),
+            None => session_id.to_string(),
+        }
+    }
+
     /// Replace the default lease map with the ONE server-wide shared map (Task 13;
     /// called by `main.rs` before this state is cloned into the router).
     pub fn set_session_leases(
@@ -1663,6 +1674,40 @@ impl FreshOpencodeState {
                     "Session ownership changed during materialization",
                 );
                 return;
+            }
+            // b8ke ext r23 F1: the placeholder→durable COORDINATOR ALIAS.
+            // The durable key now holds the authoritative owner; the
+            // placeholder identity (the pane's persisted sessionRef — the
+            // `freshopencode-*` id) becomes a resolution alias so a
+            // placeholder-holding pane (a restored/offline pane or a
+            // direct REST caller) resolves to the REAL key through the
+            // canonical chain — a handoff entering on the placeholder
+            // names the actual durable owner as its prior and stops it.
+            // Best-effort on the WS lane (the alias is a resolution hint;
+            // a failure logs and the materialization still succeeds — the
+            // durable key is authoritative regardless): the REST lane's
+            // alias is its own call.
+            if let Some(registry) = self.fresh_agent.ownership.as_ref() {
+                match registry.alias_vacant_key(
+                    PROVIDER,
+                    &session.placeholder_id,
+                    &durable_id,
+                    "freshopencode/send-materialize",
+                ) {
+                    freshell_ownership::CommitOutcome::Committed => {}
+                    other => {
+                        tracing::warn!(target: "freshell_freshagent::opencode",
+                            provider = PROVIDER,
+                            placeholder = %session.placeholder_id,
+                            durable_id = %durable_id,
+                            outcome = ?other,
+                            "freshagent.opencode.materialize_alias_refused: the \
+                             placeholder→durable coordinator alias was refused (the \
+                             durable owner stays authoritative; the placeholder \
+                             identity will not resolve until the next materialization)"
+                        );
+                    }
+                }
             }
             durable_id
         };
@@ -7278,6 +7323,43 @@ mod tests {
     /// materialization critical section holds that same lock, so the kill's
     /// enumeration provably post-dates it) joins the ONE envelope — never a
     /// second close call, never a discovered-after-the-envelope identity.
+    /// b8ke ext r23 F1: the WS materialization creates the
+    /// placeholder→durable coordinator ALIAS (`Aliased{to: ses_*}` on the
+    /// placeholder key) — the pane's persisted `freshopencode-*` identity
+    /// resolves to the durable key through the canonical chain.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_ws_materialization_creates_the_placeholder_coordinator_alias() {
+        let (mut st, _killed) = state().await;
+        let registry = std::sync::Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(std::sync::Arc::clone(&registry));
+
+        st.handle_create(create_msg("req-r23f1-alias"), None).await;
+        let placeholder = "freshopencode-req-r23f1-alias".to_string();
+
+        st.handle_send(send_msg(&placeholder, "hello")).await;
+
+        // The session materialized: the placeholder key now resolves to
+        // the durable `ses_*` key through the coordinator's alias chain.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let resolved = registry.resolve_canonical("opencode", &placeholder);
+            if resolved.starts_with("ses_") {
+                match registry.observe("opencode", &placeholder).state {
+                    freshell_ownership::OwnershipState::Aliased { to, .. } => {
+                        assert_eq!(to, resolved);
+                        break;
+                    }
+                    other => panic!("the placeholder key holds an alias record, got {other:?}"),
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the placeholder never materialized to a durable id (resolved: {resolved})"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_materialization_completing_behind_the_kills_park_joins_the_one_envelope() {
         let (st, _killed) = state().await;

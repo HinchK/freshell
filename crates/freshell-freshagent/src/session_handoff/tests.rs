@@ -5792,6 +5792,116 @@ async fn opencode_handoff_keeps_shared_serve_alive_and_session_id_stable() {
         .await;
 }
 
+/// b8ke ext r23 F1: a handoff addressed by the pane's PERSISTED
+/// `freshopencode-*` placeholder resolves through the coordinator's
+/// alias chain to the DURABLE `ses_*` key and operates there — the
+/// prior names the actual durable owner (never a vacant-key skip),
+/// the durable owner is stopped, and the handoff completes on the
+/// durable key. Pre-F1 the placeholder was NOT resolved: the handoff
+/// entered on the vacant placeholder key (prior None), the durable
+/// owner was never stopped, and the target resume of the placeholder
+/// failed.
+#[tokio::test]
+async fn an_opencode_placeholder_handoff_resolves_the_durable_owner_and_completes() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let env = FakeOpencodeServeEnv::install();
+    let durable_id = format!("ses_r23f1_{}", uuid::Uuid::new_v4().simple());
+    let placeholder_id = format!("freshopencode-req-r23f1-{}", uuid::Uuid::new_v4().simple());
+    let rig = build_rig(None);
+
+    // The DURABLE owner: a live opencode session under the ses_* key
+    // (the materialization's committed owner — the real durable
+    // identity the pane resolves to after the first send).
+    rig.fresh_opencode
+        .handle_attach(FreshAgentAttach {
+            provider: AgentProvider::Opencode,
+            session_id: durable_id.clone(),
+            session_type: SessionType::Freshopencode,
+            cwd: Some("/tmp".to_string()),
+            observed_epoch: None,
+            observed_generation: None,
+            resume_session_id: None,
+            session_ref: None,
+        })
+        .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        match rig.ownership.observe("opencode", &durable_id).state {
+            OwnershipState::Live { owner, .. } => {
+                assert_eq!(owner.kind, RuntimeOwnerKind::FreshAgent);
+                break;
+            }
+            state => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the opencode attach never committed Live: {state:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+
+    // THE PLACEHOLDER ALIAS: the materialization's resolution record —
+    // the pane's persisted placeholder identity becomes
+    // `Aliased{to: ses_*}` (the alias the WS and REST materialization
+    // sites now create at the durable commit).
+    assert!(matches!(
+        rig.ownership.alias_vacant_key(
+            "opencode",
+            &placeholder_id,
+            &durable_id,
+            "freshopencode/send-materialize",
+        ),
+        freshell_ownership::CommitOutcome::Committed
+    ));
+    assert_eq!(
+        rig.ownership.resolve_canonical("opencode", &placeholder_id),
+        durable_id,
+    );
+
+    // THE HANDOFF on the PLACEHOLDER — the runner resolves through the
+    // alias chain and operates on the DURABLE key.
+    let to_terminal = rig.runner.spawn_handoff(handoff_req_terminal(
+        "opencode",
+        &placeholder_id,
+        "opencode",
+    ));
+    let result = to_terminal.completion.await.expect("handoff completed");
+
+    // The handoff COMPLETED on the durable key (pre-F1: the handoff
+    // entered on the vacant placeholder — prior None, the target resume
+    // of the placeholder id failed).
+    assert_eq!(
+        result["ok"],
+        json!(true),
+        "the placeholder-addressed handoff completes: {result}"
+    );
+
+    // The coordinator's LIVE record is on the DURABLE key — the
+    // placeholder was the resolution alias, never the operational key.
+    match rig.ownership.observe("opencode", &durable_id).state {
+        OwnershipState::Live { owner, .. } => {
+            assert_eq!(owner.kind, RuntimeOwnerKind::Terminal);
+        }
+        other => panic!("expected Live terminal owner on the durable key, got {other:?}"),
+    }
+
+    // The placeholder is STILL the resolution alias (never an owner
+    // record — a lifecycle on the placeholder always resolves).
+    assert_eq!(
+        rig.ownership.resolve_canonical("opencode", &placeholder_id),
+        durable_id,
+    );
+
+    // The shared serve was never killed or restarted.
+    assert!(
+        env.serve_pids().len() <= 1,
+        "the shared serve is never the handoff target: {:?}",
+        env.serve_pids()
+    );
+}
+
 /// 6c. b8ke delta review F1: a handoff that stops an opencode session with
 /// an ACTIVE turn must abort the turn THROUGH THE MANAGER (the interrupt
 /// path's mechanism) before reporting Reaped — the local JoinHandle abort

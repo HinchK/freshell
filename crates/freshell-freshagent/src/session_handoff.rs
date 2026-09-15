@@ -412,8 +412,13 @@ impl SessionHandoffRunner {
         // identity that skips the prior stop and starts a second writer).
         // Every downstream surface — the coordinator enter, the lane stop,
         // the broadcast frames — then uses the one canonical id, so the
-        // panes holding EITHER id converge. Other providers have no re-key
-        // machinery: identity.
+        // panes holding EITHER id converge. b8ke ext r23 F1: OpenCode has
+        // the SAME two-identity shape — the pane's persisted
+        // `freshopencode-*` placeholder is an `Aliased{to: ses_*}`
+        // coordinator alias (created at the materialization), so a
+        // placeholder-holding restored pane or a REST caller resolves
+        // through the SAME chain to the durable key that actually holds
+        // the owner.
         let mut req = req;
         if req.provider == "claude" {
             let resolved = self.fresh_claude.resolve_ownership_key(&req.session_id);
@@ -424,6 +429,17 @@ impl SessionHandoffRunner {
                     wire_session_id = %req.session_id, canonical_session_id = %resolved,
                     "the handoff's wire id is a superseded re-key alias — the runner \
                      operates on the canonical coordinator key");
+                req.session_id = resolved;
+            }
+        } else if req.provider == "opencode" {
+            let resolved = self.fresh_opencode.resolve_ownership_key(&req.session_id);
+            if resolved != req.session_id {
+                tracing::info!(target: "freshell_ownership",
+                    event = "ownership.handoff.placeholder_alias_resolved",
+                    provider = %req.provider,
+                    wire_session_id = %req.session_id, canonical_session_id = %resolved,
+                    "the handoff's wire id is a freshopencode placeholder — the runner \
+                     operates on the durable ses_* canonical coordinator key");
                 req.session_id = resolved;
             }
         }

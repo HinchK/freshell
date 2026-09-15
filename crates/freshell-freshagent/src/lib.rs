@@ -4279,6 +4279,34 @@ async fn send_keys(
             );
         }
 
+        // b8ke ext r23 F1: the placeholder→durable COORDINATOR ALIAS —
+        // the REST/MCP materialization creates the same resolution alias
+        // the WS lane does (the pane's persisted `freshopencode-*`
+        // placeholder resolves to the durable `ses_*` key through the
+        // canonical chain). Best-effort (a concurrent WS-lane alias is
+        // a no-op warn).
+        if let Some(ownership) = state.ownership.as_ref() {
+            match ownership.alias_vacant_key(
+                PROVIDER,
+                &pane.placeholder_id,
+                &durable_id,
+                "freshopencode/rest-materialize",
+            ) {
+                freshell_ownership::CommitOutcome::Committed => {}
+                other => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        provider = PROVIDER,
+                        placeholder_id = %pane.placeholder_id,
+                        session_id = %durable_id,
+                        outcome = ?other,
+                        "freshagent.opencode.rest_placeholder_alias_refused: the \
+                         placeholder alias could not be created (a concurrent lane \
+                         likely already created it)"
+                    );
+                }
+            }
+        }
+
         durable_id
     };
 
