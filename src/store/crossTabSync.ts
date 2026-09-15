@@ -1,6 +1,8 @@
 import { z } from 'zod'
 import { mergeLocalSettings, resolveLocalSettings } from '@shared/settings'
 import { getSelectedMachineId } from '@/lib/machine-identity'
+import { paneTitleMetadataEquals } from './hydrate-pane-metadata-merge'
+import type { PanesState } from './paneTypes'
 import { hydratePanes, hydratePaneTitles } from './panesSlice'
 import { setLocalSettings } from './settingsSlice'
 import { setTabRegistryClosedTabRetentionDays } from './tabRegistrySlice'
@@ -353,6 +355,16 @@ function dispatchHydratePaneTitlesFromPersisted(
   })
 }
 
+/** Snapshot of exactly the pane-title metadata a title-only merge may
+ * change (hydratePaneTitles writes paneTitles and paneTitleSetByUser,
+ * nothing else) — the applied-vs-no-op discriminator for the foreign-key
+ * floor advance in handleIncomingRawDeduped. */
+function paneTitleMetadataOf(store: StoreLike): Pick<PanesState, 'paneTitles' | 'paneTitleSetByUser'> | undefined {
+  const panes = store.getState()?.panes
+  if (!panes) return undefined
+  return { paneTitles: panes.paneTitles, paneTitleSetByUser: panes.paneTitleSetByUser }
+}
+
 function handleIncomingRaw(
   store: StoreLike,
   key: string,
@@ -426,21 +438,36 @@ export function installCrossTabSync(store: StoreLike): () => void {
     if (isDerivedLayoutKey(key) && isForeignIncomingLayout(store, raw)) return
     const previousRaw = lastProcessedRawByKey.get(key)
     if (!tryDedupeAndMark(key, raw)) return
+    const foreignLayoutKey = isDerivedLayoutKey(key) && key !== ownLayoutKey
+    const paneTitleMetadataBefore = foreignLayoutKey ? paneTitleMetadataOf(store) : undefined
     handleIncomingRaw(store, key, raw, previousRaw, currentLocalLayoutPersistedAt)
     if (key === ownLayoutKey) {
-      // Recency floor (e3r4 finding 3): advance ONLY where the incoming
+      // Recency floor (e3r4 finding 3): advance where the incoming
       // envelope actually REPLACED local state — the own-key full-hydrate
       // path (hydrateTabs + hydratePanes), mirroring the tabs winner
-      // pattern. A foreign window's envelope — title-only, a no-op, or
-      // sharing no panes — never replaces local state, so its
-      // persistedAt must not move the floor: storage and
-      // BroadcastChannel deliveries from independent windows have no
-      // cross-source total ordering, and a foreign no-op at a higher
-      // stamp would otherwise reject a different window's
-      // strictly-newer title delivery. The floor advances for an
-      // APPLIED foreign title through the receiver's own durable
-      // reconciliation flush (onPersistBroadcast below).
+      // pattern. Storage and BroadcastChannel deliveries from independent
+      // windows have no cross-source total ordering, so a foreign NO-OP
+      // (equal titles, or sharing no panes) replaces nothing and must not
+      // move the floor — a foreign no-op at a higher stamp would
+      // otherwise reject a different window's strictly-newer title
+      // delivery.
       mergeAuthoritativeLayoutPersistedAt(parsePersistedLayoutRaw(raw)?.persistedAt)
+    } else if (foreignLayoutKey && paneTitleMetadataBefore !== undefined) {
+      // Delta r4 finding 2: an APPLIED foreign title-only event advances
+      // the floor IMMEDIATELY (to the applied event's persistedAt), not
+      // at the receiver's debounced (~500ms) durable reconciliation
+      // flush: until that flush lands the floor still names the OLD
+      // local envelope, so a second window's OLDER title — still newer
+      // than the stale floor — would apply pre-flush, overwrite the
+      // just-applied one, and the flush would make the regression
+      // durable. The applied titles ARE local state now, so their stamp
+      // is the recency truth; a foreign no-op changed nothing and still
+      // never touches the floor.
+      const paneTitleMetadataAfter = paneTitleMetadataOf(store)
+      if (paneTitleMetadataAfter !== undefined
+        && !paneTitleMetadataEquals(paneTitleMetadataBefore, paneTitleMetadataAfter)) {
+        mergeAuthoritativeLayoutPersistedAt(parsePersistedLayoutRaw(raw)?.persistedAt)
+      }
     }
   }
 

@@ -145,9 +145,9 @@ describe('classifyPersistedLayoutHealth', () => {
     // pre-merge comment framed it as the same-machine chooser re-pick, but
     // #774's pick handler now ARMS the one-shot active-selection marker on
     // every chooser pick, so the re-pick boot peeks it and classifies with
-    // activeSelection:true (the foreign pin below); the unarmed unstamped
-    // case is the ordinary reload of a remembered selection, whose layout
-    // is this machine's newest truth and must be KEPT.
+    // activeSelection:true (the armed-unstamped keep pin below); the unarmed
+    // unstamped case is the ordinary reload of a remembered selection, whose
+    // layout is this machine's newest truth and must be KEPT.
     localStorage.setItem(MACHINE_ID_STORAGE_KEY, 'machine-1')
     const envelope = healthyEnvelope('machine-1')
     delete envelope.machineId
@@ -155,20 +155,27 @@ describe('classifyPersistedLayoutHealth', () => {
     expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
   })
 
-  it('classifies an otherwise-healthy UNSTAMPED envelope as foreign under an armed active-selection marker (#774 merged into Choice B)', () => {
-    // MERGED SEMANTICS (red-first pin): the chooser's one-shot marker proves
-    // the machine was ACTIVELY chosen this boot, so an unstamped legacy
-    // envelope cannot be assumed local — it may be the PREVIOUS machine's
-    // cache, and the chosen machine's durable truth must replace it. This
-    // is the one classification the machine-id stamp cannot make on its own
-    // (unstamped data has no origin proof). #774's active-choice intent,
-    // preserved at the classifier layer instead of its superseded
-    // restoreMachineWorkspace({ activeSelection }) option.
+  it('keeps an otherwise-healthy UNSTAMPED envelope under an armed active-selection marker — a same-machine chooser re-pick keeps the legacy layout (delta r4)', () => {
+    // DELTA r4 (review finding 1): this pin previously codified 'foreign'
+    // for the armed + unstamped + healthy-content lane — the merged-rule
+    // resolution of the #774 conflict — which contradicted the ACCEPTED
+    // REQUIREMENT that a chooser re-pick of the SAME machine keep a
+    // healthy local layout (no forced server resync; the rebuild discards
+    // the exact split arrangement and pane labels). An unstamped envelope
+    // cannot PROVE machine ownership either way, so the armed marker alone
+    // must not demote a healthy layout: it keeps, and the boot's healthy
+    // backfill stamps it, so the next boot classifies unambiguously.
+    // Accepted residual: because ownership is unprovable, a DIFFERENT
+    // machine's pick during the legacy-to-stamped transition also keeps
+    // the local layout — pre-upgrade-consistent (unstamped was never
+    // foreign before stamps existed) and bounded to the transition: the
+    // keep's backfill stamp ends the window and full foreign detection
+    // resumes on the next boot.
     localStorage.setItem(MACHINE_ID_STORAGE_KEY, 'machine-1')
     const envelope = healthyEnvelope('machine-1')
     delete envelope.machineId
     seedEnvelope(envelope)
-    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW, activeSelection: true })).toBe('foreign')
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW, activeSelection: true })).toBe('healthy')
   })
 
   it('keeps a STAMPED same-machine healthy layout under an armed active-selection marker — Choice B wins the #774 boot-gate conflict', () => {
@@ -176,9 +183,11 @@ describe('classifyPersistedLayoutHealth', () => {
     // demote a provably-own healthy layout — the stamp is the stronger,
     // durable origin proof. The pick handler arms the marker on EVERY
     // chooser pick (#774), including a same-machine re-pick whose layout
-    // is stamped-healthy; Choice B window sovereignty keeps it. #774's
-    // clear-on-active-choice is thereby narrowed to the unstamped case,
-    // where foreignness is actually plausible.
+    // is stamped-healthy; Choice B window sovereignty keeps it. Delta r4
+    // extends the same keep to the UNSTAMPED legacy case (the pin above):
+    // the armed marker never demotes a healthy layout — foreignness
+    // requires the stamp's positive proof (a stamp naming another
+    // machine).
     localStorage.setItem(MACHINE_ID_STORAGE_KEY, 'machine-1')
     seedEnvelope(healthyEnvelope('machine-1'))
     expect(classifyPersistedLayoutHealth('machine-1', { now: NOW, activeSelection: true })).toBe('healthy')

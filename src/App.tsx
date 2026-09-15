@@ -843,11 +843,12 @@ export default function App() {
           // CONSUME only after the boot's adjudication completes — a restore
           // failure, cancellation, or in-flight manual reload leaves the
           // marker armed, so the retry always knows the machine was actively
-          // chosen. The peeked marker feeds the classifier: an armed marker
-          // makes an otherwise-healthy UNSTAMPED legacy envelope classify
-          // foreign (the one case the machine-id stamp cannot prove), while
-          // a STAMPED same-machine healthy layout still keeps — Choice B
-          // window sovereignty wins over #774's clear-on-active-choice.
+          // chosen. The peeked marker feeds the classifier, where it is
+          // classification-inert (delta r4: a healthy UNSTAMPED legacy
+          // envelope keeps too — a same-machine re-pick never forces a
+          // resync; foreignness requires the stamp's positive proof), while
+          // a STAMPED other-machine layout still rebuilds — Choice B window
+          // sovereignty wins over #774's clear-on-active-choice.
           const activeSelection = peekActiveMachineSelectionMark()
           // Local-first (Choice B): a healthy local layout IS this window's newest
           // truth — keep it and skip the inventory entirely. Only an absent,
@@ -884,9 +885,8 @@ export default function App() {
             // boot's 'healthy' — permanently keeping the PREVIOUS
             // machine's layout. The successful rebuild's own persisted
             // layout carries the stamp instead (the persist middleware's
-            // selectStampMachineId), so an unstamped/old-stamped envelope
-            // plus the still-armed marker re-enters foreign classification
-            // and the rebuild is retried.
+            // selectStampMachineId), so an old-stamped envelope stays
+            // foreign and the rebuild is retried.
             backfillPersistedLayoutMachineId(resolution.machine.id)
             // Healthy-keep: the durable envelope already classifies
             // healthy — no pending write can strand the evidence, so the

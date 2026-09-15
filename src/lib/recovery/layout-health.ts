@@ -510,26 +510,21 @@ export { pruneOwnStaleLayoutEnvelope } from '@/store/storage-migration'
  *             while tabs are non-empty; activePane[tabId] absent or not a
  *             leaf of that tab's layout).
  * - foreign: IFF the envelope is STAMPED and the stamp names a different
- *            machine, OR (#774 merged) the boot peeked an ARMED
- *            active-selection marker (the chooser pick's one-shot
- *            sessionStorage mark) and the envelope is UNSTAMPED — the
- *            marker proves the machine was actively chosen, so an
- *            unstamped legacy envelope cannot be assumed local (it may
- *            be the previous machine's cache). A STAMPED same-machine
- *            healthy layout still keeps under an armed marker: the stamp
- *            is the stronger origin proof, and Choice B window
- *            sovereignty wins over #774's clear-on-active-choice. An
- *            UNARMED unstamped envelope is legacy (pre-stamp) data
- *            assumed local — it can never classify foreign, so a natural
- *            reload of a remembered selection keeps a healthy unstamped
- *            layout; Task 2's stamp backfill makes unstamped a one-boot
- *            transitional state.
- *            Accepted migration residual: an unarmed unstamped envelope
- *            that actually belonged to a different machine (an origin
- *            remap before the first boot of this code) is mis-kept for
- *            one boot under this rule; the backfill then stamps it with
- *            the resolved machine id, so every later boot classifies
- *            correctly.
+ *            machine — the stamp's positive proof. An UNSTAMPED (legacy,
+ *            pre-stamp) envelope is assumed local and never classifies
+ *            foreign, armed marker or not (delta r4): unstamped data
+ *            cannot prove machine ownership either way, so the chooser's
+ *            armed marker alone must not demote a healthy layout — a
+ *            same-machine re-pick KEEPS it (the accepted requirement; a
+ *            forced rebuild would discard the exact split arrangement
+ *            and pane labels), and the healthy boot's stamp backfill
+ *            makes unstamped a one-boot transitional state.
+ *            Accepted migration residual: a different-machine pick during
+ *            that transition (armed or unarmed) also keeps the local
+ *            layout — pre-upgrade-consistent (unstamped was never
+ *            foreign before stamps existed) and bounded to the transition;
+ *            the backfill stamp ends the window and every later boot
+ *            classifies correctly.
  * - stale:   older than STALE_LAYOUT_MS.
  * - healthy: everything else — the window keeps its local layout. */
 export function classifyPersistedLayoutHealth(
@@ -538,8 +533,11 @@ export function classifyPersistedLayoutHealth(
     now?: number
     storage?: Storage
     /** True when the boot peeked the chooser's armed active-selection
-     * marker (#774): an otherwise-healthy UNSTAMPED envelope then
-     * classifies foreign (see the foreign case above). */
+     * marker (#774). Delta r4: the marker no longer demotes an otherwise
+     * healthy UNSTAMPED envelope (a same-machine re-pick keeps it — see
+     * the foreign case above), so it has no classification effect here;
+     * foreignness requires the stamp's positive proof. The boot gate still
+     * passes it as part of its peek→classify→consume protocol. */
     activeSelection?: boolean
   } = {},
 ): PersistedLayoutHealth {
@@ -701,19 +699,22 @@ export function classifyPersistedLayoutHealth(
       if (!layout || !collectLeafIdsOf(layout).has(activePaneId)) return 'corrupt'
     }
   }
-  // Foreign IFF stamped AND the stamp names a different machine. Unstamped
-  // = legacy (pre-stamp) data assumed local — never foreign on its own (a
-  // natural reload of a remembered selection keeps a healthy unstamped
-  // layout; Task 2's backfill then stamps it so the next boot is
-  // unambiguous) — EXCEPT under an ARMED active-selection marker (#774
-  // merged): the chooser pick proved the machine was actively chosen this
-  // boot, so an unstamped envelope may be the PREVIOUS machine's cache and
-  // the chosen machine's durable truth must replace it. A stamped
-  // same-machine layout keeps even under an armed marker (Choice B wins).
+  // Foreign IFF stamped AND the stamp names a different machine. An
+  // UNSTAMPED (legacy, pre-stamp) envelope is assumed local — never
+  // foreign, ARMED marker or not (delta r4): unstamped data cannot prove
+  // machine ownership either way, so the chooser's armed marker alone must
+  // not demote a healthy layout — a same-machine re-pick KEEPS it (the
+  // accepted requirement; a forced rebuild would discard the exact split
+  // arrangement and pane labels), and the healthy boot's backfill then
+  // stamps it, so the next boot is unambiguous. Accepted residual: a
+  // different-machine pick during the legacy-to-stamped transition also
+  // keeps the local layout — pre-upgrade-consistent (unstamped was never
+  // foreign before stamps existed) and bounded to the transition. A
+  // stamped same-machine layout keeps under an armed marker (Choice B
+  // wins); a stamped other-machine layout is foreign, armed or not.
   const stamp = parsed.machineId
   const stamped = typeof stamp === 'string' && !!stamp
   if (stamped && stamp !== resolvedMachineId) return 'foreign'
-  if (opts.activeSelection === true && !stamped) return 'foreign'
   const persistedAt = typeof parsed.persistedAt === 'number' ? parsed.persistedAt : 0
   if (now - persistedAt > STALE_LAYOUT_MS) return 'stale'
   return 'healthy'

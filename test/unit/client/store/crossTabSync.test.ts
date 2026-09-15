@@ -2333,6 +2333,96 @@ describe('crossTabSync', () => {
     expect(store.getState().panes.paneTitles['t1']?.['pane-a'], 'the strictly-newer-than-local title applies — the foreign no-op never moved the floor').toBe('Title from window two')
   })
 
+  it('delta r4 finding 2: an APPLIED foreign title-only event advances the recency floor immediately — another window\u2019s older pre-flush title is rejected (the reviewer\u2019s exact ordering)', () => {
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+    })
+    seedLocalWorkspace(store)
+
+    // The receiver's own durable envelope: persistedAt 100 is what install
+    // seeds the recency floor from.
+    localStorage.setItem(OWN_LAYOUT_KEY, JSON.stringify({
+      version: 3,
+      persistedAt: 100,
+      tabs: { activeTabId: 't1', tabs: [{ id: 't1', title: 'T1', createdAt: 1 }] },
+      panes: {
+        version: 6,
+        layouts: {
+          't1': {
+            type: 'leaf',
+            id: 'pane-a',
+            content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-a', status: 'running' },
+          },
+        },
+        activePane: { 't1': 'pane-a' },
+        paneTitles: { 't1': { 'pane-a': 'Local title' } },
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    }))
+
+    cleanups.push(installCrossTabSync(store as any))
+
+    // Window W1 delivers a title at 300 — strictly newer than the floor
+    // (100) — and it APPLIES (the shared pane adopts W1's title). The
+    // floor must advance to 300 IMMEDIATELY: the receiver's debounced
+    // (~500ms) persistence flush is too late to guard the window where a
+    // second window's OLDER title is still newer than the stale floor.
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: 'freshell.layout.v3.layout-window-w1',
+      newValue: JSON.stringify({
+        version: 3,
+        persistedAt: 300,
+        tabs: { activeTabId: 't1', tabs: [{ id: 't1', title: 'T1', createdAt: 1 }] },
+        panes: {
+          version: 6,
+          layouts: {
+            't1': {
+              type: 'leaf',
+              id: 'pane-a',
+              content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-a', status: 'running' },
+            },
+          },
+          activePane: { 't1': 'pane-a' },
+          paneTitles: { 't1': { 'pane-a': 'Title from window one' } },
+          paneTitleSetByUser: {},
+        },
+        tombstones: [],
+      }),
+    }))
+
+    expect(store.getState().panes.paneTitles['t1']?.['pane-a'], 'the strictly-newer title applies').toBe('Title from window one')
+
+    // Window W2's OLDER title (200) arrives PRE-FLUSH: against the
+    // unchanged floor (100) it would apply and overwrite W1's newer
+    // title — the regression the reviewer found, which the flush then
+    // makes durable. Against the advanced floor (300) it is rejected.
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: 'freshell.layout.v3.layout-window-w2',
+      newValue: JSON.stringify({
+        version: 3,
+        persistedAt: 200,
+        tabs: { activeTabId: 't1', tabs: [{ id: 't1', title: 'T1', createdAt: 1 }] },
+        panes: {
+          version: 6,
+          layouts: {
+            't1': {
+              type: 'leaf',
+              id: 'pane-a',
+              content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-a', status: 'running' },
+            },
+          },
+          activePane: { 't1': 'pane-a' },
+          paneTitles: { 't1': { 'pane-a': 'Title from window two' } },
+          paneTitleSetByUser: {},
+        },
+        tombstones: [],
+      }),
+    }))
+
+    expect(store.getState().panes.paneTitles['t1']?.['pane-a'], 'the older pre-flush title is rejected against the floor the APPLIED event advanced').toBe('Title from window one')
+  })
+
   it('keeps user-set pane titles against another window\u2019s NEWER flush (title-only path)', () => {
     const store = configureStore({
       reducer: { tabs: tabsReducer, panes: panesReducer },
