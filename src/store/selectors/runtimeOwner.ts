@@ -299,7 +299,13 @@ export function isLifecycleStartSuperseded(
   pane: { provider?: string; sessionRef?: SessionLocator; sessionId?: string },
   observedFence: ObservedOwnerFence | undefined,
 ): boolean {
-  const canonical = canonicalPaneSession(pane)
+  // b8ke ext r26 F6: resolve through the stored rekey alias chain like
+  // every other store-backed consumer — pre-r26 this called
+  // canonicalPaneSession WITHOUT the runtime-owner map, so a pane holding
+  // a pre-rekey sessionRef saw the old key's SAME-KIND mirror record and
+  // issued a stale scheduled lifecycle start instead of suppressing it
+  // (only the server-side generation fence caught it).
+  const canonical = resolveCanonicalPaneSession(state, pane)
   if (!canonical) return false
   const record = selectSessionRuntimeOwner(state, canonical.provider, canonical.sessionId)
   if (!record) return false

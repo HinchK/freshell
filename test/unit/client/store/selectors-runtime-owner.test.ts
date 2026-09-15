@@ -594,6 +594,34 @@ describe('b8ke ext F1: rekey alias chains resolve to the canonical key', () => {
     })).toEqual({ epoch: 9, generation: 7 })
   })
 
+  // b8ke ext r26 F6: isLifecycleStartSuperseded resolves the pane's
+  // canonical session through the SAME stored alias chain as every other
+  // store-backed consumer. Pre-r26 it called canonicalPaneSession without
+  // the runtime-owner map, so a pane holding a pre-rekey sessionRef saw
+  // the old key's SAME-KIND mirror record and issued a stale scheduled
+  // lifecycle start instead of suppressing it locally (only the
+  // server-side generation fence caught it).
+  it('isLifecycleStartSuperseded follows the rekey alias chain — a pre-rekey pane is superseded', () => {
+    const state = ownersState([
+      { provider: 'claude', sessionId: 'old-id', ownerKind: 'fresh-agent', aliasOf: 'new-id' },
+      { provider: 'claude', sessionId: 'new-id', ownerKind: 'terminal', terminalId: 't-1', generation: 9 },
+    ])
+    expect(isLifecycleStartSuperseded(
+      state,
+      'fresh-agent',
+      { provider: 'claude', sessionRef: { provider: 'claude', sessionId: 'old-id' } },
+      undefined,
+    )).toBe(true)
+    // Fence-aware: the canonical owner's generation is at least the
+    // captured fence's — the stale scheduled start stays suppressed.
+    expect(isLifecycleStartSuperseded(
+      state,
+      'fresh-agent',
+      { provider: 'claude', sessionRef: { provider: 'claude', sessionId: 'old-id' } },
+      { epoch: 5, generation: 8 },
+    )).toBe(true)
+  })
+
   it('a released-vacant stop frame refreshes the fence the next lifecycle request carries (b8ke ext r18 F1)', () => {
     // The kill → immediate recreate "Restart sidecar" sequence: the pane's
     // stored owner record still names the LIVE owner at generation 4, then
