@@ -789,7 +789,7 @@ Expected: PASS for all three commands (the env-set invocation proves the cloud-s
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add test/e2e-browser/helpers/fixtures.ts test/e2e-browser/specs/e2e-budget-contract.spec.ts
+git add test/e2e-browser/helpers/fixtures.ts test/e2e-browser/specs/e2e-budget-contract.spec.ts test/e2e-browser/playwright.config.ts
 git commit -m "test(e2e): extend the per-test deadline to the cloud wedge budget from the earliest test-scoped fixture (kata tg4e)"
 ```
 
@@ -802,7 +802,7 @@ git commit -m "test(e2e): extend the per-test deadline to the cloud wedge budget
 
 **Interfaces:**
 - Consumes: `Page` (type-only).
-- Produces: `SHELL_RENDER_TIMEOUT_MS: number` (60_000), `SHELL_PROBE_TIMEOUT_MS: number` (5_000, delta review r5), and `selectShellFromPicker(page: Page): Promise<void>` with the contract: (a) early returns unchanged (xterm already visible, or appears during the 500ms stabilization wait); (b) a click that fails with Playwright's `TimeoutError` is split by an existence precheck (delta review r7): `locator.count() === 0` proves the option never existed — a non-existent button cannot have dispatched — and advances on the click timeout alone (NO probe cost, so absent options keep their exact pre-run cost under the unchanged local 60s budget). Only an EXISTING button that timed out gets the creation probe (within `SHELL_PROBE_TIMEOUT_MS`, checking for a TERMINAL-content pane — the only state a fresh-boot pick uniquely creates, since the initial tab and its picker pane already exist before the picker leg runs; delta review r6: an any-tab/any-layout signal is always true on fresh boot and would misroute absent options into the 60s render wait). A late dispatch joins the success path (d); only a confirmed nothing-created advances to the next shell name (the historical detachment-race advance, now dispatch-safe; delta reviews r5+r6+r7); (c) a click (or probe) that fails with ANY non-timeout error (page closed, test interrupted, unexpected errors) propagates — loud, never swallowed; (d) a SUCCESSFUL click never escalates: it waits up to `SHELL_RENDER_TIMEOUT_MS` for `.xterm` to become visible and on timeout throws a diagnostic error naming the clicked shell and the wait; (e) the every-option-confirmed-absent fall-through contract is preserved (returns normally).
+- Produces: `SHELL_RENDER_TIMEOUT_MS: number` (60_000), `SHELL_PROBE_TIMEOUT_MS: number` (5_000, delta review r5), and `selectShellFromPicker(page: Page): Promise<void>` with the contract: (a) early returns unchanged (xterm already visible, or appears during the 500ms stabilization wait); (b) a click that fails with Playwright's `TimeoutError` is split by an existence precheck (delta reviews r7+r8): `locator.count() === 0` is AMBIGUOUS — the option never existed, OR the click dispatched and the picker pane was already replaced by the terminal pane (the picker's fade-then-replace on transitionend) before the catch ran — so the count-0 branch takes ONE immediate state read (`paneWasCreatedNow`: a dispatched-and-replaced pick has ALREADY created the terminal pane in state, so the instant read is true and the flow joins the render wait; a never-existed option reads false and advances on the click timeout alone, keeping absent options at their exact pre-run cost under the unchanged local 60s budget). Only an EXISTING button that timed out pays the full bounded creation probe (`SHELL_PROBE_TIMEOUT_MS`, checking for a TERMINAL-content pane — the only state a fresh-boot pick uniquely creates, since the initial tab and its picker pane already exist before the picker leg runs; delta review r6: an any-tab/any-layout signal is always true on fresh boot and would misroute absent options into the 60s render wait). A late dispatch joins the success path (d); only a confirmed nothing-created advances to the next shell name (the historical detachment-race advance, now dispatch-safe; delta reviews r5+r6+r7+r8); (c) a click (or probe) that fails with ANY non-timeout error (page closed, test interrupted, unexpected errors) propagates — loud, never swallowed; (d) a SUCCESSFUL click never escalates: it waits up to `SHELL_RENDER_TIMEOUT_MS` for `.xterm` to become visible and on timeout throws a diagnostic error naming the clicked shell and the wait; (e) the every-option-confirmed-absent fall-through contract is preserved (returns normally).
 
 **Why this is required scope (not residual):** the retained trace (validator LB-C, `reports/load-bearing-validator-LB-C.md`) proves the recorded tg4e failure was exactly this conflation: after a successful Shell click (terminal created server-side, active, `hasClients:true`), the 30s `.xterm` render wait failed under container-wide CPU contention, and the loop escalated into WSL/CMD — options absent on the Linux picker — silently burning the remaining budget until the 60s deadline (and double-creating terminals whenever escalation reaches an option that exists, e.g. Bash). The budget fix alone does not survive this episode class; the loop's semantics are the defect.
 
@@ -819,6 +819,7 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
     renderVisibleAfterMs?: number // omit = render never becomes visible
     lateDispatch?: boolean // click times out BUT the handler ran: the probe finds a created pane
     clickTimesOut?: boolean // click times out with NOTHING dispatched (the button exists)
+    dispatchedAndReplaced?: boolean // click dispatched, then the picker pane was REPLACED by the terminal pane before the catch ran (count 0, terminal already in state — delta r8)
   }
 
   /**
@@ -844,6 +845,7 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
     const clickTimeouts: number[] = []
     const settledMs: number[] = []
     const probeWaits: number[] = []
+    const probeNows: number[] = []
     let xtermVisibilityChecks = 0
     const xtermVisible = () => {
       xtermVisibilityChecks += 1
@@ -873,7 +875,8 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
         // probe.
         count: () => {
           const name = roleOpts.name.source.replace(/^\^/, '').replace(/\$$/, '')
-          return Promise.resolve(shells[name] ? 1 : 0)
+          const outcome = shells[name]
+          return Promise.resolve(outcome && !outcome.dispatchedAndReplaced ? 1 : 0)
         },
         click: (clickOpts: { timeout?: number }) => {
           clickTimeouts.push(clickOpts?.timeout ?? 0)
@@ -886,6 +889,12 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
           if (outcome?.lateDispatch) {
             // The click's actionability window expired mid-dispatch: the
             // timeout fires even though the handler ran (delta r5 probe case).
+            return Promise.reject(Object.assign(new Error(`click: Timeout ${clickOpts?.timeout}ms exceeded`), { name: 'TimeoutError' }))
+          }
+          if (outcome?.dispatchedAndReplaced) {
+            // Playwright delivered the action but timed out in post-action
+            // processing; by the time the catch runs the picker pane is
+            // already REPLACED by the terminal pane (delta r8 race case).
             return Promise.reject(Object.assign(new Error(`click: Timeout ${clickOpts?.timeout}ms exceeded`), { name: 'TimeoutError' }))
           }
           if (outcome?.clickTimesOut) {
@@ -905,6 +914,14 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
       waitForTimeout: (ms: number) => {
         settledMs.push(ms)
         return Promise.resolve()
+      },
+      // The instant state read for the count-0 branch (delta r8): the
+      // picker-replacement race means the terminal pane is ALREADY in
+      // state when the button vanished — one evaluate answers it.
+      evaluate: (_fn: unknown) => {
+        probeNows.push(1)
+        const last = shells[clicks[clicks.length - 1]]
+        return Promise.resolve(Boolean(last?.lateDispatch || last?.dispatchedAndReplaced))
       },
       // The post-click-timeout creation probe (delta r5): resolves when the
       // late-dispatched pick created a pane; a plain timeout means nothing
@@ -926,6 +943,7 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
       clickTimeouts,
       settledMs,
       probeWaits,
+      probeNows,
       xtermVisibilityChecks: () => xtermVisibilityChecks,
     }
   }
@@ -946,7 +964,7 @@ Expected: the moved-but-unfixed implementation produces multiple BEHAVIORAL fail
 - `a non-timeout click error propagates` FAILs: the current loop's bare `catch { continue }` swallows the page-closed error and advances.
 - `falls through silently only when every option is not clickable` PASSES (that is the current behavior too — it stays).
 - The already-visible and mid-wait-recheck tests PASS (early-return behavior is unchanged by the fix).
-- `a not-clickable option ... advances to the next shell` PASSES against the moved pre-fix loop (advance-on-timeout without a probe is the historical behavior) but the probe rows RED against it: `a click timeout with a LATE DISPATCH ... is treated as the success path` FAILs (the pre-probe loop escalates — `clicks` grows past `['Shell']`), `a click timeout on an EXISTING option probes once before advancing` FAILs (`probeWaits` is empty — no probe call exists), `a click timeout on a NON-EXISTENT option (count 0) advances with NO probe cost` FAILs against the probe-everything shape (the probe ran for absent options), and `a probe hard error (page closed) propagates loudly` FAILs (the pre-probe loop swallows the whole click-timeout path and falls through silently).
+- `a not-clickable option ... advances to the next shell` PASSES against the moved pre-fix loop (advance-on-timeout without a probe is the historical behavior) but the probe rows RED against it: `a click timeout with a LATE DISPATCH ... is treated as the success path` FAILs (the pre-probe loop escalates — `clicks` grows past `['Shell']`), `a click timeout on an EXISTING option probes once before advancing` FAILs (`probeWaits` is empty — no probe call exists), `a click timeout on a NON-EXISTENT option (count 0) advances with NO probe cost` FAILs against the probe-everything shape (the probe ran for absent options), `a click that DISPATCHED and replaced the picker before the catch (count 0) still joins the success path` FAILs against the skip-everything shape (the loop advanced instead of taking the instant read + render wait), and `a probe hard error (page closed) propagates loudly` FAILs (the pre-probe loop swallows the whole click-timeout path and falls through silently).
 - The `paneCreationProbePredicate semantics` describe (delta review r6) executes the REAL exported predicate against stubbed harness states — fresh-boot picker state false, terminal pane true, split-tree recursion, picker-only split false, missing harness false — so the probe's state-shape contract is pinned independently of the flow fakes (the fakes exercise the picker LOOP's use of the probe; the semantics tests prove what the probe itself answers in the states Freshell really boots into).
 
 - [ ] **Step 3: Add the minimal production implementation (replace the moved function's loop with the fixed contract)**
@@ -1046,6 +1064,19 @@ async function paneWasCreatedOnLateDispatch(page: Page): Promise<boolean> {
 }
 
 /**
+ * ONE immediate state read — the count-0 branch's disambiguator (delta
+ * review r8): a dispatched pick that made the button vanish did so by
+ * REPLACING the picker pane with the terminal pane (the picker's
+ * fade-then-replace on transitionend), so the terminal pane is ALREADY in
+ * state and a single evaluate answers true with no wait budget; a
+ * never-existed option answers false. This keeps absent options at their
+ * exact pre-run cost while closing the dispatch race.
+ */
+async function paneWasCreatedNow(page: Page): Promise<boolean> {
+  return page.evaluate(paneCreationProbePredicate)
+}
+
+/**
  * Select a shell from the PanePicker. Handles the race where buttons
  * detach during the platform-info Redux update: a click TimeoutError
  * means the option was not clickable within its window — absent,
@@ -1077,17 +1108,23 @@ export async function selectShellFromPicker(page: Page): Promise<void> {
     } catch (err) {
       if (!isTimeoutError(err)) throw err
       // An option that never existed cannot have dispatched: advance on
-      // the click timeout alone, with NO probe cost (delta review r7 —
+      // the click timeout alone, with no probe cost (delta review r7 —
       // absent options paid a needless 5s probe on every healthy boot
       // whose picker omits them, under the unchanged local 60s budget).
-      if (await button.count() === 0) continue
-      // A click timeout on an EXISTING button does not prove the click
-      // never dispatched (Playwright's timeout spans every click stage):
-      // probe for the pane the handler would have created. A late
-      // dispatch joins the success path below; only a confirmed
-      // nothing-created advances (delta review r5 — escalating on a late
-      // dispatch is the historical double-creation path).
-      if (!(await paneWasCreatedOnLateDispatch(page))) continue
+      if (await button.count() === 0) {
+        // count() === 0 is AMBIGUOUS (delta review r8): the option never
+        // existed, OR the click dispatched and the picker pane was
+        // already REPLACED by the terminal pane (the picker's
+        // fade-then-replace) before this catch ran. In the latter the
+        // terminal pane is ALREADY in state — one immediate read answers
+        // with no wait budget. Only a confirmed never-existed advances.
+        if (!(await paneWasCreatedNow(page))) continue
+      } else if (!(await paneWasCreatedOnLateDispatch(page))) {
+        // The button still exists but was not clickable within its
+        // window: a late dispatch may still land mid-fade, so this branch
+        // pays the full bounded probe.
+        continue
+      }
     }
     try {
       await page.locator('.xterm').first().waitFor({ state: 'visible', timeout: SHELL_RENDER_TIMEOUT_MS })

@@ -484,6 +484,7 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
     renderVisibleAfterMs?: number // omit = render never becomes visible
     lateDispatch?: boolean // click times out BUT the handler ran: the probe finds a created pane
     clickTimesOut?: boolean // click times out with NOTHING dispatched (the button exists)
+    dispatchedAndReplaced?: boolean // click dispatched, then the picker pane was REPLACED by the terminal pane before the catch ran (count 0, terminal already in state — delta r8)
   }
 
   /**
@@ -509,6 +510,7 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
     const clickTimeouts: number[] = []
     const settledMs: number[] = []
     const probeWaits: number[] = []
+    const probeNows: number[] = []
     let xtermVisibilityChecks = 0
     const xtermVisible = () => {
       xtermVisibilityChecks += 1
@@ -535,10 +537,12 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
       getByRole: (_kind: string, roleOpts: { name: RegExp }) => ({
         // Existence signal for the post-timeout precheck (delta r7): a
         // non-existent option cannot have dispatched and must not pay a
-        // probe.
+        // probe. A dispatchedAndReplaced outcome is the r8 race shape:
+        // the button is GONE because the pick replaced the picker pane.
         count: () => {
           const name = roleOpts.name.source.replace(/^\^/, '').replace(/\$$/, '')
-          return Promise.resolve(shells[name] ? 1 : 0)
+          const outcome = shells[name]
+          return Promise.resolve(outcome && !outcome.dispatchedAndReplaced ? 1 : 0)
         },
         click: (clickOpts: { timeout?: number }) => {
           clickTimeouts.push(clickOpts?.timeout ?? 0)
@@ -551,6 +555,12 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
           if (outcome?.lateDispatch) {
             // The click's actionability window expired mid-dispatch: the
             // timeout fires even though the handler ran (delta r5 probe case).
+            return Promise.reject(Object.assign(new Error(`click: Timeout ${clickOpts?.timeout}ms exceeded`), { name: 'TimeoutError' }))
+          }
+          if (outcome?.dispatchedAndReplaced) {
+            // Playwright delivered the action but timed out in post-action
+            // processing; by the time the catch runs the picker pane is
+            // already REPLACED by the terminal pane (delta r8 race case).
             return Promise.reject(Object.assign(new Error(`click: Timeout ${clickOpts?.timeout}ms exceeded`), { name: 'TimeoutError' }))
           }
           if (outcome?.clickTimesOut) {
@@ -570,6 +580,14 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
       waitForTimeout: (ms: number) => {
         settledMs.push(ms)
         return Promise.resolve()
+      },
+      // The instant state read for the count-0 branch (delta r8): the
+      // picker-replacement race means the terminal pane is ALREADY in
+      // state when the button vanished — one evaluate answers it.
+      evaluate: (_fn: unknown) => {
+        probeNows.push(1)
+        const last = shells[clicks[clicks.length - 1]]
+        return Promise.resolve(Boolean(last?.lateDispatch || last?.dispatchedAndReplaced))
       },
       // The post-click-timeout creation probe (delta r5): resolves when the
       // late-dispatched pick created a pane; a plain timeout means nothing
@@ -591,6 +609,7 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
       clickTimeouts,
       settledMs,
       probeWaits,
+      probeNows,
       xtermVisibilityChecks: () => xtermVisibilityChecks,
     }
   }
@@ -705,6 +724,25 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
     // Four existing-but-timed-out options -> four probes, each using the
     // exported probe budget; Bash succeeds, so no probe for it.
     expect(probeWaits).toEqual(Array.from({ length: 4 }, () => SHELL_PROBE_TIMEOUT_MS))
+  })
+
+  it('a click that DISPATCHED and replaced the picker before the catch (count 0) still joins the success path (delta review r8)', async () => {
+    // The race: Playwright delivered the action but timed out in
+    // post-action processing; PanePicker faded and the picker pane was
+    // REPLACED by the terminal pane before the catch ran. count() is 0,
+    // but the terminal pane is already in state — an instant read must
+    // catch it and wait for the render, never advance (advancing here
+    // burns click windows on now-absent options and skips the render
+    // wait entirely).
+    const { page, clicks, renderWaits, probeWaits, probeNows } = pickerPage({
+      Shell: { dispatchedAndReplaced: true, renderVisibleAfterMs: 1_000 },
+      WSL: {}, CMD: {}, PowerShell: {}, Bash: {},
+    })
+    await selectShellFromPicker(page)
+    expect(clicks).toEqual(['Shell']) // no advance despite count() === 0
+    expect(probeWaits).toEqual([]) // no full probe needed — the instant read answered
+    expect(probeNows).toEqual([1])
+    expect(renderWaits).toEqual([SHELL_RENDER_TIMEOUT_MS]) // the render wait runs
   })
 
   it('a probe hard error (page closed) propagates loudly, never "option absent"', async () => {

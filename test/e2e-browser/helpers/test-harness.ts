@@ -605,6 +605,19 @@ async function paneWasCreatedOnLateDispatch(page: Page): Promise<boolean> {
 }
 
 /**
+ * ONE immediate state read — the count-0 branch's disambiguator (delta
+ * review r8): a dispatched pick that made the button vanish did so by
+ * REPLACING the picker pane with the terminal pane (the picker's
+ * fade-then-replace on transitionend), so the terminal pane is ALREADY in
+ * state and a single evaluate answers true with no wait budget; a
+ * never-existed option answers false. This keeps absent options at their
+ * exact pre-run cost while closing the dispatch race.
+ */
+async function paneWasCreatedNow(page: Page): Promise<boolean> {
+  return page.evaluate(paneCreationProbePredicate)
+}
+
+/**
  * Select a shell from the PanePicker. Handles the race where buttons
  * detach during the platform-info Redux update: a click TimeoutError
  * means the option was not clickable within its window — absent,
@@ -636,17 +649,23 @@ export async function selectShellFromPicker(page: Page): Promise<void> {
     } catch (err) {
       if (!isTimeoutError(err)) throw err
       // An option that never existed cannot have dispatched: advance on
-      // the click timeout alone, with NO probe cost (delta review r7 —
+      // the click timeout alone, with no probe cost (delta review r7 —
       // absent options paid a needless 5s probe on every healthy boot
       // whose picker omits them, under the unchanged local 60s budget).
-      if (await button.count() === 0) continue
-      // A click timeout on an EXISTING button does not prove the click
-      // never dispatched (Playwright's timeout spans every click stage):
-      // probe for the pane the handler would have created. A late
-      // dispatch joins the success path below; only a confirmed
-      // nothing-created advances (delta review r5 — escalating on a late
-      // dispatch is the historical double-creation path).
-      if (!(await paneWasCreatedOnLateDispatch(page))) continue
+      if (await button.count() === 0) {
+        // count() === 0 is AMBIGUOUS (delta review r8): the option never
+        // existed, OR the click dispatched and the picker pane was
+        // already REPLACED by the terminal pane (the picker's
+        // fade-then-replace) before this catch ran. In the latter the
+        // terminal pane is ALREADY in state — one immediate read answers
+        // with no wait budget. Only a confirmed never-existed advances.
+        if (!(await paneWasCreatedNow(page))) continue
+      } else if (!(await paneWasCreatedOnLateDispatch(page))) {
+        // The button still exists but was not clickable within its
+        // window: a late dispatch may still land mid-fade, so this branch
+        // pays the full bounded probe.
+        continue
+      }
     }
     try {
       await page.locator('.xterm').first().waitFor({ state: 'visible', timeout: SHELL_RENDER_TIMEOUT_MS })
