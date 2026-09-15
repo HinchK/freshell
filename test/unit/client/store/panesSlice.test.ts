@@ -2985,6 +2985,167 @@ describe('panesSlice', () => {
         'pane-2': true,
       })
     })
+
+    const hydratePanesWith = (fixture: {
+      local: PanesState
+      incoming: PanesState
+      meta?: { localLayoutPersistedAt?: number; remoteLayoutPersistedAt?: number }
+    }): PanesState => {
+      const action = fixture.meta !== undefined
+        ? { ...hydratePanes(fixture.incoming), meta: fixture.meta }
+        : hydratePanes(fixture.incoming)
+      return panesReducer(fixture.local, action)
+    }
+
+    // Local side: a split whose titled pane is the pane under test; the
+    // same-structure incoming split always wins the layout merge
+    // (incomingLayoutTabIds), so the recency meta is the only thing that can
+    // protect the newer local title.
+    const localStateWithPaneTitle = (
+      tabId: string,
+      paneId: string,
+      title: string,
+      opts?: { userSet?: boolean },
+    ): PanesState => ({
+      layouts: {
+        [tabId]: {
+          type: 'split',
+          id: `split-${tabId}`,
+          direction: 'horizontal',
+          sizes: [50, 50],
+          children: [
+            terminalLeaf(paneId, `t-${tabId}`),
+            editorLeaf(`${paneId}-side`, `/tmp/${tabId}-local.ts`),
+          ],
+        },
+      },
+      activePane: { [tabId]: paneId },
+      paneTitles: { [tabId]: { [paneId]: title } },
+      paneTitleSetByUser: opts?.userSet ? { [tabId]: { [paneId]: true } } : {},
+      renameRequestTabId: null,
+      renameRequestPaneId: null,
+      zoomedPane: {},
+      refreshRequestsByPane: {},
+    })
+
+    // Incoming side: the same split shape (incoming layout wins) unless
+    // `asLeaf` is set — a leaf against the local split with a local-newer
+    // meta keeps the LOCAL layout (the :2939 idiom), the preserved-layout
+    // scenario test 5 pins.
+    const incomingWithPaneTitles = (
+      tabId: string,
+      paneTitles: Record<string, string>,
+      opts?: { userSet?: boolean; asLeaf?: boolean },
+    ): PanesState => ({
+      layouts: opts?.asLeaf
+        ? { [tabId]: terminalLeaf(Object.keys(paneTitles)[0], `t-${tabId}`) }
+        : {
+          [tabId]: {
+            type: 'split',
+            id: `split-${tabId}`,
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              terminalLeaf(Object.keys(paneTitles)[0], `t-${tabId}`),
+              editorLeaf(`${Object.keys(paneTitles)[0]}-side`, `/tmp/${tabId}-remote.ts`),
+            ],
+          },
+        },
+      activePane: { [tabId]: Object.keys(paneTitles)[0] },
+      paneTitles: { [tabId]: paneTitles },
+      paneTitleSetByUser: opts?.userSet
+        ? { [tabId]: Object.fromEntries(Object.keys(paneTitles).map((paneId) => [paneId, true])) }
+        : {},
+      renameRequestTabId: null,
+      renameRequestPaneId: null,
+      zoomedPane: {},
+      refreshRequestsByPane: {},
+    })
+
+    it('an older incoming layout no longer overwrites newer local pane titles even when the incoming layout wins', () => {
+      // local: tab with a split layout, one pane holding a NEWER non-user-set title
+      // incoming: same tab id, layout that wins the merge (incomingLayoutTabIds),
+      //           paneTitles carrying an OLDER title, crossTabMeta(local=now, remote=now-60_000)
+      const state = hydratePanesWith({
+        local: localStateWithPaneTitle('tab-1', 'pane-1', 'Newer local title', { userSet: false }),
+        incoming: incomingWithPaneTitles('tab-1', { 'pane-1': 'Older remote title' }),
+        meta: crossTabMeta(Date.now(), Date.now() - 60_000),   // LOCAL is newer
+      })
+      expect(state.paneTitles['tab-1']['pane-1']).toBe('Newer local title')
+    })
+
+    it('a newer incoming layout still applies incoming titles for tabs it won', () => {
+      const state = hydratePanesWith({
+        local: localStateWithPaneTitle('tab-1', 'pane-1', 'Older local title', { userSet: false }),
+        incoming: incomingWithPaneTitles('tab-1', { 'pane-1': 'Newer remote title' }),
+        meta: crossTabMeta(Date.now() - 60_000, Date.now()),   // REMOTE is newer
+      })
+      expect(state.paneTitles['tab-1']['pane-1']).toBe('Newer remote title')
+    })
+
+    it('user-set local pane titles survive regardless of recency', () => {
+      const state = hydratePanesWith({
+        local: localStateWithPaneTitle('tab-1', 'pane-1', 'My frozen title', { userSet: true }),
+        incoming: incomingWithPaneTitles('tab-1', { 'pane-1': 'Newer remote title' }),
+        meta: crossTabMeta(Date.now() - 60_000, Date.now()),   // remote newer — user-set still wins
+      })
+      expect(state.paneTitles['tab-1']['pane-1']).toBe('My frozen title')
+    })
+
+    it('an incoming USER-SET title survives when the incoming layout wins (remote newer)', () => {
+      const state = hydratePanesWith({
+        local: localStateWithPaneTitle('tab-1', 'pane-1', 'Older local title', { userSet: false }),
+        incoming: incomingWithPaneTitles('tab-1', { 'pane-1': 'Remote chosen name' }, { userSet: true }),
+        meta: crossTabMeta(Date.now() - 60_000, Date.now()),   // remote newer — incoming user-set title + flag land
+      })
+      expect(state.paneTitles['tab-1']['pane-1']).toBe('Remote chosen name')
+      expect(state.paneTitleSetByUser['tab-1']['pane-1']).toBe(true)
+    })
+
+    it('an incoming USER-SET title survives even when the local layout is preserved (remote older)', () => {
+      const state = hydratePanesWith({
+        local: localStateWithPaneTitle('tab-1', 'pane-1', 'Newer local title', { userSet: false }),
+        incoming: incomingWithPaneTitles('tab-1', { 'pane-1': 'Remote chosen name' }, { userSet: true, asLeaf: true }),
+        meta: crossTabMeta(Date.now(), Date.now() - 60_000),   // local newer — layout stays local, but the incoming USER-SET title still wins
+      })
+      expect(state.paneTitles['tab-1']['pane-1']).toBe('Remote chosen name')
+      expect(state.paneTitleSetByUser['tab-1']['pane-1']).toBe(true)
+    })
+
+    it('both sides user-set: the recency winner\'s title stands, flag true', () => {
+      const state = hydratePanesWith({
+        local: localStateWithPaneTitle('tab-1', 'pane-1', 'Local mine', { userSet: true }),
+        incoming: incomingWithPaneTitles('tab-1', { 'pane-1': 'Remote mine' }, { userSet: true }),
+        meta: crossTabMeta(Date.now() - 60_000, Date.now()),   // remote newer — the incoming user-set title stands
+      })
+      expect(state.paneTitles['tab-1']['pane-1']).toBe('Remote mine')
+      expect(state.paneTitleSetByUser['tab-1']['pane-1']).toBe(true)
+    })
+
+    it('keeps the legacy merge when no hydrate meta is provided', () => {
+      const state = hydratePanesWith({
+        local: localStateWithPaneTitle('tab-1', 'pane-1', 'Newer local title', { userSet: false }),
+        incoming: incomingWithPaneTitles('tab-1', { 'pane-1': 'Older remote title' }),
+        meta: undefined,
+      })
+      expect(state.paneTitles['tab-1']['pane-1']).toBe('Older remote title')   // current behavior preserved
+    })
+
+    it('a known remote timestamp beats a MISSING local stamp: a newly received tab\'s incoming titles apply (tabs-exact coalesced comparison)', () => {
+      // The missing-local case the tabs contract already gets right
+      // (pickHydratedTabWinner: known remote > missing local). tab-2 is NEW to
+      // this window (its incoming layout wins by absence of a local one); the
+      // meta carries a real remoteLayoutPersistedAt but NO localLayoutPersistedAt
+      // (this window has not flushed its own envelope yet). The incoming title
+      // must apply — pass the meta as an explicit literal; the suite's
+      // crossTabMeta helper types both fields as numbers.
+      const state = hydratePanesWith({
+        local: localStateWithPaneTitle('tab-1', 'pane-1', 'Older local title', { userSet: false }),
+        incoming: incomingWithPaneTitles('tab-2', { 'pane-2': 'Newly received title' }),
+        meta: { localLayoutPersistedAt: undefined, remoteLayoutPersistedAt: Date.now() },
+      })
+      expect(state.paneTitles['tab-2']['pane-2']).toBe('Newly received title')
+    })
   })
 
   describe('fresh-agent durable sessionRef identity guard', () => {

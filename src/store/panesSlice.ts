@@ -21,9 +21,10 @@ import {
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
 import { matchesDerivedPaneTitle } from '@/lib/pane-title'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
-import { buildPaneRefreshTarget, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
+import { buildPaneRefreshTarget, paneContentMatchesSessionRef, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
 import { loadPersistedPanes, loadPersistedTabs } from './persistMiddleware.js'
 import { hasPaneTreeShape, isWellFormedPaneTree } from './paneTreeValidation.js'
+import { mergeHydratedPaneMetadata, type HydratePanesMeta } from './hydrate-pane-metadata-merge.js'
 import { createLogger } from '@/lib/client-logger'
 import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
 import { sanitizeRestoreError, sanitizeCrashTrace, sanitizeSessionRef, type RestoreError } from '@shared/session-contract'
@@ -33,11 +34,6 @@ import { normalizeFreshAgentStyleOverride } from '@shared/settings'
 
 
 const log = createLogger('PanesSlice')
-
-type HydratePanesMeta = {
-  localLayoutPersistedAt?: number
-  remoteLayoutPersistedAt?: number
-}
 
 type FreshAgentSessionMaterializedPayload = {
   previousSessionId: string
@@ -440,20 +436,6 @@ function findPaneIdByTerminalId(node: PaneNode, terminalId: string): string | un
     ?? findPaneIdByTerminalId(node.children[1], terminalId)
 }
 
-/**
- * Match rule for session-keyed pane-title folds: a fresh-agent pane owning
- * the given provider:sessionId, or a terminal pane whose sessionRef points
- * at it.
- */
-function paneContentMatchesSessionRef(content: PaneContent, provider: string, sessionId: string): boolean {
-  if (content.kind === 'fresh-agent' && content.provider === provider && content.sessionId === sessionId) {
-    return true
-  }
-  return content.kind === 'terminal'
-    && content.sessionRef?.provider === provider
-    && content.sessionRef?.sessionId === sessionId
-}
-
 // Helper to find and replace a node (leaf or split) in the tree
 function findAndReplace(
   node: PaneNode,
@@ -529,116 +511,6 @@ function normalizePaneTree(node: PaneNode, previous?: PaneNode): PaneNode | null
     ...node,
     children: [normalizedLeft, normalizedRight],
   }
-}
-
-function collectLeafPaneIds(node: PaneNode): string[] {
-  if (node.type === 'leaf') {
-    return [node.id]
-  }
-  return [
-    ...collectLeafPaneIds(node.children[0]),
-    ...collectLeafPaneIds(node.children[1]),
-  ]
-}
-
-function filterPaneMetadataByLayout<T>(
-  metadata: Record<string, Record<string, T>> | undefined,
-  tabId: string,
-  paneIds: Set<string>,
-): Record<string, T> | undefined {
-  const tabMetadata = metadata?.[tabId]
-  if (!tabMetadata) return undefined
-  const filtered = Object.fromEntries(
-    Object.entries(tabMetadata).filter(([paneId]) => paneIds.has(paneId)),
-  )
-  return Object.keys(filtered).length > 0 ? filtered : undefined
-}
-
-function pickHydratedActivePane(
-  paneIds: string[],
-  incomingActivePaneId: string | undefined,
-  localActivePaneId: string | undefined,
-): string | undefined {
-  const paneIdSet = new Set(paneIds)
-  if (incomingActivePaneId && paneIdSet.has(incomingActivePaneId)) {
-    return incomingActivePaneId
-  }
-  if (localActivePaneId && paneIdSet.has(localActivePaneId)) {
-    return localActivePaneId
-  }
-  return paneIds[paneIds.length - 1]
-}
-
-function mergeHydratedPaneMetadata(
-  state: PanesState,
-  incoming: PanesState,
-  layouts: Record<string, PaneNode>,
-  incomingLayoutTabIds: Set<string>,
-): Pick<PanesState, 'activePane' | 'paneTitles' | 'paneTitleSetByUser'> {
-  const activePane: Record<string, string> = {}
-  const paneTitles: Record<string, Record<string, string>> = {}
-  const paneTitleSetByUser: Record<string, Record<string, boolean>> = {}
-
-  for (const [tabId, layout] of Object.entries(layouts)) {
-    const paneIds = collectLeafPaneIds(layout)
-    const paneIdSet = new Set(paneIds)
-    const localLayoutPreserved = !incomingLayoutTabIds.has(tabId)
-    const preferredTitleSource = localLayoutPreserved
-      ? state.paneTitles
-      : incoming.paneTitles
-    const preferredTitleSetByUserSource = localLayoutPreserved
-      ? state.paneTitleSetByUser
-      : incoming.paneTitleSetByUser
-
-    const nextActivePane = pickHydratedActivePane(
-      paneIds,
-      localLayoutPreserved ? undefined : incoming.activePane?.[tabId],
-      state.activePane?.[tabId],
-    )
-    if (nextActivePane) {
-      activePane[tabId] = nextActivePane
-    }
-
-    const nextPaneTitles = filterPaneMetadataByLayout(preferredTitleSource, tabId, paneIdSet)
-    const fallbackTitles = !localLayoutPreserved
-      ? filterPaneMetadataByLayout(state.paneTitles, tabId, paneIdSet)
-      : undefined
-    const localUserSetTitleFlags = !localLayoutPreserved
-      ? filterPaneMetadataByLayout(state.paneTitleSetByUser, tabId, paneIdSet)
-      : undefined
-    if (nextPaneTitles) {
-      if (fallbackTitles && localUserSetTitleFlags) {
-        const merged = { ...nextPaneTitles }
-        for (const [paneId, title] of Object.entries(fallbackTitles)) {
-          if (localUserSetTitleFlags[paneId]) {
-            merged[paneId] = title
-          }
-        }
-        paneTitles[tabId] = merged
-      } else {
-        paneTitles[tabId] = nextPaneTitles
-      }
-    } else if (fallbackTitles) {
-      paneTitles[tabId] = fallbackTitles
-    }
-
-    const nextPaneTitleSetByUser = filterPaneMetadataByLayout(
-      preferredTitleSetByUserSource,
-      tabId,
-      paneIdSet,
-    )
-    const fallbackTitleSetByUser = !localLayoutPreserved
-      ? filterPaneMetadataByLayout(state.paneTitleSetByUser, tabId, paneIdSet)
-      : undefined
-    if (nextPaneTitleSetByUser || fallbackTitleSetByUser) {
-      paneTitleSetByUser[tabId] = {
-        ...(nextPaneTitleSetByUser || {}),
-        ...(fallbackTitleSetByUser || {}),
-      }
-    }
-  }
-
-  return { activePane, paneTitles, paneTitleSetByUser }
 }
 
 function clearPaneRefreshRequest(state: PanesState, tabId: string, paneId: string) {
@@ -2118,7 +1990,7 @@ export const panesSlice = createSlice({
       }
 
       state.layouts = mergedLayouts
-      const nextMetadata = mergeHydratedPaneMetadata(state, incoming, mergedLayouts, incomingLayoutTabIds)
+      const nextMetadata = mergeHydratedPaneMetadata(state, incoming, mergedLayouts, incomingLayoutTabIds, meta)
       state.activePane = nextMetadata.activePane
       state.paneTitles = nextMetadata.paneTitles
       state.paneTitleSetByUser = nextMetadata.paneTitleSetByUser

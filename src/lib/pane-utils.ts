@@ -107,6 +107,20 @@ export function collectPaneEntries(node: PaneNode): PaneEntry[] {
 }
 
 /**
+ * Match rule for session-keyed pane-title folds: a fresh-agent pane owning
+ * the given provider:sessionId, or a terminal pane whose sessionRef points
+ * at it.
+ */
+export function paneContentMatchesSessionRef(content: PaneContent, provider: string, sessionId: string): boolean {
+  if (content.kind === 'fresh-agent' && content.provider === provider && content.sessionId === sessionId) {
+    return true
+  }
+  return content.kind === 'terminal'
+    && content.sessionRef?.provider === provider
+    && content.sessionRef?.sessionId === sessionId
+}
+
+/**
  * One close-evidence-bearing pane identity (focused-episode-7 round 4,
  * Finding F2): the pane id plus the createRequestId the `pane.closed` /
  * `panes.closed` / `pane.opened` lanes key by, and the terminalId when the

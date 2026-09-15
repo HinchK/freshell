@@ -1,6 +1,6 @@
 import type { Middleware } from '@reduxjs/toolkit'
 import { updatePaneTitleBySessionRef } from './panesSlice'
-import { collectPaneEntries } from '@/lib/pane-utils'
+import { collectPaneEntries, paneContentMatchesSessionRef } from '@/lib/pane-utils'
 import type { RootState } from './store'
 
 type TitledSessionRow = {
@@ -75,12 +75,7 @@ function sessionTitleDiffers(panes: RootState['panes'], provider: string, sessio
   for (const [tabId, layout] of Object.entries(panes.layouts ?? {})) {
     if (!layout) continue
     for (const { paneId, content } of collectPaneEntries(layout)) {
-      const matches =
-        (content.kind === 'fresh-agent' && content.provider === provider && content.sessionId === sessionId)
-        || (content.kind === 'terminal'
-          && content.sessionRef?.provider === provider
-          && content.sessionRef?.sessionId === sessionId)
-      if (!matches) continue
+      if (!paneContentMatchesSessionRef(content, provider, sessionId)) continue
       if (panes.paneTitleSetByUser?.[tabId]?.[paneId]) continue
       if ((panes.paneTitles?.[tabId]?.[paneId] ?? '') !== title) return true
     }

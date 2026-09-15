@@ -14,6 +14,10 @@ import type { Page } from '@playwright/test'
  * 2. A reload after the local envelope is CORRUPTED rebuilds from the
  *    machine-bootstrap inventory, which (upgrade 1) includes the window's
  *    own last pushed snapshot with PRESERVED tab and pane ids.
+ * 3. A stale (older persistedAt) envelope written from a second page in the
+ *    same context does not clobber this page's newer local pane title — the
+ *    Task 7 cross-window recency guard, over the real storage-event
+ *    hydration path.
  *
  * Cloud-runnable by construction: editor panes (no PTY, no CLI binaries),
  * owned fresh RustServer (fresh FRESHELL_HOME auto-creates the machine —
@@ -220,6 +224,101 @@ test.describe('local-first machine workspace', () => {
     expect(JSON.stringify(rebuilt.panes.layouts['tab-mango'])).toContain('tab-mango-pane')
     expect(JSON.stringify(rebuilt.panes.layouts['tab-apple'])).toContain('tab-apple-pane')
   })
+
+  test('an older persisted layout from a second page does not clobber a newer local pane title', async ({ page }) => {
+    // Establish the remembered machine in this FRESH context BEFORE first
+    // navigation (see the donor-idiom note above): seed the payload
+    // Scenario 1 captured, then boot page1 — it resolves the seeded machine
+    // (kind 'selected', machine-identity.ts:191-214) with NO chooser. This
+    // is a SEEDING init script, not the clearing kind LB-08 forbids: it
+    // writes the same values the boot itself persists, idempotently, and
+    // never touches sessionStorage or the clientInstanceId.
+    test.skip(!machineSelectionStorage, 'Scenario 1 must have captured the machine-selection payload')
+    await page.addInitScript((payload) => {
+      for (const [key, value] of Object.entries(payload)) localStorage.setItem(key, value)
+      // Without a freshell_version stamp, runStorageMigration()'s full path
+      // (storage-migration.ts:475) wipes every freshell.* key outside its
+      // keep list — including the machine-selection keys just seeded — and
+      // the boot falls into the chooser. Stamping the current version keeps
+      // the migration on its preserve-only early-return path.
+      localStorage.setItem('freshell_version', '5')
+    }, machineSelectionStorage)
+
+    await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+    const harness = new TestHarness(page)
+    await harness.waitForHarness()
+    await harness.waitForConnection()
+
+    // The seeded context has NO local envelope, so this boot REBUILDS from
+    // the machine-bootstrap inventory: Scenario 1's tabs come back with
+    // PRESERVED ids (Task 3), exactly as Scenario 2 just pinned — there is
+    // no auto shell tab to remove, and tab-mango's restored pane tree
+    // already carries the tab-mango-pane pane this scenario titles.
+    await harness.waitForTabCount(2)
+    await waitForPersistedEnvelope(page, (env) =>
+      typeof env.machineId === 'string' && env.machineId.length > 0
+      && env.tabs?.tabs?.some((t: { id: string }) => t.id === 'tab-mango'))
+
+    // page2 opens in the SAME context (shared localStorage — the donor's
+    // `page.context().newPage()` idiom, multi-client.spec.ts:198-199) and
+    // rehydrates the envelope; it resolves the same saved machine (the
+    // donor's second-page mechanism, :202/:205-206) — no init script needed.
+    const page2 = await page.context().newPage()
+    await page2.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+    const harness2 = new TestHarness(page2)
+    await harness2.waitForHarness()
+    await harness2.waitForConnection()
+
+    // page2 sets a NEWER non-user-set pane title and forces an immediate
+    // flush (the donor's flushPersistedLayout idiom, multi-client.spec.ts:
+    // 177-185: dispatch 'persist/flushNow'), then poll the shared envelope
+    // until it carries the new title — capturing its persistedAt as tLocal
+    // (page2's local stamp).
+    await page2.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.dispatch({
+      type: 'panes/updatePaneTitle',
+      payload: { tabId: 'tab-mango', paneId: 'tab-mango-pane', title: 'Newer local title', setByUser: false },
+    }))
+    await page2.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' }))
+    const tLocal = await waitForPersistedEnvelopeTitled(page, 'Newer local title')
+
+    // Let page1's response settle BEFORE staging: page2's flush fires a
+    // storage event on page1, whose crossTabSync hydrates and schedules its
+    // own debounced reflush — wait that cycle out so the staged write below
+    // is the LAST envelope write.
+    await page.waitForTimeout(2_000)
+
+    // Stage the STALE remote: from page1, mutate the shared localStorage
+    // envelope in place — same JSON, the pane title reverted, persistedAt
+    // 60s OLDER than page2's local stamp. page1's write fires a storage
+    // event on page2 only — the real crossTabSync path hydrates page2 with
+    // remoteLayoutPersistedAt < localLayoutPersistedAt.
+    // Envelope shape verified against the real writer/reader:
+    //  - paneTitles live at panes.paneTitles (persistMiddleware.ts:625-654
+    //    writes `panes: persistablePanesSection` — the state.panes spread
+    //    minus volatile fields; parsed at persistedState.ts:553). The old
+    //    sketch's top-level `env.paneTitles` dereferenced undefined and
+    //    threw — fixed.
+    //  - persistedAt is TOP-LEVEL (persistMiddleware.ts:647, read at
+    //    persistedState.ts:557).
+    //  - the storage key literal 'freshell.layout.v3' matches
+    //    LAYOUT_STORAGE_KEY (storage-keys.ts:2/:25).
+    //  - Task 1's machineId is TOP-LEVEL; the staging touches ONLY the
+    //    title and persistedAt, so the stamp (and everything else) is
+    //    preserved.
+    await page.evaluate((tLocal) => {
+      const env = JSON.parse(localStorage.getItem('freshell.layout.v3') ?? '{}')
+      env.panes.paneTitles['tab-mango']['tab-mango-pane'] = 'Stale from page1'
+      env.persistedAt = tLocal - 60_000
+      localStorage.setItem('freshell.layout.v3', JSON.stringify(env))
+    }, tLocal)
+
+    // Bounded settle for the storage-event hydration, then ONE hard read (not a
+    // poll — a poll could sample before the hydrate lands and false-pass).
+    await page2.waitForTimeout(2_000)
+    const title = await page2.evaluate(() =>
+      window.__FRESHELL_TEST_HARNESS__?.getState()?.panes?.paneTitles?.['tab-mango']?.['tab-mango-pane'])
+    expect(title).toBe('Newer local title')
+  })
 })
 
 /** Bounded node-side poll for the persisted envelope to satisfy the
@@ -245,4 +344,31 @@ async function waitForPersistedEnvelope(
     `persisted envelope did not satisfy the predicate within ${timeoutMs}ms; `
     + `last observed: ${JSON.stringify(last)?.slice(0, 400)}`,
   )
+}
+
+/** Bounded poll until the shared envelope's pane title equals the given
+ * value; resolves the envelope's persistedAt (the writer's stamp — tLocal
+ * for the page2 flush this scenario tracks). Node-side predicate over one
+ * plain JSON.parse read per round (same shape as waitForPersistedEnvelope). */
+async function waitForPersistedEnvelopeTitled(
+  page: Page,
+  expectedTitle: string,
+  timeoutMs = 10_000,
+): Promise<number> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const persistedAt = await page.evaluate((title) => {
+      try {
+        const env = JSON.parse(localStorage.getItem('freshell.layout.v3') ?? 'null')
+        if (env?.panes?.paneTitles?.['tab-mango']?.['tab-mango-pane'] === title
+          && typeof env.persistedAt === 'number') {
+          return env.persistedAt
+        }
+        return null
+      } catch { return null }
+    }, expectedTitle)
+    if (typeof persistedAt === 'number') return persistedAt
+    await new Promise((r) => setTimeout(r, 250))
+  }
+  throw new Error(`persisted envelope did not carry the pane title '${expectedTitle}' within ${timeoutMs}ms`)
 }
