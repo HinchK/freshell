@@ -91,22 +91,25 @@ export function shellPickerWorstCaseMs(): number {
 export const DEFAULT_TEST_TIMEOUT_MS = 60_000
 
 /**
- * Whether the cloud-lane budget wiring should raise a test's current
- * deadline to the composed budget (delta review r5): EXTEND-ONLY and
- * DEFAULT-CLASS-ONLY. Never shrinks (a budget below the current deadline
- * is ignored), never touches unlimited (0 — any finite value would
- * shrink it), never touches a deadline declared above the config default
- * (explicit spec budget decisions), and is a no-op without a budget
- * (local lane).
+ * The freshellPage fixture's OWN setup timeout (delta review r9): the
+ * composed budget on the cloud lane, or undefined on the local lane.
+ * Playwright gives a fixture its own timeout precisely so slow SETUP can
+ * receive a larger allowance while the test keeps its original deadline
+ * (playwright.dev/docs/test-fixtures#fixture-timeout) — the boot chain
+ * (goto + waitForHarness + self-healing waitForConnection + the picker
+ * leg) is fixture setup, and its permitted composition is exactly what
+ * resolveCloudLaneTestBudgetMs derives. undefined means no
+ * fixture-specific timeout: fixture time counts toward the test timeout —
+ * the exact pre-run behavior the local lane keeps. The test's own
+ * deadline is NEVER modified by the wiring: bodies keep their declared or
+ * config-default ceiling on every lane (the round-9 scope fix — the
+ * former whole-test extension gave unrelated bodies ~171.5s of extra
+ * ceiling and could suppress their flakes).
  */
-export function shouldExtendTestDeadlineToCloudBudget(
-  currentTimeoutMs: number,
-  cloudBudgetMs: number | null,
-): boolean {
-  return cloudBudgetMs !== null
-    && currentTimeoutMs !== 0
-    && currentTimeoutMs <= DEFAULT_TEST_TIMEOUT_MS
-    && currentTimeoutMs < cloudBudgetMs
+export function freshellPageFixtureTimeoutMs(
+  env: Record<string, string | undefined> = process.env,
+): number | undefined {
+  return resolveCloudLaneTestBudgetMs(env) ?? undefined
 }
 
 /**

@@ -4,6 +4,7 @@ import {
   CLOUD_LANE_START_RESERVE_MS,
   DEFAULT_TEST_TIMEOUT_MS,
   DEFAULT_WS_READY_TIMEOUT_MS,
+  freshellPageFixtureTimeoutMs,
   paneCreationProbePredicate,
   SHELL_CLICK_TIMEOUT_MS,
   SHELL_NAMES,
@@ -15,7 +16,6 @@ import {
   resolveCloudLaneTestBudgetMs,
   resolveWsReadyTimeoutMs,
   selectShellFromPicker,
-  shouldExtendTestDeadlineToCloudBudget,
   shellPickerWorstCaseMs,
 } from './test-harness'
 
@@ -174,33 +174,26 @@ describe('isCloudLaneWindowConfigured (one presence rule for every cloud-lane ga
   })
 })
 
-describe('shouldExtendTestDeadlineToCloudBudget (default-class extension, delta review r5)', () => {
-  const BUDGET = 231_500
+describe('freshellPageFixtureTimeoutMs (the boot chain owns its own setup allowance, delta review r9)', () => {
+  it('is the composed budget on the cloud lane — the fixture SETUP gets the large window, never the test body', () => {
+    expect(freshellPageFixtureTimeoutMs({ [ENV_VAR]: '90000' })).toBe(231_500)
+    expect(freshellPageFixtureTimeoutMs({ [ENV_VAR]: '60000' })).toBe(201_500)
+  })
 
-  it('extends only DEFAULT-CLASS deadlines: at or below the config default (the class the tg4e chain-envelope defect lives in)', () => {
+  it('is undefined on the local lane: fixture time counts toward the test timeout — the exact pre-run behavior', () => {
+    expect(freshellPageFixtureTimeoutMs({})).toBeUndefined()
+    expect(freshellPageFixtureTimeoutMs({ [ENV_VAR]: '' })).toBeUndefined()
+  })
+
+  it('falls back to the default window composition on malformed values (one parsing rule)', () => {
+    for (const malformed of ['not-a-number', '0', '-5']) {
+      expect(freshellPageFixtureTimeoutMs({ [ENV_VAR]: malformed }))
+        .toBe(30_000 + 1_000 + shellPickerWorstCaseMs() + CLOUD_LANE_START_RESERVE_MS)
+    }
+  })
+
+  it('stays pinned to the config default ceiling: the DEFAULT_TEST_TIMEOUT_MS the configs import', () => {
     expect(DEFAULT_TEST_TIMEOUT_MS).toBe(60_000)
-    expect(shouldExtendTestDeadlineToCloudBudget(60_000, BUDGET)).toBe(true)
-    expect(shouldExtendTestDeadlineToCloudBudget(30_000, BUDGET)).toBe(true)
-  })
-
-  it('never touches a deadline declared ABOVE the config default (explicit spec budget decisions, e.g. launch-retry-restart-rust 180_000)', () => {
-    expect(shouldExtendTestDeadlineToCloudBudget(60_001, BUDGET)).toBe(false)
-    expect(shouldExtendTestDeadlineToCloudBudget(120_000, BUDGET)).toBe(false)
-    expect(shouldExtendTestDeadlineToCloudBudget(180_000, BUDGET)).toBe(false)
-    expect(shouldExtendTestDeadlineToCloudBudget(240_000, BUDGET)).toBe(false)
-    expect(shouldExtendTestDeadlineToCloudBudget(BUDGET, BUDGET)).toBe(false)
-  })
-
-  it('never touches unlimited (0): a finite budget would shrink it', () => {
-    expect(shouldExtendTestDeadlineToCloudBudget(0, BUDGET)).toBe(false)
-  })
-
-  it('is a no-op when no cloud budget is configured (local lane)', () => {
-    expect(shouldExtendTestDeadlineToCloudBudget(60_000, null)).toBe(false)
-  })
-
-  it('never shrinks: a budget below the current default-class deadline is ignored', () => {
-    expect(shouldExtendTestDeadlineToCloudBudget(60_000, 50_000)).toBe(false)
   })
 })
 

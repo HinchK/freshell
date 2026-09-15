@@ -83,6 +83,13 @@ test.describe('Settings', () => {
   })
 
   test('settings persist after reload', async ({ freshellPage, page, harness, serverInfo }) => {
+    // This test reloads mid-body and re-waits for the connection under the
+    // cloud window: the wait's legal envelope (W+1s = 91s at W=90s)
+    // exceeds the config's 60s body default, so it declares its own budget
+    // from inside the body — the spec's decision, not fixture wiring
+    // (delta review r9: bodies own their ceilings; the old settings-wide
+    // 120s hook this file used to carry was removed by kata tg4e's Task 5).
+    test.setTimeout(180_000)
     await openSettings(page)
 
     // Change a setting: toggle cursor blink
@@ -183,8 +190,13 @@ test.describe('Settings', () => {
     ).toBeVisible()
   })
 
-  test('Expand thinking and Expand tools switches persist locally and reset to defaults',
-    async ({ freshellPage, page, harness, serverInfo }) => {
+  test('Expand thinking and Expand tools switches persist locally and reset to defaults', async ({ freshellPage, page, harness, serverInfo }) => {
+    // Reloads mid-body with the self-healing connection wait (opted in on
+    // the cloud lane): the wait's legal envelope (W+1s = 91s at W=90s)
+    // exceeds the config's 60s body default, so it declares its own budget
+    // from inside the body — the spec's decision, not fixture wiring
+    // (delta review r9).
+    test.setTimeout(180_000)
     await openSettingsSection(page, 'Coding Agents')
 
     // Accessible-name switch locators (each Toggle carries an exact aria-label

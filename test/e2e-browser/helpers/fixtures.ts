@@ -8,10 +8,9 @@ import {
 import { type E2eServerInfo } from './server-fixture-support.js'
 import {
   TestHarness,
+  freshellPageFixtureTimeoutMs,
   isCloudLaneWindowConfigured,
-  resolveCloudLaneTestBudgetMs,
   selectShellFromPicker,
-  shouldExtendTestDeadlineToCloudBudget,
 } from './test-harness.js'
 import { TerminalHelper } from './terminal-helpers.js'
 import { createE2eServerHandle, type E2eServerHandle } from './external-target.js'
@@ -215,39 +214,22 @@ export const test = base.extend<{
   // restore the preceding test's workspace into a fresh browser context.
   // The id remains stable for every context that one test intentionally uses.
   //
-  // Cloud-lane wedge budget (kata tg4e): this is the earliest test-scoped
-  // fixture — resolved before context/page, so every module-chain spec's
-  // whole fixture chain runs under the deadline set here. The freshellPage
-  // fixture's boot chain — self-healing waitForConnection (at most W+1s,
-  // a single total deadline) plus the picker/render tail (kata tg4e's
-  // retained trace: a container-wide CPU-contention episode starved the
-  // post-click .xterm render and the old picker loop silently burned the
-  // remaining budget escalating through options absent on this platform) —
-  // has a permitted-composed envelope (connection W+1s + picker worst + start reserve) larger than the config's 60s default,
-  // which killed fixture setup mid-envelope: the recorded
-  // "Test timeout of 60000ms exceeded while setting up freshellPage"
-  // flake. Extending the deadline from inside this fixture makes the
-  // budget cover the chain's envelope for every module-chain spec, not
-  // just settings.spec.ts (whose private hook Task 5 removes). Locally
-  // the env var is unset and the default budget applies unchanged. The
-  // mechanism is probe-verified (settings.spec.ts precedent, kata j90s):
-  // a setTimeout issued during fixture resolution extends the live
-  // deadline over fixture time. EXTEND-ONLY and DEFAULT-CLASS-ONLY (delta
-  // review r5): specs that declare a deadline above the config default —
-  // idle-gate 300s, reconcile 240s, launch-retry-restart-rust 180s — keep
-  // their own budget, whatever the composition: raising an explicit spec
-  // budget decision would touch other flakes' mechanisms, and their own
-  // deflake runs must fix any under-budgeting. A declared 0 is
-  // Playwright's UNLIMITED: any finite budget would shrink it. All three
-  // rules live in the unit-tested shouldExtendTestDeadlineToCloudBudget.
+  // Cloud-lane wedge budget (kata tg4e, delta review r9): the freshellPage
+  // boot chain — self-healing waitForConnection (at most W+1s, a single
+  // total deadline) plus the picker/render tail (kata tg4e's retained
+  // trace: a container-wide CPU-contention episode starved the post-click
+  // .xterm render and the old picker loop silently burned the remaining
+  // budget escalating through options absent on this platform) — has a
+  // permitted-composed envelope (connection W+1s + picker worst + start
+  // reserve) larger than the config's 60s default, which killed fixture
+  // setup mid-envelope: the recorded "Test timeout of 60000ms exceeded
+  // while setting up freshellPage" flake. That envelope now lives on the
+  // freshellPage fixture's OWN timeout (the tuple form above), so slow
+  // SETUP gets the allowance while every test body keeps its declared or
+  // config-default ceiling. This fixture never touches the test deadline;
+  // a declared 0 (Playwright's UNLIMITED) reaches it unchanged — hence
+  // the conditional registration-fetch bound below.
   e2eMachineId: async ({ testServer }, use) => {
-    const cloudBudgetMs = resolveCloudLaneTestBudgetMs()
-    if (
-      cloudBudgetMs !== null
-      && shouldExtendTestDeadlineToCloudBudget(test.info().timeout, cloudBudgetMs)
-    ) {
-      test.info().setTimeout(cloudBudgetMs)
-    }
     // Bound the registration fetch ONLY under an unlimited (0) test
     // deadline (delta reviews r5+r6): finite-deadline tests keep their
     // exact pre-run behavior (the deadline itself bounds resolution —
@@ -275,7 +257,21 @@ export const test = base.extend<{
     await use(new TerminalHelper(page))
   },
 
-  freshellPage: async ({ page, serverInfo, harness }, use) => {
+  // Tuple form with the fixture's OWN timeout (delta review r9): the boot
+  // chain below (goto + waitForHarness + self-healing waitForConnection +
+  // the picker leg) is fixture SETUP, and Playwright allows a fixture a
+  // separate larger timeout so slow setup gets its allowance while the
+  // TEST keeps its original deadline (playwright.dev/docs/test-fixtures#
+  // fixture-timeout). On the cloud lane the timeout is the composed
+  // budget (freshellPageFixtureTimeoutMs -> 231.5s at the default window);
+  // locally it is undefined — fixture time counts toward the test
+  // timeout, the exact pre-run behavior. The wiring NEVER modifies the
+  // test's own deadline: bodies keep their declared or config-default
+  // ceiling on every lane (the former whole-test extension gave
+  // unrelated bodies ~171.5s of extra ceiling and could suppress their
+  // flakes — one flake at a time, kata tg4e).
+  freshellPage: [
+    async ({ page, serverInfo, harness }, use) => {
     // Navigate to Freshell with auth token and test harness enabled
     await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
 
@@ -313,7 +309,9 @@ export const test = base.extend<{
     // The server is worker-scoped (shared across tests in a spec file),
     // so terminals from previous tests would otherwise pile up.
     await harness.killAllTerminals(serverInfo)
-  },
+    },
+    { timeout: freshellPageFixtureTimeoutMs() },
+  ],
 })
 
 export { expect } from '@playwright/test'
