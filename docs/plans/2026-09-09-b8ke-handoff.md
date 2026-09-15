@@ -31,7 +31,7 @@ Fix kata b8ke: make Fresh Agent to terminal-CLI session handoff atomic and cross
 - A compatibility cold-start path may remain temporarily if it goes through the shared coordinator and cannot spawn when another kind owns or is transitioning the session.
 - Production deployment of this change is outside this run's scope (separately approved).
 - Client scheduler cancellation is not required; server-side generation fencing is the required safety net even if client improvements land.
-- The independent review loop may continue beyond its default caps under explicit user grants of additional review turns (currently: up to 10 more repair-and-review turns, stopping on the first PASSED verdict).
+- The independent review loop may continue beyond its default caps under explicit user grants of additional review turns (currently: a continuation grant of up to 3 more repair-and-review turns, stopping on the first PASSED verdict).
 
 **Goal:** Reopening the same durable Codex/OpenCode session as a terminal CLI — from any device, at any moment, including while another device holds a Fresh Agent pane for it — is one atomic server-side operation that reaps the old writer first, preserves the exact session identity, converges every pane on every device, and never yields two writers, a blank session, or a dead-end failure.
 
