@@ -674,6 +674,12 @@ export async function selectShellFromPicker(page: Page): Promise<void> {
       await page.locator('.xterm').first().waitFor({ state: 'visible', timeout: SHELL_RENDER_TIMEOUT_MS })
       return
     } catch (err) {
+      // Only a TimeoutError may be diagnosed as render starvation (delta
+      // review r10): a page closure, browser crash, or interruption keeps
+      // its own identity — rewriting infrastructure failures as "did not
+      // render" would misdiagnose them, the exact swallow-class this run
+      // eliminates everywhere else (click + probe paths).
+      if (!isTimeoutError(err)) throw err
       throw new Error(
         `Shell '${name}' was clicked but the terminal did not render within ${SHELL_RENDER_TIMEOUT_MS}ms. ` +
           'A slow or starved render is a first-class failure, not a wrong-option signal — ' +

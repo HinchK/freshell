@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs'
+import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Page } from '@playwright/test'
 import {
@@ -194,6 +196,33 @@ describe('freshellPageFixtureTimeoutMs (the boot chain owns its own setup allowa
 
   it('stays pinned to the config default ceiling: the DEFAULT_TEST_TIMEOUT_MS the configs import', () => {
     expect(DEFAULT_TEST_TIMEOUT_MS).toBe(60_000)
+  })
+})
+
+describe('freshellPage fixture-timeout wiring presence (delta review r10)', () => {
+  const fixturesSource = readFileSync(path.resolve(import.meta.dirname, 'fixtures.ts'), 'utf8')
+
+  // Playwright exposes no runtime API to read a fixture's registered
+  // timeout (TestType internals are private; test.info() reports the
+  // TEST's slots only), and a behavioral e2e pin would need a wedged
+  // boot to observe the difference — the regression that recreates
+  // tg4e's 60s setup ceiling is silent under healthy boots. The
+  // resolver's VALUE and lane derivation are behaviorally pinned above;
+  // this pin guards the wiring application itself (validated by
+  // mutation: removing the tuple options or reverting to the function
+  // form fails the first assertion, and reintroducing deadline mutation
+  // inside e2eMachineId fails the second).
+  it('fixtures.ts declares freshellPage in the tuple form carrying its own composed-budget timeout', () => {
+    expect(fixturesSource).toMatch(/freshellPage:\s*\[/)
+    expect(fixturesSource).toMatch(/\{\s*timeout:\s*freshellPageFixtureTimeoutMs\(\)\s*\}/)
+  })
+
+  it('e2eMachineId never mutates the test deadline (deadline-neutral wiring)', () => {
+    const body = fixturesSource.slice(
+      fixturesSource.indexOf('e2eMachineId:'),
+      fixturesSource.indexOf('serverInfo:', fixturesSource.indexOf('e2eMachineId:')),
+    )
+    expect(body).not.toContain('test.info().setTimeout')
   })
 })
 
@@ -478,6 +507,7 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
     lateDispatch?: boolean // click times out BUT the handler ran: the probe finds a created pane
     clickTimesOut?: boolean // click times out with NOTHING dispatched (the button exists)
     dispatchedAndReplaced?: boolean // click dispatched, then the picker pane was REPLACED by the terminal pane before the catch ran (count 0, terminal already in state — delta r8)
+    renderError?: 'page-closed' // the render wait fails with a HARD non-timeout error (delta r10)
   }
 
   /**
@@ -519,9 +549,16 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
           isVisible: () => Promise.resolve(selector === '.xterm' && xtermVisible()),
           waitFor: ({ timeout }: { state?: string; timeout?: number }) => {
             renderWaits.push(timeout ?? 0)
+            if (currentShell()?.renderError === 'page-closed') {
+              // A hard infrastructure failure during the render wait —
+              // must keep its identity (delta r10).
+              return Promise.reject(Object.assign(new Error('Page closed'), { name: 'TargetClosedError' }))
+            }
             const visibleAfter = currentShell()?.renderVisibleAfterMs
             if (visibleAfter === undefined || visibleAfter > (timeout ?? 0)) {
-              return Promise.reject(new Error(`waitFor: Timeout ${timeout}ms exceeded`))
+              // Playwright's real locator.waitFor timeout carries the
+              // TimeoutError name — the loudness distinction depends on it.
+              return Promise.reject(Object.assign(new Error(`waitFor: Timeout ${timeout}ms exceeded`), { name: 'TimeoutError' }))
             }
             return Promise.resolve()
           },
@@ -645,6 +682,21 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
     await selectShellFromPicker(page)
     expect(clicks).toEqual(['Shell'])
     expect(renderWaits).toEqual([SHELL_RENDER_TIMEOUT_MS])
+  })
+
+  it('a render-wait HARD error (page closed) propagates with its original identity, never rewritten as render starvation', async () => {
+    // The delta r10 loudness rule: only a TimeoutError is diagnosed as
+    // "did not render"; page closure, browser crash, or interruption keep
+    // their own error (a rewritten page-closed would misdiagnose an
+    // infrastructure failure as render starvation).
+    const { page, clicks } = pickerPage({
+      Shell: { renderError: 'page-closed' },
+      WSL: {}, CMD: {}, PowerShell: {}, Bash: {},
+    })
+    const err = await selectShellFromPicker(page).then(() => undefined, (e: unknown) => e)
+    expect((err as Error).name).toBe('TargetClosedError')
+    expect((err as Error).message).toBe('Page closed')
+    expect(clicks).toEqual(['Shell']) // no escalation around a dead page
   })
 
   it('throws a diagnostic when a clicked shell never renders (loud, not silent)', async () => {

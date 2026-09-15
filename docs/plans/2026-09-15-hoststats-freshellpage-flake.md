@@ -31,7 +31,7 @@
 - Budget changes are cloud-only and env-gated: with `FRESHELL_E2E_WS_READY_TIMEOUT_MS` unset, no timeout changes and no different call shapes on the default path (byte-identical local lane for the budget dimension).
 - `waitForConnection`'s self-heal window W is a SINGLE TOTAL deadline: phase-1 + the reload's navigation + phase-2 share W (+1s slack), so the connection-wait envelope is W+1s (91s at the cloud window) — the budget never needs to cover a multi-W envelope. The pre-fix sequential drift (up to 135s) is fixed at the source (Task 2), not budgeted around.
 - Budget = the fixture chain's PERMITTED COMPOSITION (delta-review r2, probe-inclusive as of r5): connection envelope (W + 1s total-deadline slack) + the picker's permitted worst case (derived from the picker's own exported constants — settle + one click budget + one creation-probe budget per shell name + the render wait = 110.5s) + start/body reserve (30s) = 231.5s at the cloud default W=90s, unit-pinned so the composition cannot drift. A budget merely "evidence-sized" to the recorded episodes was rejected by review: the retained trace shows connection AND render slowness co-occurring in one container-wide disturbance, so the outer deadline must cover the waits the chain is permitted to compose, or the same outer setup-timeout flake recurs before the picker's diagnostic can fire.
-- The wiring NEVER modifies a test's own deadline (delta review r9 — the r2-r8 whole-test/default-class extension is superseded): the composed budget is the `freshellPage` fixture's OWN timeout (Playwright's fixture-timeout mechanism, playwright.dev/docs/test-fixtures#fixture-timeout), so slow boot SETUP gets its allowance while every body keeps its declared or config-default ceiling on every lane (`DEFAULT_TEST_TIMEOUT_MS` = 60_000, the constant the Playwright configs import). Specs that need a larger BODY budget declare it themselves (settings' two reload tests declare 180_000 for their mid-body connection envelope); a declared 0 (unlimited) or an above-default declaration reaches the wiring unchanged. The former whole-test extension gave unrelated bodies ~171.5s of extra ceiling and could suppress their flakes — the fixture-timeout design removes that interference structurally. The contract spec pins it.
+- The wiring NEVER modifies a test's own deadline (delta review r9 — the r2-r8 whole-test/default-class extension is superseded): the composed budget is the `freshellPage` fixture's OWN timeout (Playwright's fixture-timeout mechanism, playwright.dev/docs/test-fixtures#fixture-timeout), so slow boot SETUP gets its allowance while every body keeps its declared or config-default ceiling on every lane (`DEFAULT_TEST_TIMEOUT_MS` = 60_000, the constant the Playwright configs import). Specs that need a larger BODY budget declare it themselves, cloud-gated to exactly what the pre-run state gave them (settings' two reload tests declare 120_000 under isCloudLaneWindowConfigured() — the removed hook's exact value; locally no declaration and the exact pre-run 60s, delta review r10); a declared 0 (unlimited) or an above-default declaration reaches the wiring unchanged. The former whole-test extension gave unrelated bodies ~171.5s of extra ceiling and could suppress their flakes — the fixture-timeout design removes that interference structurally. The contract spec pins it.
 - The self-heal stays cloud-only (env-presence gated) and fresh-boot-only: never opt a mid-test `waitForConnection` site into `selfHealReload` (a reload would destroy the state under test).
 - Never loosen the ready assertion, never skip or exclude specs, never raise `retries`, never widen `CLOUD_SKIP_SPECS` — those are coverage reductions, not fixes. The picker fix TIGHTENS failure semantics (a thrown diagnostic replaces a silent fall-through past a successful click; non-timeout click errors propagate); it must not touch any passing-path assertion.
 - Malformed env values must never poison the budget (reuse `resolveWsReadyTimeoutMs`'s parsing/fallback — one parsing rule).
@@ -162,7 +162,7 @@ describe('freshellPageFixtureTimeoutMs (the boot chain owns its own setup allowa
 
 Run: `npm run test:e2e:helpers -- test-harness`
 
-Expected: FAIL because the new exports (`resolveCloudLaneTestBudgetMs`, `isCloudLaneWindowConfigured`, `shellPickerWorstCaseMs`, the picker constants, `CLOUD_LANE_START_RESERVE_MS`) are missing from `./test-harness` — the suite reports the missing exports and cannot assert the composed budget derivation (the behavior is absent).
+Expected: FAIL because the new exports (`resolveCloudLaneTestBudgetMs`, `isCloudLaneWindowConfigured`, `shellPickerWorstCaseMs`, the picker constants, `CLOUD_LANE_START_RESERVE_MS`, `DEFAULT_TEST_TIMEOUT_MS`, `freshellPageFixtureTimeoutMs`) are missing from `./test-harness` — the suite reports the missing exports and cannot assert the composed budget derivation or the fixture-timeout value (the behavior is absent).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -234,6 +234,34 @@ export function resolveCloudLaneTestBudgetMs(
   if (!isCloudLaneWindowConfigured(env)) return null
   const connectionEnvelopeMs = resolveWsReadyTimeoutMs(undefined, env) + 1000
   return connectionEnvelopeMs + shellPickerWorstCaseMs() + CLOUD_LANE_START_RESERVE_MS
+}
+
+/**
+ * The per-test deadline declared by the Playwright config (both lanes —
+ * the cloud config inherits the base). DEFAULT-CLASS in the superseded
+ * r5-r8 design; in the committed fixture-timeout design (delta r9) it is
+ * simply the TEST BODY ceiling on every lane, and the configs import it
+ * from here as the single source of truth.
+ */
+export const DEFAULT_TEST_TIMEOUT_MS = 60_000
+
+/**
+ * The freshellPage fixture's OWN setup timeout (delta review r9): the
+ * composed budget on the cloud lane, or undefined on the local lane.
+ * Playwright gives a fixture its own timeout precisely so slow SETUP can
+ * receive a larger allowance while the test keeps its original deadline
+ * (playwright.dev/docs/test-fixtures#fixture-timeout) — the boot chain
+ * (goto + waitForHarness + self-healing waitForConnection + the picker
+ * leg) is fixture setup, and its permitted composition is exactly what
+ * resolveCloudLaneTestBudgetMs derives. undefined means no
+ * fixture-specific timeout: fixture time counts toward the test timeout —
+ * the exact pre-run behavior the local lane keeps. The test's own
+ * deadline is NEVER modified by the wiring.
+ */
+export function freshellPageFixtureTimeoutMs(
+  env: Record<string, string | undefined> = process.env,
+): number | undefined {
+  return resolveCloudLaneTestBudgetMs(env) ?? undefined
 }
 
 /**
@@ -550,9 +578,30 @@ git commit -m "test(e2e): waitForConnection self-heal enforces its window as a s
 - Consumes: `freshellPageFixtureTimeoutMs()` (Task 1), `isCloudLaneWindowConfigured()` (the self-heal opt-in gate), the exported `test` object from `helpers/fixtures.ts` (tuple-form fixture definitions), `FRESHELL_E2E_WS_READY_TIMEOUT_MS` env presence.
 - Produces (as amended by delta review r9): the `freshellPage` fixture carries its OWN setup timeout — the composed budget on the cloud lane, undefined locally (fixture time counts toward the test timeout, the exact pre-run behavior) — so slow boot SETUP gets its allowance while every test body keeps its declared or config-default ceiling on every lane. The wiring NEVER modifies a test's own deadline: a declared 0 (Playwright's UNLIMITED), a declared 180s, a declared 300s all reach the run unchanged; specs that need a larger BODY budget declare it themselves (settings' two reload tests do — Task 5). The registration fetch inside `e2eMachineId` is bounded CONDITIONALLY: `AbortSignal.timeout` (60s, generous beyond every documented stall episode) applies only when the test's own deadline is unlimited (0) — a finite deadline already bounds the fetch (Playwright aborts fixture resolution at the deadline), and an unconditional private bound would be a new setup-flake vector inside the first fixture every freshellPage test resolves (delta reviews r5+r6).
 
-- [ ] **Step 1: Write the failing behavioral test (the contract spec)**
+- [ ] **Step 1: Write the failing behavioral test (the contract spec + the wiring-presence pin)**
 
-Create `test/e2e-browser/specs/e2e-budget-contract.spec.ts`:
+Create `test/e2e-browser/specs/e2e-budget-contract.spec.ts`, and add the wiring-presence regression pin to `test/e2e-browser/helpers/test-harness.test.ts` (the committed form, delta review r10 — it reads `fixtures.ts` as source because Playwright exposes no runtime API for a fixture's registered timeout, and the regression that recreates tg4e's 60s setup ceiling is silent under healthy boots; validated by mutation: removing the tuple options fails the first assertion, and reintroducing deadline mutation inside `e2eMachineId` fails the second):
+
+```ts
+describe('freshellPage fixture-timeout wiring presence (delta review r10)', () => {
+  const fixturesSource = readFileSync(path.resolve(import.meta.dirname, 'fixtures.ts'), 'utf8')
+
+  it('fixtures.ts declares freshellPage in the tuple form carrying its own composed-budget timeout', () => {
+    expect(fixturesSource).toMatch(/freshellPage:\s*\[/)
+    expect(fixturesSource).toMatch(/\{\s*timeout:\s*freshellPageFixtureTimeoutMs\(\)\s*\}/)
+  })
+
+  it('e2eMachineId never mutates the test deadline (deadline-neutral wiring)', () => {
+    const body = fixturesSource.slice(
+      fixturesSource.indexOf('e2eMachineId:'),
+      fixturesSource.indexOf('serverInfo:', fixturesSource.indexOf('e2eMachineId:')),
+    )
+    expect(body).not.toContain('test.info().setTimeout')
+  })
+})
+```
+
+Then the contract spec:
 
 ```ts
 import { test, expect } from '../helpers/fixtures.js'
@@ -653,7 +702,7 @@ Run (env-set local invocation reproduces the cloud-shaped path; first local run 
 FRESHELL_E2E_WS_READY_TIMEOUT_MS=90000 npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/e2e-budget-contract.spec.ts
 ```
 
-Expected (as amended by delta review r9 — the pre-wiring state is the r2-r8 WHOLE-TEST extension, so the exact-value pins RED against it): THREE tests FAIL under the env-set leg — the undeclared test (the old wiring replaced the default with the composed budget), the declared-60s test (the old wiring raised it to the budget; the new pin demands exactly 60_000), and the declared-180s test (the old wiring raised it to the budget; the new pin demands exactly 180_000). The never-shrink (300s) and declared-unlimited (0) tests PASS at this point and keep their behavior after the wiring. Also run the no-env leg — against the old wiring every test PASSES locally (the old wiring is a no-op without the env), so the no-env leg goes green from the start and stays green:
+Expected (delta review r10, against the TRUE pre-wiring state — freshellPage still in function form, NO fixture timeout, no deadline wiring anywhere): the WIRING-PRESENCE unit pin (Task 1's test file, `freshellPage fixture-timeout wiring presence` describe) is the RED — fixtures.ts lacks the tuple form and its `{ timeout: freshellPageFixtureTimeoutMs() }` options, so the pin fails; deleting the options or reverting to the function form fails it (validated by mutation during the r10 remediation). The contract spec's deadline-neutrality pins PASS pre-wiring BY DESIGN — they pin the ABSENCE of deadline modification, which the unwired state already satisfies; their RED value is against deadline-MUTATING wiring (demonstrated against the r2-r8 whole-test extension during the r9 remediation: three pins failed until the wiring was removed). Run both legs to see exactly that: the env-set and no-env contract-spec legs green, the wiring pin red.
 
 ```bash
 env -u FRESHELL_E2E_WS_READY_TIMEOUT_MS npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/e2e-budget-contract.spec.ts
@@ -778,7 +827,7 @@ git commit -m "test(e2e): the boot chain owns its budget — freshellPage fixtur
 
 **Interfaces:**
 - Consumes: `Page` (type-only).
-- Produces: `SHELL_RENDER_TIMEOUT_MS: number` (60_000), `SHELL_PROBE_TIMEOUT_MS: number` (5_000, delta review r5), and `selectShellFromPicker(page: Page): Promise<void>` with the contract: (a) early returns unchanged (xterm already visible, or appears during the 500ms stabilization wait); (b) a click that fails with Playwright's `TimeoutError` is split by an existence precheck (delta reviews r7+r8): `locator.count() === 0` is AMBIGUOUS — the option never existed, OR the click dispatched and the picker pane was already replaced by the terminal pane (the picker's fade-then-replace on transitionend) before the catch ran — so the count-0 branch takes ONE immediate state read (`paneWasCreatedNow`: a dispatched-and-replaced pick has ALREADY created the terminal pane in state, so the instant read is true and the flow joins the render wait; a never-existed option reads false and advances on the click timeout alone, keeping absent options at their exact pre-run cost under the unchanged local 60s budget). Only an EXISTING button that timed out pays the full bounded creation probe (`SHELL_PROBE_TIMEOUT_MS`, checking for a TERMINAL-content pane — the only state a fresh-boot pick uniquely creates, since the initial tab and its picker pane already exist before the picker leg runs; delta review r6: an any-tab/any-layout signal is always true on fresh boot and would misroute absent options into the 60s render wait). A late dispatch joins the success path (d); only a confirmed nothing-created advances to the next shell name (the historical detachment-race advance, now dispatch-safe; delta reviews r5+r6+r7+r8); (c) a click (or probe) that fails with ANY non-timeout error (page closed, test interrupted, unexpected errors) propagates — loud, never swallowed; (d) a SUCCESSFUL click never escalates: it waits up to `SHELL_RENDER_TIMEOUT_MS` for `.xterm` to become visible and on timeout throws a diagnostic error naming the clicked shell and the wait; (e) the every-option-confirmed-absent fall-through contract is preserved (returns normally).
+- Produces: `SHELL_RENDER_TIMEOUT_MS: number` (60_000), `SHELL_PROBE_TIMEOUT_MS: number` (5_000, delta review r5), and `selectShellFromPicker(page: Page): Promise<void>` with the contract: (a) early returns unchanged (xterm already visible, or appears during the 500ms stabilization wait); (b) a click that fails with Playwright's `TimeoutError` is split by an existence precheck (delta reviews r7+r8): `locator.count() === 0` is AMBIGUOUS — the option never existed, OR the click dispatched and the picker pane was already replaced by the terminal pane (the picker's fade-then-replace on transitionend) before the catch ran — so the count-0 branch takes ONE immediate state read (`paneWasCreatedNow`: a dispatched-and-replaced pick has ALREADY created the terminal pane in state, so the instant read is true and the flow joins the render wait; a never-existed option reads false and advances on the click timeout alone, keeping absent options at their exact pre-run cost under the unchanged local 60s budget). Only an EXISTING button that timed out pays the full bounded creation probe (`SHELL_PROBE_TIMEOUT_MS`, checking for a TERMINAL-content pane — the only state a fresh-boot pick uniquely creates, since the initial tab and its picker pane already exist before the picker leg runs; delta review r6: an any-tab/any-layout signal is always true on fresh boot and would misroute absent options into the 60s render wait). A late dispatch joins the success path (d); only a confirmed nothing-created advances to the next shell name (the historical detachment-race advance, now dispatch-safe; delta reviews r5+r6+r7+r8); (c) a click (or probe) that fails with ANY non-timeout error (page closed, test interrupted, unexpected errors) propagates — loud, never swallowed; (d) a SUCCESSFUL click never escalates: it waits up to `SHELL_RENDER_TIMEOUT_MS` for `.xterm` to become visible; a TimeoutError throws a diagnostic naming the clicked shell and the wait, and any non-timeout failure (page closure, crash, interruption) propagates with its original identity (delta review r10); (e) the every-option-confirmed-absent fall-through contract is preserved (returns normally).
 
 **Why this is required scope (not residual):** the retained trace (validator LB-C, `reports/load-bearing-validator-LB-C.md`) proves the recorded tg4e failure was exactly this conflation: after a successful Shell click (terminal created server-side, active, `hasClients:true`), the 30s `.xterm` render wait failed under container-wide CPU contention, and the loop escalated into WSL/CMD — options absent on the Linux picker — silently burning the remaining budget until the 60s deadline (and double-creating terminals whenever escalation reaches an option that exists, e.g. Bash). The budget fix alone does not survive this episode class; the loop's semantics are the defect.
 
@@ -796,6 +845,7 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
     lateDispatch?: boolean // click times out BUT the handler ran: the probe finds a created pane
     clickTimesOut?: boolean // click times out with NOTHING dispatched (the button exists)
     dispatchedAndReplaced?: boolean // click dispatched, then the picker pane was REPLACED by the terminal pane before the catch ran (count 0, terminal already in state — delta r8)
+    renderError?: 'page-closed' // the render wait fails with a HARD non-timeout error (delta r10)
   }
 
   /**
@@ -837,9 +887,16 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
           isVisible: () => Promise.resolve(selector === '.xterm' && xtermVisible()),
           waitFor: ({ timeout }: { state?: string; timeout?: number }) => {
             renderWaits.push(timeout ?? 0)
+            if (currentShell()?.renderError === 'page-closed') {
+              // A hard infrastructure failure during the render wait —
+              // must keep its identity (delta r10).
+              return Promise.reject(Object.assign(new Error('Page closed'), { name: 'TargetClosedError' }))
+            }
             const visibleAfter = currentShell()?.renderVisibleAfterMs
             if (visibleAfter === undefined || visibleAfter > (timeout ?? 0)) {
-              return Promise.reject(new Error(`waitFor: Timeout ${timeout}ms exceeded`))
+              // Playwright's real locator.waitFor timeout carries the
+              // TimeoutError name — the loudness distinction depends on it.
+              return Promise.reject(Object.assign(new Error(`waitFor: Timeout ${timeout}ms exceeded`), { name: 'TimeoutError' }))
             }
             return Promise.resolve()
           },
@@ -940,7 +997,7 @@ Expected: the moved-but-unfixed implementation produces multiple BEHAVIORAL fail
 - `a non-timeout click error propagates` FAILs: the current loop's bare `catch { continue }` swallows the page-closed error and advances.
 - `falls through silently only when every option is not clickable` PASSES (that is the current behavior too — it stays).
 - The already-visible and mid-wait-recheck tests PASS (early-return behavior is unchanged by the fix).
-- `a not-clickable option ... advances to the next shell` PASSES against the moved pre-fix loop (advance-on-timeout without a probe is the historical behavior) but the probe rows RED against it: `a click timeout with a LATE DISPATCH ... is treated as the success path` FAILs (the pre-probe loop escalates — `clicks` grows past `['Shell']`), `a click timeout on an EXISTING option probes once before advancing` FAILs (`probeWaits` is empty — no probe call exists), `a click timeout on a NON-EXISTENT option (count 0) advances with NO probe cost` FAILs against the probe-everything shape (the probe ran for absent options), `a click that DISPATCHED and replaced the picker before the catch (count 0) still joins the success path` FAILs against the skip-everything shape (the loop advanced instead of taking the instant read + render wait), and `a probe hard error (page closed) propagates loudly` FAILs (the pre-probe loop swallows the whole click-timeout path and falls through silently).
+- `a not-clickable option ... advances to the next shell` PASSES against the moved pre-fix loop (advance-on-timeout without a probe is the historical behavior) but the probe rows RED against it: `a click timeout with a LATE DISPATCH ... is treated as the success path` FAILs (the pre-probe loop escalates — `clicks` grows past `['Shell']`), `a click timeout on an EXISTING option probes once before advancing` FAILs (`probeWaits` is empty — no probe call exists), `a click timeout on a NON-EXISTENT option (count 0) advances with NO probe cost` FAILs against the probe-everything shape (the probe ran for absent options), `a click that DISPATCHED and replaced the picker before the catch (count 0) still joins the success path` FAILs against the skip-everything shape (the loop advanced instead of taking the instant read + render wait), and `a probe hard error (page closed) propagates loudly` FAILs (the pre-probe loop swallows the whole click-timeout path and falls through silently), and `a render-wait HARD error (page closed) propagates with its original identity` FAILs against the moved pre-r10 catch (it rewrote EVERY failure as the did-not-render diagnostic, losing the TargetClosedError identity).
 - The `paneCreationProbePredicate semantics` describe (delta review r6) executes the REAL exported predicate against stubbed harness states — fresh-boot picker state false, terminal pane true, split-tree recursion, picker-only split false, missing harness false — so the probe's state-shape contract is pinned independently of the flow fakes (the fakes exercise the picker LOOP's use of the probe; the semantics tests prove what the probe itself answers in the states Freshell really boots into).
 
 - [ ] **Step 3: Add the minimal production implementation (replace the moved function's loop with the fixed contract)**
@@ -1106,6 +1163,12 @@ export async function selectShellFromPicker(page: Page): Promise<void> {
       await page.locator('.xterm').first().waitFor({ state: 'visible', timeout: SHELL_RENDER_TIMEOUT_MS })
       return
     } catch (err) {
+      // Only a TimeoutError may be diagnosed as render starvation (delta
+      // review r10): a page closure, browser crash, or interruption keeps
+      // its own identity — rewriting infrastructure failures as "did not
+      // render" would misdiagnose them, the exact swallow-class this run
+      // eliminates everywhere else (click + probe paths).
+      if (!isTimeoutError(err)) throw err
       throw new Error(
         `Shell '${name}' was clicked but the terminal did not render within ${SHELL_RENDER_TIMEOUT_MS}ms. ` +
           'A slow or starved render is a first-class failure, not a wrong-option signal — ' +
@@ -1125,7 +1188,7 @@ In `test/e2e-browser/helpers/fixtures.ts`: delete the module-private `selectShel
 
 Run: `npm run test:e2e:helpers -- test-harness`
 
-Expected: PASS (all eleven new contract tests green — the original eight plus the three delta-r5 probe rows (late-dispatch success path, nothing-created advance with per-advance probe pins, probe hard-error propagation); all pre-existing tests green).
+Expected: PASS (all twelve new contract tests green — the original eight, the three delta-r5 probe rows (late-dispatch success path, nothing-created advance with per-advance probe pins, probe hard-error propagation), and the delta-r10 render-loudness row; all pre-existing tests green).
 
 - [ ] **Step 5: Refactor while green**
 
@@ -1156,7 +1219,7 @@ git commit -m "test(e2e): picker loop distinguishes absent options from slow ren
 - Modify: `test/e2e-browser/specs/settings.spec.ts` (delete the `test.beforeEach` block, lines 8-21 in the current file: the cloud-only `test.setTimeout(120_000)` hook; its probe-verified mechanism documentation has moved into the `e2eMachineId` fixture comment in Task 3)
 
 **Interfaces:**
-- Consumes: Task 3's fixture-level composed budget (settings.spec.ts uses `freshellPage`, so its boot chain runs under the freshellPage fixture's OWN timeout — at the cloud default window the composed budget (231.5s) strictly exceeds the removed hook's flat 120s). The hook was an under-budget artifact of the pre-composition design (delta review r2); with the fixture-timeout design (delta review r9) the fixture setup gets MORE headroom than the hook ever gave, while the test BODIES keep the config's 60s default. The two tests that reload mid-body declare their own 180_000 budgets from inside their bodies (the spec's decision, not wiring): their mid-body connection wait's legal envelope (W+1s = 91s at W=90s) exceeds the 60s body default, exactly the coverage the old hook provided.
+- Consumes: Task 3's fixture-level composed budget (settings.spec.ts uses `freshellPage`, so its boot chain runs under the freshellPage fixture's OWN timeout — at the cloud default window the composed budget (231.5s) strictly exceeds the removed hook's flat 120s). The hook was an under-budget artifact of the pre-composition design (delta review r2); with the fixture-timeout design (delta review r9) the fixture setup gets MORE headroom than the hook ever gave, while the test BODIES keep the config's 60s default. The two tests that reload mid-body restore the hook's exact coverage, cloud-gated and scoped to themselves (delta review r10): `if (isCloudLaneWindowConfigured()) test.setTimeout(120_000)` as the first statement of each body — the removed hook's exact value, under the same env gate; their mid-body connection wait's legal envelope (W+1s = 91s at W=90s) fits inside it exactly as it did for years. Locally: no declaration, the exact pre-run 60s behavior.
 - Produces: one source of truth for the cloud wedge budget (the freshellPage fixture's own timeout), no per-spec opt-in — and per-test body declarations where a test's own body envelope genuinely exceeds the default (the two reload tests).
 
 - [ ] **Step 1: Write the failing behavioral test**
@@ -1169,7 +1232,7 @@ Skip (no Red step for a pure dedup refactor; record this justification).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-Delete the `test.beforeEach(async ({}) => { ... })` block from `test/e2e-browser/specs/settings.spec.ts` (the hook whose body is `if (process.env.FRESHELL_E2E_WS_READY_TIMEOUT_MS) test.setTimeout(120_000)` plus its comment). Leave the rest of `test.describe('Settings', () => {...})` untouched, and give the two mid-body reload tests their own declarations as the FIRST statement of each body (the committed form): `test.setTimeout(180_000)` in `settings persist after reload` (its plain mid-body waitForConnection has a legal W+1s = 91s envelope at W=90s) and in `Expand thinking and Expand tools switches persist locally and reset to defaults` (its self-healing mid-body reload leg has the same envelope) — each with a comment naming the envelope and the delta-r9 body-ceiling rule.
+Delete the `test.beforeEach(async ({}) => { ... })` block from `test/e2e-browser/specs/settings.spec.ts` (the hook whose body is `if (process.env.FRESHELL_E2E_WS_READY_TIMEOUT_MS) test.setTimeout(120_000)` plus its comment). Leave the rest of `test.describe('Settings', () => {...})` untouched, and give the two mid-body reload tests the hook's exact coverage as the FIRST statement of each body (the committed form): `if (isCloudLaneWindowConfigured()) test.setTimeout(120_000)` in `settings persist after reload` (its plain mid-body waitForConnection has a legal W+1s = 91s envelope at W=90s) and in `Expand thinking and Expand tools switches persist locally and reset to defaults` (its self-healing mid-body reload leg has the same envelope) — each with a comment naming the envelope, the hook it restores, and the delta-r10 rule (cloud-gated at the pre-run value; locally unchanged).
 
 - [ ] **Step 4: Run the focused test**
 
@@ -1178,7 +1241,7 @@ FRESHELL_E2E_WS_READY_TIMEOUT_MS=90000 npm run test:e2e:local -- --project=chrom
 env -u FRESHELL_E2E_WS_READY_TIMEOUT_MS npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/settings.spec.ts
 ```
 
-Expected: PASS both (settings still green with and without the env; the boot budget now arrives via the freshellPage fixture's own timeout; the two mid-test reload legs keep working under their own declared 180_000 body budgets — the exact coverage the removed hook provided, now scoped to the two tests that need it).
+Expected: PASS both (settings still green with and without the env; the boot budget now arrives via the freshellPage fixture's own timeout; the two mid-test reload legs keep working under their cloud-gated 120_000 body declarations — the exact coverage the removed hook provided, now scoped to the two tests that need it).
 
 - [ ] **Step 5: Refactor while green**
 

@@ -29,11 +29,12 @@ export default defineConfig({
   reporter: process.env.CI
     ? [['html', { open: 'never' }], ['github']]
     : [['html', { open: 'never' }]],
-  // The per-test deadline default. Single source of truth with the cloud
-  // budget wiring's default-class threshold (delta review r5): the
-  // helpers' shouldExtendTestDeadlineToCloudBudget raises deadlines at or
-  // below THIS value to the composed cloud budget; declarations above it
-  // are explicit spec budget decisions the wiring never touches.
+  // The per-test deadline default, imported from the helpers as the single
+  // source of truth (delta review r9): this is the TEST BODY ceiling on
+  // every lane — the cloud wiring never modifies it (the boot chain's
+  // larger allowance is the freshellPage fixture's OWN timeout, see
+  // helpers/fixtures.ts); a spec may declare its own larger body deadline
+  // wherever its body envelope genuinely needs one.
   timeout: DEFAULT_TEST_TIMEOUT_MS,
   expect: { timeout: 10_000 },
   use: {
