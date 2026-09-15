@@ -17796,16 +17796,21 @@ pub(crate) mod tests {
         );
     }
 
-    /// b8ke focused episode-2 round-2 F4: the watchdog machinery registers
-    /// BEFORE the long awaits. The claim exists the moment the create-with-
-    /// resume enters `handle_create_resume`; the delta-r2 ordering registered
+    /// b8ke focused episode-2 round-2 F4 (+ the b8ke ext r20 F1 reshape):
+    /// the watchdog machinery registers BEFORE the long awaits. The claim
+    /// exists the moment the create-with-resume enters
+    /// `handle_create_resume`; the delta-r2 ordering registered
     /// cancellation/settle/partial only AFTER `spawn_sidecar` (45s budget)
     /// and `thread/resume` — a slow startup swept at 30s recovered a record
     /// with NOTHING registered (a healthy start became a registration-
     /// ignored StaleStart fence). The red/green: a REAL fake-app-server
-    /// create-with-resume with `thread/resume` parked mid-RPC; the sweep
-    /// DURING the RPC must recover a record carrying the cancellation, the
-    /// settle, AND the partial runtime with the REAL spawned pid.
+    /// create-with-resume with `thread/resume` parked mid-RPC; the
+    /// over-age sweep during the RPC SKIPS the witnessed live start (an
+    /// UNWITNESSED start would be recovered — the pre-e2r2-F4 failure),
+    /// the start keeps its Starting record through the sweep, and the
+    /// create completes and commits Live — never fenced mid-flight. The
+    /// full machinery assertions (the cancellation/settle/partial with the
+    /// REAL spawned pid) live in the ownership wiring tests.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_slow_resume_startup_is_watchdog_evidenced_during_the_await() {
         let _guard = ENV_LOCK.lock().await;
