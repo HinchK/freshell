@@ -5449,7 +5449,328 @@ async fn a_current_attach_succeeds_and_restamps() {
     ws_state.registry.kill(&terminal_id);
 }
 
-// ── b8ke ext r9 F2: the commit verifies the PTY is alive at commit time ─────
+// ── b8ke ext r24 F1: the live-owner kind/identity check ────────────────────
+
+/// A negotiated terminal create → wait for the coordinator's Live commit,
+/// returning the (terminalId, sessionId) pair.
+async fn r24_negotiated_create(ws: &mut TestWs, request_id: &str) -> (String, String) {
+    send_json(
+        ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": request_id,
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": uuid::Uuid::new_v4().to_string() },
+        }),
+    )
+    .await;
+    let created = await_frame(ws, Duration::from_secs(10), |v| {
+        v["type"] == "terminal.created" && v["requestId"] == json!(request_id)
+    })
+    .await;
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    let sid = created["sessionRef"]["sessionId"]
+        .as_str()
+        .expect("sid")
+        .to_string();
+    (terminal_id, sid)
+}
+
+/// Kill the terminal's PTY child (the NATURAL exit — the row stays
+/// `Exited`, the identity sessionRef is retained, and the reader-thread's
+/// confirmed reap releases the coordinator key fenced) and wait for the
+/// key to leave Live.
+async fn r24_natural_exit(ws_state: &WsState, provider: &str, sid: &str, terminal_id: &str) {
+    let pid = ws_state
+        .registry
+        .pid_of(terminal_id)
+        .expect("the terminal has a live child pid");
+    let _ = std::process::Command::new("kill")
+        .arg("-9")
+        .arg(pid.to_string())
+        .status();
+    let ownership = ws_state.ownership.as_ref().expect("coordinator wired");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while matches!(
+        ownership.observe(provider, sid).state,
+        freshell_ownership::OwnershipState::Live { .. }
+    ) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the natural exit never released the coordinator key"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// b8ke ext r24 F1: an unfenced attach to the RETAINED old terminal while
+/// the canonical key is Live under the OTHER runtime kind (a Fresh Agent
+/// established it after the terminal's natural exit) answers the typed
+/// fresh-owner conflict — SESSION_RESERVED with ownerKind "fresh-agent" +
+/// the owner generation, never attach.ready, never a pane-ledger restamp
+/// rebinding the pane to a dead terminal. Pre-r24 the live owner's
+/// kind/identity was never checked: an unfenced attach to the exited
+/// terminal was ACCEPTED (attach.ready + terminal.exit + the restamp).
+#[tokio::test]
+async fn an_attach_while_a_fresh_agent_owns_answers_the_typed_fresh_owner_conflict() {
+    let (url, _registry, ws_state) = spawn_server().await;
+    let mut ws = connect(&url).await;
+    let (terminal_id, sid) = r24_negotiated_create(&mut ws, "req-r24-f1-fresh").await;
+    let ownership = ws_state.ownership.as_ref().expect("coordinator wired");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !matches!(
+        ownership.observe("claude", &sid).state,
+        freshell_ownership::OwnershipState::Live { .. }
+    ) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never committed Live"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // The natural exit: the row stays (Exited), the identity sessionRef is
+    // retained, and the coordinator key vacates.
+    r24_natural_exit(&ws_state, "claude", &sid, &terminal_id).await;
+
+    // Another device establishes Live{FreshAgent} for the same session.
+    let freshell_ownership::BeginOutcome::Granted { generation: fresh_gen } =
+        ownership.begin_start(
+            "claude",
+            &sid,
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-r24-fresh-owner",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) else {
+        panic!("expected Granted")
+    };
+    assert!(matches!(
+        ownership.commit_live(
+            "claude",
+            &sid,
+            "op-r24-fresh-owner",
+            fresh_gen,
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                terminal_id: None,
+                live_session_key: Some(sid.clone()),
+                pid: None,
+                ownership_id: None,
+            },
+        ),
+        freshell_ownership::CommitOutcome::Committed
+    ));
+
+    // THE UNFENCED ATTACH to the retained old terminal — the typed
+    // fresh-owner conflict.
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.attach",
+            "terminalId": terminal_id,
+            "intent": "viewport_hydrate",
+            "cols": 80,
+            "rows": 24,
+            "sinceSeq": 0,
+            "attachRequestId": "req-r24-attach-fresh",
+            "priority": "foreground",
+        }),
+    )
+    .await;
+    let refused = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "error" && v["code"] == "SESSION_RESERVED"
+    })
+    .await;
+    assert_eq!(
+        refused["ownerKind"],
+        json!("fresh-agent"),
+        "the typed conflict names the fresh-agent owner: {refused}"
+    );
+    assert_eq!(
+        refused["ownerGeneration"],
+        json!(fresh_gen),
+        "the typed conflict carries the owner's generation: {refused}"
+    );
+
+    // NO attach.ready for the refused attach (a bounded drain finds none).
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(750);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Some(Ok(msg))) =
+            tokio::time::timeout(Duration::from_millis(250), ws.next()).await
+        {
+            if let WsMessage::Text(text) = msg {
+                let v: Value = serde_json::from_str(&text).unwrap();
+                if v["type"] == "terminal.attach.ready"
+                    && v["terminalId"] == json!(terminal_id)
+                {
+                    panic!("no attach.ready may follow the typed conflict: {v}");
+                }
+            }
+        }
+    }
+
+    // The coordinator's fresh owner is UNTOUCHED — nothing restamped, no
+    // ownership change from the refused attach.
+    assert!(
+        matches!(
+            ownership.observe("claude", &sid).state,
+            freshell_ownership::OwnershipState::Live { owner, .. }
+                if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+        ),
+        "the fresh-agent owner stands after the refused attach"
+    );
+}
+
+/// b8ke ext r24 F1: an unfenced attach to the RETAINED old terminal while
+/// a DIFFERENT terminal owns the canonical key (another device reopened the
+/// session as CLI after the old terminal's natural exit) answers the typed
+/// other-terminal conflict — SESSION_RESERVED with ownerKind "terminal",
+/// the owner generation, and the LIVE terminal id for the client's direct
+/// attach action; never attach.ready.
+#[tokio::test]
+async fn an_attach_while_a_different_terminal_owns_answers_the_typed_other_terminal_conflict() {
+    let (url, _registry, ws_state) = spawn_server().await;
+    let mut ws_a = connect(&url).await;
+    let (terminal_a, sid) = r24_negotiated_create(&mut ws_a, "req-r24-f1-other-a").await;
+    let ownership = ws_state.ownership.as_ref().expect("coordinator wired");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !matches!(
+        ownership.observe("claude", &sid).state,
+        freshell_ownership::OwnershipState::Live { .. }
+    ) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never committed Live"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // The old terminal exits naturally; the session reopens on ANOTHER
+    // device as a NEW terminal (the same sessionRef).
+    r24_natural_exit(&ws_state, "claude", &sid, &terminal_a).await;
+    let mut ws_b = connect(&url).await;
+    send_json(
+        &mut ws_b,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-r24-f1-other-b",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+    let created_b = await_frame(&mut ws_b, Duration::from_secs(10), |v| {
+        v["type"] == "terminal.created" && v["requestId"] == "req-r24-f1-other-b"
+    })
+    .await;
+    let terminal_b = created_b["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    assert_ne!(terminal_a, terminal_b, "the new owner is a different terminal");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match ownership.observe("claude", &sid).state {
+            freshell_ownership::OwnershipState::Live { owner, .. } => {
+                assert_eq!(
+                    owner.kind,
+                    freshell_ownership::RuntimeOwnerKind::Terminal,
+                    "the new terminal owns the session"
+                );
+                assert_eq!(
+                    owner.terminal_id.as_deref(),
+                    Some(terminal_b.as_str()),
+                    "the new owner names terminal B"
+                );
+                break;
+            }
+            _ => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "terminal B never committed Live"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+    let owner_b = ownership.observe("claude", &sid);
+
+    // THE UNFENCED ATTACH to the retained OLD terminal — the typed
+    // other-terminal conflict.
+    send_json(
+        &mut ws_a,
+        &json!({
+            "type": "terminal.attach",
+            "terminalId": terminal_a,
+            "intent": "viewport_hydrate",
+            "cols": 80,
+            "rows": 24,
+            "sinceSeq": 0,
+            "attachRequestId": "req-r24-attach-other",
+            "priority": "foreground",
+        }),
+    )
+    .await;
+    let refused = await_frame(&mut ws_a, Duration::from_secs(10), |v| {
+        v["type"] == "error" && v["code"] == "SESSION_RESERVED"
+    })
+    .await;
+    assert_eq!(
+        refused["ownerKind"],
+        json!("terminal"),
+        "the typed conflict names the terminal owner: {refused}"
+    );
+    assert_eq!(
+        refused["ownerGeneration"],
+        json!(owner_b.generation),
+        "the typed conflict carries the owner's generation: {refused}"
+    );
+    assert_eq!(
+        refused["liveTerminalId"],
+        json!(terminal_b),
+        "the typed conflict names the live terminal for the direct attach action: {refused}"
+    );
+
+    // NO attach.ready for the refused attach.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(750);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Some(Ok(msg))) =
+            tokio::time::timeout(Duration::from_millis(250), ws_a.next()).await
+        {
+            if let WsMessage::Text(text) = msg {
+                let v: Value = serde_json::from_str(&text).unwrap();
+                if v["type"] == "terminal.attach.ready"
+                    && v["terminalId"] == json!(terminal_a)
+                {
+                    panic!("no attach.ready may follow the typed conflict: {v}");
+                }
+            }
+        }
+    }
+
+    // Terminal B's ownership is UNTOUCHED.
+    assert!(
+        matches!(
+            ownership.observe("claude", &sid).state,
+            freshell_ownership::OwnershipState::Live { owner, .. }
+                if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal
+                    && owner.terminal_id.as_deref() == Some(terminal_b.as_str())
+        ),
+        "terminal B still owns the session after the refused attach"
+    );
+    ws_state.registry.kill(&terminal_b);
+}
+
+/// b8ke ext r9 F2: the commit verifies the PTY is alive at commit time ─────
 
 /// An instantly-dying claude spec (the fast-failing exact-resume shape —
 /// exits before the settle's binding/registration work can finish).

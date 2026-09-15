@@ -1166,6 +1166,91 @@ async fn handle_client_text(
                             )
                             .await;
                         }
+                        // b8ke ext r24 F1: the live owner's kind/identity
+                        // check — an attach NEVER overrides a live owner of
+                        // another kind; it answers the typed conflict. The
+                        // SAME-terminal owner proceeds (the legitimate
+                        // same-owner attach); a DIFFERENT terminal or a
+                        // Fresh Agent owner answers the typed conflict
+                        // carrying the owner identity (the established
+                        // additive ownerKind/ownerGeneration(/ownerEpoch)
+                        // refusal fields the client renders as the "opened
+                        // as Fresh Agent elsewhere"/other-terminal states
+                        // with their direct attach actions). No ledger
+                        // restamp and no attach.ready on any conflict arm —
+                        // the early return precedes the guard, the restamp,
+                        // and the attach registration.
+                        if let freshell_ownership::OwnershipState::Live { owner, .. } =
+                            &snap.state
+                        {
+                            let same_terminal = owner.kind
+                                == freshell_ownership::RuntimeOwnerKind::Terminal
+                                && owner.terminal_id.as_deref()
+                                    == Some(attach.terminal_id.as_str());
+                            if !same_terminal {
+                                let owner_kind_str = match owner.kind {
+                                    freshell_ownership::RuntimeOwnerKind::Terminal => "terminal",
+                                    freshell_ownership::RuntimeOwnerKind::FreshAgent => {
+                                        "fresh-agent"
+                                    }
+                                };
+                                let live_terminal_id =
+                                    if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal
+                                    {
+                                        owner.terminal_id.clone()
+                                    } else {
+                                        None
+                                    };
+                                let message =
+                                    if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                                    {
+                                        format!(
+                                            "This session is currently owned by a Fresh Agent \
+                                             (opened as Fresh Agent elsewhere); retry after it \
+                                             settles or attach from the Fresh Agent pane. \
+                                             (session {})",
+                                            session_ref.session_id
+                                        )
+                                    } else {
+                                        format!(
+                                            "This session is currently owned by a different \
+                                             terminal; the old terminal is no longer the \
+                                             session's runtime. (session {})",
+                                            session_ref.session_id
+                                        )
+                                    };
+                                tracing::warn!(
+                                    target: "freshell_ws::terminal",
+                                    terminal_id = %attach.terminal_id,
+                                    session_id = %session_ref.session_id,
+                                    owner_kind = owner_kind_str,
+                                    owner_terminal_id = ?owner.terminal_id,
+                                    generation = snap.generation,
+                                    "terminal_attach_refused: the canonical key is Live under \
+                                     another runtime owner — the attach answers the typed \
+                                     conflict, nothing restamps"
+                                );
+                                return send(
+                                    ws_tx,
+                                    &ServerMessage::Error(ErrorMsg {
+                                        owner_kind: Some(owner_kind_str.to_string()),
+                                        owner_generation: Some(snap.generation),
+                                        owner_epoch: Some(snap.epoch),
+                                        code: ErrorCode::SessionReserved,
+                                        message,
+                                        timestamp: crate::now_iso(),
+                                        actual_session_ref: None,
+                                        expected_session_ref: None,
+                                        request_id: None,
+                                        retry_after_ms: None,
+                                        terminal_exit_code: None,
+                                        terminal_id: Some(attach.terminal_id.clone()),
+                                        live_terminal_id,
+                                    }),
+                                )
+                                .await;
+                            }
+                        }
                         // A fenced observation: a stale generation answers
                         // typed (the delayed cross-device attach), a current
                         // one proceeds and restamps under the held claim.
