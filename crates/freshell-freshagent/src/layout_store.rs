@@ -78,6 +78,19 @@ const MAX_STALE_ENTRIES: usize = 4;
 /// server-created state.
 const SERVER_CLIENT_KEY: &str = "__server__";
 
+/// b8ke ext r25 F2: the per-recovery content-authority stamp — the
+/// pane's PRE-recovery leaf content recorded at the authoritative
+/// write-through (`attach_pane_content`). A reconnecting client's
+/// stale copy re-sends exactly this content (it never saw the
+/// recovery); `update_from_ui` rejects that pane write. ANY other
+/// incoming content (the client observed the recovered state, or edited
+/// past it) RELEASES the stamp — the client is authoritative again, so
+/// a server recovery never permanently blocks legitimate edits.
+#[derive(Clone, Debug, PartialEq)]
+struct RecoveryStamp {
+    pre_recovery_content: Value,
+}
+
 /// INTENTIONAL DIVERGENCE from Node (`server/agent-api/layout-store.ts` —
 /// single-snapshot field `:49`, wholesale-replace `updateFromUi` `:169-181`):
 /// Node keeps ONE shared snapshot, wholesale-replaced by whichever client
@@ -98,19 +111,6 @@ const SERVER_CLIENT_KEY: &str = "__server__";
 ///   hard eviction would leave that client's ids unresolvable for an
 ///   unbounded window. A stale entry is dropped only when a live sync covers
 ///   every one of its pane ids (lossless supersede), or past the stale cap.
-/// b8ke ext r25 F2: the per-recovery content-authority stamp — the
-/// pane's PRE-recovery leaf content recorded at the authoritative
-/// write-through (`attach_pane_content`). A reconnecting client's
-/// stale copy re-sends exactly this content (it never saw the
-/// recovery); `update_from_ui` rejects that pane write. ANY other
-/// incoming content (the client observed the recovered state, or edited
-/// past it) RELEASES the stamp — the client is authoritative again, so
-/// a server recovery never permanently blocks legitimate edits.
-#[derive(Clone, Debug, PartialEq)]
-struct RecoveryStamp {
-    pre_recovery_content: Value,
-}
-
 #[derive(Default)]
 struct LayoutInner {
     /// Most-recent-sync-first. The PRIMARY is the most recently synced LIVE
