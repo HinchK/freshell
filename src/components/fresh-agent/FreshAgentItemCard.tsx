@@ -1,6 +1,7 @@
-import { useMemo, useState } from 'react'
+import { createContext, useContext, useMemo, useState } from 'react'
 import { Check, ChevronRight, Loader2, X } from 'lucide-react'
 import DiffView from '@/components/fresh-agent/shared/DiffView'
+import { formatThoughtDuration } from '@/components/fresh-agent/shared/format-duration'
 import { getToolPreview } from '@/components/fresh-agent/shared/tool-preview'
 import { LazyMarkdown } from '@/components/markdown/LazyMarkdown'
 import type { FreshAgentTranscriptItem } from '@shared/fresh-agent-contract'
@@ -55,7 +56,16 @@ export interface FreshAgentToolDisplay {
   output?: string
   isError?: boolean
   status: 'running' | 'complete'
+  /** Display-first preview: when present, wins over getToolPreview(name, input). */
+  previewOverride?: string
 }
+
+/**
+ * Opens a fresh-agent session (e.g. a delegation's child) in the UI. The no-op
+ * default keeps item cards renderable anywhere; the provider lands with the
+ * transcript/pane wiring.
+ */
+export const FreshAgentOpenSessionContext = createContext<(sessionId: string, title?: string) => void>(() => {})
 
 export function stripSystemReminders(text: string): string {
   return text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
@@ -69,7 +79,10 @@ export function FreshAgentToolBlock({
   initialExpanded?: boolean
 }) {
   const [expanded, setExpanded] = useState(initialExpanded)
-  const preview = useMemo(() => getToolPreview(tool.name, tool.input), [tool.input, tool.name])
+  const preview = useMemo(
+    () => tool.previewOverride ?? getToolPreview(tool.name, tool.input),
+    [tool.previewOverride, tool.input, tool.name],
+  )
   const resultSummary = summarizeResult(tool.name, tool.output, tool.isError)
   const hasEditDiff = tool.name === 'Edit'
     && typeof tool.input?.old_string === 'string'
@@ -139,6 +152,78 @@ export function FreshAgentToolBlock({
           )}
         </div>
       ) : null}
+    </div>
+  )
+}
+
+/** First-letter uppercase display transform for wire-provided labels. */
+function titleCaseFirst(value: string): string {
+  const trimmed = value.trim()
+  if (!trimmed) return value
+  return trimmed[0].toUpperCase() + trimmed.slice(1)
+}
+
+/**
+ * One activity-strip member for an opencode `task` tool part: the delegation
+ * header (status icon + title + duration), compact non-expandable child
+ * tool rows, the clamped task result, and the "Open session" link to the
+ * child session. Full detail lives in the child session pane.
+ */
+export function FreshAgentDelegationBlock({ item }: { item: Extract<FreshAgentTranscriptItem, { kind: 'task_delegation' }> }) {
+  const openSession = useContext(FreshAgentOpenSessionContext)
+  const activity = item.activity ?? []
+  return (
+    <div className="fresh-agent-delegation-block my-0.5 text-xs" data-testid="fresh-agent-delegation-block" data-status={item.status}>
+      <div className="flex min-w-0 items-center gap-2 rounded-r px-2 py-0.5">
+        {item.status === 'running' ? <Loader2 className="h-3 w-3 shrink-0 animate-spin" aria-label="running" /> : null}
+        {item.status === 'completed' ? <Check className="h-3 w-3 shrink-0 text-green-500" aria-label="complete" /> : null}
+        {item.status === 'failed' ? <X className="h-3 w-3 shrink-0 text-destructive" aria-label="error" /> : null}
+        <span className="fresh-agent-delegation-title truncate font-medium">{item.title}</span>
+        {item.durationMs !== undefined ? (
+          <span className="shrink-0 text-muted-foreground">{formatThoughtDuration(item.durationMs)}</span>
+        ) : null}
+      </div>
+      {activity.length > 0 ? (
+        <div className="border-t border-border/50 px-3 py-1">
+          {activity.map((row, index) => (
+            <div key={`${row.tool}-${index}`} className="flex min-w-0 items-center gap-2 py-0.5 text-muted-foreground" data-testid="fresh-agent-delegation-row">
+              <span aria-hidden="true">↳</span>
+              <span className="shrink-0 font-medium">{titleCaseFirst(row.tool)}</span>
+              {row.preview ? <span className="truncate font-mono">{row.preview}</span> : null}
+              {row.status === 'failed' ? <span className="shrink-0 text-destructive">(failed)</span> : null}
+              {row.status === 'running' ? <Loader2 className="h-3 w-3 shrink-0 animate-spin" aria-label={`${titleCaseFirst(row.tool)} running`} /> : null}
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {item.result ? (
+        <div className="border-t border-border/50 px-3 py-1">
+          <pre data-testid="fresh-agent-delegation-result" className="fresh-agent-delegation-result max-h-24 overflow-y-auto whitespace-pre-wrap break-words font-mono opacity-80">
+            {item.result}
+          </pre>
+        </div>
+      ) : null}
+      {item.childSessionId ? (
+        <div className="border-t border-border/50 px-3 py-1">
+          <button
+            type="button"
+            className="rounded p-0.5 text-muted-foreground underline-offset-2 transition-colors hover:bg-accent/50 hover:underline"
+            onClick={() => openSession(item.childSessionId!, item.description)}
+            aria-label={`Open session ${item.description ?? item.childSessionId}`}
+          >
+            Open session
+          </button>
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+/** Muted activity-strip row for an opencode retry part. */
+export function FreshAgentRetryRow({ attempt, error }: { attempt: number; error?: string }) {
+  return (
+    <div data-testid="fresh-agent-retry-row" className="my-0.5 px-2 py-0.5 text-xs italic text-muted-foreground">
+      {`Retrying (attempt ${attempt})${error ? ` — ${error}` : ''}`}
     </div>
   )
 }
@@ -291,6 +376,22 @@ export function FreshAgentItemCard({
           <pre className="mt-2 overflow-x-auto whitespace-pre-wrap text-xs text-muted-foreground">{item.content.join('\n')}</pre>
         ) : null}
       </details>
+    )
+  }
+
+  if (item.kind === 'task_delegation') {
+    return <FreshAgentDelegationBlock item={item} />
+  }
+
+  if (item.kind === 'retry') {
+    return <FreshAgentRetryRow attempt={item.attempt} error={item.error} />
+  }
+
+  if (item.kind === 'delegated_task') {
+    return (
+      <div data-testid="fresh-agent-delegated-task" className="my-0.5 px-2 py-0.5 text-xs italic text-muted-foreground">
+        {`Delegated — ${titleCaseFirst(item.agent ?? 'Task')}${item.description ? ` · ${item.description}` : ''}`}
+      </div>
     )
   }
 
