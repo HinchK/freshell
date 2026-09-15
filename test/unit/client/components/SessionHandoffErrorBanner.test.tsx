@@ -190,4 +190,3 @@ describe('b8ke ext r12 F1: the cleared state presents the explicit re-initiation
     expect(screen.queryByRole('button', { name: /force clear/i })).toBeNull()
   })
 })
-
