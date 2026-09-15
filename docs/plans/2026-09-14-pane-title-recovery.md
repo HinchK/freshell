@@ -59,7 +59,7 @@ All facts below were verified against the worktree at `bab7d5189` by five explor
 - `updatePaneTitleByTerminalId` and `updatePaneTitleBySessionRef` already exist (panesSlice.ts:2212/2242) with the `setByUser:false` user-set guard; `terminal.inventory` is sent on every connection (crates/freshell-ws/src/lib.rs:614-622) with rows carrying `title` (server_messages.rs:1125), and the sole client handler (App.tsx:1419-1470) ignores it.
 - Session-directory rows (`SessionDirectoryItem`, shared/read-models.ts:51-86) carry `sessionId`, `provider`, `title?` and arrive via `/api/session-directory` fetches triggered by `sessions.changed` broadcasts; the sessions slice normalizes them under `state.sessions.windows[surface].projects` (sessionsSlice.ts:66-96).
 - `mergeHydratedPaneMetadata` (panesSlice.ts:578-648, module-private, dispatched only by `hydratePanes`) lets an incoming non-user-set title overwrite a newer local one whenever the incoming layout wins; the `HydratePanesMeta` timestamps (`localLayoutPersistedAt`/`remoteLayoutPersistedAt`, panesSlice.ts:37-40) are already dispatched by crossTabSync.ts:213-218 but unused there. Tabs solve this with `pickHydratedTabWinner` (tabsSlice.ts:115-128) + `reconcileHydratedTabTitle` (:137-142).
-- The boot flow renders the chooser while `machineIdentity.status !== 'ready'`; the chooser handlers (App.tsx:550-566) persist the selection then `window.location.reload()`. The parallel branch's one-shot sessionStorage marker design (key `'freshell.machine.active-selection'`, mark/peek/consume) is mapped in plan-boot-restore.md §7A. The `bd4315881` rebuild recipe (`machine-bootstrap:` exclusion prefix + `preserveIdsForMachine`) is mapped in §7B — client-side only, no Rust changes.
+- The boot flow renders the chooser while `machineIdentity.status !== 'ready'`; the chooser handlers (App.tsx:550-566) persist the selection then `window.location.reload()`. plan-boot-restore.md §7A maps the parallel branch's one-shot chooser-signal design; this run deliberately does NOT adopt it — the round-3 simplified foreign rule (an unstamped envelope is legacy data assumed local and can never classify foreign) removes the need for any active-pick signal, and Task 2's stamp backfill makes unstamped a one-boot transitional state. §7A remains background only. The `bd4315881` rebuild recipe (`machine-bootstrap:` exclusion prefix + `preserveIdsForMachine`) is mapped in §7B — client-side only, no Rust changes.
 - The recover-my-panes e2e donor idioms (owned `RustServer`, generation-file fs-polls, harness dispatch seam `window.__FRESHELL_TEST_HARNESS__`) are mapped in plan-test-infra.md §5-6.
 
 ---
@@ -73,12 +73,11 @@ Evidence: `reports/load-bearing-finder.md` (LB-IDs) in the run's logs dir. These
 3. **LB-02 (residual, documented):** with two windows where the rebuilding one sat idle >15 min, the A15 fence drops its own generations; the bootstrap rebuild then restores the sibling's newer snapshot (same machine). That is the accepted multi-window tradeoff, not a regression.
 4. **LB-06:** `fetchSessionWindow` is a hand-rolled thunk — there is NO `sessions/fetchSessionWindow/fulfilled` action. Task 6's red test must land rows via the REAL commit action: `sessions/commitSessionWindowVisibleRefresh` (payload `{ surface, projects, ... }` per sessionsThunks.ts:610-629) or `sessions/setProjects`. All session mutations are `sessions/`-prefixed (sessionsSlice.ts:321-322), so the middleware trigger design is sound.
 5. **LB-07:** Task 4's sketch corrected to the real APIs: the owned server is `new RustServer(options)` + `await server.start()` (rust-server.ts:319/:337 — there is NO `RustServerHandle.spawn`); `connect` and the generation-file fs-poll `(clientInstanceId, minRecords, timeoutMs)` over `path.join(info.homeDir, '.freshell', 'tabs-snapshots')` are donor-spec-local (recover-my-panes-rust.spec.ts:210-211, :452-494) — copy them into the new spec; read the page's clientInstanceId from `sessionStorage['freshell.tabs.client-instance-id.v1']`; `ensureRustServerBuilt` is synchronous.
-6. **LB-08 (coverage-critical):** Task 4 must NOT clear sessionStorage via `addInitScript` — an init script (even a once-guarded `sessionStorage.clear()`) cannot survive a reload (each reload is a new document/window, so the guard resets and the clear runs on EVERY load), minting a fresh clientInstanceId each time, which would let Scenario 2 pass even if the `machine-bootstrap:` prefix regressed (false green). Resolution: NO `addInitScript` at all — a fresh Playwright context starts with EMPTY storage, so there is nothing to clear, and the natural reload then preserves the clientInstanceId, making the prefix load-bearing for the spec's outcome.
+6. **LB-08 (coverage-critical):** Task 4 must NOT clear sessionStorage via `addInitScript` — an init script (even a once-guarded `sessionStorage.clear()`) cannot survive a reload (each reload is a new document/window, so the guard resets and the clear runs on EVERY load), minting a fresh clientInstanceId each time, which would let Scenario 2 pass even if the `machine-bootstrap:` prefix regressed (false green). Resolution: NO `addInitScript` at all in Task 4's scenarios — a fresh Playwright context starts with EMPTY storage, so there is nothing to clear, and the natural reload then preserves the clientInstanceId, making the prefix load-bearing for the spec's outcome. (Task 7's Scenario 3 later adds ONE deliberate, SEEDING init script to that spec — it writes the captured machine-selection localStorage keys and never touches sessionStorage/clientInstanceId; see the Task 7 Step 6 note for why that seeding kind is exempt from this rule.)
 7. **LB-11:** Task 4 Step 5's first verification command needs `--project=chromium` (without it, `--list` enumerates all projects and the grep count can never be 0).
 8. **LB-16:** the root store setup is `src/store/store.ts` (configureStore :51; middleware chain :85-102) — Task 6 modifies and commits THAT file, not `src/store/index.ts`.
 9. **LB-17 (real helper names for the test sketches):** `App.machine-identity.test.tsx` has NO `renderAppWithMachineApi`/`waitForMachineReady`/`exposeChooserHandlers` — its real style is a module-level `createStore()` + `render(<App .../>)` + `waitFor(...)` against the `mocks.restoreMachineWorkspace`/`mocks.startTabRegistrySync` refs (:49-51, :114-224), and `MachineChooser` is NOT mocked (drive the real dialog); the existing pin at :222-224 is the one Task 2 updates. `machine-workspace.test.ts`'s real helpers: `createStore()`, `inventoryFor(machineId)`, `addForeignWorkspace(store)` (assert via the imported, mocked `getRecoveryInventory`). `build-recovery-plan.test.ts`'s real builders: `inv(panes, ledgerOnly?)` (:11), `pane(over?)` (:7), `leavesOf(node)` (:17).
-10. **LB-18:** consuming the active-selection marker only after a successful restore is correct; once the LB-05 fix makes stamps work, a lingering armed marker is inert on healthy boots (the stamp branch ignores it). No change.
-11. **LB-14 (watch-item):** the new specs' persistence polls are content-based and bounded like the donor's fs-polls (not cloud-skipped); watch the mandated cloud-lane runs for `rest-tab-persistence`-class timing sensitivity and prefer generous bounded timeouts.
+10. **LB-14 (watch-item):** the new specs' persistence polls are content-based and bounded like the donor's fs-polls (not cloud-skipped); watch the mandated cloud-lane runs for `rest-tab-persistence`-class timing sensitivity and prefer generous bounded timeouts.
 
 ---
 
@@ -98,7 +97,7 @@ Evidence: `reports/load-bearing-finder.md` (LB-IDs) in the run's logs dir. These
 - Produces (used by Task 2):
   - `export type PersistedLayoutHealth = 'absent' | 'corrupt' | 'foreign' | 'stale' | 'healthy'`
   - `export const STALE_LAYOUT_MS = 7 * 24 * 60 * 60 * 1000`
-  - `export function classifyPersistedLayoutHealth(resolvedMachineId: string, opts?: { now?: number; activeSelection?: boolean; storage?: Storage }): PersistedLayoutHealth`
+  - `export function classifyPersistedLayoutHealth(resolvedMachineId: string, opts?: { now?: number; storage?: Storage }): PersistedLayoutHealth`
   - `ParsedPersistedLayout` gains `machineId?: string`.
 
 - [ ] **Step 1: Write the failing behavioral test**
@@ -185,6 +184,30 @@ describe('classifyPersistedLayoutHealth', () => {
     expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
   })
 
+  it('returns corrupt when a non-empty-tabs envelope has no valid activeTabId (the loader silently substitutes the first tab, tabsSlice.ts:260-265)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    const tabsSection = envelope.tabs as { activeTabId: string | null }
+    tabsSection.activeTabId = 'tab-does-not-exist'   // dangling: not among the parsed tab ids
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('returns corrupt when activePane names a pane that is not a leaf of that tab\u2019s layout (dangling focus)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    const panes = envelope.panes as { activePane: Record<string, string> }
+    panes.activePane['tab-a'] = 'pane-not-in-layout'
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('returns corrupt when a tab\u2019s activePane entry is missing entirely', () => {
+    const envelope = healthyEnvelope('machine-1')
+    const panes = envelope.panes as { activePane: Record<string, string> }
+    delete panes.activePane['tab-a']
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
   it('returns foreign when the stamp names a different machine', () => {
     seedEnvelope(healthyEnvelope('machine-OTHER'))
     expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('foreign')
@@ -200,28 +223,16 @@ describe('classifyPersistedLayoutHealth', () => {
     expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('stale')
   })
 
-  it('treats an unstamped envelope as healthy when the remembered selection matches the resolved machine', () => {
+  it('treats an unstamped (legacy) envelope as healthy — never foreign — so a same-machine chooser re-pick keeps the layout', () => {
+    // The accepted tradeoff pinned as a test: the re-pick persists its
+    // selection before the reload (App.tsx:557-560), so resolution sees
+    // remembered == resolved; the envelope is unstamped legacy data assumed
+    // local, classifies healthy, and the layout is KEPT (no rebuild).
     localStorage.setItem(MACHINE_ID_STORAGE_KEY, 'machine-1')
     const envelope = healthyEnvelope('machine-1')
     delete envelope.machineId
     seedEnvelope(envelope)
     expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
-  })
-
-  it('treats an unstamped envelope as foreign when the remembered selection names a different machine', () => {
-    localStorage.setItem(MACHINE_ID_STORAGE_KEY, 'machine-OLD')
-    const envelope = healthyEnvelope('machine-OLD')
-    delete envelope.machineId
-    seedEnvelope(envelope)
-    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('foreign')
-  })
-
-  it('treats an unstamped envelope as foreign after an active chooser pick, even with a matching legacy selection', () => {
-    localStorage.setItem(MACHINE_ID_STORAGE_KEY, 'machine-1')
-    const envelope = healthyEnvelope('machine-1')
-    delete envelope.machineId
-    seedEnvelope(envelope)
-    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW, activeSelection: true })).toBe('foreign')
   })
 })
 ```
@@ -273,7 +284,6 @@ function selectStampMachineId(state: RootState): string | undefined {
 Create `src/lib/recovery/layout-health.ts`:
 
 ```typescript
-import { getSelectedMachineId } from '@/lib/machine-identity'
 import { parsePersistedLayoutRaw, type ParsedPersistedLayout } from '@/store/persistedState'
 import { isWellFormedPaneTree } from '@/store/paneTreeValidation'
 import { LAYOUT_STORAGE_KEY } from '@/store/storage-keys'
@@ -293,22 +303,48 @@ function safeStorage(): Storage | undefined {
   }
 }
 
+/** Leaf pane ids of a (already well-formedness-checked) layout tree.
+ * Module-local: paneTreeValidation.ts exports no leaf collector (only
+ * hasPaneTreeShape :127, isWellFormedPaneTree :133, validatePaneTree :141),
+ * and panesSlice's collectLeaves/collectLeafPaneIds are module-private. */
+function collectLeafIdsOf(node: unknown, into: Set<string> = new Set()): Set<string> {
+  const n = node as { type?: string; id?: string; children?: unknown[] } | null
+  if (!n || typeof n !== 'object') return into
+  if (n.type === 'leaf') {
+    if (typeof n.id === 'string') into.add(n.id)
+    return into
+  }
+  for (const child of n.children ?? []) collectLeafIdsOf(child, into)
+  return into
+}
+
 /** Classify the persisted layout envelope for the machine this boot
  * resolved. Reads only localStorage; no network.
  *
  * - absent:   nothing usable is persisted.
  * - corrupt:  the envelope exists but does not parse, parse-level salvage
- *             dropped invalid tab rows, a layout tree is malformed, or
+ *             dropped invalid tab rows, a layout tree is malformed,
  *             referential integrity is broken (a layout entry without its
- *             tab, or a tab without its layout entry).
- * - foreign: the envelope belongs to a different machine: an explicit
- *            stamp mismatch, or (unstamped legacy envelopes) an active
- *            chooser pick / a remembered-selection mismatch.
+ *             tab, or a tab without its layout entry), or an active
+ *             reference is missing/dangling (activeTabId not a parsed tab
+ *             while tabs are non-empty; activePane[tabId] absent or not a
+ *             leaf of that tab's layout).
+ * - foreign: IFF the envelope is STAMPED and the stamp names a different
+ *            machine. An unstamped envelope is legacy (pre-stamp) data
+ *            assumed local — it can NEVER classify foreign, so a
+ *            same-machine chooser re-pick keeps a healthy unstamped
+ *            layout; Task 2's stamp backfill makes unstamped a one-boot
+ *            transitional state.
+ *            Accepted migration residual: a pre-migration envelope that
+ *            actually belonged to a different machine (an origin remap
+ *            before the first boot of this code) is mis-kept for one boot
+ *            under this rule; the backfill then stamps it with the
+ *            resolved machine id, so every later boot classifies correctly.
  * - stale:   older than STALE_LAYOUT_MS.
  * - healthy: everything else — the window keeps its local layout. */
 export function classifyPersistedLayoutHealth(
   resolvedMachineId: string,
-  opts: { now?: number; activeSelection?: boolean; storage?: Storage } = {},
+  opts: { now?: number; storage?: Storage } = {},
 ): PersistedLayoutHealth {
   const storage = opts.storage ?? safeStorage()
   const now = opts.now ?? Date.now()
@@ -378,22 +414,44 @@ export function classifyPersistedLayoutHealth(
   const tabCount = parsed.tabs?.tabs?.length ?? 0
   const paneCount = Object.keys(parsed.panes?.layouts ?? {}).length
   if (tabCount === 0 && paneCount === 0) return 'absent'
-  const stamp = parsed.machineId
-  if (typeof stamp === 'string' && stamp) {
-    if (stamp !== resolvedMachineId) return 'foreign'
-  } else {
-    // Legacy (pre-stamp) envelope: the remembered selection is the only
-    // same-machine evidence; an active chooser pick overrides it.
-    let remembered: string | null | undefined
-    try {
-      remembered = getSelectedMachineId()
-    } catch {
-      remembered = undefined
-    }
-    if (opts.activeSelection === true || (typeof remembered === 'string' && remembered !== resolvedMachineId)) {
-      return 'foreign'
+  // Active-reference validation (non-empty tabs). Persisted shape verified
+  // against the real writer/reader: activeTabId lives at tabs.activeTabId
+  // (persistMiddleware.ts:634 writes `state.tabs?.activeTabId ?? null`;
+  // persistedState.ts:545 reads it back), and activePane lives at
+  // panes.activePane as Record<tabId, paneId> (flushed inside the state.panes
+  // spread at persistMiddleware.ts:608-628; read at persistedState.ts:551).
+  // A legitimate flush NEVER produces a non-empty-tabs envelope without both
+  // references: every in-memory writer keeps them valid — tabsSlice removeTab
+  // re-points activeTabId to a surviving tab (tabsSlice.ts:363-371) and
+  // hydrateTabs re-points to a merged tab (:427-435); panesSlice initLayout
+  // sets activePane[tabId] to the layout's leaf (:1242), restoreLayout via
+  // findFirstLeafId (:1258), resetLayout (:1280), splitPane (:1411), addPane
+  // (:1502), closePane re-points to a surviving sibling leaf (:1466-1476),
+  // cleanOrphanedLayouts removes entries with their layouts (:325-371), and
+  // the hydrate merge validates candidates against the layout's leaf ids
+  // (pickHydratedActivePane, :599-606). The zod schema fields are optional
+  // only for legacy tolerance (persistedState.ts:52/:218) — v2/v3 writers
+  // always maintained the invariant. The loaders do NOT heal loudly: an
+  // invalid activeTabId is SILENTLY replaced with the first tab
+  // (tabsSlice.ts:260-265) and activePane loads through unvalidated
+  // (panesSlice.ts:402), so a damaged envelope would otherwise classify
+  // healthy and silently lose the saved focus. Missing or dangling → corrupt.
+  if (tabCount > 0) {
+    const activeTabId = parsed.tabs?.activeTabId
+    if (typeof activeTabId !== 'string' || !parsedTabIds.has(activeTabId)) return 'corrupt'
+    for (const tabId of parsedTabIds) {
+      const activePaneId = parsed.panes?.activePane?.[tabId]
+      if (typeof activePaneId !== 'string') return 'corrupt'
+      const layout = parsed.panes?.layouts?.[tabId]
+      if (!layout || !collectLeafIdsOf(layout).has(activePaneId)) return 'corrupt'
     }
   }
+  // Foreign IFF stamped AND the stamp names a different machine. Unstamped
+  // = legacy (pre-stamp) data assumed local — never foreign (a same-machine
+  // chooser re-pick keeps a healthy unstamped layout; Task 2's backfill then
+  // stamps it so the next boot is unambiguous).
+  const stamp = parsed.machineId
+  if (typeof stamp === 'string' && stamp && stamp !== resolvedMachineId) return 'foreign'
   const persistedAt = typeof parsed.persistedAt === 'number' ? parsed.persistedAt : 0
   if (now - persistedAt > STALE_LAYOUT_MS) return 'stale'
   return 'healthy'
@@ -441,43 +499,54 @@ git commit -m "feat(client): stamp the persisted layout with its machine id and 
 ### Task 2: Local-first boot gate — keep a healthy local layout (Choice B)
 
 **Files:**
-- Modify: `src/App.tsx:805-863` (the gate inside `resolveMachineBeforeTransport`) and `:550-566` (chooser handlers arm the marker)
-- Modify: `src/lib/machine-identity.ts` (marker functions, new)
+- Modify: `src/App.tsx:805-863` (the gate inside `resolveMachineBeforeTransport`: classify → stamp backfill → keep-vs-rebuild; the chooser handlers at `:550-566` are NOT touched — current main stays)
+- Modify: `src/lib/recovery/layout-health.ts` (add `backfillPersistedLayoutMachineId` — the one-shot stamp backfill, Task 1's module)
 - Modify: `src/lib/machine-workspace.ts` (`RestoreMachineWorkspaceOptions` gains `reason`)
-- Test: `test/unit/client/components/App.machine-identity.test.tsx`, `test/unit/client/lib/machine-identity.test.ts`, `test/unit/client/lib/machine-workspace.test.ts`
+- Test: `test/unit/client/components/App.machine-identity.test.tsx`, `test/unit/client/lib/recovery/layout-health.test.ts` (backfill unit tests), `test/unit/client/lib/machine-workspace.test.ts`
 
 **Interfaces:**
 - Consumes: `classifyPersistedLayoutHealth` from Task 1.
-- Produces: `markActiveMachineSelection()`, `peekActiveMachineSelectionMark(): boolean`, `consumeActiveMachineSelectionMark(): boolean` in `machine-identity.ts`; `RestoreMachineWorkspaceOptions = { reason?: 'absent' | 'corrupt' | 'foreign' | 'stale' }` in `machine-workspace.ts` (the rebuild recipe itself is still the current one; Task 3 upgrades it).
+- Produces: `backfillPersistedLayoutMachineId(resolvedMachineId: string, storage?: Storage): boolean` in `layout-health.ts` (stamps an unstamped-but-parseable raw envelope with the resolved machine id; `true` when it wrote); `RestoreMachineWorkspaceOptions = { reason?: 'absent' | 'corrupt' | 'foreign' | 'stale' }` in `machine-workspace.ts` (the rebuild recipe itself is still the current one; Task 3 upgrades it).
 
 - [ ] **Step 1: Write the failing behavioral tests**
 
-Red test A — marker functions (append to `test/unit/client/lib/machine-identity.test.ts`, following its storage-based style):
+Red test A — the stamp backfill (append to `test/unit/client/lib/recovery/layout-health.test.ts`, reusing its `seedEnvelope`/`healthyEnvelope`/`beforeEach` localStorage-clear idioms; the fixture's tabs/panes/active references are the healthy shape, only `machineId` varies):
 
 ```typescript
-describe('active machine selection marker', () => {
-  beforeEach(() => { sessionStorage.clear() })
+import { backfillPersistedLayoutMachineId } from '@/lib/recovery/layout-health'
 
-  it('marks, peeks, and consumes a one-shot active selection', () => {
-    expect(peekActiveMachineSelectionMark()).toBe(false)
-    markActiveMachineSelection()
-    expect(peekActiveMachineSelectionMark()).toBe(true)
-    expect(consumeActiveMachineSelectionMark()).toBe(true)
-    expect(peekActiveMachineSelectionMark()).toBe(false)
+describe('backfillPersistedLayoutMachineId', () => {
+  beforeEach(() => { localStorage.clear() })
+
+  it('stamps a healthy legacy (unstamped) envelope once machine identity resolves — with NO store action dispatched', () => {
+    // The boot moment the finding pins: identity resolved, persist
+    // middleware not dirty (machine-resolution actions never mark
+    // tabsDirty/panesDirty, persistMiddleware.ts:719-751), so nothing else
+    // would ever restamp a terminal-free healthy layout.
+    const envelope = healthyEnvelope('machine-1')
+    delete envelope.machineId
+    seedEnvelope(envelope)
+    const rawBefore = JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY)!) as Record<string, unknown>
+    expect(backfillPersistedLayoutMachineId('machine-1')).toBe(true)
+    const stamped = JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY)!) as { machineId?: string }
+    expect(stamped.machineId).toBe('machine-1')
+    // everything else is preserved — no layout mutation:
+    expect(stamped.tabs).toEqual(rawBefore.tabs)
+    expect(stamped.panes).toEqual(rawBefore.panes)
+    expect(stamped.persistedAt).toEqual(rawBefore.persistedAt)
   })
 
-  it('consume on an unarmed marker returns false and stays inert', () => {
-    expect(consumeActiveMachineSelectionMark()).toBe(false)
+  it('does not rewrite an already-stamped envelope (idempotent — content byte-identical)', () => {
+    seedEnvelope(healthyEnvelope('machine-1'))
+    const before = localStorage.getItem(LAYOUT_STORAGE_KEY)
+    expect(backfillPersistedLayoutMachineId('machine-1')).toBe(false)
+    expect(localStorage.getItem(LAYOUT_STORAGE_KEY)).toBe(before)   // no write at all
   })
 
-  it('survives storage failures silently', () => {
-    const throwing = {
-      getItem: () => { throw new Error('denied') },
-      setItem: () => { throw new Error('denied') },
-      removeItem: () => { throw new Error('denied') },
-    } as Storage
-    expect(() => { markActiveMachineSelection(throwing) }).not.toThrow()
-    expect(peekActiveMachineSelectionMark(throwing)).toBe(false)
+  it('leaves an unparseable envelope alone (no write, no throw)', () => {
+    seedEnvelope('{ not json')
+    expect(backfillPersistedLayoutMachineId('machine-1')).toBe(false)
+    expect(localStorage.getItem(LAYOUT_STORAGE_KEY)).toBe('{ not json')
   })
 })
 ```
@@ -486,17 +555,24 @@ Red test B — the gate (extend the harness in `test/unit/client/components/App.
 
 ```typescript
 // Mock the Task 1 module so the App test controls the classification
-// independently of localStorage seeding:
+// independently of localStorage seeding. The factory MUST also stub
+// backfillPersistedLayoutMachineId — the App gate imports both from this
+// module, so a classify-only mock breaks the import:
 vi.mock('@/lib/recovery/layout-health', () => ({
   classifyPersistedLayoutHealth: vi.fn(() => 'healthy'),
+  backfillPersistedLayoutMachineId: vi.fn(() => false),
 }))
-import { classifyPersistedLayoutHealth } from '@/lib/recovery/layout-health'
+import { classifyPersistedLayoutHealth, backfillPersistedLayoutMachineId } from '@/lib/recovery/layout-health'
 
-it('keeps a healthy local workspace: no restore call, straight to ready', async () => {
+it('keeps a healthy local workspace: no restore call, backfill stamps, straight to ready', async () => {
   vi.mocked(classifyPersistedLayoutHealth).mockReturnValue('healthy')
   renderAppWithMachineApi()      // existing harness helper for the machines API
   await waitForMachineReady()
   expect(restoreMachineWorkspaceMock).not.toHaveBeenCalled()
+  // classify FIRST, then backfill — the gate calls the backfill once with
+  // the resolved machine id (after classification, before any rebuild):
+  expect(backfillPersistedLayoutMachineId).toHaveBeenCalledTimes(1)
+  expect(backfillPersistedLayoutMachineId).toHaveBeenCalledWith(expect.any(String))
   expect(startTabRegistrySyncMock).toHaveBeenCalled()
 })
 
@@ -512,77 +588,72 @@ it('rebuilds for an unhealthy layout and passes the health as the reason', async
   expect(restoreMachineWorkspaceMock.mock.invocationCallOrder[0])
     .toBeLessThan(startTabRegistrySyncMock.mock.invocationCallOrder[0])
 })
-
-it('leaves the active-selection marker armed when the restore fails, so a retry still rebuilds', async () => {
-  vi.mocked(classifyPersistedLayoutHealth).mockReturnValue('foreign')
-  restoreMachineWorkspaceMock.mockRejectedValueOnce(new Error('inventory down'))
-  sessionStorage.setItem('freshell.machine.active-selection', '1')
-  renderAppWithMachineApi()
-  await waitForMachineResolutionError()
-  expect(sessionStorage.getItem('freshell.machine.active-selection')).toBe('1')
-})
-
-it('arms the marker from both chooser pick handlers', async () => {
-  const { selectMachineFromChooser, addMachineFromChooser } = await exposeChooserHandlers()
-  sessionStorage.clear()
-  await actUserPick(() => selectMachineFromChooser({ id: 'm-1', label: 'M1' }))
-  expect(sessionStorage.getItem('freshell.machine.active-selection')).toBe('1')
-  sessionStorage.clear()
-  await actUserPick(() => addMachineFromChooser('New machine'))
-  expect(sessionStorage.getItem('freshell.machine.active-selection')).toBe('1')
-})
 ```
 
-(Adapt helper names — `renderAppWithMachineApi`, `waitForMachineReady`, `waitForMachineResolutionError`, `exposeChooserHandlers` — to this suite's existing helpers; it already drives the chooser branch and the resolution-error path.)
+(Adapt helper names — `renderAppWithMachineApi`, `waitForMachineReady` — to this suite's existing helpers per LB-17.)
 
 Red test C — reason param (append to `test/unit/client/lib/machine-workspace.test.ts`): for each reason value, the restore still fetches with the plain client id (unchanged until Task 3), runs the clears, and returns the plan count.
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
-Run: `npm run test:vitest -- run test/unit/client/components/App.machine-identity.test.tsx test/unit/client/lib/machine-identity.test.ts test/unit/client/lib/machine-workspace.test.ts`
+Run: `npm run test:vitest -- run test/unit/client/components/App.machine-identity.test.tsx test/unit/client/lib/recovery/layout-health.test.ts test/unit/client/lib/machine-workspace.test.ts`
 
-Expected: FAIL — the marker functions don't exist, App does not import `classifyPersistedLayoutHealth` (the module mock is unused so the gate tests fail), and no `reason` is passed.
+Expected: FAIL — `backfillPersistedLayoutMachineId` does not exist (import error in layout-health.test.ts), App does not import `classifyPersistedLayoutHealth`/`backfillPersistedLayoutMachineId` (the module mock is unused so the gate tests fail), and no `reason` is passed.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-`src/lib/machine-identity.ts` (new functions; mirror the parallel branch's design so the eventual PR reconciliation is textual, not semantic):
+`src/lib/recovery/layout-health.ts` — add the stamp backfill (Task 1's module; it owns envelope parsing):
 
 ```typescript
-const ACTIVE_MACHINE_SELECTION_STORAGE_KEY = 'freshell.machine.active-selection'
-
-function safeSessionStorage(): Storage | undefined {
+/** One-shot stamp backfill. Machine resolution dispatches no tabs/panes
+ * action, so the persist middleware's dirty flags never fire
+ * (persistMiddleware.ts:534 returns early; :719-751 dirties only tabs/,
+ * panes/, tabRecency/, and turnCompletion changes) — a healthy legacy
+ * (unstamped) envelope could stay unstamped indefinitely (e.g. a
+ * terminal-free layout dispatches nothing on boot). Write the resolved
+ * machine id into the RAW envelope directly: parse only as the gate
+ * (parses AND lacks machineId), mutate the raw object, ONE synchronous
+ * setItem — localStorage writes are all-or-nothing per key, the atomic
+ * equivalent of the server side's temp-file+rename; there is no shared
+ * atomic-write utility in the client to reuse (verified — only prose uses
+ * "atomic" in src/). NO layout mutation (never write the reconstructed
+ * ParsedPersistedLayout back — that would normalize/rewrite fields), no
+ * full reflush, no broadcast, no store dispatch. Idempotent within a
+ * boot: an already-stamped or unparseable envelope writes nothing. */
+export function backfillPersistedLayoutMachineId(
+  resolvedMachineId: string,
+  storage: Storage = safeStorage(),
+): boolean {
+  if (!resolvedMachineId || !storage) return false
+  let raw: string | null = null
   try {
-    if (typeof sessionStorage === 'undefined') return undefined
-    sessionStorage.getItem(ACTIVE_MACHINE_SELECTION_STORAGE_KEY)
-    return sessionStorage
+    raw = storage.getItem(LAYOUT_STORAGE_KEY)
   } catch {
-    return undefined
+    return false
   }
-}
-
-/** ONE-SHOT, per-tab marker armed by the chooser's pick handlers right
- * before their intentional window.location.reload(). The next boot's
- * layout-health classification consumes it to treat an unstamped legacy
- * cache as foreign after an active pick. sessionStorage keeps it per-tab:
- * it survives the chooser's reload exactly once and is consumed on the
- * boot it armed; a later natural reload never inherits it. */
-export function markActiveMachineSelection(storage = safeSessionStorage()): void {
-  try { storage?.setItem(ACTIVE_MACHINE_SELECTION_STORAGE_KEY, '1') } catch { /* best effort */ }
-}
-
-/** Read WITHOUT consuming: the boot peeks before the (async) restore and
- * consumes only after a successful restore, so an in-flight reload leaves
- * the marker armed for the next boot. */
-export function peekActiveMachineSelectionMark(storage = safeSessionStorage()): boolean {
-  try { return storage?.getItem(ACTIVE_MACHINE_SELECTION_STORAGE_KEY) === '1' } catch { return false }
-}
-
-export function consumeActiveMachineSelectionMark(storage = safeSessionStorage()): boolean {
+  if (raw === null) return false
+  let parsed: ParsedPersistedLayout | null = null
   try {
-    const armed = storage?.getItem(ACTIVE_MACHINE_SELECTION_STORAGE_KEY) === '1'
-    storage?.removeItem(ACTIVE_MACHINE_SELECTION_STORAGE_KEY)
-    return armed
-  } catch { return false }
+    parsed = parsePersistedLayoutRaw(raw)
+  } catch {
+    parsed = null
+  }
+  if (!parsed) return false
+  if (typeof parsed.machineId === 'string' && parsed.machineId) return false
+  let rawEnvelope: { machineId?: string }
+  try {
+    rawEnvelope = JSON.parse(raw)
+  } catch {
+    return false
+  }
+  if (typeof rawEnvelope.machineId === 'string' && rawEnvelope.machineId) return false
+  rawEnvelope.machineId = resolvedMachineId
+  try {
+    storage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(rawEnvelope))
+    return true
+  } catch {
+    return false
+  }
 }
 ```
 
@@ -599,7 +670,7 @@ export type RestoreMachineWorkspaceOptions = {
 
 (`restoreMachineWorkspace` accepts the option and records it; its body is otherwise unchanged in this task — the rebuild recipe upgrade is Task 3.)
 
-`src/App.tsx` — imports: add `classifyPersistedLayoutHealth`, `markActiveMachineSelection`, `peekActiveMachineSelectionMark`, `consumeActiveMachineSelectionMark`. In `resolveMachineBeforeTransport`, replace the unconditional restore block:
+`src/App.tsx` — imports: add `classifyPersistedLayoutHealth` and `backfillPersistedLayoutMachineId` (both from `@/lib/recovery/layout-health`). In `resolveMachineBeforeTransport`, replace the unconditional restore block:
 
 ```typescript
 dispatch(setMachineRestoring(resolution.machine))
@@ -610,59 +681,51 @@ dispatch(setTabRegistryDeviceMeta({
 // Local-first (Choice B): a healthy local layout IS this window's newest
 // truth — keep it and skip the inventory entirely. Only an absent,
 // corrupt, stale, or foreign layout rebuilds from the server.
-const activeSelection = peekActiveMachineSelectionMark()
-const layoutHealth = classifyPersistedLayoutHealth(resolution.machine.id, { activeSelection })
+const layoutHealth = classifyPersistedLayoutHealth(resolution.machine.id)
+// Stamp backfill — classify FIRST, then backfill (AFTER the health gate
+// reads the envelope). Unstamped is a one-boot transitional state: this
+// is the only deterministic restamp for a terminal-free healthy layout.
+// One call site covers both resolution paths — the bootstrap success
+// path AND a chooser selection (a pick persists the selection and
+// reloads; the next boot's resolution lands here). Safe on every
+// classification outcome: absent/corrupt envelopes no-op inside the
+// helper, and a rebuilt envelope is restamped by its own flush.
+backfillPersistedLayoutMachineId(resolution.machine.id)
 if (layoutHealth !== 'healthy') {
   await restoreMachineWorkspace(appStore, resolution.machine.id, { reason: layoutHealth })
   if (cancelled) return false
-  consumeActiveMachineSelectionMark()
 }
 dispatch(setMachineReady({ machine: resolution.machine, mode: 'server-managed' }))
 return true
 ```
 
-and in both chooser handlers, arm the marker before persisting:
-
-```typescript
-const selectMachineFromChooser = useCallback(async (machine: Machine) => {
-  markActiveMachineSelection()
-  persistSelectedMachineId(machine.id)
-  restartAfterMachineSelection()
-}, [restartAfterMachineSelection])
-
-const addMachineFromChooser = useCallback(async (label: string) => {
-  const machine = await createMachine(label)
-  markActiveMachineSelection()
-  persistSelectedMachineId(machine.id)
-  restartAfterMachineSelection()
-}, [restartAfterMachineSelection])
-```
+The chooser handlers (`:550-566`) are NOT modified in this task — they already persist the selection and reload; the post-pick boot backfills through the call site above.
 
 Update the suite's existing "restore happens BEFORE startTabRegistrySync" pin to the new semantics from Red test B (restore-before-sync only on rebuild boots; healthy boots go straight to ready).
 
 - [ ] **Step 4: Run the focused tests**
 
-Run: `npm run test:vitest -- run test/unit/client/components/App.machine-identity.test.tsx test/unit/client/lib/machine-identity.test.ts test/unit/client/lib/machine-workspace.test.ts`
+Run: `npm run test:vitest -- run test/unit/client/components/App.machine-identity.test.tsx test/unit/client/lib/recovery/layout-health.test.ts test/unit/client/lib/machine-workspace.test.ts`
 
 Expected: PASS
 
 - [ ] **Step 5: Refactor while green**
 
-If `resolveMachineBeforeTransport` became hard to read, extract the keep-vs-rebuild decision into one named function (App.tsx-local or `machine-workspace.ts`, e.g. `shouldRebuildLocalWorkspace(health)`); the classification itself stays in `layout-health.ts`. Keep App.tsx additions to wiring only.
+If `resolveMachineBeforeTransport` became hard to read, extract the keep-vs-rebuild decision into one named function (App.tsx-local or `machine-workspace.ts`, e.g. `shouldRebuildLocalWorkspace(health)`); the classification and the backfill stay in `layout-health.ts`. Keep App.tsx additions to wiring only.
 
 - [ ] **Step 6: Run impacted-test verification**
 
-Impacted: every consumer of the boot sequence and the restore contract — App boot suites, machine-workspace, RecoveryOfferPanel suites (`hadPersistedLayoutAtBoot` offer is user-invoked for lost-browser-state and must remain untouched), crossTabSync installation, persist empty-guard.
+Impacted: every consumer of the boot sequence and the restore contract — App boot suites, machine-workspace, layout-health (classifier + backfill), storage-migration (the backfilled envelope's `machineId` must survive `runStorageMigration()` — the LB-05 pin already covers the shape), RecoveryOfferPanel suites (`hadPersistedLayoutAtBoot` offer is user-invoked for lost-browser-state and must remain untouched), crossTabSync installation, persist empty-guard.
 
-Run: `npm run test:vitest -- run test/unit/client/components/App.machine-identity.test.tsx test/unit/client/components/RecoveryOfferPanel.test.tsx test/unit/client/components/RecoveryOfferPanel.persisted-boot.test.tsx test/unit/client/lib/machine-workspace.test.ts test/unit/client/lib/machine-identity.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/store/persistTabsEmptyGuard.test.ts`
+Run: `npm run test:vitest -- run test/unit/client/components/App.machine-identity.test.tsx test/unit/client/components/RecoveryOfferPanel.test.tsx test/unit/client/components/RecoveryOfferPanel.persisted-boot.test.tsx test/unit/client/lib/machine-workspace.test.ts test/unit/client/lib/recovery/layout-health.test.ts test/unit/client/store/storage-migration.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/store/persistTabsEmptyGuard.test.ts`
 
 Expected: PASS
 
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add src/App.tsx src/lib/machine-identity.ts src/lib/machine-workspace.ts test/unit/client/components/App.machine-identity.test.tsx test/unit/client/lib/machine-identity.test.ts test/unit/client/lib/machine-workspace.test.ts
-git commit -m "feat(machine-identity): keep a healthy local workspace on reload; rebuild only when the layout is absent, corrupt, stale, or foreign"
+git add src/App.tsx src/lib/recovery/layout-health.ts src/lib/machine-workspace.ts test/unit/client/components/App.machine-identity.test.tsx test/unit/client/lib/recovery/layout-health.test.ts test/unit/client/lib/machine-workspace.test.ts
+git commit -m "feat(machine-identity): keep a healthy local workspace on reload and backfill the machine-id stamp; rebuild only when the layout is absent, corrupt, stale, or foreign"
 ```
 
 ---
@@ -863,6 +926,17 @@ test.describe('local-first machine workspace', () => {
   let server: RustServer
   let serverInfo: Awaited<ReturnType<RustServer['start']>>
 
+  /** Machine-selection storage payload captured from Scenario 1 (the first
+   * serial test): the remembered-selection localStorage entries
+   * ('freshell.machine-id.v1' + 'freshell.machine-selections.v1',
+   * storage-keys.ts:17-18). Scenario 3 (Task 7 Step 6) opens a FRESH
+   * per-test context against this already-existing machine; a first
+   * navigation there would open the machine chooser (machine-identity.ts:
+   * 216-222: no remembered selection + machines present → chooser) and never
+   * connect, so Scenario 3 seeds this payload into its context BEFORE first
+   * navigation. Serial mode guarantees Scenario 1 ran first. */
+  let machineSelectionStorage: Record<string, string> | undefined
+
   test.beforeAll(async () => {
     ensureRustServerBuilt()   // synchronous (rust-server.ts:92, returns the binary path — LB-07)
     server = new RustServer({/* fresh FRESHELL_HOME + ephemeral port per the fixture's options */})
@@ -937,6 +1011,19 @@ test.describe('local-first machine workspace', () => {
     const harness = new TestHarness(page)
     await harness.waitForHarness()
     await harness.waitForConnection()
+
+    // Capture the resolved machine-selection storage payload at spec scope
+    // (see the machineSelectionStorage declaration): the boot has resolved
+    // and persisted the auto-created machine by now (resolveMachineIdentity
+    // → persistSelectedMachineId, machine-identity.ts:208/:217-218).
+    machineSelectionStorage = await page.evaluate(() => {
+      const out: Record<string, string> = {}
+      for (const key of ['freshell.machine-id.v1', 'freshell.machine-selections.v1']) {
+        const value = localStorage.getItem(key)
+        if (value !== null) out[key] = value
+      }
+      return out
+    })
 
     // Fresh home auto-created a machine AND an auto shell tab — remove it.
     await harness.waitForTabCount(1)
@@ -1285,10 +1372,12 @@ git commit -m "feat(client): fold terminal inventory titles into pane titles on 
 - Create: `test/unit/client/store/sessionTitleMirror.test.ts`
 - Create: `test/unit/client/store/sessionTitleMirror.registration.test.ts` (production-store registration pin)
 - Modify: `src/store/panesSlice.ts` (`updatePaneTitleBySessionRef` :2242-2262 — extended to update ALL matching panes in every tab, not only the first per tab; line-neutral in the over-cap file: it swaps the single-match `findPaneIdBySessionRef` call for a walk over the existing `collectLeaves` helper, :495+, with the same per-pane user-set guard — no net growth)
+- Modify: `src/store/sessionsSlice.ts` (`commitWindowPayload` :227-244 — stamp every inserted-or-updated committed row with the per-row `fetchSeq` counter, the row-freshness field the mirror keys on; retained rows keep their old stamps)
+- Modify: `src/store/types.ts` (`CodingCliSession`, ending at :124, gains the optional client-side field `fetchSeq?: number` — never sent to the server, never persisted)
 - Modify: `src/store/store.ts` (the root `configureStore` at :51 and its middleware concat chain at :85-102 — LB-16: NOT `src/store/index.ts`; add the middleware to the existing chain)
 
 **Interfaces:**
-- Consumes: `updatePaneTitleBySessionRef` (panesSlice.ts:2242, existing, `setByUser:false`-guarded; matches fresh-agent panes by `provider`+`sessionId` and terminal panes by `content.sessionRef` — Task 6 ALSO extends this action to update ALL matching panes in every tab; today it updates only the FIRST matching pane per tab via `findPaneIdBySessionRef`, :448-461), sessions slice state (`state.sessions.windows[surface].projects[]` rows carrying `sessionId`/`provider`/`title?`/`lastActivityAt`, sessionsSlice.ts:66-96; each window also carries the per-window refresh stamps `lastLoadedAt`/`resultVersion` on `SessionWindowState` — sessionsSlice.ts:9-31, stamped on every commit at :232-233 — which the row-selection rule below keys on; surfaces are `'sidebar' | 'history' | 'bootstrap'` per sessionsThunks.ts:27), and the pane-binding action types `panes/initLayout`, `panes/updatePaneContent`, `panes/mergePaneContent`, `panes/materializeFreshAgentSession`, `panes/reconcileTerminalSessionRefByTerminalId`, `panes/splitPane`, `panes/addPane`, `panes/restoreLayout`, `panes/hydratePanes` (all verified against panesSlice.ts — slice name `'panes'` at :1223; reducers at :1226/:1741/:1841/:1809/:2265 and splitPane :1308, addPane :1370, restoreLayout :1248, hydratePanes :2082; real binding paths: REST/MCP agent split via ui-commands.ts:119-127, sidebar split-open via Sidebar.tsx:551-562, tab-registry reconstruction via tab-registry-open.ts:278-280, machine-bootstrap/recovery-offer rebuild via machine-workspace.ts:67 + RecoveryOfferPanel.tsx:165, cross-window hydration via crossTabSync.ts:206-219).
+- Consumes: `updatePaneTitleBySessionRef` (panesSlice.ts:2242, existing, `setByUser:false`-guarded; matches fresh-agent panes by `provider`+`sessionId` and terminal panes by `content.sessionRef` — Task 6 ALSO extends this action to update ALL matching panes in every tab; today it updates only the FIRST matching pane per tab via `findPaneIdBySessionRef`, :448-461), sessions slice state (`state.sessions.windows[surface].projects[]` rows carrying `sessionId`/`provider`/`title?`/`lastActivityAt`, sessionsSlice.ts:66-96; every committed row also carries the per-row client-side fetch stamp `fetchSeq` — a monotonic store-level counter (module-local in sessionsSlice.ts) stamped at the shared window-commit reducer `commitWindowPayload` (sessionsSlice.ts:227-244): each committed row that does not already carry a numeric `fetchSeq` gets the next counter value, so rows freshly fetched in a commit are strictly newer than rows RETAINED from an earlier fetch (the deep-page silent-refresh merge, sessionsThunks.ts:602-609, passes the previous window's row objects through unchanged — sessionsThunks.ts:184-204 — and the stamp field rides on the row object through both carry paths: normalizeProjects' reference pass-through at sessionsSlice.ts:43-64 or its `...session` spread at :80-83; no existing per-row field reflects fetch recency — `SessionDirectoryItem` carries only activity times `lastActivityAt`/`createdAt`, shared/read-models.ts:51-86, and `revision`/`snapshotSeq` are page-level, not per-row — hence the client-side counter) — which the row-selection rule below keys on; surfaces are `'sidebar' | 'history' | 'bootstrap'` per sessionsThunks.ts:27), and the pane-binding action types `panes/initLayout`, `panes/updatePaneContent`, `panes/mergePaneContent`, `panes/materializeFreshAgentSession`, `panes/reconcileTerminalSessionRefByTerminalId`, `panes/splitPane`, `panes/addPane`, `panes/restoreLayout`, `panes/hydratePanes` (all verified against panesSlice.ts — slice name `'panes'` at :1223; reducers at :1226/:1741/:1841/:1809/:2265 and splitPane :1308, addPane :1370, restoreLayout :1248, hydratePanes :2082; real binding paths: REST/MCP agent split via ui-commands.ts:119-127, sidebar split-open via Sidebar.tsx:551-562, tab-registry reconstruction via tab-registry-open.ts:278-280, machine-bootstrap/recovery-offer rebuild via machine-workspace.ts:67 + RecoveryOfferPanel.tsx:165, cross-window hydration via crossTabSync.ts:206-219).
 - Produces: `export const sessionTitleMirrorMiddleware: Middleware` (registered once in the store setup).
 
 - [ ] **Step 1: Write the failing behavioral test**
@@ -1297,7 +1386,7 @@ Create `test/unit/client/store/sessionTitleMirror.test.ts` (real reducers: tabs,
 
 ```typescript
 import { configureStore } from '@reduxjs/toolkit'
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, it } from 'vitest'
 import { sessionTitleMirrorMiddleware } from '@/store/sessionTitleMirror'
 // exact slice exports per repo: tabsReducer, panesSlice.reducer, sessionsReducer
 
@@ -1363,27 +1452,46 @@ describe('sessionTitleMirrorMiddleware', () => {
     expect(store.getState().panes).toBe(before.panes)
   })
 
-  it('a retained title in an earlier-refreshed window does not beat a newer title from a later-refreshed window (equal row lastActivityAt)', () => {
-    // The stale/fresh case that activity-time selection gets WRONG: the
-    // sidebar window committed the row first (retained title), the session
-    // was renamed server-side (a title override does NOT advance the row's
-    // lastActivityAt), and the History window refreshed LATER and holds the
-    // NEWER title with the SAME lastActivityAt. Window freshness must pick
-    // History's row. Fake Date.now so the second commit's window
-    // lastLoadedAt is strictly greater — two real commits can land in the
-    // same millisecond and fall through to the resultVersion/surface
-    // tie-breaks, making the test weather-dependent.
-    vi.useFakeTimers({ now: 1_000_000 })
-    try {
-      const store = buildStore()
-      seedFreshAgentPane(store, 'sess-1')
-      landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-1', provider: 'opencode', title: 'Retained sidebar title', lastActivityAt: 2_000 })
-      vi.setSystemTime(1_060_000)   // the History window refreshes a minute later
-      landSessionRow(store, { surface: 'history', sessionId: 'sess-1', provider: 'opencode', title: 'Fresh history title', lastActivityAt: 2_000 })
-      expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('Fresh history title')
-    } finally {
-      vi.useRealTimers()
-    }
+  it('a row RETAINED from an older fetch does not beat a fresher row another window fetched later (the deep-page retention case)', () => {
+    // The reviewer's window-freshness failure: the sidebar fetched the row
+    // FIRST (old title), History fetched it fresher LATER (new title, same
+    // lastActivityAt — a title override does not advance activity time),
+    // and THEN the sidebar ran a deep-page silent refresh whose fresh page-1
+    // did NOT include the session — the merged window RETAINED the old row
+    // (sessionsThunks.ts:602-609) while commitWindowPayload stamped the
+    // whole merged window with fresh lastLoadedAt/resultVersion
+    // (sessionsSlice.ts:231-233). Under per-WINDOW arbitration that
+    // retained old-title row would now win and regress the pane title;
+    // under per-ROW fetchSeq the retained row keeps its OLD stamp and
+    // History's fresher row keeps winning.
+    const store = buildStore()
+    seedFreshAgentPane(store, 'sess-1')
+    landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-1', provider: 'opencode', title: 'Retained sidebar title', lastActivityAt: 2_000 })
+    landSessionRow(store, { surface: 'history', sessionId: 'sess-1', provider: 'opencode', title: 'Fresh history title', lastActivityAt: 2_000 })
+    expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('Fresh history title')
+    // The later sidebar refresh: its payload is the merged window the real
+    // thunk builds — the retained row carries its existing fetchSeq because
+    // mergeProjects passes the previous window's row OBJECTS through
+    // (sessionsThunks.ts:184-204). Simulate the merged payload faithfully
+    // by committing the previous window's projects as-is.
+    const retainedProjects = store.getState().sessions.windows['sidebar'].projects
+    store.dispatch({
+      type: 'sessions/commitSessionWindowVisibleRefresh',
+      payload: { surface: 'sidebar', projects: retainedProjects },
+    })
+    // The window-level stamps are now the freshest of all three commits;
+    // the retained row must STILL lose to History's row.
+    expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('Fresh history title')
+  })
+
+  it('equal-activity rows fetched fresh by both windows: the later-fetched row wins (History holds the newer title)', () => {
+    // No fake timers needed: fetchSeq is a monotonic counter keyed to commit
+    // order, not wall-clock, so dispatch order IS freshness order.
+    const store = buildStore()
+    seedFreshAgentPane(store, 'sess-1')
+    landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-1', provider: 'opencode', title: 'Older sidebar title', lastActivityAt: 2_000 })
+    landSessionRow(store, { surface: 'history', sessionId: 'sess-1', provider: 'opencode', title: 'Newer history title', lastActivityAt: 2_000 })
+    expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('Newer history title')
   })
 
   it('titles a pane created AFTER its directory row is already loaded (the missed-ordering symptom)', () => {
@@ -1462,20 +1570,29 @@ type TitledSessionRow = {
   sessionId: string
   title: string
   surface: string
-  windowLastLoadedAt: number
-  windowResultVersion: number
+  fetchSeq: number
 }
 
 /** Collect every session row that currently has a title, DEDUPED by
  * `${provider}:${sessionId}`: the same session can sit in several retained
- * windows (e.g. sidebar AND history), and windows refresh INDEPENDENTLY —
- * a window that refreshed more recently holds the session's more recent
- * title even when the row's own `lastActivityAt` did not advance (a title
- * override does not touch activity time). So the winner is picked by
- * per-WINDOW freshness, NOT by row activity: greatest `lastLoadedAt`
- * (SessionWindowState.lastLoadedAt, sessionsSlice.ts:11, stamped on every
- * commit at :232), tie-broken by greatest `resultVersion` (:12, stamped at
- * :233), then a deterministic surface order. Row shape and nesting
+ * windows (e.g. sidebar AND history), and a later refresh of a window does
+ * NOT mean its rows are fresh — the deep-page silent refresh RETAINS older
+ * rows (sessionsThunks.ts:602-609 merges the fresh page-1 over the stored
+ * window; deeper rows survive as the SAME objects, sessionsThunks.ts:184-204)
+ * while `commitWindowPayload` stamps the whole merged window with fresh
+ * lastLoadedAt/resultVersion (sessionsSlice.ts:231-233). So the winner is
+ * picked by per-ROW freshness, NOT by window stamps and NOT by row activity
+ * (a title override does not touch `lastActivityAt`): the greatest
+ * per-row `fetchSeq` — a monotonic client-side counter stamped at the
+ * commit reducer on every inserted-or-updated row (rows the merge retained
+ * keep their old stamps: the field lives on the row object and both carry
+ * paths preserve it — the merge passes the same objects, and
+ * normalizeProjects either passes references through (sessionsSlice.ts:43-64)
+ * or spreads `...session` (:80-83)). No existing per-row field reflects
+ * fetch recency (`SessionDirectoryItem` carries only activity times,
+ * shared/read-models.ts:51-86; `revision`/`snapshotSeq` are page-level) —
+ * hence the client-side counter. Tie (e.g. both rows unstamped → 0) →
+ * deterministic surface order. Row shape and nesting
  * (windows[surface].projects[] → sessions[]) per sessionsSlice.ts:66-96;
  * surfaces are 'sidebar' | 'history' | 'bootstrap' (sessionsThunks.ts:27).
  * Adjust field names to the real normalized state, not to this sketch. */
@@ -1483,10 +1600,8 @@ const SURFACE_ORDER = ['sidebar', 'history', 'bootstrap']
 
 function collectTitledSessionRows(sessions: RootState['sessions']): TitledSessionRow[] {
   const byKey = new Map<string, TitledSessionRow>()
-  const windows = (sessions as unknown as { windows?: Record<string, { projects?: Array<Record<string, unknown>>; lastLoadedAt?: unknown; resultVersion?: unknown }> })?.windows ?? {}
+  const windows = (sessions as unknown as { windows?: Record<string, { projects?: Array<Record<string, unknown>> }> })?.windows ?? {}
   for (const [surface, window] of Object.entries(windows)) {
-    const windowLastLoadedAt = typeof window?.lastLoadedAt === 'number' ? window.lastLoadedAt : 0
-    const windowResultVersion = typeof window?.resultVersion === 'number' ? window.resultVersion : 0
     for (const project of window?.projects ?? []) {
       const sessionsList = (project?.sessions ?? []) as Array<Record<string, unknown>>
       for (const session of sessionsList) {
@@ -1494,21 +1609,16 @@ function collectTitledSessionRows(sessions: RootState['sessions']): TitledSessio
         const sessionId = session?.sessionId
         const title = session?.title
         if (typeof provider === 'string' && typeof sessionId === 'string' && typeof title === 'string' && title) {
-          const candidate: TitledSessionRow = {
-            provider, sessionId, title, surface,
-            windowLastLoadedAt, windowResultVersion,
-          }
+          const fetchSeq = typeof session?.fetchSeq === 'number' ? session.fetchSeq : 0
+          const candidate: TitledSessionRow = { provider, sessionId, title, surface, fetchSeq }
           const key = `${provider}:${sessionId}`
           const existing = byKey.get(key)
-          const fresherWindow =
+          const fresherRow =
             !existing ||
-            candidate.windowLastLoadedAt > existing.windowLastLoadedAt ||
-            (candidate.windowLastLoadedAt === existing.windowLastLoadedAt &&
-              candidate.windowResultVersion > existing.windowResultVersion) ||
-            (candidate.windowLastLoadedAt === existing.windowLastLoadedAt &&
-              candidate.windowResultVersion === existing.windowResultVersion &&
+            candidate.fetchSeq > existing.fetchSeq ||
+            (candidate.fetchSeq === existing.fetchSeq &&
               SURFACE_ORDER.indexOf(candidate.surface) < SURFACE_ORDER.indexOf(existing.surface))
-          if (fresherWindow) {
+          if (fresherRow) {
             byKey.set(key, candidate)
           }
         }
@@ -1608,6 +1718,26 @@ export const sessionTitleMirrorMiddleware: Middleware = (store) => (next) => (ac
 
 Register the middleware in `src/store/store.ts`'s existing middleware concat chain (:85-102); ordering is free — it only reads sessions state and writes panes actions, so it has no ordering constraints with persistMiddleware.
 
+Also add the per-row fetch stamp the mirror keys on — `src/store/sessionsSlice.ts`, in the shared window-commit reducer `commitWindowPayload` (:227-244; both `commitSessionWindowReplacement` :383-402 and `commitSessionWindowVisibleRefresh` :403-426 funnel through it, so every fetch-fresh land is stamped):
+
+```typescript
+// module scope in sessionsSlice.ts:
+let sessionRowFetchSeq = 0
+
+// in commitWindowPayload, immediately after
+// `window.projects = normalizeProjects(payload.projects)` (:231):
+window.projects = window.projects.map((project) => ({
+  ...project,
+  sessions: (project.sessions ?? []).map((row) =>
+    typeof (row as { fetchSeq?: unknown }).fetchSeq === 'number'
+      ? row                                        // RETAINED row — keeps its old stamp
+      : { ...row, fetchSeq: ++sessionRowFetchSeq }, // inserted-or-updated row (freshly fetched)
+  ),
+}))
+```
+
+Why "already carries a numeric fetchSeq ⇒ keep" is the right inserted-or-updated test: fresh server rows never carry the field (it is client-side only, `CodingCliSession.fetchSeq?` in src/store/types.ts — `SessionDirectoryItem` has no such field, shared/read-models.ts:51-86), while rows the deep-page merge retained arrive as the SAME objects with their stamps (sessionsThunks.ts:184-204), and even the defensive normalize path preserves the field via its `...session` spread (sessionsSlice.ts:80-83). Add the optional `fetchSeq?: number` to `CodingCliSession` (src/store/types.ts) — client-side only, never sent to the server, never persisted.
+
 Also extend the ACTION `updatePaneTitleBySessionRef` in `src/store/panesSlice.ts` (:2242-2262): replace the per-tab `findPaneIdBySessionRef` single-match call (:448-461) with a walk over the existing `collectLeaves` helper (:495+) that updates EVERY matching pane — fresh-agent `provider`+`sessionId`, terminal `content.sessionRef` — in every tab, keeping the same per-pane `setByUser === false` user-set guard. Keep `updatePaneTitleByTerminalId` unchanged (out of scope). Line-neutral in the over-cap file (one helper call swapped for another walk; no net growth). Beyond the mirror's two-panes-one-tab case, this also fixes the same-session cascade for session renames: `applySessionRenameCascade` (titleSync.ts:42) dispatches this action, and today a second pane bound to the same session in any tab keeps the stale title. No existing test pins the first-match-only behavior (paneSessionTitleSync.test.ts:26-45 seeds one pane per session), so the extension is additive-green there.
 
 - [ ] **Step 4: Run the focused tests**
@@ -1622,16 +1752,16 @@ If the sessions slice exposes an existing selector over titled rows, use it inst
 
 - [ ] **Step 6: Run impacted-test verification**
 
-Impacted: sessions suites (the middleware only reads sessions and writes panes), paneSessionTitleSync family (also the action extension's consumers), sidebar click-driven folds (Sidebar.tsx:492 — unchanged; the mirror must not fight it since both write the same title).
+Impacted: sessions suites (the middleware reads sessions and writes panes; the `fetchSeq` stamping touches `commitWindowPayload` — sessionsSlice/sessionsThunks suites pin commit behavior, including the deep-page merge retention), paneSessionTitleSync family (also the action extension's consumers), sidebar click-driven folds (Sidebar.tsx:492 — unchanged; the mirror must not fight it since both write the same title).
 
 Run: `npm run test:vitest -- run test/unit/client/store/sessionTitleMirror.test.ts test/unit/client/store/sessionsSlice.test.ts test/unit/client/store/sessionsThunks.test.ts test/unit/client/store/paneSessionTitleSync.test.ts test/unit/client/store/panesSlice.test.ts`
 
-Expected: PASS
+Expected: PASS (if an existing sessionsSlice/sessionsThunks pin asserts exact row object equality, extend it minimally with the new optional field rather than loosening it)
 
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add src/store/sessionTitleMirror.ts src/store/panesSlice.ts src/store/store.ts test/unit/client/store/sessionTitleMirror.test.ts test/unit/client/store/sessionTitleMirror.registration.test.ts
+git add src/store/sessionTitleMirror.ts src/store/panesSlice.ts src/store/sessionsSlice.ts src/store/types.ts src/store/store.ts test/unit/client/store/sessionTitleMirror.test.ts test/unit/client/store/sessionTitleMirror.registration.test.ts
 git commit -m "feat(client): mirror session-directory titles into open agent panes by sessionRef"
 ```
 
@@ -1832,37 +1962,100 @@ With the merge extracted, confirm the module boundary is clean: `hydrate-pane-me
 
 - [ ] **Step 6: Extend `local-first-reload-rust.spec.ts` with the cross-window recency scenario (e2e pin)**
 
-Add a third serial test to the spec Task 4 created — extending the existing file is cleaner than a new spec, and its registration in BOTH config lists is already in place. Two pages in ONE browser context drive the real cross-tab hydrate channel (storage events + BroadcastChannel, crossTabSync.ts:301-370); the two-pages-one-context idiom is `const page2 = await page.context().newPage()` (multi-client.spec.ts:198-199 — read it and layout-sync-authoritative.spec.ts first, as this plan's verification did):
+Add a third serial test to the spec Task 4 created — extending the existing file is cleaner than a new spec, and its registration in BOTH config lists is already in place. Two pages in ONE browser context drive the real cross-tab hydrate channel (storage events + BroadcastChannel, crossTabSync.ts:301-370); the two-pages-one-context idiom is `const page2 = await page.context().newPage()` (multi-client.spec.ts:198-199 — read it and layout-sync-authoritative.spec.ts first, as this plan's verification did).
+
+CRITICAL context hurdle: this test runs serially AFTER Scenarios 1-2, so the owned server already has a machine — and the `page` fixture is a FRESH per-test context with no remembered selection. Its first navigation would open the machine chooser (machine-identity.ts:216-222: `getSelectedMachineId` finds nothing and `machines.length > 0` → `{ kind: 'chooser' }`) and `waitForConnection` would time out — the scenario was unreachable as first sketched. The fix mirrors the donor idiom (multi-client.spec.ts:195-209, the 'two browser tabs share the same server' test): ONE shared context — `page1 = await context.newPage()` (:198) boots FIRST (:201) and its boot persists the machine selection into the shared localStorage, then `page2 = await context.newPage()` (:199) navigates (:202) and resolves the SAVED machine without the chooser (:205-206). The donor's second page inherits the selection from the first page's boot inside one context; a fresh context has no such boot, so seed it: `addInitScript` writes the machine-selection payload Task 4's Scenario 1 captured at spec scope (`machineSelectionStorage`) into localStorage BEFORE the first navigation. This is a SEEDING init script, not the clearing kind LB-08 forbids — it writes the same value the boot itself would persist, on every load, idempotently; it does not touch sessionStorage or the clientInstanceId.
 
 ```typescript
 test('an older persisted layout from a second page does not clobber a newer local pane title', async ({ page }) => {
-  // page = page1. Fresh context: seed the workspace (Task 4's dispatch idiom:
-  // tab-mango + editor pane), wait for the persisted envelope flush.
-  // page2 opens in the SAME context (shared localStorage) and rehydrates it.
+  // Establish the remembered machine in this FRESH context BEFORE first
+  // navigation (see the donor-idiom note above): seed the payload Scenario 1
+  // captured, then boot page1 — it resolves the seeded machine (kind
+  // 'selected', machine-identity.ts:191-214) with NO chooser.
+  test.skip(!machineSelectionStorage, 'Scenario 1 must have captured the machine-selection payload')
+  await page.addInitScript((payload) => {
+    for (const [key, value] of Object.entries(payload)) localStorage.setItem(key, value)
+  }, machineSelectionStorage)
+
+  await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+  const harness = new TestHarness(page)
+  await harness.waitForHarness()
+  await harness.waitForConnection()
+
+  // Remove the auto-created shell tab first (Task 4's idiom: read the tab id
+  // from the harness state, dispatch tabs/removeTab with the BARE id).
+  await harness.waitForTabCount(1)
+  await page.evaluate(() => {
+    const state = window.__FRESHELL_TEST_HARNESS__?.getState()
+    const autoId = state?.tabs?.tabs?.[0]?.id
+    if (autoId) window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'tabs/removeTab', payload: autoId })
+  })
+
+  // Seed the workspace (Task 4's dispatch idiom: one tab + editor pane).
+  await page.evaluate(() => {
+    window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'tabs/addTab', payload: { id: 'tab-mango', title: 'Mango' } })
+    window.__FRESHELL_TEST_HARNESS__?.dispatch({
+      type: 'panes/initLayout',
+      payload: {
+        tabId: 'tab-mango', paneId: 'tab-mango-pane',
+        content: { kind: 'editor', filePath: '/tmp/mango.md', language: null, readOnly: false, content: '', viewMode: 'source', wordWrap: true },
+      },
+    })
+  })
+  await waitForPersistedEnvelope(page, (env) =>
+    typeof env.machineId === 'string' && env.machineId.length > 0 && env.tabs?.tabs?.length === 1)
+
+  // page2 opens in the SAME context (shared localStorage — the donor's
+  // `page.context().newPage()` idiom, multi-client.spec.ts:199) and
+  // rehydrates the envelope; it resolves the same saved machine (the
+  // donor's second-page mechanism, :202/:205-206) — no init script needed.
   const page2 = await page.context().newPage()
   await page2.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
   const harness2 = new TestHarness(page2)
   await harness2.waitForHarness(); await harness2.waitForConnection()
 
-  // page2 sets a NEWER non-user-set pane title; its flush stamps a new
-  // persistedAt which page2's crossTabSync tracks as its local stamp.
+  // page2 sets a NEWER non-user-set pane title and forces an immediate
+  // flush (the donor's flushPersistedLayout idiom, multi-client.spec.ts:
+  // 177-185: dispatch 'persist/flushNow'), then poll the shared envelope
+  // until it carries the new title — capturing its persistedAt as tLocal
+  // (page2's local stamp).
   await page2.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.dispatch({
     type: 'panes/updatePaneTitle',
     payload: { tabId: 'tab-mango', paneId: 'tab-mango-pane', title: 'Newer local title', setByUser: false },
   }))
-  // (poll until the raw envelope carries 'Newer local title' — its stamp is T_local)
+  await page2.evaluate(() => window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' }))
+  const tLocal = await waitForPersistedEnvelopeTitled(page, 'Newer local title')
 
-  // Stage the STALE remote: from page1, overwrite the shared localStorage
-  // envelope with the same JSON but the pane title reverted and persistedAt
-  // 60s OLDER than page2's local stamp. page1's write fires a storage event
-  // on page2 only — the real crossTabSync path hydrates page2 with
+  // Let page1's response settle BEFORE staging: page2's flush fires a
+  // storage event on page1, whose crossTabSync hydrates and schedules its
+  // own debounced reflush — wait that cycle out so the staged write below
+  // is the LAST envelope write.
+  await page.waitForTimeout(2_000)
+
+  // Stage the STALE remote: from page1, mutate the shared localStorage
+  // envelope in place — same JSON, the pane title reverted, persistedAt
+  // 60s OLDER than page2's local stamp. page1's write fires a storage
+  // event on page2 only — the real crossTabSync path hydrates page2 with
   // remoteLayoutPersistedAt < localLayoutPersistedAt.
-  await page.evaluate(() => {
+  // Envelope shape verified against the real writer/reader:
+  //  - paneTitles live at panes.paneTitles (persistMiddleware.ts:630-639
+  //    writes `panes: persistablePanesSection` — the state.panes spread
+  //    minus volatile fields; parsed at persistedState.ts:552). The old
+  //    sketch's top-level `env.paneTitles` dereferenced undefined and
+  //    threw — fixed.
+  //  - persistedAt is TOP-LEVEL (persistMiddleware.ts:631, read at
+  //    persistedState.ts:556).
+  //  - the storage key literal 'freshell.layout.v3' matches
+  //    LAYOUT_STORAGE_KEY (storage-keys.ts:2/:25).
+  //  - Task 1's machineId is TOP-LEVEL; the staging touches ONLY the
+  //    title and persistedAt, so the stamp (and everything else) is
+  //    preserved.
+  await page.evaluate((tLocal) => {
     const env = JSON.parse(localStorage.getItem('freshell.layout.v3') ?? '{}')
-    env.paneTitles['tab-mango']['tab-mango-pane'] = 'Stale from page1'
-    env.persistedAt = <T_local> - 60_000
+    env.panes.paneTitles['tab-mango']['tab-mango-pane'] = 'Stale from page1'
+    env.persistedAt = tLocal - 60_000
     localStorage.setItem('freshell.layout.v3', JSON.stringify(env))
-  })
+  }, tLocal)
 
   // Bounded settle for the storage-event hydration, then ONE hard read (not a
   // poll — a poll could sample before the hydrate lands and false-pass).
@@ -1871,9 +2064,36 @@ test('an older persisted layout from a second page does not clobber a newer loca
     window.__FRESHELL_TEST_HARNESS__?.getState()?.panes?.paneTitles?.['tab-mango']?.['tab-mango-pane'])
   expect(title).toBe('Newer local title')
 })
+
+/** Bounded poll until the shared envelope's pane title equals the given
+ * value; resolves the envelope's persistedAt (the writer's stamp — tLocal
+ * for the page2 flush this scenario tracks). Node-side predicate over one
+ * plain JSON.parse read per round (same shape as waitForPersistedEnvelope). */
+async function waitForPersistedEnvelopeTitled(
+  page: import('playwright').Page,
+  expectedTitle: string,
+  timeoutMs = 10_000,
+): Promise<number> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const persistedAt = await page.evaluate((title) => {
+      try {
+        const env = JSON.parse(localStorage.getItem('freshell.layout.v3') ?? 'null')
+        if (env?.panes?.paneTitles?.['tab-mango']?.['tab-mango-pane'] === title
+          && typeof env.persistedAt === 'number') {
+          return env.persistedAt
+        }
+        return null
+      } catch { return null }
+    }, expectedTitle)
+    if (typeof persistedAt === 'number') return persistedAt
+    await new Promise((r) => setTimeout(r, 250))
+  }
+  throw new Error(`persisted envelope did not carry the pane title '${expectedTitle}' within ${timeoutMs}ms`)
+}
 ```
 
-At base this FAILS: the incoming layout wins the merge for its tab id and the incoming title clobbers page2's newer local title ('Stale from page1'). With Task 7 it PASSES (remote not strictly newer → local base; per-pane reconcile keeps the non-user-set local title). The full production path is exercised — real storage-event hydration with real `localLayoutPersistedAt`/`remoteLayoutPersistedAt` meta. (For a recorded red, reuse Task 4 Step 2's throwaway-receipt mechanism at base; otherwise the Step 2 unit reds are the red evidence. The direct stale-envelope write is the deterministic staging of an interleaved older flush — a real flush from page1 would stamp Date.now() and be newer, not older.)
+The failure mode this scenario pins: with the seeded context both pages connect; when the recency guard is missing, the incoming layout wins the merge for its tab id and the incoming title clobbers page2's newer local title (the read returns 'Stale from page1'). With Task 7 it PASSES (remote not strictly newer → local base; per-pane reconcile keeps the non-user-set local title). The full production path is exercised — real storage-event hydration with real `localLayoutPersistedAt`/`remoteLayoutPersistedAt` meta. (A standalone at-base red is unreachable: the spec is serial and Scenario 1's Task-4 red gates the run — so the Step 2 unit reds are this task's recorded red evidence, and the Task 4 Step 2 throwaway receipt documents the spec-level red. The direct stale-envelope write is the deterministic staging of an interleaved older flush — a real flush from page1 would stamp Date.now() and be newer, not older.)
 
 Then run it: `bash scripts/e2e-cloud.sh run --local --project=rust-chromium test/e2e-browser/specs/local-first-reload-rust.spec.ts` — Expected: PASS (all three scenarios; the first two unchanged from Task 4).
 
