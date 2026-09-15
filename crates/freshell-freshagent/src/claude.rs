@@ -10416,28 +10416,45 @@ rl.on('line', (line) => {
         }
     }
 
-    /// Insert a fake session whose sidecar stdin belongs to an already-exited child:
-    /// writes fail DETERMINISTICALLY (EPIPE) without racing the stdout consumer's
-    /// eviction path (a real dead sidecar's consumer would evict the record out from
-    /// under the assertion; this record carries a no-op consumer, so nothing evicts it).
+    /// A sidecar stdin on which EVERY write fails (EPIPE), no matter what other processes
+    /// hold: one end of a Unix socket pair, shut down for writing.
+    ///
+    /// Not the stdin pipe of an exited child: a pipe write fails only while NO process
+    /// holds the read end, and this test binary spawns children from many tests at once.
+    /// A sibling test's spawn that forks between this pipe's creation and its own `exec`
+    /// inherits the read end (O_CLOEXEC closes it only at `exec`), so the "dead" pipe can
+    /// still have a reader and silently accept the write. Shutdown is state of the socket
+    /// itself, so no inherited copy of either end can make a write succeed.
+    fn write_closed_sidecar_stdin() -> ChildStdin {
+        let (stdin_end, _peer) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        stdin_end
+            .shutdown(std::net::Shutdown::Write)
+            .expect("shut down the write side");
+        let fd = std::os::fd::OwnedFd::from(stdin_end);
+        ChildStdin::from_std(std::process::ChildStdin::from(fd)).expect("register stdin")
+    }
+
+    /// Insert a fake session for an already-exited sidecar whose stdin write fails
+    /// DETERMINISTICALLY ([`write_closed_sidecar_stdin`]) without racing the stdout
+    /// consumer's eviction path (a real dead sidecar's consumer would evict the record out
+    /// from under the assertion; this record carries a no-op consumer, so nothing evicts it).
     async fn insert_dead_stdin_session(
         st: &FreshClaudeState,
         session_id: &str,
         pending: ClaudePending,
     ) {
         let mut child = tokio::process::Command::new("true")
-            .stdin(Stdio::piped())
+            .stdin(Stdio::null())
             .kill_on_drop(true)
             .spawn()
             .expect("spawn true");
-        let stdin = child.stdin.take().expect("piped stdin");
         child.wait().await.expect("true exits");
         let consumer = tokio::spawn(async {});
         st.sessions.lock().await.insert(
             session_id.to_string(),
             ClaudeSession {
                 configuration: ClaudeConfiguration::default(),
-                stdin,
+                stdin: write_closed_sidecar_stdin(),
                 child,
                 ownership_id: format!("test-{session_id}"),
                 consumer,
