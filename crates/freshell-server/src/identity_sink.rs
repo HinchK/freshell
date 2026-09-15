@@ -119,6 +119,12 @@ impl PaneIdentitySink for LedgerIdentitySink {
                     effort: upsert.settings.effort.as_deref(),
                     supersedes: upsert.supersedes.as_deref(),
                     provenance,
+                    // b8ke ext r22 F2: the upsert's observed (epoch,
+                    // generation) pair threads into the ledger write —
+                    // the delayed-write fence (the write path refuses
+                    // typed on a stale pair).
+                    observed_epoch: upsert.observed_epoch,
+                    observed_generation: upsert.observed_generation,
                     now_ms: now,
                 };
                 ledger.record_fresh_agent_binding(&w)?; // binding-write failure propagates
@@ -512,6 +518,8 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings {
                 model: Some("gpt-5.3-codex-spark".into()),
                 sandbox: Some("workspace-write".into()),
@@ -607,6 +615,8 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -651,6 +661,8 @@ mod tests {
             resolves_pending: None,
             supersedes: Some("old-uuid".into()),
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             settings: settings.clone(),
         })
         .await
@@ -820,6 +832,8 @@ mod tests {
                     asserted_at: 7_777,
                 },
             ),
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -862,6 +876,8 @@ mod tests {
                     asserted_at: asserted,
                 },
             ),
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -917,6 +933,8 @@ mod tests {
                     asserted_at: 7_777,
                 },
             ),
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -938,6 +956,8 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -956,6 +976,8 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -1015,6 +1037,8 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance,
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -1071,6 +1095,8 @@ mod tests {
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             // Blank settings on purpose: lineage must resolve even for
             // lineage-only rows (settings-bearing-ness is unrelated).
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -1110,6 +1136,8 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -1195,6 +1223,8 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -1316,6 +1346,8 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -1361,6 +1393,8 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -1423,6 +1457,8 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -1516,6 +1552,8 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -1607,6 +1645,8 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -1727,6 +1767,8 @@ mod tests {
             resolves_pending: Some("freshopencode-cr-9".into()),
             supersedes: None,
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings::default(),
         })
         .await

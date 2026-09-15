@@ -162,6 +162,12 @@ pub struct FreshAgentBindingUpsert {
     /// atomic apply/preserve/clear merge lives in `freshell-ws`'s pane
     /// ledger).
     pub provenance: ProvenanceUpdate,
+    /// b8ke ext r22 F2: the operation's observed (epoch, generation) pair —
+    /// the DELAYED-WRITE FENCE. The durable-row write path refuses typed on
+    /// a stale pair, so a delayed pre-teardown write can never overwrite a
+    /// newer owner's recovery row. `None` = legacy-unfenced (accepted).
+    pub observed_epoch: Option<u64>,
+    pub observed_generation: Option<u64>,
     pub settings: FreshAgentSettings,
 }
 
@@ -879,6 +885,8 @@ impl FakeIdentitySink {
             resolves_pending: None,
             supersedes: None,
             provenance: ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             settings: s,
         });
     }
@@ -1832,6 +1840,8 @@ mod tests {
             resolves_pending: Some("freshopencode-r1".into()),
             supersedes: None,
             provenance: ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings {
                 model: Some("m".into()),
                 sandbox: None,
@@ -1870,6 +1880,8 @@ mod tests {
             resolves_pending: Some("freshopencode-cr-blank".into()),
             supersedes: None,
             provenance: ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -1912,6 +1924,8 @@ mod tests {
             resolves_pending: Some("freshopencode-cr-1".into()),
             supersedes: None,
             provenance: ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2051,6 +2065,8 @@ mod tests {
                 tab_key: Some("device-1:tab-1".into()),
                 asserted_at: 111,
             }),
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2076,6 +2092,8 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2091,6 +2109,8 @@ mod tests {
                 client_instance_id: Some("client-2".into()),
                 ..Default::default()
             }),
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2126,6 +2146,8 @@ mod tests {
                 tab_key: Some("device-3:tab-3".into()),
                 asserted_at: 50,
             }),
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2146,6 +2168,8 @@ mod tests {
                 tab_key: Some("device-4:tab-4".into()),
                 asserted_at: 222,
             }),
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2163,6 +2187,8 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2191,6 +2217,8 @@ mod tests {
                 tab_key: Some("device-1:tab-1".into()),
                 asserted_at: 222,
             }),
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2205,6 +2233,8 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: ProvenanceUpdate::Clear,
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2223,6 +2253,8 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2246,6 +2278,8 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings::default(),
         };
         fake.retire_closed("claude", "durable-m")
@@ -2354,6 +2388,8 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2385,6 +2421,8 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             settings: FreshAgentSettings::default(),
         };
         // Arm + invoke + KILL + release: suppressed.

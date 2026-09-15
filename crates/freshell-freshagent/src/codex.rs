@@ -1049,6 +1049,12 @@ impl FreshCodexState {
         // `None` on conn-less refresh/respawn lanes (the ledger merge keeps or
         // supersedes-inherits prior stamps).
         provenance: Option<&crate::BindProvenance>,
+        // b8ke ext r22 F2: the operation's observed (epoch, generation)
+        // pair — the DELAYED-WRITE FENCE the binding row carries (the
+        // write path refuses typed on a stale pair). `None` = the
+        // legacy-unfenced lanes (no commit under way).
+        observed_epoch: Option<u64>,
+        observed_generation: Option<u64>,
     ) {
         let Some(sink) = self.identity_sink() else {
             return;
@@ -1092,6 +1098,8 @@ impl FreshCodexState {
                 // asserts nothing (`Inherit` — the ledger merge keeps prior
                 // stamps).
                 provenance: provenance.cloned().into(),
+                observed_epoch,
+                observed_generation,
                 settings,
             })
             .await
@@ -2196,6 +2204,18 @@ impl FreshCodexState {
         // out from under us mid-create (watchdog): tear the just-registered
         // session down exactly like the lease-revoke arm — a stale
         // post-spawn commit must reap its uncommitted child.
+        //
+        // b8ke ext r22 F2: the binding row's fence pair — captured at the
+        // moment THIS operation's commit runs (the pre-commit ticket's
+        // generation; the delayed-write fence baseline the durable row
+        // carries below).
+        let (binding_epoch, binding_generation) =
+            match (self.ownership.as_ref(), own_ticket.as_ref()) {
+                (Some(registry), Some(ticket)) => {
+                    (Some(registry.boot_epoch()), Some(ticket.generation()))
+                }
+                _ => (None, None),
+            };
         if let Err(outcome) =
             self.commit_lane_claim_at(&mut own_ticket, &thread_id, &thread_id, sidecar_pid)
         {
@@ -2238,6 +2258,9 @@ impl FreshCodexState {
             cwd.as_deref(),
             None,
             provenance.as_ref(),
+            // b8ke ext r22 F2: the commit-time pair (the fence).
+            binding_epoch,
+            binding_generation,
         )
         .await;
 
@@ -2374,6 +2397,8 @@ impl FreshCodexState {
                     cwd.as_deref(),
                     None,
                     Some(&p),
+                    None, // observed_epoch (b8ke ext r22 F2)
+                    None, // observed_generation
                 )
                 .await;
             }
@@ -2595,6 +2620,8 @@ impl FreshCodexState {
             // Send/settings mutation is not a new browser assertion — conn-less
             // (merge keeps prior stamps, ep4 writer rules).
             None,
+            None, // observed_epoch (b8ke ext r22 F2)
+            None, // observed_generation
         )
         .await;
 
@@ -3756,6 +3783,8 @@ impl FreshCodexState {
             eff_cwd.as_deref(),
             None,
             fork_provenance.as_ref(),
+            None, // observed_epoch (b8ke ext r22 F2)
+            None, // observed_generation
         )
         .await;
 
@@ -5135,6 +5164,8 @@ impl FreshCodexState {
             cwd.as_deref(),
             None,
             None,
+            None, // observed_epoch (b8ke ext r22 F2)
+            None, // observed_generation
         )
         .await;
 
@@ -5440,6 +5471,8 @@ impl FreshCodexState {
             // D8: conn-less crash-respawn — provenance `None`; the ledger
             // inherits the superseded parent's stamps (fork-chain rule).
             None,
+            None, // observed_epoch (b8ke ext r22 F2)
+            None, // observed_generation
         )
         .await;
 
@@ -6697,6 +6730,8 @@ impl FreshCodexState {
                 // D8: conn-less attach-resume refresh — provenance `None`
                 // keeps the row's existing stamps.
                 None,
+                None, // observed_epoch (b8ke ext r22 F2)
+                None, // observed_generation
             )
             .await;
         }
@@ -13549,6 +13584,8 @@ pub(crate) mod tests {
                 tab_key: Some("device-row:tab-row".into()),
                 asserted_at: 7_777,
             }),
+            observed_epoch: None,
+            observed_generation: None,
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await
@@ -13738,6 +13775,8 @@ pub(crate) mod tests {
                 tab_key: Some("device-old:tab-old".into()),
                 asserted_at: 7_777,
             }),
+            observed_epoch: None,
+            observed_generation: None,
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await
@@ -13825,6 +13864,8 @@ pub(crate) mod tests {
                 tab_key: Some("device-row:tab-row".into()),
                 asserted_at: 7_777,
             }),
+            observed_epoch: None,
+            observed_generation: None,
             settings: crate::identity_sink::FreshAgentSettings {
                 model: Some("gpt-5.3-codex-spark".into()),
                 sandbox: None,
@@ -13923,6 +13964,8 @@ pub(crate) mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             settings: crate::identity_sink::FreshAgentSettings {
                 model: Some("gpt-5.3-codex-spark".into()),
                 sandbox: None,
@@ -15506,6 +15549,8 @@ pub(crate) mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await

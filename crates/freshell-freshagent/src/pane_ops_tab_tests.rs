@@ -1088,6 +1088,8 @@ async fn rest_resume_resolves_placeholder_sessionref_through_the_ledger() {
         resolves_pending: Some("freshopencode-cr-abc123".into()),
         supersedes: None,
         provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
+        observed_epoch: None,
+        observed_generation: None,
         settings: FreshAgentSettings::default(),
     })
     .await

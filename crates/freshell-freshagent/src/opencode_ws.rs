@@ -1248,6 +1248,8 @@ impl FreshOpencodeState {
                     Some(parked) => crate::identity_sink::ProvenanceUpdate::Replace(parked),
                     None => crate::identity_sink::ProvenanceUpdate::Inherit,
                 },
+                observed_epoch: None,
+                observed_generation: None,
                 settings: pre_park_settings.clone(),
             });
             self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
@@ -1258,6 +1260,8 @@ impl FreshOpencodeState {
                 resolves_pending: None,
                 supersedes: None,
                 provenance: crate::identity_sink::ProvenanceUpdate::Replace(p),
+                observed_epoch: None,
+                observed_generation: None,
                 settings: crate::identity_sink::FreshAgentSettings {
                     model,
                     sandbox: None,
@@ -1595,6 +1599,8 @@ impl FreshOpencodeState {
                 resolves_pending: Some(session.placeholder_id.clone()),
                 supersedes: None,
                 provenance: session.provenance.clone().into(),
+                observed_epoch: None,
+                observed_generation: None,
                 settings: crate::identity_sink::FreshAgentSettings {
                     model: session.model.clone(),
                     sandbox: None,
@@ -1668,6 +1674,8 @@ impl FreshOpencodeState {
                 resolves_pending: None,
                 supersedes: None,
                 provenance: session.provenance.clone().into(),
+                observed_epoch: None,
+                observed_generation: None,
                 settings: crate::identity_sink::FreshAgentSettings {
                     model: session.model.clone(),
                     sandbox: None,
@@ -3696,6 +3704,8 @@ impl FreshOpencodeState {
             // connection > parent's parked > parent's row); `Inherit` only
             // when no source knows the attribution — never invented.
             provenance: fork_provenance.into(),
+            observed_epoch: None,
+            observed_generation: None,
             settings: crate::identity_sink::FreshAgentSettings {
                 model,
                 sandbox: None,
@@ -4945,6 +4955,16 @@ impl FreshOpencodeState {
         // under-ticket mode (handoff continuation) SKIPS the commit — the
         // handoff runner performs the ONE `commit_live` (single commit
         // authority).
+        // b8ke ext r22 F2: the binding row's fence pair — captured at the
+        // moment this resume's commit runs (the delayed-write fence
+        // baseline the durable row carries below).
+        let (binding_epoch, binding_generation) =
+            match (self.fresh_agent.ownership.as_ref(), own_ticket.as_ref()) {
+                (Some(registry), Some(ticket)) => {
+                    (Some(registry.boot_epoch()), Some(ticket.generation()))
+                }
+                _ => (None, None),
+            };
         if handoff.is_none() {
             if let Err(outcome) = self.commit_lane_claim_at(&mut own_ticket, session_id) {
                 tracing::error!(target: "invariant",
@@ -5018,6 +5038,8 @@ impl FreshOpencodeState {
                 resolves_pending: None,
                 supersedes: None,
                 provenance,
+                observed_epoch: binding_epoch,
+                observed_generation: binding_generation,
                 settings,
             })
             .await;
@@ -8913,6 +8935,8 @@ mod tests {
             resolves_pending: Some("freshopencode-cr-lineage".into()),
             supersedes: None,
             provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await
@@ -8968,6 +8992,8 @@ mod tests {
             resolves_pending: Some("freshopencode-cr-lineage-killed".into()),
             supersedes: None,
             provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await
@@ -9752,6 +9778,8 @@ mod tests {
                 tab_key: Some("device-old:tab-old".into()),
                 asserted_at: 7_777,
             }),
+            observed_epoch: None,
+            observed_generation: None,
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await
@@ -10016,6 +10044,8 @@ mod tests {
                 tab_key: Some("device-row:tab-row".into()),
                 asserted_at: 7_777,
             }),
+            observed_epoch: None,
+            observed_generation: None,
             settings: crate::identity_sink::FreshAgentSettings {
                 model: Some("big-model".into()),
                 sandbox: None,
@@ -10111,6 +10141,8 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             settings: crate::identity_sink::FreshAgentSettings {
                 model: Some("big-model".into()),
                 sandbox: None,
@@ -10265,6 +10297,8 @@ mod tests {
                 tab_key: Some("device-row:tab-row".into()),
                 asserted_at: 7_777,
             }),
+            observed_epoch: None,
+            observed_generation: None,
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await
@@ -10348,6 +10382,8 @@ mod tests {
                 tab_key: Some("device-row:tab-row".into()),
                 asserted_at: 7_777,
             }),
+            observed_epoch: None,
+            observed_generation: None,
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await

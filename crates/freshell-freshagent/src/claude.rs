@@ -7191,6 +7191,16 @@ impl FreshClaudeState {
         // commits the authoritative Live{FreshAgent} ownership under the
         // durable id and broadcasts the owner record so every device
         // converges.
+        // b8ke ext r22 F2: the binding row's fence pair — captured at the
+        // moment THIS adoption's commit runs (the pre-commit ticket's
+        // generation; the delayed-write fence baseline the durable row
+        // carries below). `None` when no ticket was claimed (the Adopt
+        // arms — the record is already authoritative) or the coordinator
+        // is unwired.
+        let (binding_epoch, binding_generation) = (
+            self.ownership.as_ref().map(|r| r.boot_epoch()),
+            adoption_ticket.as_ref().map(|t| t.generation()),
+        );
         if let Some(ticket) = adoption_ticket.as_ref() {
             let generation = ticket.generation();
             let operation_id = ticket.operation_id().to_string();
@@ -7292,6 +7302,9 @@ impl FreshClaudeState {
                 resolves_pending: None,
                 supersedes: supersedes.map(str::to_string),
                 provenance: provenance.cloned().into(),
+                // b8ke ext r22 F2: the commit-time pair (the fence).
+                observed_epoch: binding_epoch,
+                observed_generation: binding_generation,
                 settings: settings.cloned().unwrap_or_default(),
             })
             .await
@@ -15016,6 +15029,8 @@ rl.on('line', (line) => {
             resolves_pending: None,
             supersedes: None,
             provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await

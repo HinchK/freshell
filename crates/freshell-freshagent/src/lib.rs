@@ -4094,6 +4094,17 @@ async fn send_keys(
         // under it and the rekey REFUSES typed — the pane is NOT bound
         // (the daemon-side session is abandoned; the shared serve is
         // never killed — OpenCode invariant), never two writers.
+        // b8ke ext r22 F2: the binding row's fence pair — the rekeyed
+        // ticket's (epoch, generation) at the mint (the delayed-write
+        // fence baseline the durable row carries below). None when the
+        // coordinator is unwired.
+        let (binding_epoch, binding_generation) =
+            match (state.ownership.as_ref(), own_ticket.as_ref()) {
+                (Some(registry), Some(ticket)) => {
+                    (Some(registry.boot_epoch()), Some(ticket.generation()))
+                }
+                _ => (None, None),
+            };
         if let Some(ticket) = own_ticket.as_mut() {
             let Some(registry) = state.ownership.as_ref() else {
                 unreachable!("a live ticket implies a wired coordinator");
@@ -4178,6 +4189,9 @@ async fn send_keys(
                     // without attribution are never offered by the recovery
                     // judgment (`recovery_inventory.rs`).
                     provenance: identity_sink::ProvenanceUpdate::Clear,
+                    // b8ke ext r22 F2: the mint-time pair (the fence).
+                    observed_epoch: binding_epoch,
+                    observed_generation: binding_generation,
                     settings: identity_sink::FreshAgentSettings {
                         model: pane.model.clone(),
                         sandbox: None,
